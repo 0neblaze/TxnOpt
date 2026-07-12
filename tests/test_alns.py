@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from evrptw.alns import solve_alns
 from evrptw.models import Instance, Node, NodeType, Vehicle
+from evrptw.objective import SolutionObjective
 from evrptw.validation import validate_routes
 
 
@@ -31,4 +32,8 @@ def test_alns_returns_reproducible_unified_validator_feasible_solution() -> None
     assert first.charging_subproblem_calls > 0
     assert set(first.destroy_statistics) == {"random", "worst", "related"}
     assert set(first.repair_statistics) == {"greedy", "regret2", "energy"}
-    assert validate_routes(instance, [list(route) for route in first.routes]).feasible
+    report = validate_routes(instance, [list(route) for route in first.routes])
+    assert report.feasible
+    assert first.objective is not None
+    assert first.objective.key == SolutionObjective.from_report(instance, report).key
+    assert first.objective_value == first.objective.total_distance

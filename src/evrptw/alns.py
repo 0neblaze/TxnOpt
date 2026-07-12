@@ -6,7 +6,13 @@ import time
 from dataclasses import asdict, dataclass
 
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
-from evrptw.models import Instance, Node
+from evrptw.models import Instance, Node, NodeType
+from evrptw.objective import (
+    ObjectiveComparison,
+    SolutionObjective,
+    accept_annealing_move,
+    compare_objectives,
+)
 from evrptw.validation import validate_routes
 
 _INFEASIBLE_COST = 1e12
@@ -29,7 +35,7 @@ class ALNSResult:
     feasible: bool
     routes: tuple[tuple[str, ...], ...]
     customer_sequences: tuple[tuple[str, ...], ...]
-    objective_value: float
+    objective: SolutionObjective | None
     vehicle_count: int
     total_energy: float
     total_charged_energy: float
@@ -49,13 +55,17 @@ class ALNSResult:
     repair_statistics: dict[str, dict[str, float | int]]
     failure_reason: str
 
+    @property
+    def objective_value(self) -> float:
+        return self.objective.total_distance if self.objective is not None else float("inf")
+
 
 @dataclass(frozen=True, slots=True)
 class _EvaluatedSolution:
     sequences: tuple[tuple[str, ...], ...]
     charging: tuple[ChargingSubproblemResult, ...]
     feasible: bool
-    cost: float
+    objective: SolutionObjective | None
 
 
 class _Evaluator:
@@ -84,8 +94,21 @@ class _Evaluator:
         clean = tuple(sequence for sequence in sequences if sequence)
         charging = tuple(self.route(sequence) for sequence in clean)
         feasible = bool(clean) and all(result.feasible for result in charging)
-        cost = sum(result.distance for result in charging) if feasible else _INFEASIBLE_COST
-        return _EvaluatedSolution(clean, charging, feasible, cost)
+        if not feasible:
+            return _EvaluatedSolution(clean, charging, False, None)
+        charging_count = sum(
+            1
+            for result in charging
+            for name in result.route
+            if self.instance.by_name[name].kind is NodeType.STATION
+        )
+        objective = SolutionObjective(
+            len(clean),
+            sum(result.distance for result in charging),
+            sum(result.charging_time for result in charging),
+            charging_count,
+        )
+        return _EvaluatedSolution(clean, charging, True, objective)
 
 
 class _TimeLimitReached(Exception):
@@ -117,6 +140,8 @@ def solve_alns(
     current = evaluator.solution(initial_sequences)
     if not current.feasible:
         return _failed_result(started, evaluator, "no feasible singleton initial solution")
+    if current.objective is None:
+        raise RuntimeError("feasible ALNS initial solution is missing its objective")
 
     best = current
     first_feasible_time = time.perf_counter() - started
@@ -127,7 +152,7 @@ def solve_alns(
     improved = 0
     rejected = 0
     completed_iterations = 0
-    initial_temperature = max(1.0, current.cost * 0.05)
+    initial_temperature = max(1.0, current.objective.total_distance * 0.05)
 
     for iteration in range(max_iterations):
         elapsed = time.perf_counter() - started
@@ -150,9 +175,15 @@ def solve_alns(
             break
 
         temperature = initial_temperature * max(0.001, 1.0 - iteration / max_iterations)
-        delta = candidate.cost - current.cost
-        accept = candidate.feasible and (
-            delta <= 0.0 or rng.random() < math.exp(-delta / max(temperature, 1e-12))
+        accept = (
+            candidate.feasible
+            and candidate.objective is not None
+            and accept_annealing_move(
+                current.objective,
+                candidate.objective,
+                temperature=max(temperature, 1e-12),
+                random_draw=rng.random(),
+            )
         )
         if not accept:
             rejected += 1
@@ -164,13 +195,17 @@ def solve_alns(
         destroy_stats[destroy_name].accepted += 1
         repair_stats[repair_name].accepted += 1
         reward = 1.0
-        if candidate.cost < current.cost - 1e-9:
+        if candidate.objective is None:
+            raise RuntimeError("accepted ALNS candidate is missing its objective")
+        if compare_objectives(candidate.objective, current.objective) is ObjectiveComparison.BETTER:
             improved += 1
             reward = 4.0
             destroy_stats[destroy_name].improved += 1
             repair_stats[repair_name].improved += 1
         current = candidate
-        if candidate.cost < best.cost - 1e-9:
+        if best.objective is None:
+            raise RuntimeError("feasible ALNS incumbent is missing its objective")
+        if compare_objectives(candidate.objective, best.objective) is ObjectiveComparison.BETTER:
             best = candidate
             best_time = time.perf_counter() - started
             reward = 8.0
@@ -183,11 +218,13 @@ def solve_alns(
     report = validate_routes(instance, [list(route) for route in routes])
     if not report.feasible:
         raise RuntimeError("ALNS best solution failed the unified validator")
+    if best.objective is None:
+        raise RuntimeError("feasible ALNS result is missing its objective")
     return ALNSResult(
         feasible=True,
         routes=routes,
         customer_sequences=best.sequences,
-        objective_value=best.cost,
+        objective=best.objective,
         vehicle_count=len(routes),
         total_energy=sum(result.total_energy for result in best.charging),
         total_charged_energy=sum(result.charged_energy for result in best.charging),
@@ -437,26 +474,26 @@ def _update_weight(statistics: OperatorStatistics, reward: float, reaction: floa
 
 def _failed_result(started: float, evaluator: _Evaluator, reason: str) -> ALNSResult:
     return ALNSResult(
-        False,
-        (),
-        (),
-        float("inf"),
-        0,
-        0.0,
-        0.0,
-        0.0,
-        0,
-        0,
-        0,
-        0,
-        float("inf"),
-        float("inf"),
-        time.perf_counter() - started,
-        evaluator.calls,
-        evaluator.runtime,
-        evaluator.labels_generated,
-        evaluator.labels_pruned,
-        {},
-        {},
-        reason,
+        feasible=False,
+        routes=(),
+        customer_sequences=(),
+        objective=None,
+        vehicle_count=0,
+        total_energy=0.0,
+        total_charged_energy=0.0,
+        total_charging_time=0.0,
+        iterations=0,
+        accepted_moves=0,
+        improving_moves=0,
+        rejected_moves=0,
+        first_feasible_time=float("inf"),
+        best_time=float("inf"),
+        runtime_seconds=time.perf_counter() - started,
+        charging_subproblem_calls=evaluator.calls,
+        charging_subproblem_time=evaluator.runtime,
+        charging_labels_generated=evaluator.labels_generated,
+        charging_labels_pruned=evaluator.labels_pruned,
+        destroy_statistics={},
+        repair_statistics={},
+        failure_reason=reason,
     )

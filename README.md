@@ -139,6 +139,18 @@ checksum-protected baseline is tracked under `experiments/baselines/stage00/`.
 See [the Stage 0 baseline protocol](docs/stage00_baseline.md) for verification
 and candidate-comparison commands.
 
+### Stage 1 lexicographic objective
+
+The formal objective is now vehicle-first:
+`(vehicle count, total distance, total charging time, charging count)`. ALNS
+hard-rejects moves that add a vehicle, and the small exact BPC reference uses
+the same objective for its incumbent and optimality claim. Stage 0 remains an
+immutable historical baseline.
+
+See [the Stage 1 objective protocol](docs/stage01_lexicographic_objective.md)
+for the comparison interface, acceptance policy, experiment schema, and
+reproduction command.
+
 ---
 
 ## Repository structure

@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import pytest
 
-from evrptw.bpc import generate_columns_bidirectionally, solve_branch_price_and_cut
+from evrptw.bpc import (
+    RouteColumn,
+    generate_columns_bidirectionally,
+    solve_branch_price_and_cut,
+    solve_lexicographic_set_partitioning,
+)
+from evrptw.charging import ChargingSubproblemResult
 from evrptw.models import Instance, Node, NodeType, Vehicle
+from evrptw.objective import SolutionObjective
 from evrptw.validation import validate_routes
 
 
@@ -37,12 +44,49 @@ def test_branch_price_and_cut_proves_small_instance_and_validates_incumbent() ->
 
     assert result.status == "optimal"
     assert result.proven_optimal is True
-    assert result.objective_value == pytest.approx(result.root_lower_bound)
-    assert result.final_lower_bound == pytest.approx(result.incumbent)
-    assert result.optimality_gap == pytest.approx(0.0)
+    assert result.objective is not None
+    report = validate_routes(instance, [list(route) for route in result.routes])
+    assert result.objective.key == SolutionObjective.from_report(instance, report).key
+    assert result.objective_value == pytest.approx(result.objective.total_distance)
+    assert result.search_gap == pytest.approx(0.0)
     assert result.generated_columns >= result.active_columns
     assert result.pricing_iterations >= 1
-    assert validate_routes(instance, [list(route) for route in result.routes]).feasible
+    assert report.feasible
+
+
+def _column(
+    customers: tuple[str, ...], objective: SolutionObjective, name: str
+) -> RouteColumn:
+    route = ("D0", name, "D0")
+    charging = ChargingSubproblemResult(
+        True,
+        route,
+        objective.total_distance,
+        objective.total_distance,
+        0.0,
+        objective.total_charging_time,
+        1,
+        1,
+        0,
+        0.0,
+        "",
+    )
+    return RouteColumn(customers, route, charging, objective)
+
+
+def test_exact_master_prioritizes_vehicle_count_then_charging_ties() -> None:
+    columns = (
+        _column(("C1", "C2"), SolutionObjective(1, 100.0, 8.0, 2), "R1"),
+        _column(("C1", "C2"), SolutionObjective(1, 100.0, 5.0, 1), "R2"),
+        _column(("C1",), SolutionObjective(1, 10.0, 0.0, 0), "R3"),
+        _column(("C2",), SolutionObjective(1, 10.0, 0.0, 0), "R4"),
+    )
+
+    solution = solve_lexicographic_set_partitioning(("C1", "C2"), columns)
+
+    assert solution is not None
+    assert solution.objective.key == SolutionObjective(1, 100.0, 5.0, 1).key
+    assert solution.column_indices == (1,)
 
 
 def test_exact_pricing_fails_fast_above_documented_size_limit() -> None:

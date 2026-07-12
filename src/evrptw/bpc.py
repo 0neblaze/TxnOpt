@@ -10,7 +10,8 @@ import numpy as np
 from scipy.optimize import linprog
 
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
-from evrptw.models import Instance
+from evrptw.models import Instance, NodeType
+from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
 from evrptw.validation import validate_routes
 
 _EPSILON = 1e-8
@@ -20,8 +21,12 @@ _EPSILON = 1e-8
 class RouteColumn:
     customers: tuple[str, ...]
     route: tuple[str, ...]
-    cost: float
     charging: ChargingSubproblemResult
+    objective: SolutionObjective
+
+    @property
+    def cost(self) -> float:
+        return self.objective.total_distance
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,11 +45,11 @@ class BPCResult:
     status: str
     proven_optimal: bool
     routes: tuple[tuple[str, ...], ...]
-    objective_value: float
-    root_lower_bound: float
-    final_lower_bound: float
-    incumbent: float
-    optimality_gap: float
+    objective: SolutionObjective | None
+    root_search_bound: float
+    final_search_bound: float
+    search_incumbent: float
+    search_gap: float
     branch_nodes: int
     generated_columns: int
     active_columns: int
@@ -57,6 +62,32 @@ class BPCResult:
     cuts_added: int
     runtime_seconds: float
     failure_reason: str
+
+    @property
+    def objective_value(self) -> float:
+        return self.objective.total_distance if self.objective is not None else float("inf")
+
+    @property
+    def root_lower_bound(self) -> float:
+        return self.root_search_bound
+
+    @property
+    def final_lower_bound(self) -> float:
+        return self.final_search_bound
+
+    @property
+    def incumbent(self) -> float:
+        return self.objective_value
+
+    @property
+    def optimality_gap(self) -> float:
+        return self.search_gap
+
+
+@dataclass(frozen=True, slots=True)
+class LexicographicMasterSolution:
+    objective: SolutionObjective
+    column_indices: tuple[int, ...]
 
 
 @dataclass(order=True, slots=True)
@@ -131,7 +162,24 @@ def generate_columns_bidirectionally(
         if not charging.feasible:
             pruned_infeasible += 1
             continue
-        columns.append(RouteColumn(sequence, charging.route, charging.distance, charging))
+        charging_count = sum(
+            1
+            for name in charging.route
+            if instance.by_name[name].kind is NodeType.STATION
+        )
+        columns.append(
+            RouteColumn(
+                sequence,
+                charging.route,
+                charging,
+                SolutionObjective(
+                    1,
+                    charging.distance,
+                    charging.charging_time,
+                    charging_count,
+                ),
+            )
+        )
 
     return BidirectionalPricingResult(
         tuple(columns),
@@ -142,6 +190,58 @@ def generate_columns_bidirectionally(
         pruned_infeasible,
         time.perf_counter() - started,
     )
+
+
+def solve_lexicographic_set_partitioning(
+    customers: tuple[str, ...],
+    columns: tuple[RouteColumn, ...],
+) -> LexicographicMasterSolution | None:
+    if len(set(customers)) != len(customers):
+        raise ValueError("set-partitioning customers must be unique")
+    customer_index = {name: index for index, name in enumerate(customers)}
+    column_masks: list[int] = []
+    for column in columns:
+        if len(set(column.customers)) != len(column.customers):
+            raise ValueError("route column contains duplicate customers")
+        unknown = set(column.customers) - set(customer_index)
+        if unknown:
+            raise ValueError(
+                "route column contains unknown customers: " + ", ".join(sorted(unknown))
+            )
+        mask = sum(1 << customer_index[name] for name in column.customers)
+        column_masks.append(mask)
+
+    full_mask = (1 << len(customers)) - 1
+    states: dict[int, LexicographicMasterSolution] = {
+        0: LexicographicMasterSolution(SolutionObjective.zero(), ())
+    }
+    for mask in range(full_mask + 1):
+        state = states.get(mask)
+        if state is None or mask == full_mask:
+            continue
+        first_uncovered = next(
+            index for index in range(len(customers)) if not mask & (1 << index)
+        )
+        required_bit = 1 << first_uncovered
+        for column_index, column_mask in enumerate(column_masks):
+            if not column_mask & required_bit or column_mask & mask:
+                continue
+            next_mask = mask | column_mask
+            candidate = LexicographicMasterSolution(
+                state.objective + columns[column_index].objective,
+                (*state.column_indices, column_index),
+            )
+            incumbent = states.get(next_mask)
+            if incumbent is None:
+                states[next_mask] = candidate
+                continue
+            comparison = compare_objectives(candidate.objective, incumbent.objective)
+            if comparison is ObjectiveComparison.BETTER or (
+                comparison is ObjectiveComparison.EQUAL
+                and candidate.column_indices < incumbent.column_indices
+            ):
+                states[next_mask] = candidate
+    return states.get(full_mask)
 
 
 def solve_branch_price_and_cut(
@@ -167,10 +267,12 @@ def solve_branch_price_and_cut(
             pricing,
             "at least one customer has no feasible singleton column",
         )
+    vehicle_priority_weight = 1.0 + len(customers) * max(column.cost for column in columns)
 
     queue = [_BranchNode(0.0, 0, frozenset(), frozenset())]
     serial = 1
-    incumbent = float("inf")
+    search_incumbent = float("inf")
+    incumbent_objective: SolutionObjective | None = None
     incumbent_columns: tuple[int, ...] = ()
     root_lower_bound = float("inf")
     final_lower_bound = float("inf")
@@ -190,6 +292,7 @@ def solve_branch_price_and_cut(
             singleton,
             node.fixed_zero,
             node.fixed_one,
+            vehicle_priority_weight,
             exhaustive_pool=explored > 0,
         )
         explored += 1
@@ -197,7 +300,7 @@ def solve_branch_price_and_cut(
         active_seen.update(master.active)
         if explored == 1:
             root_lower_bound = master.lower_bound
-        if not master.feasible or master.lower_bound >= incumbent - _EPSILON:
+        if not master.feasible or master.lower_bound > search_incumbent + _EPSILON:
             continue
         final_lower_bound = min((item.priority for item in queue), default=master.lower_bound)
 
@@ -212,8 +315,16 @@ def solve_branch_price_and_cut(
                 for column_index, value in zip(master.active, master.values, strict=True)
                 if value >= 1.0 - _EPSILON
             )
-            if master.objective < incumbent:
-                incumbent = master.objective
+            objective = sum(
+                (columns[index].objective for index in chosen),
+                start=SolutionObjective.zero(),
+            )
+            if incumbent_objective is None or (
+                compare_objectives(objective, incumbent_objective)
+                is ObjectiveComparison.BETTER
+            ):
+                incumbent_objective = objective
+                search_incumbent = _search_score(objective, vehicle_priority_weight)
                 incumbent_columns = chosen
             continue
 
@@ -239,26 +350,45 @@ def solve_branch_price_and_cut(
         )
         serial += 1
 
-    if math.isinf(incumbent):
-        return _bpc_failure(started, pricing, "branch-and-price found no integer incumbent")
     if not timed_out:
-        final_lower_bound = incumbent
-    elif queue:
+        exact = solve_lexicographic_set_partitioning(customers, columns)
+        if exact is None:
+            return _bpc_failure(
+                started,
+                pricing,
+                "complete column pool has no lexicographic set-partitioning solution",
+            )
+        incumbent_objective = exact.objective
+        incumbent_columns = exact.column_indices
+        search_incumbent = _search_score(exact.objective, vehicle_priority_weight)
+        final_lower_bound = search_incumbent
+    if incumbent_objective is None or math.isinf(search_incumbent):
+        return _bpc_failure(started, pricing, "branch-and-price found no integer incumbent")
+    if timed_out and queue:
         final_lower_bound = min(item.priority for item in queue)
-    gap = max(0.0, (incumbent - final_lower_bound) / max(abs(incumbent), _EPSILON))
+    gap = max(
+        0.0,
+        (search_incumbent - final_lower_bound) / max(abs(search_incumbent), _EPSILON),
+    )
     routes = tuple(columns[index].route for index in incumbent_columns)
     report = validate_routes(instance, [list(route) for route in routes])
     if not report.feasible:
         raise RuntimeError("Branch-Price-and-Cut incumbent failed unified validation")
+    validated_objective = SolutionObjective.from_report(instance, report)
+    if (
+        compare_objectives(validated_objective, incumbent_objective)
+        is not ObjectiveComparison.EQUAL
+    ):
+        raise RuntimeError("Branch-Price-and-Cut objective differs from unified validation")
     return BPCResult(
         status="timeout" if timed_out else "optimal",
         proven_optimal=not timed_out and gap <= _EPSILON,
         routes=routes,
-        objective_value=incumbent,
-        root_lower_bound=root_lower_bound,
-        final_lower_bound=final_lower_bound,
-        incumbent=incumbent,
-        optimality_gap=gap,
+        objective=incumbent_objective,
+        root_search_bound=root_lower_bound,
+        final_search_bound=final_lower_bound,
+        search_incumbent=search_incumbent,
+        search_gap=gap,
         branch_nodes=explored,
         generated_columns=len(columns),
         active_columns=len(active_seen),
@@ -280,6 +410,7 @@ def _solve_node(
     initial: set[int],
     fixed_zero: frozenset[int],
     fixed_one: frozenset[int],
+    vehicle_priority_weight: float,
     *,
     exhaustive_pool: bool,
 ) -> _MasterResult:
@@ -296,7 +427,9 @@ def _solve_node(
         for position, column_index in enumerate(active):
             for customer in columns[column_index].customers:
                 matrix[customer_index[customer], position] = 1.0
-        costs = np.array([columns[index].cost for index in active])
+        costs = np.array(
+            [vehicle_priority_weight + columns[index].cost for index in active]
+        )
         fleet_lb = math.ceil(
             sum(customer.demand for customer in instance.customers)
             / instance.vehicle.load_capacity
@@ -339,7 +472,7 @@ def _solve_node(
             covered_duals = sum(
                 duals[customer_index[name]] for name in column.customers
             )
-            reduced_cost = column.cost - covered_duals
+            reduced_cost = vehicle_priority_weight + column.cost - covered_duals
             reduced_cost += fleet_dual
             if reduced_cost < -_EPSILON:
                 candidates.append((reduced_cost, index))
@@ -349,6 +482,10 @@ def _solve_node(
             return _MasterResult(True, objective, values, tuple(active), objective, iterations)
         active.extend(index for _, index in sorted(candidates)[: min(20, len(candidates))])
         active.sort()
+
+
+def _search_score(objective: SolutionObjective, vehicle_priority_weight: float) -> float:
+    return vehicle_priority_weight * objective.vehicle_count + objective.total_distance
 
 
 def _demand(instance: Instance, customers: tuple[str, ...]) -> float:
@@ -361,24 +498,24 @@ def _bpc_failure(
     reason: str,
 ) -> BPCResult:
     return BPCResult(
-        "infeasible",
-        False,
-        (),
-        float("inf"),
-        float("inf"),
-        float("inf"),
-        float("inf"),
-        float("inf"),
-        0,
-        len(pricing.columns),
-        0,
-        0,
-        pricing.forward_labels,
-        pricing.backward_labels,
-        pricing.joined_labels,
-        pricing.labels_pruned_capacity,
-        pricing.labels_pruned_infeasible,
-        0,
-        time.perf_counter() - started,
-        reason,
+        status="infeasible",
+        proven_optimal=False,
+        routes=(),
+        objective=None,
+        root_search_bound=float("inf"),
+        final_search_bound=float("inf"),
+        search_incumbent=float("inf"),
+        search_gap=float("inf"),
+        branch_nodes=0,
+        generated_columns=len(pricing.columns),
+        active_columns=0,
+        pricing_iterations=0,
+        forward_labels=pricing.forward_labels,
+        backward_labels=pricing.backward_labels,
+        joined_labels=pricing.joined_labels,
+        labels_pruned_capacity=pricing.labels_pruned_capacity,
+        labels_pruned_infeasible=pricing.labels_pruned_infeasible,
+        cuts_added=0,
+        runtime_seconds=time.perf_counter() - started,
+        failure_reason=reason,
     )
