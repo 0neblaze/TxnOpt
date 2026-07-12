@@ -23,12 +23,10 @@ def _objective(
 
 def test_lexicographic_objective_uses_every_level_in_declared_order() -> None:
     assert (
-        compare_objectives(_objective(1, 100.0), _objective(2, 1.0))
-        is ObjectiveComparison.BETTER
+        compare_objectives(_objective(1, 100.0), _objective(2, 1.0)) is ObjectiveComparison.BETTER
     )
     assert (
-        compare_objectives(_objective(2, 10.0), _objective(2, 11.0))
-        is ObjectiveComparison.BETTER
+        compare_objectives(_objective(2, 10.0), _objective(2, 11.0)) is ObjectiveComparison.BETTER
     )
     assert (
         compare_objectives(_objective(2, 10.0, 4.0), _objective(2, 10.0, 5.0))
@@ -80,6 +78,14 @@ def test_objective_from_validator_report_counts_station_visits() -> None:
     objective = SolutionObjective.from_report(instance, report)
 
     assert objective.key == _objective(1, 8.0, 0.6, 2).key
+
+    route_objective = SolutionObjective.from_route(
+        instance,
+        ("D0", "F1", "C1", "F1", "D0"),
+        total_distance=8.0,
+        total_charging_time=0.6,
+    )
+    assert route_objective.key == objective.key
 
 
 def test_annealing_policy_never_accepts_more_vehicles_and_always_accepts_fewer() -> None:

@@ -3,6 +3,19 @@
 These instructions apply to every Codex conversation whose working directory is
 this repository or one of its subdirectories.
 
+## Formal Objective Policy
+
+- The formal optimisation objective is the lexicographic tuple
+  `(vehicle_count, total_distance, total_charging_time, charging_count)`.
+- Vehicle count has absolute priority. ALNS must always reject a candidate that
+  increases vehicle count, including during simulated annealing.
+- All objective construction and comparison must use `evrptw.objective`; callers
+  must not duplicate tuple construction, station-visit counting, or comparison
+  logic.
+- `experiments/baselines/stage00/` is an immutable frozen baseline. Later-stage
+  raw results belong under ignored `results/`, while review summaries belong in
+  tracked experiment summary directories.
+
 ## Literature Recommendation Policy
 
 - Codex recommends literature but does not obtain it. Do not access the user's

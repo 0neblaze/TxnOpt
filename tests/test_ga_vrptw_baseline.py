@@ -30,9 +30,13 @@ def test_ga_convergence_log_contains_required_fields() -> None:
     instance = generate_week02_instance(10, seed=2014)
     result = solve_ga_vrptw(instance, seed=2014, population_size=10, generations=3)
     payload = result.to_dict()
+    objective_value = payload["objective_value"]
+    runtime_seconds = payload["runtime_seconds"]
 
-    assert payload["objective_value"] > 0
-    assert payload["runtime_seconds"] >= 0
+    assert isinstance(objective_value, (int, float))
+    assert isinstance(runtime_seconds, (int, float))
+    assert objective_value > 0
+    assert runtime_seconds >= 0
     assert len(result.convergence) == 4
     assert result.convergence[-1].generation == 3
     assert result.convergence[-1].best_objective > 0

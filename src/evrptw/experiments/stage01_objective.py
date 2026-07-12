@@ -15,8 +15,13 @@ from evrptw.alns import ALNSResult, solve_alns
 from evrptw.bpc import BPCResult, solve_branch_price_and_cut
 from evrptw.environment import collect_environment
 from evrptw.experiments.stage00_baseline import Stage00Config, load_config, verify_results
-from evrptw.models import Instance, NodeType
-from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
+from evrptw.models import Instance
+from evrptw.objective import (
+    ObjectiveComparison,
+    SolutionObjective,
+    compare_objectives,
+    count_charging_visits,
+)
 from evrptw.parser import parse_schneider
 from evrptw.validation import SolutionReport, validate_routes
 
@@ -125,6 +130,12 @@ def run_stage01_objective(
     solution_dir = output_dir / "solutions"
     raw_dir.mkdir()
     solution_dir.mkdir()
+    per_run = output_dir / "stage01_per_run_results.csv"
+    summary = output_dir / "stage01_summary_results.csv"
+    failures = output_dir / "stage01_failure_cases.csv"
+    ranking = output_dir / "stage01_objective_ranking_changes.csv"
+    comparison = output_dir / "stage01_stage00_comparison.csv"
+    environment = output_dir / "stage01_environment.json"
 
     rows: list[dict[str, Any]] = []
     for name in config.instances:
@@ -136,31 +147,20 @@ def run_stage01_objective(
                 max_iterations=config.max_iterations,
                 time_limit_seconds=config.time_limit_seconds,
             )
-            rows.append(
-                _record_alns(
-                    instance, seed, alns_result, output_dir, raw_dir, solution_dir
-                )
-            )
+            row = _record_alns(instance, seed, alns_result, output_dir, raw_dir, solution_dir)
+            rows.append(row)
+            _fail_fast_after_persisting(rows, per_run, failures)
         if len(instance.customers) <= 5:
             bpc_result = solve_branch_price_and_cut(
                 instance,
                 time_limit_seconds=config.time_limit_seconds,
                 max_customers=8,
             )
-            rows.append(
-                _record_bpc(instance, bpc_result, output_dir, raw_dir, solution_dir)
-            )
-
-    per_run = output_dir / "stage01_per_run_results.csv"
-    summary = output_dir / "stage01_summary_results.csv"
-    failures = output_dir / "stage01_failure_cases.csv"
-    ranking = output_dir / "stage01_objective_ranking_changes.csv"
-    comparison = output_dir / "stage01_stage00_comparison.csv"
-    environment = output_dir / "stage01_environment.json"
+            row = _record_bpc(instance, bpc_result, output_dir, raw_dir, solution_dir)
+            rows.append(row)
+            _fail_fast_after_persisting(rows, per_run, failures)
     summary_rows = _summarize(rows)
-    ranking_rows = build_objective_ranking_report(
-        baseline_dir, benchmark_dir=config.benchmark_dir
-    )
+    ranking_rows = build_objective_ranking_report(baseline_dir, benchmark_dir=config.benchmark_dir)
     comparison_rows = _compare_with_stage00(
         baseline_dir,
         config,
@@ -189,6 +189,8 @@ def run_stage01_objective(
             "environment": collect_environment(),
         },
     )
+    if any(row["gate_status"] == "fail" for row in comparison_rows):
+        raise RuntimeError("Stage 1 failed at least one Stage 0 regression gate")
 
     summary_dir.mkdir(parents=True, exist_ok=True)
     copies = {
@@ -202,8 +204,6 @@ def run_stage01_objective(
         if destination.exists():
             raise FileExistsError(f"tracked Stage 1 summary already exists: {destination}")
         destination.write_bytes(source.read_bytes())
-    if any(row["gate_status"] == "fail" for row in comparison_rows):
-        raise RuntimeError("Stage 1 failed at least one Stage 0 regression gate")
     return {
         **{name: destination for name, (_, destination) in copies.items()},
         "environment": environment,
@@ -215,18 +215,17 @@ def run_stage01_objective(
 def build_objective_ranking_report(
     baseline_dir: Path,
     *,
-    benchmark_dir: Path | None = None,
+    benchmark_dir: Path,
 ) -> list[dict[str, Any]]:
     rows = _read_csv(baseline_dir / "per_run_results.csv")
     enriched: list[tuple[dict[str, str], SolutionObjective]] = []
     for row in rows:
-        payload = json.loads(
-            (baseline_dir / row["solution_path"]).read_text(encoding="utf-8")
-        )
+        payload = json.loads((baseline_dir / row["solution_path"]).read_text(encoding="utf-8"))
         routes = [list(route) for route in payload["routes"]]
-        charging_count = _count_charging_visits(
+        instance = parse_schneider(benchmark_dir / f"{row['instance']}.txt")
+        charging_count = count_charging_visits(
+            instance,
             routes,
-            _load_optional_instance(benchmark_dir, row["instance"]),
         )
         enriched.append(
             (
@@ -241,8 +240,10 @@ def build_objective_ranking_report(
         )
 
     output: list[dict[str, Any]] = []
-    for instance in sorted({row["instance"] for row, _ in enriched}):
-        group = [(row, objective) for row, objective in enriched if row["instance"] == instance]
+    for instance_name in sorted({row["instance"] for row, _ in enriched}):
+        group = [
+            (row, objective) for row, objective in enriched if row["instance"] == instance_name
+        ]
         old_order = sorted(group, key=lambda item: (item[1].total_distance, int(item[0]["seed"])))
         new_order = sorted(group, key=lambda item: (item[1].key, int(item[0]["seed"])))
         old_rank = {row["seed"]: rank for rank, (row, _) in enumerate(old_order, start=1)}
@@ -259,7 +260,7 @@ def build_objective_ranking_report(
                 )
             output.append(
                 {
-                    "instance": instance,
+                    "instance": instance_name,
                     "seed": row["seed"],
                     "vehicle_count": objective.vehicle_count,
                     "total_distance": objective.total_distance,
@@ -290,7 +291,7 @@ def _record_alns(
         [list(route) for route in result.routes],
         claimed_objective=result.objective_value,
     )
-    objective = _validated_objective(instance, report, result.objective)
+    objective, validation_failure = _validated_objective(instance, report, result.objective)
     identifier = f"{instance.name}-alns_exact_charging-{seed}"
     row = _base_row(identifier, instance.name, "ALNS_EXACT_CHARGING", seed, objective, report)
     row.update(
@@ -307,7 +308,7 @@ def _record_alns(
                 if result.charging_subproblem_calls
                 else 0.0
             ),
-            "failure_reason": result.failure_reason,
+            "failure_reason": _join_failures(result.failure_reason, validation_failure),
         }
     )
     _persist(row, result, result.routes, output_dir, raw_dir, solution_dir)
@@ -326,7 +327,7 @@ def _record_bpc(
         [list(route) for route in result.routes],
         claimed_objective=result.objective_value,
     )
-    objective = _validated_objective(instance, report, result.objective)
+    objective, validation_failure = _validated_objective(instance, report, result.objective)
     identifier = f"{instance.name}-branch_price_and_cut-0"
     row = _base_row(identifier, instance.name, "BRANCH_PRICE_AND_CUT", 0, objective, report)
     row.update(
@@ -336,7 +337,7 @@ def _record_bpc(
             "root_search_bound": result.root_search_bound,
             "final_search_bound": result.final_search_bound,
             "search_gap": result.search_gap,
-            "failure_reason": result.failure_reason,
+            "failure_reason": _join_failures(result.failure_reason, validation_failure),
         }
     )
     _persist(row, result, result.routes, output_dir, raw_dir, solution_dir)
@@ -348,9 +349,10 @@ def _base_row(
     instance: str,
     algorithm: str,
     seed: int,
-    objective: SolutionObjective,
+    objective: SolutionObjective | None,
     report: SolutionReport,
 ) -> dict[str, Any]:
+    accepted = report.feasible and objective is not None
     row: dict[str, Any] = {field: "" for field in STAGE01_PER_RUN_FIELDS}
     row.update(
         {
@@ -359,15 +361,19 @@ def _base_row(
             "algorithm": algorithm,
             "seed": seed,
             "objective_schema": OBJECTIVE_SCHEMA,
-            "objective_key": _render_key(objective),
-            "primary_vehicle_count": objective.vehicle_count,
-            "secondary_total_distance": objective.total_distance,
-            "tertiary_total_charging_time": objective.total_charging_time,
-            "quaternary_charging_count": objective.charging_count,
+            "objective_key": _render_key(objective) if objective is not None else "",
+            "primary_vehicle_count": objective.vehicle_count if objective is not None else "",
+            "secondary_total_distance": (objective.total_distance if objective is not None else ""),
+            "tertiary_total_charging_time": (
+                objective.total_charging_time if objective is not None else ""
+            ),
+            "quaternary_charging_count": (
+                objective.charging_count if objective is not None else ""
+            ),
             "total_energy": report.total_energy,
             "total_charged_energy": report.total_charged_energy,
-            "status": "feasible" if report.feasible else "invalid",
-            "feasible": report.feasible,
+            "status": "feasible" if accepted else "invalid",
+            "feasible": accepted,
         }
     )
     return row
@@ -394,13 +400,14 @@ def _validated_objective(
     instance: Instance,
     report: SolutionReport,
     claimed: SolutionObjective | None,
-) -> SolutionObjective:
+) -> tuple[SolutionObjective | None, str]:
     if not report.feasible:
-        raise RuntimeError("Stage 1 solver returned a solution that failed unified validation")
+        violations = (*report.violations, *(v for route in report.routes for v in route.violations))
+        return None, "unified validation failed: " + "; ".join(violations)
     objective = SolutionObjective.from_report(instance, report)
     if claimed is None or compare_objectives(objective, claimed) is not ObjectiveComparison.EQUAL:
-        raise RuntimeError("Stage 1 solver objective differs from unified validation")
-    return objective
+        return None, "solver objective differs from unified validation"
+    return objective, ""
 
 
 def _summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -442,9 +449,7 @@ def _compare_with_stage00(
     candidate_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     baseline_rows = _read_csv(baseline_dir / "per_run_results.csv")
-    ranking = build_objective_ranking_report(
-        baseline_dir, benchmark_dir=config.benchmark_dir
-    )
+    ranking = build_objective_ranking_report(baseline_dir, benchmark_dir=config.benchmark_dir)
     baseline_objectives = {
         (str(row["instance"]), str(row["seed"])): SolutionObjective(
             int(row["vehicle_count"]),
@@ -469,9 +474,19 @@ def _compare_with_stage00(
             (baseline_objectives[(instance, row["seed"])] for row in baseline_group),
             key=lambda objective: objective.key,
         )
-        candidate_objectives = [_objective_from_stage01_row(row) for row in candidate_group]
-        candidate_best = min(candidate_objectives, key=lambda objective: objective.key)
-        comparison = compare_objectives(candidate_best, baseline_best)
+        candidate_objectives = [
+            _objective_from_stage01_row(row) for row in candidate_group if bool(row["feasible"])
+        ]
+        candidate_best = (
+            min(candidate_objectives, key=lambda objective: objective.key)
+            if candidate_objectives
+            else None
+        )
+        comparison = (
+            compare_objectives(candidate_best, baseline_best)
+            if candidate_best is not None
+            else ObjectiveComparison.WORSE
+        )
         baseline_rate = sum(row["feasible"] == "True" for row in baseline_group) / len(
             baseline_group
         )
@@ -483,7 +498,9 @@ def _compare_with_stage00(
             {
                 "instance": instance,
                 "baseline_best_objective": _render_key(baseline_best),
-                "candidate_best_objective": _render_key(candidate_best),
+                "candidate_best_objective": (
+                    _render_key(candidate_best) if candidate_best is not None else ""
+                ),
                 "classification": comparison.value,
                 "baseline_feasibility_rate": baseline_rate,
                 "candidate_feasibility_rate": candidate_rate,
@@ -507,21 +524,20 @@ def _objective_from_stage01_row(row: dict[str, Any]) -> SolutionObjective:
     )
 
 
-def _count_charging_visits(
-    routes: list[list[str]], instance: Instance | None
-) -> int:
-    if instance is not None:
-        return sum(
-            1
-            for route in routes
-            for name in route
-            if instance.by_name[name].kind is NodeType.STATION
-        )
-    return sum(1 for route in routes for name in route if name.startswith(("S", "F")))
+def _join_failures(*reasons: str) -> str:
+    return "; ".join(reason for reason in reasons if reason)
 
 
-def _load_optional_instance(directory: Path | None, name: str) -> Instance | None:
-    return parse_schneider(directory / f"{name}.txt") if directory is not None else None
+def _fail_fast_after_persisting(rows: list[dict[str, Any]], per_run: Path, failures: Path) -> None:
+    if bool(rows[-1]["feasible"]):
+        return
+    _write_csv(per_run, STAGE01_PER_RUN_FIELDS, rows)
+    _write_csv(
+        failures,
+        STAGE01_PER_RUN_FIELDS,
+        [row for row in rows if not bool(row["feasible"])],
+    )
+    raise RuntimeError("Stage 1 recorded a failed solver run")
 
 
 def _mean(objectives: list[SolutionObjective], field: str) -> float | str:
@@ -557,9 +573,7 @@ def _read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def _write_csv(
-    path: Path, fields: tuple[str, ...], rows: list[dict[str, Any]]
-) -> None:
+def _write_csv(path: Path, fields: tuple[str, ...], rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle, fieldnames=fields, extrasaction="ignore", lineterminator="\n"
@@ -578,9 +592,7 @@ def _write_json(path: Path, payload: Any) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the Stage 1 lexicographic objective audit")
     parser.add_argument("--config", type=Path, default=Path("configs/stage00_baseline.toml"))
-    parser.add_argument(
-        "--baseline-dir", type=Path, default=Path("experiments/baselines/stage00")
-    )
+    parser.add_argument("--baseline-dir", type=Path, default=Path("experiments/baselines/stage00"))
     parser.add_argument("--output-dir", type=Path, default=Path("results/stage01"))
     parser.add_argument("--summary-dir", type=Path, default=Path("experiments/summaries"))
     arguments = parser.parse_args()

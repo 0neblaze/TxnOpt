@@ -6,7 +6,7 @@ import time
 from dataclasses import asdict, dataclass
 
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
-from evrptw.models import Instance, Node, NodeType
+from evrptw.models import Instance, Node
 from evrptw.objective import (
     ObjectiveComparison,
     SolutionObjective,
@@ -96,17 +96,17 @@ class _Evaluator:
         feasible = bool(clean) and all(result.feasible for result in charging)
         if not feasible:
             return _EvaluatedSolution(clean, charging, False, None)
-        charging_count = sum(
-            1
-            for result in charging
-            for name in result.route
-            if self.instance.by_name[name].kind is NodeType.STATION
-        )
-        objective = SolutionObjective(
-            len(clean),
-            sum(result.distance for result in charging),
-            sum(result.charging_time for result in charging),
-            charging_count,
+        objective = sum(
+            (
+                SolutionObjective.from_route(
+                    self.instance,
+                    result.route,
+                    total_distance=result.distance,
+                    total_charging_time=result.charging_time,
+                )
+                for result in charging
+            ),
+            start=SolutionObjective.zero(),
         )
         return _EvaluatedSolution(clean, charging, True, objective)
 
@@ -303,9 +303,7 @@ def _construct_large_initial_solution(
     if routes:
         sequences: list[tuple[str, ...]] = []
         for route in routes:
-            customer_sequence = tuple(
-                name for name in route if name != instance.depot.name
-            )
+            customer_sequence = tuple(name for name in route if name != instance.depot.name)
             split = _split_until_charging_feasible(customer_sequence, evaluator)
             if not split:
                 return ()
@@ -376,9 +374,7 @@ def _destroy(
                 node = by_name[customer]
                 after = by_name[chain[index + 1]]
                 saving = (
-                    before.distance_to(node)
-                    + node.distance_to(after)
-                    - before.distance_to(after)
+                    before.distance_to(node) + node.distance_to(after) - before.distance_to(after)
                 )
                 contribution.append((saving, customer))
         removed = [customer for _, customer in sorted(contribution, reverse=True)[:count]]
@@ -393,8 +389,7 @@ def _destroy(
         ]
     removed_set = set(removed)
     partial = tuple(
-        tuple(name for name in sequence if name not in removed_set)
-        for sequence in sequences
+        tuple(name for name in sequence if name not in removed_set) for sequence in sequences
     )
     return tuple(sequence for sequence in partial if sequence), tuple(removed)
 

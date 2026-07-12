@@ -54,9 +54,7 @@ def test_branch_price_and_cut_proves_small_instance_and_validates_incumbent() ->
     assert report.feasible
 
 
-def _column(
-    customers: tuple[str, ...], objective: SolutionObjective, name: str
-) -> RouteColumn:
+def _column(customers: tuple[str, ...], objective: SolutionObjective, name: str) -> RouteColumn:
     route = ("D0", name, "D0")
     charging = ChargingSubproblemResult(
         True,
@@ -93,3 +91,18 @@ def test_exact_pricing_fails_fast_above_documented_size_limit() -> None:
     instance = _instance()
     with pytest.raises(ValueError, match="at most 2 customers"):
         generate_columns_bidirectionally(instance, max_customers=2)
+
+
+def test_branch_price_and_cut_timeout_never_claims_optimality() -> None:
+    result = solve_branch_price_and_cut(_instance(), time_limit_seconds=1e-12)
+
+    assert result.status == "timeout"
+    assert result.proven_optimal is False
+    assert result.failure_reason
+    assert result.forward_labels >= 1
+    assert result.backward_labels >= 1
+
+
+def test_branch_price_and_cut_rejects_invalid_time_limit() -> None:
+    with pytest.raises(ValueError, match="time_limit_seconds"):
+        solve_branch_price_and_cut(_instance(), time_limit_seconds=0.0)

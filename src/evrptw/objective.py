@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -8,6 +9,14 @@ from evrptw.models import Instance, NodeType
 from evrptw.validation import SolutionReport
 
 OBJECTIVE_PRECISION_DIGITS = 9
+
+
+def count_charging_visits(instance: Instance, routes: Iterable[Iterable[str]]) -> int:
+    """Count charging-station visits using the instance's node types."""
+
+    return sum(
+        1 for route in routes for name in route if instance.by_name[name].kind is NodeType.STATION
+    )
 
 
 class ObjectiveComparison(StrEnum):
@@ -52,17 +61,28 @@ class SolutionObjective:
     def from_report(cls, instance: Instance, report: SolutionReport) -> SolutionObjective:
         if not report.feasible:
             raise ValueError("cannot construct an objective from an infeasible solution report")
-        charging_count = sum(
-            1
-            for route in report.routes
-            for name in route.route
-            if instance.by_name[name].kind is NodeType.STATION
-        )
         return cls(
             report.vehicle_count,
             report.total_distance,
             report.total_charging_time,
-            charging_count,
+            count_charging_visits(instance, (route.route for route in report.routes)),
+        )
+
+    @classmethod
+    def from_route(
+        cls,
+        instance: Instance,
+        route: Iterable[str],
+        *,
+        total_distance: float,
+        total_charging_time: float,
+    ) -> SolutionObjective:
+        route_tuple = tuple(route)
+        return cls(
+            1,
+            total_distance,
+            total_charging_time,
+            count_charging_visits(instance, (route_tuple,)),
         )
 
     def __add__(self, other: SolutionObjective) -> SolutionObjective:
@@ -76,9 +96,7 @@ class SolutionObjective:
         )
 
 
-def compare_objectives(
-    left: SolutionObjective, right: SolutionObjective
-) -> ObjectiveComparison:
+def compare_objectives(left: SolutionObjective, right: SolutionObjective) -> ObjectiveComparison:
     if left.key < right.key:
         return ObjectiveComparison.BETTER
     if left.key > right.key:

@@ -10,7 +10,7 @@ import numpy as np
 from scipy.optimize import linprog
 
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
-from evrptw.models import Instance, NodeType
+from evrptw.models import Instance
 from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
 from evrptw.validation import validate_routes
 
@@ -108,10 +108,17 @@ class _MasterResult:
     pricing_iterations: int
 
 
+class _BPCDeadlineReached(Exception):
+    def __init__(self, pricing: BidirectionalPricingResult | None = None) -> None:
+        super().__init__("BPC deadline reached")
+        self.pricing = pricing
+
+
 def generate_columns_bidirectionally(
     instance: Instance,
     *,
     max_customers: int = 8,
+    deadline: float | None = None,
 ) -> BidirectionalPricingResult:
     """Generate every feasible elementary route by joining forward/backward labels."""
 
@@ -126,23 +133,42 @@ def generate_columns_bidirectionally(
     forward: set[tuple[str, ...]] = {()}
     backward: set[tuple[str, ...]] = {()}
     pruned_capacity = 0
+    sequences: set[tuple[str, ...]] = set()
+    columns: list[RouteColumn] = []
+    joined = 0
+    pruned_infeasible = 0
+
+    def check_pricing_deadline() -> None:
+        if deadline is not None and time.perf_counter() >= deadline:
+            raise _BPCDeadlineReached(
+                BidirectionalPricingResult(
+                    tuple(columns),
+                    len(forward),
+                    len(backward),
+                    joined,
+                    pruned_capacity,
+                    pruned_infeasible,
+                    time.perf_counter() - started,
+                )
+            )
 
     for length in range(1, split + 1):
         for label in itertools.permutations(customers, length):
+            check_pricing_deadline()
             if _demand(instance, label) <= instance.vehicle.load_capacity + _EPSILON:
                 forward.add(label)
             else:
                 pruned_capacity += 1
     for length in range(1, len(customers) - split + 1):
         for label in itertools.permutations(customers, length):
+            check_pricing_deadline()
             if _demand(instance, label) <= instance.vehicle.load_capacity + _EPSILON:
                 backward.add(label)
             else:
                 pruned_capacity += 1
 
-    sequences: set[tuple[str, ...]] = set()
-    joined = 0
     for left in forward:
+        check_pricing_deadline()
         if left:
             sequences.add(left)
         left_set = set(left)
@@ -152,31 +178,26 @@ def generate_columns_bidirectionally(
                 joined += 1
                 sequences.add((*left, *right))
 
-    columns: list[RouteColumn] = []
-    pruned_infeasible = 0
     for sequence in sorted(sequences, key=lambda item: (len(item), item)):
+        check_pricing_deadline()
         if _demand(instance, sequence) > instance.vehicle.load_capacity + _EPSILON:
             pruned_capacity += 1
             continue
         charging = solve_exact_charging(instance, sequence)
+        check_pricing_deadline()
         if not charging.feasible:
             pruned_infeasible += 1
             continue
-        charging_count = sum(
-            1
-            for name in charging.route
-            if instance.by_name[name].kind is NodeType.STATION
-        )
         columns.append(
             RouteColumn(
                 sequence,
                 charging.route,
                 charging,
-                SolutionObjective(
-                    1,
-                    charging.distance,
-                    charging.charging_time,
-                    charging_count,
+                SolutionObjective.from_route(
+                    instance,
+                    charging.route,
+                    total_distance=charging.distance,
+                    total_charging_time=charging.charging_time,
                 ),
             )
         )
@@ -195,6 +216,8 @@ def generate_columns_bidirectionally(
 def solve_lexicographic_set_partitioning(
     customers: tuple[str, ...],
     columns: tuple[RouteColumn, ...],
+    *,
+    deadline: float | None = None,
 ) -> LexicographicMasterSolution | None:
     if len(set(customers)) != len(customers):
         raise ValueError("set-partitioning customers must be unique")
@@ -216,14 +239,14 @@ def solve_lexicographic_set_partitioning(
         0: LexicographicMasterSolution(SolutionObjective.zero(), ())
     }
     for mask in range(full_mask + 1):
+        _check_deadline(deadline)
         state = states.get(mask)
         if state is None or mask == full_mask:
             continue
-        first_uncovered = next(
-            index for index in range(len(customers)) if not mask & (1 << index)
-        )
+        first_uncovered = next(index for index in range(len(customers)) if not mask & (1 << index))
         required_bit = 1 << first_uncovered
         for column_index, column_mask in enumerate(column_masks):
+            _check_deadline(deadline)
             if not column_mask & required_bit or column_mask & mask:
                 continue
             next_mask = mask | column_mask
@@ -250,17 +273,26 @@ def solve_branch_price_and_cut(
     time_limit_seconds: float = 60.0,
     max_customers: int = 8,
 ) -> BPCResult:
+    if not math.isfinite(time_limit_seconds) or time_limit_seconds <= 0.0:
+        raise ValueError("time_limit_seconds must be finite and positive")
     started = time.perf_counter()
-    pricing = generate_columns_bidirectionally(instance, max_customers=max_customers)
+    deadline = started + time_limit_seconds
+    try:
+        pricing = generate_columns_bidirectionally(
+            instance, max_customers=max_customers, deadline=deadline
+        )
+    except _BPCDeadlineReached as error:
+        return _bpc_failure(
+            started,
+            error.pricing,
+            "time limit reached during complete column generation",
+            status="timeout",
+        )
     columns = pricing.columns
     customers = tuple(customer.name for customer in instance.customers)
     if not columns:
         return _bpc_failure(started, pricing, "pricing generated no feasible columns")
-    singleton = {
-        index
-        for index, column in enumerate(columns)
-        if len(column.customers) == 1
-    }
+    singleton = {index for index, column in enumerate(columns) if len(column.customers) == 1}
     if {name for index in singleton for name in columns[index].customers} != set(customers):
         return _bpc_failure(
             started,
@@ -282,7 +314,7 @@ def solve_branch_price_and_cut(
     timed_out = False
 
     while queue:
-        if time.perf_counter() - started >= time_limit_seconds:
+        if time.perf_counter() >= deadline:
             timed_out = True
             break
         node = heapq.heappop(queue)
@@ -320,8 +352,7 @@ def solve_branch_price_and_cut(
                 start=SolutionObjective.zero(),
             )
             if incumbent_objective is None or (
-                compare_objectives(objective, incumbent_objective)
-                is ObjectiveComparison.BETTER
+                compare_objectives(objective, incumbent_objective) is ObjectiveComparison.BETTER
             ):
                 incumbent_objective = objective
                 search_incumbent = _search_score(objective, vehicle_priority_weight)
@@ -350,20 +381,46 @@ def solve_branch_price_and_cut(
         )
         serial += 1
 
+    if not timed_out and time.perf_counter() >= deadline:
+        timed_out = True
     if not timed_out:
-        exact = solve_lexicographic_set_partitioning(customers, columns)
+        try:
+            exact = solve_lexicographic_set_partitioning(customers, columns, deadline=deadline)
+        except _BPCDeadlineReached:
+            exact = None
+            timed_out = True
+    if not timed_out:
         if exact is None:
             return _bpc_failure(
                 started,
                 pricing,
                 "complete column pool has no lexicographic set-partitioning solution",
+                root_search_bound=root_lower_bound,
+                final_search_bound=final_lower_bound,
+                search_incumbent=search_incumbent,
+                branch_nodes=explored,
+                active_columns=len(active_seen),
+                pricing_iterations=pricing_iterations,
+                cuts_added=explored,
             )
         incumbent_objective = exact.objective
         incumbent_columns = exact.column_indices
         search_incumbent = _search_score(exact.objective, vehicle_priority_weight)
         final_lower_bound = search_incumbent
     if incumbent_objective is None or math.isinf(search_incumbent):
-        return _bpc_failure(started, pricing, "branch-and-price found no integer incumbent")
+        return _bpc_failure(
+            started,
+            pricing,
+            "branch-and-price found no integer incumbent",
+            status="timeout" if timed_out else "infeasible",
+            root_search_bound=root_lower_bound,
+            final_search_bound=final_lower_bound,
+            search_incumbent=search_incumbent,
+            branch_nodes=explored,
+            active_columns=len(active_seen),
+            pricing_iterations=pricing_iterations,
+            cuts_added=explored,
+        )
     if timed_out and queue:
         final_lower_bound = min(item.priority for item in queue)
     gap = max(
@@ -427,16 +484,12 @@ def _solve_node(
         for position, column_index in enumerate(active):
             for customer in columns[column_index].customers:
                 matrix[customer_index[customer], position] = 1.0
-        costs = np.array(
-            [vehicle_priority_weight + columns[index].cost for index in active]
-        )
+        costs = np.array([vehicle_priority_weight + columns[index].cost for index in active])
         fleet_lb = math.ceil(
-            sum(customer.demand for customer in instance.customers)
-            / instance.vehicle.load_capacity
+            sum(customer.demand for customer in instance.customers) / instance.vehicle.load_capacity
         )
         bounds = [
-            (1.0, 1.0) if column_index in fixed_one else (0.0, 1.0)
-            for column_index in active
+            (1.0, 1.0) if column_index in fixed_one else (0.0, 1.0) for column_index in active
         ]
         result = linprog(
             costs,
@@ -469,9 +522,7 @@ def _solve_node(
         for index, column in enumerate(columns):
             if index in active_set or index in fixed_zero:
                 continue
-            covered_duals = sum(
-                duals[customer_index[name]] for name in column.customers
-            )
+            covered_duals = sum(duals[customer_index[name]] for name in column.customers)
             reduced_cost = vehicle_priority_weight + column.cost - covered_duals
             reduced_cost += fleet_dual
             if reduced_cost < -_EPSILON:
@@ -492,30 +543,44 @@ def _demand(instance: Instance, customers: tuple[str, ...]) -> float:
     return sum(instance.by_name[name].demand for name in customers)
 
 
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.perf_counter() >= deadline:
+        raise _BPCDeadlineReached
+
+
 def _bpc_failure(
     started: float,
-    pricing: BidirectionalPricingResult,
+    pricing: BidirectionalPricingResult | None,
     reason: str,
+    *,
+    status: str = "infeasible",
+    root_search_bound: float = float("inf"),
+    final_search_bound: float = float("inf"),
+    search_incumbent: float = float("inf"),
+    branch_nodes: int = 0,
+    active_columns: int = 0,
+    pricing_iterations: int = 0,
+    cuts_added: int = 0,
 ) -> BPCResult:
     return BPCResult(
-        status="infeasible",
+        status=status,
         proven_optimal=False,
         routes=(),
         objective=None,
-        root_search_bound=float("inf"),
-        final_search_bound=float("inf"),
-        search_incumbent=float("inf"),
+        root_search_bound=root_search_bound,
+        final_search_bound=final_search_bound,
+        search_incumbent=search_incumbent,
         search_gap=float("inf"),
-        branch_nodes=0,
-        generated_columns=len(pricing.columns),
-        active_columns=0,
-        pricing_iterations=0,
-        forward_labels=pricing.forward_labels,
-        backward_labels=pricing.backward_labels,
-        joined_labels=pricing.joined_labels,
-        labels_pruned_capacity=pricing.labels_pruned_capacity,
-        labels_pruned_infeasible=pricing.labels_pruned_infeasible,
-        cuts_added=0,
+        branch_nodes=branch_nodes,
+        generated_columns=len(pricing.columns) if pricing is not None else 0,
+        active_columns=active_columns,
+        pricing_iterations=pricing_iterations,
+        forward_labels=pricing.forward_labels if pricing is not None else 0,
+        backward_labels=pricing.backward_labels if pricing is not None else 0,
+        joined_labels=pricing.joined_labels if pricing is not None else 0,
+        labels_pruned_capacity=pricing.labels_pruned_capacity if pricing is not None else 0,
+        labels_pruned_infeasible=(pricing.labels_pruned_infeasible if pricing is not None else 0),
+        cuts_added=cuts_added,
         runtime_seconds=time.perf_counter() - started,
         failure_reason=reason,
     )

@@ -3,8 +3,12 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
+from evrptw.alns import solve_alns
 from evrptw.experiments.stage00_baseline import load_config, run_stage00
 from evrptw.experiments.stage01_objective import (
     STAGE01_PER_RUN_FIELDS,
@@ -13,6 +17,7 @@ from evrptw.experiments.stage01_objective import (
 )
 from evrptw.experiments.week02_baseline_comparison import write_schneider_instance
 from evrptw.models import Instance, Node, NodeType, Vehicle
+from evrptw.objective import SolutionObjective
 
 
 def _instance() -> Instance:
@@ -99,8 +104,11 @@ def test_stage01_runner_separates_objective_levels_and_preserves_stage00(tmp_pat
 
 def test_ranking_report_exposes_vehicle_first_rank_reversal(tmp_path: Path) -> None:
     baseline = tmp_path / "baseline"
+    benchmark = tmp_path / "benchmark"
     solutions = baseline / "solutions"
     solutions.mkdir(parents=True)
+    benchmark.mkdir()
+    write_schneider_instance(_instance(), benchmark / "rc105C5.txt")
     fields = (
         "instance",
         "seed",
@@ -139,7 +147,7 @@ def test_ranking_report_exposes_vehicle_first_rank_reversal(tmp_path: Path) -> N
         json.dumps({"routes": [["D0", "F1", "D0"]]}), encoding="utf-8"
     )
 
-    report = build_objective_ranking_report(baseline)
+    report = build_objective_ranking_report(baseline, benchmark_dir=benchmark)
     by_seed = {row["seed"]: row for row in report}
 
     assert by_seed["2014"]["old_distance_rank"] == 1
@@ -147,3 +155,45 @@ def test_ranking_report_exposes_vehicle_first_rank_reversal(tmp_path: Path) -> N
     assert by_seed["2015"]["old_distance_rank"] == 2
     assert by_seed["2015"]["new_lexicographic_rank"] == 1
     assert {row["reason"] for row in report} == {"vehicle_count_priority"}
+
+
+def test_stage01_persists_validation_failure_before_failing_fast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _config_file(tmp_path)
+    config = load_config(config_path)
+    baseline_dir = tmp_path / "baseline"
+    run_stage00(config, config_path, tmp_path / "stage00-results", baseline_dir=baseline_dir)
+    valid = solve_alns(_instance(), seed=2014, max_iterations=5, time_limit_seconds=1.0)
+    assert valid.objective is not None
+    inconsistent = replace(
+        valid,
+        objective=SolutionObjective(
+            valid.objective.vehicle_count + 1,
+            valid.objective.total_distance,
+            valid.objective.total_charging_time,
+            valid.objective.charging_count,
+        ),
+    )
+    monkeypatch.setattr(
+        "evrptw.experiments.stage01_objective.solve_alns",
+        lambda *args, **kwargs: inconsistent,
+    )
+    output_dir = tmp_path / "stage01-results"
+
+    with pytest.raises(RuntimeError, match="failed solver run"):
+        run_stage01_objective(
+            config_path=config_path,
+            baseline_dir=baseline_dir,
+            output_dir=output_dir,
+            summary_dir=tmp_path / "summaries",
+        )
+
+    failures = list(
+        csv.DictReader(
+            (output_dir / "stage01_failure_cases.csv").open(encoding="utf-8", newline="")
+        )
+    )
+    assert len(failures) == 1
+    assert "objective differs" in failures[0]["failure_reason"]
+    assert (output_dir / failures[0]["raw_log_path"]).exists()
