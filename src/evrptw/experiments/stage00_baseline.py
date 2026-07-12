@@ -5,6 +5,8 @@ import csv
 import hashlib
 import json
 import math
+import os
+import platform
 import shutil
 import statistics
 import subprocess
@@ -97,10 +99,9 @@ _LOWER_IS_BETTER = {
     "total_charged_energy",
     "total_charging_time",
     "runtime_seconds",
-    "charging_subproblem_calls",
-    "charging_subproblem_average_seconds",
 }
 _HIGHER_IS_BETTER = {"iterations", "feasibility_rate"}
+_COMPARISON_METRICS = _LOWER_IS_BETTER | _HIGHER_IS_BETTER
 _SOLUTION_METRICS = {
     "vehicle_count",
     "total_distance",
@@ -117,6 +118,9 @@ _SUMMARY_METRICS = (
     "total_charging_time",
     "runtime_seconds",
     "iterations",
+    "accepted_moves",
+    "improving_moves",
+    "rejected_moves",
     "charging_subproblem_calls",
     "charging_subproblem_average_seconds",
 )
@@ -225,6 +229,7 @@ def run_stage00(
         "instance_sha256": instance_hashes,
         "configuration_sha256": _sha256(config_path),
         "reference_repository_revision": _reference_revision(root),
+        "physical_memory_bytes": _physical_memory_bytes(),
         "captured_environment": collect_environment(),
     }
     outputs = _write_result_set(output_dir, config_path, rows, environment)
@@ -289,7 +294,12 @@ def compare_results(
     candidate_summary = _summary_index(_read_csv(candidate_dir / "summary_results.csv"))
     output: list[dict[str, Any]] = []
 
-    for key in sorted(set(baseline_summary) | set(candidate_summary)):
+    comparison_keys = {
+        key
+        for key in set(baseline_summary) | set(candidate_summary)
+        if key[1] in _COMPARISON_METRICS
+    }
+    for key in sorted(comparison_keys):
         instance, metric = key
         baseline = baseline_summary.get(key)
         candidate = candidate_summary.get(key)
@@ -358,7 +368,17 @@ def compare_results(
 
     baseline_rows = _read_csv(baseline_dir / "per_run_results.csv")
     candidate_rows = _read_csv(candidate_dir / "per_run_results.csv")
-    output.extend(_comparison_gate_rows(config, baseline_rows, candidate_rows, candidate_dir))
+    output.extend(
+        _comparison_gate_rows(
+            config,
+            baseline_rows,
+            candidate_rows,
+            baseline_dir,
+            candidate_dir,
+            list(baseline_summary.values()),
+            list(candidate_summary.values()),
+        )
+    )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     _write_csv(report_path, COMPARISON_FIELDS, output)
     return output
@@ -460,11 +480,13 @@ def _write_result_set(
     per_run = directory / "per_run_results.csv"
     summary = directory / "summary_results.csv"
     failures = directory / "failure_cases.csv"
+    comparison_template = directory / "comparison_template.csv"
     environment_path = directory / "environment.json"
     parameters = directory / "parameters.toml"
     _write_csv(per_run, PER_RUN_FIELDS, rows)
     _write_csv(summary, SUMMARY_FIELDS, _summarize(rows))
     _write_csv(failures, PER_RUN_FIELDS, [row for row in rows if not _bool(row["feasible"])])
+    _write_csv(comparison_template, COMPARISON_FIELDS, [])
     _write_json(environment_path, environment)
     shutil.copy2(config_path, parameters)
     _write_manifest(directory)
@@ -472,6 +494,7 @@ def _write_result_set(
         "per_run": per_run,
         "summary": summary,
         "failures": failures,
+        "comparison_template": comparison_template,
         "environment": environment_path,
         "parameters": parameters,
         "manifest": directory / "manifest.json",
@@ -519,11 +542,13 @@ def _summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 else group
             )
             values = [float(row[metric]) for row in selected if row[metric] != ""]
-            summary.append(_summary_row(instance, metric, values))
+            summary.append(summarize_metric_values(instance, metric, values))
     return summary
 
 
-def _summary_row(instance: str, metric: str, values: list[float]) -> dict[str, Any]:
+def summarize_metric_values(
+    instance: str, metric: str, values: list[float]
+) -> dict[str, Any]:
     if not values:
         return {
             "instance": instance,
@@ -644,50 +669,31 @@ def _comparison_reason(metric: str, statistic: str, classification: str) -> str:
         if statistic == "standard_deviation" or metric in _LOWER_IS_BETTER
         else "higher"
     )
-    return f"{direction} {metric} {statistic} is better"
+    if classification == "improvement":
+        return f"candidate improved because {direction} {metric} {statistic} is better"
+    return f"candidate regressed because {direction} {metric} {statistic} is better"
 
 
 def _comparison_gate_rows(
     config: Stage00Config,
     baseline_rows: list[dict[str, str]],
     candidate_rows: list[dict[str, str]],
+    baseline_dir: Path,
     candidate_dir: Path,
+    baseline_summary: list[dict[str, str]],
+    candidate_summary: list[dict[str, str]],
 ) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     expected = {(instance, str(seed)) for instance in config.instances for seed in config.seeds}
-    baseline_keys = {(row["instance"], row["seed"]) for row in baseline_rows}
-    candidate_keys = {(row["instance"], row["seed"]) for row in candidate_rows}
-    for instance, seed in sorted((expected & baseline_keys) - candidate_keys):
-        output.append(
-            _comparison_row(
-                instance,
-                "run_coverage",
-                f"seed_{seed}",
-                "present",
-                "missing",
-                "",
-                "",
-                "regression",
-                "fail",
-                "expected instance/seed record is missing",
-            )
-        )
+    output.extend(_run_key_gate_rows("baseline", expected, baseline_rows))
+    output.extend(_run_key_gate_rows("candidate", expected, candidate_rows))
+    output.extend(_summary_integrity_gate_rows("baseline", baseline_rows, baseline_summary))
+    output.extend(_summary_integrity_gate_rows("candidate", candidate_rows, candidate_summary))
+    output.extend(_solution_validation_gate_rows(config, candidate_rows, candidate_dir))
+    output.extend(_manifest_gate_rows("baseline", baseline_dir))
+    output.extend(_manifest_gate_rows("candidate", candidate_dir))
+
     invalid = [row for row in candidate_rows if not _bool(row["feasible"])]
-    for row in invalid:
-        output.append(
-            _comparison_row(
-                row["instance"],
-                "validator_feasibility",
-                f"seed_{row['seed']}",
-                "feasible",
-                row["status"],
-                "",
-                "",
-                "regression",
-                "fail",
-                "candidate solution is not validator-feasible",
-            )
-        )
     failure_rows = _read_csv(candidate_dir / "failure_cases.csv")
     retained = {row["experiment_id"] for row in failure_rows}
     for row in invalid:
@@ -707,6 +713,121 @@ def _comparison_gate_rows(
                 )
             )
     return output
+
+
+def _run_key_gate_rows(
+    source: str,
+    expected: set[tuple[str, str]],
+    rows: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    keys = [(row.get("instance", ""), row.get("seed", "")) for row in rows]
+    actual = set(keys)
+    issues: list[tuple[str, str, str]] = []
+    issues.extend((instance, seed, "missing") for instance, seed in sorted(expected - actual))
+    issues.extend((instance, seed, "unexpected") for instance, seed in sorted(actual - expected))
+    issues.extend(
+        (instance, seed, "duplicate")
+        for instance, seed in sorted(key for key in actual if keys.count(key) > 1)
+    )
+    return [
+        _comparison_row(
+            instance,
+            "run_coverage",
+            f"{source}_seed_{seed}",
+            "exactly_one",
+            issue,
+            "",
+            "",
+            "regression",
+            "fail",
+            f"{source} instance/seed record is {issue}",
+        )
+        for instance, seed, issue in issues
+    ]
+
+
+def _summary_integrity_gate_rows(
+    source: str,
+    per_run_rows: list[dict[str, str]],
+    summary_rows: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    if _normalized_rows(_summarize(per_run_rows), SUMMARY_FIELDS) == _normalized_rows(
+        summary_rows, SUMMARY_FIELDS
+    ):
+        return []
+    return [
+        _comparison_row(
+            "*",
+            "summary_integrity",
+            source,
+            "recomputable",
+            "mismatch",
+            "",
+            "",
+            "regression",
+            "fail",
+            f"{source} summary cannot be recomputed from per-run records",
+        )
+    ]
+
+
+def _solution_validation_gate_rows(
+    config: Stage00Config,
+    rows: list[dict[str, str]],
+    directory: Path,
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        reason = ""
+        try:
+            solution_path = directory / row["solution_path"]
+            payload = json.loads(solution_path.read_text(encoding="utf-8"))
+            instance = parse_schneider(config.benchmark_dir / f"{row['instance']}.txt")
+            report = validate_routes(
+                instance,
+                [list(route) for route in payload.get("routes", [])],
+                claimed_objective=_float(row, "total_distance"),
+            )
+            reason = " | ".join(_verify_row_against_report(row, report))
+        except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            reason = str(error)
+        if reason:
+            output.append(
+                _comparison_row(
+                    row.get("instance", "*"),
+                    "validator_feasibility",
+                    f"seed_{row.get('seed', '')}",
+                    "validator_feasible",
+                    "invalid",
+                    "",
+                    "",
+                    "regression",
+                    "fail",
+                    reason,
+                )
+            )
+    return output
+
+
+def _manifest_gate_rows(source: str, directory: Path) -> list[dict[str, Any]]:
+    try:
+        _verify_manifest(directory)
+    except ValueError as error:
+        return [
+            _comparison_row(
+                "*",
+                "manifest_integrity",
+                source,
+                "valid",
+                "invalid",
+                "",
+                "",
+                "regression",
+                "fail",
+                str(error),
+            )
+        ]
+    return []
 
 
 def _comparison_row(
@@ -766,6 +887,10 @@ def _verify_manifest(directory: Path) -> None:
     if not manifest_path.is_file():
         raise ValueError(f"manifest is missing: {manifest_path}")
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("manifest schema_version is invalid")
+    if payload.get("hash_algorithm") != "sha256":
+        raise ValueError("manifest hash_algorithm is invalid")
     expected = payload.get("files", {})
     actual = {
         str(path.relative_to(directory)): _sha256(path)
@@ -777,6 +902,39 @@ def _verify_manifest(directory: Path) -> None:
             path for path in set(expected) | set(actual) if expected.get(path) != actual.get(path)
         )
         raise ValueError(f"manifest checksum mismatch: {changed}")
+    _verify_tracked_manifest_unchanged(manifest_path)
+
+
+def _verify_tracked_manifest_unchanged(manifest_path: Path) -> None:
+    root = _repository_root()
+    try:
+        relative = manifest_path.resolve().relative_to(root)
+    except ValueError:
+        return
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", str(relative)],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if tracked.returncode == 1:
+        return
+    if tracked.returncode != 0:
+        raise RuntimeError(
+            "failed to inspect manifest tracking state: " + tracked.stderr.strip()
+        )
+    unchanged = subprocess.run(
+        ["git", "diff", "--quiet", "HEAD", "--", str(relative)],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if unchanged.returncode == 1:
+        raise ValueError("tracked manifest differs from the committed Git trust anchor")
+    if unchanged.returncode != 0:
+        raise RuntimeError("failed to verify manifest trust anchor: " + unchanged.stderr.strip())
 
 
 def _violations(report: SolutionReport) -> str:
@@ -816,9 +974,23 @@ def _reference_revision(root: Path) -> str | None:
         cwd=reference,
         capture_output=True,
         text=True,
-        check=False,
+        check=True,
     )
-    return result.stdout.strip() if result.returncode == 0 else None
+    return result.stdout.strip()
+
+
+def _physical_memory_bytes() -> int:
+    if platform.system() == "Darwin":
+        result = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return int(result.stdout.strip())
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    page_count = os.sysconf("SC_PHYS_PAGES")
+    return int(page_size * page_count)
 
 
 def _combined_hash(values: dict[str, str]) -> str:
@@ -866,7 +1038,12 @@ def _write_csv(
     path: Path, fields: tuple[str, ...], rows: list[dict[str, Any]]
 ) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=fields,
+            extrasaction="ignore",
+            lineterminator="\n",
+        )
         writer.writeheader()
         writer.writerows(rows)
 

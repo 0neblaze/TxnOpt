@@ -65,7 +65,9 @@ uv run python -m evrptw.experiments.stage00_baseline compare \
 
 报告逐指标标记 `improvement`、`regression` 或 `unchanged`。可行率下降、validator 失败、
 缺少实例/seed 或删除失败记录会触发 regression gate（回归门槛）失败；其余指标只分别
-分类，不提前定义跨指标总排名。正式 lexicographic objective（字典序目标）留到阶段 1。
+分类，不提前定义跨指标总排名。比较方向只用于计划已明确的车辆数、距离、能耗、充电量/
+时间、运行时间、迭代数和可行率；move 与精确充电子问题调用统计仅记录和汇总，不擅自
+判定改善或退化。正式 lexicographic objective（字典序目标）留到阶段 1。
 
 ## 5. 冻结时的 100-customer 检查点
 
@@ -78,3 +80,22 @@ uv run python -m evrptw.experiments.stage00_baseline compare \
 | `rc101_21` | 24–25 |
 
 最终数值以冻结 CSV 和 manifest 为唯一事实来源。
+
+## 6. 重复运行观察
+
+阶段 0 冻结后使用完全相同的实例、seeds、1000 次最大迭代和 30 秒限制进行了第二次运行。
+两次均为 36/36 可行，所有结构 gate 均通过；5/10/15-customer 的解指标逐位一致。
+100-customer 中 `c101_21`、seed `2014` 的第二次运行在截止前完成了 7 次迭代，而冻结运行
+完成 6 次，因此得到更短的可行解；其余解指标一致。
+
+这说明当前实现的固定 seed 能固定随机选择序列，但 30 秒 wall-clock deadline（墙钟截止
+时间）不能保证相同硬件上每次完成完全相同的迭代数，因此 100-customer 结果不是
+bitwise deterministic（逐位确定）。阶段 0 将该差异作为可观察事实保留：可行性、记录
+完整性和 validator 是硬性 gate，质量与性能指标逐项分类。若要同时保证严格时间上限与
+确定性终止，需要后续引入 deterministic work budget（确定性工作预算），不应在冻结当前
+算法时偷偷改变搜索逻辑。
+
+第二次运行的逐次记录、汇总、环境和自动比较报告保存在
+`experiments/baselines/stage00/reproduction_audit/`，并受冻结 manifest 保护。由于解指标
+发生变化，计划中的“第二次复现确定性解指标一致”这一严格验收项当前明确为 **未通过**；
+其根因和证据已固定，但不能把它报告为完成。该项需要后续获准修改搜索终止机制后才能关闭。

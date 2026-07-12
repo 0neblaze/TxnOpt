@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from evrptw.experiments.stage00_baseline import (
     compare_results,
     load_config,
     run_stage00,
+    summarize_metric_values,
     verify_results,
 )
 from evrptw.experiments.week02_baseline_comparison import write_schneider_instance
@@ -79,6 +81,16 @@ def test_user_can_load_the_frozen_stage00_configuration(tmp_path: Path) -> None:
     )
 
 
+def test_summary_statistics_match_a_known_population_example() -> None:
+    summary = summarize_metric_values("worked-example", "total_distance", [1.0, 2.0, 3.0, 10.0])
+
+    assert summary["best"] == 1.0
+    assert summary["mean"] == 4.0
+    assert summary["median"] == 2.5
+    assert summary["worst"] == 10.0
+    assert math.isclose(summary["standard_deviation"], math.sqrt(12.5))
+
+
 def test_run_verify_and_compare_form_a_reproducible_public_workflow(tmp_path: Path) -> None:
     config_path = _config_file(tmp_path)
     config = load_config(config_path)
@@ -97,8 +109,12 @@ def test_run_verify_and_compare_form_a_reproducible_public_workflow(tmp_path: Pa
     with report_path.open(encoding="utf-8", newline="") as handle:
         assert tuple(next(csv.reader(handle))) == COMPARISON_FIELDS
     assert (baseline_dir / "failure_cases.csv").read_text(encoding="utf-8").count("\n") == 1
+    with (baseline_dir / "comparison_template.csv").open(encoding="utf-8", newline="") as handle:
+        assert tuple(next(csv.reader(handle))) == COMPARISON_FIELDS
     assert (baseline_dir / "manifest.json").exists()
     assert not (baseline_dir / "raw").exists()
+    environment = json.loads((baseline_dir / "environment.json").read_text(encoding="utf-8"))
+    assert environment["physical_memory_bytes"] > 0
 
 
 def test_run_refuses_to_overwrite_an_existing_target(tmp_path: Path) -> None:
@@ -134,6 +150,20 @@ def test_manifest_detects_a_tampered_frozen_csv(tmp_path: Path) -> None:
     per_run.write_text(per_run.read_text(encoding="utf-8") + "tampered\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="manifest checksum mismatch"):
+        verify_results(config, baseline_dir, require_manifest=True)
+
+
+def test_manifest_rejects_tampered_metadata(tmp_path: Path) -> None:
+    config_path = _config_file(tmp_path)
+    config = load_config(config_path)
+    baseline_dir = tmp_path / "baseline"
+    run_stage00(config, config_path, tmp_path / "results", baseline_dir=baseline_dir)
+    manifest = baseline_dir / "manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["hash_algorithm"] = "not-sha256"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="hash_algorithm"):
         verify_results(config, baseline_dir, require_manifest=True)
 
 
@@ -202,6 +232,8 @@ def test_compare_classifies_improvement_regression_and_unchanged(tmp_path: Path)
             row["mean"] = str(float(row["mean"]) - 1.0)
         elif row["metric"] == "vehicle_count":
             row["mean"] = str(float(row["mean"]) + 1.0)
+        elif row["metric"] == "total_energy":
+            row["mean"] = str(float(row["mean"]) + 1e-10)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=tuple(rows[0]))
         writer.writeheader()
@@ -215,4 +247,51 @@ def test_compare_classifies_improvement_regression_and_unchanged(tmp_path: Path)
     }
     assert by_metric[("total_distance", "mean")] == "improvement"
     assert by_metric[("vehicle_count", "mean")] == "regression"
+    assert by_metric[("total_energy", "mean")] == "unchanged"
     assert by_metric[("iterations", "mean")] == "unchanged"
+
+
+def test_compare_fails_gate_when_candidate_solution_does_not_validate(tmp_path: Path) -> None:
+    config_path = _config_file(tmp_path)
+    config = load_config(config_path)
+    baseline_dir = tmp_path / "baseline"
+    candidate_dir = tmp_path / "candidate"
+    run_stage00(config, config_path, tmp_path / "baseline-results", baseline_dir=baseline_dir)
+    run_stage00(config, config_path, candidate_dir)
+    solution = next((candidate_dir / "solutions").glob("*.json"))
+    payload = json.loads(solution.read_text(encoding="utf-8"))
+    payload["routes"] = []
+    solution.write_text(json.dumps(payload), encoding="utf-8")
+
+    rows = compare_results(config, baseline_dir, candidate_dir, tmp_path / "comparison.csv")
+
+    assert any(
+        row["metric"] == "validator_feasibility" and row["gate_status"] == "fail"
+        for row in rows
+    )
+
+
+def test_compare_fails_gate_for_missing_run_and_deleted_failure_record(tmp_path: Path) -> None:
+    config_path = _config_file(tmp_path)
+    config = load_config(config_path)
+    baseline_dir = tmp_path / "baseline"
+    candidate_dir = tmp_path / "candidate"
+    run_stage00(config, config_path, tmp_path / "baseline-results", baseline_dir=baseline_dir)
+    run_stage00(config, config_path, candidate_dir)
+    path = candidate_dir / "per_run_results.csv"
+    rows = list(csv.DictReader(path.open(encoding="utf-8", newline="")))
+    rows[0]["feasible"] = "False"
+    rows[0]["status"] = "invalid"
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=tuple(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows[:-1])
+
+    comparison = compare_results(
+        config, baseline_dir, candidate_dir, tmp_path / "comparison.csv"
+    )
+    failed_metrics = {
+        row["metric"] for row in comparison if row["gate_status"] == "fail"
+    }
+    assert "run_coverage" in failed_metrics
+    assert "failure_record_retention" in failed_metrics
