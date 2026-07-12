@@ -1,0 +1,59 @@
+[build-system]
+requires = ["scikit-build-core>=0.11,<0.12", "pybind11>=3.0,<4"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "evrptw-reproduction"
+version = "0.1.0"
+description = "Reproducible EVRP-TW research environment"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "cplex==22.2.0.0",
+  "docplex==2.32.264",
+  "gurobipy==13.0.2",
+  "highspy>=1.12,<2",
+  "jupyterlab>=4.5,<5",
+  "matplotlib>=3.10,<4",
+  "networkx>=3.5,<4",
+  "numba>=0.63,<1",
+  "numpy>=2.3,<3",
+  "ortools>=9.14,<10",
+  "pandas>=2.3,<4",
+  "scipy>=1.16,<2",
+  "seaborn>=0.13,<1",
+]
+
+[project.scripts]
+evrptw-env = "evrptw.environment:main"
+
+[dependency-groups]
+dev = [
+  "mypy>=1.18,<2",
+  "pybind11>=3.0,<4",
+  "pytest>=9,<10",
+  "pytest-cov>=7,<8",
+  "ruff>=0.14,<1",
+  "scikit-build-core>=0.11,<0.12",
+]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = ["src/evrptw"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.13"
+packages = ["evrptw"]
+strict = true
+warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
+module = ["cplex.*", "docplex.*", "gurobipy.*", "scipy.*"]
+ignore_missing_imports = true

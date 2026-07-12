@@ -1,0 +1,112 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.envrc
+*.egg-info/
+.eggs/
+.tox/
+.nox/
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and packaging output
+node_modules/
+dist/
+build/
+site/
+wheelhouse/
+compile_commands.json
+*.so
+*.dylib
+*.dll
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Data & large files (link to sources instead of committing)
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.parquet
+*.feather
+*.zip
+*.tar.gz
+*.7z
+*.h5
+*.hdf5
+*.ckpt
+*.pth
+*.vrp
+*.instance
+*.pdf
+!/FURP_Showcase.pdf
+data/
+
+# Curated experiment summaries that are small enough to review
+!experiments/
+!experiments/summaries/
+!experiments/summaries/**/*.csv
+!experiments/summaries/**/*.tsv
+!experiments/baselines/
+!experiments/baselines/**/*.csv
+
+# Large media deliverables; store externally and link from docs
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+
+# Secrets — NEVER commit credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.lic
+*.license
+gurobi.lic
+access.ilm
+ilm_access.key
+credentials.*
+secrets.*
+
+# Solver models, solutions, logs, and temporary files
+*.log
+*.lp
+*.mps
+*.sav
+*.sol
+*.mst
+*.bas
+*.prm
+*.ord
+
+# Local literature shortcut (the files live in ~/Documents)
+/document/
+
+# Read-only reference repositories
+/reference/
+
+# Generated experiment output and local scratch work
+/results/
+/outputs/
+/scratch/
+/tmp/

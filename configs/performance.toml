@@ -1,0 +1,19 @@
+[run]
+name = "local-performance"
+seed = 2014
+repetitions = 10
+
+[solver]
+primary = "gurobi"
+cross_check = "cplex"
+threads = 0
+time_limit_seconds = 7200
+
+[heuristic]
+threads = 0
+feasibility_vns_iterations = 500
+distance_vns_iterations = 200
+
+[output]
+directory = "results/runs/performance"
+record_environment = true

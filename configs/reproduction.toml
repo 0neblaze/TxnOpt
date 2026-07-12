@@ -1,0 +1,18 @@
+[run]
+name = "paper-reproduction"
+seed = 2014
+repetitions = 10
+
+[solver]
+primary = "cplex"
+threads = 1
+time_limit_seconds = 7200
+
+[heuristic]
+threads = 1
+feasibility_vns_iterations = 500
+distance_vns_iterations = 200
+
+[output]
+directory = "results/runs/reproduction"
+record_environment = true
