@@ -110,6 +110,16 @@ def run_stage01_objective(
     verify_results(config, baseline_dir, require_manifest=True)
     if output_dir.exists():
         raise FileExistsError(f"Stage 1 output directory already exists: {output_dir}")
+    tracked_names = (
+        "stage01_per_run_results.csv",
+        "stage01_summary_results.csv",
+        "stage01_failure_cases.csv",
+        "stage01_objective_ranking_changes.csv",
+        "stage01_stage00_comparison.csv",
+    )
+    existing = [summary_dir / name for name in tracked_names if (summary_dir / name).exists()]
+    if existing:
+        raise FileExistsError(f"tracked Stage 1 summaries already exist: {existing}")
     output_dir.mkdir(parents=True)
     raw_dir = output_dir / "raw"
     solution_dir = output_dir / "solutions"
@@ -449,8 +459,11 @@ def _compare_with_stage00(
         baseline_group = [row for row in baseline_rows if row["instance"] == instance]
         candidate_group = [row for row in candidate_rows if row["instance"] == instance]
         expected_seeds = {str(seed) for seed in config.seeds}
-        actual_seeds = {str(row["seed"]) for row in candidate_group}
-        if actual_seeds != expected_seeds:
+        baseline_seeds = [row["seed"] for row in baseline_group]
+        candidate_seeds = [str(row["seed"]) for row in candidate_group]
+        if len(baseline_seeds) != len(expected_seeds) or set(baseline_seeds) != expected_seeds:
+            raise RuntimeError(f"Stage 0 baseline coverage mismatch for {instance}")
+        if len(candidate_seeds) != len(expected_seeds) or set(candidate_seeds) != expected_seeds:
             raise RuntimeError(f"Stage 1 run coverage mismatch for {instance}")
         baseline_best = min(
             (baseline_objectives[(instance, row["seed"])] for row in baseline_group),

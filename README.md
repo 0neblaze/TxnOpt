@@ -151,6 +151,11 @@ See [the Stage 1 objective protocol](docs/stage01_lexicographic_objective.md)
 for the comparison interface, acceptance policy, experiment schema, and
 reproduction command.
 
+- [Stage 1 per-run results](experiments/summaries/stage01_per_run_results.csv)
+- [Stage 1 summary](experiments/summaries/stage01_summary_results.csv)
+- [Old-vs-new objective ranking](experiments/summaries/stage01_objective_ranking_changes.csv)
+- [Stage 0 comparison](experiments/summaries/stage01_stage00_comparison.csv)
+
 ---
 
 ## Repository structure

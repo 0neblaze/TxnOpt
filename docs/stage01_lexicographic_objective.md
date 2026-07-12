@@ -71,3 +71,22 @@ per-run、summary、failure、Stage 0 comparison 和 old-vs-new ranking CSV 保�
 - `rc103C15`：车辆数与距离相同时，由充电时间和充电次数完成 tie-break（平局决胜）。
 
 该报告只读取阶段 0 冻结 CSV 和 solutions，不修改其 manifest 或任何冻结文件。
+
+## 6. 正式运行结果
+
+正式运行捕获于 clean commit（干净提交）`f6b3eb5`：
+
+- ALNS：12 个实例 × 3 个 seeds，共 36/36 可行；
+- BPC：3 个 5-customer 实例，3/3 可行且 `proven_optimal=True`；
+- Stage 0 structural feasibility gates（结构可行性门槛）：12/12 通过；
+- Stage 0 best-objective comparison：3 个实例改善、8 个不变、1 个变差；
+- old-vs-new ranking：36 条中 6 条换位。
+
+100-customer 的车辆数为：`c101_21=14/14/14`、`r101_21=28/24/28`、
+`rc101_21=25/24/22`。`rc101_21` 的最佳车辆数由阶段 0 的 24 降至 22；`r101_21`
+本次最佳为 24，差于阶段 0 的 22。该差异发生在 30 秒 time-budgeted search（时间预算
+搜索）中，阶段 1不把单批质量波动解释为算法全面改善；阶段 2将直接处理 R/RC 的车辆数。
+
+阶段 1验收结论：四级排序无歧义，增加车辆的解不能被 SA 接受或成为 incumbent，ALNS、
+BPC、runner 和文档使用同一目标，旧测试全部保持通过，阶段 0冻结文件及 manifest hash
+`b226b97e0e67288aaaf85726ad855df71cb81406685c57c8e8c40cd8996aa0da` 未改变。
