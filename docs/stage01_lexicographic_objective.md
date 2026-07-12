@@ -74,7 +74,8 @@ per-run、summary、failure、Stage 0 comparison 和 old-vs-new ranking CSV 保�
 
 ## 6. 正式运行结果
 
-正式运行捕获于 clean commit（干净提交）`f6b3eb5`：
+最终正式运行在双轴 code review（代码审查）全部问题关闭后，捕获于 clean commit
+（干净提交）`c5e2c16`：
 
 - ALNS：12 个实例 × 3 个 seeds，共 36/36 可行；
 - BPC：3 个 5-customer 实例，3/3 可行且 `proven_optimal=True`；
@@ -90,3 +91,5 @@ per-run、summary、failure、Stage 0 comparison 和 old-vs-new ranking CSV 保�
 阶段 1验收结论：四级排序无歧义，增加车辆的解不能被 SA 接受或成为 incumbent，ALNS、
 BPC、runner 和文档使用同一目标，旧测试全部保持通过，阶段 0冻结文件及 manifest hash
 `b226b97e0e67288aaaf85726ad855df71cb81406685c57c8e8c40cd8996aa0da` 未改变。
+最终质量检查为 `61 passed`，Ruff 与 mypy 均通过；39 个正式解随后再次由统一
+validator（验证器）独立重算目标并全部通过。
