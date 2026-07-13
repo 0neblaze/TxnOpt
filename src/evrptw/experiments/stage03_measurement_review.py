@@ -457,13 +457,9 @@ def _event_log_ok(
     ]
     if len(trace_events) != len(trace.events):
         return False
-    normalized_trace_events = [
-        {key: value for key, value in event.items() if key not in {"event_type", "event_index"}}
-        for event in trace_events
-    ]
     if any(
         _canonical_json(left) != _canonical_json(right)
-        for left, right in zip(normalized_trace_events, trace.events, strict=True)
+        for left, right in zip(trace_events, trace.events, strict=True)
     ):
         return False
     if solver_result is None:

@@ -43,6 +43,8 @@ Stage 3.0 只回答一个问题：在当前 `stage02_constraint_guided` 主轨�
 
 所有 summary CSV 都必须由 raw solution、raw trace、event log 和 manifest 重算。runner 写出的 `raw_per_run_results.csv` 不是审计结论。
 
+内存记录使用 OS-level `peak_rss_bytes`（峰值常驻内存），不在 exact charging 求解路径启用 `tracemalloc`；后者会改变 100-customer fixed wall-clock trajectory（固定 wall-clock 轨迹）。因此 `peak_tracemalloc_bytes` 在 Stage 3.0 raw schema 中明确为空，而不是把高开销内存追踪伪装成 solver measurement（求解器测量）。
+
 ## 运行命令
 
 运行命令必须从 clean main-repository commit（干净主仓库提交）开始；runner 会主动拒绝 dirty worktree（脏工作树）。

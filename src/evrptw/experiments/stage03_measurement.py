@@ -10,7 +10,6 @@ import resource
 import shutil
 import subprocess
 import tomllib
-import tracemalloc
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -239,7 +238,6 @@ def run_stage03(
         for seed in config.seeds:
             run_id = f"{instance_name}-{config.algorithm.lower()}-{seed}"
             start = datetime.now(UTC)
-            tracemalloc.start()
             result: ALNSResult | None = None
             trace: Stage03Trace | None = None
             error: BaseException | None = None
@@ -264,9 +262,11 @@ def run_stage03(
                     trace = Stage03Trace(MeasurementConfig())
                     trace.record_execution_error(caught)
                     trace.finish()
-            finally:
-                _, peak_tracemalloc = tracemalloc.get_traced_memory()
-                tracemalloc.stop()
+            # Do not enable tracemalloc around the solver: its allocation
+            # hooks materially change the fixed wall-clock trajectory on the
+            # 100-customer instances.  Peak RSS below remains an OS-level
+            # memory record without changing the measured solver path.
+            peak_tracemalloc: int | None = None
             peak_rss = _peak_rss_bytes()
             end = datetime.now(UTC)
             if trace is None:
@@ -354,7 +354,7 @@ def _persist_run(
     environment_payload: dict[str, Any],
     environment_hash: str,
     reference_repositories: dict[str, dict[str, object]],
-    peak_tracemalloc_bytes: int,
+    peak_tracemalloc_bytes: int | None,
     peak_rss_bytes: int | None,
 ) -> dict[str, Any]:
     raw_path = output_dir / "raw" / f"{run_id}.json"
@@ -517,7 +517,7 @@ def _run_environment(
     instance_hash: str,
     start: datetime,
     end: datetime,
-    peak_tracemalloc_bytes: int,
+    peak_tracemalloc_bytes: int | None,
     peak_rss_bytes: int | None,
 ) -> dict[str, Any]:
     return {
