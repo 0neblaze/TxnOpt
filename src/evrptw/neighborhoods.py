@@ -8,6 +8,7 @@ from enum import StrEnum
 from typing import Protocol
 
 from evrptw.charging import ChargingSubproblemResult
+from evrptw.measurement import ScreeningCheckTrace
 from evrptw.models import Instance, NodeType
 from evrptw.objective import SolutionObjective
 
@@ -247,12 +248,24 @@ class RepairResult:
 
 
 @dataclass(frozen=True, slots=True)
-class RouteScreenResult:
+class ScreeningResult:
     accepted: bool
     reason: str
     demand: float
     optimistic_finish_time: float
     energy_reachable: bool
+    checks: tuple[ScreeningCheckTrace, ...] = ()
+    first_failed_check: str = ""
+    min_time_window_slack: float = 0.0
+    distance_lower_bound: float = 0.0
+    distance_increment_lower_bound: float | None = None
+    single_segment_reachable: bool = True
+    structural_energy_lower_bound: float = 0.0
+
+
+# Stage 2.1--2.3 callers retain the old public name.  It is intentionally an
+# alias, so old positional construction and old reason strings remain valid.
+RouteScreenResult = ScreeningResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,23 +290,273 @@ class _EvaluationBudgetExceeded(RuntimeError):
     pass
 
 
-def screen_route_candidate(instance: Instance, sequence: CustomerSequence) -> RouteScreenResult:
+def screen_route_candidate(
+    instance: Instance,
+    sequence: CustomerSequence,
+    *,
+    full: bool = False,
+    reference_distance: float | None = None,
+) -> ScreeningResult:
     """Run safe, optimistic checks before exact charging evaluation.
 
-    The time propagation ignores charging and uses direct Euclidean legs, so a rejected
-    candidate is necessarily infeasible under the repository's charging model. Energy
-    reachability starts every fixed node with a full battery, which is also optimistic.
+    ``full=False`` preserves the Stage 2 prefilter surface and reason strings.
+    Stage 3.1 passes ``full=True`` and obtains a structured evidence record.  All
+    rejecting checks are optimistic lower bounds: charging can only add time, and
+    the energy frontier starts every recharge node with a full battery.
     """
 
     by_name = instance.by_name
     unknown = [name for name in sequence if name not in by_name]
     if unknown or any(by_name[name].kind is not NodeType.CUSTOMER for name in sequence):
-        return RouteScreenResult(False, "route_structure_prefilter", 0.0, 0.0, False)
+        if full:
+            return ScreeningResult(
+                False,
+                "route_structure_prefilter",
+                0.0,
+                0.0,
+                False,
+                (
+                    ScreeningCheckTrace(
+                        "route_structure",
+                        "fail",
+                        False,
+                        "sequence contains unknown or non-customer nodes",
+                    ),
+                ),
+                "route_structure",
+                0.0,
+                0.0,
+                None,
+                False,
+                0.0,
+            )
+        return ScreeningResult(False, "route_structure_prefilter", 0.0, 0.0, False)
 
     demand = sum(by_name[name].demand for name in sequence)
     if demand > instance.vehicle.load_capacity + _EPSILON:
-        return RouteScreenResult(False, "capacity_prefilter", demand, 0.0, False)
+        if full:
+            return ScreeningResult(
+                False,
+                "capacity_prefilter",
+                demand,
+                0.0,
+                False,
+                (
+                    ScreeningCheckTrace(
+                        "capacity_lower_bound",
+                        "fail",
+                        demand,
+                        "customer demand exceeds vehicle capacity",
+                    ),
+                ),
+                "capacity_lower_bound",
+                0.0,
+                0.0,
+                None,
+                False,
+                0.0,
+            )
+        return ScreeningResult(False, "capacity_prefilter", demand, 0.0, False)
 
+    if not full:
+        return _legacy_screen_route_candidate(instance, sequence, demand)
+
+    checks: list[ScreeningCheckTrace] = []
+    first_failed_check = ""
+    failure_reason = ""
+    min_slack = float("inf")
+    distance_lower_bound = 0.0
+    structural_energy_lower_bound = 0.0
+    single_segment_reachable = True
+    current_time = max(0.0, instance.depot.ready_time)
+    earliest_arrivals: dict[str, float] = {}
+    chain = (instance.depot.name, *sequence, instance.depot.name)
+
+    def reject(check: str, reason: str, value: float | bool | None) -> ScreeningResult:
+        nonlocal first_failed_check, failure_reason
+        first_failed_check = check
+        failure_reason = reason
+        checks.append(ScreeningCheckTrace(check, "fail", value, reason))
+        return ScreeningResult(
+            False,
+            failure_reason,
+            demand,
+            current_time,
+            single_segment_reachable,
+            tuple(checks),
+            first_failed_check,
+            min_slack if math.isfinite(min_slack) else 0.0,
+            distance_lower_bound,
+            (
+                None
+                if reference_distance is None
+                else distance_lower_bound - reference_distance
+            ),
+            single_segment_reachable,
+            structural_energy_lower_bound,
+        )
+
+    checks.append(
+        ScreeningCheckTrace(
+            "route_structure",
+            "pass",
+            len(set(sequence)) == len(sequence),
+            "ordered customer sequence with no non-customer nodes",
+        )
+    )
+    if len(set(sequence)) != len(sequence):
+        return reject("route_structure", "route_structure_prefilter", False)
+    checks.append(
+        ScreeningCheckTrace(
+            "capacity_lower_bound",
+            "pass",
+            demand,
+            "customer demand does not exceed vehicle capacity",
+        )
+    )
+
+    for origin_name, destination_name in zip(chain, chain[1:], strict=False):
+        origin = by_name[origin_name]
+        destination = by_name[destination_name]
+        current_time += origin.distance_to(destination) / instance.vehicle.average_velocity
+        current_time = max(current_time, destination.ready_time)
+        if destination.kind is NodeType.CUSTOMER:
+            earliest_arrivals[destination.name] = current_time
+            slack = destination.due_date - current_time
+            min_slack = min(min_slack, slack)
+            if slack < -_EPSILON:
+                return reject("forward_time_window", "forward_time_window_prefilter", slack)
+            current_time += destination.service_time
+        elif destination.kind is NodeType.DEPOT:
+            slack = destination.due_date - current_time
+            min_slack = min(min_slack, slack)
+            if slack < -_EPSILON:
+                return reject("forward_time_window", "forward_time_window_prefilter", slack)
+    checks.append(
+        ScreeningCheckTrace(
+            "forward_time_window",
+            "pass",
+            current_time,
+            "direct-leg earliest-arrival propagation",
+        )
+    )
+
+    latest_departure = instance.depot.due_date
+    latest_arrivals: dict[str, float] = {}
+    for index in range(len(chain) - 2, -1, -1):
+        origin = by_name[chain[index]]
+        destination = by_name[chain[index + 1]]
+        if destination.kind is NodeType.CUSTOMER:
+            latest_arrival = min(
+                destination.due_date,
+                latest_departure - destination.service_time,
+            )
+            latest_arrivals[destination.name] = latest_arrival
+        else:
+            latest_arrival = min(destination.due_date, latest_departure)
+        latest_departure = (
+            latest_arrival
+            - origin.distance_to(destination) / instance.vehicle.average_velocity
+        )
+    for customer_name, earliest in earliest_arrivals.items():
+        slack = latest_arrivals[customer_name] - earliest
+        min_slack = min(min_slack, slack)
+        if slack < -_EPSILON:
+            return reject("backward_time_window", "backward_time_window_prefilter", slack)
+    checks.append(
+        ScreeningCheckTrace(
+            "backward_time_window",
+            "pass",
+            min_slack if math.isfinite(min_slack) else 0.0,
+            "latest-arrival backward propagation",
+        )
+    )
+    if min_slack < -_EPSILON:
+        return reject("time_window_slack", "time_window_slack_prefilter", min_slack)
+    checks.append(
+        ScreeningCheckTrace(
+            "time_window_slack",
+            "pass",
+            min_slack if math.isfinite(min_slack) else 0.0,
+            "non-negative optimistic slack",
+        )
+    )
+
+    distance_lower_bound = sum(
+        by_name[origin_name].distance_to(by_name[destination_name])
+        for origin_name, destination_name in zip(chain, chain[1:], strict=False)
+    )
+    checks.append(
+        ScreeningCheckTrace(
+            "shortest_distance_lower_bound",
+            "recorded",
+            distance_lower_bound,
+            "safe metric only; never a rejection criterion",
+        )
+    )
+
+    for origin_name, destination_name in zip(chain, chain[1:], strict=False):
+        if not _energy_reachable_optimistically(instance, origin_name, destination_name):
+            single_segment_reachable = False
+            return reject(
+                "single_segment_battery_reachability",
+                "single_segment_energy_prefilter",
+                False,
+            )
+    checks.append(
+        ScreeningCheckTrace(
+            "single_segment_battery_reachability",
+            "pass",
+            True,
+            "optimistic depot/station frontier reachability",
+        )
+    )
+
+    recharge_nodes = (instance.depot, *instance.stations)
+    for customer_name in sequence:
+        customer = by_name[customer_name]
+        to_customer = min(node.distance_to(customer) for node in recharge_nodes)
+        from_customer = min(customer.distance_to(node) for node in recharge_nodes)
+        structural_energy_lower_bound = max(
+            structural_energy_lower_bound,
+            (to_customer + from_customer) * instance.vehicle.consumption_rate,
+        )
+    if structural_energy_lower_bound > instance.vehicle.battery_capacity + _EPSILON:
+        return reject(
+            "structural_energy_lower_bound",
+            "structural_energy_prefilter",
+            structural_energy_lower_bound,
+        )
+    checks.append(
+        ScreeningCheckTrace(
+            "structural_energy_lower_bound",
+            "pass",
+            structural_energy_lower_bound,
+            "optimistic recharge-node/customer/recharge-node bound",
+        )
+    )
+    return ScreeningResult(
+        True,
+        "",
+        demand,
+        current_time,
+        True,
+        tuple(checks),
+        "",
+        min_slack if math.isfinite(min_slack) else 0.0,
+        distance_lower_bound,
+        None if reference_distance is None else distance_lower_bound - reference_distance,
+        True,
+        structural_energy_lower_bound,
+    )
+
+
+def _legacy_screen_route_candidate(
+    instance: Instance,
+    sequence: CustomerSequence,
+    demand: float,
+) -> ScreeningResult:
+    by_name = instance.by_name
     current_time = max(0.0, instance.depot.ready_time)
     chain = (instance.depot.name, *sequence, instance.depot.name)
     for origin_name, destination_name in zip(chain, chain[1:], strict=False):
@@ -303,16 +566,16 @@ def screen_route_candidate(instance: Instance, sequence: CustomerSequence) -> Ro
         current_time = max(current_time, destination.ready_time)
         if destination.kind is NodeType.CUSTOMER:
             if current_time > destination.due_date + _EPSILON:
-                return RouteScreenResult(
+                return ScreeningResult(
                     False, "time_window_prefilter", demand, current_time, False
                 )
             current_time += destination.service_time
 
     for origin_name, destination_name in zip(chain, chain[1:], strict=False):
         if not _energy_reachable_optimistically(instance, origin_name, destination_name):
-            return RouteScreenResult(False, "energy_prefilter", demand, current_time, False)
+            return ScreeningResult(False, "energy_prefilter", demand, current_time, False)
 
-    return RouteScreenResult(True, "", demand, current_time, True)
+    return ScreeningResult(True, "", demand, current_time, True)
 
 
 def select_dynamic_removal_size(

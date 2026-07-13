@@ -1,0 +1,28 @@
+[stage03]
+schema_version = "1"
+experiment_id = "stage031-cheap-screening"
+algorithm = "ALNS_STAGE02_CONSTRAINT_GUIDED"
+operator_profile = "stage02_constraint_guided"
+stage00_config = "configs/stage00_baseline.toml"
+stage02_config = "configs/stage02_constraint_guided.toml"
+baseline_dir = "experiments/baselines/stage00"
+stage02_attempt16_per_run = "experiments/summaries/stage02_constraint_guided_attempt16_per_run_results.csv"
+stage02_rerun09_per_run = "experiments/summaries/stage02_constraint_guided_rerun09_per_run_results.csv"
+stage03_formal_run_dir = "results/stage03-measurement_formal01"
+stage03_formal_per_run = "experiments/summaries/stage03_measurement_formal01_per_run_results.csv"
+stage03_formal_review_manifest = "experiments/summaries/stage03_measurement_formal01_review_manifest.json"
+
+[benchmark]
+directory = "data/schneider"
+
+[run]
+seeds = [2014, 2015, 2016]
+time_limit_seconds = 30.0
+max_iterations = 1000
+threads = 1
+
+[screening]
+enabled = true
+schema_version = "stage031-screening-v1"
+negative_sequence_cache = true
+epsilon = 1e-9

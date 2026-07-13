@@ -27,7 +27,12 @@ from evrptw.experiments.stage02_route_reduction import (
 from evrptw.experiments.stage02_route_reduction import (
     load_config as load_stage02_config,
 )
-from evrptw.measurement import MeasurementConfig, Stage03ExecutionError, Stage03Trace
+from evrptw.measurement import (
+    CheapScreeningConfig,
+    MeasurementConfig,
+    Stage03ExecutionError,
+    Stage03Trace,
+)
 from evrptw.models import Instance
 from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
 from evrptw.parser import parse_schneider
@@ -84,6 +89,12 @@ RAW_PER_RUN_FIELDS = (
     "trace_precomputed_routes",
     "trace_route_evaluations",
     "trace_deadline_events",
+    "trace_screening_calls",
+    "trace_screening_passes",
+    "trace_screening_rejections",
+    "trace_screening_cache_hits",
+    "trace_screening_exact_call_blocked",
+    "trace_screening_reason_counts",
     "trace_reconciliation_status",
     "peak_tracemalloc_bytes",
     "peak_rss_bytes",
@@ -114,6 +125,10 @@ class Stage03Config:
     time_limit_seconds: float
     max_iterations: int
     threads: int
+    screening_config: CheapScreeningConfig | None = None
+    stage03_formal_run_dir: Path | None = None
+    stage03_formal_per_run: Path | None = None
+    stage03_formal_review_manifest: Path | None = None
 
 
 def load_config(path: Path) -> Stage03Config:
@@ -138,9 +153,29 @@ def load_config(path: Path) -> Stage03Config:
             time_limit_seconds=float(run["time_limit_seconds"]),
             max_iterations=int(run["max_iterations"]),
             threads=int(run["threads"]),
+            screening_config=(
+                CheapScreeningConfig(**dict(payload["screening"]))
+                if "screening" in payload
+                else None
+            ),
+            stage03_formal_run_dir=(
+                Path(str(stage["stage03_formal_run_dir"]))
+                if stage.get("stage03_formal_run_dir") is not None
+                else None
+            ),
+            stage03_formal_per_run=(
+                Path(str(stage["stage03_formal_per_run"]))
+                if stage.get("stage03_formal_per_run") is not None
+                else None
+            ),
+            stage03_formal_review_manifest=(
+                Path(str(stage["stage03_formal_review_manifest"]))
+                if stage.get("stage03_formal_review_manifest") is not None
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError(f"invalid Stage 3.0 configuration: {error}") from error
+        raise ValueError(f"invalid Stage 3 configuration: {error}") from error
     _validate_config(config)
     return config
 
@@ -164,8 +199,29 @@ def run_stage03(
     stage02 = load_stage02_config(_resolve(root, config.stage02_config))
     _validate_stage02_protocol(config, stage02)
     instances = _scope_instances(scope)
+    screening_enabled = (
+        config.screening_config is not None and config.screening_config.enabled
+    )
     if scope == "formal":
-        _require_smoke_gate(_resolve(root, smoke_review_dir) if smoke_review_dir else None)
+        if screening_enabled:
+            _require_stage031_smoke_gate(
+                _resolve(root, smoke_review_dir) if smoke_review_dir else None
+            )
+            if config.stage03_formal_run_dir is None:
+                raise RuntimeError(
+                    "formal Stage 3.1 is blocked: config must identify the audited "
+                    "Stage 3.0 formal run directory"
+                )
+            _require_stage03_formal_gate(
+                _resolve(root, config.stage03_formal_run_dir),
+                trusted_review_manifest=(
+                    _resolve(root, config.stage03_formal_review_manifest)
+                    if config.stage03_formal_review_manifest is not None
+                    else None
+                ),
+            )
+        else:
+            _require_smoke_gate(_resolve(root, smoke_review_dir) if smoke_review_dir else None)
     _validate_run_label(run_label)
     _assert_clean_repository(root)
     if output_dir.exists():
@@ -182,7 +238,7 @@ def run_stage03(
             f"{baseline_dir / 'manifest.json'}"
         )
     baseline_manifest_sha256 = _sha256(baseline_dir / "manifest.json")
-    source_hashes = _source_hashes(root)
+    source_hashes = _source_hashes(root, include_stage031=screening_enabled)
     algorithm_source_sha256 = _combined_hash(source_hashes)
     repository_revision = _git_revision(root)
     reference_repositories = _reference_repositories(root)
@@ -226,6 +282,34 @@ def run_stage03(
         "reference_repositories": reference_repositories,
         "captured_environment": base_environment,
         "summary_dir": str(_resolve(root, summary_dir)) if summary_dir else None,
+        "screening_config": (
+            asdict(config.screening_config) if config.screening_config is not None else None
+        ),
+        "stage03_formal_run_dir": (
+            str(_resolve(root, config.stage03_formal_run_dir))
+            if config.stage03_formal_run_dir is not None
+            else None
+        ),
+        "stage03_formal_per_run": (
+            str(_resolve(root, config.stage03_formal_per_run))
+            if config.stage03_formal_per_run is not None
+            else None
+        ),
+        "stage03_formal_per_run_sha256": (
+            _sha256(_resolve(root, config.stage03_formal_per_run))
+            if config.stage03_formal_per_run is not None
+            else None
+        ),
+        "stage03_formal_review_manifest": (
+            str(_resolve(root, config.stage03_formal_review_manifest))
+            if config.stage03_formal_review_manifest is not None
+            else None
+        ),
+        "stage03_formal_review_manifest_sha256": (
+            _sha256(_resolve(root, config.stage03_formal_review_manifest))
+            if config.stage03_formal_review_manifest is not None
+            else None
+        ),
     }
 
     output_dir.mkdir(parents=True)
@@ -259,6 +343,7 @@ def run_stage03(
                     operator_profile=config.operator_profile,
                     vehicle_operator_config=stage02.vehicle_operator_config,
                     measurement_config=MeasurementConfig(),
+                    screening_config=config.screening_config,
                 )
                 trace = result.measurement_trace
                 if trace is None:
@@ -268,7 +353,9 @@ def run_stage03(
                 if isinstance(caught, Stage03ExecutionError):
                     trace = caught.trace
                 else:
-                    trace = Stage03Trace(MeasurementConfig())
+                    trace = Stage03Trace(
+                        MeasurementConfig(), screening_config=config.screening_config
+                    )
                     trace.record_execution_error(caught)
                     trace.finish()
             # Do not enable tracemalloc around the solver: its allocation
@@ -376,6 +463,14 @@ def _persist_run(
         {"record_type": "trace_event", "event_index": index, "payload": event}
         for index, event in enumerate(trace.events)
     ]
+    event_lines.extend(
+        {
+            "record_type": "screening_decision",
+            "event_index": index,
+            "payload": asdict(decision),
+        }
+        for index, decision in enumerate(trace.screening_decisions)
+    )
     if result is not None:
         event_lines.extend(
             {
@@ -489,6 +584,16 @@ def _persist_run(
         "trace_precomputed_routes": trace.precomputed_routes,
         "trace_route_evaluations": len(trace.route_evaluations),
         "trace_deadline_events": trace.deadline_events,
+        "trace_screening_calls": trace.screening_counts["screening_calls"],
+        "trace_screening_passes": trace.screening_counts["screening_passes"],
+        "trace_screening_rejections": trace.screening_counts["screening_rejections"],
+        "trace_screening_cache_hits": trace.screening_counts["screening_cache_hits"],
+        "trace_screening_exact_call_blocked": trace.screening_counts[
+            "screening_exact_call_blocked"
+        ],
+        "trace_screening_reason_counts": json.dumps(
+            trace.screening_counts["screening_reason_counts"], sort_keys=True
+        ),
         "trace_reconciliation_status": trace_reconciliation["status"],
         "peak_tracemalloc_bytes": peak_tracemalloc_bytes,
         "peak_rss_bytes": peak_rss_bytes if peak_rss_bytes is not None else "",
@@ -569,7 +674,7 @@ def _validate_config(config: Stage03Config) -> None:
     if config.time_limit_seconds != 30.0 or config.max_iterations != 1000:
         raise ValueError("Stage 3.0 must use 30 seconds and 1000 iterations")
     if config.threads != 1:
-        raise ValueError("Stage 3.0 requires exactly one thread")
+        raise ValueError("Stage 3 requires exactly one thread")
 
 
 def _validate_stage02_protocol(config: Stage03Config, stage02: Stage02Config) -> None:
@@ -629,6 +734,80 @@ def _require_smoke_gate(review_dir: Path | None) -> None:
     )
 
 
+def _require_stage031_smoke_gate(review_dir: Path | None) -> None:
+    if review_dir is None or not review_dir.is_dir():
+        raise RuntimeError(
+            "formal Stage 3.1 is blocked: provide a Stage 3.1 smoke review directory"
+        )
+    from evrptw.experiments.stage03_measurement_review import review_run
+
+    outputs = review_run(run_dir=review_dir.parent)
+    payload = json.loads(outputs["review_manifest"].read_text(encoding="utf-8"))
+    if payload.get("scope") == "smoke" and payload.get("status") == (
+        "READY_FOR_STAGE031_FORMAL_MEASUREMENT"
+    ):
+        return
+    raise RuntimeError(
+        "formal Stage 3.1 is blocked until smoke replay reports "
+        "READY_FOR_STAGE031_FORMAL_MEASUREMENT"
+    )
+
+
+def _require_stage03_formal_gate(
+    run_dir: Path,
+    *,
+    trusted_review_manifest: Path | None = None,
+) -> None:
+    """Verify the immutable raw/manifest gate for the audited Stage 3.0 formal run."""
+
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"Stage 3.0 formal run directory is missing: {run_dir}")
+    _verify_raw_manifest_gate(run_dir)
+    candidates = [run_dir / "review" / "review_manifest.json"]
+    if trusted_review_manifest is not None:
+        candidates.append(trusted_review_manifest)
+    for review_manifest in candidates:
+        if not review_manifest.is_file():
+            continue
+        payload = json.loads(review_manifest.read_text(encoding="utf-8"))
+        recorded_payload_hash = payload.get("manifest_payload_sha256")
+        payload_without_hash = dict(payload)
+        payload_without_hash.pop("manifest_payload_sha256", None)
+        if recorded_payload_hash != _payload_sha256(payload_without_hash):
+            continue
+        listed_files = dict(payload.get("files", {}))
+        if any(
+            not (review_manifest.parent / str(name)).is_file()
+            or _sha256(review_manifest.parent / str(name)) != expected_hash
+            for name, expected_hash in listed_files.items()
+        ):
+            continue
+        if payload.get("scope") == "formal" and payload.get("status") in {
+            "READY_FOR_STAGE03_ACCELERATION",
+            "READY_FOR_STAGE03_1",
+            "READY_FOR_STAGE31",
+        }:
+            return
+    raise RuntimeError(
+        "formal Stage 3.1 is blocked: no untampered Stage 3.0 formal review "
+        "manifest reports readiness"
+    )
+
+
+def _verify_raw_manifest_gate(run_dir: Path) -> None:
+    manifest_path = run_dir / "manifest.json"
+    sidecar_path = run_dir / "manifest.sha256"
+    if not manifest_path.is_file() or not sidecar_path.is_file():
+        raise RuntimeError("raw Stage 3 evidence manifest or sidecar is missing")
+    if sidecar_path.read_text(encoding="utf-8").strip() != _sha256(manifest_path):
+        raise RuntimeError("raw Stage 3 evidence manifest sidecar hash mismatch")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for relative, expected_hash in dict(manifest.get("files", {})).items():
+        path = run_dir / str(relative)
+        if not path.is_file() or _sha256(path) != expected_hash:
+            raise RuntimeError(f"raw Stage 3 evidence hash mismatch: {path}")
+
+
 def _assert_clean_repository(root: Path) -> None:
     status = subprocess.run(
         ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=normal"],
@@ -657,8 +836,8 @@ def _assert_results_path(root: Path, path: Path, label: str) -> None:
         raise ValueError(f"Stage 3.0 {label} must be a new run directory below results/")
 
 
-def _source_hashes(root: Path) -> dict[str, str]:
-    paths = (
+def _source_hashes(root: Path, *, include_stage031: bool = False) -> dict[str, str]:
+    paths = [
         Path("src/evrptw/alns.py"),
         Path("src/evrptw/measurement.py"),
         Path("src/evrptw/neighborhoods.py"),
@@ -672,7 +851,15 @@ def _source_hashes(root: Path) -> dict[str, str]:
         Path("configs/stage02_constraint_guided.toml"),
         Path("pyproject.toml"),
         Path("uv.lock"),
-    )
+    ]
+    if include_stage031:
+        paths.extend(
+            (
+                Path("src/evrptw/experiments/stage031_cheap_screening.py"),
+                Path("src/evrptw/experiments/stage031_cheap_screening_review.py"),
+                Path("configs/stage031_cheap_screening.toml"),
+            )
+        )
     missing = [path for path in paths if not (root / path).is_file()]
     if missing:
         raise FileNotFoundError(f"Stage 3.0 source files are missing: {missing}")

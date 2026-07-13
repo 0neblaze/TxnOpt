@@ -6,9 +6,11 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
+from typing import Any, cast
 
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
 from evrptw.measurement import (
+    CheapScreeningConfig,
     MeasurementConfig,
     Stage03ExecutionError,
     Stage03Trace,
@@ -23,6 +25,7 @@ from evrptw.neighborhoods import (
     RemovalTier,
     RouteEvaluationDeadlineExceeded,
     RouteSequences,
+    ScreeningResult,
     VehicleOperatorConfig,
     propose_constraint_removal,
     propose_ejection_chain,
@@ -35,6 +38,7 @@ from evrptw.neighborhoods import (
     repair_constraint_removal,
     repair_vehicle_count_aware,
     repair_vehicle_reduction_refinement,
+    screen_route_candidate,
     select_dynamic_removal_size,
 )
 from evrptw.objective import (
@@ -47,6 +51,7 @@ from evrptw.validation import validate_routes
 
 __all__ = (
     "ALNSResult",
+    "CheapScreeningConfig",
     "MeasurementConfig",
     "Stage03ExecutionError",
     "Stage03Trace",
@@ -129,6 +134,7 @@ class ALNSResult:
     maximum_stagnation: int = 0
     constraint_operator_statistics: dict[str, dict[str, object]] = field(default_factory=dict)
     measurement_trace: Stage03Trace | None = None
+    screening_statistics: dict[str, object] = field(default_factory=dict)
 
     @property
     def objective_value(self) -> float:
@@ -151,11 +157,21 @@ class _Evaluator:
         deadline: float,
         measurement_trace: Stage03Trace | None = None,
         lane: str = "legacy",
+        screening_config: CheapScreeningConfig | None = None,
+        negative_screening_cache: dict[str, ScreeningResult] | None = None,
     ) -> None:
         self.instance = instance
         self.deadline = deadline
         self.measurement_trace = measurement_trace
         self.lane = lane
+        self.screening_config = (
+            screening_config
+            if screening_config is not None and screening_config.enabled
+            else None
+        )
+        self.negative_screening_cache = (
+            negative_screening_cache if negative_screening_cache is not None else {}
+        )
         self.iteration: int | None = None
         self.operator = "initialization"
         self.cache: dict[tuple[str, ...], ChargingSubproblemResult] = {}
@@ -164,6 +180,13 @@ class _Evaluator:
         self.runtime = 0.0
         self.labels_generated = 0
         self.labels_pruned = 0
+        self.screening_calls = 0
+        self.screening_passes = 0
+        self.screening_rejections = 0
+        self.screening_cache_hits = 0
+        self.screening_exact_call_blocked = 0
+        self.screening_runtime = 0.0
+        self.screening_reason_counts: dict[str, int] = {}
 
     @contextmanager
     def measurement_context(
@@ -198,7 +221,140 @@ class _Evaluator:
             self.iteration = iteration
             self.operator = operator
 
+    @property
+    def screening_enabled(self) -> bool:
+        return self.screening_config is not None
+
+    def screen(
+        self,
+        sequence: tuple[str, ...],
+        *,
+        reference_distance: float | None = None,
+    ) -> ScreeningResult:
+        """Run the Stage 3.1 screener and record one independent decision."""
+
+        if self.screening_config is None:
+            raise RuntimeError("screen() called while cheap screening is disabled")
+        if time.perf_counter() >= self.deadline:
+            if self.measurement_trace is not None:
+                self.measurement_trace.record_deadline_boundary(
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    boundary="before_cheap_screening",
+                    route_sequence=sequence,
+                )
+            raise _TimeLimitReached(sequence)
+
+        started = time.perf_counter()
+        key = (
+            self.measurement_trace.register_route(sequence)
+            if self.measurement_trace is not None
+            else "route:" + "|".join(f"{len(name)}:{name}" for name in sequence)
+        )
+        cached = (
+            self.negative_screening_cache.get(key)
+            if self.screening_config.negative_sequence_cache
+            else None
+        )
+        negative_cache_hit = cached is not None
+        result = (
+            cached
+            if cached is not None
+            else screen_route_candidate(
+                self.instance,
+                sequence,
+                full=True,
+                reference_distance=reference_distance,
+            )
+        )
+        completed = time.perf_counter()
+        self.screening_runtime += completed - started
+        self.screening_calls += 1
+        if negative_cache_hit:
+            self.screening_cache_hits += 1
+        elif result.accepted:
+            self.screening_passes += 1
+        else:
+            self.screening_rejections += 1
+            if self.screening_config.negative_sequence_cache:
+                self.negative_screening_cache[key] = result
+        if result.reason:
+            self.screening_reason_counts[result.reason] = (
+                self.screening_reason_counts.get(result.reason, 0) + 1
+            )
+        blocked = not result.accepted
+        if blocked:
+            self.screening_exact_call_blocked += 1
+        status = (
+            "negative_cache_hit"
+            if negative_cache_hit
+            else "pass"
+            if result.accepted
+            else "rejected"
+        )
+        if self.measurement_trace is not None:
+            self.measurement_trace.record_screening_decision(
+                sequence,
+                lane=self.lane,
+                iteration=self.iteration,
+                operator=self.operator,
+                status=status,
+                first_failed_check=result.first_failed_check,
+                reason=result.reason,
+                checks=result.checks,
+                demand=result.demand,
+                min_time_window_slack=result.min_time_window_slack,
+                distance_lower_bound=result.distance_lower_bound,
+                distance_increment_lower_bound=result.distance_increment_lower_bound,
+                single_segment_reachable=result.single_segment_reachable,
+                structural_energy_lower_bound=result.structural_energy_lower_bound,
+                negative_cache_hit=negative_cache_hit,
+                exact_call_blocked=blocked,
+                started_at=self.measurement_trace._offset(started),
+                completed_at=self.measurement_trace._offset(completed),
+            )
+            if completed >= self.deadline:
+                self.measurement_trace.record_deadline_boundary(
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    boundary="after_cheap_screening",
+                    route_sequence=sequence,
+                    reason="cheap screening completed at or after the lane deadline",
+                )
+        if completed >= self.deadline:
+            raise _TimeLimitReached(sequence)
+        return result
+
+    def screening_statistics(self) -> dict[str, object]:
+        return {
+            "screening_calls": self.screening_calls,
+            "screening_passes": self.screening_passes,
+            "screening_rejections": self.screening_rejections,
+            "screening_cache_hits": self.screening_cache_hits,
+            "screening_exact_call_blocked": self.screening_exact_call_blocked,
+            "screening_runtime_seconds": self.screening_runtime,
+            "screening_reason_counts": dict(sorted(self.screening_reason_counts.items())),
+        }
+
     def route(self, sequence: tuple[str, ...]) -> ChargingSubproblemResult:
+        if self.screening_config is not None:
+            screen = self.screen(sequence)
+            if not screen.accepted:
+                return ChargingSubproblemResult(
+                    False,
+                    (),
+                    float("inf"),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0,
+                    0,
+                    0,
+                    0.0,
+                    f"cheap_screening:{screen.reason}",
+                )
         # Check the deadline before cache lookup as well.  A cache hit is still
         # work performed by this lane and must not let a lane continue after its
         # declared wall-clock boundary.
@@ -378,6 +534,7 @@ def _solve_alns(
     operator_profile: OperatorProfile | str = OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
     vehicle_operator_config: VehicleOperatorConfig | None = None,
     measurement_trace: Stage03Trace | None = None,
+    screening_config: CheapScreeningConfig | None = None,
 ) -> ALNSResult:
     if max_iterations <= 0:
         raise ValueError("max_iterations must be positive")
@@ -404,12 +561,17 @@ def _solve_alns(
     if legacy_lane_budget <= 0.0:
         raise ValueError("constraint lane time budget must be smaller than the time limit")
     legacy_deadline = started + legacy_lane_budget
+    negative_screening_cache: dict[str, ScreeningResult] | None = (
+        {} if screening_config is not None and screening_config.enabled else None
+    )
     evaluator = _Evaluator(
         instance,
         deadline=legacy_deadline if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
         else overall_deadline,
         measurement_trace=measurement_trace,
         lane="legacy",
+        screening_config=screening_config,
+        negative_screening_cache=negative_screening_cache,
     )
     quality_evaluator = _Evaluator(
         instance,
@@ -417,6 +579,8 @@ def _solve_alns(
         else overall_deadline,
         measurement_trace=measurement_trace,
         lane="quality_shadow",
+        screening_config=screening_config,
+        negative_screening_cache=negative_screening_cache,
     )
     # The constraint lane is the explicit slice after the legacy/quality lane,
     # not an unbounded second 30-second budget.  Spell out the endpoint so the
@@ -427,6 +591,8 @@ def _solve_alns(
         deadline=constraint_deadline,
         measurement_trace=measurement_trace,
         lane="constraint_lane",
+        screening_config=screening_config,
+        negative_screening_cache=negative_screening_cache,
     )
     try:
         with evaluator.measurement_context(
@@ -1435,6 +1601,7 @@ def _solve_alns(
             for name in _CONSTRAINT_REMOVAL_ORDER
             if name in neighborhood_stats
         },
+        screening_statistics=_aggregate_screening_statistics(lane_evaluators),
     )
 
 
@@ -1448,10 +1615,13 @@ def solve_alns(
     operator_profile: OperatorProfile | str = OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
     vehicle_operator_config: VehicleOperatorConfig | None = None,
     measurement_config: MeasurementConfig | None = None,
+    screening_config: CheapScreeningConfig | None = None,
 ) -> ALNSResult:
-    """Solve ALNS, optionally emitting Stage 3.0 raw measurement evidence."""
+    """Solve ALNS with opt-in Stage 3.0 measurement and Stage 3.1 screening."""
 
-    if measurement_config is None or not measurement_config.enabled:
+    screening_enabled = screening_config is not None and screening_config.enabled
+    measurement_enabled = measurement_config is not None and measurement_config.enabled
+    if not measurement_enabled and not screening_enabled:
         return _solve_alns(
             instance,
             seed=seed,
@@ -1460,8 +1630,14 @@ def solve_alns(
             removal_fraction=removal_fraction,
             operator_profile=operator_profile,
             vehicle_operator_config=vehicle_operator_config,
+            screening_config=screening_config,
         )
-    trace = Stage03Trace(measurement_config)
+    trace_config = (
+        measurement_config
+        if measurement_config is not None and measurement_config.enabled
+        else MeasurementConfig()
+    )
+    trace = Stage03Trace(trace_config, screening_config=screening_config)
     try:
         result = _solve_alns(
             instance,
@@ -1472,6 +1648,7 @@ def solve_alns(
             operator_profile=operator_profile,
             vehicle_operator_config=vehicle_operator_config,
             measurement_trace=trace,
+            screening_config=screening_config,
         )
     except BaseException as error:
         trace.record_execution_error(error)
@@ -2131,4 +2308,31 @@ def _failed_result(
         removal_tier_counts={tier.value: 0 for tier in RemovalTier},
         maximum_stagnation=0,
         constraint_operator_statistics={},
+        screening_statistics=evaluator.screening_statistics(),
     )
+
+
+def _aggregate_screening_statistics(
+    evaluators: tuple[_Evaluator, ...],
+) -> dict[str, object]:
+    reason_counts: dict[str, int] = {}
+    total_runtime = 0.0
+    totals = {
+        "screening_calls": 0,
+        "screening_passes": 0,
+        "screening_rejections": 0,
+        "screening_cache_hits": 0,
+        "screening_exact_call_blocked": 0,
+    }
+    for evaluator in evaluators:
+        statistics = cast(Any, evaluator.screening_statistics())
+        for field_name in totals:
+            totals[field_name] += int(statistics[field_name])
+        total_runtime += float(statistics["screening_runtime_seconds"])
+        for reason, count in dict(statistics["screening_reason_counts"]).items():
+            reason_counts[str(reason)] = reason_counts.get(str(reason), 0) + int(count)
+    return {
+        **totals,
+        "screening_runtime_seconds": total_runtime,
+        "screening_reason_counts": dict(sorted(reason_counts.items())),
+    }

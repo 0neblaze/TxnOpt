@@ -5,10 +5,10 @@ import hashlib
 import json
 import shutil
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 from evrptw.experiments.stage03_measurement import (
     OBJECTIVE_SCHEMA,
@@ -34,6 +34,8 @@ from evrptw.validation import validate_routes
 REVIEW_SCHEMA_VERSION = "stage03-review-v1"
 READY_FOR_FORMAL = "READY_FOR_STAGE03_FORMAL_MEASUREMENT"
 READY_FOR_STAGE31 = "READY_FOR_STAGE03_ACCELERATION"
+READY_FOR_STAGE031_FORMAL = "READY_FOR_STAGE031_FORMAL_MEASUREMENT"
+READY_FOR_STAGE032 = "READY_FOR_STAGE03_2"
 FINDING_FIELDS = ("finding", "status", "observed", "expected", "evidence")
 TRACE_FIELDS = (
     "run_label",
@@ -45,6 +47,12 @@ TRACE_FIELDS = (
     "cache_hits",
     "precomputed_routes",
     "deadline_events",
+    "screening_calls",
+    "screening_passes",
+    "screening_rejections",
+    "screening_cache_hits",
+    "screening_exact_call_blocked",
+    "screening_reason_counts",
     "reconciliation_status",
     "reconciliation_checks",
 )
@@ -88,8 +96,31 @@ SUMMARY_FIELDS = (
     "median_trace_cache_hits",
     "mean_trace_precomputed_routes",
     "median_trace_precomputed_routes",
+    "mean_screening_calls",
+    "median_screening_calls",
+    "mean_screening_rejections",
+    "median_screening_rejections",
+    "mean_screening_cache_hits",
+    "median_screening_cache_hits",
     "mean_effective_iterations",
     "median_effective_iterations",
+)
+SCREENING_REASON_FIELDS = ("run_label", "instance", "seed", "reason", "count")
+STAGE03_COMPARISON_FIELDS = (
+    "instance",
+    "seed",
+    "candidate_objective_key",
+    "stage03_objective_key",
+    "candidate_feasible",
+    "stage03_feasible",
+    "candidate_vehicle_count",
+    "stage03_vehicle_count",
+    "candidate_exact_calls",
+    "stage03_exact_calls",
+    "exact_call_delta",
+    "classification",
+    "gate_status",
+    "reason",
 )
 
 
@@ -129,6 +160,7 @@ def review_run(
     _verify_manifest(run_dir)
     metadata = _read_json(run_dir / "run_metadata.json")
     scope = str(metadata.get("scope", ""))
+    screening_enabled = bool(metadata.get("screening_config"))
     expected_instances = tuple(str(value) for value in metadata.get("expected_instances", ()))
     expected_seeds = tuple(int(str(value)) for value in metadata.get("expected_seeds", ()))
     expected_keys = {(instance, seed) for instance in expected_instances for seed in expected_seeds}
@@ -221,6 +253,27 @@ def review_run(
             "raw trace deadline report",
         )
     )
+    screening_ok = (not screening_enabled) or bool(audited) and all(
+        _screening_trace_ok(item.trace) for item in audited
+    )
+    if screening_enabled:
+        findings.append(
+            _finding(
+                "cheap_screening_reconciliation",
+                screening_ok,
+                [
+                    {
+                        "instance": item.key[0],
+                        "seed": item.key[1],
+                        "screening": item.trace.screening_counts,
+                    }
+                    for item in audited
+                ],
+                "every exact/cache route evaluation follows a screening pass; "
+                "screening rejection/cache hit blocks exact charging",
+                "raw trace screening_decisions and route_evaluations",
+            )
+        )
 
     provenance_ok, provenance_reason = _provenance_ok(root, run_dir, metadata)
     findings.append(
@@ -296,8 +349,32 @@ def review_run(
         )
     )
 
+    stage03_comparison: list[dict[str, Any]] = []
+    if screening_enabled:
+        stage03_baselines = _load_stage03_formal_rows(root, metadata)
+        stage03_comparison = _compare_stage03_formal(audited, stage03_baselines)
+        findings.append(
+            _finding(
+                "stage03_formal_baseline_comparison",
+                bool(stage03_comparison)
+                and all(row["gate_status"] == "pass" for row in stage03_comparison),
+                stage03_comparison,
+                "C5 objective/feasibility is not worse and 100-customer vehicle count "
+                "does not increase against Stage 3.0 formal evidence",
+                "Stage 3.0 formal per-run results and raw Stage 3.1 trace",
+            )
+        )
+
     ready = all(row["status"] == "pass" for row in findings)
-    if scope == "smoke":
+    if screening_enabled and scope == "smoke":
+        status = (
+            READY_FOR_STAGE031_FORMAL
+            if ready
+            else "NOT_READY_FOR_STAGE031_FORMAL_MEASUREMENT"
+        )
+    elif screening_enabled and scope == "formal":
+        status = READY_FOR_STAGE032 if ready else "NOT_READY_FOR_STAGE03_2"
+    elif scope == "smoke":
         status = READY_FOR_FORMAL if ready else "NOT_READY_FOR_STAGE03_FORMAL_MEASUREMENT"
     elif scope == "formal":
         status = READY_FOR_STAGE31 if ready else "NOT_READY_FOR_STAGE03_1"
@@ -318,14 +395,25 @@ def review_run(
             "overall_status",
             ready,
             status,
-            READY_FOR_FORMAL if scope == "smoke" else READY_FOR_STAGE31,
-            "all Stage 3.0 acceptance gates",
+            (
+                READY_FOR_STAGE031_FORMAL
+                if screening_enabled and scope == "smoke"
+                else READY_FOR_STAGE032
+                if screening_enabled
+                else READY_FOR_FORMAL
+                if scope == "smoke"
+                else READY_FOR_STAGE31
+            ),
+            "all Stage 3.1 acceptance gates"
+            if screening_enabled
+            else "all Stage 3.0 acceptance gates",
         )
     )
     recomputed_rows = [_recomputed_row(item, metadata) for item in audited]
     summary_rows = _summarize(recomputed_rows)
     trace_rows = [_trace_row(item, label) for item in audited]
     deadline_rows = [item.deadline_row | {"run_label": label} for item in audited]
+    screening_rows = _screening_reason_rows(audited, label) if screening_enabled else []
     report_lines = _report_lines(label, scope, status, findings, len(audited))
 
     review_dir = run_dir / "review"
@@ -341,6 +429,13 @@ def review_run(
         "summary_results": review_dir / "summary_results.csv",
         "review_manifest": review_dir / "review_manifest.json",
     }
+    if screening_enabled:
+        output_paths["screening_reason_statistics"] = (
+            review_dir / "screening_reason_statistics.csv"
+        )
+        output_paths["stage03_formal_comparison"] = (
+            review_dir / "stage03_formal_comparison.csv"
+        )
     output_paths["review_report"].write_text(report_lines, encoding="utf-8")
     _write_csv(output_paths["review_findings"], FINDING_FIELDS, findings)
     _write_csv(output_paths["stage03_readiness"], FINDING_FIELDS, readiness_rows)
@@ -349,6 +444,17 @@ def review_run(
     _write_csv(output_paths["baseline_comparison"], BASELINE_FIELDS, baseline_comparison)
     _write_csv(output_paths["recomputed_per_run"], RAW_PER_RUN_FIELDS, recomputed_rows)
     _write_csv(output_paths["summary_results"], SUMMARY_FIELDS, summary_rows)
+    if screening_enabled:
+        _write_csv(
+            output_paths["screening_reason_statistics"],
+            SCREENING_REASON_FIELDS,
+            screening_rows,
+        )
+        _write_csv(
+            output_paths["stage03_formal_comparison"],
+            STAGE03_COMPARISON_FIELDS,
+            stage03_comparison,
+        )
     review_manifest = {
         "schema_version": REVIEW_SCHEMA_VERSION,
         "review_label": label,
@@ -442,6 +548,74 @@ def _audit_one_run(
     )
 
 
+def _screening_trace_ok(trace: Stage03Trace) -> bool:
+    if trace.screening_config is None:
+        return False
+    allowed_statuses = {"pass", "rejected", "negative_cache_hit"}
+    for decision in trace.screening_decisions:
+        if decision.route_key not in trace.route_dictionary:
+            return False
+        if decision.status not in allowed_statuses:
+            return False
+        if decision.status == "pass":
+            if decision.exact_call_blocked or decision.negative_cache_hit:
+                return False
+        elif not decision.exact_call_blocked:
+            return False
+        if not decision.checks:
+            return False
+
+    for evaluation in trace.route_evaluations:
+        if evaluation.kind not in {"exact_call", "cache_hit"}:
+            continue
+        matching_pass = any(
+            decision.route_key == evaluation.route_key
+            and decision.lane == evaluation.lane
+            and decision.status == "pass"
+            and decision.completed_at <= evaluation.started_at + 1e-9
+            for decision in trace.screening_decisions
+        )
+        if not matching_pass:
+            return False
+
+    for decision in trace.screening_decisions:
+        if not decision.exact_call_blocked:
+            continue
+        later_exact = any(
+            evaluation.route_key == decision.route_key
+            and evaluation.lane == decision.lane
+            and evaluation.kind in {"exact_call", "cache_hit"}
+            and evaluation.started_at >= decision.completed_at - 1e-9
+            for evaluation in trace.route_evaluations
+        )
+        if later_exact:
+            return False
+    return True
+
+
+def _screening_reason_rows(
+    audited: list[_AuditedRun],
+    label: str,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for item in audited:
+        counts: dict[str, int] = {}
+        for decision in item.trace.screening_decisions:
+            reason = decision.reason or "screening_pass"
+            counts[reason] = counts.get(reason, 0) + 1
+        rows.extend(
+            {
+                "run_label": label,
+                "instance": item.key[0],
+                "seed": item.key[1],
+                "reason": reason,
+                "count": count,
+            }
+            for reason, count in sorted(counts.items())
+        )
+    return rows
+
+
 def _candidate_state_ok(
     trace: Stage03Trace,
     solver_result: SimpleNamespace | None = None,
@@ -496,11 +670,24 @@ def _event_log_ok(
         for event in event_log
         if event.get("record_type") == "neighborhood_event"
     ]
+    screening_events = [
+        event.get("payload", {})
+        for event in event_log
+        if event.get("record_type") == "screening_decision"
+    ]
     if len(trace_events) != len(trace.events):
         return False
     if any(
         _canonical_json(left) != _canonical_json(right)
         for left, right in zip(trace_events, trace.events, strict=True)
+    ):
+        return False
+    expected_screening = [asdict(decision) for decision in trace.screening_decisions]
+    if len(screening_events) != len(expected_screening):
+        return False
+    if any(
+        _canonical_json(left) != _canonical_json(right)
+        for left, right in zip(screening_events, expected_screening, strict=True)
     ):
         return False
     if solver_result is None:
@@ -555,7 +742,9 @@ def _provenance_ok(root: Path, run_dir: Path, metadata: dict[str, Any]) -> tuple
     if metadata.get("repository_dirty") is not False:
         return False, f"repository_dirty={metadata.get('repository_dirty')}"
     try:
-        current_sources = _source_hashes(root)
+        current_sources = _source_hashes(
+            root, include_stage031=bool(metadata.get("screening_config"))
+        )
     except FileNotFoundError as error:
         return False, str(error)
     if current_sources != metadata.get("algorithm_source_files"):
@@ -649,6 +838,111 @@ def _load_baseline_rows(
                 int(objective_key[3]),
             )
     return output
+
+
+def _load_stage03_formal_rows(
+    root: Path,
+    metadata: dict[str, Any],
+) -> dict[tuple[str, int], dict[str, object]]:
+    raw_path_value = metadata.get("stage03_formal_per_run")
+    if raw_path_value in {None, ""}:
+        return {}
+    path = Path(str(raw_path_value))
+    if not path.is_absolute():
+        path = root / path
+    rows: dict[tuple[str, int], dict[str, object]] = {}
+    for row in _read_csv(path):
+        objective = json.loads(str(row.get("objective_key", "[]")))
+        rows[(str(row["instance"]), int(row["seed"]))] = {
+            "objective_key": tuple(objective),
+            "feasible": str(row.get("feasible", "False")) == "True",
+            "vehicle_count": _int_value(row.get("vehicle_count", "")),
+            "exact_calls": _int_value(row.get("trace_exact_calls", "")),
+        }
+    return rows
+
+
+def _compare_stage03_formal(
+    audited: list[_AuditedRun],
+    baselines: dict[tuple[str, int], dict[str, object]],
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for item in audited:
+        baseline = baselines.get(item.key)
+        candidate_key = item.objective.key if item.objective is not None else ()
+        candidate_feasible = item.validator_feasible and item.objective is not None
+        candidate_vehicle = item.objective.vehicle_count if item.objective is not None else ""
+        candidate_exact = item.trace.exact_calls
+        if baseline is None:
+            rows.append(
+                {
+                    "instance": item.key[0],
+                    "seed": item.key[1],
+                    "candidate_objective_key": json.dumps(candidate_key),
+                    "stage03_objective_key": "[]",
+                    "candidate_feasible": candidate_feasible,
+                    "stage03_feasible": False,
+                    "candidate_vehicle_count": candidate_vehicle,
+                    "stage03_vehicle_count": "",
+                    "candidate_exact_calls": candidate_exact,
+                    "stage03_exact_calls": "",
+                    "exact_call_delta": "",
+                    "classification": "missing_stage03_baseline",
+                    "gate_status": "fail",
+                    "reason": "Stage 3.0 formal per-run baseline is missing",
+                }
+            )
+            continue
+        baseline_key = _objective_from_key(baseline["objective_key"])
+        stage03_feasible = bool(baseline["feasible"])
+        stage03_vehicle = int(cast(Any, baseline["vehicle_count"]))
+        stage03_exact = int(cast(Any, baseline["exact_calls"]))
+        c5 = item.key[0] in {"c101C5", "r105C5", "rc105C5"}
+        focused = item.key[0] in {"c101_21", "r101_21", "rc101_21"}
+        if baseline_key is None or not stage03_feasible or not candidate_feasible:
+            gate = "fail"
+            classification = "infeasible_or_missing_objective"
+            reason = "both Stage 3.0 and Stage 3.1 formal runs must replay feasible"
+        elif c5:
+            if item.objective is None:
+                raise RuntimeError("candidate feasibility/objective state diverged")
+            gate = (
+                "pass"
+                if compare_objectives(item.objective, baseline_key)
+                is ObjectiveComparison.EQUAL
+                else "fail"
+            )
+            classification = "objective_unchanged" if gate == "pass" else "objective_regression"
+            reason = "C5 objective key must equal Stage 3.0 formal evidence"
+        elif focused:
+            if item.objective is None:
+                raise RuntimeError("candidate feasibility/objective state diverged")
+            gate = "pass" if item.objective.vehicle_count <= stage03_vehicle else "fail"
+            classification = "vehicle_guard_pass" if gate == "pass" else "vehicle_regression"
+            reason = "100-customer vehicle count must not increase; time is budget variation"
+        else:
+            gate = "pass"
+            classification = "time_budget_variation"
+            reason = "non-gated wall-clock/objective variation is recorded, not acceleration"
+        rows.append(
+            {
+                "instance": item.key[0],
+                "seed": item.key[1],
+                "candidate_objective_key": json.dumps(candidate_key),
+                "stage03_objective_key": json.dumps(baseline["objective_key"]),
+                "candidate_feasible": candidate_feasible,
+                "stage03_feasible": stage03_feasible,
+                "candidate_vehicle_count": candidate_vehicle,
+                "stage03_vehicle_count": stage03_vehicle,
+                "candidate_exact_calls": candidate_exact,
+                "stage03_exact_calls": stage03_exact,
+                "exact_call_delta": candidate_exact - stage03_exact,
+                "classification": classification,
+                "gate_status": gate,
+                "reason": reason,
+            }
+        )
+    return rows
 
 
 def _compare_baselines(
@@ -808,6 +1102,20 @@ def _recomputed_row(
             "trace_precomputed_routes": item.trace.precomputed_routes,
             "trace_route_evaluations": len(item.trace.route_evaluations),
             "trace_deadline_events": item.trace.deadline_events,
+            "trace_screening_calls": item.trace.screening_counts["screening_calls"],
+            "trace_screening_passes": item.trace.screening_counts["screening_passes"],
+            "trace_screening_rejections": item.trace.screening_counts[
+                "screening_rejections"
+            ],
+            "trace_screening_cache_hits": item.trace.screening_counts[
+                "screening_cache_hits"
+            ],
+            "trace_screening_exact_call_blocked": item.trace.screening_counts[
+                "screening_exact_call_blocked"
+            ],
+            "trace_screening_reason_counts": json.dumps(
+                item.trace.screening_counts["screening_reason_counts"], sort_keys=True
+            ),
             "trace_reconciliation_status": item.reconciliation.get("status", "not_available"),
             **solver_metrics,
             "peak_tracemalloc_bytes": environment.get("peak_tracemalloc_bytes", ""),
@@ -844,6 +1152,15 @@ def _summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         exact_calls = [int(row["trace_exact_calls"]) for row in group]
         cache_hits = [int(row["trace_cache_hits"]) for row in group]
         precomputed = [int(row["trace_precomputed_routes"]) for row in group]
+        screening_calls = [
+            int(row.get("trace_screening_calls", 0) or 0) for row in group
+        ]
+        screening_rejections = [
+            int(row.get("trace_screening_rejections", 0) or 0) for row in group
+        ]
+        screening_cache_hits = [
+            int(row.get("trace_screening_cache_hits", 0) or 0) for row in group
+        ]
         iterations = [
             int(row["effective_iterations"])
             for row in group
@@ -870,6 +1187,12 @@ def _summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "median_trace_cache_hits": _median(cache_hits),
                 "mean_trace_precomputed_routes": _mean(precomputed),
                 "median_trace_precomputed_routes": _median(precomputed),
+                "mean_screening_calls": _mean(screening_calls),
+                "median_screening_calls": _median(screening_calls),
+                "mean_screening_rejections": _mean(screening_rejections),
+                "median_screening_rejections": _median(screening_rejections),
+                "mean_screening_cache_hits": _mean(screening_cache_hits),
+                "median_screening_cache_hits": _median(screening_cache_hits),
                 "mean_effective_iterations": _mean(iterations),
                 "median_effective_iterations": _median(iterations),
             }
@@ -888,6 +1211,16 @@ def _trace_row(item: _AuditedRun, label: str) -> dict[str, Any]:
         "cache_hits": item.trace.cache_hits,
         "precomputed_routes": item.trace.precomputed_routes,
         "deadline_events": item.trace.deadline_events,
+        "screening_calls": item.trace.screening_counts["screening_calls"],
+        "screening_passes": item.trace.screening_counts["screening_passes"],
+        "screening_rejections": item.trace.screening_counts["screening_rejections"],
+        "screening_cache_hits": item.trace.screening_counts["screening_cache_hits"],
+        "screening_exact_call_blocked": item.trace.screening_counts[
+            "screening_exact_call_blocked"
+        ],
+        "screening_reason_counts": json.dumps(
+            item.trace.screening_counts["screening_reason_counts"], sort_keys=True
+        ),
         "reconciliation_status": item.reconciliation.get("status", "not_available"),
         "reconciliation_checks": json.dumps(item.reconciliation.get("checks", {}), sort_keys=True),
     }
@@ -900,6 +1233,7 @@ def _report_lines(
     findings: list[dict[str, Any]],
     run_count: int,
 ) -> str:
+    screening = any(row["finding"] == "cheap_screening_reconciliation" for row in findings)
     lines = [
         f"# {label}",
         "",
@@ -924,10 +1258,17 @@ def _report_lines(
             "",
             "## Interpretation",
             "",
-            "Stage 3.0 measures exact charging calls and replayability only. "
-            "It does not claim cache acceleration, incremental propagation, "
-            "interruptible exact solving, "
-            "parallel evaluation, or fixed-work/wall-clock improvement.",
+            (
+                "Stage 3.1 measures safe cheap screening and exact-call reduction only. "
+                "It does not claim complete route caching, incremental propagation, "
+                "interruptible exact solving, parallel evaluation, or fixed-work/wall-clock "
+                "acceleration."
+                if screening
+                else "Stage 3.0 measures exact charging calls and replayability only. "
+                "It does not claim cache acceleration, incremental propagation, "
+                "interruptible exact solving, parallel evaluation, or fixed-work/wall-clock "
+                "improvement."
+            ),
         )
     )
     return "\n".join(lines) + "\n"
@@ -960,6 +1301,10 @@ def _publish_summaries(
         "summary_results": f"{label}_summary_results.csv",
         "review_manifest": f"{label}_review_manifest.json",
     }
+    if "screening_reason_statistics" in output_paths:
+        names["screening_reason_statistics"] = f"{label}_screening_reason_statistics.csv"
+    if "stage03_formal_comparison" in output_paths:
+        names["stage03_formal_comparison"] = f"{label}_stage03_formal_comparison.csv"
     destinations = [summary_dir / name for name in names.values()]
     existing = [path for path in destinations if path.exists()]
     if existing:
@@ -1111,7 +1456,7 @@ def _median(values: list[int] | list[float]) -> float | str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Replay-audit Stage 3.0 raw evidence")
+    parser = argparse.ArgumentParser(description="Replay-audit Stage 3 raw evidence")
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--summary-dir", type=Path)
     parser.add_argument("--review-label")
@@ -1124,7 +1469,12 @@ def main() -> int:
     for name, path in outputs.items():
         print(f"{name}: {path}")
     status = _read_json(outputs["review_manifest"])["status"]
-    return 0 if status in {READY_FOR_FORMAL, READY_FOR_STAGE31} else 1
+    return 0 if status in {
+        READY_FOR_FORMAL,
+        READY_FOR_STAGE31,
+        READY_FOR_STAGE031_FORMAL,
+        READY_FOR_STAGE032,
+    } else 1
 
 
 if __name__ == "__main__":

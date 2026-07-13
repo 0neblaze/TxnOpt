@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
 
 TRACE_SCHEMA_VERSION = "stage03-trace-v1"
+SCREENING_SCHEMA_VERSION = "stage031-screening-v1"
 ROUTE_EVALUATION_KINDS = frozenset(
     {"exact_call", "cache_hit", "precomputed_route"}
 )
@@ -44,6 +45,62 @@ class MeasurementConfig:
                 f"unsupported Stage 3.0 trace schema {self.schema_version}; "
                 f"expected {TRACE_SCHEMA_VERSION}"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class CheapScreeningConfig:
+    """Opt-in Stage 3.1 screening controls.
+
+    The negative cache is deliberately the only cache introduced here.  Exact
+    route-result caching remains the evaluator's existing Stage 2/3.0 cache and
+    is recorded separately from screening evidence.
+    """
+
+    enabled: bool = True
+    schema_version: str = SCREENING_SCHEMA_VERSION
+    negative_sequence_cache: bool = True
+    epsilon: float = 1e-9
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SCREENING_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported Stage 3.1 screening schema {self.schema_version}; "
+                f"expected {SCREENING_SCHEMA_VERSION}"
+            )
+        if self.epsilon <= 0.0:
+            raise ValueError("screening epsilon must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class ScreeningCheckTrace:
+    check: str
+    status: str
+    value: float | bool | None
+    reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ScreeningDecision:
+    decision_id: int
+    route_key: str
+    lane: str
+    iteration: int | None
+    operator: str
+    status: str
+    first_failed_check: str
+    reason: str
+    checks: tuple[ScreeningCheckTrace, ...]
+    demand: float
+    min_time_window_slack: float
+    distance_lower_bound: float
+    distance_increment_lower_bound: float | None
+    single_segment_reachable: bool
+    structural_energy_lower_bound: float
+    negative_cache_hit: bool
+    exact_call_blocked: bool
+    started_at: float
+    completed_at: float
+    duration_seconds: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +189,10 @@ class Stage03Trace:
     events: list[dict[str, object]] = field(default_factory=list)
     finished_at: float | None = None
     result_summary: dict[str, object] = field(default_factory=dict)
+    # These fields are appended after the Stage 3.0 fields so positional
+    # construction of the v1 trace remains compatible.
+    screening_config: CheapScreeningConfig | None = None
+    screening_decisions: list[ScreeningDecision] = field(default_factory=list)
 
     def _offset(self, value: float | None = None) -> float:
         return (time.perf_counter() if value is None else value) - self.started_at_perf
@@ -296,6 +357,67 @@ class Stage03Trace:
             }
         )
 
+    def record_screening_decision(
+        self,
+        sequence: tuple[str, ...] | list[str],
+        *,
+        lane: str,
+        iteration: int | None,
+        operator: str,
+        status: str,
+        first_failed_check: str,
+        reason: str,
+        checks: tuple[ScreeningCheckTrace, ...],
+        demand: float,
+        min_time_window_slack: float,
+        distance_lower_bound: float,
+        distance_increment_lower_bound: float | None,
+        single_segment_reachable: bool,
+        structural_energy_lower_bound: float,
+        negative_cache_hit: bool,
+        exact_call_blocked: bool,
+        started_at: float | None = None,
+        completed_at: float | None = None,
+    ) -> int:
+        """Append one auditable Stage 3.1 screening decision.
+
+        Screening decisions deliberately have their own sequence instead of
+        being represented as a route evaluation.  A rejected sequence therefore
+        cannot inflate exact-call or route-cache counters.
+        """
+
+        key = self.register_route(sequence)
+        started = self._offset() if started_at is None else started_at
+        completed = self._offset() if completed_at is None else completed_at
+        decision = ScreeningDecision(
+            decision_id=len(self.screening_decisions) + 1,
+            route_key=key,
+            lane=lane,
+            iteration=iteration,
+            operator=operator,
+            status=status,
+            first_failed_check=first_failed_check,
+            reason=reason,
+            checks=checks,
+            demand=float(demand),
+            min_time_window_slack=float(min_time_window_slack),
+            distance_lower_bound=float(distance_lower_bound),
+            distance_increment_lower_bound=(
+                None
+                if distance_increment_lower_bound is None
+                else float(distance_increment_lower_bound)
+            ),
+            single_segment_reachable=bool(single_segment_reachable),
+            structural_energy_lower_bound=float(structural_energy_lower_bound),
+            negative_cache_hit=bool(negative_cache_hit),
+            exact_call_blocked=bool(exact_call_blocked),
+            started_at=started,
+            completed_at=completed,
+            duration_seconds=max(0.0, completed - started),
+        )
+        self.screening_decisions.append(decision)
+        return decision.decision_id
+
     def finish(self, result: object | None = None) -> None:
         self.finished_at = self._offset()
         if result is not None:
@@ -312,6 +434,10 @@ class Stage03Trace:
                 for field in fields
                 if hasattr(result, field)
             }
+            if hasattr(result, "screening_statistics"):
+                self.result_summary["screening_statistics"] = cast(
+                    Any, result
+                ).screening_statistics
 
     @property
     def started_calls(self) -> int:
@@ -344,6 +470,29 @@ class Stage03Trace:
             if event.get("event_type") == "operator_call":
                 counts[str(event["operator"])] += 1
         return dict(sorted(counts.items()))
+
+    @property
+    def screening_counts(self) -> dict[str, object]:
+        reason_counts: Counter[str] = Counter()
+        for decision in self.screening_decisions:
+            if decision.reason:
+                reason_counts[decision.reason] += 1
+        return {
+            "screening_calls": len(self.screening_decisions),
+            "screening_passes": sum(
+                decision.status == "pass" for decision in self.screening_decisions
+            ),
+            "screening_rejections": sum(
+                decision.status == "rejected" for decision in self.screening_decisions
+            ),
+            "screening_cache_hits": sum(
+                decision.negative_cache_hit for decision in self.screening_decisions
+            ),
+            "screening_exact_call_blocked": sum(
+                decision.exact_call_blocked for decision in self.screening_decisions
+            ),
+            "screening_reason_counts": dict(sorted(reason_counts.items())),
+        }
 
     def reconcile(self, result: _MeasuredResult) -> dict[str, object]:
         expected_calls = int(result.charging_subproblem_calls)
@@ -410,6 +559,26 @@ class Stage03Trace:
             "rejected_moves_equal_result": rejected_legacy == int(result.rejected_moves),
             "improving_moves_equal_result": improving_legacy == int(result.improving_moves),
         }
+        expected_screening = getattr(result, "screening_statistics", {})
+        if isinstance(expected_screening, dict) and expected_screening:
+            observed_screening = self.screening_counts
+            observed_screening = cast(dict[str, Any], observed_screening)
+            expected_screening = cast(dict[str, Any], expected_screening)
+            for field_name in (
+                "screening_calls",
+                "screening_passes",
+                "screening_rejections",
+                "screening_cache_hits",
+                "screening_exact_call_blocked",
+            ):
+                checks[f"{field_name}_equal_result"] = (
+                    int(cast(Any, observed_screening.get(field_name, 0)))
+                    == int(cast(Any, expected_screening.get(field_name, 0)))
+                )
+            checks["screening_reason_counts_equal_result"] = (
+                observed_screening.get("screening_reason_counts", {})
+                == expected_screening.get("screening_reason_counts", {})
+            )
         return {
             "status": "pass" if all(checks.values()) else "fail",
             "checks": checks,
@@ -425,6 +594,7 @@ class Stage03Trace:
                 "accepted_moves": accepted_legacy,
                 "rejected_moves": rejected_legacy,
                 "improving_moves": improving_legacy,
+                "screening": self.screening_counts,
             },
             "expected": {
                 "charging_subproblem_calls": expected_calls,
@@ -434,6 +604,7 @@ class Stage03Trace:
                 "accepted_moves": int(result.accepted_moves),
                 "rejected_moves": int(result.rejected_moves),
                 "improving_moves": int(result.improving_moves),
+                "screening": expected_screening,
             },
         }
 
@@ -455,7 +626,14 @@ class Stage03Trace:
                 "deadline_events": self.deadline_events,
                 "route_evaluation_count": len(self.route_evaluations),
                 "operator_call_counts": self.operator_call_counts,
+                "screening": self.screening_counts,
             },
+            "screening_config": (
+                asdict(self.screening_config) if self.screening_config is not None else None
+            ),
+            "screening_decisions": [
+                asdict(decision) for decision in self.screening_decisions
+            ],
             "finished_at": self.finished_at,
             "result_summary": dict(self.result_summary),
         }
@@ -504,6 +682,56 @@ class Stage03Trace:
             None if payload.get("finished_at") is None else float(payload["finished_at"])
         )
         trace.result_summary = dict(payload.get("result_summary", {}))
+        screening_payload = payload.get("screening_config")
+        if isinstance(screening_payload, dict):
+            trace.screening_config = CheapScreeningConfig(**screening_payload)
+        trace.screening_decisions = [
+            ScreeningDecision(
+                decision_id=int(item["decision_id"]),
+                route_key=str(item["route_key"]),
+                lane=str(item["lane"]),
+                iteration=(
+                    None if item.get("iteration") is None else int(item["iteration"])
+                ),
+                operator=str(item["operator"]),
+                status=str(item["status"]),
+                first_failed_check=str(item.get("first_failed_check", "")),
+                reason=str(item.get("reason", "")),
+                checks=tuple(
+                    ScreeningCheckTrace(
+                        check=str(check["check"]),
+                        status=str(check["status"]),
+                        value=(
+                            None
+                            if check.get("value") is None
+                            else bool(check["value"])
+                            if isinstance(check.get("value"), bool)
+                            else float(check["value"])
+                        ),
+                        reason=str(check.get("reason", "")),
+                    )
+                    for check in item.get("checks", [])
+                ),
+                demand=float(item.get("demand", 0.0)),
+                min_time_window_slack=float(item.get("min_time_window_slack", 0.0)),
+                distance_lower_bound=float(item.get("distance_lower_bound", 0.0)),
+                distance_increment_lower_bound=(
+                    None
+                    if item.get("distance_increment_lower_bound") is None
+                    else float(item["distance_increment_lower_bound"])
+                ),
+                single_segment_reachable=bool(item.get("single_segment_reachable", False)),
+                structural_energy_lower_bound=float(
+                    item.get("structural_energy_lower_bound", 0.0)
+                ),
+                negative_cache_hit=bool(item.get("negative_cache_hit", False)),
+                exact_call_blocked=bool(item.get("exact_call_blocked", False)),
+                started_at=float(item.get("started_at", 0.0)),
+                completed_at=float(item.get("completed_at", 0.0)),
+                duration_seconds=float(item.get("duration_seconds", 0.0)),
+            )
+            for item in payload.get("screening_decisions", [])
+        ]
         return trace
 
 

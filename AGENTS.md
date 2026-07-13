@@ -1,5 +1,20 @@
 # Repository Instructions
 
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs for this GitHub repository live in GitHub Issues; use the `gh`
+CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default five canonical labels recorded in `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository. See `docs/agents/domain.md`.
+
 These instructions apply to every Codex conversation whose working directory is
 this repository or one of its subdirectories.
 
@@ -144,6 +159,47 @@ this repository or one of its subdirectories.
   blocked until smoke review reports `READY_FOR_STAGE03_FORMAL_MEASUREMENT`.
   A passing formal measurement review is the gate into Stage 3.1; it is not an
   acceleration result.
+
+## Stage 3.1 Cheap Screening Policy
+
+- Stage 3.1 is an opt-in safe screening layer. `screening_config=None` or a
+  disabled `CheapScreeningConfig` preserves the Stage 0--3.0 solver path. It
+  may reject only a route that is proven impossible by route structure,
+  capacity lower bound, forward/backward time-window propagation, non-negative
+  slack, optimistic battery reachability, or structural energy lower bound.
+- The shortest-distance lower bound is recorded for diagnostics and candidate
+  ordering only. It must never be used as a hard rejection rule. Screening
+  rejection and negative-cache hit are separate `ScreeningDecision` records and
+  do not increase exact charging-call counters. Only a screening pass may reach
+  the existing exact route cache or exact charging solver.
+- The process-local known-infeasible sequence cache stores only safe screening
+  rejections and is keyed by the canonical route key. Exact infeasible results
+  remain in the existing exact route cache and are reported separately.
+- `Stage03Trace` v1 remains readable. Stage 3.1 appends `screening_config`,
+  `screening_decisions`, check status/reason, slack, distance and energy lower
+  bounds, cache-hit state, screening counters, and screening reason statistics;
+  the route dictionary still stores each customer sequence once.
+- `stage031_cheap_screening` and its independent review CLI use the fixed
+  `stage02_constraint_guided` profile, 30 seconds, 1000 iterations, one thread,
+  and the exact 18-run smoke scope. Formal scope is Stage 0's 36 runs and is
+  blocked until the Stage 3.1 smoke replay reports
+  `READY_FOR_STAGE031_FORMAL_MEASUREMENT` and the audited Stage 3.0 formal raw
+  manifest plus trusted review manifest pass the prerequisite gate.
+- Raw Stage 3.1 evidence is written only below ignored `results/`; interrupted,
+  failed, deadline-overrun, and partial traces are retained under a new run
+  label. `experiments/summaries/` is written only after replay of raw solution,
+  trace, screening decisions, event log, environment, and manifests passes.
+- Stage 3.1 review must report the screening reason table, exact-call ordering,
+  negative-cache semantics, validator/objective replay, candidate vehicle-first
+  acceptance, deadline semantics, source/config/instance/environment/reference
+  provenance, and comparison with the Stage 3.0 formal per-run evidence. C5
+  objectives must not regress and 100-customer vehicle count must not increase;
+  exact-call reduction is measurement evidence, not a Stage 3.3 acceleration
+  claim.
+- Stage 3.1 is complete only when formal review reports
+  `READY_FOR_STAGE03_2`. No Stage 3.2 cache, incremental propagation,
+  interruptible exact solver, parallel evaluation, or fixed-work/wall-clock
+  acceleration may be implemented under this policy.
 
 ## Literature Recommendation Policy
 
