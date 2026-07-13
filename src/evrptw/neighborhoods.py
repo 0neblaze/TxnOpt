@@ -5,7 +5,7 @@ import random
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, cast
 
 from evrptw.charging import ChargingSubproblemResult
 from evrptw.measurement import ScreeningCheckTrace
@@ -296,6 +296,7 @@ def screen_route_candidate(
     *,
     full: bool = False,
     reference_distance: float | None = None,
+    epsilon: float = _EPSILON,
 ) -> ScreeningResult:
     """Run safe, optimistic checks before exact charging evaluation.
 
@@ -305,7 +306,25 @@ def screen_route_candidate(
     the energy frontier starts every recharge node with a full battery.
     """
 
+    if epsilon <= 0.0:
+        raise ValueError("screening epsilon must be positive")
     by_name = instance.by_name
+    known_sequence = all(name in by_name for name in sequence)
+    if known_sequence:
+        distance_chain = (instance.depot.name, *sequence, instance.depot.name)
+        distance_lower_bound = sum(
+            by_name[origin_name].distance_to(by_name[destination_name])
+            for origin_name, destination_name in zip(
+                distance_chain, distance_chain[1:], strict=False
+            )
+        )
+    else:
+        distance_lower_bound = 0.0
+    distance_increment_lower_bound = (
+        None
+        if reference_distance is None
+        else distance_lower_bound - reference_distance
+    )
     unknown = [name for name in sequence if name not in by_name]
     if unknown or any(by_name[name].kind is not NodeType.CUSTOMER for name in sequence):
         if full:
@@ -325,15 +344,15 @@ def screen_route_candidate(
                 ),
                 "route_structure",
                 0.0,
-                0.0,
-                None,
+                distance_lower_bound,
+                distance_increment_lower_bound,
                 False,
                 0.0,
             )
         return ScreeningResult(False, "route_structure_prefilter", 0.0, 0.0, False)
 
     demand = sum(by_name[name].demand for name in sequence)
-    if demand > instance.vehicle.load_capacity + _EPSILON:
+    if demand > instance.vehicle.load_capacity + epsilon:
         if full:
             return ScreeningResult(
                 False,
@@ -351,8 +370,8 @@ def screen_route_candidate(
                 ),
                 "capacity_lower_bound",
                 0.0,
-                0.0,
-                None,
+                distance_lower_bound,
+                distance_increment_lower_bound,
                 False,
                 0.0,
             )
@@ -365,7 +384,6 @@ def screen_route_candidate(
     first_failed_check = ""
     failure_reason = ""
     min_slack = float("inf")
-    distance_lower_bound = 0.0
     structural_energy_lower_bound = 0.0
     single_segment_reachable = True
     current_time = max(0.0, instance.depot.ready_time)
@@ -424,13 +442,13 @@ def screen_route_candidate(
             earliest_arrivals[destination.name] = current_time
             slack = destination.due_date - current_time
             min_slack = min(min_slack, slack)
-            if slack < -_EPSILON:
+            if slack < -epsilon:
                 return reject("forward_time_window", "forward_time_window_prefilter", slack)
             current_time += destination.service_time
         elif destination.kind is NodeType.DEPOT:
             slack = destination.due_date - current_time
             min_slack = min(min_slack, slack)
-            if slack < -_EPSILON:
+            if slack < -epsilon:
                 return reject("forward_time_window", "forward_time_window_prefilter", slack)
     checks.append(
         ScreeningCheckTrace(
@@ -461,7 +479,7 @@ def screen_route_candidate(
     for customer_name, earliest in earliest_arrivals.items():
         slack = latest_arrivals[customer_name] - earliest
         min_slack = min(min_slack, slack)
-        if slack < -_EPSILON:
+        if slack < -epsilon:
             return reject("backward_time_window", "backward_time_window_prefilter", slack)
     checks.append(
         ScreeningCheckTrace(
@@ -471,7 +489,7 @@ def screen_route_candidate(
             "latest-arrival backward propagation",
         )
     )
-    if min_slack < -_EPSILON:
+    if min_slack < -epsilon:
         return reject("time_window_slack", "time_window_slack_prefilter", min_slack)
     checks.append(
         ScreeningCheckTrace(
@@ -482,10 +500,6 @@ def screen_route_candidate(
         )
     )
 
-    distance_lower_bound = sum(
-        by_name[origin_name].distance_to(by_name[destination_name])
-        for origin_name, destination_name in zip(chain, chain[1:], strict=False)
-    )
     checks.append(
         ScreeningCheckTrace(
             "shortest_distance_lower_bound",
@@ -496,7 +510,9 @@ def screen_route_candidate(
     )
 
     for origin_name, destination_name in zip(chain, chain[1:], strict=False):
-        if not _energy_reachable_optimistically(instance, origin_name, destination_name):
+        if not _energy_reachable_optimistically(
+            instance, origin_name, destination_name, epsilon=epsilon
+        ):
             single_segment_reachable = False
             return reject(
                 "single_segment_battery_reachability",
@@ -521,7 +537,7 @@ def screen_route_candidate(
             structural_energy_lower_bound,
             (to_customer + from_customer) * instance.vehicle.consumption_rate,
         )
-    if structural_energy_lower_bound > instance.vehicle.battery_capacity + _EPSILON:
+    if structural_energy_lower_bound > instance.vehicle.battery_capacity + epsilon:
         return reject(
             "structural_energy_lower_bound",
             "structural_energy_prefilter",
@@ -545,10 +561,29 @@ def screen_route_candidate(
         "",
         min_slack if math.isfinite(min_slack) else 0.0,
         distance_lower_bound,
-        None if reference_distance is None else distance_lower_bound - reference_distance,
+        distance_increment_lower_bound,
         True,
         structural_energy_lower_bound,
     )
+
+
+def _screen_with_evaluator(
+    instance: Instance,
+    evaluator: RouteEvaluator,
+    sequence: CustomerSequence,
+) -> ScreeningResult:
+    """Use the shared evaluator screener when Stage 3.1 is enabled.
+
+    Legacy test doubles and Stage 2 callers without a screening method retain
+    the historical prefilter.  The production evaluator owns the measured
+    screening decision, so every production proposal path reaches the same
+    trace and negative-cache implementation.
+    """
+
+    screen = getattr(evaluator, "screen", None)
+    if callable(screen) and bool(getattr(evaluator, "screening_enabled", False)):
+        return cast(ScreeningResult, screen(sequence))
+    return screen_route_candidate(instance, sequence)
 
 
 def _legacy_screen_route_candidate(
@@ -1378,7 +1413,7 @@ def propose_route_merge(
                     + source.sequence
                     + target.sequence[position:]
                 )
-                screen = screen_route_candidate(instance, merged)
+                screen = _screen_with_evaluator(instance, evaluator, merged)
                 if not screen.accepted:
                     events.append(
                         NeighborhoodEvent(
@@ -1860,7 +1895,7 @@ def propose_ejection_chain(
                     if next_state == state_sequences:
                         continue
                     if any(
-                        not screen_route_candidate(instance, route).accepted
+                        not _screen_with_evaluator(instance, evaluator, route).accepted
                         for route in next_state
                     ):
                         continue
@@ -2048,7 +2083,7 @@ def _evaluate_changed_candidate(
     if len({index for index, _ in changes}) != len(changes):
         return _CandidateEvaluation(None, "duplicate_changed_route", False, 0)
     for _, sequence in changes:
-        screen = screen_route_candidate(instance, sequence)
+        screen = _screen_with_evaluator(instance, evaluator, sequence)
         if not screen.accepted:
             return _CandidateEvaluation(None, screen.reason, False, 0)
     required = sum(
@@ -2292,7 +2327,7 @@ def _insertion_options(
             if evaluator.calls - before_calls >= budget:
                 raise _EvaluationBudgetExceeded
             candidate = (*base[:position], customer, *base[position:])
-            if not screen_route_candidate(instance, candidate).accepted:
+            if not _screen_with_evaluator(instance, evaluator, candidate).accepted:
                 continue
             result = evaluator.route(candidate)
             if not result.feasible:
@@ -2340,7 +2375,7 @@ def _regret_insertion_options(
             if evaluator.calls - before_calls >= budget:
                 raise _EvaluationBudgetExceeded
             candidate = (*base[:position], customer, *base[position:])
-            if not screen_route_candidate(instance, candidate).accepted:
+            if not _screen_with_evaluator(instance, evaluator, candidate).accepted:
                 continue
             result = evaluator.route(candidate)
             if result.feasible:
@@ -2378,6 +2413,8 @@ def _energy_reachable_optimistically(
     instance: Instance,
     origin_name: str,
     destination_name: str,
+    *,
+    epsilon: float = _EPSILON,
 ) -> bool:
     if origin_name == destination_name:
         return True
@@ -2390,14 +2427,14 @@ def _energy_reachable_optimistically(
     visited_safe_nodes: set[str] = set()
     while frontier:
         current = frontier.pop()
-        if current.distance_to(destination) * rate <= capacity + _EPSILON:
+        if current.distance_to(destination) * rate <= capacity + epsilon:
             return True
         if current.name != origin.name and current.kind not in (NodeType.DEPOT, NodeType.STATION):
             continue
         for station in instance.stations:
             if station.name == current.name or station.name in visited_safe_nodes:
                 continue
-            if current.distance_to(station) * rate <= capacity + _EPSILON:
+            if current.distance_to(station) * rate <= capacity + epsilon:
                 visited_safe_nodes.add(station.name)
                 frontier.append(station)
     return False

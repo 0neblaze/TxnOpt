@@ -223,6 +223,7 @@ def run_stage03(
         else:
             _require_smoke_gate(_resolve(root, smoke_review_dir) if smoke_review_dir else None)
     _validate_run_label(run_label)
+    _assert_unique_run_label(root, run_label)
     _assert_clean_repository(root)
     if output_dir.exists():
         raise FileExistsError(f"Stage 3.0 output directory already exists: {output_dir}")
@@ -731,17 +732,11 @@ def _require_stage031_smoke_gate(review_dir: Path | None) -> None:
         raise RuntimeError(
             "formal Stage 3.1 is blocked: provide a Stage 3.1 smoke review directory"
         )
-    from evrptw.experiments.stage03_measurement_review import review_run
-
-    outputs = review_run(run_dir=review_dir.parent)
-    payload = json.loads(outputs["review_manifest"].read_text(encoding="utf-8"))
-    if payload.get("scope") == "smoke" and payload.get("status") == (
-        "READY_FOR_STAGE031_FORMAL_MEASUREMENT"
-    ):
-        return
-    raise RuntimeError(
-        "formal Stage 3.1 is blocked until smoke replay reports "
-        "READY_FOR_STAGE031_FORMAL_MEASUREMENT"
+    _verify_raw_manifest_gate(review_dir.parent)
+    _verify_review_manifest_gate(
+        review_dir / "review_manifest.json",
+        scope="smoke",
+        statuses={"READY_FOR_STAGE031_FORMAL_MEASUREMENT"},
     )
 
 
@@ -755,35 +750,44 @@ def _require_stage03_formal_gate(
     if not run_dir.is_dir():
         raise FileNotFoundError(f"Stage 3.0 formal run directory is missing: {run_dir}")
     _verify_raw_manifest_gate(run_dir)
-    candidates = [run_dir / "review" / "review_manifest.json"]
-    if trusted_review_manifest is not None:
-        candidates.append(trusted_review_manifest)
-    for review_manifest in candidates:
-        if not review_manifest.is_file():
-            continue
-        payload = json.loads(review_manifest.read_text(encoding="utf-8"))
-        recorded_payload_hash = payload.get("manifest_payload_sha256")
-        payload_without_hash = dict(payload)
-        payload_without_hash.pop("manifest_payload_sha256", None)
-        if recorded_payload_hash != _payload_sha256(payload_without_hash):
-            continue
-        listed_files = dict(payload.get("files", {}))
-        if any(
-            not (review_manifest.parent / str(name)).is_file()
-            or _sha256(review_manifest.parent / str(name)) != expected_hash
-            for name, expected_hash in listed_files.items()
-        ):
-            continue
-        if payload.get("scope") == "formal" and payload.get("status") in {
-            "READY_FOR_STAGE03_ACCELERATION",
-            "READY_FOR_STAGE03_1",
-            "READY_FOR_STAGE31",
-        }:
-            return
-    raise RuntimeError(
-        "formal Stage 3.1 is blocked: no untampered Stage 3.0 formal review "
-        "manifest reports readiness"
+    if trusted_review_manifest is None:
+        raise RuntimeError(
+            "formal Stage 3.1 is blocked: a trusted Stage 3.0 formal review "
+            "manifest is required"
+        )
+    _verify_review_manifest_gate(
+        trusted_review_manifest,
+        scope="formal",
+        statuses={"READY_FOR_STAGE03_ACCELERATION", "READY_FOR_STAGE03_1", "READY_FOR_STAGE31"},
     )
+    return
+
+
+def _verify_review_manifest_gate(
+    review_manifest: Path,
+    *,
+    scope: str,
+    statuses: set[str],
+) -> None:
+    if not review_manifest.is_file():
+        raise RuntimeError(f"review manifest is missing: {review_manifest}")
+    payload = json.loads(review_manifest.read_text(encoding="utf-8"))
+    recorded_payload_hash = payload.get("manifest_payload_sha256")
+    payload_without_hash = dict(payload)
+    payload_without_hash.pop("manifest_payload_sha256", None)
+    if recorded_payload_hash != _payload_sha256(payload_without_hash):
+        raise RuntimeError(f"review manifest payload hash mismatch: {review_manifest}")
+    if payload.get("scope") != scope or payload.get("status") not in statuses:
+        raise RuntimeError(
+            f"review manifest is not ready for {scope}: {review_manifest}"
+        )
+    review_label = str(payload.get("review_label", ""))
+    for name, expected_hash in dict(payload.get("files", {})).items():
+        artifact = review_manifest.parent / str(name)
+        if not artifact.is_file() and review_label:
+            artifact = review_manifest.parent / f"{review_label}_{name}"
+        if not artifact.is_file() or _sha256(artifact) != str(expected_hash):
+            raise RuntimeError(f"review artifact hash mismatch: {artifact}")
 
 
 def _verify_raw_manifest_gate(run_dir: Path) -> None:
@@ -950,6 +954,24 @@ def _write_manifest(directory: Path) -> None:
 def _validate_run_label(run_label: str) -> None:
     if not run_label or run_label in {".", ".."} or "/" in run_label or "\\" in run_label:
         raise ValueError("run_label must be a non-empty single path segment")
+
+
+def _assert_unique_run_label(root: Path, run_label: str) -> None:
+    results_root = root / "results"
+    if not results_root.is_dir():
+        return
+    for metadata_path in sorted(results_root.glob("*/run_metadata.json")):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"cannot verify existing run label because metadata is unreadable: "
+                f"{metadata_path}"
+            ) from error
+        if metadata.get("run_label") == run_label:
+            raise FileExistsError(
+                f"run_label has already been used; choose a new label: {run_label}"
+            )
 
 
 def _repository_root() -> Path:

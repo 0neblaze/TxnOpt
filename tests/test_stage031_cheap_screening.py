@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from evrptw.alns import (
     CheapScreeningConfig,
     MeasurementConfig,
@@ -55,6 +57,7 @@ def test_full_screen_rejects_capacity_and_structural_energy_safely() -> None:
     assert not capacity_result.accepted
     assert capacity_result.reason == "capacity_prefilter"
     assert capacity_result.first_failed_check == "capacity_lower_bound"
+    assert capacity_result.distance_lower_bound > 0.0
 
     structural = Instance(
         "structural",
@@ -137,6 +140,39 @@ def test_stage031_trace_round_trip_and_result_reconciliation() -> None:
     restored = Stage03Trace.from_dict(trace.to_dict())
     assert restored.screening_counts == trace.screening_counts
     assert _screening_trace_ok(restored)
+
+
+def test_stage031_requires_route_dictionary_for_auditable_screening() -> None:
+    with pytest.raises(ValueError, match="record_route_dictionary"):
+        Stage03Trace(
+            MeasurementConfig(record_route_dictionary=False),
+            screening_config=CheapScreeningConfig(),
+        )
+
+
+def test_stage031_replay_rejects_tampered_negative_cache_semantics() -> None:
+    instance = replace(
+        _instance(),
+        nodes=tuple(
+            replace(node, due_date=0.1) if node.name == "C2" else node
+            for node in _instance().nodes
+        ),
+    )
+    trace = Stage03Trace(MeasurementConfig(), screening_config=CheapScreeningConfig())
+    evaluator = _Evaluator(
+        instance,
+        deadline=1e9,
+        measurement_trace=trace,
+        screening_config=CheapScreeningConfig(),
+        negative_screening_cache={},
+    )
+    evaluator.route(("C2",))
+    evaluator.route(("C2",))
+    hit_index = 1
+    trace.screening_decisions[hit_index] = replace(
+        trace.screening_decisions[hit_index], negative_cache_hit=False
+    )
+    assert not _screening_trace_ok(trace)
 
 
 def test_stage031_config_and_scope_are_exact() -> None:

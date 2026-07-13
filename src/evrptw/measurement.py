@@ -194,6 +194,19 @@ class Stage03Trace:
     screening_config: CheapScreeningConfig | None = None
     screening_decisions: list[ScreeningDecision] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self._validate_screening_route_dictionary()
+
+    def _validate_screening_route_dictionary(self) -> None:
+        if (
+            self.screening_config is not None
+            and self.screening_config.enabled
+            and not self.config.record_route_dictionary
+        ):
+            raise ValueError(
+                "Stage 3.1 screening requires record_route_dictionary=True"
+            )
+
     def _offset(self, value: float | None = None) -> float:
         return (time.perf_counter() if value is None else value) - self.started_at_perf
 
@@ -685,6 +698,7 @@ class Stage03Trace:
         screening_payload = payload.get("screening_config")
         if isinstance(screening_payload, dict):
             trace.screening_config = CheapScreeningConfig(**screening_payload)
+            trace._validate_screening_route_dictionary()
         trace.screening_decisions = [
             ScreeningDecision(
                 decision_id=int(item["decision_id"]),

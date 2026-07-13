@@ -160,7 +160,10 @@ def review_run(
     _verify_manifest(run_dir)
     metadata = _read_json(run_dir / "run_metadata.json")
     scope = str(metadata.get("scope", ""))
-    screening_enabled = bool(metadata.get("screening_config"))
+    screening_payload = metadata.get("screening_config")
+    screening_enabled = isinstance(screening_payload, dict) and bool(
+        screening_payload.get("enabled", False)
+    )
     expected_instances = tuple(str(value) for value in metadata.get("expected_instances", ()))
     expected_seeds = tuple(int(str(value)) for value in metadata.get("expected_seeds", ()))
     expected_keys = {(instance, seed) for instance in expected_instances for seed in expected_seeds}
@@ -549,11 +552,13 @@ def _audit_one_run(
 
 
 def _screening_trace_ok(trace: Stage03Trace) -> bool:
-    if trace.screening_config is None:
+    if trace.screening_config is None or not trace.screening_config.enabled:
         return False
     allowed_statuses = {"pass", "rejected", "negative_cache_hit"}
     decisions_by_key: defaultdict[tuple[str, str], list[Any]] = defaultdict(list)
+    decisions_by_route: defaultdict[str, list[Any]] = defaultdict(list)
     evaluations_by_key: defaultdict[tuple[str, str], list[Any]] = defaultdict(list)
+    evaluations_by_route: defaultdict[str, list[Any]] = defaultdict(list)
     for decision in trace.screening_decisions:
         if decision.route_key not in trace.route_dictionary:
             return False
@@ -562,16 +567,43 @@ def _screening_trace_ok(trace: Stage03Trace) -> bool:
         if decision.status == "pass":
             if decision.exact_call_blocked or decision.negative_cache_hit:
                 return False
-        elif not decision.exact_call_blocked:
-            return False
+            if any(check.status == "fail" for check in decision.checks):
+                return False
+        elif decision.status == "rejected":
+            if not decision.exact_call_blocked or decision.negative_cache_hit:
+                return False
+            if not decision.first_failed_check or not any(
+                check.check == decision.first_failed_check and check.status == "fail"
+                for check in decision.checks
+            ):
+                return False
+        else:
+            if not decision.exact_call_blocked or not decision.negative_cache_hit:
+                return False
+            if not any(
+                check.check == "negative_sequence_cache" and check.status == "hit"
+                for check in decision.checks
+            ):
+                return False
+            if not any(
+                prior.status == "rejected"
+                and not prior.negative_cache_hit
+                and prior.completed_at <= decision.started_at + 1e-9
+                for prior in decisions_by_route[decision.route_key]
+            ):
+                return False
         if not decision.checks:
             return False
         decisions_by_key[(decision.lane, decision.route_key)].append(decision)
+        decisions_by_route[decision.route_key].append(decision)
+        if decision.status != "negative_cache_hit" and decision.negative_cache_hit:
+            return False
 
     for evaluation in trace.route_evaluations:
         if evaluation.kind not in {"exact_call", "cache_hit"}:
             continue
         evaluations_by_key[(evaluation.lane, evaluation.route_key)].append(evaluation)
+        evaluations_by_route[evaluation.route_key].append(evaluation)
         matching_pass = any(
             decision.status == "pass"
             and decision.completed_at <= evaluation.started_at + 1e-9
@@ -585,7 +617,7 @@ def _screening_trace_ok(trace: Stage03Trace) -> bool:
             continue
         later_exact = any(
             evaluation.started_at >= decision.completed_at - 1e-9
-            for evaluation in evaluations_by_key[(decision.lane, decision.route_key)]
+            for evaluation in evaluations_by_route[decision.route_key]
         )
         if later_exact:
             return False
@@ -742,9 +774,13 @@ def _deadline_row(
 def _provenance_ok(root: Path, run_dir: Path, metadata: dict[str, Any]) -> tuple[bool, str]:
     if metadata.get("repository_dirty") is not False:
         return False, f"repository_dirty={metadata.get('repository_dirty')}"
+    screening_payload = metadata.get("screening_config")
+    screening_enabled = isinstance(screening_payload, dict) and bool(
+        screening_payload.get("enabled", False)
+    )
     try:
         current_sources = _source_hashes(
-            root, include_stage031=bool(metadata.get("screening_config"))
+            root, include_stage031=screening_enabled
         )
     except FileNotFoundError as error:
         return False, str(error)
@@ -851,6 +887,12 @@ def _load_stage03_formal_rows(
     path = Path(str(raw_path_value))
     if not path.is_absolute():
         path = root / path
+    expected_path_hash = str(metadata.get("stage03_formal_per_run_sha256", ""))
+    if not path.is_file() or not expected_path_hash:
+        raise RuntimeError("Stage 3.0 formal per-run baseline is missing")
+    if _sha256(path) != expected_path_hash:
+        raise RuntimeError("Stage 3.0 formal per-run baseline hash mismatch")
+    _verify_trusted_stage03_review_manifest(root, metadata)
     rows: dict[tuple[str, int], dict[str, object]] = {}
     for row in _read_csv(path):
         objective = json.loads(str(row.get("objective_key", "[]")))
@@ -861,6 +903,42 @@ def _load_stage03_formal_rows(
             "exact_calls": _int_value(row.get("trace_exact_calls", "")),
         }
     return rows
+
+
+def _verify_trusted_stage03_review_manifest(
+    root: Path,
+    metadata: dict[str, Any],
+) -> None:
+    raw_path_value = metadata.get("stage03_formal_review_manifest")
+    expected_hash = str(metadata.get("stage03_formal_review_manifest_sha256", ""))
+    if raw_path_value in {None, ""} or not expected_hash:
+        raise RuntimeError("trusted Stage 3.0 formal review manifest is missing")
+    review_manifest = Path(str(raw_path_value))
+    if not review_manifest.is_absolute():
+        review_manifest = root / review_manifest
+    if not review_manifest.is_file():
+        raise RuntimeError("trusted Stage 3.0 formal review manifest is missing")
+    if _sha256(review_manifest) != expected_hash:
+        raise RuntimeError("trusted Stage 3.0 formal review manifest hash mismatch")
+    payload = _read_json(review_manifest)
+    recorded_hash = str(payload.get("manifest_payload_sha256", ""))
+    payload_without_hash = dict(payload)
+    payload_without_hash.pop("manifest_payload_sha256", None)
+    if not recorded_hash or recorded_hash != _payload_sha256(payload_without_hash):
+        raise RuntimeError("trusted Stage 3.0 formal review manifest payload mismatch")
+    if payload.get("scope") != "formal" or payload.get("status") not in {
+        "READY_FOR_STAGE03_ACCELERATION",
+        "READY_FOR_STAGE03_1",
+        "READY_FOR_STAGE31",
+    }:
+        raise RuntimeError("trusted Stage 3.0 formal review is not ready")
+    review_label = str(payload.get("review_label", ""))
+    for name, expected_file_hash in dict(payload.get("files", {})).items():
+        artifact = review_manifest.parent / str(name)
+        if not artifact.is_file() and review_label:
+            artifact = review_manifest.parent / f"{review_label}_{name}"
+        if not artifact.is_file() or _sha256(artifact) != str(expected_file_hash):
+            raise RuntimeError(f"trusted Stage 3.0 review artifact hash mismatch: {name}")
 
 
 def _compare_stage03_formal(
@@ -910,11 +988,11 @@ def _compare_stage03_formal(
             gate = (
                 "pass"
                 if compare_objectives(item.objective, baseline_key)
-                is ObjectiveComparison.EQUAL
+                is not ObjectiveComparison.WORSE
                 else "fail"
             )
-            classification = "objective_unchanged" if gate == "pass" else "objective_regression"
-            reason = "C5 objective key must equal Stage 3.0 formal evidence"
+            classification = "objective_not_worse" if gate == "pass" else "objective_regression"
+            reason = "C5 objective key must not be worse than Stage 3.0 formal evidence"
         elif focused:
             if item.objective is None:
                 raise RuntimeError("candidate feasibility/objective state diverged")

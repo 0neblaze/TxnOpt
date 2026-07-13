@@ -267,6 +267,7 @@ class _Evaluator:
                 sequence,
                 full=True,
                 reference_distance=reference_distance,
+                epsilon=self.screening_config.epsilon,
             )
         )
         completed = time.perf_counter()
