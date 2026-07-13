@@ -27,7 +27,7 @@ distance improvement 和 failure reason。
 正式配置为 `configs/stage02_route_quality.toml`，固定使用 Stage 0 的 12 个实例、
 三个 seed、30 秒、1000 iterations（迭代）和单线程。objective comparison（目标比较）
 固定对照已通过的 Stage 2.1 结果：
-`experiments/summaries/stage02_attempt02_per_run_results.csv`。
+`experiments/summaries/stage02_quality_attempt02_per_run_results.csv`。
 
 ## 3. Acceptance gates（验收门槛）
 

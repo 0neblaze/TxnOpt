@@ -11,6 +11,7 @@ import subprocess
 import tomllib
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ from evrptw.validation import SolutionReport, validate_routes
 SCHEMA_VERSION = "1"
 ROUTE_REDUCTION_ALGORITHM = "ALNS_STAGE02_ROUTE_REDUCTION"
 ROUTE_QUALITY_ALGORITHM = "ALNS_STAGE02_ROUTE_QUALITY"
+CONSTRAINT_GUIDED_ALGORITHM = "ALNS_STAGE02_CONSTRAINT_GUIDED"
 # Kept as the historical public constant for Stage 2.1 callers.
 ALGORITHM = ROUTE_REDUCTION_ALGORITHM
 FOCUSED_100_INSTANCES = ("c101_21", "r101_21", "rc101_21")
@@ -97,6 +99,12 @@ PER_RUN_FIELDS = (
     "improving_moves",
     "rejected_moves",
     "charging_subproblem_calls",
+    "cache_hits",
+    "cache_misses",
+    "unique_route_evaluations",
+    "effective_iterations",
+    "removal_tier_counts",
+    "maximum_stagnation",
     "charging_subproblem_average_seconds",
     "charging_labels_generated",
     "charging_labels_pruned",
@@ -111,6 +119,7 @@ PER_RUN_FIELDS = (
     "neighborhood_events",
     "operator_failure_events",
     "operator_statistics_json",
+    "constraint_operator_statistics_json",
     "status",
     "feasible",
     "failure_reason",
@@ -194,6 +203,15 @@ OPERATOR_FAILURE_FIELDS = (
     "selection_rank",
     "chain_depth",
     "segment_length",
+    "track",
+    "constraint_category",
+    "removal_tier",
+    "removal_size_requested",
+    "removal_size_actual",
+    "stagnation_iterations",
+    "removal_trigger",
+    "reset_observed",
+    "ranking_score",
 )
 
 OPERATOR_EVENT_FIELDS = (
@@ -221,6 +239,15 @@ OPERATOR_EVENT_FIELDS = (
     "selection_rank",
     "chain_depth",
     "segment_length",
+    "track",
+    "constraint_category",
+    "removal_tier",
+    "removal_size_requested",
+    "removal_size_actual",
+    "stagnation_iterations",
+    "removal_trigger",
+    "reset_observed",
+    "ranking_score",
 )
 
 COMPARISON_FIELDS = (
@@ -322,6 +349,12 @@ def load_config(path: Path) -> Stage02Config:
                 vehicle_repair_exact_evaluation_budget=int(
                     operators["vehicle_repair_exact_evaluation_budget"]
                 ),
+                vehicle_reduction_refinement_exact_evaluation_budget=int(
+                    operators.get(
+                        "vehicle_reduction_refinement_exact_evaluation_budget",
+                        VehicleOperatorConfig().vehicle_reduction_refinement_exact_evaluation_budget,
+                    )
+                ),
                 relocate_exact_evaluation_budget=int(
                     operators.get(
                         "relocate_exact_evaluation_budget",
@@ -358,6 +391,18 @@ def load_config(path: Path) -> Stage02Config:
                         VehicleOperatorConfig().quality_probe_exact_evaluation_budget,
                     )
                 ),
+                quality_route_segment_probe_exact_evaluation_budget=int(
+                    operators.get(
+                        "quality_route_segment_probe_exact_evaluation_budget",
+                        VehicleOperatorConfig().quality_route_segment_probe_exact_evaluation_budget,
+                    )
+                ),
+                constraint_lane_time_budget_seconds=float(
+                    operators.get(
+                        "constraint_lane_time_budget_seconds",
+                        VehicleOperatorConfig().constraint_lane_time_budget_seconds,
+                    )
+                ),
                 route_segment_min_length=int(
                     operators.get(
                         "route_segment_min_length",
@@ -380,6 +425,90 @@ def load_config(path: Path) -> Stage02Config:
                     operators.get(
                         "ejection_chain_beam_width",
                         VehicleOperatorConfig().ejection_chain_beam_width,
+                    )
+                ),
+                constraint_probe_exact_evaluation_budget=int(
+                    operators.get(
+                        "constraint_probe_exact_evaluation_budget",
+                        VehicleOperatorConfig().constraint_probe_exact_evaluation_budget,
+                    )
+                ),
+                station_pressure_exact_evaluation_budget=int(
+                    operators.get(
+                        "station_pressure_exact_evaluation_budget",
+                        VehicleOperatorConfig().station_pressure_exact_evaluation_budget,
+                    )
+                ),
+                time_window_conflict_exact_evaluation_budget=int(
+                    operators.get(
+                        "time_window_conflict_exact_evaluation_budget",
+                        VehicleOperatorConfig().time_window_conflict_exact_evaluation_budget,
+                    )
+                ),
+                worst_energy_detour_exact_evaluation_budget=int(
+                    operators.get(
+                        "worst_energy_detour_exact_evaluation_budget",
+                        VehicleOperatorConfig().worst_energy_detour_exact_evaluation_budget,
+                    )
+                ),
+                shaw_related_exact_evaluation_budget=int(
+                    operators.get(
+                        "shaw_related_exact_evaluation_budget",
+                        VehicleOperatorConfig().shaw_related_exact_evaluation_budget,
+                    )
+                ),
+                small_removal_min_fraction=float(
+                    operators.get(
+                        "small_removal_min_fraction",
+                        VehicleOperatorConfig().small_removal_min_fraction,
+                    )
+                ),
+                small_removal_max_fraction=float(
+                    operators.get(
+                        "small_removal_max_fraction",
+                        VehicleOperatorConfig().small_removal_max_fraction,
+                    )
+                ),
+                medium_removal_min_fraction=float(
+                    operators.get(
+                        "medium_removal_min_fraction",
+                        VehicleOperatorConfig().medium_removal_min_fraction,
+                    )
+                ),
+                medium_removal_max_fraction=float(
+                    operators.get(
+                        "medium_removal_max_fraction",
+                        VehicleOperatorConfig().medium_removal_max_fraction,
+                    )
+                ),
+                large_removal_min_fraction=float(
+                    operators.get(
+                        "large_removal_min_fraction",
+                        VehicleOperatorConfig().large_removal_min_fraction,
+                    )
+                ),
+                large_removal_max_fraction=float(
+                    operators.get(
+                        "large_removal_max_fraction",
+                        VehicleOperatorConfig().large_removal_max_fraction,
+                    )
+                ),
+                medium_stagnation_threshold=int(
+                    operators.get(
+                        "medium_stagnation_threshold",
+                        VehicleOperatorConfig().medium_stagnation_threshold,
+                    )
+                ),
+                large_stagnation_threshold=int(
+                    operators.get(
+                        "large_stagnation_threshold",
+                        VehicleOperatorConfig().large_stagnation_threshold,
+                    )
+                ),
+                exploration_period=int(
+                    operators.get(
+                        "exploration_period",
+                        VehicleOperatorConfig().exploration_period,
                     )
                 ),
             ),
@@ -447,49 +576,72 @@ def run_stage02(
         instance_hash = _sha256(instance_path)
         instance = parse_schneider(instance_path)
         for seed in config.seeds:
-            started = datetime.now(UTC)
-            result = solve_alns(
-                instance,
-                seed=seed,
-                max_iterations=config.max_iterations,
-                time_limit_seconds=config.time_limit_seconds,
-                operator_profile=config.operator_profile,
-                vehicle_operator_config=config.vehicle_operator_config,
-            )
-            ended = datetime.now(UTC)
-            row, events = _record_run(
-                config=config,
-                run_label=run_label,
-                instance=instance,
-                seed=seed,
-                result=result,
-                started=started,
-                ended=ended,
-                repository_revision=_git_revision(root),
-                repository_dirty=_git_dirty(root),
-                algorithm_hash=algorithm_hash,
-                instance_hash=instance_hash,
-                output_dir=output_dir,
-                raw_dir=raw_dir,
-                solution_dir=solution_dir,
-            )
-            rows.append(row)
-            operator_records.append((instance.name, seed, result.neighborhood_statistics))
-            contextual_events.extend(
-                {
-                    "run_label": run_label,
-                    "instance": instance.name,
-                    "seed": seed,
-                    **event,
-                }
-                for event in events
-            )
-            _write_csv(per_run_path, PER_RUN_FIELDS, rows)
-            _write_csv(
-                failure_path,
-                PER_RUN_FIELDS,
-                [item for item in rows if not item["feasible"]],
-            )
+            try:
+                started = datetime.now(UTC)
+                result = solve_alns(
+                    instance,
+                    seed=seed,
+                    max_iterations=config.max_iterations,
+                    time_limit_seconds=config.time_limit_seconds,
+                    operator_profile=config.operator_profile,
+                    vehicle_operator_config=config.vehicle_operator_config,
+                )
+                ended = datetime.now(UTC)
+                row, events = _record_run(
+                    config=config,
+                    run_label=run_label,
+                    instance=instance,
+                    seed=seed,
+                    result=result,
+                    started=started,
+                    ended=ended,
+                    repository_revision=_git_revision(root),
+                    repository_dirty=_git_dirty(root),
+                    algorithm_hash=algorithm_hash,
+                    instance_hash=instance_hash,
+                    output_dir=output_dir,
+                    raw_dir=raw_dir,
+                    solution_dir=solution_dir,
+                )
+                rows.append(row)
+                operator_records.append((instance.name, seed, result.neighborhood_statistics))
+                contextual_events.extend(
+                    {
+                        "run_label": run_label,
+                        "instance": instance.name,
+                        "seed": seed,
+                        **event,
+                    }
+                    for event in events
+                )
+                _write_csv(per_run_path, PER_RUN_FIELDS, rows)
+                _write_csv(
+                    failure_path,
+                    PER_RUN_FIELDS,
+                    [item for item in rows if not item["feasible"]],
+                )
+            except BaseException as error:
+                _write_interrupted_run_artifacts(
+                    root=root,
+                    config=config,
+                    config_path=config_path,
+                    output_dir=output_dir,
+                    run_label=run_label,
+                    raw_dir=raw_dir,
+                    solution_dir=solution_dir,
+                    per_run_path=per_run_path,
+                    failure_path=failure_path,
+                    source_hashes=source_hashes,
+                    algorithm_hash=algorithm_hash,
+                    baseline_manifest_sha256=baseline_manifest_sha256,
+                    baseline_dir=baseline_dir,
+                    benchmark_dir=benchmark_dir,
+                    rows=rows,
+                    operator_records=operator_records,
+                    contextual_events=contextual_events,
+                    error=error,
+                )
+                raise
 
     summary_rows = _summarize(rows)
     operator_summary_rows = _summarize_operators(operator_records)
@@ -616,6 +768,125 @@ def run_stage02(
     }
 
 
+def _write_interrupted_run_artifacts(
+    *,
+    root: Path,
+    config: Stage02Config,
+    config_path: Path,
+    output_dir: Path,
+    run_label: str,
+    raw_dir: Path,
+    solution_dir: Path,
+    per_run_path: Path,
+    failure_path: Path,
+    source_hashes: dict[str, str],
+    algorithm_hash: str,
+    baseline_manifest_sha256: str,
+    baseline_dir: Path,
+    benchmark_dir: Path,
+    rows: list[dict[str, Any]],
+    operator_records: list[tuple[str, int, dict[str, dict[str, object]]]],
+    contextual_events: list[dict[str, object]],
+    error: BaseException,
+) -> None:
+    """Persist a complete partial-run evidence bundle before propagating errors."""
+
+    summary_path = output_dir / f"{run_label}_summary_results.csv"
+    operator_summary_path = output_dir / f"{run_label}_operator_summary.csv"
+    operator_event_path = output_dir / f"{run_label}_operator_events.csv"
+    operator_failure_path = output_dir / f"{run_label}_operator_failure_events.csv"
+    repeatability_path = output_dir / f"{run_label}_repeatability.csv"
+    comparison_path = output_dir / f"{run_label}_{config.comparison_label}_comparison.csv"
+    focused_path = output_dir / f"{run_label}_100_customer_comparison.csv"
+    gate_path = output_dir / f"{run_label}_gate_report.csv"
+    environment_path = output_dir / f"{run_label}_environment.json"
+    parameters_path = output_dir / f"{run_label}_parameters.toml"
+    interruption_path = output_dir / f"{run_label}_interruption.json"
+
+    _write_csv(per_run_path, PER_RUN_FIELDS, rows)
+    _write_csv(
+        failure_path,
+        PER_RUN_FIELDS,
+        [row for row in rows if not row.get("feasible")],
+    )
+    _write_csv(summary_path, SUMMARY_FIELDS, _summarize(rows))
+    _write_csv(
+        operator_summary_path,
+        OPERATOR_SUMMARY_FIELDS,
+        _summarize_operators(operator_records),
+    )
+    _write_csv(
+        operator_event_path,
+        OPERATOR_EVENT_FIELDS,
+        _operator_event_rows(contextual_events),
+    )
+    _write_csv(
+        operator_failure_path,
+        OPERATOR_FAILURE_FIELDS,
+        _operator_failure_rows(contextual_events),
+    )
+    _write_csv(
+        repeatability_path,
+        REPEATABILITY_FIELDS,
+        [
+            {
+                "first_run": "",
+                "second_run": "",
+                "status": "interrupted",
+                "first_gate_status": "",
+                "second_gate_status": "",
+                "first_run_keys": "",
+                "second_run_keys": f"{len(rows)} partial rows",
+                "configuration_match": "",
+                "details": repr(error),
+            }
+        ],
+    )
+    _write_csv(comparison_path, COMPARISON_FIELDS, [])
+    _write_csv(focused_path, COMPARISON_FIELDS, [])
+    _write_csv(
+        gate_path,
+        GATE_FIELDS,
+        [
+            _gate(
+                "run_interrupted",
+                False,
+                {"completed_runs": len(rows), "error": repr(error)},
+                "all formal runs complete",
+                "interruption evidence bundle",
+            )
+        ],
+    )
+    shutil.copy2(config_path, parameters_path)
+    _write_json(
+        environment_path,
+        _environment_record(
+            root=root,
+            config=config,
+            config_path=config_path,
+            run_label=run_label,
+            source_hashes=source_hashes,
+            algorithm_hash=algorithm_hash,
+            baseline_manifest_sha256=baseline_manifest_sha256,
+            baseline_dir=baseline_dir,
+            benchmark_dir=benchmark_dir,
+        ),
+    )
+    _write_json(
+        interruption_path,
+        {
+            "schema_version": config.schema_version,
+            "run_label": run_label,
+            "error_type": type(error).__name__,
+            "error": repr(error),
+            "completed_run_count": len(rows),
+            "raw_directory": str(raw_dir),
+            "solution_directory": str(solution_dir),
+        },
+    )
+    _write_manifest(output_dir, output_dir / f"{run_label}_manifest.json")
+
+
 def _record_run(
     *,
     config: Stage02Config,
@@ -688,6 +959,14 @@ def _record_run(
             "improving_moves": result.improving_moves,
             "rejected_moves": result.rejected_moves,
             "charging_subproblem_calls": result.charging_subproblem_calls,
+            "cache_hits": result.cache_hits,
+            "cache_misses": result.cache_misses,
+            "unique_route_evaluations": result.unique_route_evaluations,
+            "effective_iterations": result.effective_iterations,
+            "removal_tier_counts": json.dumps(
+                result.removal_tier_counts, sort_keys=True, separators=(",", ":")
+            ),
+            "maximum_stagnation": result.maximum_stagnation,
             "charging_subproblem_average_seconds": (
                 result.charging_subproblem_time / result.charging_subproblem_calls
                 if result.charging_subproblem_calls
@@ -700,6 +979,11 @@ def _record_run(
             "operator_failure_events": len(failure_events),
             "operator_statistics_json": json.dumps(
                 result.neighborhood_statistics, sort_keys=True, separators=(",", ":")
+            ),
+            "constraint_operator_statistics_json": json.dumps(
+                result.constraint_operator_statistics,
+                sort_keys=True,
+                separators=(",", ":"),
             ),
             "status": "feasible" if validation_objective is not None else "invalid",
             "feasible": validation_objective is not None,
@@ -1077,7 +1361,10 @@ def _evaluate_gates(
             "route merge event log",
         )
     )
-    if config.operator_profile is OperatorProfile.STAGE02_ROUTE_QUALITY:
+    if config.operator_profile in (
+        OperatorProfile.STAGE02_ROUTE_QUALITY,
+        OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
+    ):
         quality_operators = (
             "relocate",
             "swap",
@@ -1126,6 +1413,175 @@ def _evaluate_gates(
                 "Stage 2.2 operator event log",
             )
         )
+    if config.operator_profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED:
+        constraint_events = [
+            event
+            for event in contextual_events
+            if event.get("track") == "constraint_lane"
+            and event.get("operator") in {
+                "station_pressure",
+                "time_window_conflict",
+                "worst_energy_detour",
+                "shaw_related",
+            }
+        ]
+        for operator in (
+            "station_pressure",
+            "time_window_conflict",
+            "worst_energy_detour",
+            "shaw_related",
+        ):
+            operator_events = [
+                event for event in constraint_events if event.get("operator") == operator
+            ]
+            feasible_candidates = [
+                event
+                for event in operator_events
+                if event.get("candidate_feasible") is True
+                and event.get("status") in {"feasible_candidate", "candidate_proposed"}
+            ]
+            accepted_candidates = [
+                event for event in feasible_candidates if event.get("accepted") is True
+            ]
+            gates.append(
+                _gate(
+                    f"{operator}_called_feasible_accepted",
+                    bool(operator_events)
+                    and bool(feasible_candidates)
+                    and bool(accepted_candidates),
+                    {
+                        "calls": len(operator_events),
+                        "feasible_candidates": len(feasible_candidates),
+                        "accepted_candidates": len(accepted_candidates),
+                    },
+                    "at least one call, feasible candidate, and accepted candidate",
+                    "Stage 2.3 constraint-lane event log",
+                )
+            )
+        accepted_vehicle_increases = [
+            event
+            for event in constraint_events
+            if event.get("accepted") is True
+            and event.get("candidate_feasible") is True
+            and event.get("candidate_vehicle_delta") not in (None, "")
+            and _event_int(event.get("candidate_vehicle_delta")) > 0
+        ]
+        gates.append(
+            _gate(
+                "constraint_lane_no_accepted_vehicle_increase",
+                not accepted_vehicle_increases,
+                len(accepted_vehicle_increases),
+                "zero accepted constraint-lane candidates with increased vehicle count",
+                "Stage 2.3 constraint-lane event log",
+            )
+        )
+        observed_tiers = {
+            str(event.get("removal_tier"))
+            for event in constraint_events
+            if _event_int(event.get("removal_size_actual")) > 0
+        }
+        gates.append(
+            _gate(
+                "dynamic_removal_all_tiers",
+                {"small", "medium", "large"} <= observed_tiers,
+                sorted(observed_tiers),
+                "small, medium, and large all occur with actual removals",
+                "Stage 2.3 constraint-lane event log",
+            )
+        )
+        focused_actual_counts = [
+            _event_int(event.get("removal_size_actual"))
+            for event in constraint_events
+            if event.get("instance") in FOCUSED_100_INSTANCES
+        ]
+        gates.append(
+            _gate(
+                "100_customer_actual_removal_above_three",
+                any(count > 3 for count in focused_actual_counts),
+                max(focused_actual_counts, default=0),
+                "at least one focused 100-customer actual removal > 3",
+                "Stage 2.3 constraint-lane event log",
+            )
+        )
+        stagnation_escalations = [
+            event
+            for event in constraint_events
+            if "stagnation" in str(event.get("removal_trigger", ""))
+            and str(event.get("removal_tier")) in {"medium", "large"}
+        ]
+        gates.append(
+            _gate(
+                "stagnation_tier_escalation",
+                bool(stagnation_escalations),
+                len(stagnation_escalations),
+                "at least one medium/large tier triggered by stagnation",
+                "Stage 2.3 constraint-lane event log",
+            )
+        )
+        reset_events = [event for event in constraint_events if event.get("reset_observed") is True]
+        gates.append(
+            _gate(
+                "global_best_reset_observed",
+                bool(reset_events),
+                len(reset_events),
+                "at least one dynamic removal event records a global-best reset",
+                "Stage 2.3 constraint-lane event log",
+            )
+        )
+
+        def _valid_dynamic_count(event: dict[str, object]) -> bool:
+            requested = _event_int(event.get("removal_size_requested"))
+            actual = _event_int(event.get("removal_size_actual"))
+            if requested == 0 and actual == 0:
+                return True
+            instance_name = str(event.get("instance"))
+            customer_count = _customer_count_from_event(
+                instance_name,
+                config.benchmark_dir,
+            )
+            tier_name = str(event.get("removal_tier"))
+            fraction_bounds = {
+                "small": (
+                    config.vehicle_operator_config.small_removal_min_fraction,
+                    config.vehicle_operator_config.small_removal_max_fraction,
+                ),
+                "medium": (
+                    config.vehicle_operator_config.medium_removal_min_fraction,
+                    config.vehicle_operator_config.medium_removal_max_fraction,
+                ),
+                "large": (
+                    config.vehicle_operator_config.large_removal_min_fraction,
+                    config.vehicle_operator_config.large_removal_max_fraction,
+                ),
+            }
+            if tier_name not in fraction_bounds or customer_count <= 1:
+                return False
+            minimum, maximum = fraction_bounds[tier_name]
+            lower = max(1, min(customer_count - 1, math.ceil(customer_count * minimum)))
+            upper = max(
+                lower,
+                min(customer_count - 1, math.floor(customer_count * maximum)),
+            )
+            if (
+                actual == 0
+                and str(event.get("status")) == "time_limit"
+                and str(event.get("removal_trigger", "")).startswith("probe_not_started:")
+            ):
+                return lower <= requested <= upper
+            return lower <= requested <= upper and lower <= actual <= upper
+
+        invalid_dynamic_events = [
+            event for event in constraint_events if not _valid_dynamic_count(event)
+        ]
+        gates.append(
+            _gate(
+                "dynamic_removal_counts_within_config",
+                not invalid_dynamic_events,
+                len(invalid_dynamic_events),
+                "every requested and actual removal count is inside its tier range",
+                "Stage 2.3 constraint-lane event log and TOML",
+            )
+        )
     manifest_unchanged = _sha256(baseline_dir / "manifest.json") == baseline_manifest_sha256
     gates.append(
         _gate(
@@ -1169,7 +1625,11 @@ def _load_comparison_baseline(
     if config.comparison_label == "stage01":
         return _load_stage1_baseline(path, config)
     rows = _read_csv(path)
-    expected_algorithm = ROUTE_REDUCTION_ALGORITHM
+    expected_algorithm = (
+        ROUTE_QUALITY_ALGORITHM
+        if config.comparison_label == "stage02_2"
+        else ROUTE_REDUCTION_ALGORITHM
+    )
     filtered = [row for row in rows if row.get("algorithm") == expected_algorithm]
     expected = {(instance, seed) for instance in config.instances for seed in config.seeds}
     actual = [(str(row["instance"]), int(row["seed"])) for row in filtered]
@@ -1349,6 +1809,15 @@ def _operator_failure_rows(events: list[dict[str, object]]) -> list[dict[str, An
                 "selection_rank": event.get("selection_rank", 0),
                 "chain_depth": event.get("chain_depth", 0),
                 "segment_length": event.get("segment_length", 0),
+                "track": event.get("track", "legacy"),
+                "constraint_category": event.get("constraint_category", ""),
+                "removal_tier": event.get("removal_tier", ""),
+                "removal_size_requested": event.get("removal_size_requested", 0),
+                "removal_size_actual": event.get("removal_size_actual", 0),
+                "stagnation_iterations": event.get("stagnation_iterations", 0),
+                "removal_trigger": event.get("removal_trigger", ""),
+                "reset_observed": event.get("reset_observed", False),
+                "ranking_score": event.get("ranking_score", 0.0),
             }
         )
     return output
@@ -1523,6 +1992,15 @@ def _operator_event_rows(events: list[dict[str, object]]) -> list[dict[str, Any]
                 "selection_rank": event.get("selection_rank", 0),
                 "chain_depth": event.get("chain_depth", 0),
                 "segment_length": event.get("segment_length", 0),
+                "track": event.get("track", "legacy"),
+                "constraint_category": event.get("constraint_category", ""),
+                "removal_tier": event.get("removal_tier", ""),
+                "removal_size_requested": event.get("removal_size_requested", 0),
+                "removal_size_actual": event.get("removal_size_actual", 0),
+                "stagnation_iterations": event.get("stagnation_iterations", 0),
+                "removal_trigger": event.get("removal_trigger", ""),
+                "reset_observed": event.get("reset_observed", False),
+                "ranking_score": event.get("ranking_score", 0.0),
             }
         )
     return output
@@ -1600,6 +2078,7 @@ def _source_hashes(root: Path) -> dict[str, str]:
         Path("src/evrptw/validation.py"),
         Path("src/evrptw/experiments/stage02_route_reduction.py"),
         Path("src/evrptw/experiments/stage02_route_quality.py"),
+        Path("src/evrptw/experiments/stage02_constraint_guided.py"),
     )
     return {str(path): _sha256(root / path) for path in paths}
 
@@ -1637,6 +2116,12 @@ def _count_feasible(rows: list[dict[str, Any]]) -> str:
     return f"{sum(bool(row['feasible']) for row in rows)}/{len(rows)}"
 
 
+@cache
+def _customer_count_from_event(instance_name: str, benchmark_dir: Path) -> int:
+    path = _resolve(_repository_root(), benchmark_dir) / f"{instance_name}.txt"
+    return len(parse_schneider(path).customers)
+
+
 def _join_failures(*reasons: str) -> str:
     return "; ".join(reason for reason in reasons if reason)
 
@@ -1645,6 +2130,14 @@ def _as_int(value: object) -> int:
     if isinstance(value, (bool, int, float, str)):
         return int(value)
     raise TypeError(f"expected numeric operator statistic, got {type(value).__name__}")
+
+
+def _event_int(value: object) -> int:
+    if value is None or value == "":
+        return 0
+    if isinstance(value, (bool, int, float, str)):
+        return int(value)
+    raise TypeError(f"expected numeric event value, got {type(value).__name__}")
 
 
 def _render_key(objective: SolutionObjective | None) -> str:
@@ -1741,9 +2234,13 @@ def _validate_config(config: Stage02Config) -> None:
     expected_algorithms = {
         OperatorProfile.STAGE02_ROUTE_REDUCTION: ROUTE_REDUCTION_ALGORITHM,
         OperatorProfile.STAGE02_ROUTE_QUALITY: ROUTE_QUALITY_ALGORITHM,
+        OperatorProfile.STAGE02_CONSTRAINT_GUIDED: CONSTRAINT_GUIDED_ALGORITHM,
     }
     if config.operator_profile not in expected_algorithms:
-        raise ValueError("Stage 2 runner requires a route-reduction or route-quality profile")
+        raise ValueError(
+            "Stage 2 runner requires a route-reduction, route-quality, "
+            "or constraint-guided profile"
+        )
     if config.algorithm != expected_algorithms[config.operator_profile]:
         raise ValueError(
             f"{config.operator_profile.value} only supports "

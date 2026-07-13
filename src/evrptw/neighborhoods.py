@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+import random
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from typing import Protocol
@@ -19,6 +20,20 @@ class OperatorProfile(StrEnum):
     BASELINE = "baseline"
     STAGE02_ROUTE_REDUCTION = "stage02_route_reduction"
     STAGE02_ROUTE_QUALITY = "stage02_route_quality"
+    STAGE02_CONSTRAINT_GUIDED = "stage02_constraint_guided"
+
+
+class ConstraintRemovalOperator(StrEnum):
+    STATION_PRESSURE = "station_pressure"
+    TIME_WINDOW_CONFLICT = "time_window_conflict"
+    WORST_ENERGY_DETOUR = "worst_energy_detour"
+    SHAW_RELATED = "shaw_related"
+
+
+class RemovalTier(StrEnum):
+    SMALL = "small"
+    MEDIUM = "medium"
+    LARGE = "large"
 
 
 class RouteEvaluator(Protocol):
@@ -28,22 +43,53 @@ class RouteEvaluator(Protocol):
         """Evaluate one customer sequence with the exact charging subproblem."""
 
 
+class RouteEvaluationDeadlineExceeded(RuntimeError):
+    """Signal a cooperative exact-route deadline without losing operator events."""
+
+    def __init__(
+        self,
+        sequence: CustomerSequence | None = None,
+        *,
+        exact_route_evaluations: int = 0,
+    ) -> None:
+        super().__init__("route evaluation deadline exceeded")
+        self.sequence = sequence
+        self.exact_route_evaluations = exact_route_evaluations
+
+
 @dataclass(frozen=True, slots=True)
 class VehicleOperatorConfig:
     max_route_elimination_attempts: int = 8
     route_elimination_exact_evaluation_budget: int = 256
     route_merge_exact_evaluation_budget: int = 64
     vehicle_repair_exact_evaluation_budget: int = 256
+    vehicle_reduction_refinement_exact_evaluation_budget: int = 512
     relocate_exact_evaluation_budget: int = 48
     swap_exact_evaluation_budget: int = 48
     two_opt_star_exact_evaluation_budget: int = 32
     route_segment_exact_evaluation_budget: int = 32
     ejection_chain_exact_evaluation_budget: int = 24
     quality_probe_exact_evaluation_budget: int = 4
+    quality_route_segment_probe_exact_evaluation_budget: int = 4
+    constraint_lane_time_budget_seconds: float = 2.0
     route_segment_min_length: int = 2
     route_segment_max_length: int = 5
     ejection_chain_max_depth: int = 3
     ejection_chain_beam_width: int = 16
+    constraint_probe_exact_evaluation_budget: int = 16
+    station_pressure_exact_evaluation_budget: int = 48
+    time_window_conflict_exact_evaluation_budget: int = 48
+    worst_energy_detour_exact_evaluation_budget: int = 48
+    shaw_related_exact_evaluation_budget: int = 48
+    small_removal_min_fraction: float = 0.05
+    small_removal_max_fraction: float = 0.10
+    medium_removal_min_fraction: float = 0.10
+    medium_removal_max_fraction: float = 0.20
+    large_removal_min_fraction: float = 0.20
+    large_removal_max_fraction: float = 0.35
+    medium_stagnation_threshold: int = 4
+    large_stagnation_threshold: int = 8
+    exploration_period: int = 3
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -54,6 +100,10 @@ class VehicleOperatorConfig:
             ),
             ("route_merge_exact_evaluation_budget", self.route_merge_exact_evaluation_budget),
             ("vehicle_repair_exact_evaluation_budget", self.vehicle_repair_exact_evaluation_budget),
+            (
+                "vehicle_reduction_refinement_exact_evaluation_budget",
+                self.vehicle_reduction_refinement_exact_evaluation_budget,
+            ),
             ("relocate_exact_evaluation_budget", self.relocate_exact_evaluation_budget),
             ("swap_exact_evaluation_budget", self.swap_exact_evaluation_budget),
             (
@@ -66,15 +116,63 @@ class VehicleOperatorConfig:
                 self.ejection_chain_exact_evaluation_budget,
             ),
             ("quality_probe_exact_evaluation_budget", self.quality_probe_exact_evaluation_budget),
+            (
+                "quality_route_segment_probe_exact_evaluation_budget",
+                self.quality_route_segment_probe_exact_evaluation_budget,
+            ),
+            ("constraint_lane_time_budget_seconds", self.constraint_lane_time_budget_seconds),
             ("route_segment_min_length", self.route_segment_min_length),
             ("route_segment_max_length", self.route_segment_max_length),
             ("ejection_chain_max_depth", self.ejection_chain_max_depth),
             ("ejection_chain_beam_width", self.ejection_chain_beam_width),
+            (
+                "constraint_probe_exact_evaluation_budget",
+                self.constraint_probe_exact_evaluation_budget,
+            ),
+            (
+                "station_pressure_exact_evaluation_budget",
+                self.station_pressure_exact_evaluation_budget,
+            ),
+            (
+                "time_window_conflict_exact_evaluation_budget",
+                self.time_window_conflict_exact_evaluation_budget,
+            ),
+            (
+                "worst_energy_detour_exact_evaluation_budget",
+                self.worst_energy_detour_exact_evaluation_budget,
+            ),
+            ("shaw_related_exact_evaluation_budget", self.shaw_related_exact_evaluation_budget),
+            ("medium_stagnation_threshold", self.medium_stagnation_threshold),
+            ("large_stagnation_threshold", self.large_stagnation_threshold),
+            ("exploration_period", self.exploration_period),
         ):
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
         if self.route_segment_min_length > self.route_segment_max_length:
             raise ValueError("route_segment_min_length must not exceed route_segment_max_length")
+        for name, lower, upper in (
+            (
+                "small_removal",
+                self.small_removal_min_fraction,
+                self.small_removal_max_fraction,
+            ),
+            (
+                "medium_removal",
+                self.medium_removal_min_fraction,
+                self.medium_removal_max_fraction,
+            ),
+            (
+                "large_removal",
+                self.large_removal_min_fraction,
+                self.large_removal_max_fraction,
+            ),
+        ):
+            if not 0.0 < lower <= upper <= 1.0:
+                raise ValueError(f"{name} fractions must satisfy 0 < min <= max <= 1")
+        if self.medium_stagnation_threshold > self.large_stagnation_threshold:
+            raise ValueError(
+                "medium_stagnation_threshold must not exceed large_stagnation_threshold"
+            )
 
 
 _DEFAULT_VEHICLE_OPERATOR_CONFIG = VehicleOperatorConfig()
@@ -98,6 +196,15 @@ class NeighborhoodEvent:
     selection_rank: int = 0
     chain_depth: int = 0
     segment_length: int = 0
+    track: str = "legacy"
+    constraint_category: str = ""
+    removal_tier: str = ""
+    removal_size_requested: int = 0
+    removal_size_actual: int = 0
+    stagnation_iterations: int = 0
+    removal_trigger: str = ""
+    reset_observed: bool = False
+    ranking_score: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -107,6 +214,27 @@ class NeighborhoodEvent:
 class MoveProposal:
     operator: str
     sequences: RouteSequences | None
+    events: tuple[NeighborhoodEvent, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RemovalSizeSelection:
+    tier: RemovalTier
+    requested_count: int
+    lower_bound: int
+    upper_bound: int
+    stagnation_iterations: int
+    trigger_reason: str
+    reset_observed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RemovalProposal:
+    operator: str
+    partial: RouteSequences | None
+    removed_customers: tuple[str, ...]
+    selection: RemovalSizeSelection
+    scores: tuple[tuple[str, float], ...]
     events: tuple[NeighborhoodEvent, ...]
 
 
@@ -187,6 +315,445 @@ def screen_route_candidate(instance: Instance, sequence: CustomerSequence) -> Ro
     return RouteScreenResult(True, "", demand, current_time, True)
 
 
+def select_dynamic_removal_size(
+    customer_count: int,
+    stagnation_iterations: int,
+    iteration: int,
+    *,
+    config: VehicleOperatorConfig = _DEFAULT_VEHICLE_OPERATOR_CONFIG,
+    global_best_reset: bool = False,
+) -> RemovalSizeSelection:
+    """Select a deterministic removal tier for the Stage 2.3 lane.
+
+    The tier is driven by stagnation first.  Periodic exploration may promote the
+    selected tier by one level only after medium stagnation has been reached; it
+    never bypasses the stagnation thresholds, resets stagnation, or reduces a tier.
+    Counts use the configured lower bound so the selection is reproducible and the
+    actual removal remains inside the configured interval after clamping.
+    """
+
+    if customer_count < 0:
+        raise ValueError("customer_count must be non-negative")
+    if stagnation_iterations < 0:
+        raise ValueError("stagnation_iterations must be non-negative")
+    if iteration < 0:
+        raise ValueError("iteration must be non-negative")
+
+    if stagnation_iterations >= config.large_stagnation_threshold:
+        tier = RemovalTier.LARGE
+        trigger = "large_stagnation"
+    elif stagnation_iterations >= config.medium_stagnation_threshold:
+        tier = RemovalTier.MEDIUM
+        trigger = "medium_stagnation"
+    else:
+        tier = RemovalTier.SMALL
+        trigger = "stagnation_baseline"
+
+    if (
+        iteration > 0
+        and iteration % config.exploration_period == 0
+        and stagnation_iterations > config.medium_stagnation_threshold
+    ):
+        promoted = _next_removal_tier(tier)
+        if _removal_tier_rank(promoted) > _removal_tier_rank(tier):
+            tier = promoted
+            trigger = f"{trigger}+periodic_exploration"
+
+    if customer_count <= 1:
+        return RemovalSizeSelection(
+            tier,
+            0,
+            0,
+            0,
+            stagnation_iterations,
+            "no_removable_customer",
+            global_best_reset,
+        )
+
+    minimum, maximum = _removal_fraction_bounds(tier, config)
+    upper_customer_bound = customer_count - 1
+    lower_bound = max(1, min(upper_customer_bound, math.ceil(customer_count * minimum)))
+    upper_bound = max(
+        lower_bound,
+        min(upper_customer_bound, math.floor(customer_count * maximum)),
+    )
+    requested = lower_bound
+    return RemovalSizeSelection(
+        tier,
+        requested,
+        lower_bound,
+        upper_bound,
+        stagnation_iterations,
+        trigger,
+        global_best_reset,
+    )
+
+
+def propose_constraint_removal(
+    instance: Instance,
+    sequences: RouteSequences,
+    evaluator: RouteEvaluator,
+    *,
+    operator: ConstraintRemovalOperator | str,
+    selection: RemovalSizeSelection,
+    seed: int = 0,
+    rng: random.Random | None = None,
+    precomputed_routes: Mapping[CustomerSequence, ChargingSubproblemResult] | None = None,
+) -> RemovalProposal:
+    """Rank and remove customers using one explicit constraint signal.
+
+    This public seam only performs the removal.  Repair remains a separate call so
+    the ALNS layer can record the exact repair outcome and vehicle delta.  Every
+    source route is evaluated once unless the caller supplies its already available
+    exact route results; ties are resolved by route index and customer name.
+    """
+
+    selected_operator = ConstraintRemovalOperator(operator)
+    operator_name = selected_operator.value
+    random_source = rng if rng is not None else random.Random(seed)
+    all_customers = [name for sequence in sequences for name in sequence]
+    if len(set(all_customers)) != len(all_customers):
+        raise ValueError("constraint removal requires unique customer coverage")
+    if any(name not in instance.by_name or instance.by_name[name].kind is not NodeType.CUSTOMER
+           for name in all_customers):
+        raise ValueError("constraint removal requires customer-only route sequences")
+    if len(all_customers) <= 1 or selection.requested_count <= 0:
+        event = NeighborhoodEvent(
+            operator_name,
+            "not_applicable",
+            "no_removable_customer",
+            track="constraint_lane",
+            constraint_category=operator_name,
+            removal_tier=selection.tier.value,
+            removal_size_requested=selection.requested_count,
+            removal_size_actual=0,
+            stagnation_iterations=selection.stagnation_iterations,
+            removal_trigger=selection.trigger_reason,
+            reset_observed=selection.reset_observed,
+        )
+        return RemovalProposal(
+            operator_name,
+            None,
+            (),
+            selection,
+            (),
+            (event,),
+        )
+
+    events: list[NeighborhoodEvent] = []
+    scores: list[tuple[str, float, int]] = []
+    before_calls = evaluator.calls
+    anchor: str | None = None
+    if selected_operator is ConstraintRemovalOperator.SHAW_RELATED:
+        anchor = random_source.choice(sorted(all_customers))
+
+    try:
+        for route_index, sequence in enumerate(sequences):
+            used_precomputed = (
+                precomputed_routes is not None and sequence in precomputed_routes
+            )
+            result = (
+                precomputed_routes[sequence]
+                if precomputed_routes is not None and used_precomputed
+                else evaluator.route(sequence)
+            )
+            if not result.feasible:
+                events.append(
+                    NeighborhoodEvent(
+                        operator_name,
+                        "exact_infeasible",
+                        result.failure_reason or "source_route_infeasible",
+                        route_indices=(route_index,),
+                        affected_route_indices=(route_index,),
+                        candidate_route_sequences=(sequence,),
+                        prefilter_passed=True,
+                        exact_route_evaluations=0 if used_precomputed else 1,
+                        track="constraint_lane",
+                        constraint_category=operator_name,
+                        removal_tier=selection.tier.value,
+                        removal_size_requested=selection.requested_count,
+                        stagnation_iterations=selection.stagnation_iterations,
+                        removal_trigger=selection.trigger_reason,
+                        reset_observed=selection.reset_observed,
+                    )
+                )
+                continue
+            route_scores = _constraint_route_scores(
+                instance,
+                sequence,
+                result,
+                selected_operator,
+                anchor=anchor,
+            )
+            scores.extend(
+                (name, score, route_index) for name, score in route_scores.items()
+            )
+    except RouteEvaluationDeadlineExceeded:
+        events.append(
+            NeighborhoodEvent(
+                operator_name,
+                "time_limit",
+                "time_limit_reached_during_constraint_ranking",
+                prefilter_passed=True,
+                exact_route_evaluations=evaluator.calls - before_calls,
+                track="constraint_lane",
+                constraint_category=operator_name,
+                # This is a probe-not-started event, not a dynamic removal
+                # event.  Keep it outside the configured count gate while
+                # retaining the selected tier/count in the reason.
+                removal_trigger=(
+                    "probe_not_started:"
+                    f"tier={selection.tier.value};"
+                    f"requested={selection.requested_count};"
+                    f"{selection.trigger_reason}"
+                ),
+                reset_observed=selection.reset_observed,
+            )
+        )
+        return RemovalProposal(operator_name, None, (), selection, (), tuple(events))
+
+    exact_evaluations = evaluator.calls - before_calls
+    if not scores:
+        if not events:
+            events.append(
+                NeighborhoodEvent(
+                    operator_name,
+                    "failed",
+                    "no_rankable_customer",
+                    track="constraint_lane",
+                    constraint_category=operator_name,
+                    removal_tier=selection.tier.value,
+                    removal_size_requested=selection.requested_count,
+                    stagnation_iterations=selection.stagnation_iterations,
+                    removal_trigger=selection.trigger_reason,
+                    reset_observed=selection.reset_observed,
+                )
+            )
+        return RemovalProposal(operator_name, None, (), selection, (), tuple(events))
+
+    if selected_operator is ConstraintRemovalOperator.SHAW_RELATED:
+        ordered = sorted(scores, key=lambda item: (item[1], item[2], item[0]))
+    else:
+        ordered = sorted(scores, key=lambda item: (-item[1], item[2], item[0]))
+    actual_count = min(selection.requested_count, len(ordered), len(all_customers) - 1)
+    chosen = tuple(item[0] for item in ordered[:actual_count])
+    chosen_set = set(chosen)
+    partial = tuple(
+        tuple(name for name in sequence if name not in chosen_set)
+        for sequence in sequences
+    )
+    partial = tuple(sequence for sequence in partial if sequence)
+    affected = tuple(
+        index
+        for index, sequence in enumerate(sequences)
+        if any(name in chosen_set for name in sequence)
+    )
+    score_map = {name: score for name, score, _ in scores}
+    events.append(
+        NeighborhoodEvent(
+            operator_name,
+            "candidate_proposed",
+            "constraint_ranked_removal",
+            route_indices=affected,
+            affected_route_indices=affected,
+            removed_customers=chosen,
+            candidate_route_sequences=partial,
+            candidate_feasible=False,
+            prefilter_passed=True,
+            exact_route_evaluations=exact_evaluations,
+            selection_rank=1,
+            track="constraint_lane",
+            constraint_category=operator_name,
+            removal_tier=selection.tier.value,
+            removal_size_requested=selection.requested_count,
+            removal_size_actual=actual_count,
+            stagnation_iterations=selection.stagnation_iterations,
+            removal_trigger=selection.trigger_reason,
+            reset_observed=selection.reset_observed,
+            ranking_score=score_map[chosen[0]] if chosen else 0.0,
+        )
+    )
+    return RemovalProposal(
+        operator_name,
+        partial,
+        chosen,
+        selection,
+        tuple((name, score) for name, score, _ in ordered),
+        tuple(events),
+    )
+
+
+def _next_removal_tier(tier: RemovalTier) -> RemovalTier:
+    if tier is RemovalTier.SMALL:
+        return RemovalTier.MEDIUM
+    if tier is RemovalTier.MEDIUM:
+        return RemovalTier.LARGE
+    return RemovalTier.LARGE
+
+
+def _removal_tier_rank(tier: RemovalTier) -> int:
+    return {
+        RemovalTier.SMALL: 0,
+        RemovalTier.MEDIUM: 1,
+        RemovalTier.LARGE: 2,
+    }[tier]
+
+
+def _removal_fraction_bounds(
+    tier: RemovalTier,
+    config: VehicleOperatorConfig,
+) -> tuple[float, float]:
+    if tier is RemovalTier.SMALL:
+        return config.small_removal_min_fraction, config.small_removal_max_fraction
+    if tier is RemovalTier.MEDIUM:
+        return config.medium_removal_min_fraction, config.medium_removal_max_fraction
+    return config.large_removal_min_fraction, config.large_removal_max_fraction
+
+
+def _constraint_route_scores(
+    instance: Instance,
+    sequence: CustomerSequence,
+    result: ChargingSubproblemResult,
+    operator: ConstraintRemovalOperator,
+    *,
+    anchor: str | None,
+) -> dict[str, float]:
+    if operator is ConstraintRemovalOperator.STATION_PRESSURE:
+        return _station_pressure_scores(instance, sequence, result)
+    if operator is ConstraintRemovalOperator.TIME_WINDOW_CONFLICT:
+        return _time_window_conflict_scores(instance, result)
+    if operator is ConstraintRemovalOperator.WORST_ENERGY_DETOUR:
+        return _worst_energy_detour_scores(instance, result)
+    if anchor is None:
+        raise ValueError("Shaw-related removal requires a seeded anchor")
+    return _shaw_related_scores(instance, sequence, anchor)
+
+
+def _station_pressure_scores(
+    instance: Instance,
+    sequence: CustomerSequence,
+    result: ChargingSubproblemResult,
+) -> dict[str, float]:
+    path = result.route
+    customer_positions = [
+        (position, name)
+        for position, name in enumerate(path)
+        if instance.by_name[name].kind is NodeType.CUSTOMER
+    ]
+    station_count = sum(
+        instance.by_name[name].kind is NodeType.STATION for name in path
+    )
+    route_pressure = (
+        2.0 * station_count
+        + result.charged_energy
+        + 10.0 * result.charging_time
+    )
+    output: dict[str, float] = {}
+    for index, (_position, customer) in enumerate(customer_positions):
+        left = customer_positions[index - 1][0] if index else 0
+        right = (
+            customer_positions[index + 1][0]
+            if index + 1 < len(customer_positions)
+            else len(path) - 1
+        )
+        local_path = path[left : right + 1]
+        local_distance = _path_distance(instance, local_path)
+        direct_distance = instance.by_name[path[left]].distance_to(instance.by_name[path[right]])
+        local_stations = sum(
+            instance.by_name[name].kind is NodeType.STATION for name in local_path
+        )
+        output[customer] = (
+            local_distance - direct_distance
+            + 2.0 * local_stations
+            + route_pressure / max(1, len(customer_positions))
+        )
+    return output
+
+
+def _time_window_conflict_scores(
+    instance: Instance,
+    result: ChargingSubproblemResult,
+) -> dict[str, float]:
+    path = result.route
+    current_time = max(0.0, instance.depot.ready_time)
+    battery = instance.vehicle.battery_capacity
+    scores: dict[str, float] = {}
+    for origin_name, destination_name in zip(path, path[1:], strict=False):
+        origin = instance.by_name[origin_name]
+        destination = instance.by_name[destination_name]
+        distance = origin.distance_to(destination)
+        battery -= distance * instance.vehicle.consumption_rate
+        current_time += distance / instance.vehicle.average_velocity
+        current_time = max(current_time, destination.ready_time)
+        if destination.kind is NodeType.STATION:
+            charged = instance.vehicle.battery_capacity - max(0.0, battery)
+            current_time += charged * instance.vehicle.inverse_refueling_rate
+            battery = instance.vehicle.battery_capacity
+        elif destination.kind is NodeType.CUSTOMER:
+            scores[destination_name] = destination.due_date - current_time
+            current_time += destination.service_time
+    return {name: -slack for name, slack in scores.items()}
+
+
+def _worst_energy_detour_scores(
+    instance: Instance,
+    result: ChargingSubproblemResult,
+) -> dict[str, float]:
+    path = result.route
+    customer_positions = [
+        (position, name)
+        for position, name in enumerate(path)
+        if instance.by_name[name].kind is NodeType.CUSTOMER
+    ]
+    output: dict[str, float] = {}
+    for index, (_position, customer) in enumerate(customer_positions):
+        left = customer_positions[index - 1][0] if index else 0
+        right = (
+            customer_positions[index + 1][0]
+            if index + 1 < len(customer_positions)
+            else len(path) - 1
+        )
+        actual = _path_distance(instance, path[left : right + 1])
+        direct = instance.by_name[path[left]].distance_to(instance.by_name[path[right]])
+        output[customer] = actual - direct
+    return output
+
+
+def _shaw_related_scores(
+    instance: Instance,
+    sequence: CustomerSequence,
+    anchor: str,
+) -> dict[str, float]:
+    anchor_node = instance.by_name[anchor]
+    max_distance = max(
+        (anchor_node.distance_to(node) for node in instance.customers),
+        default=1.0,
+    )
+    max_time = max((node.due_date for node in instance.customers), default=1.0)
+    max_demand = max((node.demand for node in instance.customers), default=1.0)
+    output: dict[str, float] = {}
+    for name in sequence:
+        node = instance.by_name[name]
+        distance = anchor_node.distance_to(node) / max(max_distance, _EPSILON)
+        time_difference = (
+            abs(anchor_node.ready_time - node.ready_time)
+            + abs(anchor_node.due_date - node.due_date)
+        ) / max(max_time, _EPSILON)
+        demand_difference = abs(anchor_node.demand - node.demand) / max(max_demand, _EPSILON)
+        energy_penalty = 0.0
+        if not _energy_reachable_optimistically(instance, anchor, name):
+            energy_penalty = 1.0
+        output[name] = distance + 0.25 * time_difference + 0.25 * demand_difference + energy_penalty
+    return output
+
+
+def _path_distance(instance: Instance, path: tuple[str, ...]) -> float:
+    return sum(
+        instance.by_name[left].distance_to(instance.by_name[right])
+        for left, right in zip(path, path[1:], strict=False)
+    )
+
+
 def repair_vehicle_count_aware(
     partial: RouteSequences,
     removed: tuple[str, ...],
@@ -227,6 +794,137 @@ def repair_vehicle_count_aware(
         strict.exact_route_evaluations + fallback.exact_route_evaluations,
         fallback.failure_reason,
     )
+
+
+def repair_vehicle_reduction_refinement(
+    partial: RouteSequences,
+    removed: tuple[str, ...],
+    evaluator: RouteEvaluator,
+    instance: Instance,
+    *,
+    budget: int,
+) -> RepairResult:
+    """Regret-repair a reduced-fleet candidate without creating a route.
+
+    This bounded intensification is used only after a legacy-lane move has
+    reduced the vehicle count.  It deliberately keeps the existing route set,
+    uses the exact route evaluator only after safe screening, and uses explicit
+    deterministic tie-breaks so a late wall-clock timeout cannot change the
+    insertion ordering silently.
+    """
+
+    if budget <= 0:
+        raise ValueError("budget must be positive")
+    sequences = list(partial)
+    pending = list(removed)
+    before_calls = evaluator.calls
+    try:
+        while pending:
+            options_by_customer = {
+                customer: _regret_insertion_options(
+                    sequences,
+                    customer,
+                    evaluator,
+                    instance,
+                    before_calls=before_calls,
+                    budget=budget,
+                )
+                for customer in pending
+            }
+            feasible_customers = [
+                customer
+                for customer, options in options_by_customer.items()
+                if options
+            ]
+            if not feasible_customers:
+                return RepairResult(
+                    None,
+                    0,
+                    evaluator.calls - before_calls,
+                    "no_existing_route_insertion",
+                )
+
+            customer = max(
+                feasible_customers,
+                key=lambda item: (
+                    (
+                        float("inf")
+                        if len(options_by_customer[item]) < 2
+                        else options_by_customer[item][1][0]
+                        - options_by_customer[item][0][0]
+                    ),
+                    item,
+                ),
+            )
+            _delta, route_index, _position, sequence = options_by_customer[customer][0]
+            sequences[route_index] = sequence
+            pending.remove(customer)
+    except _EvaluationBudgetExceeded:
+        return RepairResult(
+            None,
+            0,
+            evaluator.calls - before_calls,
+            "evaluation_budget_exhausted",
+        )
+    return RepairResult(
+        tuple(sequences),
+        0,
+        evaluator.calls - before_calls,
+        "",
+    )
+
+
+def repair_constraint_removal(
+    original: RouteSequences,
+    partial: RouteSequences,
+    removed: tuple[str, ...],
+    evaluator: RouteEvaluator,
+    instance: Instance,
+    *,
+    budget: int = 16,
+) -> RepairResult:
+    """Repair a constraint probe into existing routes under an exact budget.
+
+    The repair is deliberately bounded and deterministic: it restores every removed
+    customer by trying capacity/time-window/energy-screened insertions into the
+    existing routes, then exact-evaluates only the changed route.  It never creates
+    a route and never silently falls back to the original solution.
+    """
+
+    if budget <= 0:
+        raise ValueError("budget must be positive")
+    partial_customers = [name for sequence in partial for name in sequence]
+    original_customers = [name for sequence in original for name in sequence]
+    if (
+        len(set(original_customers)) != len(original_customers)
+        or len(set(removed)) != len(removed)
+        or sorted((*partial_customers, *removed)) != sorted(original_customers)
+    ):
+        return RepairResult(None, 0, 0, "constraint_removal_customer_coverage")
+
+    result = _repair_pass(
+        partial,
+        removed,
+        evaluator,
+        instance,
+        allow_new_routes=False,
+        budget=budget,
+    )
+    if result.sequences is None and result.failure_reason == "no_existing_route_insertion":
+        return RepairResult(
+            None,
+            0,
+            result.exact_route_evaluations,
+            "constraint_removal_no_existing_route_insertion",
+        )
+    if result.sequences == original:
+        return RepairResult(
+            None,
+            0,
+            result.exact_route_evaluations,
+            "constraint_removal_no_change",
+        )
+    return result
 
 
 def propose_route_elimination(
@@ -362,7 +1060,9 @@ def propose_route_merge(
     profiles: list[_RouteProfile] = []
     events: list[NeighborhoodEvent] = []
     for index, sequence in enumerate(sequences):
+        before_calls = evaluator.calls
         result = evaluator.route(sequence)
+        exact_delta = evaluator.calls - before_calls
         if not result.feasible:
             events.append(
                 NeighborhoodEvent(
@@ -370,7 +1070,7 @@ def propose_route_merge(
                     "failed",
                     "source_route_infeasible",
                     route_indices=(index,),
-                    exact_route_evaluations=1,
+                    exact_route_evaluations=exact_delta,
                 )
             )
             continue
@@ -429,7 +1129,11 @@ def propose_route_merge(
                         )
                     )
                     continue
-                if exact_evaluations >= config.route_merge_exact_evaluation_budget:
+                requires_exact_evaluation = not _is_cached_route(evaluator, merged)
+                if (
+                    requires_exact_evaluation
+                    and exact_evaluations >= config.route_merge_exact_evaluation_budget
+                ):
                     events.append(
                         NeighborhoodEvent(
                             "route_merge",
@@ -444,7 +1148,8 @@ def propose_route_merge(
                     break
                 before_calls = evaluator.calls
                 result = evaluator.route(merged)
-                exact_evaluations += max(1, evaluator.calls - before_calls)
+                exact_delta = evaluator.calls - before_calls
+                exact_evaluations += exact_delta
                 if not result.feasible:
                     events.append(
                         NeighborhoodEvent(
@@ -454,7 +1159,7 @@ def propose_route_merge(
                             route_indices=(left.index, right.index),
                             candidate_customer_sequence=merged,
                             prefilter_passed=True,
-                            exact_route_evaluations=1,
+                            exact_route_evaluations=exact_delta,
                         )
                     )
                     continue
@@ -471,7 +1176,7 @@ def propose_route_merge(
                         candidate_customer_sequence=merged,
                         candidate_feasible=True,
                         prefilter_passed=True,
-                        exact_route_evaluations=1,
+                        exact_route_evaluations=exact_delta,
                     )
                 )
             if exact_evaluations >= config.route_merge_exact_evaluation_budget:
@@ -496,7 +1201,9 @@ def propose_route_merge(
             candidate_vehicle_delta=-1,
             candidate_feasible=True,
             prefilter_passed=True,
-            exact_route_evaluations=exact_evaluations,
+            # Exact calls belong to the individual feasible/infeasible probe
+            # events above; the final proposal only selects the best one.
+            exact_route_evaluations=0,
         )
     )
     return MoveProposal("route_merge", tuple(new_sequences), tuple(events))
@@ -524,6 +1231,7 @@ def propose_relocate(
     evaluator: RouteEvaluator,
     *,
     config: VehicleOperatorConfig = _DEFAULT_VEHICLE_OPERATOR_CONFIG,
+    precomputed_routes: Mapping[CustomerSequence, ChargingSubproblemResult] | None = None,
 ) -> MoveProposal:
     """Move one customer between two existing routes without changing fleet size."""
 
@@ -540,6 +1248,7 @@ def propose_relocate(
         evaluator,
         _relocate_candidates(sequences),
         budget=config.relocate_exact_evaluation_budget,
+        precomputed_routes=precomputed_routes,
     )
 
 
@@ -549,6 +1258,7 @@ def propose_swap(
     evaluator: RouteEvaluator,
     *,
     config: VehicleOperatorConfig = _DEFAULT_VEHICLE_OPERATOR_CONFIG,
+    precomputed_routes: Mapping[CustomerSequence, ChargingSubproblemResult] | None = None,
 ) -> MoveProposal:
     """Exchange one customer from each of two existing routes."""
 
@@ -565,6 +1275,7 @@ def propose_swap(
         evaluator,
         _swap_candidates(sequences),
         budget=config.swap_exact_evaluation_budget,
+        precomputed_routes=precomputed_routes,
     )
 
 
@@ -574,6 +1285,7 @@ def propose_two_opt_star(
     evaluator: RouteEvaluator,
     *,
     config: VehicleOperatorConfig = _DEFAULT_VEHICLE_OPERATOR_CONFIG,
+    precomputed_routes: Mapping[CustomerSequence, ChargingSubproblemResult] | None = None,
 ) -> MoveProposal:
     """Exchange tails of two routes at customer-to-customer cut points."""
 
@@ -590,6 +1302,7 @@ def propose_two_opt_star(
         evaluator,
         _two_opt_star_candidates(sequences),
         budget=config.two_opt_star_exact_evaluation_budget,
+        precomputed_routes=precomputed_routes,
     )
 
 
@@ -684,6 +1397,25 @@ def propose_route_segment_destroy(
                     )
                     if before != after
                 )
+                if not affected:
+                    events.append(
+                        NeighborhoodEvent(
+                            operator,
+                            "failed",
+                            "route_segment_no_change",
+                            route_indices=(source_index,),
+                            affected_route_indices=(),
+                            removed_customers=segment,
+                            candidate_vehicle_delta=0,
+                            candidate_feasible=False,
+                            prefilter_passed=True,
+                            new_routes_created=repair.new_routes_created,
+                            exact_route_evaluations=repair.exact_route_evaluations,
+                            segment_length=segment_length,
+                            selection_rank=considered,
+                        )
+                    )
+                    continue
                 events.append(
                     NeighborhoodEvent(
                         operator,
@@ -721,6 +1453,7 @@ def propose_ejection_chain(
     evaluator: RouteEvaluator,
     *,
     config: VehicleOperatorConfig = _DEFAULT_VEHICLE_OPERATOR_CONFIG,
+    precomputed_routes: Mapping[CustomerSequence, ChargingSubproblemResult] | None = None,
 ) -> MoveProposal:
     """Search bounded relocate/ejection chains over existing routes.
 
@@ -743,6 +1476,11 @@ def propose_ejection_chain(
 
     events: list[NeighborhoodEvent] = []
     exact_used = 0
+    base_results = _base_route_results(
+        evaluator,
+        sequences,
+        precomputed_routes=precomputed_routes,
+    )
     considered = 0
     candidate_limit = max(16, config.ejection_chain_exact_evaluation_budget * 4)
     best: tuple[SolutionObjective, RouteSequences, int, tuple[int, ...]] | None = None
@@ -805,6 +1543,7 @@ def propose_ejection_chain(
                         instance,
                         evaluator,
                         changes,
+                        base_results=base_results,
                         exact_used=exact_used,
                         budget=config.ejection_chain_exact_evaluation_budget,
                         budget_reason="ejection_chain_exact_evaluation_budget",
@@ -905,9 +1644,15 @@ def _search_changed_candidates(
     candidates: Iterable[_CandidateDescription],
     *,
     budget: int,
+    precomputed_routes: Mapping[CustomerSequence, ChargingSubproblemResult] | None = None,
 ) -> MoveProposal:
     events: list[NeighborhoodEvent] = []
     exact_used = 0
+    base_results = _base_route_results(
+        evaluator,
+        sequences,
+        precomputed_routes=precomputed_routes,
+    )
     candidate_limit = max(16, budget * 4)
     best: tuple[SolutionObjective, RouteSequences, _CandidateDescription] | None = None
     for rank, description in enumerate(candidates, start=1):
@@ -924,6 +1669,7 @@ def _search_changed_candidates(
             instance,
             evaluator,
             description.changes,
+            base_results=base_results,
             exact_used=exact_used,
             budget=budget,
             budget_reason=f"{operator}_exact_evaluation_budget",
@@ -1029,6 +1775,7 @@ def _evaluate_changed_candidate(
     evaluator: RouteEvaluator,
     changes: tuple[tuple[int, CustomerSequence], ...],
     *,
+    base_results: tuple[ChargingSubproblemResult, ...],
     exact_used: int,
     budget: int,
     budget_reason: str,
@@ -1041,7 +1788,9 @@ def _evaluate_changed_candidate(
         screen = screen_route_candidate(instance, sequence)
         if not screen.accepted:
             return _CandidateEvaluation(None, screen.reason, False, 0)
-    required = len(changes)
+    required = sum(
+        not _is_cached_route(evaluator, sequence) for _, sequence in changes
+    )
     if exact_used + required > budget:
         return _CandidateEvaluation(
             None,
@@ -1049,7 +1798,12 @@ def _evaluate_changed_candidate(
             True,
             0,
         )
-    results = [evaluator.route(sequence) for _, sequence in changes]
+    results: list[ChargingSubproblemResult] = []
+    exact_evaluations = 0
+    for _, sequence in changes:
+        before_calls = evaluator.calls
+        results.append(evaluator.route(sequence))
+        exact_evaluations += evaluator.calls - before_calls
     if not all(result.feasible for result in results):
         reason = next(
             (
@@ -1058,12 +1812,42 @@ def _evaluate_changed_candidate(
                 if not result.feasible
             ),
         )
-        return _CandidateEvaluation(None, reason, True, required)
+        return _CandidateEvaluation(None, reason, True, exact_evaluations)
+    candidate_results = list(base_results)
+    for (index, _), result in zip(changes, results, strict=True):
+        candidate_results[index] = result
     objective = sum(
-        (_route_objective(instance, result) for result in results),
+        (_route_objective(instance, result) for result in candidate_results),
         start=SolutionObjective.zero(),
     )
-    return _CandidateEvaluation(objective, "exact_charging_feasible", True, required)
+    return _CandidateEvaluation(
+        objective,
+        "exact_charging_feasible",
+        True,
+        exact_evaluations,
+    )
+
+
+def _is_cached_route(
+    evaluator: RouteEvaluator,
+    sequence: CustomerSequence,
+) -> bool:
+    cache = getattr(evaluator, "cache", None)
+    return isinstance(cache, Mapping) and sequence in cache
+
+
+def _base_route_results(
+    evaluator: RouteEvaluator,
+    sequences: RouteSequences,
+    *,
+    precomputed_routes: Mapping[CustomerSequence, ChargingSubproblemResult] | None = None,
+) -> tuple[ChargingSubproblemResult, ...]:
+    return tuple(
+        precomputed_routes[sequence]
+        if precomputed_routes is not None and sequence in precomputed_routes
+        else evaluator.route(sequence)
+        for sequence in sequences
+    )
 
 
 def _candidate_event(
@@ -1267,6 +2051,45 @@ def _insertion_options(
             option.sequence,
         ),
     )
+
+
+def _regret_insertion_options(
+    sequences: list[CustomerSequence],
+    customer: str,
+    evaluator: RouteEvaluator,
+    instance: Instance,
+    *,
+    before_calls: int,
+    budget: int,
+) -> list[tuple[float, int, int, CustomerSequence]]:
+    options: list[tuple[float, int, int, CustomerSequence]] = []
+    for route_index, base in enumerate(sequences):
+        base_demand = sum(instance.by_name[name].demand for name in base)
+        if (
+            base_demand + instance.by_name[customer].demand
+            > instance.vehicle.load_capacity + _EPSILON
+        ):
+            continue
+        if evaluator.calls - before_calls >= budget:
+            raise _EvaluationBudgetExceeded
+        old_distance = evaluator.route(base).distance if base else 0.0
+        for position in range(len(base) + 1):
+            if evaluator.calls - before_calls >= budget:
+                raise _EvaluationBudgetExceeded
+            candidate = (*base[:position], customer, *base[position:])
+            if not screen_route_candidate(instance, candidate).accepted:
+                continue
+            result = evaluator.route(candidate)
+            if result.feasible:
+                options.append(
+                    (
+                        result.distance - old_distance,
+                        route_index,
+                        position,
+                        candidate,
+                    )
+                )
+    return sorted(options, key=lambda option: (option[0], option[1], option[2], option[3]))
 
 
 def _customer_priority(customer: str, options: list[_InsertionOption]) -> tuple[float, float, str]:

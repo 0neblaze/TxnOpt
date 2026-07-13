@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from evrptw.alns import solve_alns
+from evrptw.alns import _annotated_event_record, _EvaluatedSolution, solve_alns
 from evrptw.models import Instance, Node, NodeType, Vehicle
+from evrptw.neighborhoods import NeighborhoodEvent
 from evrptw.objective import SolutionObjective
 from evrptw.validation import validate_routes
 
@@ -37,7 +38,7 @@ def test_alns_returns_reproducible_unified_validator_feasible_solution() -> None
         "energy",
         "vehicle_count_aware",
     }
-    assert set(first.neighborhood_statistics) == {
+    assert set(first.neighborhood_statistics) >= {
         "standard",
         "vehicle_count_aware_repair",
         "route_elimination",
@@ -47,6 +48,10 @@ def test_alns_returns_reproducible_unified_validator_feasible_solution() -> None
         "two_opt_star",
         "route_segment_destroy",
         "ejection_chain",
+        "station_pressure",
+        "time_window_conflict",
+        "worst_energy_detour",
+        "shaw_related",
     }
     assert first.neighborhood_events
     assert all(
@@ -59,6 +64,47 @@ def test_alns_returns_reproducible_unified_validator_feasible_solution() -> None
     assert first.objective is not None
     assert first.objective.key == SolutionObjective.from_report(instance, report).key
     assert first.objective_value == first.objective.total_distance
+
+
+def test_only_selected_feasible_probe_is_marked_accepted() -> None:
+    candidate = _EvaluatedSolution(
+        (),
+        (),
+        True,
+        SolutionObjective(1, 10.0, 0.0, 0),
+    )
+    probe = NeighborhoodEvent(
+        "relocate",
+        "feasible_candidate",
+        "probe",
+        candidate_feasible=True,
+    )
+    selected = NeighborhoodEvent(
+        "relocate",
+        "candidate_proposed",
+        "selected",
+        candidate_feasible=True,
+    )
+
+    probe_record = _annotated_event_record(
+        probe,
+        iteration=1,
+        accepted=True,
+        vehicle_reduction=False,
+        distance_improvement=True,
+        candidate=candidate,
+    )
+    selected_record = _annotated_event_record(
+        selected,
+        iteration=1,
+        accepted=True,
+        vehicle_reduction=False,
+        distance_improvement=True,
+        candidate=candidate,
+    )
+
+    assert probe_record["accepted"] is False
+    assert selected_record["accepted"] is True
 
 
 def test_alns_baseline_profile_preserves_historical_operator_surface() -> None:
@@ -93,3 +139,44 @@ def test_alns_stage02_route_reduction_profile_remains_explicitly_reproducible() 
         "route_elimination",
         "route_merge",
     }
+
+
+def test_alns_stage02_constraint_guided_profile_records_constraint_lane_and_cache_metrics() -> None:
+    result = solve_alns(
+        _instance(),
+        seed=2014,
+        max_iterations=20,
+        time_limit_seconds=1.0,
+        operator_profile="stage02_constraint_guided",
+    )
+
+    assert result.feasible is True
+    assert result.operator_profile == "stage02_constraint_guided"
+    assert set(result.constraint_operator_statistics) == {
+        "station_pressure",
+        "time_window_conflict",
+        "worst_energy_detour",
+        "shaw_related",
+    }
+    assert result.cache_hits >= 0
+    assert result.cache_misses == result.unique_route_evaluations
+    assert 0 <= result.effective_iterations <= result.iterations
+    assert set(result.removal_tier_counts) >= {"small", "medium"}
+    assert result.maximum_stagnation >= 0
+    constraint_events = [
+        event
+        for event in result.neighborhood_events
+        if event.get("track") == "constraint_lane"
+    ]
+    assert constraint_events
+    assert {
+        "station_pressure",
+        "time_window_conflict",
+        "worst_energy_detour",
+        "shaw_related",
+    } <= {str(event["operator"]) for event in constraint_events}
+    assert all(
+        int(event["removal_size_actual"]) <= int(event["removal_size_requested"])
+        for event in constraint_events
+        if int(event["removal_size_requested"])
+    )

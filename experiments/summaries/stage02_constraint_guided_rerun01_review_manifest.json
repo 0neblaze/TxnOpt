@@ -1,0 +1,79 @@
+{
+  "candidate_environment": {
+    "algorithm": "ALNS_STAGE02_CONSTRAINT_GUIDED",
+    "algorithm_source_files": {
+      "src/evrptw/alns.py": "4abf69299db9287d185a5cb55e5c22b16513a07c5698ca040f795e5fe438d193",
+      "src/evrptw/charging.py": "336ee45c81e2b786f2fc7963955286beaa17b042b88a04d4abc88ff9074af5d5",
+      "src/evrptw/experiments/stage02_constraint_guided.py": "0c0b9feee6e418e93fbc95de955cfd9f66c9ca4ccb6bdcb24fc0c0978927862f",
+      "src/evrptw/experiments/stage02_route_quality.py": "4fffe85837d3d15762bc3a6f145b9826a6d440d6c408ecd8f748ca98e7d212b5",
+      "src/evrptw/experiments/stage02_route_reduction.py": "400512d9dd22e8a8746d4fce45205262471c63267a8054d8718bbe64fedc3ae0",
+      "src/evrptw/neighborhoods.py": "7f45eb076a5aa67d1e1861f3572f2e7de6e04faac6ca755c37db5046e8814c53",
+      "src/evrptw/objective.py": "52f9688d32f6ed0bc3c892f3964b8c15c09b8be9b653a477583243558e1380db",
+      "src/evrptw/validation.py": "531c50f99059f18a8ed500940320a1c5c30af1ce290597f4a282acd34c128c26"
+    },
+    "algorithm_source_sha256": "50d601368c579c3ef24d83d9beeb19da67fc0ca55ab3ab95197bebd3e1a8e7dc",
+    "baseline_directory": "/Users/guoyiyang/Documents/GitHub/FURP-2026-Yiyang-GUO-EVRP-TW/experiments/baselines/stage00",
+    "baseline_manifest_sha256": "b226b97e0e67288aaaf85726ad855df71cb81406685c57c8e8c40cd8996aa0da",
+    "benchmark_directory": "/Users/guoyiyang/Documents/GitHub/FURP-2026-Yiyang-GUO-EVRP-TW/data/schneider",
+    "captured_environment": {
+      "captured_at": "2026-07-13T08:41:15.338939+00:00",
+      "native_extension": "/Users/guoyiyang/Documents/GitHub/FURP-2026-Yiyang-GUO-EVRP-TW/.venv/lib/python3.13/site-packages/evrptw/_core.cpython-313-darwin.so",
+      "packages": {
+        "cplex": "22.2.0.0",
+        "docplex": "2.32.264",
+        "gurobipy": "13.0.2",
+        "highspy": "1.14.0",
+        "jupyterlab": "4.5.8",
+        "matplotlib": "3.11.0",
+        "networkx": "3.6.1",
+        "numba": "0.65.1",
+        "numpy": "2.4.6",
+        "ortools": "9.15.6755",
+        "pandas": "3.0.3",
+        "pybind11": "3.0.4",
+        "scipy": "1.17.1",
+        "seaborn": "0.13.2"
+      },
+      "python": {
+        "executable": "/Users/guoyiyang/Documents/GitHub/FURP-2026-Yiyang-GUO-EVRP-TW/.venv/bin/python3",
+        "implementation": "CPython",
+        "version": "3.13.13"
+      },
+      "system": {
+        "cpu_count": 10,
+        "gpu_used": false,
+        "machine": "arm64",
+        "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+        "processor": "arm"
+      },
+      "tools": {
+        "clang": "Apple clang version 17.0.0 (clang-1700.6.3.2)",
+        "cmake": "cmake version 4.4.0",
+        "git": "git version 2.54.0",
+        "ninja": "1.13.2",
+        "uv": "uv 0.11.28 (Homebrew 2026-07-07 aarch64-apple-darwin)"
+      }
+    },
+    "configuration_sha256": "39640273bd15eaef6bf45a6496c5d10a768b4a7aaa04687a1b6e77c2cc1c1e16",
+    "experiment_id": "stage02-constraint-guided",
+    "operator_profile": "stage02_constraint_guided",
+    "reference_repository_revision": "e3a890065105f978187e532642c4442522215e02",
+    "repository_dirty": true,
+    "repository_revision": "6870b3125e9170a47246ec7333dbe382b7a0d854",
+    "run_label": "stage02_constraint_guided_rerun01",
+    "schema_version": "1"
+  },
+  "failure_case_count": 20,
+  "files": {
+    "failure_analysis.csv": "949f4aa2a2fd9959bb352c7063f465db7e2d5b454510a516637f77800129d6fb",
+    "review_findings.csv": "c00dfd1d3689fbf758c3ac7b121762ee9cddcd09f59db9561e1c617d9e6bd27a",
+    "review_report.md": "0339e13b65d7244952904a6610ea93b2827b4f70dab718c5ac9d8e116097b79c",
+    "stage03_readiness.csv": "2f849cb49c1cb5bd1ac5d74b842782ef9bbb1cd67f8097183327d9ffb05e8ba7"
+  },
+  "finding_count": 11,
+  "readiness_row_count": 36,
+  "review_label": "stage02_constraint_guided_rerun01",
+  "run_directory": "results/stage02-constraint-guided-rerun01",
+  "schema_version": "1",
+  "status": "READY_FOR_STAGE03"
+}

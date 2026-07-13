@@ -193,6 +193,68 @@ The completed formal evidence is recorded in the [successful gate report](experi
 the [independent rerun gate report](experiments/summaries/stage02_rerun01_gate_report.csv),
 and the [failure-round record](experiments/summaries/stage02_gate_report.csv).
 
+### Stage 2.2 cross-route quality
+
+Stage 2.2 adds `relocate`, `swap`, `two_opt_star`, `route_segment_destroy`, and
+bounded `ejection_chain` proposals behind the `stage02_route_quality` profile.
+The profile keeps the fixed Stage 0 scope and compares against the accepted
+Stage 2.1 per-run results. Its protocol, failure rounds, and independent rerun
+are documented in [the Stage 2.2 protocol](docs/stage02_route_quality.md).
+
+```bash
+uv run python -m evrptw.experiments.stage02_route_quality \
+  --config configs/stage02_route_quality.toml
+```
+
+The accepted Stage 2.2 comparison baseline for the next stage is
+`experiments/summaries/stage02_quality_attempt02_per_run_results.csv`.
+
+### Stage 2.3 constraint-guided search and Stage 3 readiness review
+
+Stage 2.3 is the current `solve_alns()` default profile. It adds deterministic
+constraint-guided removals (`station_pressure`, `time_window_conflict`,
+`worst_energy_detour`, and `shaw_related`) and dynamic removal tiers. The
+formal protocol keeps the 12-instance, three-seed, 30-second, 1000-iteration,
+single-thread scope and does not implement Stage 3 acceleration.
+
+```bash
+uv run pytest
+uv run ruff check .
+uv run mypy
+uv run python -m evrptw.experiments.stage02_constraint_guided \
+  --config configs/stage02_constraint_guided.toml \
+  --output-dir results/stage02-constraint-guided_attempt16 \
+  --run-label stage02_constraint_guided_attempt16
+
+uv run python -m evrptw.experiments.stage02_constraint_guided_review \
+  --run-dir results/stage02-constraint-guided_attempt16 \
+  --comparison-dir results/stage02-quality_attempt02 \
+  --review-label stage02_constraint_guided_attempt16
+
+uv run python -m evrptw.experiments.stage02_constraint_guided \
+  --config configs/stage02_constraint_guided.toml \
+  --output-dir results/stage02-constraint-guided-rerun09 \
+  --run-label stage02_constraint_guided_rerun09 \
+  --repeat-of results/stage02-constraint-guided_attempt16
+
+uv run python -m evrptw.experiments.stage02_constraint_guided_review \
+  --run-dir results/stage02-constraint-guided-rerun09 \
+  --comparison-dir results/stage02-quality_attempt02 \
+  --review-label stage02_constraint_guided_rerun09
+```
+
+The completed Stage 2.3 evidence is recorded in the [attempt16 gate report](experiments/summaries/stage02_constraint_guided_attempt16_gate_report.csv),
+the [independent rerun gate report](experiments/summaries/stage02_constraint_guided_rerun09_gate_report.csv),
+the [attempt16 readiness review](experiments/summaries/stage02_constraint_guided_attempt16_stage03_readiness.csv),
+and the [READY_FOR_STAGE03 rerun review](experiments/summaries/stage02_constraint_guided_rerun09_review_report.md).
+The readiness-only Stage 2.2 instrumentation supplement is tracked separately at
+`experiments/summaries/stage02_quality_attempt02_readiness_metrics.csv`; the formal
+comparison remains the fixed Stage 2.2 per-run table above.
+The first review remains explicitly `PENDING_INDEPENDENT_RERUN`; the independent rerun
+review is `READY_FOR_STAGE03`. Attempts 08, 09, and 10 retain their objective or
+operator-coverage failures, and all earlier failed or superseded rounds remain preserved
+under distinct attempt and rerun labels.
+
 ---
 
 ## Repository structure

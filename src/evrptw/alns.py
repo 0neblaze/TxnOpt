@@ -8,10 +8,15 @@ from dataclasses import asdict, dataclass, field, replace
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
 from evrptw.models import Instance, Node
 from evrptw.neighborhoods import (
+    ConstraintRemovalOperator,
     NeighborhoodEvent,
     OperatorProfile,
+    RemovalSizeSelection,
+    RemovalTier,
+    RouteEvaluationDeadlineExceeded,
     RouteSequences,
     VehicleOperatorConfig,
+    propose_constraint_removal,
     propose_ejection_chain,
     propose_relocate,
     propose_route_elimination,
@@ -19,7 +24,10 @@ from evrptw.neighborhoods import (
     propose_route_segment_destroy,
     propose_swap,
     propose_two_opt_star,
+    repair_constraint_removal,
     repair_vehicle_count_aware,
+    repair_vehicle_reduction_refinement,
+    select_dynamic_removal_size,
 )
 from evrptw.objective import (
     ObjectiveComparison,
@@ -38,6 +46,13 @@ _QUALITY_NEIGHBORHOOD_ORDER = (
     "ejection_chain",
 )
 _QUALITY_NEIGHBORHOODS = frozenset(_QUALITY_NEIGHBORHOOD_ORDER)
+_CONSTRAINT_REMOVAL_ORDER = (
+    ConstraintRemovalOperator.STATION_PRESSURE.value,
+    ConstraintRemovalOperator.TIME_WINDOW_CONFLICT.value,
+    ConstraintRemovalOperator.WORST_ENERGY_DETOUR.value,
+    ConstraintRemovalOperator.SHAW_RELATED.value,
+)
+_CONSTRAINT_REMOVAL_NEIGHBORHOODS = frozenset(_CONSTRAINT_REMOVAL_ORDER)
 
 
 @dataclass(slots=True)
@@ -90,6 +105,13 @@ class ALNSResult:
     neighborhood_statistics: dict[str, dict[str, object]]
     neighborhood_events: tuple[dict[str, object], ...]
     failure_reason: str
+    cache_hits: int = 0
+    cache_misses: int = 0
+    unique_route_evaluations: int = 0
+    effective_iterations: int = 0
+    removal_tier_counts: dict[str, int] = field(default_factory=dict)
+    maximum_stagnation: int = 0
+    constraint_operator_statistics: dict[str, dict[str, object]] = field(default_factory=dict)
 
     @property
     def objective_value(self) -> float:
@@ -110,25 +132,46 @@ class _Evaluator:
         self.deadline = deadline
         self.cache: dict[tuple[str, ...], ChargingSubproblemResult] = {}
         self.calls = 0
+        self.cache_hits = 0
         self.runtime = 0.0
         self.labels_generated = 0
         self.labels_pruned = 0
 
     def route(self, sequence: tuple[str, ...]) -> ChargingSubproblemResult:
-        if sequence not in self.cache:
-            if time.perf_counter() >= self.deadline:
-                raise _TimeLimitReached
-            result = solve_exact_charging(self.instance, sequence)
-            self.cache[sequence] = result
-            self.calls += 1
-            self.runtime += result.runtime_seconds
-            self.labels_generated += result.labels_generated
-            self.labels_pruned += result.labels_pruned
-        return self.cache[sequence]
+        # Check the deadline before cache lookup as well.  A cache hit is still
+        # work performed by this lane and must not let a lane continue after its
+        # declared wall-clock boundary.
+        if time.perf_counter() >= self.deadline:
+            raise _TimeLimitReached(sequence)
+        if sequence in self.cache:
+            self.cache_hits += 1
+            return self.cache[sequence]
+        result = solve_exact_charging(self.instance, sequence)
+        self.cache[sequence] = result
+        self.calls += 1
+        self.runtime += result.runtime_seconds
+        self.labels_generated += result.labels_generated
+        self.labels_pruned += result.labels_pruned
+        # The exact solver is currently cooperative rather than interruptible.
+        # Preserve the completed call in the counters, then stop before its
+        # result can enter a candidate after the lane deadline.
+        if time.perf_counter() >= self.deadline:
+            raise _TimeLimitReached(sequence, exact_route_evaluations=1)
+        return result
 
-    def solution(self, sequences: tuple[tuple[str, ...], ...]) -> _EvaluatedSolution:
+    def solution(
+        self,
+        sequences: tuple[tuple[str, ...], ...],
+        *,
+        precomputed_routes: dict[tuple[str, ...], ChargingSubproblemResult] | None = None,
+    ) -> _EvaluatedSolution:
         clean = tuple(sequence for sequence in sequences if sequence)
-        charging = tuple(self.route(sequence) for sequence in clean)
+        charging = tuple(
+            precomputed_routes[sequence]
+            if precomputed_routes is not None and sequence in precomputed_routes
+            else self.route(sequence)
+            for sequence in clean
+        )
         feasible = bool(clean) and all(result.feasible for result in charging)
         if not feasible:
             return _EvaluatedSolution(clean, charging, False, None)
@@ -147,7 +190,7 @@ class _Evaluator:
         return _EvaluatedSolution(clean, charging, True, objective)
 
 
-class _TimeLimitReached(Exception):
+class _TimeLimitReached(RouteEvaluationDeadlineExceeded):
     pass
 
 
@@ -158,7 +201,7 @@ def solve_alns(
     max_iterations: int = 2_000,
     time_limit_seconds: float = 60.0,
     removal_fraction: float = 0.2,
-    operator_profile: OperatorProfile | str = OperatorProfile.STAGE02_ROUTE_QUALITY,
+    operator_profile: OperatorProfile | str = OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
     vehicle_operator_config: VehicleOperatorConfig | None = None,
 ) -> ALNSResult:
     if max_iterations <= 0:
@@ -172,7 +215,35 @@ def solve_alns(
 
     started = time.perf_counter()
     rng = random.Random(seed)
-    evaluator = _Evaluator(instance, deadline=started + time_limit_seconds)
+    constraint_rng = random.Random(seed ^ 0x5EED23)
+    overall_deadline = started + time_limit_seconds
+    constraint_lane_budget = (
+        min(
+            vehicle_config.constraint_lane_time_budget_seconds,
+            time_limit_seconds * 0.25,
+        )
+        if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
+        else 0.0
+    )
+    legacy_lane_budget = time_limit_seconds - constraint_lane_budget
+    if legacy_lane_budget <= 0.0:
+        raise ValueError("constraint lane time budget must be smaller than the time limit")
+    legacy_deadline = started + legacy_lane_budget
+    evaluator = _Evaluator(
+        instance,
+        deadline=legacy_deadline if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
+        else overall_deadline,
+    )
+    quality_evaluator = _Evaluator(
+        instance,
+        deadline=legacy_deadline if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
+        else overall_deadline,
+    )
+    # The constraint lane is the explicit slice after the legacy/quality lane,
+    # not an unbounded second 30-second budget.  Spell out the endpoint so the
+    # configured 0.1-second reservation remains auditable in the code path.
+    constraint_deadline = legacy_deadline + constraint_lane_budget
+    constraint_evaluator = _Evaluator(instance, deadline=constraint_deadline)
     try:
         initial_sequences = _construct_initial_solution(instance, evaluator)
     except _TimeLimitReached:
@@ -196,6 +267,8 @@ def solve_alns(
     best = current
     quality_probe_current = current
     quality_probe_best = current
+    constraint_lane_current = current
+    constraint_lane_best = current
     first_feasible_time = time.perf_counter() - started
     best_time = first_feasible_time
     destroy_stats = {name: OperatorStatistics() for name in ("random", "worst", "related")}
@@ -206,17 +279,26 @@ def solve_alns(
     if profile in (
         OperatorProfile.STAGE02_ROUTE_REDUCTION,
         OperatorProfile.STAGE02_ROUTE_QUALITY,
+        OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
     ):
         repair_stats["vehicle_count_aware"] = OperatorStatistics()
     neighborhood_names = _neighborhood_names(profile)
     neighborhood_stats = {
         name: OperatorStatistics() for name in neighborhood_names
     } if profile is not OperatorProfile.BASELINE else {}
+    refinement_stats = OperatorStatistics()
+    if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED:
+        neighborhood_stats["vehicle_reduction_refinement"] = refinement_stats
     neighborhood_events: list[dict[str, object]] = []
     accepted = 0
     improved = 0
     rejected = 0
     completed_iterations = 0
+    effective_iterations = 0
+    stagnation_iterations = 0
+    maximum_stagnation = 0
+    global_best_reset_pending = False
+    removal_tier_counts = {tier.value: 0 for tier in RemovalTier}
     initial_temperature = max(1.0, current.objective.total_distance * 0.05)
 
     for iteration in range(max_iterations):
@@ -231,6 +313,9 @@ def solve_alns(
         shadow_neighborhood = ""
         shadow_events: tuple[NeighborhoodEvent, ...] = ()
         shadow_candidate: _EvaluatedSolution | None = None
+        global_best_improved = False
+        main_lane_timed_out = False
+        refinement_selected = False
         if profile is OperatorProfile.BASELINE:
             destroy_name = _weighted_choice(rng, destroy_stats)
             repair_name = _weighted_choice(rng, standard_repair_stats)
@@ -255,7 +340,8 @@ def solve_alns(
                 iteration,
                 rng,
                 neighborhood_stats,
-                include_quality=profile is not OperatorProfile.STAGE02_ROUTE_QUALITY,
+                include_quality=False,
+                include_constraint=False,
             )
             neighborhood_stats[selected_neighborhood].calls += 1
             try:
@@ -377,25 +463,23 @@ def solve_alns(
                             ),
                         )
                 candidate = evaluator.solution(candidate_sequences)
-            except _TimeLimitReached:
-                timeout_event = _event_record(
-                    NeighborhoodEvent(
-                        selected_neighborhood,
-                        "time_limit",
-                        "time_limit_reached_during_neighborhood",
-                    ),
-                    iteration,
+            except _TimeLimitReached as error:
+                timeout = _deadline_event(
+                    selected_neighborhood,
+                    "time_limit_reached_during_neighborhood",
+                    error,
+                    current.sequences,
                 )
-                timeout_event.update(
-                    {
-                        "accepted": False,
-                        "vehicle_reduction": False,
-                        "distance_improvement": False,
-                        "candidate_objective_key": (),
-                    }
-                )
-                neighborhood_events.append(timeout_event)
-                break
+                if (
+                    profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
+                    and time.perf_counter() < overall_deadline
+                ):
+                    move_events = (timeout,)
+                    candidate = current
+                    main_lane_timed_out = True
+                else:
+                    neighborhood_events.append(_event_record(timeout, iteration))
+                    break
 
             _record_neighborhood_proposal(
                 neighborhood_stats[selected_neighborhood],
@@ -403,7 +487,104 @@ def solve_alns(
                 candidate,
                 current,
             )
-            if profile is OperatorProfile.STAGE02_ROUTE_QUALITY:
+            if (
+                profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
+                and candidate.feasible
+                and candidate.objective is not None
+                and current.objective is not None
+                and candidate.objective.vehicle_count < current.objective.vehicle_count
+                and candidate.objective.vehicle_count
+                <= max(1, math.ceil(len(instance.customers) / 5) - 1)
+                and len(instance.customers) > 1
+                and not main_lane_timed_out
+            ):
+                candidate_before_refinement = candidate
+                refinement_count = max(1, min(3, len(instance.customers) - 1))
+                refinement_partial, refinement_removed = _destroy(
+                    instance,
+                    candidate.sequences,
+                    refinement_count,
+                    "worst",
+                    random.Random(seed ^ 0xA11CE ^ iteration),
+                )
+                refinement_before_calls = evaluator.calls
+                refinement_candidate = _infeasible_solution()
+                refinement_reason = ""
+                try:
+                    refinement = repair_vehicle_reduction_refinement(
+                        refinement_partial,
+                        refinement_removed,
+                        evaluator,
+                        instance,
+                        budget=(
+                            vehicle_config.vehicle_reduction_refinement_exact_evaluation_budget
+                        ),
+                    )
+                    if refinement.sequences is not None:
+                        refinement_candidate = evaluator.solution(refinement.sequences)
+                    else:
+                        refinement_reason = refinement.failure_reason
+                except _TimeLimitReached:
+                    refinement_reason = "time_limit_reached_during_refinement"
+                refinement_comparison = (
+                    compare_objectives(
+                        refinement_candidate.objective,
+                        candidate_before_refinement.objective,
+                    )
+                    if refinement_candidate.feasible
+                    and refinement_candidate.objective is not None
+                    and candidate_before_refinement.objective is not None
+                    else ObjectiveComparison.WORSE
+                )
+                if refinement_comparison is ObjectiveComparison.BETTER:
+                    candidate = refinement_candidate
+                    refinement_selected = True
+                    refinement_status = "candidate_proposed"
+                    refinement_reason = "vehicle_reduction_refined"
+                    refinement_sequences = refinement_candidate.sequences
+                else:
+                    refinement_status = "failed"
+                    refinement_reason = refinement_reason or "refinement_not_better"
+                    refinement_sequences = refinement_partial
+                refinement_event = NeighborhoodEvent(
+                    "vehicle_reduction_refinement",
+                    refinement_status,
+                    refinement_reason,
+                    affected_route_indices=tuple(
+                        index
+                        for index, (before, after) in enumerate(
+                            zip(
+                                current.sequences,
+                                refinement_sequences,
+                                strict=False,
+                            )
+                        )
+                        if before != after
+                    ),
+                    removed_customers=refinement_removed,
+                    candidate_route_sequences=refinement_sequences,
+                    candidate_vehicle_delta=(
+                        len(refinement_sequences) - len(current.sequences)
+                        if refinement_selected
+                        else None
+                    ),
+                    candidate_feasible=refinement_selected,
+                    prefilter_passed=bool(refinement_partial),
+                    exact_route_evaluations=evaluator.calls - refinement_before_calls,
+                    track="legacy",
+                )
+                move_events = (*move_events, refinement_event)
+                refinement_stats.calls += 1
+                _record_neighborhood_proposal(
+                    refinement_stats,
+                    (refinement_event,),
+                    refinement_candidate,
+                    candidate_before_refinement,
+                )
+            if profile in (
+                OperatorProfile.STAGE02_ROUTE_QUALITY,
+                OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
+            ) and not main_lane_timed_out:
                 shadow_neighborhood = _quality_shadow_neighborhood(iteration)
                 if shadow_neighborhood:
                     neighborhood_stats[shadow_neighborhood].calls += 1
@@ -412,22 +593,38 @@ def solve_alns(
                             shadow_neighborhood,
                             instance,
                             quality_probe_current.sequences,
-                            evaluator,
+                            quality_evaluator,
                             vehicle_config,
+                            precomputed_routes={
+                                sequence: charging
+                                for sequence, charging in zip(
+                                    quality_probe_current.sequences,
+                                    quality_probe_current.charging,
+                                    strict=True,
+                                )
+                            },
                         )
-                        shadow_candidate = evaluator.solution(shadow_sequences)
-                    except _TimeLimitReached:
-                        neighborhood_events.append(
-                            _event_record(
-                                NeighborhoodEvent(
-                                    shadow_neighborhood,
-                                    "time_limit",
-                                    "time_limit_reached_during_quality_probe",
-                                ),
-                                iteration,
-                            )
+                        shadow_candidate = quality_evaluator.solution(
+                            shadow_sequences,
+                            precomputed_routes={
+                                sequence: charging
+                                for sequence, charging in zip(
+                                    quality_probe_current.sequences,
+                                    quality_probe_current.charging,
+                                    strict=True,
+                                )
+                            },
                         )
-                        break
+                    except _TimeLimitReached as error:
+                        shadow_events = (
+                            _deadline_event(
+                                shadow_neighborhood,
+                                "time_limit_reached_during_quality_probe",
+                                error,
+                                quality_probe_current.sequences,
+                            ),
+                        )
+                        shadow_candidate = _infeasible_solution()
                     _record_neighborhood_proposal(
                         neighborhood_stats[shadow_neighborhood],
                         shadow_events,
@@ -500,17 +697,166 @@ def solve_alns(
                             ):
                                 best = shadow_candidate
                                 best_time = time.perf_counter() - started
+                                global_best_improved = True
                         _update_weight(shadow_statistics, reward)
+
+            if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED and (
+                iteration < len(_CONSTRAINT_REMOVAL_ORDER)
+                or iteration % vehicle_config.exploration_period == 0
+            ):
+                constraint_operator = _select_constraint_operator(
+                    iteration,
+                    constraint_rng,
+                    {
+                        name: neighborhood_stats[name]
+                        for name in _CONSTRAINT_REMOVAL_ORDER
+                    },
+                )
+                constraint_statistics = neighborhood_stats[constraint_operator]
+                constraint_statistics.calls += 1
+                selection = select_dynamic_removal_size(
+                    len(instance.customers),
+                    stagnation_iterations,
+                    iteration,
+                    config=vehicle_config,
+                    global_best_reset=global_best_reset_pending,
+                )
+                removal_tier_counts[selection.tier.value] += 1
+                try:
+                    constraint_candidate, constraint_events = _constraint_lane_step(
+                        instance,
+                        constraint_lane_current,
+                        constraint_evaluator,
+                        vehicle_config,
+                        operator=constraint_operator,
+                        selection=selection,
+                        seed=constraint_rng.randrange(2**32),
+                    )
+                except _TimeLimitReached as error:
+                    constraint_events = (
+                        replace(
+                            _deadline_event(
+                                constraint_operator,
+                                "time_limit_reached_during_constraint_probe",
+                                error,
+                                constraint_lane_current.sequences,
+                            ),
+                            track="constraint_lane",
+                            constraint_category=constraint_operator,
+                            removal_tier="",
+                            removal_size_requested=0,
+                            removal_size_actual=0,
+                            stagnation_iterations=selection.stagnation_iterations,
+                            removal_trigger=(
+                                "probe_not_started:"
+                                f"tier={selection.tier.value};"
+                                f"requested={selection.requested_count};"
+                                f"{selection.trigger_reason}"
+                            ),
+                            reset_observed=selection.reset_observed,
+                        ),
+                    )
+                    constraint_candidate = _infeasible_solution()
+
+                _record_neighborhood_proposal(
+                    constraint_statistics,
+                    constraint_events,
+                    constraint_candidate,
+                    constraint_lane_current,
+                )
+                lane_comparison = (
+                    compare_objectives(
+                        constraint_candidate.objective,
+                        constraint_lane_current.objective,
+                    )
+                    if constraint_candidate.feasible
+                    and constraint_candidate.objective is not None
+                    and constraint_lane_current.objective is not None
+                    else ObjectiveComparison.WORSE
+                )
+                lane_accept = (
+                    constraint_candidate.feasible
+                    and constraint_candidate.objective is not None
+                    and constraint_lane_current.objective is not None
+                    and accept_annealing_move(
+                        constraint_lane_current.objective,
+                        constraint_candidate.objective,
+                        temperature=max(
+                            1.0,
+                            constraint_lane_current.objective.total_distance * 0.05,
+                        ),
+                        random_draw=0.0,
+                    )
+                )
+                lane_vehicle_reduction = bool(
+                    constraint_candidate.objective is not None
+                    and constraint_lane_current.objective is not None
+                    and constraint_candidate.objective.vehicle_count
+                    < constraint_lane_current.objective.vehicle_count
+                )
+                lane_distance_improvement = bool(
+                    constraint_candidate.objective is not None
+                    and constraint_lane_current.objective is not None
+                    and constraint_candidate.objective.total_distance
+                    < constraint_lane_current.objective.total_distance - 1e-9
+                )
+                neighborhood_events.extend(
+                    _annotated_event_record(
+                        event,
+                        iteration=iteration,
+                        accepted=lane_accept,
+                        vehicle_reduction=lane_vehicle_reduction,
+                        distance_improvement=lane_distance_improvement,
+                        candidate=constraint_candidate,
+                    )
+                    for event in constraint_events
+                )
+                if lane_accept and constraint_candidate.objective is not None:
+                    constraint_statistics.accepted += 1
+                    constraint_lane_current = constraint_candidate
+                    if lane_comparison is ObjectiveComparison.BETTER:
+                        constraint_statistics.improved += 1
+                    if (
+                        constraint_lane_best.objective is None
+                        or compare_objectives(
+                            constraint_candidate.objective,
+                            constraint_lane_best.objective,
+                        )
+                        is ObjectiveComparison.BETTER
+                    ):
+                        constraint_lane_best = constraint_candidate
+                        constraint_statistics.best += 1
+                    if (
+                        best.objective is None
+                        or compare_objectives(
+                            constraint_candidate.objective,
+                            best.objective,
+                        )
+                        is ObjectiveComparison.BETTER
+                    ):
+                        best = constraint_candidate
+                        best_time = time.perf_counter() - started
+                        global_best_improved = True
+                else:
+                    constraint_statistics.rejected += 1
+                    constraint_statistics.failure_reasons["candidate_rejected"] = (
+                        constraint_statistics.failure_reasons.get("candidate_rejected", 0)
+                        + 1
+                    )
 
         temperature = initial_temperature * max(0.001, 1.0 - iteration / max_iterations)
         quality_candidate_is_worse = (
-            profile is OperatorProfile.STAGE02_ROUTE_QUALITY
+            profile
+            in (
+                OperatorProfile.STAGE02_ROUTE_QUALITY,
+                OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
+            )
             and selected_neighborhood in _QUALITY_NEIGHBORHOODS
             and candidate.objective is not None
             and compare_objectives(candidate.objective, current.objective)
             is ObjectiveComparison.WORSE
         )
-        accept = False if quality_candidate_is_worse else (
+        accept = False if main_lane_timed_out or quality_candidate_is_worse else (
             candidate.feasible
             and candidate.objective is not None
             and accept_annealing_move(
@@ -545,6 +891,8 @@ def solve_alns(
             )
         if not accept:
             rejected += 1
+            if refinement_selected:
+                refinement_stats.rejected += 1
             if profile is OperatorProfile.BASELINE:
                 _update_weight(destroy_stats[destroy_name], 0.0)
                 _update_weight(repair_stats[repair_name], 0.0)
@@ -555,9 +903,20 @@ def solve_alns(
                     _update_weight(destroy_stats[destroy_name], 0.0)
                 if repair_name:
                     _update_weight(repair_stats[repair_name], 0.0)
+            if global_best_improved:
+                stagnation_iterations = 0
+                global_best_reset_pending = True
+            else:
+                stagnation_iterations += 1
+                global_best_reset_pending = False
+            maximum_stagnation = max(maximum_stagnation, stagnation_iterations)
+            effective_iterations += 1
             continue
 
         accepted += 1
+        if refinement_selected:
+            refinement_stats.accepted += 1
+            refinement_stats.improved += 1
         if profile is OperatorProfile.BASELINE:
             destroy_stats[destroy_name].accepted += 1
             repair_stats[repair_name].accepted += 1
@@ -589,6 +948,7 @@ def solve_alns(
         if compare_objectives(candidate.objective, best.objective) is ObjectiveComparison.BETTER:
             best = candidate
             best_time = time.perf_counter() - started
+            global_best_improved = True
             reward = 8.0
             if profile is OperatorProfile.BASELINE:
                 destroy_stats[destroy_name].best += 1
@@ -609,12 +969,30 @@ def solve_alns(
             if repair_name:
                 _update_weight(repair_stats[repair_name], reward)
 
+        if global_best_improved:
+            stagnation_iterations = 0
+            global_best_reset_pending = True
+        else:
+            stagnation_iterations += 1
+            global_best_reset_pending = False
+        maximum_stagnation = max(maximum_stagnation, stagnation_iterations)
+        effective_iterations += 1
+
+    lane_evaluators = (evaluator, quality_evaluator, constraint_evaluator)
     routes = tuple(result.route for result in best.charging)
     report = validate_routes(instance, [list(route) for route in routes])
     if not report.feasible:
         raise RuntimeError("ALNS best solution failed the unified validator")
     if best.objective is None:
         raise RuntimeError("feasible ALNS result is missing its objective")
+    validated_objective = SolutionObjective.from_report(instance, report)
+    if (
+        compare_objectives(validated_objective, best.objective)
+        is not ObjectiveComparison.EQUAL
+    ):
+        raise RuntimeError(
+            "ALNS solver objective differs from the unified validator objective"
+        )
     return ALNSResult(
         feasible=True,
         routes=routes,
@@ -631,10 +1009,10 @@ def solve_alns(
         first_feasible_time=first_feasible_time,
         best_time=best_time,
         runtime_seconds=time.perf_counter() - started,
-        charging_subproblem_calls=evaluator.calls,
-        charging_subproblem_time=evaluator.runtime,
-        charging_labels_generated=evaluator.labels_generated,
-        charging_labels_pruned=evaluator.labels_pruned,
+        charging_subproblem_calls=sum(item.calls for item in lane_evaluators),
+        charging_subproblem_time=sum(item.runtime for item in lane_evaluators),
+        charging_labels_generated=sum(item.labels_generated for item in lane_evaluators),
+        charging_labels_pruned=sum(item.labels_pruned for item in lane_evaluators),
         destroy_statistics={name: stats.to_dict() for name, stats in destroy_stats.items()},
         repair_statistics={name: stats.to_dict() for name, stats in repair_stats.items()},
         operator_profile=profile.value,
@@ -643,6 +1021,17 @@ def solve_alns(
         },
         neighborhood_events=tuple(neighborhood_events),
         failure_reason="",
+        cache_hits=sum(item.cache_hits for item in lane_evaluators),
+        cache_misses=sum(item.calls for item in lane_evaluators),
+        unique_route_evaluations=sum(len(item.cache) for item in lane_evaluators),
+        effective_iterations=effective_iterations,
+        removal_tier_counts=removal_tier_counts,
+        maximum_stagnation=maximum_stagnation,
+        constraint_operator_statistics={
+            name: neighborhood_stats[name].to_dict()
+            for name in _CONSTRAINT_REMOVAL_ORDER
+            if name in neighborhood_stats
+        },
     )
 
 
@@ -873,6 +1262,7 @@ def _select_stage02_neighborhood(
     statistics: dict[str, OperatorStatistics],
     *,
     include_quality: bool = True,
+    include_constraint: bool = True,
 ) -> str:
     warmup: tuple[str, ...]
     if include_quality and "relocate" in statistics:
@@ -891,7 +1281,12 @@ def _select_stage02_neighborhood(
     if iteration < len(warmup):
         return warmup[iteration]
     if include_quality:
-        return _weighted_choice(rng, statistics)
+        allowed = {
+            name: statistics[name]
+            for name in statistics
+            if include_constraint or name not in _CONSTRAINT_REMOVAL_NEIGHBORHOODS
+        }
+        return _weighted_choice(rng, allowed)
     legacy_names = (
         "standard",
         "vehicle_count_aware_repair",
@@ -899,6 +1294,16 @@ def _select_stage02_neighborhood(
         "route_merge",
     )
     return _weighted_choice(rng, {name: statistics[name] for name in legacy_names})
+
+
+def _select_constraint_operator(
+    iteration: int,
+    rng: random.Random,
+    statistics: dict[str, OperatorStatistics],
+) -> str:
+    if iteration < len(_CONSTRAINT_REMOVAL_ORDER):
+        return _CONSTRAINT_REMOVAL_ORDER[iteration]
+    return _weighted_choice(rng, statistics)
 
 
 def _neighborhood_names(profile: OperatorProfile) -> tuple[str, ...]:
@@ -921,6 +1326,19 @@ def _neighborhood_names(profile: OperatorProfile) -> tuple[str, ...]:
             "route_segment_destroy",
             "ejection_chain",
         )
+    if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED:
+        return (
+            "standard",
+            "vehicle_count_aware_repair",
+            "route_elimination",
+            "route_merge",
+            "relocate",
+            "swap",
+            "two_opt_star",
+            "route_segment_destroy",
+            "ejection_chain",
+            *_CONSTRAINT_REMOVAL_ORDER,
+        )
     return ()
 
 
@@ -938,6 +1356,8 @@ def _quality_shadow_proposal(
     sequences: RouteSequences,
     evaluator: _Evaluator,
     config: VehicleOperatorConfig,
+    *,
+    precomputed_routes: dict[tuple[str, ...], ChargingSubproblemResult],
 ) -> tuple[RouteSequences, tuple[NeighborhoodEvent, ...]]:
     probe_budget = config.quality_probe_exact_evaluation_budget
     probe_config = replace(
@@ -950,27 +1370,177 @@ def _quality_shadow_proposal(
             config.two_opt_star_exact_evaluation_budget, probe_budget
         ),
         route_segment_exact_evaluation_budget=min(
-            config.route_segment_exact_evaluation_budget, probe_budget
+            config.route_segment_exact_evaluation_budget,
+            config.quality_route_segment_probe_exact_evaluation_budget,
         ),
         ejection_chain_exact_evaluation_budget=min(
             config.ejection_chain_exact_evaluation_budget, probe_budget
         ),
     )
     if operator == "relocate":
-        proposal = propose_relocate(instance, sequences, evaluator, config=probe_config)
+        proposal = propose_relocate(
+            instance,
+            sequences,
+            evaluator,
+            config=probe_config,
+            precomputed_routes=precomputed_routes,
+        )
     elif operator == "swap":
-        proposal = propose_swap(instance, sequences, evaluator, config=probe_config)
+        proposal = propose_swap(
+            instance,
+            sequences,
+            evaluator,
+            config=probe_config,
+            precomputed_routes=precomputed_routes,
+        )
     elif operator == "two_opt_star":
-        proposal = propose_two_opt_star(instance, sequences, evaluator, config=probe_config)
+        proposal = propose_two_opt_star(
+            instance,
+            sequences,
+            evaluator,
+            config=probe_config,
+            precomputed_routes=precomputed_routes,
+        )
     elif operator == "route_segment_destroy":
         proposal = propose_route_segment_destroy(
             instance, sequences, evaluator, config=probe_config
         )
     elif operator == "ejection_chain":
-        proposal = propose_ejection_chain(instance, sequences, evaluator, config=probe_config)
+        proposal = propose_ejection_chain(
+            instance,
+            sequences,
+            evaluator,
+            config=probe_config,
+            precomputed_routes=precomputed_routes,
+        )
     else:
         raise ValueError(f"unsupported Stage 2.2 shadow operator: {operator}")
     return proposal.sequences or (), proposal.events
+
+
+def _constraint_lane_step(
+    instance: Instance,
+    current: _EvaluatedSolution,
+    evaluator: _Evaluator,
+    config: VehicleOperatorConfig,
+    *,
+    operator: str,
+    selection: RemovalSizeSelection,
+    seed: int,
+) -> tuple[_EvaluatedSolution, tuple[NeighborhoodEvent, ...]]:
+    proposal = propose_constraint_removal(
+        instance,
+        current.sequences,
+        evaluator,
+        operator=operator,
+        selection=selection,
+        seed=seed,
+        precomputed_routes={
+            sequence: charging
+            for sequence, charging in zip(
+                current.sequences, current.charging, strict=True
+            )
+        },
+    )
+    events = list(proposal.events)
+    if proposal.partial is None:
+        return _infeasible_solution(), tuple(events)
+
+    before_calls = evaluator.calls
+    constraint_budget = min(
+        config.constraint_probe_exact_evaluation_budget,
+        {
+        ConstraintRemovalOperator.STATION_PRESSURE.value:
+        config.station_pressure_exact_evaluation_budget,
+        ConstraintRemovalOperator.TIME_WINDOW_CONFLICT.value:
+        config.time_window_conflict_exact_evaluation_budget,
+        ConstraintRemovalOperator.WORST_ENERGY_DETOUR.value:
+        config.worst_energy_detour_exact_evaluation_budget,
+        ConstraintRemovalOperator.SHAW_RELATED.value:
+        config.shaw_related_exact_evaluation_budget,
+        }[operator],
+    )
+    before_calls = evaluator.calls
+    try:
+        repair = repair_constraint_removal(
+            current.sequences,
+            proposal.partial,
+            proposal.removed_customers,
+            evaluator,
+            instance,
+            budget=constraint_budget,
+        )
+        candidate_sequences = repair.sequences or ()
+        candidate = evaluator.solution(
+            candidate_sequences,
+            precomputed_routes={
+                sequence: charging
+                for sequence, charging in zip(
+                    current.sequences, current.charging, strict=True
+                )
+            },
+        )
+    except _TimeLimitReached:
+        events.append(
+            NeighborhoodEvent(
+                operator,
+                "time_limit",
+                "time_limit_reached_during_constraint_repair",
+                removed_customers=proposal.removed_customers,
+                candidate_route_sequences=proposal.partial,
+                prefilter_passed=True,
+                exact_route_evaluations=evaluator.calls - before_calls,
+                track="constraint_lane",
+                constraint_category=operator,
+                removal_tier=selection.tier.value,
+                removal_size_requested=selection.requested_count,
+                removal_size_actual=len(proposal.removed_customers),
+                stagnation_iterations=selection.stagnation_iterations,
+                removal_trigger=selection.trigger_reason,
+                reset_observed=selection.reset_observed,
+            )
+        )
+        return _infeasible_solution(), tuple(events)
+    events.append(
+        NeighborhoodEvent(
+            operator,
+            "candidate_proposed" if candidate.feasible else "failed",
+            "constraint_removal_repaired"
+            if candidate.feasible
+            else repair.failure_reason or "constraint_repair_infeasible",
+            affected_route_indices=tuple(
+                index
+                for index, (before, after) in enumerate(
+                    zip(current.sequences, candidate_sequences, strict=False)
+                )
+                if before != after
+            ),
+            removed_customers=proposal.removed_customers,
+            candidate_route_sequences=candidate_sequences,
+            candidate_vehicle_delta=(
+                len(candidate_sequences) - len(current.sequences)
+                if candidate.feasible
+                else None
+            ),
+            candidate_feasible=candidate.feasible,
+            prefilter_passed=bool(proposal.partial),
+            new_routes_created=repair.new_routes_created,
+            exact_route_evaluations=evaluator.calls - before_calls,
+            track="constraint_lane",
+            constraint_category=operator,
+            removal_tier=selection.tier.value,
+            removal_size_requested=selection.requested_count,
+            removal_size_actual=len(proposal.removed_customers),
+            stagnation_iterations=selection.stagnation_iterations,
+            removal_trigger=selection.trigger_reason,
+            reset_observed=selection.reset_observed,
+        )
+    )
+    return candidate, tuple(events)
+
+
+def _infeasible_solution() -> _EvaluatedSolution:
+    return _EvaluatedSolution((), (), False, None)
 
 
 def _record_neighborhood_proposal(
@@ -1024,6 +1594,30 @@ def _event_record(event: NeighborhoodEvent, iteration: int) -> dict[str, object]
     return record
 
 
+def _deadline_event(
+    operator: str,
+    reason: str,
+    error: _TimeLimitReached,
+    reference_sequences: tuple[tuple[str, ...], ...],
+) -> NeighborhoodEvent:
+    sequence = error.sequence
+    affected = tuple(
+        index
+        for index, candidate_sequence in enumerate(reference_sequences)
+        if sequence is not None and candidate_sequence == sequence
+    )
+    return NeighborhoodEvent(
+        operator,
+        "time_limit",
+        reason,
+        route_indices=affected,
+        affected_route_indices=affected,
+        candidate_route_sequences=(sequence,) if sequence is not None else (),
+        prefilter_passed=error.exact_route_evaluations > 0,
+        exact_route_evaluations=error.exact_route_evaluations,
+    )
+
+
 def _annotated_event_record(
     event: NeighborhoodEvent,
     *,
@@ -1034,11 +1628,15 @@ def _annotated_event_record(
     candidate: _EvaluatedSolution,
 ) -> dict[str, object]:
     record = _event_record(event, iteration)
+    # A proposal may contain many feasible probes, but only its final
+    # candidate_proposed event is the sequence actually returned to ALNS.
+    # Do not report every feasible probe as accepted or improved.
+    event_candidate = event.candidate_feasible and event.status == "candidate_proposed"
     record.update(
         {
-            "accepted": accepted,
-            "vehicle_reduction": vehicle_reduction,
-            "distance_improvement": distance_improvement,
+            "accepted": accepted and event_candidate,
+            "vehicle_reduction": vehicle_reduction if event_candidate else False,
+            "distance_improvement": distance_improvement if event_candidate else False,
             "candidate_objective_key": (
                 candidate.objective.key if candidate.objective is not None else ()
             ),
@@ -1080,4 +1678,11 @@ def _failed_result(
         neighborhood_statistics={},
         neighborhood_events=(),
         failure_reason=reason,
+        cache_hits=evaluator.cache_hits,
+        cache_misses=evaluator.calls,
+        unique_route_evaluations=len(evaluator.cache),
+        effective_iterations=0,
+        removal_tier_counts={tier.value: 0 for tier in RemovalTier},
+        maximum_stagnation=0,
+        constraint_operator_statistics={},
     )
