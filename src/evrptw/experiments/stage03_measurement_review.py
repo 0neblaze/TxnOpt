@@ -997,9 +997,9 @@ def _event_log_ok_stream(
     neighborhood_index = 0
     row_count = 0
     expected_neighborhood = (
-        list(getattr(solver_result, "neighborhood_events", ()))
+        getattr(solver_result, "neighborhood_events", ())
         if solver_result is not None
-        else []
+        else ()
     )
     try:
         with path.open(encoding="utf-8") as handle:
