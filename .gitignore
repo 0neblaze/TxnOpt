@@ -65,6 +65,10 @@ data/
 !experiments/summaries/**/*.tsv
 !experiments/baselines/
 !experiments/baselines/**/*.csv
+!experiments/registries/
+!experiments/registries/**/*.csv
+!experiments/manifests/
+!experiments/manifests/**/*.json
 # Stage 2.1 keeps complete high-volume operator logs in ignored results/;
 # only aggregate operator summaries and gate reports are tracked.
 experiments/summaries/stage02*_operator_events.csv

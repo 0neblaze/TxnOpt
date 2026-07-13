@@ -6,6 +6,36 @@ exact charging（精确充电）前安全地排除不可能可行的 customer se
 序列）；它不改变 lexicographic objective（字典序目标）、统一 validator
 （验证器）、vehicle-first acceptance（车辆数优先接受）或 Stage 0--3.0 的默认轨迹。
 
+## Canonical artifact contract（规范产物契约）
+
+Stage 3.1 的 canonical stage ID（规范阶段编号）是 `stage03.1`，component
+固定为 `screening`。新的 run label 必须使用
+`stage03.1_screening_attemptNN` 或 `stage03.1_screening_rerunNN`；产物文件和逻辑
+目录分别遵循：
+
+```text
+<stage_id>_<component>_<attempt_or_rerun>_<artifact_type>[_<instance>_<seed>].<ext>
+results/<run_label>/<instance>/<seed>/
+```
+
+已经完成的旧 `stage031_cheap_screening_*` 运行不改名、不移动。它们登记在
+`experiments/registries/stage03.1_artifact_registry.csv`，旧路径与
+`stage03.0`/Stage 0/Stage 2.3 兼容映射统一登记在
+`experiments/registries/stage03_legacy_path_map.csv`。canonical path 是逻辑登记
+视图，实际 raw/solution/events/trace 文件仍只有旧路径这一份。
+
+正式实验或下一阶段前使用：
+
+```bash
+uv run python tools/stage03_artifact_migration.py
+uv run python tools/stage03_artifact_migration.py --write
+```
+
+`--write` 不运行 cheap screening，不重算已有结果，也不覆盖旧 summary；它只更新
+tracked registry、manifest 和 legacy mapping。后文的旧命令保留作历史复现说明，
+新 run 必须先通过 canonical label、checksum、manifest 和 semantic raw-to-summary
+检查。
+
 ## 固定协议
 
 | 项目 | 规定 |

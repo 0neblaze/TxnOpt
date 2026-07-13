@@ -123,6 +123,46 @@ this repository or one of its subdirectories.
   parallel, and exact-charging acceleration are readiness targets only and must
   not be reported as implemented in Stage 2.3.
 
+## Stage 3 Canonical Artifact and Legacy Mapping Policy
+
+- This repository currently has completed evidence only for `stage03.0` with
+  component `measurement` and `stage03.1` with component `screening`.
+  `stage03.2`, `stage03.3`, and `stage03.4` are planned stages only; do not
+  create placeholder results, registries, or readiness claims for them.
+- Canonical run labels are `stage03.0_measurement_attemptNN` or
+  `stage03.1_screening_attemptNN`. Every artifact registry row records the
+  canonical `run_label`, `attempt_or_rerun`, `artifact_type`, instance/seed
+  scope, checksum, status, provenance hashes, validator status, comparison
+  baseline, and `legacy_path` mapping.
+- The canonical logical layout is
+  `results/<run_label>/<instance>/<seed>/`. Canonical filenames follow
+  `<stage_id>_<component>_<attempt_or_rerun>_<artifact_type>[_<instance>_<seed>].<ext>`.
+  The current raw evidence remains physically stored under its original
+  ignored `results/stage03-*` paths; the canonical paths are registry views and
+  must not be implemented by copying or moving raw evidence.
+- `experiments/registries/stage03.0_artifact_registry.csv` and
+  `experiments/registries/stage03.1_artifact_registry.csv` are the stage
+  registries. `experiments/registries/stage03_legacy_path_map.csv` records the
+  preserved old Stage 3 paths, the immutable Stage 0 frozen baseline, and the
+  Stage 2.3 historical comparison references.
+- The corresponding manifests are
+  `experiments/manifests/stage03.0_measurement_artifact_manifest.json` and
+  `experiments/manifests/stage03.1_screening_artifact_manifest.json`. Before a
+  formal run or stage transition, the migration/preflight tool must verify
+  canonical labels, artifact types, unique run labels, raw checksums and
+  sidecars, manifest recomputability, legacy mappings, and semantic
+  raw-to-summary consistency. Byte equality is not required when an auditor
+  recomputes metadata; the declared semantic fields must agree.
+- `stage02_constraint_guided_attempt16` and `stage02_constraint_guided_rerun09`
+  remain historical baseline references under their old paths. Their recorded
+  `repository_dirty=true` provenance is immutable and must remain visible.
+  `experiments/baselines/stage00` is also immutable; only the compatibility map
+  may add its `stage00_frozen_baseline` label.
+- Historical incomplete, failed, timeout, or unreviewed Stage 3 rounds remain
+  registered with explicit `legacy_with_manifest_error`, `not_present`, or
+  `not_published` status. They must never be relabelled as successful evidence
+  or overwritten by a later migration.
+
 ## Stage 3.0 Measurement and Replay Policy
 
 - Stage 3.0 is measurement-only. It must not implement or claim cache

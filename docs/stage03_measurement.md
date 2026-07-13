@@ -2,6 +2,32 @@
 
 Stage 3.0 只回答一个问题：在当前 `stage02_constraint_guided` 主轨迹中，时间究竟消耗在什么 exact charging（精确充电）调用上。它不改变求解器行为，也不宣称加速。
 
+## Canonical artifact contract（规范产物契约）
+
+Stage 3.0 的 canonical stage ID（规范阶段编号）是 `stage03.0`，component
+固定为 `measurement`。新的 run label（运行标签）必须使用
+`stage03.0_measurement_attemptNN` 或 `stage03.0_measurement_rerunNN`；产物文件
+使用 `<stage_id>_<component>_<attempt_or_rerun>_<artifact_type>[_<instance>_<seed>].<ext>`，
+逻辑目录使用 `results/<run_label>/<instance>/<seed>/`。
+
+本仓库已经完成的历史运行仍保留旧标签和旧目录。它们通过
+`experiments/registries/stage03.0_artifact_registry.csv` 和
+`experiments/registries/stage03_legacy_path_map.csv` 提供 canonical logical view
+（规范逻辑视图），不复制或移动 raw evidence（原始证据）。映射表和预检工具见
+[`docs/stage03_artifact_registry.md`](stage03_artifact_registry.md)。
+
+只读检查与登记命令为：
+
+```bash
+uv run python tools/stage03_artifact_migration.py
+uv run python tools/stage03_artifact_migration.py --write
+```
+
+上面的 `--write` 只生成 tracked registry/manifest/mapping，不调用 solver，也不
+覆盖历史 `results/` 或 `experiments/summaries/`。本文后面的旧命令仅用于历史
+run 的复现说明；新正式 run 必须使用 canonical label，并在发布 summary 前完成
+registry、checksum、manifest 和 semantic raw-to-summary（语义原始数据到汇总）检查。
+
 ## 固定协议
 
 | 项目 | 规定 |
