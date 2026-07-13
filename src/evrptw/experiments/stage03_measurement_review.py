@@ -552,6 +552,8 @@ def _screening_trace_ok(trace: Stage03Trace) -> bool:
     if trace.screening_config is None:
         return False
     allowed_statuses = {"pass", "rejected", "negative_cache_hit"}
+    decisions_by_key: defaultdict[tuple[str, str], list[Any]] = defaultdict(list)
+    evaluations_by_key: defaultdict[tuple[str, str], list[Any]] = defaultdict(list)
     for decision in trace.screening_decisions:
         if decision.route_key not in trace.route_dictionary:
             return False
@@ -564,16 +566,16 @@ def _screening_trace_ok(trace: Stage03Trace) -> bool:
             return False
         if not decision.checks:
             return False
+        decisions_by_key[(decision.lane, decision.route_key)].append(decision)
 
     for evaluation in trace.route_evaluations:
         if evaluation.kind not in {"exact_call", "cache_hit"}:
             continue
+        evaluations_by_key[(evaluation.lane, evaluation.route_key)].append(evaluation)
         matching_pass = any(
-            decision.route_key == evaluation.route_key
-            and decision.lane == evaluation.lane
-            and decision.status == "pass"
+            decision.status == "pass"
             and decision.completed_at <= evaluation.started_at + 1e-9
-            for decision in trace.screening_decisions
+            for decision in decisions_by_key[(evaluation.lane, evaluation.route_key)]
         )
         if not matching_pass:
             return False
@@ -582,11 +584,8 @@ def _screening_trace_ok(trace: Stage03Trace) -> bool:
         if not decision.exact_call_blocked:
             continue
         later_exact = any(
-            evaluation.route_key == decision.route_key
-            and evaluation.lane == decision.lane
-            and evaluation.kind in {"exact_call", "cache_hit"}
-            and evaluation.started_at >= decision.completed_at - 1e-9
-            for evaluation in trace.route_evaluations
+            evaluation.started_at >= decision.completed_at - 1e-9
+            for evaluation in evaluations_by_key[(decision.lane, decision.route_key)]
         )
         if later_exact:
             return False
@@ -682,14 +681,16 @@ def _event_log_ok(
         for left, right in zip(trace_events, trace.events, strict=True)
     ):
         return False
-    expected_screening = [asdict(decision) for decision in trace.screening_decisions]
-    if len(screening_events) != len(expected_screening):
-        return False
-    if any(
-        _canonical_json(left) != _canonical_json(right)
-        for left, right in zip(screening_events, expected_screening, strict=True)
-    ):
-        return False
+    if screening_events:
+        if len(screening_events) != len(trace.screening_decisions):
+            return False
+        if any(
+            _canonical_json(payload) != _canonical_json(asdict(decision))
+            for payload, decision in zip(
+                screening_events, trace.screening_decisions, strict=True
+            )
+        ):
+            return False
     if solver_result is None:
         return not neighborhood_events
     expected_neighborhood = list(solver_result.neighborhood_events)

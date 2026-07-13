@@ -12,6 +12,7 @@ from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
 from evrptw.measurement import (
     CheapScreeningConfig,
     MeasurementConfig,
+    ScreeningCheckTrace,
     Stage03ExecutionError,
     Stage03Trace,
     route_result_fields,
@@ -294,6 +295,18 @@ class _Evaluator:
             else "rejected"
         )
         if self.measurement_trace is not None:
+            decision_checks = (
+                (
+                    ScreeningCheckTrace(
+                        "negative_sequence_cache",
+                        "hit",
+                        True,
+                        "reused a previously recorded safe screening rejection",
+                    ),
+                )
+                if negative_cache_hit
+                else result.checks
+            )
             self.measurement_trace.record_screening_decision(
                 sequence,
                 lane=self.lane,
@@ -302,7 +315,7 @@ class _Evaluator:
                 status=status,
                 first_failed_check=result.first_failed_check,
                 reason=result.reason,
-                checks=result.checks,
+                checks=decision_checks,
                 demand=result.demand,
                 min_time_window_slack=result.min_time_window_slack,
                 distance_lower_bound=result.distance_lower_bound,

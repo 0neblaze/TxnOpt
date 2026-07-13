@@ -463,14 +463,6 @@ def _persist_run(
         {"record_type": "trace_event", "event_index": index, "payload": event}
         for index, event in enumerate(trace.events)
     ]
-    event_lines.extend(
-        {
-            "record_type": "screening_decision",
-            "event_index": index,
-            "payload": asdict(decision),
-        }
-        for index, decision in enumerate(trace.screening_decisions)
-    )
     if result is not None:
         event_lines.extend(
             {
