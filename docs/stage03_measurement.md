@@ -28,6 +28,7 @@ Stage 3.0 只回答一个问题：在当前 `stage02_constraint_guided` 主轨�
 - `events/<run>.jsonl`：trace event（trace 事件）与既有 `NeighborhoodEvent`（邻域事件）的逐行记录。
 - `environments/<run>.json`：source/config/instance/environment hash、Python/package/native extension、hardware、peak memory、Stage 0 manifest hash，以及 `VRP-EVRP-Project-Hub` 和 `py-ga-VRPTW` 的 revision/dirty 状态。
 - `raw/<run>.json`：原始 record、solver result、validator replay 线索和其他 raw 文件相对路径。
+- `manifest.json` 与旁置的 `manifest.sha256`：raw 文件清单、SHA-256 和清单完整性锚点；auditor 会先验证二者。
 
 `Stage03Trace` 的关键聚合字段如下：
 
@@ -43,7 +44,7 @@ Stage 3.0 只回答一个问题：在当前 `stage02_constraint_guided` 主轨�
 
 所有 summary CSV 都必须由 raw solution、raw trace、event log 和 manifest 重算。runner 写出的 `raw_per_run_results.csv` 不是审计结论。
 
-内存记录使用 OS-level `peak_rss_bytes`（峰值常驻内存），不在 exact charging 求解路径启用 `tracemalloc`；后者会改变 100-customer fixed wall-clock trajectory（固定 wall-clock 轨迹）。因此 `peak_tracemalloc_bytes` 在 Stage 3.0 raw schema 中明确为空，而不是把高开销内存追踪伪装成 solver measurement（求解器测量）。
+内存记录使用 OS-level `peak_rss_bytes`（进程生命周期内的峰值常驻内存），不在 exact charging 求解路径启用 `tracemalloc`；后者会改变 100-customer fixed wall-clock trajectory（固定 wall-clock 轨迹）。因此 `peak_tracemalloc_bytes` 在 Stage 3.0 raw schema 中明确为空，而不是把高开销内存追踪伪装成 solver measurement（求解器测量）。
 
 ## 运行命令
 
@@ -77,7 +78,7 @@ uv run python -m evrptw.experiments.stage03_measurement \
 
 ## 保留规则与门槛
 
-- 输出目录和 run label 已存在时直接失败；历史 Stage 2.3 目录与摘要不覆盖。
+- 输出目录和 run label 已存在时直接失败；raw output 强制位于 ignored `results/`，tracked summaries 强制位于 `experiments/summaries/`；历史 Stage 2.3 目录与摘要不覆盖。
 - 求解异常、deadline 中断和未完成 exact call 先写入 partial trace、event log、environment 和 raw record，再重新抛错；不可用半成品候选冒充 accepted。
 - replay auditor 先验证 manifest SHA-256，再读取任何 raw 结论。篡改 solution、trace、event 或 manifest 文件都会 fail fast。
 - smoke 必须覆盖 18 个唯一 run key；所有 solution 通过 validator，objective replay 一致，trace 与 `ALNSResult` 对账一致；C5 objective key 必须与 Stage 2.3 attempt16 对应 baseline 一致，100-customer runs 必须可行且 vehicle count 不得变差。

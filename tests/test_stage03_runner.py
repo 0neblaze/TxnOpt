@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import evrptw.experiments.stage03_measurement_review as stage03_review
 from evrptw.experiments.stage03_measurement import (
     SMOKE_INSTANCES,
     _scope_instances,
@@ -40,7 +41,25 @@ def test_stage03_manifest_rejects_tampered_raw_artifact(
         _verify_manifest(tmp_path)
 
 
-def test_stage03_summary_publish_rejects_overwrite(tmp_path: Path) -> None:
+def test_stage03_manifest_rejects_tampered_manifest_or_sidecar(tmp_path: Path) -> None:
+    _write_manifest(tmp_path)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace('"1"', '"2"'),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="sidecar hash mismatch"):
+        _verify_manifest(tmp_path)
+
+    _write_manifest(tmp_path)
+    (tmp_path / "manifest.sha256").write_text("0" * 64 + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="sidecar hash mismatch"):
+        _verify_manifest(tmp_path)
+
+
+def test_stage03_summary_publish_rejects_overwrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     output_paths = {}
     for key in (
         "review_report",
@@ -56,8 +75,9 @@ def test_stage03_summary_publish_rejects_overwrite(tmp_path: Path) -> None:
         path = tmp_path / f"{key}.txt"
         path.write_text("raw\n", encoding="utf-8")
         output_paths[key] = path
-    summary_dir = tmp_path / "summaries"
-    summary_dir.mkdir()
+    monkeypatch.setattr(stage03_review, "_repository_root", lambda: tmp_path)
+    summary_dir = tmp_path / "experiments" / "summaries"
+    summary_dir.mkdir(parents=True)
     (summary_dir / "run_review_report.md").write_text("existing\n", encoding="utf-8")
 
     with pytest.raises(FileExistsError, match="already exist"):

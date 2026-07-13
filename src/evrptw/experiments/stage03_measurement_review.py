@@ -11,7 +11,9 @@ from types import SimpleNamespace
 from typing import Any
 
 from evrptw.experiments.stage03_measurement import (
+    OBJECTIVE_SCHEMA,
     RAW_PER_RUN_FIELDS,
+    _assert_results_path,
     _combined_hash,
     _read_csv,
     _repository_root,
@@ -21,7 +23,11 @@ from evrptw.experiments.stage03_measurement import (
     _write_json,
 )
 from evrptw.measurement import Stage03Trace
-from evrptw.objective import SolutionObjective
+from evrptw.objective import (
+    ObjectiveComparison,
+    SolutionObjective,
+    compare_objectives,
+)
 from evrptw.parser import parse_schneider
 from evrptw.validation import validate_routes
 
@@ -93,6 +99,7 @@ class _AuditedRun:
     raw_row: dict[str, str]
     raw_payload: dict[str, Any]
     solution_payload: dict[str, Any]
+    environment_payload: dict[str, Any]
     trace: Stage03Trace
     solver_result: SimpleNamespace | None
     instance: Any
@@ -118,6 +125,7 @@ def review_run(
     run_dir = run_dir if run_dir.is_absolute() else root / run_dir
     if not run_dir.is_dir():
         raise FileNotFoundError(f"Stage 3.0 run directory is missing: {run_dir}")
+    _assert_results_path(root, run_dir, "run_dir")
     _verify_manifest(run_dir)
     metadata = _read_json(run_dir / "run_metadata.json")
     scope = str(metadata.get("scope", ""))
@@ -225,6 +233,20 @@ def review_run(
             "run_metadata.json, parameters.toml, and Stage 0 manifest",
         )
     )
+    run_provenance = [
+        _per_run_provenance(root, run_dir, metadata, item.raw_row)
+        for item in audited
+    ]
+    findings.append(
+        _finding(
+            "per_run_environment_and_instance_provenance",
+            bool(audited) and len(run_provenance) == len(expected_keys)
+            and all(passed for passed, _ in run_provenance),
+            [reason for _, reason in run_provenance],
+            "each raw environment, instance, source/config, and reference hash matches",
+            "environments/<run>.json, raw_per_run_results.csv, and benchmark files",
+        )
+    )
     historical_provenance = metadata.get("historical_stage02_baselines", {})
     historical_dirty_ok = all(
         isinstance(value, dict) and value.get("repository_dirty") is True
@@ -300,7 +322,7 @@ def review_run(
             "all Stage 3.0 acceptance gates",
         )
     )
-    recomputed_rows = [_recomputed_row(item, metadata) for item in audited]
+    recomputed_rows = [_recomputed_row(item, metadata, run_dir) for item in audited]
     summary_rows = _summarize(recomputed_rows)
     trace_rows = [_trace_row(item, label) for item in audited]
     deadline_rows = [item.deadline_row | {"run_label": label} for item in audited]
@@ -358,6 +380,7 @@ def _audit_one_run(
     seed = int(str(row["seed"]))
     raw_payload = _read_json(run_dir / row["raw_path"])
     solution_payload = _read_json(run_dir / row["solution_path"])
+    environment_payload = _read_json(run_dir / row["environment_path"])
     trace = Stage03Trace.from_dict(_read_json(run_dir / row["trace_path"]))
     event_log = _read_jsonl(run_dir / row["event_path"])
     solver_payload = raw_payload.get("solver_result")
@@ -368,27 +391,27 @@ def _audit_one_run(
     routes = [[str(value) for value in route] for route in solution_payload.get("routes", [])]
     report = validate_routes(instance, routes)
     objective = SolutionObjective.from_report(instance, report) if report.feasible else None
-    solution_key = tuple(
-        _int_value(value) if index in {0, 3} else float(value)
-        for index, value in enumerate(solution_payload.get("objective_key", ()))
-    )
+    solution_objective = _objective_from_key(solution_payload.get("objective_key", ()))
     solver_objective = solver_payload.get("objective") if isinstance(solver_payload, dict) else None
-    solver_key = (
-        (
+    solver_solution_objective = (
+        SolutionObjective(
             int(solver_objective["vehicle_count"]),
-            round(float(solver_objective["total_distance"]), 9),
-            round(float(solver_objective["total_charging_time"]), 9),
+            float(solver_objective["total_distance"]),
+            float(solver_objective["total_charging_time"]),
             int(solver_objective["charging_count"]),
         )
         if isinstance(solver_objective, dict)
-        else ()
+        else None
     )
     objective_replay_ok = (
         objective is not None
-        and solution_key == objective.key
-        and solver_key == objective.key
+        and solution_objective is not None
+        and solver_solution_objective is not None
+        and compare_objectives(solution_objective, objective) is ObjectiveComparison.EQUAL
+        and compare_objectives(solver_solution_objective, objective)
+        is ObjectiveComparison.EQUAL
     )
-    candidate_state_ok = _candidate_state_ok(trace)
+    candidate_state_ok = _candidate_state_ok(trace, solver_result)
     event_log_ok = _event_log_ok(event_log, trace, solver_result)
     reconciliation: dict[str, object]
     if solver_result is not None:
@@ -404,6 +427,7 @@ def _audit_one_run(
         raw_row=row,
         raw_payload=raw_payload,
         solution_payload=solution_payload,
+        environment_payload=environment_payload,
         trace=trace,
         solver_result=solver_result,
         instance=instance,
@@ -418,7 +442,15 @@ def _audit_one_run(
     )
 
 
-def _candidate_state_ok(trace: Stage03Trace) -> bool:
+def _candidate_state_ok(
+    trace: Stage03Trace,
+    solver_result: SimpleNamespace | None = None,
+) -> bool:
+    candidate_states = [
+        event
+        for event in trace.events
+        if event.get("event_type") == "candidate_state"
+    ]
     for event in trace.events:
         if event.get("event_type") != "candidate_state":
             continue
@@ -437,7 +469,16 @@ def _candidate_state_ok(trace: Stage03Trace) -> bool:
                 return False
             if event.get("status") == "time_limit":
                 return False
-    return True
+    if solver_result is None:
+        return True
+    legacy_states = [event for event in candidate_states if event.get("lane") == "legacy"]
+    return (
+        len(legacy_states) == _int_value(getattr(solver_result, "effective_iterations", 0))
+        and sum(event.get("accepted") is True for event in legacy_states)
+        == _int_value(getattr(solver_result, "accepted_moves", 0))
+        and sum(event.get("accepted") is not True for event in legacy_states)
+        == _int_value(getattr(solver_result, "rejected_moves", 0))
+    )
 
 
 def _event_log_ok(
@@ -528,7 +569,60 @@ def _provenance_ok(root: Path, run_dir: Path, metadata: dict[str, Any]) -> tuple
     baseline_manifest = Path(str(metadata["baseline_directory"])) / "manifest.json"
     if _sha256(baseline_manifest) != metadata.get("stage00_manifest_sha256"):
         return False, "Stage 0 manifest changed after the run"
+    expected_hashes = {
+        "stage00_configuration_sha256": root / "configs" / "stage00_baseline.toml",
+        "stage02_configuration_sha256": root / "configs" / "stage02_constraint_guided.toml",
+        "stage02_attempt16_per_run_sha256": Path(
+            str(metadata["stage02_attempt16_per_run"])
+        ),
+        "stage02_rerun09_per_run_sha256": Path(str(metadata["stage02_rerun09_per_run"])),
+    }
+    for metadata_key, path in expected_hashes.items():
+        if not path.is_absolute():
+            path = root / path
+        if _sha256(path) != metadata.get(metadata_key):
+            return False, f"{metadata_key} changed after the run"
     return True, "source/config/Stage 0/reference provenance matches raw metadata"
+
+
+def _per_run_provenance(
+    root: Path,
+    run_dir: Path,
+    metadata: dict[str, Any],
+    row: dict[str, str],
+) -> tuple[bool, str]:
+    try:
+        environment_path = run_dir / row["environment_path"]
+        environment = _read_json(environment_path)
+        benchmark_dir = Path(str(metadata["benchmark_directory"]))
+        if not benchmark_dir.is_absolute():
+            benchmark_dir = root / benchmark_dir
+        instance_path = benchmark_dir / f"{row['instance']}.txt"
+        expected_reference = metadata.get("reference_repositories", {})
+        checks = {
+            "environment_hash": _sha256(environment_path) == row["environment_sha256"],
+            "instance_hash": _sha256(instance_path) == row["instance_sha256"]
+            == environment.get("instance_sha256"),
+            "repository_revision": environment.get("repository_revision")
+            == metadata.get("repository_revision")
+            == row["repository_revision"],
+            "repository_dirty": environment.get("repository_dirty") is False
+            and row["repository_dirty"] == "False",
+            "source_hash": environment.get("algorithm_source_sha256")
+            == metadata.get("algorithm_source_sha256")
+            == row["algorithm_source_sha256"],
+            "configuration_hash": environment.get("configuration_sha256")
+            == metadata.get("configuration_sha256")
+            == row["configuration_sha256"],
+            "stage00_manifest_hash": environment.get("stage00_manifest_sha256")
+            == metadata.get("stage00_manifest_sha256")
+            == row["stage00_manifest_sha256"],
+            "reference_repositories": environment.get("reference_repositories")
+            == expected_reference,
+        }
+    except (KeyError, FileNotFoundError, TypeError, ValueError) as error:
+        return False, f"provenance exception: {error}"
+    return all(checks.values()), json.dumps(checks, sort_keys=True)
 
 
 def _load_baseline_rows(
@@ -566,21 +660,41 @@ def _compare_baselines(
         candidate_key = item.objective.key if item.objective is not None else ()
         attempt16 = baselines.get("attempt16", {}).get(item.key, ())
         rerun09 = baselines.get("rerun09", {}).get(item.key, ())
-        if item.objective is None or not attempt16:
+        candidate_objective = item.objective
+        attempt16_objective = _objective_from_key(attempt16)
+        rerun09_objective = _objective_from_key(rerun09)
+        if candidate_objective is None or attempt16_objective is None or rerun09_objective is None:
             classification = "missing_candidate_or_baseline"
             gate = "fail"
             vehicle_delta: object = ""
         else:
-            candidate = item.objective.key
-            vehicle_delta = candidate[0] - attempt16[0]
+            vehicle_delta = (
+                candidate_objective.vehicle_count - attempt16_objective.vehicle_count
+            )
             if item.key[0] in {"c101C5", "r105C5", "rc105C5"}:
-                gate = "pass" if candidate == attempt16 else "fail"
-                classification = "unchanged" if candidate == attempt16 else "regression"
-                reason = "C5 objective key must match attempt16 exactly"
+                gate = (
+                    "pass"
+                    if compare_objectives(candidate_objective, attempt16_objective)
+                    is ObjectiveComparison.EQUAL
+                    and compare_objectives(candidate_objective, rerun09_objective)
+                    is ObjectiveComparison.EQUAL
+                    else "fail"
+                )
+                classification = "unchanged" if gate == "pass" else "regression"
+                reason = "C5 objective key must match both historical Stage 2.3 baselines"
             elif item.key[0] in {"c101_21", "r101_21", "rc101_21"}:
-                gate = "pass" if item.validator_feasible and vehicle_delta <= 0 else "fail"
+                gate = (
+                    "pass"
+                    if item.validator_feasible
+                    and candidate_objective.vehicle_count <= attempt16_objective.vehicle_count
+                    and candidate_objective.vehicle_count <= rerun09_objective.vehicle_count
+                    else "fail"
+                )
                 classification = "vehicle_guard_pass" if gate == "pass" else "vehicle_regression"
-                reason = "100-customer vehicle count guard; wall-clock is time-budget variation"
+                reason = (
+                    "100-customer vehicle count guard against both historical baselines; "
+                    "wall-clock is time-budget variation"
+                )
             else:
                 gate = "pass"
                 classification = "time_budget_variation"
@@ -597,7 +711,9 @@ def _compare_baselines(
                 "gate_status": gate,
                 "reason": (
                     reason
-                    if item.objective is not None and attempt16
+                    if candidate_objective is not None
+                    and attempt16_objective is not None
+                    and rerun09_objective is not None
                     else "raw baseline coverage is missing"
                 ),
             }
@@ -605,13 +721,17 @@ def _compare_baselines(
     return output
 
 
-def _recomputed_row(item: _AuditedRun, metadata: dict[str, Any]) -> dict[str, Any]:
+def _recomputed_row(
+    item: _AuditedRun,
+    metadata: dict[str, Any],
+    run_dir: Path,
+) -> dict[str, Any]:
     raw = item.raw_row
     solver = item.solver_result
-    result: dict[str, Any] = {
-        field: raw.get(field, "")
-        for field in RAW_PER_RUN_FIELDS
-    }
+    environment = item.environment_payload
+    reference_repositories = environment.get("reference_repositories", {})
+    instance_path = Path(str(metadata["benchmark_directory"])) / f"{item.key[0]}.txt"
+    environment_path = run_dir / raw["environment_path"]
     solver_feasible = bool(getattr(solver, "feasible", False)) if solver is not None else False
     solver_metrics = {
         field: getattr(solver, field, "") if solver is not None else ""
@@ -625,15 +745,46 @@ def _recomputed_row(item: _AuditedRun, metadata: dict[str, Any]) -> dict[str, An
             "improving_moves",
             "rejected_moves",
             "charging_subproblem_calls",
+            "total_energy",
+            "total_charged_energy",
         )
     }
+    result: dict[str, Any] = {field: "" for field in RAW_PER_RUN_FIELDS}
     result.update(
         {
             "schema_version": metadata["schema_version"],
             "run_label": metadata["run_label"],
+            "experiment_id": raw.get("experiment_id", ""),
             "scope": metadata["scope"],
             "instance": item.key[0],
             "seed": item.key[1],
+            "algorithm": metadata["algorithm"],
+            "operator_profile": metadata["operator_profile"],
+            "repository_revision": environment.get("repository_revision", ""),
+            "repository_dirty": environment.get("repository_dirty", ""),
+            "algorithm_source_sha256": environment.get("algorithm_source_sha256", ""),
+            "configuration_sha256": environment.get("configuration_sha256", ""),
+            "instance_sha256": _sha256(instance_path),
+            "stage00_manifest_sha256": environment.get("stage00_manifest_sha256", ""),
+            "environment_sha256": _sha256(environment_path),
+            "reference_vrp_evrp_hub_revision": reference_repositories.get(
+                "VRP-EVRP-Project-Hub", {}
+            ).get("revision", ""),
+            "reference_vrp_evrp_hub_dirty": reference_repositories.get(
+                "VRP-EVRP-Project-Hub", {}
+            ).get("dirty", ""),
+            "reference_py_ga_vrptw_revision": reference_repositories.get(
+                "py-ga-VRPTW", {}
+            ).get("revision", ""),
+            "reference_py_ga_vrptw_dirty": reference_repositories.get(
+                "py-ga-VRPTW", {}
+            ).get("dirty", ""),
+            "start_utc": environment.get("run_start_utc", ""),
+            "end_utc": environment.get("run_end_utc", ""),
+            "time_limit_seconds": metadata["time_limit_seconds"],
+            "max_iterations": metadata["max_iterations"],
+            "threads": metadata["threads"],
+            "objective_schema": OBJECTIVE_SCHEMA,
             "objective_key": json.dumps(item.objective.key if item.objective else ()),
             "vehicle_count": item.objective.vehicle_count if item.objective else "",
             "total_distance": item.objective.total_distance if item.objective else "",
@@ -661,6 +812,13 @@ def _recomputed_row(item: _AuditedRun, metadata: dict[str, Any]) -> dict[str, An
             "trace_deadline_events": item.trace.deadline_events,
             "trace_reconciliation_status": item.reconciliation.get("status", "not_available"),
             **solver_metrics,
+            "peak_tracemalloc_bytes": environment.get("peak_tracemalloc_bytes", ""),
+            "peak_rss_bytes": environment.get("peak_rss_bytes", ""),
+            "raw_path": raw.get("raw_path", ""),
+            "solution_path": raw.get("solution_path", ""),
+            "trace_path": raw.get("trace_path", ""),
+            "event_path": raw.get("event_path", ""),
+            "environment_path": raw.get("environment_path", ""),
             "failure_reason": (
                 "; ".join(item.validator_violations)
                 or str(getattr(solver, "failure_reason", ""))
@@ -693,7 +851,8 @@ def _summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             for row in group
             if row.get("effective_iterations", "") != ""
         ]
-        best = min(objectives) if objectives else ()
+        best_objective = _best_objective(objectives)
+        best = best_objective.key if best_objective is not None else ()
         output.append(
             {
                 "instance": instance,
@@ -781,6 +940,16 @@ def _publish_summaries(
     label: str,
     output_paths: dict[str, Path],
 ) -> None:
+    root = _repository_root()
+    summaries_root = (root / "experiments" / "summaries").resolve()
+    candidate = summary_dir.resolve()
+    try:
+        candidate.relative_to(summaries_root)
+    except ValueError as error:
+        raise ValueError(
+            "Stage 3.0 summary_dir must be below experiments/summaries/: "
+            f"{candidate}"
+        ) from error
     summary_dir.mkdir(parents=True, exist_ok=True)
     names = {
         "review_report": f"{label}_review_report.md",
@@ -805,7 +974,20 @@ def _verify_manifest(run_dir: Path) -> None:
     manifest_path = run_dir / "manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Stage 3.0 manifest is missing: {manifest_path}")
+    sidecar_path = run_dir / "manifest.sha256"
+    if not sidecar_path.is_file():
+        raise ValueError(f"Stage 3.0 manifest sidecar is missing: {sidecar_path}")
+    observed_manifest_hash = sidecar_path.read_text(encoding="utf-8").strip()
+    if observed_manifest_hash != _sha256(manifest_path):
+        raise ValueError(
+            "Stage 3.0 manifest sidecar hash mismatch: "
+            f"expected {observed_manifest_hash}, observed {_sha256(manifest_path)}"
+        )
     payload = _read_json(manifest_path)
+    if payload.get("schema_version") != "1":
+        raise ValueError(
+            f"unsupported Stage 3.0 manifest schema: {payload.get('schema_version')}"
+        )
     expected = dict(payload.get("files", {}))
     observed: dict[str, str] = {}
     for relative, expected_hash in expected.items():
@@ -823,6 +1005,7 @@ def _verify_manifest(run_dir: Path) -> None:
         for path in run_dir.rglob("*")
         if path.is_file()
         and path != manifest_path
+        and path != sidecar_path
         and "review" not in path.relative_to(run_dir).parts
     }
     if actual_files != set(expected):
@@ -874,6 +1057,31 @@ def _finding(
 
 def _render(value: object) -> str:
     return value if isinstance(value, str) else json.dumps(value, sort_keys=True, default=str)
+
+
+def _objective_from_key(value: object) -> SolutionObjective | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        return SolutionObjective(
+            int(value[0]),
+            float(value[1]),
+            float(value[2]),
+            int(value[3]),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _best_objective(values: list[object]) -> SolutionObjective | None:
+    best: SolutionObjective | None = None
+    for value in values:
+        candidate = _objective_from_key(value)
+        if candidate is None:
+            continue
+        if best is None or compare_objectives(candidate, best) is ObjectiveComparison.BETTER:
+            best = candidate
+    return best
 
 
 def _string_tuple(value: object) -> tuple[str, ...]:

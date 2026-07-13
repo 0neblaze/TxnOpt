@@ -125,7 +125,9 @@ this repository or one of its subdirectories.
   Their recorded `repository_dirty=true` value must remain visible; it is not
   rewritten as a clean run. New Stage 3.0 runs require a clean main-repository
   commit before the runner starts.
-- Stage 3.0 raw artifacts belong under a new ignored `results/` run directory.
+- Stage 3.0 raw artifacts belong under a new ignored `results/` run directory;
+  the runner rejects output paths elsewhere. The raw manifest has a separate
+  `manifest.sha256` sidecar and the auditor verifies both before replay.
   Every run retains its raw solution, raw trace, event log, environment record,
   source/config/instance hashes, Stage 0 manifest hash, both reference-repo
   revision/dirty records, and interruption evidence. A failed run gets a new

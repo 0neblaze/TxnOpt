@@ -5,6 +5,8 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
+
 if TYPE_CHECKING:
     from evrptw.models import Instance
 
@@ -85,6 +87,21 @@ class _MeasuredResult(Protocol):
 
     @property
     def neighborhood_statistics(self) -> dict[str, dict[str, object]]: ...
+
+    @property
+    def destroy_statistics(self) -> dict[str, dict[str, object]]: ...
+
+    @property
+    def repair_statistics(self) -> dict[str, dict[str, object]]: ...
+
+    @property
+    def accepted_moves(self) -> int: ...
+
+    @property
+    def rejected_moves(self) -> int: ...
+
+    @property
+    def improving_moves(self) -> int: ...
 
 
 class _ChargingResult(Protocol):
@@ -332,33 +349,66 @@ class Stage03Trace:
         expected_calls = int(result.charging_subproblem_calls)
         expected_cache_hits = int(result.cache_hits)
         expected_unique = int(result.unique_route_evaluations)
-        expected_statistics = result.neighborhood_statistics
-        observed_statistics = Counter(
-            str(event["operator"])
-            for event in self.events
-            if event.get("event_type") == "operator_call"
-            and event.get("statistics_group") == "neighborhood_statistics"
-        )
-        expected_operator_calls = {
-            str(name): int(cast(Any, values.get("calls", 0)))
-            for name, values in expected_statistics.items()
-        }
-        observed_statistics.update(
-            {name: 0 for name in expected_operator_calls if name not in observed_statistics}
-        )
         exact_route_keys = {
             (record.lane, record.route_key)
             for record in self.route_evaluations
             if record.kind == "exact_call"
         }
+        operator_call_counts: dict[str, dict[str, int]] = {}
+        expected_operator_calls: dict[str, dict[str, int]] = {}
+        for group, statistics in (
+            ("destroy_statistics", result.destroy_statistics),
+            ("repair_statistics", result.repair_statistics),
+            ("neighborhood_statistics", result.neighborhood_statistics),
+        ):
+            observed = Counter(
+                str(event["operator"])
+                for event in self.events
+                if event.get("event_type") == "operator_call"
+                and event.get("statistics_group") == group
+            )
+            expected = {
+                str(name): int(cast(Any, values.get("calls", 0)))
+                for name, values in statistics.items()
+            }
+            observed.update({name: 0 for name in expected if name not in observed})
+            operator_call_counts[group] = dict(sorted(observed.items()))
+            expected_operator_calls[group] = dict(sorted(expected.items()))
+
+        legacy_candidate_states = [
+            event
+            for event in self.events
+            if event.get("event_type") == "candidate_state"
+            and event.get("lane") == "legacy"
+        ]
+        accepted_legacy = sum(event.get("accepted") is True for event in legacy_candidate_states)
+        rejected_legacy = sum(
+            event.get("accepted") is not True for event in legacy_candidate_states
+        )
+        improving_legacy = 0
+        for event in legacy_candidate_states:
+            if event.get("accepted") is not True:
+                continue
+            current = _objective_from_key(event.get("current_objective_key"))
+            candidate = _objective_from_key(event.get("candidate_objective_key"))
+            if (
+                current is not None
+                and candidate is not None
+                and compare_objectives(candidate, current) is ObjectiveComparison.BETTER
+            ):
+                improving_legacy += 1
         checks = {
             "started_calls_not_less_than_completed": self.started_calls >= self.completed_calls,
             "completed_calls_equal_result": self.completed_calls == expected_calls,
             "exact_calls_equal_result": self.exact_calls == expected_calls,
             "cache_hits_equal_result": self.cache_hits == expected_cache_hits,
             "unique_routes_equal_result": len(exact_route_keys) == expected_unique,
-            "operator_calls_equal_result": dict(sorted(observed_statistics.items()))
-            == dict(sorted(expected_operator_calls.items())),
+            "operator_calls_equal_result": operator_call_counts == expected_operator_calls,
+            "legacy_candidate_states_equal_effective_iterations": len(legacy_candidate_states)
+            == int(getattr(result, "effective_iterations", 0)),
+            "accepted_moves_equal_result": accepted_legacy == int(result.accepted_moves),
+            "rejected_moves_equal_result": rejected_legacy == int(result.rejected_moves),
+            "improving_moves_equal_result": improving_legacy == int(result.improving_moves),
         }
         return {
             "status": "pass" if all(checks.values()) else "fail",
@@ -370,13 +420,20 @@ class Stage03Trace:
                 "cache_hits": self.cache_hits,
                 "precomputed_routes": self.precomputed_routes,
                 "unique_route_evaluations": len(exact_route_keys),
-                "operator_calls": dict(sorted(observed_statistics.items())),
+                "operator_calls": operator_call_counts,
+                "legacy_candidate_states": len(legacy_candidate_states),
+                "accepted_moves": accepted_legacy,
+                "rejected_moves": rejected_legacy,
+                "improving_moves": improving_legacy,
             },
             "expected": {
                 "charging_subproblem_calls": expected_calls,
                 "cache_hits": expected_cache_hits,
                 "unique_route_evaluations": expected_unique,
                 "operator_calls": expected_operator_calls,
+                "accepted_moves": int(result.accepted_moves),
+                "rejected_moves": int(result.rejected_moves),
+                "improving_moves": int(result.improving_moves),
             },
         }
 
@@ -469,6 +526,20 @@ def route_result_fields(result: _ChargingResult) -> dict[str, Any]:
         "labels_expanded": int(result.labels_expanded),
         "labels_pruned": int(result.labels_pruned),
     }
+
+
+def _objective_from_key(value: object) -> SolutionObjective | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        return SolutionObjective(
+            int(value[0]),
+            float(value[1]),
+            float(value[2]),
+            int(value[3]),
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def instance_route_key(instance: Instance, route: tuple[str, ...]) -> str:

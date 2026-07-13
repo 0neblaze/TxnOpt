@@ -246,7 +246,7 @@ class _Evaluator:
                     operator=self.operator,
                     kind="exact_call",
                     started_at=started_offset,
-                    completed_at=None,
+                    completed_at=self.measurement_trace._offset(),
                     exact_started=True,
                     exact_completed=False,
                     feasible=None,
@@ -325,6 +325,16 @@ class _Evaluator:
         sequence: tuple[str, ...],
         result: ChargingSubproblemResult,
     ) -> ChargingSubproblemResult:
+        if self.measurement_trace is not None and time.perf_counter() >= self.deadline:
+            if self.measurement_trace is not None:
+                self.measurement_trace.record_deadline_boundary(
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    boundary="before_precomputed_route",
+                    route_sequence=sequence,
+                )
+            raise _TimeLimitReached(sequence)
         if self.measurement_trace is not None:
             fields = route_result_fields(result)
             started = time.perf_counter()
@@ -340,6 +350,17 @@ class _Evaluator:
                 exact_completed=False,
                 **fields,
             )
+        if self.measurement_trace is not None and time.perf_counter() >= self.deadline:
+            if self.measurement_trace is not None:
+                self.measurement_trace.record_deadline_boundary(
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    boundary="after_precomputed_route",
+                    route_sequence=sequence,
+                    reason="precomputed route completed after the lane deadline",
+                )
+            raise _TimeLimitReached(sequence)
         return result
 
 
@@ -483,6 +504,7 @@ def _solve_alns(
         shadow_events: tuple[NeighborhoodEvent, ...] = ()
         shadow_candidate: _EvaluatedSolution | None = None
         global_best_improved = False
+        main_global_best_improved = False
         main_lane_timed_out = False
         refinement_selected = False
         if profile is OperatorProfile.BASELINE:
@@ -1258,7 +1280,7 @@ def _solve_alns(
                     ),
                     candidate_feasible=candidate.feasible,
                     accepted=False,
-                    global_best=global_best_improved,
+                    global_best=main_global_best_improved,
                     status="rejected" if not main_lane_timed_out else "time_limit",
                     reason=(
                         "main lane deadline reached"
@@ -1304,6 +1326,7 @@ def _solve_alns(
             best = candidate
             best_time = time.perf_counter() - started
             global_best_improved = True
+            main_global_best_improved = True
             reward = 8.0
             if profile is OperatorProfile.BASELINE:
                 destroy_stats[destroy_name].best += 1
@@ -1345,7 +1368,7 @@ def _solve_alns(
                 ),
                 candidate_feasible=candidate.feasible,
                 accepted=True,
-                global_best=global_best_improved,
+                global_best=main_global_best_improved,
                 status="accepted",
             )
 

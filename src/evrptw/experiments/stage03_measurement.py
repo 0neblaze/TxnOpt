@@ -159,6 +159,7 @@ def run_stage03(
     root = _repository_root()
     config_path = _resolve(root, config_path)
     output_dir = _resolve(root, output_dir)
+    _assert_results_path(root, output_dir, "output_dir")
     config = load_config(config_path)
     stage02 = load_stage02_config(_resolve(root, config.stage02_config))
     _validate_stage02_protocol(config, stage02)
@@ -206,6 +207,14 @@ def run_stage03(
         "algorithm_source_sha256": algorithm_source_sha256,
         "algorithm_source_files": source_hashes,
         "configuration_sha256": _sha256(config_path),
+        "stage00_configuration_sha256": _sha256(_resolve(root, config.stage00_config)),
+        "stage02_configuration_sha256": _sha256(_resolve(root, config.stage02_config)),
+        "stage02_attempt16_per_run_sha256": _sha256(
+            _resolve(root, config.stage02_attempt16_per_run)
+        ),
+        "stage02_rerun09_per_run_sha256": _sha256(
+            _resolve(root, config.stage02_rerun09_per_run)
+        ),
         "stage00_manifest_sha256": baseline_manifest_sha256,
         "benchmark_directory": str(benchmark_dir),
         "baseline_directory": str(baseline_dir),
@@ -574,6 +583,18 @@ def _validate_stage02_protocol(config: Stage03Config, stage02: Stage02Config) ->
         raise ValueError("Stage 3.0 time limit differs from Stage 2.3")
     if stage02.max_iterations != config.max_iterations or stage02.threads != config.threads:
         raise ValueError("Stage 3.0 iteration/thread protocol differs from Stage 2.3")
+    if stage02.vehicle_operator_config.constraint_lane_time_budget_seconds != 0.1:
+        raise ValueError("Stage 3.0 requires the fixed 0.1-second constraint-lane slice")
+    vehicle_config = stage02.vehicle_operator_config
+    if (
+        vehicle_config.quality_probe_exact_evaluation_budget != 2
+        or vehicle_config.quality_route_segment_probe_exact_evaluation_budget != 4
+        or vehicle_config.vehicle_reduction_refinement_exact_evaluation_budget != 512
+    ):
+        raise ValueError(
+            "Stage 3.0 requires the accepted Stage 2.3 probe/refinement budgets "
+            "(2, 4, and 512)"
+        )
 
 
 def _scope_instances(scope: str) -> tuple[str, ...]:
@@ -590,20 +611,17 @@ def _require_smoke_gate(review_dir: Path | None) -> None:
             "formal Stage 3.0 is blocked: provide a smoke review directory with "
             "READY_FOR_STAGE03_FORMAL_MEASUREMENT"
         )
-    manifest = review_dir / "review_manifest.json"
-    if manifest.is_file():
-        payload = json.loads(manifest.read_text(encoding="utf-8"))
-        if payload.get("status") == "READY_FOR_STAGE03_FORMAL_MEASUREMENT":
-            return
-    readiness = review_dir / "stage03_readiness.csv"
-    if readiness.is_file():
-        rows = _read_csv(readiness)
-        if any(
-            row.get("status") == "pass"
-            and row.get("observed") == "READY_FOR_STAGE03_FORMAL_MEASUREMENT"
-            for row in rows
-        ):
-            return
+    # Re-run the auditor from the raw run directory.  A status string in a
+    # mutable review CSV/JSON is not an authorization token for formal work.
+    from evrptw.experiments.stage03_measurement_review import review_run
+
+    outputs = review_run(run_dir=review_dir.parent)
+    manifest = outputs["review_manifest"]
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    if payload.get("scope") == "smoke" and payload.get("status") == (
+        "READY_FOR_STAGE03_FORMAL_MEASUREMENT"
+    ):
+        return
     raise RuntimeError(
         "formal Stage 3.0 is blocked until smoke replay reports "
         "READY_FOR_STAGE03_FORMAL_MEASUREMENT"
@@ -624,6 +642,20 @@ def _assert_clean_repository(root: Path) -> None:
         )
 
 
+def _assert_results_path(root: Path, path: Path, label: str) -> None:
+    results_root = (root / "results").resolve()
+    candidate = path.resolve()
+    try:
+        relative = candidate.relative_to(results_root)
+    except ValueError as error:
+        raise ValueError(
+            f"Stage 3.0 {label} must be a child of the ignored results/ directory: "
+            f"{candidate}"
+        ) from error
+    if not relative.parts:
+        raise ValueError(f"Stage 3.0 {label} must be a new run directory below results/")
+
+
 def _source_hashes(root: Path) -> dict[str, str]:
     paths = (
         Path("src/evrptw/alns.py"),
@@ -631,9 +663,14 @@ def _source_hashes(root: Path) -> dict[str, str]:
         Path("src/evrptw/neighborhoods.py"),
         Path("src/evrptw/objective.py"),
         Path("src/evrptw/charging.py"),
+        Path("src/evrptw/environment.py"),
         Path("src/evrptw/validation.py"),
         Path("src/evrptw/experiments/stage03_measurement.py"),
         Path("src/evrptw/experiments/stage03_measurement_review.py"),
+        Path("configs/stage00_baseline.toml"),
+        Path("configs/stage02_constraint_guided.toml"),
+        Path("pyproject.toml"),
+        Path("uv.lock"),
     )
     missing = [path for path in paths if not (root / path).is_file()]
     if missing:
@@ -717,12 +754,17 @@ def _peak_rss_bytes() -> int | None:
 
 def _write_manifest(directory: Path) -> None:
     manifest_path = directory / "manifest.json"
+    sidecar_path = directory / "manifest.sha256"
     files = {
         str(path.relative_to(directory)): _sha256(path)
         for path in sorted(directory.rglob("*"))
-        if path.is_file() and path != manifest_path
+        if path.is_file() and path not in {manifest_path, sidecar_path}
     }
     _write_json(manifest_path, {"schema_version": SCHEMA_VERSION, "files": files})
+    sidecar_path.write_text(
+        _sha256(manifest_path) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _validate_run_label(run_label: str) -> None:
