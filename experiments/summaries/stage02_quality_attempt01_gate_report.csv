@@ -1,0 +1,19 @@
+gate,status,observed,expected,evidence
+run_coverage,pass,"36 rows, 36 unique keys","exactly 36 unique (instance, seed) keys",stage02 per-run results
+validator_feasibility,pass,36/36,36/36,per-run validator result
+stage02_1_best_objective,fail,c101C5:equal; r105C5:equal; rc105C5:equal; c104C10:equal; r103C10:equal; rc102C10:equal; c106C15:equal; r105C15:equal; rc103C15:equal; c101_21:worse; r101_21:equal; rc101_21:worse,every instance is better or equal,stage02_1 formal objective comparison
+r101_21_mean_vehicle_reduction,pass,20.333333333333332,23.333333333333332,Stage 0 vehicle-count mean
+r101_21_distance_guard,pass,1797.5812694844965,2189.5004302511775,Stage 1 mean distance × 1.10
+r101_21_vehicle_seed_stability,pass,0.4714045207910317,2.6246692913372702,population standard deviation over three seeds
+rc101_21_mean_vehicle_reduction,pass,19.333333333333332,23.666666666666668,Stage 0 vehicle-count mean
+rc101_21_distance_guard,pass,2026.8100990976764,2386.783450719752,Stage 1 mean distance × 1.10
+rc101_21_vehicle_seed_stability,pass,0.4714045207910317,0.4714045207910317,population standard deviation over three seeds
+route_elimination_multiple_instances,pass,"['c101_21', 'c106C15', 'r101_21', 'r103C10', 'r105C15', 'rc101_21', 'rc103C15', 'rc105C5']",at least 2 distinct instances,route elimination event log
+route_merge_vehicle_reduction,pass,13,at least 1 candidate,route merge event log
+relocate_candidate_coverage,pass,"{'calls': 283735, 'feasible_candidates': 19689}",at least one call and one feasible candidate,Stage 2.2 operator event log
+swap_candidate_coverage,pass,"{'calls': 62836, 'feasible_candidates': 4933}",at least one call and one feasible candidate,Stage 2.2 operator event log
+two_opt_star_candidate_coverage,pass,"{'calls': 35620, 'feasible_candidates': 5629}",at least one call and one feasible candidate,Stage 2.2 operator event log
+route_segment_destroy_candidate_coverage,pass,"{'calls': 5548, 'feasible_candidates': 5548}",at least one call and one feasible candidate,Stage 2.2 operator event log
+ejection_chain_candidate_coverage,pass,"{'calls': 280558, 'feasible_candidates': 22262}",at least one call and one feasible candidate,Stage 2.2 operator event log
+route_quality_accepted_same_vehicle_distance_improvement,pass,10871,at least 1 accepted same-vehicle-count distance improvement,Stage 2.2 operator event log
+stage00_immutable,pass,b226b97e0e67288aaaf85726ad855df71cb81406685c57c8e8c40cd8996aa0da,b226b97e0e67288aaaf85726ad855df71cb81406685c57c8e8c40cd8996aa0da,Stage 0 manifest SHA-256

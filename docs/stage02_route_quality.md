@@ -42,8 +42,7 @@ distance improvement 和 failure reason。
 7. 第二次独立完整复跑通过 `independent_complete_rerun`。
 
 失败轮次保留新的 `results/` raw JSON、solution、事件日志、failure cases、environment
-和 manifest，不覆盖既有证据。只有第一轮和独立复跑全部 hard gates 通过后，才在本节记录
-正式完成结果。
+和 manifest，不覆盖既有证据。
 
 ## 4. 运行命令
 
@@ -58,5 +57,38 @@ uv run python -m evrptw.experiments.stage02_route_quality \
   --config configs/stage02_route_quality.toml \
   --output-dir results/stage02-quality-rerun01 \
   --run-label stage02_quality_rerun01 \
-  --repeat-of results/stage02-quality_attempt01
+  --repeat-of results/stage02-quality_attempt02
 ```
+
+## 5. 正式验收结果（2026-07-13）
+
+第一轮 `stage02_quality_attempt01` 的 36/36 runs 均通过 validator，但
+`stage02_1_best_objective` 未通过：`c101_21` 和 `rc101_21` 的质量算子接受轨迹在固定
+30 秒预算内偏离了 Stage 2.1 best objective。该轮完整证据保留在
+`results/stage02-quality_attempt01/` 及对应的 tracked summaries 中。
+
+根因修复为保留 Stage 2.1 的主搜索轨迹，把五个新增算子作为独立、可观测的 quality probe
+轨道；probe 只在不劣于其自身 incumbent（当前解）时接受，且其 exact evaluation budget
+固定为 4 并写入 TOML。修复提交为 `96a6307`。
+
+修复后的第一轮 `stage02_quality_attempt02` 和独立复跑
+`stage02_quality_rerun01` 均通过全部 gates：
+
+| Gate / 指标 | 结果 |
+| --- | --- |
+| validator-feasible | 两轮均 36/36 |
+| Stage 2.1 best objective comparison | 12/12 instances equal or better |
+| `r101_21` mean vehicles | 20.667；Stage 0 为 23.333 |
+| `rc101_21` mean vehicles | 19.333；Stage 0 为 23.667 |
+| R/RC mean distance | 1812.683 / 1968.100；均低于 Stage 1 × 1.10 |
+| R/RC vehicle standard deviation | 0.471 / 0.471；不高于 Stage 0 |
+| route elimination | 8 个不同实例产生真实减车候选 |
+| route merge | 11 个真实减车候选 |
+| five new operator candidate coverage | 五类均有调用和可行 candidate |
+| accepted same-vehicle distance improvement | 21 个事件 |
+| independent complete rerun | pass；36/36 keys、配置匹配 |
+| Stage 0 manifest SHA-256 | `b226b97e0e67288aaaf85726ad855df71cb81406685c57c8e8c40cd8996aa0da` |
+
+因此阶段 2.2 的实现与正式验收门槛均已完成。失败轮和两个成功轮的 raw 输出仍分别保留在
+新的 ignored `results/` 目录；汇总、gate report、environment、parameters 和 failure
+cases 保留在 `experiments/summaries/`。

@@ -1,0 +1,49 @@
+[stage02]
+schema_version = "1"
+experiment_id = "stage02-route-quality"
+algorithm = "ALNS_STAGE02_ROUTE_QUALITY"
+operator_profile = "stage02_route_quality"
+baseline_dir = "experiments/baselines/stage00"
+stage01_per_run = "experiments/summaries/stage01_per_run_results.csv"
+comparison_per_run = "experiments/summaries/stage02_attempt02_per_run_results.csv"
+comparison_label = "stage02_1"
+comparison_gate = "stage02_1_best_objective"
+
+[benchmark]
+directory = "data/schneider"
+instances = [
+  "c101C5",
+  "r105C5",
+  "rc105C5",
+  "c104C10",
+  "r103C10",
+  "rc102C10",
+  "c106C15",
+  "r105C15",
+  "rc103C15",
+  "c101_21",
+  "r101_21",
+  "rc101_21",
+]
+
+[run]
+seeds = [2014, 2015, 2016]
+time_limit_seconds = 30.0
+max_iterations = 1000
+threads = 1
+
+[vehicle_operators]
+max_route_elimination_attempts = 8
+route_elimination_exact_evaluation_budget = 256
+route_merge_exact_evaluation_budget = 64
+vehicle_repair_exact_evaluation_budget = 256
+relocate_exact_evaluation_budget = 48
+swap_exact_evaluation_budget = 48
+two_opt_star_exact_evaluation_budget = 32
+route_segment_exact_evaluation_budget = 32
+ejection_chain_exact_evaluation_budget = 24
+quality_probe_exact_evaluation_budget = 4
+route_segment_min_length = 2
+route_segment_max_length = 5
+ejection_chain_max_depth = 3
+ejection_chain_beam_width = 16

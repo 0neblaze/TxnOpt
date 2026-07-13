@@ -1,0 +1,109 @@
+instance,operator,runs,calls,feasible_repairs,accepted,rejected,improved,best,vehicle_reductions,distance_improvements,prefilter_passed,prefilter_rejected,new_routes_created,exact_route_evaluations,failure_reasons_json
+c101C5,ejection_chain,3,425,425,219,206,95,0,0,95,4228,36997,0,7606,"{""time_window_prefilter"":36997}"
+c101C5,relocate,3,317,317,150,167,55,3,0,55,634,5072,0,634,"{""time_window_prefilter"":5072}"
+c101C5,route_elimination,3,65,0,0,65,0,0,0,0,130,0,0,3,"{""no_existing_route_insertion"":130}"
+c101C5,route_merge,3,54,0,0,54,0,0,0,0,0,378,0,0,"{""time_window_prefilter"":378}"
+c101C5,route_segment_destroy,3,756,756,756,0,68,0,0,68,756,0,0,6,{}
+c101C5,standard,3,287,287,108,179,0,0,0,64,0,0,0,0,{}
+c101C5,swap,3,194,194,58,136,23,0,0,23,582,776,0,776,"{""time_window_prefilter"":776}"
+c101C5,two_opt_star,3,253,253,71,182,27,0,0,27,759,0,0,1012,{}
+c101C5,vehicle_count_aware_repair,3,649,649,649,0,0,0,0,0,0,0,0,0,{}
+c101_21,ejection_chain,3,16,6,5,11,5,3,0,5,30,1512,0,48,"{""capacity_prefilter"":278,""no feasible station-insertion pattern for fixed customer order"":17,""time_window_prefilter"":1234}"
+c101_21,relocate,3,16,7,4,12,4,4,0,4,85,2994,0,156,"{""capacity_prefilter"":935,""no feasible station-insertion pattern for fixed customer order"":58,""relocate_candidate_budget"":16,""time_window_prefilter"":2059}"
+c101_21,route_elimination,3,18,6,6,12,6,6,6,6,102,0,0,688,"{""no_existing_route_insertion"":96}"
+c101_21,route_merge,3,7,0,0,7,0,0,0,0,12,8984,0,12,"{""capacity_prefilter"":8337,""no feasible station-insertion pattern for fixed customer order"":12,""time_window_prefilter"":647}"
+c101_21,route_segment_destroy,3,10,10,10,0,0,0,0,0,10,0,0,18,{}
+c101_21,standard,3,13,10,10,0,6,5,0,6,0,0,0,0,{}
+c101_21,swap,3,12,11,10,2,5,3,0,5,44,2271,0,66,"{""capacity_prefilter"":110,""no feasible station-insertion pattern for fixed customer order"":21,""swap_candidate_budget"":12,""time_window_prefilter"":2161}"
+c101_21,two_opt_star,3,5,5,3,2,0,0,0,0,64,581,0,118,"{""capacity_prefilter"":182,""no feasible station-insertion pattern for fixed customer order"":44,""time_window_prefilter"":399,""two_opt_star_candidate_budget"":5}"
+c101_21,vehicle_count_aware_repair,3,17,17,17,0,5,5,0,5,0,0,0,89,{}
+c104C10,ejection_chain,3,397,397,218,179,67,3,0,67,7215,1779,0,9528,"{""ejection_chain_exact_evaluation_budget"":526,""no feasible station-insertion pattern for fixed customer order"":4184,""time_window_prefilter"":1779}"
+c104C10,relocate,3,372,371,155,217,78,6,0,78,9671,3475,0,17856,"{""no feasible station-insertion pattern for fixed customer order"":6652,""relocate_exact_evaluation_budget"":372,""time_window_prefilter"":3475}"
+c104C10,route_elimination,3,64,0,0,64,0,0,0,0,128,0,0,1686,"{""no_existing_route_insertion"":128}"
+c104C10,route_merge,3,67,0,0,67,0,0,0,0,176,628,0,176,"{""no feasible station-insertion pattern for fixed customer order"":176,""time_window_prefilter"":628}"
+c104C10,route_segment_destroy,3,662,662,619,43,31,3,0,31,662,0,0,666,{}
+c104C10,standard,3,692,692,663,29,88,6,0,88,0,0,0,0,{}
+c104C10,swap,3,158,133,57,101,25,3,0,25,3154,694,0,6042,"{""no feasible station-insertion pattern for fixed customer order"":1832,""time_window_prefilter"":694}"
+c104C10,two_opt_star,3,164,164,50,114,23,0,0,23,2065,537,0,3802,"{""no feasible station-insertion pattern for fixed customer order"":1105,""time_window_prefilter"":537}"
+c104C10,vehicle_count_aware_repair,3,424,424,275,149,42,4,0,42,0,0,0,1262,{}
+c106C15,ejection_chain,3,274,274,83,191,33,1,0,33,4740,20142,0,6403,"{""ejection_chain_exact_evaluation_budget"":1062,""no feasible station-insertion pattern for fixed customer order"":2401,""time_window_prefilter"":20142}"
+c106C15,relocate,3,292,292,90,202,41,5,0,41,7592,26405,0,14016,"{""no feasible station-insertion pattern for fixed customer order"":3432,""relocate_exact_evaluation_budget"":292,""time_window_prefilter"":26405}"
+c106C15,route_elimination,3,96,3,3,93,3,3,3,0,282,0,0,884,"{""no_existing_route_insertion"":279}"
+c106C15,route_merge,3,75,0,0,75,0,0,0,0,67,2633,0,67,"{""no feasible station-insertion pattern for fixed customer order"":67,""time_window_prefilter"":2633}"
+c106C15,route_segment_destroy,3,425,425,337,88,5,0,0,5,425,0,0,69,{}
+c106C15,standard,3,1133,1133,1043,90,51,1,0,61,0,0,0,0,{}
+c106C15,swap,3,170,170,45,125,25,5,0,25,2804,9459,0,5268,"{""no feasible station-insertion pattern for fixed customer order"":1841,""time_window_prefilter"":9459}"
+c106C15,two_opt_star,3,233,233,55,178,25,0,0,25,4120,5788,0,7356,"{""no feasible station-insertion pattern for fixed customer order"":1927,""time_window_prefilter"":5788,""two_opt_star_exact_evaluation_budget"":209}"
+c106C15,vehicle_count_aware_repair,3,302,302,97,205,6,1,0,6,0,0,7,600,{}
+r101_21,ejection_chain,3,12,0,0,12,0,0,0,0,3,1149,0,6,"{""no feasible station-insertion pattern for fixed customer order"":3,""time_window_prefilter"":1149}"
+r101_21,relocate,3,17,10,10,7,0,0,0,0,53,3221,0,86,"{""no feasible station-insertion pattern for fixed customer order"":13,""relocate_candidate_budget"":17,""time_window_prefilter"":3221}"
+r101_21,route_elimination,3,34,10,10,24,10,10,10,10,213,0,0,307,"{""no_existing_route_insertion"":203}"
+r101_21,route_merge,3,28,7,7,21,7,7,7,7,168,68959,0,322,"{""capacity_prefilter"":5378,""no feasible station-insertion pattern for fixed customer order"":58,""time_window_prefilter"":63581}"
+r101_21,route_segment_destroy,3,18,18,18,0,1,0,0,1,18,0,0,35,{}
+r101_21,standard,3,22,21,10,11,3,2,0,7,0,0,0,0,{}
+r101_21,swap,3,31,31,30,1,10,0,0,10,371,5612,0,680,"{""no feasible station-insertion pattern for fixed customer order"":103,""swap_candidate_budget"":31,""time_window_prefilter"":5612}"
+r101_21,two_opt_star,3,35,35,34,1,26,2,0,26,553,3481,0,994,"{""capacity_prefilter"":1,""no feasible station-insertion pattern for fixed customer order"":100,""time_window_prefilter"":3480,""two_opt_star_candidate_budget"":14,""two_opt_star_exact_evaluation_budget"":21}"
+r101_21,vehicle_count_aware_repair,3,25,25,23,2,6,3,3,6,0,0,0,91,{}
+r103C10,ejection_chain,3,549,549,416,133,136,1,0,136,10411,29884,0,13176,"{""ejection_chain_exact_evaluation_budget"":532,""no feasible station-insertion pattern for fixed customer order"":4794,""time_window_prefilter"":29884}"
+r103C10,relocate,3,435,435,248,187,148,9,0,148,5852,19929,0,10834,"{""no feasible station-insertion pattern for fixed customer order"":3362,""time_window_prefilter"":19929}"
+r103C10,route_elimination,3,64,3,3,61,3,3,3,0,128,0,0,285,"{""no_existing_route_insertion"":125}"
+r103C10,route_merge,3,49,0,0,49,0,0,0,0,0,588,0,0,"{""time_window_prefilter"":588}"
+r103C10,route_segment_destroy,3,493,493,427,66,82,2,0,82,493,0,0,278,{}
+r103C10,standard,3,463,463,300,163,56,0,0,84,0,0,0,0,{}
+r103C10,swap,3,231,170,70,161,37,1,0,37,1336,4449,0,2332,"{""no feasible station-insertion pattern for fixed customer order"":906,""time_window_prefilter"":4449}"
+r103C10,two_opt_star,3,200,119,67,133,25,0,0,25,974,2158,0,1710,"{""no feasible station-insertion pattern for fixed customer order"":567,""time_window_prefilter"":2158}"
+r103C10,vehicle_count_aware_repair,3,516,516,369,147,53,2,0,53,0,0,5,481,{}
+r105C15,ejection_chain,3,230,224,62,168,32,1,0,32,1483,20821,0,2505,"{""no feasible station-insertion pattern for fixed customer order"":967,""time_window_prefilter"":20821}"
+r105C15,relocate,3,442,442,196,246,68,6,0,68,7178,78128,0,13472,"{""no feasible station-insertion pattern for fixed customer order"":4014,""relocate_candidate_budget"":442,""time_window_prefilter"":78128}"
+r105C15,route_elimination,3,82,3,3,79,3,3,3,3,328,0,0,145,"{""no_existing_route_insertion"":325}"
+r105C15,route_merge,3,63,0,0,63,0,0,0,0,0,3591,0,0,"{""time_window_prefilter"":3591}"
+r105C15,route_segment_destroy,3,521,521,407,114,0,0,0,0,521,0,0,29,{}
+r105C15,standard,3,788,788,770,18,79,1,0,79,0,0,0,0,{}
+r105C15,swap,3,121,121,23,98,14,3,0,14,1549,8548,0,2856,"{""no feasible station-insertion pattern for fixed customer order"":906,""time_window_prefilter"":8548}"
+r105C15,two_opt_star,3,98,98,11,87,3,0,0,3,1328,3022,0,2446,"{""no feasible station-insertion pattern for fixed customer order"":830,""time_window_prefilter"":3022,""two_opt_star_exact_evaluation_budget"":7}"
+r105C15,vehicle_count_aware_repair,3,655,655,512,143,21,1,0,21,0,0,48,160,{}
+r105C5,ejection_chain,3,164,164,26,138,12,0,0,12,2132,7568,0,3936,"{""no feasible station-insertion pattern for fixed customer order"":1628,""time_window_prefilter"":7568}"
+r105C5,relocate,3,155,155,28,127,14,0,0,14,775,2015,0,1240,"{""no feasible station-insertion pattern for fixed customer order"":465,""time_window_prefilter"":2015}"
+r105C5,route_elimination,3,71,0,0,71,0,0,0,0,142,0,0,9,"{""no_existing_route_insertion"":142}"
+r105C5,route_merge,3,69,0,0,69,0,0,0,0,0,483,0,0,"{""time_window_prefilter"":483}"
+r105C5,route_segment_destroy,3,834,834,834,0,0,0,0,0,834,0,0,4,{}
+r105C5,standard,3,792,792,792,0,3,0,0,3,0,0,0,0,{}
+r105C5,swap,3,77,77,0,77,0,0,0,0,233,306,0,312,"{""no feasible station-insertion pattern for fixed customer order"":79,""time_window_prefilter"":306}"
+r105C5,two_opt_star,3,73,2,0,73,0,0,0,0,77,71,0,150,"{""no feasible station-insertion pattern for fixed customer order"":73,""time_window_prefilter"":71}"
+r105C5,vehicle_count_aware_repair,3,765,765,675,90,0,0,0,0,0,0,0,1,{}
+rc101_21,ejection_chain,3,6,3,2,4,0,0,0,0,21,558,0,36,"{""no feasible station-insertion pattern for fixed customer order"":9,""time_window_prefilter"":558}"
+rc101_21,relocate,3,18,12,12,6,6,5,0,6,139,3329,0,254,"{""no feasible station-insertion pattern for fixed customer order"":29,""relocate_candidate_budget"":18,""time_window_prefilter"":3329}"
+rc101_21,route_elimination,3,31,14,14,17,14,14,14,12,187,0,0,731,"{""no_existing_route_insertion"":173}"
+rc101_21,route_merge,3,26,6,6,20,6,6,6,6,291,62327,0,519,"{""capacity_prefilter"":14601,""no feasible station-insertion pattern for fixed customer order"":214,""time_window_prefilter"":47726}"
+rc101_21,route_segment_destroy,3,11,11,11,0,1,0,0,1,11,0,0,79,{}
+rc101_21,standard,3,15,13,11,2,6,5,0,6,0,0,0,0,{}
+rc101_21,swap,3,15,15,13,2,5,3,0,5,198,2697,0,366,"{""no feasible station-insertion pattern for fixed customer order"":66,""swap_candidate_budget"":15,""time_window_prefilter"":2697}"
+rc101_21,two_opt_star,3,17,17,16,1,10,2,0,10,244,1676,0,440,"{""no feasible station-insertion pattern for fixed customer order"":97,""time_window_prefilter"":1676,""two_opt_star_candidate_budget"":10,""two_opt_star_exact_evaluation_budget"":7}"
+rc101_21,vehicle_count_aware_repair,3,17,16,13,3,1,1,0,1,0,0,0,148,{}
+rc102C10,ejection_chain,3,739,739,734,5,39,0,0,39,10110,61571,0,17297,"{""ejection_chain_exact_evaluation_budget"":14,""no feasible station-insertion pattern for fixed customer order"":4732,""time_window_prefilter"":61571}"
+rc102C10,relocate,3,151,151,24,127,18,0,0,18,2191,13410,0,4080,"{""no feasible station-insertion pattern for fixed customer order"":1170,""time_window_prefilter"":13410}"
+rc102C10,route_elimination,3,72,0,0,72,0,0,0,0,288,0,0,52,"{""no_existing_route_insertion"":288}"
+rc102C10,route_merge,3,56,0,0,56,0,0,0,0,0,2352,0,0,"{""time_window_prefilter"":2352}"
+rc102C10,route_segment_destroy,3,501,501,310,191,4,0,0,4,501,0,0,21,{}
+rc102C10,standard,3,707,707,650,57,20,0,0,20,0,0,0,0,{}
+rc102C10,swap,3,106,89,9,97,4,0,0,4,719,3216,0,1260,"{""no feasible station-insertion pattern for fixed customer order"":540,""time_window_prefilter"":3216}"
+rc102C10,two_opt_star,3,93,79,8,85,2,0,0,2,430,799,0,702,"{""no feasible station-insertion pattern for fixed customer order"":269,""time_window_prefilter"":799}"
+rc102C10,vehicle_count_aware_repair,3,575,575,424,151,5,0,0,5,0,0,288,29,{}
+rc103C15,ejection_chain,3,533,533,444,89,151,2,0,150,5816,45668,0,7205,"{""ejection_chain_exact_evaluation_budget"":24,""no feasible station-insertion pattern for fixed customer order"":3034,""time_window_prefilter"":45668}"
+rc103C15,relocate,3,478,478,334,144,168,0,0,168,11406,78015,0,21526,"{""no feasible station-insertion pattern for fixed customer order"":5863,""relocate_candidate_budget"":313,""relocate_exact_evaluation_budget"":165,""time_window_prefilter"":78015}"
+rc103C15,route_elimination,3,70,3,3,67,3,3,3,3,280,0,0,326,"{""no_existing_route_insertion"":277}"
+rc103C15,route_merge,3,47,0,0,47,0,0,0,0,0,2679,0,0,"{""time_window_prefilter"":2679}"
+rc103C15,route_segment_destroy,3,455,455,452,3,25,3,0,25,455,0,0,69,{}
+rc103C15,standard,3,534,534,474,60,109,5,0,114,0,0,0,0,{}
+rc103C15,swap,3,158,97,54,104,15,0,0,15,1369,11953,0,2544,"{""no feasible station-insertion pattern for fixed customer order"":1132,""time_window_prefilter"":11953}"
+rc103C15,two_opt_star,3,148,112,48,100,16,1,0,16,894,5828,0,1564,"{""no feasible station-insertion pattern for fixed customer order"":623,""time_window_prefilter"":5828}"
+rc103C15,vehicle_count_aware_repair,3,577,577,557,20,132,5,0,125,0,0,12,569,{}
+rc105C5,ejection_chain,3,70,0,0,70,0,0,0,0,630,6090,0,1260,"{""no feasible station-insertion pattern for fixed customer order"":630,""time_window_prefilter"":6090}"
+rc105C5,relocate,3,80,0,0,80,0,0,0,0,160,1200,0,320,"{""no feasible station-insertion pattern for fixed customer order"":160,""time_window_prefilter"":1200}"
+rc105C5,route_elimination,3,92,3,3,89,3,3,3,3,187,0,0,18,"{""no_existing_route_insertion"":184}"
+rc105C5,route_merge,3,65,0,0,65,0,0,0,0,0,455,0,0,"{""time_window_prefilter"":455}"
+rc105C5,route_segment_destroy,3,862,862,862,0,0,0,0,0,862,0,0,3,{}
+rc105C5,standard,3,827,827,801,26,0,0,0,0,0,0,0,0,{}
+rc105C5,swap,3,73,0,0,73,0,0,0,0,73,365,0,146,"{""no feasible station-insertion pattern for fixed customer order"":73,""time_window_prefilter"":365}"
+rc105C5,two_opt_star,3,71,0,0,71,0,0,0,0,71,71,0,142,"{""no feasible station-insertion pattern for fixed customer order"":71,""time_window_prefilter"":71}"
+rc105C5,vehicle_count_aware_repair,3,860,860,860,0,0,0,0,0,0,0,0,0,{}
