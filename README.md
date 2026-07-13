@@ -189,6 +189,10 @@ run label and output directory. The second run writes an `independent_complete_r
 gate after comparing the first run's complete gate report. Curated summaries are
 written under `experiments/summaries/` only after the corresponding run completes.
 
+The completed formal evidence is recorded in the [successful gate report](experiments/summaries/stage02_attempt02_gate_report.csv),
+the [independent rerun gate report](experiments/summaries/stage02_rerun01_gate_report.csv),
+and the [failure-round record](experiments/summaries/stage02_gate_report.csv).
+
 ---
 
 ## Repository structure

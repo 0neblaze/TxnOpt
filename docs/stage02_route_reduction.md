@@ -87,3 +87,25 @@ manifest，并在正式结果写入后重新验证 validator、Stage 1 比较、
 每轮失败都保留完整证据，并在下一轮前定位具体 gate 和根因。修复后需要新增 regression test
 （回归测试），在不可覆盖的新目录重新运行 36 次正式实验，再重新检查全部 gates。阶段文档只在
 正式实验和两次独立复跑全部通过后更新为完成状态。
+
+## 6. 正式验收结果
+
+第一轮 `stage02` 发现 `c101_21` 的 route elimination 在第 0 次邻域调用中因 exact
+charging evaluation（精确充电评估）耗尽 30 秒预算，触发 `stage01_best_objective` 失败。
+失败轮次的 raw、solution、operator events、failure cases、environment 和 manifest 保留在
+`results/stage02/` 及对应的 `stage02_*` summaries 中。根因修复为在 vehicle-aware insertion
+进入 exact charging 前增加 safe capacity/time-window/energy prefilters，并加入回归测试。
+
+修复提交 `372df9a` 后，`stage02_attempt02` 和独立复跑 `stage02_rerun01` 均完成 36/36，
+且全部 gates 通过。两次运行的 `independent_complete_rerun` gate 记录了 36/36 keys 和配置一致。
+
+| 100-customer instance | Stage 0 mean vehicles | Stage 2.1 mean vehicles | Stage 2.1 vehicle std | Stage 2.1 mean distance |
+| --- | ---: | ---: | ---: | ---: |
+| `c101_21` | 14.000 | 12.000 | 0.000 | 1062.862 |
+| `r101_21` | 23.333 | 20.667 | 0.471 | 1812.683 |
+| `rc101_21` | 23.667 | 19.333 | 0.471 | 1968.100 |
+
+两次正式成功运行均为 36/36 validator-feasible；route elimination 在 8 个不同实例产生真实
+减车，route merge 产生 11 个真实减车候选；Stage 0 manifest SHA-256 保持
+`b226b97e0e67288aaaf85726ad855df71cb81406685c57c8e8c40cd8996aa0da`。独立 validator 对两次
+运行的 72 个 solution 重新计算目标，72/72 与 solver objective 完全一致。

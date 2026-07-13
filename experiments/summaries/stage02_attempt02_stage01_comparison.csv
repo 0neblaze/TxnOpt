@@ -1,0 +1,61 @@
+instance,baseline,candidate,metric,statistic,baseline_value,candidate_value,absolute_delta,relative_delta,classification,gate_status,reason
+c101C5,stage01,stage02,objective,best,"[2,264.440732989,439.66473683,3]","[2,257.747451864,472.556700052,3]",,,better,pass,vehicle-first objective comparison
+c101C5,stage01,stage02,vehicle_count,mean,2.0,2.0,0.0,0.0,unchanged,pass,descriptive comparison
+c101C5,stage01,stage02,total_distance,mean,264.4407329887187,257.7474518641999,-6.693281124518819,-0.025311082180385427,improvement,pass,descriptive comparison
+c101C5,stage01,stage02,total_charging_time,mean,439.6647368296096,472.55670005197175,32.891963222362165,0.07481146534412497,regression,pass,descriptive comparison
+c101C5,stage01,stage02,charging_count,mean,3.0,3.0,0.0,0.0,unchanged,pass,descriptive comparison
+c101_21,stage01,stage02,objective,best,"[14,1203.979724269,1467.041944497,8]","[12,1055.920259047,1386.415951629,8]",,,better,pass,vehicle-first objective comparison
+c101_21,stage01,stage02,vehicle_count,mean,14.0,12.0,-2.0,-0.14285714285714285,improvement,pass,descriptive comparison
+c101_21,stage01,stage02,total_distance,mean,1220.7246486487995,1062.8618914331591,-157.86275721564039,-0.12931889053798998,improvement,pass,descriptive comparison
+c101_21,stage01,stage02,total_charging_time,mean,1469.4364437633383,1332.7144308589852,-136.72201290435305,-0.09304384240954144,improvement,pass,descriptive comparison
+c101_21,stage01,stage02,charging_count,mean,7.666666666666667,7.666666666666667,0.0,0.0,unchanged,pass,descriptive comparison
+c104C10,stage01,stage02,objective,best,"[2,273.931237129,589.151039592,3]","[2,273.931237129,589.151039592,3]",,,equal,pass,vehicle-first objective comparison
+c104C10,stage01,stage02,vehicle_count,mean,2.0,2.0,0.0,0.0,unchanged,pass,descriptive comparison
+c104C10,stage01,stage02,total_distance,mean,275.93186443869917,277.93249174868214,2.000627309982974,0.007250439575192419,regression,pass,descriptive comparison
+c104C10,stage01,stage02,total_charging_time,mean,586.2346195054946,613.2962708750043,27.06165136950972,0.046161810423848704,regression,pass,descriptive comparison
+c104C10,stage01,stage02,charging_count,mean,3.0,3.0,0.0,0.0,unchanged,pass,descriptive comparison
+c106C15,stage01,stage02,objective,best,"[3,275.133168873,437.989595186,2]","[3,275.133168873,437.989595186,2]",,,equal,pass,vehicle-first objective comparison
+c106C15,stage01,stage02,vehicle_count,mean,3.0,3.0,0.0,0.0,unchanged,pass,descriptive comparison
+c106C15,stage01,stage02,total_distance,mean,282.8197955011379,275.1331688731623,-7.686626627975613,-0.027178531171608483,improvement,pass,descriptive comparison
+c106C15,stage01,stage02,total_charging_time,mean,447.60227310060736,437.98959518620296,-9.6126779144044,-0.021475936321359485,improvement,pass,descriptive comparison
+c106C15,stage01,stage02,charging_count,mean,2.0,2.0,0.0,0.0,unchanged,pass,descriptive comparison
+r101_21,stage01,stage02,objective,best,"[24,1876.503278666,390.503556565,23]","[20,1799.548688513,463.254013128,27]",,,better,pass,vehicle-first objective comparison
+r101_21,stage01,stage02,vehicle_count,mean,26.666666666666668,20.666666666666668,-6.0,-0.22499999999999998,improvement,pass,descriptive comparison
+r101_21,stage01,stage02,total_distance,mean,1990.4549365919793,1812.683201209865,-177.77173538211423,-0.08931211257989681,improvement,pass,descriptive comparison
+r101_21,stage01,stage02,total_charging_time,mean,392.1387898368959,449.3485036151181,57.20971377822218,0.14589149367757695,regression,pass,descriptive comparison
+r101_21,stage01,stage02,charging_count,mean,22.666666666666668,26.333333333333332,3.6666666666666643,0.16176470588235284,regression,pass,descriptive comparison
+r103C10,stage01,stage02,objective,best,"[3,202.852685745,30.457682654,2]","[2,207.051154172,49.247992351,3]",,,better,pass,vehicle-first objective comparison
+r103C10,stage01,stage02,vehicle_count,mean,3.0,2.0,-1.0,-0.3333333333333333,improvement,pass,descriptive comparison
+r103C10,stage01,stage02,total_distance,mean,202.85268574464007,207.85586985323093,5.003184108590858,0.02466412554620592,regression,pass,descriptive comparison
+r103C10,stage01,stage02,total_charging_time,mean,30.45768265386458,48.75151234354644,18.293829689681857,0.6006310426693171,regression,pass,descriptive comparison
+r103C10,stage01,stage02,charging_count,mean,2.0,2.6666666666666665,0.6666666666666665,0.33333333333333326,regression,pass,descriptive comparison
+r105C15,stage01,stage02,objective,best,"[4,336.1536021,80.684092212,4]","[4,336.1536021,80.684092212,4]",,,equal,pass,vehicle-first objective comparison
+r105C15,stage01,stage02,vehicle_count,mean,4.0,4.0,0.0,0.0,unchanged,pass,descriptive comparison
+r105C15,stage01,stage02,total_distance,mean,336.1536020996758,343.7192122947591,7.565610195083252,0.022506408224773112,regression,pass,descriptive comparison
+r105C15,stage01,stage02,total_charging_time,mean,80.68409221221032,84.77248102152096,4.0883888093106435,0.050671559872764206,regression,pass,descriptive comparison
+r105C15,stage01,stage02,charging_count,mean,4.0,4.0,0.0,0.0,unchanged,pass,descriptive comparison
+r105C5,stage01,stage02,objective,best,"[2,156.082069464,44.159902941,2]","[2,156.082069464,44.159902941,2]",,,equal,pass,vehicle-first objective comparison
+r105C5,stage01,stage02,vehicle_count,mean,2.0,2.0,0.0,0.0,unchanged,pass,descriptive comparison
+r105C5,stage01,stage02,total_distance,mean,156.08206946417084,156.08206946417084,0.0,0.0,unchanged,pass,descriptive comparison
+r105C5,stage01,stage02,total_charging_time,mean,44.159902941361445,44.159902941361445,0.0,0.0,unchanged,pass,descriptive comparison
+r105C5,stage01,stage02,charging_count,mean,2.0,2.0,0.0,0.0,unchanged,pass,descriptive comparison
+rc101_21,stage01,stage02,objective,best,"[22,2114.735792586,366.087415726,20]","[19,1925.362709303,325.819224421,19]",,,better,pass,vehicle-first objective comparison
+rc101_21,stage01,stage02,vehicle_count,mean,23.666666666666668,19.333333333333332,-4.333333333333336,-0.18309859154929586,improvement,pass,descriptive comparison
+rc101_21,stage01,stage02,total_distance,mean,2169.8031370179565,1968.1000951143212,-201.70304190363527,-0.09295914383313293,improvement,pass,descriptive comparison
+rc101_21,stage01,stage02,total_charging_time,mean,351.2673766162382,346.91528995511345,-4.352086661124758,-0.012389669382475675,improvement,pass,descriptive comparison
+rc101_21,stage01,stage02,charging_count,mean,19.666666666666668,20.0,0.33333333333333215,0.01694915254237282,regression,pass,descriptive comparison
+rc102C10,stage01,stage02,objective,best,"[4,423.510181924,69.382613231,3]","[4,423.510181924,69.382613231,3]",,,equal,pass,vehicle-first objective comparison
+rc102C10,stage01,stage02,vehicle_count,mean,4.0,4.0,0.0,0.0,unchanged,pass,descriptive comparison
+rc102C10,stage01,stage02,total_distance,mean,423.5101819239308,423.5101819239308,0.0,0.0,unchanged,pass,descriptive comparison
+rc102C10,stage01,stage02,total_charging_time,mean,69.38261323056489,69.38261323056489,0.0,0.0,unchanged,pass,descriptive comparison
+rc102C10,stage01,stage02,charging_count,mean,3.0,3.0,0.0,0.0,unchanged,pass,descriptive comparison
+rc103C15,stage01,stage02,objective,best,"[4,397.669856913,67.687714099,4]","[4,397.669856913,67.687714099,4]",,,equal,pass,vehicle-first objective comparison
+rc103C15,stage01,stage02,vehicle_count,mean,4.0,4.0,0.0,0.0,unchanged,pass,descriptive comparison
+rc103C15,stage01,stage02,total_distance,mean,397.66985691304916,397.66985691304916,0.0,0.0,unchanged,pass,descriptive comparison
+rc103C15,stage01,stage02,total_charging_time,mean,67.68771409904316,67.68771409904316,0.0,0.0,unchanged,pass,descriptive comparison
+rc103C15,stage01,stage02,charging_count,mean,4.0,4.0,0.0,0.0,unchanged,pass,descriptive comparison
+rc105C5,stage01,stage02,objective,best,"[2,241.296391877,59.789763586,3]","[2,241.296391877,59.789763586,3]",,,equal,pass,vehicle-first objective comparison
+rc105C5,stage01,stage02,vehicle_count,mean,2.6666666666666665,2.0,-0.6666666666666665,-0.24999999999999994,improvement,pass,descriptive comparison
+rc105C5,stage01,stage02,total_distance,mean,240.81384062209608,241.29639187672765,0.48255125463157356,0.002003835217215902,regression,pass,descriptive comparison
+rc105C5,stage01,stage02,total_charging_time,mean,44.234341992842836,59.789763585628236,15.5554215927854,0.35165938707310906,regression,pass,descriptive comparison
+rc105C5,stage01,stage02,charging_count,mean,2.3333333333333335,3.0,0.6666666666666665,0.28571428571428564,regression,pass,descriptive comparison
