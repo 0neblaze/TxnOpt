@@ -937,6 +937,12 @@ def _verify_trusted_stage03_review_manifest(
         artifact = review_manifest.parent / str(name)
         if not artifact.is_file() and review_label:
             artifact = review_manifest.parent / f"{review_label}_{name}"
+        if (
+            not artifact.is_file()
+            and name == "recomputed_per_run_results.csv"
+            and review_label
+        ):
+            artifact = review_manifest.parent / f"{review_label}_per_run_results.csv"
         if not artifact.is_file() or _sha256(artifact) != str(expected_file_hash):
             raise RuntimeError(f"trusted Stage 3.0 review artifact hash mismatch: {name}")
 

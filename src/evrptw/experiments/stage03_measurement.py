@@ -786,6 +786,14 @@ def _verify_review_manifest_gate(
         artifact = review_manifest.parent / str(name)
         if not artifact.is_file() and review_label:
             artifact = review_manifest.parent / f"{review_label}_{name}"
+        if (
+            not artifact.is_file()
+            and name == "recomputed_per_run_results.csv"
+            and review_label
+        ):
+            # The tracked publisher uses the canonical per-run summary name;
+            # the raw review manifest retains the auditor's internal name.
+            artifact = review_manifest.parent / f"{review_label}_per_run_results.csv"
         if not artifact.is_file() or _sha256(artifact) != str(expected_hash):
             raise RuntimeError(f"review artifact hash mismatch: {artifact}")
 
