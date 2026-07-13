@@ -134,13 +134,26 @@ STAGE03_COMPARISON_FIELDS = (
 
 
 @dataclass(frozen=True, slots=True)
+class _TraceSummary:
+    started_calls: int
+    completed_calls: int
+    exact_calls: int
+    cache_hits: int
+    precomputed_routes: int
+    deadline_events: int
+    route_evaluation_count: int
+    screening_counts: dict[str, object]
+    cache_incremental_counts: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
 class _AuditedRun:
     key: tuple[str, int]
     raw_row: dict[str, str]
     raw_payload: dict[str, Any]
     solution_payload: dict[str, Any]
     environment_payload: dict[str, Any]
-    trace: Stage03Trace
+    trace_summary: _TraceSummary
     solver_result: SimpleNamespace | None
     instance: Any
     objective: SolutionObjective | None
@@ -150,6 +163,9 @@ class _AuditedRun:
     reconciliation: dict[str, object]
     candidate_state_ok: bool
     event_log_ok: bool
+    screening_ok: bool
+    cache_incremental_ok: bool
+    screening_reason_counts: dict[str, int]
     deadline_row: dict[str, object]
 
 
@@ -270,7 +286,7 @@ def review_run(
         )
     )
     screening_ok = (not screening_enabled) or bool(audited) and all(
-        _screening_trace_ok(item.trace) for item in audited
+        item.screening_ok for item in audited
     )
     if screening_enabled:
         findings.append(
@@ -281,7 +297,7 @@ def review_run(
                     {
                         "instance": item.key[0],
                         "seed": item.key[1],
-                        "screening": item.trace.screening_counts,
+                        "screening": item.trace_summary.screening_counts,
                     }
                     for item in audited
                 ],
@@ -294,7 +310,7 @@ def review_run(
     cache_incremental_ok = (not cache_incremental_enabled) or (
         bool(audited)
         and all(
-            _cache_incremental_trace_ok(item.trace, item.instance, item.solver_result)
+            item.cache_incremental_ok
             for item in audited
         )
     )
@@ -307,7 +323,7 @@ def review_run(
                     {
                         "instance": item.key[0],
                         "seed": item.key[1],
-                        "cache_incremental": item.trace.cache_incremental_counts,
+                        "cache_incremental": item.trace_summary.cache_incremental_counts,
                     }
                     for item in audited
                 ],
@@ -554,7 +570,6 @@ def _audit_one_run(
     solution_payload = _read_json(run_dir / row["solution_path"])
     environment_payload = _read_json(run_dir / row["environment_path"])
     trace = Stage03Trace.from_dict(_read_json(run_dir / row["trace_path"]))
-    event_log = _read_jsonl(run_dir / row["event_path"])
     solver_payload = raw_payload.get("solver_result")
     solver_result = SimpleNamespace(**solver_payload) if isinstance(solver_payload, dict) else None
     benchmark_dir = Path(str(metadata["benchmark_directory"]))
@@ -584,7 +599,22 @@ def _audit_one_run(
         is ObjectiveComparison.EQUAL
     )
     candidate_state_ok = _candidate_state_ok(trace, solver_result)
-    event_log_ok = _event_log_ok(event_log, trace, solver_result)
+    screening_ok = _screening_trace_ok(trace)
+    cache_incremental_ok = (
+        _cache_incremental_trace_ok(trace, instance, solver_result)
+        if trace.cache_incremental_config is not None
+        and bool(getattr(trace.cache_incremental_config, "enabled", False))
+        else False
+    )
+    screening_reason_counts: dict[str, int] = {}
+    for decision in trace.screening_decisions:
+        reason = decision.reason or "screening_pass"
+        screening_reason_counts[reason] = screening_reason_counts.get(reason, 0) + 1
+    event_log_ok, event_log_rows = _event_log_ok_stream(
+        run_dir / row["event_path"],
+        trace,
+        solver_result,
+    )
     reconciliation: dict[str, object]
     if solver_result is not None:
         reconciliation = trace.reconcile(solver_result)
@@ -593,15 +623,19 @@ def _audit_one_run(
     route_violations = tuple(
         item for route in report.routes for item in route.violations
     )
-    deadline_row = _deadline_row(trace, event_log, instance_name, seed)
+    deadline_row = _deadline_row(trace, event_log_rows, instance_name, seed)
+    trace_summary = _trace_summary(trace)
+    solver_result_payload = solver_result
+    if solver_result_payload is not None:
+        solver_result_payload.neighborhood_events = []
     return _AuditedRun(
         key=(instance_name, seed),
         raw_row=row,
-        raw_payload=raw_payload,
-        solution_payload=solution_payload,
+        raw_payload={},
+        solution_payload={},
         environment_payload=environment_payload,
-        trace=trace,
-        solver_result=solver_result,
+        trace_summary=trace_summary,
+        solver_result=solver_result_payload,
         instance=instance,
         objective=objective,
         validator_feasible=report.feasible,
@@ -610,6 +644,9 @@ def _audit_one_run(
         reconciliation=reconciliation,
         candidate_state_ok=candidate_state_ok,
         event_log_ok=event_log_ok,
+        screening_ok=screening_ok,
+        cache_incremental_ok=cache_incremental_ok,
+        screening_reason_counts=screening_reason_counts,
         deadline_row=deadline_row,
     )
 
@@ -853,13 +890,27 @@ def _cache_incremental_trace_ok(
     return True
 
 
+def _trace_summary(trace: Stage03Trace) -> _TraceSummary:
+    return _TraceSummary(
+        started_calls=trace.started_calls,
+        completed_calls=trace.completed_calls,
+        exact_calls=trace.exact_calls,
+        cache_hits=trace.cache_hits,
+        precomputed_routes=trace.precomputed_routes,
+        deadline_events=trace.deadline_events,
+        route_evaluation_count=len(trace.route_evaluations),
+        screening_counts=dict(trace.screening_counts),
+        cache_incremental_counts=dict(trace.cache_incremental_counts),
+    )
+
+
 def _cache_statistics_rows(
     audited: list[_AuditedRun],
     label: str,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for item in audited:
-        values = item.trace.cache_incremental_counts
+        values = item.trace_summary.cache_incremental_counts
         rows.extend(
             {
                 "run_label": label,
@@ -880,9 +931,8 @@ def _screening_reason_rows(
     rows: list[dict[str, object]] = []
     for item in audited:
         counts: dict[str, int] = {}
-        for decision in item.trace.screening_decisions:
-            reason = decision.reason or "screening_pass"
-            counts[reason] = counts.get(reason, 0) + 1
+        for reason, count in item.screening_reason_counts.items():
+            counts[reason] = count
         rows.extend(
             {
                 "run_label": label,
@@ -932,6 +982,69 @@ def _candidate_state_ok(
         == _int_value(getattr(solver_result, "accepted_moves", 0))
         and sum(event.get("accepted") is not True for event in legacy_states)
         == _int_value(getattr(solver_result, "rejected_moves", 0))
+    )
+
+
+def _event_log_ok_stream(
+    path: Path,
+    trace: Stage03Trace,
+    solver_result: SimpleNamespace | None,
+) -> tuple[bool, int]:
+    """Replay the event log without materialising millions of JSON objects."""
+
+    trace_index = 0
+    screening_index = 0
+    neighborhood_index = 0
+    row_count = 0
+    expected_neighborhood = (
+        list(getattr(solver_result, "neighborhood_events", ()))
+        if solver_result is not None
+        else []
+    )
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row_count += 1
+                record = json.loads(line)
+                record_type = record.get("record_type")
+                payload = record.get("payload", {})
+                if record_type == "trace_event":
+                    if trace_index >= len(trace.events):
+                        return False, row_count
+                    if _canonical_json(payload) != _canonical_json(trace.events[trace_index]):
+                        return False, row_count
+                    trace_index += 1
+                elif record_type == "screening_decision":
+                    if screening_index >= len(trace.screening_decisions):
+                        return False, row_count
+                    if _canonical_json(payload) != _canonical_json(
+                        asdict(trace.screening_decisions[screening_index])
+                    ):
+                        return False, row_count
+                    screening_index += 1
+                elif record_type == "neighborhood_event":
+                    if neighborhood_index >= len(expected_neighborhood):
+                        return False, row_count
+                    expected = expected_neighborhood[neighborhood_index]
+                    if _canonical_json(payload) != _canonical_json(expected):
+                        return False, row_count
+                    if payload.get("accepted") is True:
+                        if payload.get("candidate_feasible") is not True:
+                            return False, row_count
+                        if _int_value(payload.get("candidate_vehicle_delta", 0)) > 0:
+                            return False, row_count
+                    neighborhood_index += 1
+                else:
+                    return False, row_count
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return False, row_count
+    return (
+        trace_index == len(trace.events)
+        and screening_index == len(trace.screening_decisions)
+        and neighborhood_index == len(expected_neighborhood),
+        row_count,
     )
 
 
@@ -991,7 +1104,7 @@ def _event_log_ok(
 
 def _deadline_row(
     trace: Stage03Trace,
-    event_log: list[dict[str, Any]],
+    event_log_rows: int,
     instance: str,
     seed: int,
 ) -> dict[str, object]:
@@ -1016,7 +1129,7 @@ def _deadline_row(
             if trace.deadline_events
             else "no_deadline_boundary_observed"
         ),
-        "event_log_rows": len(event_log),
+        "event_log_rows": event_log_rows,
     }
 
 
@@ -1266,7 +1379,7 @@ def _compare_stage03_formal(
         candidate_key = item.objective.key if item.objective is not None else ()
         candidate_feasible = item.validator_feasible and item.objective is not None
         candidate_vehicle = item.objective.vehicle_count if item.objective is not None else ""
-        candidate_exact = item.trace.exact_calls
+        candidate_exact = item.trace_summary.exact_calls
         if baseline is None:
             rows.append(
                 {
@@ -1489,34 +1602,34 @@ def _recomputed_row(
                 if item.validator_feasible and item.objective_replay_ok and solver_feasible
                 else "invalid"
             ),
-            "trace_started_calls": item.trace.started_calls,
-            "trace_completed_calls": item.trace.completed_calls,
-            "trace_exact_calls": item.trace.exact_calls,
-            "trace_cache_hits": item.trace.cache_hits,
-            "trace_precomputed_routes": item.trace.precomputed_routes,
-            "trace_route_evaluations": len(item.trace.route_evaluations),
-            "trace_deadline_events": item.trace.deadline_events,
-            "trace_screening_calls": item.trace.screening_counts["screening_calls"],
-            "trace_screening_passes": item.trace.screening_counts["screening_passes"],
-            "trace_screening_rejections": item.trace.screening_counts[
+            "trace_started_calls": item.trace_summary.started_calls,
+            "trace_completed_calls": item.trace_summary.completed_calls,
+            "trace_exact_calls": item.trace_summary.exact_calls,
+            "trace_cache_hits": item.trace_summary.cache_hits,
+            "trace_precomputed_routes": item.trace_summary.precomputed_routes,
+            "trace_route_evaluations": item.trace_summary.route_evaluation_count,
+            "trace_deadline_events": item.trace_summary.deadline_events,
+            "trace_screening_calls": item.trace_summary.screening_counts["screening_calls"],
+            "trace_screening_passes": item.trace_summary.screening_counts["screening_passes"],
+            "trace_screening_rejections": item.trace_summary.screening_counts[
                 "screening_rejections"
             ],
-            "trace_screening_cache_hits": item.trace.screening_counts[
+            "trace_screening_cache_hits": item.trace_summary.screening_counts[
                 "screening_cache_hits"
             ],
-            "trace_screening_exact_call_blocked": item.trace.screening_counts[
+            "trace_screening_exact_call_blocked": item.trace_summary.screening_counts[
                 "screening_exact_call_blocked"
             ],
             "trace_screening_reason_counts": json.dumps(
-                item.trace.screening_counts["screening_reason_counts"], sort_keys=True
+                item.trace_summary.screening_counts["screening_reason_counts"], sort_keys=True
             ),
             "trace_cache_incremental_counts": json.dumps(
-                item.trace.cache_incremental_counts, sort_keys=True
+                item.trace_summary.cache_incremental_counts, sort_keys=True
             ),
-            "trace_incremental_propagations": item.trace.cache_incremental_counts[
+            "trace_incremental_propagations": item.trace_summary.cache_incremental_counts[
                 "incremental_propagations"
             ],
-            "trace_incremental_fallbacks": item.trace.cache_incremental_counts[
+            "trace_incremental_fallbacks": item.trace_summary.cache_incremental_counts[
                 "incremental_fallbacks"
             ],
             "trace_reconciliation_status": item.reconciliation.get("status", "not_available"),
@@ -1609,24 +1722,24 @@ def _trace_row(item: _AuditedRun, label: str) -> dict[str, Any]:
         "run_label": label,
         "instance": item.key[0],
         "seed": item.key[1],
-        "started_calls": item.trace.started_calls,
-        "completed_calls": item.trace.completed_calls,
-        "exact_calls": item.trace.exact_calls,
-        "cache_hits": item.trace.cache_hits,
-        "precomputed_routes": item.trace.precomputed_routes,
-        "deadline_events": item.trace.deadline_events,
-        "screening_calls": item.trace.screening_counts["screening_calls"],
-        "screening_passes": item.trace.screening_counts["screening_passes"],
-        "screening_rejections": item.trace.screening_counts["screening_rejections"],
-        "screening_cache_hits": item.trace.screening_counts["screening_cache_hits"],
-        "screening_exact_call_blocked": item.trace.screening_counts[
+        "started_calls": item.trace_summary.started_calls,
+        "completed_calls": item.trace_summary.completed_calls,
+        "exact_calls": item.trace_summary.exact_calls,
+        "cache_hits": item.trace_summary.cache_hits,
+        "precomputed_routes": item.trace_summary.precomputed_routes,
+        "deadline_events": item.trace_summary.deadline_events,
+        "screening_calls": item.trace_summary.screening_counts["screening_calls"],
+        "screening_passes": item.trace_summary.screening_counts["screening_passes"],
+        "screening_rejections": item.trace_summary.screening_counts["screening_rejections"],
+        "screening_cache_hits": item.trace_summary.screening_counts["screening_cache_hits"],
+        "screening_exact_call_blocked": item.trace_summary.screening_counts[
             "screening_exact_call_blocked"
         ],
         "screening_reason_counts": json.dumps(
-            item.trace.screening_counts["screening_reason_counts"], sort_keys=True
+            item.trace_summary.screening_counts["screening_reason_counts"], sort_keys=True
         ),
         "cache_incremental_counts": json.dumps(
-            item.trace.cache_incremental_counts, sort_keys=True
+            item.trace_summary.cache_incremental_counts, sort_keys=True
         ),
         "reconciliation_status": item.reconciliation.get("status", "not_available"),
         "reconciliation_checks": json.dumps(item.reconciliation.get("checks", {}), sort_keys=True),
