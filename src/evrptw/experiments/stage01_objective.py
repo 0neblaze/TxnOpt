@@ -146,6 +146,7 @@ def run_stage01_objective(
                 seed=seed,
                 max_iterations=config.max_iterations,
                 time_limit_seconds=config.time_limit_seconds,
+                operator_profile="baseline",
             )
             row = _record_alns(instance, seed, alns_result, output_dir, raw_dir, solution_dir)
             rows.append(row)

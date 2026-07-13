@@ -3,10 +3,18 @@ from __future__ import annotations
 import math
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
 from evrptw.models import Instance, Node
+from evrptw.neighborhoods import (
+    NeighborhoodEvent,
+    OperatorProfile,
+    VehicleOperatorConfig,
+    propose_route_elimination,
+    propose_route_merge,
+    repair_vehicle_count_aware,
+)
 from evrptw.objective import (
     ObjectiveComparison,
     SolutionObjective,
@@ -21,12 +29,21 @@ _INFEASIBLE_COST = 1e12
 @dataclass(slots=True)
 class OperatorStatistics:
     calls: int = 0
+    feasible_repairs: int = 0
     accepted: int = 0
     improved: int = 0
     best: int = 0
+    vehicle_reductions: int = 0
+    distance_improvements: int = 0
+    rejected: int = 0
+    prefilter_passed: int = 0
+    prefilter_rejected: int = 0
+    new_routes_created: int = 0
+    exact_route_evaluations: int = 0
+    failure_reasons: dict[str, int] = field(default_factory=dict)
     weight: float = 1.0
 
-    def to_dict(self) -> dict[str, float | int]:
+    def to_dict(self) -> dict[str, object]:
         return asdict(self)
 
 
@@ -51,8 +68,11 @@ class ALNSResult:
     charging_subproblem_time: float
     charging_labels_generated: int
     charging_labels_pruned: int
-    destroy_statistics: dict[str, dict[str, float | int]]
-    repair_statistics: dict[str, dict[str, float | int]]
+    destroy_statistics: dict[str, dict[str, object]]
+    repair_statistics: dict[str, dict[str, object]]
+    operator_profile: str
+    neighborhood_statistics: dict[str, dict[str, object]]
+    neighborhood_events: tuple[dict[str, object], ...]
     failure_reason: str
 
     @property
@@ -122,6 +142,8 @@ def solve_alns(
     max_iterations: int = 2_000,
     time_limit_seconds: float = 60.0,
     removal_fraction: float = 0.2,
+    operator_profile: OperatorProfile | str = OperatorProfile.STAGE02_ROUTE_REDUCTION,
+    vehicle_operator_config: VehicleOperatorConfig | None = None,
 ) -> ALNSResult:
     if max_iterations <= 0:
         raise ValueError("max_iterations must be positive")
@@ -129,6 +151,8 @@ def solve_alns(
         raise ValueError("time_limit_seconds must be positive")
     if not 0.0 < removal_fraction <= 1.0:
         raise ValueError("removal_fraction must be in (0, 1]")
+    profile = OperatorProfile(operator_profile)
+    vehicle_config = vehicle_operator_config or VehicleOperatorConfig()
 
     started = time.perf_counter()
     rng = random.Random(seed)
@@ -136,10 +160,20 @@ def solve_alns(
     try:
         initial_sequences = _construct_initial_solution(instance, evaluator)
     except _TimeLimitReached:
-        return _failed_result(started, evaluator, "time limit reached during initial construction")
+        return _failed_result(
+            started,
+            evaluator,
+            "time limit reached during initial construction",
+            operator_profile=profile.value,
+        )
     current = evaluator.solution(initial_sequences)
     if not current.feasible:
-        return _failed_result(started, evaluator, "no feasible singleton initial solution")
+        return _failed_result(
+            started,
+            evaluator,
+            "no feasible singleton initial solution",
+            operator_profile=profile.value,
+        )
     if current.objective is None:
         raise RuntimeError("feasible ALNS initial solution is missing its objective")
 
@@ -147,7 +181,22 @@ def solve_alns(
     first_feasible_time = time.perf_counter() - started
     best_time = first_feasible_time
     destroy_stats = {name: OperatorStatistics() for name in ("random", "worst", "related")}
-    repair_stats = {name: OperatorStatistics() for name in ("greedy", "regret2", "energy")}
+    standard_repair_stats = {
+        name: OperatorStatistics() for name in ("greedy", "regret2", "energy")
+    }
+    repair_stats = dict(standard_repair_stats)
+    if profile is OperatorProfile.STAGE02_ROUTE_REDUCTION:
+        repair_stats["vehicle_count_aware"] = OperatorStatistics()
+    neighborhood_names = (
+        "standard",
+        "vehicle_count_aware_repair",
+        "route_elimination",
+        "route_merge",
+    )
+    neighborhood_stats = {
+        name: OperatorStatistics() for name in neighborhood_names
+    } if profile is OperatorProfile.STAGE02_ROUTE_REDUCTION else {}
+    neighborhood_events: list[dict[str, object]] = []
     accepted = 0
     improved = 0
     rejected = 0
@@ -159,20 +208,134 @@ def solve_alns(
         if elapsed >= time_limit_seconds:
             break
         completed_iterations = iteration + 1
-        destroy_name = _weighted_choice(rng, destroy_stats)
-        repair_name = _weighted_choice(rng, repair_stats)
-        destroy_stats[destroy_name].calls += 1
-        repair_stats[repair_name].calls += 1
+        destroy_name = ""
+        repair_name = ""
+        selected_neighborhood = ""
+        move_events: tuple[NeighborhoodEvent, ...] = ()
+        if profile is OperatorProfile.BASELINE:
+            destroy_name = _weighted_choice(rng, destroy_stats)
+            repair_name = _weighted_choice(rng, standard_repair_stats)
+            destroy_stats[destroy_name].calls += 1
+            repair_stats[repair_name].calls += 1
 
-        remove_count = max(1, math.ceil(len(instance.customers) * removal_fraction))
-        if len(instance.customers) > 20:
-            remove_count = min(remove_count, 3)
-        partial, removed = _destroy(instance, current.sequences, remove_count, destroy_name, rng)
-        try:
-            candidate_sequences = _repair(partial, removed, repair_name, evaluator, instance, rng)
-            candidate = evaluator.solution(candidate_sequences)
-        except _TimeLimitReached:
-            break
+            remove_count = max(1, math.ceil(len(instance.customers) * removal_fraction))
+            if len(instance.customers) > 20:
+                remove_count = min(remove_count, 3)
+            partial, removed = _destroy(
+                instance, current.sequences, remove_count, destroy_name, rng
+            )
+            try:
+                candidate_sequences = _repair(
+                    partial, removed, repair_name, evaluator, instance, rng
+                )
+                candidate = evaluator.solution(candidate_sequences)
+            except _TimeLimitReached:
+                break
+        else:
+            selected_neighborhood = _select_stage02_neighborhood(
+                iteration, rng, neighborhood_stats
+            )
+            neighborhood_stats[selected_neighborhood].calls += 1
+            try:
+                if selected_neighborhood == "route_elimination":
+                    proposal = propose_route_elimination(
+                        instance,
+                        current.sequences,
+                        evaluator,
+                        config=vehicle_config,
+                    )
+                    candidate_sequences = proposal.sequences or ()
+                    move_events = proposal.events
+                elif selected_neighborhood == "route_merge":
+                    proposal = propose_route_merge(
+                        instance,
+                        current.sequences,
+                        evaluator,
+                        config=vehicle_config,
+                    )
+                    candidate_sequences = proposal.sequences or ()
+                    move_events = proposal.events
+                else:
+                    destroy_name = _weighted_choice(rng, destroy_stats)
+                    destroy_stats[destroy_name].calls += 1
+                    remove_count = max(1, math.ceil(len(instance.customers) * removal_fraction))
+                    if len(instance.customers) > 20:
+                        remove_count = min(remove_count, 3)
+                    partial, removed = _destroy(
+                        instance, current.sequences, remove_count, destroy_name, rng
+                    )
+                    if selected_neighborhood == "vehicle_count_aware_repair":
+                        repair_name = "vehicle_count_aware"
+                        repair_stats[repair_name].calls += 1
+                        before_calls = evaluator.calls
+                        repair = repair_vehicle_count_aware(
+                            partial,
+                            removed,
+                            evaluator,
+                            instance,
+                            config=vehicle_config,
+                            allow_new_routes=True,
+                        )
+                        candidate_sequences = repair.sequences or ()
+                        move_events = (
+                            NeighborhoodEvent(
+                                "vehicle_count_aware_repair",
+                                "candidate_proposed"
+                                if repair.sequences is not None
+                                else "failed",
+                                repair.failure_reason or "existing_route_repair",
+                                removed_customers=removed,
+                                candidate_vehicle_delta=(
+                                    len(candidate_sequences) - len(current.sequences)
+                                    if repair.sequences is not None
+                                    else None
+                                ),
+                                candidate_feasible=repair.sequences is not None,
+                                new_routes_created=repair.new_routes_created,
+                                exact_route_evaluations=evaluator.calls - before_calls,
+                            ),
+                        )
+                    else:
+                        repair_name = _weighted_choice(rng, standard_repair_stats)
+                        repair_stats[repair_name].calls += 1
+                        candidate_sequences = _repair(
+                            partial, removed, repair_name, evaluator, instance, rng
+                        )
+                        move_events = (
+                            NeighborhoodEvent(
+                                "standard",
+                                "proposal",
+                                f"{destroy_name}+{repair_name}",
+                                removed_customers=removed,
+                            ),
+                        )
+                candidate = evaluator.solution(candidate_sequences)
+            except _TimeLimitReached:
+                timeout_event = _event_record(
+                    NeighborhoodEvent(
+                        selected_neighborhood,
+                        "time_limit",
+                        "time_limit_reached_during_neighborhood",
+                    ),
+                    iteration,
+                )
+                timeout_event.update(
+                    {
+                        "accepted": False,
+                        "vehicle_reduction": False,
+                        "distance_improvement": False,
+                        "candidate_objective_key": (),
+                    }
+                )
+                neighborhood_events.append(timeout_event)
+                break
+
+            _record_neighborhood_proposal(
+                neighborhood_stats[selected_neighborhood],
+                move_events,
+                candidate,
+                current,
+            )
 
         temperature = initial_temperature * max(0.001, 1.0 - iteration / max_iterations)
         accept = (
@@ -185,23 +348,69 @@ def solve_alns(
                 random_draw=rng.random(),
             )
         )
+        if profile is OperatorProfile.STAGE02_ROUTE_REDUCTION:
+            vehicle_reduction = bool(
+                candidate.objective is not None
+                and current.objective is not None
+                and candidate.objective.vehicle_count < current.objective.vehicle_count
+            )
+            distance_improvement = bool(
+                candidate.objective is not None
+                and current.objective is not None
+                and candidate.objective.total_distance
+                < current.objective.total_distance - 1e-9
+            )
+            neighborhood_events.extend(
+                _annotated_event_record(
+                    event,
+                    iteration=iteration,
+                    accepted=accept,
+                    vehicle_reduction=vehicle_reduction,
+                    distance_improvement=distance_improvement,
+                    candidate=candidate,
+                )
+                for event in move_events
+            )
         if not accept:
             rejected += 1
-            _update_weight(destroy_stats[destroy_name], 0.0)
-            _update_weight(repair_stats[repair_name], 0.0)
+            if profile is OperatorProfile.BASELINE:
+                _update_weight(destroy_stats[destroy_name], 0.0)
+                _update_weight(repair_stats[repair_name], 0.0)
+            else:
+                neighborhood_stats[selected_neighborhood].rejected += 1
+                _update_weight(neighborhood_stats[selected_neighborhood], 0.0)
+                if destroy_name:
+                    _update_weight(destroy_stats[destroy_name], 0.0)
+                if repair_name:
+                    _update_weight(repair_stats[repair_name], 0.0)
             continue
 
         accepted += 1
-        destroy_stats[destroy_name].accepted += 1
-        repair_stats[repair_name].accepted += 1
+        if profile is OperatorProfile.BASELINE:
+            destroy_stats[destroy_name].accepted += 1
+            repair_stats[repair_name].accepted += 1
+        else:
+            neighborhood_stats[selected_neighborhood].accepted += 1
+            _update_weight(neighborhood_stats[selected_neighborhood], 1.0)
+            if destroy_name:
+                destroy_stats[destroy_name].accepted += 1
+            if repair_name:
+                repair_stats[repair_name].accepted += 1
         reward = 1.0
         if candidate.objective is None:
             raise RuntimeError("accepted ALNS candidate is missing its objective")
         if compare_objectives(candidate.objective, current.objective) is ObjectiveComparison.BETTER:
             improved += 1
             reward = 4.0
-            destroy_stats[destroy_name].improved += 1
-            repair_stats[repair_name].improved += 1
+            if profile is OperatorProfile.BASELINE:
+                destroy_stats[destroy_name].improved += 1
+                repair_stats[repair_name].improved += 1
+            else:
+                neighborhood_stats[selected_neighborhood].improved += 1
+                if destroy_name:
+                    destroy_stats[destroy_name].improved += 1
+                if repair_name:
+                    repair_stats[repair_name].improved += 1
         current = candidate
         if best.objective is None:
             raise RuntimeError("feasible ALNS incumbent is missing its objective")
@@ -209,10 +418,24 @@ def solve_alns(
             best = candidate
             best_time = time.perf_counter() - started
             reward = 8.0
-            destroy_stats[destroy_name].best += 1
-            repair_stats[repair_name].best += 1
-        _update_weight(destroy_stats[destroy_name], reward)
-        _update_weight(repair_stats[repair_name], reward)
+            if profile is OperatorProfile.BASELINE:
+                destroy_stats[destroy_name].best += 1
+                repair_stats[repair_name].best += 1
+            else:
+                neighborhood_stats[selected_neighborhood].best += 1
+                if destroy_name:
+                    destroy_stats[destroy_name].best += 1
+                if repair_name:
+                    repair_stats[repair_name].best += 1
+        if profile is OperatorProfile.BASELINE:
+            _update_weight(destroy_stats[destroy_name], reward)
+            _update_weight(repair_stats[repair_name], reward)
+        else:
+            _update_weight(neighborhood_stats[selected_neighborhood], reward)
+            if destroy_name:
+                _update_weight(destroy_stats[destroy_name], reward)
+            if repair_name:
+                _update_weight(repair_stats[repair_name], reward)
 
     routes = tuple(result.route for result in best.charging)
     report = validate_routes(instance, [list(route) for route in routes])
@@ -242,6 +465,11 @@ def solve_alns(
         charging_labels_pruned=evaluator.labels_pruned,
         destroy_statistics={name: stats.to_dict() for name, stats in destroy_stats.items()},
         repair_statistics={name: stats.to_dict() for name, stats in repair_stats.items()},
+        operator_profile=profile.value,
+        neighborhood_statistics={
+            name: stats.to_dict() for name, stats in neighborhood_stats.items()
+        },
+        neighborhood_events=tuple(neighborhood_events),
         failure_reason="",
     )
 
@@ -467,7 +695,94 @@ def _update_weight(statistics: OperatorStatistics, reward: float, reaction: floa
     statistics.weight = max(0.05, (1.0 - reaction) * statistics.weight + reaction * reward)
 
 
-def _failed_result(started: float, evaluator: _Evaluator, reason: str) -> ALNSResult:
+def _select_stage02_neighborhood(
+    iteration: int,
+    rng: random.Random,
+    statistics: dict[str, OperatorStatistics],
+) -> str:
+    warmup = ("route_elimination", "vehicle_count_aware_repair", "route_merge")
+    if iteration < len(warmup):
+        return warmup[iteration]
+    return _weighted_choice(rng, statistics)
+
+
+def _record_neighborhood_proposal(
+    statistics: OperatorStatistics,
+    events: tuple[NeighborhoodEvent, ...],
+    candidate: _EvaluatedSolution,
+    current: _EvaluatedSolution,
+) -> None:
+    statistics.prefilter_passed += sum(event.prefilter_passed for event in events)
+    statistics.prefilter_rejected += sum(
+        event.status == "prefilter_rejected" for event in events
+    )
+    statistics.new_routes_created += sum(event.new_routes_created for event in events)
+    statistics.exact_route_evaluations += sum(
+        event.exact_route_evaluations for event in events
+    )
+    failure_statuses = {
+        "failed",
+        "prefilter_rejected",
+        "exact_infeasible",
+        "budget_exhausted",
+        "not_applicable",
+        "time_limit",
+    }
+    for event in events:
+        if event.status in failure_statuses:
+            statistics.failure_reasons[event.reason] = (
+                statistics.failure_reasons.get(event.reason, 0) + 1
+            )
+    if candidate.feasible:
+        statistics.feasible_repairs += 1
+    elif not events:
+        statistics.failure_reasons["candidate_infeasible"] = (
+            statistics.failure_reasons.get("candidate_infeasible", 0) + 1
+        )
+    if candidate.objective is None or current.objective is None:
+        return
+    if candidate.objective.vehicle_count < current.objective.vehicle_count:
+        statistics.vehicle_reductions += 1
+    if candidate.objective.total_distance < current.objective.total_distance - 1e-9:
+        statistics.distance_improvements += 1
+
+
+def _event_record(event: NeighborhoodEvent, iteration: int) -> dict[str, object]:
+    record = event.to_dict()
+    record["iteration"] = iteration
+    return record
+
+
+def _annotated_event_record(
+    event: NeighborhoodEvent,
+    *,
+    iteration: int,
+    accepted: bool,
+    vehicle_reduction: bool,
+    distance_improvement: bool,
+    candidate: _EvaluatedSolution,
+) -> dict[str, object]:
+    record = _event_record(event, iteration)
+    record.update(
+        {
+            "accepted": accepted,
+            "vehicle_reduction": vehicle_reduction,
+            "distance_improvement": distance_improvement,
+            "candidate_objective_key": (
+                candidate.objective.key if candidate.objective is not None else ()
+            ),
+        }
+    )
+    return record
+
+
+def _failed_result(
+    started: float,
+    evaluator: _Evaluator,
+    reason: str,
+    *,
+    operator_profile: str = OperatorProfile.BASELINE.value,
+) -> ALNSResult:
     return ALNSResult(
         feasible=False,
         routes=(),
@@ -490,5 +805,8 @@ def _failed_result(started: float, evaluator: _Evaluator, reason: str) -> ALNSRe
         charging_labels_pruned=evaluator.labels_pruned,
         destroy_statistics={},
         repair_statistics={},
+        operator_profile=operator_profile,
+        neighborhood_statistics={},
+        neighborhood_events=(),
         failure_reason=reason,
     )

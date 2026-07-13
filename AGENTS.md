@@ -16,6 +16,26 @@ this repository or one of its subdirectories.
   raw results belong under ignored `results/`, while review summaries belong in
   tracked experiment summary directories.
 
+## Stage 2.1 Route-Reduction Policy
+
+- `solve_alns()` defaults to the `stage02_route_reduction` operator profile.
+  Stage 0 and Stage 1 historical runners must pass `operator_profile="baseline"`
+  explicitly so their historical operator surface remains reproducible.
+- Route elimination, vehicle-count-aware repair, and route merge are implemented
+  behind the deep module `evrptw.neighborhoods`; callers use its proposals and
+  event records rather than duplicating screening, repair, or objective logic.
+- Route elimination is successful only when every removed customer is repaired
+  into existing routes and the candidate has exactly one fewer route. Vehicle-
+  count-aware repair must exhaust existing-route insertion before creating a new
+  route. Route merge must pass safe capacity, optimistic time-window, and energy
+  prefilters before exact charging evaluation.
+- Every Stage 2.1 attempt records operator calls, prefilter decisions, exact
+  evaluations, feasibility, acceptance, vehicle reductions, distance changes,
+  and failure reasons. Failed rounds retain their complete raw output and use a
+  new run label/output directory; prior failure evidence must not be overwritten.
+- Stage 2.1 formal runs use the fixed Stage 0 12-instance, three-seed scope and
+  are accepted only when every gate and both independent complete reruns pass.
+
 ## Literature Recommendation Policy
 
 - Codex recommends literature but does not obtain it. Do not access the user's

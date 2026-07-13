@@ -419,6 +419,7 @@ def _run_once(
         seed=seed,
         max_iterations=config.max_iterations,
         time_limit_seconds=config.time_limit_seconds,
+        operator_profile="baseline",
     )
     end = datetime.now(UTC)
     routes = [list(route) for route in result.routes]

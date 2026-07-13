@@ -156,6 +156,39 @@ reproduction command.
 - [Old-vs-new objective ranking](experiments/summaries/stage01_objective_ranking_changes.csv)
 - [Stage 0 comparison](experiments/summaries/stage01_stage00_comparison.csv)
 
+### Stage 2.1 route-reduction operators
+
+Stage 2.1 adds `route elimination destroy`, `vehicle-count-aware repair`, and
+`route merge` behind the `stage02_route_reduction` operator profile. The formal
+experiment keeps Stage 0's 12 instances, three seeds, 30-second limit, 1000
+maximum iterations, and one thread. Every run is validated independently and
+records raw JSON, solution routes, operator events, failure reasons, environment
+metadata, and comparison gates.
+
+See [the Stage 2.1 route-reduction protocol](docs/stage02_route_reduction.md)
+for the implementation invariants, fixed experiment scope, failure loop, and
+acceptance gates.
+
+```bash
+uv run pytest
+uv run ruff check .
+uv run mypy
+uv run python -m evrptw.experiments.stage02_route_reduction \
+  --config configs/stage02_route_reduction.toml
+
+# 第二次独立完整复跑
+uv run python -m evrptw.experiments.stage02_route_reduction \
+  --config configs/stage02_route_reduction.toml \
+  --output-dir results/stage02-rerun01 \
+  --run-label stage02_rerun01 \
+  --repeat-of results/stage02
+```
+
+Raw Stage 2.1 evidence remains under ignored `results/`; each retry uses a new
+run label and output directory. The second run writes an `independent_complete_rerun`
+gate after comparing the first run's complete gate report. Curated summaries are
+written under `experiments/summaries/` only after the corresponding run completes.
+
 ---
 
 ## Repository structure
