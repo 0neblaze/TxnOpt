@@ -8,6 +8,15 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, cast
 
+from evrptw.cache_incremental import (
+    CacheIncrementalConfig,
+    RouteEvaluationCache,
+    RoutePropagationSnapshot,
+    StationReachabilityIndex,
+    build_route_propagation_snapshot,
+    canonical_instance_hash,
+    incremental_route_propagation,
+)
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
 from evrptw.measurement import (
     CheapScreeningConfig,
@@ -52,6 +61,7 @@ from evrptw.validation import validate_routes
 
 __all__ = (
     "ALNSResult",
+    "CacheIncrementalConfig",
     "CheapScreeningConfig",
     "MeasurementConfig",
     "Stage03ExecutionError",
@@ -136,6 +146,7 @@ class ALNSResult:
     constraint_operator_statistics: dict[str, dict[str, object]] = field(default_factory=dict)
     measurement_trace: Stage03Trace | None = None
     screening_statistics: dict[str, object] = field(default_factory=dict)
+    cache_incremental_statistics: dict[str, object] = field(default_factory=dict)
 
     @property
     def objective_value(self) -> float:
@@ -160,6 +171,8 @@ class _Evaluator:
         lane: str = "legacy",
         screening_config: CheapScreeningConfig | None = None,
         negative_screening_cache: dict[str, ScreeningResult] | None = None,
+        cache_incremental_config: CacheIncrementalConfig | None = None,
+        route_cache: RouteEvaluationCache | None = None,
     ) -> None:
         self.instance = instance
         self.deadline = deadline
@@ -170,6 +183,25 @@ class _Evaluator:
             if screening_config is not None and screening_config.enabled
             else None
         )
+        self.cache_incremental_config = (
+            cache_incremental_config
+            if cache_incremental_config is not None and cache_incremental_config.enabled
+            else None
+        )
+        self.route_cache = route_cache
+        self.reachability_index = (
+            StationReachabilityIndex(instance)
+            if self.cache_incremental_config is not None
+            and self.cache_incremental_config.station_reachability_bitset
+            else None
+        )
+        self.propagation_snapshots: dict[
+            tuple[str, ...], RoutePropagationSnapshot
+        ] = {}
+        self.incremental_propagations = 0
+        self.incremental_fallbacks = 0
+        self.incremental_reused_prefix_edges = 0
+        self.incremental_reused_suffix_edges = 0
         self.negative_screening_cache = (
             negative_screening_cache if negative_screening_cache is not None else {}
         )
@@ -226,13 +258,24 @@ class _Evaluator:
     def screening_enabled(self) -> bool:
         return self.screening_config is not None
 
+    @property
+    def cache_incremental_enabled(self) -> bool:
+        return self.cache_incremental_config is not None and self.route_cache is not None
+
+    def has_cached_route(self, sequence: tuple[str, ...]) -> bool:
+        if self.route_cache is not None:
+            return self.route_cache.contains(sequence)
+        return sequence in self.cache
+
     def screen(
         self,
         sequence: tuple[str, ...],
         *,
         reference_distance: float | None = None,
+        base_sequence: tuple[str, ...] | None = None,
+        operator: str = "",
     ) -> ScreeningResult:
-        """Run the Stage 3.1 screener and record one independent decision."""
+        """Run the shared screening seam and record one independent decision."""
 
         if self.screening_config is None:
             raise RuntimeError("screen() called while cheap screening is disabled")
@@ -259,6 +302,33 @@ class _Evaluator:
             else None
         )
         negative_cache_hit = cached is not None
+        incremental_metrics = None
+        if (
+            cached is None
+            and self.cache_incremental_enabled
+            and base_sequence is not None
+            and operator in {"relocate", "swap"}
+        ):
+            base_snapshot = self.propagation_snapshots.get(base_sequence)
+            if base_snapshot is None:
+                base_snapshot = build_route_propagation_snapshot(
+                    self.instance,
+                    base_sequence,
+                    epsilon=self.screening_config.epsilon,
+                )
+                self.propagation_snapshots[base_sequence] = base_snapshot
+            incremental_metrics = incremental_route_propagation(
+                self.instance,
+                base_snapshot,
+                sequence,
+                epsilon=self.screening_config.epsilon,
+            )
+            if incremental_metrics.status == "fallback":
+                self.incremental_fallbacks += 1
+            else:
+                self.incremental_propagations += 1
+                self.incremental_reused_prefix_edges += incremental_metrics.reused_prefix_edges
+                self.incremental_reused_suffix_edges += incremental_metrics.reused_suffix_edges
         result = (
             cached
             if cached is not None
@@ -266,10 +336,35 @@ class _Evaluator:
                 self.instance,
                 sequence,
                 full=True,
-                reference_distance=reference_distance,
+                reference_distance=(
+                    reference_distance
+                    if reference_distance is not None
+                    else (
+                        self.propagation_snapshots[base_sequence].total_distance
+                        if base_sequence is not None
+                        and base_sequence in self.propagation_snapshots
+                        else None
+                    )
+                ),
                 epsilon=self.screening_config.epsilon,
+                reachability_index=self.reachability_index,
+                incremental_metrics=(
+                    incremental_metrics
+                    if incremental_metrics is not None
+                    and incremental_metrics.status == "incremental"
+                    else None
+                ),
             )
         )
+        if self.cache_incremental_enabled and cached is None:
+            self.propagation_snapshots.setdefault(
+                sequence,
+                build_route_propagation_snapshot(
+                    self.instance,
+                    sequence,
+                    epsilon=self.screening_config.epsilon,
+                ),
+            )
         completed = time.perf_counter()
         self.screening_runtime += completed - started
         self.screening_calls += 1
@@ -328,6 +423,23 @@ class _Evaluator:
                 started_at=self.measurement_trace._offset(started),
                 completed_at=self.measurement_trace._offset(completed),
             )
+            if incremental_metrics is not None:
+                self.measurement_trace.record_incremental_propagation(
+                    operator=operator or self.operator,
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    base_sequence=base_sequence or (),
+                    candidate_sequence=sequence,
+                    status=incremental_metrics.status,
+                    reason=incremental_metrics.reason,
+                    distance_lower_bound=incremental_metrics.distance_lower_bound,
+                    min_time_window_slack=incremental_metrics.min_time_window_slack,
+                    finish_time=incremental_metrics.finish_time,
+                    reused_prefix_edges=incremental_metrics.reused_prefix_edges,
+                    reused_suffix_edges=incremental_metrics.reused_suffix_edges,
+                    recomputed_forward_edges=incremental_metrics.recomputed_forward_edges,
+                    recomputed_backward_edges=incremental_metrics.recomputed_backward_edges,
+                )
             if completed >= self.deadline:
                 self.measurement_trace.record_deadline_boundary(
                     lane=self.lane,
@@ -341,6 +453,13 @@ class _Evaluator:
             raise _TimeLimitReached(sequence)
         return result
 
+    def route_with_status(
+        self,
+        sequence: tuple[str, ...],
+        route_change_status: str,
+    ) -> ChargingSubproblemResult:
+        return self.route(sequence, route_change_status=route_change_status)
+
     def screening_statistics(self) -> dict[str, object]:
         return {
             "screening_calls": self.screening_calls,
@@ -352,9 +471,28 @@ class _Evaluator:
             "screening_reason_counts": dict(sorted(self.screening_reason_counts.items())),
         }
 
-    def route(self, sequence: tuple[str, ...]) -> ChargingSubproblemResult:
+    def incremental_statistics(self) -> dict[str, object]:
+        reachability = (
+            self.reachability_index.to_dict()
+            if self.reachability_index is not None
+            else {}
+        )
+        return {
+            "incremental_propagations": self.incremental_propagations,
+            "incremental_fallbacks": self.incremental_fallbacks,
+            "incremental_reused_prefix_edges": self.incremental_reused_prefix_edges,
+            "incremental_reused_suffix_edges": self.incremental_reused_suffix_edges,
+            "station_reachability": reachability,
+        }
+
+    def route(
+        self,
+        sequence: tuple[str, ...],
+        *,
+        route_change_status: str = "unknown",
+    ) -> ChargingSubproblemResult:
         if self.screening_config is not None:
-            screen = self.screen(sequence)
+            screen = self.screen(sequence, operator=self.operator)
             if not screen.accepted:
                 return ChargingSubproblemResult(
                     False,
@@ -382,7 +520,52 @@ class _Evaluator:
                     route_sequence=sequence,
                 )
             raise _TimeLimitReached(sequence)
-        if sequence in self.cache:
+        if self.route_cache is not None:
+            lookup = self.route_cache.lookup(sequence)
+            cache_key_digest = lookup.key.digest
+            if self.measurement_trace is not None:
+                self.measurement_trace.record_cache_event(
+                    operation="lookup",
+                    route_key=lookup.key.route_key,
+                    cache_key_digest=cache_key_digest,
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    current_entries=lookup.current_entries,
+                    current_bytes=lookup.current_bytes,
+                )
+                self.measurement_trace.record_cache_event(
+                    operation="hit" if lookup.hit else "miss",
+                    route_key=lookup.key.route_key,
+                    cache_key_digest=cache_key_digest,
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    current_entries=lookup.current_entries,
+                    current_bytes=lookup.current_bytes,
+                )
+            if lookup.hit and lookup.result is not None:
+                self.cache[sequence] = lookup.result
+                self.cache_hits += 1
+                if self.measurement_trace is not None:
+                    started = time.perf_counter()
+                    fields = route_result_fields(lookup.result)
+                    self.measurement_trace.record_route_evaluation(
+                        sequence,
+                        lane=self.lane,
+                        iteration=self.iteration,
+                        operator=self.operator,
+                        kind="cache_hit",
+                        started_at=self.measurement_trace._offset(started),
+                        completed_at=self.measurement_trace._offset(),
+                        exact_started=False,
+                        exact_completed=False,
+                        cache_key_digest=cache_key_digest,
+                        route_change_status=route_change_status,
+                        **fields,
+                    )
+                return lookup.result
+        elif sequence in self.cache:
             self.cache_hits += 1
             if self.measurement_trace is not None:
                 started = time.perf_counter()
@@ -397,6 +580,7 @@ class _Evaluator:
                     completed_at=self.measurement_trace._offset(),
                     exact_started=False,
                     exact_completed=False,
+                    route_change_status=route_change_status,
                     **fields,
                 )
             return self.cache[sequence]
@@ -421,9 +605,44 @@ class _Evaluator:
                     exact_completed=False,
                     feasible=None,
                     failure_reason=f"{type(error).__name__}: {error}",
+                    cache_key_digest=(
+                        self.route_cache.make_key(sequence).digest
+                        if self.route_cache is not None
+                        else ""
+                    ),
+                    route_change_status=route_change_status,
                 )
             raise
         self.cache[sequence] = result
+        cache_key_digest = ""
+        if self.route_cache is not None:
+            store = self.route_cache.store(sequence, result)
+            cache_key_digest = store.key.digest
+            if self.measurement_trace is not None:
+                for evicted in store.evicted:
+                    self.measurement_trace.record_cache_event(
+                        operation="evict",
+                        route_key=evicted.route_key,
+                        cache_key_digest=evicted.digest,
+                        lane=self.lane,
+                        iteration=self.iteration,
+                        operator=self.operator,
+                        reason="lru_capacity_or_memory",
+                        current_entries=store.current_entries,
+                        current_bytes=store.current_bytes,
+                    )
+                self.measurement_trace.record_cache_event(
+                    operation=("store" if store.stored else "oversize_not_cached"),
+                    route_key=store.key.route_key,
+                    cache_key_digest=store.key.digest,
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    reason=store.reason,
+                    entry_bytes=store.entry_bytes,
+                    current_entries=store.current_entries,
+                    current_bytes=store.current_bytes,
+                )
         self.calls += 1
         self.runtime += result.runtime_seconds
         self.labels_generated += result.labels_generated
@@ -441,6 +660,8 @@ class _Evaluator:
                 completed_at=self.measurement_trace._offset(),
                 exact_started=True,
                 exact_completed=True,
+                cache_key_digest=cache_key_digest,
+                route_change_status=route_change_status,
                 **fields,
             )
         # The exact solver is currently cooperative rather than interruptible.
@@ -470,7 +691,7 @@ class _Evaluator:
         charging = tuple(
             self._precomputed_route(sequence, precomputed_routes[sequence])
             if precomputed_routes is not None and sequence in precomputed_routes
-            else self.route(sequence)
+            else self.route(sequence, route_change_status="changed")
             for sequence in clean
         )
         feasible = bool(clean) and all(result.feasible for result in charging)
@@ -518,6 +739,12 @@ class _Evaluator:
                 completed_at=self.measurement_trace._offset(),
                 exact_started=False,
                 exact_completed=False,
+                route_change_status="unchanged",
+                cache_key_digest=(
+                    self.route_cache.make_key(sequence).digest
+                    if self.route_cache is not None
+                    else ""
+                ),
                 **fields,
             )
         if self.measurement_trace is not None and time.perf_counter() >= self.deadline:
@@ -549,6 +776,7 @@ def _solve_alns(
     vehicle_operator_config: VehicleOperatorConfig | None = None,
     measurement_trace: Stage03Trace | None = None,
     screening_config: CheapScreeningConfig | None = None,
+    cache_incremental_config: CacheIncrementalConfig | None = None,
 ) -> ALNSResult:
     if max_iterations <= 0:
         raise ValueError("max_iterations must be positive")
@@ -558,6 +786,21 @@ def _solve_alns(
         raise ValueError("removal_fraction must be in (0, 1]")
     profile = OperatorProfile(operator_profile)
     vehicle_config = vehicle_operator_config or VehicleOperatorConfig()
+    cache_enabled = (
+        cache_incremental_config is not None and cache_incremental_config.enabled
+    )
+    if cache_enabled and (screening_config is None or not screening_config.enabled):
+        raise ValueError(
+            "Stage 3.2 cache/incremental evaluation requires enabled Stage 3.1 screening"
+        )
+    if cache_incremental_config is not None and cache_incremental_config.enabled:
+        cache_incremental_config = replace(
+            cache_incremental_config,
+            instance_hash=(
+                cache_incremental_config.instance_hash
+                or canonical_instance_hash(instance)
+            ),
+        )
 
     started = time.perf_counter()
     rng = random.Random(seed)
@@ -578,6 +821,25 @@ def _solve_alns(
     negative_screening_cache: dict[str, ScreeningResult] | None = (
         {} if screening_config is not None and screening_config.enabled else None
     )
+    shared_route_cache = (
+        RouteEvaluationCache(instance, cache_incremental_config)
+        if cache_enabled
+        and cache_incremental_config is not None
+        and cache_incremental_config.shared_across_lanes
+        else None
+    )
+    lane_route_caches: list[RouteEvaluationCache | None]
+    if shared_route_cache is not None:
+        lane_route_caches = [shared_route_cache] * 3
+    else:
+        lane_route_caches = [
+            (
+                RouteEvaluationCache(instance, cache_incremental_config)
+                if cache_enabled and cache_incremental_config is not None
+                else None
+            )
+            for _ in range(3)
+        ]
     evaluator = _Evaluator(
         instance,
         deadline=legacy_deadline if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
@@ -586,6 +848,8 @@ def _solve_alns(
         lane="legacy",
         screening_config=screening_config,
         negative_screening_cache=negative_screening_cache,
+        cache_incremental_config=cache_incremental_config,
+        route_cache=lane_route_caches[0],
     )
     quality_evaluator = _Evaluator(
         instance,
@@ -595,6 +859,8 @@ def _solve_alns(
         lane="quality_shadow",
         screening_config=screening_config,
         negative_screening_cache=negative_screening_cache,
+        cache_incremental_config=cache_incremental_config,
+        route_cache=lane_route_caches[1],
     )
     # The constraint lane is the explicit slice after the legacy/quality lane,
     # not an unbounded second 30-second budget.  Spell out the endpoint so the
@@ -607,6 +873,8 @@ def _solve_alns(
         lane="constraint_lane",
         screening_config=screening_config,
         negative_screening_cache=negative_screening_cache,
+        cache_incremental_config=cache_incremental_config,
+        route_cache=lane_route_caches[2],
     )
     try:
         with evaluator.measurement_context(
@@ -1604,9 +1872,21 @@ def _solve_alns(
         },
         neighborhood_events=tuple(neighborhood_events),
         failure_reason="",
-        cache_hits=sum(item.cache_hits for item in lane_evaluators),
-        cache_misses=sum(item.calls for item in lane_evaluators),
-        unique_route_evaluations=sum(len(item.cache) for item in lane_evaluators),
+        cache_hits=(
+            _cache_statistics(lane_route_caches)["cache_hits"]
+            if cache_enabled
+            else sum(item.cache_hits for item in lane_evaluators)
+        ),
+        cache_misses=(
+            _cache_statistics(lane_route_caches)["cache_misses"]
+            if cache_enabled
+            else sum(item.calls for item in lane_evaluators)
+        ),
+        unique_route_evaluations=(
+            _cache_statistics(lane_route_caches)["unique_route_evaluations"]
+            if cache_enabled
+            else sum(len(item.cache) for item in lane_evaluators)
+        ),
         effective_iterations=effective_iterations,
         removal_tier_counts=removal_tier_counts,
         maximum_stagnation=maximum_stagnation,
@@ -1616,6 +1896,11 @@ def _solve_alns(
             if name in neighborhood_stats
         },
         screening_statistics=_aggregate_screening_statistics(lane_evaluators),
+        cache_incremental_statistics=_aggregate_cache_incremental_statistics(
+            lane_evaluators,
+            cache_incremental_config,
+            lane_route_caches,
+        ),
     )
 
 
@@ -1630,12 +1915,28 @@ def solve_alns(
     vehicle_operator_config: VehicleOperatorConfig | None = None,
     measurement_config: MeasurementConfig | None = None,
     screening_config: CheapScreeningConfig | None = None,
+    cache_incremental_config: CacheIncrementalConfig | None = None,
 ) -> ALNSResult:
-    """Solve ALNS with opt-in Stage 3.0 measurement and Stage 3.1 screening."""
+    """Solve ALNS with opt-in Stage 3.0--3.2 evidence and evaluation layers."""
 
     screening_enabled = screening_config is not None and screening_config.enabled
     measurement_enabled = measurement_config is not None and measurement_config.enabled
-    if not measurement_enabled and not screening_enabled:
+    cache_incremental_enabled = (
+        cache_incremental_config is not None and cache_incremental_config.enabled
+    )
+    if cache_incremental_enabled and not screening_enabled:
+        raise ValueError(
+            "Stage 3.2 cache/incremental evaluation requires enabled Stage 3.1 screening"
+        )
+    if cache_incremental_config is not None and cache_incremental_config.enabled:
+        cache_incremental_config = replace(
+            cache_incremental_config,
+            instance_hash=(
+                cache_incremental_config.instance_hash
+                or canonical_instance_hash(instance)
+            ),
+        )
+    if not measurement_enabled and not screening_enabled and not cache_incremental_enabled:
         return _solve_alns(
             instance,
             seed=seed,
@@ -1645,13 +1946,20 @@ def solve_alns(
             operator_profile=operator_profile,
             vehicle_operator_config=vehicle_operator_config,
             screening_config=screening_config,
+            cache_incremental_config=cache_incremental_config,
         )
     trace_config = (
         measurement_config
         if measurement_config is not None and measurement_config.enabled
         else MeasurementConfig()
     )
-    trace = Stage03Trace(trace_config, screening_config=screening_config)
+    trace = Stage03Trace(
+        trace_config,
+        screening_config=screening_config,
+        cache_incremental_config=(
+            cache_incremental_config if cache_incremental_enabled else None
+        ),
+    )
     try:
         result = _solve_alns(
             instance,
@@ -1663,6 +1971,7 @@ def solve_alns(
             vehicle_operator_config=vehicle_operator_config,
             measurement_trace=trace,
             screening_config=screening_config,
+            cache_incremental_config=cache_incremental_config,
         )
     except BaseException as error:
         trace.record_execution_error(error)
@@ -2315,14 +2624,31 @@ def _failed_result(
         neighborhood_statistics={},
         neighborhood_events=(),
         failure_reason=reason,
-        cache_hits=evaluator.cache_hits,
-        cache_misses=evaluator.calls,
-        unique_route_evaluations=len(evaluator.cache),
+        cache_hits=(
+            _cache_statistics([evaluator.route_cache])["cache_hits"]
+            if evaluator.cache_incremental_enabled
+            else evaluator.cache_hits
+        ),
+        cache_misses=(
+            _cache_statistics([evaluator.route_cache])["cache_misses"]
+            if evaluator.cache_incremental_enabled
+            else evaluator.calls
+        ),
+        unique_route_evaluations=(
+            _cache_statistics([evaluator.route_cache])["unique_route_evaluations"]
+            if evaluator.cache_incremental_enabled
+            else len(evaluator.cache)
+        ),
         effective_iterations=0,
         removal_tier_counts={tier.value: 0 for tier in RemovalTier},
         maximum_stagnation=0,
         constraint_operator_statistics={},
         screening_statistics=evaluator.screening_statistics(),
+        cache_incremental_statistics=_aggregate_cache_incremental_statistics(
+            (evaluator,),
+            evaluator.cache_incremental_config,
+            [evaluator.route_cache],
+        ),
     )
 
 
@@ -2349,4 +2675,91 @@ def _aggregate_screening_statistics(
         **totals,
         "screening_runtime_seconds": total_runtime,
         "screening_reason_counts": dict(sorted(reason_counts.items())),
+    }
+
+
+def _unique_route_caches(
+    route_caches: list[RouteEvaluationCache | None],
+) -> tuple[RouteEvaluationCache, ...]:
+    unique: list[RouteEvaluationCache] = []
+    seen: set[int] = set()
+    for cache in route_caches:
+        if cache is None or id(cache) in seen:
+            continue
+        seen.add(id(cache))
+        unique.append(cache)
+    return tuple(unique)
+
+
+def _cache_statistics(
+    route_caches: list[RouteEvaluationCache | None],
+) -> dict[str, int]:
+    totals = {
+        "cache_lookups": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "cache_stores": 0,
+        "cache_evictions": 0,
+        "cache_oversize_not_cached": 0,
+        "entries_current": 0,
+        "entries_peak": 0,
+        "bytes_current": 0,
+        "bytes_peak": 0,
+        "unique_route_evaluations": 0,
+    }
+    for cache in _unique_route_caches(route_caches):
+        statistics = cache.statistics
+        totals["cache_lookups"] += statistics.lookups
+        totals["cache_hits"] += statistics.hits
+        totals["cache_misses"] += statistics.misses
+        totals["cache_stores"] += statistics.stores
+        totals["cache_evictions"] += statistics.evictions
+        totals["cache_oversize_not_cached"] += statistics.oversize_not_cached
+        totals["entries_current"] += statistics.entries_current
+        totals["entries_peak"] += statistics.entries_peak
+        totals["bytes_current"] += statistics.bytes_current
+        totals["bytes_peak"] += statistics.bytes_peak
+        totals["unique_route_evaluations"] += statistics.unique_keys_seen
+    return totals
+
+
+def _aggregate_cache_incremental_statistics(
+    evaluators: tuple[_Evaluator, ...],
+    config: CacheIncrementalConfig | None,
+    route_caches: list[RouteEvaluationCache | None],
+) -> dict[str, object]:
+    if config is None or not config.enabled:
+        return {}
+    cache_statistics = _cache_statistics(route_caches)
+    incremental_totals: dict[str, int] = {
+        "incremental_propagations": 0,
+        "incremental_fallbacks": 0,
+        "incremental_reused_prefix_edges": 0,
+        "incremental_reused_suffix_edges": 0,
+    }
+    station_reachability: dict[str, object] = {}
+    station_queries = 0
+    for evaluator in evaluators:
+        statistics = evaluator.incremental_statistics()
+        for field_name in incremental_totals:
+            incremental_totals[field_name] += int(cast(Any, statistics[field_name]))
+        reachability = statistics["station_reachability"]
+        if isinstance(reachability, dict) and not station_reachability:
+            station_reachability = dict(reachability)
+        if isinstance(reachability, dict):
+            station_queries += int(reachability.get("queries", 0))
+    station_reachability["queries"] = station_queries
+    return {
+        "schema_version": config.schema_version,
+        "config": asdict(config),
+        **cache_statistics,
+        **incremental_totals,
+        "route_cache": {
+            **cache_statistics,
+            "eviction_policy": config.eviction_policy,
+            "max_entries": config.max_entries,
+            "max_memory_bytes": config.max_memory_bytes,
+            "instance_hash": config.instance_hash,
+        },
+        "station_reachability": station_reachability,
     }

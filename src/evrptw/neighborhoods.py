@@ -7,6 +7,10 @@ from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from typing import Protocol, cast
 
+from evrptw.cache_incremental import (
+    IncrementalPropagationResult,
+    StationReachabilityIndex,
+)
 from evrptw.charging import ChargingSubproblemResult
 from evrptw.measurement import ScreeningCheckTrace
 from evrptw.models import Instance, NodeType
@@ -297,6 +301,8 @@ def screen_route_candidate(
     full: bool = False,
     reference_distance: float | None = None,
     epsilon: float = _EPSILON,
+    reachability_index: StationReachabilityIndex | None = None,
+    incremental_metrics: IncrementalPropagationResult | None = None,
 ) -> ScreeningResult:
     """Run safe, optimistic checks before exact charging evaluation.
 
@@ -310,7 +316,9 @@ def screen_route_candidate(
         raise ValueError("screening epsilon must be positive")
     by_name = instance.by_name
     known_sequence = all(name in by_name for name in sequence)
-    if known_sequence:
+    if known_sequence and not (
+        incremental_metrics is not None and incremental_metrics.status == "incremental"
+    ):
         distance_chain = (instance.depot.name, *sequence, instance.depot.name)
         distance_lower_bound = sum(
             by_name[origin_name].distance_to(by_name[destination_name])
@@ -320,6 +328,8 @@ def screen_route_candidate(
         )
     else:
         distance_lower_bound = 0.0
+    if incremental_metrics is not None and incremental_metrics.status == "incremental":
+        distance_lower_bound = incremental_metrics.distance_lower_bound
     distance_increment_lower_bound = (
         None
         if reference_distance is None
@@ -433,23 +443,33 @@ def screen_route_candidate(
         )
     )
 
-    for origin_name, destination_name in zip(chain, chain[1:], strict=False):
-        origin = by_name[origin_name]
-        destination = by_name[destination_name]
-        current_time += origin.distance_to(destination) / instance.vehicle.average_velocity
-        current_time = max(current_time, destination.ready_time)
-        if destination.kind is NodeType.CUSTOMER:
-            earliest_arrivals[destination.name] = current_time
-            slack = destination.due_date - current_time
-            min_slack = min(min_slack, slack)
-            if slack < -epsilon:
-                return reject("forward_time_window", "forward_time_window_prefilter", slack)
-            current_time += destination.service_time
-        elif destination.kind is NodeType.DEPOT:
-            slack = destination.due_date - current_time
-            min_slack = min(min_slack, slack)
-            if slack < -epsilon:
-                return reject("forward_time_window", "forward_time_window_prefilter", slack)
+    if incremental_metrics is not None and incremental_metrics.status == "incremental":
+        current_time = incremental_metrics.finish_time
+        min_slack = incremental_metrics.min_time_window_slack
+        if not incremental_metrics.forward_feasible:
+            return reject(
+                incremental_metrics.first_failed_check or "forward_time_window",
+                incremental_metrics.reason or "forward_time_window_prefilter",
+                min_slack,
+            )
+    else:
+        for origin_name, destination_name in zip(chain, chain[1:], strict=False):
+            origin = by_name[origin_name]
+            destination = by_name[destination_name]
+            current_time += origin.distance_to(destination) / instance.vehicle.average_velocity
+            current_time = max(current_time, destination.ready_time)
+            if destination.kind is NodeType.CUSTOMER:
+                earliest_arrivals[destination.name] = current_time
+                slack = destination.due_date - current_time
+                min_slack = min(min_slack, slack)
+                if slack < -epsilon:
+                    return reject("forward_time_window", "forward_time_window_prefilter", slack)
+                current_time += destination.service_time
+            elif destination.kind is NodeType.DEPOT:
+                slack = destination.due_date - current_time
+                min_slack = min(min_slack, slack)
+                if slack < -epsilon:
+                    return reject("forward_time_window", "forward_time_window_prefilter", slack)
     checks.append(
         ScreeningCheckTrace(
             "forward_time_window",
@@ -459,28 +479,36 @@ def screen_route_candidate(
         )
     )
 
-    latest_departure = instance.depot.due_date
-    latest_arrivals: dict[str, float] = {}
-    for index in range(len(chain) - 2, -1, -1):
-        origin = by_name[chain[index]]
-        destination = by_name[chain[index + 1]]
-        if destination.kind is NodeType.CUSTOMER:
-            latest_arrival = min(
-                destination.due_date,
-                latest_departure - destination.service_time,
+    if incremental_metrics is not None and incremental_metrics.status == "incremental":
+        if not incremental_metrics.backward_feasible:
+            return reject(
+                incremental_metrics.first_failed_check or "backward_time_window",
+                incremental_metrics.reason or "backward_time_window_prefilter",
+                min_slack,
             )
-            latest_arrivals[destination.name] = latest_arrival
-        else:
-            latest_arrival = min(destination.due_date, latest_departure)
-        latest_departure = (
-            latest_arrival
-            - origin.distance_to(destination) / instance.vehicle.average_velocity
-        )
-    for customer_name, earliest in earliest_arrivals.items():
-        slack = latest_arrivals[customer_name] - earliest
-        min_slack = min(min_slack, slack)
-        if slack < -epsilon:
-            return reject("backward_time_window", "backward_time_window_prefilter", slack)
+    else:
+        latest_departure = instance.depot.due_date
+        latest_arrivals: dict[str, float] = {}
+        for index in range(len(chain) - 2, -1, -1):
+            origin = by_name[chain[index]]
+            destination = by_name[chain[index + 1]]
+            if destination.kind is NodeType.CUSTOMER:
+                latest_arrival = min(
+                    destination.due_date,
+                    latest_departure - destination.service_time,
+                )
+                latest_arrivals[destination.name] = latest_arrival
+            else:
+                latest_arrival = min(destination.due_date, latest_departure)
+            latest_departure = (
+                latest_arrival
+                - origin.distance_to(destination) / instance.vehicle.average_velocity
+            )
+        for customer_name, earliest in earliest_arrivals.items():
+            slack = latest_arrivals[customer_name] - earliest
+            min_slack = min(min_slack, slack)
+            if slack < -epsilon:
+                return reject("backward_time_window", "backward_time_window_prefilter", slack)
     checks.append(
         ScreeningCheckTrace(
             "backward_time_window",
@@ -510,9 +538,14 @@ def screen_route_candidate(
     )
 
     for origin_name, destination_name in zip(chain, chain[1:], strict=False):
-        if not _energy_reachable_optimistically(
-            instance, origin_name, destination_name, epsilon=epsilon
-        ):
+        reachable = (
+            reachability_index.can_reach(origin_name, destination_name)
+            if reachability_index is not None
+            else _energy_reachable_optimistically(
+                instance, origin_name, destination_name, epsilon=epsilon
+            )
+        )
+        if not reachable:
             single_segment_reachable = False
             return reject(
                 "single_segment_battery_reachability",
@@ -571,6 +604,9 @@ def _screen_with_evaluator(
     instance: Instance,
     evaluator: RouteEvaluator,
     sequence: CustomerSequence,
+    *,
+    base_sequence: CustomerSequence | None = None,
+    operator: str = "",
 ) -> ScreeningResult:
     """Use the shared evaluator screener when Stage 3.1 is enabled.
 
@@ -582,8 +618,27 @@ def _screen_with_evaluator(
 
     screen = getattr(evaluator, "screen", None)
     if callable(screen) and bool(getattr(evaluator, "screening_enabled", False)):
-        return cast(ScreeningResult, screen(sequence))
+        return cast(
+            ScreeningResult,
+            screen(sequence, base_sequence=base_sequence, operator=operator),
+        )
     return screen_route_candidate(instance, sequence)
+
+
+def _route_with_status(
+    evaluator: RouteEvaluator,
+    sequence: CustomerSequence,
+    route_change_status: str,
+) -> ChargingSubproblemResult:
+    """Call the optional measured route seam without widening the legacy protocol."""
+
+    route_with_status = getattr(evaluator, "route_with_status", None)
+    if callable(route_with_status):
+        return cast(
+            ChargingSubproblemResult,
+            route_with_status(sequence, route_change_status),
+        )
+    return evaluator.route(sequence)
 
 
 def _legacy_screen_route_candidate(
@@ -1841,6 +1896,8 @@ def propose_ejection_chain(
                         instance,
                         evaluator,
                         changes,
+                        base_sequences=sequences,
+                        operator=operator,
                         base_results=base_results,
                         exact_used=exact_used,
                         budget=config.ejection_chain_exact_evaluation_budget,
@@ -1967,6 +2024,8 @@ def _search_changed_candidates(
             instance,
             evaluator,
             description.changes,
+            base_sequences=sequences,
+            operator=operator,
             base_results=base_results,
             exact_used=exact_used,
             budget=budget,
@@ -2073,6 +2132,8 @@ def _evaluate_changed_candidate(
     evaluator: RouteEvaluator,
     changes: tuple[tuple[int, CustomerSequence], ...],
     *,
+    base_sequences: RouteSequences,
+    operator: str,
     base_results: tuple[ChargingSubproblemResult, ...],
     exact_used: int,
     budget: int,
@@ -2082,8 +2143,17 @@ def _evaluate_changed_candidate(
         return _CandidateEvaluation(None, "no_changed_route", False, 0)
     if len({index for index, _ in changes}) != len(changes):
         return _CandidateEvaluation(None, "duplicate_changed_route", False, 0)
-    for _, sequence in changes:
-        screen = _screen_with_evaluator(instance, evaluator, sequence)
+    for index, sequence in changes:
+        base_sequence = (
+            base_sequences[index] if 0 <= index < len(base_sequences) else None
+        )
+        screen = _screen_with_evaluator(
+            instance,
+            evaluator,
+            sequence,
+            base_sequence=base_sequence,
+            operator=operator,
+        )
         if not screen.accepted:
             return _CandidateEvaluation(None, screen.reason, False, 0)
     required = sum(
@@ -2100,7 +2170,7 @@ def _evaluate_changed_candidate(
     exact_evaluations = 0
     for _, sequence in changes:
         before_calls = evaluator.calls
-        results.append(evaluator.route(sequence))
+        results.append(_route_with_status(evaluator, sequence, "changed"))
         exact_evaluations += evaluator.calls - before_calls
     if not all(result.feasible for result in results):
         reason = next(
@@ -2130,6 +2200,9 @@ def _is_cached_route(
     evaluator: RouteEvaluator,
     sequence: CustomerSequence,
 ) -> bool:
+    has_cached_route = getattr(evaluator, "has_cached_route", None)
+    if callable(has_cached_route):
+        return bool(has_cached_route(sequence))
     cache = getattr(evaluator, "cache", None)
     return isinstance(cache, Mapping) and sequence in cache
 

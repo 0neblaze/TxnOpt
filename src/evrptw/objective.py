@@ -9,6 +9,7 @@ from evrptw.models import Instance, NodeType
 from evrptw.validation import SolutionReport
 
 OBJECTIVE_PRECISION_DIGITS = 9
+OBJECTIVE_SCHEMA_VERSION = "vehicles,distance,charging_time,charging_count"
 
 
 def count_charging_visits(instance: Instance, routes: Iterable[Iterable[str]]) -> int:

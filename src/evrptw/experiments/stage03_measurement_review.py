@@ -10,6 +10,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+from evrptw.cache_incremental import (
+    RouteCacheKey,
+    StationReachabilityIndex,
+    build_route_propagation_snapshot,
+    incremental_route_propagation,
+)
 from evrptw.experiments.stage03_measurement import (
     OBJECTIVE_SCHEMA,
     RAW_PER_RUN_FIELDS,
@@ -36,6 +42,8 @@ READY_FOR_FORMAL = "READY_FOR_STAGE03_FORMAL_MEASUREMENT"
 READY_FOR_STAGE31 = "READY_FOR_STAGE03_ACCELERATION"
 READY_FOR_STAGE031_FORMAL = "READY_FOR_STAGE031_FORMAL_MEASUREMENT"
 READY_FOR_STAGE032 = "READY_FOR_STAGE03_2"
+READY_FOR_STAGE032_FORMAL = "READY_FOR_STAGE032_FORMAL_MEASUREMENT"
+READY_FOR_STAGE033 = "READY_FOR_STAGE03_3"
 FINDING_FIELDS = ("finding", "status", "observed", "expected", "evidence")
 TRACE_FIELDS = (
     "run_label",
@@ -53,6 +61,7 @@ TRACE_FIELDS = (
     "screening_cache_hits",
     "screening_exact_call_blocked",
     "screening_reason_counts",
+    "cache_incremental_counts",
     "reconciliation_status",
     "reconciliation_checks",
 )
@@ -163,6 +172,10 @@ def review_run(
     screening_payload = metadata.get("screening_config")
     screening_enabled = isinstance(screening_payload, dict) and bool(
         screening_payload.get("enabled", False)
+    )
+    cache_payload = metadata.get("cache_incremental_config")
+    cache_incremental_enabled = isinstance(cache_payload, dict) and bool(
+        cache_payload.get("enabled", False)
     )
     expected_instances = tuple(str(value) for value in metadata.get("expected_instances", ()))
     expected_seeds = tuple(int(str(value)) for value in metadata.get("expected_seeds", ()))
@@ -278,6 +291,32 @@ def review_run(
             )
         )
 
+    cache_incremental_ok = (not cache_incremental_enabled) or (
+        bool(audited)
+        and all(
+            _cache_incremental_trace_ok(item.trace, item.instance, item.solver_result)
+            for item in audited
+        )
+    )
+    if cache_incremental_enabled:
+        findings.append(
+            _finding(
+                "cache_incremental_reconciliation",
+                cache_incremental_ok,
+                [
+                    {
+                        "instance": item.key[0],
+                        "seed": item.key[1],
+                        "cache_incremental": item.trace.cache_incremental_counts,
+                    }
+                    for item in audited
+                ],
+                "cache key/lifecycle, screening order, changed-route propagation, "
+                "station bitsets, evictions, and ALNSResult counters reconcile",
+                "raw trace, raw event log, solver_result, and independent recomputation",
+            )
+        )
+
     provenance_ok, provenance_reason = _provenance_ok(root, run_dir, metadata)
     findings.append(
         _finding(
@@ -369,7 +408,15 @@ def review_run(
         )
 
     ready = all(row["status"] == "pass" for row in findings)
-    if screening_enabled and scope == "smoke":
+    if cache_incremental_enabled and scope == "smoke":
+        status = (
+            READY_FOR_STAGE032_FORMAL
+            if ready
+            else "NOT_READY_FOR_STAGE032_FORMAL_MEASUREMENT"
+        )
+    elif cache_incremental_enabled and scope == "formal":
+        status = READY_FOR_STAGE033 if ready else "NOT_READY_FOR_STAGE03_3"
+    elif screening_enabled and scope == "smoke":
         status = (
             READY_FOR_STAGE031_FORMAL
             if ready
@@ -399,7 +446,11 @@ def review_run(
             ready,
             status,
             (
-                READY_FOR_STAGE031_FORMAL
+                READY_FOR_STAGE032_FORMAL
+                if cache_incremental_enabled and scope == "smoke"
+                else READY_FOR_STAGE033
+                if cache_incremental_enabled
+                else READY_FOR_STAGE031_FORMAL
                 if screening_enabled and scope == "smoke"
                 else READY_FOR_STAGE032
                 if screening_enabled
@@ -407,7 +458,9 @@ def review_run(
                 if scope == "smoke"
                 else READY_FOR_STAGE31
             ),
-            "all Stage 3.1 acceptance gates"
+            "all Stage 3.2 acceptance gates"
+            if cache_incremental_enabled
+            else "all Stage 3.1 acceptance gates"
             if screening_enabled
             else "all Stage 3.0 acceptance gates",
         )
@@ -439,6 +492,10 @@ def review_run(
         output_paths["stage03_formal_comparison"] = (
             review_dir / "stage03_formal_comparison.csv"
         )
+    if cache_incremental_enabled:
+        output_paths["cache_incremental_statistics"] = (
+            review_dir / "cache_incremental_statistics.csv"
+        )
     output_paths["review_report"].write_text(report_lines, encoding="utf-8")
     _write_csv(output_paths["review_findings"], FINDING_FIELDS, findings)
     _write_csv(output_paths["stage03_readiness"], FINDING_FIELDS, readiness_rows)
@@ -457,6 +514,12 @@ def review_run(
             output_paths["stage03_formal_comparison"],
             STAGE03_COMPARISON_FIELDS,
             stage03_comparison,
+        )
+    if cache_incremental_enabled:
+        _write_csv(
+            output_paths["cache_incremental_statistics"],
+            ("run_label", "instance", "seed", "metric", "value"),
+            _cache_statistics_rows(audited, label),
         )
     review_manifest = {
         "schema_version": REVIEW_SCHEMA_VERSION,
@@ -624,6 +687,192 @@ def _screening_trace_ok(trace: Stage03Trace) -> bool:
     return True
 
 
+def _cache_incremental_trace_ok(
+    trace: Stage03Trace,
+    instance: Any,
+    solver_result: SimpleNamespace | None,
+) -> bool:
+    config = trace.cache_incremental_config
+    if config is None or not bool(getattr(config, "enabled", False)):
+        return False
+    if solver_result is None:
+        return False
+    expected = getattr(solver_result, "cache_incremental_statistics", {})
+    if not isinstance(expected, dict):
+        return False
+    observed = trace.cache_incremental_counts
+    for field_name in (
+        "cache_lookups",
+        "cache_hits",
+        "cache_misses",
+        "cache_stores",
+        "cache_evictions",
+        "cache_oversize_not_cached",
+        "incremental_propagations",
+        "incremental_fallbacks",
+    ):
+        if int(observed.get(field_name, 0)) != int(expected.get(field_name, 0)):
+            return False
+
+    # The route dictionary is the only source of customer sequences used by
+    # replay.  Recompute every digest from the four-part cache key rather than
+    # trusting a summary field.
+    for evaluation in trace.route_evaluations:
+        sequence = trace.route_dictionary.get(evaluation.route_key)
+        if sequence is None or not evaluation.cache_key_digest:
+            return False
+        key = RouteCacheKey(
+            str(config.instance_hash),
+            sequence,
+            str(config.charging_configuration_version),
+            str(config.objective_schema_version),
+        )
+        if evaluation.cache_key_digest != key.digest:
+            return False
+        if evaluation.kind == "precomputed_route":
+            if evaluation.route_change_status != "unchanged":
+                return False
+        elif evaluation.route_change_status == "unchanged":
+            return False
+
+    cache_events = [
+        event for event in trace.events if event.get("event_type") == "cache_event"
+    ]
+    allowed_operations = {
+        "lookup",
+        "hit",
+        "miss",
+        "store",
+        "evict",
+        "oversize_not_cached",
+    }
+    if any(str(event.get("operation")) not in allowed_operations for event in cache_events):
+        return False
+    for event in cache_events:
+        route_key = str(event.get("route_key", ""))
+        sequence = trace.route_dictionary.get(route_key)
+        if sequence is None:
+            return False
+        key = RouteCacheKey(
+            str(config.instance_hash),
+            sequence,
+            str(config.charging_configuration_version),
+            str(config.objective_schema_version),
+        )
+        if str(event.get("cache_key_digest", "")) != key.digest:
+            return False
+    if len([event for event in cache_events if event.get("operation") == "lookup"]) != int(
+        observed["cache_lookups"]
+    ):
+        return False
+
+    # A cache hit cannot be the first observation of a key.  If a key is exact
+    # evaluated again, the raw event log must show its eviction or an explicit
+    # oversize-not-cached decision in between.
+    exact_by_digest: dict[str, list[float]] = defaultdict(list)
+    for evaluation in trace.route_evaluations:
+        if evaluation.kind == "exact_call":
+            exact_by_digest[evaluation.cache_key_digest].append(evaluation.started_at)
+    for digest, starts in exact_by_digest.items():
+        if len(starts) <= 1:
+            continue
+        for previous, current in zip(starts, starts[1:], strict=False):
+            lifecycle = [
+                event
+                for event in cache_events
+                if event.get("cache_key_digest") == digest
+                and previous
+                <= float(cast(Any, event.get("timestamp_seconds", 0.0)))
+                <= current
+                and event.get("operation") in {"evict", "oversize_not_cached"}
+            ]
+            if not lifecycle:
+                return False
+
+    screening_by_lane_route: defaultdict[tuple[str, str], list[Any]] = defaultdict(list)
+    for decision in trace.screening_decisions:
+        screening_by_lane_route[(decision.lane, decision.route_key)].append(decision)
+    for evaluation in trace.route_evaluations:
+        if evaluation.kind not in {"exact_call", "cache_hit"}:
+            continue
+        prior_pass = any(
+            decision.status == "pass"
+            and decision.completed_at <= evaluation.started_at + 1e-9
+            for decision in screening_by_lane_route[(evaluation.lane, evaluation.route_key)]
+        )
+        if not prior_pass:
+            return False
+
+    expected_reachability = expected.get("station_reachability", {})
+    if not isinstance(expected_reachability, dict):
+        return False
+    independent_reachability = StationReachabilityIndex(instance).to_dict()
+    if (
+        expected_reachability.get("safe_nodes")
+        != independent_reachability.get("safe_nodes")
+        or expected_reachability.get("bitsets")
+        != independent_reachability.get("bitsets")
+    ):
+        return False
+    for record in trace.incremental_propagations:
+        base_sequence = trace.route_dictionary.get(str(record.get("base_route_key", "")))
+        candidate_sequence = trace.route_dictionary.get(
+            str(record.get("candidate_route_key", ""))
+        )
+        if base_sequence is None or candidate_sequence is None:
+            return False
+        base_snapshot = build_route_propagation_snapshot(instance, base_sequence)
+        independent = incremental_route_propagation(instance, base_snapshot, candidate_sequence)
+        full = build_route_propagation_snapshot(instance, candidate_sequence)
+        if str(record.get("status")) != independent.status:
+            return False
+        for field_name in (
+            "distance_lower_bound",
+            "min_time_window_slack",
+            "finish_time",
+        ):
+            observed_value = float(cast(Any, record.get(field_name, 0.0)))
+            expected_value = float(getattr(independent, field_name))
+            if abs(observed_value - expected_value) > 1e-7:
+                return False
+        if (
+            abs(
+                float(cast(Any, record.get("distance_lower_bound", 0.0)))
+                - full.total_distance
+            )
+            > 1e-7
+            or abs(
+                float(cast(Any, record.get("min_time_window_slack", 0.0)))
+                - full.min_time_window_slack
+            )
+            > 1e-7
+            or abs(float(cast(Any, record.get("finish_time", 0.0))) - full.finish_time)
+            > 1e-7
+        ):
+            return False
+    return True
+
+
+def _cache_statistics_rows(
+    audited: list[_AuditedRun],
+    label: str,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for item in audited:
+        values = item.trace.cache_incremental_counts
+        rows.extend(
+            {
+                "run_label": label,
+                "instance": item.key[0],
+                "seed": item.key[1],
+                "metric": metric,
+                "value": value,
+            }
+            for metric, value in sorted(values.items())
+        )
+    return rows
+
+
 def _screening_reason_rows(
     audited: list[_AuditedRun],
     label: str,
@@ -778,9 +1027,15 @@ def _provenance_ok(root: Path, run_dir: Path, metadata: dict[str, Any]) -> tuple
     screening_enabled = isinstance(screening_payload, dict) and bool(
         screening_payload.get("enabled", False)
     )
+    cache_payload = metadata.get("cache_incremental_config")
+    cache_incremental_enabled = isinstance(cache_payload, dict) and bool(
+        cache_payload.get("enabled", False)
+    )
     try:
         current_sources = _source_hashes(
-            root, include_stage031=screening_enabled
+            root,
+            include_stage031=screening_enabled,
+            include_stage032=cache_incremental_enabled,
         )
     except FileNotFoundError as error:
         return False, str(error)
@@ -881,18 +1136,36 @@ def _load_stage03_formal_rows(
     root: Path,
     metadata: dict[str, Any],
 ) -> dict[tuple[str, int], dict[str, object]]:
-    raw_path_value = metadata.get("stage03_formal_per_run")
+    cache_payload = metadata.get("cache_incremental_config")
+    cache_incremental_enabled = isinstance(cache_payload, dict) and bool(
+        cache_payload.get("enabled", False)
+    )
+    raw_path_value = (
+        metadata.get("stage031_formal_per_run")
+        if cache_incremental_enabled
+        else metadata.get("stage03_formal_per_run")
+    )
     if raw_path_value in {None, ""}:
         return {}
     path = Path(str(raw_path_value))
     if not path.is_absolute():
         path = root / path
-    expected_path_hash = str(metadata.get("stage03_formal_per_run_sha256", ""))
+    expected_path_hash = str(
+        metadata.get(
+            "stage031_formal_per_run_sha256"
+            if cache_incremental_enabled
+            else "stage03_formal_per_run_sha256",
+            "",
+        )
+    )
     if not path.is_file() or not expected_path_hash:
         raise RuntimeError("Stage 3.0 formal per-run baseline is missing")
     if _sha256(path) != expected_path_hash:
         raise RuntimeError("Stage 3.0 formal per-run baseline hash mismatch")
-    _verify_trusted_stage03_review_manifest(root, metadata)
+    if cache_incremental_enabled:
+        _verify_trusted_stage031_review_manifest(root, metadata)
+    else:
+        _verify_trusted_stage03_review_manifest(root, metadata)
     rows: dict[tuple[str, int], dict[str, object]] = {}
     for row in _read_csv(path):
         objective = json.loads(str(row.get("objective_key", "[]")))
@@ -945,6 +1218,42 @@ def _verify_trusted_stage03_review_manifest(
             artifact = review_manifest.parent / f"{review_label}_per_run_results.csv"
         if not artifact.is_file() or _sha256(artifact) != str(expected_file_hash):
             raise RuntimeError(f"trusted Stage 3.0 review artifact hash mismatch: {name}")
+
+
+def _verify_trusted_stage031_review_manifest(
+    root: Path,
+    metadata: dict[str, Any],
+) -> None:
+    raw_path_value = metadata.get("stage031_formal_review_manifest")
+    expected_hash = str(metadata.get("stage031_formal_review_manifest_sha256", ""))
+    if raw_path_value in {None, ""} or not expected_hash:
+        raise RuntimeError("trusted Stage 3.1 formal review manifest is missing")
+    review_manifest = Path(str(raw_path_value))
+    if not review_manifest.is_absolute():
+        review_manifest = root / review_manifest
+    if not review_manifest.is_file() or _sha256(review_manifest) != expected_hash:
+        raise RuntimeError("trusted Stage 3.1 formal review manifest hash mismatch")
+    payload = _read_json(review_manifest)
+    recorded_hash = str(payload.get("manifest_payload_sha256", ""))
+    payload_without_hash = dict(payload)
+    payload_without_hash.pop("manifest_payload_sha256", None)
+    if not recorded_hash or recorded_hash != _payload_sha256(payload_without_hash):
+        raise RuntimeError("trusted Stage 3.1 review manifest payload mismatch")
+    if payload.get("scope") != "formal" or payload.get("status") != READY_FOR_STAGE032:
+        raise RuntimeError("trusted Stage 3.1 formal review is not READY_FOR_STAGE03_2")
+    review_label = str(payload.get("review_label", ""))
+    for name, expected_file_hash in dict(payload.get("files", {})).items():
+        artifact = review_manifest.parent / str(name)
+        if not artifact.is_file() and review_label:
+            artifact = review_manifest.parent / f"{review_label}_{name}"
+        if (
+            not artifact.is_file()
+            and name == "recomputed_per_run_results.csv"
+            and review_label
+        ):
+            artifact = review_manifest.parent / f"{review_label}_per_run_results.csv"
+        if not artifact.is_file() or _sha256(artifact) != str(expected_file_hash):
+            raise RuntimeError(f"trusted Stage 3.1 review artifact hash mismatch: {name}")
 
 
 def _compare_stage03_formal(
@@ -1201,6 +1510,15 @@ def _recomputed_row(
             "trace_screening_reason_counts": json.dumps(
                 item.trace.screening_counts["screening_reason_counts"], sort_keys=True
             ),
+            "trace_cache_incremental_counts": json.dumps(
+                item.trace.cache_incremental_counts, sort_keys=True
+            ),
+            "trace_incremental_propagations": item.trace.cache_incremental_counts[
+                "incremental_propagations"
+            ],
+            "trace_incremental_fallbacks": item.trace.cache_incremental_counts[
+                "incremental_fallbacks"
+            ],
             "trace_reconciliation_status": item.reconciliation.get("status", "not_available"),
             **solver_metrics,
             "peak_tracemalloc_bytes": environment.get("peak_tracemalloc_bytes", ""),
@@ -1210,6 +1528,7 @@ def _recomputed_row(
             "trace_path": raw.get("trace_path", ""),
             "event_path": raw.get("event_path", ""),
             "environment_path": raw.get("environment_path", ""),
+            "failure_path": raw.get("failure_path", ""),
             "failure_reason": (
                 "; ".join(item.validator_violations)
                 or str(getattr(solver, "failure_reason", ""))
@@ -1306,6 +1625,9 @@ def _trace_row(item: _AuditedRun, label: str) -> dict[str, Any]:
         "screening_reason_counts": json.dumps(
             item.trace.screening_counts["screening_reason_counts"], sort_keys=True
         ),
+        "cache_incremental_counts": json.dumps(
+            item.trace.cache_incremental_counts, sort_keys=True
+        ),
         "reconciliation_status": item.reconciliation.get("status", "not_available"),
         "reconciliation_checks": json.dumps(item.reconciliation.get("checks", {}), sort_keys=True),
     }
@@ -1319,6 +1641,9 @@ def _report_lines(
     run_count: int,
 ) -> str:
     screening = any(row["finding"] == "cheap_screening_reconciliation" for row in findings)
+    cache_incremental = any(
+        row["finding"] == "cache_incremental_reconciliation" for row in findings
+    )
     lines = [
         f"# {label}",
         "",
@@ -1344,7 +1669,10 @@ def _report_lines(
             "## Interpretation",
             "",
             (
-                "Stage 3.1 measures safe cheap screening and exact-call reduction only. "
+                "Stage 3.2 audits bounded route caching and incremental propagation. "
+                "Cache evidence is not a Stage 3.3 fixed-work/wall-clock acceleration claim."
+                if cache_incremental
+                else "Stage 3.1 measures safe cheap screening and exact-call reduction only. "
                 "It does not claim complete route caching, incremental propagation, "
                 "interruptible exact solving, parallel evaluation, or fixed-work/wall-clock "
                 "acceleration."
@@ -1390,6 +1718,10 @@ def _publish_summaries(
         names["screening_reason_statistics"] = f"{label}_screening_reason_statistics.csv"
     if "stage03_formal_comparison" in output_paths:
         names["stage03_formal_comparison"] = f"{label}_stage03_formal_comparison.csv"
+    if "cache_incremental_statistics" in output_paths:
+        names["cache_incremental_statistics"] = (
+            f"{label}_cache_incremental_statistics.csv"
+        )
     destinations = [summary_dir / name for name in names.values()]
     existing = [path for path in destinations if path.exists()]
     if existing:

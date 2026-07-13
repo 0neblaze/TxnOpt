@@ -1,0 +1,19 @@
+{
+  "schema_version": "stage03-artifact-migration-v1",
+  "stage_id": "stage03.2",
+  "component": "cache_incremental",
+  "status": "implementation_ready_no_run_evidence",
+  "solver_rerun_performed": false,
+  "raw_artifacts_moved": false,
+  "historical_paths_overwritten": false,
+  "registry": "experiments/registries/stage03.2_artifact_registry.csv",
+  "legacy_mapping": "experiments/registries/stage03_legacy_path_map.csv",
+  "run_label_pattern": "^stage03\\.2_cache_incremental_(attempt|rerun)[0-9]{2}$",
+  "attempt_or_rerun_policy": "attemptNN_or_rerunNN",
+  "artifact_filename_policy": "<stage_id>_<component>_<attempt_or_rerun>_<artifact_type>[_<instance>_<seed>].<ext>",
+  "logical_directory_policy": "results/<run_label>/<instance>/<seed>/",
+  "notes": [
+    "This manifest is a schema/template record until Stage 3.2 raw smoke evidence is reviewed.",
+    "No Stage 3.2 summary or readiness claim is inferred from this template."
+  ]
+}

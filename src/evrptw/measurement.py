@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
 
 TRACE_SCHEMA_VERSION = "stage03-trace-v1"
+CACHE_INCREMENTAL_TRACE_SCHEMA_VERSION = "stage03-trace-v2"
 SCREENING_SCHEMA_VERSION = "stage031-screening-v1"
 ROUTE_EVALUATION_KINDS = frozenset(
     {"exact_call", "cache_hit", "precomputed_route"}
@@ -122,6 +123,8 @@ class RouteEvaluationTrace:
     labels_expanded: int = 0
     labels_pruned: int = 0
     deadline_boundary: str = ""
+    cache_key_digest: str = ""
+    route_change_status: str = "unknown"
 
     def __post_init__(self) -> None:
         if self.kind not in ROUTE_EVALUATION_KINDS:
@@ -130,6 +133,8 @@ class RouteEvaluationTrace:
             raise ValueError("evaluation_id must be positive")
         if self.exact_completed and not self.exact_started:
             raise ValueError("an exact call cannot complete before it starts")
+        if self.route_change_status not in {"changed", "unchanged", "unknown"}:
+            raise ValueError(f"unsupported route change status: {self.route_change_status}")
 
 
 class _MeasuredResult(Protocol):
@@ -193,9 +198,19 @@ class Stage03Trace:
     # construction of the v1 trace remains compatible.
     screening_config: CheapScreeningConfig | None = None
     screening_decisions: list[ScreeningDecision] = field(default_factory=list)
+    cache_incremental_config: Any | None = None
+    incremental_propagations: list[dict[str, object]] = field(default_factory=list)
+    trace_schema_version: str = TRACE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         self._validate_screening_route_dictionary()
+        if self.trace_schema_version not in (
+            TRACE_SCHEMA_VERSION,
+            CACHE_INCREMENTAL_TRACE_SCHEMA_VERSION,
+        ):
+            raise ValueError(f"unsupported Stage 3 trace schema {self.trace_schema_version}")
+        if self.cache_incremental_config is not None:
+            self.trace_schema_version = CACHE_INCREMENTAL_TRACE_SCHEMA_VERSION
 
     def _validate_screening_route_dictionary(self) -> None:
         if (
@@ -238,6 +253,8 @@ class Stage03Trace:
         labels_expanded: int = 0,
         labels_pruned: int = 0,
         deadline_boundary: str = "",
+        cache_key_digest: str = "",
+        route_change_status: str = "unknown",
     ) -> int:
         if kind not in ROUTE_EVALUATION_KINDS:
             raise ValueError(f"unsupported route evaluation kind: {kind}")
@@ -265,9 +282,77 @@ class Stage03Trace:
             labels_expanded=labels_expanded,
             labels_pruned=labels_pruned,
             deadline_boundary=deadline_boundary,
+            cache_key_digest=cache_key_digest,
+            route_change_status=route_change_status,
         )
         self.route_evaluations.append(record)
         return record.evaluation_id
+
+    def record_cache_event(
+        self,
+        *,
+        operation: str,
+        route_key: str,
+        cache_key_digest: str,
+        lane: str,
+        iteration: int | None,
+        operator: str,
+        **fields: object,
+    ) -> None:
+        self.events.append(
+            {
+                "event_type": "cache_event",
+                "operation": operation,
+                "route_key": route_key,
+                "cache_key_digest": cache_key_digest,
+                "lane": lane,
+                "iteration": iteration,
+                "operator": operator,
+                "timestamp_seconds": self._offset(),
+                **fields,
+            }
+        )
+
+    def record_incremental_propagation(
+        self,
+        *,
+        operator: str,
+        lane: str,
+        iteration: int | None,
+        base_sequence: tuple[str, ...],
+        candidate_sequence: tuple[str, ...],
+        status: str,
+        reason: str,
+        distance_lower_bound: float,
+        min_time_window_slack: float,
+        finish_time: float,
+        reused_prefix_edges: int,
+        reused_suffix_edges: int,
+        recomputed_forward_edges: int,
+        recomputed_backward_edges: int,
+    ) -> None:
+        base_key = self.register_route(base_sequence)
+        candidate_key = self.register_route(candidate_sequence)
+        self.incremental_propagations.append(
+            {
+                "propagation_id": len(self.incremental_propagations) + 1,
+                "lane": lane,
+                "iteration": iteration,
+                "operator": operator,
+                "base_route_key": base_key,
+                "candidate_route_key": candidate_key,
+                "status": status,
+                "reason": reason,
+                "distance_lower_bound": float(distance_lower_bound),
+                "min_time_window_slack": float(min_time_window_slack),
+                "finish_time": float(finish_time),
+                "reused_prefix_edges": int(reused_prefix_edges),
+                "reused_suffix_edges": int(reused_suffix_edges),
+                "recomputed_forward_edges": int(recomputed_forward_edges),
+                "recomputed_backward_edges": int(recomputed_backward_edges),
+                "timestamp_seconds": self._offset(),
+            }
+        )
 
     def record_deadline_boundary(
         self,
@@ -451,6 +536,10 @@ class Stage03Trace:
                 self.result_summary["screening_statistics"] = cast(
                     Any, result
                 ).screening_statistics
+            if hasattr(result, "cache_incremental_statistics"):
+                self.result_summary["cache_incremental_statistics"] = cast(
+                    Any, result
+                ).cache_incremental_statistics
 
     @property
     def started_calls(self) -> int:
@@ -505,6 +594,26 @@ class Stage03Trace:
                 decision.exact_call_blocked for decision in self.screening_decisions
             ),
             "screening_reason_counts": dict(sorted(reason_counts.items())),
+        }
+
+    @property
+    def cache_incremental_counts(self) -> dict[str, int]:
+        counts = Counter(
+            str(event.get("operation", ""))
+            for event in self.events
+            if event.get("event_type") == "cache_event"
+        )
+        return {
+            "cache_lookups": counts["lookup"],
+            "cache_hits": counts["hit"],
+            "cache_misses": counts["miss"],
+            "cache_stores": counts["store"],
+            "cache_evictions": counts["evict"],
+            "cache_oversize_not_cached": counts["oversize_not_cached"],
+            "incremental_propagations": len(self.incremental_propagations),
+            "incremental_fallbacks": sum(
+                item.get("status") == "fallback" for item in self.incremental_propagations
+            ),
         }
 
     def reconcile(self, result: _MeasuredResult) -> dict[str, object]:
@@ -592,6 +701,24 @@ class Stage03Trace:
                 observed_screening.get("screening_reason_counts", {})
                 == expected_screening.get("screening_reason_counts", {})
             )
+        expected_cache_incremental = getattr(result, "cache_incremental_statistics", {})
+        if isinstance(expected_cache_incremental, dict) and expected_cache_incremental:
+            observed_cache_incremental = self.cache_incremental_counts
+            expected_cache_incremental = cast(dict[str, Any], expected_cache_incremental)
+            for field_name in (
+                "cache_lookups",
+                "cache_hits",
+                "cache_misses",
+                "cache_stores",
+                "cache_evictions",
+                "cache_oversize_not_cached",
+                "incremental_propagations",
+                "incremental_fallbacks",
+            ):
+                checks[f"{field_name}_equal_result"] = (
+                    int(observed_cache_incremental.get(field_name, 0))
+                    == int(expected_cache_incremental.get(field_name, 0))
+                )
         return {
             "status": "pass" if all(checks.values()) else "fail",
             "checks": checks,
@@ -608,6 +735,7 @@ class Stage03Trace:
                 "rejected_moves": rejected_legacy,
                 "improving_moves": improving_legacy,
                 "screening": self.screening_counts,
+                "cache_incremental": self.cache_incremental_counts,
             },
             "expected": {
                 "charging_subproblem_calls": expected_calls,
@@ -618,6 +746,7 @@ class Stage03Trace:
                 "rejected_moves": int(result.rejected_moves),
                 "improving_moves": int(result.improving_moves),
                 "screening": expected_screening,
+                "cache_incremental": expected_cache_incremental,
             },
         }
 
@@ -644,6 +773,14 @@ class Stage03Trace:
             "screening_config": (
                 asdict(self.screening_config) if self.screening_config is not None else None
             ),
+            "trace_schema_version": self.trace_schema_version,
+            "cache_incremental_config": (
+                asdict(self.cache_incremental_config)
+                if self.cache_incremental_config is not None
+                else None
+            ),
+            "cache_incremental_summary": self.cache_incremental_counts,
+            "incremental_propagations": list(self.incremental_propagations),
             "screening_decisions": [
                 asdict(decision) for decision in self.screening_decisions
             ],
@@ -653,9 +790,13 @@ class Stage03Trace:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> Stage03Trace:
+        trace_schema_version = str(
+            payload.get("trace_schema_version", TRACE_SCHEMA_VERSION)
+        )
         config_payload = payload.get("config", {})
         config = MeasurementConfig(**config_payload)
         trace = cls(config)
+        trace.trace_schema_version = trace_schema_version
         trace.route_dictionary = {
             str(key): tuple(str(value) for value in values)
             for key, values in dict(payload.get("route_dictionary", {})).items()
@@ -687,6 +828,8 @@ class Stage03Trace:
                 labels_expanded=int(item.get("labels_expanded", 0)),
                 labels_pruned=int(item.get("labels_pruned", 0)),
                 deadline_boundary=str(item.get("deadline_boundary", "")),
+                cache_key_digest=str(item.get("cache_key_digest", "")),
+                route_change_status=str(item.get("route_change_status", "unknown")),
             )
             for item in payload.get("route_evaluations", [])
         ]
@@ -699,6 +842,15 @@ class Stage03Trace:
         if isinstance(screening_payload, dict):
             trace.screening_config = CheapScreeningConfig(**screening_payload)
             trace._validate_screening_route_dictionary()
+        cache_payload = payload.get("cache_incremental_config")
+        if isinstance(cache_payload, dict):
+            from evrptw.cache_incremental import CacheIncrementalConfig
+
+            trace.cache_incremental_config = CacheIncrementalConfig(**cache_payload)
+            trace.trace_schema_version = CACHE_INCREMENTAL_TRACE_SCHEMA_VERSION
+        trace.incremental_propagations = [
+            dict(item) for item in payload.get("incremental_propagations", [])
+        ]
         trace.screening_decisions = [
             ScreeningDecision(
                 decision_id=int(item["decision_id"]),

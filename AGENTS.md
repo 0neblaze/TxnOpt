@@ -125,12 +125,14 @@ this repository or one of its subdirectories.
 
 ## Stage 3 Canonical Artifact and Legacy Mapping Policy
 
-- This repository currently has completed evidence only for `stage03.0` with
-  component `measurement` and `stage03.1` with component `screening`.
-  `stage03.2`, `stage03.3`, and `stage03.4` are planned stages only; do not
-  create placeholder results, registries, or readiness claims for them.
-- Canonical run labels are `stage03.0_measurement_attemptNN` or
-  `stage03.1_screening_attemptNN`. Every artifact registry row records the
+- Stage 3.0 and Stage 3.1 historical evidence remains immutable. Stage 3.2
+  implementation and its new raw evidence use component `cache_incremental`;
+  Stage 3.3 and Stage 3.4 remain planned and must not receive placeholder
+  results or readiness claims.
+- Canonical run labels are `stage03.0_measurement_attemptNN`,
+  `stage03.1_screening_attemptNN`, or
+  `stage03.2_cache_incremental_attemptNN` (and the corresponding `rerunNN`
+  form). Every artifact registry row records the
   canonical `run_label`, `attempt_or_rerun`, `artifact_type`, instance/seed
   scope, checksum, status, provenance hashes, validator status, comparison
   baseline, and `legacy_path` mapping.
@@ -140,14 +142,16 @@ this repository or one of its subdirectories.
   The current raw evidence remains physically stored under its original
   ignored `results/stage03-*` paths; the canonical paths are registry views and
   must not be implemented by copying or moving raw evidence.
-- `experiments/registries/stage03.0_artifact_registry.csv` and
-  `experiments/registries/stage03.1_artifact_registry.csv` are the stage
+- `experiments/registries/stage03.0_artifact_registry.csv`,
+  `experiments/registries/stage03.1_artifact_registry.csv`, and
+  `experiments/registries/stage03.2_artifact_registry.csv` are the stage
   registries. `experiments/registries/stage03_legacy_path_map.csv` records the
   preserved old Stage 3 paths, the immutable Stage 0 frozen baseline, and the
   Stage 2.3 historical comparison references.
 - The corresponding manifests are
   `experiments/manifests/stage03.0_measurement_artifact_manifest.json` and
-  `experiments/manifests/stage03.1_screening_artifact_manifest.json`. Before a
+  `experiments/manifests/stage03.1_screening_artifact_manifest.json`, plus the
+  Stage 3.2 cache/incremental manifest after its raw review. Before a
   formal run or stage transition, the migration/preflight tool must verify
   canonical labels, artifact types, unique run labels, raw checksums and
   sidecars, manifest recomputability, legacy mappings, and semantic
@@ -237,9 +241,11 @@ this repository or one of its subdirectories.
   exact-call reduction is measurement evidence, not a Stage 3.3 acceleration
   claim.
 - Stage 3.1 is complete only when formal review reports
-  `READY_FOR_STAGE03_2`. No Stage 3.2 cache, incremental propagation,
-  interruptible exact solver, parallel evaluation, or fixed-work/wall-clock
-  acceleration may be implemented under this policy.
+  `READY_FOR_STAGE03_2`. Stage 3.2 is opt-in and audits bounded route cache,
+  station-reachability bitsets, and relocate/swap incremental propagation;
+  its formal review must report `READY_FOR_STAGE03_3` before Stage 3.3. Stage
+  3.2 must not implement interruptible exact solving, fixed-work/wall-clock
+  diagnostics, or parallel evaluation.
 
 ## Literature Recommendation Policy
 

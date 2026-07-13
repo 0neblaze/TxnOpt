@@ -10,12 +10,13 @@ import resource
 import shutil
 import subprocess
 import tomllib
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from evrptw.alns import ALNSResult, solve_alns
+from evrptw.cache_incremental import CacheIncrementalConfig
 from evrptw.environment import collect_environment
 from evrptw.experiments.stage00_baseline import load_config as load_stage00_config
 from evrptw.experiments.stage02_route_reduction import (
@@ -34,12 +35,17 @@ from evrptw.measurement import (
     Stage03Trace,
 )
 from evrptw.models import Instance
-from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
+from evrptw.objective import (
+    OBJECTIVE_SCHEMA_VERSION,
+    ObjectiveComparison,
+    SolutionObjective,
+    compare_objectives,
+)
 from evrptw.parser import parse_schneider
 from evrptw.validation import validate_routes
 
 SCHEMA_VERSION = "1"
-OBJECTIVE_SCHEMA = "vehicles,distance,charging_time,charging_count"
+OBJECTIVE_SCHEMA = OBJECTIVE_SCHEMA_VERSION
 SMOKE_INSTANCES = ("c101C5", "r105C5", "rc105C5", "c101_21", "r101_21", "rc101_21")
 SEEDS = FORMAL_SEEDS
 RAW_PER_RUN_FIELDS = (
@@ -95,12 +101,16 @@ RAW_PER_RUN_FIELDS = (
     "trace_screening_cache_hits",
     "trace_screening_exact_call_blocked",
     "trace_screening_reason_counts",
+    "trace_cache_incremental_counts",
+    "trace_incremental_propagations",
+    "trace_incremental_fallbacks",
     "trace_reconciliation_status",
     "peak_tracemalloc_bytes",
     "peak_rss_bytes",
     "status",
     "feasible",
     "failure_reason",
+    "failure_path",
     "raw_path",
     "solution_path",
     "trace_path",
@@ -126,9 +136,13 @@ class Stage03Config:
     max_iterations: int
     threads: int
     screening_config: CheapScreeningConfig | None = None
+    cache_incremental_config: CacheIncrementalConfig | None = None
     stage03_formal_run_dir: Path | None = None
     stage03_formal_per_run: Path | None = None
     stage03_formal_review_manifest: Path | None = None
+    stage031_formal_run_dir: Path | None = None
+    stage031_formal_per_run: Path | None = None
+    stage031_formal_review_manifest: Path | None = None
 
 
 def load_config(path: Path) -> Stage03Config:
@@ -158,6 +172,11 @@ def load_config(path: Path) -> Stage03Config:
                 if "screening" in payload
                 else None
             ),
+            cache_incremental_config=(
+                CacheIncrementalConfig(**dict(payload["cache_incremental"]))
+                if "cache_incremental" in payload
+                else None
+            ),
             stage03_formal_run_dir=(
                 Path(str(stage["stage03_formal_run_dir"]))
                 if stage.get("stage03_formal_run_dir") is not None
@@ -171,6 +190,21 @@ def load_config(path: Path) -> Stage03Config:
             stage03_formal_review_manifest=(
                 Path(str(stage["stage03_formal_review_manifest"]))
                 if stage.get("stage03_formal_review_manifest") is not None
+                else None
+            ),
+            stage031_formal_run_dir=(
+                Path(str(stage["stage031_formal_run_dir"]))
+                if stage.get("stage031_formal_run_dir") is not None
+                else None
+            ),
+            stage031_formal_per_run=(
+                Path(str(stage["stage031_formal_per_run"]))
+                if stage.get("stage031_formal_per_run") is not None
+                else None
+            ),
+            stage031_formal_review_manifest=(
+                Path(str(stage["stage031_formal_review_manifest"]))
+                if stage.get("stage031_formal_review_manifest") is not None
                 else None
             ),
         )
@@ -202,8 +236,31 @@ def run_stage03(
     screening_enabled = (
         config.screening_config is not None and config.screening_config.enabled
     )
+    cache_incremental_enabled = (
+        config.cache_incremental_config is not None
+        and config.cache_incremental_config.enabled
+    )
+    if cache_incremental_enabled and not screening_enabled:
+        raise ValueError("Stage 3.2 requires enabled Stage 3.1 screening")
     if scope == "formal":
-        if screening_enabled:
+        if cache_incremental_enabled:
+            _require_stage032_smoke_gate(
+                _resolve(root, smoke_review_dir) if smoke_review_dir else None
+            )
+            if config.stage031_formal_run_dir is None:
+                raise RuntimeError(
+                    "formal Stage 3.2 is blocked: config must identify the audited "
+                    "Stage 3.1 formal run directory"
+                )
+            _require_stage031_formal_gate(
+                _resolve(root, config.stage031_formal_run_dir),
+                trusted_review_manifest=(
+                    _resolve(root, config.stage031_formal_review_manifest)
+                    if config.stage031_formal_review_manifest is not None
+                    else None
+                ),
+            )
+        elif screening_enabled:
             _require_stage031_smoke_gate(
                 _resolve(root, smoke_review_dir) if smoke_review_dir else None
             )
@@ -226,7 +283,7 @@ def run_stage03(
     _assert_unique_run_label(root, run_label)
     _assert_clean_repository(root)
     if output_dir.exists():
-        raise FileExistsError(f"Stage 3.0 output directory already exists: {output_dir}")
+        raise FileExistsError(f"Stage 3 output directory already exists: {output_dir}")
 
     benchmark_dir = _resolve(root, config.benchmark_dir)
     baseline_dir = _resolve(root, config.baseline_dir)
@@ -239,7 +296,11 @@ def run_stage03(
             f"{baseline_dir / 'manifest.json'}"
         )
     baseline_manifest_sha256 = _sha256(baseline_dir / "manifest.json")
-    source_hashes = _source_hashes(root, include_stage031=screening_enabled)
+    source_hashes = _source_hashes(
+        root,
+        include_stage031=screening_enabled,
+        include_stage032=cache_incremental_enabled,
+    )
     algorithm_source_sha256 = _combined_hash(source_hashes)
     repository_revision = _git_revision(root)
     reference_repositories = _reference_repositories(root)
@@ -286,6 +347,36 @@ def run_stage03(
         "screening_config": (
             asdict(config.screening_config) if config.screening_config is not None else None
         ),
+        "cache_incremental_config": (
+            asdict(config.cache_incremental_config)
+            if config.cache_incremental_config is not None
+            else None
+        ),
+        "stage031_formal_run_dir": (
+            str(_resolve(root, config.stage031_formal_run_dir))
+            if config.stage031_formal_run_dir is not None
+            else None
+        ),
+        "stage031_formal_review_manifest": (
+            str(_resolve(root, config.stage031_formal_review_manifest))
+            if config.stage031_formal_review_manifest is not None
+            else None
+        ),
+        "stage031_formal_review_manifest_sha256": (
+            _sha256(_resolve(root, config.stage031_formal_review_manifest))
+            if config.stage031_formal_review_manifest is not None
+            else None
+        ),
+        "stage031_formal_per_run": (
+            str(_resolve(root, config.stage031_formal_per_run))
+            if config.stage031_formal_per_run is not None
+            else None
+        ),
+        "stage031_formal_per_run_sha256": (
+            _sha256(_resolve(root, config.stage031_formal_per_run))
+            if config.stage031_formal_per_run is not None
+            else None
+        ),
         "stage03_formal_run_dir": (
             str(_resolve(root, config.stage03_formal_run_dir))
             if config.stage03_formal_run_dir is not None
@@ -314,7 +405,14 @@ def run_stage03(
     }
 
     output_dir.mkdir(parents=True)
-    for name in ("raw", "solutions", "traces", "events", "environments"):
+    for name in (
+        "raw",
+        "solutions",
+        "traces",
+        "events",
+        "environments",
+        "failures",
+    ):
         (output_dir / name).mkdir()
     _write_json(output_dir / "run_metadata.json", metadata)
     shutil.copy2(config_path, output_dir / "parameters.toml")
@@ -329,6 +427,15 @@ def run_stage03(
             raise FileNotFoundError(f"benchmark instance is missing: {instance_path}")
         instance_hash = _sha256(instance_path)
         instance = parse_schneider(instance_path)
+        run_cache_config = (
+            replace(
+                config.cache_incremental_config,
+                instance_hash=instance_hash,
+            )
+            if config.cache_incremental_config is not None
+            and config.cache_incremental_config.enabled
+            else config.cache_incremental_config
+        )
         for seed in config.seeds:
             run_id = f"{instance_name}-{config.algorithm.lower()}-{seed}"
             start = datetime.now(UTC)
@@ -345,6 +452,7 @@ def run_stage03(
                     vehicle_operator_config=stage02.vehicle_operator_config,
                     measurement_config=MeasurementConfig(),
                     screening_config=config.screening_config,
+                    cache_incremental_config=run_cache_config,
                 )
                 trace = result.measurement_trace
                 if trace is None:
@@ -355,7 +463,9 @@ def run_stage03(
                     trace = caught.trace
                 else:
                     trace = Stage03Trace(
-                        MeasurementConfig(), screening_config=config.screening_config
+                        MeasurementConfig(),
+                        screening_config=config.screening_config,
+                        cache_incremental_config=run_cache_config,
                     )
                     trace.record_execution_error(caught)
                     trace.finish()
@@ -459,11 +569,20 @@ def _persist_run(
     trace_path = output_dir / "traces" / f"{run_id}.json"
     event_path = output_dir / "events" / f"{run_id}.jsonl"
     environment_path = output_dir / "environments" / f"{run_id}.json"
+    failure_path = output_dir / "failures" / f"{run_id}.json"
     _write_json(trace_path, trace.to_dict())
     event_lines = [
         {"record_type": "trace_event", "event_index": index, "payload": event}
         for index, event in enumerate(trace.events)
     ]
+    event_lines.extend(
+        {
+            "record_type": "screening_decision",
+            "event_index": index,
+            "payload": asdict(decision),
+        }
+        for index, decision in enumerate(trace.screening_decisions)
+    )
     if result is not None:
         event_lines.extend(
             {
@@ -519,6 +638,22 @@ def _persist_run(
         },
     )
     _write_json(environment_path, environment_payload)
+    if error is not None:
+        _write_json(
+            failure_path,
+            {
+                "schema_version": config.schema_version,
+                "run_id": run_id,
+                "run_label": run_label,
+                "instance": instance.name,
+                "seed": seed,
+                "error_type": type(error).__name__,
+                "failure_reason": str(error),
+                "trace_path": str(trace_path.relative_to(output_dir)),
+                "event_path": str(event_path.relative_to(output_dir)),
+                "environment_path": str(environment_path.relative_to(output_dir)),
+            },
+        )
     solver_result = asdict(result) if result is not None else None
     if solver_result is not None:
         solver_result["measurement_trace"] = None
@@ -587,12 +722,24 @@ def _persist_run(
         "trace_screening_reason_counts": json.dumps(
             trace.screening_counts["screening_reason_counts"], sort_keys=True
         ),
+        "trace_cache_incremental_counts": json.dumps(
+            trace.cache_incremental_counts, sort_keys=True
+        ),
+        "trace_incremental_propagations": trace.cache_incremental_counts[
+            "incremental_propagations"
+        ],
+        "trace_incremental_fallbacks": trace.cache_incremental_counts[
+            "incremental_fallbacks"
+        ],
         "trace_reconciliation_status": trace_reconciliation["status"],
         "peak_tracemalloc_bytes": peak_tracemalloc_bytes,
         "peak_rss_bytes": peak_rss_bytes if peak_rss_bytes is not None else "",
         "status": status,
         "feasible": feasible,
         "failure_reason": failure_reason,
+        "failure_path": (
+            str(failure_path.relative_to(output_dir)) if error is not None else ""
+        ),
         "raw_path": str(raw_path.relative_to(output_dir)),
         "solution_path": str(solution_path.relative_to(output_dir)),
         "trace_path": str(trace_path.relative_to(output_dir)),
@@ -611,6 +758,7 @@ def _persist_run(
             },
             "trace_path": row["trace_path"],
             "event_path": row["event_path"],
+            "failure_path": row["failure_path"],
         },
     )
     return row
@@ -668,6 +816,12 @@ def _validate_config(config: Stage03Config) -> None:
         raise ValueError("Stage 3.0 must use 30 seconds and 1000 iterations")
     if config.threads != 1:
         raise ValueError("Stage 3 requires exactly one thread")
+    if (
+        config.cache_incremental_config is not None
+        and config.cache_incremental_config.enabled
+        and (config.screening_config is None or not config.screening_config.enabled)
+    ):
+        raise ValueError("Stage 3.2 requires enabled Stage 3.1 screening")
 
 
 def _validate_stage02_protocol(config: Stage03Config, stage02: Stage02Config) -> None:
@@ -740,6 +894,19 @@ def _require_stage031_smoke_gate(review_dir: Path | None) -> None:
     )
 
 
+def _require_stage032_smoke_gate(review_dir: Path | None) -> None:
+    if review_dir is None or not review_dir.is_dir():
+        raise RuntimeError(
+            "formal Stage 3.2 is blocked: provide a Stage 3.2 smoke review directory"
+        )
+    _verify_raw_manifest_gate(review_dir.parent)
+    _verify_review_manifest_gate(
+        review_dir / "review_manifest.json",
+        scope="smoke",
+        statuses={"READY_FOR_STAGE032_FORMAL_MEASUREMENT"},
+    )
+
+
 def _require_stage03_formal_gate(
     run_dir: Path,
     *,
@@ -761,6 +928,28 @@ def _require_stage03_formal_gate(
         statuses={"READY_FOR_STAGE03_ACCELERATION", "READY_FOR_STAGE03_1", "READY_FOR_STAGE31"},
     )
     return
+
+
+def _require_stage031_formal_gate(
+    run_dir: Path,
+    *,
+    trusted_review_manifest: Path | None = None,
+) -> None:
+    """Verify the Stage 3.1 formal raw and trusted review prerequisite."""
+
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"Stage 3.1 formal run directory is missing: {run_dir}")
+    _verify_raw_manifest_gate(run_dir)
+    if trusted_review_manifest is None:
+        raise RuntimeError(
+            "formal Stage 3.2 is blocked: a trusted Stage 3.1 formal review "
+            "manifest is required"
+        )
+    _verify_review_manifest_gate(
+        trusted_review_manifest,
+        scope="formal",
+        statuses={"READY_FOR_STAGE03_2"},
+    )
 
 
 def _verify_review_manifest_gate(
@@ -840,7 +1029,12 @@ def _assert_results_path(root: Path, path: Path, label: str) -> None:
         raise ValueError(f"Stage 3.0 {label} must be a new run directory below results/")
 
 
-def _source_hashes(root: Path, *, include_stage031: bool = False) -> dict[str, str]:
+def _source_hashes(
+    root: Path,
+    *,
+    include_stage031: bool = False,
+    include_stage032: bool = False,
+) -> dict[str, str]:
     paths = [
         Path("src/evrptw/alns.py"),
         Path("src/evrptw/measurement.py"),
@@ -862,6 +1056,15 @@ def _source_hashes(root: Path, *, include_stage031: bool = False) -> dict[str, s
                 Path("src/evrptw/experiments/stage031_cheap_screening.py"),
                 Path("src/evrptw/experiments/stage031_cheap_screening_review.py"),
                 Path("configs/stage031_cheap_screening.toml"),
+            )
+        )
+    if include_stage032:
+        paths.extend(
+            (
+                Path("src/evrptw/experiments/stage032_cache_incremental.py"),
+                Path("src/evrptw/experiments/stage032_cache_incremental_review.py"),
+                Path("src/evrptw/cache_incremental.py"),
+                Path("configs/stage032_cache_incremental.toml"),
             )
         )
     missing = [path for path in paths if not (root / path).is_file()]

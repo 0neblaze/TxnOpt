@@ -1,21 +1,22 @@
 # Stage 3 artifact registry（阶段 3 产物登记）
 
-本文档把外部路线图的 canonical naming（规范命名）落到已经完成的
-Stage 3.0 和 Stage 3.1 evidence（证据）上。它只整理 registry（登记表）、
+本文档把外部路线图的 canonical naming（规范命名）落到 Stage 3.0、Stage 3.1
+历史 evidence（证据）和 Stage 3.2 cache/incremental evidence（缓存/增量证据）上。它只整理 registry（登记表）、
 manifest（校验清单）和 legacy mapping（历史路径映射），不重新运行 solver
 （求解器），不移动或复制 `results/` 中的 raw evidence（原始证据）。
 
 ## 适用范围
 
-当前只登记以下两个已完成子阶段：
+当前维护以下子阶段：
 
 | Canonical stage ID | Component | 已登记的历史 run |
 | --- | --- | --- |
 | `stage03.0` | `measurement` | 4 个 smoke 历史轮次和 1 个 formal 历史轮次 |
 | `stage03.1` | `screening` | 3 个 smoke 历史轮次和 1 个 formal 历史轮次 |
+| `stage03.2` | `cache_incremental` | 新 runner 的 smoke/formal evidence，review 通过后登记为 verified |
 
-`stage03.2`、`stage03.3`、`stage03.4` 仍是 planned（计划中）阶段。本次不创建
-它们的伪造 registry、summary 或 readiness（就绪）结论。
+`stage03.3`、`stage03.4` 仍是 planned（计划中）阶段；不创建它们的伪造
+registry、summary 或 readiness（就绪）结论。
 
 ## Canonical naming and logical layout（规范命名与逻辑目录）
 
@@ -63,9 +64,11 @@ events 或 trace 文件。
 
 - `experiments/registries/stage03.0_artifact_registry.csv`
 - `experiments/registries/stage03.1_artifact_registry.csv`
+- `experiments/registries/stage03.2_artifact_registry.csv`
 - `experiments/registries/stage03_legacy_path_map.csv`
 - `experiments/manifests/stage03.0_measurement_artifact_manifest.json`
 - `experiments/manifests/stage03.1_screening_artifact_manifest.json`
+- `experiments/manifests/stage03.2_cache_incremental_artifact_manifest.json`
 
 Registry 至少登记每个旧目录中的 raw、solution、events、trace、environment、
 config、failure、manifest 和 review 文件，以及已发布的 tracked summaries。每行
@@ -134,3 +137,9 @@ Stage 3.0 的 formal raw manifest、formal raw-to-summary 和 trusted formal rev
 `stage03.0_measurement_attempt05`；exact-call reduction（精确调用减少）仍只是
 measurement evidence（测量证据），不是 Stage 3.3 fixed-work/wall-clock
 acceleration（固定工作量/墙钟加速）结论。
+
+Stage 3.2 的 comparison baseline 是 Stage 3.1 formal per-run evidence。reviewer
+还必须重算 route cache key、cache hit/miss/store/eviction、feasible/infeasible
+cache 生命周期、changed/unchanged route、station reachability bitset，以及
+incremental propagation 与 full propagation 的一致性。Stage 3.2 formal review
+状态必须为 `READY_FOR_STAGE03_3` 才能进入下一阶段；这不是 Stage 3.3 加速结论。

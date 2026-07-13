@@ -22,7 +22,7 @@ from typing import Any
 
 SCHEMA_VERSION = "stage03-artifact-migration-v1"
 CANONICAL_LABEL_RE = re.compile(
-    r"^stage03\.(?P<minor>[01])_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}$"
+    r"^stage03\.(?P<minor>[012])_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}$"
 )
 READY_REVIEW_STATUSES = {
     "READY_FOR_STAGE03_ACCELERATION",
@@ -31,6 +31,8 @@ READY_REVIEW_STATUSES = {
     "READY_FOR_STAGE031_FORMAL_MEASUREMENT",
     "READY_FOR_STAGE31",
     "READY_FOR_STAGE03_2",
+    "READY_FOR_STAGE032_FORMAL_MEASUREMENT",
+    "READY_FOR_STAGE03_3",
 }
 RAW_PER_RUN_COMPARISON_FIELDS = (
     "instance",
@@ -55,6 +57,11 @@ STAGE03_1_COMPARISON_FIELDS = (
     "trace_screening_cache_hits",
     "trace_screening_exact_call_blocked",
     "trace_screening_reason_counts",
+)
+STAGE03_2_COMPARISON_FIELDS = (
+    "trace_cache_incremental_counts",
+    "trace_incremental_propagations",
+    "trace_incremental_fallbacks",
 )
 REGISTRY_FIELDS = (
     "stage_id",
@@ -363,6 +370,8 @@ def classify_artifact(relative: Path) -> str:
         return "trace"
     if parts and parts[0] == "environments":
         return "environment"
+    if parts and parts[0] == "failures":
+        return "failure"
     if parts and parts[0] == "review":
         stem = Path(name).stem
         if name == "review_manifest.json":
@@ -412,6 +421,7 @@ def compare_raw_to_summary(
     summary_path: Path,
     *,
     screening: bool,
+    cache_incremental: bool = False,
 ) -> tuple[str, list[str]]:
     if not summary_path.is_file():
         return "not_published", []
@@ -429,6 +439,8 @@ def compare_raw_to_summary(
     fields = list(RAW_PER_RUN_COMPARISON_FIELDS)
     if screening:
         fields.extend(STAGE03_1_COMPARISON_FIELDS)
+    if cache_incremental:
+        fields.extend(STAGE03_2_COMPARISON_FIELDS)
     differences = [
         f"{row_key}:{field}"
         for row_key in sorted(raw_by_key)
@@ -480,12 +492,48 @@ def legacy_run_directory(root: Path, legacy_label: str) -> Path:
         directory_name = legacy_label.replace(
             "stage031_cheap_screening_", "stage031-cheap-screening_", 1
         )
+    elif legacy_label.startswith("stage03.2_cache_incremental_"):
+        directory_name = legacy_label
     else:
         raise RuntimeError(f"unsupported legacy Stage 3 run label: {legacy_label}")
     path = root / "results" / directory_name
     if not path.is_dir():
         raise RuntimeError(f"legacy run directory not found: {legacy_label} -> {path}")
     return path
+
+
+def active_specs(root: Path) -> tuple[StageSpec, ...]:
+    """Add Stage 3.2 only after a real raw run directory exists."""
+
+    stage032_directories = sorted(
+        path
+        for path in (root / "results").glob("stage03.2_cache_incremental_*")
+        if path.is_dir()
+        and re.fullmatch(
+            r"stage03\.2_cache_incremental_(?:attempt|rerun)[0-9]{2}",
+            path.name,
+        )
+    )
+    if not stage032_directories:
+        return SPECS
+    labels = tuple((path.name, path.name) for path in stage032_directories)
+    formal_labels = [
+        label
+        for label, _canonical in labels
+        if (root / "results" / label / "run_metadata.json").is_file()
+        and read_json(root / "results" / label / "run_metadata.json").get("scope")
+        == "formal"
+    ]
+    trusted_label = sorted(formal_labels)[-1] if formal_labels else labels[-1][0]
+    stage032 = StageSpec(
+        "stage03.2",
+        "cache_incremental",
+        "stage03.2_cache_incremental",
+        labels,
+        f"experiments/summaries/{trusted_label}_review_manifest.json",
+        "stage03.1_screening_attempt04",
+    )
+    return (*SPECS, stage032)
 
 
 def summary_artifact_type(summary_suffix: str) -> str:
@@ -616,10 +664,14 @@ def build_stage(
         review_hashes, raw_review_status, review_errors = verify_review_manifest(
             run_dir / "review"
         )
-        screening = spec.stage_id == "stage03.1"
+        screening = spec.stage_id in {"stage03.1", "stage03.2"}
+        cache_incremental = spec.stage_id == "stage03.2"
         summary_path = root / "experiments" / "summaries" / f"{legacy_label}_per_run_results.csv"
         summary_status, summary_errors = compare_raw_to_summary(
-            raw_csv, summary_path, screening=screening
+            raw_csv,
+            summary_path,
+            screening=screening,
+            cache_incremental=cache_incremental,
         )
         scope = str(metadata.get("scope", ""))
         formal_run = scope == "formal"
@@ -1039,7 +1091,8 @@ def migrate(root: Path, *, write: bool) -> int:
     all_registry_rows: dict[str, list[dict[str, object]]] = {}
     manifests: dict[str, dict[str, object]] = {}
     legacy_map = build_shared_legacy_map(root)
-    for spec in SPECS:
+    specs = active_specs(root)
+    for spec in specs:
         registry_rows, manifest, stage_legacy_map = build_stage(root, spec)
         all_registry_rows[spec.stage_id] = registry_rows
         manifests[spec.stage_id] = manifest
@@ -1047,7 +1100,7 @@ def migrate(root: Path, *, write: bool) -> int:
 
     registry_paths: dict[str, Path] = {}
     manifest_paths: dict[str, Path] = {}
-    for spec in SPECS:
+    for spec in specs:
         registry_path = root / "experiments/registries" / (
             f"{spec.stage_id}_artifact_registry.csv"
         )
@@ -1070,7 +1123,7 @@ def migrate(root: Path, *, write: bool) -> int:
     legacy_path = root / "experiments/registries/stage03_legacy_path_map.csv"
     if write:
         write_csv(legacy_path, LEGACY_MAP_FIELDS, legacy_map)
-    for spec in SPECS:
+    for spec in specs:
         manifest = manifests[spec.stage_id]
         manifest["legacy_path_map"] = root_relative(root, legacy_path)
         if write:
@@ -1109,7 +1162,7 @@ def migrate(root: Path, *, write: bool) -> int:
             for name in HARD_CHECKS
             if not bool(manifests[spec.stage_id]["checks"].get(name, False))
         ]
-        for spec in SPECS
+        for spec in specs
     }
     report_status = "fail" if any(hard_failures.values()) else "pass"
 
@@ -1125,7 +1178,7 @@ def migrate(root: Path, *, write: bool) -> int:
                 "manifest_checks": manifests[spec.stage_id]["checks"],
                 "manifest_path": root_relative(root, manifest_paths[spec.stage_id]),
             }
-            for spec in SPECS
+            for spec in specs
         },
         "legacy_path_map_count": len(legacy_map),
     }
