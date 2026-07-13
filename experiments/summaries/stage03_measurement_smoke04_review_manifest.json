@@ -1,0 +1,19 @@
+{
+  "files": {
+    "baseline_comparison.csv": "2a6a0297f0dc33b291319571129e71982dfa8221abf5138a83e74ed97f9c3b01",
+    "deadline_report.csv": "d06483cc1e191db1e2d15c27d2887fe6adbaa6c1933538e78add56e86f4c6065",
+    "recomputed_per_run_results.csv": "5badc82528a33d0dd538404ac328658fef5e2ed1b5ec664ce948414ed93f8b74",
+    "review_findings.csv": "fad3d77c14514b5cf1d24aa9549120b499535a76aad2483eae60918181243607",
+    "review_report.md": "4e225b894574ebe42c023e2628f95ae774d68941406b11df3e5af5f301f795cc",
+    "stage03_readiness.csv": "2a2b296ce1b2c4badd2c697ca0af784c25f0f54c06ade717744e29165c71b5a1",
+    "summary_results.csv": "2b5e62ba8048eeaa4c876284123f430e330465943c20dfbc27fcd4b12c0d5b86",
+    "trace_reconciliation.csv": "5099c4e19b8319529c289fbd3239ad1f897979a2cfcf285c5c6ce3f3d037bc0c"
+  },
+  "finding_count": 11,
+  "manifest_payload_sha256": "07db8114f91c87e5b5b6de717fee49f4db7503ca8b5025b723adebfc3408815d",
+  "review_label": "stage03_measurement_smoke04",
+  "run_directory": "/Users/guoyiyang/Documents/GitHub/FURP-2026-Yiyang-GUO-EVRP-TW/results/stage03-measurement_smoke04",
+  "schema_version": "stage03-review-v1",
+  "scope": "smoke",
+  "status": "READY_FOR_STAGE03_FORMAL_MEASUREMENT"
+}
