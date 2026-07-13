@@ -3,9 +3,17 @@ from __future__ import annotations
 import math
 import random
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
+from evrptw.measurement import (
+    MeasurementConfig,
+    Stage03ExecutionError,
+    Stage03Trace,
+    route_result_fields,
+)
 from evrptw.models import Instance, Node
 from evrptw.neighborhoods import (
     ConstraintRemovalOperator,
@@ -36,6 +44,14 @@ from evrptw.objective import (
     compare_objectives,
 )
 from evrptw.validation import validate_routes
+
+__all__ = (
+    "ALNSResult",
+    "MeasurementConfig",
+    "Stage03ExecutionError",
+    "Stage03Trace",
+    "solve_alns",
+)
 
 _INFEASIBLE_COST = 1e12
 _QUALITY_NEIGHBORHOOD_ORDER = (
@@ -112,6 +128,7 @@ class ALNSResult:
     removal_tier_counts: dict[str, int] = field(default_factory=dict)
     maximum_stagnation: int = 0
     constraint_operator_statistics: dict[str, dict[str, object]] = field(default_factory=dict)
+    measurement_trace: Stage03Trace | None = None
 
     @property
     def objective_value(self) -> float:
@@ -127,9 +144,20 @@ class _EvaluatedSolution:
 
 
 class _Evaluator:
-    def __init__(self, instance: Instance, *, deadline: float) -> None:
+    def __init__(
+        self,
+        instance: Instance,
+        *,
+        deadline: float,
+        measurement_trace: Stage03Trace | None = None,
+        lane: str = "legacy",
+    ) -> None:
         self.instance = instance
         self.deadline = deadline
+        self.measurement_trace = measurement_trace
+        self.lane = lane
+        self.iteration: int | None = None
+        self.operator = "initialization"
         self.cache: dict[tuple[str, ...], ChargingSubproblemResult] = {}
         self.calls = 0
         self.cache_hits = 0
@@ -137,25 +165,128 @@ class _Evaluator:
         self.labels_generated = 0
         self.labels_pruned = 0
 
+    @contextmanager
+    def measurement_context(
+        self,
+        *,
+        lane: str | None = None,
+        iteration: int | None = None,
+        operator: str | None = None,
+    ) -> Iterator[None]:
+        previous = (self.lane, self.iteration, self.operator)
+        if self.measurement_trace is not None:
+            if lane is not None:
+                self.lane = lane
+            self.iteration = iteration
+            if operator is not None:
+                self.operator = operator
+        try:
+            yield
+        finally:
+            if self.measurement_trace is not None:
+                self.lane, self.iteration, self.operator = previous
+
+    def set_measurement_context(
+        self,
+        *,
+        lane: str,
+        iteration: int | None,
+        operator: str,
+    ) -> None:
+        if self.measurement_trace is not None:
+            self.lane = lane
+            self.iteration = iteration
+            self.operator = operator
+
     def route(self, sequence: tuple[str, ...]) -> ChargingSubproblemResult:
         # Check the deadline before cache lookup as well.  A cache hit is still
         # work performed by this lane and must not let a lane continue after its
         # declared wall-clock boundary.
         if time.perf_counter() >= self.deadline:
+            if self.measurement_trace is not None:
+                self.measurement_trace.record_deadline_boundary(
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    boundary="before_route_evaluation",
+                    route_sequence=sequence,
+                )
             raise _TimeLimitReached(sequence)
         if sequence in self.cache:
             self.cache_hits += 1
+            if self.measurement_trace is not None:
+                started = time.perf_counter()
+                fields = route_result_fields(self.cache[sequence])
+                self.measurement_trace.record_route_evaluation(
+                    sequence,
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    kind="cache_hit",
+                    started_at=self.measurement_trace._offset(started),
+                    completed_at=self.measurement_trace._offset(),
+                    exact_started=False,
+                    exact_completed=False,
+                    **fields,
+                )
             return self.cache[sequence]
-        result = solve_exact_charging(self.instance, sequence)
+        started = time.perf_counter()
+        if self.measurement_trace is not None:
+            started_offset = self.measurement_trace._offset(started)
+        else:
+            started_offset = 0.0
+        try:
+            result = solve_exact_charging(self.instance, sequence)
+        except BaseException as error:
+            if self.measurement_trace is not None:
+                self.measurement_trace.record_route_evaluation(
+                    sequence,
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    kind="exact_call",
+                    started_at=started_offset,
+                    completed_at=None,
+                    exact_started=True,
+                    exact_completed=False,
+                    feasible=None,
+                    failure_reason=f"{type(error).__name__}: {error}",
+                )
+            raise
         self.cache[sequence] = result
         self.calls += 1
         self.runtime += result.runtime_seconds
         self.labels_generated += result.labels_generated
         self.labels_pruned += result.labels_pruned
+        exact_call_id: int | None = None
+        if self.measurement_trace is not None:
+            fields = route_result_fields(result)
+            exact_call_id = self.measurement_trace.record_route_evaluation(
+                sequence,
+                lane=self.lane,
+                iteration=self.iteration,
+                operator=self.operator,
+                kind="exact_call",
+                started_at=started_offset,
+                completed_at=self.measurement_trace._offset(),
+                exact_started=True,
+                exact_completed=True,
+                **fields,
+            )
         # The exact solver is currently cooperative rather than interruptible.
         # Preserve the completed call in the counters, then stop before its
         # result can enter a candidate after the lane deadline.
         if time.perf_counter() >= self.deadline:
+            if self.measurement_trace is not None:
+                self.measurement_trace.record_deadline_boundary(
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    boundary="after_exact_call",
+                    route_sequence=sequence,
+                    exact_call_id=exact_call_id,
+                    reason="exact call completed after the lane deadline",
+                )
             raise _TimeLimitReached(sequence, exact_route_evaluations=1)
         return result
 
@@ -167,7 +298,7 @@ class _Evaluator:
     ) -> _EvaluatedSolution:
         clean = tuple(sequence for sequence in sequences if sequence)
         charging = tuple(
-            precomputed_routes[sequence]
+            self._precomputed_route(sequence, precomputed_routes[sequence])
             if precomputed_routes is not None and sequence in precomputed_routes
             else self.route(sequence)
             for sequence in clean
@@ -189,12 +320,34 @@ class _Evaluator:
         )
         return _EvaluatedSolution(clean, charging, True, objective)
 
+    def _precomputed_route(
+        self,
+        sequence: tuple[str, ...],
+        result: ChargingSubproblemResult,
+    ) -> ChargingSubproblemResult:
+        if self.measurement_trace is not None:
+            fields = route_result_fields(result)
+            started = time.perf_counter()
+            self.measurement_trace.record_route_evaluation(
+                sequence,
+                lane=self.lane,
+                iteration=self.iteration,
+                operator=self.operator,
+                kind="precomputed_route",
+                started_at=self.measurement_trace._offset(started),
+                completed_at=self.measurement_trace._offset(),
+                exact_started=False,
+                exact_completed=False,
+                **fields,
+            )
+        return result
+
 
 class _TimeLimitReached(RouteEvaluationDeadlineExceeded):
     pass
 
 
-def solve_alns(
+def _solve_alns(
     instance: Instance,
     *,
     seed: int,
@@ -203,6 +356,7 @@ def solve_alns(
     removal_fraction: float = 0.2,
     operator_profile: OperatorProfile | str = OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
     vehicle_operator_config: VehicleOperatorConfig | None = None,
+    measurement_trace: Stage03Trace | None = None,
 ) -> ALNSResult:
     if max_iterations <= 0:
         raise ValueError("max_iterations must be positive")
@@ -233,19 +387,31 @@ def solve_alns(
         instance,
         deadline=legacy_deadline if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
         else overall_deadline,
+        measurement_trace=measurement_trace,
+        lane="legacy",
     )
     quality_evaluator = _Evaluator(
         instance,
         deadline=legacy_deadline if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
         else overall_deadline,
+        measurement_trace=measurement_trace,
+        lane="quality_shadow",
     )
     # The constraint lane is the explicit slice after the legacy/quality lane,
     # not an unbounded second 30-second budget.  Spell out the endpoint so the
     # configured 0.1-second reservation remains auditable in the code path.
     constraint_deadline = legacy_deadline + constraint_lane_budget
-    constraint_evaluator = _Evaluator(instance, deadline=constraint_deadline)
+    constraint_evaluator = _Evaluator(
+        instance,
+        deadline=constraint_deadline,
+        measurement_trace=measurement_trace,
+        lane="constraint_lane",
+    )
     try:
-        initial_sequences = _construct_initial_solution(instance, evaluator)
+        with evaluator.measurement_context(
+            lane="initialization", iteration=None, operator="initial_solution"
+        ):
+            initial_sequences = _construct_initial_solution(instance, evaluator)
     except _TimeLimitReached:
         return _failed_result(
             started,
@@ -253,7 +419,10 @@ def solve_alns(
             "time limit reached during initial construction",
             operator_profile=profile.value,
         )
-    current = evaluator.solution(initial_sequences)
+    with evaluator.measurement_context(
+        lane="initialization", iteration=None, operator="initial_solution"
+    ):
+        current = evaluator.solution(initial_sequences)
     if not current.feasible:
         return _failed_result(
             started,
@@ -321,6 +490,22 @@ def solve_alns(
             repair_name = _weighted_choice(rng, standard_repair_stats)
             destroy_stats[destroy_name].calls += 1
             repair_stats[repair_name].calls += 1
+            evaluator.set_measurement_context(
+                lane="legacy", iteration=iteration, operator=f"{destroy_name}+{repair_name}"
+            )
+            if measurement_trace is not None:
+                measurement_trace.record_operator_call(
+                    lane="legacy",
+                    iteration=iteration,
+                    operator=destroy_name,
+                    statistics_group="destroy_statistics",
+                )
+                measurement_trace.record_operator_call(
+                    lane="legacy",
+                    iteration=iteration,
+                    operator=repair_name,
+                    statistics_group="repair_statistics",
+                )
 
             remove_count = max(1, math.ceil(len(instance.customers) * removal_fraction))
             if len(instance.customers) > 20:
@@ -344,6 +529,15 @@ def solve_alns(
                 include_constraint=False,
             )
             neighborhood_stats[selected_neighborhood].calls += 1
+            evaluator.set_measurement_context(
+                lane="legacy", iteration=iteration, operator=selected_neighborhood
+            )
+            if measurement_trace is not None:
+                measurement_trace.record_operator_call(
+                    lane="legacy",
+                    iteration=iteration,
+                    operator=selected_neighborhood,
+                )
             try:
                 if selected_neighborhood == "route_elimination":
                     proposal = propose_route_elimination(
@@ -411,6 +605,16 @@ def solve_alns(
                 else:
                     destroy_name = _weighted_choice(rng, destroy_stats)
                     destroy_stats[destroy_name].calls += 1
+                    evaluator.set_measurement_context(
+                        lane="legacy", iteration=iteration, operator=destroy_name
+                    )
+                    if measurement_trace is not None:
+                        measurement_trace.record_operator_call(
+                            lane="legacy",
+                            iteration=iteration,
+                            operator=destroy_name,
+                            statistics_group="destroy_statistics",
+                        )
                     remove_count = max(1, math.ceil(len(instance.customers) * removal_fraction))
                     if len(instance.customers) > 20:
                         remove_count = min(remove_count, 3)
@@ -420,6 +624,16 @@ def solve_alns(
                     if selected_neighborhood == "vehicle_count_aware_repair":
                         repair_name = "vehicle_count_aware"
                         repair_stats[repair_name].calls += 1
+                        evaluator.set_measurement_context(
+                            lane="legacy", iteration=iteration, operator=repair_name
+                        )
+                        if measurement_trace is not None:
+                            measurement_trace.record_operator_call(
+                                lane="legacy",
+                                iteration=iteration,
+                                operator=repair_name,
+                                statistics_group="repair_statistics",
+                            )
                         before_calls = evaluator.calls
                         repair = repair_vehicle_count_aware(
                             partial,
@@ -451,6 +665,16 @@ def solve_alns(
                     else:
                         repair_name = _weighted_choice(rng, standard_repair_stats)
                         repair_stats[repair_name].calls += 1
+                        evaluator.set_measurement_context(
+                            lane="legacy", iteration=iteration, operator=repair_name
+                        )
+                        if measurement_trace is not None:
+                            measurement_trace.record_operator_call(
+                                lane="legacy",
+                                iteration=iteration,
+                                operator=repair_name,
+                                statistics_group="repair_statistics",
+                            )
                         candidate_sequences = _repair(
                             partial, removed, repair_name, evaluator, instance, rng
                         )
@@ -462,6 +686,9 @@ def solve_alns(
                                 removed_customers=removed,
                             ),
                         )
+                evaluator.set_measurement_context(
+                    lane="legacy", iteration=iteration, operator=selected_neighborhood
+                )
                 candidate = evaluator.solution(candidate_sequences)
             except _TimeLimitReached as error:
                 timeout = _deadline_event(
@@ -510,6 +737,9 @@ def solve_alns(
                 refinement_before_calls = evaluator.calls
                 refinement_candidate = _infeasible_solution()
                 refinement_reason = ""
+                evaluator.set_measurement_context(
+                    lane="legacy", iteration=iteration, operator="vehicle_reduction_refinement"
+                )
                 try:
                     refinement = repair_vehicle_reduction_refinement(
                         refinement_partial,
@@ -575,11 +805,20 @@ def solve_alns(
                 )
                 move_events = (*move_events, refinement_event)
                 refinement_stats.calls += 1
+                if measurement_trace is not None:
+                    measurement_trace.record_operator_call(
+                        lane="legacy",
+                        iteration=iteration,
+                        operator="vehicle_reduction_refinement",
+                    )
                 _record_neighborhood_proposal(
                     refinement_stats,
                     (refinement_event,),
                     refinement_candidate,
                     candidate_before_refinement,
+                )
+                evaluator.set_measurement_context(
+                    lane="legacy", iteration=iteration, operator=selected_neighborhood
                 )
             if profile in (
                 OperatorProfile.STAGE02_ROUTE_QUALITY,
@@ -588,6 +827,19 @@ def solve_alns(
                 shadow_neighborhood = _quality_shadow_neighborhood(iteration)
                 if shadow_neighborhood:
                     neighborhood_stats[shadow_neighborhood].calls += 1
+                    quality_evaluator.set_measurement_context(
+                        lane="quality_shadow",
+                        iteration=iteration,
+                        operator=shadow_neighborhood,
+                    )
+                    if measurement_trace is not None:
+                        measurement_trace.record_operator_call(
+                            lane="quality_shadow",
+                            iteration=iteration,
+                            operator=shadow_neighborhood,
+                        )
+                    shadow_current_before = quality_probe_current
+                    shadow_global_best_improved = False
                     try:
                         shadow_sequences, shadow_events = _quality_shadow_proposal(
                             shadow_neighborhood,
@@ -698,7 +950,37 @@ def solve_alns(
                                 best = shadow_candidate
                                 best_time = time.perf_counter() - started
                                 global_best_improved = True
+                                shadow_global_best_improved = True
                         _update_weight(shadow_statistics, reward)
+                    if measurement_trace is not None and shadow_candidate is not None:
+                        measurement_trace.record_candidate_state(
+                            lane="quality_shadow",
+                            iteration=iteration,
+                            operator=shadow_neighborhood,
+                            current_sequences=shadow_current_before.sequences,
+                            candidate_sequences=shadow_candidate.sequences,
+                            current_objective_key=(
+                                shadow_current_before.objective.key
+                                if shadow_current_before.objective is not None
+                                else ()
+                            ),
+                            candidate_objective_key=(
+                                shadow_candidate.objective.key
+                                if shadow_candidate.objective is not None
+                                else ()
+                            ),
+                            candidate_feasible=shadow_candidate.feasible,
+                            accepted=quality_probe_accept,
+                            global_best=shadow_global_best_improved,
+                            status=(
+                                "accepted"
+                                if quality_probe_accept
+                                else "time_limit"
+                                if any(event.status == "time_limit" for event in shadow_events)
+                                else "rejected"
+                            ),
+                            reason="quality shadow probe",
+                        )
 
             if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED and (
                 iteration < len(_CONSTRAINT_REMOVAL_ORDER)
@@ -714,6 +996,17 @@ def solve_alns(
                 )
                 constraint_statistics = neighborhood_stats[constraint_operator]
                 constraint_statistics.calls += 1
+                constraint_evaluator.set_measurement_context(
+                    lane="constraint_lane",
+                    iteration=iteration,
+                    operator=constraint_operator,
+                )
+                if measurement_trace is not None:
+                    measurement_trace.record_operator_call(
+                        lane="constraint_lane",
+                        iteration=iteration,
+                        operator=constraint_operator,
+                    )
                 selection = select_dynamic_removal_size(
                     len(instance.customers),
                     stagnation_iterations,
@@ -722,6 +1015,8 @@ def solve_alns(
                     global_best_reset=global_best_reset_pending,
                 )
                 removal_tier_counts[selection.tier.value] += 1
+                constraint_current_before = constraint_lane_current
+                constraint_global_best_improved = False
                 try:
                     constraint_candidate, constraint_events = _constraint_lane_step(
                         instance,
@@ -837,13 +1132,44 @@ def solve_alns(
                         best = constraint_candidate
                         best_time = time.perf_counter() - started
                         global_best_improved = True
+                        constraint_global_best_improved = True
                 else:
                     constraint_statistics.rejected += 1
                     constraint_statistics.failure_reasons["candidate_rejected"] = (
                         constraint_statistics.failure_reasons.get("candidate_rejected", 0)
                         + 1
                     )
+                if measurement_trace is not None:
+                    measurement_trace.record_candidate_state(
+                        lane="constraint_lane",
+                        iteration=iteration,
+                        operator=constraint_operator,
+                        current_sequences=constraint_current_before.sequences,
+                        candidate_sequences=constraint_candidate.sequences,
+                        current_objective_key=(
+                            constraint_current_before.objective.key
+                            if constraint_current_before.objective is not None
+                            else ()
+                        ),
+                        candidate_objective_key=(
+                            constraint_candidate.objective.key
+                            if constraint_candidate.objective is not None
+                            else ()
+                        ),
+                        candidate_feasible=constraint_candidate.feasible,
+                        accepted=lane_accept,
+                        global_best=constraint_global_best_improved,
+                        status=(
+                            "accepted"
+                            if lane_accept
+                            else "time_limit"
+                            if any(event.status == "time_limit" for event in constraint_events)
+                            else "rejected"
+                        ),
+                        reason="constraint lane probe",
+                    )
 
+        previous_current = current
         temperature = initial_temperature * max(0.001, 1.0 - iteration / max_iterations)
         quality_candidate_is_worse = (
             profile
@@ -911,6 +1237,35 @@ def solve_alns(
                 global_best_reset_pending = False
             maximum_stagnation = max(maximum_stagnation, stagnation_iterations)
             effective_iterations += 1
+            if measurement_trace is not None:
+                measurement_trace.record_candidate_state(
+                    lane="legacy",
+                    iteration=iteration,
+                    operator=(
+                        selected_neighborhood
+                        if selected_neighborhood
+                        else f"{destroy_name}+{repair_name}"
+                    ),
+                    current_sequences=previous_current.sequences,
+                    candidate_sequences=candidate.sequences,
+                    current_objective_key=(
+                        previous_current.objective.key
+                        if previous_current.objective is not None
+                        else ()
+                    ),
+                    candidate_objective_key=(
+                        candidate.objective.key if candidate.objective is not None else ()
+                    ),
+                    candidate_feasible=candidate.feasible,
+                    accepted=False,
+                    global_best=global_best_improved,
+                    status="rejected" if not main_lane_timed_out else "time_limit",
+                    reason=(
+                        "main lane deadline reached"
+                        if main_lane_timed_out
+                        else "candidate rejected by lexicographic acceptance"
+                    ),
+                )
             continue
 
         accepted += 1
@@ -968,6 +1323,31 @@ def solve_alns(
                 _update_weight(destroy_stats[destroy_name], reward)
             if repair_name:
                 _update_weight(repair_stats[repair_name], reward)
+
+        if measurement_trace is not None:
+            measurement_trace.record_candidate_state(
+                lane="legacy",
+                iteration=iteration,
+                operator=(
+                    selected_neighborhood
+                    if selected_neighborhood
+                    else f"{destroy_name}+{repair_name}"
+                ),
+                current_sequences=previous_current.sequences,
+                candidate_sequences=candidate.sequences,
+                current_objective_key=(
+                    previous_current.objective.key
+                    if previous_current.objective is not None
+                    else ()
+                ),
+                candidate_objective_key=(
+                    candidate.objective.key if candidate.objective is not None else ()
+                ),
+                candidate_feasible=candidate.feasible,
+                accepted=True,
+                global_best=global_best_improved,
+                status="accepted",
+            )
 
         if global_best_improved:
             stagnation_iterations = 0
@@ -1033,6 +1413,49 @@ def solve_alns(
             if name in neighborhood_stats
         },
     )
+
+
+def solve_alns(
+    instance: Instance,
+    *,
+    seed: int,
+    max_iterations: int = 2_000,
+    time_limit_seconds: float = 60.0,
+    removal_fraction: float = 0.2,
+    operator_profile: OperatorProfile | str = OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
+    vehicle_operator_config: VehicleOperatorConfig | None = None,
+    measurement_config: MeasurementConfig | None = None,
+) -> ALNSResult:
+    """Solve ALNS, optionally emitting Stage 3.0 raw measurement evidence."""
+
+    if measurement_config is None or not measurement_config.enabled:
+        return _solve_alns(
+            instance,
+            seed=seed,
+            max_iterations=max_iterations,
+            time_limit_seconds=time_limit_seconds,
+            removal_fraction=removal_fraction,
+            operator_profile=operator_profile,
+            vehicle_operator_config=vehicle_operator_config,
+        )
+    trace = Stage03Trace(measurement_config)
+    try:
+        result = _solve_alns(
+            instance,
+            seed=seed,
+            max_iterations=max_iterations,
+            time_limit_seconds=time_limit_seconds,
+            removal_fraction=removal_fraction,
+            operator_profile=operator_profile,
+            vehicle_operator_config=vehicle_operator_config,
+            measurement_trace=trace,
+        )
+    except BaseException as error:
+        trace.record_execution_error(error)
+        trace.finish()
+        raise Stage03ExecutionError(trace, error) from error
+    trace.finish(result)
+    return replace(result, measurement_trace=trace)
 
 
 def _construct_initial_solution(

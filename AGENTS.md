@@ -108,6 +108,41 @@ this repository or one of its subdirectories.
   parallel, and exact-charging acceleration are readiness targets only and must
   not be reported as implemented in Stage 2.3.
 
+## Stage 3.0 Measurement and Replay Policy
+
+- Stage 3.0 is measurement-only. It must not implement or claim cache
+  acceleration, incremental propagation, interruptible exact charging,
+  parallel evaluation, or fixed-work/wall-clock improvement.
+- `solve_alns(..., measurement_config=None)` keeps measurement disabled. An
+  opt-in `MeasurementConfig` creates one `Stage03Trace` containing a canonical
+  route dictionary, route-level timing, `exact_call`, `cache_hit`, and
+  `precomputed_route` records, separate `started_calls` and `completed_calls`,
+  lane/iteration/operator context, candidate state, acceptance/global-best
+  state, and deadline-boundary events.
+- Stage 2.3 accepted evidence
+  `stage02_constraint_guided_attempt16` and
+  `stage02_constraint_guided_rerun09` is immutable historical provenance.
+  Their recorded `repository_dirty=true` value must remain visible; it is not
+  rewritten as a clean run. New Stage 3.0 runs require a clean main-repository
+  commit before the runner starts.
+- Stage 3.0 raw artifacts belong under a new ignored `results/` run directory.
+  Every run retains its raw solution, raw trace, event log, environment record,
+  source/config/instance hashes, Stage 0 manifest hash, both reference-repo
+  revision/dirty records, and interruption evidence. A failed run gets a new
+  run label and is never overwritten.
+- The independent `stage03_measurement_review` CLI must verify the raw
+  manifest first, replay `validate_routes` and `evrptw.objective`, reconcile
+  trace counters with `ALNSResult`, and check candidate/deadline semantics.
+  Summary CSVs may be written under tracked `experiments/summaries/` only after
+  replay gates pass; they must be recomputed from raw artifacts rather than
+  copied from runner status tables.
+- The smoke scope is exactly `c101C5`, `r105C5`, `rc105C5`, `c101_21`,
+  `r101_21`, and `rc101_21`, with seeds `2014/2015/2016`, 30 seconds, 1000
+  iterations, and one thread. Formal scope is Stage 0's exact 12x3 set and is
+  blocked until smoke review reports `READY_FOR_STAGE03_FORMAL_MEASUREMENT`.
+  A passing formal measurement review is the gate into Stage 3.1; it is not an
+  acceleration result.
+
 ## Literature Recommendation Policy
 
 - Codex recommends literature but does not obtain it. Do not access the user's
