@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from evrptw.charging import ChargingSubproblemResult
 from evrptw.models import Instance, Node, NodeType, Vehicle
@@ -122,6 +122,32 @@ def test_vehicle_count_aware_repair_does_not_fallback_after_budget_exhaustion() 
     assert result.sequences is None
     assert result.new_routes_created == 0
     assert result.failure_reason == "evaluation_budget_exhausted"
+
+
+def test_vehicle_repair_screens_time_windows_before_exact_evaluation() -> None:
+    base = _instance()
+    instance = Instance(
+        base.name,
+        tuple(
+            replace(node, due_date=0.1) if node.name == "C2" else node
+            for node in base.nodes
+        ),
+        base.vehicle,
+    )
+    evaluator = FakeEvaluator(instance)
+
+    result = repair_vehicle_count_aware(
+        (("C1",),),
+        ("C2",),
+        evaluator,
+        instance,
+        config=VehicleOperatorConfig(),
+        allow_new_routes=False,
+    )
+
+    assert result.sequences is None
+    assert result.failure_reason == "no_existing_route_insertion"
+    assert evaluator.calls == 0
 
 
 def test_route_merge_capacity_prefilter_avoids_exact_merged_route_evaluation() -> None:

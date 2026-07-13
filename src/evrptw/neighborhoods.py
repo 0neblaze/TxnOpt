@@ -565,6 +565,8 @@ def _insertion_options(
             if evaluator.calls - before_calls >= budget:
                 raise _EvaluationBudgetExceeded
             candidate = (*base[:position], customer, *base[position:])
+            if not screen_route_candidate(instance, candidate).accepted:
+                continue
             result = evaluator.route(candidate)
             if not result.feasible:
                 continue
