@@ -6,8 +6,13 @@ from evrptw.charging import ChargingSubproblemResult
 from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.neighborhoods import (
     VehicleOperatorConfig,
+    propose_ejection_chain,
+    propose_relocate,
     propose_route_elimination,
     propose_route_merge,
+    propose_route_segment_destroy,
+    propose_swap,
+    propose_two_opt_star,
     repair_vehicle_count_aware,
     screen_route_candidate,
 )
@@ -48,6 +53,7 @@ def _instance(*, battery_capacity: float = 100.0, load_capacity: float = 10.0) -
             Node("C1", NodeType.CUSTOMER, 1.0, 0.0, 1.0, 0.0, 1000.0, 0.0),
             Node("C2", NodeType.CUSTOMER, 2.0, 0.0, 1.0, 0.0, 1000.0, 0.0),
             Node("C3", NodeType.CUSTOMER, 3.0, 0.0, 1.0, 0.0, 1000.0, 0.0),
+            Node("C4", NodeType.CUSTOMER, 4.0, 0.0, 1.0, 0.0, 1000.0, 0.0),
         ),
         Vehicle(battery_capacity, load_capacity, 1.0, 0.1, 1.0),
     )
@@ -182,3 +188,94 @@ def test_route_screen_rejects_energy_unreachable_sequence_without_solver() -> No
 
     assert result.accepted is False
     assert result.reason == "energy_prefilter"
+
+
+def test_relocate_keeps_route_count_and_coverage() -> None:
+    instance = _instance()
+    proposal = propose_relocate(
+        instance,
+        (("C1", "C2"), ("C3", "C4")),
+        FakeEvaluator(instance, maximum_customers_per_route=3),
+    )
+
+    assert proposal.sequences is not None
+    assert len(proposal.sequences) == 2
+    assert sorted(name for route in proposal.sequences for name in route) == [
+        "C1",
+        "C2",
+        "C3",
+        "C4",
+    ]
+    assert any(event.status == "candidate_proposed" for event in proposal.events)
+    assert all(event.candidate_vehicle_delta in (None, 0) for event in proposal.events)
+
+
+def test_swap_keeps_route_count_and_records_affected_routes() -> None:
+    instance = _instance()
+    proposal = propose_swap(
+        instance,
+        (("C1", "C2"), ("C3", "C4")),
+        FakeEvaluator(instance, maximum_customers_per_route=2),
+    )
+
+    assert proposal.sequences is not None
+    assert len(proposal.sequences) == 2
+    assert any(event.status == "candidate_proposed" for event in proposal.events)
+    assert any(event.affected_route_indices == (0, 1) for event in proposal.events)
+
+
+def test_two_opt_star_exchanges_tails_only_after_prefilters() -> None:
+    instance = _instance()
+    proposal = propose_two_opt_star(
+        instance,
+        (("C1", "C2"), ("C3", "C4")),
+        FakeEvaluator(instance, maximum_customers_per_route=2),
+    )
+
+    assert proposal.sequences is not None
+    assert len(proposal.sequences) == 2
+    assert any(event.operator == "two_opt_star" for event in proposal.events)
+    assert any(event.candidate_route_sequences for event in proposal.events)
+
+
+def test_route_segment_destroy_repairs_into_existing_routes() -> None:
+    instance = _instance()
+    proposal = propose_route_segment_destroy(
+        instance,
+        (("C1", "C2", "C3"), ("C4",)),
+        FakeEvaluator(instance, maximum_customers_per_route=4),
+        config=VehicleOperatorConfig(
+            route_segment_min_length=2,
+            route_segment_max_length=2,
+        ),
+    )
+
+    assert proposal.sequences is not None
+    assert len(proposal.sequences) == 2
+    assert any(event.status == "candidate_proposed" for event in proposal.events)
+    assert all(event.new_routes_created == 0 for event in proposal.events)
+
+
+def test_ejection_chain_is_bounded_and_can_complete_a_capacity_blocked_relocate() -> None:
+    instance = _instance()
+    proposal = propose_ejection_chain(
+        instance,
+        (("C1", "C2"), ("C3", "C4")),
+        FakeEvaluator(instance, maximum_customers_per_route=2),
+        config=VehicleOperatorConfig(
+            ejection_chain_max_depth=3,
+            ejection_chain_beam_width=16,
+            ejection_chain_exact_evaluation_budget=24,
+        ),
+    )
+
+    assert proposal.sequences is not None
+    assert len(proposal.sequences) == 2
+    assert any(event.status == "candidate_proposed" for event in proposal.events)
+    assert max(event.chain_depth for event in proposal.events) <= 3
+    assert sorted(name for route in proposal.sequences for name in route) == [
+        "C1",
+        "C2",
+        "C3",
+        "C4",
+    ]

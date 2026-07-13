@@ -42,6 +42,11 @@ def test_alns_returns_reproducible_unified_validator_feasible_solution() -> None
         "vehicle_count_aware_repair",
         "route_elimination",
         "route_merge",
+        "relocate",
+        "swap",
+        "two_opt_star",
+        "route_segment_destroy",
+        "ejection_chain",
     }
     assert first.neighborhood_events
     assert all(
@@ -70,3 +75,21 @@ def test_alns_baseline_profile_preserves_historical_operator_surface() -> None:
     assert result.neighborhood_statistics == {}
     assert result.neighborhood_events == ()
     assert set(result.repair_statistics) == {"greedy", "regret2", "energy"}
+
+
+def test_alns_stage02_route_reduction_profile_remains_explicitly_reproducible() -> None:
+    result = solve_alns(
+        _instance(),
+        seed=2014,
+        max_iterations=10,
+        time_limit_seconds=1.0,
+        operator_profile="stage02_route_reduction",
+    )
+
+    assert result.feasible is True
+    assert set(result.neighborhood_statistics) == {
+        "standard",
+        "vehicle_count_aware_repair",
+        "route_elimination",
+        "route_merge",
+    }

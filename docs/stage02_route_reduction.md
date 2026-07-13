@@ -21,9 +21,10 @@
 ## 2. 实现边界
 
 `src/evrptw/neighborhoods.py` 是 deep module（深模块），隐藏路线筛选、插入顺序、精确评估
-预算和失败原因。`solve_alns()` 默认使用 `stage02_route_reduction` profile（配置档），并
-保留 `baseline` profile 供 Stage 0/Stage 1 历史流程复现。Stage 0 冻结目录、Stage 1 历史
-结果和 `reference/` 参考仓库不修改。
+预算和失败原因。Stage 2.1 通过显式的 `stage02_route_reduction` profile（配置档）复现；
+当前 `solve_alns()` 默认 profile 已切换为 `stage02_route_quality`，并保留 `baseline` 与
+Stage 2.1 profile 供历史流程复现。Stage 0 冻结目录、Stage 1 历史结果和 `reference/`
+参考仓库不修改。
 
 每次新算子调用都会记录：调用、prefilter（预筛选）通过/拒绝、精确路线评估、候选可行性、
 接受/拒绝、车辆减少、距离改善、新路线数量和失败原因。正式实验还保存每次运行的 raw JSON、

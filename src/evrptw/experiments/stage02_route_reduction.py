@@ -34,7 +34,10 @@ from evrptw.parser import parse_schneider
 from evrptw.validation import SolutionReport, validate_routes
 
 SCHEMA_VERSION = "1"
-ALGORITHM = "ALNS_STAGE02_ROUTE_REDUCTION"
+ROUTE_REDUCTION_ALGORITHM = "ALNS_STAGE02_ROUTE_REDUCTION"
+ROUTE_QUALITY_ALGORITHM = "ALNS_STAGE02_ROUTE_QUALITY"
+# Kept as the historical public constant for Stage 2.1 callers.
+ALGORITHM = ROUTE_REDUCTION_ALGORITHM
 FOCUSED_100_INSTANCES = ("c101_21", "r101_21", "rc101_21")
 FOCUSED_R_RC_INSTANCES = ("r101_21", "rc101_21")
 FORMAL_INSTANCES = (
@@ -180,13 +183,17 @@ OPERATOR_FAILURE_FIELDS = (
     "status",
     "reason",
     "route_indices",
+    "affected_route_indices",
     "removed_customers",
     "candidate_customer_sequence",
+    "candidate_route_sequences",
     "candidate_vehicle_delta",
     "prefilter_passed",
     "new_routes_created",
     "exact_route_evaluations",
     "selection_rank",
+    "chain_depth",
+    "segment_length",
 )
 
 OPERATOR_EVENT_FIELDS = (
@@ -202,14 +209,18 @@ OPERATOR_EVENT_FIELDS = (
     "distance_improvement",
     "candidate_objective_key",
     "route_indices",
+    "affected_route_indices",
     "removed_customers",
     "candidate_customer_sequence",
+    "candidate_route_sequences",
     "candidate_vehicle_delta",
     "candidate_feasible",
     "prefilter_passed",
     "new_routes_created",
     "exact_route_evaluations",
     "selection_rank",
+    "chain_depth",
+    "segment_length",
 )
 
 COMPARISON_FIELDS = (
@@ -255,8 +266,12 @@ class Stage02Config:
     schema_version: str
     experiment_id: str
     algorithm: str
+    operator_profile: OperatorProfile
     baseline_dir: Path
     stage01_per_run: Path
+    comparison_per_run: Path
+    comparison_label: str
+    comparison_gate: str
     benchmark_dir: Path
     instances: tuple[str, ...]
     seeds: tuple[int, ...]
@@ -278,8 +293,18 @@ def load_config(path: Path) -> Stage02Config:
             schema_version=str(stage["schema_version"]),
             experiment_id=str(stage["experiment_id"]),
             algorithm=str(stage["algorithm"]),
+            operator_profile=OperatorProfile(
+                str(stage.get("operator_profile", OperatorProfile.STAGE02_ROUTE_REDUCTION.value))
+            ),
             baseline_dir=Path(str(stage["baseline_dir"])),
-            stage01_per_run=Path(str(stage["stage01_per_run"])),
+            stage01_per_run=Path(
+                str(stage.get("stage01_per_run") or stage["comparison_per_run"])
+            ),
+            comparison_per_run=Path(
+                str(stage.get("comparison_per_run") or stage["stage01_per_run"])
+            ),
+            comparison_label=str(stage.get("comparison_label", "stage01")),
+            comparison_gate=str(stage.get("comparison_gate", "stage01_best_objective")),
             benchmark_dir=Path(str(benchmark["directory"])),
             instances=tuple(str(value) for value in benchmark["instances"]),
             seeds=tuple(int(value) for value in run["seeds"]),
@@ -297,10 +322,64 @@ def load_config(path: Path) -> Stage02Config:
                 vehicle_repair_exact_evaluation_budget=int(
                     operators["vehicle_repair_exact_evaluation_budget"]
                 ),
+                relocate_exact_evaluation_budget=int(
+                    operators.get(
+                        "relocate_exact_evaluation_budget",
+                        VehicleOperatorConfig().relocate_exact_evaluation_budget,
+                    )
+                ),
+                swap_exact_evaluation_budget=int(
+                    operators.get(
+                        "swap_exact_evaluation_budget",
+                        VehicleOperatorConfig().swap_exact_evaluation_budget,
+                    )
+                ),
+                two_opt_star_exact_evaluation_budget=int(
+                    operators.get(
+                        "two_opt_star_exact_evaluation_budget",
+                        VehicleOperatorConfig().two_opt_star_exact_evaluation_budget,
+                    )
+                ),
+                route_segment_exact_evaluation_budget=int(
+                    operators.get(
+                        "route_segment_exact_evaluation_budget",
+                        VehicleOperatorConfig().route_segment_exact_evaluation_budget,
+                    )
+                ),
+                ejection_chain_exact_evaluation_budget=int(
+                    operators.get(
+                        "ejection_chain_exact_evaluation_budget",
+                        VehicleOperatorConfig().ejection_chain_exact_evaluation_budget,
+                    )
+                ),
+                route_segment_min_length=int(
+                    operators.get(
+                        "route_segment_min_length",
+                        VehicleOperatorConfig().route_segment_min_length,
+                    )
+                ),
+                route_segment_max_length=int(
+                    operators.get(
+                        "route_segment_max_length",
+                        VehicleOperatorConfig().route_segment_max_length,
+                    )
+                ),
+                ejection_chain_max_depth=int(
+                    operators.get(
+                        "ejection_chain_max_depth",
+                        VehicleOperatorConfig().ejection_chain_max_depth,
+                    )
+                ),
+                ejection_chain_beam_width=int(
+                    operators.get(
+                        "ejection_chain_beam_width",
+                        VehicleOperatorConfig().ejection_chain_beam_width,
+                    )
+                ),
             ),
         )
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError(f"invalid Stage 2.1 configuration: {error}") from error
+        raise ValueError(f"invalid Stage 2 configuration: {error}") from error
     _validate_config(config)
     return config
 
@@ -318,21 +397,23 @@ def run_stage02(
     root = _repository_root()
     baseline_dir = _resolve(root, config.baseline_dir)
     stage01_path = _resolve(root, config.stage01_per_run)
+    comparison_path = _resolve(root, config.comparison_per_run)
     benchmark_dir = _resolve(root, config.benchmark_dir)
     stage00_config_path = root / "configs" / "stage00_baseline.toml"
     stage00_config = load_stage00_config(stage00_config_path)
     if benchmark_dir.resolve() != stage00_config.benchmark_dir.resolve():
-        raise RuntimeError("Stage 2.1 benchmark directory differs from Stage 0")
+        raise RuntimeError("Stage 2 benchmark directory differs from Stage 0")
     if stage00_config.instances != config.instances or stage00_config.seeds != config.seeds:
-        raise RuntimeError("Stage 2.1 scope differs from the canonical Stage 0 scope")
+        raise RuntimeError("Stage 2 scope differs from the canonical Stage 0 scope")
     verify_results(stage00_config, baseline_dir, require_manifest=True)
     stage1_baseline = _load_stage1_baseline(stage01_path, config)
+    comparison_baseline = _load_comparison_baseline(comparison_path, config)
     stage00_baseline = _load_stage00_baseline(baseline_dir, benchmark_dir, config)
     baseline_manifest_sha256 = _sha256(baseline_dir / "manifest.json")
 
     if output_dir.exists():
         raise FileExistsError(f"Stage 2.1 output directory already exists: {output_dir}")
-    tracked_names = _tracked_names(run_label)
+    tracked_names = _tracked_names(run_label, config.comparison_label)
     existing = [summary_dir / name for name in tracked_names if (summary_dir / name).exists()]
     if existing:
         raise FileExistsError(f"tracked Stage 2.1 summaries already exist: {existing}")
@@ -366,7 +447,7 @@ def run_stage02(
                 seed=seed,
                 max_iterations=config.max_iterations,
                 time_limit_seconds=config.time_limit_seconds,
-                operator_profile=OperatorProfile.STAGE02_ROUTE_REDUCTION,
+                operator_profile=config.operator_profile,
                 vehicle_operator_config=config.vehicle_operator_config,
             )
             ended = datetime.now(UTC)
@@ -407,13 +488,19 @@ def run_stage02(
     summary_rows = _summarize(rows)
     operator_summary_rows = _summarize_operators(operator_records)
     operator_failure_rows = _operator_failure_rows(contextual_events)
-    comparison_rows = _compare_stage01(stage1_baseline, rows)
+    comparison_rows = _compare_baseline(
+        comparison_baseline,
+        rows,
+        baseline_label=config.comparison_label,
+        candidate_label=config.operator_profile.value,
+    )
     focused_rows = [row for row in comparison_rows if row["instance"] in FOCUSED_100_INSTANCES]
     gate_rows = _evaluate_gates(
         config=config,
         rows=rows,
         stage00_baseline=stage00_baseline,
         stage1_baseline=stage1_baseline,
+        comparison_baseline=comparison_baseline,
         contextual_events=contextual_events,
         baseline_manifest_sha256=baseline_manifest_sha256,
         baseline_dir=baseline_dir,
@@ -441,7 +528,7 @@ def run_stage02(
     operator_event_path = output_dir / f"{run_label}_operator_events.csv"
     operator_failure_path = output_dir / f"{run_label}_operator_failure_events.csv"
     repeatability_path = output_dir / f"{run_label}_repeatability.csv"
-    comparison_path = output_dir / f"{run_label}_stage01_comparison.csv"
+    comparison_path = output_dir / f"{run_label}_{config.comparison_label}_comparison.csv"
     focused_path = output_dir / f"{run_label}_100_customer_comparison.csv"
     gate_path = output_dir / f"{run_label}_gate_report.csv"
     environment_path = output_dir / f"{run_label}_environment.json"
@@ -492,9 +579,9 @@ def run_stage02(
             repeatability_path,
             summary_dir / f"{run_label}_repeatability.csv",
         ),
-        "stage01_comparison": (
+        "comparison": (
             comparison_path,
-            summary_dir / f"{run_label}_stage01_comparison.csv",
+            summary_dir / f"{run_label}_{config.comparison_label}_comparison.csv",
         ),
         "100_customer_comparison": (
             focused_path,
@@ -508,12 +595,12 @@ def run_stage02(
     for source, destination in copies.values():
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():
-            raise FileExistsError(f"tracked Stage 2.1 summary already exists: {destination}")
+            raise FileExistsError(f"tracked Stage 2 summary already exists: {destination}")
         destination.write_bytes(source.read_bytes())
 
     if any(row["status"] != "pass" for row in gate_rows):
         failed = "; ".join(row["gate"] for row in gate_rows if row["status"] != "pass")
-        raise RuntimeError(f"Stage 2.1 acceptance gates failed: {failed}")
+        raise RuntimeError(f"Stage 2 acceptance gates failed: {failed}")
 
     return {
         **{name: destination for name, (_, destination) in copies.items()},
@@ -545,7 +632,7 @@ def _record_run(
     validation_objective, validation_failure = _validated_objective(
         instance, report, result.objective
     )
-    identifier = f"{instance.name}-alns_stage02_route_reduction-{seed}"
+    identifier = f"{instance.name}-alns_{config.operator_profile.value}-{seed}"
     raw_path = raw_dir / f"{identifier}.json"
     solution_path = solution_dir / f"{identifier}.json"
     events = tuple(result.neighborhood_events)
@@ -662,7 +749,7 @@ def _summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         output.append(
             {
                 "instance": instance,
-                "algorithm": ALGORITHM,
+                "algorithm": str(group[0]["algorithm"]),
                 "runs": len(group),
                 "feasible_runs": len(feasible),
                 "feasibility_rate": len(feasible) / len(group),
@@ -712,9 +799,12 @@ def _summarize_operators(
     return output
 
 
-def _compare_stage01(
-    stage1_baseline: dict[tuple[str, int], SolutionObjective],
+def _compare_baseline(
+    baseline: dict[tuple[str, int], SolutionObjective],
     rows: list[dict[str, Any]],
+    *,
+    baseline_label: str,
+    candidate_label: str,
 ) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -723,14 +813,14 @@ def _compare_stage01(
     for instance, group in sorted(grouped.items()):
         candidate_objectives = [_objective_from_row(row) for row in group if bool(row["feasible"])]
         baseline_objectives = [
-            stage1_baseline[(instance, int(row["seed"]))] for row in group
+            baseline[(instance, int(row["seed"]))] for row in group
         ]
         if not candidate_objectives:
             output.append(
                 _comparison_row(
                     instance,
-                    "stage01",
-                    "stage02",
+                    baseline_label,
+                    candidate_label,
                     "objective",
                     "best",
                     _render_key(min(baseline_objectives, key=lambda value: value.key)),
@@ -739,7 +829,7 @@ def _compare_stage01(
                     "",
                     "invalid",
                     "fail",
-                    "no validator-feasible Stage 2.1 run",
+                    f"no validator-feasible {candidate_label} run",
                 )
             )
             continue
@@ -749,8 +839,8 @@ def _compare_stage01(
         output.append(
             _comparison_row(
                 instance,
-                "stage01",
-                "stage02",
+                baseline_label,
+                candidate_label,
                 "objective",
                 "best",
                 _render_key(baseline_best),
@@ -773,8 +863,8 @@ def _compare_stage01(
             output.append(
                 _comparison_row(
                     instance,
-                    "stage01",
-                    "stage02",
+                    baseline_label,
+                    candidate_label,
                     metric,
                     "mean",
                     statistics.fmean(baseline_values),
@@ -801,6 +891,7 @@ def _evaluate_gates(
     rows: list[dict[str, Any]],
     stage00_baseline: dict[tuple[str, int], SolutionObjective],
     stage1_baseline: dict[tuple[str, int], SolutionObjective],
+    comparison_baseline: dict[tuple[str, int], SolutionObjective],
     contextual_events: list[dict[str, object]],
     baseline_manifest_sha256: str,
     baseline_dir: Path,
@@ -830,7 +921,7 @@ def _evaluate_gates(
         )
     )
 
-    stage1_by_instance = _group_objectives(stage1_baseline)
+    comparison_by_instance = _group_objectives(comparison_baseline)
     candidate_by_instance = _group_objectives(
         {
             (str(row["instance"]), int(row["seed"])): _objective_from_row(row)
@@ -841,7 +932,7 @@ def _evaluate_gates(
     objective_ok = True
     objective_observed: list[str] = []
     for instance in config.instances:
-        baseline_best = min(stage1_by_instance[instance], key=lambda value: value.key)
+        baseline_best = min(comparison_by_instance[instance], key=lambda value: value.key)
         candidate_values = candidate_by_instance.get(instance, [])
         if len(candidate_values) != len(config.seeds):
             objective_ok = False
@@ -855,11 +946,11 @@ def _evaluate_gates(
         objective_ok = objective_ok and comparison is not ObjectiveComparison.WORSE
     gates.append(
         _gate(
-            "stage01_best_objective",
+            config.comparison_gate,
             objective_ok,
             "; ".join(objective_observed),
             "every instance is better or equal",
-            "stage01 formal objective comparison",
+            f"{config.comparison_label} formal objective comparison",
         )
     )
 
@@ -980,6 +1071,55 @@ def _evaluate_gates(
             "route merge event log",
         )
     )
+    if config.operator_profile is OperatorProfile.STAGE02_ROUTE_QUALITY:
+        quality_operators = (
+            "relocate",
+            "swap",
+            "two_opt_star",
+            "route_segment_destroy",
+            "ejection_chain",
+        )
+        for operator in quality_operators:
+            operator_events = [
+                event for event in contextual_events if event.get("operator") == operator
+            ]
+            feasible_candidates = [
+                event
+                for event in operator_events
+                if event.get("candidate_feasible") is True
+                and event.get("status") in {"feasible_candidate", "candidate_proposed"}
+            ]
+            gates.append(
+                _gate(
+                    f"{operator}_candidate_coverage",
+                    bool(operator_events) and bool(feasible_candidates),
+                    {
+                        "calls": len(operator_events),
+                        "feasible_candidates": len(feasible_candidates),
+                    },
+                    "at least one call and one feasible candidate",
+                    "Stage 2.2 operator event log",
+                )
+            )
+        accepted_distance_improvements = [
+            event
+            for event in contextual_events
+            if event.get("operator") in quality_operators
+            and event.get("status") in {"feasible_candidate", "candidate_proposed"}
+            and event.get("candidate_feasible") is True
+            and event.get("accepted") is True
+            and event.get("distance_improvement") is True
+            and event.get("vehicle_reduction") is False
+        ]
+        gates.append(
+            _gate(
+                "route_quality_accepted_same_vehicle_distance_improvement",
+                bool(accepted_distance_improvements),
+                len(accepted_distance_improvements),
+                "at least 1 accepted same-vehicle-count distance improvement",
+                "Stage 2.2 operator event log",
+            )
+        )
     manifest_unchanged = _sha256(baseline_dir / "manifest.json") == baseline_manifest_sha256
     gates.append(
         _gate(
@@ -1005,6 +1145,34 @@ def _load_stage1_baseline(
         raise RuntimeError("Stage 1 baseline coverage does not match Stage 2.1 configuration")
     if any(row.get("feasible") != "True" for row in filtered):
         raise RuntimeError("Stage 1 baseline contains an infeasible ALNS run")
+    return {
+        (str(row["instance"]), int(row["seed"])): SolutionObjective(
+            int(row["primary_vehicle_count"]),
+            float(row["secondary_total_distance"]),
+            float(row["tertiary_total_charging_time"]),
+            int(row["quaternary_charging_count"]),
+        )
+        for row in filtered
+    }
+
+
+def _load_comparison_baseline(
+    path: Path,
+    config: Stage02Config,
+) -> dict[tuple[str, int], SolutionObjective]:
+    if config.comparison_label == "stage01":
+        return _load_stage1_baseline(path, config)
+    rows = _read_csv(path)
+    expected_algorithm = ROUTE_REDUCTION_ALGORITHM
+    filtered = [row for row in rows if row.get("algorithm") == expected_algorithm]
+    expected = {(instance, seed) for instance in config.instances for seed in config.seeds}
+    actual = [(str(row["instance"]), int(row["seed"])) for row in filtered]
+    if set(actual) != expected or len(actual) != len(set(actual)):
+        raise RuntimeError(
+            f"{config.comparison_label} baseline coverage does not match Stage 2 scope"
+        )
+    if any(row.get("feasible") != "True" for row in filtered):
+        raise RuntimeError(f"{config.comparison_label} baseline contains an infeasible run")
     return {
         (str(row["instance"]), int(row["seed"])): SolutionObjective(
             int(row["primary_vehicle_count"]),
@@ -1158,15 +1326,23 @@ def _operator_failure_rows(events: list[dict[str, object]]) -> list[dict[str, An
                 "status": event.get("status", ""),
                 "reason": event.get("reason", ""),
                 "route_indices": json.dumps(event.get("route_indices", ())),
+                "affected_route_indices": json.dumps(
+                    event.get("affected_route_indices", ())
+                ),
                 "removed_customers": json.dumps(event.get("removed_customers", ())),
                 "candidate_customer_sequence": json.dumps(
                     event.get("candidate_customer_sequence", ())
+                ),
+                "candidate_route_sequences": json.dumps(
+                    event.get("candidate_route_sequences", ())
                 ),
                 "candidate_vehicle_delta": event.get("candidate_vehicle_delta", ""),
                 "prefilter_passed": event.get("prefilter_passed", False),
                 "new_routes_created": event.get("new_routes_created", 0),
                 "exact_route_evaluations": event.get("exact_route_evaluations", 0),
                 "selection_rank": event.get("selection_rank", 0),
+                "chain_depth": event.get("chain_depth", 0),
+                "segment_length": event.get("segment_length", 0),
             }
         )
     return output
@@ -1294,8 +1470,8 @@ def _same_run_configuration(rows: list[dict[str, str]], config: Stage02Config) -
         return False
     for row in rows:
         if (
-            row.get("algorithm") != ALGORITHM
-            or row.get("operator_profile") != OperatorProfile.STAGE02_ROUTE_REDUCTION.value
+            row.get("algorithm") != config.algorithm
+            or row.get("operator_profile") != config.operator_profile.value
             or float(row.get("time_limit_seconds", "nan")) != config.time_limit_seconds
             or int(row.get("max_iterations", "-1")) != config.max_iterations
             or int(row.get("threads", "-1")) != config.threads
@@ -1323,9 +1499,15 @@ def _operator_event_rows(events: list[dict[str, object]]) -> list[dict[str, Any]
                     event.get("candidate_objective_key", ())
                 ),
                 "route_indices": json.dumps(event.get("route_indices", ())),
+                "affected_route_indices": json.dumps(
+                    event.get("affected_route_indices", ())
+                ),
                 "removed_customers": json.dumps(event.get("removed_customers", ())),
                 "candidate_customer_sequence": json.dumps(
                     event.get("candidate_customer_sequence", ())
+                ),
+                "candidate_route_sequences": json.dumps(
+                    event.get("candidate_route_sequences", ())
                 ),
                 "candidate_vehicle_delta": event.get("candidate_vehicle_delta", ""),
                 "candidate_feasible": event.get("candidate_feasible", False),
@@ -1333,6 +1515,8 @@ def _operator_event_rows(events: list[dict[str, object]]) -> list[dict[str, Any]
                 "new_routes_created": event.get("new_routes_created", 0),
                 "exact_route_evaluations": event.get("exact_route_evaluations", 0),
                 "selection_rank": event.get("selection_rank", 0),
+                "chain_depth": event.get("chain_depth", 0),
+                "segment_length": event.get("segment_length", 0),
             }
         )
     return output
@@ -1387,7 +1571,7 @@ def _environment_record(
         "experiment_id": config.experiment_id,
         "run_label": run_label,
         "algorithm": config.algorithm,
-        "operator_profile": OperatorProfile.STAGE02_ROUTE_REDUCTION.value,
+        "operator_profile": config.operator_profile.value,
         "repository_revision": _git_revision(root),
         "repository_dirty": _git_dirty(root),
         "algorithm_source_sha256": algorithm_hash,
@@ -1409,6 +1593,7 @@ def _source_hashes(root: Path) -> dict[str, str]:
         Path("src/evrptw/charging.py"),
         Path("src/evrptw/validation.py"),
         Path("src/evrptw/experiments/stage02_route_reduction.py"),
+        Path("src/evrptw/experiments/stage02_route_quality.py"),
     )
     return {str(path): _sha256(root / path) for path in paths}
 
@@ -1422,7 +1607,7 @@ def _write_manifest(directory: Path, manifest_path: Path) -> None:
     _write_json(manifest_path, {"schema_version": SCHEMA_VERSION, "files": files})
 
 
-def _tracked_names(run_label: str) -> tuple[str, ...]:
+def _tracked_names(run_label: str, comparison_label: str) -> tuple[str, ...]:
     return tuple(
         f"{run_label}_{suffix}"
         for suffix in (
@@ -1433,7 +1618,7 @@ def _tracked_names(run_label: str) -> tuple[str, ...]:
             "operator_events.csv",
             "operator_failure_events.csv",
             "repeatability.csv",
-            "stage01_comparison.csv",
+            f"{comparison_label}_comparison.csv",
             "100_customer_comparison.csv",
             "gate_report.csv",
             "environment.json",
@@ -1546,26 +1731,35 @@ def _validate_run_label(run_label: str) -> None:
 
 def _validate_config(config: Stage02Config) -> None:
     if config.schema_version != SCHEMA_VERSION:
-        raise ValueError(f"unsupported Stage 2.1 schema version: {config.schema_version}")
-    if config.algorithm != ALGORITHM:
-        raise ValueError(f"Stage 2.1 only supports {ALGORITHM}")
+        raise ValueError(f"unsupported Stage 2 schema version: {config.schema_version}")
+    expected_algorithms = {
+        OperatorProfile.STAGE02_ROUTE_REDUCTION: ROUTE_REDUCTION_ALGORITHM,
+        OperatorProfile.STAGE02_ROUTE_QUALITY: ROUTE_QUALITY_ALGORITHM,
+    }
+    if config.operator_profile not in expected_algorithms:
+        raise ValueError("Stage 2 runner requires a route-reduction or route-quality profile")
+    if config.algorithm != expected_algorithms[config.operator_profile]:
+        raise ValueError(
+            f"{config.operator_profile.value} only supports "
+            f"{expected_algorithms[config.operator_profile]}"
+        )
     if config.instances != FORMAL_INSTANCES:
         raise ValueError(
-            "Stage 2.1 formal scope must exactly match Stage 0 instances: "
+            "Stage 2 formal scope must exactly match Stage 0 instances: "
             f"{FORMAL_INSTANCES}"
         )
     if config.seeds != FORMAL_SEEDS:
         raise ValueError(
-            "Stage 2.1 formal scope must exactly match Stage 0 seeds: " f"{FORMAL_SEEDS}"
+            "Stage 2 formal scope must exactly match Stage 0 seeds: " f"{FORMAL_SEEDS}"
         )
     if config.time_limit_seconds <= 0 or config.max_iterations <= 0:
         raise ValueError("time limit and maximum iterations must be positive")
     if config.threads != 1:
-        raise ValueError("Stage 2.1 requires exactly one thread")
+        raise ValueError("Stage 2 requires exactly one thread")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run Stage 2.1 route-reduction experiments")
+    parser = argparse.ArgumentParser(description="Run Stage 2 route experiments")
     parser.add_argument("--config", type=Path, default=Path("configs/stage02_route_reduction.toml"))
     parser.add_argument("--output-dir", type=Path, default=Path("results/stage02"))
     parser.add_argument("--summary-dir", type=Path, default=Path("experiments/summaries"))
@@ -1573,7 +1767,7 @@ def main() -> int:
     parser.add_argument(
         "--repeat-of",
         type=Path,
-        help="first complete Stage 2.1 output directory or gate report to compare",
+        help="first complete Stage 2 output directory or gate report to compare",
     )
     arguments = parser.parse_args()
     outputs = run_stage02(

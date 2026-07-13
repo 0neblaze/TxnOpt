@@ -11,8 +11,13 @@ from evrptw.neighborhoods import (
     NeighborhoodEvent,
     OperatorProfile,
     VehicleOperatorConfig,
+    propose_ejection_chain,
+    propose_relocate,
     propose_route_elimination,
     propose_route_merge,
+    propose_route_segment_destroy,
+    propose_swap,
+    propose_two_opt_star,
     repair_vehicle_count_aware,
 )
 from evrptw.objective import (
@@ -40,6 +45,8 @@ class OperatorStatistics:
     prefilter_rejected: int = 0
     new_routes_created: int = 0
     exact_route_evaluations: int = 0
+    candidate_proposals: int = 0
+    feasible_candidates: int = 0
     failure_reasons: dict[str, int] = field(default_factory=dict)
     weight: float = 1.0
 
@@ -142,7 +149,7 @@ def solve_alns(
     max_iterations: int = 2_000,
     time_limit_seconds: float = 60.0,
     removal_fraction: float = 0.2,
-    operator_profile: OperatorProfile | str = OperatorProfile.STAGE02_ROUTE_REDUCTION,
+    operator_profile: OperatorProfile | str = OperatorProfile.STAGE02_ROUTE_QUALITY,
     vehicle_operator_config: VehicleOperatorConfig | None = None,
 ) -> ALNSResult:
     if max_iterations <= 0:
@@ -185,17 +192,15 @@ def solve_alns(
         name: OperatorStatistics() for name in ("greedy", "regret2", "energy")
     }
     repair_stats = dict(standard_repair_stats)
-    if profile is OperatorProfile.STAGE02_ROUTE_REDUCTION:
+    if profile in (
+        OperatorProfile.STAGE02_ROUTE_REDUCTION,
+        OperatorProfile.STAGE02_ROUTE_QUALITY,
+    ):
         repair_stats["vehicle_count_aware"] = OperatorStatistics()
-    neighborhood_names = (
-        "standard",
-        "vehicle_count_aware_repair",
-        "route_elimination",
-        "route_merge",
-    )
+    neighborhood_names = _neighborhood_names(profile)
     neighborhood_stats = {
         name: OperatorStatistics() for name in neighborhood_names
-    } if profile is OperatorProfile.STAGE02_ROUTE_REDUCTION else {}
+    } if profile is not OperatorProfile.BASELINE else {}
     neighborhood_events: list[dict[str, object]] = []
     accepted = 0
     improved = 0
@@ -248,6 +253,51 @@ def solve_alns(
                     move_events = proposal.events
                 elif selected_neighborhood == "route_merge":
                     proposal = propose_route_merge(
+                        instance,
+                        current.sequences,
+                        evaluator,
+                        config=vehicle_config,
+                    )
+                    candidate_sequences = proposal.sequences or ()
+                    move_events = proposal.events
+                elif selected_neighborhood == "relocate":
+                    proposal = propose_relocate(
+                        instance,
+                        current.sequences,
+                        evaluator,
+                        config=vehicle_config,
+                    )
+                    candidate_sequences = proposal.sequences or ()
+                    move_events = proposal.events
+                elif selected_neighborhood == "swap":
+                    proposal = propose_swap(
+                        instance,
+                        current.sequences,
+                        evaluator,
+                        config=vehicle_config,
+                    )
+                    candidate_sequences = proposal.sequences or ()
+                    move_events = proposal.events
+                elif selected_neighborhood == "two_opt_star":
+                    proposal = propose_two_opt_star(
+                        instance,
+                        current.sequences,
+                        evaluator,
+                        config=vehicle_config,
+                    )
+                    candidate_sequences = proposal.sequences or ()
+                    move_events = proposal.events
+                elif selected_neighborhood == "route_segment_destroy":
+                    proposal = propose_route_segment_destroy(
+                        instance,
+                        current.sequences,
+                        evaluator,
+                        config=vehicle_config,
+                    )
+                    candidate_sequences = proposal.sequences or ()
+                    move_events = proposal.events
+                elif selected_neighborhood == "ejection_chain":
+                    proposal = propose_ejection_chain(
                         instance,
                         current.sequences,
                         evaluator,
@@ -348,7 +398,7 @@ def solve_alns(
                 random_draw=rng.random(),
             )
         )
-        if profile is OperatorProfile.STAGE02_ROUTE_REDUCTION:
+        if profile is not OperatorProfile.BASELINE:
             vehicle_reduction = bool(
                 candidate.objective is not None
                 and current.objective is not None
@@ -700,10 +750,46 @@ def _select_stage02_neighborhood(
     rng: random.Random,
     statistics: dict[str, OperatorStatistics],
 ) -> str:
-    warmup = ("route_elimination", "vehicle_count_aware_repair", "route_merge")
+    warmup: tuple[str, ...]
+    if "relocate" in statistics:
+        warmup = (
+            "route_elimination",
+            "vehicle_count_aware_repair",
+            "route_merge",
+            "relocate",
+            "swap",
+            "two_opt_star",
+            "route_segment_destroy",
+            "ejection_chain",
+        )
+    else:
+        warmup = ("route_elimination", "vehicle_count_aware_repair", "route_merge")
     if iteration < len(warmup):
         return warmup[iteration]
     return _weighted_choice(rng, statistics)
+
+
+def _neighborhood_names(profile: OperatorProfile) -> tuple[str, ...]:
+    if profile is OperatorProfile.STAGE02_ROUTE_REDUCTION:
+        return (
+            "standard",
+            "vehicle_count_aware_repair",
+            "route_elimination",
+            "route_merge",
+        )
+    if profile is OperatorProfile.STAGE02_ROUTE_QUALITY:
+        return (
+            "standard",
+            "vehicle_count_aware_repair",
+            "route_elimination",
+            "route_merge",
+            "relocate",
+            "swap",
+            "two_opt_star",
+            "route_segment_destroy",
+            "ejection_chain",
+        )
+    return ()
 
 
 def _record_neighborhood_proposal(
@@ -720,6 +806,10 @@ def _record_neighborhood_proposal(
     statistics.exact_route_evaluations += sum(
         event.exact_route_evaluations for event in events
     )
+    statistics.candidate_proposals += sum(
+        event.status == "candidate_proposed" for event in events
+    )
+    statistics.feasible_candidates += sum(event.candidate_feasible for event in events)
     failure_statuses = {
         "failed",
         "prefilter_rejected",

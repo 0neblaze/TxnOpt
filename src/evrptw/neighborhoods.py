@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from typing import Protocol
@@ -17,6 +18,7 @@ _EPSILON = 1e-9
 class OperatorProfile(StrEnum):
     BASELINE = "baseline"
     STAGE02_ROUTE_REDUCTION = "stage02_route_reduction"
+    STAGE02_ROUTE_QUALITY = "stage02_route_quality"
 
 
 class RouteEvaluator(Protocol):
@@ -32,6 +34,15 @@ class VehicleOperatorConfig:
     route_elimination_exact_evaluation_budget: int = 256
     route_merge_exact_evaluation_budget: int = 64
     vehicle_repair_exact_evaluation_budget: int = 256
+    relocate_exact_evaluation_budget: int = 48
+    swap_exact_evaluation_budget: int = 48
+    two_opt_star_exact_evaluation_budget: int = 32
+    route_segment_exact_evaluation_budget: int = 32
+    ejection_chain_exact_evaluation_budget: int = 24
+    route_segment_min_length: int = 2
+    route_segment_max_length: int = 5
+    ejection_chain_max_depth: int = 3
+    ejection_chain_beam_width: int = 16
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -42,9 +53,26 @@ class VehicleOperatorConfig:
             ),
             ("route_merge_exact_evaluation_budget", self.route_merge_exact_evaluation_budget),
             ("vehicle_repair_exact_evaluation_budget", self.vehicle_repair_exact_evaluation_budget),
+            ("relocate_exact_evaluation_budget", self.relocate_exact_evaluation_budget),
+            ("swap_exact_evaluation_budget", self.swap_exact_evaluation_budget),
+            (
+                "two_opt_star_exact_evaluation_budget",
+                self.two_opt_star_exact_evaluation_budget,
+            ),
+            ("route_segment_exact_evaluation_budget", self.route_segment_exact_evaluation_budget),
+            (
+                "ejection_chain_exact_evaluation_budget",
+                self.ejection_chain_exact_evaluation_budget,
+            ),
+            ("route_segment_min_length", self.route_segment_min_length),
+            ("route_segment_max_length", self.route_segment_max_length),
+            ("ejection_chain_max_depth", self.ejection_chain_max_depth),
+            ("ejection_chain_beam_width", self.ejection_chain_beam_width),
         ):
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.route_segment_min_length > self.route_segment_max_length:
+            raise ValueError("route_segment_min_length must not exceed route_segment_max_length")
 
 
 _DEFAULT_VEHICLE_OPERATOR_CONFIG = VehicleOperatorConfig()
@@ -56,14 +84,18 @@ class NeighborhoodEvent:
     status: str
     reason: str
     route_indices: tuple[int, ...] = ()
+    affected_route_indices: tuple[int, ...] = ()
     removed_customers: tuple[str, ...] = ()
     candidate_customer_sequence: tuple[str, ...] = ()
+    candidate_route_sequences: tuple[CustomerSequence, ...] = ()
     candidate_vehicle_delta: int | None = None
     candidate_feasible: bool = False
     prefilter_passed: bool = False
     new_routes_created: int = 0
     exact_route_evaluations: int = 0
     selection_rank: int = 0
+    chain_depth: int = 0
+    segment_length: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -466,6 +498,652 @@ def propose_route_merge(
         )
     )
     return MoveProposal("route_merge", tuple(new_sequences), tuple(events))
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateDescription:
+    changes: tuple[tuple[int, CustomerSequence], ...]
+    removed_customers: tuple[str, ...] = ()
+    chain_depth: int = 0
+    segment_length: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateEvaluation:
+    objective: SolutionObjective | None
+    reason: str
+    prefilter_passed: bool
+    exact_route_evaluations: int
+
+
+def propose_relocate(
+    instance: Instance,
+    sequences: RouteSequences,
+    evaluator: RouteEvaluator,
+    *,
+    config: VehicleOperatorConfig = _DEFAULT_VEHICLE_OPERATOR_CONFIG,
+) -> MoveProposal:
+    """Move one customer between two existing routes without changing fleet size."""
+
+    if len(sequences) <= 1:
+        return MoveProposal(
+            "relocate",
+            None,
+            (NeighborhoodEvent("relocate", "not_applicable", "only_one_route"),),
+        )
+    return _search_changed_candidates(
+        "relocate",
+        instance,
+        sequences,
+        evaluator,
+        _relocate_candidates(sequences),
+        budget=config.relocate_exact_evaluation_budget,
+    )
+
+
+def propose_swap(
+    instance: Instance,
+    sequences: RouteSequences,
+    evaluator: RouteEvaluator,
+    *,
+    config: VehicleOperatorConfig = _DEFAULT_VEHICLE_OPERATOR_CONFIG,
+) -> MoveProposal:
+    """Exchange one customer from each of two existing routes."""
+
+    if len(sequences) <= 1:
+        return MoveProposal(
+            "swap",
+            None,
+            (NeighborhoodEvent("swap", "not_applicable", "only_one_route"),),
+        )
+    return _search_changed_candidates(
+        "swap",
+        instance,
+        sequences,
+        evaluator,
+        _swap_candidates(sequences),
+        budget=config.swap_exact_evaluation_budget,
+    )
+
+
+def propose_two_opt_star(
+    instance: Instance,
+    sequences: RouteSequences,
+    evaluator: RouteEvaluator,
+    *,
+    config: VehicleOperatorConfig = _DEFAULT_VEHICLE_OPERATOR_CONFIG,
+) -> MoveProposal:
+    """Exchange tails of two routes at customer-to-customer cut points."""
+
+    if len(sequences) <= 1:
+        return MoveProposal(
+            "two_opt_star",
+            None,
+            (NeighborhoodEvent("two_opt_star", "not_applicable", "only_one_route"),),
+        )
+    return _search_changed_candidates(
+        "two_opt_star",
+        instance,
+        sequences,
+        evaluator,
+        _two_opt_star_candidates(sequences),
+        budget=config.two_opt_star_exact_evaluation_budget,
+    )
+
+
+def propose_route_segment_destroy(
+    instance: Instance,
+    sequences: RouteSequences,
+    evaluator: RouteEvaluator,
+    *,
+    config: VehicleOperatorConfig = _DEFAULT_VEHICLE_OPERATOR_CONFIG,
+) -> MoveProposal:
+    """Remove a contiguous segment and repair it only into existing routes."""
+
+    operator = "route_segment_destroy"
+    min_length = config.route_segment_min_length
+    max_length = config.route_segment_max_length
+    events: list[NeighborhoodEvent] = []
+    exact_used = 0
+    candidate_limit = max(16, config.route_segment_exact_evaluation_budget * 4)
+    considered = 0
+
+    for source_index, source in enumerate(sequences):
+        if len(source) <= min_length:
+            continue
+        for segment_length in range(min_length, min(max_length, len(source) - 1) + 1):
+            for start in range(len(source) - segment_length + 1):
+                if considered >= candidate_limit:
+                    events.append(
+                        NeighborhoodEvent(
+                            operator,
+                            "budget_exhausted",
+                            "route_segment_candidate_budget",
+                            route_indices=(source_index,),
+                            affected_route_indices=(source_index,),
+                            segment_length=segment_length,
+                        )
+                    )
+                    break
+                considered += 1
+                segment = source[start : start + segment_length]
+                partial = list(sequences)
+                partial[source_index] = source[:start] + source[start + segment_length :]
+                remaining = config.route_segment_exact_evaluation_budget - exact_used
+                if remaining <= 0:
+                    events.append(
+                        NeighborhoodEvent(
+                            operator,
+                            "budget_exhausted",
+                            "route_segment_exact_evaluation_budget",
+                            route_indices=(source_index,),
+                            affected_route_indices=(source_index,),
+                            removed_customers=segment,
+                            segment_length=segment_length,
+                        )
+                    )
+                    break
+                repair_config = replace(
+                    config,
+                    vehicle_repair_exact_evaluation_budget=remaining,
+                )
+                repair = repair_vehicle_count_aware(
+                    tuple(partial),
+                    segment,
+                    evaluator,
+                    instance,
+                    config=repair_config,
+                    allow_new_routes=False,
+                )
+                exact_used += repair.exact_route_evaluations
+                if repair.sequences is None or len(repair.sequences) != len(sequences):
+                    events.append(
+                        NeighborhoodEvent(
+                            operator,
+                            "failed",
+                            repair.failure_reason or "route_segment_repair_failed",
+                            route_indices=(source_index,),
+                            affected_route_indices=(source_index,),
+                            removed_customers=segment,
+                            candidate_vehicle_delta=0,
+                            candidate_feasible=False,
+                            prefilter_passed=repair.exact_route_evaluations > 0,
+                            new_routes_created=repair.new_routes_created,
+                            exact_route_evaluations=repair.exact_route_evaluations,
+                            segment_length=segment_length,
+                        )
+                    )
+                    continue
+
+                affected = tuple(
+                    index
+                    for index, (before, after) in enumerate(
+                        zip(sequences, repair.sequences, strict=True)
+                    )
+                    if before != after
+                )
+                events.append(
+                    NeighborhoodEvent(
+                        operator,
+                        "candidate_proposed",
+                        "route_segment_repaired",
+                        route_indices=(source_index,),
+                        affected_route_indices=affected,
+                        removed_customers=segment,
+                        candidate_route_sequences=repair.sequences,
+                        candidate_vehicle_delta=0,
+                        candidate_feasible=True,
+                        prefilter_passed=True,
+                        new_routes_created=repair.new_routes_created,
+                        exact_route_evaluations=repair.exact_route_evaluations,
+                        segment_length=segment_length,
+                        selection_rank=considered,
+                    )
+                )
+                return MoveProposal(operator, repair.sequences, tuple(events))
+            if exact_used >= config.route_segment_exact_evaluation_budget:
+                break
+        if exact_used >= config.route_segment_exact_evaluation_budget:
+            break
+
+    if not events:
+        events.append(
+            NeighborhoodEvent(operator, "failed", "no_route_with_segment_length")
+        )
+    return MoveProposal(operator, None, tuple(events))
+
+
+def propose_ejection_chain(
+    instance: Instance,
+    sequences: RouteSequences,
+    evaluator: RouteEvaluator,
+    *,
+    config: VehicleOperatorConfig = _DEFAULT_VEHICLE_OPERATOR_CONFIG,
+) -> MoveProposal:
+    """Search bounded relocate/ejection chains over existing routes.
+
+    A chain removes one pending customer from a source route, inserts it into a
+    different route while ejecting one customer, and repeats for at most the
+    configured depth.  The final pending customer is inserted without an
+    ejection.  Route count therefore remains unchanged and every customer is
+    present exactly once in a completed proposal.
+    """
+
+    operator = "ejection_chain"
+    if len(sequences) <= 1:
+        return MoveProposal(
+            operator,
+            None,
+            (NeighborhoodEvent(operator, "not_applicable", "only_one_route"),),
+        )
+    if config.ejection_chain_max_depth < 1:
+        raise ValueError("ejection_chain_max_depth must be positive")
+
+    events: list[NeighborhoodEvent] = []
+    exact_used = 0
+    considered = 0
+    candidate_limit = max(16, config.ejection_chain_exact_evaluation_budget * 4)
+    best: tuple[SolutionObjective, RouteSequences, int, tuple[int, ...]] | None = None
+
+    initial_states = [
+        (tuple(
+            sequence[:position] + sequence[position + 1 :]
+            if index == source_index
+            else sequence
+            for index, sequence in enumerate(sequences)
+        ), customer, 0)
+        for source_index, sequence in enumerate(sequences)
+        if len(sequence) > 1
+        for position, customer in enumerate(sequence)
+    ]
+    beam = sorted(
+        initial_states,
+        key=lambda state: (
+            _route_sequence_distance(instance, state[0]),
+            state[0],
+            state[1],
+        ),
+    )[: config.ejection_chain_beam_width]
+    seen: set[tuple[RouteSequences, str, int]] = set()
+
+    for _ in range(config.ejection_chain_max_depth):
+        next_beam: list[tuple[RouteSequences, str, int]] = []
+        for state_sequences, pending, ejection_depth in beam:
+            state_key = (state_sequences, pending, ejection_depth)
+            if state_key in seen:
+                continue
+            seen.add(state_key)
+            chain_depth = ejection_depth + 1
+            for target_index, target in enumerate(state_sequences):
+                for position in range(len(target) + 1):
+                    if considered >= candidate_limit:
+                        break
+                    candidate_routes = list(state_sequences)
+                    candidate_routes[target_index] = (
+                        target[:position] + (pending,) + target[position:]
+                    )
+                    candidate = tuple(candidate_routes)
+                    if candidate == sequences:
+                        continue
+                    changes = tuple(
+                        (index, route)
+                        for index, (before, route) in enumerate(
+                            zip(sequences, candidate, strict=True)
+                        )
+                        if before != route
+                    )
+                    if not changes:
+                        continue
+                    considered += 1
+                    description = _CandidateDescription(
+                        changes,
+                        chain_depth=chain_depth,
+                    )
+                    evaluation = _evaluate_changed_candidate(
+                        instance,
+                        evaluator,
+                        changes,
+                        exact_used=exact_used,
+                        budget=config.ejection_chain_exact_evaluation_budget,
+                        budget_reason="ejection_chain_exact_evaluation_budget",
+                    )
+                    exact_used += evaluation.exact_route_evaluations
+                    events.append(
+                        _candidate_event(
+                            operator,
+                            description,
+                            evaluation,
+                            considered,
+                        )
+                    )
+                    if evaluation.objective is not None:
+                        candidate_key = (
+                            evaluation.objective.key,
+                            candidate,
+                            chain_depth,
+                            tuple(index for index, _ in changes),
+                        )
+                        if best is None or candidate_key < (
+                            best[0].key,
+                            best[1],
+                            best[2],
+                            best[3],
+                        ):
+                            best = (
+                                evaluation.objective,
+                                candidate,
+                                chain_depth,
+                                tuple(index for index, _ in changes),
+                            )
+                    if evaluation.reason == "ejection_chain_exact_evaluation_budget":
+                        break
+                if exact_used >= config.ejection_chain_exact_evaluation_budget:
+                    break
+
+            if exact_used >= config.ejection_chain_exact_evaluation_budget:
+                break
+            if ejection_depth + 1 >= config.ejection_chain_max_depth:
+                continue
+            for target_index, target in enumerate(state_sequences):
+                if not target:
+                    continue
+                for position, ejected in enumerate(target):
+                    next_routes = list(state_sequences)
+                    next_routes[target_index] = (
+                        target[:position] + (pending,) + target[position + 1 :]
+                    )
+                    next_state = tuple(next_routes)
+                    if next_state == state_sequences:
+                        continue
+                    if any(
+                        not screen_route_candidate(instance, route).accepted
+                        for route in next_state
+                    ):
+                        continue
+                    next_beam.append((next_state, ejected, ejection_depth + 1))
+        if exact_used >= config.ejection_chain_exact_evaluation_budget:
+            break
+        beam = sorted(
+            next_beam,
+            key=lambda state: (
+                _route_sequence_distance(instance, state[0]),
+                state[0],
+                state[1],
+                state[2],
+            ),
+        )[: config.ejection_chain_beam_width]
+        if not beam:
+            break
+
+    if best is None:
+        if not events:
+            events.append(NeighborhoodEvent(operator, "failed", "no_feasible_candidate"))
+        return MoveProposal(operator, None, tuple(events))
+    events.append(
+        NeighborhoodEvent(
+            operator,
+            "candidate_proposed",
+            "ejection_chain_completed",
+            affected_route_indices=best[3],
+            candidate_route_sequences=best[1],
+            candidate_vehicle_delta=0,
+            candidate_feasible=True,
+            prefilter_passed=True,
+            chain_depth=best[2],
+        )
+    )
+    return MoveProposal(operator, best[1], tuple(events))
+
+
+def _search_changed_candidates(
+    operator: str,
+    instance: Instance,
+    sequences: RouteSequences,
+    evaluator: RouteEvaluator,
+    candidates: Iterable[_CandidateDescription],
+    *,
+    budget: int,
+) -> MoveProposal:
+    events: list[NeighborhoodEvent] = []
+    exact_used = 0
+    candidate_limit = max(16, budget * 4)
+    best: tuple[SolutionObjective, RouteSequences, _CandidateDescription] | None = None
+    for rank, description in enumerate(candidates, start=1):
+        if rank > candidate_limit:
+            events.append(
+                NeighborhoodEvent(
+                    operator,
+                    "budget_exhausted",
+                    f"{operator}_candidate_budget",
+                )
+            )
+            break
+        evaluation = _evaluate_changed_candidate(
+            instance,
+            evaluator,
+            description.changes,
+            exact_used=exact_used,
+            budget=budget,
+            budget_reason=f"{operator}_exact_evaluation_budget",
+        )
+        exact_used += evaluation.exact_route_evaluations
+        events.append(_candidate_event(operator, description, evaluation, rank))
+        if evaluation.objective is not None:
+            candidate = _apply_changes(sequences, description.changes)
+            candidate_key = (evaluation.objective.key, candidate)
+            if best is None or candidate_key < (best[0].key, best[1]):
+                best = (evaluation.objective, candidate, description)
+        if evaluation.reason == f"{operator}_exact_evaluation_budget":
+            break
+    if best is None:
+        if not events:
+            events.append(NeighborhoodEvent(operator, "failed", "no_feasible_candidate"))
+        return MoveProposal(operator, None, tuple(events))
+    events.append(
+        _candidate_proposed_event(
+            operator,
+            best[2],
+            reason=f"{operator}_candidate",
+        )
+    )
+    return MoveProposal(operator, best[1], tuple(events))
+
+
+def _relocate_candidates(sequences: RouteSequences) -> Iterable[_CandidateDescription]:
+    for source_index, source in enumerate(sequences):
+        if len(source) <= 1:
+            continue
+        for source_position, customer in enumerate(source):
+            source_without = source[:source_position] + source[source_position + 1 :]
+            for target_index, target in enumerate(sequences):
+                if target_index == source_index:
+                    continue
+                for target_position in range(len(target) + 1):
+                    target_with = (
+                        target[:target_position]
+                        + (customer,)
+                        + target[target_position:]
+                    )
+                    yield_changes = _ordered_changes(
+                        (source_index, source_without), (target_index, target_with)
+                    )
+                    yield _CandidateDescription(
+                        yield_changes,
+                        removed_customers=(customer,),
+                    )
+
+
+def _swap_candidates(sequences: RouteSequences) -> Iterable[_CandidateDescription]:
+    for left_index, left in enumerate(sequences):
+        for right_index in range(left_index + 1, len(sequences)):
+            right = sequences[right_index]
+            for left_position, left_customer in enumerate(left):
+                for right_position, right_customer in enumerate(right):
+                    new_left = (
+                        left[:left_position]
+                        + (right_customer,)
+                        + left[left_position + 1 :]
+                    )
+                    new_right = (
+                        right[:right_position]
+                        + (left_customer,)
+                        + right[right_position + 1 :]
+                    )
+                    yield _CandidateDescription(
+                        _ordered_changes(
+                            (left_index, new_left),
+                            (right_index, new_right),
+                        ),
+                        removed_customers=(left_customer, right_customer),
+                    )
+
+
+def _two_opt_star_candidates(sequences: RouteSequences) -> Iterable[_CandidateDescription]:
+    for left_index, left in enumerate(sequences):
+        for right_index in range(left_index + 1, len(sequences)):
+            right = sequences[right_index]
+            for left_cut in range(1, len(left)):
+                for right_cut in range(1, len(right)):
+                    new_left = left[:left_cut] + right[right_cut:]
+                    new_right = right[:right_cut] + left[left_cut:]
+                    if not new_left or not new_right:
+                        continue
+                    yield _CandidateDescription(
+                        _ordered_changes(
+                            (left_index, new_left),
+                            (right_index, new_right),
+                        )
+                    )
+
+
+def _ordered_changes(
+    *changes: tuple[int, CustomerSequence],
+) -> tuple[tuple[int, CustomerSequence], ...]:
+    return tuple(sorted(changes, key=lambda change: change[0]))
+
+
+def _evaluate_changed_candidate(
+    instance: Instance,
+    evaluator: RouteEvaluator,
+    changes: tuple[tuple[int, CustomerSequence], ...],
+    *,
+    exact_used: int,
+    budget: int,
+    budget_reason: str,
+) -> _CandidateEvaluation:
+    if not changes:
+        return _CandidateEvaluation(None, "no_changed_route", False, 0)
+    if len({index for index, _ in changes}) != len(changes):
+        return _CandidateEvaluation(None, "duplicate_changed_route", False, 0)
+    for _, sequence in changes:
+        screen = screen_route_candidate(instance, sequence)
+        if not screen.accepted:
+            return _CandidateEvaluation(None, screen.reason, False, 0)
+    required = len(changes)
+    if exact_used + required > budget:
+        return _CandidateEvaluation(
+            None,
+            budget_reason,
+            True,
+            0,
+        )
+    results = [evaluator.route(sequence) for _, sequence in changes]
+    if not all(result.feasible for result in results):
+        reason = next(
+            (
+                result.failure_reason or "exact_charging_infeasible"
+                for result in results
+                if not result.feasible
+            ),
+        )
+        return _CandidateEvaluation(None, reason, True, required)
+    objective = sum(
+        (_route_objective(instance, result) for result in results),
+        start=SolutionObjective.zero(),
+    )
+    return _CandidateEvaluation(objective, "exact_charging_feasible", True, required)
+
+
+def _candidate_event(
+    operator: str,
+    description: _CandidateDescription,
+    evaluation: _CandidateEvaluation,
+    rank: int,
+) -> NeighborhoodEvent:
+    if evaluation.objective is not None:
+        status = "feasible_candidate"
+    elif evaluation.reason.endswith("_exact_evaluation_budget"):
+        status = "budget_exhausted"
+    elif evaluation.prefilter_passed:
+        status = "exact_infeasible"
+    else:
+        status = "prefilter_rejected"
+    indices = tuple(index for index, _ in description.changes)
+    routes = tuple(sequence for _, sequence in description.changes)
+    return NeighborhoodEvent(
+        operator,
+        status,
+        evaluation.reason,
+        route_indices=indices,
+        affected_route_indices=indices,
+        removed_customers=description.removed_customers,
+        candidate_customer_sequence=routes[0] if len(routes) == 1 else (),
+        candidate_route_sequences=routes,
+        candidate_feasible=evaluation.objective is not None,
+        prefilter_passed=evaluation.prefilter_passed,
+        exact_route_evaluations=evaluation.exact_route_evaluations,
+        selection_rank=rank,
+        chain_depth=description.chain_depth,
+        segment_length=description.segment_length,
+    )
+
+
+def _candidate_proposed_event(
+    operator: str,
+    description: _CandidateDescription,
+    *,
+    reason: str,
+) -> NeighborhoodEvent:
+    indices = tuple(index for index, _ in description.changes)
+    routes = tuple(sequence for _, sequence in description.changes)
+    return NeighborhoodEvent(
+        operator,
+        "candidate_proposed",
+        reason,
+        route_indices=indices,
+        affected_route_indices=indices,
+        removed_customers=description.removed_customers,
+        candidate_customer_sequence=routes[0] if len(routes) == 1 else (),
+        candidate_route_sequences=routes,
+        candidate_vehicle_delta=0,
+        candidate_feasible=True,
+        prefilter_passed=True,
+        chain_depth=description.chain_depth,
+        segment_length=description.segment_length,
+    )
+
+
+def _apply_changes(
+    sequences: RouteSequences,
+    changes: tuple[tuple[int, CustomerSequence], ...],
+) -> RouteSequences:
+    by_index = dict(changes)
+    return tuple(by_index.get(index, sequence) for index, sequence in enumerate(sequences))
+
+
+def _route_sequence_distance(instance: Instance, sequences: RouteSequences) -> float:
+    depot = instance.depot
+    return sum(
+        sum(
+            origin.distance_to(destination)
+            for origin, destination in zip(
+                (depot, *(instance.by_name[name] for name in sequence), depot),
+                (*(instance.by_name[name] for name in sequence), depot),
+                strict=False,
+            )
+        )
+        for sequence in sequences
+    )
 
 
 def _repair_pass(

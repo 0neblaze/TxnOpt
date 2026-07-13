@@ -36,6 +36,23 @@ this repository or one of its subdirectories.
 - Stage 2.1 formal runs use the fixed Stage 0 12-instance, three-seed scope and
   are accepted only when every gate and both independent complete reruns pass.
 
+## Stage 2.2 Cross-Route Quality Policy
+
+- `solve_alns()` defaults to `stage02_route_quality`; `baseline` and
+  `stage02_route_reduction` remain explicit profiles for historical reproduction.
+- `relocate`, `swap`, `two_opt_star`, `route_segment_destroy`, and
+  `ejection_chain` remain behind `evrptw.neighborhoods`; each proposal preserves
+  route count and the segment/chain operators may repair only into existing routes.
+- Every changed route passes the shared capacity, optimistic time-window, and
+  optimistic energy prefilters before exact charging evaluation. Only changed
+  routes are sent to the exact subproblem.
+- Stage 2.2 uses the fixed Stage 0 scope and compares formal best objectives to
+  `experiments/summaries/stage02_attempt02_per_run_results.csv`; it inherits all
+  Stage 2.1 gates and requires every new operator to produce a feasible candidate
+  plus at least one accepted same-vehicle-count distance improvement.
+- Failed rounds retain raw JSON, solutions, event and failure logs, environment
+  metadata, and manifests under a new ignored `results/` directory and run label.
+
 ## Literature Recommendation Policy
 
 - Codex recommends literature but does not obtain it. Do not access the user's
