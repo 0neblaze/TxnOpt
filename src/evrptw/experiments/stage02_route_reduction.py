@@ -352,6 +352,12 @@ def load_config(path: Path) -> Stage02Config:
                         VehicleOperatorConfig().ejection_chain_exact_evaluation_budget,
                     )
                 ),
+                quality_probe_exact_evaluation_budget=int(
+                    operators.get(
+                        "quality_probe_exact_evaluation_budget",
+                        VehicleOperatorConfig().quality_probe_exact_evaluation_budget,
+                    )
+                ),
                 route_segment_min_length=int(
                     operators.get(
                         "route_segment_min_length",

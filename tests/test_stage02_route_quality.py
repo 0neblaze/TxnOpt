@@ -27,3 +27,4 @@ def test_stage02_route_quality_config_keeps_formal_scope_and_fixed_comparison() 
     assert config.vehicle_operator_config.route_segment_max_length == 5
     assert config.vehicle_operator_config.ejection_chain_max_depth == 3
     assert config.vehicle_operator_config.ejection_chain_beam_width == 16
+    assert config.vehicle_operator_config.quality_probe_exact_evaluation_budget == 4

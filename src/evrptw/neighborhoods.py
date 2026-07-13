@@ -39,6 +39,7 @@ class VehicleOperatorConfig:
     two_opt_star_exact_evaluation_budget: int = 32
     route_segment_exact_evaluation_budget: int = 32
     ejection_chain_exact_evaluation_budget: int = 24
+    quality_probe_exact_evaluation_budget: int = 4
     route_segment_min_length: int = 2
     route_segment_max_length: int = 5
     ejection_chain_max_depth: int = 3
@@ -64,6 +65,7 @@ class VehicleOperatorConfig:
                 "ejection_chain_exact_evaluation_budget",
                 self.ejection_chain_exact_evaluation_budget,
             ),
+            ("quality_probe_exact_evaluation_budget", self.quality_probe_exact_evaluation_budget),
             ("route_segment_min_length", self.route_segment_min_length),
             ("route_segment_max_length", self.route_segment_max_length),
             ("ejection_chain_max_depth", self.ejection_chain_max_depth),

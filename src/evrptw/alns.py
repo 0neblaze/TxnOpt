@@ -3,13 +3,14 @@ from __future__ import annotations
 import math
 import random
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
 from evrptw.models import Instance, Node
 from evrptw.neighborhoods import (
     NeighborhoodEvent,
     OperatorProfile,
+    RouteSequences,
     VehicleOperatorConfig,
     propose_ejection_chain,
     propose_relocate,
@@ -29,6 +30,14 @@ from evrptw.objective import (
 from evrptw.validation import validate_routes
 
 _INFEASIBLE_COST = 1e12
+_QUALITY_NEIGHBORHOOD_ORDER = (
+    "relocate",
+    "swap",
+    "two_opt_star",
+    "route_segment_destroy",
+    "ejection_chain",
+)
+_QUALITY_NEIGHBORHOODS = frozenset(_QUALITY_NEIGHBORHOOD_ORDER)
 
 
 @dataclass(slots=True)
@@ -185,6 +194,8 @@ def solve_alns(
         raise RuntimeError("feasible ALNS initial solution is missing its objective")
 
     best = current
+    quality_probe_current = current
+    quality_probe_best = current
     first_feasible_time = time.perf_counter() - started
     best_time = first_feasible_time
     destroy_stats = {name: OperatorStatistics() for name in ("random", "worst", "related")}
@@ -217,6 +228,9 @@ def solve_alns(
         repair_name = ""
         selected_neighborhood = ""
         move_events: tuple[NeighborhoodEvent, ...] = ()
+        shadow_neighborhood = ""
+        shadow_events: tuple[NeighborhoodEvent, ...] = ()
+        shadow_candidate: _EvaluatedSolution | None = None
         if profile is OperatorProfile.BASELINE:
             destroy_name = _weighted_choice(rng, destroy_stats)
             repair_name = _weighted_choice(rng, standard_repair_stats)
@@ -238,7 +252,10 @@ def solve_alns(
                 break
         else:
             selected_neighborhood = _select_stage02_neighborhood(
-                iteration, rng, neighborhood_stats
+                iteration,
+                rng,
+                neighborhood_stats,
+                include_quality=profile is not OperatorProfile.STAGE02_ROUTE_QUALITY,
             )
             neighborhood_stats[selected_neighborhood].calls += 1
             try:
@@ -386,9 +403,114 @@ def solve_alns(
                 candidate,
                 current,
             )
+            if profile is OperatorProfile.STAGE02_ROUTE_QUALITY:
+                shadow_neighborhood = _quality_shadow_neighborhood(iteration)
+                if shadow_neighborhood:
+                    neighborhood_stats[shadow_neighborhood].calls += 1
+                    try:
+                        shadow_sequences, shadow_events = _quality_shadow_proposal(
+                            shadow_neighborhood,
+                            instance,
+                            quality_probe_current.sequences,
+                            evaluator,
+                            vehicle_config,
+                        )
+                        shadow_candidate = evaluator.solution(shadow_sequences)
+                    except _TimeLimitReached:
+                        neighborhood_events.append(
+                            _event_record(
+                                NeighborhoodEvent(
+                                    shadow_neighborhood,
+                                    "time_limit",
+                                    "time_limit_reached_during_quality_probe",
+                                ),
+                                iteration,
+                            )
+                        )
+                        break
+                    _record_neighborhood_proposal(
+                        neighborhood_stats[shadow_neighborhood],
+                        shadow_events,
+                        shadow_candidate,
+                        quality_probe_current,
+                    )
+                    quality_comparison = (
+                        compare_objectives(
+                            shadow_candidate.objective,
+                            quality_probe_current.objective,
+                        )
+                        if shadow_candidate.feasible
+                        and shadow_candidate.objective is not None
+                        and quality_probe_current.objective is not None
+                        else ObjectiveComparison.WORSE
+                    )
+                    quality_probe_accept = (
+                        shadow_candidate.feasible
+                        and quality_comparison is not ObjectiveComparison.WORSE
+                    )
+                    quality_probe_vehicle_reduction = bool(
+                        shadow_candidate.objective is not None
+                        and quality_probe_current.objective is not None
+                        and shadow_candidate.objective.vehicle_count
+                        < quality_probe_current.objective.vehicle_count
+                    )
+                    quality_probe_distance_improvement = bool(
+                        shadow_candidate.objective is not None
+                        and quality_probe_current.objective is not None
+                        and shadow_candidate.objective.total_distance
+                        < quality_probe_current.objective.total_distance - 1e-9
+                    )
+                    neighborhood_events.extend(
+                        _annotated_event_record(
+                            event,
+                            iteration=iteration,
+                            accepted=quality_probe_accept,
+                            vehicle_reduction=quality_probe_vehicle_reduction,
+                            distance_improvement=quality_probe_distance_improvement,
+                            candidate=shadow_candidate,
+                        )
+                        for event in shadow_events
+                    )
+                    if quality_probe_accept and shadow_candidate.objective is not None:
+                        shadow_statistics = neighborhood_stats[shadow_neighborhood]
+                        shadow_statistics.accepted += 1
+                        reward = 1.0
+                        if quality_comparison is ObjectiveComparison.BETTER:
+                            shadow_statistics.improved += 1
+                            reward = 4.0
+                        quality_probe_current = shadow_candidate
+                        if (
+                            quality_probe_best.objective is None
+                            or compare_objectives(
+                                shadow_candidate.objective,
+                                quality_probe_best.objective,
+                            )
+                            is ObjectiveComparison.BETTER
+                        ):
+                            quality_probe_best = shadow_candidate
+                            shadow_statistics.best += 1
+                            reward = 8.0
+                            if (
+                                best.objective is None
+                                or compare_objectives(
+                                    shadow_candidate.objective,
+                                    best.objective,
+                                )
+                                is ObjectiveComparison.BETTER
+                            ):
+                                best = shadow_candidate
+                                best_time = time.perf_counter() - started
+                        _update_weight(shadow_statistics, reward)
 
         temperature = initial_temperature * max(0.001, 1.0 - iteration / max_iterations)
-        accept = (
+        quality_candidate_is_worse = (
+            profile is OperatorProfile.STAGE02_ROUTE_QUALITY
+            and selected_neighborhood in _QUALITY_NEIGHBORHOODS
+            and candidate.objective is not None
+            and compare_objectives(candidate.objective, current.objective)
+            is ObjectiveComparison.WORSE
+        )
+        accept = False if quality_candidate_is_worse else (
             candidate.feasible
             and candidate.objective is not None
             and accept_annealing_move(
@@ -749,9 +871,11 @@ def _select_stage02_neighborhood(
     iteration: int,
     rng: random.Random,
     statistics: dict[str, OperatorStatistics],
+    *,
+    include_quality: bool = True,
 ) -> str:
     warmup: tuple[str, ...]
-    if "relocate" in statistics:
+    if include_quality and "relocate" in statistics:
         warmup = (
             "route_elimination",
             "vehicle_count_aware_repair",
@@ -766,7 +890,15 @@ def _select_stage02_neighborhood(
         warmup = ("route_elimination", "vehicle_count_aware_repair", "route_merge")
     if iteration < len(warmup):
         return warmup[iteration]
-    return _weighted_choice(rng, statistics)
+    if include_quality:
+        return _weighted_choice(rng, statistics)
+    legacy_names = (
+        "standard",
+        "vehicle_count_aware_repair",
+        "route_elimination",
+        "route_merge",
+    )
+    return _weighted_choice(rng, {name: statistics[name] for name in legacy_names})
 
 
 def _neighborhood_names(profile: OperatorProfile) -> tuple[str, ...]:
@@ -790,6 +922,55 @@ def _neighborhood_names(profile: OperatorProfile) -> tuple[str, ...]:
             "ejection_chain",
         )
     return ()
+
+
+def _quality_shadow_neighborhood(iteration: int) -> str:
+    return (
+        _QUALITY_NEIGHBORHOOD_ORDER[iteration]
+        if iteration < len(_QUALITY_NEIGHBORHOOD_ORDER)
+        else ""
+    )
+
+
+def _quality_shadow_proposal(
+    operator: str,
+    instance: Instance,
+    sequences: RouteSequences,
+    evaluator: _Evaluator,
+    config: VehicleOperatorConfig,
+) -> tuple[RouteSequences, tuple[NeighborhoodEvent, ...]]:
+    probe_budget = config.quality_probe_exact_evaluation_budget
+    probe_config = replace(
+        config,
+        relocate_exact_evaluation_budget=min(
+            config.relocate_exact_evaluation_budget, probe_budget
+        ),
+        swap_exact_evaluation_budget=min(config.swap_exact_evaluation_budget, probe_budget),
+        two_opt_star_exact_evaluation_budget=min(
+            config.two_opt_star_exact_evaluation_budget, probe_budget
+        ),
+        route_segment_exact_evaluation_budget=min(
+            config.route_segment_exact_evaluation_budget, probe_budget
+        ),
+        ejection_chain_exact_evaluation_budget=min(
+            config.ejection_chain_exact_evaluation_budget, probe_budget
+        ),
+    )
+    if operator == "relocate":
+        proposal = propose_relocate(instance, sequences, evaluator, config=probe_config)
+    elif operator == "swap":
+        proposal = propose_swap(instance, sequences, evaluator, config=probe_config)
+    elif operator == "two_opt_star":
+        proposal = propose_two_opt_star(instance, sequences, evaluator, config=probe_config)
+    elif operator == "route_segment_destroy":
+        proposal = propose_route_segment_destroy(
+            instance, sequences, evaluator, config=probe_config
+        )
+    elif operator == "ejection_chain":
+        proposal = propose_ejection_chain(instance, sequences, evaluator, config=probe_config)
+    else:
+        raise ValueError(f"unsupported Stage 2.2 shadow operator: {operator}")
+    return proposal.sequences or (), proposal.events
 
 
 def _record_neighborhood_proposal(

@@ -42,6 +42,7 @@ swap_exact_evaluation_budget = 48
 two_opt_star_exact_evaluation_budget = 32
 route_segment_exact_evaluation_budget = 32
 ejection_chain_exact_evaluation_budget = 24
+quality_probe_exact_evaluation_budget = 4
 route_segment_min_length = 2
 route_segment_max_length = 5
 ejection_chain_max_depth = 3
