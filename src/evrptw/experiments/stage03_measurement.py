@@ -553,6 +553,7 @@ def _run_environment(
         "run_end_utc": end.isoformat(),
         "peak_tracemalloc_bytes": peak_tracemalloc_bytes,
         "peak_rss_bytes": peak_rss_bytes,
+        "peak_rss_scope": "process_lifetime",
     }
 
 

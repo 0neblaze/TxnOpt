@@ -322,7 +322,7 @@ def review_run(
             "all Stage 3.0 acceptance gates",
         )
     )
-    recomputed_rows = [_recomputed_row(item, metadata, run_dir) for item in audited]
+    recomputed_rows = [_recomputed_row(item, metadata) for item in audited]
     summary_rows = _summarize(recomputed_rows)
     trace_rows = [_trace_row(item, label) for item in audited]
     deadline_rows = [item.deadline_row | {"run_label": label} for item in audited]
@@ -600,7 +600,7 @@ def _per_run_provenance(
         instance_path = benchmark_dir / f"{row['instance']}.txt"
         expected_reference = metadata.get("reference_repositories", {})
         checks = {
-            "environment_hash": _sha256(environment_path) == row["environment_sha256"],
+            "environment_hash": _payload_sha256(environment) == row["environment_sha256"],
             "instance_hash": _sha256(instance_path) == row["instance_sha256"]
             == environment.get("instance_sha256"),
             "repository_revision": environment.get("repository_revision")
@@ -724,14 +724,12 @@ def _compare_baselines(
 def _recomputed_row(
     item: _AuditedRun,
     metadata: dict[str, Any],
-    run_dir: Path,
 ) -> dict[str, Any]:
     raw = item.raw_row
     solver = item.solver_result
     environment = item.environment_payload
     reference_repositories = environment.get("reference_repositories", {})
     instance_path = Path(str(metadata["benchmark_directory"])) / f"{item.key[0]}.txt"
-    environment_path = run_dir / raw["environment_path"]
     solver_feasible = bool(getattr(solver, "feasible", False)) if solver is not None else False
     solver_metrics = {
         field: getattr(solver, field, "") if solver is not None else ""
@@ -766,7 +764,7 @@ def _recomputed_row(
             "configuration_sha256": environment.get("configuration_sha256", ""),
             "instance_sha256": _sha256(instance_path),
             "stage00_manifest_sha256": environment.get("stage00_manifest_sha256", ""),
-            "environment_sha256": _sha256(environment_path),
+            "environment_sha256": _payload_sha256(environment),
             "reference_vrp_evrp_hub_revision": reference_repositories.get(
                 "VRP-EVRP-Project-Hub", {}
             ).get("revision", ""),

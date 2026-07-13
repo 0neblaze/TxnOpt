@@ -8,6 +8,7 @@ import pytest
 import evrptw.experiments.stage03_measurement_review as stage03_review
 from evrptw.experiments.stage03_measurement import (
     SMOKE_INSTANCES,
+    _assert_results_path,
     _scope_instances,
     _write_manifest,
 )
@@ -24,6 +25,11 @@ def test_stage03_scope_is_exact_and_unique() -> None:
     assert len(SMOKE_INSTANCES) == len(set(SMOKE_INSTANCES))
     with pytest.raises(ValueError, match="scope"):
         _scope_instances("formal-ish")
+
+
+def test_stage03_output_path_cannot_escape_ignored_results(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="results/"):
+        _assert_results_path(tmp_path, tmp_path / "reference" / "run", "output_dir")
 
 
 @pytest.mark.parametrize("filename", ("raw.json", "solution.json", "trace.json", "event.jsonl"))
