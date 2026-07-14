@@ -1404,6 +1404,15 @@ def propose_route_elimination(
             profile.index,
         ),
     )
+    if bool(getattr(evaluator, "candidate_control_enabled", False)):
+        return _propose_controlled_route_elimination(
+            instance,
+            sequences,
+            evaluator,
+            ordered[: config.max_route_elimination_attempts],
+            config,
+            events,
+        )
     for rank, profile in enumerate(ordered[: config.max_route_elimination_attempts], start=1):
         partial = tuple(
             sequence for index, sequence in enumerate(sequences) if index != profile.index
@@ -1464,6 +1473,90 @@ def propose_route_elimination(
     return MoveProposal("route_elimination", None, tuple(events))
 
 
+def _propose_controlled_route_elimination(
+    instance: Instance,
+    sequences: RouteSequences,
+    evaluator: RouteEvaluator,
+    profiles: list[_RouteProfile],
+    config: VehicleOperatorConfig,
+    events: list[NeighborhoodEvent],
+) -> MoveProposal:
+    """Assemble every complete elimination plan before exact selection."""
+
+    plans: list[RouteSequences] = []
+    removed_by_plan: dict[RouteSequences, tuple[int, CustomerSequence]] = {}
+    for rank, profile in enumerate(profiles, start=1):
+        partial = tuple(
+            sequence for index, sequence in enumerate(sequences) if index != profile.index
+        )
+        repair = _candidate_control_repair_pass(
+            partial,
+            profile.sequence,
+            evaluator,
+            instance,
+            allow_new_routes=False,
+            route_change_limit=getattr(
+                evaluator,
+                "candidate_control_route_change_limit",
+                None,
+            ),
+        )
+        profile_plans = (repair.sequences,) if repair.sequences is not None else ()
+        feasible_plans = tuple(
+            plan for plan in profile_plans if len(plan) == len(sequences) - 1
+        )
+        if not feasible_plans:
+            events.append(
+                NeighborhoodEvent(
+                    "route_elimination",
+                    "failed",
+                    repair.failure_reason or "route_elimination_repair_failed",
+                    route_indices=(profile.index,),
+                    removed_customers=profile.sequence,
+                    selection_rank=rank,
+                )
+            )
+            continue
+        for plan in feasible_plans:
+            if plan in removed_by_plan:
+                continue
+            plans.append(plan)
+            removed_by_plan[plan] = (profile.index, profile.sequence)
+
+    selector = getattr(evaluator, "select_feasible_candidate_plan", None)
+    if not callable(selector):
+        raise RuntimeError("Stage 3.4 evaluator is missing complete plan selection")
+    before_calls = evaluator.calls
+    selected = cast(
+        RouteSequences | None,
+        selector(plans, current_sequences=sequences),
+    )
+    exact_calls = evaluator.calls - before_calls
+    if selected is None:
+        events.append(
+            NeighborhoodEvent(
+                "route_elimination",
+                "candidate_control_skipped",
+                "no_selected_complete_plan_feasible",
+                exact_route_evaluations=exact_calls,
+            )
+        )
+        return MoveProposal("route_elimination", None, tuple(events))
+    profile_index, removed = removed_by_plan[selected]
+    events.append(
+        NeighborhoodEvent(
+            "route_elimination",
+            "candidate_proposed",
+            "route_eliminated",
+            route_indices=(profile_index,),
+            removed_customers=removed,
+            candidate_vehicle_delta=-1,
+            candidate_feasible=True,
+            prefilter_passed=True,
+            exact_route_evaluations=exact_calls,
+        )
+    )
+    return MoveProposal("route_elimination", selected, tuple(events))
 def propose_route_merge(
     instance: Instance,
     sequences: RouteSequences,
@@ -1786,7 +1879,6 @@ def _controlled_merge_orders(
                 + target.sequence[position:],
                 source.sequence,
             )
-
     return tuple(output)
 
 
@@ -2645,12 +2737,16 @@ def _candidate_control_repair_pass(
     instance: Instance,
     *,
     allow_new_routes: bool,
+    route_change_limit: int | None = None,
 ) -> RepairResult:
     """Build one complete repair from safe bounds before any exact evaluation."""
 
     sequences = list(partial)
     pending = list(removed)
     new_routes = 0
+    changed_route_indices: set[int] = set()
+    if route_change_limit is not None and route_change_limit <= 0:
+        raise RuntimeError("Stage 3.4 repair requires a positive route-change limit")
     screening_counts: Counter[str] = Counter()
     screening_digest = hashlib.sha256()
 
@@ -2687,6 +2783,13 @@ def _candidate_control_repair_pass(
         ] = []
         for customer in pending:
             for route_index, base in enumerate(sequences):
+                if (
+                    route_change_limit is not None
+                    and
+                    route_index not in changed_route_indices
+                    and len(changed_route_indices) >= route_change_limit
+                ):
+                    continue
                 base_demand = sum(instance.by_name[name].demand for name in base)
                 if (
                     base_demand + instance.by_name[customer].demand
@@ -2709,6 +2812,7 @@ def _candidate_control_repair_pass(
         if options:
             _score, customer, route_index, _position, candidate = min(options)
             sequences[route_index] = candidate
+            changed_route_indices.add(route_index)
             pending.remove(customer)
             continue
         if not allow_new_routes:

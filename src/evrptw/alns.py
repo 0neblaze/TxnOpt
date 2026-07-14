@@ -20,6 +20,7 @@ from evrptw.cache_incremental import (
 from evrptw.candidate_control import (
     CandidateControlConfig,
     CandidateControlRuntime,
+    CandidatePlan,
 )
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
 from evrptw.cpu_batch import (
@@ -271,6 +272,9 @@ class _Evaluator:
         self.iteration: int | None = None
         self.operator = "initialization"
         self.cache: dict[tuple[str, ...], ChargingSubproblemResult] = {}
+        self.known_route_results: dict[
+            tuple[str, ...], ChargingSubproblemResult
+        ] = {}
         self.evaluated_routes: set[tuple[str, ...]] = set()
         self.evaluated_route_keys: set[tuple[str, tuple[str, ...]]] = set()
         self.calls = 0
@@ -417,6 +421,13 @@ class _Evaluator:
     def candidate_control_enabled(self) -> bool:
         return self.candidate_control_runtime is not None
 
+    @property
+    def candidate_control_route_change_limit(self) -> int | None:
+        runtime = self.candidate_control_runtime
+        if runtime is None:
+            return None
+        return runtime.config.max_exact_calls_per_round
+
     def candidate_route_batch(
         self,
         sequences: Sequence[tuple[str, ...]],
@@ -456,6 +467,88 @@ class _Evaluator:
                 "candidate_pool_hash": candidate_pool_hash,
             }
         )
+
+    def remember_incumbent(self, solution: _EvaluatedSolution) -> None:
+        """Retain only the current lane incumbent outside the bounded LRU."""
+
+        self.known_route_results = dict(
+            zip(solution.sequences, solution.charging, strict=True)
+        )
+
+    def select_feasible_candidate_plan(
+        self,
+        plans: Sequence[tuple[tuple[str, ...], ...]],
+        *,
+        current_sequences: tuple[tuple[str, ...], ...],
+    ) -> tuple[tuple[str, ...], ...] | None:
+        """Rank complete solution states and exact-evaluate selected plans atomically."""
+
+        runtime = self.candidate_control_runtime
+        if runtime is None:
+            raise RuntimeError("complete candidate-plan selection requires Stage 3.4")
+        current_set = set(current_sequences)
+        rankable: list[CandidatePlan] = []
+        for ordinal, sequences in enumerate(plans):
+            if len(sequences) > len(current_sequences):
+                runtime.events.append(
+                    {
+                        "event_type": "candidate_plan_decision",
+                        "status": "vehicle_increase_rejected",
+                        "lane": self.lane,
+                        "iteration": self.iteration,
+                        "operator": self.operator,
+                        "proposal_ordinal": ordinal,
+                        "vehicle_count": len(sequences),
+                    }
+                )
+                continue
+            screens = tuple(
+                screen_route_candidate(self.instance, sequence, full=True)
+                for sequence in sequences
+            )
+            if not all(screen.accepted for screen in screens):
+                continue
+            rankable.append(
+                CandidatePlan(
+                    candidate_id=ordinal,
+                    customer_sequences=sequences,
+                    vehicle_count=len(sequences),
+                    optimistic_total_distance=sum(
+                        screen.distance_lower_bound for screen in screens
+                    ),
+                    changed_route_count=sum(
+                        sequence not in current_set for sequence in sequences
+                    ),
+                    proposal_ordinal=ordinal,
+                )
+            )
+        selected = runtime.select_plans(
+            rankable,
+            lane=self.lane,
+            iteration=self.iteration or 0,
+            operator=self.operator,
+        )
+        best: _EvaluatedSolution | None = None
+        precomputed = {
+            sequence: self.known_route_results[sequence]
+            for sequence in current_sequences
+            if sequence in self.known_route_results
+        }
+        for plan in selected:
+            candidate = self.solution(
+                plan.customer_sequences,
+                precomputed_routes=precomputed,
+            )
+            if not candidate.feasible or candidate.objective is None:
+                continue
+            if (
+                best is None
+                or best.objective is None
+                or compare_objectives(candidate.objective, best.objective)
+                is ObjectiveComparison.BETTER
+            ):
+                best = candidate
+        return best.sequences if best is not None else None
 
     @property
     def cache_incremental_enabled(self) -> bool:
@@ -800,6 +893,14 @@ class _Evaluator:
             # Initial and newly created routes are changes relative to the
             # current candidate; never leave their Stage 3.2 status ambiguous.
             route_change_status = "changed"
+        if (
+            route_change_status == "unchanged"
+            and sequence in self.known_route_results
+        ):
+            return self._precomputed_route(
+                sequence,
+                self.known_route_results[sequence],
+            )
         if self.screening_config is not None:
             screen = self.screen(sequence, operator=self.operator)
             if not screen.accepted:
@@ -1119,6 +1220,16 @@ class _Evaluator:
             pending_set.clear()
 
         for index, sequence in enumerate(clean):
+            if (
+                route_change_status == "unchanged"
+                and sequence in self.known_route_results
+            ):
+                flush_pending()
+                resolved[index] = self._precomputed_route(
+                    sequence,
+                    self.known_route_results[sequence],
+                )
+                continue
             if self.screening_config is not None:
                 screen = self.screen(sequence, operator=self.operator)
                 if not screen.accepted:
@@ -1719,6 +1830,9 @@ def _solve_alns(
         )
     if current.objective is None:
         raise RuntimeError("feasible ALNS initial solution is missing its objective")
+    evaluator.remember_incumbent(current)
+    quality_evaluator.remember_incumbent(current)
+    constraint_evaluator.remember_incumbent(current)
 
     best = current
     quality_probe_current = current
@@ -2252,6 +2366,7 @@ def _solve_alns(
                             shadow_statistics.improved += 1
                             reward = 4.0
                         quality_probe_current = shadow_candidate
+                        quality_evaluator.remember_incumbent(quality_probe_current)
                         if (
                             quality_probe_best.objective is None
                             or compare_objectives(
@@ -2433,6 +2548,7 @@ def _solve_alns(
                 if lane_accept and constraint_candidate.objective is not None:
                     constraint_statistics.accepted += 1
                     constraint_lane_current = constraint_candidate
+                    constraint_evaluator.remember_incumbent(constraint_lane_current)
                     if lane_comparison is ObjectiveComparison.BETTER:
                         constraint_statistics.improved += 1
                     if (
@@ -2626,6 +2742,7 @@ def _solve_alns(
                 if repair_name:
                     repair_stats[repair_name].improved += 1
         current = candidate
+        evaluator.remember_incumbent(current)
         if best.objective is None:
             raise RuntimeError("feasible ALNS incumbent is missing its objective")
         if compare_objectives(candidate.objective, best.objective) is ObjectiveComparison.BETTER:

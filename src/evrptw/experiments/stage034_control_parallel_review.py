@@ -578,9 +578,7 @@ def _trajectory_hash(events: Sequence[Mapping[str, object]]) -> str:
         {
             key: event.get(key)
             for key in (
-                "lane_id",
                 "iteration",
-                "operator_id",
                 "status",
                 "accepted",
                 "global_best",
