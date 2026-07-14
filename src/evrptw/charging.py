@@ -76,7 +76,7 @@ def solve_exact_charging(
         path=(depot.name,),
     )
     labels: dict[tuple[int, str], list[ChargingLabel]] = {(0, depot.name): [initial]}
-    queue: list[_QueueEntry] = [_QueueEntry((0.0, initial.elapsed_time, 0), 0, initial)]
+    queue: list[_QueueEntry] = [_QueueEntry(_queue_priority(initial), 0, initial)]
     generated = 1
     expanded = 0
     pruned = 0
@@ -117,7 +117,7 @@ def solve_exact_charging(
             heapq.heappush(
                 queue,
                 _QueueEntry(
-                    (candidate.distance, candidate.elapsed_time, -candidate.progress),
+                    _queue_priority(candidate),
                     serial,
                     candidate,
                 ),
@@ -212,11 +212,39 @@ def _extend(
     origin = instance.by_name[label.node_name]
     distance = origin.distance_to(destination)
     energy = distance * instance.vehicle.consumption_rate
+    travel_time = distance / instance.vehicle.average_velocity
+    return _extend_with_transition(
+        instance,
+        label,
+        destination,
+        progress,
+        distance=distance,
+        energy=energy,
+        travel_time=travel_time,
+    )
+
+
+def _queue_priority(label: ChargingLabel) -> tuple[float, float, int]:
+    """Keep the scalar and batched label queue ordering identical."""
+
+    return (label.distance, label.elapsed_time, -label.progress)
+
+
+def _extend_with_transition(
+    instance: Instance,
+    label: ChargingLabel,
+    destination: Node,
+    progress: int,
+    *,
+    distance: float,
+    energy: float,
+    travel_time: float,
+) -> ChargingLabel | None:
     if energy > label.battery + _EPSILON:
         return None
 
     battery = max(0.0, label.battery - energy)
-    elapsed = label.elapsed_time + distance / instance.vehicle.average_velocity
+    elapsed = label.elapsed_time + travel_time
     elapsed = max(elapsed, destination.ready_time)
     if elapsed > destination.due_date + _EPSILON:
         return None

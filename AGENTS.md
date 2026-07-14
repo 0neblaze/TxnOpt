@@ -254,6 +254,30 @@ this repository or one of its subdirectories.
   interruptible exact solving, fixed-work/wall-clock diagnostics, or parallel
   evaluation.
 
+## Independent Apple Metal GPU Pilot Policy
+
+- `gpu_batch_pilot_attempt01` is an independent performance pilot. It is not
+  Stage 3.3, must not publish Stage 3.3 readiness, and must not rewrite Stage
+  3.0--3.2 evidence.
+- The pilot uses `c101C5`, `c101_21`, `r101_21`, and `rc101_21` with seeds
+  `2014/2015/2016`. Its CPU profiler gate must show an exact-charging median
+  time share of at least 50% for each 100-customer family before replay or
+  Metal execution is allowed.
+- `cpu_scalar`, `cpu_batch`, and `metal_batch` are explicit exact-charging
+  backends. CPU owns the label queue, dominance pruning, and path
+  reconstruction; Metal may only process transition arithmetic. Metal
+  unavailability, precision disagreement, and label-buffer overflow fail the
+  run without an implicit CPU fallback. `solve_alns()` remains CPU by default.
+- Replay and paired runs must use the same candidate-work manifest. The paired
+  ALNS mode uses 40 fixed iterations, one thread, disabled screening/cache, and
+  a 120-second watchdog. A candidate-work, exact-call, route-result, objective,
+  or iteration mismatch invalidates the pair and suppresses speedup claims.
+- Raw pilot evidence belongs under ignored `results/gpu_batch_pilot_attempt01/`.
+  `experiments/summaries/` may be written only by the independent pilot review
+  command. A positive result requires at least 10% median end-to-end saving for
+  the three 100-customer families and real improvement for at least two of the
+  three families; otherwise the result is reported as no-go.
+
 ## Experiment Artifact Storage v2
 
 - All new Stage 0–8 runs must use an enabled `[artifact_storage]` configuration

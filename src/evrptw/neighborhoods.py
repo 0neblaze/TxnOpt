@@ -641,6 +641,31 @@ def _route_with_status(
     return evaluator.route(sequence)
 
 
+def _route_batch_with_status(
+    evaluator: RouteEvaluator,
+    sequences: Iterable[CustomerSequence],
+    route_change_status: str,
+) -> tuple[ChargingSubproblemResult, ...]:
+    """Use the explicit batch seam when the evaluator provides one."""
+
+    ordered = tuple(sequences)
+    if not ordered:
+        return ()
+    route_batch = getattr(evaluator, "route_batch", None)
+    backend = getattr(evaluator, "backend", None)
+    backend_name = getattr(backend, "value", backend)
+    if callable(route_batch) and (
+        backend_name != "cpu_scalar"
+        or bool(getattr(evaluator, "batch_work_enabled", False))
+    ):
+        results = route_batch(ordered, route_change_status=route_change_status)
+        return tuple(cast(ChargingSubproblemResult, result) for result in results)
+    return tuple(
+        _route_with_status(evaluator, sequence, route_change_status)
+        for sequence in ordered
+    )
+
+
 def _legacy_screen_route_candidate(
     instance: Instance,
     sequence: CustomerSequence,
@@ -801,6 +826,14 @@ def propose_constraint_removal(
         anchor = random_source.choice(sorted(all_customers))
 
     try:
+        pending = [
+            sequence
+            for sequence in sequences
+            if precomputed_routes is None or sequence not in precomputed_routes
+        ]
+        pending_results = iter(
+            _route_batch_with_status(evaluator, pending, "unchanged")
+        )
         for route_index, sequence in enumerate(sequences):
             used_precomputed = (
                 precomputed_routes is not None and sequence in precomputed_routes
@@ -808,7 +841,7 @@ def propose_constraint_removal(
             result = (
                 precomputed_routes[sequence]
                 if precomputed_routes is not None and used_precomputed
-                else _route_with_status(evaluator, sequence, "unchanged")
+                else next(pending_results)
             )
             if not result.feasible:
                 events.append(
@@ -1299,8 +1332,8 @@ def propose_route_elimination(
 
     events: list[NeighborhoodEvent] = []
     profiles: list[_RouteProfile] = []
-    for index, sequence in enumerate(sequences):
-        result = _route_with_status(evaluator, sequence, "unchanged")
+    results = _route_batch_with_status(evaluator, sequences, "unchanged")
+    for index, (sequence, result) in enumerate(zip(sequences, results, strict=True)):
         if not result.feasible:
             events.append(
                 NeighborhoodEvent(
@@ -1414,10 +1447,14 @@ def propose_route_merge(
 
     profiles: list[_RouteProfile] = []
     events: list[NeighborhoodEvent] = []
-    for index, sequence in enumerate(sequences):
-        before_calls = evaluator.calls
-        result = _route_with_status(evaluator, sequence, "unchanged")
-        exact_delta = evaluator.calls - before_calls
+    profile_exact_deltas = [
+        0 if _is_cached_route(evaluator, sequence) else 1 for sequence in sequences
+    ]
+    profile_results = _route_batch_with_status(evaluator, sequences, "unchanged")
+    for index, (sequence, result) in enumerate(
+        zip(sequences, profile_results, strict=True)
+    ):
+        exact_delta = profile_exact_deltas[index]
         if not result.feasible:
             events.append(
                 NeighborhoodEvent(
@@ -2168,12 +2205,15 @@ def _evaluate_changed_candidate(
             True,
             0,
         )
-    results: list[ChargingSubproblemResult] = []
-    exact_evaluations = 0
-    for _, sequence in changes:
-        before_calls = evaluator.calls
-        results.append(_route_with_status(evaluator, sequence, "changed"))
-        exact_evaluations += evaluator.calls - before_calls
+    before_calls = evaluator.calls
+    results = list(
+        _route_batch_with_status(
+            evaluator,
+            (sequence for _, sequence in changes),
+            "changed",
+        )
+    )
+    exact_evaluations = evaluator.calls - before_calls
     if not all(result.feasible for result in results):
         reason = next(
             (
@@ -2215,10 +2255,30 @@ def _base_route_results(
     *,
     precomputed_routes: Mapping[CustomerSequence, ChargingSubproblemResult] | None = None,
 ) -> tuple[ChargingSubproblemResult, ...]:
+    backend = getattr(evaluator, "backend", None)
+    backend_name = getattr(backend, "value", backend)
+    if (
+        backend_name == "cpu_scalar"
+        and not bool(getattr(evaluator, "batch_work_enabled", False))
+    ) or not callable(
+        getattr(evaluator, "route_batch", None)
+    ):
+        return tuple(
+            precomputed_routes[sequence]
+            if precomputed_routes is not None and sequence in precomputed_routes
+            else evaluator.route(sequence)
+            for sequence in sequences
+        )
+    pending = [
+        sequence
+        for sequence in sequences
+        if precomputed_routes is None or sequence not in precomputed_routes
+    ]
+    pending_results = iter(_route_batch_with_status(evaluator, pending, "unchanged"))
     return tuple(
         precomputed_routes[sequence]
         if precomputed_routes is not None and sequence in precomputed_routes
-        else evaluator.route(sequence)
+        else next(pending_results)
         for sequence in sequences
     )
 

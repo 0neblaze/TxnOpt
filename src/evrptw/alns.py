@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import random
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, cast
@@ -18,6 +18,11 @@ from evrptw.cache_incremental import (
     incremental_route_propagation,
 )
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
+from evrptw.gpu_batch import (
+    BackendMetrics,
+    ExactChargingBackend,
+    solve_exact_charging_batch,
+)
 from evrptw.measurement import (
     CheapScreeningConfig,
     MeasurementConfig,
@@ -147,6 +152,12 @@ class ALNSResult:
     measurement_trace: Stage03Trace | None = None
     screening_statistics: dict[str, object] = field(default_factory=dict)
     cache_incremental_statistics: dict[str, object] = field(default_factory=dict)
+    charging_backend: str = ExactChargingBackend.CPU_SCALAR.value
+    batch_size: int = 128
+    backend_metrics: dict[str, object] = field(default_factory=dict)
+    termination_mode: str = "wall_clock"
+    watchdog_triggered: bool = False
+    candidate_work_hash: str = ""
 
     @property
     def objective_value(self) -> float:
@@ -173,6 +184,11 @@ class _Evaluator:
         negative_screening_cache: dict[str, ScreeningResult] | None = None,
         cache_incremental_config: CacheIncrementalConfig | None = None,
         route_cache: RouteEvaluationCache | None = None,
+        backend: ExactChargingBackend | str = ExactChargingBackend.CPU_SCALAR,
+        batch_size: int = 128,
+        label_buffer_capacity: int = 1_000_000,
+        disable_cache: bool = False,
+        batch_work_enabled: bool = False,
     ) -> None:
         self.instance = instance
         self.deadline = deadline
@@ -189,6 +205,18 @@ class _Evaluator:
             else None
         )
         self.route_cache = route_cache
+        if disable_cache and route_cache is not None:
+            raise ValueError("disable_cache cannot be combined with a Stage 3.2 route cache")
+        self.local_cache_enabled = not disable_cache
+        self.backend = ExactChargingBackend(backend)
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if label_buffer_capacity <= 0:
+            raise ValueError("label_buffer_capacity must be positive")
+        self.batch_size = batch_size
+        self.label_buffer_capacity = label_buffer_capacity
+        self.batch_work_enabled = batch_work_enabled
+        self.backend_metrics = BackendMetrics(self.backend.value, batch_size)
         self.reachability_index = (
             StationReachabilityIndex(instance)
             if self.cache_incremental_config is not None
@@ -208,6 +236,8 @@ class _Evaluator:
         self.iteration: int | None = None
         self.operator = "initialization"
         self.cache: dict[tuple[str, ...], ChargingSubproblemResult] = {}
+        self.evaluated_routes: set[tuple[str, ...]] = set()
+        self.evaluated_route_keys: set[tuple[str, tuple[str, ...]]] = set()
         self.calls = 0
         self.cache_hits = 0
         self.runtime = 0.0
@@ -263,6 +293,8 @@ class _Evaluator:
         return self.cache_incremental_config is not None and self.route_cache is not None
 
     def has_cached_route(self, sequence: tuple[str, ...]) -> bool:
+        if not self.local_cache_enabled:
+            return False
         if self.route_cache is not None:
             return self.route_cache.contains(sequence)
         return sequence in self.cache
@@ -568,7 +600,7 @@ class _Evaluator:
                         **fields,
                     )
                 return lookup.result
-        elif sequence in self.cache:
+        elif self.local_cache_enabled and sequence in self.cache:
             self.cache_hits += 1
             if self.measurement_trace is not None:
                 started = time.perf_counter()
@@ -593,7 +625,25 @@ class _Evaluator:
         else:
             started_offset = 0.0
         try:
-            result = solve_exact_charging(self.instance, sequence)
+            self.evaluated_routes.add(sequence)
+            self.evaluated_route_keys.add((self.lane, sequence))
+            if self.backend is ExactChargingBackend.CPU_SCALAR:
+                result = solve_exact_charging(self.instance, sequence)
+                self.backend_metrics.batch_launches += 1
+                self.backend_metrics.exact_calls += 1
+                self.backend_metrics.transitions += max(0, result.labels_generated - 1)
+                self.backend_metrics.total_seconds += result.runtime_seconds
+                self.backend_metrics.cpu_postprocess_seconds += result.runtime_seconds
+            else:
+                batch = solve_exact_charging_batch(
+                    self.instance,
+                    (sequence,),
+                    backend=self.backend,
+                    batch_size=self.batch_size,
+                    label_buffer_capacity=self.label_buffer_capacity,
+                )
+                result = batch.results[0]
+                self.backend_metrics.add(batch.metrics)
         except BaseException as error:
             if self.measurement_trace is not None:
                 self.measurement_trace.record_route_evaluation(
@@ -616,7 +666,7 @@ class _Evaluator:
                     route_change_status=route_change_status,
                 )
             raise
-        if self.route_cache is None:
+        if self.route_cache is None and self.local_cache_enabled:
             # Stage 0--3.1 retain their historical lane-local cache.  Stage
             # 3.2 has only the bounded RouteEvaluationCache so the memory cap
             # applies to every exact result held by the evaluator.
@@ -695,12 +745,21 @@ class _Evaluator:
         precomputed_routes: dict[tuple[str, ...], ChargingSubproblemResult] | None = None,
     ) -> _EvaluatedSolution:
         clean = tuple(sequence for sequence in sequences if sequence)
-        charging = tuple(
-            self._precomputed_route(sequence, precomputed_routes[sequence])
-            if precomputed_routes is not None and sequence in precomputed_routes
-            else self.route(sequence, route_change_status="changed")
-            for sequence in clean
-        )
+        if (
+            precomputed_routes is None
+            and self.backend is not ExactChargingBackend.CPU_SCALAR
+            and self.screening_config is None
+            and self.route_cache is None
+            and not self.local_cache_enabled
+        ):
+            charging = self.route_batch(clean, route_change_status="changed")
+        else:
+            charging = tuple(
+                self._precomputed_route(sequence, precomputed_routes[sequence])
+                if precomputed_routes is not None and sequence in precomputed_routes
+                else self.route(sequence, route_change_status="changed")
+                for sequence in clean
+            )
         feasible = bool(clean) and all(result.feasible for result in charging)
         if not feasible:
             return _EvaluatedSolution(clean, charging, False, None)
@@ -717,6 +776,76 @@ class _Evaluator:
             start=SolutionObjective.zero(),
         )
         return _EvaluatedSolution(clean, charging, True, objective)
+
+    def route_batch(
+        self,
+        sequences: Sequence[tuple[str, ...]],
+        *,
+        route_change_status: str = "changed",
+    ) -> tuple[ChargingSubproblemResult, ...]:
+        """Evaluate uncached routes as one deterministic backend work batch."""
+
+        clean = tuple(sequence for sequence in sequences if sequence)
+        if not clean:
+            return ()
+        if self.backend is ExactChargingBackend.CPU_SCALAR:
+            return tuple(
+                self.route(sequence, route_change_status=route_change_status)
+                for sequence in clean
+            )
+        if (
+            self.screening_config is not None
+            or self.route_cache is not None
+            or self.local_cache_enabled
+        ):
+            return tuple(
+                self.route(sequence, route_change_status=route_change_status)
+                for sequence in clean
+            )
+        if time.perf_counter() >= self.deadline:
+            raise _TimeLimitReached(clean[0])
+        batch_started = time.perf_counter()
+        batch = solve_exact_charging_batch(
+            self.instance,
+            clean,
+            backend=self.backend,
+            batch_size=self.batch_size,
+            label_buffer_capacity=self.label_buffer_capacity,
+        )
+        self.backend_metrics.add(batch.metrics)
+        self.calls += len(batch.results)
+        self.runtime += batch.metrics.total_seconds
+        self.labels_generated += sum(item.labels_generated for item in batch.results)
+        self.labels_pruned += sum(item.labels_pruned for item in batch.results)
+        self.evaluated_routes.update(clean)
+        self.evaluated_route_keys.update((self.lane, sequence) for sequence in clean)
+        batch_duration = batch.metrics.total_seconds
+        for index, (sequence, result) in enumerate(zip(clean, batch.results, strict=True)):
+            if self.measurement_trace is not None:
+                fields = route_result_fields(result)
+                allocated_start = self.measurement_trace._offset(
+                    batch_started + batch_duration * index / len(clean)
+                )
+                allocated_end = self.measurement_trace._offset(
+                    batch_started + batch_duration * (index + 1) / len(clean)
+                )
+                self.measurement_trace.record_route_evaluation(
+                    sequence,
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    kind="exact_call",
+                    started_at=allocated_start,
+                    completed_at=allocated_end,
+                    exact_started=True,
+                    exact_completed=True,
+                    cache_key_digest="",
+                    route_change_status=route_change_status,
+                    **fields,
+                )
+        if time.perf_counter() >= self.deadline:
+            raise _TimeLimitReached(clean[-1], exact_route_evaluations=len(clean))
+        return batch.results
 
     def _precomputed_route(
         self,
@@ -811,6 +940,11 @@ def _solve_alns(
     measurement_trace: Stage03Trace | None = None,
     screening_config: CheapScreeningConfig | None = None,
     cache_incremental_config: CacheIncrementalConfig | None = None,
+    backend: ExactChargingBackend | str = ExactChargingBackend.CPU_SCALAR,
+    batch_size: int = 128,
+    label_buffer_capacity: int = 1_000_000,
+    termination_mode: str = "wall_clock",
+    disable_cache: bool = False,
 ) -> ALNSResult:
     if max_iterations <= 0:
         raise ValueError("max_iterations must be positive")
@@ -818,6 +952,9 @@ def _solve_alns(
         raise ValueError("time_limit_seconds must be positive")
     if not 0.0 < removal_fraction <= 1.0:
         raise ValueError("removal_fraction must be in (0, 1]")
+    if termination_mode not in {"wall_clock", "fixed_work"}:
+        raise ValueError("termination_mode must be 'wall_clock' or 'fixed_work'")
+    batch_work_enabled = termination_mode == "fixed_work"
     profile = OperatorProfile(operator_profile)
     vehicle_config = vehicle_operator_config or VehicleOperatorConfig()
     cache_enabled = (
@@ -884,6 +1021,11 @@ def _solve_alns(
         negative_screening_cache=negative_screening_cache,
         cache_incremental_config=cache_incremental_config,
         route_cache=lane_route_caches[0],
+        backend=backend,
+        batch_size=batch_size,
+        label_buffer_capacity=label_buffer_capacity,
+        disable_cache=disable_cache,
+        batch_work_enabled=batch_work_enabled,
     )
     quality_evaluator = _Evaluator(
         instance,
@@ -895,6 +1037,11 @@ def _solve_alns(
         negative_screening_cache=negative_screening_cache,
         cache_incremental_config=cache_incremental_config,
         route_cache=lane_route_caches[1],
+        backend=backend,
+        batch_size=batch_size,
+        label_buffer_capacity=label_buffer_capacity,
+        disable_cache=disable_cache,
+        batch_work_enabled=batch_work_enabled,
     )
     # The constraint lane is the explicit slice after the legacy/quality lane,
     # not an unbounded second 30-second budget.  Spell out the endpoint so the
@@ -909,6 +1056,11 @@ def _solve_alns(
         negative_screening_cache=negative_screening_cache,
         cache_incremental_config=cache_incremental_config,
         route_cache=lane_route_caches[2],
+        backend=backend,
+        batch_size=batch_size,
+        label_buffer_capacity=label_buffer_capacity,
+        disable_cache=disable_cache,
+        batch_work_enabled=batch_work_enabled,
     )
     try:
         with evaluator.measurement_context(
@@ -921,6 +1073,7 @@ def _solve_alns(
             evaluator,
             "time limit reached during initial construction",
             operator_profile=profile.value,
+            termination_mode=termination_mode,
         )
     with evaluator.measurement_context(
         lane="initialization", iteration=None, operator="initial_solution"
@@ -932,6 +1085,7 @@ def _solve_alns(
             evaluator,
             "no feasible singleton initial solution",
             operator_profile=profile.value,
+            termination_mode=termination_mode,
         )
     if current.objective is None:
         raise RuntimeError("feasible ALNS initial solution is missing its objective")
@@ -973,9 +1127,11 @@ def _solve_alns(
     removal_tier_counts = {tier.value: 0 for tier in RemovalTier}
     initial_temperature = max(1.0, current.objective.total_distance * 0.05)
 
+    watchdog_triggered = False
     for iteration in range(max_iterations):
         elapsed = time.perf_counter() - started
         if elapsed >= time_limit_seconds:
+            watchdog_triggered = termination_mode == "fixed_work"
             break
         completed_iterations = iteration + 1
         destroy_name = ""
@@ -1886,6 +2042,9 @@ def _solve_alns(
         maximum_stagnation = max(maximum_stagnation, stagnation_iterations)
         effective_iterations += 1
 
+    if termination_mode == "fixed_work" and effective_iterations < max_iterations:
+        watchdog_triggered = True
+
     lane_evaluators = (evaluator, quality_evaluator, constraint_evaluator)
     routes = tuple(result.route for result in best.charging)
     report = validate_routes(instance, [list(route) for route in routes])
@@ -1942,7 +2101,12 @@ def _solve_alns(
         unique_route_evaluations=(
             _cache_statistics(lane_route_caches)["unique_route_evaluations"]
             if cache_enabled
-            else sum(len(item.cache) for item in lane_evaluators)
+            else sum(
+                len(item.cache)
+                if item.local_cache_enabled
+                else len(item.evaluated_route_keys)
+                for item in lane_evaluators
+            )
         ),
         effective_iterations=effective_iterations,
         removal_tier_counts=removal_tier_counts,
@@ -1958,6 +2122,11 @@ def _solve_alns(
             cache_incremental_config,
             lane_route_caches,
         ),
+        charging_backend=ExactChargingBackend(backend).value,
+        batch_size=batch_size,
+        backend_metrics=_aggregate_backend_metrics(lane_evaluators),
+        termination_mode=termination_mode,
+        watchdog_triggered=watchdog_triggered,
     )
 
 
@@ -1973,6 +2142,11 @@ def solve_alns(
     measurement_config: MeasurementConfig | None = None,
     screening_config: CheapScreeningConfig | None = None,
     cache_incremental_config: CacheIncrementalConfig | None = None,
+    backend: ExactChargingBackend | str = ExactChargingBackend.CPU_SCALAR,
+    batch_size: int = 128,
+    label_buffer_capacity: int = 1_000_000,
+    termination_mode: str = "wall_clock",
+    disable_cache: bool = False,
 ) -> ALNSResult:
     """Solve ALNS with opt-in Stage 3.0--3.2 evidence and evaluation layers."""
 
@@ -2004,6 +2178,11 @@ def solve_alns(
             vehicle_operator_config=vehicle_operator_config,
             screening_config=screening_config,
             cache_incremental_config=cache_incremental_config,
+            backend=backend,
+            batch_size=batch_size,
+            label_buffer_capacity=label_buffer_capacity,
+            termination_mode=termination_mode,
+            disable_cache=disable_cache,
         )
     trace_config = (
         measurement_config
@@ -2029,6 +2208,11 @@ def solve_alns(
             measurement_trace=trace,
             screening_config=screening_config,
             cache_incremental_config=cache_incremental_config,
+            backend=backend,
+            batch_size=batch_size,
+            label_buffer_capacity=label_buffer_capacity,
+            termination_mode=termination_mode,
+            disable_cache=disable_cache,
         )
     except BaseException as error:
         trace.record_execution_error(error)
@@ -2051,17 +2235,63 @@ def _construct_initial_solution(
         return _construct_large_initial_solution(instance, customers, evaluator)
     for customer in customers:
         best: tuple[float, int, tuple[str, ...]] | None = None
+        if (
+            evaluator.backend is ExactChargingBackend.CPU_SCALAR
+            and not evaluator.batch_work_enabled
+        ):
+            for route_index in range(len(sequences) + 1):
+                base = sequences[route_index] if route_index < len(sequences) else ()
+                for position in range(len(base) + 1):
+                    candidate = (*base[:position], customer.name, *base[position:])
+                    result = evaluator.route(candidate)
+                    if not result.feasible:
+                        continue
+                    old_distance = evaluator.route(base).distance if base else 0.0
+                    key = (result.distance - old_distance, route_index, candidate)
+                    if best is None or key < best:
+                        best = key
+            if best is None:
+                return ()
+            _, route_index, sequence = best
+            if route_index == len(sequences):
+                sequences.append(sequence)
+            else:
+                sequences[route_index] = sequence
+            continue
+        candidate_metadata: list[tuple[int, tuple[str, ...], tuple[str, ...]]] = []
         for route_index in range(len(sequences) + 1):
             base = sequences[route_index] if route_index < len(sequences) else ()
             for position in range(len(base) + 1):
                 candidate = (*base[:position], customer.name, *base[position:])
-                result = evaluator.route(candidate)
-                if not result.feasible:
-                    continue
-                old_distance = evaluator.route(base).distance if base else 0.0
-                key = (result.distance - old_distance, route_index, candidate)
-                if best is None or key < best:
-                    best = key
+                candidate_metadata.append((route_index, base, candidate))
+        candidate_results = evaluator.route_batch(
+            tuple(candidate for _, _, candidate in candidate_metadata),
+            route_change_status="changed",
+        )
+        nonempty_bases = [
+            (route_index, base)
+            for route_index, base, _ in candidate_metadata
+            if base and route_index < len(sequences)
+        ]
+        base_results = evaluator.route_batch(
+            tuple(base for _, base in nonempty_bases),
+            route_change_status="unchanged",
+        )
+        old_distances = {
+            route_index: result.distance
+            for (route_index, _), result in zip(nonempty_bases, base_results, strict=True)
+        }
+        for (route_index, _base, candidate), result in zip(
+            candidate_metadata,
+            candidate_results,
+            strict=True,
+        ):
+            if not result.feasible:
+                continue
+            old_distance = old_distances.get(route_index, 0.0)
+            key = (result.distance - old_distance, route_index, candidate)
+            if best is None or key < best:
+                best = key
         if best is None:
             return ()
         _, route_index, sequence = best
@@ -2112,10 +2342,35 @@ def _construct_sequential_initial_solution(
     sequences: list[tuple[str, ...]] = []
     current: tuple[str, ...] = ()
     for customer in customers:
+        if (
+            evaluator.backend is ExactChargingBackend.CPU_SCALAR
+            and not evaluator.batch_work_enabled
+        ):
+            scalar_candidates: list[tuple[float, tuple[str, ...]]] = []
+            for position in range(len(current) + 1):
+                candidate = (*current[:position], customer.name, *current[position:])
+                result = evaluator.route(candidate)
+                if result.feasible:
+                    scalar_candidates.append((result.distance, candidate))
+            if scalar_candidates:
+                current = min(scalar_candidates)[1]
+                continue
+            if current:
+                sequences.append(current)
+            current = (customer.name,)
+            if not evaluator.route(current).feasible:
+                return ()
+            continue
+        candidate_sequences = [
+            (*current[:position], customer.name, *current[position:])
+            for position in range(len(current) + 1)
+        ]
+        candidate_results = evaluator.route_batch(
+            tuple(candidate_sequences),
+            route_change_status="changed",
+        )
         candidates: list[tuple[float, tuple[str, ...]]] = []
-        for position in range(len(current) + 1):
-            candidate = (*current[:position], customer.name, *current[position:])
-            result = evaluator.route(candidate)
+        for candidate, result in zip(candidate_sequences, candidate_results, strict=True):
             if result.feasible:
                 candidates.append((result.distance, candidate))
         if candidates:
@@ -2124,7 +2379,7 @@ def _construct_sequential_initial_solution(
         if current:
             sequences.append(current)
         current = (customer.name,)
-        if not evaluator.route(current).feasible:
+        if not evaluator.route_batch((current,), route_change_status="changed")[0].feasible:
             return ()
     if current:
         sequences.append(current)
@@ -2232,21 +2487,64 @@ def _insertion_options(
     mode: str,
 ) -> list[tuple[float, int, tuple[str, ...]]]:
     options: list[tuple[float, int, tuple[str, ...]]] = []
+    if (
+        evaluator.backend is ExactChargingBackend.CPU_SCALAR
+        and not evaluator.batch_work_enabled
+    ):
+        for route_index in range(len(sequences) + 1):
+            base = sequences[route_index] if route_index < len(sequences) else ()
+            old = evaluator.route(base).distance if base else 0.0
+            for position in range(len(base) + 1):
+                candidate = (*base[:position], customer, *base[position:])
+                result = evaluator.route(candidate)
+                if not result.feasible:
+                    continue
+                score = result.distance - old
+                if mode == "energy":
+                    score += 0.05 * result.charged_energy
+                demand = sum(instance.by_name[name].demand for name in candidate)
+                if demand > instance.vehicle.load_capacity + 1e-9:
+                    continue
+                options.append((score, route_index, candidate))
+        return sorted(options)
+    base_entries = [
+        (route_index, base)
+        for route_index in range(len(sequences) + 1)
+        for base in (sequences[route_index] if route_index < len(sequences) else (),)
+        if base
+    ]
+    base_results = evaluator.route_batch(
+        tuple(base for _, base in base_entries),
+        route_change_status="unchanged",
+    )
+    old_distances = {
+        route_index: result.distance
+        for (route_index, _), result in zip(base_entries, base_results, strict=True)
+    }
+    candidate_metadata: list[tuple[int, tuple[str, ...], tuple[str, ...]]] = []
     for route_index in range(len(sequences) + 1):
         base = sequences[route_index] if route_index < len(sequences) else ()
-        old = evaluator.route(base).distance if base else 0.0
         for position in range(len(base) + 1):
             candidate = (*base[:position], customer, *base[position:])
-            result = evaluator.route(candidate)
-            if not result.feasible:
-                continue
-            score = result.distance - old
-            if mode == "energy":
-                score += 0.05 * result.charged_energy
-            demand = sum(instance.by_name[name].demand for name in candidate)
-            if demand > instance.vehicle.load_capacity + 1e-9:
-                continue
-            options.append((score, route_index, candidate))
+            candidate_metadata.append((route_index, base, candidate))
+    candidate_results = evaluator.route_batch(
+        tuple(candidate for _, _, candidate in candidate_metadata),
+        route_change_status="changed",
+    )
+    for (route_index, _, candidate), result in zip(
+        candidate_metadata,
+        candidate_results,
+        strict=True,
+    ):
+        if not result.feasible:
+            continue
+        score = result.distance - old_distances.get(route_index, 0.0)
+        if mode == "energy":
+            score += 0.05 * result.charged_energy
+        demand = sum(instance.by_name[name].demand for name in candidate)
+        if demand > instance.vehicle.load_capacity + 1e-9:
+            continue
+        options.append((score, route_index, candidate))
     return sorted(options)
 
 
@@ -2654,6 +2952,7 @@ def _failed_result(
     reason: str,
     *,
     operator_profile: str = OperatorProfile.BASELINE.value,
+    termination_mode: str = "wall_clock",
 ) -> ALNSResult:
     return ALNSResult(
         feasible=False,
@@ -2694,7 +2993,11 @@ def _failed_result(
         unique_route_evaluations=(
             _cache_statistics([evaluator.route_cache])["unique_route_evaluations"]
             if evaluator.cache_incremental_enabled
-            else len(evaluator.cache)
+            else (
+                len(evaluator.cache)
+                if evaluator.local_cache_enabled
+                else len(evaluator.evaluated_route_keys)
+            )
         ),
         effective_iterations=0,
         removal_tier_counts={tier.value: 0 for tier in RemovalTier},
@@ -2706,7 +3009,29 @@ def _failed_result(
             evaluator.cache_incremental_config,
             [evaluator.route_cache],
         ),
+        charging_backend=evaluator.backend.value,
+        batch_size=evaluator.batch_size,
+        backend_metrics=evaluator.backend_metrics.to_dict(),
+        termination_mode=termination_mode,
+        watchdog_triggered=termination_mode == "fixed_work",
     )
+
+
+def _aggregate_backend_metrics(
+    evaluators: tuple[_Evaluator, ...],
+) -> dict[str, object]:
+    if not evaluators:
+        return {}
+    backends = {evaluator.backend.value for evaluator in evaluators}
+    if len(backends) != 1:
+        raise RuntimeError(f"ALNS lanes used inconsistent charging backends: {backends}")
+    aggregate = BackendMetrics(
+        next(iter(backends)),
+        max(evaluator.batch_size for evaluator in evaluators),
+    )
+    for evaluator in evaluators:
+        aggregate.add(evaluator.backend_metrics)
+    return aggregate.to_dict()
 
 
 def _aggregate_screening_statistics(
