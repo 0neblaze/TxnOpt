@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import json
 import shutil
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,13 +12,13 @@ from typing import Any, cast
 
 from evrptw.cache_incremental import (
     RouteCacheKey,
-    StationReachabilityIndex,
     build_route_propagation_snapshot,
-    incremental_route_propagation,
 )
+from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES, FORMAL_SEEDS
 from evrptw.experiments.stage03_measurement import (
     OBJECTIVE_SCHEMA,
     RAW_PER_RUN_FIELDS,
+    SMOKE_INSTANCES,
     _assert_results_path,
     _combined_hash,
     _read_csv,
@@ -193,8 +193,10 @@ def review_run(
     cache_incremental_enabled = isinstance(cache_payload, dict) and bool(
         cache_payload.get("enabled", False)
     )
-    expected_instances = tuple(str(value) for value in metadata.get("expected_instances", ()))
-    expected_seeds = tuple(int(str(value)) for value in metadata.get("expected_seeds", ()))
+    expected_instances = (
+        tuple(SMOKE_INSTANCES) if scope == "smoke" else tuple(FORMAL_INSTANCES)
+    )
+    expected_seeds = tuple(FORMAL_SEEDS)
     expected_keys = {(instance, seed) for instance in expected_instances for seed in expected_seeds}
     label = review_label or str(metadata.get("run_label", run_dir.name))
     raw_rows = _read_csv(run_dir / "raw_per_run_results.csv")
@@ -724,6 +726,97 @@ def _screening_trace_ok(trace: Stage03Trace) -> bool:
     return True
 
 
+def _independent_station_reachability(instance: Any) -> dict[str, object]:
+    """Recompute optimistic depot/station bitsets without the production index."""
+
+    safe_nodes = (instance.depot, *instance.stations)
+    safe_index = {node.name: index for index, node in enumerate(safe_nodes)}
+    capacity = instance.vehicle.battery_capacity
+    rate = instance.vehicle.consumption_rate
+
+    def direct(left: Any, right: Any) -> bool:
+        return bool(left.distance_to(right) * rate <= capacity + 1e-9)
+
+    safe_bitsets: dict[str, int] = {}
+    for origin in safe_nodes:
+        mask = 0
+        frontier = [origin]
+        visited = {origin.name}
+        while frontier:
+            current = frontier.pop()
+            for destination in safe_nodes:
+                if destination.name in visited or not direct(current, destination):
+                    continue
+                visited.add(destination.name)
+                mask |= 1 << safe_index[destination.name]
+                frontier.append(destination)
+        mask |= 1 << safe_index[origin.name]
+        safe_bitsets[origin.name] = mask
+
+    origin_bitsets: dict[str, int] = {}
+    for origin in instance.nodes:
+        if origin.name in safe_bitsets:
+            origin_bitsets[origin.name] = safe_bitsets[origin.name]
+            continue
+        mask = sum(
+            1 << index
+            for index, destination in enumerate(safe_nodes)
+            if direct(origin, destination)
+        )
+        changed = True
+        while changed:
+            changed = False
+            for index, destination in enumerate(safe_nodes):
+                if mask & (1 << index):
+                    expanded = mask | safe_bitsets[destination.name]
+                    if expanded != mask:
+                        mask = expanded
+                        changed = True
+        origin_bitsets[origin.name] = mask
+    return {
+        "safe_nodes": [node.name for node in safe_nodes],
+        "bitsets": dict(sorted(safe_bitsets.items())),
+        "origin_bitsets": dict(sorted(origin_bitsets.items())),
+    }
+
+
+def _independent_energy_reachable(instance: Any, origin_name: str, destination_name: str) -> bool:
+    """Check the optimistic recharge frontier independently of the bitset index."""
+
+    by_name = instance.by_name
+    origin = by_name[origin_name]
+    destination = by_name[destination_name]
+    capacity = instance.vehicle.battery_capacity
+    rate = instance.vehicle.consumption_rate
+    safe_nodes = (instance.depot, *instance.stations)
+    safe_names = {node.name for node in safe_nodes}
+    frontier = [origin]
+    visited = {origin.name}
+    while frontier:
+        current = frontier.pop()
+        if current.distance_to(destination) * rate <= capacity + 1e-9:
+            return True
+        if current.name != origin.name and current.name not in safe_names:
+            continue
+        for safe_node in safe_nodes:
+            if safe_node.name in visited:
+                continue
+            if current.distance_to(safe_node) * rate <= capacity + 1e-9:
+                visited.add(safe_node.name)
+                frontier.append(safe_node)
+    return False
+
+
+def _cache_result_fingerprint(evaluation: Any) -> tuple[object, ...]:
+    return (
+        evaluation.feasible,
+        evaluation.failure_reason,
+        evaluation.labels_generated,
+        evaluation.labels_expanded,
+        evaluation.labels_pruned,
+    )
+
+
 def _cache_incremental_trace_ok(
     trace: Stage03Trace,
     instance: Any,
@@ -803,28 +896,78 @@ def _cache_incremental_trace_ok(
     ):
         return False
 
-    # A cache hit cannot be the first observation of a key.  If a key is exact
-    # evaluated again, the raw event log must show its eviction or an explicit
-    # oversize-not-cached decision in between.
-    exact_by_digest: dict[str, list[float]] = defaultdict(list)
+    # Replay the bounded LRU state independently.  This verifies that a hit
+    # has a preceding store, that an infeasible result is not silently changed
+    # between exact and hit, and that an exact re-evaluation is possible only
+    # after eviction or an oversize-not-cached decision.
+    exact_by_digest: defaultdict[str, list[Any]] = defaultdict(list)
+    hit_by_digest: defaultdict[str, list[Any]] = defaultdict(list)
     for evaluation in trace.route_evaluations:
-        if evaluation.kind == "exact_call":
-            exact_by_digest[evaluation.cache_key_digest].append(evaluation.started_at)
-    for digest, starts in exact_by_digest.items():
-        if len(starts) <= 1:
-            continue
-        for previous, current in zip(starts, starts[1:], strict=False):
-            lifecycle = [
-                event
-                for event in cache_events
-                if event.get("cache_key_digest") == digest
-                and previous
-                <= float(cast(Any, event.get("timestamp_seconds", 0.0)))
-                <= current
-                and event.get("operation") in {"evict", "oversize_not_cached"}
-            ]
-            if not lifecycle:
+        if evaluation.kind == "exact_call" and evaluation.exact_completed:
+            exact_by_digest[evaluation.cache_key_digest].append(evaluation)
+        elif evaluation.kind == "cache_hit":
+            hit_by_digest[evaluation.cache_key_digest].append(evaluation)
+    exact_cursor: defaultdict[str, int] = defaultdict(int)
+    cache_state: OrderedDict[str, tuple[Any, int]] = OrderedDict()
+    replayed_hits: defaultdict[str, list[tuple[object, ...]]] = defaultdict(list)
+    for event in cache_events:
+        operation = str(event.get("operation"))
+        digest = str(event.get("cache_key_digest", ""))
+        current_bytes = sum(entry[1] for entry in cache_state.values())
+        if operation == "lookup":
+            if _int_value(event.get("current_entries", -1)) != len(cache_state):
                 return False
+            if _int_value(event.get("current_bytes", -1)) != current_bytes:
+                return False
+            if digest in cache_state:
+                cache_state.move_to_end(digest)
+        elif operation == "miss":
+            if digest in cache_state:
+                return False
+        elif operation == "hit":
+            if digest not in cache_state:
+                return False
+            replayed_hits[digest].append(_cache_result_fingerprint(cache_state[digest][0]))
+            cache_state.move_to_end(digest)
+        elif operation == "evict":
+            if digest not in cache_state:
+                return False
+            del cache_state[digest]
+        elif operation == "oversize_not_cached":
+            if _int_value(event.get("entry_bytes", 0)) <= config.max_memory_bytes:
+                return False
+            if digest in cache_state:
+                return False
+        elif operation == "store":
+            if digest in cache_state:
+                return False
+            candidates = exact_by_digest[digest]
+            cursor = exact_cursor[digest]
+            if cursor >= len(candidates):
+                return False
+            exact_cursor[digest] += 1
+            entry_bytes = _int_value(event.get("entry_bytes", 0))
+            if entry_bytes <= 0 or entry_bytes > config.max_memory_bytes:
+                return False
+            cache_state[digest] = (candidates[cursor], entry_bytes)
+            if _int_value(event.get("current_entries", -1)) != len(cache_state):
+                return False
+            expected_bytes = sum(entry[1] for entry in cache_state.values())
+            if _int_value(event.get("current_bytes", -1)) != expected_bytes:
+                return False
+    if sum(exact_cursor.values()) != sum(
+        1 for event in cache_events if event.get("operation") == "store"
+    ):
+        return False
+    observed_hit_fingerprints = {
+        digest: [_cache_result_fingerprint(item) for item in values]
+        for digest, values in hit_by_digest.items()
+    }
+    if dict(replayed_hits) != observed_hit_fingerprints:
+        return False
+    expected_entries = int(expected.get("entries_current", len(cache_state)))
+    if len(cache_state) != expected_entries:
+        return False
 
     screening_by_lane_route: defaultdict[tuple[str, str], list[Any]] = defaultdict(list)
     for decision in trace.screening_decisions:
@@ -843,14 +986,40 @@ def _cache_incremental_trace_ok(
     expected_reachability = expected.get("station_reachability", {})
     if not isinstance(expected_reachability, dict):
         return False
-    independent_reachability = StationReachabilityIndex(instance).to_dict()
+    independent_reachability = _independent_station_reachability(instance)
     if (
         expected_reachability.get("safe_nodes")
         != independent_reachability.get("safe_nodes")
         or expected_reachability.get("bitsets")
         != independent_reachability.get("bitsets")
+        or (
+            "origin_bitsets" in expected_reachability
+            and expected_reachability.get("origin_bitsets")
+            != independent_reachability.get("origin_bitsets")
+        )
     ):
         return False
+    for decision in trace.screening_decisions:
+        energy_check = next(
+            (
+                check
+                for check in decision.checks
+                if check.check == "single_segment_battery_reachability"
+            ),
+            None,
+        )
+        if energy_check is None:
+            continue
+        sequence = trace.route_dictionary.get(decision.route_key)
+        if sequence is None:
+            return False
+        chain = (instance.depot.name, *sequence, instance.depot.name)
+        expected_energy = all(
+            _independent_energy_reachable(instance, left, right)
+            for left, right in zip(chain, chain[1:], strict=False)
+        )
+        if (energy_check.status == "pass") != expected_energy:
+            return False
     for record in trace.incremental_propagations:
         base_sequence = trace.route_dictionary.get(str(record.get("base_route_key", "")))
         candidate_sequence = trace.route_dictionary.get(
@@ -858,10 +1027,13 @@ def _cache_incremental_trace_ok(
         )
         if base_sequence is None or candidate_sequence is None:
             return False
-        base_snapshot = build_route_propagation_snapshot(instance, base_sequence)
-        independent = incremental_route_propagation(instance, base_snapshot, candidate_sequence)
         full = build_route_propagation_snapshot(instance, candidate_sequence)
-        if str(record.get("status")) != independent.status:
+        candidate_is_structurally_valid = (
+            all(name in instance.by_name for name in candidate_sequence)
+            and len(set(candidate_sequence)) == len(candidate_sequence)
+        )
+        expected_status = "incremental" if candidate_is_structurally_valid else "fallback"
+        if str(record.get("status")) != expected_status:
             return False
         for field_name in (
             "distance_lower_bound",
@@ -869,7 +1041,13 @@ def _cache_incremental_trace_ok(
             "finish_time",
         ):
             observed_value = float(cast(Any, record.get(field_name, 0.0)))
-            expected_value = float(getattr(independent, field_name))
+            expected_value = float(
+                getattr(full, {
+                    "distance_lower_bound": "total_distance",
+                    "min_time_window_slack": "min_time_window_slack",
+                    "finish_time": "finish_time",
+                }[field_name])
+            )
             if abs(observed_value - expected_value) > 1e-7:
                 return False
         if (

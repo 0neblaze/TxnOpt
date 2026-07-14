@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import resource
 import shutil
 import subprocess
@@ -280,6 +281,8 @@ def run_stage03(
         else:
             _require_smoke_gate(_resolve(root, smoke_review_dir) if smoke_review_dir else None)
     _validate_run_label(run_label)
+    if cache_incremental_enabled:
+        _validate_stage032_run_label(run_label)
     _assert_unique_run_label(root, run_label)
     _assert_clean_repository(root)
     if output_dir.exists():
@@ -320,6 +323,7 @@ def run_stage03(
         "time_limit_seconds": config.time_limit_seconds,
         "max_iterations": config.max_iterations,
         "threads": config.threads,
+        "objective_schema": OBJECTIVE_SCHEMA,
         "repository_revision": repository_revision,
         "repository_dirty": False,
         "algorithm_source_sha256": algorithm_source_sha256,
@@ -638,7 +642,17 @@ def _persist_run(
         },
     )
     _write_json(environment_path, environment_payload)
+    failure_evidence_reasons: list[str] = []
     if error is not None:
+        failure_evidence_reasons.append("execution_exception")
+    if status != "feasible":
+        failure_evidence_reasons.append(status)
+    if trace.deadline_events:
+        failure_evidence_reasons.append("deadline_boundary_observed")
+    if any(event.get("event_type") == "execution_error" for event in trace.events):
+        failure_evidence_reasons.append("trace_execution_error")
+    failure_evidence_required = bool(failure_evidence_reasons)
+    if failure_evidence_required:
         _write_json(
             failure_path,
             {
@@ -647,8 +661,10 @@ def _persist_run(
                 "run_label": run_label,
                 "instance": instance.name,
                 "seed": seed,
-                "error_type": type(error).__name__,
-                "failure_reason": str(error),
+                "error_type": type(error).__name__ if error is not None else "",
+                "failure_reason": failure_reason,
+                "evidence_reasons": failure_evidence_reasons,
+                "partial_trace": status != "feasible" or error is not None,
                 "trace_path": str(trace_path.relative_to(output_dir)),
                 "event_path": str(event_path.relative_to(output_dir)),
                 "environment_path": str(environment_path.relative_to(output_dir)),
@@ -738,7 +754,9 @@ def _persist_run(
         "feasible": feasible,
         "failure_reason": failure_reason,
         "failure_path": (
-            str(failure_path.relative_to(output_dir)) if error is not None else ""
+            str(failure_path.relative_to(output_dir))
+            if failure_evidence_required
+            else ""
         ),
         "raw_path": str(raw_path.relative_to(output_dir)),
         "solution_path": str(solution_path.relative_to(output_dir)),
@@ -800,6 +818,14 @@ def _run_environment(
         "peak_tracemalloc_bytes": peak_tracemalloc_bytes,
         "peak_rss_bytes": peak_rss_bytes,
         "peak_rss_scope": "process_lifetime",
+        "objective_schema_version": metadata.get("objective_schema", OBJECTIVE_SCHEMA),
+        "screening_config": metadata.get("screening_config"),
+        "cache_incremental_config": metadata.get("cache_incremental_config"),
+        "charging_configuration_version": (
+            (metadata.get("cache_incremental_config") or {}).get(
+                "charging_configuration_version", ""
+            )
+        ),
     }
 
 
@@ -1165,6 +1191,15 @@ def _write_manifest(directory: Path) -> None:
 def _validate_run_label(run_label: str) -> None:
     if not run_label or run_label in {".", ".."} or "/" in run_label or "\\" in run_label:
         raise ValueError("run_label must be a non-empty single path segment")
+
+
+def _validate_stage032_run_label(run_label: str) -> None:
+    if re.fullmatch(r"stage03\.2_cache_incremental_(?:attempt|rerun)[0-9]{2}", run_label) is None:
+        raise ValueError(
+            "Stage 3.2 run_label must match "
+            "stage03.2_cache_incremental_attemptNN or "
+            "stage03.2_cache_incremental_rerunNN"
+        )
 
 
 def _assert_unique_run_label(root: Path, run_label: str) -> None:

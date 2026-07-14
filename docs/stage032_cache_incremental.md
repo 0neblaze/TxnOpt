@@ -13,14 +13,16 @@ cache（缓存）与 incremental propagation（增量传播）层；`solve_alns`
   Stage 3.2 smoke review，以及 Stage 3.1 formal 的 raw manifest、sidecar 和 trusted
   review manifest；后者必须为 `READY_FOR_STAGE03_2`。
 - route cache（路线缓存）只在单次 `solve_alns` 内存在。默认是 4096 entries、64 MiB、
-  LRU；实际配置、instance hash、objective schema version 和 charging configuration
-  version 都写入 trace/result/environment evidence。
+  LRU；Stage 3.2 evaluator 不再保留第二份无界 exact-result 字典。实际配置、instance
+  hash、objective schema version 和 charging configuration version 都写入
+  trace/result/environment evidence。
 - cache key 由 `instance_hash`、ordered canonical customer sequence、charging
   configuration version/hash 和 `OBJECTIVE_SCHEMA_VERSION` 组成。feasible 与明确
   infeasible exact result 都可以缓存；screening rejection 不冒充 exact result。
-- station reachability 使用 depot/station safe-node bitset（位集）。relocate/swap
-  使用增量 distance、forward/backward time-window propagation；无法安全复用时返回
-  并记录 `fallback`，不静默降级。
+- station reachability 使用 depot/station safe-node bitset（位集），并为 customer
+  origin 保存可到达 safe-node closure；reviewer 通过独立 optimistic frontier 重算。
+  relocate/swap 使用增量 distance、forward/backward time-window propagation；无法安全
+  复用时返回并记录 `fallback`，不静默降级。
 - 不实现 Stage 3.3 的 interruptible exact solver、fixed-work/wall-clock diagnostic，
   也不实现 Stage 3.4 parallel evaluation。
 
@@ -55,7 +57,8 @@ results/stage03.2_cache_incremental_attemptNN/
 
 runner 只写 ignored `results/`。每个 run 同时记录 source/config/instance/environment
 hash、Stage 0 manifest hash、主仓库 revision/dirty、两个 reference repository 的
-revision/dirty、硬件和峰值 RSS。失败和 partial trace 保留，summary 不覆盖历史文件。
+revision/dirty、硬件和峰值 RSS。失败、partial trace 和 deadline boundary 都保留
+`failures/` evidence，summary 不覆盖历史文件。
 
 reviewer 的结论只来自 raw solution、raw trace、event log、environment 和 manifest。
 它会重算 validator/objective，检查 screening→cache→exact 顺序、cache digest 和

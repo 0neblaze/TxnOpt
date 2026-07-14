@@ -242,10 +242,17 @@ this repository or one of its subdirectories.
   claim.
 - Stage 3.1 is complete only when formal review reports
   `READY_FOR_STAGE03_2`. Stage 3.2 is opt-in and audits bounded route cache,
-  station-reachability bitsets, and relocate/swap incremental propagation;
-  its formal review must report `READY_FOR_STAGE03_3` before Stage 3.3. Stage
-  3.2 must not implement interruptible exact solving, fixed-work/wall-clock
-  diagnostics, or parallel evaluation.
+  station-reachability bitsets, and relocate/swap incremental propagation. The
+  only Stage 3.2 exact-result store is the configured process-local LRU; every
+  cache hit/miss/store/eviction and every changed/unchanged route status must be
+  auditable. Review recomputes station reachability and cache lifecycle
+  independently before trusting raw-to-summary reconciliation. Every Stage 3.2
+  runner label must match `stage03.2_cache_incremental_attemptNN` or
+  `stage03.2_cache_incremental_rerunNN`, and deadline/partial evidence is kept
+  under `failures/` without overwriting prior runs. Its formal review must
+  report `READY_FOR_STAGE03_3` before Stage 3.3. Stage 3.2 must not implement
+  interruptible exact solving, fixed-work/wall-clock diagnostics, or parallel
+  evaluation.
 
 ## Literature Recommendation Policy
 

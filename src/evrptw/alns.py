@@ -491,6 +491,10 @@ class _Evaluator:
         *,
         route_change_status: str = "unknown",
     ) -> ChargingSubproblemResult:
+        if self.cache_incremental_enabled and route_change_status == "unknown":
+            # Initial and newly created routes are changes relative to the
+            # current candidate; never leave their Stage 3.2 status ambiguous.
+            route_change_status = "changed"
         if self.screening_config is not None:
             screen = self.screen(sequence, operator=self.operator)
             if not screen.accepted:
@@ -545,7 +549,6 @@ class _Evaluator:
                     current_bytes=lookup.current_bytes,
                 )
             if lookup.hit and lookup.result is not None:
-                self.cache[sequence] = lookup.result
                 self.cache_hits += 1
                 if self.measurement_trace is not None:
                     started = time.perf_counter()
@@ -613,7 +616,11 @@ class _Evaluator:
                     route_change_status=route_change_status,
                 )
             raise
-        self.cache[sequence] = result
+        if self.route_cache is None:
+            # Stage 0--3.1 retain their historical lane-local cache.  Stage
+            # 3.2 has only the bounded RouteEvaluationCache so the memory cap
+            # applies to every exact result held by the evaluator.
+            self.cache[sequence] = result
         cache_key_digest = ""
         if self.route_cache is not None:
             store = self.route_cache.store(sequence, result)
@@ -759,6 +766,33 @@ class _Evaluator:
                 )
             raise _TimeLimitReached(sequence)
         return result
+
+
+def _unchanged_precomputed_routes(
+    evaluator: _Evaluator,
+    current: _EvaluatedSolution,
+    candidate_sequences: tuple[tuple[str, ...], ...],
+) -> dict[tuple[str, ...], ChargingSubproblemResult] | None:
+    """Reuse only routes that are unchanged in the Stage 3.2 candidate.
+
+    This helper is deliberately opt-in.  Historical Stage 0--3.1 paths keep
+    their lane-local evaluation behaviour, while Stage 3.2 never re-enters
+    exact charging for a route that survived an operator unchanged.
+    """
+
+    if not evaluator.cache_incremental_enabled:
+        return None
+    current_results = {
+        sequence: result
+        for sequence, result in zip(
+            current.sequences, current.charging, strict=True
+        )
+    }
+    return {
+        sequence: current_results[sequence]
+        for sequence in candidate_sequences
+        if sequence in current_results
+    }
 
 
 class _TimeLimitReached(RouteEvaluationDeadlineExceeded):
@@ -987,7 +1021,12 @@ def _solve_alns(
                 candidate_sequences = _repair(
                     partial, removed, repair_name, evaluator, instance, rng
                 )
-                candidate = evaluator.solution(candidate_sequences)
+                candidate = evaluator.solution(
+                    candidate_sequences,
+                    precomputed_routes=_unchanged_precomputed_routes(
+                        evaluator, current, candidate_sequences
+                    ),
+                )
             except _TimeLimitReached:
                 break
         else:
@@ -1159,7 +1198,12 @@ def _solve_alns(
                 evaluator.set_measurement_context(
                     lane="legacy", iteration=iteration, operator=selected_neighborhood
                 )
-                candidate = evaluator.solution(candidate_sequences)
+                candidate = evaluator.solution(
+                    candidate_sequences,
+                    precomputed_routes=_unchanged_precomputed_routes(
+                        evaluator, current, candidate_sequences
+                    ),
+                )
             except _TimeLimitReached as error:
                 timeout = _deadline_event(
                     selected_neighborhood,
@@ -1221,7 +1265,12 @@ def _solve_alns(
                         ),
                     )
                     if refinement.sequences is not None:
-                        refinement_candidate = evaluator.solution(refinement.sequences)
+                        refinement_candidate = evaluator.solution(
+                            refinement.sequences,
+                            precomputed_routes=_unchanged_precomputed_routes(
+                                evaluator, candidate_before_refinement, refinement.sequences
+                            ),
+                        )
                     else:
                         refinement_reason = refinement.failure_reason
                 except _TimeLimitReached:

@@ -808,7 +808,7 @@ def propose_constraint_removal(
             result = (
                 precomputed_routes[sequence]
                 if precomputed_routes is not None and used_precomputed
-                else evaluator.route(sequence)
+                else _route_with_status(evaluator, sequence, "unchanged")
             )
             if not result.feasible:
                 events.append(
@@ -1298,7 +1298,7 @@ def propose_route_elimination(
     events: list[NeighborhoodEvent] = []
     profiles: list[_RouteProfile] = []
     for index, sequence in enumerate(sequences):
-        result = evaluator.route(sequence)
+        result = _route_with_status(evaluator, sequence, "unchanged")
         if not result.feasible:
             events.append(
                 NeighborhoodEvent(
@@ -1414,7 +1414,7 @@ def propose_route_merge(
     events: list[NeighborhoodEvent] = []
     for index, sequence in enumerate(sequences):
         before_calls = evaluator.calls
-        result = evaluator.route(sequence)
+        result = _route_with_status(evaluator, sequence, "unchanged")
         exact_delta = evaluator.calls - before_calls
         if not result.feasible:
             events.append(
@@ -1500,7 +1500,7 @@ def propose_route_merge(
                     )
                     break
                 before_calls = evaluator.calls
-                result = evaluator.route(merged)
+                result = _route_with_status(evaluator, merged, "changed")
                 exact_delta = evaluator.calls - before_calls
                 exact_evaluations += exact_delta
                 if not result.feasible:
@@ -2357,7 +2357,7 @@ def _repair_pass(
             if evaluator.calls - before_calls >= budget:
                 raise _EvaluationBudgetExceeded
             singleton = (customer,)
-            result = evaluator.route(singleton)
+            result = _route_with_status(evaluator, singleton, "changed")
             if not result.feasible:
                 return RepairResult(
                     None,
@@ -2402,7 +2402,7 @@ def _insertion_options(
             candidate = (*base[:position], customer, *base[position:])
             if not _screen_with_evaluator(instance, evaluator, candidate).accepted:
                 continue
-            result = evaluator.route(candidate)
+            result = _route_with_status(evaluator, candidate, "changed")
             if not result.feasible:
                 continue
             options.append(
@@ -2443,14 +2443,16 @@ def _regret_insertion_options(
             continue
         if evaluator.calls - before_calls >= budget:
             raise _EvaluationBudgetExceeded
-        old_distance = evaluator.route(base).distance if base else 0.0
+        old_distance = (
+            _route_with_status(evaluator, base, "unchanged").distance if base else 0.0
+        )
         for position in range(len(base) + 1):
             if evaluator.calls - before_calls >= budget:
                 raise _EvaluationBudgetExceeded
             candidate = (*base[:position], customer, *base[position:])
             if not _screen_with_evaluator(instance, evaluator, candidate).accepted:
                 continue
-            result = evaluator.route(candidate)
+            result = _route_with_status(evaluator, candidate, "changed")
             if result.feasible:
                 options.append(
                     (

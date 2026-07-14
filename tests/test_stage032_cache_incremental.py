@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from evrptw.alns import solve_alns
 from evrptw.cache_incremental import (
     CacheIncrementalConfig,
@@ -12,6 +14,7 @@ from evrptw.cache_incremental import (
     incremental_route_propagation,
 )
 from evrptw.charging import ChargingSubproblemResult
+from evrptw.experiments.stage03_measurement import _validate_stage032_run_label
 from evrptw.measurement import CheapScreeningConfig, MeasurementConfig, Stage03Trace
 from evrptw.models import Instance, Node, NodeType, Vehicle
 
@@ -68,6 +71,14 @@ def test_route_cache_key_contains_instance_sequence_configuration_and_objective(
     ).make_key(("C1", "C2")).digest
 
 
+def test_stage032_runner_labels_are_canonical_and_non_overlapping() -> None:
+    _validate_stage032_run_label("stage03.2_cache_incremental_attempt01")
+    _validate_stage032_run_label("stage03.2_cache_incremental_rerun99")
+
+    with pytest.raises(ValueError):
+        _validate_stage032_run_label("stage032_cache_incremental_attempt01")
+
+
 def test_route_cache_reuses_feasible_and_infeasible_results() -> None:
     instance = _instance()
     cache = RouteEvaluationCache(
@@ -111,7 +122,8 @@ def test_station_reachability_bitset_matches_safe_frontier_example() -> None:
     index = StationReachabilityIndex(_instance(battery=4.0))
 
     assert index.can_reach("D0", "C3") is True
-    assert index.can_reach("C1", "C3") is False
+    assert index.can_reach("C1", "C3") is True
+    assert index.to_dict()["origin_bitsets"]["C1"] & 2
     assert index.bitset_for("D0") & 1
 
 
@@ -163,6 +175,11 @@ def test_stage032_solve_trace_round_trip_and_result_reconciliation() -> None:
     assert trace.trace_schema_version == "stage03-trace-v2"
     assert trace.cache_incremental_config is not None
     assert trace.cache_incremental_counts["cache_lookups"] > 0
+    assert trace.precomputed_routes > 0
+    assert all(
+        evaluation.route_change_status in {"changed", "unchanged"}
+        for evaluation in trace.route_evaluations
+    )
     assert trace.reconcile(result)["status"] == "pass"
 
     restored = Stage03Trace.from_dict(trace.to_dict())

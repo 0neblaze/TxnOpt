@@ -531,6 +531,7 @@ class StationReachabilityIndex:
         self.safe_nodes = (instance.depot, *instance.stations)
         self._safe_index = {node.name: index for index, node in enumerate(self.safe_nodes)}
         self._reachable_masks = self._build_masks()
+        self._origin_masks = self._build_origin_masks()
         self.queries = 0
 
     def _build_masks(self) -> dict[str, int]:
@@ -542,15 +543,49 @@ class StationReachabilityIndex:
             visited = {origin.name}
             while frontier:
                 current = frontier.pop()
-                for station in self.instance.stations:
-                    if station.name in visited:
+                for safe_node in self.safe_nodes:
+                    if safe_node.name in visited:
                         continue
-                    if current.distance_to(station) * self.instance.vehicle.consumption_rate <= (
+                    if current.distance_to(safe_node) * self.instance.vehicle.consumption_rate <= (
                         self.instance.vehicle.battery_capacity + self.epsilon
                     ):
-                        visited.add(station.name)
-                        masks[origin.name] |= 1 << self._safe_index[station.name]
-                        frontier.append(station)
+                        visited.add(safe_node.name)
+                        masks[origin.name] |= 1 << self._safe_index[safe_node.name]
+                        frontier.append(safe_node)
+        return masks
+
+    def _build_origin_masks(self) -> dict[str, int]:
+        """Build the optimistic safe-node frontier for every node.
+
+        The bitset itself stores only depot/station nodes, but a customer can
+        first reach a station and then continue through the station frontier.
+        Materialising that closure here keeps ``can_reach`` equivalent to the
+        independent optimistic frontier while retaining O(1) bit operations at
+        query time.
+        """
+
+        masks: dict[str, int] = {}
+        for origin in self.instance.nodes:
+            if origin.name in self._reachable_masks:
+                masks[origin.name] = self._reachable_masks[origin.name]
+                continue
+            initial = 0
+            for index, safe_node in enumerate(self.safe_nodes):
+                if origin.distance_to(safe_node) * self.instance.vehicle.consumption_rate <= (
+                    self.instance.vehicle.battery_capacity + self.epsilon
+                ):
+                    initial |= 1 << index
+            expanded = initial
+            changed = True
+            while changed:
+                changed = False
+                for index, safe_node in enumerate(self.safe_nodes):
+                    if expanded & (1 << index):
+                        new_bits = expanded | self._reachable_masks[safe_node.name]
+                        if new_bits != expanded:
+                            expanded = new_bits
+                            changed = True
+            masks[origin.name] = expanded
         return masks
 
     def bitset_for(self, origin_name: str) -> int:
@@ -563,15 +598,11 @@ class StationReachabilityIndex:
         by_name = self.instance.by_name
         origin = by_name[origin_name]
         destination = by_name[destination_name]
-        if origin_name not in self._safe_index:
-            return origin.distance_to(destination) * self.instance.vehicle.consumption_rate <= (
-                self.instance.vehicle.battery_capacity + self.epsilon
-            )
         if origin.distance_to(destination) * self.instance.vehicle.consumption_rate <= (
             self.instance.vehicle.battery_capacity + self.epsilon
         ):
             return True
-        mask = self.bitset_for(origin_name)
+        mask = self._origin_masks[origin_name]
         return any(
             mask & (1 << index)
             and node.distance_to(destination) * self.instance.vehicle.consumption_rate
@@ -583,5 +614,6 @@ class StationReachabilityIndex:
         return {
             "safe_nodes": [node.name for node in self.safe_nodes],
             "bitsets": {name: mask for name, mask in self._reachable_masks.items()},
+            "origin_bitsets": dict(sorted(self._origin_masks.items())),
             "queries": self.queries,
         }
