@@ -23,7 +23,10 @@ from evrptw.experiments.stage033_exact_deadline import (
     run_paired_diagnostic,
     validate_stage033_run_label,
 )
-from evrptw.experiments.stage033_exact_deadline_review import evaluate_stage033_gate
+from evrptw.experiments.stage033_exact_deadline_review import (
+    _no_cache_store_after_boundary,
+    evaluate_stage033_gate,
+)
 from evrptw.measurement import CheapScreeningConfig, MeasurementConfig, Stage03Trace
 from evrptw.models import Instance, Node, NodeType, Vehicle
 
@@ -261,6 +264,29 @@ def test_stage033_labels_and_scope_gate_are_canonical() -> None:
     assert gate["status"] == "READY_FOR_STAGE033_FORMAL"
     rows[0]["backend"] = "cpu_scalar"
     assert evaluate_stage033_gate(rows, scope="smoke")["status"] == "NOT_READY"
+
+
+def test_budget_boundary_uses_timestamped_candidate_state_as_acceptance_authority() -> None:
+    events = [
+        {"event_id": 1, "event_type": "exact_budget_boundary"},
+        {
+            "event_id": 2,
+            "record_type": "neighborhood_event",
+            "accepted": True,
+            "timestamp_seconds": None,
+        },
+    ]
+
+    assert _no_cache_store_after_boundary(events)
+    events.append(
+        {
+            "event_id": 3,
+            "record_type": "candidate_state",
+            "accepted": True,
+            "timestamp_seconds": 1.0,
+        }
+    )
+    assert not _no_cache_store_after_boundary(events)
 
 
 def test_stage033_paired_artifact_keeps_axes_and_backend_evidence(tmp_path: Path) -> None:

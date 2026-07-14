@@ -533,8 +533,13 @@ def _no_cache_store_after_boundary(events: Sequence[Mapping[str, object]]) -> bo
                 event.get("record_type") == "cache_event"
                 and event.get("operation") == "store"
             )
-            or bool(event.get("accepted"))
-            or bool(event.get("global_best"))
+            or (
+                event.get("record_type") == "candidate_state"
+                and (
+                    bool(event.get("accepted"))
+                    or bool(event.get("global_best"))
+                )
+            )
         )
         for event in events
     )
