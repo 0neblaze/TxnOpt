@@ -71,7 +71,7 @@
     "rc105C5"
   ],
   "legacy_path_map": "experiments/registries/stage03_legacy_path_map.csv",
-  "legacy_path_map_sha256": "a26a279ef31fe47572a6099507e11d5a94d738925f9d6d0c1545f2e2540f2ab6",
+  "legacy_path_map_sha256": "08c1a52d8c2fc1d5cf2b83d6d6182c75a310e10f67651cfa63beb5032ae7f444",
   "legacy_run_labels": [
     "stage031_cheap_screening_smoke01",
     "stage031_cheap_screening_smoke02",

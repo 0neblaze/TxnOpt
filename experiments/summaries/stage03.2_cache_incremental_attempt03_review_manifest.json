@@ -1,0 +1,22 @@
+{
+  "files": {
+    "baseline_comparison.csv": "5222aa4cac3b14572faf97ee6829c706a14447bb5b48a3b5e888f827a0a0ce6e",
+    "cache_incremental_statistics.csv": "3ec469979542ac4a78dfdf6fe1f725f728fc3f31aac8afd06eb9f0a474f8c6df",
+    "deadline_report.csv": "aba6df5404a16004afe279e1fb33157355882c942aaa7ffd57e80460432d2fd9",
+    "recomputed_per_run_results.csv": "6d81c869a30fed628850de9a1410ae4ad1958d14c66e47b30bfb2691d005023d",
+    "review_findings.csv": "e32a0230e89a844724830bfdd131d4b4372534634ca7b075e34e9068ea7011ad",
+    "review_report.md": "f976bd6aef3b3c7f0c5105253f3a2e1dc12363e14c18c66ee106b4ce1a46ebb2",
+    "screening_reason_statistics.csv": "38326aba5b45b4326eff7e52a607ef3e43ed715c2c30ccf174ccd7c9d34dcacc",
+    "stage03_formal_comparison.csv": "04093d5b58e04f2470d48e2c863b061aaa14d22037c0a28b696a843cf28777a9",
+    "stage03_readiness.csv": "1edb297f8658264a607d5b415f11c9c825b504f5af92414f2dee4efb8a89ab1c",
+    "summary_results.csv": "9cb0835762da50edc5f99ba7440e21702ab2169b108e7306b07cf10e7f6108d1",
+    "trace_reconciliation.csv": "195c7c73f5b61e07e5d11dc0be6fef1c355201ba24f21d6642b7b105ce31f304"
+  },
+  "finding_count": 14,
+  "manifest_payload_sha256": "a6bf8765e1e8b4b2ffa95e635cacb367d8d6878374d327a1d8191e424e345df2",
+  "review_label": "stage03.2_cache_incremental_attempt03",
+  "run_directory": "/Users/guoyiyang/Documents/GitHub/FURP-2026-Yiyang-GUO-EVRP-TW/results/stage03.2_cache_incremental_attempt03",
+  "schema_version": "stage03-review-v1",
+  "scope": "formal",
+  "status": "READY_FOR_STAGE03_3"
+}

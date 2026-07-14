@@ -1,9 +1,9 @@
 {
-  "artifact_count": 414,
+  "artifact_count": 1101,
   "artifact_filename_policy": "<stage_id>_<component>_<attempt_or_rerun>_<artifact_type>[_<instance>_<seed>].<ext>",
   "artifact_registry": "experiments/registries/stage03.2_artifact_registry.csv",
-  "artifact_registry_rows_sha256": "a53b4c8f6e34686b16292669407d34cc93517179d221f825cf6ec9f5b222ec99",
-  "artifact_registry_sha256": "c31e5a9e8d6a7c8ef1aed07c2f2f77993cfe469bcd044e747f8acbf1b41107f6",
+  "artifact_registry_rows_sha256": "063fd9bc82c4d7e4af6b82282332fbb2f9723ae69508e1902c7e727222f64b54",
+  "artifact_registry_sha256": "444893d3e1d31e34c7b0ed6028222f9bb4f2c8fd699363d9d4dea879fdac6260",
   "artifact_types": [
     "baseline_comparison",
     "cache_incremental_statistics",
@@ -11,6 +11,7 @@
     "deadline_report",
     "environment",
     "events",
+    "failure",
     "manifest",
     "manifest_checksum",
     "manifest_metadata",
@@ -33,7 +34,12 @@
   "canonical_run_labels": [
     "stage03.2_cache_incremental_attempt01",
     "stage03.2_cache_incremental_attempt02",
-    "stage03.2_cache_incremental_rerun01"
+    "stage03.2_cache_incremental_attempt03",
+    "stage03.2_cache_incremental_rerun01",
+    "stage03.2_cache_incremental_rerun02",
+    "stage03.2_cache_incremental_rerun03",
+    "stage03.2_cache_incremental_rerun04",
+    "stage03.2_cache_incremental_rerun05"
   ],
   "checks": {
     "artifact_type_check": true,
@@ -72,11 +78,16 @@
     "rc105C5"
   ],
   "legacy_path_map": "experiments/registries/stage03_legacy_path_map.csv",
-  "legacy_path_map_sha256": "a26a279ef31fe47572a6099507e11d5a94d738925f9d6d0c1545f2e2540f2ab6",
+  "legacy_path_map_sha256": "08c1a52d8c2fc1d5cf2b83d6d6182c75a310e10f67651cfa63beb5032ae7f444",
   "legacy_run_labels": [
     "stage03.2_cache_incremental_attempt01",
     "stage03.2_cache_incremental_attempt02",
-    "stage03.2_cache_incremental_rerun01"
+    "stage03.2_cache_incremental_attempt03",
+    "stage03.2_cache_incremental_rerun01",
+    "stage03.2_cache_incremental_rerun02",
+    "stage03.2_cache_incremental_rerun03",
+    "stage03.2_cache_incremental_rerun04",
+    "stage03.2_cache_incremental_rerun05"
   ],
   "logical_directory_policy": "results/<run_label>/<instance>/<seed>/",
   "migration_mode": "retrospective_registry_only",
@@ -162,6 +173,45 @@
       "validator_status": "pass"
     },
     {
+      "attempt_or_rerun": "attempt03",
+      "canonical_run_label": "stage03.2_cache_incremental_attempt03",
+      "failure_reason": "",
+      "instance_scope": [
+        "c101C5",
+        "r105C5",
+        "rc105C5",
+        "c104C10",
+        "r103C10",
+        "rc102C10",
+        "c106C15",
+        "r105C15",
+        "rc103C15",
+        "c101_21",
+        "r101_21",
+        "rc101_21"
+      ],
+      "legacy_path": "results/stage03.2_cache_incremental_attempt03",
+      "legacy_run_label": "stage03.2_cache_incremental_attempt03",
+      "raw_manifest_errors": [],
+      "raw_manifest_status": "pass",
+      "raw_review_status": "READY_FOR_STAGE03_3",
+      "raw_to_summary_errors": [],
+      "raw_to_summary_status": "pass",
+      "review_manifest_errors": [],
+      "review_manifest_status": "pass",
+      "review_status": "READY_FOR_STAGE03_3",
+      "run_label": "stage03.2_cache_incremental_attempt03",
+      "run_status": "feasible",
+      "scope": "formal",
+      "seed_scope": [
+        2014,
+        2015,
+        2016
+      ],
+      "trusted_review_status": "READY_FOR_STAGE03_3",
+      "validator_status": "pass"
+    },
+    {
       "attempt_or_rerun": "rerun01",
       "canonical_run_label": "stage03.2_cache_incremental_rerun01",
       "failure_reason": "",
@@ -193,6 +243,138 @@
       ],
       "trusted_review_status": "not_applicable",
       "validator_status": "pass"
+    },
+    {
+      "attempt_or_rerun": "rerun02",
+      "canonical_run_label": "stage03.2_cache_incremental_rerun02",
+      "failure_reason": "",
+      "instance_scope": [
+        "c101C5",
+        "r105C5",
+        "rc105C5",
+        "c101_21",
+        "r101_21",
+        "rc101_21"
+      ],
+      "legacy_path": "results/stage03.2_cache_incremental_rerun02",
+      "legacy_run_label": "stage03.2_cache_incremental_rerun02",
+      "raw_manifest_errors": [],
+      "raw_manifest_status": "pass",
+      "raw_review_status": "NOT_READY_FOR_STAGE032_FORMAL_MEASUREMENT",
+      "raw_to_summary_errors": [],
+      "raw_to_summary_status": "not_published",
+      "review_manifest_errors": [],
+      "review_manifest_status": "pass",
+      "review_status": "NOT_READY_FOR_STAGE032_FORMAL_MEASUREMENT",
+      "run_label": "stage03.2_cache_incremental_rerun02",
+      "run_status": "feasible",
+      "scope": "smoke",
+      "seed_scope": [
+        2014,
+        2015,
+        2016
+      ],
+      "trusted_review_status": "not_applicable",
+      "validator_status": "not_verified"
+    },
+    {
+      "attempt_or_rerun": "rerun03",
+      "canonical_run_label": "stage03.2_cache_incremental_rerun03",
+      "failure_reason": "",
+      "instance_scope": [
+        "c101C5",
+        "r105C5",
+        "rc105C5",
+        "c101_21",
+        "r101_21",
+        "rc101_21"
+      ],
+      "legacy_path": "results/stage03.2_cache_incremental_rerun03",
+      "legacy_run_label": "stage03.2_cache_incremental_rerun03",
+      "raw_manifest_errors": [],
+      "raw_manifest_status": "pass",
+      "raw_review_status": "NOT_READY_FOR_STAGE032_FORMAL_MEASUREMENT",
+      "raw_to_summary_errors": [],
+      "raw_to_summary_status": "not_published",
+      "review_manifest_errors": [],
+      "review_manifest_status": "pass",
+      "review_status": "NOT_READY_FOR_STAGE032_FORMAL_MEASUREMENT",
+      "run_label": "stage03.2_cache_incremental_rerun03",
+      "run_status": "feasible",
+      "scope": "smoke",
+      "seed_scope": [
+        2014,
+        2015,
+        2016
+      ],
+      "trusted_review_status": "not_applicable",
+      "validator_status": "not_verified"
+    },
+    {
+      "attempt_or_rerun": "rerun04",
+      "canonical_run_label": "stage03.2_cache_incremental_rerun04",
+      "failure_reason": "",
+      "instance_scope": [
+        "c101C5",
+        "r105C5",
+        "rc105C5",
+        "c101_21",
+        "r101_21",
+        "rc101_21"
+      ],
+      "legacy_path": "results/stage03.2_cache_incremental_rerun04",
+      "legacy_run_label": "stage03.2_cache_incremental_rerun04",
+      "raw_manifest_errors": [],
+      "raw_manifest_status": "pass",
+      "raw_review_status": "NOT_READY_FOR_STAGE032_FORMAL_MEASUREMENT",
+      "raw_to_summary_errors": [],
+      "raw_to_summary_status": "not_published",
+      "review_manifest_errors": [],
+      "review_manifest_status": "pass",
+      "review_status": "NOT_READY_FOR_STAGE032_FORMAL_MEASUREMENT",
+      "run_label": "stage03.2_cache_incremental_rerun04",
+      "run_status": "feasible",
+      "scope": "smoke",
+      "seed_scope": [
+        2014,
+        2015,
+        2016
+      ],
+      "trusted_review_status": "not_applicable",
+      "validator_status": "not_verified"
+    },
+    {
+      "attempt_or_rerun": "rerun05",
+      "canonical_run_label": "stage03.2_cache_incremental_rerun05",
+      "failure_reason": "",
+      "instance_scope": [
+        "c101C5",
+        "r105C5",
+        "rc105C5",
+        "c101_21",
+        "r101_21",
+        "rc101_21"
+      ],
+      "legacy_path": "results/stage03.2_cache_incremental_rerun05",
+      "legacy_run_label": "stage03.2_cache_incremental_rerun05",
+      "raw_manifest_errors": [],
+      "raw_manifest_status": "pass",
+      "raw_review_status": "READY_FOR_STAGE032_FORMAL_MEASUREMENT",
+      "raw_to_summary_errors": [],
+      "raw_to_summary_status": "not_published",
+      "review_manifest_errors": [],
+      "review_manifest_status": "pass",
+      "review_status": "READY_FOR_STAGE032_FORMAL_MEASUREMENT",
+      "run_label": "stage03.2_cache_incremental_rerun05",
+      "run_status": "feasible",
+      "scope": "smoke",
+      "seed_scope": [
+        2014,
+        2015,
+        2016
+      ],
+      "trusted_review_status": "not_applicable",
+      "validator_status": "pass"
     }
   ],
   "schema_version": "stage03-artifact-migration-v1",
@@ -203,7 +385,7 @@
   ],
   "solver_rerun_performed": false,
   "stage_id": "stage03.2",
-  "trusted_formal_review": "experiments/summaries/stage03.2_cache_incremental_attempt02_review_manifest.json",
+  "trusted_formal_review": "experiments/summaries/stage03.2_cache_incremental_attempt03_review_manifest.json",
   "trusted_formal_review_errors": [],
   "trusted_formal_review_status": "READY_FOR_STAGE03_3"
 }
