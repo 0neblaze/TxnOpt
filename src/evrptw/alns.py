@@ -17,6 +17,10 @@ from evrptw.cache_incremental import (
     canonical_instance_hash,
     incremental_route_propagation,
 )
+from evrptw.candidate_control import (
+    CandidateControlConfig,
+    CandidateControlRuntime,
+)
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
 from evrptw.cpu_batch import (
     BackendMetrics,
@@ -69,6 +73,7 @@ from evrptw.validation import validate_routes
 __all__ = (
     "ALNSResult",
     "CacheIncrementalConfig",
+    "CandidateControlConfig",
     "CheapScreeningConfig",
     "ExactDeadlineConfig",
     "MeasurementConfig",
@@ -166,6 +171,9 @@ class ALNSResult:
     exact_budget_exhaustions: int = 0
     termination_reason: str = ""
     exact_deadline_statistics: dict[str, object] = field(default_factory=dict)
+    candidate_control_statistics: dict[str, object] = field(default_factory=dict)
+    candidate_work_hash: str = ""
+    route_result_hash: str = ""
 
     @property
     def objective_value(self) -> float:
@@ -178,6 +186,22 @@ class _EvaluatedSolution:
     charging: tuple[ChargingSubproblemResult, ...]
     feasible: bool
     objective: SolutionObjective | None
+
+
+def _candidate_control_skip_result(reason: str) -> ChargingSubproblemResult:
+    return ChargingSubproblemResult(
+        False,
+        (),
+        float("inf"),
+        0.0,
+        0.0,
+        0.0,
+        0,
+        0,
+        0,
+        0.0,
+        f"candidate_control:{reason}",
+    )
 
 
 class _Evaluator:
@@ -197,6 +221,7 @@ class _Evaluator:
         disable_cache: bool = False,
         batch_work_enabled: bool = False,
         exact_call_controller: ExactCallController | None = None,
+        candidate_control_runtime: CandidateControlRuntime | None = None,
     ) -> None:
         self.instance = instance
         self.deadline = deadline
@@ -222,6 +247,7 @@ class _Evaluator:
         self.batch_size = batch_size
         self.batch_work_enabled = batch_work_enabled
         self.exact_call_controller = exact_call_controller
+        self.candidate_control_runtime = candidate_control_runtime
         self.pending_candidate_cache: dict[
             tuple[str, ...], ChargingSubproblemResult
         ] = {}
@@ -386,6 +412,22 @@ class _Evaluator:
     @property
     def screening_enabled(self) -> bool:
         return self.screening_config is not None
+
+    @property
+    def candidate_control_enabled(self) -> bool:
+        return self.candidate_control_runtime is not None
+
+    def candidate_route_batch(
+        self,
+        sequences: Sequence[tuple[str, ...]],
+        *,
+        route_change_status: str = "changed",
+    ) -> tuple[ChargingSubproblemResult, ...]:
+        return self.route_batch(
+            sequences,
+            route_change_status=route_change_status,
+            candidate_pool=True,
+        )
 
     @property
     def cache_incremental_enabled(self) -> bool:
@@ -752,6 +794,14 @@ class _Evaluator:
         )
         if cached is not None:
             return cached
+        if self.candidate_control_runtime is not None:
+            granted = self.candidate_control_runtime.reserve(
+                1,
+                atomic=True,
+                context=f"{self.lane}:{self.operator}:single_route",
+            )
+            if granted == 0:
+                return _candidate_control_skip_result("round_budget_exhausted")
         reservation = (
             self.exact_call_controller.reserve(1)
             if self.exact_call_controller is not None
@@ -778,12 +828,24 @@ class _Evaluator:
                 self.backend_metrics.total_seconds += result.runtime_seconds
                 self.backend_metrics.label_management_seconds += result.runtime_seconds
             else:
-                batch = solve_exact_charging_batch(
-                    self.instance,
-                    (sequence,),
-                    backend=self.backend,
-                    batch_size=self.batch_size,
-                    deadline=self.deadline,
+                batch = (
+                    self.candidate_control_runtime.solve_batch(
+                        self.instance,
+                        (sequence,),
+                        batch_size=self.batch_size,
+                        deadline=self.deadline,
+                        lane=self.lane,
+                        iteration=self.iteration,
+                        operator=self.operator,
+                    )
+                    if self.candidate_control_runtime is not None
+                    else solve_exact_charging_batch(
+                        self.instance,
+                        (sequence,),
+                        backend=self.backend,
+                        batch_size=self.batch_size,
+                        deadline=self.deadline,
+                    )
                 )
                 result = batch.results[0]
                 self.backend_metrics.add(batch.metrics)
@@ -928,6 +990,19 @@ class _Evaluator:
             and self.backend is not ExactChargingBackend.CPU_SCALAR
         ):
             charging = self.route_batch(clean, route_change_status="changed")
+        elif precomputed_routes is not None and self.candidate_control_runtime is not None:
+            missing = tuple(
+                sequence for sequence in clean if sequence not in precomputed_routes
+            )
+            missing_results = iter(
+                self.route_batch(missing, route_change_status="changed")
+            )
+            charging = tuple(
+                self._precomputed_route(sequence, precomputed_routes[sequence])
+                if sequence in precomputed_routes
+                else next(missing_results)
+                for sequence in clean
+            )
         else:
             charging = tuple(
                 self._precomputed_route(sequence, precomputed_routes[sequence])
@@ -975,12 +1050,18 @@ class _Evaluator:
         sequences: Sequence[tuple[str, ...]],
         *,
         route_change_status: str = "changed",
+        candidate_pool: bool = False,
     ) -> tuple[ChargingSubproblemResult, ...]:
         """Evaluate ordered routes while batching CPU cache misses."""
 
         clean = tuple(sequence for sequence in sequences if sequence)
         if not clean:
             return ()
+        if self.candidate_control_runtime is not None and candidate_pool:
+            return self._controlled_candidate_route_batch(
+                clean,
+                route_change_status=route_change_status,
+            )
         if self.backend is ExactChargingBackend.CPU_SCALAR or len(clean) == 1:
             return tuple(
                 self.route(sequence, route_change_status=route_change_status)
@@ -1048,15 +1129,119 @@ class _Evaluator:
             raise RuntimeError("CPU batch lost a cached route result")
         return completed
 
+    def _controlled_candidate_route_batch(
+        self,
+        clean: tuple[tuple[str, ...], ...],
+        *,
+        route_change_status: str,
+    ) -> tuple[ChargingSubproblemResult, ...]:
+        runtime = self.candidate_control_runtime
+        if runtime is None:
+            raise RuntimeError("controlled route batch requires Stage 3.4 runtime")
+        resolved: list[ChargingSubproblemResult | None] = [None] * len(clean)
+        rankable: list[tuple[int, tuple[str, ...], float]] = []
+        for index, sequence in enumerate(clean):
+            lower_bound = 0.0
+            if self.screening_config is not None:
+                screen = self.screen(sequence, operator=self.operator)
+                lower_bound = screen.distance_lower_bound
+                if not screen.accepted:
+                    resolved[index] = _candidate_control_skip_result(
+                        f"screening_rejected:{screen.reason}"
+                    )
+                    continue
+            cached, _ = self._lookup_cached_result(sequence, route_change_status)
+            if cached is not None:
+                resolved[index] = cached
+                continue
+            rankable.append((index, sequence, lower_bound))
+        selected = runtime.select_route_candidates(
+            rankable,
+            lane=self.lane,
+            iteration=self.iteration,
+            operator=self.operator,
+        )
+        granted = runtime.reserve(
+            len(selected),
+            atomic=False,
+            context=f"{self.lane}:{self.operator}:candidate_pool",
+        )
+        active_indices = selected[:granted]
+        active_sequences = tuple(clean[index] for index in active_indices)
+        if active_sequences:
+            active_results = self._solve_uncached_batch(
+                active_sequences,
+                route_change_status,
+                candidate_control_reserved=True,
+            )
+            for index, result in zip(active_indices, active_results, strict=True):
+                resolved[index] = result
+        selected_set = set(active_indices)
+        top_k_set = set(selected)
+        for index, _sequence, _lower_bound in rankable:
+            if resolved[index] is not None:
+                continue
+            reason = (
+                "round_budget_exhausted"
+                if index in top_k_set and index not in selected_set
+                else "not_selected"
+            )
+            resolved[index] = _candidate_control_skip_result(reason)
+        completed = tuple(result for result in resolved if result is not None)
+        if len(completed) != len(clean):
+            raise RuntimeError("candidate control lost an ordered route result")
+        return completed
+
     def _solve_uncached_batch(
         self,
         sequences: tuple[tuple[str, ...], ...],
         route_change_status: str,
+        *,
+        candidate_control_reserved: bool = False,
     ) -> tuple[ChargingSubproblemResult, ...]:
         """Solve a non-empty ordered group of known cache misses."""
 
         if not sequences:
             return ()
+        if (
+            self.candidate_control_runtime is not None
+            and not candidate_control_reserved
+        ):
+            granted = self.candidate_control_runtime.reserve(
+                len(sequences),
+                atomic=True,
+                context=f"{self.lane}:{self.operator}:complete_candidate",
+            )
+            if granted == 0:
+                return tuple(
+                    _candidate_control_skip_result("round_budget_exhausted")
+                    for _ in sequences
+                )
+        if (
+            self.candidate_control_runtime is not None
+            and self.exact_call_controller is not None
+            and self.exact_call_controller.budget is not None
+            and self.exact_call_controller.budget - self.exact_call_controller.started_calls
+            < len(sequences)
+        ):
+            self.candidate_control_runtime.events.append(
+                {
+                    "event_type": "candidate_control_budget",
+                    "status": "global_budget_atomic_skip",
+                    "context": f"{self.lane}:{self.operator}:complete_candidate",
+                    "requested": len(sequences),
+                    "granted": 0,
+                    "remaining": (
+                        self.exact_call_controller.budget
+                        - self.exact_call_controller.started_calls
+                    ),
+                    "iteration": self.iteration,
+                }
+            )
+            return tuple(
+                _candidate_control_skip_result("global_budget_atomic_skip")
+                for _ in sequences
+            )
         if time.perf_counter() >= self.deadline:
             self._discard_pending_candidate_cache("deadline_before_exact_batch")
             raise _TimeLimitReached(sequences[0])
@@ -1080,12 +1265,24 @@ class _Evaluator:
             else 0.0
         )
         try:
-            batch = solve_exact_charging_batch(
-                self.instance,
-                active_sequences,
-                backend=self.backend,
-                batch_size=self.batch_size,
-                deadline=self.deadline,
+            batch = (
+                self.candidate_control_runtime.solve_batch(
+                    self.instance,
+                    active_sequences,
+                    batch_size=self.batch_size,
+                    deadline=self.deadline,
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                )
+                if self.candidate_control_runtime is not None
+                else solve_exact_charging_batch(
+                    self.instance,
+                    active_sequences,
+                    backend=self.backend,
+                    batch_size=self.batch_size,
+                    deadline=self.deadline,
+                )
             )
         except BaseException as error:
             self._discard_pending_candidate_cache(
@@ -1331,6 +1528,7 @@ def _solve_alns(
     termination_mode: str = "wall_clock",
     disable_cache: bool = False,
     exact_call_controller: ExactCallController | None = None,
+    candidate_control_runtime: CandidateControlRuntime | None = None,
 ) -> ALNSResult:
     if max_iterations <= 0:
         raise ValueError("max_iterations must be positive")
@@ -1416,6 +1614,7 @@ def _solve_alns(
         disable_cache=disable_cache,
         batch_work_enabled=batch_work_enabled,
         exact_call_controller=exact_call_controller,
+        candidate_control_runtime=candidate_control_runtime,
     )
     quality_evaluator = _Evaluator(
         instance,
@@ -1432,6 +1631,7 @@ def _solve_alns(
         disable_cache=disable_cache,
         batch_work_enabled=batch_work_enabled,
         exact_call_controller=exact_call_controller,
+        candidate_control_runtime=candidate_control_runtime,
     )
     # The constraint lane is the explicit slice after the legacy/quality lane,
     # not an unbounded second 30-second budget.  Spell out the endpoint so the
@@ -1451,6 +1651,7 @@ def _solve_alns(
         disable_cache=disable_cache,
         batch_work_enabled=batch_work_enabled,
         exact_call_controller=exact_call_controller,
+        candidate_control_runtime=candidate_control_runtime,
     )
     try:
         with evaluator.measurement_context(
@@ -1532,6 +1733,8 @@ def _solve_alns(
                 )
             )
             break
+        if candidate_control_runtime is not None:
+            candidate_control_runtime.begin_round(iteration)
         completed_iterations = iteration + 1
         destroy_name = ""
         repair_name = ""
@@ -2470,6 +2673,8 @@ def _solve_alns(
         raise RuntimeError(
             "ALNS solver objective differs from the unified validator objective"
         )
+    if candidate_control_runtime is not None:
+        candidate_control_runtime.finish_round()
     exact_statistics = (
         exact_call_controller.to_dict() if exact_call_controller is not None else {}
     )
@@ -2567,6 +2772,21 @@ def _solve_alns(
         ),
         termination_reason=termination_reason,
         exact_deadline_statistics=exact_statistics,
+        candidate_control_statistics=(
+            candidate_control_runtime.statistics()
+            if candidate_control_runtime is not None
+            else {}
+        ),
+        candidate_work_hash=(
+            candidate_control_runtime.candidate_work_hash
+            if candidate_control_runtime is not None
+            else ""
+        ),
+        route_result_hash=(
+            candidate_control_runtime.route_result_hash
+            if candidate_control_runtime is not None
+            else ""
+        ),
     )
 
 
@@ -2587,14 +2807,28 @@ def solve_alns(
     termination_mode: str = "wall_clock",
     disable_cache: bool = False,
     exact_deadline_config: ExactDeadlineConfig | None = None,
+    candidate_control_config: CandidateControlConfig | None = None,
 ) -> ALNSResult:
-    """Solve ALNS with opt-in Stage 3.0--3.3 evaluation layers."""
+    """Solve ALNS with opt-in Stage 3.0--3.4 evaluation layers."""
 
     if (
         exact_deadline_config is not None
         and ExactChargingBackend(backend) is not ExactChargingBackend.CPU_BATCH
     ):
         raise ValueError("Stage 3.3 exact deadline requires the cpu_batch backend")
+    candidate_control_enabled = (
+        candidate_control_config is not None and candidate_control_config.enabled
+    )
+    if (
+        candidate_control_enabled
+        and ExactChargingBackend(backend) is not ExactChargingBackend.CPU_BATCH
+    ):
+        raise ValueError("Stage 3.4 candidate control requires the cpu_batch backend")
+    candidate_control_runtime = (
+        CandidateControlRuntime(candidate_control_config)
+        if candidate_control_enabled and candidate_control_config is not None
+        else None
+    )
     exact_call_controller = (
         ExactCallController(exact_deadline_config)
         if exact_deadline_config is not None
@@ -2630,22 +2864,27 @@ def solve_alns(
         and not cache_incremental_enabled
         and exact_deadline_config is None
     ):
-        return _solve_alns(
-            instance,
-            seed=seed,
-            max_iterations=max_iterations,
-            time_limit_seconds=time_limit_seconds,
-            removal_fraction=removal_fraction,
-            operator_profile=operator_profile,
-            vehicle_operator_config=vehicle_operator_config,
-            screening_config=screening_config,
-            cache_incremental_config=cache_incremental_config,
-            backend=backend,
-            batch_size=batch_size,
-            termination_mode=termination_mode,
-            disable_cache=disable_cache,
-            exact_call_controller=exact_call_controller,
-        )
+        try:
+            return _solve_alns(
+                instance,
+                seed=seed,
+                max_iterations=max_iterations,
+                time_limit_seconds=time_limit_seconds,
+                removal_fraction=removal_fraction,
+                operator_profile=operator_profile,
+                vehicle_operator_config=vehicle_operator_config,
+                screening_config=screening_config,
+                cache_incremental_config=cache_incremental_config,
+                backend=backend,
+                batch_size=batch_size,
+                termination_mode=termination_mode,
+                disable_cache=disable_cache,
+                exact_call_controller=exact_call_controller,
+                candidate_control_runtime=candidate_control_runtime,
+            )
+        finally:
+            if candidate_control_runtime is not None:
+                candidate_control_runtime.close()
     trace_config = (
         measurement_config
         if measurement_config is not None and measurement_config.enabled
@@ -2658,6 +2897,9 @@ def solve_alns(
             cache_incremental_config if cache_incremental_enabled else None
         ),
         exact_deadline_config=exact_deadline_config,
+        candidate_control_config=(
+            candidate_control_config if candidate_control_enabled else None
+        ),
     )
     try:
         result = _solve_alns(
@@ -2676,13 +2918,41 @@ def solve_alns(
             termination_mode=termination_mode,
             disable_cache=disable_cache,
             exact_call_controller=exact_call_controller,
+            candidate_control_runtime=candidate_control_runtime,
         )
     except BaseException as error:
+        if candidate_control_runtime is not None:
+            candidate_control_runtime.close(cancel_futures=True, wait=False)
+            _append_candidate_control_events(trace, candidate_control_runtime)
         trace.record_execution_error(error)
         trace.finish()
         raise Stage03ExecutionError(trace, error) from error
+    if candidate_control_runtime is not None:
+        candidate_control_runtime.close()
+        _append_candidate_control_events(trace, candidate_control_runtime)
     trace.finish(result)
     return replace(result, measurement_trace=trace)
+
+
+def _append_candidate_control_events(
+    trace: Stage03Trace,
+    runtime: CandidateControlRuntime,
+) -> None:
+    for runtime_event in runtime.events:
+        event = dict(runtime_event)
+        sequence = event.pop("customer_sequence", None)
+        if isinstance(sequence, list):
+            event["route_keys"] = (
+                trace.register_route(tuple(str(name) for name in sequence)),
+            )
+        sequences = event.pop("customer_sequences", None)
+        if isinstance(sequences, list):
+            event["route_keys"] = tuple(
+                trace.register_route(tuple(str(name) for name in item))
+                for item in sequences
+                if isinstance(item, list)
+            )
+        trace.events.append(event)
 
 
 def _construct_initial_solution(
@@ -2730,6 +3000,7 @@ def _construct_initial_solution(
         candidate_results = evaluator.route_batch(
             tuple(candidate for _, _, candidate in candidate_metadata),
             route_change_status="changed",
+            candidate_pool=True,
         )
         nonempty_bases = [
             (route_index, base)
@@ -2831,6 +3102,7 @@ def _construct_sequential_initial_solution(
         candidate_results = evaluator.route_batch(
             tuple(candidate_sequences),
             route_change_status="changed",
+            candidate_pool=True,
         )
         candidates: list[tuple[float, tuple[str, ...]]] = []
         for candidate, result in zip(candidate_sequences, candidate_results, strict=True):
@@ -2993,6 +3265,7 @@ def _insertion_options(
     candidate_results = evaluator.route_batch(
         tuple(candidate for _, _, candidate in candidate_metadata),
         route_change_status="changed",
+        candidate_pool=True,
     )
     for (route_index, _, candidate), result in zip(
         candidate_metadata,

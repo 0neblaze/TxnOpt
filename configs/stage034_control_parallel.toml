@@ -1,0 +1,72 @@
+[stage03]
+schema_version = "1"
+experiment_id = "stage034-control-parallel"
+algorithm = "ALNS_STAGE02_CONSTRAINT_GUIDED"
+operator_profile = "stage02_constraint_guided"
+stage02_config = "configs/stage02_constraint_guided.toml"
+stage033_review_manifest = "experiments/summaries/stage03.3_exact_deadline_attempt06_review/review_manifest.json"
+
+[benchmark]
+directory = "data/schneider"
+
+[run]
+seeds = [2014, 2015, 2016]
+time_limit_seconds = 30.0
+max_iterations = 1000
+
+[exact_deadline]
+exact_backend = "cpu_batch"
+exact_call_budget = 100
+watchdog_seconds = 120.0
+batch_size = 128
+
+[candidate_control]
+enabled = true
+schema_version = "stage034-control-parallel-v1"
+proposal_top_k = 2
+max_exact_calls_per_round = 2
+worker_counts = [1, 4]
+executor_model = "process_spawn"
+ranking_policy = "vehicle_distance_changed_routes_route_key_ordinal"
+merge_policy = "submission_order"
+
+[candidate_control_grid]
+proposal_top_k = [1, 2, 4]
+max_exact_calls_per_round = [1, 2, 4]
+selection_order = [
+  "all_gates",
+  "r_rc_median_started_calls",
+  "fixed_work_median_effective_iterations_desc",
+  "wall_clock_runtime",
+  "smallest_parameter_tuple",
+]
+
+[artifact_storage]
+enabled = true
+storage_policy_version = "artifact-storage-v1"
+event_format = "parquet"
+compression = "zstd"
+compression_level = 3
+critical_evidence = "full"
+diagnostic_evidence = "aggregate"
+per_instance_seed_max_bytes = 2147483648
+per_run_max_bytes = 34359738368
+
+[screening]
+enabled = true
+schema_version = "stage031-screening-v1"
+negative_sequence_cache = true
+epsilon = 1e-9
+
+[cache_incremental]
+enabled = true
+schema_version = "stage032-cache-incremental-v1"
+max_entries = 4096
+max_memory_bytes = 67108864
+eviction_policy = "lru"
+shared_across_lanes = true
+incremental_relocate = true
+incremental_swap = true
+station_reachability_bitset = true
+charging_configuration_version = "exact-charging-v1"
+objective_schema_version = "vehicles,distance,charging_time,charging_count"

@@ -666,6 +666,27 @@ def _route_batch_with_status(
     )
 
 
+def _candidate_route_batch_with_status(
+    evaluator: RouteEvaluator,
+    sequences: Iterable[CustomerSequence],
+) -> tuple[ChargingSubproblemResult, ...]:
+    """Evaluate an ordered Stage 3.4 candidate pool through its public seam."""
+
+    ordered = tuple(sequences)
+    if not ordered:
+        return ()
+    candidate_batch = getattr(evaluator, "candidate_route_batch", None)
+    if callable(candidate_batch):
+        return tuple(
+            cast(ChargingSubproblemResult, result)
+            for result in candidate_batch(
+                ordered,
+                route_change_status="changed",
+            )
+        )
+    return _route_batch_with_status(evaluator, ordered, "changed")
+
+
 def _legacy_screen_route_candidate(
     instance: Instance,
     sequence: CustomerSequence,
@@ -1497,6 +1518,15 @@ def propose_route_merge(
         for right in profiles[position + 1 :]
     )
 
+    if bool(getattr(evaluator, "candidate_control_enabled", False)):
+        return _propose_controlled_route_merge(
+            instance,
+            sequences,
+            evaluator,
+            pairs,
+            events,
+        )
+
     best: tuple[SolutionObjective, CustomerSequence, int, int] | None = None
     exact_evaluations = 0
     for _, left, right in pairs:
@@ -1599,6 +1629,143 @@ def propose_route_merge(
         )
     )
     return MoveProposal("route_merge", tuple(new_sequences), tuple(events))
+
+
+def _propose_controlled_route_merge(
+    instance: Instance,
+    sequences: RouteSequences,
+    evaluator: RouteEvaluator,
+    pairs: list[tuple[tuple[int, float, float, float, int, int], _RouteProfile, _RouteProfile]],
+    events: list[NeighborhoodEvent],
+) -> MoveProposal:
+    """Rank the complete merge pool before spending the shared round budget."""
+
+    metadata: dict[CustomerSequence, tuple[int, int, CustomerSequence]] = {}
+    candidates: list[CustomerSequence] = []
+    for _, left, right in pairs:
+        for merged, source_sequence in _controlled_merge_orders(instance, left, right):
+            screen = _screen_with_evaluator(instance, evaluator, merged)
+            if not screen.accepted:
+                events.append(
+                    NeighborhoodEvent(
+                        "route_merge",
+                        "prefilter_rejected",
+                        screen.reason,
+                        route_indices=(left.index, right.index),
+                        removed_customers=source_sequence,
+                        candidate_customer_sequence=merged,
+                        prefilter_passed=False,
+                    )
+                )
+                continue
+            if merged not in metadata:
+                metadata[merged] = (left.index, right.index, source_sequence)
+                candidates.append(merged)
+
+    before_calls = evaluator.calls
+    results = _candidate_route_batch_with_status(evaluator, candidates)
+    exact_evaluations = evaluator.calls - before_calls
+    best: tuple[SolutionObjective, CustomerSequence, int, int] | None = None
+    for merged, result in zip(candidates, results, strict=True):
+        left_index, right_index, source_sequence = metadata[merged]
+        if result.failure_reason.startswith("candidate_control:"):
+            events.append(
+                NeighborhoodEvent(
+                    "route_merge",
+                    "candidate_control_skipped",
+                    result.failure_reason,
+                    route_indices=(left_index, right_index),
+                    removed_customers=source_sequence,
+                    candidate_customer_sequence=merged,
+                    prefilter_passed=True,
+                )
+            )
+            continue
+        if not result.feasible:
+            events.append(
+                NeighborhoodEvent(
+                    "route_merge",
+                    "exact_infeasible",
+                    result.failure_reason or "exact_charging_infeasible",
+                    route_indices=(left_index, right_index),
+                    candidate_customer_sequence=merged,
+                    prefilter_passed=True,
+                )
+            )
+            continue
+        objective = _route_objective(instance, result)
+        candidate_key = (objective.key, merged, left_index, right_index)
+        if best is None or candidate_key < (best[0].key, best[1], best[2], best[3]):
+            best = (objective, merged, left_index, right_index)
+        events.append(
+            NeighborhoodEvent(
+                "route_merge",
+                "feasible_candidate",
+                "exact_charging_feasible",
+                route_indices=(left_index, right_index),
+                candidate_customer_sequence=merged,
+                candidate_feasible=True,
+                prefilter_passed=True,
+            )
+        )
+
+    if best is None:
+        if exact_evaluations == 0 and candidates:
+            events.append(
+                NeighborhoodEvent(
+                    "route_merge",
+                    "budget_exhausted",
+                    "candidate_control_round_budget",
+                    exact_route_evaluations=0,
+                )
+            )
+        return MoveProposal("route_merge", None, tuple(events))
+
+    _, merged, left_index, right_index = best
+    new_sequences = list(sequences)
+    new_sequences[left_index] = merged
+    del new_sequences[right_index]
+    events.append(
+        NeighborhoodEvent(
+            "route_merge",
+            "candidate_proposed",
+            "route_merged",
+            route_indices=(left_index, right_index),
+            candidate_customer_sequence=merged,
+            candidate_vehicle_delta=-1,
+            candidate_feasible=True,
+            prefilter_passed=True,
+            exact_route_evaluations=exact_evaluations,
+        )
+    )
+    return MoveProposal("route_merge", tuple(new_sequences), tuple(events))
+
+
+def _controlled_merge_orders(
+    _instance: Instance,
+    left: _RouteProfile,
+    right: _RouteProfile,
+) -> tuple[tuple[CustomerSequence, CustomerSequence], ...]:
+    """Generate deterministic complete orders, including non-block interleavings."""
+
+    output: list[tuple[CustomerSequence, CustomerSequence]] = []
+    seen: set[CustomerSequence] = set()
+
+    def add(sequence: CustomerSequence, source: CustomerSequence) -> None:
+        if sequence not in seen:
+            seen.add(sequence)
+            output.append((sequence, source))
+
+    for source, target in ((left, right), (right, left)):
+        for position in range(len(target.sequence) + 1):
+            add(
+                target.sequence[:position]
+                + source.sequence
+                + target.sequence[position:],
+                source.sequence,
+            )
+
+    return tuple(output)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2374,6 +2541,14 @@ def _repair_pass(
     allow_new_routes: bool,
     budget: int,
 ) -> RepairResult:
+    if bool(getattr(evaluator, "candidate_control_enabled", False)):
+        return _candidate_control_repair_pass(
+            partial,
+            removed,
+            evaluator,
+            instance,
+            allow_new_routes=allow_new_routes,
+        )
     sequences = list(partial)
     pending = list(removed)
     before_calls = evaluator.calls
@@ -2439,6 +2614,67 @@ def _repair_pass(
         )
 
     return RepairResult(tuple(sequences), new_routes, evaluator.calls - before_calls, "")
+
+
+def _candidate_control_repair_pass(
+    partial: RouteSequences,
+    removed: tuple[str, ...],
+    evaluator: RouteEvaluator,
+    instance: Instance,
+    *,
+    allow_new_routes: bool,
+) -> RepairResult:
+    """Build one complete repair from safe bounds before any exact evaluation."""
+
+    sequences = list(partial)
+    pending = list(removed)
+    new_routes = 0
+    while pending:
+        options: list[
+            tuple[float, str, int, int, CustomerSequence]
+        ] = []
+        for customer in pending:
+            for route_index, base in enumerate(sequences):
+                base_demand = sum(instance.by_name[name].demand for name in base)
+                if (
+                    base_demand + instance.by_name[customer].demand
+                    > instance.vehicle.load_capacity + _EPSILON
+                ):
+                    continue
+                for position in range(len(base) + 1):
+                    candidate = (*base[:position], customer, *base[position:])
+                    screen = _screen_with_evaluator(
+                        instance,
+                        evaluator,
+                        candidate,
+                        base_sequence=base,
+                    )
+                    if not screen.accepted:
+                        continue
+                    score = (
+                        screen.distance_increment_lower_bound
+                        if screen.distance_increment_lower_bound is not None
+                        else screen.distance_lower_bound
+                    )
+                    options.append(
+                        (score, customer, route_index, position, candidate)
+                    )
+        if options:
+            _score, customer, route_index, _position, candidate = min(options)
+            sequences[route_index] = candidate
+            pending.remove(customer)
+            continue
+        if not allow_new_routes:
+            return RepairResult(None, new_routes, 0, "no_existing_route_insertion")
+        customer = min(pending)
+        singleton = (customer,)
+        screen = _screen_with_evaluator(instance, evaluator, singleton)
+        if not screen.accepted:
+            return RepairResult(None, new_routes, 0, "new_singleton_route_infeasible")
+        sequences.append(singleton)
+        pending.remove(customer)
+        new_routes += 1
+    return RepairResult(tuple(sequences), new_routes, 0, "")
 
 
 def _insertion_options(

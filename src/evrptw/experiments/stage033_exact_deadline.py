@@ -176,11 +176,13 @@ def persist_paired_diagnostic(
     pair: Mapping[str, ALNSResult],
     scope: str,
     environment_payload: Mapping[str, object],
+    diagnostic_axes: tuple[str, ...] = DIAGNOSTIC_AXES,
+    schema_version: str = STAGE033_SCHEMA_VERSION,
 ) -> dict[str, str]:
     """Persist one paired diagnostic through the shared artifact writer."""
 
-    if set(pair) != set(DIAGNOSTIC_AXES):
-        raise ValueError("Stage 3.3 evidence requires both diagnostic axes")
+    if set(pair) != set(diagnostic_axes):
+        raise ValueError("diagnostic evidence does not match its declared axes")
     route_dictionary: dict[str, tuple[str, ...]] = {}
     critical_events: list[dict[str, object]] = []
     diagnostic_rows: list[dict[str, object]] = []
@@ -188,7 +190,7 @@ def persist_paired_diagnostic(
     solution_axes: dict[str, object] = {}
     trace_axes: dict[str, object] = {}
     failures: list[str] = []
-    for axis in DIAGNOSTIC_AXES:
+    for axis in diagnostic_axes:
         result = pair[axis]
         if result.charging_backend != "cpu_batch":
             raise RuntimeError("Stage 3.3 evidence may record only cpu_batch")
@@ -253,6 +255,9 @@ def persist_paired_diagnostic(
             "exact_deadline_statistics": result.exact_deadline_statistics,
             "trace_reconciliation": reconciliation,
             "valid": valid,
+            "candidate_control_statistics": result.candidate_control_statistics,
+            "candidate_work_hash": result.candidate_work_hash,
+            "route_result_hash": result.route_result_hash,
         }
         solution_axes[axis] = {
             "routes": [list(route) for route in result.routes],
@@ -268,11 +273,14 @@ def persist_paired_diagnostic(
             "instance_hash": canonical_instance_hash(instance),
             "config": trace_payload["config"],
             "exact_deadline_config": trace_payload.get("exact_deadline_config"),
+            "candidate_control_config": trace_payload.get(
+                "candidate_control_config"
+            ),
             "summary": trace_payload["summary"],
             "result_summary": trace_payload["result_summary"],
         }
     raw_payload = {
-        "schema_version": STAGE033_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "run_label": writer.context.run_label,
         "scope": scope,
         "instance": instance.name,
@@ -282,7 +290,7 @@ def persist_paired_diagnostic(
     }
     failure_payload = (
         {
-            "schema_version": STAGE033_SCHEMA_VERSION,
+            "schema_version": schema_version,
             "instance": instance.name,
             "seed": seed,
             "reasons": failures,
@@ -296,13 +304,13 @@ def persist_paired_diagnostic(
         seed=seed,
         raw_payload=raw_payload,
         solution_payload={
-            "schema_version": STAGE033_SCHEMA_VERSION,
+            "schema_version": schema_version,
             "instance": instance.name,
             "seed": seed,
             "axes": solution_axes,
         },
         trace_payload={
-            "trace_schema_version": "stage033-paired-trace-v1",
+            "trace_schema_version": f"{schema_version}-trace-index-v1",
             "axes": trace_axes,
         },
         environment_payload=dict(environment_payload),

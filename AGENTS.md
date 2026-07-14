@@ -312,6 +312,32 @@ this repository or one of its subdirectories.
   on the fixed-work axis their median effective iterations are 6 and 3.
   Candidate control and the remaining performance target belong to Stage 3.4.
 
+## Stage 3.4 Candidate Control and Controlled Parallel Policy
+
+- Stage 3.4 is opt-in through `CandidateControlConfig`; `None` preserves the
+  Stage 0--3.3 execution path. Its canonical component is `control_parallel`
+  and its only exact backend is `cpu_batch`.
+- Candidate ranking is deterministic and vehicle-first. Safe screening and
+  cache lookup happen before exact work. A complete candidate whose cache
+  misses do not fit the shared per-iteration budget is skipped atomically; it
+  is not exact-infeasible and cannot populate the negative or exact cache.
+- The serial and four-worker paths share candidate order and work. The
+  four-worker path owns one reusable `spawn` process pool per solve, submits
+  deterministic contiguous chunks, records actual completion order, and
+  merges only in submission order. Worker or deadline failure aborts the
+  candidate transaction without serial or `cpu_scalar` fallback.
+- Smoke and formal diagnostics each use four axes: serial/parallel crossed
+  with 100-call fixed-work and 30-second wall-clock. Smoke is exactly 72 axes
+  and formal is exactly 144 axes. Failed attempts retain their raw bundles and
+  use a new canonical attempt label.
+- `READY_FOR_STAGE04` may be published only by the independent raw replay. In
+  addition to inherited gates, both fixed-work worker variants must be
+  semantically identical, both wall-clock variants must not regress any
+  Stage 3.3 instance/seed objective, R/RC wall-clock median started calls must
+  be at most 100, and R/RC fixed-work median effective iterations must be at
+  least 50. Missing backend evidence, `cpu_scalar`, fallback, partial evidence,
+  or any reconciliation failure is `NOT_READY`.
+
 ## Experiment Artifact Storage v2
 
 - All new Stage 0–8 runs must use an enabled `[artifact_storage]` configuration

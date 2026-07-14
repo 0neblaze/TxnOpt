@@ -5,6 +5,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from evrptw.candidate_control import CandidateControlConfig
 from evrptw.exact_deadline import ExactDeadlineConfig
 from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
 
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
 TRACE_SCHEMA_VERSION = "stage03-trace-v1"
 CACHE_INCREMENTAL_TRACE_SCHEMA_VERSION = "stage03-trace-v2"
 EXACT_DEADLINE_TRACE_SCHEMA_VERSION = "stage03-trace-v3"
+CANDIDATE_CONTROL_TRACE_SCHEMA_VERSION = "stage03-trace-v4"
 SCREENING_SCHEMA_VERSION = "stage031-screening-v1"
 ROUTE_EVALUATION_KINDS = frozenset(
     {"exact_call", "cache_hit", "precomputed_route"}
@@ -205,6 +207,7 @@ class Stage03Trace:
     incremental_propagations: list[dict[str, object]] = field(default_factory=list)
     trace_schema_version: str = TRACE_SCHEMA_VERSION
     exact_deadline_config: ExactDeadlineConfig | None = None
+    candidate_control_config: CandidateControlConfig | None = None
 
     def __post_init__(self) -> None:
         self._validate_screening_route_dictionary()
@@ -212,12 +215,15 @@ class Stage03Trace:
             TRACE_SCHEMA_VERSION,
             CACHE_INCREMENTAL_TRACE_SCHEMA_VERSION,
             EXACT_DEADLINE_TRACE_SCHEMA_VERSION,
+            CANDIDATE_CONTROL_TRACE_SCHEMA_VERSION,
         ):
             raise ValueError(f"unsupported Stage 3 trace schema {self.trace_schema_version}")
         if self.cache_incremental_config is not None:
             self.trace_schema_version = CACHE_INCREMENTAL_TRACE_SCHEMA_VERSION
         if self.exact_deadline_config is not None:
             self.trace_schema_version = EXACT_DEADLINE_TRACE_SCHEMA_VERSION
+        if self.candidate_control_config is not None:
+            self.trace_schema_version = CANDIDATE_CONTROL_TRACE_SCHEMA_VERSION
 
     def _validate_screening_route_dictionary(self) -> None:
         if (
@@ -554,6 +560,8 @@ class Stage03Trace:
                 "exact_interrupted_calls",
                 "exact_budget_exhaustions",
                 "termination_reason",
+                "candidate_work_hash",
+                "route_result_hash",
             )
             self.result_summary = {
                 field: getattr(result, field)
@@ -568,6 +576,10 @@ class Stage03Trace:
                 self.result_summary["cache_incremental_statistics"] = cast(
                     Any, result
                 ).cache_incremental_statistics
+            if hasattr(result, "candidate_control_statistics"):
+                self.result_summary["candidate_control_statistics"] = cast(
+                    Any, result
+                ).candidate_control_statistics
 
     @property
     def started_calls(self) -> int:
@@ -829,6 +841,11 @@ class Stage03Trace:
                 if self.exact_deadline_config is not None
                 else None
             ),
+            "candidate_control_config": (
+                asdict(self.candidate_control_config)
+                if self.candidate_control_config is not None
+                else None
+            ),
             "incremental_propagations": list(self.incremental_propagations),
             "screening_decisions": [
                 asdict(decision) for decision in self.screening_decisions
@@ -902,6 +919,12 @@ class Stage03Trace:
         if isinstance(exact_deadline_payload, dict):
             trace.exact_deadline_config = ExactDeadlineConfig(**exact_deadline_payload)
             trace.trace_schema_version = EXACT_DEADLINE_TRACE_SCHEMA_VERSION
+        candidate_control_payload = payload.get("candidate_control_config")
+        if isinstance(candidate_control_payload, dict):
+            trace.candidate_control_config = CandidateControlConfig(
+                **candidate_control_payload
+            )
+            trace.trace_schema_version = CANDIDATE_CONTROL_TRACE_SCHEMA_VERSION
         trace.incremental_propagations = [
             dict(item) for item in payload.get("incremental_propagations", [])
         ]
