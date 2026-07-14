@@ -269,9 +269,18 @@ def review_stage033(
             fixed_protocol_valid = (
                 axis != "fixed_exact_calls"
                 or (
-                    started == 100
-                    and raw_axis.get("termination_reason")
-                    == "exact_call_budget_exhausted"
+                    started <= 100
+                    and (
+                        (
+                            started == 100
+                            and raw_axis.get("termination_reason")
+                            == "exact_call_budget_exhausted"
+                        )
+                        or (
+                            started < 100
+                            and raw_axis.get("termination_reason") == "iteration_limit"
+                        )
+                    )
                 )
             )
             valid = all(

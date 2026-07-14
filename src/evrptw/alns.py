@@ -2517,7 +2517,13 @@ def _solve_alns(
             else sum(item.calls for item in lane_evaluators)
         ),
         unique_route_evaluations=(
-            _cache_statistics(lane_route_caches)["unique_route_evaluations"]
+            len(
+                set().union(
+                    *(item.evaluated_route_keys for item in lane_evaluators)
+                )
+            )
+            if exact_call_controller is not None
+            else _cache_statistics(lane_route_caches)["unique_route_evaluations"]
             if cache_enabled
             else sum(
                 len(item.cache)
@@ -3449,7 +3455,9 @@ def _failed_result(
             else evaluator.calls
         ),
         unique_route_evaluations=(
-            _cache_statistics([evaluator.route_cache])["unique_route_evaluations"]
+            len(evaluator.evaluated_route_keys)
+            if exact_controller is not None
+            else _cache_statistics([evaluator.route_cache])["unique_route_evaluations"]
             if evaluator.cache_incremental_enabled
             else (
                 len(evaluator.cache)

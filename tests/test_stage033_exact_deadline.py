@@ -137,6 +137,14 @@ def test_fixed_exact_call_budget_stops_at_cap_and_keeps_complete_incumbent() -> 
     assert result.measurement_trace is not None
     assert result.measurement_trace.started_calls == 10
     assert result.measurement_trace.completed_calls == 10
+    assert result.unique_route_evaluations == len(
+        {
+            (record.lane, record.route_key)
+            for record in result.measurement_trace.route_evaluations
+            if record.kind == "exact_call" and record.exact_started
+        }
+    )
+    assert result.measurement_trace.reconcile(result)["status"] == "pass"
     assert any(
         event.get("event_type") == "exact_budget_boundary"
         for event in result.measurement_trace.events
