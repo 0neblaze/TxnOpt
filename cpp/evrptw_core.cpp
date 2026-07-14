@@ -9,10 +9,6 @@
 
 namespace py = pybind11;
 
-#ifdef __APPLE__
-void bind_metal(py::module_& module);
-#endif
-
 using Point = std::pair<double, double>;
 
 double distance(const Point& first, const Point& second) {
@@ -56,7 +52,4 @@ PYBIND11_MODULE(_core, module) {
     module.def(
         "two_opt_delta", &two_opt_delta, py::arg("points"), py::arg("route"),
         py::arg("first"), py::arg("second"));
-#ifdef __APPLE__
-    bind_metal(module);
-#endif
 }

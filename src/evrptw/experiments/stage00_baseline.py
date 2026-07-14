@@ -320,6 +320,7 @@ def _run_stage00_current(
                 max_iterations=config.max_iterations,
                 time_limit_seconds=config.time_limit_seconds,
                 operator_profile="baseline",
+                backend="cpu_scalar",
             )
             ended = datetime.now(UTC)
             routes = [list(route) for route in result.routes]
@@ -592,6 +593,7 @@ def _run_once(
         max_iterations=config.max_iterations,
         time_limit_seconds=config.time_limit_seconds,
         operator_profile="baseline",
+        backend="cpu_scalar",
     )
     end = datetime.now(UTC)
     routes = [list(route) for route in result.routes]

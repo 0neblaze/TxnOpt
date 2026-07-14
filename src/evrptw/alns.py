@@ -18,8 +18,9 @@ from evrptw.cache_incremental import (
     incremental_route_propagation,
 )
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
-from evrptw.gpu_batch import (
+from evrptw.cpu_batch import (
     BackendMetrics,
+    ExactBatchDeadlineExceeded,
     ExactChargingBackend,
     solve_exact_charging_batch,
 )
@@ -152,12 +153,11 @@ class ALNSResult:
     measurement_trace: Stage03Trace | None = None
     screening_statistics: dict[str, object] = field(default_factory=dict)
     cache_incremental_statistics: dict[str, object] = field(default_factory=dict)
-    charging_backend: str = ExactChargingBackend.CPU_SCALAR.value
+    charging_backend: str = ExactChargingBackend.CPU_BATCH.value
     batch_size: int = 128
     backend_metrics: dict[str, object] = field(default_factory=dict)
     termination_mode: str = "wall_clock"
     watchdog_triggered: bool = False
-    candidate_work_hash: str = ""
 
     @property
     def objective_value(self) -> float:
@@ -186,7 +186,6 @@ class _Evaluator:
         route_cache: RouteEvaluationCache | None = None,
         backend: ExactChargingBackend | str = ExactChargingBackend.CPU_SCALAR,
         batch_size: int = 128,
-        label_buffer_capacity: int = 1_000_000,
         disable_cache: bool = False,
         batch_work_enabled: bool = False,
     ) -> None:
@@ -211,10 +210,7 @@ class _Evaluator:
         self.backend = ExactChargingBackend(backend)
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        if label_buffer_capacity <= 0:
-            raise ValueError("label_buffer_capacity must be positive")
         self.batch_size = batch_size
-        self.label_buffer_capacity = label_buffer_capacity
         self.batch_work_enabled = batch_work_enabled
         self.backend_metrics = BackendMetrics(self.backend.value, batch_size)
         self.reachability_index = (
@@ -517,6 +513,76 @@ class _Evaluator:
             "station_reachability": reachability,
         }
 
+    def _lookup_cached_result(
+        self,
+        sequence: tuple[str, ...],
+        route_change_status: str,
+    ) -> tuple[ChargingSubproblemResult | None, str]:
+        """Perform one ordered cache lookup and emit its observable result."""
+
+        if time.perf_counter() >= self.deadline:
+            if self.measurement_trace is not None:
+                self.measurement_trace.record_deadline_boundary(
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    boundary="before_route_evaluation",
+                    route_sequence=sequence,
+                )
+            raise _TimeLimitReached(sequence)
+        cache_key_digest = ""
+        cached: ChargingSubproblemResult | None = None
+        if self.route_cache is not None:
+            lookup = self.route_cache.lookup(sequence)
+            cache_key_digest = lookup.key.digest
+            if self.measurement_trace is not None:
+                self.measurement_trace.record_cache_event(
+                    operation="lookup",
+                    route_key=lookup.key.route_key,
+                    cache_key_digest=cache_key_digest,
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    current_entries=lookup.current_entries,
+                    current_bytes=lookup.current_bytes,
+                )
+                self.measurement_trace.record_cache_event(
+                    operation="hit" if lookup.hit else "miss",
+                    route_key=lookup.key.route_key,
+                    cache_key_digest=cache_key_digest,
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    current_entries=lookup.current_entries,
+                    current_bytes=lookup.current_bytes,
+                )
+            if lookup.hit:
+                cached = lookup.result
+        elif self.local_cache_enabled:
+            cached = self.cache.get(sequence)
+        if cached is None:
+            return None, cache_key_digest
+
+        self.cache_hits += 1
+        if self.measurement_trace is not None:
+            started = time.perf_counter()
+            fields = route_result_fields(cached)
+            self.measurement_trace.record_route_evaluation(
+                sequence,
+                lane=self.lane,
+                iteration=self.iteration,
+                operator=self.operator,
+                kind="cache_hit",
+                started_at=self.measurement_trace._offset(started),
+                completed_at=self.measurement_trace._offset(),
+                exact_started=False,
+                exact_completed=False,
+                cache_key_digest=cache_key_digest,
+                route_change_status=route_change_status,
+                **fields,
+            )
+        return cached, cache_key_digest
+
     def route(
         self,
         sequence: tuple[str, ...],
@@ -543,82 +609,12 @@ class _Evaluator:
                     0.0,
                     f"cheap_screening:{screen.reason}",
                 )
-        # Check the deadline before cache lookup as well.  A cache hit is still
-        # work performed by this lane and must not let a lane continue after its
-        # declared wall-clock boundary.
-        if time.perf_counter() >= self.deadline:
-            if self.measurement_trace is not None:
-                self.measurement_trace.record_deadline_boundary(
-                    lane=self.lane,
-                    iteration=self.iteration,
-                    operator=self.operator,
-                    boundary="before_route_evaluation",
-                    route_sequence=sequence,
-                )
-            raise _TimeLimitReached(sequence)
-        if self.route_cache is not None:
-            lookup = self.route_cache.lookup(sequence)
-            cache_key_digest = lookup.key.digest
-            if self.measurement_trace is not None:
-                self.measurement_trace.record_cache_event(
-                    operation="lookup",
-                    route_key=lookup.key.route_key,
-                    cache_key_digest=cache_key_digest,
-                    lane=self.lane,
-                    iteration=self.iteration,
-                    operator=self.operator,
-                    current_entries=lookup.current_entries,
-                    current_bytes=lookup.current_bytes,
-                )
-                self.measurement_trace.record_cache_event(
-                    operation="hit" if lookup.hit else "miss",
-                    route_key=lookup.key.route_key,
-                    cache_key_digest=cache_key_digest,
-                    lane=self.lane,
-                    iteration=self.iteration,
-                    operator=self.operator,
-                    current_entries=lookup.current_entries,
-                    current_bytes=lookup.current_bytes,
-                )
-            if lookup.hit and lookup.result is not None:
-                self.cache_hits += 1
-                if self.measurement_trace is not None:
-                    started = time.perf_counter()
-                    fields = route_result_fields(lookup.result)
-                    self.measurement_trace.record_route_evaluation(
-                        sequence,
-                        lane=self.lane,
-                        iteration=self.iteration,
-                        operator=self.operator,
-                        kind="cache_hit",
-                        started_at=self.measurement_trace._offset(started),
-                        completed_at=self.measurement_trace._offset(),
-                        exact_started=False,
-                        exact_completed=False,
-                        cache_key_digest=cache_key_digest,
-                        route_change_status=route_change_status,
-                        **fields,
-                    )
-                return lookup.result
-        elif self.local_cache_enabled and sequence in self.cache:
-            self.cache_hits += 1
-            if self.measurement_trace is not None:
-                started = time.perf_counter()
-                fields = route_result_fields(self.cache[sequence])
-                self.measurement_trace.record_route_evaluation(
-                    sequence,
-                    lane=self.lane,
-                    iteration=self.iteration,
-                    operator=self.operator,
-                    kind="cache_hit",
-                    started_at=self.measurement_trace._offset(started),
-                    completed_at=self.measurement_trace._offset(),
-                    exact_started=False,
-                    exact_completed=False,
-                    route_change_status=route_change_status,
-                    **fields,
-                )
-            return self.cache[sequence]
+        cached, cache_key_digest = self._lookup_cached_result(
+            sequence,
+            route_change_status,
+        )
+        if cached is not None:
+            return cached
         started = time.perf_counter()
         if self.measurement_trace is not None:
             started_offset = self.measurement_trace._offset(started)
@@ -629,18 +625,19 @@ class _Evaluator:
             self.evaluated_route_keys.add((self.lane, sequence))
             if self.backend is ExactChargingBackend.CPU_SCALAR:
                 result = solve_exact_charging(self.instance, sequence)
-                self.backend_metrics.batch_launches += 1
+                self.backend_metrics.work_batches += 1
+                self.backend_metrics.transition_batches += 1
                 self.backend_metrics.exact_calls += 1
                 self.backend_metrics.transitions += max(0, result.labels_generated - 1)
                 self.backend_metrics.total_seconds += result.runtime_seconds
-                self.backend_metrics.cpu_postprocess_seconds += result.runtime_seconds
+                self.backend_metrics.label_management_seconds += result.runtime_seconds
             else:
                 batch = solve_exact_charging_batch(
                     self.instance,
                     (sequence,),
                     backend=self.backend,
                     batch_size=self.batch_size,
-                    label_buffer_capacity=self.label_buffer_capacity,
+                    deadline=self.deadline,
                 )
                 result = batch.results[0]
                 self.backend_metrics.add(batch.metrics)
@@ -748,9 +745,6 @@ class _Evaluator:
         if (
             precomputed_routes is None
             and self.backend is not ExactChargingBackend.CPU_SCALAR
-            and self.screening_config is None
-            and self.route_cache is None
-            and not self.local_cache_enabled
         ):
             charging = self.route_batch(clean, route_change_status="changed")
         else:
@@ -783,68 +777,197 @@ class _Evaluator:
         *,
         route_change_status: str = "changed",
     ) -> tuple[ChargingSubproblemResult, ...]:
-        """Evaluate uncached routes as one deterministic backend work batch."""
+        """Evaluate ordered routes while batching CPU cache misses."""
 
         clean = tuple(sequence for sequence in sequences if sequence)
         if not clean:
             return ()
-        if self.backend is ExactChargingBackend.CPU_SCALAR:
+        if self.backend is ExactChargingBackend.CPU_SCALAR or len(clean) == 1:
             return tuple(
                 self.route(sequence, route_change_status=route_change_status)
                 for sequence in clean
             )
-        if (
-            self.screening_config is not None
-            or self.route_cache is not None
-            or self.local_cache_enabled
-        ):
-            return tuple(
-                self.route(sequence, route_change_status=route_change_status)
-                for sequence in clean
+        resolved: list[ChargingSubproblemResult | None] = [None] * len(clean)
+        pending_sequences: list[tuple[str, ...]] = []
+        pending_indices: list[int] = []
+        pending_set: set[tuple[str, ...]] = set()
+        cache_available = self.route_cache is not None or self.local_cache_enabled
+
+        def flush_pending() -> None:
+            if not pending_sequences:
+                return
+            batch_results = self._solve_uncached_batch(
+                tuple(pending_sequences),
+                route_change_status,
             )
+            for request_index, result in zip(
+                pending_indices,
+                batch_results,
+                strict=True,
+            ):
+                resolved[request_index] = result
+            pending_sequences.clear()
+            pending_indices.clear()
+            pending_set.clear()
+
+        for index, sequence in enumerate(clean):
+            if self.screening_config is not None:
+                screen = self.screen(sequence, operator=self.operator)
+                if not screen.accepted:
+                    flush_pending()
+                    resolved[index] = ChargingSubproblemResult(
+                        False,
+                        (),
+                        float("inf"),
+                        0.0,
+                        0.0,
+                        0.0,
+                        0,
+                        0,
+                        0,
+                        0.0,
+                        f"cheap_screening:{screen.reason}",
+                    )
+                    continue
+            if cache_available and (
+                sequence in pending_set or self.has_cached_route(sequence)
+            ):
+                flush_pending()
+            cached, _ = self._lookup_cached_result(
+                sequence,
+                route_change_status,
+            )
+            if cached is not None:
+                resolved[index] = cached
+                continue
+            pending_sequences.append(sequence)
+            pending_indices.append(index)
+            pending_set.add(sequence)
+        flush_pending()
+        completed = tuple(result for result in resolved if result is not None)
+        if len(completed) != len(clean):
+            raise RuntimeError("CPU batch lost a cached route result")
+        return completed
+
+    def _solve_uncached_batch(
+        self,
+        sequences: tuple[tuple[str, ...], ...],
+        route_change_status: str,
+    ) -> tuple[ChargingSubproblemResult, ...]:
+        """Solve a non-empty ordered group of known cache misses."""
+
+        if not sequences:
+            return ()
         if time.perf_counter() >= self.deadline:
-            raise _TimeLimitReached(clean[0])
+            raise _TimeLimitReached(sequences[0])
         batch_started = time.perf_counter()
-        batch = solve_exact_charging_batch(
-            self.instance,
-            clean,
-            backend=self.backend,
-            batch_size=self.batch_size,
-            label_buffer_capacity=self.label_buffer_capacity,
+        started_offset = (
+            self.measurement_trace._offset(batch_started)
+            if self.measurement_trace is not None
+            else 0.0
         )
+        try:
+            batch = solve_exact_charging_batch(
+                self.instance,
+                sequences,
+                backend=self.backend,
+                batch_size=self.batch_size,
+                deadline=self.deadline,
+            )
+        except BaseException as error:
+            if self.measurement_trace is not None:
+                completed_offset = self.measurement_trace._offset()
+                for sequence in sequences:
+                    self.measurement_trace.record_route_evaluation(
+                        sequence,
+                        lane=self.lane,
+                        iteration=self.iteration,
+                        operator=self.operator,
+                        kind="exact_call",
+                        started_at=started_offset,
+                        completed_at=completed_offset,
+                        exact_started=True,
+                        exact_completed=False,
+                        feasible=None,
+                        failure_reason=f"{type(error).__name__}: {error}",
+                        route_change_status=route_change_status,
+                    )
+            if isinstance(error, ExactBatchDeadlineExceeded):
+                raise _TimeLimitReached(
+                    sequences[0],
+                    exact_route_evaluations=error.completed_exact_calls,
+                ) from error
+            raise
+        batch_completed = time.perf_counter()
         self.backend_metrics.add(batch.metrics)
         self.calls += len(batch.results)
         self.runtime += batch.metrics.total_seconds
         self.labels_generated += sum(item.labels_generated for item in batch.results)
         self.labels_pruned += sum(item.labels_pruned for item in batch.results)
-        self.evaluated_routes.update(clean)
-        self.evaluated_route_keys.update((self.lane, sequence) for sequence in clean)
-        batch_duration = batch.metrics.total_seconds
-        for index, (sequence, result) in enumerate(zip(clean, batch.results, strict=True)):
+        self.evaluated_routes.update(sequences)
+        self.evaluated_route_keys.update((self.lane, sequence) for sequence in sequences)
+        for sequence, result in zip(sequences, batch.results, strict=True):
+            cache_key_digest = ""
+            if self.route_cache is None and self.local_cache_enabled:
+                self.cache[sequence] = result
+            if self.route_cache is not None:
+                store = self.route_cache.store(sequence, result)
+                cache_key_digest = store.key.digest
+                if self.measurement_trace is not None:
+                    for evicted in store.evicted:
+                        self.measurement_trace.record_cache_event(
+                            operation="evict",
+                            route_key=evicted.route_key,
+                            cache_key_digest=evicted.digest,
+                            lane=self.lane,
+                            iteration=self.iteration,
+                            operator=self.operator,
+                            reason="lru_capacity_or_memory",
+                            current_entries=store.current_entries,
+                            current_bytes=store.current_bytes,
+                        )
+                    self.measurement_trace.record_cache_event(
+                        operation=("store" if store.stored else "oversize_not_cached"),
+                        route_key=store.key.route_key,
+                        cache_key_digest=store.key.digest,
+                        lane=self.lane,
+                        iteration=self.iteration,
+                        operator=self.operator,
+                        reason=store.reason,
+                        entry_bytes=store.entry_bytes,
+                        current_entries=store.current_entries,
+                        current_bytes=store.current_bytes,
+                    )
             if self.measurement_trace is not None:
                 fields = route_result_fields(result)
-                allocated_start = self.measurement_trace._offset(
-                    batch_started + batch_duration * index / len(clean)
-                )
-                allocated_end = self.measurement_trace._offset(
-                    batch_started + batch_duration * (index + 1) / len(clean)
-                )
                 self.measurement_trace.record_route_evaluation(
                     sequence,
                     lane=self.lane,
                     iteration=self.iteration,
                     operator=self.operator,
                     kind="exact_call",
-                    started_at=allocated_start,
-                    completed_at=allocated_end,
+                    started_at=started_offset,
+                    completed_at=self.measurement_trace._offset(batch_completed),
                     exact_started=True,
                     exact_completed=True,
-                    cache_key_digest="",
+                    cache_key_digest=cache_key_digest,
                     route_change_status=route_change_status,
                     **fields,
                 )
         if time.perf_counter() >= self.deadline:
-            raise _TimeLimitReached(clean[-1], exact_route_evaluations=len(clean))
+            if self.measurement_trace is not None:
+                self.measurement_trace.record_deadline_boundary(
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    boundary="after_exact_batch",
+                    route_sequence=sequences[-1],
+                    reason="CPU exact batch completed at or after the lane deadline",
+                )
+            raise _TimeLimitReached(
+                sequences[-1],
+                exact_route_evaluations=len(sequences),
+            )
         return batch.results
 
     def _precomputed_route(
@@ -940,9 +1063,8 @@ def _solve_alns(
     measurement_trace: Stage03Trace | None = None,
     screening_config: CheapScreeningConfig | None = None,
     cache_incremental_config: CacheIncrementalConfig | None = None,
-    backend: ExactChargingBackend | str = ExactChargingBackend.CPU_SCALAR,
+    backend: ExactChargingBackend | str = ExactChargingBackend.CPU_BATCH,
     batch_size: int = 128,
-    label_buffer_capacity: int = 1_000_000,
     termination_mode: str = "wall_clock",
     disable_cache: bool = False,
 ) -> ALNSResult:
@@ -1023,7 +1145,6 @@ def _solve_alns(
         route_cache=lane_route_caches[0],
         backend=backend,
         batch_size=batch_size,
-        label_buffer_capacity=label_buffer_capacity,
         disable_cache=disable_cache,
         batch_work_enabled=batch_work_enabled,
     )
@@ -1039,7 +1160,6 @@ def _solve_alns(
         route_cache=lane_route_caches[1],
         backend=backend,
         batch_size=batch_size,
-        label_buffer_capacity=label_buffer_capacity,
         disable_cache=disable_cache,
         batch_work_enabled=batch_work_enabled,
     )
@@ -1058,7 +1178,6 @@ def _solve_alns(
         route_cache=lane_route_caches[2],
         backend=backend,
         batch_size=batch_size,
-        label_buffer_capacity=label_buffer_capacity,
         disable_cache=disable_cache,
         batch_work_enabled=batch_work_enabled,
     )
@@ -2142,9 +2261,8 @@ def solve_alns(
     measurement_config: MeasurementConfig | None = None,
     screening_config: CheapScreeningConfig | None = None,
     cache_incremental_config: CacheIncrementalConfig | None = None,
-    backend: ExactChargingBackend | str = ExactChargingBackend.CPU_SCALAR,
+    backend: ExactChargingBackend | str = ExactChargingBackend.CPU_BATCH,
     batch_size: int = 128,
-    label_buffer_capacity: int = 1_000_000,
     termination_mode: str = "wall_clock",
     disable_cache: bool = False,
 ) -> ALNSResult:
@@ -2180,7 +2298,6 @@ def solve_alns(
             cache_incremental_config=cache_incremental_config,
             backend=backend,
             batch_size=batch_size,
-            label_buffer_capacity=label_buffer_capacity,
             termination_mode=termination_mode,
             disable_cache=disable_cache,
         )
@@ -2210,7 +2327,6 @@ def solve_alns(
             cache_incremental_config=cache_incremental_config,
             backend=backend,
             batch_size=batch_size,
-            label_buffer_capacity=label_buffer_capacity,
             termination_mode=termination_mode,
             disable_cache=disable_cache,
         )

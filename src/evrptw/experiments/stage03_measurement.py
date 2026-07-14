@@ -461,6 +461,7 @@ def run_stage03(
                     max_iterations=config.max_iterations,
                     time_limit_seconds=config.time_limit_seconds,
                     operator_profile=config.operator_profile,
+                    backend="cpu_scalar",
                     vehicle_operator_config=stage02.vehicle_operator_config,
                     measurement_config=MeasurementConfig(),
                     screening_config=config.screening_config,

@@ -617,6 +617,7 @@ def run_stage02(
                     max_iterations=config.max_iterations,
                     time_limit_seconds=config.time_limit_seconds,
                     operator_profile=config.operator_profile,
+                    backend="cpu_scalar",
                     vehicle_operator_config=config.vehicle_operator_config,
                 )
                 ended = datetime.now(UTC)
@@ -857,6 +858,7 @@ def _run_stage02_current(
                 max_iterations=config.max_iterations,
                 time_limit_seconds=config.time_limit_seconds,
                 operator_profile=config.operator_profile,
+                backend="cpu_scalar",
                 vehicle_operator_config=config.vehicle_operator_config,
             )
             ended = datetime.now(UTC)

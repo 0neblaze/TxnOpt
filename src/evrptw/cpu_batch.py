@@ -1,14 +1,9 @@
-"""Explicit exact-charging backends for the Apple Metal pilot.
+"""CPU-only exact-charging backends.
 
-The label-setting algorithm in :mod:`evrptw.charging` remains the reference
-implementation. This module adds a batch seam around its transition
-arithmetic. CPU code still owns the priority queues, dominance checks and path
-reconstruction; a Metal backend is allowed to calculate only distance, energy
-and travel-time arithmetic for an ordered batch of transitions.
-
-The module deliberately has no implicit fallback. A requested Metal backend
-either runs through the native bridge or raises a typed error which the pilot
-runner records as an invalid run.
+The scalar label-setting algorithm in :mod:`evrptw.charging` remains the
+reference implementation.  The batched backend advances several independent
+route searches together while preserving request order, queue ordering,
+dominance pruning and exact result semantics.
 """
 
 from __future__ import annotations
@@ -19,7 +14,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Protocol, cast
+from typing import Protocol
 
 from evrptw.charging import (
     _EPSILON,
@@ -38,51 +33,33 @@ from evrptw.charging import (
 from evrptw.models import Instance, Node, NodeType
 from evrptw.validation import validate_routes
 
-_native_core: Any | None
-try:  # The extension is optional on non-Apple development machines.
-    from evrptw import _core as _native_core
-except ImportError:  # pragma: no cover - depends on the local build environment
-    _native_core = None
-
 
 class ExactChargingBackend(StrEnum):
-    """Supported exact-charging execution backends."""
+    """Supported CPU exact-charging execution backends."""
 
     CPU_SCALAR = "cpu_scalar"
     CPU_BATCH = "cpu_batch"
-    METAL_BATCH = "metal_batch"
 
 
-class GPUBackendError(RuntimeError):
-    """Base class for errors that invalidate a GPU pilot run."""
+class ExactBatchDeadlineExceeded(RuntimeError):
+    """The cooperative CPU batch crossed its deadline before completion."""
 
-
-class MetalUnavailableError(GPUBackendError):
-    """The native Metal bridge or a usable Metal device is unavailable."""
-
-
-class MetalPrecisionError(GPUBackendError):
-    """GPU transition arithmetic is outside the declared precision bound."""
-
-
-class LabelBufferOverflowError(GPUBackendError):
-    """The bounded batch label buffer would overflow."""
+    def __init__(self, completed_exact_calls: int = 0) -> None:
+        self.completed_exact_calls = completed_exact_calls
+        super().__init__("CPU exact-charging batch deadline exceeded")
 
 
 @dataclass(slots=True)
 class BackendMetrics:
-    """Timing and work counters emitted by one backend invocation."""
+    """CPU timing and work counters emitted by one backend invocation."""
 
     backend: str
     batch_size: int
     total_seconds: float = 0.0
-    kernel_seconds: float = 0.0
-    transfer_seconds: float = 0.0
-    packing_seconds: float = 0.0
-    unpacking_seconds: float = 0.0
-    cpu_postprocess_seconds: float = 0.0
-    initialization_seconds: float = 0.0
-    batch_launches: int = 0
+    transition_seconds: float = 0.0
+    label_management_seconds: float = 0.0
+    work_batches: int = 0
+    transition_batches: int = 0
     transitions: int = 0
     exact_calls: int = 0
 
@@ -93,15 +70,11 @@ class BackendMetrics:
             )
         for field_name in (
             "total_seconds",
-            "kernel_seconds",
-            "transfer_seconds",
-            "packing_seconds",
-            "unpacking_seconds",
-            "cpu_postprocess_seconds",
-            "initialization_seconds",
+            "transition_seconds",
+            "label_management_seconds",
         ):
             setattr(self, field_name, getattr(self, field_name) + getattr(other, field_name))
-        for field_name in ("batch_launches", "transitions", "exact_calls"):
+        for field_name in ("work_batches", "transition_batches", "transitions", "exact_calls"):
             setattr(self, field_name, getattr(self, field_name) + getattr(other, field_name))
         self.batch_size = max(self.batch_size, other.batch_size)
 
@@ -110,13 +83,10 @@ class BackendMetrics:
             "backend": self.backend,
             "batch_size": self.batch_size,
             "total_seconds": self.total_seconds,
-            "kernel_seconds": self.kernel_seconds,
-            "transfer_seconds": self.transfer_seconds,
-            "packing_seconds": self.packing_seconds,
-            "unpacking_seconds": self.unpacking_seconds,
-            "cpu_postprocess_seconds": self.cpu_postprocess_seconds,
-            "initialization_seconds": self.initialization_seconds,
-            "batch_launches": self.batch_launches,
+            "transition_seconds": self.transition_seconds,
+            "label_management_seconds": self.label_management_seconds,
+            "work_batches": self.work_batches,
+            "transition_batches": self.transition_batches,
             "transitions": self.transitions,
             "exact_calls": self.exact_calls,
         }
@@ -124,7 +94,7 @@ class BackendMetrics:
 
 @dataclass(frozen=True, slots=True)
 class TransitionArithmetic:
-    """Arithmetic returned by a transition backend before host-side semantics."""
+    """Transition arithmetic before label-management semantics."""
 
     distance: float
     energy: float
@@ -184,117 +154,8 @@ class _CPUTransitionBackend:
                     travel_time=distance / request.instance.vehicle.average_velocity,
                 )
             )
-        self.metrics.kernel_seconds += time.perf_counter() - started
+        self.metrics.transition_seconds += time.perf_counter() - started
         return tuple(values)
-
-
-class _MetalTransitionBackend:
-    _RELATIVE_TOLERANCE = 2e-6
-
-    def __init__(self, metrics: BackendMetrics) -> None:
-        if _native_core is None or not hasattr(_native_core, "metal_backend_info"):
-            raise MetalUnavailableError(
-                "Metal backend requested but the native extension has no Metal bridge"
-            )
-        try:
-            info = dict(_native_core.metal_backend_info())
-        except BaseException as error:
-            raise MetalUnavailableError("Metal capability query failed") from error
-        if not bool(info.get("available", False)):
-            reason = str(info.get("reason", "no usable Metal device"))
-            raise MetalUnavailableError(reason)
-        self.metrics = metrics
-        self.metrics.initialization_seconds = float(
-            cast(Any, info.get("initialization_seconds", 0.0))
-        )
-
-    def evaluate(
-        self,
-        requests: Sequence[_TransitionRequest],
-    ) -> tuple[TransitionArithmetic, ...]:
-        if not requests:
-            return ()
-        try:
-            import numpy as np
-        except ImportError as error:  # pragma: no cover - NumPy is a project dependency
-            raise MetalUnavailableError("Metal batch packing requires NumPy") from error
-
-        packed_started = time.perf_counter()
-        dx = np.asarray(
-            [request.origin.x - request.destination.x for request in requests],
-            dtype=np.float32,
-        )
-        dy = np.asarray(
-            [request.origin.y - request.destination.y for request in requests],
-            dtype=np.float32,
-        )
-        consumption = np.asarray(
-            [request.instance.vehicle.consumption_rate for request in requests],
-            dtype=np.float32,
-        )
-        velocity = np.asarray(
-            [request.instance.vehicle.average_velocity for request in requests],
-            dtype=np.float32,
-        )
-        self.metrics.packing_seconds += time.perf_counter() - packed_started
-        if _native_core is None:
-            raise MetalUnavailableError("Metal native bridge disappeared after capability probe")
-        result = _native_core.metal_transition_batch(dx, dy, consumption, velocity)
-        self.metrics.transfer_seconds += float(cast(Any, result["transfer_seconds"]))
-        self.metrics.kernel_seconds += float(cast(Any, result["kernel_seconds"]))
-        self.metrics.initialization_seconds += float(
-            cast(Any, result.get("initialization_seconds", 0.0))
-        )
-
-        unpacked_started = time.perf_counter()
-        outputs = np.asarray(result["outputs"], dtype=np.float32)
-        if outputs.shape != (len(requests), 3):
-            raise MetalPrecisionError(
-                "Metal transition kernel returned an unexpected output shape"
-            )
-        values: list[TransitionArithmetic] = []
-        for request, output in zip(requests, outputs, strict=True):
-            distance = float(output[0])
-            energy = float(output[1])
-            travel_time = float(output[2])
-            if not all(math.isfinite(value) for value in (distance, energy, travel_time)):
-                raise MetalPrecisionError("Metal transition kernel returned a non-finite value")
-            reference_distance = math.hypot(
-                request.origin.x - request.destination.x,
-                request.origin.y - request.destination.y,
-            )
-            reference_energy = reference_distance * request.instance.vehicle.consumption_rate
-            reference_time = reference_distance / request.instance.vehicle.average_velocity
-            for name, actual, reference in (
-                ("distance", distance, reference_distance),
-                ("energy", energy, reference_energy),
-                ("travel_time", travel_time, reference_time),
-            ):
-                tolerance = max(1e-7, self._RELATIVE_TOLERANCE * max(1.0, abs(reference)))
-                if abs(actual - reference) > tolerance:
-                    raise MetalPrecisionError(
-                        f"Metal {name} arithmetic exceeded tolerance: "
-                        f"actual={actual!r}, reference={reference!r}, tolerance={tolerance!r}"
-                    )
-            values.append(
-                TransitionArithmetic(distance, energy, travel_time)
-            )
-        self.metrics.unpacking_seconds += time.perf_counter() - unpacked_started
-        return tuple(values)
-
-
-def metal_backend_info() -> dict[str, object]:
-    """Return the local Metal capability without selecting a fallback backend."""
-
-    if _native_core is None or not hasattr(_native_core, "metal_backend_info"):
-        return {
-            "available": False,
-            "reason": "native extension was built without the Metal bridge",
-        }
-    try:
-        return dict(_native_core.metal_backend_info())
-    except BaseException as error:
-        return {"available": False, "reason": f"capability query failed: {error}"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,39 +172,34 @@ def solve_exact_charging_batch(
     *,
     backend: ExactChargingBackend | str = ExactChargingBackend.CPU_BATCH,
     batch_size: int = 128,
-    label_buffer_capacity: int = 1_000_000,
+    deadline: float | None = None,
 ) -> BatchChargingResult:
-    """Evaluate fixed customer orders with an explicit arithmetic backend.
-
-    ``cpu_scalar`` delegates to the scalar reference. ``cpu_batch`` and
-    ``metal_batch`` use the same host-side label manager, but process the
-    transition arithmetic for multiple active route searches together. The
-    request and result order is stable and is part of the pilot replay hash.
-    """
+    """Evaluate fixed customer orders with an explicit CPU backend."""
 
     selected = ExactChargingBackend(backend)
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    if label_buffer_capacity <= 0:
-        raise LabelBufferOverflowError("label buffer capacity must be positive")
+    if deadline is not None and time.perf_counter() >= deadline:
+        raise ExactBatchDeadlineExceeded()
     orders = tuple(tuple(order) for order in customer_orders)
-    metrics = BackendMetrics(selected.value, batch_size, exact_calls=len(orders))
+    metrics = BackendMetrics(
+        selected.value,
+        batch_size,
+        work_batches=(len(orders) if selected is ExactChargingBackend.CPU_SCALAR else bool(orders)),
+        exact_calls=len(orders),
+    )
     started = time.perf_counter()
     if selected is ExactChargingBackend.CPU_SCALAR:
         scalar_results = tuple(solve_exact_charging(instance, order) for order in orders)
         metrics.transitions = sum(
             max(0, result.labels_generated - 1) for result in scalar_results
         )
-        metrics.batch_launches = len(scalar_results)
-        metrics.cpu_postprocess_seconds = time.perf_counter() - started
-        metrics.total_seconds = metrics.cpu_postprocess_seconds
+        metrics.transition_batches = len(scalar_results)
+        metrics.label_management_seconds = time.perf_counter() - started
+        metrics.total_seconds = metrics.label_management_seconds
         return BatchChargingResult(scalar_results, metrics)
 
-    transition_backend: _TransitionBackend
-    if selected is ExactChargingBackend.CPU_BATCH:
-        transition_backend = _CPUTransitionBackend(metrics)
-    else:
-        transition_backend = _MetalTransitionBackend(metrics)
+    transition_backend: _TransitionBackend = _CPUTransitionBackend(metrics)
     states: list[_SearchState] = []
     results: list[ChargingSubproblemResult | None] = [None] * len(orders)
     for index, order in enumerate(orders):
@@ -374,6 +230,8 @@ def solve_exact_charging_batch(
 
     states_by_index = {state.route_index: state for state in states}
     while True:
+        if deadline is not None and time.perf_counter() >= deadline:
+            raise ExactBatchDeadlineExceeded()
         requests: list[_TransitionRequest] = []
         progressed = False
         for state in states:
@@ -405,8 +263,10 @@ def solve_exact_charging_batch(
             continue
 
         for offset in range(0, len(requests), batch_size):
+            if deadline is not None and time.perf_counter() >= deadline:
+                raise ExactBatchDeadlineExceeded()
             chunk = requests[offset : offset + batch_size]
-            metrics.batch_launches += 1
+            metrics.transition_batches += 1
             metrics.transitions += len(chunk)
             arithmetic = transition_backend.evaluate(chunk)
             apply_started = time.perf_counter()
@@ -445,17 +305,14 @@ def solve_exact_charging_batch(
                 state.pruned += len(current_labels) - len(survivors)
                 survivors.append(candidate)
                 state.labels[key] = survivors
-                if sum(len(labels) for labels in state.labels.values()) > label_buffer_capacity:
-                    raise LabelBufferOverflowError(
-                        f"route {state.route_index} exceeded label buffer capacity "
-                        f"{label_buffer_capacity}"
-                    )
                 state.serial += 1
                 heapq.heappush(
                     state.queue,
                     _QueueEntry(_queue_priority(candidate), state.serial, candidate),
                 )
-            metrics.cpu_postprocess_seconds += time.perf_counter() - apply_started
+            metrics.label_management_seconds += time.perf_counter() - apply_started
+            if deadline is not None and time.perf_counter() >= deadline:
+                raise ExactBatchDeadlineExceeded()
 
     for state in states:
         if state.best is None:
@@ -509,13 +366,10 @@ def solve_exact_charging_batch(
         )
 
     metrics.total_seconds = time.perf_counter() - started
-    metrics.cpu_postprocess_seconds = max(
+    metrics.label_management_seconds = max(
         0.0,
         metrics.total_seconds
-        - metrics.kernel_seconds
-        - metrics.transfer_seconds
-        - metrics.packing_seconds
-        - metrics.unpacking_seconds,
+        - metrics.transition_seconds,
     )
     completed = tuple(result for result in results if result is not None)
     if len(completed) != len(orders):
