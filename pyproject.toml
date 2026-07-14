@@ -20,6 +20,7 @@ dependencies = [
   "numpy>=2.3,<3",
   "ortools>=9.14,<10",
   "pandas>=2.3,<4",
+  "pyarrow>=18,<24",
   "scipy>=1.16,<2",
   "seaborn>=0.13,<1",
 ]
@@ -56,4 +57,8 @@ warn_unused_ignores = false
 
 [[tool.mypy.overrides]]
 module = ["cplex.*", "docplex.*", "gurobipy.*", "scipy.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["pyarrow.*"]
 ignore_missing_imports = true

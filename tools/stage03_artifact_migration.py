@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from evrptw.artifacts import ArtifactReader
+
 SCHEMA_VERSION = "stage03-artifact-migration-v1"
 CANONICAL_LABEL_RE = re.compile(
     r"^stage03\.(?P<minor>[012])_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}$"
@@ -98,6 +100,15 @@ REGISTRY_FIELDS = (
     "comparison_baseline",
     "supersedes",
     "legacy_path_mapping",
+    "storage_policy_version",
+    "storage_format",
+    "compression",
+    "retention_class",
+    "evidence_completeness",
+    "schema_fingerprint",
+    "row_count",
+    "byte_size",
+    "policy_compliance",
 )
 LEGACY_MAP_FIELDS = (
     "mapping_type",
@@ -274,6 +285,17 @@ def verify_generated_outputs(
 
 
 def verify_raw_manifest(run_dir: Path) -> tuple[dict[str, str], list[str]]:
+    current_manifest = sorted((run_dir / "control").glob("*_manifest.json"))
+    if current_manifest:
+        try:
+            reader = ArtifactReader(run_dir)
+        except (OSError, ValueError, RuntimeError) as error:
+            return {}, [f"current raw manifest verification failed: {error}"]
+        return {
+            str(item["relative_path"]): str(item["checksum"])
+            for item in reader.manifest.get("artifacts", [])
+            if isinstance(item, dict)
+        }, []
     manifest_path = run_dir / "manifest.json"
     sidecar_path = run_dir / "manifest.sha256"
     errors: list[str] = []
@@ -360,6 +382,44 @@ def verify_trusted_review(root: Path, relative_path: str) -> tuple[str, list[str
 def classify_artifact(relative: Path) -> str:
     parts = relative.parts
     name = relative.name
+    if parts and parts[0] == "control":
+        if name.endswith("_manifest.sha256") or name == "manifest.sha256":
+            return "manifest_checksum"
+        if "_run_metadata" in name:
+            return "manifest_metadata"
+        if "_config" in name:
+            return "config"
+        if "_raw_per_run_results" in name:
+            return "raw_per_run_results"
+    if name.endswith(".parquet"):
+        if "_route_dictionary_" in name:
+            return "route_dictionary"
+        if "_screening_checks_" in name:
+            return "screening_checks"
+        if "_diagnostic_" in name:
+            return "diagnostic"
+        if "_events_" in name:
+            return "events"
+    if len(parts) >= 2 and parts[0] not in {
+        "raw",
+        "solutions",
+        "events",
+        "traces",
+        "environments",
+        "failures",
+        "review",
+        "control",
+    }:
+        if "_solution_" in name:
+            return "solution"
+        if "_trace_" in name:
+            return "trace"
+        if "_environment_" in name:
+            return "environment"
+        if "_failure_" in name:
+            return "failure"
+        if "_raw_" in name:
+            return "raw"
     if parts and parts[0] == "raw":
         return "raw"
     if parts and parts[0] == "solutions":
@@ -460,13 +520,19 @@ def canonical_path(
     seed = str(row.get("seed", "")) if row else ""
     suffix = file_suffix(relative)
     if instance and seed:
-        filename = f"{run_label}_{artifact_type}_{instance}_{seed}{suffix}"
+        filename = canonical_filename(
+            run_label,
+            artifact_type,
+            suffix,
+            instance,
+            seed,
+        )
         return (
             f"results/{run_label}/{instance}/{seed}/{filename}",
             instance,
             seed,
         )
-    filename = f"{run_label}_{artifact_type}{suffix}"
+    filename = canonical_filename(run_label, artifact_type, suffix)
     if relative.parts and relative.parts[0] == "review":
         return f"results/{run_label}/review/{filename}", "__all__", "__all__"
     if artifact_type == "raw_per_run_results":
@@ -502,38 +568,126 @@ def legacy_run_directory(root: Path, legacy_label: str) -> Path:
     return path
 
 
-def active_specs(root: Path) -> tuple[StageSpec, ...]:
-    """Add Stage 3.2 only after a real raw run directory exists."""
+def run_directory(root: Path, legacy_label: str) -> Path:
+    """Use an existing canonical bundle before falling back to old spelling."""
 
-    stage032_directories = sorted(
-        path
-        for path in (root / "results").glob("stage03.2_cache_incremental_*")
-        if path.is_dir()
-        and re.fullmatch(
-            r"stage03\.2_cache_incremental_(?:attempt|rerun)[0-9]{2}",
-            path.name,
+    current = root / "results" / legacy_label
+    if current.is_dir():
+        return current
+    return legacy_run_directory(root, legacy_label)
+
+
+def metadata_path(run_dir: Path) -> Path:
+    legacy = run_dir / "run_metadata.json"
+    if legacy.is_file():
+        return legacy
+    candidates = sorted((run_dir / "control").glob("*_run_metadata.json"))
+    if not candidates:
+        raise RuntimeError(f"run metadata is missing: {run_dir}")
+    return candidates[0]
+
+
+def raw_per_run_path(run_dir: Path) -> Path:
+    legacy = run_dir / "raw_per_run_results.csv"
+    if legacy.is_file():
+        return legacy
+    candidates = sorted((run_dir / "control").glob("*_raw_per_run_results.csv"))
+    if not candidates:
+        raise RuntimeError(f"raw per-run index is missing: {run_dir}")
+    return candidates[0]
+
+
+def active_specs(root: Path) -> tuple[StageSpec, ...]:
+    """Include every physically present canonical Stage 3 run directory.
+
+    Historical mappings in ``SPECS`` remain the source of truth for the old
+    labels.  New canonical directories are appended to the corresponding
+    stage specification so a later registry generation cannot silently omit a
+    valid Stage 3.0 or Stage 3.1 run merely because it was created after this
+    tool was released.
+    """
+
+    definitions = (
+        (
+            "stage03.0",
+            "measurement",
+            "stage03_measurement",
+            "stage02.3_constraint_guided_attempt16 + stage02.3_constraint_guided_rerun09",
+            "experiments/summaries/stage03_measurement_formal01_review_manifest.json",
+        ),
+        (
+            "stage03.1",
+            "screening",
+            "stage031_cheap_screening",
+            "stage03.0_measurement_attempt05",
+            "experiments/summaries/stage031_cheap_screening_formal01_review_manifest.json",
+        ),
+        (
+            "stage03.2",
+            "cache_incremental",
+            "stage03.2_cache_incremental",
+            "stage03.1_screening_attempt04",
+            "experiments/summaries/stage032_cheap_screening_formal01_review_manifest.json",
+        ),
+    )
+    result_root = root / "results"
+    specs = list(SPECS)
+    for stage_id, component, legacy_prefix, comparison_baseline, default_trusted in definitions:
+        prefix = f"{stage_id}_{component}_"
+        current_labels = tuple(
+            path.name
+            for path in sorted(result_root.glob(f"{prefix}*"))
+            if path.is_dir()
+            and re.fullmatch(
+                rf"{re.escape(prefix)}(?:attempt|rerun)[0-9]{{2}}",
+                path.name,
+            )
         )
-    )
-    if not stage032_directories:
-        return SPECS
-    labels = tuple((path.name, path.name) for path in stage032_directories)
-    formal_labels = [
-        label
-        for label, _canonical in labels
-        if (root / "results" / label / "run_metadata.json").is_file()
-        and read_json(root / "results" / label / "run_metadata.json").get("scope")
-        == "formal"
-    ]
-    trusted_label = sorted(formal_labels)[-1] if formal_labels else labels[-1][0]
-    stage032 = StageSpec(
-        "stage03.2",
-        "cache_incremental",
-        "stage03.2_cache_incremental",
-        labels,
-        f"experiments/summaries/{trusted_label}_review_manifest.json",
-        "stage03.1_screening_attempt04",
-    )
-    return (*SPECS, stage032)
+        if not current_labels:
+            continue
+
+        existing_index = next(
+            (index for index, spec in enumerate(specs) if spec.stage_id == stage_id),
+            None,
+        )
+        existing = specs[existing_index] if existing_index is not None else None
+        existing_labels = {
+            canonical
+            for _legacy, canonical in (existing.run_labels if existing else ())
+        }
+        additions = tuple(
+            (label, label) for label in current_labels if label not in existing_labels
+        )
+        if not additions:
+            continue
+
+        run_labels = (existing.run_labels if existing else ()) + additions
+        formal_current_labels: list[str] = []
+        for label in current_labels:
+            try:
+                if read_json(metadata_path(result_root / label)).get("scope") == "formal":
+                    formal_current_labels.append(label)
+            except (OSError, RuntimeError, json.JSONDecodeError):
+                # The builder will retain the manifest error for an incomplete
+                # run.  It must still be registered rather than disappearing
+                # from the registry because metadata could not be read here.
+                continue
+        trusted = existing.trusted_formal_review if existing else default_trusted
+        if formal_current_labels:
+            trusted = f"results/{sorted(formal_current_labels)[-1]}/review/review_manifest.json"
+        replacement = StageSpec(
+            stage_id,
+            component,
+            existing.legacy_prefix if existing else legacy_prefix,
+            run_labels,
+            trusted,
+            existing.comparison_baseline if existing else comparison_baseline,
+        )
+        if existing_index is None:
+            specs.append(replacement)
+        else:
+            specs[existing_index] = replacement
+    return tuple(specs)
 
 
 def summary_artifact_type(summary_suffix: str) -> str:
@@ -572,7 +726,11 @@ def canonical_filename(
     instance: str = "__all__",
     seed: str = "__all__",
 ) -> str:
-    filename = f"{run_label}_{artifact_type}"
+    filename_type = {
+        "manifest_metadata": "run_metadata",
+        "manifest_checksum": "manifest",
+    }.get(artifact_type, artifact_type)
+    filename = f"{run_label}_{filename_type}"
     if instance != "__all__" and seed != "__all__":
         filename += f"_{instance}_{seed}"
     return f"{filename}{suffix}"
@@ -654,19 +812,34 @@ def build_stage(
         root, spec.trusted_formal_review
     )
     for legacy_label, canonical_label in spec.run_labels:
-        run_dir = legacy_run_directory(root, legacy_label)
-        metadata = read_json(run_dir / "run_metadata.json")
-        raw_csv = run_dir / "raw_per_run_results.csv"
+        run_dir = run_directory(root, legacy_label)
+        metadata = read_json(metadata_path(run_dir))
+        raw_csv = raw_per_run_path(run_dir)
         with raw_csv.open(encoding="utf-8", newline="") as handle:
             raw_rows = list(csv.DictReader(handle))
         row_lookup = run_id_lookup(raw_rows)
         raw_hashes, raw_errors = verify_raw_manifest(run_dir)
+        current_artifact_metadata: dict[str, dict[str, object]] = {}
+        current_storage = bool(
+            sorted((run_dir / "control").glob("*_manifest.json"))
+        )
+        if current_storage:
+            current_reader = ArtifactReader(run_dir, verify=False)
+            current_artifact_metadata = {
+                str(item.get("relative_path")): dict(item)
+                for item in current_reader.manifest.get("artifacts", [])
+                if isinstance(item, dict)
+            }
         review_hashes, raw_review_status, review_errors = verify_review_manifest(
             run_dir / "review"
         )
         screening = spec.stage_id in {"stage03.1", "stage03.2"}
         cache_incremental = spec.stage_id == "stage03.2"
         summary_path = root / "experiments" / "summaries" / f"{legacy_label}_per_run_results.csv"
+        if not summary_path.is_file():
+            summary_path = (
+                root / "experiments" / "summaries" / f"{canonical_label}_per_run_results.csv"
+            )
         summary_status, summary_errors = compare_raw_to_summary(
             raw_csv,
             summary_path,
@@ -737,7 +910,12 @@ def build_stage(
                 "legacy_path": root_relative(root, run_dir),
                 "artifact_type": "run_directory",
                 "status": "preserved",
-                "checksum": sha256_file(run_dir / "manifest.json"),
+                "checksum": sha256_file(
+                    next(
+                        iter(sorted((run_dir / "control").glob("*_manifest.json"))),
+                        run_dir / "manifest.json",
+                    )
+                ),
                 "checksum_source": "raw_manifest",
                 "repository_revision": metadata.get("repository_revision", ""),
                 "repository_dirty": metadata.get("repository_dirty", ""),
@@ -769,6 +947,12 @@ def build_stage(
                 checksum = sha256_file(path)
                 checksum_source = "computed"
             context = metadata_context(metadata, row)
+            storage = current_artifact_metadata.get(relative.as_posix(), {})
+            storage_policy_version = (
+                str(metadata.get("storage_policy_version", "artifact-storage-v1"))
+                if current_storage
+                else "legacy"
+            )
             artifact_manifest_error = bool(raw_errors)
             if relative.parts and relative.parts[0] == "review":
                 artifact_manifest_error = bool(review_errors)
@@ -815,6 +999,24 @@ def build_stage(
                     "comparison_baseline": spec.comparison_baseline,
                     "supersedes": "",
                     "legacy_path_mapping": "preserve;see stage03_legacy_path_map.csv",
+                    "storage_policy_version": storage_policy_version,
+                    "storage_format": str(
+                        storage.get(
+                            "storage_format",
+                            "legacy_json_or_jsonl" if not current_storage else "json_control",
+                        )
+                    ),
+                    "compression": str(storage.get("compression", "none")),
+                    "retention_class": str(
+                        storage.get("retention_class", "legacy")
+                    ),
+                    "evidence_completeness": str(
+                        storage.get("evidence_completeness", "legacy_unknown")
+                    ),
+                    "schema_fingerprint": str(storage.get("schema_fingerprint", "")),
+                    "row_count": storage.get("row_count", ""),
+                    "byte_size": storage.get("byte_size", path.stat().st_size),
+                    "policy_compliance": "current" if current_storage else "legacy_compatible",
                 }
             )
 
@@ -876,6 +1078,21 @@ def build_stage(
                     "comparison_baseline": spec.comparison_baseline,
                     "supersedes": "",
                     "legacy_path_mapping": "preserve;canonical summary name is registry-only",
+                    "storage_policy_version": (
+                        "artifact-storage-v1" if current_storage else "legacy"
+                    ),
+                    "storage_format": "csv_summary",
+                    "compression": "none",
+                    "retention_class": "diagnostic",
+                    "evidence_completeness": "complete",
+                    "schema_fingerprint": "",
+                    "row_count": (
+                        len(tracked_summary.read_text(encoding="utf-8").splitlines()) - 1
+                    ),
+                    "byte_size": tracked_summary.stat().st_size,
+                    "policy_compliance": (
+                        "current" if current_storage else "legacy_compatible"
+                    ),
                 }
             )
 

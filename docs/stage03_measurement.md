@@ -47,14 +47,20 @@ registry、checksum、manifest 和 semantic raw-to-summary（语义原始数据�
 
 ## 数据字典
 
-每个 run 至少包含以下 raw 文件：
+新格式每个 instance/seed 至少包含以下 raw artifacts：
 
-- `solutions/<run>.json`：最终 route sequence（路线序列）和求解器给出的 objective key；审计器会重新运行统一 validator。
-- `traces/<run>.json`：`Stage03Trace`。`route_dictionary` 以 canonical route key（规范路线键）保存客户序列；`route_evaluations` 保存 `exact_call`、`cache_hit`、`precomputed_route`、lane、iteration、operator、timing、feasibility、failure reason、label 统计，以及 `exact_started`/`exact_completed`。
-- `events/<run>.jsonl`：trace event（trace 事件）与既有 `NeighborhoodEvent`（邻域事件）的逐行记录。
-- `environments/<run>.json`：source/config/instance/environment hash、Python/package/native extension、hardware、peak memory、Stage 0 manifest hash，以及 `VRP-EVRP-Project-Hub` 和 `py-ga-VRPTW` 的 revision/dirty 状态。
-- `raw/<run>.json`：原始 record、solver result、validator replay 线索和其他 raw 文件相对路径。
-- `manifest.json` 与旁置的 `manifest.sha256`：raw 文件清单、SHA-256 和清单完整性锚点；auditor 会先验证二者。
+- `*_raw_*.json`：原始 record、solver result 和 validator replay 线索；
+- `*_solution_*.json`：最终 route sequence（路线序列）和 objective key；审计器会重新运行统一 validator；
+- `*_trace_*.json`：只保存 `Stage03Trace` counters、配置、Parquet 引用和 schema fingerprint；
+- `*_events_*.parquet`：全局 `event_id`、route ID、exact call、candidate、deadline、failure 和其他 critical event；
+- `*_route_dictionary_*.parquet`：每个 canonical route key（规范路线键）只保存一次完整客户序列；
+- `*_screening_checks_*.parquet`：规范化 screening check（预筛选检查）列；
+- `*_diagnostic_*.parquet`：按 run/lane/iteration/operator/reason 聚合的诊断统计；
+- `*_environment_*.json`：source/config/instance/environment hash、Python/package/native extension、hardware、peak memory、Stage 0 manifest hash，以及两个 reference repository 的 revision/dirty 状态。
+
+`control/` 下的 run metadata、复制的 config、manifest 和
+`<canonical>_manifest.sha256` 是完整性锚点。历史 JSON/JSONL 目录仍使用旧的数据
+字典，并由 legacy reader 读取；不会为了符合新字段而重写历史字节。
 
 `Stage03Trace` 的关键聚合字段如下：
 
@@ -80,13 +86,13 @@ registry、checksum、manifest 和 semantic raw-to-summary（语义原始数据�
 uv run python -m evrptw.experiments.stage03_measurement \
   --config configs/stage03_measurement.toml \
   --scope smoke \
-  --run-label stage03_measurement_smoke01 \
-  --output-dir results/stage03-measurement_smoke01
+  --run-label stage03.0_measurement_attempt01 \
+  --output-dir results/stage03.0_measurement_attempt01
 
 uv run python -m evrptw.experiments.stage03_measurement_review \
-  --run-dir results/stage03-measurement_smoke01 \
+  --run-dir results/stage03.0_measurement_attempt01 \
   --summary-dir experiments/summaries \
-  --review-label stage03_measurement_smoke01
+  --review-label stage03.0_measurement_attempt01
 ```
 
 只有 smoke review 输出 `READY_FOR_STAGE03_FORMAL_MEASUREMENT` 后，才允许启动正式 36-run：
@@ -95,9 +101,9 @@ uv run python -m evrptw.experiments.stage03_measurement_review \
 uv run python -m evrptw.experiments.stage03_measurement \
   --config configs/stage03_measurement.toml \
   --scope formal \
-  --run-label stage03_measurement_formal01 \
-  --output-dir results/stage03-measurement_formal01 \
-  --smoke-review-dir results/stage03-measurement_smoke01/review
+  --run-label stage03.0_measurement_attempt02 \
+  --output-dir results/stage03.0_measurement_attempt02 \
+  --smoke-review-dir results/stage03.0_measurement_attempt01/review
 ```
 
 正式 run 完成后再次使用 `stage03_measurement_review`。正式审计通过才报告已具备进入 Stage 3.1 的证据；不会把 Stage 3.0 报告写成 acceleration result（加速结果）。
@@ -110,3 +116,16 @@ uv run python -m evrptw.experiments.stage03_measurement \
 - smoke 必须覆盖 18 个唯一 run key；所有 solution 通过 validator，objective replay 一致，trace 与 `ALNSResult` 对账一致；C5 objective key 必须与 Stage 2.3 attempt16 对应 baseline 一致，100-customer runs 必须可行且 vehicle count 不得变差。
 - 其他 wall-clock 差异统一标为 `time-budget variation`。fixed-work/wall-clock 双轴诊断留给 Stage 3.3。
 - 36-run formal replay 通过后，才允许开始 Stage 3.1 的 cheap screening（廉价预筛）；Stage 3.0 本身不实现 3.1–3.4。
+# Stage 3.0 measurement storage note
+
+Stage 3.0 的新运行必须使用 [实验产物存储规则 v2](experiment_artifact_storage.md)。
+新 raw bundle 由 `ArtifactBundleWriter` 写入 Parquet/Arrow events、route dictionary、
+diagnostic aggregate、per-instance environment 和 control manifest；`trace.json` 只
+是可回放索引。历史 Stage 3.0 JSON/JSONL 目录保持原字节和原路径，通过
+`ArtifactReader` 的 legacy compatibility path 读取，不能物理迁移。
+
+Stage 3.0 仍然只是 measurement（测量），不实现 cache acceleration、incremental
+propagation、interruptible exact solver、parallel evaluation 或 fixed-work/wall-clock
+加速结论。只有 independent review 完成 current/legacy replay、validator/objective、
+critical event、deadline、provenance 和 raw-to-summary 检查后，才能发布 tracked
+summary。

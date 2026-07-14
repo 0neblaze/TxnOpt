@@ -54,14 +54,15 @@ operators（破坏/修复算子）的邻域结构；车辆感知修复和路径�
 uv run python -m evrptw.experiments.stage01_objective \
   --config configs/stage00_baseline.toml \
   --baseline-dir experiments/baselines/stage00 \
-  --output-dir results/stage01 \
+  --output-dir results/stage01_objective_attempt01 \
   --summary-dir experiments/summaries
 ```
 
-完整 raw logs（原始日志）和 solutions（解）保存在 ignored `results/stage01/`；审阅用
-per-run、summary、failure、Stage 0 comparison 和 old-vs-new ranking CSV 保存在
-`experiments/summaries/`。runner 在运行前重新验证阶段 0 manifest，并在结束时拒绝任何
-可行率退化、缺失 seed 或 validator 失败。
+新运行的 raw、solution、trace、events、environment 和 failure evidence 保存在
+ignored `results/stage01_objective_attempt01/` 的 current artifact bundle 中；
+`trace.json` 是 trace index，事件使用 Parquet/Arrow。runner 不得直接发布 tracked
+summary，必须由独立 review/preflight 在 raw replay 通过后发布。旧的 `results/stage01/`
+路径只作为历史兼容映射，不得由带 `[artifact_storage]` 的新配置继续生成。
 
 ## 5. 冻结结果排序审计
 

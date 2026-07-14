@@ -17,3 +17,14 @@ distance_vns_iterations = 200
 [output]
 directory = "results/runs/performance"
 record_environment = true
+
+[artifact_storage]
+enabled = true
+storage_policy_version = "artifact-storage-v1"
+event_format = "parquet"
+compression = "zstd"
+compression_level = 3
+critical_evidence = "full"
+diagnostic_evidence = "aggregate"
+per_instance_seed_max_bytes = 2147483648
+per_run_max_bytes = 34359738368

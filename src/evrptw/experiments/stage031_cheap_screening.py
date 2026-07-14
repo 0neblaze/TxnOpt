@@ -14,7 +14,7 @@ def run_stage031(
     config_path: Path,
     output_dir: Path,
     scope: str = "smoke",
-    run_label: str = "stage031_cheap_screening",
+    run_label: str = "stage03.1_screening_attempt01",
     summary_dir: Path | None = None,
     smoke_review_dir: Path | None = None,
 ) -> dict[str, Path]:
@@ -42,7 +42,7 @@ def main() -> int:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--scope", choices=("smoke", "formal"), default="smoke")
-    parser.add_argument("--run-label", default="stage031_cheap_screening")
+    parser.add_argument("--run-label", default="stage03.1_screening_attempt01")
     parser.add_argument("--summary-dir", type=Path)
     parser.add_argument("--smoke-review-dir", type=Path)
     arguments = parser.parse_args()

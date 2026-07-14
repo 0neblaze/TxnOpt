@@ -51,13 +51,15 @@ uv run pytest
 uv run ruff check .
 uv run mypy
 uv run python -m evrptw.experiments.stage02_route_quality \
-  --config configs/stage02_route_quality.toml
+  --config configs/stage02_route_quality.toml \
+  --output-dir results/stage02.2_route_quality_attempt01 \
+  --run-label stage02.2_route_quality_attempt01
 
 uv run python -m evrptw.experiments.stage02_route_quality \
   --config configs/stage02_route_quality.toml \
-  --output-dir results/stage02-quality-rerun01 \
-  --run-label stage02_quality_rerun01 \
-  --repeat-of results/stage02-quality_attempt02
+  --output-dir results/stage02.2_route_quality_rerun01 \
+  --run-label stage02.2_route_quality_rerun01 \
+  --repeat-of results/stage02.2_route_quality_attempt01
 ```
 
 ## 5. 正式验收结果（2026-07-13）

@@ -91,13 +91,13 @@ Stage 3.1 trace 仍使用 Stage 3.0 的 route dictionary（路线字典）去重
 uv run python -m evrptw.experiments.stage031_cheap_screening \
   --config configs/stage031_cheap_screening.toml \
   --scope smoke \
-  --run-label stage031_cheap_screening_smoke01 \
-  --output-dir results/stage031-cheap-screening_smoke01
+  --run-label stage03.1_screening_attempt01 \
+  --output-dir results/stage03.1_screening_attempt01
 
 uv run python -m evrptw.experiments.stage031_cheap_screening_review \
-  --run-dir results/stage031-cheap-screening_smoke01 \
+  --run-dir results/stage03.1_screening_attempt01 \
   --summary-dir experiments/summaries \
-  --review-label stage031_cheap_screening_smoke01
+  --review-label stage03.1_screening_attempt01
 ```
 
 Smoke replay 通过后运行 formal：
@@ -106,14 +106,14 @@ Smoke replay 通过后运行 formal：
 uv run python -m evrptw.experiments.stage031_cheap_screening \
   --config configs/stage031_cheap_screening.toml \
   --scope formal \
-  --run-label stage031_cheap_screening_formal01 \
-  --output-dir results/stage031-cheap-screening_formal01 \
-  --smoke-review-dir results/stage031-cheap-screening_smoke01/review
+  --run-label stage03.1_screening_attempt02 \
+  --output-dir results/stage03.1_screening_attempt02 \
+  --smoke-review-dir results/stage03.1_screening_attempt01/review
 
 uv run python -m evrptw.experiments.stage031_cheap_screening_review \
-  --run-dir results/stage031-cheap-screening_formal01 \
+  --run-dir results/stage03.1_screening_attempt02 \
   --summary-dir experiments/summaries \
-  --review-label stage031_cheap_screening_formal01
+  --review-label stage03.1_screening_attempt02
 ```
 
 ## Failure retention and review gates
@@ -132,3 +132,14 @@ uv run python -m evrptw.experiments.stage031_cheap_screening_review \
   可以报告，但不能宣称 Stage 3.3 fixed-work/wall-clock acceleration。
 - formal review 通过后必须输出 `READY_FOR_STAGE03_2`，这才是进入 Stage 3.2
   的唯一门槛。
+# Stage 3.1 storage note
+
+Stage 3.1 新运行沿用 `artifact-storage-v1`，screening decision 和每个 check 是
+critical evidence，写入 `events.parquet` 与独立 `screening_checks.parquet`；普通
+诊断按 run/lane/iteration/operator/reason 聚合到 `diagnostic.parquet`。历史 JSON/JSONL
+证据不转换，`ArtifactReader` 同时支持新旧格式。
+
+reviewer 必须先验证 raw manifest，再回放 screening pass/rejection/negative-cache
+语义、exact-call ordering、validator/objective、vehicle-first acceptance、deadline、
+provenance 和 Stage 3.0 comparison。审计通过前不得发布 summary；exact-call reduction
+仍是 measurement evidence，不是 Stage 3.3 加速结论。

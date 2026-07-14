@@ -16,6 +16,14 @@ from pathlib import Path
 from typing import Any
 
 from evrptw.alns import ALNSResult, solve_alns
+from evrptw.artifacts import (
+    ArtifactBundleWriter,
+    ArtifactStorageConfig,
+    artifact_context_from_run_label,
+    canonical_run_label_is_valid,
+    require_current_storage_config,
+    write_solver_result_bundle,
+)
 from evrptw.environment import collect_environment
 from evrptw.experiments.stage00_baseline import (
     load_config as load_stage00_config,
@@ -306,6 +314,7 @@ class Stage02Config:
     max_iterations: int
     threads: int
     vehicle_operator_config: VehicleOperatorConfig
+    artifact_storage: ArtifactStorageConfig | None = None
 
 
 def load_config(path: Path) -> Stage02Config:
@@ -338,6 +347,11 @@ def load_config(path: Path) -> Stage02Config:
             time_limit_seconds=float(run["time_limit_seconds"]),
             max_iterations=int(run["max_iterations"]),
             threads=int(run["threads"]),
+            artifact_storage=(
+                ArtifactStorageConfig(**dict(payload["artifact_storage"]))
+                if "artifact_storage" in payload
+                else None
+            ),
             vehicle_operator_config=VehicleOperatorConfig(
                 max_route_elimination_attempts=int(operators["max_route_elimination_attempts"]),
                 route_elimination_exact_evaluation_budget=int(
@@ -529,6 +543,25 @@ def run_stage02(
 ) -> dict[str, Path]:
     config = load_config(config_path)
     _validate_run_label(run_label)
+    if config.artifact_storage is not None and not canonical_run_label_is_valid(run_label):
+        raise ValueError(
+            "a configured new Stage 2 run must use a canonical attemptNN/rerunNN "
+            "label; the legacy run label is reserved for compatibility"
+        )
+    # Historical Stage 2 labels such as
+    # ``stage02_constraint_guided_attempt16`` must keep their legacy writer
+    # and output path.  Only the dotted Stage 2.x namespace opts into the
+    # current Artifact Storage v2 bundle.
+    if (
+        run_label.startswith("stage02.")
+        and canonical_run_label_is_valid(run_label)
+    ):
+        return _run_stage02_current(
+            config=config,
+            config_path=config_path,
+            output_dir=output_dir,
+            run_label=run_label,
+        )
     root = _repository_root()
     baseline_dir = _resolve(root, config.baseline_dir)
     stage01_path = _resolve(root, config.stage01_per_run)
@@ -765,6 +798,146 @@ def run_stage02(
         "raw_dir": raw_dir,
         "solution_dir": solution_dir,
         "manifest": manifest_path,
+    }
+
+
+def _run_stage02_current(
+    *,
+    config: Stage02Config,
+    config_path: Path,
+    output_dir: Path,
+    run_label: str,
+) -> dict[str, Path]:
+    root = _repository_root()
+    storage = require_current_storage_config(run_label, config.artifact_storage)
+    if output_dir.name != run_label:
+        raise ValueError("current Stage 2 output directory must equal its canonical run label")
+    if output_dir.exists():
+        raise FileExistsError(f"output directory already exists: {output_dir}")
+    context = artifact_context_from_run_label(run_label)
+    writer = ArtifactBundleWriter(output_dir, context, storage)
+    source_hashes = _source_hashes(root)
+    algorithm_hash = _combined_hash(source_hashes)
+    revision = _git_revision(root)
+    dirty = _git_dirty(root)
+    benchmark_dir = _resolve(root, config.benchmark_dir)
+    metadata = {
+        "schema_version": config.schema_version,
+        "experiment_id": config.experiment_id,
+        "run_label": run_label,
+        "scope": "formal",
+        "algorithm": config.algorithm,
+        "operator_profile": config.operator_profile.value,
+        "expected_instances": list(config.instances),
+        "expected_seeds": list(config.seeds),
+        "benchmark_directory": str(benchmark_dir),
+        "repository_revision": revision,
+        "repository_dirty": dirty,
+        "algorithm_source_sha256": algorithm_hash,
+        "algorithm_source_files": source_hashes,
+        "configuration_sha256": _sha256(_resolve(root, config_path)),
+        "captured_environment": collect_environment(),
+    }
+    writer.write_control(
+        metadata=metadata,
+        configuration_path=_resolve(root, config_path),
+    )
+    index_path = output_dir / "control" / f"{run_label}_per_run_results.csv"
+    _write_csv(index_path, PER_RUN_FIELDS, [])
+    rows: list[dict[str, Any]] = []
+    for instance_name in config.instances:
+        instance_path = benchmark_dir / f"{instance_name}.txt"
+        instance_hash = _sha256(instance_path)
+        instance = parse_schneider(instance_path)
+        for seed in config.seeds:
+            started = datetime.now(UTC)
+            result = solve_alns(
+                instance,
+                seed=seed,
+                max_iterations=config.max_iterations,
+                time_limit_seconds=config.time_limit_seconds,
+                operator_profile=config.operator_profile,
+                vehicle_operator_config=config.vehicle_operator_config,
+            )
+            ended = datetime.now(UTC)
+            routes = [list(route) for route in result.routes]
+            report = validate_routes(instance, routes, claimed_objective=result.objective_value)
+            objective = result.objective
+            row: dict[str, Any] = {
+                "schema_version": config.schema_version,
+                "run_label": run_label,
+                "experiment_id": f"{instance.name}-alns-{seed}",
+                "instance": instance.name,
+                "algorithm": config.algorithm,
+                "operator_profile": config.operator_profile.value,
+                "seed": seed,
+                "repository_revision": revision,
+                "repository_dirty": dirty,
+                "algorithm_source_sha256": algorithm_hash,
+                "instance_sha256": instance_hash,
+                "start_utc": started.isoformat(),
+                "end_utc": ended.isoformat(),
+                "time_limit_seconds": config.time_limit_seconds,
+                "max_iterations": config.max_iterations,
+                "threads": config.threads,
+                "objective_schema": OBJECTIVE_SCHEMA,
+                "objective_key": json.dumps(objective.key if objective else ()),
+                "primary_vehicle_count": objective.vehicle_count if objective else "",
+                "secondary_total_distance": objective.total_distance if objective else "",
+                "tertiary_total_charging_time": (
+                    objective.total_charging_time if objective else ""
+                ),
+                "quaternary_charging_count": objective.charging_count if objective else "",
+                "total_energy": report.total_energy,
+                "total_charged_energy": report.total_charged_energy,
+                "runtime_seconds": result.runtime_seconds,
+                "first_feasible_time": result.first_feasible_time,
+                "best_time": result.best_time,
+                "iterations": result.iterations,
+                "accepted_moves": result.accepted_moves,
+                "improving_moves": result.improving_moves,
+                "rejected_moves": result.rejected_moves,
+                "charging_subproblem_calls": result.charging_subproblem_calls,
+                "cache_hits": result.cache_hits,
+                "cache_misses": result.cache_misses,
+                "unique_route_evaluations": result.unique_route_evaluations,
+                "effective_iterations": result.effective_iterations,
+                "neighborhood_events": len(result.neighborhood_events),
+                "status": "feasible" if report.feasible else "invalid",
+                "feasible": report.feasible,
+                "failure_reason": result.failure_reason or ";".join(report.violations),
+            }
+            refs = write_solver_result_bundle(
+                writer,
+                instance=instance,
+                seed=seed,
+                result=result,
+                raw_record=row,
+                environment_payload={
+                    **metadata,
+                    "instance": instance.name,
+                    "seed": seed,
+                    "instance_sha256": instance_hash,
+                    "run_start_utc": started.isoformat(),
+                    "run_end_utc": ended.isoformat(),
+                },
+            )
+            row["raw_log_path"] = refs["raw"]
+            row["solution_path"] = refs["solution"]
+            rows.append(row)
+            _write_csv(index_path, PER_RUN_FIELDS, rows)
+    writer.record_existing_file(
+        index_path,
+        artifact_type="per_run_results",
+        retention_class="control",
+        storage_format="csv_control",
+        row_count=len(rows),
+    )
+    bundle = writer.finalize()
+    return {
+        "output_dir": output_dir,
+        "per_run": index_path,
+        "manifest": bundle.manifest_path,
     }
 
 
@@ -2264,9 +2437,16 @@ def _validate_config(config: Stage02Config) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run Stage 2 route experiments")
     parser.add_argument("--config", type=Path, default=Path("configs/stage02_route_reduction.toml"))
-    parser.add_argument("--output-dir", type=Path, default=Path("results/stage02"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("results/stage02.1_route_reduction_attempt01"),
+    )
     parser.add_argument("--summary-dir", type=Path, default=Path("experiments/summaries"))
-    parser.add_argument("--run-label", default="stage02")
+    parser.add_argument(
+        "--run-label",
+        default="stage02.1_route_reduction_attempt01",
+    )
     parser.add_argument(
         "--repeat-of",
         type=Path,

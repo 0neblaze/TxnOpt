@@ -46,14 +46,16 @@ uv run pytest
 uv run ruff check .
 uv run mypy
 uv run python -m evrptw.experiments.stage02_route_reduction \
-  --config configs/stage02_route_reduction.toml
+  --config configs/stage02_route_reduction.toml \
+  --output-dir results/stage02.1_route_reduction_attempt01 \
+  --run-label stage02.1_route_reduction_attempt01
 
 # 第二次独立完整复跑；路径和 run label 必须是新的
 uv run python -m evrptw.experiments.stage02_route_reduction \
   --config configs/stage02_route_reduction.toml \
-  --output-dir results/stage02-rerun01 \
-  --run-label stage02_rerun01 \
-  --repeat-of results/stage02
+  --output-dir results/stage02.1_route_reduction_rerun01 \
+  --run-label stage02.1_route_reduction_rerun01 \
+  --repeat-of results/stage02.1_route_reduction_attempt01
 ```
 
 每一轮必须使用新的 `--run-label` 和 raw output directory。runner 在开始时重新验证 Stage 0

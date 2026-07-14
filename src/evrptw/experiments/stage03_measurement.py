@@ -8,7 +8,6 @@ import os
 import platform
 import re
 import resource
-import shutil
 import subprocess
 import tomllib
 from dataclasses import asdict, dataclass, replace
@@ -17,6 +16,14 @@ from pathlib import Path
 from typing import Any
 
 from evrptw.alns import ALNSResult, solve_alns
+from evrptw.artifacts import (
+    ArtifactBundleWriter,
+    ArtifactRunContext,
+    ArtifactStorageConfig,
+    aggregate_diagnostic_events,
+    build_stage03_critical_events,
+    verify_manifest,
+)
 from evrptw.cache_incremental import CacheIncrementalConfig
 from evrptw.environment import collect_environment
 from evrptw.experiments.stage00_baseline import load_config as load_stage00_config
@@ -136,6 +143,7 @@ class Stage03Config:
     time_limit_seconds: float
     max_iterations: int
     threads: int
+    artifact_storage: ArtifactStorageConfig
     screening_config: CheapScreeningConfig | None = None
     cache_incremental_config: CacheIncrementalConfig | None = None
     stage03_formal_run_dir: Path | None = None
@@ -168,6 +176,9 @@ def load_config(path: Path) -> Stage03Config:
             time_limit_seconds=float(run["time_limit_seconds"]),
             max_iterations=int(run["max_iterations"]),
             threads=int(run["threads"]),
+            artifact_storage=ArtifactStorageConfig(
+                **dict(payload["artifact_storage"])
+            ),
             screening_config=(
                 CheapScreeningConfig(**dict(payload["screening"]))
                 if "screening" in payload
@@ -220,7 +231,7 @@ def run_stage03(
     config_path: Path,
     output_dir: Path,
     scope: str = "smoke",
-    run_label: str = "stage03_measurement",
+    run_label: str = "stage03.0_measurement_attempt01",
     summary_dir: Path | None = None,
     smoke_review_dir: Path | None = None,
 ) -> dict[str, Path]:
@@ -281,6 +292,9 @@ def run_stage03(
         else:
             _require_smoke_gate(_resolve(root, smoke_review_dir) if smoke_review_dir else None)
     _validate_run_label(run_label)
+    _validate_current_run_label(run_label)
+    if output_dir.name != run_label:
+        raise ValueError("current Stage 3 output directory must equal its canonical run label")
     if cache_incremental_enabled:
         _validate_stage032_run_label(run_label)
     _assert_unique_run_label(root, run_label)
@@ -408,23 +422,17 @@ def run_stage03(
         ),
     }
 
-    output_dir.mkdir(parents=True)
-    for name in (
-        "raw",
-        "solutions",
-        "traces",
-        "events",
-        "environments",
-        "failures",
-    ):
-        (output_dir / name).mkdir()
-    _write_json(output_dir / "run_metadata.json", metadata)
-    shutil.copy2(config_path, output_dir / "parameters.toml")
-    raw_per_run_path = output_dir / "raw_per_run_results.csv"
+    context = _artifact_context(run_label)
+    artifact_writer = ArtifactBundleWriter(
+        output_dir,
+        context,
+        config.artifact_storage,
+    )
+    artifact_writer.write_control(metadata=metadata, configuration_path=config_path)
+    raw_per_run_path = output_dir / "control" / f"{run_label}_raw_per_run_results.csv"
     _write_csv(raw_per_run_path, RAW_PER_RUN_FIELDS, [])
 
     rows: list[dict[str, Any]] = []
-    run_environment_hashes: dict[str, str] = {}
     for instance_name in instances:
         instance_path = benchmark_dir / f"{instance_name}.txt"
         if not instance_path.is_file():
@@ -493,9 +501,8 @@ def run_stage03(
                 peak_rss_bytes=peak_rss,
             )
             environment_hash = _payload_sha256(environment_payload)
-            run_environment_hashes[run_id] = environment_hash
-            row = _persist_run(
-                output_dir=output_dir,
+            row = _persist_run_current(
+                artifact_writer=artifact_writer,
                 run_id=run_id,
                 run_label=run_label,
                 scope=scope,
@@ -521,25 +528,31 @@ def run_stage03(
             rows.append(row)
             _write_csv(raw_per_run_path, RAW_PER_RUN_FIELDS, rows)
             if error is not None:
-                _write_json(output_dir / "environment.json", {
-                    **metadata,
-                    "run_environment_sha256": run_environment_hashes,
-                })
-                _write_manifest(output_dir)
+                artifact_writer.record_existing_file(
+                    raw_per_run_path,
+                    artifact_type="raw_per_run_results",
+                    retention_class="control",
+                    storage_format="csv_control",
+                    row_count=len(rows),
+                )
+                artifact_writer.finalize(status="failed", evidence_completeness="partial")
                 raise error
 
-    _write_json(
-        output_dir / "environment.json",
-        {**metadata, "run_environment_sha256": run_environment_hashes},
+    artifact_writer.record_existing_file(
+        raw_per_run_path,
+        artifact_type="raw_per_run_results",
+        retention_class="control",
+        storage_format="csv_control",
+        row_count=len(rows),
     )
-    _write_manifest(output_dir)
+    final_bundle = artifact_writer.finalize()
     return {
         "output_dir": output_dir,
         "raw_per_run": raw_per_run_path,
-        "metadata": output_dir / "run_metadata.json",
-        "environment": output_dir / "environment.json",
-        "parameters": output_dir / "parameters.toml",
-        "manifest": output_dir / "manifest.json",
+        "metadata": output_dir / "control" / f"{run_label}_run_metadata.json",
+        "environment": output_dir / "control" / f"{run_label}_run_metadata.json",
+        "parameters": output_dir / "control" / f"{run_label}_config.toml",
+        "manifest": final_bundle.manifest_path,
     }
 
 
@@ -673,6 +686,7 @@ def _persist_run(
     solver_result = asdict(result) if result is not None else None
     if solver_result is not None:
         solver_result["measurement_trace"] = None
+        solver_result["neighborhood_events"] = None
     row: dict[str, Any] = {
         "schema_version": config.schema_version,
         "run_label": run_label,
@@ -780,6 +794,245 @@ def _persist_run(
         },
     )
     return row
+
+
+def _persist_run_current(
+    *,
+    artifact_writer: ArtifactBundleWriter,
+    run_id: str,
+    run_label: str,
+    scope: str,
+    config: Stage03Config,
+    instance: Instance,
+    instance_hash: str,
+    seed: int,
+    result: ALNSResult | None,
+    trace: Stage03Trace,
+    error: BaseException | None,
+    start: datetime,
+    end: datetime,
+    repository_revision: str,
+    algorithm_source_sha256: str,
+    configuration_sha256: str,
+    baseline_manifest_sha256: str,
+    environment_payload: dict[str, Any],
+    environment_hash: str,
+    reference_repositories: dict[str, dict[str, object]],
+    peak_tracemalloc_bytes: int | None,
+    peak_rss_bytes: int | None,
+) -> dict[str, Any]:
+    """Persist one new-format Stage 3 run through the shared writer."""
+
+    routes = [list(route) for route in result.routes] if result is not None else []
+    objective = result.objective if result is not None else None
+    report = validate_routes(instance, routes)
+    replay_objective = SolutionObjective.from_report(instance, report) if report.feasible else None
+    objective_matches = (
+        objective is not None
+        and replay_objective is not None
+        and compare_objectives(objective, replay_objective) is ObjectiveComparison.EQUAL
+    )
+    trace_reconciliation = trace.reconcile(result) if result is not None else {
+        "status": "not_available",
+        "checks": {},
+    }
+    if error is not None:
+        status = "interrupted"
+        feasible = False
+        failure_reason = f"{type(error).__name__}: {error}"
+    elif result is None:
+        status = "invalid"
+        feasible = False
+        failure_reason = "missing solver result"
+    elif report.feasible and result.feasible and objective_matches:
+        status = "feasible"
+        feasible = True
+        failure_reason = ""
+    else:
+        status = "invalid"
+        feasible = False
+        failure_reason = result.failure_reason or (
+            "validator/objective replay mismatch"
+            if report.feasible and not objective_matches
+            else "solver result is infeasible"
+        )
+
+    refs = _current_artifact_paths(run_label, instance.name, seed)
+    failure_evidence_reasons: list[str] = []
+    if error is not None:
+        failure_evidence_reasons.append("execution_exception")
+    if status != "feasible":
+        failure_evidence_reasons.append(status)
+    if trace.deadline_events:
+        failure_evidence_reasons.append("deadline_boundary_observed")
+    if any(event.get("event_type") == "execution_error" for event in trace.events):
+        failure_evidence_reasons.append("trace_execution_error")
+    failure_evidence_required = bool(failure_evidence_reasons)
+    failure_path = refs["failure"] if failure_evidence_required else ""
+
+    row: dict[str, Any] = {
+        "schema_version": config.schema_version,
+        "run_label": run_label,
+        "experiment_id": run_id,
+        "scope": scope,
+        "instance": instance.name,
+        "seed": seed,
+        "algorithm": config.algorithm,
+        "operator_profile": config.operator_profile,
+        "repository_revision": repository_revision,
+        "repository_dirty": False,
+        "algorithm_source_sha256": algorithm_source_sha256,
+        "configuration_sha256": configuration_sha256,
+        "instance_sha256": instance_hash,
+        "stage00_manifest_sha256": baseline_manifest_sha256,
+        "environment_sha256": environment_hash,
+        "reference_vrp_evrp_hub_revision": reference_repositories[
+            "VRP-EVRP-Project-Hub"
+        ]["revision"],
+        "reference_vrp_evrp_hub_dirty": reference_repositories[
+            "VRP-EVRP-Project-Hub"
+        ]["dirty"],
+        "reference_py_ga_vrptw_revision": reference_repositories["py-ga-VRPTW"][
+            "revision"
+        ],
+        "reference_py_ga_vrptw_dirty": reference_repositories["py-ga-VRPTW"]["dirty"],
+        "start_utc": start.isoformat(),
+        "end_utc": end.isoformat(),
+        "time_limit_seconds": config.time_limit_seconds,
+        "max_iterations": config.max_iterations,
+        "threads": config.threads,
+        "objective_schema": OBJECTIVE_SCHEMA,
+        "objective_key": json.dumps(objective.key if objective is not None else ()),
+        "vehicle_count": replay_objective.vehicle_count if replay_objective else "",
+        "total_distance": replay_objective.total_distance if replay_objective else "",
+        "total_charging_time": replay_objective.total_charging_time if replay_objective else "",
+        "charging_count": replay_objective.charging_count if replay_objective else "",
+        "runtime_seconds": result.runtime_seconds if result is not None else "",
+        "first_feasible_time": result.first_feasible_time if result is not None else "",
+        "best_time": result.best_time if result is not None else "",
+        "iterations": result.iterations if result is not None else "",
+        "effective_iterations": result.effective_iterations if result is not None else "",
+        "accepted_moves": result.accepted_moves if result is not None else "",
+        "improving_moves": result.improving_moves if result is not None else "",
+        "rejected_moves": result.rejected_moves if result is not None else "",
+        "charging_subproblem_calls": result.charging_subproblem_calls if result is not None else "",
+        "trace_started_calls": trace.started_calls,
+        "trace_completed_calls": trace.completed_calls,
+        "trace_exact_calls": trace.exact_calls,
+        "trace_cache_hits": trace.cache_hits,
+        "trace_precomputed_routes": trace.precomputed_routes,
+        "trace_route_evaluations": len(trace.route_evaluations),
+        "trace_deadline_events": trace.deadline_events,
+        "trace_screening_calls": trace.screening_counts["screening_calls"],
+        "trace_screening_passes": trace.screening_counts["screening_passes"],
+        "trace_screening_rejections": trace.screening_counts["screening_rejections"],
+        "trace_screening_cache_hits": trace.screening_counts["screening_cache_hits"],
+        "trace_screening_exact_call_blocked": trace.screening_counts[
+            "screening_exact_call_blocked"
+        ],
+        "trace_screening_reason_counts": json.dumps(
+            trace.screening_counts["screening_reason_counts"], sort_keys=True
+        ),
+        "trace_cache_incremental_counts": json.dumps(
+            trace.cache_incremental_counts, sort_keys=True
+        ),
+        "trace_incremental_propagations": trace.cache_incremental_counts[
+            "incremental_propagations"
+        ],
+        "trace_incremental_fallbacks": trace.cache_incremental_counts[
+            "incremental_fallbacks"
+        ],
+        "trace_reconciliation_status": trace_reconciliation["status"],
+        "peak_tracemalloc_bytes": peak_tracemalloc_bytes,
+        "peak_rss_bytes": peak_rss_bytes if peak_rss_bytes is not None else "",
+        "status": status,
+        "feasible": feasible,
+        "failure_reason": failure_reason,
+        "failure_path": failure_path,
+        "raw_path": refs["raw"],
+        "solution_path": refs["solution"],
+        "trace_path": refs["trace"],
+        "event_path": refs["events"],
+        "environment_path": refs["environment"],
+    }
+    solver_result = asdict(result) if result is not None else None
+    if solver_result is not None:
+        solver_result["measurement_trace"] = None
+        solver_result["neighborhood_events"] = None
+    raw_payload = {
+        "record": row,
+        "solver_result": solver_result,
+        "validator_replay": {
+            "feasible": report.feasible,
+            "objective_key": list(replay_objective.key) if replay_objective else [],
+            "violations": [*report.violations],
+        },
+        "artifact_references": refs,
+    }
+    failure_payload = (
+        {
+            "schema_version": config.schema_version,
+            "run_id": run_id,
+            "run_label": run_label,
+            "instance": instance.name,
+            "seed": seed,
+            "error_type": type(error).__name__ if error is not None else "",
+            "failure_reason": failure_reason,
+            "evidence_reasons": failure_evidence_reasons,
+            "partial_trace": status != "feasible" or error is not None,
+            "trace_path": refs["trace"],
+            "event_path": refs["events"],
+            "environment_path": refs["environment"],
+        }
+        if failure_evidence_required
+        else None
+    )
+    critical_events = build_stage03_critical_events(
+        trace,
+        result.neighborhood_events if result is not None else (),
+    )
+    diagnostic_rows = aggregate_diagnostic_events(
+        critical_events,
+        run_label=run_label,
+        instance=instance.name,
+        seed=seed,
+    )
+    artifact_writer.write_instance_seed(
+        instance=instance.name,
+        seed=seed,
+        raw_payload=raw_payload,
+        solution_payload={
+            "schema_version": config.schema_version,
+            "instance": instance.name,
+            "seed": seed,
+            "routes": routes,
+            "objective_key": list(objective.key) if objective is not None else [],
+            "solver_feasible": result.feasible if result is not None else False,
+        },
+        trace_payload=trace.to_dict(),
+        environment_payload=environment_payload,
+        route_dictionary=trace.route_dictionary,
+        critical_events=critical_events,
+        diagnostic_rows=diagnostic_rows,
+        failure_payload=failure_payload,
+    )
+    return row
+
+
+def _current_artifact_paths(run_label: str, instance: str, seed: int) -> dict[str, str]:
+    base = f"{run_label}_"
+    prefix = f"{instance}/{seed}/{base}"
+    return {
+        "raw": f"{prefix}raw_{instance}_{seed}.json",
+        "solution": f"{prefix}solution_{instance}_{seed}.json",
+        "trace": f"{prefix}trace_{instance}_{seed}.json",
+        "events": f"{prefix}events_{instance}_{seed}.parquet",
+        "route_dictionary": f"{prefix}route_dictionary_{instance}_{seed}.parquet",
+        "screening_checks": f"{prefix}screening_checks_{instance}_{seed}.parquet",
+        "diagnostic": f"{prefix}diagnostic_{instance}_{seed}.parquet",
+        "environment": f"{prefix}environment_{instance}_{seed}.json",
+        "failure": f"{prefix}failure_{instance}_{seed}.json",
+    }
 
 
 def _run_environment(
@@ -1014,6 +1267,15 @@ def _verify_review_manifest_gate(
 
 
 def _verify_raw_manifest_gate(run_dir: Path) -> None:
+    if (run_dir / "control").is_dir() and list((run_dir / "control").glob("*_manifest.json")):
+        try:
+            verify_manifest(run_dir)
+        except Exception as error:
+            raise RuntimeError(
+                "raw Stage 3 current-format evidence failed verification: "
+                f"{run_dir}"
+            ) from error
+        return
     manifest_path = run_dir / "manifest.json"
     sidecar_path = run_dir / "manifest.sha256"
     if not manifest_path.is_file() or not sidecar_path.is_file():
@@ -1064,6 +1326,7 @@ def _source_hashes(
     paths = [
         Path("src/evrptw/alns.py"),
         Path("src/evrptw/measurement.py"),
+        Path("src/evrptw/artifacts.py"),
         Path("src/evrptw/neighborhoods.py"),
         Path("src/evrptw/objective.py"),
         Path("src/evrptw/charging.py"),
@@ -1193,6 +1456,30 @@ def _validate_run_label(run_label: str) -> None:
         raise ValueError("run_label must be a non-empty single path segment")
 
 
+def _validate_current_run_label(run_label: str) -> None:
+    if re.fullmatch(
+        r"stage03\.[012]_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}", run_label
+    ) is None:
+        raise ValueError(
+            "new Stage 3 run_label must match the canonical stage03.0/3.1/3.2 "
+            "component_attemptNN or component_rerunNN form"
+        )
+
+
+def _artifact_context(run_label: str) -> ArtifactRunContext:
+    match = re.fullmatch(
+        r"(?P<stage>stage03\.(?P<minor>[012]))_(?P<component>.+)_(?:attempt|rerun)[0-9]{2}",
+        run_label,
+    )
+    if match is None:
+        raise ValueError(f"cannot derive artifact context from run label: {run_label}")
+    return ArtifactRunContext(
+        stage_id=match.group("stage"),
+        component=match.group("component"),
+        run_label=run_label,
+    )
+
+
 def _validate_stage032_run_label(run_label: str) -> None:
     if re.fullmatch(r"stage03\.2_cache_incremental_(?:attempt|rerun)[0-9]{2}", run_label) is None:
         raise ValueError(
@@ -1206,7 +1493,11 @@ def _assert_unique_run_label(root: Path, run_label: str) -> None:
     results_root = root / "results"
     if not results_root.is_dir():
         return
-    for metadata_path in sorted(results_root.glob("*/run_metadata.json")):
+    metadata_paths = [
+        *results_root.glob("*/run_metadata.json"),
+        *results_root.glob("*/control/*_run_metadata.json"),
+    ]
+    for metadata_path in sorted(set(metadata_paths)):
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
@@ -1286,7 +1577,9 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=Path("configs/stage03_measurement.toml"))
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--scope", choices=("smoke", "formal"), default="smoke")
-    parser.add_argument("--run-label", default="stage03_measurement")
+    parser.add_argument(
+        "--run-label", default="stage03.0_measurement_attempt01"
+    )
     parser.add_argument("--summary-dir", type=Path)
     parser.add_argument("--smoke-review-dir", type=Path)
     arguments = parser.parse_args()

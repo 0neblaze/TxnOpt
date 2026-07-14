@@ -17,6 +17,14 @@ from pathlib import Path
 from typing import Any
 
 from evrptw.alns import solve_alns
+from evrptw.artifacts import (
+    ArtifactBundleWriter,
+    ArtifactStorageConfig,
+    artifact_context_from_run_label,
+    canonical_run_label_is_valid,
+    require_current_storage_config,
+    write_solver_result_bundle,
+)
 from evrptw.environment import collect_environment
 from evrptw.models import Instance
 from evrptw.parser import parse_schneider
@@ -143,6 +151,7 @@ class Stage00Config:
     max_iterations: int
     threads: int
     command: str
+    artifact_storage: ArtifactStorageConfig | None = None
 
 
 def load_config(path: Path) -> Stage00Config:
@@ -163,6 +172,11 @@ def load_config(path: Path) -> Stage00Config:
             max_iterations=int(run["max_iterations"]),
             threads=int(run["threads"]),
             command=str(run["command"]),
+            artifact_storage=(
+                ArtifactStorageConfig(**dict(payload["artifact_storage"]))
+                if "artifact_storage" in payload
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"invalid Stage 0 configuration: {error}") from error
@@ -177,6 +191,18 @@ def run_stage00(
     *,
     baseline_dir: Path | None = None,
 ) -> dict[str, Path]:
+    if config.artifact_storage is not None and not _is_current_storage_run(output_dir):
+        raise ValueError(
+            "a configured new Stage 0 run must use a canonical attemptNN/rerunNN "
+            "directory; non-canonical output is reserved for legacy compatibility"
+        )
+    if _is_current_storage_run(output_dir):
+        return _run_stage00_current(
+            config,
+            config_path,
+            output_dir,
+            baseline_dir=baseline_dir,
+        )
     if output_dir.exists():
         raise FileExistsError(f"output directory already exists: {output_dir}")
     if baseline_dir is not None and baseline_dir.exists():
@@ -235,6 +261,152 @@ def run_stage00(
     outputs = _write_result_set(output_dir, config_path, rows, environment)
     if baseline_dir is not None:
         _export_curated_baseline(output_dir, baseline_dir, config_path, rows, environment)
+        outputs["baseline_dir"] = baseline_dir
+    return outputs
+
+
+def _is_current_storage_run(output_dir: Path) -> bool:
+    return canonical_run_label_is_valid(output_dir.name)
+
+
+def _run_stage00_current(
+    config: Stage00Config,
+    config_path: Path,
+    output_dir: Path,
+    *,
+    baseline_dir: Path | None = None,
+) -> dict[str, Path]:
+    root = _repository_root()
+    storage = require_current_storage_config(output_dir.name, config.artifact_storage)
+    if output_dir.exists():
+        raise FileExistsError(f"output directory already exists: {output_dir}")
+    if baseline_dir is not None and baseline_dir.exists():
+        raise FileExistsError(f"immutable baseline directory already exists: {baseline_dir}")
+    context = artifact_context_from_run_label(output_dir.name)
+    writer = ArtifactBundleWriter(output_dir, context, storage)
+    revision, dirty = _git_state(root)
+    source_hashes = {str(path): _sha256(root / path) for path in _CORE_ALGORITHM_FILES}
+    algorithm_hash = _combined_hash(source_hashes)
+    metadata = {
+        "schema_version": config.schema_version,
+        "baseline_id": config.baseline_id,
+        "algorithm": config.algorithm,
+        "run_label": output_dir.name,
+        "scope": "formal",
+        "expected_instances": list(config.instances),
+        "expected_seeds": list(config.seeds),
+        "benchmark_directory": str(config.benchmark_dir),
+        "repository_revision": revision,
+        "repository_dirty": dirty,
+        "algorithm_source_sha256": algorithm_hash,
+        "algorithm_source_files": source_hashes,
+        "configuration_sha256": _sha256(config_path),
+        "reference_repository_revision": _reference_revision(root),
+        "captured_environment": collect_environment(),
+    }
+    writer.write_control(metadata=metadata, configuration_path=config_path)
+    index_path = output_dir / "control" / f"{output_dir.name}_per_run_results.csv"
+    _write_csv(index_path, PER_RUN_FIELDS, [])
+    rows: list[dict[str, Any]] = []
+    for instance_name in config.instances:
+        instance_path = config.benchmark_dir / f"{instance_name}.txt"
+        instance_hash = _sha256(instance_path)
+        instance = parse_schneider(instance_path)
+        for seed in config.seeds:
+            started = datetime.now(UTC)
+            result = solve_alns(
+                instance,
+                seed=seed,
+                max_iterations=config.max_iterations,
+                time_limit_seconds=config.time_limit_seconds,
+                operator_profile="baseline",
+            )
+            ended = datetime.now(UTC)
+            routes = [list(route) for route in result.routes]
+            report = validate_routes(instance, routes, claimed_objective=result.objective_value)
+            experiment_id = f"{instance.name}-{config.algorithm.lower()}-{seed}"
+            row: dict[str, Any] = {
+                "schema_version": config.schema_version,
+                "experiment_id": experiment_id,
+                "instance": instance.name,
+                "seed": seed,
+                "algorithm": config.algorithm,
+                "repository_revision": revision,
+                "repository_dirty": dirty,
+                "algorithm_source_sha256": algorithm_hash,
+                "instance_sha256": instance_hash,
+                "start_utc": started.isoformat(),
+                "end_utc": ended.isoformat(),
+                "time_limit_seconds": config.time_limit_seconds,
+                "max_iterations": config.max_iterations,
+                "threads": config.threads,
+                "vehicle_count": report.vehicle_count,
+                "total_distance": report.total_distance,
+                "total_energy": report.total_energy,
+                "total_charged_energy": report.total_charged_energy,
+                "total_charging_time": report.total_charging_time,
+                "runtime_seconds": result.runtime_seconds,
+                "iterations": result.iterations,
+                "accepted_moves": result.accepted_moves,
+                "improving_moves": result.improving_moves,
+                "rejected_moves": result.rejected_moves,
+                "charging_subproblem_calls": result.charging_subproblem_calls,
+                "charging_subproblem_average_seconds": (
+                    result.charging_subproblem_time / result.charging_subproblem_calls
+                    if result.charging_subproblem_calls
+                    else 0.0
+                ),
+                **_violation_counts(report),
+                "status": "feasible" if report.feasible else "invalid",
+                "feasible": report.feasible,
+                "failure_reason": result.failure_reason or _violations(report),
+            }
+            environment = {
+                **metadata,
+                "instance": instance.name,
+                "seed": seed,
+                "instance_sha256": instance_hash,
+                "run_start_utc": started.isoformat(),
+                "run_end_utc": ended.isoformat(),
+            }
+            refs = write_solver_result_bundle(
+                writer,
+                instance=instance,
+                seed=seed,
+                result=result,
+                raw_record=row,
+                environment_payload=environment,
+            )
+            row["raw_log_path"] = refs["raw"]
+            row["solution_path"] = refs["solution"]
+            rows.append(row)
+            _write_csv(index_path, PER_RUN_FIELDS, rows)
+    writer.record_existing_file(
+        index_path,
+        artifact_type="per_run_results",
+        retention_class="control",
+        storage_format="csv_control",
+        row_count=len(rows),
+    )
+    bundle = writer.finalize()
+    outputs: dict[str, Path] = {
+        "output_dir": output_dir,
+        "per_run": index_path,
+        "manifest": bundle.manifest_path,
+    }
+    if baseline_dir is not None:
+        baseline_environment = {
+            **metadata,
+            "baseline_view_of": str(output_dir),
+            "physical_memory_bytes": _physical_memory_bytes(),
+        }
+        _export_current_baseline_view(
+            output_dir,
+            baseline_dir,
+            config_path,
+            rows,
+            baseline_environment,
+        )
         outputs["baseline_dir"] = baseline_dir
     return outputs
 
@@ -514,6 +686,41 @@ def _export_curated_baseline(
     curated_rows = [dict(row) for row in rows]
     for row in curated_rows:
         row["raw_log_path"] = str((output_dir / str(row["raw_log_path"])).resolve())
+    _write_result_set(baseline_dir, config_path, curated_rows, environment)
+
+
+def _export_current_baseline_view(
+    output_dir: Path,
+    baseline_dir: Path,
+    config_path: Path,
+    rows: list[dict[str, Any]],
+    environment: dict[str, Any],
+) -> None:
+    """Create a compatibility baseline view after current evidence is complete.
+
+    The current Parquet/JSON bundle remains the source of truth.  The view
+    contains only the legacy solution index and summary files required by
+    existing Stage 1/2 consumers; each raw path points back to the immutable
+    current bundle instead of copying raw evidence into the frozen directory.
+    """
+
+    baseline_dir.mkdir(parents=True)
+    solution_dir = baseline_dir / "solutions"
+    solution_dir.mkdir()
+    curated_rows: list[dict[str, Any]] = []
+    for row in rows:
+        current_solution = output_dir / str(row["solution_path"])
+        if not current_solution.is_file():
+            raise FileNotFoundError(f"current solution artifact is missing: {current_solution}")
+        solution_name = f"{row['experiment_id']}.json"
+        destination = solution_dir / solution_name
+        shutil.copy2(current_solution, destination)
+        curated_row = dict(row)
+        curated_row["solution_path"] = str(destination.relative_to(baseline_dir))
+        curated_row["raw_log_path"] = str(
+            (output_dir / str(row["raw_log_path"])).resolve()
+        )
+        curated_rows.append(curated_row)
     _write_result_set(baseline_dir, config_path, curated_rows, environment)
 
 

@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+from evrptw.artifacts import ArtifactReader, verify_manifest
 from evrptw.cache_incremental import (
     RouteCacheKey,
     build_route_propagation_snapshot,
@@ -183,7 +184,12 @@ def review_run(
         raise FileNotFoundError(f"Stage 3.0 run directory is missing: {run_dir}")
     _assert_results_path(root, run_dir, "run_dir")
     _verify_manifest(run_dir)
-    metadata = _read_json(run_dir / "run_metadata.json")
+    current_reader = (
+        ArtifactReader(run_dir, verify=False)
+        if (run_dir / "control").is_dir()
+        else None
+    )
+    metadata = _read_run_metadata(run_dir)
     scope = str(metadata.get("scope", ""))
     screening_payload = metadata.get("screening_config")
     screening_enabled = isinstance(screening_payload, dict) and bool(
@@ -199,7 +205,7 @@ def review_run(
     expected_seeds = tuple(FORMAL_SEEDS)
     expected_keys = {(instance, seed) for instance in expected_instances for seed in expected_seeds}
     label = review_label or str(metadata.get("run_label", run_dir.name))
-    raw_rows = _read_csv(run_dir / "raw_per_run_results.csv")
+    raw_rows = _read_csv(_raw_per_run_path(run_dir))
     findings: list[dict[str, Any]] = []
     findings.append(
         _finding(
@@ -222,6 +228,21 @@ def review_run(
             "raw_per_run_results.csv and run_metadata.json",
         )
     )
+    global_event_order_ok = True
+    global_event_order_observed: object = "legacy JSONL order"
+    if current_reader is not None:
+        global_event_order_ok, global_event_order_observed = _global_event_order_ok(
+            current_reader, raw_rows
+        )
+        findings.append(
+            _finding(
+                "global_event_order",
+                global_event_order_ok,
+                global_event_order_observed,
+                "current-format event_id values are contiguous, unique, and globally ordered",
+                "all current events.parquet files",
+            )
+        )
 
     rows_by_key = {key: row for key, row in zip(actual_keys, raw_rows, strict=False)}
     audited: list[_AuditedRun] = []
@@ -229,7 +250,9 @@ def review_run(
         row = rows_by_key.get(key)
         if row is None:
             continue
-        audited.append(_audit_one_run(run_dir, metadata, row))
+        audited.append(
+            _audit_one_run(run_dir, metadata, row, reader=current_reader)
+        )
 
     validator_ok = bool(audited) and len(audited) == len(expected_keys) and all(
         item.validator_feasible
@@ -254,7 +277,7 @@ def review_run(
         item.reconciliation.get("status") == "pass"
         and item.event_log_ok
         for item in audited
-    )
+    ) and global_event_order_ok
     findings.append(
         _finding(
             "trace_reconciliation",
@@ -565,13 +588,38 @@ def _audit_one_run(
     run_dir: Path,
     metadata: dict[str, Any],
     row: dict[str, str],
+    *,
+    reader: ArtifactReader | None = None,
 ) -> _AuditedRun:
     instance_name = str(row["instance"])
     seed = int(str(row["seed"]))
-    raw_payload = _read_json(run_dir / row["raw_path"])
-    solution_payload = _read_json(run_dir / row["solution_path"])
-    environment_payload = _read_json(run_dir / row["environment_path"])
-    trace = Stage03Trace.from_dict(_read_json(run_dir / row["trace_path"]))
+    current = reader is not None and reader.is_current
+    raw_payload = (
+        reader.read_json(row["raw_path"])
+        if current and reader is not None
+        else _read_json(run_dir / row["raw_path"])
+    )
+    solution_payload = (
+        reader.read_json(row["solution_path"])
+        if current and reader is not None
+        else _read_json(run_dir / row["solution_path"])
+    )
+    environment_payload = (
+        reader.read_json(row["environment_path"])
+        if current and reader is not None
+        else _read_json(run_dir / row["environment_path"])
+    )
+    neighborhood_events: list[dict[str, Any]] = []
+    if current and reader is not None:
+        trace_payload = reader.reconstruct_trace(row["trace_path"])
+        neighborhood_events = [
+            dict(event)
+            for event in trace_payload.pop("neighborhood_events", [])
+            if isinstance(event, dict)
+        ]
+        trace = Stage03Trace.from_dict(trace_payload)
+    else:
+        trace = Stage03Trace.from_dict(_read_json(run_dir / row["trace_path"]))
     solver_payload = raw_payload.get("solver_result")
     solver_result = SimpleNamespace(**solver_payload) if isinstance(solver_payload, dict) else None
     benchmark_dir = Path(str(metadata["benchmark_directory"]))
@@ -612,11 +660,19 @@ def _audit_one_run(
     for decision in trace.screening_decisions:
         reason = decision.reason or "screening_pass"
         screening_reason_counts[reason] = screening_reason_counts.get(reason, 0) + 1
-    event_log_ok, event_log_rows = _event_log_ok_stream(
-        run_dir / row["event_path"],
-        trace,
-        solver_result,
-    )
+    if current and reader is not None:
+        event_log_ok, event_log_rows = _current_event_log_ok(
+            reader,
+            row["event_path"],
+            trace,
+            neighborhood_events,
+        )
+    else:
+        event_log_ok, event_log_rows = _event_log_ok_stream(
+            run_dir / row["event_path"],
+            trace,
+            solver_result,
+        )
     reconciliation: dict[str, object]
     if solver_result is not None:
         reconciliation = trace.reconcile(solver_result)
@@ -876,6 +932,7 @@ def _cache_incremental_trace_ok(
     ]
     allowed_operations = {
         "lookup",
+        "lookup_result",
         "hit",
         "miss",
         "store",
@@ -897,9 +954,12 @@ def _cache_incremental_trace_ok(
         )
         if str(event.get("cache_key_digest", "")) != key.digest:
             return False
-    if len([event for event in cache_events if event.get("operation") == "lookup"]) != int(
-        observed["cache_lookups"]
-    ):
+    lookup_events = [
+        event
+        for event in cache_events
+        if event.get("operation") in {"lookup", "lookup_result"}
+    ]
+    if len(lookup_events) != int(observed["cache_lookups"]):
         return False
 
     # Replay the bounded LRU state independently.  This verifies that a hit
@@ -920,13 +980,31 @@ def _cache_incremental_trace_ok(
         operation = str(event.get("operation"))
         digest = str(event.get("cache_key_digest", ""))
         current_bytes = sum(entry[1] for entry in cache_state.values())
-        if operation == "lookup":
-            if _int_value(event.get("current_entries", -1)) != len(cache_state):
+        if operation in {"lookup", "lookup_result"}:
+            entries_value = event.get(
+                "lookup_current_entries", event.get("current_entries", -1)
+            )
+            bytes_value = event.get(
+                "lookup_current_bytes", event.get("current_bytes", -1)
+            )
+            if _int_value(entries_value) != len(cache_state):
                 return False
-            if _int_value(event.get("current_bytes", -1)) != current_bytes:
+            if _int_value(bytes_value) != current_bytes:
                 return False
-            if digest in cache_state:
-                cache_state.move_to_end(digest)
+            if operation == "lookup":
+                if digest in cache_state:
+                    cache_state.move_to_end(digest)
+            else:
+                lookup_result = str(event.get("lookup_result", ""))
+                if lookup_result == "hit":
+                    if digest not in cache_state:
+                        return False
+                    replayed_hits[digest].append(
+                        _cache_result_fingerprint(cache_state[digest][0])
+                    )
+                    cache_state.move_to_end(digest)
+                elif lookup_result != "miss" or digest in cache_state:
+                    return False
         elif operation == "miss":
             if digest in cache_state:
                 return False
@@ -1232,6 +1310,64 @@ def _event_log_ok_stream(
     )
 
 
+def _current_event_log_ok(
+    reader: ArtifactReader,
+    event_path: str,
+    trace: Stage03Trace,
+    neighborhood_events: list[dict[str, Any]],
+) -> tuple[bool, int]:
+    """Replay the v2 Arrow event stream without reconstructing customer strings."""
+
+    try:
+        rows = reader.read_events(event_path)
+    except (OSError, ValueError, TypeError):
+        return False, 0
+    event_ids = [int(row.get("event_id", -1)) for row in rows]
+    if event_ids != sorted(event_ids) or len(event_ids) != len(set(event_ids)):
+        return False, len(rows)
+    expected_count = (
+        len(trace.route_evaluations)
+        + len(trace.screening_decisions)
+        + len(trace.incremental_propagations)
+        + len(trace.events)
+        + len(neighborhood_events)
+    )
+    if len(rows) != expected_count:
+        return False, len(rows)
+    for row in rows:
+        if row.get("exact_completed") is True and row.get("exact_started") is not True:
+            return False, len(rows)
+        if row.get("accepted") is True:
+            current = _int_value(row.get("current_vehicle_count", 0))
+            candidate = _int_value(row.get("candidate_vehicle_count", 0))
+            if candidate > current or row.get("status") == "time_limit":
+                return False, len(rows)
+    return True, len(rows)
+
+
+def _global_event_order_ok(
+    reader: ArtifactReader,
+    raw_rows: list[dict[str, str]],
+) -> tuple[bool, object]:
+    event_ids: list[int] = []
+    try:
+        for row in raw_rows:
+            event_ids.extend(
+                int(event.get("event_id", -1))
+                for event in reader.read_events(row["event_path"])
+            )
+    except (KeyError, OSError, TypeError, ValueError):
+        return False, "cannot read all current events.parquet files"
+    expected = list(range(1, len(event_ids) + 1))
+    passed = event_ids == expected
+    return passed, {
+        "event_count": len(event_ids),
+        "first_event_id": event_ids[0] if event_ids else None,
+        "last_event_id": event_ids[-1] if event_ids else None,
+        "unique_event_ids": len(set(event_ids)),
+    }
+
+
 def _event_log_ok(
     event_log: list[dict[str, Any]],
     trace: Stage03Trace,
@@ -1340,11 +1476,21 @@ def _provenance_ok(root: Path, run_dir: Path, metadata: dict[str, Any]) -> tuple
         return False, "current source hashes differ from the run metadata"
     if _combined_hash(current_sources) != metadata.get("algorithm_source_sha256"):
         return False, "combined source hash differs from the run metadata"
-    parameters = run_dir / "parameters.toml"
+    current_config_candidates = sorted(
+        (run_dir / "control").glob("*_config.toml")
+    )
+    parameters = (
+        current_config_candidates[0]
+        if current_config_candidates
+        else run_dir / "parameters.toml"
+    )
     config_hash = _sha256(parameters) if parameters.is_file() else ""
     if config_hash != metadata.get("configuration_sha256"):
-        return False, "parameters.toml hash differs from the run metadata"
-    baseline_manifest = Path(str(metadata["baseline_directory"])) / "manifest.json"
+        return False, "configuration file hash differs from the run metadata"
+    baseline_directory = Path(str(metadata["baseline_directory"]))
+    if not baseline_directory.is_absolute():
+        baseline_directory = root / baseline_directory
+    baseline_manifest = baseline_directory / "manifest.json"
     if _sha256(baseline_manifest) != metadata.get("stage00_manifest_sha256"):
         return False, "Stage 0 manifest changed after the run"
     expected_hashes = {
@@ -2028,6 +2174,9 @@ def _publish_summaries(
 
 
 def _verify_manifest(run_dir: Path) -> None:
+    if (run_dir / "control").is_dir() and list((run_dir / "control").glob("*_manifest.json")):
+        verify_manifest(run_dir)
+        return
     manifest_path = run_dir / "manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Stage 3.0 manifest is missing: {manifest_path}")
@@ -2078,6 +2227,26 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"expected JSON object: {path}")
     return payload
+
+
+def _read_run_metadata(run_dir: Path) -> dict[str, Any]:
+    legacy = run_dir / "run_metadata.json"
+    if legacy.is_file():
+        return _read_json(legacy)
+    candidates = sorted((run_dir / "control").glob("*_run_metadata.json"))
+    if not candidates:
+        raise FileNotFoundError(f"run metadata is missing under {run_dir}")
+    return _read_json(candidates[0])
+
+
+def _raw_per_run_path(run_dir: Path) -> Path:
+    legacy = run_dir / "raw_per_run_results.csv"
+    if legacy.is_file():
+        return legacy
+    candidates = sorted((run_dir / "control").glob("*_raw_per_run_results.csv"))
+    if not candidates:
+        raise FileNotFoundError(f"raw per-run index is missing under {run_dir}")
+    return candidates[0]
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

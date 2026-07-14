@@ -44,15 +44,18 @@ uv run python -m evrptw.experiments.stage032_cache_incremental_review \
 
 ```text
 results/stage03.2_cache_incremental_attemptNN/
-  raw/             # raw per-run payload
-  solutions/       # solver solution payload
-  traces/          # Stage03Trace v2
-  events/          # trace, screening and neighborhood event log
-  environments/    # per-run provenance and resource evidence
-  failures/        # interruption/deadline/exception evidence, if any
+  control/         # metadata, config, manifest and manifest sidecar
+  <instance>/<seed>/
+    *_raw_*.json
+    *_solution_*.json
+    *_trace_*.json
+    *_events_*.parquet
+    *_route_dictionary_*.parquet
+    *_screening_checks_*.parquet
+    *_diagnostic_*.parquet
+    *_environment_*.json
+    *_failure_*.json  # only when applicable
   review/          # generated only by independent replay reviewer
-  manifest.json
-  manifest.sha256
 ```
 
 runner 只写 ignored `results/`。每个 run 同时记录 source/config/instance/environment
@@ -93,3 +96,15 @@ events、trace、environment、failure、manifest、review 和 tracked summary�
 4. raw manifest、hash、source/config/reference provenance 和 Stage 3.1 formal 对比通过；
 5. 报告中的 exact-call reduction 只能标为 Stage 3.2 cache evidence，不能宣称 Stage
    3.3 acceleration（加速）。
+# Stage 3.2 storage note
+
+Stage 3.2 新运行必须使用 `stage03.2_cache_incremental_attemptNN` 或 `rerunNN`，并
+通过共享 `ArtifactBundleWriter` 保存 bounded route cache、station reachability、
+incremental propagation、fallback、eviction、deadline 和失败证据。Cache lookup 的
+每个结果只写一条 critical event；route sequence 只在 route dictionary 保存一次。
+
+历史 Stage 3.2 raw evidence 不物理迁移。独立 reviewer 通过 `ArtifactReader` 的
+Parquet/legacy 双路径，重算 manifest、schema、checksum、cache lifecycle、route
+change status、station bitset、full propagation 对账、validator/objective 和
+raw-to-summary。只有 review 状态为 `READY_FOR_STAGE03_3` 才能进入 Stage 3.3；该
+状态不代表已经完成 Stage 3.3 加速诊断。

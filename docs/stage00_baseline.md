@@ -23,19 +23,24 @@
 deviation（最佳值/均值/中位数/最差值/总体标准差）。即使无失败，
 `failure_cases.csv` 仍必须存在并保留表头。
 
-完整 raw JSON（原始记录）保存在 Git-ignored（Git 忽略）的 `results/stage00/`；可审阅的
-CSV、环境、配置快照、经过验证的 solution JSON 和 checksum manifest（校验清单）保存在
-`experiments/baselines/stage00/`。正式基准目录不允许原地覆盖，任何文件变化都会被
-manifest 检测。
+新运行必须使用 `artifact-storage-v1`：raw、solution、trace index、environment 和
+failure JSON 与 Parquet `events`、route dictionary、diagnostic evidence 写入
+`results/<canonical-run-label>/`，由共享 `ArtifactBundleWriter` 维护 manifest 和
+sidecar。`experiments/baselines/stage00/` 是 immutable frozen baseline（不可变冻结基线）；
+未来冻结操作先完成新格式 evidence，再生成兼容 baseline view。历史 `results/stage00/`
+或冻结目录不做物理迁移，继续按 legacy 兼容规则读取。
 
 ## 3. 正式生成与验证
 
 在干净工作区运行：
 
+现有 `experiments/baselines/stage00/` 已冻结，不得用下面的命令覆盖它；如果进行新的
+冻结操作，必须把 `--baseline-dir` 改成一个尚不存在的新兼容 view 目录，并保留旧目录。
+
 ```bash
 uv run python -m evrptw.experiments.stage00_baseline run \
   --config configs/stage00_baseline.toml \
-  --output-dir results/stage00 \
+  --output-dir results/stage00_baseline_attempt01 \
   --baseline-dir experiments/baselines/stage00
 ```
 
@@ -53,14 +58,14 @@ uv run python -m evrptw.experiments.stage00_baseline verify \
 
 ## 4. 后续版本比较
 
-候选版本先使用同一配置运行到新的目录（不传 `--baseline-dir`），再执行：
+候选版本先使用新的 canonical rerun label 运行到新的目录（不传 `--baseline-dir`），再执行：
 
 ```bash
 uv run python -m evrptw.experiments.stage00_baseline compare \
   --config configs/stage00_baseline.toml \
   --baseline-dir experiments/baselines/stage00 \
-  --candidate-dir results/stage00-candidate \
-  --report results/stage00-candidate/comparison.csv
+  --candidate-dir results/stage00_baseline_rerun01 \
+  --report results/stage00_baseline_rerun01/comparison.csv
 ```
 
 报告逐指标标记 `improvement`、`regression` 或 `unchanged`。可行率下降、validator 失败、

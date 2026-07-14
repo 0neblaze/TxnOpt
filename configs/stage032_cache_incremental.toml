@@ -8,7 +8,7 @@ stage02_config = "configs/stage02_constraint_guided.toml"
 baseline_dir = "experiments/baselines/stage00"
 stage02_attempt16_per_run = "experiments/summaries/stage02_constraint_guided_attempt16_per_run_results.csv"
 stage02_rerun09_per_run = "experiments/summaries/stage02_constraint_guided_rerun09_per_run_results.csv"
-stage031_formal_run_dir = "results/stage031-cheap-screening_formal01"
+stage031_formal_run_dir = "results/stage03.1_screening_attempt04"
 stage031_formal_per_run = "experiments/summaries/stage031_cheap_screening_formal01_per_run_results.csv"
 stage031_formal_review_manifest = "experiments/summaries/stage031_cheap_screening_formal01_review_manifest.json"
 
@@ -20,6 +20,17 @@ seeds = [2014, 2015, 2016]
 time_limit_seconds = 30.0
 max_iterations = 1000
 threads = 1
+
+[artifact_storage]
+enabled = true
+storage_policy_version = "artifact-storage-v1"
+event_format = "parquet"
+compression = "zstd"
+compression_level = 3
+critical_evidence = "full"
+diagnostic_evidence = "aggregate"
+per_instance_seed_max_bytes = 2147483648
+per_run_max_bytes = 34359738368
 
 [screening]
 enabled = true

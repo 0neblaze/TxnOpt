@@ -18,14 +18,17 @@ def main() -> int:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("results/stage02-constraint-guided"),
+        default=Path("results/stage02.3_constraint_guided_attempt01"),
     )
     parser.add_argument(
         "--summary-dir",
         type=Path,
         default=Path("experiments/summaries"),
     )
-    parser.add_argument("--run-label", default="stage02_constraint_guided")
+    parser.add_argument(
+        "--run-label",
+        default="stage02.3_constraint_guided_attempt01",
+    )
     parser.add_argument(
         "--repeat-of",
         type=Path,

@@ -2,8 +2,8 @@
   "artifact_count": 622,
   "artifact_filename_policy": "<stage_id>_<component>_<attempt_or_rerun>_<artifact_type>[_<instance>_<seed>].<ext>",
   "artifact_registry": "experiments/registries/stage03.0_artifact_registry.csv",
-  "artifact_registry_rows_sha256": "93c6579ef18f226c7e26b22d20cdd287760555aa42ca58a6d0cbb89b1fb84acf",
-  "artifact_registry_sha256": "25423e497d25e96eaf65c794171b04ccfb6534ab154a7557167a66158701c01a",
+  "artifact_registry_rows_sha256": "3ba575b8a1c182d8705254aa6e551e200a975db297796c0dd309fe987916b127",
+  "artifact_registry_sha256": "f9c7e128bf5c738158f74a167f6cdd550d7dd1a976d7c5d22ddabddea92fae8c",
   "artifact_types": [
     "baseline_comparison",
     "config",

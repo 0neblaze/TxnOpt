@@ -12,10 +12,13 @@ def main() -> int:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("results/stage02-quality"),
+        default=Path("results/stage02.2_route_quality_attempt01"),
     )
     parser.add_argument("--summary-dir", type=Path, default=Path("experiments/summaries"))
-    parser.add_argument("--run-label", default="stage02_quality")
+    parser.add_argument(
+        "--run-label",
+        default="stage02.2_route_quality_attempt01",
+    )
     parser.add_argument(
         "--repeat-of",
         type=Path,

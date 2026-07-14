@@ -254,6 +254,47 @@ this repository or one of its subdirectories.
   interruptible exact solving, fixed-work/wall-clock diagnostics, or parallel
   evaluation.
 
+## Experiment Artifact Storage v2
+
+- All new Stage 0–8 runs must use an enabled `[artifact_storage]` configuration
+  and the shared `evrptw.artifacts.ArtifactBundleWriter`/`ArtifactReader`; a
+  canonical `attemptNN` or `rerunNN` label is mandatory. Runners must not
+  duplicate JSON, event, checksum, or manifest persistence logic.
+- The old non-canonical Stage 0–2 entry points remain only for historical
+  compatibility tests/reproduction when their configuration has no
+  `[artifact_storage]`; the shipped new configurations reject those paths.
+- The current policy is `artifact-storage-v1`: Parquet events with Zstandard
+  level 3, complete critical evidence, aggregated diagnostic evidence, 2 GiB
+  per instance/seed, and 32 GiB per run. New physical evidence belongs under
+  `results/<run_label>/<instance>/<seed>/` with control metadata and a manifest
+  under `control/`.
+- Critical events are never dropped. Ordinary candidates, repeated timings, and
+  operator totals may be aggregated into diagnostic Parquet only when replay
+  semantics are unchanged. Route sequences are stored once in the route
+  dictionary; events use global `event_id` and integer route IDs.
+- A cache lookup and its immediate hit/miss result are one persisted
+  `lookup_result` event; the in-memory evaluator trace may retain the two
+  callbacks for debugging, but storage and replay must count the logical lookup
+  once. A missing failure artifact is represented explicitly as
+  `artifact_status.failure=not_applicable` in the manifest.
+- Event rows use integer route/lane/operator IDs; the trace index carries the
+  lane/operator dictionaries and the route dictionary remains the sole store
+  for complete customer sequences.
+- A byte-budget violation must retain completed raw/solution/event/environment/
+  failure evidence, write `evidence_completeness=partial`, update the manifest
+  and sidecar, then fail immediately. Partial, timeout, failure, and manifest
+  error bundles cannot publish summaries.
+- Historical Stage 0 frozen artifacts and Stage 3.0–3.2 raw evidence are
+  immutable and remain `legacy_json_or_jsonl`, `legacy`, and
+  `legacy_compatible`. Compatibility mappings are registry views only; they do
+  not copy, move, compress, or rewrite historical bytes. Recorded dirty states
+  remain visible.
+- Independent preflight/review must verify manifest first, then checksum, Arrow
+  schema fingerprint, row count, byte size, critical-event completeness,
+  validator/objective replay, deadline semantics, provenance, and raw-to-summary
+  consistency. Tracked summaries and registry publication are downstream of
+  that review.
+
 ## Literature Recommendation Policy
 
 - Codex recommends literature but does not obtain it. Do not access the user's

@@ -82,6 +82,14 @@ config、failure、manifest 和 review 文件，以及已发布的 tracked summa
 - artifact checksum、checksum source、source/config/instance/environment hash；
 - Stage 0 manifest hash、主仓库 revision/dirty 状态、两个 reference repository
   的 revision/dirty 状态、comparison baseline 和 supersedes/mapping 字段。
+- `storage_policy_version`、`storage_format`、`compression`、`retention_class`、
+  `evidence_completeness`、`schema_fingerprint`、`row_count`、`byte_size` 和
+  `policy_compliance`。
+
+历史文件固定标记为 `legacy_json_or_jsonl`、`legacy`、`legacy_unknown`、
+`legacy_compatible`；新文件固定标记为 `parquet_or_json_control`、
+`critical/diagnostic/control` 和 `current`。Parquet 的 schema fingerprint 与
+row count 必须由实际文件重算，不能复制 runner summary。
 
 `stage03_legacy_path_map.csv` 特别保留：
 
@@ -124,6 +132,12 @@ raw-to-summary 是 semantic comparison（语义比较），不是未经审计的
 复制）。Stage 3.0 比较 objective、feasibility、trace counters 和 reconciliation
 字段；Stage 3.1 另外比较 screening counters/reason statistics。历史 review
 缺失记为 `not_present`，没有 summary 的轮次记为 `not_published`，不被提升为通过。
+
+新 run 的物理路径为 `results/<run_label>/<instance>/<seed>/`，registry 中的
+canonical path 只是 logical view（逻辑视图），不表示复制或移动。独立 reviewer
+必须先验证 manifest/sidecar、Parquet schema、row count、checksum、critical event
+completeness、validator/objective replay、trace reconciliation、deadline 和
+raw-to-summary；通过前不得写 tracked summary 或把 registry 行标为 published。
 
 ## 历史异常与失败保留
 

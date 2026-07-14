@@ -12,9 +12,22 @@ from pathlib import Path
 from typing import Any
 
 from evrptw.alns import ALNSResult, solve_alns
+from evrptw.artifacts import (
+    ArtifactBundleWriter,
+    artifact_context_from_run_label,
+    canonical_run_label_is_valid,
+    require_current_storage_config,
+    write_solver_result_bundle,
+)
 from evrptw.bpc import BPCResult, solve_branch_price_and_cut
 from evrptw.environment import collect_environment
-from evrptw.experiments.stage00_baseline import Stage00Config, load_config, verify_results
+from evrptw.experiments.stage00_baseline import (
+    Stage00Config,
+    _combined_hash,
+    _repository_root,
+    load_config,
+    verify_results,
+)
 from evrptw.models import Instance
 from evrptw.objective import (
     ObjectiveComparison,
@@ -113,6 +126,18 @@ def run_stage01_objective(
 ) -> dict[str, Path]:
     config = load_config(config_path)
     verify_results(config, baseline_dir, require_manifest=True)
+    if config.artifact_storage is not None and not canonical_run_label_is_valid(output_dir.name):
+        raise ValueError(
+            "a configured new Stage 1 run must use a canonical attemptNN/rerunNN "
+            "directory; non-canonical output is reserved for legacy compatibility"
+        )
+    if canonical_run_label_is_valid(output_dir.name):
+        return _run_stage01_current(
+            config=config,
+            config_path=config_path,
+            baseline_dir=baseline_dir,
+            output_dir=output_dir,
+        )
     if output_dir.exists():
         raise FileExistsError(f"Stage 1 output directory already exists: {output_dir}")
     tracked_names = (
@@ -211,6 +236,155 @@ def run_stage01_objective(
         "raw_dir": raw_dir,
         "solution_dir": solution_dir,
     }
+
+
+def _run_stage01_current(
+    *,
+    config: Stage00Config,
+    config_path: Path,
+    baseline_dir: Path,
+    output_dir: Path,
+) -> dict[str, Path]:
+    root = _repository_root()
+    storage = require_current_storage_config(output_dir.name, config.artifact_storage)
+    if output_dir.exists():
+        raise FileExistsError(f"output directory already exists: {output_dir}")
+    context = artifact_context_from_run_label(output_dir.name)
+    writer = ArtifactBundleWriter(output_dir, context, storage)
+    source_hashes = {
+        str(path): _sha256(root / path)
+        for path in (
+            Path("src/evrptw/alns.py"),
+            Path("src/evrptw/bpc.py"),
+            Path("src/evrptw/objective.py"),
+            Path("src/evrptw/validation.py"),
+        )
+    }
+    metadata = {
+        "schema_version": "stage01-artifact-storage-v1",
+        "run_label": output_dir.name,
+        "scope": "formal",
+        "expected_instances": list(config.instances),
+        "expected_seeds": list(config.seeds),
+        "benchmark_directory": str(config.benchmark_dir),
+        "repository_revision": _git_revision(),
+        "repository_dirty": _git_dirty(),
+        "algorithm_source_sha256": _combined_hash(source_hashes),
+        "algorithm_source_files": source_hashes,
+        "configuration_sha256": _sha256(config_path),
+        "stage00_manifest_sha256": _sha256(baseline_dir / "manifest.json"),
+        "captured_environment": collect_environment(),
+    }
+    writer.write_control(metadata=metadata, configuration_path=config_path)
+    index_path = output_dir / "control" / f"{output_dir.name}_per_run_results.csv"
+    _write_csv(index_path, STAGE01_PER_RUN_FIELDS, [])
+    rows: list[dict[str, Any]] = []
+    for name in config.instances:
+        instance = parse_schneider(config.benchmark_dir / f"{name}.txt")
+        for seed in config.seeds:
+            result = solve_alns(
+                instance,
+                seed=seed,
+                max_iterations=config.max_iterations,
+                time_limit_seconds=config.time_limit_seconds,
+                operator_profile="baseline",
+            )
+            report = validate_routes(
+                instance,
+                [list(route) for route in result.routes],
+                claimed_objective=result.objective_value,
+            )
+            objective, validation_failure = _validated_objective(
+                instance, report, result.objective
+            )
+            row = _base_row(
+                f"{instance.name}-alns_exact_charging-{seed}",
+                instance.name,
+                "ALNS_EXACT_CHARGING",
+                seed,
+                objective,
+                report,
+            )
+            row.update(
+                {
+                    "proven_optimal": False,
+                    "runtime_seconds": result.runtime_seconds,
+                    "iterations": result.iterations,
+                    "accepted_moves": result.accepted_moves,
+                    "improving_moves": result.improving_moves,
+                    "rejected_moves": result.rejected_moves,
+                    "charging_subproblem_calls": result.charging_subproblem_calls,
+                    "failure_reason": _join_failures(
+                        result.failure_reason, validation_failure
+                    ),
+                }
+            )
+            refs = write_solver_result_bundle(
+                writer,
+                instance=instance,
+                seed=seed,
+                result=result,
+                raw_record=row,
+                environment_payload={**metadata, "instance": instance.name, "seed": seed},
+            )
+            row["raw_log_path"] = refs["raw"]
+            row["solution_path"] = refs["solution"]
+            rows.append(row)
+        if len(instance.customers) <= 5:
+            bpc_result = solve_branch_price_and_cut(
+                instance,
+                time_limit_seconds=config.time_limit_seconds,
+                max_customers=8,
+            )
+            report = validate_routes(
+                instance,
+                [list(route) for route in bpc_result.routes],
+                claimed_objective=bpc_result.objective_value,
+            )
+            objective, validation_failure = _validated_objective(
+                instance, report, bpc_result.objective
+            )
+            row = _base_row(
+                f"{instance.name}-branch_price_and_cut-0",
+                instance.name,
+                "BRANCH_PRICE_AND_CUT",
+                0,
+                objective,
+                report,
+            )
+            row.update(
+                {
+                    "proven_optimal": bpc_result.proven_optimal,
+                    "runtime_seconds": bpc_result.runtime_seconds,
+                    "root_search_bound": bpc_result.root_search_bound,
+                    "final_search_bound": bpc_result.final_search_bound,
+                    "search_gap": bpc_result.search_gap,
+                    "failure_reason": _join_failures(
+                        bpc_result.failure_reason, validation_failure
+                    ),
+                }
+            )
+            refs = write_solver_result_bundle(
+                writer,
+                instance=instance,
+                seed=0,
+                result=bpc_result,
+                raw_record=row,
+                environment_payload={**metadata, "instance": instance.name, "seed": 0},
+            )
+            row["raw_log_path"] = refs["raw"]
+            row["solution_path"] = refs["solution"]
+            rows.append(row)
+        _write_csv(index_path, STAGE01_PER_RUN_FIELDS, rows)
+    writer.record_existing_file(
+        index_path,
+        artifact_type="per_run_results",
+        retention_class="control",
+        storage_format="csv_control",
+        row_count=len(rows),
+    )
+    bundle = writer.finalize()
+    return {"output_dir": output_dir, "per_run": index_path, "manifest": bundle.manifest_path}
 
 
 def build_objective_ranking_report(
@@ -594,7 +768,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run the Stage 1 lexicographic objective audit")
     parser.add_argument("--config", type=Path, default=Path("configs/stage00_baseline.toml"))
     parser.add_argument("--baseline-dir", type=Path, default=Path("experiments/baselines/stage00"))
-    parser.add_argument("--output-dir", type=Path, default=Path("results/stage01"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("results/stage01_objective_attempt01"),
+    )
     parser.add_argument("--summary-dir", type=Path, default=Path("experiments/summaries"))
     arguments = parser.parse_args()
     outputs = run_stage01_objective(

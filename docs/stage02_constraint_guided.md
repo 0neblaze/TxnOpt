@@ -106,13 +106,13 @@ uv run mypy
 
 uv run python -m evrptw.experiments.stage02_constraint_guided \
   --config configs/stage02_constraint_guided.toml \
-  --output-dir results/stage02-constraint-guided_attempt16 \
-  --run-label stage02_constraint_guided_attempt16
+  --output-dir results/stage02.3_constraint_guided_attempt01 \
+  --run-label stage02.3_constraint_guided_attempt01
 
 uv run python -m evrptw.experiments.stage02_constraint_guided_review \
-  --run-dir results/stage02-constraint-guided_attempt16 \
+  --run-dir results/stage02.3_constraint_guided_attempt01 \
   --comparison-dir results/stage02-quality_attempt02 \
-  --review-label stage02_constraint_guided_attempt16
+  --review-label stage02.3_constraint_guided_attempt01
 ```
 
 独立完整复跑必须使用全新目录和 label（标签）：
@@ -120,14 +120,14 @@ uv run python -m evrptw.experiments.stage02_constraint_guided_review \
 ```bash
 uv run python -m evrptw.experiments.stage02_constraint_guided \
   --config configs/stage02_constraint_guided.toml \
-  --output-dir results/stage02-constraint-guided-rerun09 \
-  --run-label stage02_constraint_guided_rerun09 \
-  --repeat-of results/stage02-constraint-guided_attempt16
+  --output-dir results/stage02.3_constraint_guided_rerun01 \
+  --run-label stage02.3_constraint_guided_rerun01 \
+  --repeat-of results/stage02.3_constraint_guided_attempt01
 
 uv run python -m evrptw.experiments.stage02_constraint_guided_review \
-  --run-dir results/stage02-constraint-guided-rerun09 \
+  --run-dir results/stage02.3_constraint_guided_rerun01 \
   --comparison-dir results/stage02-quality_attempt02 \
-  --review-label stage02_constraint_guided_rerun09
+  --review-label stage02.3_constraint_guided_rerun01
 ```
 
 raw artifacts（原始产物）位于 Git-ignored `results/`；tracked summaries（受版本控制的汇总）

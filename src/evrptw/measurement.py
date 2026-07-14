@@ -598,11 +598,16 @@ class Stage03Trace:
 
     @property
     def cache_incremental_counts(self) -> dict[str, int]:
-        counts = Counter(
-            str(event.get("operation", ""))
-            for event in self.events
-            if event.get("event_type") == "cache_event"
-        )
+        counts: Counter[str] = Counter()
+        for event in self.events:
+            if event.get("event_type") != "cache_event":
+                continue
+            operation = str(event.get("operation", ""))
+            if operation == "lookup_result":
+                counts["lookup"] += 1
+                counts[str(event.get("lookup_result", ""))] += 1
+            else:
+                counts[operation] += 1
         return {
             "cache_lookups": counts["lookup"],
             "cache_hits": counts["hit"],

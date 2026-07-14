@@ -2,8 +2,8 @@
   "artifact_count": 1101,
   "artifact_filename_policy": "<stage_id>_<component>_<attempt_or_rerun>_<artifact_type>[_<instance>_<seed>].<ext>",
   "artifact_registry": "experiments/registries/stage03.2_artifact_registry.csv",
-  "artifact_registry_rows_sha256": "063fd9bc82c4d7e4af6b82282332fbb2f9723ae69508e1902c7e727222f64b54",
-  "artifact_registry_sha256": "444893d3e1d31e34c7b0ed6028222f9bb4f2c8fd699363d9d4dea879fdac6260",
+  "artifact_registry_rows_sha256": "1b4e6036bd9adc6e26909f2ee6effaec372b55d91d56ce17122ea339f27e616e",
+  "artifact_registry_sha256": "142a36d10b6e2fb5d36e78732dd28c8cf0ab90daa9ed8913e069b379ed1de52d",
   "artifact_types": [
     "baseline_comparison",
     "cache_incremental_statistics",
@@ -385,7 +385,7 @@
   ],
   "solver_rerun_performed": false,
   "stage_id": "stage03.2",
-  "trusted_formal_review": "experiments/summaries/stage03.2_cache_incremental_attempt03_review_manifest.json",
+  "trusted_formal_review": "results/stage03.2_cache_incremental_attempt03/review/review_manifest.json",
   "trusted_formal_review_errors": [],
   "trusted_formal_review_status": "READY_FOR_STAGE03_3"
 }
