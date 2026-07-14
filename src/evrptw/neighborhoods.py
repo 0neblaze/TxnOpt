@@ -1156,6 +1156,7 @@ def repair_vehicle_reduction_refinement(
     instance: Instance,
     *,
     budget: int,
+    precomputed_routes: Mapping[CustomerSequence, ChargingSubproblemResult] | None = None,
 ) -> RepairResult:
     """Regret-repair a reduced-fleet candidate without creating a route.
 
@@ -1181,6 +1182,7 @@ def repair_vehicle_reduction_refinement(
                     instance,
                     before_calls=before_calls,
                     budget=budget,
+                    precomputed_routes=precomputed_routes,
                 )
                 for customer in pending
             }
@@ -2432,6 +2434,7 @@ def _regret_insertion_options(
     *,
     before_calls: int,
     budget: int,
+    precomputed_routes: Mapping[CustomerSequence, ChargingSubproblemResult] | None = None,
 ) -> list[tuple[float, int, int, CustomerSequence]]:
     options: list[tuple[float, int, int, CustomerSequence]] = []
     for route_index, base in enumerate(sequences):
@@ -2443,9 +2446,12 @@ def _regret_insertion_options(
             continue
         if evaluator.calls - before_calls >= budget:
             raise _EvaluationBudgetExceeded
-        old_distance = (
-            _route_with_status(evaluator, base, "unchanged").distance if base else 0.0
-        )
+        if not base:
+            old_distance = 0.0
+        elif precomputed_routes is not None and base in precomputed_routes:
+            old_distance = precomputed_routes[base].distance
+        else:
+            old_distance = _route_with_status(evaluator, base, "unchanged").distance
         for position in range(len(base) + 1):
             if evaluator.calls - before_calls >= budget:
                 raise _EvaluationBudgetExceeded

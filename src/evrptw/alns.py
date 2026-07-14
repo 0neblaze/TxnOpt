@@ -1263,6 +1263,14 @@ def _solve_alns(
                         budget=(
                             vehicle_config.vehicle_reduction_refinement_exact_evaluation_budget
                         ),
+                        precomputed_routes={
+                            sequence: result
+                            for sequence, result in zip(
+                                candidate_before_refinement.sequences,
+                                candidate_before_refinement.charging,
+                                strict=True,
+                            )
+                        },
                     )
                     if refinement.sequences is not None:
                         refinement_candidate = evaluator.solution(

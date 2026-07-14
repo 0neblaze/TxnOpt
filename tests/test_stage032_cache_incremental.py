@@ -17,6 +17,7 @@ from evrptw.charging import ChargingSubproblemResult
 from evrptw.experiments.stage03_measurement import _validate_stage032_run_label
 from evrptw.measurement import CheapScreeningConfig, MeasurementConfig, Stage03Trace
 from evrptw.models import Instance, Node, NodeType, Vehicle
+from evrptw.neighborhoods import repair_vehicle_reduction_refinement
 
 
 def _instance(*, due_c3: float = 100.0, battery: float = 5.0) -> Instance:
@@ -151,6 +152,38 @@ def test_incremental_propagation_reports_time_window_failure_and_fallback() -> N
     assert rejected.first_failed_check == "forward_time_window"
     assert fallback.status == "fallback"
     assert fallback.first_failed_check == "route_structure"
+
+
+def test_refinement_uses_precomputed_current_route_without_unchanged_exact_call() -> None:
+    instance = _instance(battery=20.0)
+
+    class FakeEvaluator:
+        calls = 0
+
+        def __init__(self) -> None:
+            self.statuses: list[tuple[tuple[str, ...], str]] = []
+
+        def route_with_status(
+            self, sequence: tuple[str, ...], status: str
+        ) -> ChargingSubproblemResult:
+            self.calls += 1
+            self.statuses.append((sequence, status))
+            return _result(feasible=True)
+
+    evaluator = FakeEvaluator()
+    base = ("C1", "C2")
+    result = repair_vehicle_reduction_refinement(
+        (base,),
+        ("C3",),
+        evaluator,
+        instance,
+        budget=8,
+        precomputed_routes={base: _result(feasible=True)},
+    )
+
+    assert result.sequences is not None
+    assert evaluator.calls > 0
+    assert (base, "unchanged") not in evaluator.statuses
 
 
 def test_stage032_solve_trace_round_trip_and_result_reconciliation() -> None:
