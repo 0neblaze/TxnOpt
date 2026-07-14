@@ -823,6 +823,11 @@ class _Evaluator:
                     ),
                     route_change_status=route_change_status,
                 )
+            if isinstance(error, ExactBatchDeadlineExceeded):
+                raise _TimeLimitReached(
+                    sequence,
+                    exact_route_evaluations=error.completed_exact_calls,
+                ) from error
             raise
         if self.exact_call_controller is not None:
             self.exact_call_controller.complete(1)

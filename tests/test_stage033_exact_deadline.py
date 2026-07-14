@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import evrptw.alns as alns_module
 from evrptw.alns import solve_alns
 from evrptw.artifacts import (
     ArtifactBundleWriter,
@@ -87,6 +88,39 @@ def test_stage033_config_requires_cpu_batch() -> None:
 def test_stage033_rejects_scalar_backend_without_fallback() -> None:
     with pytest.raises(ValueError, match="cpu_batch"):
         _solve(backend="cpu_scalar")
+
+
+def test_single_route_batch_deadline_is_a_candidate_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = alns_module.BackendMetrics(
+        "cpu_batch",
+        8,
+        exact_calls=1,
+        started_calls=1,
+        interrupted_calls=1,
+    )
+
+    def interrupt(*args: object, **kwargs: object) -> object:
+        raise ExactBatchDeadlineExceeded(
+            started_exact_calls=1,
+            completed_exact_calls=0,
+            metrics=metrics,
+            completed_indices=(),
+        )
+
+    monkeypatch.setattr(alns_module, "solve_exact_charging_batch", interrupt)
+    evaluator = alns_module._Evaluator(
+        _instance(),
+        deadline=float("inf"),
+        backend="cpu_batch",
+        exact_call_controller=alns_module.ExactCallController(
+            ExactDeadlineConfig.wall_clock()
+        ),
+    )
+
+    with pytest.raises(alns_module._TimeLimitReached):
+        evaluator.route(("C1",))
 
 
 def test_fixed_exact_call_budget_stops_at_cap_and_keeps_complete_incumbent() -> None:
