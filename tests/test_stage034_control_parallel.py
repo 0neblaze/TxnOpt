@@ -23,7 +23,13 @@ from evrptw.experiments.stage034_control_parallel import (
     load_stage034_config,
     run_control_parallel_diagnostic,
 )
-from evrptw.experiments.stage034_control_parallel_review import evaluate_stage034_gate
+from evrptw.experiments.stage034_control_parallel_review import (
+    _budget_ledger_valid,
+    _parallel_event_valid,
+    _plan_decision_group_valid,
+    _plan_history_valid,
+    evaluate_stage034_gate,
+)
 from evrptw.measurement import CheapScreeningConfig, MeasurementConfig
 from evrptw.models import Instance, Node, NodeType, Vehicle
 
@@ -113,9 +119,7 @@ def test_candidate_control_ranks_and_budgets_each_complete_round() -> None:
             continue
         iteration = event.get("iteration")
         if iteration is not None:
-            per_round[int(iteration)] = per_round.get(int(iteration), 0) + int(
-                event["granted"]
-            )
+            per_round[int(iteration)] = per_round.get(int(iteration), 0) + int(event["granted"])
     assert per_round
     assert max(per_round.values()) <= 1
 
@@ -139,9 +143,28 @@ def test_complete_plan_ranking_is_vehicle_first_and_budget_is_atomic() -> None:
         iteration=0,
         operator="test",
     )
+    retried = runtime.select_plans(
+        plans,
+        lane="all",
+        iteration=1,
+        operator="test",
+    )
     runtime.begin_round(0)
 
     assert selected == (plans[1],)
+    assert retried == selected
+    runtime.mark_plan_attempted(
+        plans[1],
+        lane="all",
+        iteration=1,
+        operator="test",
+    )
+    assert runtime.select_plans(
+        plans,
+        lane="all",
+        iteration=2,
+        operator="test",
+    ) == (plans[0],)
     assert runtime.reserve(3, atomic=True, context="complete_candidate") == 0
     assert runtime.round_remaining == 2
 
@@ -196,10 +219,7 @@ def test_controlled_parallelism_preserves_fixed_work_semantics() -> None:
         and event.get("status") == "parallel_complete"
     ]
     assert parallel_events
-    assert all(
-        event["merge_order"] == event["submission_order"]
-        for event in parallel_events
-    )
+    assert all(event["merge_order"] == event["submission_order"] for event in parallel_events)
 
 
 def test_spawn_worker_failure_and_deadline_do_not_publish_results() -> None:
@@ -211,6 +231,22 @@ def test_spawn_worker_failure_and_deadline_do_not_publish_results() -> None:
         )
     )
     sequences = (("C1",), ("C2",), ("C3",), ("C1", "C2"))
+
+    single = runtime.solve_batch(
+        _instance(),
+        (("C1",),),
+        batch_size=8,
+        deadline=time.perf_counter() + 10.0,
+        lane="test",
+        iteration=0,
+        operator="single_route",
+    )
+    assert len(single.results) == 1
+    assert runtime.events[-1]["status"] == "parallel_complete"
+    assert runtime.events[-1]["worker_count"] == 4
+    completed_before_failures = sum(
+        event.get("status") == "parallel_complete" for event in runtime.events
+    )
 
     with pytest.raises(CandidateParallelExecutionError, match="deadline"):
         runtime.solve_batch(
@@ -236,8 +272,9 @@ def test_spawn_worker_failure_and_deadline_do_not_publish_results() -> None:
         )
 
     assert runtime.route_result_hash == first_result_hash
-    assert not any(
-        event.get("status") == "parallel_complete" for event in runtime.events
+    assert (
+        sum(event.get("status") == "parallel_complete" for event in runtime.events)
+        == completed_before_failures
     )
 
 
@@ -270,10 +307,7 @@ def test_stage034_formal_gate_requires_quality_and_performance() -> None:
 
     failed = [dict(row) for row in rows]
     for failed_row in failed:
-        if (
-            failed_row["instance"] == "r101_21"
-            and failed_row["axis"] == "serial_wall_clock"
-        ):
+        if failed_row["instance"] == "r101_21" and failed_row["axis"] == "serial_wall_clock":
             failed_row["started_calls"] = 101
     not_ready = evaluate_stage034_gate(
         failed,
@@ -324,3 +358,137 @@ def test_stage034_runner_persists_four_current_storage_axes(tmp_path) -> None:
     assert manifest["stage_id"] == "stage03.4"
     assert manifest["component"] == "control_parallel"
     assert manifest["evidence_completeness"] == "complete"
+
+
+def test_reviewer_rejects_non_prefix_candidate_selection() -> None:
+    group = [
+        {
+            "candidate_id": 1,
+            "rank": 1,
+            "vehicle_count": 2,
+            "optimistic_total_distance": 10.0,
+            "changed_route_count": 1,
+            "customer_sequences": [["A"], ["Z", "B"]],
+            "proposal_ordinal": 0,
+            "status": "not_selected",
+        },
+        {
+            "candidate_id": 2,
+            "rank": 2,
+            "vehicle_count": 2,
+            "optimistic_total_distance": 10.0,
+            "changed_route_count": 1,
+            "customer_sequences": [["A", "Z"], ["B"]],
+            "proposal_ordinal": 1,
+            "status": "selected",
+        },
+    ]
+
+    assert not _plan_decision_group_valid(group, proposal_top_k=1)
+
+
+def test_reviewer_uses_runtime_nested_tuple_route_order() -> None:
+    group = [
+        {
+            "candidate_id": 1,
+            "rank": 1,
+            "vehicle_count": 2,
+            "optimistic_total_distance": 10.0,
+            "changed_route_count": 1,
+            "customer_sequences": [["A"], ["Z", "B"]],
+            "proposal_ordinal": 0,
+            "status": "selected",
+        },
+        {
+            "candidate_id": 2,
+            "rank": 2,
+            "vehicle_count": 2,
+            "optimistic_total_distance": 10.0,
+            "changed_route_count": 1,
+            "customer_sequences": [["A", "Z"], ["B"]],
+            "proposal_ordinal": 1,
+            "status": "not_selected",
+        },
+    ]
+
+    assert _plan_decision_group_valid(group, proposal_top_k=1)
+
+
+def test_reviewer_rebuilds_attempted_plan_history() -> None:
+    decision = {
+        "event_type": "candidate_plan_decision",
+        "candidate_id": 1,
+        "rank": 1,
+        "vehicle_count": 1,
+        "optimistic_total_distance": 1.0,
+        "changed_route_count": 1,
+        "customer_sequences": [["C1"]],
+        "proposal_ordinal": 0,
+        "status": "already_attempted",
+    }
+
+    assert not _plan_history_valid([decision], proposal_top_k=1)
+    assert _plan_history_valid(
+        [
+            {**decision, "status": "selected"},
+            {
+                "event_type": "candidate_plan_attempted",
+                "status": "complete_transaction",
+                "customer_sequences": [["C1"]],
+            },
+            decision,
+        ],
+        proposal_top_k=1,
+    )
+
+
+def test_reviewer_reconciles_round_budget_ledger() -> None:
+    events = [
+        {
+            "event_type": "candidate_control_round",
+            "status": "started",
+            "iteration": 3,
+            "budget": 2,
+        },
+        {
+            "event_type": "candidate_control_budget",
+            "status": "reserved",
+            "iteration": 3,
+            "requested": 1,
+            "granted": 1,
+            "remaining": 1,
+        },
+        {
+            "event_type": "candidate_control_round",
+            "status": "completed",
+            "iteration": 3,
+            "budget": 2,
+            "used": 1,
+            "remainder": 1,
+        },
+    ]
+
+    assert _budget_ledger_valid(events, max_round_budget=2)
+    assert not _budget_ledger_valid(
+        [*events[:-1], {**events[-1], "used": 0}],
+        max_round_budget=2,
+    )
+
+
+def test_reviewer_rejects_invalid_deadline_completion_indices() -> None:
+    event = {
+        "status": "deadline_rollback",
+        "worker_count": 4,
+        "submission_order": [1, 2],
+        "completion_order": [2],
+        "merge_order": [],
+        "chunk_sizes": [2, 2],
+        "result_count": 0,
+        "completed_indices": [0, 3],
+    }
+
+    assert _parallel_event_valid(event, expects_parallel=True)
+    assert not _parallel_event_valid(
+        {**event, "completed_indices": [0, 4]},
+        expects_parallel=True,
+    )

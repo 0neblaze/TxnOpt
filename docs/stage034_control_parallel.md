@@ -65,3 +65,14 @@ The reviewer writes `READY_FOR_STAGE04` only if all correctness, provenance,
 objective, deterministic-equivalence, and performance gates pass. Until an
 accepted Formal review exists, Stage 3.4 and Stage 3 performance remain
 incomplete.
+
+## Current evidence status
+
+`stage03.4_control_parallel_attempt05` completed the full 72-axis Smoke scope.
+Independent replay reported `NOT_READY`: scope completeness and deterministic
+serial/parallel fixed-work semantics passed, while the strict objective and
+R/RC performance gates failed. The review also found non-zero unchanged-route
+exact calls in that immutable attempt. The status is intentionally preserved;
+later code fixed the route-status cause but has not yet produced a complete
+passing Smoke attempt. Formal 144-axis execution and publication remain
+blocked.

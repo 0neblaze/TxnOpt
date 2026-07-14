@@ -197,9 +197,7 @@ class _IncumbentRouteLedger:
     ] = field(default_factory=dict)
 
     def remember(self, lane: str, solution: _EvaluatedSolution) -> None:
-        self.by_lane[lane] = dict(
-            zip(solution.sequences, solution.charging, strict=True)
-        )
+        self.by_lane[lane] = dict(zip(solution.sequences, solution.charging, strict=True))
 
     def get(
         self,
@@ -254,9 +252,7 @@ class _Evaluator:
         self.lane = lane
         self.incumbent_lane = lane
         self.screening_config = (
-            screening_config
-            if screening_config is not None and screening_config.enabled
-            else None
+            screening_config if screening_config is not None and screening_config.enabled else None
         )
         self.cache_incremental_config = (
             cache_incremental_config
@@ -275,9 +271,7 @@ class _Evaluator:
         self.exact_call_controller = exact_call_controller
         self.candidate_control_runtime = candidate_control_runtime
         self.incumbent_route_ledger = incumbent_route_ledger
-        self.pending_candidate_cache: dict[
-            tuple[str, ...], ChargingSubproblemResult
-        ] = {}
+        self.pending_candidate_cache: dict[tuple[str, ...], ChargingSubproblemResult] = {}
         self.backend_metrics = BackendMetrics(self.backend.value, batch_size)
         self.reachability_index = (
             StationReachabilityIndex(instance)
@@ -285,9 +279,7 @@ class _Evaluator:
             and self.cache_incremental_config.station_reachability_bitset
             else None
         )
-        self.propagation_snapshots: dict[
-            tuple[str, ...], RoutePropagationSnapshot
-        ] = {}
+        self.propagation_snapshots: dict[tuple[str, ...], RoutePropagationSnapshot] = {}
         self.incremental_propagations = 0
         self.incremental_fallbacks = 0
         self.incremental_reused_prefix_edges = 0
@@ -531,7 +523,7 @@ class _Evaluator:
             if len(sequences) > len(current_sequences):
                 runtime.events.append(
                     {
-                        "event_type": "candidate_plan_decision",
+                        "event_type": "candidate_plan_screening",
                         "status": "vehicle_increase_rejected",
                         "lane": self.lane,
                         "iteration": self.iteration,
@@ -543,6 +535,19 @@ class _Evaluator:
                 continue
             screens = tuple(candidate_screen(sequence) for sequence in sequences)
             if not all(screen.accepted for screen in screens):
+                runtime.events.append(
+                    {
+                        "event_type": "candidate_plan_screening",
+                        "status": "screening_rejected",
+                        "lane": self.lane,
+                        "iteration": self.iteration,
+                        "operator": self.operator,
+                        "proposal_ordinal": ordinal,
+                        "vehicle_count": len(sequences),
+                        "customer_sequences": [list(sequence) for sequence in sequences],
+                        "reasons": [screen.reason for screen in screens if not screen.accepted],
+                    }
+                )
                 continue
             rankable.append(
                 CandidatePlan(
@@ -552,9 +557,7 @@ class _Evaluator:
                     optimistic_total_distance=sum(
                         screen.distance_lower_bound for screen in screens
                     ),
-                    changed_route_count=sum(
-                        sequence not in current_set for sequence in sequences
-                    ),
+                    changed_route_count=sum(sequence not in current_set for sequence in sequences),
                     proposal_ordinal=ordinal,
                 )
             )
@@ -574,6 +577,17 @@ class _Evaluator:
             candidate = self.solution(
                 plan.customer_sequences,
                 precomputed_routes=precomputed,
+            )
+            if any(
+                result.failure_reason.startswith("candidate_control:")
+                for result in candidate.charging
+            ):
+                continue
+            runtime.mark_plan_attempted(
+                plan,
+                lane=self.lane,
+                iteration=self.iteration,
+                operator=self.operator,
             )
             if not candidate.feasible or candidate.objective is None:
                 continue
@@ -671,8 +685,7 @@ class _Evaluator:
                     if reference_distance is not None
                     else (
                         self.propagation_snapshots[base_sequence].total_distance
-                        if base_sequence is not None
-                        and base_sequence in self.propagation_snapshots
+                        if base_sequence is not None and base_sequence in self.propagation_snapshots
                         else None
                     )
                 ),
@@ -804,9 +817,7 @@ class _Evaluator:
 
     def incremental_statistics(self) -> dict[str, object]:
         reachability = (
-            self.reachability_index.to_dict()
-            if self.reachability_index is not None
-            else {}
+            self.reachability_index.to_dict() if self.reachability_index is not None else {}
         )
         return {
             "incremental_propagations": self.incremental_propagations,
@@ -826,9 +837,7 @@ class _Evaluator:
         pending = self.pending_candidate_cache.get(sequence)
         if pending is not None:
             cache_key_digest = (
-                self.route_cache.make_key(sequence).digest
-                if self.route_cache is not None
-                else ""
+                self.route_cache.make_key(sequence).digest if self.route_cache is not None else ""
             )
             self.cache_hits += 1
             if self.measurement_trace is not None:
@@ -1013,13 +1022,9 @@ class _Evaluator:
                 result = batch.results[0]
                 self.backend_metrics.add(batch.metrics)
         except BaseException as error:
-            self._discard_pending_candidate_cache(
-                f"exact_call_interrupted:{type(error).__name__}"
-            )
+            self._discard_pending_candidate_cache(f"exact_call_interrupted:{type(error).__name__}")
             completed_on_error = (
-                error.completed_exact_calls
-                if isinstance(error, ExactBatchDeadlineExceeded)
-                else 0
+                error.completed_exact_calls if isinstance(error, ExactBatchDeadlineExceeded) else 0
             )
             if self.exact_call_controller is not None:
                 self.exact_call_controller.complete(completed_on_error)
@@ -1057,8 +1062,7 @@ class _Evaluator:
         if self.exact_call_controller is not None:
             self.exact_call_controller.complete(1)
         transactional_deadline = (
-            self.exact_call_controller is not None
-            and time.perf_counter() >= self.deadline
+            self.exact_call_controller is not None and time.perf_counter() >= self.deadline
         )
         if self.exact_call_controller is not None and not transactional_deadline:
             self.pending_candidate_cache[sequence] = result
@@ -1148,18 +1152,11 @@ class _Evaluator:
         precomputed_routes: dict[tuple[str, ...], ChargingSubproblemResult] | None = None,
     ) -> _EvaluatedSolution:
         clean = tuple(sequence for sequence in sequences if sequence)
-        if (
-            precomputed_routes is None
-            and self.backend is not ExactChargingBackend.CPU_SCALAR
-        ):
+        if precomputed_routes is None and self.backend is not ExactChargingBackend.CPU_SCALAR:
             charging = self.route_batch(clean, route_change_status="changed")
         elif precomputed_routes is not None and self.candidate_control_runtime is not None:
-            missing = tuple(
-                sequence for sequence in clean if sequence not in precomputed_routes
-            )
-            missing_results = iter(
-                self.route_batch(missing, route_change_status="changed")
-            )
+            missing = tuple(sequence for sequence in clean if sequence not in precomputed_routes)
+            missing_results = iter(self.route_batch(missing, route_change_status="changed"))
             charging = tuple(
                 self._precomputed_route(sequence, precomputed_routes[sequence])
                 if sequence in precomputed_routes
@@ -1227,8 +1224,7 @@ class _Evaluator:
             )
         if self.backend is ExactChargingBackend.CPU_SCALAR or len(clean) == 1:
             return tuple(
-                self.route(sequence, route_change_status=route_change_status)
-                for sequence in clean
+                self.route(sequence, route_change_status=route_change_status) for sequence in clean
             )
         resolved: list[ChargingSubproblemResult | None] = [None] * len(clean)
         pending_sequences: list[tuple[str, ...]] = []
@@ -1280,9 +1276,7 @@ class _Evaluator:
                         f"cheap_screening:{screen.reason}",
                     )
                     continue
-            if cache_available and (
-                sequence in pending_set or self.has_cached_route(sequence)
-            ):
+            if cache_available and (sequence in pending_set or self.has_cached_route(sequence)):
                 flush_pending()
             cached, _ = self._lookup_cached_result(
                 sequence,
@@ -1385,10 +1379,7 @@ class _Evaluator:
 
         if not sequences:
             return ()
-        if (
-            self.candidate_control_runtime is not None
-            and not candidate_control_reserved
-        ):
+        if self.candidate_control_runtime is not None and not candidate_control_reserved:
             granted = self.candidate_control_runtime.reserve(
                 len(sequences),
                 atomic=True,
@@ -1396,8 +1387,7 @@ class _Evaluator:
             )
             if granted == 0:
                 return tuple(
-                    _candidate_control_skip_result("round_budget_exhausted")
-                    for _ in sequences
+                    _candidate_control_skip_result("round_budget_exhausted") for _ in sequences
                 )
         if (
             self.candidate_control_runtime is not None
@@ -1414,15 +1404,13 @@ class _Evaluator:
                     "requested": len(sequences),
                     "granted": 0,
                     "remaining": (
-                        self.exact_call_controller.budget
-                        - self.exact_call_controller.started_calls
+                        self.exact_call_controller.budget - self.exact_call_controller.started_calls
                     ),
                     "iteration": self.iteration,
                 }
             )
             return tuple(
-                _candidate_control_skip_result("global_budget_atomic_skip")
-                for _ in sequences
+                _candidate_control_skip_result("global_budget_atomic_skip") for _ in sequences
             )
         if time.perf_counter() >= self.deadline:
             self._discard_pending_candidate_cache("deadline_before_exact_batch")
@@ -1467,9 +1455,7 @@ class _Evaluator:
                 )
             )
         except BaseException as error:
-            self._discard_pending_candidate_cache(
-                f"exact_batch_interrupted:{type(error).__name__}"
-            )
+            self._discard_pending_candidate_cache(f"exact_batch_interrupted:{type(error).__name__}")
             completed_indices = (
                 set(error.completed_indices)
                 if isinstance(error, ExactBatchDeadlineExceeded)
@@ -1477,9 +1463,7 @@ class _Evaluator:
             )
             if self.exact_call_controller is not None:
                 self.exact_call_controller.complete(len(completed_indices))
-                self.exact_call_controller.interrupt(
-                    len(active_sequences) - len(completed_indices)
-                )
+                self.exact_call_controller.interrupt(len(active_sequences) - len(completed_indices))
             if isinstance(error, ExactBatchDeadlineExceeded):
                 self.backend_metrics.add(error.metrics)
                 self.calls += len(completed_indices)
@@ -1516,12 +1500,9 @@ class _Evaluator:
         self.labels_generated += sum(item.labels_generated for item in batch.results)
         self.labels_pruned += sum(item.labels_pruned for item in batch.results)
         self.evaluated_routes.update(active_sequences)
-        self.evaluated_route_keys.update(
-            (self.lane, sequence) for sequence in active_sequences
-        )
+        self.evaluated_route_keys.update((self.lane, sequence) for sequence in active_sequences)
         transactional_deadline = (
-            self.exact_call_controller is not None
-            and batch_completed >= self.deadline
+            self.exact_call_controller is not None and batch_completed >= self.deadline
         )
         for sequence, result in zip(active_sequences, batch.results, strict=True):
             cache_key_digest = ""
@@ -1540,8 +1521,7 @@ class _Evaluator:
                 self.cache[sequence] = result
             if (
                 self.exact_call_controller is None
-                and
-                not partial_budget_batch
+                and not partial_budget_batch
                 and not transactional_deadline
                 and self.route_cache is not None
             ):
@@ -1678,9 +1658,7 @@ def _unchanged_precomputed_routes(
         return None
     current_results = {
         sequence: result
-        for sequence, result in zip(
-            current.sequences, current.charging, strict=True
-        )
+        for sequence, result in zip(current.sequences, current.charging, strict=True)
     }
     return {
         sequence: current_results[sequence]
@@ -1727,9 +1705,7 @@ def _solve_alns(
     batch_work_enabled = termination_mode == "fixed_work" or fixed_exact_calls
     profile = OperatorProfile(operator_profile)
     vehicle_config = vehicle_operator_config or VehicleOperatorConfig()
-    cache_enabled = (
-        cache_incremental_config is not None and cache_incremental_config.enabled
-    )
+    cache_enabled = cache_incremental_config is not None and cache_incremental_config.enabled
     if cache_enabled and (screening_config is None or not screening_config.enabled):
         raise ValueError(
             "Stage 3.2 cache/incremental evaluation requires enabled Stage 3.1 screening"
@@ -1738,8 +1714,7 @@ def _solve_alns(
         cache_incremental_config = replace(
             cache_incremental_config,
             instance_hash=(
-                cache_incremental_config.instance_hash
-                or canonical_instance_hash(instance)
+                cache_incremental_config.instance_hash or canonical_instance_hash(instance)
             ),
         )
 
@@ -1786,7 +1761,8 @@ def _solve_alns(
     )
     evaluator = _Evaluator(
         instance,
-        deadline=legacy_deadline if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
+        deadline=legacy_deadline
+        if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
         else overall_deadline,
         measurement_trace=measurement_trace,
         lane="legacy",
@@ -1804,7 +1780,8 @@ def _solve_alns(
     )
     quality_evaluator = _Evaluator(
         instance,
-        deadline=legacy_deadline if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
+        deadline=legacy_deadline
+        if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
         else overall_deadline,
         measurement_trace=measurement_trace,
         lane="quality_shadow",
@@ -1880,9 +1857,7 @@ def _solve_alns(
     first_feasible_time = time.perf_counter() - started
     best_time = first_feasible_time
     destroy_stats = {name: OperatorStatistics() for name in ("random", "worst", "related")}
-    standard_repair_stats = {
-        name: OperatorStatistics() for name in ("greedy", "regret2", "energy")
-    }
+    standard_repair_stats = {name: OperatorStatistics() for name in ("greedy", "regret2", "energy")}
     repair_stats = dict(standard_repair_stats)
     if profile in (
         OperatorProfile.STAGE02_ROUTE_REDUCTION,
@@ -1891,9 +1866,11 @@ def _solve_alns(
     ):
         repair_stats["vehicle_count_aware"] = OperatorStatistics()
     neighborhood_names = _neighborhood_names(profile)
-    neighborhood_stats = {
-        name: OperatorStatistics() for name in neighborhood_names
-    } if profile is not OperatorProfile.BASELINE else {}
+    neighborhood_stats = (
+        {name: OperatorStatistics() for name in neighborhood_names}
+        if profile is not OperatorProfile.BASELINE
+        else {}
+    )
     refinement_stats = OperatorStatistics()
     if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED:
         neighborhood_stats["vehicle_reduction_refinement"] = refinement_stats
@@ -1916,12 +1893,9 @@ def _solve_alns(
             break
         elapsed = time.perf_counter() - started
         if elapsed >= time_limit_seconds:
-            watchdog_triggered = (
-                termination_mode == "fixed_work"
-                or (
-                    exact_call_controller is not None
-                    and exact_call_controller.config.mode == "exact_call_budget"
-                )
+            watchdog_triggered = termination_mode == "fixed_work" or (
+                exact_call_controller is not None
+                and exact_call_controller.config.mode == "exact_call_budget"
             )
             break
         if candidate_control_runtime is not None:
@@ -1995,7 +1969,7 @@ def _solve_alns(
                     lane="legacy",
                     iteration=iteration,
                     operator=selected_neighborhood,
-            )
+                )
             try:
                 if selected_neighborhood == "route_elimination":
                     proposal = propose_route_elimination(
@@ -2105,9 +2079,7 @@ def _solve_alns(
                         move_events = (
                             NeighborhoodEvent(
                                 "vehicle_count_aware_repair",
-                                "candidate_proposed"
-                                if repair.sequences is not None
-                                else "failed",
+                                "candidate_proposed" if repair.sequences is not None else "failed",
                                 repair.failure_reason or "existing_route_repair",
                                 removed_customers=removed,
                                 candidate_vehicle_delta=(
@@ -2296,10 +2268,14 @@ def _solve_alns(
                 evaluator.set_measurement_context(
                     lane="legacy", iteration=iteration, operator=selected_neighborhood
                 )
-            if profile in (
-                OperatorProfile.STAGE02_ROUTE_QUALITY,
-                OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
-            ) and not main_lane_timed_out:
+            if (
+                profile
+                in (
+                    OperatorProfile.STAGE02_ROUTE_QUALITY,
+                    OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
+                )
+                and not main_lane_timed_out
+            ):
                 shadow_neighborhood = _quality_shadow_neighborhood(iteration)
                 if shadow_neighborhood:
                     neighborhood_stats[shadow_neighborhood].calls += 1
@@ -2466,10 +2442,7 @@ def _solve_alns(
                 constraint_operator = _select_constraint_operator(
                     iteration,
                     constraint_rng,
-                    {
-                        name: neighborhood_stats[name]
-                        for name in _CONSTRAINT_REMOVAL_ORDER
-                    },
+                    {name: neighborhood_stats[name] for name in _CONSTRAINT_REMOVAL_ORDER},
                 )
                 constraint_statistics = neighborhood_stats[constraint_operator]
                 constraint_statistics.calls += 1
@@ -2614,8 +2587,7 @@ def _solve_alns(
                 else:
                     constraint_statistics.rejected += 1
                     constraint_statistics.failure_reasons["candidate_rejected"] = (
-                        constraint_statistics.failure_reasons.get("candidate_rejected", 0)
-                        + 1
+                        constraint_statistics.failure_reasons.get("candidate_rejected", 0) + 1
                     )
                 if measurement_trace is not None:
                     measurement_trace.record_candidate_state(
@@ -2664,14 +2636,18 @@ def _solve_alns(
             and compare_objectives(candidate.objective, current.objective)
             is ObjectiveComparison.WORSE
         )
-        accept = False if main_lane_timed_out or quality_candidate_is_worse else (
-            candidate.feasible
-            and candidate.objective is not None
-            and accept_annealing_move(
-                current.objective,
-                candidate.objective,
-                temperature=max(temperature, 1e-12),
-                random_draw=rng.random(),
+        accept = (
+            False
+            if main_lane_timed_out or quality_candidate_is_worse
+            else (
+                candidate.feasible
+                and candidate.objective is not None
+                and accept_annealing_move(
+                    current.objective,
+                    candidate.objective,
+                    temperature=max(temperature, 1e-12),
+                    random_draw=rng.random(),
+                )
             )
         )
         if profile is not OperatorProfile.BASELINE:
@@ -2683,8 +2659,7 @@ def _solve_alns(
             distance_improvement = bool(
                 candidate.objective is not None
                 and current.objective is not None
-                and candidate.objective.total_distance
-                < current.objective.total_distance - 1e-9
+                and candidate.objective.total_distance < current.objective.total_distance - 1e-9
             )
             neighborhood_events.extend(
                 _annotated_event_record(
@@ -2820,9 +2795,7 @@ def _solve_alns(
                 current_sequences=previous_current.sequences,
                 candidate_sequences=candidate.sequences,
                 current_objective_key=(
-                    previous_current.objective.key
-                    if previous_current.objective is not None
-                    else ()
+                    previous_current.objective.key if previous_current.objective is not None else ()
                 ),
                 candidate_objective_key=(
                     candidate.objective.key if candidate.objective is not None else ()
@@ -2846,9 +2819,7 @@ def _solve_alns(
         exact_call_controller is not None
         and exact_call_controller.config.mode == "exact_call_budget"
     )
-    budget_reached = (
-        exact_call_controller is not None and exact_call_controller.budget_reached
-    )
+    budget_reached = exact_call_controller is not None and exact_call_controller.budget_reached
     if fixed_watchdog_mode and effective_iterations < max_iterations and not budget_reached:
         watchdog_triggered = True
 
@@ -2860,18 +2831,11 @@ def _solve_alns(
     if best.objective is None:
         raise RuntimeError("feasible ALNS result is missing its objective")
     validated_objective = SolutionObjective.from_report(instance, report)
-    if (
-        compare_objectives(validated_objective, best.objective)
-        is not ObjectiveComparison.EQUAL
-    ):
-        raise RuntimeError(
-            "ALNS solver objective differs from the unified validator objective"
-        )
+    if compare_objectives(validated_objective, best.objective) is not ObjectiveComparison.EQUAL:
+        raise RuntimeError("ALNS solver objective differs from the unified validator objective")
     if candidate_control_runtime is not None:
         candidate_control_runtime.finish_round()
-    exact_statistics = (
-        exact_call_controller.to_dict() if exact_call_controller is not None else {}
-    )
+    exact_statistics = exact_call_controller.to_dict() if exact_call_controller is not None else {}
     termination_reason = (
         "exact_call_budget_exhausted"
         if exact_call_controller is not None and exact_call_controller.budget_reached
@@ -2925,9 +2889,7 @@ def _solve_alns(
             else _cache_statistics(lane_route_caches)["unique_route_evaluations"]
             if cache_enabled
             else sum(
-                len(item.cache)
-                if item.local_cache_enabled
-                else len(item.evaluated_route_keys)
+                len(item.cache) if item.local_cache_enabled else len(item.evaluated_route_keys)
                 for item in lane_evaluators
             )
         ),
@@ -2960,16 +2922,12 @@ def _solve_alns(
             exact_call_controller.interrupted_calls if exact_call_controller is not None else 0
         ),
         exact_budget_exhaustions=(
-            exact_call_controller.budget_exhaustions
-            if exact_call_controller is not None
-            else 0
+            exact_call_controller.budget_exhaustions if exact_call_controller is not None else 0
         ),
         termination_reason=termination_reason,
         exact_deadline_statistics=exact_statistics,
         candidate_control_statistics=(
-            candidate_control_runtime.statistics()
-            if candidate_control_runtime is not None
-            else {}
+            candidate_control_runtime.statistics() if candidate_control_runtime is not None else {}
         ),
         candidate_work_hash=(
             candidate_control_runtime.candidate_work_hash
@@ -3024,9 +2982,7 @@ def solve_alns(
         else None
     )
     exact_call_controller = (
-        ExactCallController(exact_deadline_config)
-        if exact_deadline_config is not None
-        else None
+        ExactCallController(exact_deadline_config) if exact_deadline_config is not None else None
     )
     if (
         exact_deadline_config is not None
@@ -3048,8 +3004,7 @@ def solve_alns(
         cache_incremental_config = replace(
             cache_incremental_config,
             instance_hash=(
-                cache_incremental_config.instance_hash
-                or canonical_instance_hash(instance)
+                cache_incremental_config.instance_hash or canonical_instance_hash(instance)
             ),
         )
     if (
@@ -3087,13 +3042,9 @@ def solve_alns(
     trace = Stage03Trace(
         trace_config,
         screening_config=screening_config,
-        cache_incremental_config=(
-            cache_incremental_config if cache_incremental_enabled else None
-        ),
+        cache_incremental_config=(cache_incremental_config if cache_incremental_enabled else None),
         exact_deadline_config=exact_deadline_config,
-        candidate_control_config=(
-            candidate_control_config if candidate_control_enabled else None
-        ),
+        candidate_control_config=(candidate_control_config if candidate_control_enabled else None),
     )
     try:
         result = _solve_alns(
@@ -3136,9 +3087,7 @@ def _append_candidate_control_events(
         event = dict(runtime_event)
         sequence = event.pop("customer_sequence", None)
         if isinstance(sequence, list):
-            event["route_keys"] = (
-                trace.register_route(tuple(str(name) for name in sequence)),
-            )
+            event["route_keys"] = (trace.register_route(tuple(str(name) for name in sequence)),)
         sequences = event.pop("customer_sequences", None)
         if isinstance(sequences, list):
             event["route_keys"] = tuple(
@@ -3441,10 +3390,7 @@ def _insertion_options(
     mode: str,
 ) -> list[tuple[float, int, tuple[str, ...]]]:
     options: list[tuple[float, int, tuple[str, ...]]] = []
-    if (
-        evaluator.backend is ExactChargingBackend.CPU_SCALAR
-        and not evaluator.batch_work_enabled
-    ):
+    if evaluator.backend is ExactChargingBackend.CPU_SCALAR and not evaluator.batch_work_enabled:
         for route_index in range(len(sequences) + 1):
             base = sequences[route_index] if route_index < len(sequences) else ()
             old = evaluator.route(base).distance if base else 0.0
@@ -3618,9 +3564,7 @@ def _quality_shadow_proposal(
     probe_budget = config.quality_probe_exact_evaluation_budget
     probe_config = replace(
         config,
-        relocate_exact_evaluation_budget=min(
-            config.relocate_exact_evaluation_budget, probe_budget
-        ),
+        relocate_exact_evaluation_budget=min(config.relocate_exact_evaluation_budget, probe_budget),
         swap_exact_evaluation_budget=min(config.swap_exact_evaluation_budget, probe_budget),
         two_opt_star_exact_evaluation_budget=min(
             config.two_opt_star_exact_evaluation_budget, probe_budget
@@ -3693,9 +3637,7 @@ def _constraint_lane_step(
         seed=seed,
         precomputed_routes={
             sequence: charging
-            for sequence, charging in zip(
-                current.sequences, current.charging, strict=True
-            )
+            for sequence, charging in zip(current.sequences, current.charging, strict=True)
         },
     )
     events = list(proposal.events)
@@ -3706,14 +3648,14 @@ def _constraint_lane_step(
     constraint_budget = min(
         config.constraint_probe_exact_evaluation_budget,
         {
-        ConstraintRemovalOperator.STATION_PRESSURE.value:
-        config.station_pressure_exact_evaluation_budget,
-        ConstraintRemovalOperator.TIME_WINDOW_CONFLICT.value:
-        config.time_window_conflict_exact_evaluation_budget,
-        ConstraintRemovalOperator.WORST_ENERGY_DETOUR.value:
-        config.worst_energy_detour_exact_evaluation_budget,
-        ConstraintRemovalOperator.SHAW_RELATED.value:
-        config.shaw_related_exact_evaluation_budget,
+            ConstraintRemovalOperator.STATION_PRESSURE.value:
+                config.station_pressure_exact_evaluation_budget,
+            ConstraintRemovalOperator.TIME_WINDOW_CONFLICT.value:
+                config.time_window_conflict_exact_evaluation_budget,
+            ConstraintRemovalOperator.WORST_ENERGY_DETOUR.value:
+                config.worst_energy_detour_exact_evaluation_budget,
+            ConstraintRemovalOperator.SHAW_RELATED.value:
+                config.shaw_related_exact_evaluation_budget,
         }[operator],
     )
     before_calls = evaluator.calls
@@ -3731,9 +3673,7 @@ def _constraint_lane_step(
             candidate_sequences,
             precomputed_routes={
                 sequence: charging
-                for sequence, charging in zip(
-                    current.sequences, current.charging, strict=True
-                )
+                for sequence, charging in zip(current.sequences, current.charging, strict=True)
             },
         )
     except _TimeLimitReached:
@@ -3774,9 +3714,7 @@ def _constraint_lane_step(
             removed_customers=proposal.removed_customers,
             candidate_route_sequences=candidate_sequences,
             candidate_vehicle_delta=(
-                len(candidate_sequences) - len(current.sequences)
-                if candidate.feasible
-                else None
+                len(candidate_sequences) - len(current.sequences) if candidate.feasible else None
             ),
             candidate_feasible=candidate.feasible,
             prefilter_passed=bool(proposal.partial),
@@ -3814,12 +3752,8 @@ def _record_neighborhood_proposal(
         if event.status in {"prefilter_rejected", "prefilter_rejected_aggregate"}
     )
     statistics.new_routes_created += sum(event.new_routes_created for event in events)
-    statistics.exact_route_evaluations += sum(
-        event.exact_route_evaluations for event in events
-    )
-    statistics.candidate_proposals += sum(
-        event.status == "candidate_proposed" for event in events
-    )
+    statistics.exact_route_evaluations += sum(event.exact_route_evaluations for event in events)
+    statistics.candidate_proposals += sum(event.status == "candidate_proposed" for event in events)
     statistics.feasible_candidates += sum(
         event.aggregate_count for event in events if event.candidate_feasible
     )
@@ -3837,8 +3771,7 @@ def _record_neighborhood_proposal(
     for event in events:
         if event.status in failure_statuses:
             statistics.failure_reasons[event.reason] = (
-                statistics.failure_reasons.get(event.reason, 0)
-                + event.aggregate_count
+                statistics.failure_reasons.get(event.reason, 0) + event.aggregate_count
             )
     if candidate.feasible:
         statistics.feasible_repairs += 1
@@ -3982,9 +3915,7 @@ def _failed_result(
         backend_metrics=evaluator.backend_metrics.to_dict(),
         termination_mode=termination_mode,
         watchdog_triggered=termination_mode == "fixed_work",
-        exact_started_calls=(
-            exact_controller.started_calls if exact_controller is not None else 0
-        ),
+        exact_started_calls=(exact_controller.started_calls if exact_controller is not None else 0),
         exact_completed_calls=(
             exact_controller.completed_calls if exact_controller is not None else 0
         ),

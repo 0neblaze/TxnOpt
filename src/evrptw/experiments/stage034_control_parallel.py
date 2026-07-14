@@ -12,7 +12,12 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from evrptw.alns import ALNSResult, solve_alns
-from evrptw.artifacts import ArtifactBundleWriter, ArtifactRunContext, ArtifactStorageConfig
+from evrptw.artifacts import (
+    ArtifactBundleWriter,
+    ArtifactRunContext,
+    ArtifactStorageConfig,
+    verify_manifest,
+)
 from evrptw.cache_incremental import CacheIncrementalConfig
 from evrptw.candidate_control import CandidateControlConfig
 from evrptw.environment import collect_environment
@@ -34,9 +39,7 @@ from evrptw.neighborhoods import VehicleOperatorConfig
 from evrptw.parser import parse_schneider
 
 STAGE034_SCHEMA_VERSION = "stage034-control-parallel-v1"
-STAGE034_RUN_LABEL = re.compile(
-    r"stage03\.4_control_parallel_(?:attempt|rerun)[0-9]{2}"
-)
+STAGE034_RUN_LABEL = re.compile(r"stage03\.4_control_parallel_(?:attempt|rerun)[0-9]{2}")
 DIAGNOSTIC_AXES = (
     "serial_fixed_exact_calls",
     "parallel_fixed_exact_calls",
@@ -91,17 +94,11 @@ def load_stage034_config(path: Path) -> Stage034Config:
                 worker_count=1,
                 **control,
             ),
-            proposal_top_k_grid=tuple(
-                int(value) for value in grid["proposal_top_k"]
-            ),
-            round_budget_grid=tuple(
-                int(value) for value in grid["max_exact_calls_per_round"]
-            ),
+            proposal_top_k_grid=tuple(int(value) for value in grid["proposal_top_k"]),
+            round_budget_grid=tuple(int(value) for value in grid["max_exact_calls_per_round"]),
             selection_order=tuple(str(value) for value in grid["selection_order"]),
             screening_config=CheapScreeningConfig(**dict(payload["screening"])),
-            cache_incremental_config=CacheIncrementalConfig(
-                **dict(payload["cache_incremental"])
-            ),
+            cache_incremental_config=CacheIncrementalConfig(**dict(payload["cache_incremental"])),
             artifact_storage=ArtifactStorageConfig(**dict(payload["artifact_storage"])),
         )
     except (KeyError, TypeError, ValueError) as error:
@@ -117,10 +114,8 @@ def load_stage034_config(path: Path) -> Stage034Config:
     if config.proposal_top_k_grid != (1, 2, 4) or config.round_budget_grid != (1, 2, 4):
         raise ValueError("Stage 3.4 candidate-control grid must be {1,2,4} x {1,2,4}")
     if (
-        config.candidate_control_config.proposal_top_k
-        not in config.proposal_top_k_grid
-        or config.candidate_control_config.max_exact_calls_per_round
-        not in config.round_budget_grid
+        config.candidate_control_config.proposal_top_k not in config.proposal_top_k_grid
+        or config.candidate_control_config.max_exact_calls_per_round not in config.round_budget_grid
     ):
         raise ValueError("selected Stage 3.4 configuration is outside the preregistered grid")
     return config
@@ -129,8 +124,7 @@ def load_stage034_config(path: Path) -> Stage034Config:
 def validate_stage034_run_label(run_label: str) -> None:
     if STAGE034_RUN_LABEL.fullmatch(run_label) is None:
         raise ValueError(
-            "Stage 3.4 run label must be stage03.4_control_parallel_attemptNN "
-            "or rerunNN"
+            "Stage 3.4 run label must be stage03.4_control_parallel_attemptNN or rerunNN"
         )
 
 
@@ -210,15 +204,14 @@ def run_stage034(
     _require_stage033_ready(_resolve(root, config.stage033_review_manifest))
     if scope == "formal":
         _require_stage034_smoke_ready(
-            _resolve(root, smoke_review_dir) if smoke_review_dir else None
+            _resolve(root, smoke_review_dir) if smoke_review_dir else None,
+            benchmark_dir=_resolve(root, config.benchmark_dir),
         )
     instances = SMOKE_INSTANCES if scope == "smoke" else FORMAL_INSTANCES
     stage02 = load_stage02_config(_resolve(root, config.stage02_config))
     repository_revision = _git(root, "rev-parse", "HEAD")
     source_sha256 = _source_sha256(root)
-    stage00_manifest_sha256 = _sha256(
-        root / "experiments/baselines/stage00/manifest.json"
-    )
+    stage00_manifest_sha256 = _sha256(root / "experiments/baselines/stage00/manifest.json")
     references = _reference_repositories(root)
     environment = {
         **collect_environment(),
@@ -317,12 +310,49 @@ def _require_stage033_ready(path: Path) -> None:
         raise RuntimeError("Stage 3.3 review is not READY_FOR_STAGE03_4")
 
 
-def _require_stage034_smoke_ready(path: Path | None) -> None:
+def _require_stage034_smoke_ready(
+    path: Path | None,
+    *,
+    benchmark_dir: Path,
+) -> None:
     if path is None:
         raise RuntimeError("formal Stage 3.4 requires a smoke review")
     manifest = path / "review_manifest.json" if path.is_dir() else path
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    if payload.get("status") != "READY_FOR_STAGE034_FORMAL":
+    review_dir = manifest.parent
+    files = payload.get("files")
+    if not isinstance(files, Mapping) or not files:
+        raise RuntimeError("Stage 3.4 smoke review file hashes are missing")
+    for name, expected in files.items():
+        reviewed_file = review_dir / str(name)
+        if not reviewed_file.is_file() or _sha256(reviewed_file) != str(expected):
+            raise RuntimeError("Stage 3.4 smoke review file hash mismatch")
+    run_directory = payload.get("run_directory")
+    if not isinstance(run_directory, str):
+        raise RuntimeError("Stage 3.4 smoke raw run directory is missing")
+    raw_run_directory = Path(run_directory)
+    raw_manifest = verify_manifest(raw_run_directory)
+    # Rebuild the decision from raw evidence with the current reviewer. A set
+    # of mutually consistent review hashes is not itself a trust anchor.
+    from evrptw.experiments.stage034_control_parallel_review import review_stage034
+
+    review_stage034(
+        run_dir=raw_run_directory,
+        scope="smoke",
+        benchmark_dir=benchmark_dir,
+        output_dir=review_dir,
+    )
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    if (
+        payload.get("status") != "READY_FOR_STAGE034_FORMAL"
+        or payload.get("scope") != "smoke"
+        or payload.get("scope_complete") is not True
+        or payload.get("all_rows_valid") is not True
+        or payload.get("quality_gate") is not True
+        or payload.get("semantics_gate") is not True
+        or payload.get("performance_gate") is not True
+        or payload.get("run_label") != raw_manifest.get("run_label")
+    ):
         raise RuntimeError("Stage 3.4 smoke review is not ready for formal")
 
 

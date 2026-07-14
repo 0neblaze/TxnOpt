@@ -226,9 +226,7 @@ class CandidateControlRuntime:
 
         ordered = sorted(plans, key=lambda plan: plan.rank_key)
         available = [
-            plan
-            for plan in ordered
-            if plan.customer_sequences not in self._attempted_plans
+            plan for plan in ordered if plan.customer_sequences not in self._attempted_plans
         ]
         selected = tuple(available[: self.config.proposal_top_k])
         selected_ids = {plan.candidate_id for plan in selected}
@@ -253,14 +251,34 @@ class CandidateControlRuntime:
                     "vehicle_count": plan.vehicle_count,
                     "optimistic_total_distance": plan.optimistic_total_distance,
                     "changed_route_count": plan.changed_route_count,
-                    "customer_sequences": [
-                        list(sequence) for sequence in plan.customer_sequences
-                    ],
+                    "customer_sequences": [list(sequence) for sequence in plan.customer_sequences],
                     "proposal_ordinal": plan.proposal_ordinal,
                 }
             )
-        self._attempted_plans.update(plan.customer_sequences for plan in selected)
         return selected
+
+    def mark_plan_attempted(
+        self,
+        plan: CandidatePlan,
+        *,
+        lane: str,
+        iteration: int | None,
+        operator: str,
+    ) -> None:
+        """Record a plan only after its complete transaction actually ran."""
+
+        self._attempted_plans.add(plan.customer_sequences)
+        self.events.append(
+            {
+                "event_type": "candidate_plan_attempted",
+                "status": "complete_transaction",
+                "lane": lane,
+                "iteration": iteration,
+                "operator": operator,
+                "candidate_id": plan.candidate_id,
+                "customer_sequences": [list(sequence) for sequence in plan.customer_sequences],
+            }
+        )
 
     def solve_batch(
         self,
@@ -283,7 +301,7 @@ class CandidateControlRuntime:
                 "sequences": [list(sequence) for sequence in sequences],
             }
         )
-        if self.config.worker_count == 1 or len(sequences) == 1:
+        if self.config.worker_count == 1:
             result = solve_exact_charging_batch(
                 instance,
                 sequences,
@@ -308,6 +326,7 @@ class CandidateControlRuntime:
             return result
 
         chunks = _contiguous_chunks(sequences, self.config.worker_count)
+        chunk_sizes = [len(chunk) for chunk in chunks]
         remaining = deadline - time.perf_counter()
         if remaining <= 0.0:
             raise CandidateParallelExecutionError("deadline reached before parallel submission")
@@ -324,7 +343,7 @@ class CandidateControlRuntime:
                 instance,
                 chunk,
                 batch_size,
-                remaining,
+                deadline,
             )
             future_to_submission[future] = (
                 submission_id,
@@ -384,6 +403,8 @@ class CandidateControlRuntime:
                     "submission_order": submission_order,
                     "completion_order": completion_order,
                     "merge_order": [],
+                    "chunk_sizes": chunk_sizes,
+                    "result_count": 0,
                     "completed_indices": sorted(completed_indices),
                     "lane": lane,
                     "iteration": iteration,
@@ -413,6 +434,9 @@ class CandidateControlRuntime:
                 "submission_order": submission_order,
                 "completion_order": completion_order,
                 "merge_order": submission_order,
+                "chunk_sizes": chunk_sizes,
+                "result_count": len(merged_results),
+                "completed_indices": list(range(len(sequences))),
                 "lane": lane,
                 "iteration": iteration,
                 "operator": operator,
@@ -474,7 +498,8 @@ class CandidateControlRuntime:
 
     def statistics(self) -> dict[str, object]:
         decisions = [
-            event for event in self.events
+            event
+            for event in self.events
             if event.get("event_type")
             in {
                 "candidate_control_decision",
@@ -483,8 +508,7 @@ class CandidateControlRuntime:
             }
         ]
         budgets = [
-            event for event in self.events
-            if event.get("event_type") == "candidate_control_budget"
+            event for event in self.events if event.get("event_type") == "candidate_control_budget"
         ]
         rounds = [
             event
@@ -503,14 +527,10 @@ class CandidateControlRuntime:
             "merge_policy": self.config.merge_policy,
             "candidate_decisions": len(decisions),
             "selected_candidates": sum(
-                _event_count(event)
-                for event in decisions
-                if event.get("status") == "selected"
+                _event_count(event) for event in decisions if event.get("status") == "selected"
             ),
             "skipped_candidates": sum(
-                _event_count(event)
-                for event in decisions
-                if event.get("status") != "selected"
+                _event_count(event) for event in decisions if event.get("status") != "selected"
             ),
             "budget_events": len(budgets),
             "budget_skips": sum(event.get("status") == "budget_skipped" for event in budgets),
@@ -545,9 +565,8 @@ def _solve_cpu_batch_worker(
     instance: Instance,
     sequences: tuple[tuple[str, ...], ...],
     batch_size: int,
-    timeout_seconds: float,
+    deadline: float,
 ) -> BatchChargingResult:
-    deadline = time.perf_counter() + max(0.0, timeout_seconds)
     return solve_exact_charging_batch(
         instance,
         sequences,
@@ -564,8 +583,7 @@ def _contiguous_chunks(
     chunk_count = min(workers, len(sequences))
     chunk_size = math.ceil(len(sequences) / chunk_count)
     return tuple(
-        sequences[offset : offset + chunk_size]
-        for offset in range(0, len(sequences), chunk_size)
+        sequences[offset : offset + chunk_size] for offset in range(0, len(sequences), chunk_size)
     )
 
 

@@ -20,7 +20,10 @@ from evrptw.experiments.stage033_exact_deadline_review import (
     _event_axis,
     _verify_frozen_cpu_batch_evidence,
 )
-from evrptw.experiments.stage034_control_parallel import DIAGNOSTIC_AXES
+from evrptw.experiments.stage034_control_parallel import (
+    DIAGNOSTIC_AXES,
+    _source_sha256,
+)
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.validation import validate_routes
@@ -62,8 +65,7 @@ def evaluate_stage034_gate(
             (
                 row.get("backend") == "cpu_batch",
                 bool(row.get("valid")),
-                0 <= _as_int(row.get("completed_calls"))
-                <= _as_int(row.get("started_calls")),
+                0 <= _as_int(row.get("completed_calls")) <= _as_int(row.get("started_calls")),
                 _as_int(row.get("unchanged_exact_calls")) == 0,
                 bool(row.get("exact_reconciliation_valid")),
             )
@@ -84,8 +86,7 @@ def evaluate_stage034_gate(
             wall_values = [
                 _as_int(row.get("started_calls"))
                 for row in rows
-                if row.get("instance") == instance
-                and row.get("axis") == f"{worker}_wall_clock"
+                if row.get("instance") == instance and row.get("axis") == f"{worker}_wall_clock"
             ]
             fixed_values = [
                 _as_int(row.get("effective_iterations"))
@@ -146,11 +147,10 @@ def review_stage034(
         raise RuntimeError("partial Stage 3.4 evidence cannot become ready")
     reader = ArtifactReader(run_dir)
     metadata_ref = next(
-        item
-        for item in manifest["artifacts"]
-        if item.get("artifact_type") == "manifest_metadata"
+        item for item in manifest["artifacts"] if item.get("artifact_type") == "manifest_metadata"
     )
     control = reader.read_json(str(metadata_ref["relative_path"]))
+    root = run_dir.parents[1]
     if not all(
         (
             control.get("scope") == scope,
@@ -160,10 +160,15 @@ def review_stage034(
             control.get("worker_counts") == [1, 4],
             isinstance(control.get("candidate_control"), Mapping),
             isinstance(control.get("candidate_control_grid"), Mapping),
+            control.get("source_sha256") == _source_sha256(root),
+            control.get("configuration_sha256")
+            == _sha256(root / "configs/stage034_control_parallel.toml"),
+            control.get("stage00_manifest_sha256")
+            == _sha256(root / "experiments/baselines/stage00/manifest.json"),
         )
     ):
         raise RuntimeError("Stage 3.4 control provenance is invalid")
-    baseline = _load_stage033_baseline(run_dir.parents[1])
+    baseline = _load_stage033_baseline(root)
     rows: list[dict[str, object]] = []
     findings: list[dict[str, object]] = []
     ordering_rows: list[dict[str, object]] = []
@@ -177,9 +182,8 @@ def review_stage034(
     candidate_configuration = _object(
         control.get("candidate_control"), "candidate-control configuration"
     )
-    max_round_budget = _as_int(
-        candidate_configuration.get("max_exact_calls_per_round")
-    )
+    max_round_budget = _as_int(candidate_configuration.get("max_exact_calls_per_round"))
+    proposal_top_k = _as_int(candidate_configuration.get("proposal_top_k"))
     grouped = _artifact_groups(manifest)
     for (instance_name, seed), artifacts in sorted(grouped.items()):
         raw = reader.read_json(artifacts["raw"])
@@ -203,9 +207,7 @@ def review_stage034(
             routes = _routes(solution_axis.get("routes"))
             validation = validate_routes(instance, routes)
             objective = (
-                SolutionObjective.from_report(instance, validation)
-                if validation.feasible
-                else None
+                SolutionObjective.from_report(instance, validation) if validation.feasible else None
             )
             objective_key = solution_axis.get("objective_key")
             objective_matches = (
@@ -223,8 +225,7 @@ def review_stage034(
                 for event in axis_events
             )
             event_started = sum(
-                event.get("record_type") == "route_evaluation"
-                and bool(event.get("exact_started"))
+                event.get("record_type") == "route_evaluation" and bool(event.get("exact_started"))
                 for event in axis_events
             )
             event_completed = sum(
@@ -232,13 +233,13 @@ def review_stage034(
                 and bool(event.get("exact_completed"))
                 for event in axis_events
             )
-            exact_reconciliation_valid = (
-                event_started == _as_int(raw_axis.get("started_calls"))
-                and event_completed == _as_int(raw_axis.get("completed_calls"))
-            )
+            exact_reconciliation_valid = event_started == _as_int(
+                raw_axis.get("started_calls")
+            ) and event_completed == _as_int(raw_axis.get("completed_calls"))
             candidate_valid, candidate_details = _candidate_control_valid(
                 axis_events,
                 max_round_budget=max_round_budget,
+                proposal_top_k=proposal_top_k,
             )
             ordering_valid, ordering_details = _parallel_ordering_valid(axis_events, axis)
             baseline_key = baseline.get((instance_name, seed))
@@ -310,9 +311,9 @@ def review_stage034(
                     "seed": seed,
                     "axis": axis,
                     "objective_key": row["objective_key"],
-                    "stage033_wall_clock_objective": json.dumps(
-                        baseline_key, separators=(",", ":")
-                    ) if baseline_key is not None else "",
+                    "stage033_wall_clock_objective": json.dumps(baseline_key, separators=(",", ":"))
+                    if baseline_key is not None
+                    else "",
                     "not_worse": objective_not_worse,
                 }
             )
@@ -396,18 +397,22 @@ def review_stage034(
         for suffix in ("fixed_exact_calls", "wall_clock"):
             serial = axis_rows[f"serial_{suffix}"]
             parallel = axis_rows[f"parallel_{suffix}"]
-            paired = all(
-                serial[field] == parallel[field]
-                for field in (
-                    "objective_key",
-                    "candidate_work_hash",
-                    "route_result_hash",
-                    "started_calls",
-                    "completed_calls",
-                    "effective_iterations",
-                    "acceptance_trajectory_hash",
+            paired = (
+                all(
+                    serial[field] == parallel[field]
+                    for field in (
+                        "objective_key",
+                        "candidate_work_hash",
+                        "route_result_hash",
+                        "started_calls",
+                        "completed_calls",
+                        "effective_iterations",
+                        "acceptance_trajectory_hash",
+                    )
                 )
-            ) if suffix == "fixed_exact_calls" else True
+                if suffix == "fixed_exact_calls"
+                else True
+            )
             serial["paired_semantics_valid"] = paired
             parallel["paired_semantics_valid"] = paired
         findings.extend(
@@ -420,7 +425,7 @@ def review_stage034(
             }
             for axis, row in axis_rows.items()
         )
-    prerequisites = _prerequisites_valid(run_dir.parents[1])
+    prerequisites = _prerequisites_valid(root)
     gate = evaluate_stage034_gate(
         rows,
         scope=scope,
@@ -469,9 +474,7 @@ def review_stage034(
         encoding="utf-8",
     )
     file_hashes = {
-        path.name: _sha256(path)
-        for name, path in paths.items()
-        if name != "review_manifest"
+        path.name: _sha256(path) for name, path in paths.items() if name != "review_manifest"
     }
     paths["review_manifest"].write_text(
         json.dumps(
@@ -495,6 +498,7 @@ def _candidate_control_valid(
     events: Sequence[Mapping[str, object]],
     *,
     max_round_budget: int,
+    proposal_top_k: int,
 ) -> tuple[bool, dict[str, object]]:
     decoded = [_decoded_event(event) for event in events]
     decisions = [
@@ -503,10 +507,9 @@ def _candidate_control_valid(
         if event.get("event_type")
         in {"candidate_control_decision", "candidate_control_decision_aggregate"}
     ]
-    budgets = [
-        event
-        for event in decoded
-        if event.get("event_type") == "candidate_control_budget"
+    budgets = [event for event in decoded if event.get("event_type") == "candidate_control_budget"]
+    plan_decisions = [
+        event for event in decoded if event.get("event_type") == "candidate_plan_decision"
     ]
     per_iteration: dict[int, int] = {}
     for event in budgets:
@@ -516,8 +519,31 @@ def _candidate_control_valid(
         key = _as_int(iteration)
         per_iteration[key] = per_iteration.get(key, 0) + _as_int(event.get("granted"))
     max_granted = max(per_iteration.values(), default=0)
-    valid = bool(decisions) and max_granted <= max_round_budget and all(
-        event.get("status") in {"selected", "not_selected"} for event in decisions
+    atomic_budgets = all(
+        (
+            0 <= _as_int(event.get("granted")) <= _as_int(event.get("requested"))
+            if str(event.get("context", "")).endswith(":candidate_pool")
+            else _as_int(event.get("granted")) in {0, _as_int(event.get("requested"))}
+        )
+        and _as_int(event.get("remaining")) >= 0
+        and (
+            event.get("status") == "global_budget_atomic_skip"
+            or _as_int(event.get("remaining")) <= max_round_budget
+        )
+        for event in budgets
+    )
+    plan_ranking_valid = _plan_history_valid(decoded, proposal_top_k=proposal_top_k)
+    budget_ledger_valid = _budget_ledger_valid(
+        decoded,
+        max_round_budget=max_round_budget,
+    )
+    valid = (
+        bool(decisions)
+        and max_granted <= max_round_budget
+        and atomic_budgets
+        and budget_ledger_valid
+        and plan_ranking_valid
+        and all(event.get("status") in {"selected", "not_selected"} for event in decisions)
     )
     return valid, {
         "valid": valid,
@@ -534,7 +560,154 @@ def _candidate_control_valid(
         ),
         "budget_events": len(budgets),
         "maximum_granted_per_iteration": max_granted,
+        "atomic_budgets": atomic_budgets,
+        "budget_ledger_valid": budget_ledger_valid,
+        "candidate_plan_decisions": len(plan_decisions),
+        "plan_ranking_valid": plan_ranking_valid,
     }
+
+
+def _plan_decision_group_valid(
+    group: Sequence[Mapping[str, object]],
+    *,
+    proposal_top_k: int,
+    attempted: set[tuple[tuple[str, ...], ...]] | None = None,
+) -> bool:
+    ordered = sorted(group, key=lambda event: _as_int(event.get("rank")))
+    ranks = [_as_int(event.get("rank")) for event in ordered]
+    rank_keys = [
+        (
+            _as_int(event.get("vehicle_count")),
+            _as_float(event.get("optimistic_total_distance")),
+            _as_int(event.get("changed_route_count")),
+            _nested_route_key(event.get("customer_sequences")),
+            _as_int(event.get("proposal_ordinal")),
+        )
+        for event in ordered
+    ]
+    attempted = attempted or set()
+    declared_attempted_valid = all(
+        (event.get("status") == "already_attempted")
+        == (_nested_route_key(event.get("customer_sequences")) in attempted)
+        for event in ordered
+    )
+    available = [
+        event
+        for event in ordered
+        if _nested_route_key(event.get("customer_sequences")) not in attempted
+    ]
+    expected_selected_ids = {
+        _as_int(event.get("candidate_id")) for event in available[:proposal_top_k]
+    }
+    selected_ids = {
+        _as_int(event.get("candidate_id")) for event in ordered if event.get("status") == "selected"
+    }
+    return (
+        ranks == list(range(1, len(ordered) + 1))
+        and rank_keys == sorted(rank_keys)
+        and declared_attempted_valid
+        and selected_ids == expected_selected_ids
+        and all(
+            event.get("status") in {"selected", "not_selected", "already_attempted"}
+            for event in ordered
+        )
+    )
+
+
+def _plan_history_valid(
+    events: Sequence[Mapping[str, object]],
+    *,
+    proposal_top_k: int,
+) -> bool:
+    attempted: set[tuple[tuple[str, ...], ...]] = set()
+    pending: list[Mapping[str, object]] = []
+
+    def flush() -> bool:
+        if not pending:
+            return True
+        valid = _plan_decision_group_valid(
+            pending,
+            proposal_top_k=proposal_top_k,
+            attempted=attempted,
+        )
+        pending.clear()
+        return valid
+
+    for event in events:
+        event_type = event.get("event_type")
+        if event_type == "candidate_plan_decision":
+            pending.append(event)
+            continue
+        if not flush():
+            return False
+        if event_type == "candidate_plan_attempted":
+            if event.get("status") != "complete_transaction":
+                return False
+            sequence_key = _nested_route_key(event.get("customer_sequences"))
+            if not sequence_key:
+                return False
+            attempted.add(sequence_key)
+    return flush()
+
+
+def _budget_ledger_valid(
+    events: Sequence[Mapping[str, object]],
+    *,
+    max_round_budget: int,
+) -> bool:
+    active_iteration: int | None = None
+    used = 0
+    for event in events:
+        if event.get("event_type") == "candidate_control_round":
+            status = event.get("status")
+            if status == "started":
+                if active_iteration is not None:
+                    return False
+                active_iteration = _as_int(event.get("iteration"))
+                used = 0
+                if _as_int(event.get("budget")) != max_round_budget:
+                    return False
+            elif status == "completed":
+                if active_iteration != _as_int(event.get("iteration")):
+                    return False
+                if _as_int(event.get("used")) != used:
+                    return False
+                if _as_int(event.get("remainder")) != max_round_budget - used:
+                    return False
+                active_iteration = None
+            continue
+        if event.get("event_type") != "candidate_control_budget":
+            continue
+        requested = _as_int(event.get("requested"))
+        granted = _as_int(event.get("granted"))
+        status = event.get("status")
+        if status == "global_budget_atomic_skip":
+            if granted != 0 or _as_int(event.get("remaining")) >= requested:
+                return False
+            continue
+        if status == "reserved" and granted != requested:
+            return False
+        if status == "budget_skipped" and granted >= requested:
+            return False
+        iteration = event.get("iteration")
+        if iteration is not None:
+            if active_iteration != _as_int(iteration):
+                return False
+            used += granted
+            if used > max_round_budget:
+                return False
+    return active_iteration is None
+
+
+def _nested_route_key(value: object) -> tuple[tuple[str, ...], ...]:
+    if not isinstance(value, list):
+        return ()
+    output: list[tuple[str, ...]] = []
+    for route in value:
+        if not isinstance(route, list) or not all(isinstance(item, str) for item in route):
+            return ()
+        output.append(tuple(route))
+    return tuple(output)
 
 
 def _parallel_ordering_valid(
@@ -547,20 +720,67 @@ def _parallel_ordering_valid(
         if _decoded_event(event).get("event_type") == "parallel_batch"
     ]
     expects_parallel = axis.startswith("parallel_")
-    relevant = [
-        event for event in batches
-        if event.get("status") == ("parallel_complete" if expects_parallel else "serial_complete")
-    ]
-    valid = bool(relevant) and all(
-        event.get("merge_order") == event.get("submission_order")
-        and _as_int(event.get("worker_count", 0)) == (4 if expects_parallel else 1)
-        for event in relevant
+    expected_status = "parallel_complete" if expects_parallel else "serial_complete"
+    allowed_statuses = (
+        {expected_status, "deadline_rollback"} if expects_parallel else {expected_status}
+    )
+    relevant = [event for event in batches if event.get("status") in allowed_statuses]
+    valid = (
+        bool(batches)
+        and len(relevant) == len(batches)
+        and all(
+            _parallel_event_valid(event, expects_parallel=expects_parallel) for event in relevant
+        )
     )
     return valid, {
         "valid": valid,
         "batch_events": len(relevant),
         "worker_count": 4 if expects_parallel else 1,
     }
+
+
+def _parallel_event_valid(
+    event: Mapping[str, object],
+    *,
+    expects_parallel: bool,
+) -> bool:
+    expected_workers = 4 if expects_parallel else 1
+    status = event.get("status")
+    if _as_int(event.get("worker_count")) != expected_workers:
+        return False
+    if not expects_parallel:
+        return event.get("merge_order") == event.get("submission_order")
+    chunk_sizes = event.get("chunk_sizes")
+    submission_order = event.get("submission_order")
+    if not isinstance(chunk_sizes, list) or not isinstance(submission_order, list):
+        return False
+    if len(chunk_sizes) != len(submission_order) or not all(
+        _as_int(size) > 0 for size in chunk_sizes
+    ):
+        return False
+    completion_order = event.get("completion_order")
+    completed_indices = event.get("completed_indices")
+    if not isinstance(completion_order, list) or not isinstance(completed_indices, list):
+        return False
+    if len(set(completion_order)) != len(completion_order) or not set(completion_order).issubset(
+        set(submission_order)
+    ):
+        return False
+    total_items = sum(_as_int(size) for size in chunk_sizes)
+    normalized_indices = [_as_int(index) for index in completed_indices]
+    if normalized_indices != sorted(set(normalized_indices)) or any(
+        index < 0 or index >= total_items for index in normalized_indices
+    ):
+        return False
+    if status == "deadline_rollback":
+        return event.get("merge_order") == [] and _as_int(event.get("result_count")) == 0
+    return (
+        status == "parallel_complete"
+        and set(completion_order) == set(submission_order)
+        and normalized_indices == list(range(total_items))
+        and event.get("merge_order") == submission_order
+        and total_items == _as_int(event.get("result_count"))
+    )
 
 
 def _decoded_event(event: Mapping[str, object]) -> dict[str, object]:
@@ -603,8 +823,7 @@ def _load_stage033_baseline(
     root: Path,
 ) -> dict[tuple[str, int], tuple[int, float, float, int]]:
     path = root / (
-        "experiments/summaries/"
-        "stage03.3_exact_deadline_attempt06_review/per_run_results.csv"
+        "experiments/summaries/stage03.3_exact_deadline_attempt06_review/per_run_results.csv"
     )
     output: dict[tuple[str, int], tuple[int, float, float, int]] = {}
     with path.open(newline="", encoding="utf-8") as handle:
@@ -613,31 +832,30 @@ def _load_stage033_baseline(
                 continue
             key = json.loads(row["objective_key"])
             output[(row["instance"], _as_int(row["seed"]))] = (
-                int(key[0]), float(key[1]), float(key[2]), int(key[3])
+                int(key[0]),
+                float(key[1]),
+                float(key[2]),
+                int(key[3]),
             )
     return output
 
 
 def _prerequisites_valid(root: Path) -> bool:
     stage033 = root / (
-        "experiments/summaries/"
-        "stage03.3_exact_deadline_attempt06_review/review_manifest.json"
+        "experiments/summaries/stage03.3_exact_deadline_attempt06_review/review_manifest.json"
     )
     if not stage033.is_file():
         return False
     payload = json.loads(stage033.read_text(encoding="utf-8"))
-    return (
-        payload.get("status") == "READY_FOR_STAGE03_4"
-        and _verify_frozen_cpu_batch_evidence(root)
+    return payload.get("status") == "READY_FOR_STAGE03_4" and _verify_frozen_cpu_batch_evidence(
+        root
     )
 
 
 def _paired_rows(rows: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
     grouped: dict[tuple[str, int], dict[str, Mapping[str, object]]] = {}
     for row in rows:
-        grouped.setdefault((str(row["instance"]), _as_int(row["seed"])), {})[
-            str(row["axis"])
-        ] = row
+        grouped.setdefault((str(row["instance"]), _as_int(row["seed"])), {})[str(row["axis"])] = row
     return [
         {
             "instance": instance,
@@ -677,6 +895,17 @@ def _as_int(value: object) -> int:
         raise RuntimeError(f"expected integer, got {value!r}") from error
 
 
+def _as_float(value: object) -> float:
+    try:
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, (str, bytes, bytearray, int, float)):
+            return float(value)
+        raise TypeError(type(value).__name__)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"expected float, got {value!r}") from error
+
+
 def _write_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
     fields = sorted({key for row in rows for key in row}) or ["status"]
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -704,7 +933,8 @@ def main() -> int:
     )
     for name, path in outputs.items():
         print(f"{name}: {path}")
-    return 0
+    review_manifest = json.loads(outputs["review_manifest"].read_text(encoding="utf-8"))
+    return 0 if str(review_manifest.get("status", "")).startswith("READY_FOR_") else 1
 
 
 if __name__ == "__main__":

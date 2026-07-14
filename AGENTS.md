@@ -127,13 +127,15 @@ this repository or one of its subdirectories.
 
 - Stage 3.0 and Stage 3.1 historical evidence remains immutable. Stage 3.2
   implementation and its raw evidence use component `cache_incremental`.
-  Stage 3.3 implementation uses component `exact_deadline`; until its complete
-  formal evidence passes independent review it must not receive a readiness
-  claim. Stage 3.4 remains planned and must not receive placeholder results.
+  Stage 3.3 uses component `exact_deadline` and its accepted evidence is
+  published. Stage 3.4 implementation uses component `control_parallel`, but
+  its current Smoke evidence is `NOT_READY`; it must not receive placeholder
+  Formal, registry, manifest, summary, or readiness results.
 - Canonical run labels are `stage03.0_measurement_attemptNN`,
   `stage03.1_screening_attemptNN`, or
   `stage03.2_cache_incremental_attemptNN`, or
-  `stage03.3_exact_deadline_attemptNN` (and the corresponding `rerunNN` form).
+  `stage03.3_exact_deadline_attemptNN`, or
+  `stage03.4_control_parallel_attemptNN` (and the corresponding `rerunNN` form).
   Every artifact registry row records the
   canonical `run_label`, `attempt_or_rerun`, `artifact_type`, instance/seed
   scope, checksum, status, provenance hashes, validator status, comparison
@@ -337,6 +339,12 @@ this repository or one of its subdirectories.
   be at most 100, and R/RC fixed-work median effective iterations must be at
   least 50. Missing backend evidence, `cpu_scalar`, fallback, partial evidence,
   or any reconciliation failure is `NOT_READY`.
+- Smoke `stage03.4_control_parallel_attempt05` completed all 72 axes but its
+  independent review is `NOT_READY`: deterministic fixed-work semantics passed,
+  while objective, R/RC call-count, and unchanged-route reconciliation gates
+  failed. The unchanged-route cause was fixed after that immutable attempt, but
+  no later complete Smoke has passed. Formal execution and Stage 3.4 registry,
+  manifest, summary, or readiness publication therefore remain blocked.
 
 ## Experiment Artifact Storage v2
 
