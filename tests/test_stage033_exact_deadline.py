@@ -149,6 +149,15 @@ def test_fixed_exact_call_budget_stops_at_cap_and_keeps_complete_incumbent() -> 
         event.get("event_type") == "exact_budget_boundary"
         for event in result.measurement_trace.events
     )
+    boundary_index = next(
+        index
+        for index, event in enumerate(result.measurement_trace.events)
+        if event.get("event_type") == "exact_budget_boundary"
+    )
+    assert not any(
+        bool(event.get("accepted")) or bool(event.get("global_best"))
+        for event in result.measurement_trace.events[boundary_index + 1 :]
+    )
     rollbacks = [
         event
         for event in result.measurement_trace.events

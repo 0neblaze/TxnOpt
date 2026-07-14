@@ -2251,6 +2251,10 @@ def _solve_alns(
                         reason="constraint lane probe",
                     )
 
+        if exact_call_controller is not None and exact_call_controller.budget_reached:
+            evaluator._record_exact_budget_boundary()
+            break
+
         previous_current = current
         temperature = initial_temperature * max(0.001, 1.0 - iteration / max_iterations)
         quality_candidate_is_worse = (
@@ -2517,11 +2521,7 @@ def _solve_alns(
             else sum(item.calls for item in lane_evaluators)
         ),
         unique_route_evaluations=(
-            len(
-                set().union(
-                    *(item.evaluated_route_keys for item in lane_evaluators)
-                )
-            )
+            exact_call_controller.started_calls
             if exact_call_controller is not None
             else _cache_statistics(lane_route_caches)["unique_route_evaluations"]
             if cache_enabled
@@ -3455,7 +3455,7 @@ def _failed_result(
             else evaluator.calls
         ),
         unique_route_evaluations=(
-            len(evaluator.evaluated_route_keys)
+            exact_controller.started_calls
             if exact_controller is not None
             else _cache_statistics([evaluator.route_cache])["unique_route_evaluations"]
             if evaluator.cache_incremental_enabled
