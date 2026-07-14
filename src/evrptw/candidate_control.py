@@ -16,6 +16,7 @@ from evrptw.charging import ChargingSubproblemResult
 from evrptw.cpu_batch import (
     BackendMetrics,
     BatchChargingResult,
+    ExactBatchDeadlineExceeded,
     ExactChargingBackend,
     solve_exact_charging_batch,
 )
@@ -285,8 +286,9 @@ class CandidateControlRuntime:
         if remaining <= 0.0:
             raise CandidateParallelExecutionError("deadline reached before parallel submission")
         pool = self._ensure_pool()
-        future_to_submission: dict[Any, int] = {}
+        future_to_submission: dict[Any, tuple[int, int, int]] = {}
         submission_order: list[int] = []
+        chunk_offset = 0
         for chunk in chunks:
             submission_id = self._submission_serial
             self._submission_serial += 1
@@ -298,14 +300,31 @@ class CandidateControlRuntime:
                 batch_size,
                 remaining,
             )
-            future_to_submission[future] = submission_id
+            future_to_submission[future] = (
+                submission_id,
+                chunk_offset,
+                len(chunk),
+            )
+            chunk_offset += len(chunk)
         completed: dict[int, BatchChargingResult] = {}
+        completed_spans: dict[int, tuple[int, int]] = {}
+        interrupted: list[tuple[int, int, ExactBatchDeadlineExceeded]] = []
         completion_order: list[int] = []
         try:
-            for future in as_completed(future_to_submission, timeout=remaining):
-                submission_id = future_to_submission[future]
+            # Workers retain the exact solve deadline. The parent receives a
+            # bounded reconciliation window so a cooperative deadline result
+            # is not misclassified as an infrastructure timeout.
+            for future in as_completed(
+                future_to_submission,
+                timeout=remaining + 0.5,
+            ):
+                submission_id, offset, length = future_to_submission[future]
                 completion_order.append(submission_id)
-                completed[submission_id] = future.result()
+                try:
+                    completed[submission_id] = future.result()
+                    completed_spans[submission_id] = (offset, length)
+                except ExactBatchDeadlineExceeded as caught_deadline:
+                    interrupted.append((submission_id, offset, caught_deadline))
         except BaseException as error:
             for future in future_to_submission:
                 future.cancel()
@@ -313,10 +332,44 @@ class CandidateControlRuntime:
             raise CandidateParallelExecutionError(
                 f"parallel cpu_batch failed without fallback: {type(error).__name__}: {error}"
             ) from error
-        if set(completed) != set(submission_order):
+        observed_submissions = set(completed) | {
+            submission_id for submission_id, _offset, _error in interrupted
+        }
+        if observed_submissions != set(submission_order):
             self.close(cancel_futures=True, wait=False)
             raise CandidateParallelExecutionError("parallel cpu_batch lost a submitted task")
         metrics = BackendMetrics("cpu_batch", batch_size)
+        if interrupted:
+            completed_indices: set[int] = set()
+            for submission_id, result in completed.items():
+                metrics.add(result.metrics)
+                offset, length = completed_spans[submission_id]
+                completed_indices.update(range(offset, offset + length))
+            for _submission_id, offset, deadline_item in interrupted:
+                metrics.add(deadline_item.metrics)
+                completed_indices.update(
+                    offset + index for index in deadline_item.completed_indices
+                )
+            self.events.append(
+                {
+                    "event_type": "parallel_batch",
+                    "status": "deadline_rollback",
+                    "worker_count": self.config.worker_count,
+                    "submission_order": submission_order,
+                    "completion_order": completion_order,
+                    "merge_order": [],
+                    "completed_indices": sorted(completed_indices),
+                    "lane": lane,
+                    "iteration": iteration,
+                    "operator": operator,
+                }
+            )
+            raise ExactBatchDeadlineExceeded(
+                started_exact_calls=len(sequences),
+                completed_exact_calls=len(completed_indices),
+                metrics=metrics,
+                completed_indices=tuple(sorted(completed_indices)),
+            )
         merged_results: list[ChargingSubproblemResult] = []
         for submission_id in submission_order:
             item = completed[submission_id]
