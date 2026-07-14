@@ -126,13 +126,15 @@ this repository or one of its subdirectories.
 ## Stage 3 Canonical Artifact and Legacy Mapping Policy
 
 - Stage 3.0 and Stage 3.1 historical evidence remains immutable. Stage 3.2
-  implementation and its new raw evidence use component `cache_incremental`;
-  Stage 3.3 and Stage 3.4 remain planned and must not receive placeholder
-  results or readiness claims.
+  implementation and its raw evidence use component `cache_incremental`.
+  Stage 3.3 implementation uses component `exact_deadline`; until its complete
+  formal evidence passes independent review it must not receive a readiness
+  claim. Stage 3.4 remains planned and must not receive placeholder results.
 - Canonical run labels are `stage03.0_measurement_attemptNN`,
   `stage03.1_screening_attemptNN`, or
-  `stage03.2_cache_incremental_attemptNN` (and the corresponding `rerunNN`
-  form). Every artifact registry row records the
+  `stage03.2_cache_incremental_attemptNN`, or
+  `stage03.3_exact_deadline_attemptNN` (and the corresponding `rerunNN` form).
+  Every artifact registry row records the
   canonical `run_label`, `attempt_or_rerun`, `artifact_type`, instance/seed
   scope, checksum, status, provenance hashes, validator status, comparison
   baseline, and `legacy_path` mapping.
@@ -144,14 +146,16 @@ this repository or one of its subdirectories.
   must not be implemented by copying or moving raw evidence.
 - `experiments/registries/stage03.0_artifact_registry.csv`,
   `experiments/registries/stage03.1_artifact_registry.csv`, and
-  `experiments/registries/stage03.2_artifact_registry.csv` are the stage
-  registries. `experiments/registries/stage03_legacy_path_map.csv` records the
+  `experiments/registries/stage03.2_artifact_registry.csv` are the published
+  stage registries. Stage 3.3 publishes its registry only after formal review.
+  `experiments/registries/stage03_legacy_path_map.csv` records the
   preserved old Stage 3 paths, the immutable Stage 0 frozen baseline, and the
   Stage 2.3 historical comparison references.
 - The corresponding manifests are
   `experiments/manifests/stage03.0_measurement_artifact_manifest.json` and
   `experiments/manifests/stage03.1_screening_artifact_manifest.json`, plus the
-  Stage 3.2 cache/incremental manifest after its raw review. Before a
+  Stage 3.2 cache/incremental manifest and the Stage 3.3 exact-deadline manifest
+  after their raw reviews. Before a
   formal run or stage transition, the migration/preflight tool must verify
   canonical labels, artifact types, unique run labels, raw checksums and
   sidecars, manifest recomputability, legacy mappings, and semantic
@@ -272,6 +276,31 @@ this repository or one of its subdirectories.
 - CPU performance evidence belongs under a new canonical attempt directory in
   ignored `results/`; tracked summaries require independent review. Failed or
   inconclusive attempts remain explicit and must not be reported as Stage 3.3.
+
+## Stage 3.3 Exact Deadline Policy
+
+- Stage 3.3 uses component `exact_deadline` and canonical labels
+  `stage03.3_exact_deadline_attemptNN` or `stage03.3_exact_deadline_rerunNN`.
+  Its only formal backend is `cpu_batch`; `cpu_scalar`, missing backend fields,
+  and implicit fallback are hard failures.
+- `ExactDeadlineConfig` provides the two audited axes. Formal wall-clock runs
+  use 30 seconds and 1000 iterations; fixed-work runs share one process-wide
+  100 exact-call budget across every ALNS lane and use a 120-second watchdog.
+- Exact calls are counted when an ordered cache miss is started. If the
+  remaining budget cannot cover a complete candidate batch, the permitted
+  prefix is recorded but the incomplete candidate and its cache writes are
+  discarded. Deadline interruption likewise returns only the most recent
+  complete ALNS incumbent and may not update acceptance or global best state.
+- Every call records started, completed, infeasible, interrupted, or budget
+  boundary state. Backend evidence includes batch launches, transitions,
+  packing/unpacking time, checkpoint count, exact calls, and total batch time.
+- Smoke evidence is the fixed six-instance, three-seed scope with both axes.
+  Formal evidence is the Stage 0 12-instance, three-seed scope with both axes.
+  Independent review must verify current artifact storage, validator/objective,
+  trace and cache reconciliation, deadline semantics, and the frozen CPU batch
+  golden evidence before reporting `READY_FOR_STAGE03_4`.
+- Stage 3.3 readiness is not Stage 3 completion. Any unmet median exact-call or
+  effective-iteration target remains explicit work for Stage 3.4.
 
 ## Experiment Artifact Storage v2
 

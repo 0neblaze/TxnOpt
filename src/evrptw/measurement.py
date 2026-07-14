@@ -5,6 +5,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from evrptw.exact_deadline import ExactDeadlineConfig
 from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
 
 if TYPE_CHECKING:
@@ -13,6 +14,7 @@ if TYPE_CHECKING:
 
 TRACE_SCHEMA_VERSION = "stage03-trace-v1"
 CACHE_INCREMENTAL_TRACE_SCHEMA_VERSION = "stage03-trace-v2"
+EXACT_DEADLINE_TRACE_SCHEMA_VERSION = "stage03-trace-v3"
 SCREENING_SCHEMA_VERSION = "stage031-screening-v1"
 ROUTE_EVALUATION_KINDS = frozenset(
     {"exact_call", "cache_hit", "precomputed_route"}
@@ -125,6 +127,7 @@ class RouteEvaluationTrace:
     deadline_boundary: str = ""
     cache_key_digest: str = ""
     route_change_status: str = "unknown"
+    status: str = ""
 
     def __post_init__(self) -> None:
         if self.kind not in ROUTE_EVALUATION_KINDS:
@@ -201,16 +204,20 @@ class Stage03Trace:
     cache_incremental_config: Any | None = None
     incremental_propagations: list[dict[str, object]] = field(default_factory=list)
     trace_schema_version: str = TRACE_SCHEMA_VERSION
+    exact_deadline_config: ExactDeadlineConfig | None = None
 
     def __post_init__(self) -> None:
         self._validate_screening_route_dictionary()
         if self.trace_schema_version not in (
             TRACE_SCHEMA_VERSION,
             CACHE_INCREMENTAL_TRACE_SCHEMA_VERSION,
+            EXACT_DEADLINE_TRACE_SCHEMA_VERSION,
         ):
             raise ValueError(f"unsupported Stage 3 trace schema {self.trace_schema_version}")
         if self.cache_incremental_config is not None:
             self.trace_schema_version = CACHE_INCREMENTAL_TRACE_SCHEMA_VERSION
+        if self.exact_deadline_config is not None:
+            self.trace_schema_version = EXACT_DEADLINE_TRACE_SCHEMA_VERSION
 
     def _validate_screening_route_dictionary(self) -> None:
         if (
@@ -255,6 +262,7 @@ class Stage03Trace:
         deadline_boundary: str = "",
         cache_key_digest: str = "",
         route_change_status: str = "unknown",
+        status: str = "",
     ) -> int:
         if kind not in ROUTE_EVALUATION_KINDS:
             raise ValueError(f"unsupported route evaluation kind: {kind}")
@@ -264,6 +272,20 @@ class Stage03Trace:
             self._offset() if completed_at is None and exact_completed else completed_at
         )
         duration = max(0.0, (completed - started) if completed is not None else 0.0)
+        resolved_status = status
+        if not resolved_status:
+            if kind != "exact_call":
+                resolved_status = kind
+            elif exact_completed and feasible is True:
+                resolved_status = "completed_feasible"
+            elif exact_completed and feasible is False:
+                resolved_status = "completed_infeasible"
+            elif exact_completed:
+                resolved_status = "completed_discarded"
+            elif exact_started:
+                resolved_status = "interrupted_deadline"
+            else:
+                resolved_status = "not_started"
         record = RouteEvaluationTrace(
             evaluation_id=len(self.route_evaluations) + 1,
             route_key=key,
@@ -284,6 +306,7 @@ class Stage03Trace:
             deadline_boundary=deadline_boundary,
             cache_key_digest=cache_key_digest,
             route_change_status=route_change_status,
+            status=resolved_status,
         )
         self.route_evaluations.append(record)
         return record.evaluation_id
@@ -526,6 +549,11 @@ class Stage03Trace:
                 "unique_route_evaluations",
                 "iterations",
                 "effective_iterations",
+                "exact_started_calls",
+                "exact_completed_calls",
+                "exact_interrupted_calls",
+                "exact_budget_exhaustions",
+                "termination_reason",
             )
             self.result_summary = {
                 field: getattr(result, field)
@@ -623,6 +651,9 @@ class Stage03Trace:
 
     def reconcile(self, result: _MeasuredResult) -> dict[str, object]:
         expected_calls = int(result.charging_subproblem_calls)
+        expected_started_calls = int(
+            getattr(result, "exact_started_calls", expected_calls) or expected_calls
+        )
         expected_cache_hits = int(result.cache_hits)
         expected_unique = int(result.unique_route_evaluations)
         exact_route_keys = {
@@ -676,7 +707,7 @@ class Stage03Trace:
         checks = {
             "started_calls_not_less_than_completed": self.started_calls >= self.completed_calls,
             "completed_calls_equal_result": self.completed_calls == expected_calls,
-            "exact_calls_equal_result": self.exact_calls == expected_calls,
+            "exact_calls_equal_result": self.exact_calls == expected_started_calls,
             "cache_hits_equal_result": self.cache_hits == expected_cache_hits,
             "unique_routes_equal_result": len(exact_route_keys) == expected_unique,
             "operator_calls_equal_result": operator_call_counts == expected_operator_calls,
@@ -771,6 +802,14 @@ class Stage03Trace:
                 "cache_hits": self.cache_hits,
                 "precomputed_routes": self.precomputed_routes,
                 "deadline_events": self.deadline_events,
+                "interrupted_calls": sum(
+                    record.status == "interrupted_deadline"
+                    for record in self.route_evaluations
+                ),
+                "budget_exhaustions": sum(
+                    event.get("event_type") == "exact_budget_boundary"
+                    for event in self.events
+                ),
                 "route_evaluation_count": len(self.route_evaluations),
                 "operator_call_counts": self.operator_call_counts,
                 "screening": self.screening_counts,
@@ -785,6 +824,11 @@ class Stage03Trace:
                 else None
             ),
             "cache_incremental_summary": self.cache_incremental_counts,
+            "exact_deadline_config": (
+                asdict(self.exact_deadline_config)
+                if self.exact_deadline_config is not None
+                else None
+            ),
             "incremental_propagations": list(self.incremental_propagations),
             "screening_decisions": [
                 asdict(decision) for decision in self.screening_decisions
@@ -835,6 +879,7 @@ class Stage03Trace:
                 deadline_boundary=str(item.get("deadline_boundary", "")),
                 cache_key_digest=str(item.get("cache_key_digest", "")),
                 route_change_status=str(item.get("route_change_status", "unknown")),
+                status=str(item.get("status", "")),
             )
             for item in payload.get("route_evaluations", [])
         ]
@@ -853,6 +898,10 @@ class Stage03Trace:
 
             trace.cache_incremental_config = CacheIncrementalConfig(**cache_payload)
             trace.trace_schema_version = CACHE_INCREMENTAL_TRACE_SCHEMA_VERSION
+        exact_deadline_payload = payload.get("exact_deadline_config")
+        if isinstance(exact_deadline_payload, dict):
+            trace.exact_deadline_config = ExactDeadlineConfig(**exact_deadline_payload)
+            trace.trace_schema_version = EXACT_DEADLINE_TRACE_SCHEMA_VERSION
         trace.incremental_propagations = [
             dict(item) for item in payload.get("incremental_propagations", [])
         ]

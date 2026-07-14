@@ -44,8 +44,19 @@ class ExactChargingBackend(StrEnum):
 class ExactBatchDeadlineExceeded(RuntimeError):
     """The cooperative CPU batch crossed its deadline before completion."""
 
-    def __init__(self, completed_exact_calls: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        started_exact_calls: int = 0,
+        completed_exact_calls: int = 0,
+        metrics: BackendMetrics | None = None,
+        completed_indices: tuple[int, ...] = (),
+    ) -> None:
+        self.started_exact_calls = started_exact_calls
         self.completed_exact_calls = completed_exact_calls
+        self.interrupted_exact_calls = started_exact_calls - completed_exact_calls
+        self.metrics = metrics or BackendMetrics("cpu_batch", 0)
+        self.completed_indices = completed_indices
         super().__init__("CPU exact-charging batch deadline exceeded")
 
 
@@ -62,6 +73,13 @@ class BackendMetrics:
     transition_batches: int = 0
     transitions: int = 0
     exact_calls: int = 0
+    batch_launches: int = 0
+    packing_seconds: float = 0.0
+    unpacking_seconds: float = 0.0
+    checkpoint_count: int = 0
+    started_calls: int = 0
+    completed_calls: int = 0
+    interrupted_calls: int = 0
 
     def add(self, other: BackendMetrics) -> None:
         if self.backend != other.backend:
@@ -72,9 +90,21 @@ class BackendMetrics:
             "total_seconds",
             "transition_seconds",
             "label_management_seconds",
+            "packing_seconds",
+            "unpacking_seconds",
         ):
             setattr(self, field_name, getattr(self, field_name) + getattr(other, field_name))
-        for field_name in ("work_batches", "transition_batches", "transitions", "exact_calls"):
+        for field_name in (
+            "work_batches",
+            "transition_batches",
+            "transitions",
+            "exact_calls",
+            "batch_launches",
+            "checkpoint_count",
+            "started_calls",
+            "completed_calls",
+            "interrupted_calls",
+        ):
             setattr(self, field_name, getattr(self, field_name) + getattr(other, field_name))
         self.batch_size = max(self.batch_size, other.batch_size)
 
@@ -89,6 +119,13 @@ class BackendMetrics:
             "transition_batches": self.transition_batches,
             "transitions": self.transitions,
             "exact_calls": self.exact_calls,
+            "batch_launches": self.batch_launches,
+            "packing_seconds": self.packing_seconds,
+            "unpacking_seconds": self.unpacking_seconds,
+            "checkpoint_count": self.checkpoint_count,
+            "started_calls": self.started_calls,
+            "completed_calls": self.completed_calls,
+            "interrupted_calls": self.interrupted_calls,
         }
 
 
@@ -179,16 +216,34 @@ def solve_exact_charging_batch(
     selected = ExactChargingBackend(backend)
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    if deadline is not None and time.perf_counter() >= deadline:
-        raise ExactBatchDeadlineExceeded()
     orders = tuple(tuple(order) for order in customer_orders)
     metrics = BackendMetrics(
         selected.value,
         batch_size,
         work_batches=(len(orders) if selected is ExactChargingBackend.CPU_SCALAR else bool(orders)),
         exact_calls=len(orders),
+        batch_launches=int(bool(orders)),
+        started_calls=len(orders),
     )
     started = time.perf_counter()
+    completed_indices: set[int] = set()
+
+    def checkpoint() -> None:
+        metrics.checkpoint_count += 1
+        now = time.perf_counter()
+        if deadline is None or now < deadline:
+            return
+        metrics.completed_calls = len(completed_indices)
+        metrics.interrupted_calls = len(orders) - len(completed_indices)
+        metrics.total_seconds = max(0.0, now - started)
+        raise ExactBatchDeadlineExceeded(
+            started_exact_calls=len(orders),
+            completed_exact_calls=len(completed_indices),
+            metrics=metrics,
+            completed_indices=tuple(sorted(completed_indices)),
+        )
+
+    checkpoint()
     if selected is ExactChargingBackend.CPU_SCALAR:
         scalar_results = tuple(solve_exact_charging(instance, order) for order in orders)
         metrics.transitions = sum(
@@ -197,8 +252,10 @@ def solve_exact_charging_batch(
         metrics.transition_batches = len(scalar_results)
         metrics.label_management_seconds = time.perf_counter() - started
         metrics.total_seconds = metrics.label_management_seconds
+        metrics.completed_calls = len(orders)
         return BatchChargingResult(scalar_results, metrics)
 
+    packing_started = time.perf_counter()
     transition_backend: _TransitionBackend = _CPUTransitionBackend(metrics)
     states: list[_SearchState] = []
     results: list[ChargingSubproblemResult | None] = [None] * len(orders)
@@ -206,6 +263,7 @@ def solve_exact_charging_batch(
         failure = _validate_order(instance, order)
         if failure:
             results[index] = _failure_result(started, failure)
+            completed_indices.add(index)
             continue
         initial = ChargingLabel(
             progress=0,
@@ -227,16 +285,16 @@ def solve_exact_charging_batch(
                 queue=[_QueueEntry(_queue_priority(initial), 0, initial)],
             )
         )
+    metrics.packing_seconds = time.perf_counter() - packing_started
 
     states_by_index = {state.route_index: state for state in states}
     while True:
-        if deadline is not None and time.perf_counter() >= deadline:
-            raise ExactBatchDeadlineExceeded()
         requests: list[_TransitionRequest] = []
         progressed = False
         for state in states:
             entry = _pop_live_entry(state)
             if entry is None:
+                completed_indices.add(state.route_index)
                 continue
             label = entry.label
             if state.best is not None and label.distance >= state.best.distance - _EPSILON:
@@ -257,14 +315,14 @@ def solve_exact_charging_batch(
                         progress=progress,
                     )
                 )
+        checkpoint()
         if not requests:
             if not progressed:
                 break
             continue
 
         for offset in range(0, len(requests), batch_size):
-            if deadline is not None and time.perf_counter() >= deadline:
-                raise ExactBatchDeadlineExceeded()
+            checkpoint()
             chunk = requests[offset : offset + batch_size]
             metrics.transition_batches += 1
             metrics.transitions += len(chunk)
@@ -311,9 +369,8 @@ def solve_exact_charging_batch(
                     _QueueEntry(_queue_priority(candidate), state.serial, candidate),
                 )
             metrics.label_management_seconds += time.perf_counter() - apply_started
-            if deadline is not None and time.perf_counter() >= deadline:
-                raise ExactBatchDeadlineExceeded()
 
+    unpacking_started = time.perf_counter()
     for state in states:
         if state.best is None:
             results[state.route_index] = ChargingSubproblemResult(
@@ -329,6 +386,7 @@ def solve_exact_charging_batch(
                 time.perf_counter() - state.started,
                 "no feasible station-insertion pattern for fixed customer order",
             )
+            completed_indices.add(state.route_index)
             continue
         routed_customers = tuple(
             name
@@ -364,7 +422,9 @@ def solve_exact_charging_batch(
             time.perf_counter() - state.started,
             "",
         )
+        completed_indices.add(state.route_index)
 
+    metrics.unpacking_seconds = time.perf_counter() - unpacking_started
     metrics.total_seconds = time.perf_counter() - started
     metrics.label_management_seconds = max(
         0.0,
@@ -374,6 +434,8 @@ def solve_exact_charging_batch(
     completed = tuple(result for result in results if result is not None)
     if len(completed) != len(orders):
         raise RuntimeError("batched exact charging lost a result while preserving request order")
+    metrics.completed_calls = len(orders)
+    metrics.interrupted_calls = 0
     return BatchChargingResult(completed, metrics)
 
 

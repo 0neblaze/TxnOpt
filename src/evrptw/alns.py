@@ -24,6 +24,7 @@ from evrptw.cpu_batch import (
     ExactChargingBackend,
     solve_exact_charging_batch,
 )
+from evrptw.exact_deadline import ExactCallController, ExactDeadlineConfig
 from evrptw.measurement import (
     CheapScreeningConfig,
     MeasurementConfig,
@@ -69,6 +70,7 @@ __all__ = (
     "ALNSResult",
     "CacheIncrementalConfig",
     "CheapScreeningConfig",
+    "ExactDeadlineConfig",
     "MeasurementConfig",
     "Stage03ExecutionError",
     "Stage03Trace",
@@ -158,6 +160,12 @@ class ALNSResult:
     backend_metrics: dict[str, object] = field(default_factory=dict)
     termination_mode: str = "wall_clock"
     watchdog_triggered: bool = False
+    exact_started_calls: int = 0
+    exact_completed_calls: int = 0
+    exact_interrupted_calls: int = 0
+    exact_budget_exhaustions: int = 0
+    termination_reason: str = ""
+    exact_deadline_statistics: dict[str, object] = field(default_factory=dict)
 
     @property
     def objective_value(self) -> float:
@@ -188,6 +196,7 @@ class _Evaluator:
         batch_size: int = 128,
         disable_cache: bool = False,
         batch_work_enabled: bool = False,
+        exact_call_controller: ExactCallController | None = None,
     ) -> None:
         self.instance = instance
         self.deadline = deadline
@@ -212,6 +221,10 @@ class _Evaluator:
             raise ValueError("batch_size must be positive")
         self.batch_size = batch_size
         self.batch_work_enabled = batch_work_enabled
+        self.exact_call_controller = exact_call_controller
+        self.pending_candidate_cache: dict[
+            tuple[str, ...], ChargingSubproblemResult
+        ] = {}
         self.backend_metrics = BackendMetrics(self.backend.value, batch_size)
         self.reachability_index = (
             StationReachabilityIndex(instance)
@@ -246,6 +259,96 @@ class _Evaluator:
         self.screening_exact_call_blocked = 0
         self.screening_runtime = 0.0
         self.screening_reason_counts: dict[str, int] = {}
+
+    def _record_exact_budget_boundary(self) -> None:
+        controller = self.exact_call_controller
+        if controller is None or controller.boundary_recorded:
+            return
+        controller.boundary_recorded = True
+        if self.measurement_trace is not None:
+            self.measurement_trace.events.append(
+                {
+                    "event_type": "exact_budget_boundary",
+                    "status": "budget_exhausted",
+                    "timestamp_seconds": self.measurement_trace._offset(),
+                    "lane": self.lane,
+                    "iteration": self.iteration,
+                    "operator": self.operator,
+                    "exact_call_budget": controller.budget,
+                    "started_calls": controller.started_calls,
+                    "completed_calls": controller.completed_calls,
+                    "interrupted_calls": controller.interrupted_calls,
+                }
+            )
+
+    def _discard_pending_candidate_cache(self, reason: str) -> None:
+        if not self.pending_candidate_cache:
+            return
+        discarded = len(self.pending_candidate_cache)
+        self.pending_candidate_cache.clear()
+        if self.measurement_trace is not None:
+            self.measurement_trace.events.append(
+                {
+                    "event_type": "candidate_cache_rollback",
+                    "status": "discarded",
+                    "reason": reason,
+                    "discarded_entries": discarded,
+                    "timestamp_seconds": self.measurement_trace._offset(),
+                    "lane": self.lane,
+                    "iteration": self.iteration,
+                    "operator": self.operator,
+                }
+            )
+
+    def _commit_pending_candidate_cache(self) -> None:
+        if not self.pending_candidate_cache:
+            return
+        pending = tuple(self.pending_candidate_cache.items())
+        self.pending_candidate_cache.clear()
+        for sequence, result in pending:
+            if self.route_cache is None:
+                if self.local_cache_enabled:
+                    self.cache[sequence] = result
+                continue
+            store = self.route_cache.store(sequence, result)
+            if self.measurement_trace is None:
+                continue
+            for evicted in store.evicted:
+                self.measurement_trace.record_cache_event(
+                    operation="evict",
+                    route_key=evicted.route_key,
+                    cache_key_digest=evicted.digest,
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    reason="lru_capacity_or_memory",
+                    current_entries=store.current_entries,
+                    current_bytes=store.current_bytes,
+                )
+            self.measurement_trace.record_cache_event(
+                operation=("store" if store.stored else "oversize_not_cached"),
+                route_key=store.key.route_key,
+                cache_key_digest=store.key.digest,
+                lane=self.lane,
+                iteration=self.iteration,
+                operator=self.operator,
+                reason=store.reason,
+                entry_bytes=store.entry_bytes,
+                current_entries=store.current_entries,
+                current_bytes=store.current_bytes,
+            )
+        if self.measurement_trace is not None:
+            self.measurement_trace.events.append(
+                {
+                    "event_type": "candidate_cache_commit",
+                    "status": "committed",
+                    "committed_entries": len(pending),
+                    "timestamp_seconds": self.measurement_trace._offset(),
+                    "lane": self.lane,
+                    "iteration": self.iteration,
+                    "operator": self.operator,
+                }
+            )
 
     @contextmanager
     def measurement_context(
@@ -478,6 +581,7 @@ class _Evaluator:
                     reason="cheap screening completed at or after the lane deadline",
                 )
         if completed >= self.deadline:
+            self._discard_pending_candidate_cache("deadline_after_screening")
             raise _TimeLimitReached(sequence)
         return result
 
@@ -520,7 +624,40 @@ class _Evaluator:
     ) -> tuple[ChargingSubproblemResult | None, str]:
         """Perform one ordered cache lookup and emit its observable result."""
 
+        pending = self.pending_candidate_cache.get(sequence)
+        if pending is not None:
+            cache_key_digest = (
+                self.route_cache.make_key(sequence).digest
+                if self.route_cache is not None
+                else ""
+            )
+            self.cache_hits += 1
+            if self.measurement_trace is not None:
+                fields = route_result_fields(pending)
+                route_key = self.measurement_trace.register_route(sequence)
+                self.measurement_trace.record_cache_event(
+                    operation="candidate_pending_hit",
+                    route_key=route_key,
+                    cache_key_digest=cache_key_digest,
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                )
+                self.measurement_trace.record_route_evaluation(
+                    sequence,
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    kind="cache_hit",
+                    exact_started=False,
+                    exact_completed=False,
+                    cache_key_digest=cache_key_digest,
+                    route_change_status=route_change_status,
+                    **fields,
+                )
+            return pending, cache_key_digest
         if time.perf_counter() >= self.deadline:
+            self._discard_pending_candidate_cache("deadline_before_route_evaluation")
             if self.measurement_trace is not None:
                 self.measurement_trace.record_deadline_boundary(
                     lane=self.lane,
@@ -615,6 +752,15 @@ class _Evaluator:
         )
         if cached is not None:
             return cached
+        reservation = (
+            self.exact_call_controller.reserve(1)
+            if self.exact_call_controller is not None
+            else None
+        )
+        if reservation is not None and reservation.granted == 0:
+            self._discard_pending_candidate_cache("exact_call_budget_exhausted")
+            self._record_exact_budget_boundary()
+            raise _TimeLimitReached(sequence)
         started = time.perf_counter()
         if self.measurement_trace is not None:
             started_offset = self.measurement_trace._offset(started)
@@ -642,6 +788,21 @@ class _Evaluator:
                 result = batch.results[0]
                 self.backend_metrics.add(batch.metrics)
         except BaseException as error:
+            self._discard_pending_candidate_cache(
+                f"exact_call_interrupted:{type(error).__name__}"
+            )
+            completed_on_error = (
+                error.completed_exact_calls
+                if isinstance(error, ExactBatchDeadlineExceeded)
+                else 0
+            )
+            if self.exact_call_controller is not None:
+                self.exact_call_controller.complete(completed_on_error)
+                self.exact_call_controller.interrupt(1 - completed_on_error)
+            if isinstance(error, ExactBatchDeadlineExceeded):
+                self.backend_metrics.add(error.metrics)
+                self.calls += error.completed_exact_calls
+                self.runtime += error.metrics.total_seconds
             if self.measurement_trace is not None:
                 self.measurement_trace.record_route_evaluation(
                     sequence,
@@ -652,7 +813,7 @@ class _Evaluator:
                     started_at=started_offset,
                     completed_at=self.measurement_trace._offset(),
                     exact_started=True,
-                    exact_completed=False,
+                    exact_completed=completed_on_error == 1,
                     feasible=None,
                     failure_reason=f"{type(error).__name__}: {error}",
                     cache_key_digest=(
@@ -663,13 +824,27 @@ class _Evaluator:
                     route_change_status=route_change_status,
                 )
             raise
-        if self.route_cache is None and self.local_cache_enabled:
+        if self.exact_call_controller is not None:
+            self.exact_call_controller.complete(1)
+        transactional_deadline = (
+            self.exact_call_controller is not None
+            and time.perf_counter() >= self.deadline
+        )
+        if self.exact_call_controller is not None and not transactional_deadline:
+            self.pending_candidate_cache[sequence] = result
+        elif not transactional_deadline and self.route_cache is None and self.local_cache_enabled:
             # Stage 0--3.1 retain their historical lane-local cache.  Stage
             # 3.2 has only the bounded RouteEvaluationCache so the memory cap
             # applies to every exact result held by the evaluator.
             self.cache[sequence] = result
         cache_key_digest = ""
-        if self.route_cache is not None:
+        if self.exact_call_controller is not None and self.route_cache is not None:
+            cache_key_digest = self.route_cache.make_key(sequence).digest
+        if (
+            self.exact_call_controller is None
+            and not transactional_deadline
+            and self.route_cache is not None
+        ):
             store = self.route_cache.store(sequence, result)
             cache_key_digest = store.key.digest
             if self.measurement_trace is not None:
@@ -722,6 +897,7 @@ class _Evaluator:
         # Preserve the completed call in the counters, then stop before its
         # result can enter a candidate after the lane deadline.
         if time.perf_counter() >= self.deadline:
+            self._discard_pending_candidate_cache("deadline_after_exact_call")
             if self.measurement_trace is not None:
                 self.measurement_trace.record_deadline_boundary(
                     lane=self.lane,
@@ -755,20 +931,38 @@ class _Evaluator:
                 for sequence in clean
             )
         feasible = bool(clean) and all(result.feasible for result in charging)
+        objective = (
+            sum(
+                (
+                    SolutionObjective.from_route(
+                        self.instance,
+                        result.route,
+                        total_distance=result.distance,
+                        total_charging_time=result.charging_time,
+                    )
+                    for result in charging
+                ),
+                start=SolutionObjective.zero(),
+            )
+            if feasible
+            else None
+        )
+        if self.exact_call_controller is not None and time.perf_counter() >= self.deadline:
+            self._discard_pending_candidate_cache("deadline_before_candidate_commit")
+            if self.measurement_trace is not None:
+                self.measurement_trace.record_deadline_boundary(
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    boundary="before_candidate_commit",
+                    reason="candidate completed at or after the exact deadline",
+                )
+            raise _TimeLimitReached(clean[-1] if clean else ())
+        self._commit_pending_candidate_cache()
         if not feasible:
             return _EvaluatedSolution(clean, charging, False, None)
-        objective = sum(
-            (
-                SolutionObjective.from_route(
-                    self.instance,
-                    result.route,
-                    total_distance=result.distance,
-                    total_charging_time=result.charging_time,
-                )
-                for result in charging
-            ),
-            start=SolutionObjective.zero(),
-        )
+        if objective is None:
+            raise RuntimeError("feasible candidate is missing its objective")
         return _EvaluatedSolution(clean, charging, True, objective)
 
     def route_batch(
@@ -859,7 +1053,21 @@ class _Evaluator:
         if not sequences:
             return ()
         if time.perf_counter() >= self.deadline:
+            self._discard_pending_candidate_cache("deadline_before_exact_batch")
             raise _TimeLimitReached(sequences[0])
+        reservation = (
+            self.exact_call_controller.reserve(len(sequences))
+            if self.exact_call_controller is not None
+            else None
+        )
+        if reservation is not None and reservation.granted == 0:
+            self._discard_pending_candidate_cache("exact_call_budget_exhausted")
+            self._record_exact_budget_boundary()
+            raise _TimeLimitReached(sequences[0])
+        active_sequences = (
+            sequences[: reservation.granted] if reservation is not None else sequences
+        )
+        partial_budget_batch = reservation is not None and reservation.partial
         batch_started = time.perf_counter()
         started_offset = (
             self.measurement_trace._offset(batch_started)
@@ -869,15 +1077,32 @@ class _Evaluator:
         try:
             batch = solve_exact_charging_batch(
                 self.instance,
-                sequences,
+                active_sequences,
                 backend=self.backend,
                 batch_size=self.batch_size,
                 deadline=self.deadline,
             )
         except BaseException as error:
+            self._discard_pending_candidate_cache(
+                f"exact_batch_interrupted:{type(error).__name__}"
+            )
+            completed_indices = (
+                set(error.completed_indices)
+                if isinstance(error, ExactBatchDeadlineExceeded)
+                else set()
+            )
+            if self.exact_call_controller is not None:
+                self.exact_call_controller.complete(len(completed_indices))
+                self.exact_call_controller.interrupt(
+                    len(active_sequences) - len(completed_indices)
+                )
+            if isinstance(error, ExactBatchDeadlineExceeded):
+                self.backend_metrics.add(error.metrics)
+                self.calls += len(completed_indices)
+                self.runtime += error.metrics.total_seconds
             if self.measurement_trace is not None:
                 completed_offset = self.measurement_trace._offset()
-                for sequence in sequences:
+                for index, sequence in enumerate(active_sequences):
                     self.measurement_trace.record_route_evaluation(
                         sequence,
                         lane=self.lane,
@@ -887,7 +1112,7 @@ class _Evaluator:
                         started_at=started_offset,
                         completed_at=completed_offset,
                         exact_started=True,
-                        exact_completed=False,
+                        exact_completed=index in completed_indices,
                         feasible=None,
                         failure_reason=f"{type(error).__name__}: {error}",
                         route_change_status=route_change_status,
@@ -899,18 +1124,43 @@ class _Evaluator:
                 ) from error
             raise
         batch_completed = time.perf_counter()
+        if self.exact_call_controller is not None:
+            self.exact_call_controller.complete(len(batch.results))
         self.backend_metrics.add(batch.metrics)
         self.calls += len(batch.results)
         self.runtime += batch.metrics.total_seconds
         self.labels_generated += sum(item.labels_generated for item in batch.results)
         self.labels_pruned += sum(item.labels_pruned for item in batch.results)
-        self.evaluated_routes.update(sequences)
-        self.evaluated_route_keys.update((self.lane, sequence) for sequence in sequences)
-        for sequence, result in zip(sequences, batch.results, strict=True):
+        self.evaluated_routes.update(active_sequences)
+        self.evaluated_route_keys.update(
+            (self.lane, sequence) for sequence in active_sequences
+        )
+        transactional_deadline = (
+            self.exact_call_controller is not None
+            and batch_completed >= self.deadline
+        )
+        for sequence, result in zip(active_sequences, batch.results, strict=True):
             cache_key_digest = ""
-            if self.route_cache is None and self.local_cache_enabled:
+            if self.exact_call_controller is not None and not (
+                partial_budget_batch or transactional_deadline
+            ):
+                self.pending_candidate_cache[sequence] = result
+                if self.route_cache is not None:
+                    cache_key_digest = self.route_cache.make_key(sequence).digest
+            elif (
+                not partial_budget_batch
+                and not transactional_deadline
+                and self.route_cache is None
+                and self.local_cache_enabled
+            ):
                 self.cache[sequence] = result
-            if self.route_cache is not None:
+            if (
+                self.exact_call_controller is None
+                and
+                not partial_budget_batch
+                and not transactional_deadline
+                and self.route_cache is not None
+            ):
                 store = self.route_cache.store(sequence, result)
                 cache_key_digest = store.key.digest
                 if self.measurement_trace is not None:
@@ -954,19 +1204,27 @@ class _Evaluator:
                     route_change_status=route_change_status,
                     **fields,
                 )
+        if partial_budget_batch:
+            self._discard_pending_candidate_cache("partial_exact_call_budget_batch")
+            self._record_exact_budget_boundary()
+            raise _TimeLimitReached(
+                active_sequences[-1],
+                exact_route_evaluations=len(active_sequences),
+            )
         if time.perf_counter() >= self.deadline:
+            self._discard_pending_candidate_cache("deadline_after_exact_batch")
             if self.measurement_trace is not None:
                 self.measurement_trace.record_deadline_boundary(
                     lane=self.lane,
                     iteration=self.iteration,
                     operator=self.operator,
                     boundary="after_exact_batch",
-                    route_sequence=sequences[-1],
+                    route_sequence=active_sequences[-1],
                     reason="CPU exact batch completed at or after the lane deadline",
                 )
             raise _TimeLimitReached(
-                sequences[-1],
-                exact_route_evaluations=len(sequences),
+                active_sequences[-1],
+                exact_route_evaluations=len(active_sequences),
             )
         return batch.results
 
@@ -1067,6 +1325,7 @@ def _solve_alns(
     batch_size: int = 128,
     termination_mode: str = "wall_clock",
     disable_cache: bool = False,
+    exact_call_controller: ExactCallController | None = None,
 ) -> ALNSResult:
     if max_iterations <= 0:
         raise ValueError("max_iterations must be positive")
@@ -1076,7 +1335,11 @@ def _solve_alns(
         raise ValueError("removal_fraction must be in (0, 1]")
     if termination_mode not in {"wall_clock", "fixed_work"}:
         raise ValueError("termination_mode must be 'wall_clock' or 'fixed_work'")
-    batch_work_enabled = termination_mode == "fixed_work"
+    fixed_exact_calls = (
+        exact_call_controller is not None
+        and exact_call_controller.config.mode == "exact_call_budget"
+    )
+    batch_work_enabled = termination_mode == "fixed_work" or fixed_exact_calls
     profile = OperatorProfile(operator_profile)
     vehicle_config = vehicle_operator_config or VehicleOperatorConfig()
     cache_enabled = (
@@ -1104,7 +1367,7 @@ def _solve_alns(
             vehicle_config.constraint_lane_time_budget_seconds,
             time_limit_seconds * 0.25,
         )
-        if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
+        if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED and not fixed_exact_calls
         else 0.0
     )
     legacy_lane_budget = time_limit_seconds - constraint_lane_budget
@@ -1147,6 +1410,7 @@ def _solve_alns(
         batch_size=batch_size,
         disable_cache=disable_cache,
         batch_work_enabled=batch_work_enabled,
+        exact_call_controller=exact_call_controller,
     )
     quality_evaluator = _Evaluator(
         instance,
@@ -1162,6 +1426,7 @@ def _solve_alns(
         batch_size=batch_size,
         disable_cache=disable_cache,
         batch_work_enabled=batch_work_enabled,
+        exact_call_controller=exact_call_controller,
     )
     # The constraint lane is the explicit slice after the legacy/quality lane,
     # not an unbounded second 30-second budget.  Spell out the endpoint so the
@@ -1180,6 +1445,7 @@ def _solve_alns(
         batch_size=batch_size,
         disable_cache=disable_cache,
         batch_work_enabled=batch_work_enabled,
+        exact_call_controller=exact_call_controller,
     )
     try:
         with evaluator.measurement_context(
@@ -1248,9 +1514,18 @@ def _solve_alns(
 
     watchdog_triggered = False
     for iteration in range(max_iterations):
+        if exact_call_controller is not None and exact_call_controller.budget_reached:
+            evaluator._record_exact_budget_boundary()
+            break
         elapsed = time.perf_counter() - started
         if elapsed >= time_limit_seconds:
-            watchdog_triggered = termination_mode == "fixed_work"
+            watchdog_triggered = (
+                termination_mode == "fixed_work"
+                or (
+                    exact_call_controller is not None
+                    and exact_call_controller.config.mode == "exact_call_budget"
+                )
+            )
             break
         completed_iterations = iteration + 1
         destroy_name = ""
@@ -1321,7 +1596,7 @@ def _solve_alns(
                     lane="legacy",
                     iteration=iteration,
                     operator=selected_neighborhood,
-                )
+            )
             try:
                 if selected_neighborhood == "route_elimination":
                     proposal = propose_route_elimination(
@@ -2161,7 +2436,14 @@ def _solve_alns(
         maximum_stagnation = max(maximum_stagnation, stagnation_iterations)
         effective_iterations += 1
 
-    if termination_mode == "fixed_work" and effective_iterations < max_iterations:
+    fixed_watchdog_mode = termination_mode == "fixed_work" or (
+        exact_call_controller is not None
+        and exact_call_controller.config.mode == "exact_call_budget"
+    )
+    budget_reached = (
+        exact_call_controller is not None and exact_call_controller.budget_reached
+    )
+    if fixed_watchdog_mode and effective_iterations < max_iterations and not budget_reached:
         watchdog_triggered = True
 
     lane_evaluators = (evaluator, quality_evaluator, constraint_evaluator)
@@ -2179,6 +2461,18 @@ def _solve_alns(
         raise RuntimeError(
             "ALNS solver objective differs from the unified validator objective"
         )
+    exact_statistics = (
+        exact_call_controller.to_dict() if exact_call_controller is not None else {}
+    )
+    termination_reason = (
+        "exact_call_budget_exhausted"
+        if exact_call_controller is not None and exact_call_controller.budget_reached
+        else "watchdog_exhausted"
+        if watchdog_triggered
+        else "wall_clock_deadline"
+        if time.perf_counter() >= overall_deadline
+        else "iteration_limit"
+    )
     return ALNSResult(
         feasible=True,
         routes=routes,
@@ -2246,6 +2540,22 @@ def _solve_alns(
         backend_metrics=_aggregate_backend_metrics(lane_evaluators),
         termination_mode=termination_mode,
         watchdog_triggered=watchdog_triggered,
+        exact_started_calls=(
+            exact_call_controller.started_calls if exact_call_controller is not None else 0
+        ),
+        exact_completed_calls=(
+            exact_call_controller.completed_calls if exact_call_controller is not None else 0
+        ),
+        exact_interrupted_calls=(
+            exact_call_controller.interrupted_calls if exact_call_controller is not None else 0
+        ),
+        exact_budget_exhaustions=(
+            exact_call_controller.budget_exhaustions
+            if exact_call_controller is not None
+            else 0
+        ),
+        termination_reason=termination_reason,
+        exact_deadline_statistics=exact_statistics,
     )
 
 
@@ -2265,8 +2575,26 @@ def solve_alns(
     batch_size: int = 128,
     termination_mode: str = "wall_clock",
     disable_cache: bool = False,
+    exact_deadline_config: ExactDeadlineConfig | None = None,
 ) -> ALNSResult:
-    """Solve ALNS with opt-in Stage 3.0--3.2 evidence and evaluation layers."""
+    """Solve ALNS with opt-in Stage 3.0--3.3 evaluation layers."""
+
+    if (
+        exact_deadline_config is not None
+        and ExactChargingBackend(backend) is not ExactChargingBackend.CPU_BATCH
+    ):
+        raise ValueError("Stage 3.3 exact deadline requires the cpu_batch backend")
+    exact_call_controller = (
+        ExactCallController(exact_deadline_config)
+        if exact_deadline_config is not None
+        else None
+    )
+    if (
+        exact_deadline_config is not None
+        and exact_deadline_config.mode == "exact_call_budget"
+        and exact_deadline_config.watchdog_seconds is not None
+    ):
+        time_limit_seconds = exact_deadline_config.watchdog_seconds
 
     screening_enabled = screening_config is not None and screening_config.enabled
     measurement_enabled = measurement_config is not None and measurement_config.enabled
@@ -2285,7 +2613,12 @@ def solve_alns(
                 or canonical_instance_hash(instance)
             ),
         )
-    if not measurement_enabled and not screening_enabled and not cache_incremental_enabled:
+    if (
+        not measurement_enabled
+        and not screening_enabled
+        and not cache_incremental_enabled
+        and exact_deadline_config is None
+    ):
         return _solve_alns(
             instance,
             seed=seed,
@@ -2300,6 +2633,7 @@ def solve_alns(
             batch_size=batch_size,
             termination_mode=termination_mode,
             disable_cache=disable_cache,
+            exact_call_controller=exact_call_controller,
         )
     trace_config = (
         measurement_config
@@ -2312,6 +2646,7 @@ def solve_alns(
         cache_incremental_config=(
             cache_incremental_config if cache_incremental_enabled else None
         ),
+        exact_deadline_config=exact_deadline_config,
     )
     try:
         result = _solve_alns(
@@ -2329,6 +2664,7 @@ def solve_alns(
             batch_size=batch_size,
             termination_mode=termination_mode,
             disable_cache=disable_cache,
+            exact_call_controller=exact_call_controller,
         )
     except BaseException as error:
         trace.record_execution_error(error)
@@ -3070,6 +3406,7 @@ def _failed_result(
     operator_profile: str = OperatorProfile.BASELINE.value,
     termination_mode: str = "wall_clock",
 ) -> ALNSResult:
+    exact_controller = evaluator.exact_call_controller
     return ALNSResult(
         feasible=False,
         routes=(),
@@ -3130,6 +3467,26 @@ def _failed_result(
         backend_metrics=evaluator.backend_metrics.to_dict(),
         termination_mode=termination_mode,
         watchdog_triggered=termination_mode == "fixed_work",
+        exact_started_calls=(
+            exact_controller.started_calls if exact_controller is not None else 0
+        ),
+        exact_completed_calls=(
+            exact_controller.completed_calls if exact_controller is not None else 0
+        ),
+        exact_interrupted_calls=(
+            exact_controller.interrupted_calls if exact_controller is not None else 0
+        ),
+        exact_budget_exhaustions=(
+            exact_controller.budget_exhaustions if exact_controller is not None else 0
+        ),
+        termination_reason=(
+            "exact_call_budget_exhausted"
+            if exact_controller is not None and exact_controller.budget_reached
+            else "initialization_failed"
+        ),
+        exact_deadline_statistics=(
+            exact_controller.to_dict() if exact_controller is not None else {}
+        ),
     )
 
 
