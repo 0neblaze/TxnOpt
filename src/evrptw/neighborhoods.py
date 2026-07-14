@@ -2651,6 +2651,36 @@ def _candidate_control_repair_pass(
     sequences = list(partial)
     pending = list(removed)
     new_routes = 0
+    screening_counts: Counter[str] = Counter()
+    screening_digest = hashlib.sha256()
+
+    def screened(
+        sequence: CustomerSequence,
+        *,
+        base: CustomerSequence = (),
+    ) -> ScreeningResult:
+        reference_distance = (
+            _route_sequence_distance(instance, (base,)) if base else None
+        )
+        decision = screen_route_candidate(
+            instance,
+            sequence,
+            full=True,
+            reference_distance=reference_distance,
+        )
+        key = f"{'pass' if decision.accepted else 'rejected'}:{decision.reason}"
+        screening_counts[key] += 1
+        screening_digest.update(
+            json.dumps((key, sequence), separators=(",", ":")).encode()
+        )
+        return decision
+
+    def output(result: RepairResult) -> RepairResult:
+        recorder = getattr(evaluator, "record_candidate_screening_aggregate", None)
+        if callable(recorder):
+            recorder(screening_counts, screening_digest.hexdigest())
+        return result
+
     while pending:
         options: list[
             tuple[float, str, int, int, CustomerSequence]
@@ -2665,12 +2695,7 @@ def _candidate_control_repair_pass(
                     continue
                 for position in range(len(base) + 1):
                     candidate = (*base[:position], customer, *base[position:])
-                    screen = _screen_with_evaluator(
-                        instance,
-                        evaluator,
-                        candidate,
-                        base_sequence=base,
-                    )
+                    screen = screened(candidate, base=base)
                     if not screen.accepted:
                         continue
                     score = (
@@ -2687,16 +2712,20 @@ def _candidate_control_repair_pass(
             pending.remove(customer)
             continue
         if not allow_new_routes:
-            return RepairResult(None, new_routes, 0, "no_existing_route_insertion")
+            return output(
+                RepairResult(None, new_routes, 0, "no_existing_route_insertion")
+            )
         customer = min(pending)
         singleton = (customer,)
-        screen = _screen_with_evaluator(instance, evaluator, singleton)
+        screen = screened(singleton)
         if not screen.accepted:
-            return RepairResult(None, new_routes, 0, "new_singleton_route_infeasible")
+            return output(
+                RepairResult(None, new_routes, 0, "new_singleton_route_infeasible")
+            )
         sequences.append(singleton)
         pending.remove(customer)
         new_routes += 1
-    return RepairResult(tuple(sequences), new_routes, 0, "")
+    return output(RepairResult(tuple(sequences), new_routes, 0, ""))
 
 
 def _insertion_options(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import random
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, cast
@@ -434,6 +434,27 @@ class _Evaluator:
         return self.route_batch(
             clean,
             route_change_status=route_change_status,
+        )
+
+    def record_candidate_screening_aggregate(
+        self,
+        counts: Mapping[str, int],
+        candidate_pool_hash: str,
+    ) -> None:
+        runtime = self.candidate_control_runtime
+        if runtime is None:
+            return
+        runtime.events.append(
+            {
+                "event_type": "candidate_screening_aggregate",
+                "status": "aggregated",
+                "lane": self.lane,
+                "iteration": self.iteration,
+                "operator": self.operator,
+                "counts": dict(sorted(counts.items())),
+                "aggregate_count": sum(counts.values()),
+                "candidate_pool_hash": candidate_pool_hash,
+            }
         )
 
     @property
