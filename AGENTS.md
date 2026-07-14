@@ -146,8 +146,9 @@ this repository or one of its subdirectories.
   must not be implemented by copying or moving raw evidence.
 - `experiments/registries/stage03.0_artifact_registry.csv`,
   `experiments/registries/stage03.1_artifact_registry.csv`, and
-  `experiments/registries/stage03.2_artifact_registry.csv` are the published
-  stage registries. Stage 3.3 publishes its registry only after formal review.
+  `experiments/registries/stage03.2_artifact_registry.csv`, plus
+  `experiments/registries/stage03.3_artifact_registry.csv`, are the published
+  stage registries. Stage 3.3 was published only after formal review passed.
   `experiments/registries/stage03_legacy_path_map.csv` records the
   preserved old Stage 3 paths, the immutable Stage 0 frozen baseline, and the
   Stage 2.3 historical comparison references.
@@ -301,6 +302,15 @@ this repository or one of its subdirectories.
   golden evidence before reporting `READY_FOR_STAGE03_4`.
 - Stage 3.3 readiness is not Stage 3 completion. Any unmet median exact-call or
   effective-iteration target remains explicit work for Stage 3.4.
+- The accepted Stage 3.3 evidence is smoke
+  `stage03.3_exact_deadline_attempt05` and formal
+  `stage03.3_exact_deadline_attempt06`. The independent formal review reports
+  `READY_FOR_STAGE03_4` with all 72 axes valid. Attempts 01--04 remain retained
+  as partial or `NOT_READY` evidence and must not be relabelled.
+- Stage 3 performance is not complete: on the formal wall-clock axis the
+  `r101_21` and `rc101_21` median started exact calls are 1860 and 2039, while
+  on the fixed-work axis their median effective iterations are 6 and 3.
+  Candidate control and the remaining performance target belong to Stage 3.4.
 
 ## Experiment Artifact Storage v2
 

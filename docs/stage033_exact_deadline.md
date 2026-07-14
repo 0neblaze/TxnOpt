@@ -46,3 +46,24 @@ reviewer。只有 reviewer 从 raw solution、Parquet events 和 manifest 独立
 Stage 3 的 `median exact charging calls <= 100` 与
 `median effective iterations >= 50` 仍需在 formal report 中如实展示；Stage 3.3
 不通过改时间预算或排除运行来宣称这些目标已经达到。
+
+## 已接受证据（2026-07-14）
+
+- Smoke：`stage03.3_exact_deadline_attempt05`，36/36 axes 有效，状态
+  `READY_FOR_STAGE033_FORMAL`。
+- Formal：`stage03.3_exact_deadline_attempt06`，72/72 axes 有效，状态
+  `READY_FOR_STAGE03_4`。
+- `attempt01` 保留为 partial；`attempt02`--`attempt04` 保留为 `NOT_READY`。
+  这些轮次分别暴露并修复了 single-route deadline adapter、started/completed
+  对账、global budget transaction 和 untimestamped summary ordering 问题。
+
+Formal 中 `r101_21` 与 `rc101_21` 的 wall-clock median started calls 分别为
+1860 和 2039，高于 Stage 3 的 `<=100` 目标；fixed-work median effective
+iterations 分别为 6 和 3，低于 `>=50` 目标。因此 readiness 只授权 Stage 3.4，
+不表示 Stage 3 总体性能目标完成。
+
+发布文件：
+
+- `experiments/registries/stage03.3_artifact_registry.csv`
+- `experiments/manifests/stage03.3_exact_deadline_artifact_manifest.json`
+- `experiments/summaries/stage03.3_exact_deadline_attempt06_review/`
