@@ -189,6 +189,29 @@ class _EvaluatedSolution:
     objective: SolutionObjective | None
 
 
+@dataclass(slots=True)
+class _IncumbentRouteLedger:
+    by_lane: dict[
+        str,
+        dict[tuple[str, ...], ChargingSubproblemResult],
+    ] = field(default_factory=dict)
+
+    def remember(self, lane: str, solution: _EvaluatedSolution) -> None:
+        self.by_lane[lane] = dict(
+            zip(solution.sequences, solution.charging, strict=True)
+        )
+
+    def get(
+        self,
+        sequence: tuple[str, ...],
+    ) -> ChargingSubproblemResult | None:
+        for lane in sorted(self.by_lane):
+            result = self.by_lane[lane].get(sequence)
+            if result is not None:
+                return result
+        return None
+
+
 def _candidate_control_skip_result(reason: str) -> ChargingSubproblemResult:
     return ChargingSubproblemResult(
         False,
@@ -223,11 +246,13 @@ class _Evaluator:
         batch_work_enabled: bool = False,
         exact_call_controller: ExactCallController | None = None,
         candidate_control_runtime: CandidateControlRuntime | None = None,
+        incumbent_route_ledger: _IncumbentRouteLedger | None = None,
     ) -> None:
         self.instance = instance
         self.deadline = deadline
         self.measurement_trace = measurement_trace
         self.lane = lane
+        self.incumbent_lane = lane
         self.screening_config = (
             screening_config
             if screening_config is not None and screening_config.enabled
@@ -249,6 +274,7 @@ class _Evaluator:
         self.batch_work_enabled = batch_work_enabled
         self.exact_call_controller = exact_call_controller
         self.candidate_control_runtime = candidate_control_runtime
+        self.incumbent_route_ledger = incumbent_route_ledger
         self.pending_candidate_cache: dict[
             tuple[str, ...], ChargingSubproblemResult
         ] = {}
@@ -272,9 +298,6 @@ class _Evaluator:
         self.iteration: int | None = None
         self.operator = "initialization"
         self.cache: dict[tuple[str, ...], ChargingSubproblemResult] = {}
-        self.known_route_results: dict[
-            tuple[str, ...], ChargingSubproblemResult
-        ] = {}
         self.evaluated_routes: set[tuple[str, ...]] = set()
         self.evaluated_route_keys: set[tuple[str, tuple[str, ...]]] = set()
         self.calls = 0
@@ -471,9 +494,16 @@ class _Evaluator:
     def remember_incumbent(self, solution: _EvaluatedSolution) -> None:
         """Retain only the current lane incumbent outside the bounded LRU."""
 
-        self.known_route_results = dict(
-            zip(solution.sequences, solution.charging, strict=True)
-        )
+        ledger = self.incumbent_route_ledger
+        if ledger is not None:
+            ledger.remember(self.incumbent_lane, solution)
+
+    def incumbent_route_result(
+        self,
+        sequence: tuple[str, ...],
+    ) -> ChargingSubproblemResult | None:
+        ledger = self.incumbent_route_ledger
+        return None if ledger is None else ledger.get(sequence)
 
     def select_feasible_candidate_plan(
         self,
@@ -487,6 +517,15 @@ class _Evaluator:
         if runtime is None:
             raise RuntimeError("complete candidate-plan selection requires Stage 3.4")
         current_set = set(current_sequences)
+        screen_cache: dict[tuple[str, ...], ScreeningResult] = {}
+
+        def candidate_screen(sequence: tuple[str, ...]) -> ScreeningResult:
+            decision = screen_cache.get(sequence)
+            if decision is None:
+                decision = screen_route_candidate(self.instance, sequence, full=True)
+                screen_cache[sequence] = decision
+            return decision
+
         rankable: list[CandidatePlan] = []
         for ordinal, sequences in enumerate(plans):
             if len(sequences) > len(current_sequences):
@@ -502,10 +541,7 @@ class _Evaluator:
                     }
                 )
                 continue
-            screens = tuple(
-                screen_route_candidate(self.instance, sequence, full=True)
-                for sequence in sequences
-            )
+            screens = tuple(candidate_screen(sequence) for sequence in sequences)
             if not all(screen.accepted for screen in screens):
                 continue
             rankable.append(
@@ -530,9 +566,9 @@ class _Evaluator:
         )
         best: _EvaluatedSolution | None = None
         precomputed = {
-            sequence: self.known_route_results[sequence]
+            sequence: result
             for sequence in current_sequences
-            if sequence in self.known_route_results
+            if (result := self.incumbent_route_result(sequence)) is not None
         }
         for plan in selected:
             candidate = self.solution(
@@ -893,13 +929,11 @@ class _Evaluator:
             # Initial and newly created routes are changes relative to the
             # current candidate; never leave their Stage 3.2 status ambiguous.
             route_change_status = "changed"
-        if (
-            route_change_status == "unchanged"
-            and sequence in self.known_route_results
-        ):
+        incumbent_result = self.incumbent_route_result(sequence)
+        if route_change_status == "unchanged" and incumbent_result is not None:
             return self._precomputed_route(
                 sequence,
-                self.known_route_results[sequence],
+                incumbent_result,
             )
         if self.screening_config is not None:
             screen = self.screen(sequence, operator=self.operator)
@@ -1220,14 +1254,12 @@ class _Evaluator:
             pending_set.clear()
 
         for index, sequence in enumerate(clean):
-            if (
-                route_change_status == "unchanged"
-                and sequence in self.known_route_results
-            ):
+            incumbent_result = self.incumbent_route_result(sequence)
+            if route_change_status == "unchanged" and incumbent_result is not None:
                 flush_pending()
                 resolved[index] = self._precomputed_route(
                     sequence,
-                    self.known_route_results[sequence],
+                    incumbent_result,
                 )
                 continue
             if self.screening_config is not None:
@@ -1749,6 +1781,9 @@ def _solve_alns(
             )
             for _ in range(3)
         ]
+    incumbent_route_ledger = (
+        _IncumbentRouteLedger() if candidate_control_runtime is not None else None
+    )
     evaluator = _Evaluator(
         instance,
         deadline=legacy_deadline if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
@@ -1765,6 +1800,7 @@ def _solve_alns(
         batch_work_enabled=batch_work_enabled,
         exact_call_controller=exact_call_controller,
         candidate_control_runtime=candidate_control_runtime,
+        incumbent_route_ledger=incumbent_route_ledger,
     )
     quality_evaluator = _Evaluator(
         instance,
@@ -1782,6 +1818,7 @@ def _solve_alns(
         batch_work_enabled=batch_work_enabled,
         exact_call_controller=exact_call_controller,
         candidate_control_runtime=candidate_control_runtime,
+        incumbent_route_ledger=incumbent_route_ledger,
     )
     # The constraint lane is the explicit slice after the legacy/quality lane,
     # not an unbounded second 30-second budget.  Spell out the endpoint so the
@@ -1802,6 +1839,7 @@ def _solve_alns(
         batch_work_enabled=batch_work_enabled,
         exact_call_controller=exact_call_controller,
         candidate_control_runtime=candidate_control_runtime,
+        incumbent_route_ledger=incumbent_route_ledger,
     )
     try:
         with evaluator.measurement_context(
@@ -3163,9 +3201,9 @@ def _construct_initial_solution(
             for route_index, base, _ in candidate_metadata
             if base and route_index < len(sequences)
         ]
-        base_results = evaluator.route_batch(
+        base_results = _repair_base_route_results(
+            evaluator,
             tuple(base for _, base in nonempty_bases),
-            route_change_status="unchanged",
         )
         old_distances = {
             route_index: result.distance
@@ -3370,6 +3408,31 @@ def _repair(
     return tuple(sequences)
 
 
+def _repair_base_route_results(
+    evaluator: _Evaluator,
+    bases: tuple[tuple[str, ...], ...],
+) -> tuple[ChargingSubproblemResult, ...]:
+    """Resolve repair bases with truthful current-versus-changed status."""
+
+    results: dict[tuple[str, ...], ChargingSubproblemResult] = {}
+    changed: list[tuple[str, ...]] = []
+    for base in dict.fromkeys(bases):
+        if evaluator.incumbent_route_result(base) is not None:
+            results[base] = evaluator.route(
+                base,
+                route_change_status="unchanged",
+            )
+        else:
+            changed.append(base)
+    if changed:
+        changed_results = evaluator.route_batch(
+            tuple(changed),
+            route_change_status="changed",
+        )
+        results.update(zip(changed, changed_results, strict=True))
+    return tuple(results[base] for base in bases)
+
+
 def _insertion_options(
     sequences: list[tuple[str, ...]],
     customer: str,
@@ -3404,9 +3467,9 @@ def _insertion_options(
         for base in (sequences[route_index] if route_index < len(sequences) else (),)
         if base
     ]
-    base_results = evaluator.route_batch(
+    base_results = _repair_base_route_results(
+        evaluator,
         tuple(base for _, base in base_entries),
-        route_change_status="unchanged",
     )
     old_distances = {
         route_index: result.distance

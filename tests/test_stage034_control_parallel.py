@@ -181,6 +181,12 @@ def test_controlled_parallelism_preserves_fixed_work_semantics() -> None:
     assert serial.route_result_hash == parallel.route_result_hash
     assert serial.exact_started_calls == parallel.exact_started_calls
     assert serial.effective_iterations == parallel.effective_iterations
+    for result in (serial, parallel):
+        assert result.measurement_trace is not None
+        assert not any(
+            record.exact_started and record.route_change_status == "unchanged"
+            for record in result.measurement_trace.route_evaluations
+        )
     assert parallel.candidate_control_statistics["parallel_batches"] > 0
     assert parallel.measurement_trace is not None
     parallel_events = [

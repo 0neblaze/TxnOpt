@@ -2321,6 +2321,14 @@ def _search_changed_candidates(
     budget: int,
     precomputed_routes: Mapping[CustomerSequence, ChargingSubproblemResult] | None = None,
 ) -> MoveProposal:
+    if bool(getattr(evaluator, "candidate_control_enabled", False)):
+        return _search_controlled_candidate_plans(
+            operator,
+            instance,
+            sequences,
+            evaluator,
+            candidates,
+        )
     events: list[NeighborhoodEvent] = []
     exact_used = 0
     base_results = _base_route_results(
@@ -2372,6 +2380,67 @@ def _search_changed_candidates(
         )
     )
     return MoveProposal(operator, best[1], tuple(events))
+
+
+def _search_controlled_candidate_plans(
+    operator: str,
+    instance: Instance,
+    sequences: RouteSequences,
+    evaluator: RouteEvaluator,
+    candidates: Iterable[_CandidateDescription],
+) -> MoveProposal:
+    """Rank complete neighborhood plans before any exact route evaluation."""
+
+    plans: list[RouteSequences] = []
+    descriptions: dict[RouteSequences, _CandidateDescription] = {}
+    pool_digest = hashlib.sha256()
+    for description in candidates:
+        candidate = _apply_changes(sequences, description.changes)
+        if candidate in descriptions:
+            continue
+        plans.append(candidate)
+        descriptions[candidate] = description
+        pool_digest.update(
+            json.dumps(candidate, separators=(",", ":")).encode()
+        )
+
+    events: list[NeighborhoodEvent] = [
+        NeighborhoodEvent(
+            operator,
+            "candidate_pool_aggregate",
+            f"{operator}_complete_candidate_pool",
+            aggregate_count=len(plans),
+            candidate_pool_hash=pool_digest.hexdigest(),
+        )
+    ]
+    selector = getattr(evaluator, "select_feasible_candidate_plan", None)
+    if not callable(selector):
+        raise RuntimeError("Stage 3.4 evaluator is missing complete plan selection")
+    before_calls = evaluator.calls
+    selected = cast(
+        RouteSequences | None,
+        selector(plans, current_sequences=sequences),
+    )
+    exact_calls = evaluator.calls - before_calls
+    if selected is None:
+        events.append(
+            NeighborhoodEvent(
+                operator,
+                "candidate_control_skipped",
+                "no_selected_complete_plan_feasible",
+                exact_route_evaluations=exact_calls,
+            )
+        )
+        return MoveProposal(operator, None, tuple(events))
+    description = descriptions[selected]
+    events.append(
+        _candidate_proposed_event(
+            operator,
+            description,
+            reason=f"{operator}_candidate",
+        )
+    )
+    return MoveProposal(operator, selected, tuple(events))
 
 
 def _relocate_candidates(sequences: RouteSequences) -> Iterable[_CandidateDescription]:
