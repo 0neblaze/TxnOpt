@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import random
+from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
@@ -210,9 +213,16 @@ class NeighborhoodEvent:
     removal_trigger: str = ""
     reset_observed: bool = False
     ranking_score: float = 0.0
+    aggregate_count: int = 1
+    candidate_pool_hash: str = ""
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        record = asdict(self)
+        if self.aggregate_count == 1:
+            record.pop("aggregate_count")
+        if not self.candidate_pool_hash:
+            record.pop("candidate_pool_hash")
+        return record
 
 
 @dataclass(frozen=True, slots=True)
@@ -682,6 +692,7 @@ def _candidate_route_batch_with_status(
             for result in candidate_batch(
                 ordered,
                 route_change_status="changed",
+                prescreened=True,
             )
         )
     return _route_batch_with_status(evaluator, ordered, "changed")
@@ -1642,72 +1653,83 @@ def _propose_controlled_route_merge(
 
     metadata: dict[CustomerSequence, tuple[int, int, CustomerSequence]] = {}
     candidates: list[CustomerSequence] = []
+    prefilter_counts: Counter[str] = Counter()
+    prefilter_digest = hashlib.sha256()
     for _, left, right in pairs:
         for merged, source_sequence in _controlled_merge_orders(instance, left, right):
-            screen = _screen_with_evaluator(instance, evaluator, merged)
+            # Full Stage 3.4 pools can contain tens of thousands of ordinary
+            # rejections. Use the same safe screener and persist an aggregate
+            # reason/hash below instead of materialising duplicate trace rows.
+            screen = screen_route_candidate(instance, merged)
             if not screen.accepted:
-                events.append(
-                    NeighborhoodEvent(
-                        "route_merge",
-                        "prefilter_rejected",
-                        screen.reason,
-                        route_indices=(left.index, right.index),
-                        removed_customers=source_sequence,
-                        candidate_customer_sequence=merged,
-                        prefilter_passed=False,
-                    )
+                prefilter_counts[screen.reason] += 1
+                prefilter_digest.update(
+                    json.dumps(
+                        (screen.reason, merged),
+                        separators=(",", ":"),
+                    ).encode()
                 )
                 continue
             if merged not in metadata:
                 metadata[merged] = (left.index, right.index, source_sequence)
                 candidates.append(merged)
+    events.extend(
+        NeighborhoodEvent(
+            "route_merge",
+            "prefilter_rejected_aggregate",
+            reason,
+            prefilter_passed=False,
+            aggregate_count=count,
+            candidate_pool_hash=prefilter_digest.hexdigest(),
+        )
+        for reason, count in sorted(prefilter_counts.items())
+    )
 
     before_calls = evaluator.calls
     results = _candidate_route_batch_with_status(evaluator, candidates)
     exact_evaluations = evaluator.calls - before_calls
     best: tuple[SolutionObjective, CustomerSequence, int, int] | None = None
+    result_counts: Counter[tuple[str, str]] = Counter()
+    result_digest = hashlib.sha256()
     for merged, result in zip(candidates, results, strict=True):
-        left_index, right_index, source_sequence = metadata[merged]
+        left_index, right_index, _source_sequence = metadata[merged]
         if result.failure_reason.startswith("candidate_control:"):
-            events.append(
-                NeighborhoodEvent(
-                    "route_merge",
-                    "candidate_control_skipped",
-                    result.failure_reason,
-                    route_indices=(left_index, right_index),
-                    removed_customers=source_sequence,
-                    candidate_customer_sequence=merged,
-                    prefilter_passed=True,
-                )
-            )
-            continue
-        if not result.feasible:
-            events.append(
-                NeighborhoodEvent(
-                    "route_merge",
-                    "exact_infeasible",
-                    result.failure_reason or "exact_charging_infeasible",
-                    route_indices=(left_index, right_index),
-                    candidate_customer_sequence=merged,
-                    prefilter_passed=True,
-                )
-            )
-            continue
-        objective = _route_objective(instance, result)
-        candidate_key = (objective.key, merged, left_index, right_index)
-        if best is None or candidate_key < (best[0].key, best[1], best[2], best[3]):
-            best = (objective, merged, left_index, right_index)
-        events.append(
-            NeighborhoodEvent(
-                "route_merge",
-                "feasible_candidate",
-                "exact_charging_feasible",
-                route_indices=(left_index, right_index),
-                candidate_customer_sequence=merged,
-                candidate_feasible=True,
-                prefilter_passed=True,
-            )
+            status = "candidate_control_skipped"
+            reason = result.failure_reason
+        elif not result.feasible:
+            status = "exact_infeasible"
+            reason = result.failure_reason or "exact_charging_infeasible"
+        else:
+            status = "feasible_candidate"
+            reason = "exact_charging_feasible"
+            objective = _route_objective(instance, result)
+            candidate_key = (objective.key, merged, left_index, right_index)
+            if best is None or candidate_key < (
+                best[0].key,
+                best[1],
+                best[2],
+                best[3],
+            ):
+                best = (objective, merged, left_index, right_index)
+        result_counts[(status, reason)] += 1
+        result_digest.update(
+            json.dumps(
+                (status, reason, merged),
+                separators=(",", ":"),
+            ).encode()
         )
+    events.extend(
+        NeighborhoodEvent(
+            "route_merge",
+            f"{status}_aggregate",
+            reason,
+            candidate_feasible=status == "feasible_candidate",
+            prefilter_passed=True,
+            aggregate_count=count,
+            candidate_pool_hash=result_digest.hexdigest(),
+        )
+        for (status, reason), count in sorted(result_counts.items())
+    )
 
     if best is None:
         if exact_evaluations == 0 and candidates:

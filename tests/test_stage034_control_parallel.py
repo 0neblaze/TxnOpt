@@ -103,7 +103,8 @@ def test_candidate_control_ranks_and_budgets_each_complete_round() -> None:
     decisions = [
         event
         for event in result.measurement_trace.events
-        if event.get("event_type") == "candidate_control_decision"
+        if event.get("event_type")
+        in {"candidate_control_decision", "candidate_control_decision_aggregate"}
     ]
     assert {event["status"] for event in decisions} >= {"selected", "not_selected"}
     per_round: dict[int, int] = {}

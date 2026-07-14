@@ -322,6 +322,11 @@ def review_stage034(
                 for event in decoded_events
                 if event.get("record_type") == "screening_decision"
             )
+            for event in decoded_events:
+                if event.get("status") != "prefilter_rejected_aggregate":
+                    continue
+                key = (str(event.get("status")), str(event.get("reason") or ""))
+                screening_counts[key] += _as_int(event.get("aggregate_count") or 1)
             screening_rows.extend(
                 {
                     **identity,
@@ -495,7 +500,8 @@ def _candidate_control_valid(
     decisions = [
         event
         for event in decoded
-        if event.get("event_type") == "candidate_control_decision"
+        if event.get("event_type")
+        in {"candidate_control_decision", "candidate_control_decision_aggregate"}
     ]
     budgets = [
         event
@@ -516,8 +522,16 @@ def _candidate_control_valid(
     return valid, {
         "valid": valid,
         "decisions": len(decisions),
-        "selected": sum(event.get("status") == "selected" for event in decisions),
-        "not_selected": sum(event.get("status") == "not_selected" for event in decisions),
+        "selected": sum(
+            _as_int(event.get("aggregate_count") or 1)
+            for event in decisions
+            if event.get("status") == "selected"
+        ),
+        "not_selected": sum(
+            _as_int(event.get("aggregate_count") or 1)
+            for event in decisions
+            if event.get("status") == "not_selected"
+        ),
         "budget_events": len(budgets),
         "maximum_granted_per_iteration": max_granted,
     }

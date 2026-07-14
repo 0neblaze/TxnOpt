@@ -422,11 +422,18 @@ class _Evaluator:
         sequences: Sequence[tuple[str, ...]],
         *,
         route_change_status: str = "changed",
+        prescreened: bool = False,
     ) -> tuple[ChargingSubproblemResult, ...]:
+        clean = tuple(sequence for sequence in sequences if sequence)
+        if self.candidate_control_runtime is not None:
+            return self._controlled_candidate_route_batch(
+                clean,
+                route_change_status=route_change_status,
+                prescreened=prescreened,
+            )
         return self.route_batch(
-            sequences,
+            clean,
             route_change_status=route_change_status,
-            candidate_pool=True,
         )
 
     @property
@@ -1134,6 +1141,7 @@ class _Evaluator:
         clean: tuple[tuple[str, ...], ...],
         *,
         route_change_status: str,
+        prescreened: bool = False,
     ) -> tuple[ChargingSubproblemResult, ...]:
         runtime = self.candidate_control_runtime
         if runtime is None:
@@ -1143,17 +1151,17 @@ class _Evaluator:
         for index, sequence in enumerate(clean):
             lower_bound = 0.0
             if self.screening_config is not None:
-                screen = self.screen(sequence, operator=self.operator)
+                screen = (
+                    screen_route_candidate(self.instance, sequence)
+                    if prescreened
+                    else self.screen(sequence, operator=self.operator)
+                )
                 lower_bound = screen.distance_lower_bound
                 if not screen.accepted:
                     resolved[index] = _candidate_control_skip_result(
                         f"screening_rejected:{screen.reason}"
                     )
                     continue
-            cached, _ = self._lookup_cached_result(sequence, route_change_status)
-            if cached is not None:
-                resolved[index] = cached
-                continue
             rankable.append((index, sequence, lower_bound))
         selected = runtime.select_route_candidates(
             rankable,
@@ -1161,12 +1169,22 @@ class _Evaluator:
             iteration=self.iteration,
             operator=self.operator,
         )
+        selected_misses: list[int] = []
+        for index in selected:
+            cached, _ = self._lookup_cached_result(
+                clean[index],
+                route_change_status,
+            )
+            if cached is not None:
+                resolved[index] = cached
+            else:
+                selected_misses.append(index)
         granted = runtime.reserve(
-            len(selected),
+            len(selected_misses),
             atomic=False,
             context=f"{self.lane}:{self.operator}:candidate_pool",
         )
-        active_indices = selected[:granted]
+        active_indices = tuple(selected_misses[:granted])
         active_sequences = tuple(clean[index] for index in active_indices)
         if active_sequences:
             active_results = self._solve_uncached_batch(
@@ -3586,9 +3604,13 @@ def _record_neighborhood_proposal(
     candidate: _EvaluatedSolution,
     current: _EvaluatedSolution,
 ) -> None:
-    statistics.prefilter_passed += sum(event.prefilter_passed for event in events)
+    statistics.prefilter_passed += sum(
+        event.aggregate_count for event in events if event.prefilter_passed
+    )
     statistics.prefilter_rejected += sum(
-        event.status == "prefilter_rejected" for event in events
+        event.aggregate_count
+        for event in events
+        if event.status in {"prefilter_rejected", "prefilter_rejected_aggregate"}
     )
     statistics.new_routes_created += sum(event.new_routes_created for event in events)
     statistics.exact_route_evaluations += sum(
@@ -3597,7 +3619,9 @@ def _record_neighborhood_proposal(
     statistics.candidate_proposals += sum(
         event.status == "candidate_proposed" for event in events
     )
-    statistics.feasible_candidates += sum(event.candidate_feasible for event in events)
+    statistics.feasible_candidates += sum(
+        event.aggregate_count for event in events if event.candidate_feasible
+    )
     failure_statuses = {
         "failed",
         "prefilter_rejected",
@@ -3605,11 +3629,15 @@ def _record_neighborhood_proposal(
         "budget_exhausted",
         "not_applicable",
         "time_limit",
+        "prefilter_rejected_aggregate",
+        "exact_infeasible_aggregate",
+        "candidate_control_skipped_aggregate",
     }
     for event in events:
         if event.status in failure_statuses:
             statistics.failure_reasons[event.reason] = (
-                statistics.failure_reasons.get(event.reason, 0) + 1
+                statistics.failure_reasons.get(event.reason, 0)
+                + event.aggregate_count
             )
     if candidate.feasible:
         statistics.feasible_repairs += 1

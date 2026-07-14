@@ -172,11 +172,22 @@ class CandidateControlRuntime:
         ordered = sorted(candidates, key=lambda item: (item[2], item[1], item[0]))
         selected = tuple(item[0] for item in ordered[: self.config.proposal_top_k])
         selected_set = set(selected)
+        skipped_payload: list[dict[str, object]] = []
         for rank, (index, sequence, lower_bound) in enumerate(ordered, start=1):
+            if index not in selected_set:
+                skipped_payload.append(
+                    {
+                        "index": index,
+                        "rank": rank,
+                        "sequence": list(sequence),
+                        "distance_lower_bound": lower_bound,
+                    }
+                )
+                continue
             self.events.append(
                 {
                     "event_type": "candidate_control_decision",
-                    "status": "selected" if index in selected_set else "not_selected",
+                    "status": "selected",
                     "lane": lane,
                     "iteration": iteration,
                     "operator": operator,
@@ -184,6 +195,21 @@ class CandidateControlRuntime:
                     "rank": rank,
                     "distance_lower_bound": lower_bound,
                     "customer_sequence": list(sequence),
+                }
+            )
+        if skipped_payload:
+            self.events.append(
+                {
+                    "event_type": "candidate_control_decision_aggregate",
+                    "status": "not_selected",
+                    "reason": "proposal_top_k",
+                    "lane": lane,
+                    "iteration": iteration,
+                    "operator": operator,
+                    "aggregate_count": len(skipped_payload),
+                    "first_rank": self.config.proposal_top_k + 1,
+                    "last_rank": len(ordered),
+                    "candidate_pool_hash": _stable_hash(skipped_payload),
                 }
             )
         return selected
@@ -450,7 +476,11 @@ class CandidateControlRuntime:
         decisions = [
             event for event in self.events
             if event.get("event_type")
-            in {"candidate_control_decision", "candidate_plan_decision"}
+            in {
+                "candidate_control_decision",
+                "candidate_control_decision_aggregate",
+                "candidate_plan_decision",
+            }
         ]
         budgets = [
             event for event in self.events
@@ -473,10 +503,14 @@ class CandidateControlRuntime:
             "merge_policy": self.config.merge_policy,
             "candidate_decisions": len(decisions),
             "selected_candidates": sum(
-                event.get("status") == "selected" for event in decisions
+                _event_count(event)
+                for event in decisions
+                if event.get("status") == "selected"
             ),
             "skipped_candidates": sum(
-                event.get("status") != "selected" for event in decisions
+                _event_count(event)
+                for event in decisions
+                if event.get("status") != "selected"
             ),
             "budget_events": len(budgets),
             "budget_skips": sum(event.get("status") == "budget_skipped" for event in budgets),
@@ -501,6 +535,10 @@ def _integer_event_field(event: dict[str, object], field_name: str) -> int:
     if isinstance(value, (int, float, str)):
         return int(value)
     raise TypeError(f"candidate-control event field {field_name} is not numeric")
+
+
+def _event_count(event: dict[str, object]) -> int:
+    return _integer_event_field(event, "aggregate_count") if "aggregate_count" in event else 1
 
 
 def _solve_cpu_batch_worker(
