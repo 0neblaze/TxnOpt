@@ -2451,7 +2451,11 @@ def _regret_insertion_options(
         elif precomputed_routes is not None and base in precomputed_routes:
             old_distance = precomputed_routes[base].distance
         else:
-            old_distance = _route_with_status(evaluator, base, "unchanged").distance
+            # ``partial`` has already gone through destroy.  If the route is
+            # not supplied as a precomputed current-route result, it may have
+            # changed during that destroy and must not be mislabeled as an
+            # unchanged route when exact evaluation is required.
+            old_distance = _route_with_status(evaluator, base, "changed").distance
         for position in range(len(base) + 1):
             if evaluator.calls - before_calls >= budget:
                 raise _EvaluationBudgetExceeded
