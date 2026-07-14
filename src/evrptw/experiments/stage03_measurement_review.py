@@ -862,7 +862,13 @@ def _cache_incremental_trace_ok(
         if evaluation.kind == "precomputed_route":
             if evaluation.route_change_status != "unchanged":
                 return False
-        elif evaluation.route_change_status == "unchanged":
+        elif (
+            evaluation.kind == "exact_call"
+            and evaluation.route_change_status == "unchanged"
+        ):
+            # An unchanged route may be served by a precomputed result or by
+            # the shared Stage 3.2 cache.  It must never re-enter exact
+            # charging, but a cache hit is a valid unchanged-route result.
             return False
 
     cache_events = [
