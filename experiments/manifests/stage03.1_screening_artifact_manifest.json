@@ -71,7 +71,7 @@
     "rc105C5"
   ],
   "legacy_path_map": "experiments/registries/stage03_legacy_path_map.csv",
-  "legacy_path_map_sha256": "550704510951d4837e72c2525398999d9c5aba64be2ce025122d5bb8ec57ba26",
+  "legacy_path_map_sha256": "a26a279ef31fe47572a6099507e11d5a94d738925f9d6d0c1545f2e2540f2ab6",
   "legacy_run_labels": [
     "stage031_cheap_screening_smoke01",
     "stage031_cheap_screening_smoke02",
@@ -87,7 +87,7 @@
     "Tracked summary and review files are registered only when their semantic raw-to-summary check is pass; missing historical reviews remain visible as not_published."
   ],
   "raw_artifacts_moved": false,
-  "run_label_pattern": "^stage03\\.(?P<minor>[01])_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}$",
+  "run_label_pattern": "^stage03\\.(?P<minor>[012])_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}$",
   "run_records": [
     {
       "attempt_or_rerun": "attempt01",
