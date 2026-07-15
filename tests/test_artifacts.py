@@ -362,3 +362,43 @@ def test_cache_lookup_and_result_are_one_persisted_event(tmp_path: Path) -> None
     assert rows[0]["operator_id"] == 0
     assert "lane" not in rows[0]
     assert json.loads(rows[0]["extras_json"])["lookup_result"] == "miss"
+
+
+def test_event_storage_keeps_explicit_ordering_audit_lists(tmp_path: Path) -> None:
+    writer = ArtifactBundleWriter(
+        tmp_path / "results" / "stage03.4_control_parallel_attempt01",
+        ArtifactRunContext(
+            "stage03.4", "control_parallel", "stage03.4_control_parallel_attempt01"
+        ),
+    )
+    writer.write_control(metadata={})
+    writer.write_instance_seed(
+        instance="toy",
+        seed=2014,
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+        route_dictionary={},
+        critical_events=[
+            {
+                "event_type": "parallel_batch",
+                "submission_order": [0, 1],
+                "completion_order": [1, 0],
+                "merge_order": [0, 1],
+                "chunk_sizes": [2, 1],
+                "completed_indices": [0, 1, 2],
+            }
+        ],
+        diagnostic_rows=[],
+    )
+    result = writer.finalize()
+    event_path = result.run_dir / "toy" / "2014" / (
+        "stage03.4_control_parallel_attempt01_events_toy_2014.parquet"
+    )
+    extras = json.loads(pq.read_table(event_path).to_pylist()[0]["extras_json"])
+    assert extras["submission_order"] == [0, 1]
+    assert extras["completion_order"] == [1, 0]
+    assert extras["merge_order"] == [0, 1]
+    assert extras["chunk_sizes"] == [2, 1]
+    assert extras["completed_indices"] == [0, 1, 2]

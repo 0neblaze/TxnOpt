@@ -475,7 +475,18 @@ def _normalise_event(
         if key not in known
         and (
             not isinstance(value, (list, tuple, dict))
-            or key in {"current_objective_key", "candidate_objective_key"}
+            or key
+            in {
+                "current_objective_key",
+                "candidate_objective_key",
+                "source_objective_key",
+                "objective_key",
+                "submission_order",
+                "completion_order",
+                "merge_order",
+                "chunk_sizes",
+                "completed_indices",
+            }
         )
     }
     if event.get("record_class"):
@@ -492,7 +503,7 @@ def _normalise_event(
         "iteration": _as_int(event.get("iteration")),
         "operator_id": operator_ids[str(event.get("operator", ""))],
         "route_id": route_id,
-        "route_ids": _route_ids(event.get("route_ids"), route_ids),
+        "route_ids": _route_ids(event.get("route_ids", event.get("route_keys")), route_ids),
         "current_route_ids": current_route_ids,
         "candidate_route_ids": candidate_route_ids,
         "base_route_id": base_route_id,

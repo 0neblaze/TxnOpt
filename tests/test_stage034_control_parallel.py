@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
 import pytest
 
 from evrptw.alns import solve_alns
-from evrptw.artifacts import ArtifactBundleWriter, ArtifactRunContext, verify_manifest
+from evrptw.artifacts import (
+    ArtifactBundleWriter,
+    ArtifactReader,
+    ArtifactRunContext,
+    verify_manifest,
+)
 from evrptw.cache_incremental import CacheIncrementalConfig
 from evrptw.candidate_control import (
     CandidateControlConfig,
@@ -25,6 +31,8 @@ from evrptw.experiments.stage034_control_parallel import (
 )
 from evrptw.experiments.stage034_control_parallel_review import (
     _budget_ledger_valid,
+    _candidate_control_valid,
+    _event_customer_sequences,
     _parallel_event_valid,
     _plan_decision_group_valid,
     _plan_history_valid,
@@ -383,7 +391,7 @@ def test_stage034_runner_persists_four_current_storage_axes(tmp_path) -> None:
         ),
         config.artifact_storage,
     )
-    persist_paired_diagnostic(
+    paths = persist_paired_diagnostic(
         writer,
         instance=_instance(),
         seed=2014,
@@ -399,6 +407,25 @@ def test_stage034_runner_persists_four_current_storage_axes(tmp_path) -> None:
     assert manifest["stage_id"] == "stage03.4"
     assert manifest["component"] == "control_parallel"
     assert manifest["evidence_completeness"] == "complete"
+    reader = ArtifactReader(bundle.run_dir)
+    events = reader.read_events(paths["events"])
+    routes = reader.read_parquet(paths["route_dictionary"])
+    route_sequences = {
+        int(item["route_id"]): tuple(item["customer_sequence"]) for item in routes
+    }
+    for axis in DIAGNOSTIC_AXES:
+        axis_events = [
+            event
+            for event in events
+            if axis == json.loads(event["extras_json"] or "{}").get("diagnostic_axis")
+        ]
+        candidate_valid, details = _candidate_control_valid(
+            axis_events,
+            max_round_budget=config.candidate_control_config.max_exact_calls_per_round,
+            proposal_top_k=config.candidate_control_config.proposal_top_k,
+            route_sequences=route_sequences,
+        )
+        assert candidate_valid, json.dumps(details, sort_keys=True)
 
 
 def test_reviewer_rejects_non_prefix_candidate_selection() -> None:
@@ -481,6 +508,13 @@ def test_reviewer_rebuilds_attempted_plan_history() -> None:
         ],
         proposal_top_k=1,
     )
+
+
+def test_reviewer_rebuilds_candidate_sequences_from_route_dictionary() -> None:
+    event = {"route_ids": [2, 1]}
+    routes = {1: ("C1",), 2: ("C2", "C3")}
+
+    assert _event_customer_sequences(event, routes) == (("C2", "C3"), ("C1",))
 
 
 def test_reviewer_reconciles_round_budget_ledger() -> None:

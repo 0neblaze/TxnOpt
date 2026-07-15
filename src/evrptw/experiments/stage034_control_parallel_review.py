@@ -195,11 +195,19 @@ def review_stage034(
         instance = parse_schneider(benchmark_dir / f"{instance_name}.txt")
         raw_axes = _object(raw.get("axes"), "raw axes")
         solution_axes = _object(solution.get("axes"), "solution axes")
-        route_ids = {int(item["route_id"]) for item in route_dictionary}
+        route_sequences = {
+            int(item["route_id"]): tuple(str(node) for node in item["customer_sequence"])
+            for item in route_dictionary
+        }
+        route_ids = set(route_sequences)
         route_references_valid = all(
             event.get(field) is None or int(event[field]) in route_ids
             for event in events
             for field in ("route_id", "base_route_id", "candidate_route_id")
+        ) and all(
+            all(int(route_id) in route_ids for route_id in (event.get(field) or []))
+            for event in events
+            for field in ("route_ids", "current_route_ids", "candidate_route_ids")
         )
         axis_rows: dict[str, dict[str, object]] = {}
         for axis in DIAGNOSTIC_AXES:
@@ -241,6 +249,7 @@ def review_stage034(
                 axis_events,
                 max_round_budget=max_round_budget,
                 proposal_top_k=proposal_top_k,
+                route_sequences=route_sequences,
             )
             ordering_valid, ordering_details = _parallel_ordering_valid(axis_events, axis)
             baseline_key = baseline.get((instance_name, seed))
@@ -250,6 +259,7 @@ def review_stage034(
                 instance=instance_name,
                 seed=seed,
                 expected_objective=baseline_key,
+                route_sequences=route_sequences,
             )
             objective_not_worse = (
                 True
@@ -509,13 +519,18 @@ def _candidate_control_valid(
     *,
     max_round_budget: int,
     proposal_top_k: int,
+    route_sequences: Mapping[int, tuple[str, ...]] | None = None,
 ) -> tuple[bool, dict[str, object]]:
     decoded = [_decoded_event(event) for event in events]
     decisions = [
         event
         for event in decoded
         if event.get("event_type")
-        in {"candidate_control_decision", "candidate_control_decision_aggregate"}
+        in {
+            "candidate_control_decision",
+            "candidate_control_decision_aggregate",
+            "candidate_plan_decision",
+        }
     ]
     budgets = [event for event in decoded if event.get("event_type") == "candidate_control_budget"]
     plan_decisions = [
@@ -542,7 +557,11 @@ def _candidate_control_valid(
         )
         for event in budgets
     )
-    plan_ranking_valid = _plan_history_valid(decoded, proposal_top_k=proposal_top_k)
+    plan_ranking_valid = _plan_history_valid(
+        decoded,
+        proposal_top_k=proposal_top_k,
+        route_sequences=route_sequences,
+    )
     budget_ledger_valid = _budget_ledger_valid(
         decoded,
         max_round_budget=max_round_budget,
@@ -553,7 +572,10 @@ def _candidate_control_valid(
         and atomic_budgets
         and budget_ledger_valid
         and plan_ranking_valid
-        and all(event.get("status") in {"selected", "not_selected"} for event in decisions)
+        and all(
+            event.get("status") in {"selected", "not_selected", "already_attempted"}
+            for event in decisions
+        )
     )
     return valid, {
         "valid": valid,
@@ -582,6 +604,7 @@ def _plan_decision_group_valid(
     *,
     proposal_top_k: int,
     attempted: set[tuple[tuple[str, ...], ...]] | None = None,
+    route_sequences: Mapping[int, tuple[str, ...]] | None = None,
 ) -> bool:
     ordered = sorted(group, key=lambda event: _as_int(event.get("rank")))
     ranks = [_as_int(event.get("rank")) for event in ordered]
@@ -590,7 +613,7 @@ def _plan_decision_group_valid(
             _as_int(event.get("vehicle_count")),
             _as_float(event.get("optimistic_total_distance")),
             _as_int(event.get("changed_route_count")),
-            _nested_route_key(event.get("customer_sequences")),
+            _event_customer_sequences(event, route_sequences),
             _as_int(event.get("proposal_ordinal")),
         )
         for event in ordered
@@ -598,13 +621,13 @@ def _plan_decision_group_valid(
     attempted = attempted or set()
     declared_attempted_valid = all(
         (event.get("status") == "already_attempted")
-        == (_nested_route_key(event.get("customer_sequences")) in attempted)
+        == (_event_customer_sequences(event, route_sequences) in attempted)
         for event in ordered
     )
     available = [
         event
         for event in ordered
-        if _nested_route_key(event.get("customer_sequences")) not in attempted
+        if _event_customer_sequences(event, route_sequences) not in attempted
     ]
     expected_selected_ids = {
         _as_int(event.get("candidate_id")) for event in available[:proposal_top_k]
@@ -628,6 +651,7 @@ def _plan_history_valid(
     events: Sequence[Mapping[str, object]],
     *,
     proposal_top_k: int,
+    route_sequences: Mapping[int, tuple[str, ...]] | None = None,
 ) -> bool:
     attempted: set[tuple[tuple[str, ...], ...]] = set()
     pending: list[Mapping[str, object]] = []
@@ -639,6 +663,7 @@ def _plan_history_valid(
             pending,
             proposal_top_k=proposal_top_k,
             attempted=attempted,
+            route_sequences=route_sequences,
         )
         pending.clear()
         return valid
@@ -653,7 +678,7 @@ def _plan_history_valid(
         if event_type == "candidate_plan_attempted":
             if event.get("status") != "complete_transaction":
                 return False
-            sequence_key = _nested_route_key(event.get("customer_sequences"))
+            sequence_key = _event_customer_sequences(event, route_sequences)
             if not sequence_key:
                 return False
             attempted.add(sequence_key)
@@ -718,6 +743,22 @@ def _nested_route_key(value: object) -> tuple[tuple[str, ...], ...]:
             return ()
         output.append(tuple(route))
     return tuple(output)
+
+
+def _event_customer_sequences(
+    event: Mapping[str, object],
+    route_sequences: Mapping[int, tuple[str, ...]] | None,
+) -> tuple[tuple[str, ...], ...]:
+    embedded = _nested_route_key(event.get("customer_sequences"))
+    if embedded:
+        return embedded
+    raw_ids = event.get("route_ids")
+    if not isinstance(raw_ids, list) or route_sequences is None:
+        return ()
+    try:
+        return tuple(route_sequences[_as_int(route_id)] for route_id in raw_ids)
+    except KeyError:
+        return ()
 
 
 def _parallel_ordering_valid(
@@ -857,6 +898,7 @@ def _inherited_initial_solution_valid(
     instance: str,
     seed: int,
     expected_objective: tuple[int, float, float, int] | None,
+    route_sequences: Mapping[int, tuple[str, ...]],
 ) -> bool:
     verified = [
         event
@@ -878,8 +920,15 @@ def _inherited_initial_solution_valid(
         / str(seed)
         / f"{run_label}_solution_{instance}_{seed}.json"
     )
-    source_objective = event.get("source_objective_key")
+    source_payload = json.loads(solution_path.read_text(encoding="utf-8"))
+    source_axis = _object(
+        _object(source_payload.get("axes"), "source axes").get("wall_clock"),
+        "source wall-clock axis",
+    )
+    source_objective = source_axis.get("objective_key")
+    source_sequences = _nested_route_key(source_axis.get("customer_sequences"))
     verified_objective = event.get("objective_key")
+    verified_sequences = _event_customer_sequences(event, route_sequences)
     return all(
         (
             event.get("source_stage") == "stage03.3",
@@ -891,6 +940,8 @@ def _inherited_initial_solution_valid(
             and tuple(source_objective) == expected_objective,
             isinstance(verified_objective, list)
             and tuple(verified_objective) == expected_objective,
+            bool(source_sequences),
+            verified_sequences == source_sequences,
         )
     )
 

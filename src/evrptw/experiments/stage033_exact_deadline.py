@@ -35,7 +35,7 @@ from evrptw.experiments.stage03_measurement import (
     SMOKE_INSTANCES,
     _reference_repositories,
 )
-from evrptw.measurement import CheapScreeningConfig, MeasurementConfig
+from evrptw.measurement import CheapScreeningConfig, MeasurementConfig, canonical_route_key
 from evrptw.models import Instance
 from evrptw.neighborhoods import VehicleOperatorConfig
 from evrptw.parser import parse_schneider
@@ -204,6 +204,7 @@ def persist_paired_diagnostic(
             result.neighborhood_events,
         )
         for event in axis_events:
+            event = _route_reference_event(event, route_dictionary)
             lane = str(event.get("lane", ""))
             critical_events.append(
                 {
@@ -319,6 +320,32 @@ def persist_paired_diagnostic(
         diagnostic_rows=diagnostic_rows,
         failure_payload=failure_payload,
     )
+
+
+def _route_reference_event(
+    event: Mapping[str, object],
+    route_dictionary: dict[str, tuple[str, ...]],
+) -> dict[str, object]:
+    """Replace complete candidate routes with dictionary references before storage."""
+
+    output = dict(event)
+    raw_sequences = output.pop("customer_sequences", None)
+    if raw_sequences is None:
+        return output
+    if not isinstance(raw_sequences, (list, tuple)):
+        raise TypeError("candidate customer_sequences must be a sequence")
+    route_keys: list[str] = []
+    for raw_sequence in raw_sequences:
+        if not isinstance(raw_sequence, (list, tuple)) or not all(
+            isinstance(node, str) for node in raw_sequence
+        ):
+            raise TypeError("candidate route must contain node identifiers")
+        sequence = tuple(raw_sequence)
+        route_key = canonical_route_key(sequence)
+        route_dictionary.setdefault(route_key, sequence)
+        route_keys.append(route_key)
+    output["route_keys"] = route_keys
+    return output
 
 
 def run_stage033(
