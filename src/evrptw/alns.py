@@ -502,8 +502,25 @@ class _Evaluator:
         plans: Sequence[tuple[tuple[str, ...], ...]],
         *,
         current_sequences: tuple[tuple[str, ...], ...],
+        allow_vehicle_increase: bool = False,
     ) -> tuple[tuple[str, ...], ...] | None:
         """Rank complete solution states and exact-evaluate selected plans atomically."""
+
+        feasible = self.evaluate_feasible_candidate_plans(
+            plans,
+            current_sequences=current_sequences,
+            allow_vehicle_increase=allow_vehicle_increase,
+        )
+        return feasible[0] if feasible else None
+
+    def evaluate_feasible_candidate_plans(
+        self,
+        plans: Sequence[tuple[tuple[str, ...], ...]],
+        *,
+        current_sequences: tuple[tuple[str, ...], ...],
+        allow_vehicle_increase: bool = False,
+    ) -> tuple[tuple[tuple[str, ...], ...], ...]:
+        """Return selected feasible plans in deterministic objective order."""
 
         runtime = self.candidate_control_runtime
         if runtime is None:
@@ -520,7 +537,7 @@ class _Evaluator:
 
         rankable: list[CandidatePlan] = []
         for ordinal, sequences in enumerate(plans):
-            if len(sequences) > len(current_sequences):
+            if not allow_vehicle_increase and len(sequences) > len(current_sequences):
                 runtime.events.append(
                     {
                         "event_type": "candidate_plan_screening",
@@ -567,7 +584,7 @@ class _Evaluator:
             iteration=self.iteration or 0,
             operator=self.operator,
         )
-        best: _EvaluatedSolution | None = None
+        feasible: list[_EvaluatedSolution] = []
         precomputed = {
             sequence: result
             for sequence in current_sequences
@@ -591,14 +608,14 @@ class _Evaluator:
             )
             if not candidate.feasible or candidate.objective is None:
                 continue
-            if (
-                best is None
-                or best.objective is None
-                or compare_objectives(candidate.objective, best.objective)
-                is ObjectiveComparison.BETTER
-            ):
-                best = candidate
-        return best.sequences if best is not None else None
+            feasible.append(candidate)
+        feasible.sort(
+            key=lambda candidate: (
+                candidate.objective.key if candidate.objective is not None else (),
+                candidate.sequences,
+            )
+        )
+        return tuple(candidate.sequences for candidate in feasible)
 
     @property
     def cache_incremental_enabled(self) -> bool:
@@ -1689,6 +1706,8 @@ def _solve_alns(
     disable_cache: bool = False,
     exact_call_controller: ExactCallController | None = None,
     candidate_control_runtime: CandidateControlRuntime | None = None,
+    initial_customer_sequences: tuple[tuple[str, ...], ...] | None = None,
+    initial_solution_provenance: Mapping[str, object] | None = None,
 ) -> ALNSResult:
     if max_iterations <= 0:
         raise ValueError("max_iterations must be positive")
@@ -1822,7 +1841,27 @@ def _solve_alns(
         with evaluator.measurement_context(
             lane="initialization", iteration=None, operator="initial_solution"
         ):
-            initial_sequences = _construct_initial_solution(instance, evaluator)
+            if initial_customer_sequences is None:
+                initial_sequences = _construct_initial_solution(instance, evaluator)
+            else:
+                if candidate_control_runtime is None:
+                    raise RuntimeError("inherited initialization requires candidate control")
+                candidate_control_runtime.events.append(
+                    {
+                        "event_type": "candidate_initial_solution",
+                        "status": "submitted",
+                        "customer_sequences": [
+                            list(sequence) for sequence in initial_customer_sequences
+                        ],
+                        **dict(initial_solution_provenance or {}),
+                    }
+                )
+                selected_initial = evaluator.select_feasible_candidate_plan(
+                    (initial_customer_sequences,),
+                    current_sequences=(),
+                    allow_vehicle_increase=True,
+                )
+                initial_sequences = selected_initial or ()
     except _TimeLimitReached:
         return _failed_result(
             started,
@@ -1835,6 +1874,16 @@ def _solve_alns(
         lane="initialization", iteration=None, operator="initial_solution"
     ):
         current = evaluator.solution(initial_sequences)
+    if initial_customer_sequences is not None and candidate_control_runtime is not None:
+        candidate_control_runtime.events.append(
+            {
+                "event_type": "candidate_initial_solution",
+                "status": "verified" if current.feasible else "verification_failed",
+                "customer_sequences": [list(sequence) for sequence in initial_sequences],
+                "objective_key": current.objective.key if current.objective is not None else (),
+                **dict(initial_solution_provenance or {}),
+            }
+        )
     if not current.feasible:
         return _failed_result(
             started,
@@ -2960,6 +3009,8 @@ def solve_alns(
     disable_cache: bool = False,
     exact_deadline_config: ExactDeadlineConfig | None = None,
     candidate_control_config: CandidateControlConfig | None = None,
+    initial_customer_sequences: tuple[tuple[str, ...], ...] | None = None,
+    initial_solution_provenance: Mapping[str, object] | None = None,
 ) -> ALNSResult:
     """Solve ALNS with opt-in Stage 3.0--3.4 evaluation layers."""
 
@@ -2971,6 +3022,17 @@ def solve_alns(
     candidate_control_enabled = (
         candidate_control_config is not None and candidate_control_config.enabled
     )
+    if initial_customer_sequences is not None:
+        if not candidate_control_enabled:
+            raise ValueError("an inherited initial solution requires candidate control")
+        supplied_customers = [
+            customer for sequence in initial_customer_sequences for customer in sequence
+        ]
+        expected_customers = sorted(customer.name for customer in instance.customers)
+        if sorted(supplied_customers) != expected_customers:
+            raise ValueError("inherited initial solution must cover every customer exactly once")
+    elif initial_solution_provenance is not None:
+        raise ValueError("initial solution provenance requires inherited customer sequences")
     if (
         candidate_control_enabled
         and ExactChargingBackend(backend) is not ExactChargingBackend.CPU_BATCH
@@ -3030,6 +3092,8 @@ def solve_alns(
                 disable_cache=disable_cache,
                 exact_call_controller=exact_call_controller,
                 candidate_control_runtime=candidate_control_runtime,
+                initial_customer_sequences=initial_customer_sequences,
+                initial_solution_provenance=initial_solution_provenance,
             )
         finally:
             if candidate_control_runtime is not None:
@@ -3064,6 +3128,8 @@ def solve_alns(
             disable_cache=disable_cache,
             exact_call_controller=exact_call_controller,
             candidate_control_runtime=candidate_control_runtime,
+            initial_customer_sequences=initial_customer_sequences,
+            initial_solution_provenance=initial_solution_provenance,
         )
     except BaseException as error:
         if candidate_control_runtime is not None:
@@ -3390,6 +3456,14 @@ def _insertion_options(
     mode: str,
 ) -> list[tuple[float, int, tuple[str, ...]]]:
     options: list[tuple[float, int, tuple[str, ...]]] = []
+    if evaluator.candidate_control_enabled:
+        return _controlled_insertion_options(
+            sequences,
+            customer,
+            evaluator,
+            instance,
+            mode,
+        )
     if evaluator.backend is ExactChargingBackend.CPU_SCALAR and not evaluator.batch_work_enabled:
         for route_index in range(len(sequences) + 1):
             base = sequences[route_index] if route_index < len(sequences) else ()
@@ -3445,6 +3519,51 @@ def _insertion_options(
         demand = sum(instance.by_name[name].demand for name in candidate)
         if demand > instance.vehicle.load_capacity + 1e-9:
             continue
+        options.append((score, route_index, candidate))
+    return sorted(options)
+
+
+def _controlled_insertion_options(
+    sequences: list[tuple[str, ...]],
+    customer: str,
+    evaluator: _Evaluator,
+    instance: Instance,
+    mode: str,
+) -> list[tuple[float, int, tuple[str, ...]]]:
+    options: list[tuple[float, int, tuple[str, ...]]] = []
+    current = tuple(sequences)
+    plan_metadata: dict[
+        tuple[tuple[str, ...], ...],
+        tuple[int, tuple[str, ...], tuple[str, ...]],
+    ] = {}
+    for route_index in range(len(sequences) + 1):
+        base = sequences[route_index] if route_index < len(sequences) else ()
+        for position in range(len(base) + 1):
+            candidate = (*base[:position], customer, *base[position:])
+            demand = sum(instance.by_name[name].demand for name in candidate)
+            if demand > instance.vehicle.load_capacity + 1e-9:
+                continue
+            plan = (
+                (*current[:route_index], candidate, *current[route_index + 1 :])
+                if route_index < len(sequences)
+                else (*current, candidate)
+            )
+            plan_metadata.setdefault(plan, (route_index, base, candidate))
+    feasible_plans = evaluator.evaluate_feasible_candidate_plans(
+        tuple(plan_metadata),
+        current_sequences=current,
+    )
+    for plan in feasible_plans:
+        route_index, base, candidate = plan_metadata[plan]
+        result = evaluator.route(candidate)
+        if not result.feasible:
+            raise RuntimeError("selected insertion plan lost its exact route result")
+        old_result = evaluator.incumbent_route_result(base) if base else None
+        if base and old_result is None:
+            old_result = evaluator.route(base)
+        score = result.distance - (old_result.distance if old_result is not None else 0.0)
+        if mode == "energy":
+            score += 0.05 * result.charged_energy
         options.append((score, route_index, candidate))
     return sorted(options)
 

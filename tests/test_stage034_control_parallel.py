@@ -81,6 +81,47 @@ def test_candidate_control_is_opt_in_and_requires_cpu_batch() -> None:
         )
 
 
+def test_inherited_initial_solution_is_exactly_revalidated() -> None:
+    initial = (("C1", "C3"), ("C2",))
+    result = solve_alns(
+        _instance(),
+        seed=2014,
+        max_iterations=2,
+        time_limit_seconds=2.0,
+        measurement_config=MeasurementConfig(),
+        candidate_control_config=CandidateControlConfig(
+            proposal_top_k=1,
+            max_exact_calls_per_round=1,
+            worker_count=1,
+        ),
+        initial_customer_sequences=initial,
+        initial_solution_provenance={
+            "source_stage": "stage03.3",
+            "source_run_label": "test-stage03.3",
+            "source_axis": "wall_clock",
+            "source_solution_sha256": "a" * 64,
+        },
+    )
+
+    assert result.feasible
+    assert result.vehicle_count <= len(initial)
+    assert result.measurement_trace is not None
+    initial_events = [
+        event
+        for event in result.measurement_trace.events
+        if event.get("event_type") == "candidate_initial_solution"
+    ]
+    assert [event["status"] for event in initial_events] == ["submitted", "verified"]
+    with pytest.raises(ValueError, match="cover every customer"):
+        solve_alns(
+            _instance(),
+            seed=2014,
+            max_iterations=1,
+            candidate_control_config=CandidateControlConfig(),
+            initial_customer_sequences=(("C1",),),
+        )
+
+
 def test_candidate_control_ranks_and_budgets_each_complete_round() -> None:
     result = solve_alns(
         _instance(),

@@ -34,7 +34,7 @@ from evrptw.experiments.stage033_exact_deadline import (
     persist_paired_diagnostic,
 )
 from evrptw.measurement import CheapScreeningConfig, MeasurementConfig
-from evrptw.models import Instance
+from evrptw.models import Instance, NodeType
 from evrptw.neighborhoods import VehicleOperatorConfig
 from evrptw.parser import parse_schneider
 
@@ -60,6 +60,7 @@ class Stage034Config:
     watchdog_seconds: float
     batch_size: int
     candidate_control_config: CandidateControlConfig
+    inherit_stage033_incumbent: bool
     proposal_top_k_grid: tuple[int, ...]
     round_budget_grid: tuple[int, ...]
     selection_order: tuple[str, ...]
@@ -78,6 +79,7 @@ def load_stage034_config(path: Path) -> Stage034Config:
         control = dict(payload["candidate_control"])
         grid = payload["candidate_control_grid"]
         worker_counts = tuple(int(value) for value in control.pop("worker_counts"))
+        inherit_stage033_incumbent = bool(control.pop("inherit_stage033_incumbent"))
         if worker_counts != (1, 4):
             raise ValueError("worker_counts must be [1, 4]")
         config = Stage034Config(
@@ -94,6 +96,7 @@ def load_stage034_config(path: Path) -> Stage034Config:
                 worker_count=1,
                 **control,
             ),
+            inherit_stage033_incumbent=inherit_stage033_incumbent,
             proposal_top_k_grid=tuple(int(value) for value in grid["proposal_top_k"]),
             round_budget_grid=tuple(int(value) for value in grid["max_exact_calls_per_round"]),
             selection_order=tuple(str(value) for value in grid["selection_order"]),
@@ -111,6 +114,8 @@ def load_stage034_config(path: Path) -> Stage034Config:
         raise ValueError("Stage 3.4 requires 100 calls and a 120-second watchdog")
     if config.batch_size <= 0:
         raise ValueError("Stage 3.4 batch_size must be positive")
+    if not config.inherit_stage033_incumbent:
+        raise ValueError("Stage 3.4 requires the audited Stage 3.3 incumbent warm start")
     if config.proposal_top_k_grid != (1, 2, 4) or config.round_budget_grid != (1, 2, 4):
         raise ValueError("Stage 3.4 candidate-control grid must be {1,2,4} x {1,2,4}")
     if (
@@ -141,6 +146,8 @@ def run_control_parallel_diagnostic(
     watchdog_seconds: float,
     max_iterations: int,
     batch_size: int,
+    initial_customer_sequences: tuple[tuple[str, ...], ...] | None = None,
+    initial_solution_provenance: Mapping[str, object] | None = None,
 ) -> Mapping[str, ALNSResult]:
     output: dict[str, ALNSResult] = {}
     for worker_label, worker_count in (("serial", 1), ("parallel", 4)):
@@ -162,6 +169,8 @@ def run_control_parallel_diagnostic(
                 watchdog_seconds=watchdog_seconds,
             ),
             candidate_control_config=control,
+            initial_customer_sequences=initial_customer_sequences,
+            initial_solution_provenance=initial_solution_provenance,
         )
         output[f"{worker_label}_wall_clock"] = solve_alns(
             instance,
@@ -177,6 +186,8 @@ def run_control_parallel_diagnostic(
             batch_size=batch_size,
             exact_deadline_config=ExactDeadlineConfig.wall_clock(),
             candidate_control_config=control,
+            initial_customer_sequences=initial_customer_sequences,
+            initial_solution_provenance=initial_solution_provenance,
         )
     return output
 
@@ -201,7 +212,8 @@ def run_stage034(
         raise FileExistsError(resolved_output)
     _require_clean_repository(root)
     config = load_stage034_config(resolved_config)
-    _require_stage033_ready(_resolve(root, config.stage033_review_manifest))
+    stage033_review_manifest = _resolve(root, config.stage033_review_manifest)
+    _require_stage033_ready(stage033_review_manifest)
     if scope == "formal":
         _require_stage034_smoke_ready(
             _resolve(root, smoke_review_dir) if smoke_review_dir else None,
@@ -252,6 +264,7 @@ def run_stage034(
             "max_iterations": config.max_iterations,
             "worker_counts": [1, 4],
             "candidate_control": asdict(config.candidate_control_config),
+            "inherit_stage033_incumbent": config.inherit_stage033_incumbent,
             "candidate_control_grid": {
                 "proposal_top_k": list(config.proposal_top_k_grid),
                 "max_exact_calls_per_round": list(config.round_budget_grid),
@@ -266,6 +279,11 @@ def run_stage034(
                 _resolve(root, config.benchmark_dir) / f"{instance_name}.txt"
             )
             for seed in config.seeds:
+                initial_sequences, initial_provenance = _stage033_initial_solution(
+                    stage033_review_manifest,
+                    instance,
+                    seed,
+                )
                 peak_before = _peak_rss_bytes()
                 axes = run_control_parallel_diagnostic(
                     instance,
@@ -279,6 +297,8 @@ def run_stage034(
                     watchdog_seconds=config.watchdog_seconds,
                     max_iterations=config.max_iterations,
                     batch_size=config.batch_size,
+                    initial_customer_sequences=initial_sequences,
+                    initial_solution_provenance=initial_provenance,
                 )
                 persist_paired_diagnostic(
                     writer,
@@ -308,6 +328,52 @@ def _require_stage033_ready(path: Path) -> None:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("status") != "READY_FOR_STAGE03_4":
         raise RuntimeError("Stage 3.3 review is not READY_FOR_STAGE03_4")
+
+
+def _stage033_initial_solution(
+    review_manifest: Path,
+    instance: Instance,
+    seed: int,
+) -> tuple[tuple[tuple[str, ...], ...], dict[str, object]]:
+    review = json.loads(review_manifest.read_text(encoding="utf-8"))
+    run_directory = review.get("run_directory")
+    run_label = review.get("run_label")
+    if not isinstance(run_directory, str) or not isinstance(run_label, str):
+        raise RuntimeError("Stage 3.3 review lacks inherited-solution provenance")
+    solution_path = (
+        Path(run_directory)
+        / instance.name
+        / str(seed)
+        / f"{run_label}_solution_{instance.name}_{seed}.json"
+    )
+    payload = json.loads(solution_path.read_text(encoding="utf-8"))
+    wall_clock = payload.get("axes", {}).get("wall_clock")
+    if not isinstance(wall_clock, Mapping):
+        raise RuntimeError("Stage 3.3 inherited wall-clock solution is missing")
+    routes = wall_clock.get("routes")
+    objective_key = wall_clock.get("objective_key")
+    if not isinstance(routes, list) or not isinstance(objective_key, list):
+        raise RuntimeError("Stage 3.3 inherited solution payload is invalid")
+    sequences = tuple(
+        tuple(
+            name
+            for name in route
+            if isinstance(name, str)
+            and name in instance.by_name
+            and instance.by_name[name].kind is NodeType.CUSTOMER
+        )
+        for route in routes
+        if isinstance(route, list)
+    )
+    return sequences, {
+        "source_stage": "stage03.3",
+        "source_run_label": run_label,
+        "source_axis": "wall_clock",
+        "source_instance": instance.name,
+        "source_seed": seed,
+        "source_solution_sha256": _sha256(solution_path),
+        "source_objective_key": objective_key,
+    }
 
 
 def _require_stage034_smoke_ready(

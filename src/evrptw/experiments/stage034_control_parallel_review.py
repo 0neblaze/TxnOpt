@@ -158,6 +158,7 @@ def review_stage034(
             control.get("repository_dirty") is False,
             control.get("diagnostic_axes") == list(DIAGNOSTIC_AXES),
             control.get("worker_counts") == [1, 4],
+            control.get("inherit_stage033_incumbent") is True,
             isinstance(control.get("candidate_control"), Mapping),
             isinstance(control.get("candidate_control_grid"), Mapping),
             control.get("source_sha256") == _source_sha256(root),
@@ -243,6 +244,13 @@ def review_stage034(
             )
             ordering_valid, ordering_details = _parallel_ordering_valid(axis_events, axis)
             baseline_key = baseline.get((instance_name, seed))
+            inherited_initial_valid = _inherited_initial_solution_valid(
+                decoded_events,
+                root=root,
+                instance=instance_name,
+                seed=seed,
+                expected_objective=baseline_key,
+            )
             objective_not_worse = (
                 True
                 if not axis.endswith("wall_clock")
@@ -261,6 +269,7 @@ def review_stage034(
                     candidate_valid,
                     ordering_valid,
                     exact_reconciliation_valid,
+                    inherited_initial_valid,
                     unchanged_exact == 0,
                     environment.get("repository_dirty") is False,
                     environment.get("exact_backend") == "cpu_batch",
@@ -281,6 +290,7 @@ def review_stage034(
                 "candidate_reconciliation_valid": candidate_valid,
                 "exact_reconciliation_valid": exact_reconciliation_valid,
                 "parallel_ordering_valid": ordering_valid,
+                "inherited_initial_solution_valid": inherited_initial_valid,
                 "paired_semantics_valid": False,
                 "candidate_work_hash": str(raw_axis.get("candidate_work_hash") or ""),
                 "route_result_hash": str(raw_axis.get("route_result_hash") or ""),
@@ -838,6 +848,51 @@ def _load_stage033_baseline(
                 int(key[3]),
             )
     return output
+
+
+def _inherited_initial_solution_valid(
+    events: Sequence[Mapping[str, object]],
+    *,
+    root: Path,
+    instance: str,
+    seed: int,
+    expected_objective: tuple[int, float, float, int] | None,
+) -> bool:
+    verified = [
+        event
+        for event in events
+        if event.get("event_type") == "candidate_initial_solution"
+        and event.get("status") == "verified"
+    ]
+    if len(verified) != 1 or expected_objective is None:
+        return False
+    event = verified[0]
+    run_label = event.get("source_run_label")
+    if run_label != "stage03.3_exact_deadline_attempt06":
+        return False
+    solution_path = (
+        root
+        / "results"
+        / str(run_label)
+        / instance
+        / str(seed)
+        / f"{run_label}_solution_{instance}_{seed}.json"
+    )
+    source_objective = event.get("source_objective_key")
+    verified_objective = event.get("objective_key")
+    return all(
+        (
+            event.get("source_stage") == "stage03.3",
+            event.get("source_axis") == "wall_clock",
+            event.get("source_instance") == instance,
+            _as_int(event.get("source_seed")) == seed,
+            event.get("source_solution_sha256") == _sha256(solution_path),
+            isinstance(source_objective, list)
+            and tuple(source_objective) == expected_objective,
+            isinstance(verified_objective, list)
+            and tuple(verified_objective) == expected_objective,
+        )
+    )
 
 
 def _prerequisites_valid(root: Path) -> bool:

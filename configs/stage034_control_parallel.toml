@@ -23,9 +23,10 @@ batch_size = 128
 [candidate_control]
 enabled = true
 schema_version = "stage034-control-parallel-v1"
-proposal_top_k = 2
-max_exact_calls_per_round = 2
+proposal_top_k = 1
+max_exact_calls_per_round = 1
 worker_counts = [1, 4]
+inherit_stage033_incumbent = true
 executor_model = "process_spawn"
 ranking_policy = "vehicle_distance_changed_routes_route_key_ordinal"
 merge_policy = "submission_order"
