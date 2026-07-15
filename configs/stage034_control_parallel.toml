@@ -27,6 +27,7 @@ proposal_top_k = 1
 max_exact_calls_per_round = 1
 worker_counts = [1, 4]
 inherit_stage033_incumbent = true
+fixed_work_exhaustion_rounds = 10
 executor_model = "process_spawn"
 ranking_policy = "vehicle_distance_changed_routes_route_key_ordinal"
 merge_policy = "submission_order"

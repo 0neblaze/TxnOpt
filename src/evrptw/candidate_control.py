@@ -38,6 +38,7 @@ class CandidateControlConfig:
     executor_model: ExecutorModel = "process_spawn"
     ranking_policy: str = "vehicle_distance_changed_routes_route_key_ordinal"
     merge_policy: str = "submission_order"
+    fixed_work_exhaustion_rounds: int = 10
 
     def __post_init__(self) -> None:
         if self.schema_version != CANDIDATE_CONTROL_SCHEMA_VERSION:
@@ -54,6 +55,8 @@ class CandidateControlConfig:
             raise ValueError("Stage 3.4 requires executor_model=process_spawn")
         if self.merge_policy != "submission_order":
             raise ValueError("Stage 3.4 requires deterministic submission-order merge")
+        if self.fixed_work_exhaustion_rounds < 10:
+            raise ValueError("Stage 3.4 fixed-work exhaustion window must be at least 10 rounds")
 
 
 @dataclass(frozen=True, slots=True)

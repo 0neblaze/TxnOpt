@@ -1936,6 +1936,8 @@ def _solve_alns(
     initial_temperature = max(1.0, current.objective.total_distance * 0.05)
 
     watchdog_triggered = False
+    candidate_exhausted = False
+    no_exact_rounds = 0
     for iteration in range(max_iterations):
         if exact_call_controller is not None and exact_call_controller.budget_reached:
             evaluator._record_exact_budget_boundary()
@@ -1949,6 +1951,9 @@ def _solve_alns(
             break
         if candidate_control_runtime is not None:
             candidate_control_runtime.begin_round(iteration)
+        round_started_calls = (
+            exact_call_controller.started_calls if exact_call_controller is not None else 0
+        )
         completed_iterations = iteration + 1
         destroy_name = ""
         repair_name = ""
@@ -2863,13 +2868,34 @@ def _solve_alns(
             global_best_reset_pending = False
         maximum_stagnation = max(maximum_stagnation, stagnation_iterations)
         effective_iterations += 1
+        if (
+            candidate_control_runtime is not None
+            and fixed_exact_calls
+            and exact_call_controller is not None
+        ):
+            if exact_call_controller.started_calls == round_started_calls:
+                no_exact_rounds += 1
+            else:
+                no_exact_rounds = 0
+            if (
+                effective_iterations >= 50
+                and no_exact_rounds
+                >= candidate_control_runtime.config.fixed_work_exhaustion_rounds
+            ):
+                candidate_exhausted = True
+                break
 
     fixed_watchdog_mode = termination_mode == "fixed_work" or (
         exact_call_controller is not None
         and exact_call_controller.config.mode == "exact_call_budget"
     )
     budget_reached = exact_call_controller is not None and exact_call_controller.budget_reached
-    if fixed_watchdog_mode and effective_iterations < max_iterations and not budget_reached:
+    if (
+        fixed_watchdog_mode
+        and effective_iterations < max_iterations
+        and not budget_reached
+        and not candidate_exhausted
+    ):
         watchdog_triggered = True
 
     lane_evaluators = (evaluator, quality_evaluator, constraint_evaluator)
@@ -2888,6 +2914,8 @@ def _solve_alns(
     termination_reason = (
         "exact_call_budget_exhausted"
         if exact_call_controller is not None and exact_call_controller.budget_reached
+        else "candidate_control_exhausted"
+        if candidate_exhausted
         else "watchdog_exhausted"
         if watchdog_triggered
         else "wall_clock_deadline"
