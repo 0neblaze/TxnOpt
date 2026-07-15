@@ -69,6 +69,7 @@ from evrptw.objective import (
     accept_annealing_move,
     compare_objectives,
 )
+from evrptw.stage04 import Stage04Config
 from evrptw.validation import validate_routes
 
 __all__ = (
@@ -80,6 +81,7 @@ __all__ = (
     "MeasurementConfig",
     "Stage03ExecutionError",
     "Stage03Trace",
+    "Stage04Config",
     "solve_alns",
 )
 
@@ -111,6 +113,10 @@ class OperatorStatistics:
     vehicle_reductions: int = 0
     distance_improvements: int = 0
     rejected: int = 0
+    # Stage 4 six-category split of *accepted* moves.
+    accepted_improving: int = 0
+    accepted_equal: int = 0
+    accepted_worse: int = 0
     prefilter_passed: int = 0
     prefilter_rejected: int = 0
     new_routes_created: int = 0
@@ -119,6 +125,10 @@ class OperatorStatistics:
     feasible_candidates: int = 0
     failure_reasons: dict[str, int] = field(default_factory=dict)
     weight: float = 1.0
+    # Segment-based accumulation (Stage 4).
+    segment_reward_sum: float = 0.0
+    segment_calls: int = 0
+    weight_history: list[tuple[int, float]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -175,6 +185,11 @@ class ALNSResult:
     candidate_control_statistics: dict[str, object] = field(default_factory=dict)
     candidate_work_hash: str = ""
     route_result_hash: str = ""
+    # Stage 4 adaptive-weight and search-control statistics.
+    stage04_statistics: dict[str, object] = field(default_factory=dict)
+    stage04_weight_history: dict[str, list[tuple[int, float]]] = field(default_factory=dict)
+    stage04_temperature_history: tuple[tuple[int, float], ...] = ()
+    stage04_event_log: tuple[dict[str, object], ...] = ()
 
     @property
     def objective_value(self) -> float:
@@ -1708,6 +1723,7 @@ def _solve_alns(
     candidate_control_runtime: CandidateControlRuntime | None = None,
     initial_customer_sequences: tuple[tuple[str, ...], ...] | None = None,
     initial_solution_provenance: Mapping[str, object] | None = None,
+    stage04_config: Stage04Config | None = None,
 ) -> ALNSResult:
     if max_iterations <= 0:
         raise ValueError("max_iterations must be positive")
@@ -1940,7 +1956,48 @@ def _solve_alns(
     maximum_stagnation = 0
     global_best_reset_pending = False
     removal_tier_counts = {tier.value: 0 for tier in RemovalTier}
-    initial_temperature = max(1.0, current.objective.total_distance * 0.05)
+
+    # ── Stage 4 adaptive weights and search control ──────────────
+    stage04_enabled = (
+        stage04_config is not None and stage04_config.enabled
+    )
+    stage04_events: list[dict[str, object]] = []
+    temperature_history: list[tuple[int, float]] = []
+    reheat_count = 0
+    restart_count = 0
+    reheat_floor = 0.0
+    intensification_active = False
+    intensification_remaining = 0
+    acceptance_window: list[bool] = []
+
+    if stage04_enabled and stage04_config is not None:
+        if stage04_config.auto_temperature:
+            initial_temperature = _estimate_initial_temperature(
+                instance,
+                current,
+                evaluator,
+                rng,
+                stage04_config,
+            )
+        else:
+            initial_temperature = max(
+                1.0, current.objective.total_distance * stage04_config.temperature_fallback_fraction
+            )
+        if not stage04_config.fixed_weights:
+            stage04_events.append({
+                "type": "stage04_config",
+                "segment_length": stage04_config.segment_length,
+                "min_calls_per_operator": stage04_config.min_calls_per_operator,
+                "auto_temperature": stage04_config.auto_temperature,
+                "initial_temperature": initial_temperature,
+                "reheat_enabled": stage04_config.reheat_enabled,
+                "restart_enabled": stage04_config.restart_enabled,
+                "intensification_enabled": stage04_config.intensification_enabled,
+                "fixed_weights": stage04_config.fixed_weights,
+            })
+            temperature_history.append((0, initial_temperature))
+    else:
+        initial_temperature = max(1.0, current.objective.total_distance * 0.05)
 
     watchdog_triggered = False
     candidate_exhausted = False
@@ -2439,7 +2496,12 @@ def _solve_alns(
                         reward = 1.0
                         if quality_comparison is ObjectiveComparison.BETTER:
                             shadow_statistics.improved += 1
+                            shadow_statistics.accepted_improving += 1
                             reward = 4.0
+                        elif quality_comparison is ObjectiveComparison.EQUAL:
+                            shadow_statistics.accepted_equal += 1
+                        else:
+                            shadow_statistics.accepted_worse += 1
                         quality_probe_current = shadow_candidate
                         quality_evaluator.remember_incumbent(quality_probe_current)
                         if (
@@ -2623,6 +2685,11 @@ def _solve_alns(
                     constraint_evaluator.remember_incumbent(constraint_lane_current)
                     if lane_comparison is ObjectiveComparison.BETTER:
                         constraint_statistics.improved += 1
+                        constraint_statistics.accepted_improving += 1
+                    elif lane_comparison is ObjectiveComparison.EQUAL:
+                        constraint_statistics.accepted_equal += 1
+                    else:
+                        constraint_statistics.accepted_worse += 1
                     if (
                         constraint_lane_best.objective is None
                         or compare_objectives(
@@ -2685,7 +2752,14 @@ def _solve_alns(
             break
 
         previous_current = current
-        temperature = initial_temperature * max(0.001, 1.0 - iteration / max_iterations)
+        if stage04_enabled:
+            cooled = initial_temperature * max(0.001, 1.0 - iteration / max_iterations)
+            reheat_floor *= 0.99
+            temperature = max(cooled, reheat_floor)
+            if iteration % 10 == 0:
+                temperature_history.append((iteration, temperature))
+        else:
+            temperature = initial_temperature * max(0.001, 1.0 - iteration / max_iterations)
         quality_candidate_is_worse = (
             profile
             in (
@@ -2737,16 +2811,34 @@ def _solve_alns(
             rejected += 1
             if refinement_selected:
                 refinement_stats.rejected += 1
+            reward_rejected = (
+                stage04_config.reward_rejected
+                if stage04_enabled and stage04_config is not None
+                else 0.0
+            )
             if profile is OperatorProfile.BASELINE:
-                _update_weight(destroy_stats[destroy_name], 0.0)
-                _update_weight(repair_stats[repair_name], 0.0)
+                if stage04_enabled and stage04_config is not None:
+                    _stage04_accumulate(destroy_stats[destroy_name], reward_rejected)
+                    _stage04_accumulate(repair_stats[repair_name], reward_rejected)
+                else:
+                    _update_weight(destroy_stats[destroy_name], 0.0)
+                    _update_weight(repair_stats[repair_name], 0.0)
             else:
                 neighborhood_stats[selected_neighborhood].rejected += 1
-                _update_weight(neighborhood_stats[selected_neighborhood], 0.0)
-                if destroy_name:
-                    _update_weight(destroy_stats[destroy_name], 0.0)
-                if repair_name:
-                    _update_weight(repair_stats[repair_name], 0.0)
+                if stage04_enabled and stage04_config is not None:
+                    _stage04_accumulate(
+                        neighborhood_stats[selected_neighborhood], reward_rejected
+                    )
+                    if destroy_name:
+                        _stage04_accumulate(destroy_stats[destroy_name], reward_rejected)
+                    if repair_name:
+                        _stage04_accumulate(repair_stats[repair_name], reward_rejected)
+                else:
+                    _update_weight(neighborhood_stats[selected_neighborhood], 0.0)
+                    if destroy_name:
+                        _update_weight(destroy_stats[destroy_name], 0.0)
+                    if repair_name:
+                        _update_weight(repair_stats[repair_name], 0.0)
             if global_best_improved:
                 stagnation_iterations = 0
                 global_best_reset_pending = True
@@ -2754,6 +2846,74 @@ def _solve_alns(
                 stagnation_iterations += 1
                 global_best_reset_pending = False
             maximum_stagnation = max(maximum_stagnation, stagnation_iterations)
+
+            # ── Stage 4 segment-based weight update (reject path) ──
+            if (
+                stage04_enabled
+                and stage04_config is not None
+                and not stage04_config.fixed_weights
+                and (iteration + 1) % stage04_config.segment_length == 0
+            ):
+                _apply_stage04_segment_update(
+                    neighborhood_stats if profile is not OperatorProfile.BASELINE
+                    else {**destroy_stats, **repair_stats},
+                    stage04_config,
+                    iteration,
+                    stage04_events,
+                )
+
+            # ── Stage 4 reheating (reject path) ──────────────────
+            if (
+                stage04_enabled
+                and stage04_config is not None
+                and stage04_config.reheat_enabled
+                and reheat_count < stage04_config.max_reheats
+                and stagnation_iterations >= stage04_config.reheat_stagnation_threshold
+            ):
+                reheat_floor = initial_temperature * stage04_config.reheat_factor
+                reheat_count += 1
+                stage04_events.append({
+                    "type": "stage04_reheat",
+                    "iteration": iteration,
+                    "reheat_count": reheat_count,
+                    "reheat_floor": reheat_floor,
+                    "stagnation_iterations": stagnation_iterations,
+                })
+                temperature_history.append((iteration, reheat_floor))
+
+            # ── Stage 4 stagnation restart (reject path) ─────────
+            if (
+                stage04_enabled
+                and stage04_config is not None
+                and stage04_config.restart_enabled
+                and restart_count < stage04_config.max_restarts
+                and stagnation_iterations >= stage04_config.restart_stagnation_threshold
+            ):
+                current = best
+                evaluator.remember_incumbent(current)
+                stagnation_iterations = 0
+                restart_count += 1
+                reheat_floor = initial_temperature * stage04_config.reheat_factor
+                if (
+                    stage04_config.intensification_enabled
+                    and not intensification_active
+                ):
+                    intensification_active = True
+                    intensification_remaining = stage04_config.intensification_iterations
+                stage04_events.append({
+                    "type": "stage04_restart",
+                    "iteration": iteration,
+                    "restart_count": restart_count,
+                    "intensification": intensification_active,
+                    "stagnation_at_trigger": stagnation_iterations,
+                })
+
+            # ── Stage 4 acceptance-rate tracking (reject path) ────
+            if stage04_enabled:
+                acceptance_window.append(False)
+                if len(acceptance_window) > 50:
+                    acceptance_window.pop(0)
+
             effective_iterations += 1
             if measurement_trace is not None:
                 measurement_trace.record_candidate_state(
@@ -2790,41 +2950,74 @@ def _solve_alns(
         if refinement_selected:
             refinement_stats.accepted += 1
             refinement_stats.improved += 1
+            refinement_stats.accepted_improving += 1
+        if candidate.objective is None:
+            raise RuntimeError("accepted ALNS candidate is missing its objective")
+        comparison_result = compare_objectives(candidate.objective, current.objective)
+        is_better = comparison_result is ObjectiveComparison.BETTER
+        is_equal = comparison_result is ObjectiveComparison.EQUAL
+        is_worse = comparison_result is ObjectiveComparison.WORSE
+        veh_reduction_accept = bool(
+            candidate.objective is not None
+            and current.objective is not None
+            and candidate.objective.vehicle_count < current.objective.vehicle_count
+        )
         if profile is OperatorProfile.BASELINE:
             destroy_stats[destroy_name].accepted += 1
             repair_stats[repair_name].accepted += 1
+            if is_better:
+                destroy_stats[destroy_name].improved += 1
+                destroy_stats[destroy_name].accepted_improving += 1
+                repair_stats[repair_name].improved += 1
+                repair_stats[repair_name].accepted_improving += 1
+            elif is_equal:
+                destroy_stats[destroy_name].accepted_equal += 1
+                repair_stats[repair_name].accepted_equal += 1
+            elif is_worse:
+                destroy_stats[destroy_name].accepted_worse += 1
+                repair_stats[repair_name].accepted_worse += 1
         else:
             neighborhood_stats[selected_neighborhood].accepted += 1
-            _update_weight(neighborhood_stats[selected_neighborhood], 1.0)
+            if is_better:
+                neighborhood_stats[selected_neighborhood].improved += 1
+                neighborhood_stats[selected_neighborhood].accepted_improving += 1
+            elif is_equal:
+                neighborhood_stats[selected_neighborhood].accepted_equal += 1
+            elif is_worse:
+                neighborhood_stats[selected_neighborhood].accepted_worse += 1
+            if not (stage04_enabled and stage04_config is not None):
+                _update_weight(neighborhood_stats[selected_neighborhood], 1.0)
             if destroy_name:
                 destroy_stats[destroy_name].accepted += 1
+                if is_better:
+                    destroy_stats[destroy_name].accepted_improving += 1
+                elif is_equal:
+                    destroy_stats[destroy_name].accepted_equal += 1
+                elif is_worse:
+                    destroy_stats[destroy_name].accepted_worse += 1
             if repair_name:
                 repair_stats[repair_name].accepted += 1
-        reward = 1.0
-        if candidate.objective is None:
-            raise RuntimeError("accepted ALNS candidate is missing its objective")
-        if compare_objectives(candidate.objective, current.objective) is ObjectiveComparison.BETTER:
+                if is_better:
+                    repair_stats[repair_name].accepted_improving += 1
+                elif is_equal:
+                    repair_stats[repair_name].accepted_equal += 1
+                elif is_worse:
+                    repair_stats[repair_name].accepted_worse += 1
+        if is_better:
             improved += 1
-            reward = 4.0
-            if profile is OperatorProfile.BASELINE:
-                destroy_stats[destroy_name].improved += 1
-                repair_stats[repair_name].improved += 1
-            else:
-                neighborhood_stats[selected_neighborhood].improved += 1
-                if destroy_name:
-                    destroy_stats[destroy_name].improved += 1
-                if repair_name:
-                    repair_stats[repair_name].improved += 1
         current = candidate
         evaluator.remember_incumbent(current)
         if best.objective is None:
             raise RuntimeError("feasible ALNS incumbent is missing its objective")
-        if compare_objectives(candidate.objective, best.objective) is ObjectiveComparison.BETTER:
+        is_new_global_best = (
+            compare_objectives(candidate.objective, best.objective)
+            is ObjectiveComparison.BETTER
+        )
+        if is_new_global_best:
             best = candidate
             best_time = time.perf_counter() - started
             global_best_improved = True
             main_global_best_improved = True
-            reward = 8.0
             if profile is OperatorProfile.BASELINE:
                 destroy_stats[destroy_name].best += 1
                 repair_stats[repair_name].best += 1
@@ -2834,15 +3027,46 @@ def _solve_alns(
                     destroy_stats[destroy_name].best += 1
                 if repair_name:
                     repair_stats[repair_name].best += 1
-        if profile is OperatorProfile.BASELINE:
-            _update_weight(destroy_stats[destroy_name], reward)
-            _update_weight(repair_stats[repair_name], reward)
+
+        # ── Differentiated reward computation ────────────────────
+        if stage04_enabled and stage04_config is not None:
+            comparison_str = (
+                "better" if is_better else ("equal" if is_equal else "worse")
+            )
+            reward = stage04_config.reward_for(
+                accepted=True,
+                comparison=comparison_str,
+                is_global_best=is_new_global_best,
+                vehicle_reduction=veh_reduction_accept,
+            )
         else:
-            _update_weight(neighborhood_stats[selected_neighborhood], reward)
-            if destroy_name:
+            reward = 1.0
+            if is_better:
+                reward = 4.0
+            if is_new_global_best:
+                reward = 8.0
+
+        # ── Weight feedback ──────────────────────────────────────
+        if stage04_enabled and stage04_config is not None:
+            if profile is OperatorProfile.BASELINE:
+                _stage04_accumulate(destroy_stats[destroy_name], reward)
+                _stage04_accumulate(repair_stats[repair_name], reward)
+            else:
+                _stage04_accumulate(neighborhood_stats[selected_neighborhood], reward)
+                if destroy_name:
+                    _stage04_accumulate(destroy_stats[destroy_name], reward)
+                if repair_name:
+                    _stage04_accumulate(repair_stats[repair_name], reward)
+        else:
+            if profile is OperatorProfile.BASELINE:
                 _update_weight(destroy_stats[destroy_name], reward)
-            if repair_name:
                 _update_weight(repair_stats[repair_name], reward)
+            else:
+                _update_weight(neighborhood_stats[selected_neighborhood], reward)
+                if destroy_name:
+                    _update_weight(destroy_stats[destroy_name], reward)
+                if repair_name:
+                    _update_weight(repair_stats[repair_name], reward)
 
         if measurement_trace is not None:
             measurement_trace.record_candidate_state(
@@ -2874,6 +3098,85 @@ def _solve_alns(
             stagnation_iterations += 1
             global_best_reset_pending = False
         maximum_stagnation = max(maximum_stagnation, stagnation_iterations)
+
+        # ── Stage 4 segment-based weight update ───────────────────
+        if (
+            stage04_enabled
+            and stage04_config is not None
+            and not stage04_config.fixed_weights
+            and (iteration + 1) % stage04_config.segment_length == 0
+        ):
+            _apply_stage04_segment_update(
+                neighborhood_stats if profile is not OperatorProfile.BASELINE
+                else {**destroy_stats, **repair_stats},
+                stage04_config,
+                iteration,
+                stage04_events,
+            )
+
+        # ── Stage 4 reheating ────────────────────────────────────
+        if (
+            stage04_enabled
+            and stage04_config is not None
+            and stage04_config.reheat_enabled
+            and reheat_count < stage04_config.max_reheats
+            and stagnation_iterations >= stage04_config.reheat_stagnation_threshold
+        ):
+            reheat_floor = initial_temperature * stage04_config.reheat_factor
+            reheat_count += 1
+            stage04_events.append({
+                "type": "stage04_reheat",
+                "iteration": iteration,
+                "reheat_count": reheat_count,
+                "reheat_floor": reheat_floor,
+                "stagnation_iterations": stagnation_iterations,
+            })
+            temperature_history.append((iteration, reheat_floor))
+
+        # ── Stage 4 stagnation restart ───────────────────────────
+        if (
+            stage04_enabled
+            and stage04_config is not None
+            and stage04_config.restart_enabled
+            and restart_count < stage04_config.max_restarts
+            and stagnation_iterations >= stage04_config.restart_stagnation_threshold
+        ):
+            current = best
+            evaluator.remember_incumbent(current)
+            stagnation_iterations = 0
+            restart_count += 1
+            reheat_floor = initial_temperature * stage04_config.reheat_factor
+            if (
+                stage04_config.intensification_enabled
+                and not intensification_active
+            ):
+                intensification_active = True
+                intensification_remaining = stage04_config.intensification_iterations
+            stage04_events.append({
+                "type": "stage04_restart",
+                "iteration": iteration,
+                "restart_count": restart_count,
+                "intensification": intensification_active,
+                "stagnation_at_trigger": stagnation_iterations,
+            })
+
+        # ── Stage 4 incumbent intensification ────────────────────
+        if intensification_active:
+            if intensification_remaining > 0:
+                intensification_remaining -= 1
+            else:
+                intensification_active = False
+                stage04_events.append({
+                    "type": "stage04_intensification_end",
+                    "iteration": iteration,
+                })
+
+        # ── Stage 4 acceptance-rate tracking ─────────────────────
+        if stage04_enabled:
+            acceptance_window.append(accept)
+            if len(acceptance_window) > 50:
+                acceptance_window.pop(0)
+
         effective_iterations += 1
         if (
             candidate_control_runtime is not None
@@ -3026,6 +3329,58 @@ def _solve_alns(
             if candidate_control_runtime is not None
             else ""
         ),
+        stage04_statistics=(
+            {
+                "enabled": stage04_enabled,
+                "reheat_count": reheat_count,
+                "restart_count": restart_count,
+                "intensification_active": intensification_active,
+                "acceptance_rate": (
+                    sum(acceptance_window) / len(acceptance_window)
+                    if acceptance_window
+                    else 0.0
+                ),
+                "segment_length": (
+                    stage04_config.segment_length
+                    if stage04_enabled and stage04_config is not None
+                    else 0
+                ),
+                "min_calls_per_operator": (
+                    stage04_config.min_calls_per_operator
+                    if stage04_enabled and stage04_config is not None
+                    else 0
+                ),
+                "fixed_weights": (
+                    stage04_config.fixed_weights
+                    if stage04_enabled and stage04_config is not None
+                    else False
+                ),
+                "auto_temperature": (
+                    stage04_config.auto_temperature
+                    if stage04_enabled and stage04_config is not None
+                    else False
+                ),
+                "initial_temperature": initial_temperature,
+                "maximum_stagnation": maximum_stagnation,
+            }
+            if stage04_enabled
+            else {}
+        ),
+        stage04_weight_history=(
+            {
+                name: list(stats.weight_history)
+                for name, stats in (
+                    neighborhood_stats.items()
+                    if profile is not OperatorProfile.BASELINE
+                    else {**destroy_stats, **repair_stats}.items()
+                )
+                if stats.weight_history
+            }
+            if stage04_enabled
+            else {}
+        ),
+        stage04_temperature_history=tuple(temperature_history),
+        stage04_event_log=tuple(stage04_events),
     )
 
 
@@ -3049,8 +3404,9 @@ def solve_alns(
     candidate_control_config: CandidateControlConfig | None = None,
     initial_customer_sequences: tuple[tuple[str, ...], ...] | None = None,
     initial_solution_provenance: Mapping[str, object] | None = None,
+    stage04_config: Stage04Config | None = None,
 ) -> ALNSResult:
-    """Solve ALNS with opt-in Stage 3.0--3.4 evaluation layers."""
+    """Solve ALNS with opt-in Stage 3.0--3.4 and Stage 4 evaluation layers."""
 
     if (
         exact_deadline_config is not None
@@ -3076,6 +3432,12 @@ def solve_alns(
         and ExactChargingBackend(backend) is not ExactChargingBackend.CPU_BATCH
     ):
         raise ValueError("Stage 3.4 candidate control requires the cpu_batch backend")
+    if (
+        stage04_config is not None
+        and stage04_config.enabled
+        and ExactChargingBackend(backend) is not ExactChargingBackend.CPU_BATCH
+    ):
+        raise ValueError("Stage 4 adaptive weights requires the cpu_batch backend")
     candidate_control_runtime = (
         CandidateControlRuntime(candidate_control_config)
         if candidate_control_enabled and candidate_control_config is not None
@@ -3132,6 +3494,7 @@ def solve_alns(
                 candidate_control_runtime=candidate_control_runtime,
                 initial_customer_sequences=initial_customer_sequences,
                 initial_solution_provenance=initial_solution_provenance,
+                stage04_config=stage04_config,
             )
         finally:
             if candidate_control_runtime is not None:
@@ -3168,6 +3531,7 @@ def solve_alns(
             candidate_control_runtime=candidate_control_runtime,
             initial_customer_sequences=initial_customer_sequences,
             initial_solution_provenance=initial_solution_provenance,
+            stage04_config=stage04_config,
         )
     except BaseException as error:
         if candidate_control_runtime is not None:
@@ -3644,6 +4008,114 @@ def _weighted_choice(rng: random.Random, statistics: dict[str, OperatorStatistic
 
 def _update_weight(statistics: OperatorStatistics, reward: float, reaction: float = 0.2) -> None:
     statistics.weight = max(0.05, (1.0 - reaction) * statistics.weight + reaction * reward)
+
+
+def _estimate_initial_temperature(
+    instance: Instance,
+    current: _EvaluatedSolution,
+    evaluator: _Evaluator,
+    rng: random.Random,
+    config: Stage04Config,
+) -> float:
+    """Estimate the SA initial temperature by sampling random worse moves.
+
+    A small sample of random destroy-repair cycles is evaluated.  The
+    positive distance deltas are used to compute the temperature that
+    yields the target worse-solution acceptance rate::
+
+        T = -mean_delta / ln(target_rate)
+
+    Falls back to the legacy ``distance * fallback_fraction`` heuristic
+    if sampling does not produce enough positive deltas.
+    """
+    if current.objective is None:
+        return max(1.0, 1_000.0 * config.temperature_fallback_fraction)
+    distance_deltas: list[float] = []
+    sequences = list(current.sequences)
+    sample = min(config.temperature_sample_size, max(5, len(instance.customers)))
+    for _ in range(sample):
+        if len(sequences) <= 1:
+            break
+        shuffled = sequences[:]
+        rng.shuffle(shuffled)
+        # merge two random routes as a proxy for a worse candidate
+        idx1, idx2 = rng.randrange(len(shuffled)), rng.randrange(len(shuffled))
+        if idx1 == idx2:
+            continue
+        r1, r2 = shuffled[idx1], shuffled[idx2]
+        merged = (*r1, *r2)
+        remaining = [s for j, s in enumerate(shuffled) if j not in (idx1, idx2)]
+        candidate_sequences = (*remaining, merged)
+        try:
+            candidate = evaluator.solution(candidate_sequences)
+        except _TimeLimitReached:
+            continue
+        if (
+            candidate.feasible
+            and candidate.objective is not None
+            and current.objective is not None
+        ):
+            delta = candidate.objective.total_distance - current.objective.total_distance
+            if delta > 0:
+                distance_deltas.append(delta)
+    if len(distance_deltas) < 3:
+        return max(
+            1.0,
+            current.objective.total_distance * config.temperature_fallback_fraction,
+        )
+    mean_delta = sum(distance_deltas) / len(distance_deltas)
+    if mean_delta <= 0:
+        return max(
+            1.0,
+            current.objective.total_distance * config.temperature_fallback_fraction,
+        )
+    target = config.temperature_target_acceptance_rate
+    temperature = -mean_delta / math.log(target)
+    return max(1.0, temperature)
+
+
+def _apply_stage04_segment_update(
+    all_stats: dict[str, OperatorStatistics],
+    config: Stage04Config,
+    iteration: int,
+    events: list[dict[str, object]],
+) -> None:
+    """Apply the segment-based weight update to every operator.
+
+    Only operators with at least ``min_calls_per_operator`` calls in the
+    current segment have their weight updated.  Segment accumulators are
+    reset after the update.  The weight change is logged.
+    """
+    for name, stats in all_stats.items():
+        if stats.segment_calls < config.min_calls_per_operator:
+            stats.segment_calls = 0
+            stats.segment_reward_sum = 0.0
+            continue
+        old_weight = stats.weight
+        new_weight = config.apply_segment_update(
+            stats.weight,
+            stats.segment_reward_sum,
+            stats.segment_calls,
+        )
+        stats.weight = new_weight
+        stats.weight_history.append((iteration, new_weight))
+        events.append({
+            "type": "stage04_segment_update",
+            "operator": name,
+            "iteration": iteration,
+            "old_weight": old_weight,
+            "new_weight": new_weight,
+            "segment_calls": stats.segment_calls,
+            "segment_reward_sum": stats.segment_reward_sum,
+        })
+        stats.segment_calls = 0
+        stats.segment_reward_sum = 0.0
+
+
+def _stage04_accumulate(stats: OperatorStatistics, reward: float) -> None:
+    """Accumulate reward into the segment buffer."""
+    stats.segment_reward_sum += reward
+    stats.segment_calls += 1
 
 
 def _select_stage02_neighborhood(
