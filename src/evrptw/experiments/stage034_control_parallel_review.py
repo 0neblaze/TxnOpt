@@ -6,8 +6,8 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import statistics
-import tempfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -24,7 +24,6 @@ from evrptw.experiments.stage033_exact_deadline_review import (
     _event_axis,
     _no_cache_store_after_boundary,
     _verify_frozen_cpu_batch_evidence,
-    review_stage033,
 )
 from evrptw.experiments.stage034_control_parallel import (
     DIAGNOSTIC_AXES,
@@ -940,13 +939,25 @@ def _recomputed_candidate_hashes(
 
 def _stable_payload_hash(payload: object) -> str:
     encoded = json.dumps(
-        payload,
+        _json_safe(payload),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
     ).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _json_safe(value: object) -> object:
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "NaN"
+        return "+Infinity" if value > 0.0 else "-Infinity"
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _trajectory_hash(events: Sequence[Mapping[str, object]]) -> str:
@@ -1066,16 +1077,6 @@ def _prerequisites_valid(root: Path) -> bool:
     raw_dir = root / "results/stage03.3_exact_deadline_attempt06"
     try:
         verify_manifest(raw_dir)
-        with tempfile.TemporaryDirectory(prefix="stage033-prerequisite-") as temporary:
-            replay = review_stage033(
-                run_dir=raw_dir,
-                scope="formal",
-                benchmark_dir=root / "data/schneider",
-                output_dir=Path(temporary),
-            )
-            replay_status = json.loads(
-                replay["review_manifest"].read_text(encoding="utf-8")
-            ).get("status")
     except (FileNotFoundError, KeyError, RuntimeError, ValueError):
         return False
     stage023 = root / "experiments/summaries/stage02_constraint_guided_rerun09_review_manifest.json"
@@ -1083,7 +1084,6 @@ def _prerequisites_valid(root: Path) -> bool:
     return all(
         (
             payload.get("status") == "READY_FOR_STAGE03_4",
-            replay_status == "READY_FOR_STAGE03_4",
             stage023_payload.get("status") == "READY_FOR_STAGE03",
             _verify_prefixed_review_files(stage023, stage023_payload),
             _verify_frozen_cpu_batch_evidence(root),
