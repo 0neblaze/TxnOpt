@@ -137,4 +137,4 @@ incremental_relocate = true
 incremental_swap = true
 station_reachability_bitset = true
 charging_configuration_version = "full_recharge_v1"
-objective_schema_version = "lexicographic_v1"
+objective_schema_version = "vehicles,distance,charging_time,charging_count"
