@@ -9,9 +9,9 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from evrptw.artifacts import ArtifactReader, find_manifest, verify_manifest
-
 from publish_stage033_artifacts import REGISTRY_FIELDS, instance_seed, load_json, sha256
+
+from evrptw.artifacts import ArtifactReader, find_manifest, verify_manifest
 
 SMOKE_LABEL = "stage03.4_control_parallel_attempt10"
 FORMAL_LABEL = "stage03.4_control_parallel_attempt11"
@@ -171,6 +171,10 @@ def _rows_for_run(root: Path, run_dir: Path) -> list[dict[str, object]]:
             expected = review_manifest.get("files", {}).get(path.name)
             if expected is not None and expected != sha256(path):
                 raise RuntimeError(f"review checksum mismatch: {path}")
+            row_count: int | str = ""
+            if path.suffix == ".csv" and path.stat().st_size > 0:
+                with path.open(encoding="utf-8") as handle:
+                    row_count = sum(1 for _ in handle) - 1
             rows.append(
                 {
                     **base,
@@ -187,9 +191,7 @@ def _rows_for_run(root: Path, run_dir: Path) -> list[dict[str, object]]:
                     "compression": "none",
                     "retention_class": "review",
                     "schema_fingerprint": "",
-                    "row_count": sum(1 for _ in path.open(encoding="utf-8")) - 1
-                    if path.suffix == ".csv"
-                    else "",
+                    "row_count": row_count,
                     "byte_size": path.stat().st_size,
                 }
             )

@@ -1080,7 +1080,12 @@ def _prerequisites_valid(root: Path) -> bool:
     except (FileNotFoundError, KeyError, RuntimeError, ValueError):
         return False
     stage023 = root / "experiments/summaries/stage02_constraint_guided_rerun09_review_manifest.json"
-    stage023_payload = json.loads(stage023.read_text(encoding="utf-8"))
+    if not stage023.is_file():
+        return False
+    try:
+        stage023_payload = json.loads(stage023.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return False
     return all(
         (
             payload.get("status") == "READY_FOR_STAGE03_4",
