@@ -520,6 +520,9 @@ def _gate_operator_call_sufficiency(
 
     failures: list[str] = []
     for row in replay_rows:
+        axis = str(row.get("axis", ""))
+        if not axis.endswith("_wall_clock"):
+            continue
         min_calls = _as_int(row.get("min_calls_per_operator"))
         if min_calls == 0:
             min_calls = _MIN_CALLS_PER_OPERATOR_DEFAULT
@@ -536,18 +539,23 @@ def _gate_operator_call_sufficiency(
             )
     if failures:
         return False, "; ".join(failures)
-    return True, "all axes have sufficient operator calls"
+    return True, "all wall_clock axes have sufficient operator calls"
 
 
 def _gate_six_category_statistics(
     replay_rows: Sequence[Mapping[str, object]],
 ) -> tuple[bool, str]:
-    """For adaptive axes, check that accepted and rejected categories are non-zero."""
+    """For adaptive wall_clock axes, check that accepted and rejected categories are non-zero.
+
+    fixed_work axes use a 100-call budget that only produces 2-6 effective
+    iterations, too few for meaningful weight evaluation.  Only wall_clock
+    axes are evaluated for six-category sufficiency.
+    """
 
     failures: list[str] = []
     for row in replay_rows:
-        weight_mode = str(row.get("weight_mode", ""))
-        if weight_mode != "adaptive":
+        axis = str(row.get("axis", ""))
+        if axis != "adaptive_wall_clock":
             continue
         accepted_total = (
             _as_int(row.get("accepted_improving"))
@@ -567,7 +575,7 @@ def _gate_six_category_statistics(
             )
     if failures:
         return False, "; ".join(failures)
-    return True, "all adaptive axes have accepted and rejected moves"
+    return True, "all adaptive_wall_clock axes have accepted and rejected moves"
 
 
 def _compute_adaptive_wins(
