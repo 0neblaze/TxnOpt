@@ -424,6 +424,53 @@ this repository or one of its subdirectories.
   `experiments/registries/stage04_artifact_registry.csv` and the manifest is
   `experiments/manifests/stage04_adaptive_weights_artifact_manifest.json`.
 
+## Stage 5.1 Best-Known Values Policy
+
+- Stage 5.1 uses component `best_known` and canonical labels
+  `stage05.1_best_known_attemptNN` or `stage05.1_best_known_rerunNN`. The
+  entry prerequisite is Stage 4 `READY_FOR_STAGE05`.
+- The runner does not invoke `solve_alns`. Its evidence is the collected
+  best-known-solution (BKS) reference data from `evrptw.best_known`, not a
+  solver output. The runner requires a clean main-repository commit before it
+  starts and writes raw evidence only under a new ignored `results/` run
+  directory.
+- BKS data sources are formally published journal articles only. Small
+  instances (5, 10, 15 customers) use Schneider, Stenger & Goeke (2014)
+  Table 5 CPLEX optimal values, with RC204-15 updated to the VNS/TS value
+  from the same table. Large instances (100 customers) use Keskin & Çatay
+  (2016) Table 2, which compiles the best-known values from SSG, Goeke &
+  Schneider (2015), and Hiermann et al. (2016). Goeke & Schneider is not in
+  the VOR collection; its DOI was verified via CrossRef but the PDF was not
+  stored locally.
+- Instance name mapping: paper notation `C101-5` maps to repository
+  `c101C5` (lowercase, replace hyphen with `C`); paper `c101` maps to
+  `c101_21` (append `_21` suffix for Solomon 100-customer instances). All 92
+  instances (36 small + 56 large) have BKS values. Charging time and charging
+  count are never reported in published BKS tables and are always `unknown`.
+- Model compatibility is assessed across five dimensions: charging model
+  (full recharge — compatible), objective function (published BKS uses
+  lexicographic vehicle-count-first distance minimization without charging-time
+  or charging-count terms — incompatible), distance metric (published BKS may
+  use rounded Euclidean — incompatible), time windows (compatible), and vehicle
+  parameters (compatible). Overall compatibility is `False`.
+- Because the models are not completely identical, no gap computation is
+  performed. All 92 instances are marked `model_compatible=False` in
+  `experiments/baselines/schneider_best_known.csv` with a compatibility note
+  explaining the objective mismatch. No estimated, backfilled, or
+  model-inconsistent gap is reported.
+- The independent review CLI verifies five gates: `instance_coverage` (all
+  92 instances present), `bks_values_present` (no `unknown` distance or
+  vehicle values), `no_gap_computation` (no gap columns in the BKS CSV),
+  `compatibility_assessment_correct` (CSV matches the canonical
+  `COMPATIBILITY_ASSESSMENT`), and `replay_consistency` (CSV values match the
+  canonical `BEST_KNOWN_VALUES`). The review reports `READY_FOR_STAGE05_2`
+  only when all five gates pass.
+- The accepted evidence will use `stage05.1_best_known_attempt01` after a
+  clean commit run. The artifact registry will be
+  `experiments/registries/stage05.1_artifact_registry.csv` and the manifest
+  will be `experiments/manifests/stage05.1_best_known_artifact_manifest.json`,
+  published only after formal review passes.
+
 ## Experiment Artifact Storage v2
 
 - All new Stage 0–8 runs must use an enabled `[artifact_storage]` configuration

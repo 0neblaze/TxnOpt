@@ -702,6 +702,18 @@ Stage 5 的 pilot、完整 benchmark 和所有仍调用 exact charging 的 ablat
 4. 模型不一致的结果单独列出，禁止直接比较；
 5. 对没有 best-known value 的实例，报告 `unknown`，不能估算或补填。
 
+##### 实施结果（2026-07-15）
+
+Stage 5.1 已完成实现。BKS 数据来自三篇正式发表的期刊文章：Schneider, Stenger & Goeke (2014) Table 5 提供小规模实例（5/10/15 customers）的 CPLEX 最优值，其中 RC204-15 使用 VNS/TS 改进值；Keskin & Çatay (2016) Table 2 提供大规模实例（100 customers）的汇编最佳已知值，该表整合了 SSG、Goeke & Schneider (2015) 和 Hiermann et al. (2016) 的结果。Goeke & Schneider 的 DOI 已通过 CrossRef 验证，但其 PDF 尚未纳入本地 VOR 文献库。
+
+实例命名映射：文献记法 `C101-5` 映射为仓库 `c101C5`（小写，连字符替换为 `C`）；文献记法 `c101` 映射为 `c101_21`（追加 Solomon 100-customer 后缀）。全部 92 个实例（36 小规模 + 56 大规模）均有 BKS 车辆数和距离值。充电时间和充电次数在已发表的 BKS 表格中从不报告，统一记为 `unknown`。
+
+模型兼容性评估覆盖五个维度：充电模型（满充——兼容）、目标函数（已发表 BKS 使用以车辆数优先的距离最小化，不含充电时间或充电次数项——不兼容）、距离度量（已发表 BKS 可能使用四舍五入的欧氏距离——不兼容）、时间窗（兼容）、车辆参数（兼容）。总体兼容性为 `False`。由于模型不完全一致，不进行 gap 计算；所有 92 个实例在 `experiments/baselines/schneider_best_known.csv` 中标记 `model_compatible=False`。
+
+实现文件：核心数据模块 `src/evrptw/best_known.py`（92 条 BKS 记录、源文献引用、兼容性评估）；实验 runner `src/evrptw/experiments/stage051_best_known.py`；独立审查 CLI `src/evrptw/experiments/stage051_best_known_review.py`（5 个 gate：`instance_coverage`、`bks_values_present`、`no_gap_computation`、`compatibility_assessment_correct`、`replay_consistency`）；配置 `configs/stage051_best_known.toml`；文档 `docs/stage051_best_known.md`；单元测试 `tests/test_stage051.py`（48 个测试全部通过）。Ruff 和 mypy 均通过，全仓库 254 个测试通过。
+
+正式运行需要 clean commit 后执行；审查通过后发布 `experiments/registries/stage05.1_artifact_registry.csv` 和 `experiments/manifests/stage05.1_best_known_artifact_manifest.json`，审查状态为 `READY_FOR_STAGE05_2`。
+
 #### 5.2 扩展 benchmark
 
 本部分产物前缀固定为 `stage05.2_benchmark`，manifest 的 component 记录为 `benchmark`。
