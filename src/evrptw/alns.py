@@ -1356,7 +1356,7 @@ class _Evaluator:
                 selected_misses.append(index)
         granted = runtime.reserve(
             len(selected_misses),
-            atomic=False,
+            atomic=True,
             context=f"{self.lane}:{self.operator}:candidate_pool",
         )
         active_indices = tuple(selected_misses[:granted])
@@ -1862,6 +1862,13 @@ def _solve_alns(
                     allow_vehicle_increase=True,
                 )
                 initial_sequences = selected_initial or ()
+            if candidate_control_runtime is not None and initial_customer_sequences is None:
+                initial_sequences = _refine_controlled_initial_solution(
+                    instance,
+                    initial_sequences,
+                    evaluator,
+                    vehicle_config,
+                )
     except _TimeLimitReached:
         return _failed_result(
             started,
@@ -2873,12 +2880,15 @@ def _solve_alns(
             and fixed_exact_calls
             and exact_call_controller is not None
         ):
-            if exact_call_controller.started_calls == round_started_calls:
+            if (
+                exact_call_controller.started_calls == round_started_calls
+            ):
                 no_exact_rounds += 1
             else:
                 no_exact_rounds = 0
             if (
-                effective_iterations >= 50
+                effective_iterations
+                >= candidate_control_runtime.config.min_iterations_before_exhaustion
                 and no_exact_rounds
                 >= candidate_control_runtime.config.fixed_work_exhaustion_rounds
             ):
@@ -3273,6 +3283,31 @@ def _construct_initial_solution(
     return tuple(sequences)
 
 
+def _refine_controlled_initial_solution(
+    instance: Instance,
+    sequences: tuple[tuple[str, ...], ...],
+    evaluator: _Evaluator,
+    vehicle_config: VehicleOperatorConfig,
+) -> tuple[tuple[str, ...], ...]:
+    """Greedily consume ranked feasible route merges before ALNS sampling."""
+
+    current = sequences
+    for _ in range(len(sequences)):
+        proposal = propose_route_merge(
+            instance,
+            current,
+            evaluator,
+            config=vehicle_config,
+        )
+        if proposal.sequences is None or len(proposal.sequences) >= len(current):
+            break
+        candidate = evaluator.solution(proposal.sequences)
+        if not candidate.feasible:
+            break
+        current = candidate.sequences
+    return current
+
+
 def _construct_large_initial_solution(
     instance: Instance,
     customers: list[Node],
@@ -3366,10 +3401,16 @@ def _split_until_charging_feasible(
         return (sequence,)
     if len(sequence) <= 1:
         return ()
+    if evaluator.candidate_control_runtime is not None:
+        for split_index in range(1, len(sequence)):
+            left_part = sequence[:split_index]
+            right_part = sequence[split_index:]
+            if evaluator.route(left_part).feasible and evaluator.route(right_part).feasible:
+                return (left_part, right_part)
     midpoint = len(sequence) // 2
-    left = _split_until_charging_feasible(sequence[:midpoint], evaluator)
-    right = _split_until_charging_feasible(sequence[midpoint:], evaluator)
-    return (*left, *right) if left and right else ()
+    left_splits = _split_until_charging_feasible(sequence[:midpoint], evaluator)
+    right_splits = _split_until_charging_feasible(sequence[midpoint:], evaluator)
+    return (*left_splits, *right_splits) if left_splits and right_splits else ()
 
 
 def _destroy(

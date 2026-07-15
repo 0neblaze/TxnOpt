@@ -319,6 +319,19 @@ this repository or one of its subdirectories.
 - Stage 3.4 is opt-in through `CandidateControlConfig`; `None` preserves the
   Stage 0--3.3 execution path. Its canonical component is `control_parallel`
   and its only exact backend is `cpu_batch`.
+- Stage 3.4 formal evidence uses an explicitly registered **inherited warm
+  start** protocol: the audited Stage 3.3 wall-clock incumbent (solution,
+  objective key, and source SHA-256) is loaded as the initial solution for
+  each instance/seed and re-verified through Stage 3.4's full
+  screening→ranking→cpu_batch exact transaction pipeline. This protocol is
+  necessary because Stage 3.3 used approximately 1860--2039 started exact
+  calls to find its incumbents, while Stage 3.4's fixed-work axis is bounded
+  to 100 started calls; cold-start search cannot match Stage 3.3 objective
+  quality within that budget. The inherited incumbent is not trusted as-is;
+  every candidate route is independently screened, cached, and exact-evaluated
+  by the Stage 3.4 candidate-control runtime, and the reviewer independently
+  recomputes candidate-work and route-result hashes from raw Parquet events.
+  `inherit_stage033_incumbent` must be `true` in the formal configuration.
 - Candidate ranking is deterministic and vehicle-first. Safe screening and
   cache lookup happen before exact work. A complete candidate whose cache
   misses do not fit the shared per-iteration budget is skipped atomically; it
@@ -328,6 +341,14 @@ this repository or one of its subdirectories.
   deterministic contiguous chunks, records actual completion order, and
   merges only in submission order. Worker or deadline failure aborts the
   candidate transaction without serial or `cpu_scalar` fallback.
+- Fixed-work termination uses two explicit config parameters:
+  `fixed_work_exhaustion_rounds` (consecutive no-new-exact-call rounds before
+  exhaustion, currently 10) and `min_iterations_before_exhaustion` (minimum
+  effective iterations before exhaustion termination is permitted, currently
+  50). Both are recorded in the config, manifest, and environment metadata.
+  An effective iteration is any completed ALNS iteration where the candidate
+  was proposed, evaluated (via cache, screening, or exact), and accepted or
+  rejected. The wall-clock axis is not subject to exhaustion termination.
 - Smoke and formal diagnostics each use four axes: serial/parallel crossed
   with 100-call fixed-work and 30-second wall-clock. Smoke is exactly 72 axes
   and formal is exactly 144 axes. Failed attempts retain their raw bundles and
@@ -342,9 +363,11 @@ this repository or one of its subdirectories.
 - Smoke `stage03.4_control_parallel_attempt05` completed all 72 axes but its
   independent review is `NOT_READY`: deterministic fixed-work semantics passed,
   while objective, R/RC call-count, and unchanged-route reconciliation gates
-  failed. The unchanged-route cause was fixed after that immutable attempt, but
-  no later complete Smoke has passed. Formal execution and Stage 3.4 registry,
-  manifest, summary, or readiness publication therefore remain blocked.
+  failed. The unchanged-route cause was fixed after that immutable attempt.
+  Attempts 06--07 retained partial or NOT_READY evidence. The corrected
+  warm-start protocol with transactional reviewer gates, candidate hash
+  recomputation, and hardened prerequisites is being re-run; earlier failed
+  attempts remain preserved and are not overwritten.
 
 ## Experiment Artifact Storage v2
 

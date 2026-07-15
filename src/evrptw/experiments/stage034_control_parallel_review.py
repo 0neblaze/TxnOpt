@@ -7,6 +7,7 @@ import csv
 import hashlib
 import json
 import statistics
+import tempfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -17,8 +18,13 @@ from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES, FORMAL_
 from evrptw.experiments.stage03_measurement import SMOKE_INSTANCES
 from evrptw.experiments.stage033_exact_deadline_review import (
     _artifact_groups,
+    _cache_lifecycle_valid,
+    _candidate_rollbacks_are_transactional,
+    _deadline_context_is_transactional,
     _event_axis,
+    _no_cache_store_after_boundary,
     _verify_frozen_cpu_batch_evidence,
+    review_stage033,
 )
 from evrptw.experiments.stage034_control_parallel import (
     DIAGNOSTIC_AXES,
@@ -189,6 +195,7 @@ def review_stage034(
     for (instance_name, seed), artifacts in sorted(grouped.items()):
         raw = reader.read_json(artifacts["raw"])
         solution = reader.read_json(artifacts["solution"])
+        trace_index = reader.trace_index(artifacts["trace"])
         events = reader.read_events(artifacts["events"])
         environment = reader.read_json(artifacts["environment"])
         route_dictionary = reader.read_parquet(artifacts["route_dictionary"])
@@ -200,6 +207,18 @@ def review_stage034(
             for item in route_dictionary
         }
         route_ids = set(route_sequences)
+        lane_dictionary = {
+            int(key): str(value)
+            for key, value in _object(
+                trace_index.get("lane_dictionary"), "lane dictionary"
+            ).items()
+        }
+        operator_dictionary = {
+            int(key): str(value)
+            for key, value in _object(
+                trace_index.get("operator_dictionary"), "operator dictionary"
+            ).items()
+        }
         route_references_valid = all(
             event.get(field) is None or int(event[field]) in route_ids
             for event in events
@@ -245,6 +264,16 @@ def review_stage034(
             exact_reconciliation_valid = event_started == _as_int(
                 raw_axis.get("started_calls")
             ) and event_completed == _as_int(raw_axis.get("completed_calls"))
+            cache_lifecycle_valid = _cache_lifecycle_valid(axis_events)
+            candidate_transaction_valid = _candidate_rollbacks_are_transactional(
+                axis_events
+            )
+            deadline_transaction_valid = all(
+                (
+                    _deadline_context_is_transactional(axis_events),
+                    _no_cache_store_after_boundary(axis_events),
+                )
+            )
             candidate_valid, candidate_details = _candidate_control_valid(
                 axis_events,
                 max_round_budget=max_round_budget,
@@ -260,6 +289,19 @@ def review_stage034(
                 seed=seed,
                 expected_objective=baseline_key,
                 route_sequences=route_sequences,
+            )
+            candidate_work_hash, route_result_hash = _recomputed_candidate_hashes(
+                decoded_events,
+                route_sequences,
+                lane_dictionary,
+                operator_dictionary,
+                axis,
+            )
+            candidate_hashes_valid = all(
+                (
+                    candidate_work_hash == raw_axis.get("candidate_work_hash"),
+                    route_result_hash == raw_axis.get("route_result_hash"),
+                )
             )
             objective_not_worse = (
                 True
@@ -279,7 +321,11 @@ def review_stage034(
                     candidate_valid,
                     ordering_valid,
                     exact_reconciliation_valid,
+                    cache_lifecycle_valid,
+                    candidate_transaction_valid,
+                    deadline_transaction_valid,
                     inherited_initial_valid,
+                    candidate_hashes_valid,
                     unchanged_exact == 0,
                     environment.get("repository_dirty") is False,
                     environment.get("exact_backend") == "cpu_batch",
@@ -299,8 +345,14 @@ def review_stage034(
                 "unchanged_exact_calls": unchanged_exact,
                 "candidate_reconciliation_valid": candidate_valid,
                 "exact_reconciliation_valid": exact_reconciliation_valid,
+                "cache_lifecycle_valid": cache_lifecycle_valid,
+                "candidate_transaction_valid": candidate_transaction_valid,
+                "deadline_transaction_valid": deadline_transaction_valid,
                 "parallel_ordering_valid": ordering_valid,
                 "inherited_initial_solution_valid": inherited_initial_valid,
+                "candidate_hashes_valid": candidate_hashes_valid,
+                "recomputed_candidate_work_hash": candidate_work_hash,
+                "recomputed_route_result_hash": route_result_hash,
                 "paired_semantics_valid": False,
                 "candidate_work_hash": str(raw_axis.get("candidate_work_hash") or ""),
                 "route_result_hash": str(raw_axis.get("route_result_hash") or ""),
@@ -545,11 +597,7 @@ def _candidate_control_valid(
         per_iteration[key] = per_iteration.get(key, 0) + _as_int(event.get("granted"))
     max_granted = max(per_iteration.values(), default=0)
     atomic_budgets = all(
-        (
-            0 <= _as_int(event.get("granted")) <= _as_int(event.get("requested"))
-            if str(event.get("context", "")).endswith(":candidate_pool")
-            else _as_int(event.get("granted")) in {0, _as_int(event.get("requested"))}
-        )
+        _as_int(event.get("granted")) in {0, _as_int(event.get("requested"))}
         and _as_int(event.get("remaining")) >= 0
         and (
             event.get("status") == "global_budget_atomic_skip"
@@ -844,6 +892,63 @@ def _decoded_event(event: Mapping[str, object]) -> dict[str, object]:
     return output
 
 
+def _recomputed_candidate_hashes(
+    events: Sequence[Mapping[str, object]],
+    route_sequences: Mapping[int, tuple[str, ...]],
+    lane_dictionary: Mapping[int, str],
+    operator_dictionary: Mapping[int, str],
+    axis: str,
+) -> tuple[str, str]:
+    work = []
+    results = []
+    for event in events:
+        event_type = event.get("event_type")
+        sequences = _event_customer_sequences(event, route_sequences)
+        if event_type == "parallel_batch":
+            work.append(
+                {
+                    "lane": lane_dictionary.get(_as_int(event.get("lane_id")), "").removeprefix(
+                        f"{axis}:"
+                    ),
+                    "iteration": event.get("iteration"),
+                    "operator": operator_dictionary.get(
+                        _as_int(event.get("operator_id")), ""
+                    ),
+                    "sequences": [list(sequence) for sequence in sequences],
+                }
+            )
+        elif event_type == "candidate_route_result" and len(sequences) == 2:
+            results.append(
+                {
+                    "sequence": list(sequences[0]),
+                    "result": {
+                        "feasible": bool(event.get("feasible")),
+                        "route": list(sequences[1]),
+                        "distance": _as_float(event.get("distance")),
+                        "total_energy": _as_float(event.get("total_energy")),
+                        "charged_energy": _as_float(event.get("charged_energy")),
+                        "charging_time": _as_float(event.get("charging_time")),
+                        "labels_generated": _as_int(event.get("labels_generated")),
+                        "labels_expanded": _as_int(event.get("labels_expanded")),
+                        "labels_pruned": _as_int(event.get("labels_pruned")),
+                        "failure_reason": str(event.get("failure_reason", "")),
+                    },
+                }
+            )
+    return _stable_payload_hash(work), _stable_payload_hash(results)
+
+
+def _stable_payload_hash(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _trajectory_hash(events: Sequence[Mapping[str, object]]) -> str:
     trajectory = [
         {
@@ -947,14 +1052,56 @@ def _inherited_initial_solution_valid(
 
 
 def _prerequisites_valid(root: Path) -> bool:
-    stage033 = root / (
-        "experiments/summaries/stage03.3_exact_deadline_attempt06_review/review_manifest.json"
-    )
+    review_dir = root / "experiments/summaries/stage03.3_exact_deadline_attempt06_review"
+    stage033 = review_dir / "review_manifest.json"
     if not stage033.is_file():
         return False
     payload = json.loads(stage033.read_text(encoding="utf-8"))
-    return payload.get("status") == "READY_FOR_STAGE03_4" and _verify_frozen_cpu_batch_evidence(
-        root
+    declared_files = payload.get("files")
+    if not isinstance(declared_files, Mapping) or any(
+        _sha256(review_dir / str(name)) != str(digest)
+        for name, digest in declared_files.items()
+    ):
+        return False
+    raw_dir = root / "results/stage03.3_exact_deadline_attempt06"
+    try:
+        verify_manifest(raw_dir)
+        with tempfile.TemporaryDirectory(prefix="stage033-prerequisite-") as temporary:
+            replay = review_stage033(
+                run_dir=raw_dir,
+                scope="formal",
+                benchmark_dir=root / "data/schneider",
+                output_dir=Path(temporary),
+            )
+            replay_status = json.loads(
+                replay["review_manifest"].read_text(encoding="utf-8")
+            ).get("status")
+    except (FileNotFoundError, KeyError, RuntimeError, ValueError):
+        return False
+    stage023 = root / "experiments/summaries/stage02_constraint_guided_rerun09_review_manifest.json"
+    stage023_payload = json.loads(stage023.read_text(encoding="utf-8"))
+    return all(
+        (
+            payload.get("status") == "READY_FOR_STAGE03_4",
+            replay_status == "READY_FOR_STAGE03_4",
+            stage023_payload.get("status") == "READY_FOR_STAGE03",
+            _verify_prefixed_review_files(stage023, stage023_payload),
+            _verify_frozen_cpu_batch_evidence(root),
+        )
+    )
+
+
+def _verify_prefixed_review_files(
+    manifest_path: Path,
+    payload: Mapping[str, object],
+) -> bool:
+    files = payload.get("files")
+    if not isinstance(files, Mapping):
+        return False
+    prefix = manifest_path.name.removesuffix("review_manifest.json")
+    return all(
+        _sha256(manifest_path.with_name(f"{prefix}{name}")) == str(digest)
+        for name, digest in files.items()
     )
 
 

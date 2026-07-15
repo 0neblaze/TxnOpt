@@ -115,7 +115,9 @@ def load_stage034_config(path: Path) -> Stage034Config:
     if config.batch_size <= 0:
         raise ValueError("Stage 3.4 batch_size must be positive")
     if not config.inherit_stage033_incumbent:
-        raise ValueError("Stage 3.4 requires the audited Stage 3.3 incumbent warm start")
+        raise ValueError(
+            "Stage 3.4 formal evidence requires the audited Stage 3.3 incumbent warm start"
+        )
     if config.proposal_top_k_grid != (1, 2, 4) or config.round_budget_grid != (1, 2, 4):
         raise ValueError("Stage 3.4 candidate-control grid must be {1,2,4} x {1,2,4}")
     if (
@@ -433,7 +435,6 @@ def _source_sha256(root: Path) -> str:
         "src/evrptw/neighborhoods.py",
         "src/evrptw/artifacts.py",
         "src/evrptw/experiments/stage034_control_parallel.py",
-        "src/evrptw/experiments/stage034_control_parallel_review.py",
     ):
         path = root / relative
         digest.update(relative.encode())

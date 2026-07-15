@@ -39,6 +39,7 @@ class CandidateControlConfig:
     ranking_policy: str = "vehicle_distance_changed_routes_route_key_ordinal"
     merge_policy: str = "submission_order"
     fixed_work_exhaustion_rounds: int = 10
+    min_iterations_before_exhaustion: int = 50
 
     def __post_init__(self) -> None:
         if self.schema_version != CANDIDATE_CONTROL_SCHEMA_VERSION:
@@ -312,7 +313,13 @@ class CandidateControlRuntime:
                 batch_size=batch_size,
                 deadline=deadline,
             )
-            self._record_results(sequences, result.results)
+            self._record_results(
+                sequences,
+                result.results,
+                lane=lane,
+                iteration=iteration,
+                operator=operator,
+            )
             self.events.append(
                 {
                     "event_type": "parallel_batch",
@@ -321,6 +328,7 @@ class CandidateControlRuntime:
                     "submission_order": [0],
                     "completion_order": [0],
                     "merge_order": [0],
+                    "customer_sequences": [list(sequence) for sequence in sequences],
                     "lane": lane,
                     "iteration": iteration,
                     "operator": operator,
@@ -409,6 +417,7 @@ class CandidateControlRuntime:
                     "chunk_sizes": chunk_sizes,
                     "result_count": 0,
                     "completed_indices": sorted(completed_indices),
+                    "customer_sequences": [list(sequence) for sequence in sequences],
                     "lane": lane,
                     "iteration": iteration,
                     "operator": operator,
@@ -428,7 +437,13 @@ class CandidateControlRuntime:
         if len(merged_results) != len(sequences):
             raise CandidateParallelExecutionError("parallel cpu_batch result count mismatch")
         output = BatchChargingResult(tuple(merged_results), metrics)
-        self._record_results(sequences, output.results)
+        self._record_results(
+            sequences,
+            output.results,
+            lane=lane,
+            iteration=iteration,
+            operator=operator,
+        )
         self.events.append(
             {
                 "event_type": "parallel_batch",
@@ -440,6 +455,7 @@ class CandidateControlRuntime:
                 "chunk_sizes": chunk_sizes,
                 "result_count": len(merged_results),
                 "completed_indices": list(range(len(sequences))),
+                "customer_sequences": [list(sequence) for sequence in sequences],
                 "lane": lane,
                 "iteration": iteration,
                 "operator": operator,
@@ -451,25 +467,39 @@ class CandidateControlRuntime:
         self,
         sequences: Sequence[tuple[str, ...]],
         results: Sequence[ChargingSubproblemResult],
+        *,
+        lane: str,
+        iteration: int | None,
+        operator: str,
     ) -> None:
-        self._route_results.extend(
-            {
-                "sequence": list(sequence),
-                "result": {
-                    "feasible": result.feasible,
-                    "route": list(result.route),
-                    "distance": result.distance,
-                    "total_energy": result.total_energy,
-                    "charged_energy": result.charged_energy,
-                    "charging_time": result.charging_time,
-                    "labels_generated": result.labels_generated,
-                    "labels_expanded": result.labels_expanded,
-                    "labels_pruned": result.labels_pruned,
-                    "failure_reason": result.failure_reason,
-                },
+        for sequence, result in zip(sequences, results, strict=True):
+            result_payload: dict[str, object] = {
+                "feasible": result.feasible,
+                "route": list(result.route),
+                "distance": result.distance,
+                "total_energy": result.total_energy,
+                "charged_energy": result.charged_energy,
+                "charging_time": result.charging_time,
+                "labels_generated": result.labels_generated,
+                "labels_expanded": result.labels_expanded,
+                "labels_pruned": result.labels_pruned,
+                "failure_reason": result.failure_reason,
             }
-            for sequence, result in zip(sequences, results, strict=True)
-        )
+            payload: dict[str, object] = {
+                "sequence": list(sequence),
+                "result": result_payload,
+            }
+            self._route_results.append(payload)
+            event: dict[str, object] = {
+                "event_type": "candidate_route_result",
+                "status": "complete",
+                "lane": lane,
+                "iteration": iteration,
+                "operator": operator,
+                "customer_sequences": [list(sequence), list(result.route)],
+            }
+            event.update(result_payload)
+            self.events.append(event)
 
     def _ensure_pool(self) -> ProcessPoolExecutor:
         if self._pool is None:
