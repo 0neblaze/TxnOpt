@@ -1,0 +1,3 @@
+run_label,component,artifact_type,instance_scope,seed_scope,attempt,relative_path,status,checksum,comparison_baseline,storage_format,retention_class,policy_compliance,legacy_path,supersedes
+stage05.1_best_known_attempt01,best_known,raw,all_92,n/a,attempt01,results/stage05.1_best_known_attempt01/stage05.1_best_known_attempt01/,complete,,stage04_adaptive_weights_attempt02,artifact-storage-v1,current,compliant,,
+stage05.1_best_known_attempt01,best_known,review,all_92,n/a,attempt01,results/stage05.1_best_known_attempt01/stage05.1_best_known_attempt01/review/,complete,,stage05.1_best_known_attempt01,legacy_json_or_jsonl,current,compliant,,
