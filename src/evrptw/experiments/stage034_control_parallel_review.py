@@ -184,6 +184,7 @@ def review_stage034(
     cache_rows: list[dict[str, object]] = []
     backend_rows: list[dict[str, object]] = []
     profile_rows: list[dict[str, object]] = []
+    timing_rows: list[dict[str, object]] = []
     deadline_rows: list[dict[str, object]] = []
     candidate_configuration = _object(
         control.get("candidate_control"), "candidate-control configuration"
@@ -425,19 +426,24 @@ def review_stage034(
                 }
                 for (operation, lookup_result), count in sorted(cache_counts.items())
             )
-            backend_metrics = _object(
+            deadline_statistics = _object(
                 raw_axis.get("exact_deadline_statistics") or {},
                 "exact deadline statistics",
             )
+            batch_metrics = _object(
+                raw_axis.get("backend_metrics") or {},
+                "backend metrics",
+            )
+            merged_backend: dict[str, object] = {}
+            for source in (deadline_statistics, batch_metrics):
+                for metric_key, value in source.items():
+                    if isinstance(value, (str, int, float, bool)) or value is None:
+                        merged_backend[str(metric_key)] = value
             backend_rows.append(
                 {
                     **identity,
                     "backend": backend,
-                    **{
-                        str(key): value
-                        for key, value in backend_metrics.items()
-                        if isinstance(value, (str, int, float, bool)) or value is None
-                    },
+                    **merged_backend,
                 }
             )
             runtime_seconds = float(raw_axis.get("runtime_seconds") or 0.0)
@@ -465,6 +471,60 @@ def review_stage034(
                 {**identity, "boundary": boundary, "count": count}
                 for boundary, count in sorted(deadline_counts.items())
             )
+            route_evals = [
+                event
+                for event in axis_events
+                if event.get("record_type") == "route_evaluation"
+            ]
+            operator_durations: dict[str, list[float]] = {}
+            route_durations: dict[str, list[float]] = {}
+            for event in route_evals:
+                raw_duration = event.get("duration_seconds")
+                duration = (
+                    float(raw_duration)
+                    if isinstance(raw_duration, (int, float))
+                    else 0.0
+                )
+                if duration <= 0.0:
+                    continue
+                raw_operator_id = event.get("operator_id")
+                if raw_operator_id is not None:
+                    operator_key = _as_int(raw_operator_id)
+                    operator_label = str(
+                        operator_dictionary.get(operator_key, str(raw_operator_id))
+                    )
+                else:
+                    operator_label = str(event.get("operator", ""))
+                operator_durations.setdefault(operator_label, []).append(duration)
+                route_key = str(event.get("route_key") or event.get("route_id") or "")
+                if route_key:
+                    route_durations.setdefault(route_key, []).append(duration)
+            for operator_label, durations in sorted(operator_durations.items()):
+                timing_rows.append(
+                    {
+                        **identity,
+                        "aggregation": "operator",
+                        "label": operator_label,
+                        "evaluation_count": len(durations),
+                        "total_duration_seconds": sum(durations),
+                        "mean_duration_seconds": (
+                            sum(durations) / len(durations) if durations else 0.0
+                        ),
+                    }
+                )
+            for route_key, durations in sorted(route_durations.items()):
+                timing_rows.append(
+                    {
+                        **identity,
+                        "aggregation": "route",
+                        "label": route_key,
+                        "evaluation_count": len(durations),
+                        "total_duration_seconds": sum(durations),
+                        "mean_duration_seconds": (
+                            sum(durations) / len(durations) if durations else 0.0
+                        ),
+                    }
+                )
         for suffix in ("fixed_exact_calls", "wall_clock"):
             serial = axis_rows[f"serial_{suffix}"]
             parallel = axis_rows[f"parallel_{suffix}"]
@@ -513,6 +573,7 @@ def review_stage034(
         "cache_statistics": output_dir / "cache_statistics.csv",
         "backend_metrics": output_dir / "backend_metrics.csv",
         "performance_profile": output_dir / "performance_profile.csv",
+        "route_operator_timing": output_dir / "route_operator_timing.csv",
         "deadline_report": output_dir / "deadline_report.csv",
         "review_findings": output_dir / "review_findings.csv",
         "stage04_readiness": output_dir / "stage04_readiness.csv",
@@ -529,6 +590,7 @@ def review_stage034(
     _write_csv(paths["cache_statistics"], cache_rows)
     _write_csv(paths["backend_metrics"], backend_rows)
     _write_csv(paths["performance_profile"], profile_rows)
+    _write_csv(paths["route_operator_timing"], timing_rows)
     _write_csv(paths["deadline_report"], deadline_rows)
     _write_csv(paths["review_findings"], findings)
     _write_csv(

@@ -1,8 +1,8 @@
 {
-  "artifact_count": 1734,
+  "artifact_count": 1735,
   "artifact_registry": "experiments/registries/stage03.4_artifact_registry.csv",
-  "artifact_registry_rows_sha256": "ae7a14cd8eccdd49d5bc1be0330eed3ff322ecc79b407a7e1e9191c9fc2f784a",
-  "artifact_registry_sha256": "944aa22b4d28726c002cda69d67443f18f2c2872c9dc08d10c48788e67836a15",
+  "artifact_registry_rows_sha256": "1c607b74014074a8d2e39ef2d33b3807789b2860b263fbf5651a14f9ebbae46f",
+  "artifact_registry_sha256": "40364e947cf8abb2c5c39103856451480b079f5cc5541ce433d7f45fa524cf53",
   "canonical_run_labels": [
     "stage03.4_control_parallel_attempt01",
     "stage03.4_control_parallel_attempt02",
