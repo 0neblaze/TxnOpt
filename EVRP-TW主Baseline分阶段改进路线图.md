@@ -537,12 +537,11 @@ Stage 3 性能完成。
 
 本部分产物前缀固定为 `stage03.4_control_parallel`，manifest 的 component 记录为 `control_parallel`。
 
-当前状态（2026-07-15）：`stage03.4_control_parallel_attempt05` 已完成 Smoke
-72/72 axes，独立审查为 `NOT_READY`。固定工作量串并行语义门槛通过，但严格
-objective、R/RC wall-clock exact-call 与 unchanged-route 对账未通过。后续
-attempt06--07 保留为 partial 或 NOT_READY 证据。corrected warm-start 协议
-（含交易性 reviewer gate、候选哈希独立重算、硬化前置检查）正在重新运行 Smoke
-和 Formal；早期失败 attempt 保留且不覆盖。
+当前状态（2026-07-15）：Smoke `stage03.4_control_parallel_attempt10` 完成
+72/72 axes 全部通过，独立审查为 `READY_FOR_STAGE034_FORMAL`。Formal
+`stage03.4_control_parallel_attempt11` 完成 144/144 axes 全部通过，独立审查为
+`READY_FOR_STAGE04`。corrected warm-start 协议（含交易性 reviewer gate、候选哈希
+独立重算、硬化前置检查）已通过全部门槛。早期失败 attempt（01--09）保留且不覆盖。
 
 Stage 3.4 formal evidence 使用显式注册的 **inherited warm start（继承热启动）**
 协议：从已审查的 Stage 3.3 wall-clock incumbent（解、目标键和来源 SHA-256）

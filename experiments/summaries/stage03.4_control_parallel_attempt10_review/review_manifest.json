@@ -1,0 +1,31 @@
+{
+  "all_rows_valid": true,
+  "expected_rows": 72,
+  "files": {
+    "backend_metrics.csv": "ee03c2598ccbb1693bec5bdc6dd3410592ed0d5edb8eaa8a764e62bb4c11aabd",
+    "cache_statistics.csv": "9cc3c30f341c947dbde3340770262d05158c1789587e3dec8a3cc065c3053e36",
+    "candidate_control_reconciliation.csv": "b7ef9ae3ae02767d6210a50bb885adb30805b9bde4d16bff472481f4520a9ecf",
+    "deadline_report.csv": "140790eaf7c0e1f79cafb3cca1d6d49f29924f04c7bd508eac235513d336896e",
+    "fixed_work_wall_clock.csv": "b7d0649a664d2d287cc6bf402e5df394647758e7b9b8143925c560229cb32d2f",
+    "objective_comparison.csv": "ad06de5d1761ae272b6934f663bd3ec323737933d08be8b49b112b28462d2cfc",
+    "parallel_ordering.csv": "8f452eb12327236e3c3f14f8e210db5c9c6b9cebed3ae5b4280091bd423cdc3e",
+    "per_run_results.csv": "c32f51a76646c33021706c8982763e3bb0aa3040c26642e4481a5f40c5311109",
+    "performance_profile.csv": "1923ca23d4fe902983f8c25ee6ada5669ca7ee666fd9d8634428e444cefdfcfd",
+    "review_findings.csv": "be7d59221ce3a4381782dc043bc9693023b706ba4e9e8e6f60eda7ff8db6da89",
+    "review_report.md": "4598bdaac9a44acb18918f6e341df28c93f967eb46a7994baf19c845d3fbc062",
+    "screening_reason_statistics.csv": "77a720bb0bf02861ceee1eb04c6ba8c09c36705ac231eb011c517f114203bd8f",
+    "stage04_readiness.csv": "50ef6ee5eaddb2de48f746703a64e452afd35d70b16d8d378f19e296c63d0c05"
+  },
+  "observed_rows": 72,
+  "performance_gate": true,
+  "prerequisites_valid": true,
+  "quality_gate": true,
+  "reviewer_sha256": "24c3c6cda9d5cc1dd4bfdd72ed586134aff3d0ead12adc6537976cb54e1f25fc",
+  "run_directory": "/Users/guoyiyang/Documents/GitHub/FURP-2026-Yiyang-GUO-EVRP-TW/results/stage03.4_control_parallel_attempt10",
+  "run_label": "stage03.4_control_parallel_attempt10",
+  "schema_version": "stage034-review-v1",
+  "scope": "smoke",
+  "scope_complete": true,
+  "semantics_gate": true,
+  "status": "READY_FOR_STAGE034_FORMAL"
+}

@@ -13,8 +13,8 @@ from evrptw.artifacts import ArtifactReader, find_manifest, verify_manifest
 
 from publish_stage033_artifacts import REGISTRY_FIELDS, instance_seed, load_json, sha256
 
-SMOKE_LABEL = "stage03.4_control_parallel_attempt08"
-FORMAL_LABEL = "stage03.4_control_parallel_attempt09"
+SMOKE_LABEL = "stage03.4_control_parallel_attempt10"
+FORMAL_LABEL = "stage03.4_control_parallel_attempt11"
 READY_STATUSES = {"READY_FOR_STAGE034_FORMAL", "READY_FOR_STAGE04"}
 
 

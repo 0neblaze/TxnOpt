@@ -128,9 +128,8 @@ this repository or one of its subdirectories.
 - Stage 3.0 and Stage 3.1 historical evidence remains immutable. Stage 3.2
   implementation and its raw evidence use component `cache_incremental`.
   Stage 3.3 uses component `exact_deadline` and its accepted evidence is
-  published. Stage 3.4 implementation uses component `control_parallel`, but
-  its current Smoke evidence is `NOT_READY`; it must not receive placeholder
-  Formal, registry, manifest, summary, or readiness results.
+  published. Stage 3.4 uses component `control_parallel` and its accepted
+  evidence is published with formal review status `READY_FOR_STAGE04`.
 - Canonical run labels are `stage03.0_measurement_attemptNN`,
   `stage03.1_screening_attemptNN`, or
   `stage03.2_cache_incremental_attemptNN`, or
@@ -149,16 +148,18 @@ this repository or one of its subdirectories.
 - `experiments/registries/stage03.0_artifact_registry.csv`,
   `experiments/registries/stage03.1_artifact_registry.csv`, and
   `experiments/registries/stage03.2_artifact_registry.csv`, plus
-  `experiments/registries/stage03.3_artifact_registry.csv`, are the published
-  stage registries. Stage 3.3 was published only after formal review passed.
+  `experiments/registries/stage03.3_artifact_registry.csv`, and
+  `experiments/registries/stage03.4_artifact_registry.csv`, are the published
+  stage registries. Stages 3.3 and 3.4 were published only after formal review
+  passed.
   `experiments/registries/stage03_legacy_path_map.csv` records the
   preserved old Stage 3 paths, the immutable Stage 0 frozen baseline, and the
   Stage 2.3 historical comparison references.
 - The corresponding manifests are
   `experiments/manifests/stage03.0_measurement_artifact_manifest.json` and
   `experiments/manifests/stage03.1_screening_artifact_manifest.json`, plus the
-  Stage 3.2 cache/incremental manifest and the Stage 3.3 exact-deadline manifest
-  after their raw reviews. Before a
+  Stage 3.2 cache/incremental manifest, the Stage 3.3 exact-deadline manifest,
+  and the Stage 3.4 control-parallel manifest after their raw reviews. Before a
   formal run or stage transition, the migration/preflight tool must verify
   canonical labels, artifact types, unique run labels, raw checksums and
   sidecars, manifest recomputability, legacy mappings, and semantic
@@ -364,10 +365,14 @@ this repository or one of its subdirectories.
   independent review is `NOT_READY`: deterministic fixed-work semantics passed,
   while objective, R/RC call-count, and unchanged-route reconciliation gates
   failed. The unchanged-route cause was fixed after that immutable attempt.
-  Attempts 06--07 retained partial or NOT_READY evidence. The corrected
-  warm-start protocol with transactional reviewer gates, candidate hash
-  recomputation, and hardened prerequisites is being re-run; earlier failed
-  attempts remain preserved and are not overwritten.
+  Attempts 06--07 retained partial or NOT_READY evidence. Attempts 08--09 were
+  intermediate warm-start protocol runs. The corrected warm-start protocol with
+  transactional reviewer gates, candidate hash recomputation, and hardened
+  prerequisites was accepted as smoke `stage03.4_control_parallel_attempt10`
+  (72/72 axes valid, `READY_FOR_STAGE034_FORMAL`) and formal
+  `stage03.4_control_parallel_attempt11` (144/144 axes valid,
+  `READY_FOR_STAGE04`). Earlier failed attempts remain preserved and are not
+  overwritten.
 
 ## Experiment Artifact Storage v2
 
