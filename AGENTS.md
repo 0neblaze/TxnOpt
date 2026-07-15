@@ -374,6 +374,56 @@ this repository or one of its subdirectories.
   `READY_FOR_STAGE04`). Earlier failed attempts remain preserved and are not
   overwritten.
 
+## Stage 4 Adaptive Weights and Search Control Policy
+
+- Stage 4 is opt-in through `Stage04Config`; `None` preserves the Stage 0--3.4
+  execution path. Its canonical component is `adaptive_weights` and its only
+  exact backend is `cpu_batch`.
+- `Stage04Config` is a frozen dataclass defined in `evrptw.stage04`. It
+  controls segment length, min calls per operator, weight reaction/smoothing,
+  fixed-weight ablation, differentiated reward tiers, auto-estimated SA
+  temperature, reheating, stagnation restart, and incumbent intensification.
+  The `reward_for()` method computes differentiated rewards: vehicle reduction
+  (8.0) > distance improvement (4.0) > accepted equal (1.0) > accepted worse
+  (0.5) > rejected (0.0); new global best with vehicle reduction gets 16.0.
+  The `with_fixed_weights()` helper creates a fixed-weight ablation copy.
+- Segment-based weight update replaces per-call exponential moving average.
+  Weights are updated at segment boundaries (default 50 iterations) using
+  accumulated rewards and smoothing. Each operator must reach a minimum call
+  count (default 5) within a segment before its weight is updated.
+- `OperatorStatistics` tracks six categories: `accepted_improving`,
+  `accepted_equal`, `accepted_worse`, `rejected`, `new_global_best`, and
+  `vehicle_reduction`. All three ALNS lanes (legacy, quality_shadow,
+  constraint) and the refinement path increment these categories.
+- Auto-estimated SA temperature samples random worse moves (default 30
+  samples) to calibrate the initial temperature targeting a 50% acceptance
+  rate. Reheating boosts the temperature floor on stagnation (default
+  threshold 10, factor 0.5, max 5 reheats); the floor decays at 0.99 per
+  iteration.
+- Stagnation restart (default threshold 20, max 3) resets the current solution
+  to the global best. Incumbent intensification (default 10 iterations, 10%
+  removal fraction) concentrates search around the best after restart.
+- Canonical run labels are `stage04_adaptive_weights_attemptNN` or
+  `stage04_adaptive_weights_rerunNN`. The experiment runner uses four axes:
+  `adaptive_wall_clock`, `adaptive_fixed_work`, `fixed_wall_clock`,
+  `fixed_fixed_work`. Smoke scope is the 6-instance, 3-seed set; formal scope
+  is Stage 0's 12-instance, 3-seed set (144 axes).
+- The independent review CLI re-reads raw artifacts, replays
+  validator/objective, and evaluates six gates: `operator_call_sufficiency`
+  (wall_clock axes only), `six_category_statistics` (adaptive_wall_clock only),
+  `adaptive_better_than_fixed` (>= 3 wins on different instance/seed pairs),
+  `not_single_best_seed` (>= 2 winning seeds), `std_not_increased` (Stage 4
+  vehicle_count std <= Stage 0), and `replay_consistency` (all axes valid with
+  matching objectives).
+- The accepted smoke evidence is `stage04_adaptive_weights_attempt01` (72/72
+  axes, `READY_FOR_STAGE05`). The accepted formal evidence is
+  `stage04_adaptive_weights_attempt02` (144/144 axes, `READY_FOR_STAGE05`).
+  Earlier failed or partial attempts remain preserved.
+- Stage 4 review products are tracked under `experiments/summaries/` with
+  `stage04_adaptive_weights_attempt02_` prefix; the artifact registry is
+  `experiments/registries/stage04_artifact_registry.csv` and the manifest is
+  `experiments/manifests/stage04_adaptive_weights_artifact_manifest.json`.
+
 ## Experiment Artifact Storage v2
 
 - All new Stage 0–8 runs must use an enabled `[artifact_storage]` configuration

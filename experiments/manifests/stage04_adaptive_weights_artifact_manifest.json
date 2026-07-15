@@ -1,0 +1,63 @@
+{
+  "stage_id": "stage04",
+  "component": "adaptive_weights",
+  "run_label": "stage04_adaptive_weights_attempt02",
+  "scope": "formal",
+  "status": "READY_FOR_STAGE05",
+  "artifact_type": "manifest",
+  "instance_scope": "formal_12",
+  "seed_scope": [
+    2014,
+    2015,
+    2016
+  ],
+  "comparison_baseline": "stage03.4_control_parallel_attempt11",
+  "review_status": "READY_FOR_STAGE05",
+  "gates_passed": [
+    "operator_call_sufficiency",
+    "six_category_statistics",
+    "adaptive_better_than_fixed",
+    "not_single_best_seed",
+    "std_not_increased",
+    "replay_consistency"
+  ],
+  "observed_axes": 144,
+  "adaptive_wins": 4,
+  "winning_seeds": [
+    2014,
+    2015,
+    2016
+  ],
+  "files": {
+    "per_run_results": {
+      "path": "experiments/summaries/stage04_adaptive_weights_attempt02_per_run_results.csv",
+      "sha256": "2aeccb24821aedf7d08977fda7fb1a09d0f394b7cdeaa3199689b21643d0601b",
+      "size_bytes": 27590
+    },
+    "summary_results": {
+      "path": "experiments/summaries/stage04_adaptive_weights_attempt02_summary_results.csv",
+      "sha256": "fa2489bbb87b6bbf84f740020bf5e69a59d7dd9e55b48882fc75668a309ca3e6",
+      "size_bytes": 7902
+    },
+    "review_report": {
+      "path": "experiments/summaries/stage04_adaptive_weights_attempt02_review_report.md",
+      "sha256": "dfa0210df88ea661ea6728efca8320e753545deae1042f27a9371f3f51b8dc76",
+      "size_bytes": 929
+    },
+    "review_findings": {
+      "path": "experiments/summaries/stage04_adaptive_weights_attempt02_review_findings.csv",
+      "sha256": "00b7aae0844029f1ff3946fa99ef777562a9ca6d53820c3edd043d220a98e79f",
+      "size_bytes": 13228
+    },
+    "gate_evaluation": {
+      "path": "experiments/summaries/stage04_adaptive_weights_attempt02_gate_evaluation.csv",
+      "sha256": "190d47cd62408b7e6cf62e38df730ddbefe66838846ae8c4276045e4f120535f",
+      "size_bytes": 606
+    },
+    "review_manifest": {
+      "path": "experiments/summaries/stage04_adaptive_weights_attempt02_review_manifest.json",
+      "sha256": "6b43c8890bd9d2669b4e8af2c25c30ffd1af59d1e476e93c058664fe605caf44",
+      "size_bytes": 1619
+    }
+  }
+}

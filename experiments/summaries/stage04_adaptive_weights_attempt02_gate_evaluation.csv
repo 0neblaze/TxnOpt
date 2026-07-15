@@ -1,0 +1,7 @@
+gate,status,details
+operator_call_sufficiency,pass,all wall_clock axes have sufficient operator calls
+six_category_statistics,pass,all adaptive_wall_clock axes have accepted and rejected moves
+adaptive_better_than_fixed,pass,"adaptive wins 4 (instance, seed) pairs; need >= 3. won: [('c101_21', 2014), ('c101_21', 2016), ('r105C15', 2016), ('rc101_21', 2015)]"
+not_single_best_seed,pass,"adaptive wins on 3 unique seeds: [2014, 2015, 2016]; need >= 2."
+std_not_increased,pass,Stage 4 vehicle_count std <= Stage 0 for all instances
+replay_consistency,pass,all 144 axes valid with matching objectives

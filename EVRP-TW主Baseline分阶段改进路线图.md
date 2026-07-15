@@ -643,6 +643,37 @@ Stage 4 的 fixed/adaptive、temperature、restart 和 intensification 对比统
 - 结果标准差相对阶段 0 下降；若未下降，必须报告原因，不得删除高波动 seed；
 - 算子奖励、事件计数和 objective 重算通过 Stage 3 replay auditor。
 
+### 实施结果（2026-07-15）
+
+Stage 4 实现了 segment-based weight update（分段权重更新）、six-category operator statistics（六类算子统计）、auto-estimated SA temperature（自动估计模拟退火初始温度）、reheating（再加热）、stagnation restart（停滞重启）、incumbent intensification（围绕最佳解强化搜索）和 differentiated rewards（差异化奖励），并完成 fixed weights vs adaptive weights 的 ablation comparison（消融对比）。全部使用 `cpu_batch` 后端和 `stage02_constraint_guided` operator profile。
+
+Smoke `stage04_adaptive_weights_attempt01` 完成 72/72 axes 全部可行，独立审查状态为 `READY_FOR_STAGE05`。Formal `stage04_adaptive_weights_attempt02` 完成 144/144 axes 全部可行，独立审查状态为 `READY_FOR_STAGE05`。
+
+六个审查 gate 的结果：
+
+| Gate | Status | Details |
+|------|--------|---------|
+| operator_call_sufficiency | PASS | 所有 wall_clock 轴算子调用充足 |
+| six_category_statistics | PASS | 所有 adaptive_wall_clock 轴有接受和拒绝操作 |
+| adaptive_better_than_fixed | PASS | adaptive 在 4 个 (instance, seed) 上严格优于 fixed |
+| not_single_best_seed | PASS | adaptive 在 3 个 seed (2014, 2015, 2016) 上均有胜出 |
+| std_not_increased | PASS | Stage 4 vehicle_count std 不超过 Stage 0 |
+| replay_consistency | PASS | 144/144 axes 通过 validator 和 objective 重算 |
+
+Formal 100-customer 结果（adaptive_wall_clock 轴，3 seeds 的 best/mean/median）：
+
+| 实例 | Best 车辆数 | Mean 车辆数 | Median 车辆数 | Std | Best 距离 |
+|---|---:|---:|---:|---:|---:|
+| `c101_21` | 12 | 12.5 | 12.5 | 0.5 | 1054.03 |
+| `r101_21` | 20 | 22.08 | 21.0 | 2.47 | 1745.58 |
+| `rc101_21` | 18 | 21.0 | 20.5 | 2.92 | 1858.33 |
+
+自适应权重在 4 个 (instance, seed) 对上严格优于固定权重：`c101_21/2014`、`c101_21/2016`、`r105C15/2016`、`rc101_21/2015`。胜出分布在全部 3 个 seed 上，不依赖单一最佳 seed。
+
+Stage 4 的配置参数记录在 `configs/stage04_weights.toml`；`Stage04Config` 定义在 `src/evrptw/stage04.py`；ALNS 集成在 `src/evrptw/alns.py`；实验 runner 在 `src/evrptw/experiments/stage04_weights.py`；独立审查 CLI 在 `src/evrptw/experiments/stage04_weights_review.py`；单元测试在 `tests/test_stage04.py`（32 个测试全部通过）。Ruff 和 mypy 均通过。
+
+可追溯证据位于 `results/stage04_adaptive_weights_attempt02/`（formal raw artifacts）、`results/stage04_adaptive_weights_attempt02_review/`（review artifacts）、`experiments/summaries/stage04_adaptive_weights_attempt02_*.csv` 和 `.md`（tracked summaries）、`experiments/registries/stage04_artifact_registry.csv` 和 `experiments/manifests/stage04_adaptive_weights_artifact_manifest.json`。Stage 0 manifest SHA-256 保持为 `b226b97e0e67288aaaf85726ad855df71cb81406685c57c8e8c40cd8996aa0da`，冻结文件未修改。
+
 ---
 
 ## 阶段 5：建立 Best-Known 对照与完整实验体系
