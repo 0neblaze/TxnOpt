@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any
 
 from evrptw.artifacts import ArtifactReader, verify_manifest
-from evrptw.benchmark import parse_schneider
 from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES, FORMAL_SEEDS
 from evrptw.experiments.stage03_measurement import SMOKE_INSTANCES
 from evrptw.experiments.stage04_weights import DIAGNOSTIC_AXES
@@ -28,6 +27,7 @@ from evrptw.objective import (
     SolutionObjective,
     compare_objectives,
 )
+from evrptw.parser import parse_schneider
 from evrptw.validation import validate_routes
 
 READY_FOR_STAGE05 = "READY_FOR_STAGE05"
@@ -309,8 +309,14 @@ def review_stage04(
                 "axis": axis,
             }
             per_run = _find_per_run_row(per_run_rows, instance_name, seed, axis)
-            sol_axis = sol_axes.get(axis) if isinstance(sol_axes.get(axis), Mapping) else {}
-            raw_axis = raw_axes.get(axis) if isinstance(raw_axes.get(axis), Mapping) else {}
+            sol_axis_value = sol_axes.get(axis)
+            sol_axis: Mapping[str, Any] = (
+                sol_axis_value if isinstance(sol_axis_value, Mapping) else {}
+            )
+            raw_axis_value = raw_axes.get(axis)
+            raw_axis: Mapping[str, Any] = (
+                raw_axis_value if isinstance(raw_axis_value, Mapping) else {}
+            )
 
             # --- Revalidate routes ---
             routes_data = sol_axis.get("routes")
@@ -494,6 +500,7 @@ def review_stage04(
     gate_results = _evaluate_gates(
         replay_rows, per_run_rows, stage00_std, scope
     )
+    gate_entries = _gate_entries(gate_results)
     findings.extend(_gate_specific_findings(gate_results, replay_rows))
 
     # ------------------------------------------------------------------
@@ -521,7 +528,7 @@ def review_stage04(
             "status": "pass" if passed else "fail",
             "details": details,
         }
-        for name, (passed, details) in gate_results["gates"].items()
+        for name, (passed, details) in gate_entries.items()
     ]
     _write_csv(
         paths["gate_evaluation"],
@@ -557,7 +564,7 @@ def review_stage04(
                 "status": gate_results["status"],
                 "gates": {
                     name: {"passed": passed, "details": details}
-                    for name, (passed, details) in gate_results["gates"].items()
+                    for name, (passed, details) in gate_entries.items()
                 },
                 "expected_axes": expected_axes,
                 "observed_axes": len(replay_rows),
@@ -821,8 +828,9 @@ def _compute_stage4_vehicle_std(
         vc = row.get("vehicle_count")
         if vc is None or vc == "":
             continue
-        with contextlib.suppress(TypeError, ValueError):
-            by_instance.setdefault(str(row["instance"]), []).append(int(vc))
+        parsed = _as_int_or_none(vc)
+        if parsed is not None:
+            by_instance.setdefault(str(row["instance"]), []).append(parsed)
     return {
         instance: statistics.pstdev(values) if len(values) > 1 else 0.0
         for instance, values in by_instance.items()
@@ -836,9 +844,7 @@ def _gate_specific_findings(
     """Generate per-axis findings for gate failures."""
 
     findings: list[dict[str, object]] = []
-    gates = gate_results.get("gates", {})
-    if not isinstance(gates, Mapping):
-        return findings
+    gates = _gate_entries(gate_results)
 
     # Operator call sufficiency failures.
     passed, details = gates.get(_GATE_OPERATOR_CALL_SUFFICIENCY, (True, ""))
@@ -1043,7 +1049,7 @@ def _render_report(
     """Render the Markdown review report."""
 
     status = gate_results["status"]
-    gates = gate_results.get("gates", {})
+    gates = _gate_entries(gate_results)
 
     lines: list[str] = [
         "# Stage 4 adaptive-weights independent review\n",
@@ -1220,10 +1226,34 @@ def _as_int_or_none(value: object) -> int | None:
 
     if value is None or value == "":
         return None
+    if not isinstance(value, (str, bytes, bytearray, int, float)):
+        return None
     try:
         return int(float(value))
     except (TypeError, ValueError):
         return None
+
+
+def _gate_entries(
+    gate_results: Mapping[str, object],
+) -> dict[str, tuple[bool, str]]:
+    """Validate and narrow the internal gate-result structure."""
+
+    raw_gates = gate_results.get("gates")
+    if not isinstance(raw_gates, Mapping):
+        raise TypeError("gate results are missing the gates mapping")
+    gates: dict[str, tuple[bool, str]] = {}
+    for name, value in raw_gates.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(value, tuple)
+            or len(value) != 2
+            or not isinstance(value[0], bool)
+            or not isinstance(value[1], str)
+        ):
+            raise TypeError("malformed gate result")
+        gates[name] = (value[0], value[1])
+    return gates
 
 
 def _sha256(path: Path) -> str:

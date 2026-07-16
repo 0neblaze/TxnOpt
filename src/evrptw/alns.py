@@ -2953,6 +2953,8 @@ def _solve_alns(
             refinement_stats.accepted_improving += 1
         if candidate.objective is None:
             raise RuntimeError("accepted ALNS candidate is missing its objective")
+        if current.objective is None:
+            raise RuntimeError("current ALNS solution is missing its objective")
         comparison_result = compare_objectives(candidate.objective, current.objective)
         is_better = comparison_result is ObjectiveComparison.BETTER
         is_equal = comparison_result is ObjectiveComparison.EQUAL

@@ -12,10 +12,6 @@ per-call weight update and linear SA cooling schedule are preserved.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from evrptw.instance import Instance  # noqa: F401
 
 __all__ = ("Stage04Config",)
 

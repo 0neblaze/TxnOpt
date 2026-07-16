@@ -267,11 +267,15 @@ def _sum_operator_field(
 ) -> int:
     """Sum a per-operator statistic across all neighborhoods."""
 
-    return sum(
-        int(stats.get(field, 0))
-        for stats in result.neighborhood_statistics.values()
-        if isinstance(stats, Mapping)
-    )
+    total = 0
+    for stats in result.neighborhood_statistics.values():
+        if not isinstance(stats, Mapping):
+            continue
+        value = stats.get(field, 0)
+        if not isinstance(value, (int, float)):
+            raise TypeError(f"operator statistic {field!r} is not numeric")
+        total += int(value)
+    return total
 
 
 def _per_run_row(
@@ -671,6 +675,9 @@ def run_stage04_weights(
     per_run_path = resolved_output / "control" / f"{run_label}_per_run_results.csv"
     _write_csv(per_run_path, PER_RUN_FIELDS, [])
     per_run_rows: list[dict[str, Any]] = []
+    adaptive_stage04_config = config.stage04_config
+    if adaptive_stage04_config is None:
+        raise RuntimeError("Stage 4 experiment requires an enabled Stage04Config")
     try:
         for instance_name in instances:
             instance = parse_schneider(
@@ -681,9 +688,14 @@ def run_stage04_weights(
                 axes: dict[str, ALNSResult] = {}
                 for axis in DIAGNOSTIC_AXES:
                     if axis.startswith("fixed_"):
-                        stage04_cfg = with_fixed_weights(config.stage04_config)
+                        fixed_stage04_config = with_fixed_weights(
+                            adaptive_stage04_config
+                        )
+                        if fixed_stage04_config is None:
+                            raise RuntimeError("fixed-weight Stage 4 config is missing")
+                        stage04_cfg = fixed_stage04_config
                     else:
-                        stage04_cfg = config.stage04_config
+                        stage04_cfg = adaptive_stage04_config
                     axes[axis] = _run_axis(
                         instance,
                         seed=seed,
