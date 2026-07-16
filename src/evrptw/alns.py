@@ -2820,10 +2820,6 @@ def _solve_alns(
                         reason="constraint lane probe",
                     )
 
-        if exact_call_controller is not None and exact_call_controller.budget_reached:
-            evaluator._record_exact_budget_boundary()
-            break
-
         previous_current = current
         if stage04_enabled:
             cooled = initial_temperature * max(0.001, 1.0 - iteration / max_iterations)
