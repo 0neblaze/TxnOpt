@@ -51,6 +51,122 @@ _GATE_NAMES = (
     _GATE_REPLAY_CONSISTENCY,
 )
 
+_SIX_CATEGORY_FIELDS = (
+    "accepted_improving",
+    "accepted_equal",
+    "accepted_worse",
+    "rejected",
+    "new_global_best",
+    "vehicle_reduction",
+)
+
+
+def validate_stage04_operator_audit(
+    operator_statistics: Mapping[str, object],
+    segment_events: Sequence[Mapping[str, object]],
+    *,
+    min_calls: int,
+) -> tuple[bool, str]:
+    """Validate complete six-category statistics and segment update boundaries."""
+
+    if not operator_statistics:
+        return False, "adaptive operator statistics are missing"
+    failures: list[str] = []
+    for name, raw_stats in operator_statistics.items():
+        if not isinstance(raw_stats, Mapping):
+            failures.append(f"{name}: statistics are not an object")
+            continue
+        missing = [field for field in _SIX_CATEGORY_FIELDS if field not in raw_stats]
+        if missing:
+            failures.append(f"{name}: missing six-category fields {missing}")
+            continue
+        try:
+            values = {
+                field: _strict_nonnegative_int(raw_stats[field], field)
+                for field in _SIX_CATEGORY_FIELDS
+            }
+            accepted = _strict_nonnegative_int(raw_stats.get("accepted"), "accepted")
+            calls = _strict_nonnegative_int(raw_stats.get("calls"), "calls")
+        except ValueError as error:
+            failures.append(f"{name}: {error}")
+            continue
+        accepted_sum = (
+            values["accepted_improving"]
+            + values["accepted_equal"]
+            + values["accepted_worse"]
+        )
+        if accepted != accepted_sum:
+            failures.append(f"{name}: accepted={accepted} but category sum={accepted_sum}")
+        if calls < accepted + values["rejected"]:
+            failures.append(f"{name}: calls are smaller than accepted + rejected")
+        if values["new_global_best"] > values["accepted_improving"]:
+            failures.append(f"{name}: new_global_best exceeds accepted_improving")
+        if values["vehicle_reduction"] > values["accepted_improving"]:
+            failures.append(f"{name}: vehicle_reduction exceeds accepted_improving")
+    for event in segment_events:
+        event_type = event.get("type")
+        if event_type not in {"stage04_segment_update", "stage04_segment_skip"}:
+            failures.append(f"unexpected segment event type {event_type!r}")
+            continue
+        try:
+            calls = _strict_nonnegative_int(event.get("segment_calls"), "segment_calls")
+        except ValueError as error:
+            failures.append(str(error))
+            continue
+        if event_type == "stage04_segment_update" and calls < min_calls:
+            failures.append(f"{event.get('operator')}: update with {calls} calls below {min_calls}")
+        if event_type == "stage04_segment_skip" and calls >= min_calls:
+            failures.append(
+                f"{event.get('operator')}: skipped with {calls} calls at or above "
+                f"{min_calls}"
+            )
+    detail = "; ".join(failures) if failures else "complete operator and segment audit passed"
+    return not failures, detail
+
+
+def _strict_nonnegative_int(value: object, field: str) -> int:
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"{field} must be a non-negative integer")
+    if isinstance(value, int):
+        result = value
+    elif isinstance(value, str) and value.isdigit():
+        result = int(value)
+    else:
+        raise ValueError(f"{field} must be a non-negative integer")
+    if result < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return result
+
+
+def validate_stage04_scope_identities(
+    rows: Sequence[Mapping[str, object]], *, scope: str
+) -> tuple[bool, str]:
+    """Require the exact configured instance/seed/axis identity set."""
+
+    if scope not in {"smoke", "formal"}:
+        return False, f"unknown scope {scope!r}"
+    instances = SMOKE_INSTANCES if scope == "smoke" else FORMAL_INSTANCES
+    expected = {
+        (instance, int(seed), axis)
+        for instance in instances
+        for seed in FORMAL_SEEDS
+        for axis in DIAGNOSTIC_AXES
+    }
+    observed = [
+        (str(row.get("instance")), _as_int(row.get("seed")), str(row.get("axis")))
+        for row in rows
+    ]
+    details: list[str] = []
+    if len(observed) != len(set(observed)):
+        details.append("duplicate instance/seed/axis identities")
+    missing = expected - set(observed)
+    extra = set(observed) - expected
+    if missing:
+        details.append(f"missing={len(missing)}")
+    if extra:
+        details.append(f"extra={len(extra)}")
+    return not details, "; ".join(details) if details else f"exact {len(expected)}-axis scope"
+
 
 def review_stage04(
     *,
@@ -259,6 +375,19 @@ def review_stage04(
             if not isinstance(neighborhood_stats, Mapping):
                 neighborhood_stats = None
 
+            operator_statistics = raw_axis.get("adaptive_operator_statistics")
+            segment_events = raw_axis.get("stage04_segment_events")
+            operator_audit_ok = False
+            operator_audit_detail = "Stage 4 v2 operator audit evidence is missing"
+            if isinstance(operator_statistics, Mapping) and isinstance(segment_events, list):
+                typed_events = [event for event in segment_events if isinstance(event, Mapping)]
+                if len(typed_events) == len(segment_events):
+                    operator_audit_ok, operator_audit_detail = validate_stage04_operator_audit(
+                        operator_statistics,
+                        typed_events,
+                        min_calls=min_calls,
+                    )
+
             # --- Extract per-run data for gate evaluation ---
             accepted_improving = _as_int(
                 per_run.get("accepted_improving")
@@ -314,6 +443,8 @@ def review_stage04(
                 "vehicle_count": vehicle_count if vehicle_count is not None else "",
                 "weight_mode": weight_mode,
                 "neighborhood_statistics_present": neighborhood_stats is not None,
+                "operator_audit_ok": operator_audit_ok,
+                "operator_audit_detail": operator_audit_detail,
             }
             replay_rows.append(replay_row)
 
@@ -419,7 +550,7 @@ def review_stage04(
     paths["review_manifest"].write_text(
         json.dumps(
             {
-                "schema_version": "stage04-review-v1",
+                "schema_version": "stage04-review-v2",
                 "run_label": run_label,
                 "run_directory": str(run_dir),
                 "scope": scope,
@@ -489,13 +620,13 @@ def _evaluate_gates(
     )
 
     # Gate 4f: Replay consistency.
-    gates[_GATE_REPLAY_CONSISTENCY] = _gate_replay_consistency(replay_rows)
+    gates[_GATE_REPLAY_CONSISTENCY] = _gate_replay_consistency(replay_rows, scope)
 
     all_pass = all(passed for passed, _ in gates.values())
     status = READY_FOR_STAGE05 if all_pass else NOT_READY
 
     return {
-        "schema_version": "stage04-review-v1",
+        "schema_version": "stage04-review-v2",
         "scope": scope,
         "status": status,
         "gates": gates,
@@ -523,23 +654,14 @@ def _gate_operator_call_sufficiency(
         axis = str(row.get("axis", ""))
         if not axis.endswith("_wall_clock"):
             continue
-        min_calls = _as_int(row.get("min_calls_per_operator"))
-        if min_calls == 0:
-            min_calls = _MIN_CALLS_PER_OPERATOR_DEFAULT
-        total_calls = (
-            _as_int(row.get("accepted_improving"))
-            + _as_int(row.get("accepted_equal"))
-            + _as_int(row.get("accepted_worse"))
-            + _as_int(row.get("rejected_moves"))
-        )
-        if total_calls < min_calls:
+        if not bool(row.get("operator_audit_ok")):
             failures.append(
                 f"{row['instance']}/{row['seed']}/{row['axis']}: "
-                f"total_calls={total_calls} < min={min_calls}"
+                f"{row.get('operator_audit_detail')}"
             )
     if failures:
         return False, "; ".join(failures)
-    return True, "all wall_clock axes have sufficient operator calls"
+    return True, "all wall_clock axes passed per-operator segment audit"
 
 
 def _gate_six_category_statistics(
@@ -557,25 +679,14 @@ def _gate_six_category_statistics(
         axis = str(row.get("axis", ""))
         if axis != "adaptive_wall_clock":
             continue
-        accepted_total = (
-            _as_int(row.get("accepted_improving"))
-            + _as_int(row.get("accepted_equal"))
-            + _as_int(row.get("accepted_worse"))
-        )
-        rejected = _as_int(row.get("rejected_moves"))
-        if accepted_total == 0:
+        if not bool(row.get("operator_audit_ok")):
             failures.append(
                 f"{row['instance']}/{row['seed']}/{row['axis']}: "
-                f"no accepted moves"
-            )
-        if rejected == 0:
-            failures.append(
-                f"{row['instance']}/{row['seed']}/{row['axis']}: "
-                f"no rejected moves"
+                f"{row.get('operator_audit_detail')}"
             )
     if failures:
         return False, "; ".join(failures)
-    return True, "all adaptive_wall_clock axes have accepted and rejected moves"
+    return True, "all adaptive_wall_clock axes have complete reconciled six-category statistics"
 
 
 def _compute_adaptive_wins(
@@ -664,10 +775,14 @@ def _gate_std_not_increased(
 
 def _gate_replay_consistency(
     replay_rows: Sequence[Mapping[str, object]],
+    scope: str,
 ) -> tuple[bool, str]:
     """All solutions pass validator, objectives match, exact calls consistent."""
 
     failures: list[str] = []
+    scope_ok, scope_detail = validate_stage04_scope_identities(replay_rows, scope=scope)
+    if not scope_ok:
+        failures.append(scope_detail)
     valid_count = 0
     for row in replay_rows:
         if not bool(row.get("valid")):
@@ -691,7 +806,7 @@ def _gate_replay_consistency(
         return False, f"{valid_count}/{len(replay_rows)} valid; " + "; ".join(
             failures
         )
-    return True, f"all {len(replay_rows)} axes valid with matching objectives"
+    return True, f"{scope_detail}; all objectives and exact-call counts match"
 
 
 def _compute_stage4_vehicle_std(
@@ -1018,7 +1133,7 @@ def _write_failure_report(
     paths["review_manifest"].write_text(
         json.dumps(
             {
-                "schema_version": "stage04-review-v1",
+                "schema_version": "stage04-review-v2",
                 "run_label": run_label or run_dir.name,
                 "run_directory": str(run_dir),
                 "scope": scope,

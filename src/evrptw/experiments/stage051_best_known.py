@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
 import re
 import subprocess
 import tomllib
@@ -23,6 +24,7 @@ from evrptw.artifacts import (
     ArtifactBundleWriter,
     ArtifactRunContext,
     ArtifactStorageConfig,
+    verify_manifest,
 )
 from evrptw.best_known import (
     BEST_KNOWN_VALUES,
@@ -32,7 +34,7 @@ from evrptw.best_known import (
 )
 from evrptw.environment import collect_environment
 
-STAGE051_SCHEMA_VERSION = "stage05.1-best-known-v1"
+STAGE051_SCHEMA_VERSION = "stage05.1-best-known-v2"
 STAGE051_RUN_LABEL = re.compile(r"^stage05\.1_best_known_(?:attempt|rerun)[0-9]{2}$")
 
 BKS_DATA_FIELDS: tuple[str, ...] = (
@@ -87,6 +89,7 @@ class Stage051Config:
     """Configuration for Stage 5.1."""
 
     benchmark_dir: Path
+    stage04_review_manifest: Path
     artifact_storage: ArtifactStorageConfig
 
 
@@ -98,6 +101,12 @@ def load_stage051_config(path: Path) -> Stage051Config:
     storage_section = data.get("artifact_storage", {})
     return Stage051Config(
         benchmark_dir=Path(data.get("benchmark", {}).get("directory", "data/schneider")),
+        stage04_review_manifest=Path(
+            data.get("stage05_1", {}).get(
+                "stage04_review_manifest",
+                "experiments/manifests/stage04_adaptive_weights_artifact_manifest.json",
+            )
+        ),
         artifact_storage=ArtifactStorageConfig(
             enabled=storage_section.get("enabled", True),
             storage_policy_version=storage_section.get(
@@ -129,6 +138,15 @@ def validate_stage051_run_label(run_label: str) -> None:
         )
 
 
+def validate_stage051_output_dir(repo_root: Path, output_dir: Path, run_label: str) -> Path:
+    """Return the canonical run directory or reject nested/non-canonical layouts."""
+
+    resolved = output_dir.resolve()
+    if resolved != repo_root.resolve() / "results" / run_label:
+        raise ValueError("Stage 5.1 output must be results/<canonical-run-label>")
+    return resolved
+
+
 def run_stage051_best_known(
     *,
     config_path: Path,
@@ -143,7 +161,10 @@ def run_stage051_best_known(
     _require_clean_repository(repo_root)
 
     config = load_stage051_config(config_path)
-    run_dir = output_dir / run_label
+    run_dir = validate_stage051_output_dir(repo_root, output_dir, run_label)
+    stage04_prerequisite = verify_stage04_prerequisite(
+        repo_root, config.stage04_review_manifest
+    )
     if run_dir.exists():
         raise RuntimeError(f"output directory already exists: {run_dir}")
     run_dir.mkdir(parents=True)
@@ -165,6 +186,7 @@ def run_stage051_best_known(
         "git_dirty": git_dirty,
         "source_sha256": source_hashes,
         "config_sha256": config_hash,
+        "stage04_prerequisite": stage04_prerequisite,
         "source_references": {
             abbr: {
                 "authors": ref.authors,
@@ -244,40 +266,7 @@ def _write_bks_csv(path: Path) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=BKS_DATA_FIELDS)
         writer.writeheader()
-        for rec in BEST_KNOWN_VALUES:
-            src = SOURCE_REFERENCES[rec.source_ref]
-            comp = SOURCE_REFERENCES[rec.compilation_ref]
-            writer.writerow({
-                "instance": rec.instance,
-                "paper_name": rec.paper_name,
-                "customer_count": rec.customer_count,
-                "class_name": rec.class_name,
-                "bks_vehicles": rec.bks_vehicles,
-                "bks_distance": rec.bks_distance,
-                "bks_charging_time": (
-                    rec.bks_charging_time
-                    if rec.bks_charging_time is not None
-                    else "unknown"
-                ),
-                "bks_charging_count": (
-                    rec.bks_charging_count
-                    if rec.bks_charging_count is not None
-                    else "unknown"
-                ),
-                "source_ref": rec.source_ref,
-                "source_doi": src.doi,
-                "source_year": src.year,
-                "source_in_vor_collection": src.in_vor_collection,
-                "compilation_ref": rec.compilation_ref,
-                "compilation_doi": comp.doi,
-                "source_table": rec.source_table,
-                "optimal_proven": rec.optimal_proven,
-                "charging_model": _OUR_CHARGING,
-                "objective_function": _OUR_OBJECTIVE,
-                "distance_metric": _OUR_DISTANCE,
-                "model_compatible": False,
-                "compatibility_notes": _COMPATIBILITY_NOTES,
-            })
+        writer.writerows(canonical_stage051_rows()[0])
 
 
 def _write_compatibility_csv(path: Path) -> None:
@@ -286,14 +275,50 @@ def _write_compatibility_csv(path: Path) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=COMPATIBILITY_FIELDS)
         writer.writeheader()
-        for dim in COMPATIBILITY_ASSESSMENT.dimensions:
-            writer.writerow({
-                "dimension": dim.dimension,
-                "our_model": dim.our_model,
-                "published_model": dim.published_model,
-                "compatible": dim.compatible,
-                "notes": dim.notes,
-            })
+        writer.writerows(canonical_stage051_rows()[1])
+
+
+def canonical_stage051_rows() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Return the complete canonical CSV rows used by both runner and reviewer."""
+
+    bks_rows: list[dict[str, str]] = []
+    for rec in BEST_KNOWN_VALUES:
+        src = SOURCE_REFERENCES[rec.source_ref]
+        comp = SOURCE_REFERENCES[rec.compilation_ref]
+        bks_rows.append({
+            "instance": rec.instance,
+            "paper_name": rec.paper_name,
+            "customer_count": str(rec.customer_count),
+            "class_name": rec.class_name,
+            "bks_vehicles": str(rec.bks_vehicles),
+            "bks_distance": str(rec.bks_distance),
+            "bks_charging_time": "unknown",
+            "bks_charging_count": "unknown",
+            "source_ref": rec.source_ref,
+            "source_doi": src.doi,
+            "source_year": str(src.year),
+            "source_in_vor_collection": str(src.in_vor_collection),
+            "compilation_ref": rec.compilation_ref,
+            "compilation_doi": comp.doi,
+            "source_table": rec.source_table,
+            "optimal_proven": str(rec.optimal_proven),
+            "charging_model": _OUR_CHARGING,
+            "objective_function": _OUR_OBJECTIVE,
+            "distance_metric": _OUR_DISTANCE,
+            "model_compatible": "False",
+            "compatibility_notes": _COMPATIBILITY_NOTES,
+        })
+    compatibility_rows = [
+        {
+            "dimension": dim.dimension,
+            "our_model": dim.our_model,
+            "published_model": dim.published_model,
+            "compatible": str(dim.compatible),
+            "notes": dim.notes,
+        }
+        for dim in COMPATIBILITY_ASSESSMENT.dimensions
+    ]
+    return bks_rows, compatibility_rows
 
 
 def _write_summary_report(path: Path, run_label: str, git_revision: str) -> None:
@@ -390,6 +415,50 @@ def _git(root: Path, *args: str) -> str:
 def _require_clean_repository(root: Path) -> None:
     if _git(root, "status", "--porcelain"):
         raise RuntimeError("Stage 5.1 runner requires a clean main repository commit")
+
+
+def verify_stage04_prerequisite(
+    root: Path, configured_path: Path
+) -> dict[str, str]:
+    publication_path = configured_path if configured_path.is_absolute() else root / configured_path
+    sidecar_path = publication_path.with_suffix(publication_path.suffix + ".sha256")
+    expected_digest = sidecar_path.read_text(encoding="utf-8").split()[0]
+    if _sha256(publication_path) != expected_digest:
+        raise RuntimeError("Stage 4 publication manifest sidecar mismatch")
+    publication = json.loads(publication_path.read_text(encoding="utf-8"))
+    run_label = publication.get("run_label")
+    if (
+        publication.get("schema_version") != "stage04-publication-v2"
+        or publication.get("review_status") != "READY_FOR_STAGE05"
+        or not isinstance(run_label, str)
+    ):
+        raise RuntimeError("Stage 5.1 requires a published Stage 4 READY_FOR_STAGE05 review")
+    raw_dir = root / "results" / run_label
+    verify_manifest(raw_dir)
+    files = publication.get("files")
+    if not isinstance(files, dict) or any(
+        _sha256(root / str(record["path"])) != str(record["sha256"])
+        for record in files.values()
+        if isinstance(record, dict)
+    ):
+        raise RuntimeError("Stage 4 published review file hashes are invalid")
+    review_record = files.get("review_manifest")
+    if not isinstance(review_record, dict):
+        raise RuntimeError("Stage 4 publication is missing its review manifest")
+    review = json.loads(
+        (root / str(review_record["path"])).read_text(encoding="utf-8")
+    )
+    if (
+        review.get("schema_version") != "stage04-review-v2"
+        or review.get("status") != "READY_FOR_STAGE05"
+    ):
+        raise RuntimeError("Stage 4 v2 review is not READY_FOR_STAGE05")
+    return {
+        "publication_manifest": str(publication_path.relative_to(root)),
+        "publication_sha256": expected_digest,
+        "run_label": run_label,
+        "review_status": "READY_FOR_STAGE05",
+    }
 
 
 def _sha256(path: Path) -> str:

@@ -16,6 +16,70 @@ from evrptw.objective import ObjectiveComparison, SolutionObjective
 from evrptw.stage04 import with_fixed_weights
 from evrptw.validation import validate_routes
 
+
+def test_stage04_operator_audit_rejects_update_below_minimum() -> None:
+    from evrptw.experiments.stage04_weights_review import (
+        validate_stage04_operator_audit,
+    )
+
+    statistics = {
+        "standard": {
+            "calls": 4,
+            "accepted": 2,
+            "accepted_improving": 1,
+            "accepted_equal": 1,
+            "accepted_worse": 0,
+            "rejected": 2,
+            "new_global_best": 0,
+            "vehicle_reduction": 0,
+        }
+    }
+    events = [{"type": "stage04_segment_update", "operator": "standard", "segment_calls": 4}]
+    passed, _ = validate_stage04_operator_audit(statistics, events, min_calls=5)
+    assert not passed
+
+
+def test_stage04_operator_audit_requires_all_six_categories() -> None:
+    from evrptw.experiments.stage04_weights_review import (
+        validate_stage04_operator_audit,
+    )
+
+    statistics = {
+        "standard": {
+            "calls": 5,
+            "accepted": 3,
+            "accepted_improving": 1,
+            "accepted_equal": 2,
+            "accepted_worse": 0,
+            "rejected": 2,
+            "new_global_best": 0,
+        }
+    }
+    passed, _ = validate_stage04_operator_audit(statistics, [], min_calls=5)
+    assert not passed
+
+
+def test_stage04_scope_audit_rejects_missing_and_duplicate_axes() -> None:
+    from evrptw.experiments.stage04_weights_review import validate_stage04_scope_identities
+
+    rows = [
+        {"instance": "c101C5", "seed": 2014, "axis": "adaptive_wall_clock"},
+        {"instance": "c101C5", "seed": 2014, "axis": "adaptive_wall_clock"},
+    ]
+    passed, detail = validate_stage04_scope_identities(rows, scope="smoke")
+    assert not passed
+    assert "duplicate" in detail
+    assert "missing" in detail
+
+
+def test_stage04_prerequisite_rejects_missing_publication(tmp_path: object) -> None:
+    from pathlib import Path
+
+    from evrptw.experiments.stage04_weights import verify_stage034_prerequisite
+
+    with pytest.raises(FileNotFoundError):
+        verify_stage034_prerequisite(Path(str(tmp_path)), Path("missing.json"))
+
 # ─── Config validation ──────────────────────────────────────────────
 
 

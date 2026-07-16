@@ -1,7 +1,8 @@
 [stage05_1]
-schema_version = "stage05.1-best-known-v1"
+schema_version = "stage05.1-best-known-v2"
 experiment_id = "stage05.1-best-known"
 component = "best_known"
+stage04_review_manifest = "experiments/manifests/stage04_adaptive_weights_artifact_manifest.json"
 
 [benchmark]
 directory = "data/schneider"

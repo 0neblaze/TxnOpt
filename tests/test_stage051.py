@@ -14,6 +14,52 @@ from evrptw.best_known import (
 )
 
 
+def test_stage051_replay_rejects_tampered_compatibility_text() -> None:
+    from evrptw.experiments.stage051_best_known import canonical_stage051_rows
+    from evrptw.experiments.stage051_best_known_review import validate_stage051_rows
+
+    bks_rows, compatibility_rows = canonical_stage051_rows()
+    tampered = [dict(row) for row in compatibility_rows]
+    tampered[0]["published_model"] = "tampered"
+    passed, _ = validate_stage051_rows(bks_rows, tampered)
+    assert not passed
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("source_doi", "wrong"), ("bks_charging_time", "0"), ("model_compatible", "True")],
+)
+def test_stage051_replay_rejects_tampered_bks_fields(field: str, value: str) -> None:
+    from evrptw.experiments.stage051_best_known import canonical_stage051_rows
+    from evrptw.experiments.stage051_best_known_review import validate_stage051_rows
+
+    bks_rows, compatibility_rows = canonical_stage051_rows()
+    tampered = [dict(row) for row in bks_rows]
+    tampered[0][field] = value
+    passed, _ = validate_stage051_rows(tampered, compatibility_rows)
+    assert not passed
+
+
+def test_stage051_output_layout_rejects_double_run_label(tmp_path: object) -> None:
+    from pathlib import Path
+
+    from evrptw.experiments.stage051_best_known import validate_stage051_output_dir
+
+    root = Path(str(tmp_path))
+    label = "stage05.1_best_known_attempt02"
+    with pytest.raises(ValueError, match="results/<canonical-run-label>"):
+        validate_stage051_output_dir(root, root / "results" / label / label, label)
+
+
+def test_stage051_prerequisite_rejects_missing_publication(tmp_path: object) -> None:
+    from pathlib import Path
+
+    from evrptw.experiments.stage051_best_known import verify_stage04_prerequisite
+
+    with pytest.raises(FileNotFoundError):
+        verify_stage04_prerequisite(Path(str(tmp_path)), Path("missing.json"))
+
+
 class TestBKSDataCompleteness:
     """Verify that all 92 Schneider benchmark instances have BKS records."""
 

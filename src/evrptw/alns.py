@@ -4088,6 +4088,14 @@ def _apply_stage04_segment_update(
     """
     for name, stats in all_stats.items():
         if stats.segment_calls < config.min_calls_per_operator:
+            events.append({
+                "type": "stage04_segment_skip",
+                "operator": name,
+                "iteration": iteration,
+                "segment_calls": stats.segment_calls,
+                "segment_reward_sum": stats.segment_reward_sum,
+                "minimum_calls": config.min_calls_per_operator,
+            })
             stats.segment_calls = 0
             stats.segment_reward_sum = 0.0
             continue

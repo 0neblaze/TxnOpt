@@ -11,8 +11,14 @@ from typing import Any
 from evrptw.artifacts import verify_manifest
 from evrptw.best_known import (
     BEST_KNOWN_VALUES,
-    COMPATIBILITY_ASSESSMENT,
     TOTAL_INSTANCES,
+)
+from evrptw.experiments.stage051_best_known import (
+    BKS_DATA_FIELDS,
+    COMPATIBILITY_FIELDS,
+    STAGE051_SCHEMA_VERSION,
+    canonical_stage051_rows,
+    verify_stage04_prerequisite,
 )
 
 READY_FOR_STAGE05_2 = "READY_FOR_STAGE05_2"
@@ -43,6 +49,9 @@ def review_stage051(
     output_dir.mkdir(parents=True, exist_ok=True)
     findings: list[dict[str, str]] = []
     gate_results: dict[str, tuple[bool, str]] = {}
+
+    if run_dir.parent.name != "results":
+        return _write_failure(output_dir, "run directory is not results/<canonical-run-label>")
 
     # --- Manifest verification ---
     try:
@@ -79,6 +88,30 @@ def review_stage051(
         )
 
     run_label = manifest.get("run_label", run_dir.name)
+    if run_label != run_dir.name:
+        return _write_failure(output_dir, "manifest run label does not match run directory")
+    metadata_refs = [
+        item
+        for item in manifest.get("artifacts", [])
+        if isinstance(item, dict) and item.get("artifact_type") == "manifest_metadata"
+    ]
+    if len(metadata_refs) != 1:
+        return _write_failure(output_dir, "exactly one manifest metadata artifact is required")
+    metadata_path = run_dir / str(metadata_refs[0]["relative_path"])
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("schema_version") != STAGE051_SCHEMA_VERSION:
+        return _write_failure(output_dir, "Stage 5.1 v2 metadata is required")
+    if metadata.get("git_dirty") is not False:
+        return _write_failure(output_dir, "Stage 5.1 evidence must come from a clean revision")
+    try:
+        prerequisite = verify_stage04_prerequisite(
+            run_dir.parents[1],
+            Path("experiments/manifests/stage04_adaptive_weights_artifact_manifest.json"),
+        )
+    except (FileNotFoundError, KeyError, RuntimeError, ValueError) as error:
+        return _write_failure(output_dir, f"Stage 4 prerequisite failed: {error}")
+    if metadata.get("stage04_prerequisite") != prerequisite:
+        return _write_failure(output_dir, "Stage 4 prerequisite provenance mismatch")
 
     # --- Find and read BKS data CSV ---
     bks_csv_name = f"{run_label}_bks_data.csv"
@@ -101,11 +134,16 @@ def review_stage051(
             compat_rows = list(reader)
 
     # --- Gate 1: Instance coverage ---
-    csv_instances = {row["instance"] for row in bks_rows}
+    csv_instances = {row.get("instance", "") for row in bks_rows}
     canonical_instances = {rec.instance for rec in BEST_KNOWN_VALUES}
     missing = canonical_instances - csv_instances
     extra = csv_instances - canonical_instances
-    coverage_ok = len(missing) == 0 and len(extra) == 0
+    coverage_ok = (
+        len(bks_rows) == TOTAL_INSTANCES
+        and len(csv_instances) == TOTAL_INSTANCES
+        and len(missing) == 0
+        and len(extra) == 0
+    )
     detail = f"csv={len(csv_instances)} canonical={len(canonical_instances)}"
     if missing:
         detail += f" missing={sorted(missing)[:5]}"
@@ -137,14 +175,15 @@ def review_stage051(
     )
 
     # --- Gate 4: Compatibility assessment ---
+    strict_rows_ok, strict_detail = validate_stage051_rows(bks_rows, compat_rows)
     compat_ok = _check_compatibility(compat_rows)
     gate_results[_GATE_COMPATIBILITY] = (
         compat_ok,
-        f"{len(compat_rows)} dimensions, overall={COMPATIBILITY_ASSESSMENT.overall_compatible}",
+        strict_detail,
     )
 
     # --- Gate 5: Replay consistency ---
-    replay_ok = _check_replay(bks_rows)
+    replay_ok = _check_replay(bks_rows) and strict_rows_ok
     detail = "all BKS values match canonical data"
     if not replay_ok:
         mismatches = _find_replay_mismatches(bks_rows)
@@ -182,47 +221,56 @@ def review_stage051(
 def _check_compatibility(rows: list[dict[str, str]]) -> bool:
     """Check that compatibility assessment matches canonical data."""
 
-    if len(rows) != len(COMPATIBILITY_ASSESSMENT.dimensions):
-        return False
-    for row, dim in zip(rows, COMPATIBILITY_ASSESSMENT.dimensions, strict=False):
-        if row.get("dimension") != dim.dimension:
-            return False
-        if row.get("compatible", "").lower() != str(dim.compatible).lower():
-            return False
-    return True
+    _, canonical = canonical_stage051_rows()
+    return rows == canonical
 
 
 def _check_replay(rows: list[dict[str, str]]) -> bool:
     """Check that CSV BKS values match canonical data."""
 
-    canonical = {rec.instance: rec for rec in BEST_KNOWN_VALUES}
-    for row in rows:
-        inst = row.get("instance", "")
-        rec = canonical.get(inst)
-        if rec is None:
-            return False
-        if int(row["bks_vehicles"]) != rec.bks_vehicles:
-            return False
-        if abs(float(row["bks_distance"]) - rec.bks_distance) > 1e-6:
-            return False
-    return True
+    canonical, _ = canonical_stage051_rows()
+    return rows == canonical
+
+
+def validate_stage051_rows(
+    bks_rows: list[dict[str, str]],
+    compatibility_rows: list[dict[str, str]],
+) -> tuple[bool, str]:
+    """Strictly compare every published Stage 5.1 field with canonical data."""
+
+    canonical_bks, canonical_compatibility = canonical_stage051_rows()
+    if len(bks_rows) != TOTAL_INSTANCES:
+        return False, f"expected {TOTAL_INSTANCES} BKS rows, got {len(bks_rows)}"
+    if len({row.get("instance", "") for row in bks_rows}) != TOTAL_INSTANCES:
+        return False, "BKS instances must be unique"
+    if any(tuple(row) != BKS_DATA_FIELDS for row in bks_rows):
+        return False, "BKS CSV columns or column order do not match the canonical schema"
+    if any(tuple(row) != COMPATIBILITY_FIELDS for row in compatibility_rows):
+        return False, "compatibility CSV columns or column order do not match the canonical schema"
+    if bks_rows != canonical_bks:
+        return False, "one or more BKS fields differ from canonical data"
+    if compatibility_rows != canonical_compatibility:
+        return False, "compatibility assessment differs from the complete canonical assessment"
+    if any("gap" in key.lower() for row in bks_rows for key in row):
+        return False, "gap columns are not permitted"
+    return True, "all BKS and compatibility fields match canonical data"
 
 
 def _find_replay_mismatches(rows: list[dict[str, str]]) -> list[str]:
     """Return instance names with mismatched BKS values."""
 
-    canonical = {rec.instance: rec for rec in BEST_KNOWN_VALUES}
+    canonical_rows, _ = canonical_stage051_rows()
+    canonical = {row["instance"]: row for row in canonical_rows}
     mismatches: list[str] = []
     for row in rows:
         inst = row.get("instance", "")
-        rec = canonical.get(inst)
-        if rec is None:
+        expected = canonical.get(inst)
+        if expected is None:
             mismatches.append(f"{inst}:not_found")
             continue
-        if int(row["bks_vehicles"]) != rec.bks_vehicles:
-            mismatches.append(f"{inst}:vehicles")
-        if abs(float(row["bks_distance"]) - rec.bks_distance) > 1e-6:
-            mismatches.append(f"{inst}:distance")
+        differing = [field for field in BKS_DATA_FIELDS if row.get(field) != expected[field]]
+        if differing:
+            mismatches.append(f"{inst}:{','.join(differing)}")
     return mismatches
 
 
@@ -308,7 +356,7 @@ def _write_review_outputs(
         "stage_id": "stage05.1",
         "component": "best_known",
         "status": status,
-        "schema_version": "stage05.1-review-v1",
+        "schema_version": "stage05.1-review-v2",
         "gates": {
             name: {"passed": passed, "detail": detail}
             for name, (passed, detail) in gate_results.items()

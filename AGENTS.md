@@ -415,10 +415,15 @@ this repository or one of its subdirectories.
   `not_single_best_seed` (>= 2 winning seeds), `std_not_increased` (Stage 4
   vehicle_count std <= Stage 0), and `replay_consistency` (all axes valid with
   matching objectives).
-- The accepted smoke evidence is `stage04_adaptive_weights_attempt01` (72/72
-  axes, `READY_FOR_STAGE05`). The accepted formal evidence is
-  `stage04_adaptive_weights_attempt02` (144/144 axes, `READY_FOR_STAGE05`).
-  Earlier failed or partial attempts remain preserved.
+- Stage 4 v2 raw evidence persists normalized per-operator six-category
+  statistics and every segment update/skip decision. The reviewer requires the
+  exact scope identity set, rejects missing or duplicate axes, and verifies
+  that an update occurs only after the configured minimum segment calls.
+- `stage04_adaptive_weights_attempt01` and
+  `stage04_adaptive_weights_attempt02` are preserved v1 evidence. The v1
+  reviewer did not independently verify complete per-operator six-category
+  and segment evidence, so v2 does not inherit their readiness claim. New v2
+  Smoke and Formal evidence must use new attempt labels.
 - Stage 4 review products are tracked under `experiments/summaries/` with
   `stage04_adaptive_weights_attempt02_` prefix; the artifact registry is
   `experiments/registries/stage04_artifact_registry.csv` and the manifest is
@@ -465,8 +470,12 @@ this repository or one of its subdirectories.
   `COMPATIBILITY_ASSESSMENT`), and `replay_consistency` (CSV values match the
   canonical `BEST_KNOWN_VALUES`). The review reports `READY_FOR_STAGE05_2`
   only when all five gates pass.
-- The accepted evidence will use `stage05.1_best_known_attempt01` after a
-  clean commit run. The artifact registry will be
+- Stage 5.1 v2 additionally requires the published Stage 4 v2 prerequisite,
+  canonical single-level run layout, exact CSV schemas, unique instance rows,
+  and complete field-by-field replay including citations, charging unknowns,
+  and model-compatibility fields. `stage05.1_best_known_attempt01` remains
+  preserved v1 evidence and is superseded for readiness purposes.
+- The accepted v2 evidence will use a new attempt label. The artifact registry is
   `experiments/registries/stage05.1_artifact_registry.csv` and the manifest
   will be `experiments/manifests/stage05.1_best_known_artifact_manifest.json`,
   published only after formal review passes.

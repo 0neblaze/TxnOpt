@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
 import re
 import resource
 import statistics
@@ -27,7 +28,7 @@ import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from evrptw.alns import ALNSResult, solve_alns
 from evrptw.artifacts import (
@@ -36,6 +37,7 @@ from evrptw.artifacts import (
     ArtifactStorageConfig,
     aggregate_diagnostic_events,
     build_stage03_critical_events,
+    verify_manifest,
 )
 from evrptw.cache_incremental import CacheIncrementalConfig, canonical_instance_hash
 from evrptw.environment import collect_environment
@@ -58,7 +60,7 @@ from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.stage04 import Stage04Config, with_fixed_weights
 
-STAGE04_SCHEMA_VERSION = "stage04-adaptive-weights-v1"
+STAGE04_SCHEMA_VERSION = "stage04-adaptive-weights-v2"
 STAGE04_RUN_LABEL = re.compile(
     r"stage04_adaptive_weights_(?:attempt|rerun)[0-9]{2}"
 )
@@ -134,6 +136,7 @@ class Stage04WeightsConfig:
 
     benchmark_dir: Path
     stage02_config: Path
+    stage034_review_manifest: Path
     seeds: tuple[int, ...]
     wall_clock_seconds: float
     max_iterations: int
@@ -159,6 +162,7 @@ def load_stage04_config(path: Path) -> Stage04WeightsConfig:
         config = Stage04WeightsConfig(
             benchmark_dir=Path(str(payload["benchmark"]["directory"])),
             stage02_config=Path(str(stage["stage02_config"])),
+            stage034_review_manifest=Path(str(stage["stage034_review_manifest"])),
             seeds=tuple(int(value) for value in run["seeds"]),
             wall_clock_seconds=float(run["time_limit_seconds"]),
             max_iterations=int(run["max_iterations"]),
@@ -375,6 +379,25 @@ def _bool(value: Any) -> bool:
     return normalized == "true"
 
 
+def _adaptive_operator_statistics(result: ALNSResult) -> dict[str, dict[str, object]]:
+    """Normalize the six audited categories for every adaptive operator."""
+
+    return {
+        name: {
+            "role": "adaptive_weight_operator",
+            "calls": cast(int, stats["calls"]),
+            "accepted": cast(int, stats["accepted"]),
+            "accepted_improving": cast(int, stats["accepted_improving"]),
+            "accepted_equal": cast(int, stats["accepted_equal"]),
+            "accepted_worse": cast(int, stats["accepted_worse"]),
+            "rejected": cast(int, stats["rejected"]),
+            "new_global_best": cast(int, stats["best"]),
+            "vehicle_reduction": cast(int, stats["vehicle_reductions"]),
+        }
+        for name, stats in result.neighborhood_statistics.items()
+    }
+
+
 def _write_csv(path: Path, fields: Sequence[str], rows: Sequence[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -458,6 +481,13 @@ def _persist_axis_evidence(
             "trace_reconciliation": reconciliation,
             "valid": valid,
             "stage04_statistics": result.stage04_statistics,
+            "adaptive_operator_statistics": _adaptive_operator_statistics(result),
+            "stage04_segment_events": [
+                dict(event)
+                for event in result.stage04_event_log
+                if event.get("type")
+                in {"stage04_segment_update", "stage04_segment_skip"}
+            ],
         }
         solution_axes[axis] = {
             "routes": [list(route) for route in result.routes],
@@ -581,6 +611,7 @@ def run_stage04_weights(
         raise FileExistsError(resolved_output)
     _require_clean_repository(root)
     config = load_stage04_config(resolved_config)
+    verify_stage034_prerequisite(root, config.stage034_review_manifest)
     instances = SMOKE_INSTANCES if scope == "smoke" else FORMAL_INSTANCES
     stage02 = load_stage02_config(_resolve(root, config.stage02_config))
     repository_revision = _git(root, "rev-parse", "HEAD")
@@ -733,6 +764,29 @@ def _git(root: Path, *arguments: str) -> str:
 def _require_clean_repository(root: Path) -> None:
     if _git(root, "status", "--porcelain"):
         raise RuntimeError("Stage 4 runner requires a clean main repository commit")
+
+
+def verify_stage034_prerequisite(root: Path, configured_path: Path) -> None:
+    publication_path = _resolve(root, configured_path)
+    publication = json.loads(publication_path.read_text(encoding="utf-8"))
+    run_label = publication.get("formal_run_label")
+    if (
+        publication.get("formal_review_status") != "READY_FOR_STAGE04"
+        or not isinstance(run_label, str)
+    ):
+        raise RuntimeError("Stage 4 requires a published Stage 3.4 READY_FOR_STAGE04 review")
+    raw_dir = root / "results" / run_label
+    verify_manifest(raw_dir)
+    review_manifest_path = raw_dir / "review" / "review_manifest.json"
+    review = json.loads(review_manifest_path.read_text(encoding="utf-8"))
+    if review.get("status") != "READY_FOR_STAGE04":
+        raise RuntimeError("Stage 3.4 formal raw review is not READY_FOR_STAGE04")
+    files = review.get("files")
+    if not isinstance(files, Mapping) or any(
+        _sha256(review_manifest_path.with_name(str(name))) != str(digest)
+        for name, digest in files.items()
+    ):
+        raise RuntimeError("Stage 3.4 formal review file hashes are invalid")
 
 
 def _sha256(path: Path) -> str:
