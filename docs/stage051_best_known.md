@@ -78,8 +78,9 @@ promoted by the v2 reviewer.
 
 ## Accepted Evidence
 
-`stage05.1_best_known_attempt02` is the accepted v2 evidence. Its raw bundle
-uses the canonical single-level layout, contains exactly 92 unique instance
-rows, and independently replays to `READY_FOR_STAGE05_2` with all five gates
-passing. `stage05.1_best_known_attempt01` is retained as superseded v1 evidence
-under its historical nested layout.
+`stage05.1_best_known_attempt02` is preserved v2 evidence. Its raw bundle uses
+the canonical single-level layout and contains exactly 92 unique instance rows,
+but it is superseded by the v3 Stage 4 prerequisite and independent-conversion
+replay requirements. A new attempt must pass those gates before
+`READY_FOR_STAGE05_2` is republished. `stage05.1_best_known_attempt01` remains
+superseded v1 evidence under its historical nested layout.

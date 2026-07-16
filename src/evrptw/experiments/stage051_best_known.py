@@ -34,7 +34,7 @@ from evrptw.best_known import (
 )
 from evrptw.environment import collect_environment
 
-STAGE051_SCHEMA_VERSION = "stage05.1-best-known-v2"
+STAGE051_SCHEMA_VERSION = "stage05.1-best-known-v3"
 STAGE051_RUN_LABEL = re.compile(r"^stage05\.1_best_known_(?:attempt|rerun)[0-9]{2}$")
 
 BKS_DATA_FIELDS: tuple[str, ...] = (
@@ -428,18 +428,26 @@ def verify_stage04_prerequisite(
     publication = json.loads(publication_path.read_text(encoding="utf-8"))
     run_label = publication.get("run_label")
     if (
-        publication.get("schema_version") != "stage04-publication-v2"
+        publication.get("schema_version") != "stage04-publication-v3"
         or publication.get("review_status") != "READY_FOR_STAGE05"
         or not isinstance(run_label, str)
     ):
         raise RuntimeError("Stage 5.1 requires a published Stage 4 READY_FOR_STAGE05 review")
     raw_dir = root / "results" / run_label
     verify_manifest(raw_dir)
+    raw_manifest_path = raw_dir / "control" / f"{run_label}_manifest.json"
+    if publication.get("raw_manifest_sha256") != _sha256(raw_manifest_path):
+        raise RuntimeError("Stage 4 publication raw manifest hash is invalid")
     files = publication.get("files")
-    if not isinstance(files, dict) or any(
-        _sha256(root / str(record["path"])) != str(record["sha256"])
-        for record in files.values()
-        if isinstance(record, dict)
+    if (
+        not isinstance(files, dict)
+        or not files
+        or any(not isinstance(record, dict) for record in files.values())
+        or any(
+            set(record) < {"path", "sha256"}
+            or _sha256(root / str(record["path"])) != str(record["sha256"])
+            for record in files.values()
+        )
     ):
         raise RuntimeError("Stage 4 published review file hashes are invalid")
     review_record = files.get("review_manifest")
@@ -449,7 +457,7 @@ def verify_stage04_prerequisite(
         (root / str(review_record["path"])).read_text(encoding="utf-8")
     )
     if (
-        review.get("schema_version") != "stage04-review-v2"
+        review.get("schema_version") != "stage04-review-v3"
         or review.get("status") != "READY_FOR_STAGE05"
     ):
         raise RuntimeError("Stage 4 v2 review is not READY_FOR_STAGE05")

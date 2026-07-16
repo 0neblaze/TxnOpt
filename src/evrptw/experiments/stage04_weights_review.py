@@ -13,6 +13,7 @@ import contextlib
 import csv
 import hashlib
 import json
+import math
 import statistics
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -21,7 +22,7 @@ from typing import Any
 from evrptw.artifacts import ArtifactReader, verify_manifest
 from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES, FORMAL_SEEDS
 from evrptw.experiments.stage03_measurement import SMOKE_INSTANCES
-from evrptw.experiments.stage04_weights import DIAGNOSTIC_AXES
+from evrptw.experiments.stage04_weights import DIAGNOSTIC_AXES, PER_RUN_FIELDS
 from evrptw.objective import (
     ObjectiveComparison,
     SolutionObjective,
@@ -32,6 +33,8 @@ from evrptw.validation import validate_routes
 
 READY_FOR_STAGE05 = "READY_FOR_STAGE05"
 NOT_READY = "NOT_READY"
+STAGE04_REVIEW_SCHEMA_VERSION = "stage04-review-v3"
+STAGE04_RAW_SCHEMA_VERSION = "stage04-adaptive-weights-v3"
 
 _MIN_CALLS_PER_OPERATOR_DEFAULT = 5
 
@@ -72,6 +75,8 @@ def validate_stage04_operator_audit(
     if not operator_statistics:
         return False, "adaptive operator statistics are missing"
     failures: list[str] = []
+    if not segment_events:
+        failures.append("adaptive segment events are missing")
     for name, raw_stats in operator_statistics.items():
         if not isinstance(raw_stats, Mapping):
             failures.append(f"{name}: statistics are not an object")
@@ -80,6 +85,10 @@ def validate_stage04_operator_audit(
         if missing:
             failures.append(f"{name}: missing six-category fields {missing}")
             continue
+        role = raw_stats.get("role")
+        expected_role = name.partition(":")[0]
+        if role not in {"neighborhood", "destroy", "repair"} or role != expected_role:
+            failures.append(f"{name}: invalid or mismatched adaptive weight role {role!r}")
         try:
             values = {
                 field: _strict_nonnegative_int(raw_stats[field], field)
@@ -97,8 +106,11 @@ def validate_stage04_operator_audit(
         )
         if accepted != accepted_sum:
             failures.append(f"{name}: accepted={accepted} but category sum={accepted_sum}")
-        if calls < accepted + values["rejected"]:
-            failures.append(f"{name}: calls are smaller than accepted + rejected")
+        if calls != accepted + values["rejected"]:
+            failures.append(
+                f"{name}: calls={calls} but accepted + rejected="
+                f"{accepted + values['rejected']}"
+            )
         if values["new_global_best"] > values["accepted_improving"]:
             failures.append(f"{name}: new_global_best exceeds accepted_improving")
         if values["vehicle_reduction"] > values["accepted_improving"]:
@@ -108,6 +120,11 @@ def validate_stage04_operator_audit(
         if event_type not in {"stage04_segment_update", "stage04_segment_skip"}:
             failures.append(f"unexpected segment event type {event_type!r}")
             continue
+        operator = event.get("operator")
+        if operator not in operator_statistics:
+            failures.append(f"segment event references unknown operator {operator!r}")
+        elif event.get("role") != str(operator).partition(":")[0]:
+            failures.append(f"{operator}: segment event role is missing or invalid")
         try:
             calls = _strict_nonnegative_int(event.get("segment_calls"), "segment_calls")
         except ValueError as error:
@@ -166,6 +183,56 @@ def validate_stage04_scope_identities(
     if extra:
         details.append(f"extra={len(extra)}")
     return not details, "; ".join(details) if details else f"exact {len(expected)}-axis scope"
+
+
+def validate_stage04_per_run_rows(
+    rows: Sequence[Mapping[str, str]], *, scope: str
+) -> tuple[bool, str]:
+    """Strictly validate the complete per-run CSV schema, types, and identities."""
+
+    failures: list[str] = []
+    numeric_int_fields = {
+        "seed", "vehicle_count", "charging_count", "iterations",
+        "effective_iterations", "accepted_moves", "improving_moves",
+        "rejected_moves", "accepted_improving", "accepted_equal",
+        "accepted_worse", "reheat_count", "restart_count",
+        "maximum_stagnation", "exact_started_calls", "exact_completed_calls",
+    }
+    numeric_float_fields = {
+        "total_distance", "total_charging_time", "acceptance_rate",
+        "initial_temperature",
+    }
+    identities: list[dict[str, object]] = []
+    for index, row in enumerate(rows):
+        if tuple(row) != PER_RUN_FIELDS:
+            failures.append(f"row {index}: invalid CSV schema or column order")
+        try:
+            for field in numeric_int_fields:
+                _strict_nonnegative_int(row.get(field), field)
+            for field in numeric_float_fields:
+                value = row.get(field)
+                if value is None or value == "" or not isinstance(value, str):
+                    raise ValueError(f"{field} must be numeric")
+                parsed = float(value)
+                if not math.isfinite(parsed) or parsed < 0:
+                    raise ValueError(f"{field} must be a finite non-negative number")
+            if row.get("feasible") not in {"True", "False"}:
+                raise ValueError("feasible must be True or False")
+            if row.get("intensification_active") not in {"True", "False"}:
+                raise ValueError("intensification_active must be True or False")
+        except ValueError as error:
+            failures.append(f"row {index}: invalid value: {error}")
+        identities.append({
+            "instance": row.get("instance", ""),
+            "seed": row.get("seed", ""),
+            "axis": row.get("axis", ""),
+        })
+    identity_ok, identity_detail = validate_stage04_scope_identities(
+        identities, scope=scope
+    )
+    if not identity_ok:
+        failures.append(identity_detail)
+    return not failures, "; ".join(failures) if failures else identity_detail
 
 
 def review_stage04(
@@ -231,6 +298,19 @@ def review_stage04(
             expected_axes,
             run_label=run_label,
         )
+    metadata_path = run_dir / "control" / f"{run_label}_run_metadata.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
+        return _write_failure_report(
+            output_dir, run_dir, scope, f"metadata verification failed: {error}",
+            expected_axes, run_label=run_label,
+        )
+    if metadata.get("schema_version") != STAGE04_RAW_SCHEMA_VERSION:
+        return _write_failure_report(
+            output_dir, run_dir, scope, "Stage 4 v3 metadata is required",
+            expected_axes, run_label=run_label,
+        )
 
     # ------------------------------------------------------------------
     # 2. Read per_run_results.csv from the run directory.
@@ -245,6 +325,18 @@ def review_stage04(
             run_dir,
             scope,
             f"per_run_results.csv not found at {per_run_path}",
+            expected_axes,
+            run_label=run_label,
+        )
+    per_run_ok, per_run_detail = validate_stage04_per_run_rows(
+        per_run_rows, scope=scope
+    )
+    if not per_run_ok:
+        return _write_failure_report(
+            output_dir,
+            run_dir,
+            scope,
+            f"per_run_results.csv validation failed: {per_run_detail}",
             expected_axes,
             run_label=run_label,
         )
@@ -385,7 +477,11 @@ def review_stage04(
             segment_events = raw_axis.get("stage04_segment_events")
             operator_audit_ok = False
             operator_audit_detail = "Stage 4 v2 operator audit evidence is missing"
-            if isinstance(operator_statistics, Mapping) and isinstance(segment_events, list):
+            if (
+                axis.startswith("adaptive_")
+                and isinstance(operator_statistics, Mapping)
+                and isinstance(segment_events, list)
+            ):
                 typed_events = [event for event in segment_events if isinstance(event, Mapping)]
                 if len(typed_events) == len(segment_events):
                     operator_audit_ok, operator_audit_detail = validate_stage04_operator_audit(
@@ -557,7 +653,7 @@ def review_stage04(
     paths["review_manifest"].write_text(
         json.dumps(
             {
-                "schema_version": "stage04-review-v2",
+                "schema_version": STAGE04_REVIEW_SCHEMA_VERSION,
                 "run_label": run_label,
                 "run_directory": str(run_dir),
                 "scope": scope,
@@ -633,7 +729,7 @@ def _evaluate_gates(
     status = READY_FOR_STAGE05 if all_pass else NOT_READY
 
     return {
-        "schema_version": "stage04-review-v2",
+        "schema_version": STAGE04_REVIEW_SCHEMA_VERSION,
         "scope": scope,
         "status": status,
         "gates": gates,
@@ -659,7 +755,7 @@ def _gate_operator_call_sufficiency(
     failures: list[str] = []
     for row in replay_rows:
         axis = str(row.get("axis", ""))
-        if not axis.endswith("_wall_clock"):
+        if axis != "adaptive_wall_clock":
             continue
         if not bool(row.get("operator_audit_ok")):
             failures.append(
@@ -1139,7 +1235,7 @@ def _write_failure_report(
     paths["review_manifest"].write_text(
         json.dumps(
             {
-                "schema_version": "stage04-review-v2",
+                "schema_version": STAGE04_REVIEW_SCHEMA_VERSION,
                 "run_label": run_label or run_dir.name,
                 "run_directory": str(run_dir),
                 "scope": scope,

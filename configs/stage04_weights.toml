@@ -9,7 +9,7 @@
 # × wall_clock/fixed_work) = 144 runs.
 
 [stage04]
-schema_version = "stage04-weights-v2"
+schema_version = "stage04-weights-v3"
 experiment_id = "stage04-adaptive-weights"
 algorithm = "ALNS_EXACT_CHARGING"
 operator_profile = "stage02_constraint_guided"

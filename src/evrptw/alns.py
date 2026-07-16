@@ -2855,8 +2855,12 @@ def _solve_alns(
                 and (iteration + 1) % stage04_config.segment_length == 0
             ):
                 _apply_stage04_segment_update(
-                    neighborhood_stats if profile is not OperatorProfile.BASELINE
-                    else {**destroy_stats, **repair_stats},
+                    _stage04_adaptive_weight_statistics(
+                        profile,
+                        neighborhood_stats,
+                        destroy_stats,
+                        standard_repair_stats,
+                    ),
                     stage04_config,
                     iteration,
                     stage04_events,
@@ -3109,8 +3113,12 @@ def _solve_alns(
             and (iteration + 1) % stage04_config.segment_length == 0
         ):
             _apply_stage04_segment_update(
-                neighborhood_stats if profile is not OperatorProfile.BASELINE
-                else {**destroy_stats, **repair_stats},
+                _stage04_adaptive_weight_statistics(
+                    profile,
+                    neighborhood_stats,
+                    destroy_stats,
+                    standard_repair_stats,
+                ),
                 stage04_config,
                 iteration,
                 stage04_events,
@@ -4089,10 +4097,12 @@ def _apply_stage04_segment_update(
     reset after the update.  The weight change is logged.
     """
     for name, stats in all_stats.items():
+        role = name.partition(":")[0] if ":" in name else "unspecified"
         if stats.segment_calls < config.min_calls_per_operator:
             events.append({
                 "type": "stage04_segment_skip",
                 "operator": name,
+                "role": role,
                 "iteration": iteration,
                 "segment_calls": stats.segment_calls,
                 "segment_reward_sum": stats.segment_reward_sum,
@@ -4112,6 +4122,7 @@ def _apply_stage04_segment_update(
         events.append({
             "type": "stage04_segment_update",
             "operator": name,
+            "role": role,
             "iteration": iteration,
             "old_weight": old_weight,
             "new_weight": new_weight,
@@ -4126,6 +4137,30 @@ def _stage04_accumulate(stats: OperatorStatistics, reward: float) -> None:
     """Accumulate reward into the segment buffer."""
     stats.segment_reward_sum += reward
     stats.segment_calls += 1
+
+
+def _stage04_adaptive_weight_statistics(
+    profile: OperatorProfile,
+    neighborhood_statistics: dict[str, OperatorStatistics],
+    destroy_statistics: dict[str, OperatorStatistics],
+    repair_statistics: dict[str, OperatorStatistics],
+) -> dict[str, OperatorStatistics]:
+    """Return exactly the operators whose weights participate in selection."""
+
+    selected: dict[str, OperatorStatistics] = {}
+    if profile is not OperatorProfile.BASELINE:
+        selected.update({
+            f"neighborhood:{name}": stats
+            for name, stats in neighborhood_statistics.items()
+            if name != "vehicle_reduction_refinement"
+        })
+    selected.update({
+        f"destroy:{name}": stats for name, stats in destroy_statistics.items()
+    })
+    selected.update({
+        f"repair:{name}": stats for name, stats in repair_statistics.items()
+    })
+    return selected
 
 
 def _select_stage02_neighborhood(

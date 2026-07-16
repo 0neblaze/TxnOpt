@@ -423,11 +423,14 @@ this repository or one of its subdirectories.
   `stage04_adaptive_weights_attempt02` are preserved v1 evidence. The v1
   reviewer did not independently verify complete per-operator six-category
   and segment evidence, so v2 does not inherit their readiness claim.
-- The accepted v2 evidence is Smoke `stage04_adaptive_weights_attempt03`
-  (72/72 axes valid) and Formal `stage04_adaptive_weights_attempt05`
-  (144/144 axes valid, `READY_FOR_STAGE05`). Formal attempt04 was interrupted
+- The v2 evidence Smoke `stage04_adaptive_weights_attempt03` and Formal
+  `stage04_adaptive_weights_attempt05` is preserved but superseded: the v3
+  reviewer correctly rejects its incomplete adaptive-role and call-partition
+  audit, so neither run is current readiness evidence. Formal attempt04 was interrupted
   after 30 of 36 instance/seed bundles and remains preserved as incomplete
-  evidence; it was not overwritten or used for readiness.
+  evidence; it was not overwritten or used for readiness. New v3 Smoke and
+  Formal evidence require new attempt labels before `READY_FOR_STAGE05` may be
+  republished.
 - Stage 4 review products are tracked under `experiments/summaries/` with
   `stage04_adaptive_weights_attempt05_` prefix; the artifact registry is
   `experiments/registries/stage04_artifact_registry.csv` and the manifest is
@@ -479,10 +482,11 @@ this repository or one of its subdirectories.
   and complete field-by-field replay including citations, charging unknowns,
   and model-compatibility fields. `stage05.1_best_known_attempt01` remains
   preserved v1 evidence and is superseded for readiness purposes.
-- The accepted v2 evidence is `stage05.1_best_known_attempt02`: its canonical
-  single-level bundle contains exactly 92 unique instances and its independent
-  review reports `READY_FOR_STAGE05_2`. Attempt01 remains preserved under its
-  historical nested layout and is not used for current readiness.
+- `stage05.1_best_known_attempt02` remains preserved v2 evidence with a
+  canonical single-level 92-instance bundle, but it is superseded by the v3
+  prerequisite and independent-conversion replay requirements. No current
+  Stage 5.1 readiness may be published until a new attempt passes after Stage 4
+  v3 is republished. Attempt01 remains historical nested-layout evidence.
 - The artifact registry is
   `experiments/registries/stage05.1_artifact_registry.csv` and the manifest
   is `experiments/manifests/stage05.1_best_known_artifact_manifest.json`.

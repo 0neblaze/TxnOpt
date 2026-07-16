@@ -60,6 +60,21 @@ def test_stage051_prerequisite_rejects_missing_publication(tmp_path: object) -> 
         verify_stage04_prerequisite(Path(str(tmp_path)), Path("missing.json"))
 
 
+def test_stage051_reviewer_does_not_use_runner_row_converter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import evrptw.experiments.stage051_best_known as runner
+    from evrptw.experiments.stage051_best_known_review import (
+        reviewer_canonical_stage051_rows,
+        validate_stage051_rows,
+    )
+
+    bks_rows, compatibility_rows = reviewer_canonical_stage051_rows()
+    monkeypatch.setattr(runner, "canonical_stage051_rows", lambda: ([], []))
+    passed, _ = validate_stage051_rows(bks_rows, compatibility_rows)
+    assert passed
+
+
 class TestBKSDataCompleteness:
     """Verify that all 92 Schneider benchmark instances have BKS records."""
 

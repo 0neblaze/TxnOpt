@@ -5,10 +5,12 @@ from __future__ import annotations
 import pytest
 
 from evrptw.alns import (
+    OperatorProfile,
     OperatorStatistics,
     Stage04Config,
     _apply_stage04_segment_update,
     _stage04_accumulate,
+    _stage04_adaptive_weight_statistics,
     solve_alns,
 )
 from evrptw.benchmark import parse_schneider
@@ -24,6 +26,7 @@ def test_stage04_operator_audit_rejects_update_below_minimum() -> None:
 
     statistics = {
         "standard": {
+            "role": "neighborhood",
             "calls": 4,
             "accepted": 2,
             "accepted_improving": 1,
@@ -46,6 +49,7 @@ def test_stage04_operator_audit_requires_all_six_categories() -> None:
 
     statistics = {
         "standard": {
+            "role": "neighborhood",
             "calls": 5,
             "accepted": 3,
             "accepted_improving": 1,
@@ -57,6 +61,93 @@ def test_stage04_operator_audit_requires_all_six_categories() -> None:
     }
     passed, _ = validate_stage04_operator_audit(statistics, [], min_calls=5)
     assert not passed
+
+
+def test_stage04_operator_audit_requires_exact_call_partition_and_role() -> None:
+    from evrptw.experiments.stage04_weights_review import (
+        validate_stage04_operator_audit,
+    )
+
+    statistics = {
+        "neighborhood:standard": {
+            "role": "neighborhood",
+            "calls": 5,
+            "accepted": 2,
+            "accepted_improving": 1,
+            "accepted_equal": 1,
+            "accepted_worse": 0,
+            "rejected": 2,
+            "new_global_best": 0,
+            "vehicle_reduction": 0,
+        }
+    }
+    passed, detail = validate_stage04_operator_audit(
+        statistics,
+        [{
+            "type": "stage04_segment_update",
+            "operator": "neighborhood:standard",
+            "role": "neighborhood",
+            "segment_calls": 5,
+        }],
+        min_calls=5,
+    )
+    assert not passed
+    assert "calls" in detail
+
+    statistics["neighborhood:standard"]["rejected"] = 3
+    statistics["neighborhood:standard"].pop("role")
+    passed, detail = validate_stage04_operator_audit(
+        statistics,
+        [{
+            "type": "stage04_segment_update",
+            "operator": "neighborhood:standard",
+            "role": "neighborhood",
+            "segment_calls": 5,
+        }],
+        min_calls=5,
+    )
+    assert not passed
+    assert "role" in detail
+
+
+def test_stage04_operator_audit_requires_segment_events() -> None:
+    from evrptw.experiments.stage04_weights_review import (
+        validate_stage04_operator_audit,
+    )
+
+    statistics = {
+        "destroy:random": {
+            "role": "destroy",
+            "calls": 5,
+            "accepted": 0,
+            "accepted_improving": 0,
+            "accepted_equal": 0,
+            "accepted_worse": 0,
+            "rejected": 5,
+            "new_global_best": 0,
+            "vehicle_reduction": 0,
+        }
+    }
+    passed, detail = validate_stage04_operator_audit(statistics, [], min_calls=5)
+    assert not passed
+    assert "segment" in detail
+
+
+def test_stage04_per_run_rows_reject_duplicate_and_invalid_numeric_fields() -> None:
+    from evrptw.experiments.stage04_weights_review import validate_stage04_per_run_rows
+
+    rows = [
+        {"instance": "c101C5", "seed": "2014", "axis": "adaptive_wall_clock", "vehicle_count": "2"},
+        {"instance": "c101C5", "seed": "2014", "axis": "adaptive_wall_clock", "vehicle_count": "2"},
+    ]
+    passed, detail = validate_stage04_per_run_rows(rows, scope="smoke")
+    assert not passed
+    assert "duplicate" in detail
+
+    rows[1]["seed"] = "not-an-int"
+    passed, detail = validate_stage04_per_run_rows(rows, scope="smoke")
+    assert not passed
+    assert "invalid" in detail
 
 
 def test_stage04_scope_audit_rejects_missing_and_duplicate_axes() -> None:
@@ -79,6 +170,21 @@ def test_stage04_prerequisite_rejects_missing_publication(tmp_path: object) -> N
 
     with pytest.raises(FileNotFoundError):
         verify_stage034_prerequisite(Path(str(tmp_path)), Path("missing.json"))
+
+
+def test_stage04_prerequisite_rejects_publication_sidecar_mismatch(
+    tmp_path: object,
+) -> None:
+    from pathlib import Path
+
+    from evrptw.experiments.stage04_weights import verify_stage034_prerequisite
+
+    root = Path(str(tmp_path))
+    publication = root / "publication.json"
+    publication.write_text("{}", encoding="utf-8")
+    publication.with_suffix(".json.sha256").write_text("0" * 64, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="sidecar mismatch"):
+        verify_stage034_prerequisite(root, publication)
 
 # ─── Config validation ──────────────────────────────────────────────
 
@@ -229,6 +335,25 @@ class TestWithFixedWeights:
 
 
 class TestSegmentWeightUpdate:
+    def test_adaptive_weight_set_matches_actual_selection_roles(self) -> None:
+        neighborhoods = {
+            "standard": OperatorStatistics(),
+            "vehicle_reduction_refinement": OperatorStatistics(),
+        }
+        destroy = {"random": OperatorStatistics()}
+        repair = {"greedy": OperatorStatistics()}
+        selected = _stage04_adaptive_weight_statistics(
+            OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
+            neighborhoods,
+            destroy,
+            repair,
+        )
+        assert set(selected) == {
+            "neighborhood:standard",
+            "destroy:random",
+            "repair:greedy",
+        }
+
     def test_segment_accumulation(self) -> None:
         stats = OperatorStatistics()
         _stage04_accumulate(stats, 4.0)

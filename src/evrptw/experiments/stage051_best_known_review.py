@@ -11,18 +11,20 @@ from typing import Any
 from evrptw.artifacts import verify_manifest
 from evrptw.best_known import (
     BEST_KNOWN_VALUES,
+    COMPATIBILITY_ASSESSMENT,
+    SOURCE_REFERENCES,
     TOTAL_INSTANCES,
 )
 from evrptw.experiments.stage051_best_known import (
     BKS_DATA_FIELDS,
     COMPATIBILITY_FIELDS,
     STAGE051_SCHEMA_VERSION,
-    canonical_stage051_rows,
     verify_stage04_prerequisite,
 )
 
 READY_FOR_STAGE05_2 = "READY_FOR_STAGE05_2"
 NOT_READY = "NOT_READY"
+STAGE051_REVIEW_SCHEMA_VERSION = "stage05.1-review-v3"
 
 _GATE_COVERAGE = "instance_coverage"
 _GATE_BKS_VALUES = "bks_values_present"
@@ -221,14 +223,14 @@ def review_stage051(
 def _check_compatibility(rows: list[dict[str, str]]) -> bool:
     """Check that compatibility assessment matches canonical data."""
 
-    _, canonical = canonical_stage051_rows()
+    _, canonical = reviewer_canonical_stage051_rows()
     return rows == canonical
 
 
 def _check_replay(rows: list[dict[str, str]]) -> bool:
     """Check that CSV BKS values match canonical data."""
 
-    canonical, _ = canonical_stage051_rows()
+    canonical, _ = reviewer_canonical_stage051_rows()
     return rows == canonical
 
 
@@ -238,7 +240,7 @@ def validate_stage051_rows(
 ) -> tuple[bool, str]:
     """Strictly compare every published Stage 5.1 field with canonical data."""
 
-    canonical_bks, canonical_compatibility = canonical_stage051_rows()
+    canonical_bks, canonical_compatibility = reviewer_canonical_stage051_rows()
     if len(bks_rows) != TOTAL_INSTANCES:
         return False, f"expected {TOTAL_INSTANCES} BKS rows, got {len(bks_rows)}"
     if len({row.get("instance", "") for row in bks_rows}) != TOTAL_INSTANCES:
@@ -259,7 +261,7 @@ def validate_stage051_rows(
 def _find_replay_mismatches(rows: list[dict[str, str]]) -> list[str]:
     """Return instance names with mismatched BKS values."""
 
-    canonical_rows, _ = canonical_stage051_rows()
+    canonical_rows, _ = reviewer_canonical_stage051_rows()
     canonical = {row["instance"]: row for row in canonical_rows}
     mismatches: list[str] = []
     for row in rows:
@@ -272,6 +274,64 @@ def _find_replay_mismatches(rows: list[dict[str, str]]) -> list[str]:
         if differing:
             mismatches.append(f"{inst}:{','.join(differing)}")
     return mismatches
+
+
+def reviewer_canonical_stage051_rows() -> tuple[
+    list[dict[str, str]], list[dict[str, str]]
+]:
+    """Independently compile canonical rows without the runner conversion path."""
+
+    charging_model = "full_recharge: t = (Q - b) * g"
+    objective = (
+        "lexicographic(vehicle_count, total_distance, "
+        "total_charging_time, charging_count)"
+    )
+    distance_metric = "unrounded Euclidean (math.hypot)"
+    compatibility_notes = (
+        "Objective mismatch: our 4-component lexicographic objective adds "
+        "total_charging_time and charging_count not present in published "
+        "objectives; HPH uses weighted sum rather than strict lexicographic; "
+        "distance metric may differ due to rounding conventions. "
+        "No gap computation permitted."
+    )
+    bks_rows: list[dict[str, str]] = []
+    for record in BEST_KNOWN_VALUES:
+        source = SOURCE_REFERENCES[record.source_ref]
+        compilation = SOURCE_REFERENCES[record.compilation_ref]
+        bks_rows.append({
+            "instance": record.instance,
+            "paper_name": record.paper_name,
+            "customer_count": str(record.customer_count),
+            "class_name": record.class_name,
+            "bks_vehicles": str(record.bks_vehicles),
+            "bks_distance": str(record.bks_distance),
+            "bks_charging_time": "unknown",
+            "bks_charging_count": "unknown",
+            "source_ref": record.source_ref,
+            "source_doi": source.doi,
+            "source_year": str(source.year),
+            "source_in_vor_collection": str(source.in_vor_collection),
+            "compilation_ref": record.compilation_ref,
+            "compilation_doi": compilation.doi,
+            "source_table": record.source_table,
+            "optimal_proven": str(record.optimal_proven),
+            "charging_model": charging_model,
+            "objective_function": objective,
+            "distance_metric": distance_metric,
+            "model_compatible": "False",
+            "compatibility_notes": compatibility_notes,
+        })
+    compatibility_rows = [
+        {
+            "dimension": dimension.dimension,
+            "our_model": dimension.our_model,
+            "published_model": dimension.published_model,
+            "compatible": str(dimension.compatible),
+            "notes": dimension.notes,
+        }
+        for dimension in COMPATIBILITY_ASSESSMENT.dimensions
+    ]
+    return bks_rows, compatibility_rows
 
 
 def _find_manifest_name(run_dir: Path) -> str:
@@ -356,7 +416,7 @@ def _write_review_outputs(
         "stage_id": "stage05.1",
         "component": "best_known",
         "status": status,
-        "schema_version": "stage05.1-review-v2",
+        "schema_version": STAGE051_REVIEW_SCHEMA_VERSION,
         "gates": {
             name: {"passed": passed, "detail": detail}
             for name, (passed, detail) in gate_results.items()

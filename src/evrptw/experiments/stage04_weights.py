@@ -60,7 +60,7 @@ from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.stage04 import Stage04Config, with_fixed_weights
 
-STAGE04_SCHEMA_VERSION = "stage04-adaptive-weights-v2"
+STAGE04_SCHEMA_VERSION = "stage04-adaptive-weights-v3"
 STAGE04_RUN_LABEL = re.compile(
     r"stage04_adaptive_weights_(?:attempt|rerun)[0-9]{2}"
 )
@@ -386,20 +386,37 @@ def _bool(value: Any) -> bool:
 def _adaptive_operator_statistics(result: ALNSResult) -> dict[str, dict[str, object]]:
     """Normalize the six audited categories for every adaptive operator."""
 
-    return {
-        name: {
-            "role": "adaptive_weight_operator",
-            "calls": cast(int, stats["calls"]),
-            "accepted": cast(int, stats["accepted"]),
-            "accepted_improving": cast(int, stats["accepted_improving"]),
-            "accepted_equal": cast(int, stats["accepted_equal"]),
-            "accepted_worse": cast(int, stats["accepted_worse"]),
-            "rejected": cast(int, stats["rejected"]),
-            "new_global_best": cast(int, stats["best"]),
-            "vehicle_reduction": cast(int, stats["vehicle_reductions"]),
-        }
-        for name, stats in result.neighborhood_statistics.items()
-    }
+    groups = (
+        ("neighborhood", result.neighborhood_statistics),
+        ("destroy", result.destroy_statistics),
+        ("repair", {
+            name: stats
+            for name, stats in result.repair_statistics.items()
+            if name != "vehicle_count_aware"
+        }),
+    )
+    normalized: dict[str, dict[str, object]] = {}
+    for role, operator_group in groups:
+        for name, stats in operator_group.items():
+            if role == "neighborhood" and name == "vehicle_reduction_refinement":
+                continue
+            calls = cast(int, stats["calls"])
+            accepted = cast(int, stats["accepted"])
+            if calls < accepted:
+                raise RuntimeError(f"{role}:{name} has more accepted moves than calls")
+            normalized[f"{role}:{name}"] = {
+                "role": role,
+                "calls": calls,
+                "accepted": accepted,
+                "accepted_improving": cast(int, stats["accepted_improving"]),
+                "accepted_equal": cast(int, stats["accepted_equal"]),
+                "accepted_worse": cast(int, stats["accepted_worse"]),
+                "rejected": calls - accepted,
+                "recorded_rejected": cast(int, stats["rejected"]),
+                "new_global_best": cast(int, stats["best"]),
+                "vehicle_reduction": cast(int, stats["vehicle_reductions"]),
+            }
+    return normalized
 
 
 def _write_csv(path: Path, fields: Sequence[str], rows: Sequence[Mapping[str, Any]]) -> None:
@@ -780,6 +797,10 @@ def _require_clean_repository(root: Path) -> None:
 
 def verify_stage034_prerequisite(root: Path, configured_path: Path) -> None:
     publication_path = _resolve(root, configured_path)
+    sidecar_path = publication_path.with_suffix(publication_path.suffix + ".sha256")
+    expected_digest = sidecar_path.read_text(encoding="utf-8").split()[0]
+    if _sha256(publication_path) != expected_digest:
+        raise RuntimeError("Stage 3.4 publication manifest sidecar mismatch")
     publication = json.loads(publication_path.read_text(encoding="utf-8"))
     run_label = publication.get("formal_run_label")
     if (

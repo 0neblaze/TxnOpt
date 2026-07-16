@@ -1,27 +1,21 @@
 {
-  "schema_version": "stage05.1-publication-v2",
+  "schema_version": "stage05.1-publication-v3",
   "stage_id": "stage05.1",
   "component": "best_known",
   "run_label": "stage05.1_best_known_attempt02",
   "scope": "formal",
-  "status": "READY_FOR_STAGE05_2",
+  "status": "NOT_READY",
   "artifact_type": "manifest",
   "instance_scope": "all_92",
   "seed_scope": [],
   "comparison_baseline": "stage04_adaptive_weights_attempt05",
-  "review_status": "READY_FOR_STAGE05_2",
+  "review_status": "NOT_READY",
   "raw_schema_version": "stage05.1-best-known-v2",
   "review_schema_version": "stage05.1-review-v2",
   "raw_manifest_sha256": "74ff3b4a92e16229f909d0be5ada832466e61362ad1352174f0878686c4b9c9c",
   "git_revision": "19b4e141b2217bfa4db928d06783c27ae155bf93",
   "git_dirty": false,
-  "gates_passed": [
-    "instance_coverage",
-    "bks_values_present",
-    "no_gap_computation",
-    "compatibility_assessment_correct",
-    "replay_consistency"
-  ],
+  "gates_passed": [],
   "total_instances": 92,
   "bks_row_count": 92,
   "compatibility_dimensions": 5,
@@ -34,7 +28,7 @@
   },
   "evidence_history": {
     "stage05.1_best_known_attempt01": "preserved_v1_superseded_nested_layout",
-    "stage05.1_best_known_attempt02": "READY_FOR_STAGE05_2_v2_single_level_layout"
+    "stage05.1_best_known_attempt02": "preserved_v2_superseded_by_v3_prerequisite_and_independent_replay"
   },
   "files": {
     "bks_data": {
