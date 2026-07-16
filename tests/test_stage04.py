@@ -206,6 +206,14 @@ def test_stage04_fixed_work_boundary_rejects_late_acceptance() -> None:
         },
         {
             "event_id": 11,
+            "event_type": "neighborhood_event",
+            "lane_id": 3,
+            "status": "accepted",
+            "accepted": True,
+            "global_best": False,
+        },
+        {
+            "event_id": 12,
             "event_type": "candidate_state",
             "lane_id": 3,
             "status": "accepted",

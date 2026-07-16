@@ -229,7 +229,9 @@ def validate_fixed_work_boundary_events(
         failures.append("unexpected exact-call budget marker")
     if marker_positions:
         for _, event in axis_events[marker_positions[0] + 1 :]:
-            if event.get("accepted") is True or event.get("global_best") is True:
+            if event.get("event_type") == "candidate_state" and (
+                event.get("accepted") is True or event.get("global_best") is True
+            ):
                 failures.append("accepted/global-best event occurs after budget marker")
                 break
     detail = "; ".join(failures) if failures else "fixed-work boundary semantics passed"
