@@ -422,10 +422,14 @@ this repository or one of its subdirectories.
 - `stage04_adaptive_weights_attempt01` and
   `stage04_adaptive_weights_attempt02` are preserved v1 evidence. The v1
   reviewer did not independently verify complete per-operator six-category
-  and segment evidence, so v2 does not inherit their readiness claim. New v2
-  Smoke and Formal evidence must use new attempt labels.
+  and segment evidence, so v2 does not inherit their readiness claim.
+- The accepted v2 evidence is Smoke `stage04_adaptive_weights_attempt03`
+  (72/72 axes valid) and Formal `stage04_adaptive_weights_attempt05`
+  (144/144 axes valid, `READY_FOR_STAGE05`). Formal attempt04 was interrupted
+  after 30 of 36 instance/seed bundles and remains preserved as incomplete
+  evidence; it was not overwritten or used for readiness.
 - Stage 4 review products are tracked under `experiments/summaries/` with
-  `stage04_adaptive_weights_attempt02_` prefix; the artifact registry is
+  `stage04_adaptive_weights_attempt05_` prefix; the artifact registry is
   `experiments/registries/stage04_artifact_registry.csv` and the manifest is
   `experiments/manifests/stage04_adaptive_weights_artifact_manifest.json`.
 
