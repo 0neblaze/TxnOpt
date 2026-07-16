@@ -489,7 +489,10 @@ this repository or one of its subdirectories.
   canonical single-level 92-instance bundle, but it is superseded by the v3
   prerequisite and independent-conversion replay requirements. No current
   Stage 5.1 readiness may be published until a new attempt passes after Stage 4
-  v3 is republished. Attempt01 remains historical nested-layout evidence.
+  v3 is republished. Attempt01 remains historical nested-layout evidence. The
+  accepted v3 evidence is `stage05.1_best_known_attempt03`: exactly 92 unique
+  instances in the canonical single-level layout, with independent review
+  status `READY_FOR_STAGE05_2`.
 - The artifact registry is
   `experiments/registries/stage05.1_artifact_registry.csv` and the manifest
   is `experiments/manifests/stage05.1_best_known_artifact_manifest.json`.

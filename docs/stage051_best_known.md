@@ -84,3 +84,8 @@ but it is superseded by the v3 Stage 4 prerequisite and independent-conversion
 replay requirements. A new attempt must pass those gates before
 `READY_FOR_STAGE05_2` is republished. `stage05.1_best_known_attempt01` remains
 superseded v1 evidence under its historical nested layout.
+
+The accepted v3 evidence is `stage05.1_best_known_attempt03`. It uses the
+published Stage 4 attempt07 prerequisite, the canonical single-level layout,
+and an independent reviewer conversion; all five gates pass with exactly 92
+unique instances and status `READY_FOR_STAGE05_2`.
