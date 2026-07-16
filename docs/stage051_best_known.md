@@ -75,3 +75,11 @@ canonical `results/<run_label>/` layout, verifies the clean revision and the
 published Stage 4 v2 prerequisite, and rejects duplicate, missing, additional,
 or malformed rows. Stage 5.1 v1 evidence remains historical and cannot be
 promoted by the v2 reviewer.
+
+## Accepted Evidence
+
+`stage05.1_best_known_attempt02` is the accepted v2 evidence. Its raw bundle
+uses the canonical single-level layout, contains exactly 92 unique instance
+rows, and independently replays to `READY_FOR_STAGE05_2` with all five gates
+passing. `stage05.1_best_known_attempt01` is retained as superseded v1 evidence
+under its historical nested layout.

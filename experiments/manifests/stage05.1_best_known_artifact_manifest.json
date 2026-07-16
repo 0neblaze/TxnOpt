@@ -1,73 +1,81 @@
 {
-    "stage_id": "stage05.1",
-    "component": "best_known",
-    "run_label": "stage05.1_best_known_attempt01",
-    "scope": "formal",
-    "status": "READY_FOR_STAGE05_2",
-    "artifact_type": "manifest",
-    "instance_scope": "all_92",
-    "seed_scope": [],
-    "comparison_baseline": "stage04_adaptive_weights_attempt02",
-    "review_status": "READY_FOR_STAGE05_2",
-    "gates_passed": [
-        "instance_coverage",
-        "bks_values_present",
-        "no_gap_computation",
-        "compatibility_assessment_correct",
-        "replay_consistency"
-    ],
-    "total_instances": 92,
-    "bks_row_count": 92,
-    "compatibility_dimensions": 5,
-    "overall_compatible": false,
-    "gap_computed": false,
-    "git_revision": "dc935320f79257142525ef5f59af8763fe6eeb1c",
-    "git_dirty": false,
-    "files": {
-        "bks_data": {
-            "path": "results/stage05.1_best_known_attempt01/stage05.1_best_known_attempt01/stage05.1_best_known_attempt01_bks_data.csv",
-            "sha256": "cac7e1dc0da5e203db0402e9b6152ef7219a3054ee863bd0925cf7bff3fd2d2c",
-            "size_bytes": 52355
-        },
-        "compatibility_assessment": {
-            "path": "results/stage05.1_best_known_attempt01/stage05.1_best_known_attempt01/stage05.1_best_known_attempt01_compatibility_assessment.csv",
-            "sha256": "a7d2a5c81ba292abfa469fde0785ac221aee13ab563b309c506af92d47b7252b",
-            "size_bytes": 1630
-        },
-        "summary_report": {
-            "path": "results/stage05.1_best_known_attempt01/stage05.1_best_known_attempt01/stage05.1_best_known_attempt01_summary_report.md",
-            "sha256": "45fdfa0f641eaf83d339fc524a4a9f38910738540e1a8cc4a584dfcd7ad40492",
-            "size_bytes": 2671
-        },
-        "raw_manifest": {
-            "path": "results/stage05.1_best_known_attempt01/stage05.1_best_known_attempt01/control/stage05.1_best_known_attempt01_manifest.json",
-            "sha256": "ced5d673839cfce6ea71f4f0d70309cc2a7d2bfbb828d4bb7f4bc0aea205f826",
-            "size_bytes": 3466
-        },
-        "review_report": {
-            "path": "results/stage05.1_best_known_attempt01/stage05.1_best_known_attempt01/review/review_report.md",
-            "sha256": "6a628137a61c35973d6f15fd124e47df3fe95b13d2e176f7d9b5d2dd24f14c26",
-            "size_bytes": 583
-        },
-        "review_findings": {
-            "path": "results/stage05.1_best_known_attempt01/stage05.1_best_known_attempt01/review/review_findings.csv",
-            "sha256": "f64f7f92dfbad465784a3d701b00561519289fe5ccf849cfd7755b7114724ba2",
-            "size_bytes": 311
-        },
-        "gate_evaluation": {
-            "path": "results/stage05.1_best_known_attempt01/stage05.1_best_known_attempt01/review/gate_evaluation.csv",
-            "sha256": "4b1749c3c9e23ea16d3f9e1369a9fd3d6d7e9d4c397835daef1f205de34cdd46",
-            "size_bytes": 311
-        },
-        "review_manifest": {
-            "path": "results/stage05.1_best_known_attempt01/stage05.1_best_known_attempt01/review/review_manifest.json",
-            "sha256": "c952d79f7e3745295bb299cb0f3f694a447d0fe8ff72d98c06fc6fab97219c6d",
-            "size_bytes": 815
-        }
+  "schema_version": "stage05.1-publication-v2",
+  "stage_id": "stage05.1",
+  "component": "best_known",
+  "run_label": "stage05.1_best_known_attempt02",
+  "scope": "formal",
+  "status": "READY_FOR_STAGE05_2",
+  "artifact_type": "manifest",
+  "instance_scope": "all_92",
+  "seed_scope": [],
+  "comparison_baseline": "stage04_adaptive_weights_attempt05",
+  "review_status": "READY_FOR_STAGE05_2",
+  "raw_schema_version": "stage05.1-best-known-v2",
+  "review_schema_version": "stage05.1-review-v2",
+  "raw_manifest_sha256": "74ff3b4a92e16229f909d0be5ada832466e61362ad1352174f0878686c4b9c9c",
+  "git_revision": "19b4e141b2217bfa4db928d06783c27ae155bf93",
+  "git_dirty": false,
+  "gates_passed": [
+    "instance_coverage",
+    "bks_values_present",
+    "no_gap_computation",
+    "compatibility_assessment_correct",
+    "replay_consistency"
+  ],
+  "total_instances": 92,
+  "bks_row_count": 92,
+  "compatibility_dimensions": 5,
+  "overall_compatible": false,
+  "gap_computed": false,
+  "stage04_prerequisite": {
+    "run_label": "stage04_adaptive_weights_attempt05",
+    "review_status": "READY_FOR_STAGE05",
+    "publication_sha256": "a99b249d1afd526c32fe21473eb1dcd925a2f3b12fbf85ceb7ad3c65cb6d292a"
+  },
+  "evidence_history": {
+    "stage05.1_best_known_attempt01": "preserved_v1_superseded_nested_layout",
+    "stage05.1_best_known_attempt02": "READY_FOR_STAGE05_2_v2_single_level_layout"
+  },
+  "files": {
+    "bks_data": {
+      "path": "experiments/summaries/stage05.1_best_known_attempt02_bks_data.csv",
+      "sha256": "cac7e1dc0da5e203db0402e9b6152ef7219a3054ee863bd0925cf7bff3fd2d2c",
+      "size_bytes": 52355
     },
-    "source_hashes": {
-        "src/evrptw/best_known.py": "3f2fd794abbbff27dd71e6011c47cfd01c273090cca80eeb44ec18d1c17b0f83",
-        "src/evrptw/experiments/stage051_best_known.py": "a691cbb5be0af0bcdc7cdb51dbac6bd5dbb12ecd2f06595f8c853d9b2fbf2b4b"
+    "compatibility_assessment": {
+      "path": "experiments/summaries/stage05.1_best_known_attempt02_compatibility_assessment.csv",
+      "sha256": "a7d2a5c81ba292abfa469fde0785ac221aee13ab563b309c506af92d47b7252b",
+      "size_bytes": 1630
     },
-    "config_sha256": "92ed07ddc20b9ba6b941e850535198aa8ffa03a468df3cb2999382c85edb7a4e"
+    "summary_report": {
+      "path": "experiments/summaries/stage05.1_best_known_attempt02_summary_report.md",
+      "sha256": "ac1cdab09fb798b689103ee56c41362f91912fc72732ba92e68a8f05e21eeb28",
+      "size_bytes": 2671
+    },
+    "review_report": {
+      "path": "experiments/summaries/stage05.1_best_known_attempt02_review_report.md",
+      "sha256": "35707af25fe306b2a952db3ece5ec5aa13ff7c3a9c20f93fb6fed9dbc309cb06",
+      "size_bytes": 609
+    },
+    "review_findings": {
+      "path": "experiments/summaries/stage05.1_best_known_attempt02_review_findings.csv",
+      "sha256": "f9fc7abe2e2ab0023d1485724aec1781ec5bc9beec1a5b28397dc44507a2bfd4",
+      "size_bytes": 335
+    },
+    "gate_evaluation": {
+      "path": "experiments/summaries/stage05.1_best_known_attempt02_gate_evaluation.csv",
+      "sha256": "39247388a80acb064cd7841d57498120d700e0b3ed978a1a2803d9d33092b8f2",
+      "size_bytes": 335
+    },
+    "review_manifest": {
+      "path": "experiments/summaries/stage05.1_best_known_attempt02_review_manifest.json",
+      "sha256": "0870cd68f905ff2fb11a22312a76fb19cd4c8c1d039ed208e4e0d4a2fefdaed5",
+      "size_bytes": 841
+    }
+  },
+  "source_hashes": {
+    "src/evrptw/best_known.py": "3f2fd794abbbff27dd71e6011c47cfd01c273090cca80eeb44ec18d1c17b0f83",
+    "src/evrptw/experiments/stage051_best_known.py": "5c3d3402a44be7883bd2b49becd0d0c25d51d82f45fa4c37eb0f25b20e14db49"
+  },
+  "config_sha256": "dac4bd8e90eb24054af487afb0e75d585f7095ad1a20312ecd68bc26d40188f1"
 }

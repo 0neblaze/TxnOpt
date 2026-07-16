@@ -479,10 +479,13 @@ this repository or one of its subdirectories.
   and complete field-by-field replay including citations, charging unknowns,
   and model-compatibility fields. `stage05.1_best_known_attempt01` remains
   preserved v1 evidence and is superseded for readiness purposes.
-- The accepted v2 evidence will use a new attempt label. The artifact registry is
+- The accepted v2 evidence is `stage05.1_best_known_attempt02`: its canonical
+  single-level bundle contains exactly 92 unique instances and its independent
+  review reports `READY_FOR_STAGE05_2`. Attempt01 remains preserved under its
+  historical nested layout and is not used for current readiness.
+- The artifact registry is
   `experiments/registries/stage05.1_artifact_registry.csv` and the manifest
-  will be `experiments/manifests/stage05.1_best_known_artifact_manifest.json`,
-  published only after formal review passes.
+  is `experiments/manifests/stage05.1_best_known_artifact_manifest.json`.
 
 ## Experiment Artifact Storage v2
 
