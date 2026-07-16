@@ -189,6 +189,49 @@ def test_stage04_operator_audit_requires_exact_boundary_operator_matrix() -> Non
     assert "unexpected" in detail
 
 
+def test_stage04_fixed_work_boundary_rejects_late_acceptance() -> None:
+    from evrptw.experiments.stage04_weights_review import (
+        validate_fixed_work_boundary_events,
+    )
+
+    lanes = {"3": "adaptive_fixed_work:legacy"}
+    events = [
+        {
+            "event_id": 10,
+            "event_type": "exact_budget_boundary",
+            "lane_id": 3,
+            "status": "budget_exhausted",
+            "accepted": False,
+            "global_best": False,
+        },
+        {
+            "event_id": 11,
+            "event_type": "candidate_state",
+            "lane_id": 3,
+            "status": "accepted",
+            "accepted": True,
+            "global_best": False,
+        },
+    ]
+    passed, detail = validate_fixed_work_boundary_events(
+        events,
+        lanes,
+        axis="adaptive_fixed_work",
+        boundary_expected=True,
+    )
+    assert not passed
+    assert "after budget" in detail
+
+    events.pop()
+    passed, _ = validate_fixed_work_boundary_events(
+        events,
+        lanes,
+        axis="adaptive_fixed_work",
+        boundary_expected=True,
+    )
+    assert passed
+
+
 def test_stage04_per_run_rows_reject_duplicate_and_invalid_numeric_fields() -> None:
     from evrptw.experiments.stage04_weights_review import validate_stage04_per_run_rows
 

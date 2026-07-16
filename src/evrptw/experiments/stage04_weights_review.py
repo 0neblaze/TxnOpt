@@ -33,8 +33,8 @@ from evrptw.validation import validate_routes
 
 READY_FOR_STAGE05 = "READY_FOR_STAGE05"
 NOT_READY = "NOT_READY"
-STAGE04_REVIEW_SCHEMA_VERSION = "stage04-review-v4"
-STAGE04_RAW_SCHEMA_VERSION = "stage04-adaptive-weights-v4"
+STAGE04_REVIEW_SCHEMA_VERSION = "stage04-review-v5"
+STAGE04_RAW_SCHEMA_VERSION = "stage04-adaptive-weights-v5"
 
 _MIN_CALLS_PER_OPERATOR_DEFAULT = 5
 
@@ -193,6 +193,47 @@ def _strict_nonnegative_int(value: object, field: str) -> int:
     if result < 0:
         raise ValueError(f"{field} must be a non-negative integer")
     return result
+
+
+def validate_fixed_work_boundary_events(
+    events: Sequence[Mapping[str, object]],
+    lane_dictionary: Mapping[str, object],
+    *,
+    axis: str,
+    boundary_expected: bool,
+) -> tuple[bool, str]:
+    """Reject acceptance or global-best updates after an exact-work boundary."""
+
+    axis_events: list[tuple[int, Mapping[str, object]]] = []
+    failures: list[str] = []
+    for event in events:
+        lane_id = event.get("lane_id")
+        lane = lane_dictionary.get(str(lane_id))
+        if not isinstance(lane, str) or lane.partition(":")[0] != axis:
+            continue
+        try:
+            event_id = _strict_nonnegative_int(event.get("event_id"), "event_id")
+        except ValueError as error:
+            failures.append(str(error))
+            continue
+        axis_events.append((event_id, event))
+    axis_events.sort(key=lambda item: item[0])
+    marker_positions = [
+        index
+        for index, (_, event) in enumerate(axis_events)
+        if event.get("event_type") == "exact_budget_boundary"
+    ]
+    if boundary_expected and len(marker_positions) != 1:
+        failures.append(f"expected exactly one budget marker, found {len(marker_positions)}")
+    if not boundary_expected and marker_positions:
+        failures.append("unexpected exact-call budget marker")
+    if marker_positions:
+        for _, event in axis_events[marker_positions[0] + 1 :]:
+            if event.get("accepted") is True or event.get("global_best") is True:
+                failures.append("accepted/global-best event occurs after budget marker")
+                break
+    detail = "; ".join(failures) if failures else "fixed-work boundary semantics passed"
+    return not failures, detail
 
 
 def validate_stage04_scope_identities(
@@ -402,6 +443,8 @@ def review_stage04(
 
         raw: dict[str, Any] = {}
         solution: dict[str, Any] = {}
+        critical_events: list[dict[str, Any]] = []
+        lane_dictionary: Mapping[str, object] = {}
         if "raw" in group:
             try:
                 raw = reader.read_json(group["raw"])
@@ -424,6 +467,33 @@ def review_stage04(
                     "seed": seed,
                     "axis": "",
                     "finding": f"solution JSON unreadable: {error}",
+                    "status": "fail",
+                })
+        if "events" in group:
+            try:
+                critical_events = reader.read_events(group["events"])
+            except (FileNotFoundError, OSError, ValueError) as error:
+                findings.append({
+                    "gate": _GATE_REPLAY_CONSISTENCY,
+                    "instance": instance_name,
+                    "seed": seed,
+                    "axis": "",
+                    "finding": f"critical events unreadable: {error}",
+                    "status": "fail",
+                })
+        if "trace" in group:
+            try:
+                trace_index = reader.read_json(group["trace"])
+                raw_lane_dictionary = trace_index.get("lane_dictionary")
+                if isinstance(raw_lane_dictionary, Mapping):
+                    lane_dictionary = raw_lane_dictionary
+            except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
+                findings.append({
+                    "gate": _GATE_REPLAY_CONSISTENCY,
+                    "instance": instance_name,
+                    "seed": seed,
+                    "axis": "",
+                    "finding": f"trace index unreadable: {error}",
                     "status": "fail",
                 })
 
@@ -500,6 +570,19 @@ def review_stage04(
                 exact_started == per_run_started
                 and exact_completed == per_run_completed
             )
+            budget_boundary_ok = True
+            budget_boundary_detail = "not a fixed-work axis"
+            if axis.endswith("fixed_work"):
+                budget_boundary_ok, budget_boundary_detail = (
+                    validate_fixed_work_boundary_events(
+                        critical_events,
+                        lane_dictionary,
+                        axis=axis,
+                        boundary_expected=(
+                            _as_int(raw_axis.get("budget_exhaustions")) > 0
+                        ),
+                    )
+                )
 
             # --- Extract Stage 4 statistics ---
             stage04_stats = raw_axis.get("stage04_statistics")
@@ -561,6 +644,8 @@ def review_stage04(
                 ),
                 "objective_matches": objective_matches,
                 "exact_consistent": exact_consistent,
+                "budget_boundary_ok": budget_boundary_ok,
+                "budget_boundary_detail": budget_boundary_detail,
                 "recomputed_objective_key": (
                     json.dumps(list(objective.key), separators=(",", ":"))
                     if objective is not None
@@ -631,6 +716,13 @@ def review_stage04(
                         f"raw={exact_started}/{exact_completed} "
                         f"per_run={per_run_started}/{per_run_completed}"
                     ),
+                    "status": "fail",
+                })
+            if not budget_boundary_ok:
+                findings.append({
+                    **identity,
+                    "gate": _GATE_REPLAY_CONSISTENCY,
+                    "finding": budget_boundary_detail,
                     "status": "fail",
                 })
 
@@ -946,6 +1038,12 @@ def _gate_replay_consistency(
             failures.append(
                 f"{row['instance']}/{row['seed']}/{row['axis']}: "
                 f"exact-call inconsistency"
+            )
+            continue
+        if not bool(row.get("budget_boundary_ok")):
+            failures.append(
+                f"{row['instance']}/{row['seed']}/{row['axis']}: "
+                f"{row.get('budget_boundary_detail')}"
             )
             continue
         valid_count += 1

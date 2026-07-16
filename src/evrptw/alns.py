@@ -2423,6 +2423,10 @@ def _solve_alns(
                     OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
                 )
                 and not main_lane_timed_out
+                and not (
+                    exact_call_controller is not None
+                    and exact_call_controller.budget_reached
+                )
             ):
                 shadow_neighborhood = _quality_shadow_neighborhood(iteration)
                 if shadow_neighborhood:
@@ -2496,6 +2500,10 @@ def _solve_alns(
                     quality_probe_accept = (
                         shadow_candidate.feasible
                         and quality_comparison is not ObjectiveComparison.WORSE
+                        and not (
+                            exact_call_controller is not None
+                            and exact_call_controller.budget_reached
+                        )
                     )
                     quality_probe_vehicle_reduction = bool(
                         shadow_candidate.objective is not None
@@ -2618,6 +2626,9 @@ def _solve_alns(
             if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED and (
                 iteration < len(_CONSTRAINT_REMOVAL_ORDER)
                 or iteration % vehicle_config.exploration_period == 0
+            ) and not (
+                exact_call_controller is not None
+                and exact_call_controller.budget_reached
             ):
                 constraint_operator = _select_constraint_operator(
                     iteration,
@@ -2711,6 +2722,10 @@ def _solve_alns(
                             constraint_lane_current.objective.total_distance * 0.05,
                         ),
                         random_draw=0.0,
+                    )
+                    and not (
+                        exact_call_controller is not None
+                        and exact_call_controller.budget_reached
                     )
                 )
                 lane_vehicle_reduction = bool(
@@ -2819,6 +2834,37 @@ def _solve_alns(
                         ),
                         reason="constraint lane probe",
                     )
+
+        if exact_call_controller is not None and exact_call_controller.budget_reached:
+            evaluator._record_exact_budget_boundary()
+            reward_rejected = (
+                stage04_config.reward_rejected
+                if stage04_enabled and stage04_config is not None
+                else 0.0
+            )
+            if profile is OperatorProfile.BASELINE:
+                destroy_stats[destroy_name].rejected += 1
+                repair_stats[repair_name].rejected += 1
+                if stage04_enabled and stage04_config is not None:
+                    _stage04_accumulate(destroy_stats[destroy_name], reward_rejected)
+                    _stage04_accumulate(repair_stats[repair_name], reward_rejected)
+            else:
+                neighborhood_stats[selected_neighborhood].rejected += 1
+                if destroy_name:
+                    destroy_stats[destroy_name].rejected += 1
+                if repair_name:
+                    repair_stats[repair_name].rejected += 1
+                if stage04_enabled and stage04_config is not None:
+                    _stage04_accumulate(
+                        neighborhood_stats[selected_neighborhood], reward_rejected
+                    )
+                    if destroy_name:
+                        _stage04_accumulate(
+                            destroy_stats[destroy_name], reward_rejected
+                        )
+                    if repair_name:
+                        _stage04_accumulate(repair_stats[repair_name], reward_rejected)
+            break
 
         previous_current = current
         if stage04_enabled:

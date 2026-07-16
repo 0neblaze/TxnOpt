@@ -24,7 +24,7 @@ from evrptw.experiments.stage051_best_known import (
 
 READY_FOR_STAGE05_2 = "READY_FOR_STAGE05_2"
 NOT_READY = "NOT_READY"
-STAGE051_REVIEW_SCHEMA_VERSION = "stage05.1-review-v4"
+STAGE051_REVIEW_SCHEMA_VERSION = "stage05.1-review-v5"
 
 _GATE_COVERAGE = "instance_coverage"
 _GATE_BKS_VALUES = "bks_values_present"

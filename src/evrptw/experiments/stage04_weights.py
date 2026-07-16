@@ -60,7 +60,7 @@ from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.stage04 import Stage04Config, with_fixed_weights
 
-STAGE04_SCHEMA_VERSION = "stage04-adaptive-weights-v4"
+STAGE04_SCHEMA_VERSION = "stage04-adaptive-weights-v5"
 STAGE04_RUN_LABEL = re.compile(
     r"stage04_adaptive_weights_(?:attempt|rerun)[0-9]{2}"
 )

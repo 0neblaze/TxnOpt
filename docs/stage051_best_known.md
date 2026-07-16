@@ -86,6 +86,7 @@ replay requirements. A new attempt must pass those gates before
 superseded v1 evidence under its historical nested layout.
 
 The v3 evidence `stage05.1_best_known_attempt03` is preserved but superseded
-because its Stage 4 v3 prerequisite was withdrawn. A new v4 attempt must use a
-published Stage 4 v4 prerequisite and independently replay all 92 unique
-instances before `READY_FOR_STAGE05_2` may be republished.
+because its Stage 4 v3 prerequisite was withdrawn. v4 attempt04 is also
+preserved but superseded after the Stage 4 v4 prerequisite was withdrawn. A new
+attempt must use a published Stage 4 v5 prerequisite and independently replay
+all 92 unique instances before `READY_FOR_STAGE05_2` may be republished.

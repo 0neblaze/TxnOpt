@@ -1,28 +1,21 @@
 {
-  "schema_version": "stage04-publication-v4",
+  "schema_version": "stage04-publication-v5",
   "stage_id": "stage04",
   "component": "adaptive_weights",
   "run_label": "stage04_adaptive_weights_attempt11",
   "scope": "formal",
-  "status": "READY_FOR_STAGE05",
+  "status": "NOT_READY",
   "artifact_type": "manifest",
   "instance_scope": "formal_12",
   "seed_scope": [2014, 2015, 2016],
   "comparison_baseline": "stage03.4_control_parallel_attempt11",
-  "review_status": "READY_FOR_STAGE05",
+  "review_status": "NOT_READY",
   "raw_schema_version": "stage04-adaptive-weights-v4",
   "review_schema_version": "stage04-review-v4",
   "repository_revision": "ec8705843d7c0e842a9621985107880c9e22f98d",
   "repository_dirty": false,
   "raw_manifest_sha256": "dde5b4a4e30bbf6633aa59e473d2b6493445b32400dfedf020e83691d693f8ab",
-  "gates_passed": [
-    "operator_call_sufficiency",
-    "six_category_statistics",
-    "adaptive_better_than_fixed",
-    "not_single_best_seed",
-    "std_not_increased",
-    "replay_consistency"
-  ],
+  "gates_passed": [],
   "observed_axes": 144,
   "adaptive_wins": 7,
   "winning_seeds": [2014, 2015, 2016],
@@ -37,7 +30,7 @@
     "stage04_adaptive_weights_attempt08": "preserved_incomplete_v4_call_partition_failure",
     "stage04_adaptive_weights_attempt09": "preserved_incomplete_v4_work_boundary_failure",
     "stage04_adaptive_weights_attempt10": "READY_FOR_STAGE05_smoke_v4_72_axes",
-    "stage04_adaptive_weights_attempt11": "READY_FOR_STAGE05_formal_v4_144_axes"
+    "stage04_adaptive_weights_attempt11": "NOT_READY_under_v5_exact_budget_boundary_replay"
   },
   "files": {
     "per_run_results": {

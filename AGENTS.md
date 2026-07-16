@@ -415,7 +415,7 @@ this repository or one of its subdirectories.
   `not_single_best_seed` (>= 2 winning seeds), `std_not_increased` (Stage 4
   vehicle_count std <= Stage 0), and `replay_consistency` (all axes valid with
   matching objectives).
-- Stage 4 v4 raw evidence persists normalized per-operator six-category
+- Stage 4 v5 raw evidence persists normalized per-operator six-category
   statistics and every segment update/skip decision. All adaptive-weight roles
   in the legacy, quality-shadow, and constraint lanes use segment accumulation;
   per-call weight updates are forbidden. The reviewer requires the exact scope
@@ -440,8 +440,12 @@ this repository or one of its subdirectories.
   09 are preserved incomplete failure evidence that exposed two remaining
   unclassified-call paths. The corrected accepted evidence is Smoke
   `stage04_adaptive_weights_attempt10` (72/72 axes) and Formal
-  `stage04_adaptive_weights_attempt11` (144/144 axes,
-  `READY_FOR_STAGE05`).
+  `stage04_adaptive_weights_attempt11` (144/144 axes). That v4 evidence is
+  preserved but superseded because a fixed-work budget boundary could still be
+  followed by candidate acceptance. The v5 reviewer independently replays
+  critical boundary events and rejects any later accepted/global-best event.
+  New v5 Smoke and Formal attempts are required before `READY_FOR_STAGE05` is
+  republished.
 - Stage 4 review products are tracked under `experiments/summaries/` with
   `stage04_adaptive_weights_attempt11_` prefix; the artifact registry is
   `experiments/registries/stage04_artifact_registry.csv` and the manifest is
@@ -499,9 +503,10 @@ this repository or one of its subdirectories.
   Stage 5.1 readiness may be published until a new attempt passes after Stage 4
   v3 is republished. Attempt01 remains historical nested-layout evidence. The
   v3 evidence `stage05.1_best_known_attempt03` is preserved but superseded
-  after the Stage 4 v3 prerequisite was withdrawn. No current
-  `READY_FOR_STAGE05_2` is published until Stage 4 v4 passes and a new Stage 5.1
-  attempt independently replays all 92 unique instances.
+  after the Stage 4 v3 prerequisite was withdrawn. v4 attempt04 is also
+  preserved but superseded after the Stage 4 v4 prerequisite was withdrawn.
+  No current `READY_FOR_STAGE05_2` may be published until Stage 4 v5 passes and
+  a new Stage 5.1 attempt independently replays all 92 canonical rows.
 - The artifact registry is
   `experiments/registries/stage05.1_artifact_registry.csv` and the manifest
   is `experiments/manifests/stage05.1_best_known_artifact_manifest.json`.
