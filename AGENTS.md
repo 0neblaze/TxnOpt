@@ -430,9 +430,12 @@ this repository or one of its subdirectories.
   after 30 of 36 instance/seed bundles and remains preserved as incomplete
   evidence; it was not overwritten or used for readiness. New v3 Smoke and
   Formal evidence require new attempt labels before `READY_FOR_STAGE05` may be
-  republished.
+  republished. The accepted v3 evidence is Smoke
+  `stage04_adaptive_weights_attempt06` (72/72 axes) and Formal
+  `stage04_adaptive_weights_attempt07` (144/144 axes,
+  `READY_FOR_STAGE05`).
 - Stage 4 review products are tracked under `experiments/summaries/` with
-  `stage04_adaptive_weights_attempt05_` prefix; the artifact registry is
+  `stage04_adaptive_weights_attempt07_` prefix; the artifact registry is
   `experiments/registries/stage04_artifact_registry.csv` and the manifest is
   `experiments/manifests/stage04_adaptive_weights_artifact_manifest.json`.
 
