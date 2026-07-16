@@ -2,20 +2,27 @@
   "schema_version": "stage04-publication-v4",
   "stage_id": "stage04",
   "component": "adaptive_weights",
-  "run_label": "stage04_adaptive_weights_attempt07",
+  "run_label": "stage04_adaptive_weights_attempt11",
   "scope": "formal",
-  "status": "NOT_READY",
+  "status": "READY_FOR_STAGE05",
   "artifact_type": "manifest",
   "instance_scope": "formal_12",
   "seed_scope": [2014, 2015, 2016],
   "comparison_baseline": "stage03.4_control_parallel_attempt11",
-  "review_status": "NOT_READY",
-  "raw_schema_version": "stage04-adaptive-weights-v3",
-  "review_schema_version": "stage04-review-v3",
-  "repository_revision": "1481a434019c727e44eb6bc788e34de6f195f113",
+  "review_status": "READY_FOR_STAGE05",
+  "raw_schema_version": "stage04-adaptive-weights-v4",
+  "review_schema_version": "stage04-review-v4",
+  "repository_revision": "ec8705843d7c0e842a9621985107880c9e22f98d",
   "repository_dirty": false,
-  "raw_manifest_sha256": "8eeec87979c1cb39e2499fb163ef912b55fddf2ba43f617cc393ad5f96142af9",
-  "gates_passed": [],
+  "raw_manifest_sha256": "dde5b4a4e30bbf6633aa59e473d2b6493445b32400dfedf020e83691d693f8ab",
+  "gates_passed": [
+    "operator_call_sufficiency",
+    "six_category_statistics",
+    "adaptive_better_than_fixed",
+    "not_single_best_seed",
+    "std_not_increased",
+    "replay_consistency"
+  ],
   "observed_axes": 144,
   "adaptive_wins": 7,
   "winning_seeds": [2014, 2015, 2016],
@@ -26,37 +33,41 @@
     "stage04_adaptive_weights_attempt04": "preserved_incomplete_30_of_36_bundles",
     "stage04_adaptive_weights_attempt05": "NOT_READY_under_strict_v3_operator_audit",
     "stage04_adaptive_weights_attempt06": "preserved_v3_superseded_incomplete_lane_statistics_and_event_matrix",
-    "stage04_adaptive_weights_attempt07": "NOT_READY_under_v4_lane_statistics_and_event_matrix"
+    "stage04_adaptive_weights_attempt07": "NOT_READY_under_v4_lane_statistics_and_event_matrix",
+    "stage04_adaptive_weights_attempt08": "preserved_incomplete_v4_call_partition_failure",
+    "stage04_adaptive_weights_attempt09": "preserved_incomplete_v4_work_boundary_failure",
+    "stage04_adaptive_weights_attempt10": "READY_FOR_STAGE05_smoke_v4_72_axes",
+    "stage04_adaptive_weights_attempt11": "READY_FOR_STAGE05_formal_v4_144_axes"
   },
   "files": {
     "per_run_results": {
-      "path": "experiments/summaries/stage04_adaptive_weights_attempt07_per_run_results.csv",
-      "sha256": "271592d741820d4f49e0fbfda33056025ae5d7c9f06e1f58b5238304da23ac4b",
-      "size_bytes": 27454
+      "path": "experiments/summaries/stage04_adaptive_weights_attempt11_per_run_results.csv",
+      "sha256": "4ef25ff9c4e5ecc46dc7d007a7c6de6ff43c093053e1359cba72afa59e6c0db4",
+      "size_bytes": 27428
     },
     "summary_results": {
-      "path": "experiments/summaries/stage04_adaptive_weights_attempt07_summary_results.csv",
-      "sha256": "72a846c366cee02d711d30c6b999c240c0803bd4eb0879f63815730ee58897bc",
-      "size_bytes": 7728
+      "path": "experiments/summaries/stage04_adaptive_weights_attempt11_summary_results.csv",
+      "sha256": "abdc84823fc829fa56896c79c52eac8f033a4cdc8fb8fc09d3fbc5862da937e0",
+      "size_bytes": 7752
     },
     "review_report": {
-      "path": "experiments/summaries/stage04_adaptive_weights_attempt07_review_report.md",
-      "sha256": "7896cbe975e2795b0aa7841ee4f1c6145b3f306435e7b50150527fb617042019",
+      "path": "experiments/summaries/stage04_adaptive_weights_attempt11_review_report.md",
+      "sha256": "e172cf87a1f31881cd59db1c2fb695a7118f6bf2d5b11c101ca899592ebeddc9",
       "size_bytes": 1027
     },
     "review_findings": {
-      "path": "experiments/summaries/stage04_adaptive_weights_attempt07_review_findings.csv",
+      "path": "experiments/summaries/stage04_adaptive_weights_attempt11_review_findings.csv",
       "sha256": "91b0fcebc0641801f50080bdb684ece438126aa5d37128926dbd078890f7ed3e",
       "size_bytes": 13083
     },
     "gate_evaluation": {
-      "path": "experiments/summaries/stage04_adaptive_weights_attempt07_gate_evaluation.csv",
+      "path": "experiments/summaries/stage04_adaptive_weights_attempt11_gate_evaluation.csv",
       "sha256": "9fa6b506bf8f948c680f49953218af9ad7e1904396383d30d01b193937e5522e",
       "size_bytes": 697
     },
     "review_manifest": {
-      "path": "experiments/summaries/stage04_adaptive_weights_attempt07_review_manifest.json",
-      "sha256": "36e9ef21f7d8f83639ab8223647f3bf6b12482a751cde52b1c715daf7d2acfe5",
+      "path": "experiments/summaries/stage04_adaptive_weights_attempt11_review_manifest.json",
+      "sha256": "7de72b969ba3fa36e73446d6615c8c883d8154a9d076db9ef99a2d0de0bc351e",
       "size_bytes": 1717
     }
   }

@@ -436,10 +436,14 @@ this repository or one of its subdirectories.
   republished. The v3 Smoke `stage04_adaptive_weights_attempt06` and Formal
   `stage04_adaptive_weights_attempt07` are preserved but superseded because
   their producer still used per-call updates in one lane and their reviewer did
-  not enforce the complete boundary/operator event matrix. No current
-  `READY_FOR_STAGE05` is published until new v4 Smoke and Formal evidence pass.
+  not enforce the complete boundary/operator event matrix. v4 attempts 08 and
+  09 are preserved incomplete failure evidence that exposed two remaining
+  unclassified-call paths. The corrected accepted evidence is Smoke
+  `stage04_adaptive_weights_attempt10` (72/72 axes) and Formal
+  `stage04_adaptive_weights_attempt11` (144/144 axes,
+  `READY_FOR_STAGE05`).
 - Stage 4 review products are tracked under `experiments/summaries/` with
-  the current accepted attempt prefix; the artifact registry is
+  `stage04_adaptive_weights_attempt11_` prefix; the artifact registry is
   `experiments/registries/stage04_artifact_registry.csv` and the manifest is
   `experiments/manifests/stage04_adaptive_weights_artifact_manifest.json`.
 
