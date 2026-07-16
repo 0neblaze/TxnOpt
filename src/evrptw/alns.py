@@ -2070,6 +2070,15 @@ def _solve_alns(
                     ),
                 )
             except _TimeLimitReached:
+                destroy_stats[destroy_name].rejected += 1
+                repair_stats[repair_name].rejected += 1
+                if stage04_enabled and stage04_config is not None:
+                    _stage04_accumulate(
+                        destroy_stats[destroy_name], stage04_config.reward_rejected
+                    )
+                    _stage04_accumulate(
+                        repair_stats[repair_name], stage04_config.reward_rejected
+                    )
                 break
         else:
             selected_neighborhood = _select_stage02_neighborhood(
@@ -2260,6 +2269,26 @@ def _solve_alns(
                     main_lane_timed_out = True
                 else:
                     neighborhood_events.append(_event_record(timeout, iteration))
+                    neighborhood_stats[selected_neighborhood].rejected += 1
+                    if destroy_name:
+                        destroy_stats[destroy_name].rejected += 1
+                    if repair_name:
+                        repair_stats[repair_name].rejected += 1
+                    if stage04_enabled and stage04_config is not None:
+                        _stage04_accumulate(
+                            neighborhood_stats[selected_neighborhood],
+                            stage04_config.reward_rejected,
+                        )
+                        if destroy_name:
+                            _stage04_accumulate(
+                                destroy_stats[destroy_name],
+                                stage04_config.reward_rejected,
+                            )
+                        if repair_name:
+                            _stage04_accumulate(
+                                repair_stats[repair_name],
+                                stage04_config.reward_rejected,
+                            )
                     break
 
             _record_neighborhood_proposal(

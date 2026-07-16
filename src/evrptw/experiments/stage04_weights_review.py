@@ -529,7 +529,9 @@ def review_stage04(
                         typed_events,
                         min_calls=min_calls,
                         segment_length=_as_int(stage04_stats.get("segment_length")),
-                        completed_iterations=_as_int(raw_axis.get("iterations")),
+                        completed_iterations=_as_int(
+                            raw_axis.get("effective_iterations")
+                        ),
                     )
 
             # --- Extract per-run data for gate evaluation ---
