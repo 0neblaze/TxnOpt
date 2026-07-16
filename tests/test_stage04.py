@@ -133,6 +133,62 @@ def test_stage04_operator_audit_requires_segment_events() -> None:
     assert "segment" in detail
 
 
+def test_stage04_operator_audit_requires_exact_boundary_operator_matrix() -> None:
+    from evrptw.experiments.stage04_weights_review import (
+        validate_stage04_operator_audit,
+    )
+
+    statistics = {
+        "destroy:random": {
+            "role": "destroy",
+            "calls": 10,
+            "accepted": 5,
+            "accepted_improving": 2,
+            "accepted_equal": 2,
+            "accepted_worse": 1,
+            "rejected": 5,
+            "new_global_best": 1,
+            "vehicle_reduction": 0,
+        }
+    }
+    boundary_event = {
+        "type": "stage04_segment_update",
+        "operator": "destroy:random",
+        "role": "destroy",
+        "iteration": 49,
+        "segment_calls": 5,
+    }
+    passed, detail = validate_stage04_operator_audit(
+        statistics,
+        [boundary_event],
+        min_calls=5,
+        segment_length=50,
+        completed_iterations=100,
+    )
+    assert not passed
+    assert "missing" in detail
+
+    passed, detail = validate_stage04_operator_audit(
+        statistics,
+        [boundary_event, boundary_event, {**boundary_event, "iteration": 99}],
+        min_calls=5,
+        segment_length=50,
+        completed_iterations=100,
+    )
+    assert not passed
+    assert "duplicate" in detail
+
+    passed, detail = validate_stage04_operator_audit(
+        statistics,
+        [boundary_event, {**boundary_event, "iteration": 50}],
+        min_calls=5,
+        segment_length=50,
+        completed_iterations=100,
+    )
+    assert not passed
+    assert "unexpected" in detail
+
+
 def test_stage04_per_run_rows_reject_duplicate_and_invalid_numeric_fields() -> None:
     from evrptw.experiments.stage04_weights_review import validate_stage04_per_run_rows
 

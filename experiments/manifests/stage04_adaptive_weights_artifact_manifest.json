@@ -1,28 +1,21 @@
 {
-  "schema_version": "stage04-publication-v3",
+  "schema_version": "stage04-publication-v4",
   "stage_id": "stage04",
   "component": "adaptive_weights",
   "run_label": "stage04_adaptive_weights_attempt07",
   "scope": "formal",
-  "status": "READY_FOR_STAGE05",
+  "status": "NOT_READY",
   "artifact_type": "manifest",
   "instance_scope": "formal_12",
   "seed_scope": [2014, 2015, 2016],
   "comparison_baseline": "stage03.4_control_parallel_attempt11",
-  "review_status": "READY_FOR_STAGE05",
+  "review_status": "NOT_READY",
   "raw_schema_version": "stage04-adaptive-weights-v3",
   "review_schema_version": "stage04-review-v3",
   "repository_revision": "1481a434019c727e44eb6bc788e34de6f195f113",
   "repository_dirty": false,
   "raw_manifest_sha256": "8eeec87979c1cb39e2499fb163ef912b55fddf2ba43f617cc393ad5f96142af9",
-  "gates_passed": [
-    "operator_call_sufficiency",
-    "six_category_statistics",
-    "adaptive_better_than_fixed",
-    "not_single_best_seed",
-    "std_not_increased",
-    "replay_consistency"
-  ],
+  "gates_passed": [],
   "observed_axes": 144,
   "adaptive_wins": 7,
   "winning_seeds": [2014, 2015, 2016],
@@ -32,8 +25,8 @@
     "stage04_adaptive_weights_attempt03": "preserved_v2_superseded_by_strict_v3",
     "stage04_adaptive_weights_attempt04": "preserved_incomplete_30_of_36_bundles",
     "stage04_adaptive_weights_attempt05": "NOT_READY_under_strict_v3_operator_audit",
-    "stage04_adaptive_weights_attempt06": "READY_FOR_STAGE05_smoke_v3_72_axes",
-    "stage04_adaptive_weights_attempt07": "READY_FOR_STAGE05_formal_v3_144_axes"
+    "stage04_adaptive_weights_attempt06": "preserved_v3_superseded_incomplete_lane_statistics_and_event_matrix",
+    "stage04_adaptive_weights_attempt07": "NOT_READY_under_v4_lane_statistics_and_event_matrix"
   },
   "files": {
     "per_run_results": {

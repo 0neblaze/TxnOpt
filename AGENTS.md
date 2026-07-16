@@ -415,10 +415,13 @@ this repository or one of its subdirectories.
   `not_single_best_seed` (>= 2 winning seeds), `std_not_increased` (Stage 4
   vehicle_count std <= Stage 0), and `replay_consistency` (all axes valid with
   matching objectives).
-- Stage 4 v2 raw evidence persists normalized per-operator six-category
-  statistics and every segment update/skip decision. The reviewer requires the
-  exact scope identity set, rejects missing or duplicate axes, and verifies
-  that an update occurs only after the configured minimum segment calls.
+- Stage 4 v4 raw evidence persists normalized per-operator six-category
+  statistics and every segment update/skip decision. All adaptive-weight roles
+  in the legacy, quality-shadow, and constraint lanes use segment accumulation;
+  per-call weight updates are forbidden. The reviewer requires the exact scope
+  identity set, rejects missing or duplicate axes, and requires exactly one
+  event for every segment-boundary/operator pair. It verifies that an update
+  occurs only after the configured minimum segment calls.
 - `stage04_adaptive_weights_attempt01` and
   `stage04_adaptive_weights_attempt02` are preserved v1 evidence. The v1
   reviewer did not independently verify complete per-operator six-category
@@ -430,12 +433,13 @@ this repository or one of its subdirectories.
   after 30 of 36 instance/seed bundles and remains preserved as incomplete
   evidence; it was not overwritten or used for readiness. New v3 Smoke and
   Formal evidence require new attempt labels before `READY_FOR_STAGE05` may be
-  republished. The accepted v3 evidence is Smoke
-  `stage04_adaptive_weights_attempt06` (72/72 axes) and Formal
-  `stage04_adaptive_weights_attempt07` (144/144 axes,
-  `READY_FOR_STAGE05`).
+  republished. The v3 Smoke `stage04_adaptive_weights_attempt06` and Formal
+  `stage04_adaptive_weights_attempt07` are preserved but superseded because
+  their producer still used per-call updates in one lane and their reviewer did
+  not enforce the complete boundary/operator event matrix. No current
+  `READY_FOR_STAGE05` is published until new v4 Smoke and Formal evidence pass.
 - Stage 4 review products are tracked under `experiments/summaries/` with
-  `stage04_adaptive_weights_attempt07_` prefix; the artifact registry is
+  the current accepted attempt prefix; the artifact registry is
   `experiments/registries/stage04_artifact_registry.csv` and the manifest is
   `experiments/manifests/stage04_adaptive_weights_artifact_manifest.json`.
 
@@ -490,9 +494,10 @@ this repository or one of its subdirectories.
   prerequisite and independent-conversion replay requirements. No current
   Stage 5.1 readiness may be published until a new attempt passes after Stage 4
   v3 is republished. Attempt01 remains historical nested-layout evidence. The
-  accepted v3 evidence is `stage05.1_best_known_attempt03`: exactly 92 unique
-  instances in the canonical single-level layout, with independent review
-  status `READY_FOR_STAGE05_2`.
+  v3 evidence `stage05.1_best_known_attempt03` is preserved but superseded
+  after the Stage 4 v3 prerequisite was withdrawn. No current
+  `READY_FOR_STAGE05_2` is published until Stage 4 v4 passes and a new Stage 5.1
+  attempt independently replays all 92 unique instances.
 - The artifact registry is
   `experiments/registries/stage05.1_artifact_registry.csv` and the manifest
   is `experiments/manifests/stage05.1_best_known_artifact_manifest.json`.

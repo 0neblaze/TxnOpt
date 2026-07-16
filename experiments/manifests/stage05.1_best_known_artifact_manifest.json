@@ -1,27 +1,21 @@
 {
-  "schema_version": "stage05.1-publication-v3",
+  "schema_version": "stage05.1-publication-v4",
   "stage_id": "stage05.1",
   "component": "best_known",
   "run_label": "stage05.1_best_known_attempt03",
   "scope": "formal",
-  "status": "READY_FOR_STAGE05_2",
+  "status": "NOT_READY",
   "artifact_type": "manifest",
   "instance_scope": "all_92",
   "seed_scope": [],
   "comparison_baseline": "stage04_adaptive_weights_attempt07",
-  "review_status": "READY_FOR_STAGE05_2",
+  "review_status": "NOT_READY",
   "raw_schema_version": "stage05.1-best-known-v3",
   "review_schema_version": "stage05.1-review-v3",
   "raw_manifest_sha256": "a57bc4170ad789cbd2cdabfba45dd4131466b067db00893e2417b655d1defe0a",
   "git_revision": "86c30c2b1c74e78a2447da5b218b34a8ab66edbd",
   "git_dirty": false,
-  "gates_passed": [
-    "instance_coverage",
-    "bks_values_present",
-    "no_gap_computation",
-    "compatibility_assessment_correct",
-    "replay_consistency"
-  ],
+  "gates_passed": [],
   "total_instances": 92,
   "bks_row_count": 92,
   "compatibility_dimensions": 5,
@@ -35,7 +29,7 @@
   "evidence_history": {
     "stage05.1_best_known_attempt01": "preserved_v1_superseded_nested_layout",
     "stage05.1_best_known_attempt02": "preserved_v2_superseded_by_v3_prerequisite_and_independent_replay",
-    "stage05.1_best_known_attempt03": "READY_FOR_STAGE05_2_v3_independent_replay"
+    "stage05.1_best_known_attempt03": "preserved_v3_superseded_after_stage04_v3_withdrawal"
   },
   "files": {
     "bks_data": {

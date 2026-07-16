@@ -60,7 +60,7 @@ from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.stage04 import Stage04Config, with_fixed_weights
 
-STAGE04_SCHEMA_VERSION = "stage04-adaptive-weights-v3"
+STAGE04_SCHEMA_VERSION = "stage04-adaptive-weights-v4"
 STAGE04_RUN_LABEL = re.compile(
     r"stage04_adaptive_weights_(?:attempt|rerun)[0-9]{2}"
 )
@@ -402,8 +402,12 @@ def _adaptive_operator_statistics(result: ALNSResult) -> dict[str, dict[str, obj
                 continue
             calls = cast(int, stats["calls"])
             accepted = cast(int, stats["accepted"])
-            if calls < accepted:
-                raise RuntimeError(f"{role}:{name} has more accepted moves than calls")
+            rejected = cast(int, stats["rejected"])
+            if calls != accepted + rejected:
+                raise RuntimeError(
+                    f"{role}:{name} calls={calls} does not equal "
+                    f"accepted + rejected={accepted + rejected}"
+                )
             normalized[f"{role}:{name}"] = {
                 "role": role,
                 "calls": calls,
@@ -411,10 +415,11 @@ def _adaptive_operator_statistics(result: ALNSResult) -> dict[str, dict[str, obj
                 "accepted_improving": cast(int, stats["accepted_improving"]),
                 "accepted_equal": cast(int, stats["accepted_equal"]),
                 "accepted_worse": cast(int, stats["accepted_worse"]),
-                "rejected": calls - accepted,
-                "recorded_rejected": cast(int, stats["rejected"]),
+                "rejected": rejected,
                 "new_global_best": cast(int, stats["best"]),
-                "vehicle_reduction": cast(int, stats["vehicle_reductions"]),
+                "vehicle_reduction": cast(
+                    int, stats["accepted_vehicle_reductions"]
+                ),
             }
     return normalized
 

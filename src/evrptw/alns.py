@@ -111,6 +111,7 @@ class OperatorStatistics:
     improved: int = 0
     best: int = 0
     vehicle_reductions: int = 0
+    accepted_vehicle_reductions: int = 0
     distance_improvements: int = 0
     rejected: int = 0
     # Stage 4 six-category split of *accepted* moves.
@@ -2490,18 +2491,18 @@ def _solve_alns(
                         )
                         for event in shadow_events
                     )
+                    shadow_statistics = neighborhood_stats[shadow_neighborhood]
                     if quality_probe_accept and shadow_candidate.objective is not None:
-                        shadow_statistics = neighborhood_stats[shadow_neighborhood]
                         shadow_statistics.accepted += 1
-                        reward = 1.0
                         if quality_comparison is ObjectiveComparison.BETTER:
                             shadow_statistics.improved += 1
                             shadow_statistics.accepted_improving += 1
-                            reward = 4.0
                         elif quality_comparison is ObjectiveComparison.EQUAL:
                             shadow_statistics.accepted_equal += 1
                         else:
                             shadow_statistics.accepted_worse += 1
+                        if quality_probe_vehicle_reduction:
+                            shadow_statistics.accepted_vehicle_reductions += 1
                         quality_probe_current = shadow_candidate
                         quality_evaluator.remember_incumbent(quality_probe_current)
                         if (
@@ -2513,8 +2514,6 @@ def _solve_alns(
                             is ObjectiveComparison.BETTER
                         ):
                             quality_probe_best = shadow_candidate
-                            shadow_statistics.best += 1
-                            reward = 8.0
                             if (
                                 best.objective is None
                                 or compare_objectives(
@@ -2527,7 +2526,36 @@ def _solve_alns(
                                 best_time = time.perf_counter() - started
                                 global_best_improved = True
                                 shadow_global_best_improved = True
-                        _update_weight(shadow_statistics, reward)
+                                shadow_statistics.best += 1
+                        if stage04_enabled and stage04_config is not None:
+                            reward = stage04_config.reward_for(
+                                accepted=True,
+                                comparison=(
+                                    "better"
+                                    if quality_comparison is ObjectiveComparison.BETTER
+                                    else "equal"
+                                    if quality_comparison is ObjectiveComparison.EQUAL
+                                    else "worse"
+                                ),
+                                is_global_best=shadow_global_best_improved,
+                                vehicle_reduction=quality_probe_vehicle_reduction,
+                            )
+                            _stage04_accumulate(shadow_statistics, reward)
+                        else:
+                            reward = 8.0 if shadow_global_best_improved else (
+                                4.0
+                                if quality_comparison is ObjectiveComparison.BETTER
+                                else 1.0
+                            )
+                            _update_weight(shadow_statistics, reward)
+                    else:
+                        shadow_statistics.rejected += 1
+                        if stage04_enabled and stage04_config is not None:
+                            _stage04_accumulate(
+                                shadow_statistics, stage04_config.reward_rejected
+                            )
+                        else:
+                            _update_weight(shadow_statistics, 0.0)
                     if measurement_trace is not None and shadow_candidate is not None:
                         measurement_trace.record_candidate_state(
                             lane="quality_shadow",
@@ -2690,6 +2718,8 @@ def _solve_alns(
                         constraint_statistics.accepted_equal += 1
                     else:
                         constraint_statistics.accepted_worse += 1
+                    if lane_vehicle_reduction:
+                        constraint_statistics.accepted_vehicle_reductions += 1
                     if (
                         constraint_lane_best.objective is None
                         or compare_objectives(
@@ -2699,7 +2729,6 @@ def _solve_alns(
                         is ObjectiveComparison.BETTER
                     ):
                         constraint_lane_best = constraint_candidate
-                        constraint_statistics.best += 1
                     if (
                         best.objective is None
                         or compare_objectives(
@@ -2712,11 +2741,26 @@ def _solve_alns(
                         best_time = time.perf_counter() - started
                         global_best_improved = True
                         constraint_global_best_improved = True
+                        constraint_statistics.best += 1
                 else:
                     constraint_statistics.rejected += 1
                     constraint_statistics.failure_reasons["candidate_rejected"] = (
                         constraint_statistics.failure_reasons.get("candidate_rejected", 0) + 1
                     )
+                if stage04_enabled and stage04_config is not None:
+                    constraint_reward = stage04_config.reward_for(
+                        accepted=lane_accept,
+                        comparison=(
+                            "better"
+                            if lane_comparison is ObjectiveComparison.BETTER
+                            else "equal"
+                            if lane_comparison is ObjectiveComparison.EQUAL
+                            else "worse"
+                        ),
+                        is_global_best=constraint_global_best_improved,
+                        vehicle_reduction=lane_vehicle_reduction and lane_accept,
+                    )
+                    _stage04_accumulate(constraint_statistics, constraint_reward)
                 if measurement_trace is not None:
                     measurement_trace.record_candidate_state(
                         lane="constraint_lane",
@@ -2817,6 +2861,8 @@ def _solve_alns(
                 else 0.0
             )
             if profile is OperatorProfile.BASELINE:
+                destroy_stats[destroy_name].rejected += 1
+                repair_stats[repair_name].rejected += 1
                 if stage04_enabled and stage04_config is not None:
                     _stage04_accumulate(destroy_stats[destroy_name], reward_rejected)
                     _stage04_accumulate(repair_stats[repair_name], reward_rejected)
@@ -2825,6 +2871,10 @@ def _solve_alns(
                     _update_weight(repair_stats[repair_name], 0.0)
             else:
                 neighborhood_stats[selected_neighborhood].rejected += 1
+                if destroy_name:
+                    destroy_stats[destroy_name].rejected += 1
+                if repair_name:
+                    repair_stats[repair_name].rejected += 1
                 if stage04_enabled and stage04_config is not None:
                     _stage04_accumulate(
                         neighborhood_stats[selected_neighborhood], reward_rejected
@@ -3009,6 +3059,18 @@ def _solve_alns(
                     repair_stats[repair_name].accepted_equal += 1
                 elif is_worse:
                     repair_stats[repair_name].accepted_worse += 1
+        if veh_reduction_accept:
+            if profile is OperatorProfile.BASELINE:
+                destroy_stats[destroy_name].accepted_vehicle_reductions += 1
+                repair_stats[repair_name].accepted_vehicle_reductions += 1
+            else:
+                neighborhood_stats[
+                    selected_neighborhood
+                ].accepted_vehicle_reductions += 1
+                if destroy_name:
+                    destroy_stats[destroy_name].accepted_vehicle_reductions += 1
+                if repair_name:
+                    repair_stats[repair_name].accepted_vehicle_reductions += 1
         if is_better:
             improved += 1
         current = candidate

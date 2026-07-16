@@ -33,8 +33,8 @@ from evrptw.validation import validate_routes
 
 READY_FOR_STAGE05 = "READY_FOR_STAGE05"
 NOT_READY = "NOT_READY"
-STAGE04_REVIEW_SCHEMA_VERSION = "stage04-review-v3"
-STAGE04_RAW_SCHEMA_VERSION = "stage04-adaptive-weights-v3"
+STAGE04_REVIEW_SCHEMA_VERSION = "stage04-review-v4"
+STAGE04_RAW_SCHEMA_VERSION = "stage04-adaptive-weights-v4"
 
 _MIN_CALLS_PER_OPERATOR_DEFAULT = 5
 
@@ -69,13 +69,23 @@ def validate_stage04_operator_audit(
     segment_events: Sequence[Mapping[str, object]],
     *,
     min_calls: int,
+    segment_length: int | None = None,
+    completed_iterations: int | None = None,
 ) -> tuple[bool, str]:
     """Validate complete six-category statistics and segment update boundaries."""
 
     if not operator_statistics:
         return False, "adaptive operator statistics are missing"
     failures: list[str] = []
-    if not segment_events:
+    exact_event_matrix = segment_length is not None or completed_iterations is not None
+    if exact_event_matrix and (
+        segment_length is None
+        or completed_iterations is None
+        or segment_length <= 0
+        or completed_iterations < 0
+    ):
+        failures.append("segment length and completed iterations are invalid")
+    elif not exact_event_matrix and not segment_events:
         failures.append("adaptive segment events are missing")
     for name, raw_stats in operator_statistics.items():
         if not isinstance(raw_stats, Mapping):
@@ -115,6 +125,7 @@ def validate_stage04_operator_audit(
             failures.append(f"{name}: new_global_best exceeds accepted_improving")
         if values["vehicle_reduction"] > values["accepted_improving"]:
             failures.append(f"{name}: vehicle_reduction exceeds accepted_improving")
+    observed_event_keys: list[tuple[int, str]] = []
     for event in segment_events:
         event_type = event.get("type")
         if event_type not in {"stage04_segment_update", "stage04_segment_skip"}:
@@ -126,6 +137,7 @@ def validate_stage04_operator_audit(
         elif event.get("role") != str(operator).partition(":")[0]:
             failures.append(f"{operator}: segment event role is missing or invalid")
         try:
+            iteration = _strict_nonnegative_int(event.get("iteration"), "iteration")
             calls = _strict_nonnegative_int(event.get("segment_calls"), "segment_calls")
         except ValueError as error:
             failures.append(str(error))
@@ -136,6 +148,34 @@ def validate_stage04_operator_audit(
             failures.append(
                 f"{event.get('operator')}: skipped with {calls} calls at or above "
                 f"{min_calls}"
+            )
+        if isinstance(operator, str):
+            observed_event_keys.append((iteration, operator))
+    if (
+        exact_event_matrix
+        and segment_length is not None
+        and completed_iterations is not None
+        and segment_length > 0
+        and completed_iterations >= 0
+    ):
+        boundaries = range(segment_length - 1, completed_iterations, segment_length)
+        expected_event_keys = {
+            (boundary, operator)
+            for boundary in boundaries
+            for operator in operator_statistics
+        }
+        observed_event_key_set = set(observed_event_keys)
+        if len(observed_event_keys) != len(observed_event_key_set):
+            failures.append("duplicate segment boundary/operator event")
+        missing_events = expected_event_keys - observed_event_key_set
+        extra_events = observed_event_key_set - expected_event_keys
+        if missing_events:
+            failures.append(
+                f"missing {len(missing_events)} segment boundary/operator events"
+            )
+        if extra_events:
+            failures.append(
+                f"unexpected {len(extra_events)} segment boundary/operator events"
             )
     detail = "; ".join(failures) if failures else "complete operator and segment audit passed"
     return not failures, detail
@@ -488,6 +528,8 @@ def review_stage04(
                         operator_statistics,
                         typed_events,
                         min_calls=min_calls,
+                        segment_length=_as_int(stage04_stats.get("segment_length")),
+                        completed_iterations=_as_int(raw_axis.get("iterations")),
                     )
 
             # --- Extract per-run data for gate evaluation ---
