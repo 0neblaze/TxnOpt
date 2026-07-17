@@ -9,7 +9,6 @@ dominance pruning and exact result semantics.
 from __future__ import annotations
 
 import heapq
-import math
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -170,8 +169,11 @@ class _TransitionBackend(Protocol):
 
 
 class _CPUTransitionBackend:
-    def __init__(self, metrics: BackendMetrics) -> None:
+    def __init__(self, metrics: BackendMetrics, instance: Instance) -> None:
         self.metrics = metrics
+        self._distance = instance.distance
+        self._consumption_rate = instance.vehicle.consumption_rate
+        self._average_velocity = instance.vehicle.average_velocity
 
     def evaluate(
         self,
@@ -179,16 +181,20 @@ class _CPUTransitionBackend:
     ) -> tuple[TransitionArithmetic, ...]:
         started = time.perf_counter()
         values: list[TransitionArithmetic] = []
+        append = values.append
+        distance_between = self._distance
+        consumption_rate = self._consumption_rate
+        average_velocity = self._average_velocity
         for request in requests:
-            distance = math.hypot(
-                request.origin.x - request.destination.x,
-                request.origin.y - request.destination.y,
+            distance = distance_between(
+                request.origin.name,
+                request.destination.name,
             )
-            values.append(
+            append(
                 TransitionArithmetic(
                     distance=distance,
-                    energy=distance * request.instance.vehicle.consumption_rate,
-                    travel_time=distance / request.instance.vehicle.average_velocity,
+                    energy=distance * consumption_rate,
+                    travel_time=distance / average_velocity,
                 )
             )
         self.metrics.transition_seconds += time.perf_counter() - started
@@ -256,7 +262,7 @@ def solve_exact_charging_batch(
         return BatchChargingResult(scalar_results, metrics)
 
     packing_started = time.perf_counter()
-    transition_backend: _TransitionBackend = _CPUTransitionBackend(metrics)
+    transition_backend: _TransitionBackend = _CPUTransitionBackend(metrics, instance)
     states: list[_SearchState] = []
     results: list[ChargingSubproblemResult | None] = [None] * len(orders)
     for index, order in enumerate(orders):

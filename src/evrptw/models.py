@@ -53,6 +53,9 @@ class Instance:
     _distance_matrix: tuple[tuple[float, ...], ...] = field(
         init=False, repr=False, compare=False
     )
+    _distance_rows: dict[str, tuple[float, ...]] = field(
+        init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         depots = [node for node in self.nodes if node.kind is NodeType.DEPOT]
@@ -98,6 +101,15 @@ class Instance:
             "_distance_matrix",
             matrix,
         )
+        object.__setattr__(
+            self,
+            "_distance_rows",
+            (
+                {node.name: matrix[index] for index, node in enumerate(self.nodes)}
+                if self.distance_backend != "none"
+                else {}
+            ),
+        )
 
     @property
     def depot(self) -> Node:
@@ -136,9 +148,7 @@ class Instance:
 
         try:
             if self.distance_backend != "none":
-                return self._distance_matrix[
-                    self._node_index[origin]
-                ][self._node_index[destination]]
+                return self._distance_rows[origin][self._node_index[destination]]
             return self._by_name[origin].distance_to(self._by_name[destination])
         except KeyError as error:
             raise KeyError(f"unknown node in distance lookup: {error.args[0]}") from error
