@@ -121,6 +121,11 @@ def review_stage052(
         "optimization_profile": _optimization_profile_gate(
             selected, metadata.get("optimization_profile")
         ),
+        "persistence_attribution": {
+            "passed": metadata.get("persistence_attribution")
+            == "critical_event_rows",
+            "detail": str(metadata.get("persistence_attribution")),
+        },
     }
     gates.update(
         _component_gates(

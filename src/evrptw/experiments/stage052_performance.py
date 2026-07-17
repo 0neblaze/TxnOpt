@@ -55,6 +55,7 @@ PER_RUN_FIELDS = (
     "backend",
     "worker_count",
     "storage_policy_version",
+    "persistence_attribution",
     "solver_seconds",
     "artifact_persistence_seconds",
     "end_to_end_seconds",
@@ -260,6 +261,7 @@ def run_stage052(
         "storage_policy_version": storage.storage_policy_version,
         "backend": "cpu_batch",
         "optimization_profile": _optimization_profile(selected),
+        "persistence_attribution": "critical_event_rows",
         "repository_revision": revision,
         "repository_dirty": False,
         "configuration_sha256": _sha256(resolved_config),
@@ -441,7 +443,7 @@ def _run_and_persist_shard(
         storage,
     )
     persistence_started = time.perf_counter()
-    semantic_digests = _persist_shard(
+    semantic_digests, event_counts = _persist_shard(
         shard_writer,
         task=task,
         instance=instance,
@@ -451,6 +453,7 @@ def _run_and_persist_shard(
     persistence_seconds = time.perf_counter() - persistence_started
     peak_rss = _peak_rss_bytes()
     rows: list[dict[str, object]] = []
+    total_events = sum(event_counts.values())
     for axis in axes:
         result = results[axis.name]
         backend = result.backend_metrics
@@ -458,6 +461,11 @@ def _run_and_persist_shard(
         report = validate_routes(instance, [list(route) for route in result.routes])
         batch_launches = _strict_int(backend.get("work_batches", 0), "work_batches")
         exact_calls = _strict_int(backend.get("exact_calls", 0), "exact_calls")
+        persistence_share = (
+            persistence_seconds * event_counts[axis.name] / total_events
+            if total_events
+            else persistence_seconds / len(axes)
+        )
         rows.append(
             {
                 "instance": task.instance_name,
@@ -468,10 +476,10 @@ def _run_and_persist_shard(
                 "backend": result.charging_backend,
                 "worker_count": task.worker_count,
                 "storage_policy_version": storage.storage_policy_version,
+                "persistence_attribution": "critical_event_rows",
                 "solver_seconds": solver_times[axis.name],
-                "artifact_persistence_seconds": persistence_seconds / len(axes),
-                "end_to_end_seconds": solver_times[axis.name]
-                + persistence_seconds / len(axes),
+                "artifact_persistence_seconds": persistence_share,
+                "end_to_end_seconds": solver_times[axis.name] + persistence_share,
                 "screening_seconds": result.screening_statistics.get(
                     "screening_runtime_seconds", 0.0
                 ),
@@ -508,7 +516,7 @@ def _persist_shard(
     instance: Instance,
     results: Mapping[str, ALNSResult],
     storage: ArtifactStorageConfig,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, int]]:
     route_dictionary: dict[str, tuple[str, ...]] = {}
     critical_events: list[dict[str, object]] = []
     diagnostic_rows: list[dict[str, object]] = []
@@ -516,6 +524,7 @@ def _persist_shard(
     solution_axes: dict[str, object] = {}
     trace_axes: dict[str, object] = {}
     semantic_digests: dict[str, str] = {}
+    event_counts: dict[str, int] = {}
     failures: list[str] = []
     for axis, result in results.items():
         trace = result.measurement_trace
@@ -530,6 +539,7 @@ def _persist_shard(
             record["benchmark_axis"] = axis
             normalized_events.append(record)
         critical_events.extend(normalized_events)
+        event_counts[axis] = len(normalized_events)
         diagnostic_rows.extend(
             aggregate_diagnostic_events(
                 normalized_events,
@@ -649,7 +659,7 @@ def _persist_shard(
         shard_ordinal=shard_ordinal,
         worker_identity=worker_identity,
     )
-    return semantic_digests
+    return semantic_digests, event_counts
 
 
 def _route_reference_event(
