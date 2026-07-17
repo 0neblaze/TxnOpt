@@ -29,6 +29,9 @@ from evrptw.validation import validate_routes
 
 STAGE052_REVIEW_SCHEMA_VERSION = "stage05.2-review-v1"
 NOT_READY = "NOT_READY"
+_CANONICAL_CUSTOMER_COUNTS = {
+    record.instance: record.customer_count for record in BEST_KNOWN_VALUES
+}
 _NEXT_STATUS = {
     Stage052Component.PERF_BASELINE: "READY_FOR_STAGE052_HOT_PATH",
     Stage052Component.HOT_PATH: "READY_FOR_STAGE052_ARTIFACT_STREAMING",
@@ -57,15 +60,23 @@ def validate_per_run_scope(
     failures: list[str] = []
     for row in rows:
         try:
+            instance_name = str(row["instance"])
             identity = (
-                str(row["instance"]),
+                instance_name,
                 _strict_int(row["seed"], "seed"),
                 str(row["axis"]),
             )
+            customer_count = _strict_int(row["customer_count"], "customer_count")
         except (KeyError, TypeError, ValueError) as error:
             failures.append(str(error))
             continue
         observed.append(identity)
+        expected_customer_count = _CANONICAL_CUSTOMER_COUNTS.get(instance_name)
+        if expected_customer_count != customer_count:
+            failures.append(
+                f"customer_count mismatch for {identity}: "
+                f"expected={expected_customer_count} observed={customer_count}"
+            )
         if not _strict_bool(row.get("validator_passed")):
             failures.append(f"validator failed for {identity}")
         if str(row.get("failure_status", "")):
@@ -195,12 +206,13 @@ def _validate_formal_scope(
     instances: Sequence[str],
     seeds: Sequence[int],
 ) -> tuple[bool, str]:
-    counts = {record.instance: record.customer_count for record in BEST_KNOWN_VALUES}
     expected = {
         (instance, seed, axis.name)
         for instance in instances
         for seed in seeds
-        for axis in axes_for_scope("formal", customer_count=counts[instance])
+        for axis in axes_for_scope(
+            "formal", customer_count=_CANONICAL_CUSTOMER_COUNTS[instance]
+        )
     }
     observed = {
         (str(row["instance"]), _strict_int(row["seed"], "seed"), str(row["axis"]))
@@ -208,6 +220,14 @@ def _validate_formal_scope(
     }
     if len(rows) != len(observed):
         return False, "duplicate formal identity"
+    count_failures = [
+        str(row.get("instance"))
+        for row in rows
+        if _CANONICAL_CUSTOMER_COUNTS.get(str(row.get("instance")))
+        != _strict_int(row.get("customer_count"), "customer_count")
+    ]
+    if count_failures:
+        return False, f"customer_count mismatch for {len(count_failures)} formal axes"
     if observed != expected:
         return False, f"formal scope mismatch: expected={len(expected)} observed={len(observed)}"
     if len(expected) != 2040:
@@ -388,6 +408,7 @@ def _observations(
         PerformanceObservation(
             instance=str(row["instance"]),
             seed=_strict_int(row["seed"], "seed"),
+            customer_count=_strict_int(row["customer_count"], "customer_count"),
             end_to_end_seconds=_strict_float(row["end_to_end_seconds"]),
             semantic_digest=str(row["semantic_digest"]),
         )

@@ -34,10 +34,13 @@ class AcceleratorDecision(StrEnum):
 class PerformanceObservation:
     instance: str
     seed: int
+    customer_count: int
     end_to_end_seconds: float
     semantic_digest: str
 
     def __post_init__(self) -> None:
+        if self.customer_count not in {5, 10, 15, 100}:
+            raise ValueError("customer_count must be 5, 10, 15, or 100")
         if self.end_to_end_seconds <= 0.0:
             raise ValueError("end_to_end_seconds must be positive")
         if not self.semantic_digest:
@@ -124,13 +127,27 @@ def evaluate_promotion(
     by_family: dict[str, list[float]] = {}
     for key, baseline in previous_by_key.items():
         promoted = candidate_by_key[key]
+        if baseline.customer_count != promoted.customer_count:
+            return PromotionDecision(False, 0.0, {}, "paired customer-count mismatch")
+        if baseline.customer_count != 100:
+            continue
         saving = 1.0 - promoted.end_to_end_seconds / baseline.end_to_end_seconds
         savings.append(saving)
         by_family.setdefault(_instance_family(baseline.instance), []).append(saving)
+    if not savings:
+        return PromotionDecision(False, 0.0, {}, "100-customer paired evidence is empty")
     aggregate = statistics.median(savings)
     family_medians = {
         family: statistics.median(values) for family, values in sorted(by_family.items())
     }
+    required_families = {"C", "R", "RC"}
+    if set(family_medians) != required_families:
+        return PromotionDecision(
+            False,
+            aggregate,
+            family_medians,
+            "100-customer families must be exactly C, R, and RC",
+        )
     family_regressions = {
         family: value
         for family, value in family_medians.items()

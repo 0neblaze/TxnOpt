@@ -31,11 +31,13 @@ def _observation(
     seed: int,
     seconds: float,
     *,
+    customer_count: int = 100,
     semantic_digest: str = "same",
 ) -> PerformanceObservation:
     return PerformanceObservation(
         instance=instance,
         seed=seed,
+        customer_count=customer_count,
         end_to_end_seconds=seconds,
         semantic_digest=semantic_digest,
     )
@@ -80,6 +82,30 @@ def test_promotion_requires_semantic_equality_and_15_percent_gain() -> None:
     decision = evaluate_promotion(previous, promoted)
     assert not decision.passed
     assert "semantic" in decision.detail
+
+
+def test_promotion_uses_100_customer_pairs_and_keeps_c5_as_control() -> None:
+    previous = [
+        _observation("c101C5", 2014, 100.0, customer_count=5),
+        _observation("c101_21", 2014, 100.0),
+        _observation("r101_21", 2014, 100.0),
+        _observation("rc101_21", 2014, 100.0),
+    ]
+    promoted = [
+        _observation("c101C5", 2014, 100.0, customer_count=5),
+        _observation("c101_21", 2014, 84.0),
+        _observation("r101_21", 2014, 84.0),
+        _observation("rc101_21", 2014, 84.0),
+    ]
+
+    decision = evaluate_promotion(previous, promoted)
+
+    assert decision.passed
+    assert decision.aggregate_median_saving == pytest.approx(0.16)
+
+    incomplete = evaluate_promotion(previous[1:-1], promoted[1:-1])
+    assert not incomplete.passed
+    assert "families" in incomplete.detail
 
 
 def test_worker_selection_is_fail_fast_and_memory_bounded() -> None:
@@ -143,6 +169,7 @@ def test_stage052_reviewer_rejects_duplicate_or_missing_axes() -> None:
             "instance": instance,
             "seed": str(seed),
             "axis": axis,
+            "customer_count": "5" if instance == "c101C5" else "100",
             "validator_passed": "True",
             "failure_status": "",
         }
@@ -166,6 +193,33 @@ def test_stage052_reviewer_rejects_duplicate_or_missing_axes() -> None:
     )
     assert not passed
     assert "duplicate" in detail
+
+
+def test_stage052_reviewer_recomputes_customer_count_identity() -> None:
+    rows = [
+        {
+            "instance": instance,
+            "seed": str(seed),
+            "axis": axis,
+            "customer_count": "5" if instance == "c101C5" else "100",
+            "validator_passed": "True",
+            "failure_status": "",
+        }
+        for instance in PERFORMANCE_INSTANCES
+        for seed in PERFORMANCE_SEEDS
+        for axis in ("fixed_work_control", "fixed_work", "wall_clock_30")
+    ]
+    rows[9]["customer_count"] = "5"
+
+    passed, detail = validate_per_run_scope(
+        rows,
+        instances=PERFORMANCE_INSTANCES,
+        seeds=PERFORMANCE_SEEDS,
+        axes=("fixed_work_control", "fixed_work", "wall_clock_30"),
+    )
+
+    assert not passed
+    assert "customer_count mismatch" in detail
 
 
 def test_native_distance_matrix_matches_worked_euclidean_fixture() -> None:
