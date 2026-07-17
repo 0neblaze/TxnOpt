@@ -340,6 +340,12 @@ def _safe_artifact_path(run_dir: Path, relative_path: str) -> Path:
     return run_dir / relative
 
 
+def _is_appledouble_path(path: Path) -> bool:
+    """Identify macOS AppleDouble metadata created by non-APFS volumes."""
+
+    return any(part.startswith("._") for part in path.parts)
+
+
 def _schema_fingerprint(schema: pa.Schema) -> str:
     # Arrow may rename the child field of a list from ``item`` to
     # ``element`` while round-tripping through Parquet.  Fingerprint the
@@ -1081,6 +1087,8 @@ class ArtifactBundleWriter:
             raise ValueError("expected shard identities contain duplicates")
         discovered: list[tuple[int, str, int, Path, dict[str, Any]]] = []
         for manifest_path in self.run_dir.glob("*/*/*_shard_manifest_*.json"):
+            if _is_appledouble_path(manifest_path.relative_to(self.run_dir)):
+                continue
             payload = _json_read(manifest_path)
             try:
                 identity = (str(payload["instance"]), int(payload["seed"]))
@@ -1916,7 +1924,11 @@ def build_stage03_critical_events(
 def find_manifest(run_dir: Path) -> Path:
     """Find a v2 control manifest, falling back to the legacy root manifest."""
 
-    candidates = sorted((run_dir / "control").glob("*_manifest.json"))
+    candidates = sorted(
+        path
+        for path in (run_dir / "control").glob("*_manifest.json")
+        if not _is_appledouble_path(path.relative_to(run_dir))
+    )
     if candidates:
         return candidates[0]
     legacy = run_dir / "manifest.json"
@@ -1994,6 +2006,8 @@ def verify_manifest(run_dir: Path) -> dict[str, Any]:
         if not path.is_file() or path in {manifest_path, sidecar}:
             continue
         relative = path.relative_to(run_dir).as_posix()
+        if _is_appledouble_path(path.relative_to(run_dir)):
+            continue
         if relative == "review" or relative.startswith("review/"):
             continue
         if relative not in listed_paths:

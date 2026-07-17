@@ -292,6 +292,25 @@ def test_manifest_detects_parquet_tampering(tmp_path: Path) -> None:
         verify_manifest(result.run_dir)
 
 
+def test_manifest_ignores_external_volume_appledouble_metadata(tmp_path: Path) -> None:
+    writer = _writer(tmp_path)
+    writer.write_instance_seed(
+        instance="toy",
+        seed=2014,
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+        route_dictionary={},
+        critical_events=[],
+    )
+    result = writer.finalize()
+    (result.run_dir / "control" / "._fake_manifest.json").write_bytes(b"appledouble")
+    (result.run_dir / "toy" / "2014" / "._events.parquet").write_bytes(b"appledouble")
+    manifest = verify_manifest(result.run_dir)
+    assert manifest["status"] == "complete"
+
+
 def test_event_ids_are_global_and_trace_json_is_an_index(tmp_path: Path) -> None:
     writer = _writer(tmp_path)
     for seed in (2014, 2015):
