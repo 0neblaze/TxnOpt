@@ -1,0 +1,32 @@
+{
+  "run_label": "stage05.1_best_known_attempt05",
+  "stage_id": "stage05.1",
+  "component": "best_known",
+  "status": "READY_FOR_STAGE05_2",
+  "schema_version": "stage05.1-review-v5",
+  "gates": {
+    "instance_coverage": {
+      "passed": true,
+      "detail": "csv=92 canonical=92"
+    },
+    "bks_values_present": {
+      "passed": true,
+      "detail": "all 92 instances have bks_vehicles and bks_distance"
+    },
+    "no_gap_computation": {
+      "passed": true,
+      "detail": "no gap columns"
+    },
+    "compatibility_assessment_correct": {
+      "passed": true,
+      "detail": "all BKS and compatibility fields match canonical data"
+    },
+    "replay_consistency": {
+      "passed": true,
+      "detail": "all BKS values match canonical data"
+    }
+  },
+  "total_instances": 92,
+  "bks_row_count": 92,
+  "compat_row_count": 5
+}

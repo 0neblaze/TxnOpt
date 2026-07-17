@@ -70,11 +70,13 @@ results/stage05.1_best_known_attemptNN/
 
 Review status `READY_FOR_STAGE05_2` requires all five gates to pass.
 
-The v2 reviewer compares every BKS and compatibility field, requires the
-canonical `results/<run_label>/` layout, verifies the clean revision and the
-published Stage 4 v2 prerequisite, and rejects duplicate, missing, additional,
-or malformed rows. Stage 5.1 v1 evidence remains historical and cannot be
-promoted by the v2 reviewer.
+The v5 reviewer compares every canonical BKS and compatibility field,
+including source/compilation references, DOI, charging fields, and
+`model_compatible`; it requires the canonical single-level
+`results/<run_label>/` layout, a clean revision, and the published Stage 4 v5
+prerequisite. Duplicate, missing, additional, or malformed rows fail the
+review immediately. Earlier evidence remains historical and cannot be promoted
+by the v5 reviewer.
 
 ## Accepted Evidence
 
@@ -87,6 +89,9 @@ superseded v1 evidence under its historical nested layout.
 
 The v3 evidence `stage05.1_best_known_attempt03` is preserved but superseded
 because its Stage 4 v3 prerequisite was withdrawn. v4 attempt04 is also
-preserved but superseded after the Stage 4 v4 prerequisite was withdrawn. A new
-attempt must use a published Stage 4 v5 prerequisite and independently replay
-all 92 unique instances before `READY_FOR_STAGE05_2` may be republished.
+preserved but superseded after the Stage 4 v4 prerequisite was withdrawn.
+`stage05.1_best_known_attempt05` uses the published v5 Stage 4 formal review
+(`stage04_adaptive_weights_attempt13`) and passes all five independent replay
+gates for exactly 92 unique instances. It is the current
+`READY_FOR_STAGE05_2` evidence; no gap field or model-inconsistent gap is
+published.
