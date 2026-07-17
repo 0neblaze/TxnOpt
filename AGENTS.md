@@ -501,10 +501,11 @@ this repository or one of its subdirectories.
   `COMPATIBILITY_ASSESSMENT`), and `replay_consistency` (CSV values match the
   canonical `BEST_KNOWN_VALUES`). The review reports `READY_FOR_STAGE05_2`
   only when all five gates pass.
-- Stage 5.1 v5 requires the published Stage 4 v5 prerequisite, canonical
-  single-level run layout, exact CSV schemas, unique instance rows, and
-  complete field-by-field replay including citations, charging unknowns, and
-  model-compatibility fields. `stage05.1_best_known_attempt01` remains
+- Stage 5.1 v6 requires the published Stage 4 v6 Formal prerequisite
+  (`stage04_adaptive_weights_attempt15`, Formal scope, 144 axes, and matching
+  review identity), canonical single-level run layout, exact CSV schemas, unique
+  instance rows, and complete field-by-field replay including citations,
+  charging unknowns, and model-compatibility fields. `stage05.1_best_known_attempt01` remains
   preserved v1 evidence and is superseded for readiness purposes.
 - `stage05.1_best_known_attempt02` remains preserved v2 evidence with a
   canonical single-level 92-instance bundle, but it is superseded by the v3
