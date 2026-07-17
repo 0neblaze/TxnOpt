@@ -444,10 +444,13 @@ this repository or one of its subdirectories.
   preserved but superseded because a fixed-work budget boundary could still be
   followed by candidate acceptance. The v5 reviewer independently replays
   critical boundary events and rejects any later accepted/global-best event.
-  New v5 Smoke and Formal attempts are required before `READY_FOR_STAGE05` is
-  republished.
+  Smoke `stage04_adaptive_weights_attempt12` passed 72/72 axes under v5; its
+  original ordering-sensitive review is preserved and the corrected independent
+  `review_v2` is the accepted smoke review. Formal
+  `stage04_adaptive_weights_attempt13` passed 144/144 axes and all six gates
+  under the same v5 reviewer, publishing `READY_FOR_STAGE05`.
 - Stage 4 review products are tracked under `experiments/summaries/` with
-  `stage04_adaptive_weights_attempt11_` prefix; the artifact registry is
+  `stage04_adaptive_weights_attempt13_` prefix; the artifact registry is
   `experiments/registries/stage04_artifact_registry.csv` and the manifest is
   `experiments/manifests/stage04_adaptive_weights_artifact_manifest.json`.
 

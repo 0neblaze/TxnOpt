@@ -1,0 +1,41 @@
+{
+  "expected_axes": 144,
+  "files": {
+    "gate_evaluation.csv": "9c43a875cec947d8771e9c0ef53866843882a8cfda4c6e356721cdd2ee13c4e0",
+    "review_findings.csv": "00b7aae0844029f1ff3946fa99ef777562a9ca6d53820c3edd043d220a98e79f",
+    "review_report.md": "49ce5d6ce4d4ea5aa6c3da2adf8a1bd9a43a8ff34cfd23181549f0d888927f06"
+  },
+  "gates": {
+    "adaptive_better_than_fixed": {
+      "details": "adaptive wins 7 (instance, seed) pairs; need >= 3. won: [('c101_21', 2014), ('c101_21', 2015), ('c101_21', 2016), ('r101_21', 2015), ('r105C15', 2016), ('rc101_21', 2014), ('rc101_21', 2015)]",
+      "passed": true
+    },
+    "not_single_best_seed": {
+      "details": "adaptive wins on 3 unique seeds: [2014, 2015, 2016]; need >= 2.",
+      "passed": true
+    },
+    "operator_call_sufficiency": {
+      "details": "all wall_clock axes passed per-operator segment audit",
+      "passed": true
+    },
+    "replay_consistency": {
+      "details": "exact 144-axis scope; all objectives and exact-call counts match",
+      "passed": true
+    },
+    "six_category_statistics": {
+      "details": "all adaptive_wall_clock axes have complete reconciled six-category statistics",
+      "passed": true
+    },
+    "std_not_increased": {
+      "details": "Stage 4 vehicle_count std <= Stage 0 for all instances",
+      "passed": true
+    }
+  },
+  "observed_axes": 144,
+  "reviewer_sha256": "8d64431acab14962f7b570d46d86a95f5263928e5a33134b12d32ad79526f935",
+  "run_directory": "/Users/guoyiyang/Documents/GitHub/FURP-2026-Yiyang-GUO-EVRP-TW/results/stage04_adaptive_weights_attempt13",
+  "run_label": "stage04_adaptive_weights_attempt13",
+  "schema_version": "stage04-review-v5",
+  "scope": "formal",
+  "status": "READY_FOR_STAGE05"
+}
