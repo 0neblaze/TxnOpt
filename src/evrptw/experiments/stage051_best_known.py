@@ -16,6 +16,7 @@ import json
 import re
 import subprocess
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,7 @@ from evrptw.best_known import (
 )
 from evrptw.environment import collect_environment
 
-STAGE051_SCHEMA_VERSION = "stage05.1-best-known-v5"
+STAGE051_SCHEMA_VERSION = "stage05.1-best-known-v6"
 STAGE051_RUN_LABEL = re.compile(r"^stage05\.1_best_known_(?:attempt|rerun)[0-9]{2}$")
 
 BKS_DATA_FIELDS: tuple[str, ...] = (
@@ -428,7 +429,7 @@ def verify_stage04_prerequisite(
     publication = json.loads(publication_path.read_text(encoding="utf-8"))
     run_label = publication.get("run_label")
     if (
-        publication.get("schema_version") != "stage04-publication-v5"
+        publication.get("schema_version") != "stage04-publication-v6"
         or publication.get("review_status") != "READY_FOR_STAGE05"
         or not isinstance(run_label, str)
     ):
@@ -457,16 +458,35 @@ def verify_stage04_prerequisite(
         (root / str(review_record["path"])).read_text(encoding="utf-8")
     )
     if (
-        review.get("schema_version") != "stage04-review-v5"
+        review.get("schema_version") != "stage04-review-v6"
         or review.get("status") != "READY_FOR_STAGE05"
     ):
-        raise RuntimeError("Stage 4 v5 review is not READY_FOR_STAGE05")
+        raise RuntimeError("Stage 4 v6 review is not READY_FOR_STAGE05")
+    formal_ok, formal_detail = validate_stage04_formal_identity(publication, review)
+    if not formal_ok:
+        raise RuntimeError(f"Stage 4 Formal identity is invalid: {formal_detail}")
     return {
         "publication_manifest": str(publication_path.relative_to(root)),
         "publication_sha256": expected_digest,
         "run_label": run_label,
         "review_status": "READY_FOR_STAGE05",
     }
+
+
+def validate_stage04_formal_identity(
+    publication: Mapping[str, object], review: Mapping[str, object]
+) -> tuple[bool, str]:
+    """Require Stage 5.1 to inherit exactly the Stage 4 Formal evidence."""
+
+    failures: list[str] = []
+    for name, payload in (("publication", publication), ("review", review)):
+        if payload.get("scope") != "formal":
+            failures.append(f"{name} scope is not formal")
+        if payload.get("observed_axes") != 144:
+            failures.append(f"{name} observed_axes is not 144")
+    if publication.get("run_label") != review.get("run_label"):
+        failures.append("publication/review run_label mismatch")
+    return not failures, "; ".join(failures) if failures else "Stage 4 Formal identity is exact"
 
 
 def _sha256(path: Path) -> str:

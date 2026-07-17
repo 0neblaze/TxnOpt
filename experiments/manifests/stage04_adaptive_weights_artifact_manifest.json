@@ -1,15 +1,15 @@
 {
-  "schema_version": "stage04-publication-v5",
+  "schema_version": "stage04-publication-v6",
   "stage_id": "stage04",
   "component": "adaptive_weights",
   "run_label": "stage04_adaptive_weights_attempt13",
   "scope": "formal",
-  "status": "READY_FOR_STAGE05",
+  "status": "NOT_READY",
   "artifact_type": "manifest",
   "instance_scope": "formal_12",
   "seed_scope": [2014, 2015, 2016],
   "comparison_baseline": "stage03.4_control_parallel_attempt11",
-  "review_status": "READY_FOR_STAGE05",
+  "review_status": "NOT_READY",
   "raw_schema_version": "stage04-adaptive-weights-v5",
   "review_schema_version": "stage04-review-v5",
   "repository_revision": "7ef2450dc9799abc13e4a7bbf919f1824ab4cdd2",
@@ -17,14 +17,7 @@
   "raw_manifest_sha256": "01b48e400f9e27b1f0359d107e5abd2a3bb57789f5e0d12116385260196b05a6",
   "source_sha256": "d93d88da1d7d7b45905b77ff695bee0d4a4d928237915ac6e24452a5da292c8f",
   "config_sha256": "22c60851cac104e0b8c1507909c3f4c067088cb9a2e9c32d36ff15b5c9a16cbc",
-  "gates_passed": [
-    "operator_call_sufficiency",
-    "six_category_statistics",
-    "adaptive_better_than_fixed",
-    "not_single_best_seed",
-    "std_not_increased",
-    "replay_consistency"
-  ],
+  "gates_passed": [],
   "observed_axes": 144,
   "adaptive_wins": 7,
   "winning_seeds": [2014, 2015, 2016],
@@ -40,8 +33,9 @@
     "stage04_adaptive_weights_attempt09": "preserved_incomplete_v4_work_boundary_failure",
     "stage04_adaptive_weights_attempt10": "preserved_v4_superseded_after_v5_budget_boundary_replay",
     "stage04_adaptive_weights_attempt11": "preserved_v4_superseded_after_v5_budget_boundary_replay",
-    "stage04_adaptive_weights_attempt12": "READY_FOR_STAGE05_smoke_v5_72_axes_review_v2",
-    "stage04_adaptive_weights_attempt13": "READY_FOR_STAGE05_formal_v5_144_axes"
+    "stage04_adaptive_weights_attempt12": "preserved_v5_smoke_superseded_by_complete_operator_and_identity_audit",
+    "stage04_adaptive_weights_attempt13": "preserved_v5_formal_superseded_by_complete_operator_and_identity_audit",
+    "stage04_v6": "new_smoke_and_formal_attempts_required_before_READY_FOR_STAGE05"
   },
   "files": {
     "per_run_results": {

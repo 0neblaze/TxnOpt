@@ -38,8 +38,8 @@
     "stage03.4_control_parallel_attempt05": "NOT_READY",
     "stage03.4_control_parallel_attempt06": "not_present",
     "stage03.4_control_parallel_attempt07": "NOT_READY",
-    "stage03.4_control_parallel_attempt08": "READY_FOR_STAGE034_FORMAL",
-    "stage03.4_control_parallel_attempt09": "READY_FOR_STAGE04",
+    "stage03.4_control_parallel_attempt08": "historical_READY_FOR_STAGE034_FORMAL_superseded_by_attempt10",
+    "stage03.4_control_parallel_attempt09": "historical_READY_FOR_STAGE04_superseded_by_attempt11",
     "stage03.4_control_parallel_attempt10": "READY_FOR_STAGE034_FORMAL",
     "stage03.4_control_parallel_attempt11": "READY_FOR_STAGE04"
   },

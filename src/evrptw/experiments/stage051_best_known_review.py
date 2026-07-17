@@ -24,7 +24,7 @@ from evrptw.experiments.stage051_best_known import (
 
 READY_FOR_STAGE05_2 = "READY_FOR_STAGE05_2"
 NOT_READY = "NOT_READY"
-STAGE051_REVIEW_SCHEMA_VERSION = "stage05.1-review-v5"
+STAGE051_REVIEW_SCHEMA_VERSION = "stage05.1-review-v6"
 
 _GATE_COVERAGE = "instance_coverage"
 _GATE_BKS_VALUES = "bks_values_present"
@@ -39,6 +39,18 @@ _GATE_NAMES = (
     _GATE_COMPATIBILITY,
     _GATE_REPLAY,
 )
+
+
+def validate_stage051_manifest_completeness(
+    manifest: dict[str, Any],
+) -> tuple[bool, str]:
+    """Reject a partial raw BKS bundle before replaying its CSV files."""
+
+    if manifest.get("status") != "complete":
+        return False, "partial Stage 5.1 evidence cannot become ready"
+    if manifest.get("evidence_completeness") != "complete":
+        return False, "incomplete Stage 5.1 evidence cannot become ready"
+    return True, "Stage 5.1 evidence is complete"
 
 
 def review_stage051(
@@ -81,6 +93,10 @@ def review_stage051(
     else:
         return _write_failure(output_dir, "manifest not found")
 
+    complete, completeness_detail = validate_stage051_manifest_completeness(manifest)
+    if not complete:
+        return _write_failure(output_dir, completeness_detail)
+
     stage_id = manifest.get("stage_id", "")
     component = manifest.get("component", "")
     if stage_id != "stage05.1" or component != "best_known":
@@ -102,7 +118,7 @@ def review_stage051(
     metadata_path = run_dir / str(metadata_refs[0]["relative_path"])
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     if metadata.get("schema_version") != STAGE051_SCHEMA_VERSION:
-        return _write_failure(output_dir, "Stage 5.1 v2 metadata is required")
+        return _write_failure(output_dir, "Stage 5.1 v6 metadata is required")
     if metadata.get("git_dirty") is not False:
         return _write_failure(output_dir, "Stage 5.1 evidence must come from a clean revision")
     try:

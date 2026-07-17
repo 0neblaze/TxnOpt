@@ -444,13 +444,14 @@ this repository or one of its subdirectories.
   preserved but superseded because a fixed-work budget boundary could still be
   followed by candidate acceptance. The v5 reviewer independently replays
   critical boundary events and rejects any later accepted/global-best event.
-  Smoke `stage04_adaptive_weights_attempt12` passed 72/72 axes under v5; its
-  original ordering-sensitive review is preserved and the corrected independent
-  `review_v2` is the accepted smoke review. Formal
-  `stage04_adaptive_weights_attempt13` passed 144/144 axes and all six gates
-  under the same v5 reviewer, publishing `READY_FOR_STAGE05`.
+  Smoke `stage04_adaptive_weights_attempt12` and Formal
+  `stage04_adaptive_weights_attempt13` are preserved v5 evidence, but are
+  superseded: the v6 reviewer adds the missing non-adaptive refinement call
+  partition, exact raw/solution/trace axis identity, and fail-fast raw numeric
+  parsing. New v6 Smoke and Formal attempts are required before
+  `READY_FOR_STAGE05` is republished.
 - Stage 4 review products are tracked under `experiments/summaries/` with
-  `stage04_adaptive_weights_attempt13_` prefix; the artifact registry is
+  the current accepted Formal attempt prefix; the artifact registry is
   `experiments/registries/stage04_artifact_registry.csv` and the manifest is
   `experiments/manifests/stage04_adaptive_weights_artifact_manifest.json`.
 
@@ -508,9 +509,11 @@ this repository or one of its subdirectories.
   v3 evidence `stage05.1_best_known_attempt03` is preserved but superseded
   after the Stage 4 v3 prerequisite was withdrawn. v4 attempt04 is also
   preserved but superseded after the Stage 4 v4 prerequisite was withdrawn.
-  `stage05.1_best_known_attempt05` uses the published v5 Stage 4 Formal
-  prerequisite and independently replays exactly 92 canonical rows, passing
-  all five gates and publishing `READY_FOR_STAGE05_2`.
+  `stage05.1_best_known_attempt05` is preserved v5 evidence but superseded
+  after the Stage 4 v5 prerequisite was withdrawn. Stage 5.1 v6 additionally
+  requires the exact Stage 4 Formal identity (`scope=formal`, 144 axes, and a
+  matching review run label) before a new 92-row independent replay may publish
+  `READY_FOR_STAGE05_2`.
 - The artifact registry is
   `experiments/registries/stage05.1_artifact_registry.csv` and the manifest
   is `experiments/manifests/stage05.1_best_known_artifact_manifest.json`.

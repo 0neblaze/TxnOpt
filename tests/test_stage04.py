@@ -27,6 +27,7 @@ def test_stage04_operator_audit_rejects_update_below_minimum() -> None:
     statistics = {
         "standard": {
             "role": "neighborhood",
+            "weight_participates": True,
             "calls": 4,
             "accepted": 2,
             "accepted_improving": 1,
@@ -50,6 +51,7 @@ def test_stage04_operator_audit_requires_all_six_categories() -> None:
     statistics = {
         "standard": {
             "role": "neighborhood",
+            "weight_participates": True,
             "calls": 5,
             "accepted": 3,
             "accepted_improving": 1,
@@ -71,6 +73,7 @@ def test_stage04_operator_audit_requires_exact_call_partition_and_role() -> None
     statistics = {
         "neighborhood:standard": {
             "role": "neighborhood",
+            "weight_participates": True,
             "calls": 5,
             "accepted": 2,
             "accepted_improving": 1,
@@ -118,6 +121,7 @@ def test_stage04_operator_audit_requires_segment_events() -> None:
     statistics = {
         "destroy:random": {
             "role": "destroy",
+            "weight_participates": True,
             "calls": 5,
             "accepted": 0,
             "accepted_improving": 0,
@@ -141,6 +145,7 @@ def test_stage04_operator_audit_requires_exact_boundary_operator_matrix() -> Non
     statistics = {
         "destroy:random": {
             "role": "destroy",
+            "weight_participates": True,
             "calls": 10,
             "accepted": 5,
             "accepted_improving": 2,
@@ -268,6 +273,72 @@ def test_stage04_scope_audit_rejects_missing_and_duplicate_axes() -> None:
     assert not passed
     assert "duplicate" in detail
     assert "missing" in detail
+
+
+def test_stage04_operator_audit_tracks_nonadaptive_refinement_without_segment_event() -> None:
+    from evrptw.experiments.stage04_weights_review import (
+        validate_stage04_operator_audit,
+    )
+
+    statistics = {
+        "neighborhood:vehicle_reduction_refinement": {
+            "role": "neighborhood",
+            "weight_participates": False,
+            "calls": 4,
+            "accepted": 1,
+            "accepted_improving": 1,
+            "accepted_equal": 0,
+            "accepted_worse": 0,
+            "rejected": 3,
+            "new_global_best": 0,
+            "vehicle_reduction": 1,
+        }
+    }
+    passed, detail = validate_stage04_operator_audit(
+        statistics,
+        [],
+        min_calls=5,
+        segment_length=50,
+        completed_iterations=100,
+    )
+    assert passed, detail
+
+
+@pytest.mark.parametrize("value", ["not-a-number", 1.9, True, None, -1])
+def test_stage04_raw_axis_rejects_illegal_integer_fields(value: object) -> None:
+    from evrptw.experiments.stage04_weights_review import (
+        validate_stage04_raw_axis_numbers,
+    )
+
+    raw_axis = {
+        "started_calls": 1,
+        "completed_calls": 1,
+        "budget_exhaustions": 0,
+        "effective_iterations": 1,
+        "stage04_statistics": {
+            "min_calls_per_operator": 5,
+            "segment_length": 50,
+        },
+    }
+    raw_axis["started_calls"] = value
+    passed, detail = validate_stage04_raw_axis_numbers(raw_axis)
+    assert not passed
+    assert "started_calls" in detail
+
+
+def test_stage04_axis_maps_reject_extra_axis() -> None:
+    from evrptw.experiments.stage04_weights_review import validate_stage04_axis_maps
+
+    expected = ("adaptive_wall_clock",)
+    raw_axes = {"adaptive_wall_clock": {}, "undeclared_axis": {}}
+    passed, detail = validate_stage04_axis_maps(
+        raw_axes,
+        {"adaptive_wall_clock": {}},
+        {"adaptive_wall_clock": {}},
+        expected_axes=expected,
+    )
+    assert not passed
+    assert "undeclared_axis" in detail
 
 
 def test_stage04_prerequisite_rejects_missing_publication(tmp_path: object) -> None:
@@ -603,6 +674,28 @@ class TestStage04EndToEnd:
                     + stats["accepted_worse"]
                     == stats["accepted"]
                 )
+
+    def test_stage04_refinement_statistics_have_a_complete_partition(
+        self, c101c5_instance: object
+    ) -> None:
+        result = solve_alns(
+            c101c5_instance,
+            seed=2014,
+            max_iterations=50,
+            time_limit_seconds=10,
+            operator_profile="stage02_constraint_guided",
+            backend="cpu_batch",
+            stage04_config=Stage04Config(),
+        )
+        refinement = result.neighborhood_statistics["vehicle_reduction_refinement"]
+        assert refinement["calls"] == refinement["accepted"] + refinement["rejected"]
+        assert refinement["accepted"] == (
+            refinement["accepted_improving"]
+            + refinement["accepted_equal"]
+            + refinement["accepted_worse"]
+        )
+        assert refinement["best"] <= refinement["accepted_improving"]
+        assert refinement["accepted_vehicle_reductions"] <= refinement["accepted_improving"]
 
     def test_stage04_adaptive_records_temperature_history(
         self, c101c5_instance: object

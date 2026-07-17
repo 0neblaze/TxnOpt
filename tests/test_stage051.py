@@ -60,6 +60,49 @@ def test_stage051_prerequisite_rejects_missing_publication(tmp_path: object) -> 
         verify_stage04_prerequisite(Path(str(tmp_path)), Path("missing.json"))
 
 
+def test_stage051_stage04_identity_requires_formal_144_axis_review() -> None:
+    from evrptw.experiments.stage051_best_known import validate_stage04_formal_identity
+
+    publication = {
+        "scope": "formal",
+        "observed_axes": 144,
+        "run_label": "stage04_adaptive_weights_attempt15",
+    }
+    review = {
+        "scope": "formal",
+        "observed_axes": 144,
+        "run_label": "stage04_adaptive_weights_attempt15",
+    }
+    passed, detail = validate_stage04_formal_identity(publication, review)
+    assert passed, detail
+
+    for field, bad_value in (("scope", "smoke"), ("observed_axes", 72)):
+        tampered = dict(review)
+        tampered[field] = bad_value
+        passed, _ = validate_stage04_formal_identity(publication, tampered)
+        assert not passed
+
+    tampered = dict(review, run_label="stage04_adaptive_weights_attempt14")
+    passed, _ = validate_stage04_formal_identity(publication, tampered)
+    assert not passed
+
+
+def test_stage051_reviewer_rejects_partial_manifest() -> None:
+    from evrptw.experiments.stage051_best_known_review import (
+        validate_stage051_manifest_completeness,
+    )
+
+    assert not validate_stage051_manifest_completeness(
+        {"status": "partial", "evidence_completeness": "complete"}
+    )[0]
+    assert not validate_stage051_manifest_completeness(
+        {"status": "complete", "evidence_completeness": "partial"}
+    )[0]
+    assert validate_stage051_manifest_completeness(
+        {"status": "complete", "evidence_completeness": "complete"}
+    )[0]
+
+
 def test_stage051_reviewer_does_not_use_runner_row_converter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

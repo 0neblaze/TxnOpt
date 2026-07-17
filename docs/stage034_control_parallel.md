@@ -69,9 +69,11 @@ incomplete.
 ## Current evidence status
 
 `stage03.4_control_parallel_attempt05` completed the full 72-axis Smoke scope
-but independently reviewed as `NOT_READY`. Attempts 06--09 remain preserved as
-partial, failed, or intermediate warm-start evidence. The corrected
-transactional warm-start protocol passed as Smoke
+but independently reviewed as `NOT_READY`. Attempts 06--07 remain preserved as
+partial or failed evidence. Attempts 08--09 are complete intermediate
+warm-start runs that received their then-current historical reviewer statuses,
+but are explicitly superseded in the manifest and registry by the corrected
+transactional protocol. That protocol passed as Smoke
 `stage03.4_control_parallel_attempt10` (72/72 axes,
 `READY_FOR_STAGE034_FORMAL`) and Formal
 `stage03.4_control_parallel_attempt11` (144/144 axes,

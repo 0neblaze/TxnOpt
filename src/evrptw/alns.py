@@ -2401,6 +2401,11 @@ def _solve_alns(
                 )
                 move_events = (*move_events, refinement_event)
                 refinement_stats.calls += 1
+                if not refinement_selected:
+                    # A refinement call that did not replace the main candidate
+                    # is a rejected operator outcome, even if that main
+                    # candidate is later accepted.
+                    refinement_stats.rejected += 1
                 if measurement_trace is not None:
                     measurement_trace.record_operator_call(
                         lane="legacy",
@@ -3072,10 +3077,6 @@ def _solve_alns(
             continue
 
         accepted += 1
-        if refinement_selected:
-            refinement_stats.accepted += 1
-            refinement_stats.improved += 1
-            refinement_stats.accepted_improving += 1
         if candidate.objective is None:
             raise RuntimeError("accepted ALNS candidate is missing its objective")
         if current.objective is None:
@@ -3084,6 +3085,15 @@ def _solve_alns(
         is_better = comparison_result is ObjectiveComparison.BETTER
         is_equal = comparison_result is ObjectiveComparison.EQUAL
         is_worse = comparison_result is ObjectiveComparison.WORSE
+        if refinement_selected:
+            refinement_stats.accepted += 1
+            if is_better:
+                refinement_stats.improved += 1
+                refinement_stats.accepted_improving += 1
+            elif is_equal:
+                refinement_stats.accepted_equal += 1
+            elif is_worse:
+                refinement_stats.accepted_worse += 1
         veh_reduction_accept = bool(
             candidate.objective is not None
             and current.objective is not None
@@ -3142,6 +3152,8 @@ def _solve_alns(
                     destroy_stats[destroy_name].accepted_vehicle_reductions += 1
                 if repair_name:
                     repair_stats[repair_name].accepted_vehicle_reductions += 1
+            if refinement_selected:
+                refinement_stats.accepted_vehicle_reductions += 1
         if is_better:
             improved += 1
         current = candidate
@@ -3162,6 +3174,8 @@ def _solve_alns(
                 repair_stats[repair_name].best += 1
             else:
                 neighborhood_stats[selected_neighborhood].best += 1
+                if refinement_selected:
+                    refinement_stats.best += 1
                 if destroy_name:
                     destroy_stats[destroy_name].best += 1
                 if repair_name:

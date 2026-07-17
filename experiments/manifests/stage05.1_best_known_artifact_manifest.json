@@ -1,27 +1,21 @@
 {
-  "schema_version": "stage05.1-publication-v5",
+  "schema_version": "stage05.1-publication-v6",
   "stage_id": "stage05.1",
   "component": "best_known",
   "run_label": "stage05.1_best_known_attempt05",
   "scope": "formal",
-  "status": "READY_FOR_STAGE05_2",
+  "status": "NOT_READY",
   "artifact_type": "manifest",
   "instance_scope": "all_92",
   "seed_scope": [],
   "comparison_baseline": "stage04_adaptive_weights_attempt13",
-  "review_status": "READY_FOR_STAGE05_2",
+  "review_status": "NOT_READY",
   "raw_schema_version": "stage05.1-best-known-v5",
   "review_schema_version": "stage05.1-review-v5",
   "raw_manifest_sha256": "e925b9c44ef0c89b27f53fe409cd2590178aca0ed7727705880539174b964657",
   "git_revision": "3921aa48a8d524e73a0c56ad41243301c6d314cf",
   "git_dirty": false,
-  "gates_passed": [
-    "instance_coverage",
-    "bks_values_present",
-    "no_gap_computation",
-    "compatibility_assessment_correct",
-    "replay_consistency"
-  ],
+  "gates_passed": [],
   "total_instances": 92,
   "bks_row_count": 92,
   "compatibility_dimensions": 5,
@@ -37,7 +31,8 @@
     "stage05.1_best_known_attempt02": "preserved_v2_superseded_by_v3_prerequisite_and_independent_replay",
     "stage05.1_best_known_attempt03": "preserved_v3_superseded_after_stage04_v3_withdrawal",
     "stage05.1_best_known_attempt04": "preserved_v4_superseded_after_stage04_v4_withdrawal",
-    "stage05.1_best_known_attempt05": "READY_FOR_STAGE05_2_v5_92_instances"
+    "stage05.1_best_known_attempt05": "preserved_v5_superseded_after_stage04_v5_withdrawal",
+    "stage05.1_best_known_v6": "new_attempt_required_after_stage04_v6_FORMAL_READY"
   },
   "files": {
     "bks_data": {

@@ -60,7 +60,7 @@ from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.stage04 import Stage04Config, with_fixed_weights
 
-STAGE04_SCHEMA_VERSION = "stage04-adaptive-weights-v5"
+STAGE04_SCHEMA_VERSION = "stage04-adaptive-weights-v6"
 STAGE04_RUN_LABEL = re.compile(
     r"stage04_adaptive_weights_(?:attempt|rerun)[0-9]{2}"
 )
@@ -384,22 +384,20 @@ def _bool(value: Any) -> bool:
 
 
 def _adaptive_operator_statistics(result: ALNSResult) -> dict[str, dict[str, object]]:
-    """Normalize the six audited categories for every adaptive operator."""
+    """Normalize all operator statistics and declare weight applicability."""
 
     groups = (
         ("neighborhood", result.neighborhood_statistics),
         ("destroy", result.destroy_statistics),
-        ("repair", {
-            name: stats
-            for name, stats in result.repair_statistics.items()
-            if name != "vehicle_count_aware"
-        }),
+        ("repair", result.repair_statistics),
     )
     normalized: dict[str, dict[str, object]] = {}
     for role, operator_group in groups:
         for name, stats in operator_group.items():
-            if role == "neighborhood" and name == "vehicle_reduction_refinement":
-                continue
+            weight_participates = not (
+                (role == "neighborhood" and name == "vehicle_reduction_refinement")
+                or (role == "repair" and name == "vehicle_count_aware")
+            )
             calls = cast(int, stats["calls"])
             accepted = cast(int, stats["accepted"])
             rejected = cast(int, stats["rejected"])
@@ -410,6 +408,7 @@ def _adaptive_operator_statistics(result: ALNSResult) -> dict[str, dict[str, obj
                 )
             normalized[f"{role}:{name}"] = {
                 "role": role,
+                "weight_participates": weight_participates,
                 "calls": calls,
                 "accepted": accepted,
                 "accepted_improving": cast(int, stats["accepted_improving"]),

@@ -33,8 +33,8 @@ from evrptw.validation import validate_routes
 
 READY_FOR_STAGE05 = "READY_FOR_STAGE05"
 NOT_READY = "NOT_READY"
-STAGE04_REVIEW_SCHEMA_VERSION = "stage04-review-v5"
-STAGE04_RAW_SCHEMA_VERSION = "stage04-adaptive-weights-v5"
+STAGE04_REVIEW_SCHEMA_VERSION = "stage04-review-v6"
+STAGE04_RAW_SCHEMA_VERSION = "stage04-adaptive-weights-v6"
 
 _MIN_CALLS_PER_OPERATOR_DEFAULT = 5
 
@@ -85,8 +85,7 @@ def validate_stage04_operator_audit(
         or completed_iterations < 0
     ):
         failures.append("segment length and completed iterations are invalid")
-    elif not exact_event_matrix and not segment_events:
-        failures.append("adaptive segment events are missing")
+    weight_participants: set[str] = set()
     for name, raw_stats in operator_statistics.items():
         if not isinstance(raw_stats, Mapping):
             failures.append(f"{name}: statistics are not an object")
@@ -99,6 +98,11 @@ def validate_stage04_operator_audit(
         expected_role = name.partition(":")[0]
         if role not in {"neighborhood", "destroy", "repair"} or role != expected_role:
             failures.append(f"{name}: invalid or mismatched adaptive weight role {role!r}")
+        weight_participates = raw_stats.get("weight_participates")
+        if not isinstance(weight_participates, bool):
+            failures.append(f"{name}: weight_participates must be a boolean")
+        elif weight_participates:
+            weight_participants.add(name)
         try:
             values = {
                 field: _strict_nonnegative_int(raw_stats[field], field)
@@ -125,6 +129,8 @@ def validate_stage04_operator_audit(
             failures.append(f"{name}: new_global_best exceeds accepted_improving")
         if values["vehicle_reduction"] > values["accepted_improving"]:
             failures.append(f"{name}: vehicle_reduction exceeds accepted_improving")
+    if not exact_event_matrix and weight_participants and not segment_events:
+        failures.append("adaptive segment events are missing")
     observed_event_keys: list[tuple[int, str]] = []
     for event in segment_events:
         event_type = event.get("type")
@@ -136,6 +142,8 @@ def validate_stage04_operator_audit(
             failures.append(f"segment event references unknown operator {operator!r}")
         elif event.get("role") != str(operator).partition(":")[0]:
             failures.append(f"{operator}: segment event role is missing or invalid")
+        elif operator not in weight_participants:
+            failures.append(f"{operator}: non-adaptive operator has a segment event")
         try:
             iteration = _strict_nonnegative_int(event.get("iteration"), "iteration")
             calls = _strict_nonnegative_int(event.get("segment_calls"), "segment_calls")
@@ -162,7 +170,7 @@ def validate_stage04_operator_audit(
         expected_event_keys = {
             (boundary, operator)
             for boundary in boundaries
-            for operator in operator_statistics
+            for operator in weight_participants
         }
         observed_event_key_set = set(observed_event_keys)
         if len(observed_event_keys) != len(observed_event_key_set):
@@ -193,6 +201,103 @@ def _strict_nonnegative_int(value: object, field: str) -> int:
     if result < 0:
         raise ValueError(f"{field} must be a non-negative integer")
     return result
+
+
+def validate_stage04_raw_axis_numbers(
+    raw_axis: Mapping[str, object],
+) -> tuple[bool, str]:
+    """Require the raw integer fields used by the independent replay."""
+
+    failures: list[str] = []
+    for field in (
+        "started_calls",
+        "completed_calls",
+        "budget_exhaustions",
+        "effective_iterations",
+    ):
+        try:
+            _strict_nonnegative_int(raw_axis.get(field), field)
+        except ValueError as error:
+            failures.append(str(error))
+    stage04_statistics = raw_axis.get("stage04_statistics")
+    if not isinstance(stage04_statistics, Mapping):
+        failures.append("stage04_statistics must be an object")
+    else:
+        for field in ("min_calls_per_operator", "segment_length"):
+            try:
+                value = _strict_nonnegative_int(stage04_statistics.get(field), field)
+                if value <= 0:
+                    failures.append(f"{field} must be a positive integer")
+            except ValueError as error:
+                failures.append(str(error))
+    return not failures, "; ".join(failures) if failures else "raw integer fields valid"
+
+
+def validate_stage04_axis_maps(
+    raw_axes: object,
+    solution_axes: object,
+    trace_axes: object,
+    *,
+    expected_axes: Sequence[str] = DIAGNOSTIC_AXES,
+) -> tuple[bool, str]:
+    """Require raw, solution, and trace axis mappings to be identical."""
+
+    expected = set(expected_axes)
+    failures: list[str] = []
+    for name, axes in (
+        ("raw", raw_axes),
+        ("solution", solution_axes),
+        ("trace", trace_axes),
+    ):
+        if not isinstance(axes, Mapping):
+            failures.append(f"{name} axes must be an object")
+            continue
+        observed = set(axes)
+        missing = expected - observed
+        extra = observed - expected
+        if missing:
+            failures.append(f"{name} axes missing {sorted(missing)}")
+        if extra:
+            failures.append(f"{name} axes include undeclared {sorted(extra)}")
+        for axis in expected & observed:
+            if not isinstance(axes[axis], Mapping):
+                failures.append(f"{name} axis {axis} must be an object")
+    return not failures, "; ".join(failures) if failures else "axis mappings are exact"
+
+
+def validate_stage04_bundle_identity(
+    raw: Mapping[str, object],
+    solution: Mapping[str, object],
+    trace: Mapping[str, object],
+    *,
+    instance: str,
+    seed: int,
+    scope: str,
+    run_label: str,
+) -> tuple[bool, str]:
+    """Bind each raw bundle to its manifest directory identity and axis set."""
+
+    failures: list[str] = []
+    for name, payload in (("raw", raw), ("solution", solution)):
+        if payload.get("instance") != instance:
+            failures.append(f"{name} instance identity mismatch")
+        try:
+            payload_seed = _strict_nonnegative_int(payload.get("seed"), f"{name} seed")
+        except ValueError as error:
+            failures.append(str(error))
+        else:
+            if payload_seed != seed:
+                failures.append(f"{name} seed identity mismatch")
+    if raw.get("scope") != scope:
+        failures.append("raw scope identity mismatch")
+    if raw.get("run_label") != run_label:
+        failures.append("raw run-label identity mismatch")
+    axes_ok, axes_detail = validate_stage04_axis_maps(
+        raw.get("axes"), solution.get("axes"), trace.get("axes")
+    )
+    if not axes_ok:
+        failures.append(axes_detail)
+    return not failures, "; ".join(failures) if failures else "bundle identity is exact"
 
 
 def validate_fixed_work_boundary_events(
@@ -445,6 +550,7 @@ def review_stage04(
 
         raw: dict[str, Any] = {}
         solution: dict[str, Any] = {}
+        trace_index: dict[str, Any] = {}
         critical_events: list[dict[str, Any]] = []
         lane_dictionary: Mapping[str, object] = {}
         if "raw" in group:
@@ -499,12 +605,32 @@ def review_stage04(
                     "status": "fail",
                 })
 
-        raw_axes = raw.get("axes")
-        if not isinstance(raw_axes, Mapping):
-            raw_axes = {}
-        sol_axes = solution.get("axes")
-        if not isinstance(sol_axes, Mapping):
-            sol_axes = {}
+        bundle_identity_ok, bundle_identity_detail = validate_stage04_bundle_identity(
+            raw,
+            solution,
+            trace_index,
+            instance=instance_name,
+            seed=seed,
+            scope=scope,
+            run_label=run_label,
+        )
+        if not bundle_identity_ok:
+            findings.append({
+                "gate": _GATE_REPLAY_CONSISTENCY,
+                "instance": instance_name,
+                "seed": seed,
+                "axis": "",
+                "finding": bundle_identity_detail,
+                "status": "fail",
+            })
+        raw_axes_value = raw.get("axes")
+        raw_axes: Mapping[str, object] = (
+            raw_axes_value if isinstance(raw_axes_value, Mapping) else {}
+        )
+        sol_axes_value = solution.get("axes")
+        sol_axes: Mapping[str, object] = (
+            sol_axes_value if isinstance(sol_axes_value, Mapping) else {}
+        )
 
         for axis in DIAGNOSTIC_AXES:
             identity = {
@@ -559,9 +685,27 @@ def review_stage04(
                 and raw_key == stored_key
             )
 
-            # --- Check exact-call consistency ---
-            exact_started = _as_int(raw_axis.get("started_calls"))
-            exact_completed = _as_int(raw_axis.get("completed_calls"))
+            # --- Check exact-call consistency and raw numeric integrity ---
+            raw_numbers_ok, raw_numbers_detail = validate_stage04_raw_axis_numbers(
+                raw_axis
+            )
+            if not raw_numbers_ok:
+                findings.append({
+                    **identity,
+                    "gate": _GATE_REPLAY_CONSISTENCY,
+                    "finding": raw_numbers_detail,
+                    "status": "fail",
+                })
+            exact_started = (
+                _strict_nonnegative_int(raw_axis.get("started_calls"), "started_calls")
+                if raw_numbers_ok
+                else 0
+            )
+            exact_completed = (
+                _strict_nonnegative_int(raw_axis.get("completed_calls"), "completed_calls")
+                if raw_numbers_ok
+                else 0
+            )
             per_run_started = _as_int(
                 per_run.get("exact_started_calls")
             ) if per_run else 0
@@ -581,7 +725,11 @@ def review_stage04(
                         lane_dictionary,
                         axis=axis,
                         boundary_expected=(
-                            _as_int(raw_axis.get("budget_exhaustions")) > 0
+                            raw_numbers_ok
+                            and _strict_nonnegative_int(
+                                raw_axis.get("budget_exhaustions"),
+                                "budget_exhaustions",
+                            ) > 0
                         ),
                     )
                 )
@@ -590,9 +738,14 @@ def review_stage04(
             stage04_stats = raw_axis.get("stage04_statistics")
             if not isinstance(stage04_stats, Mapping):
                 stage04_stats = {}
-            min_calls = _as_int(
-                stage04_stats.get("min_calls_per_operator")
-            ) or _MIN_CALLS_PER_OPERATOR_DEFAULT
+            min_calls = (
+                _strict_nonnegative_int(
+                    stage04_stats.get("min_calls_per_operator"),
+                    "min_calls_per_operator",
+                )
+                if raw_numbers_ok
+                else 0
+            )
 
             neighborhood_stats = raw_axis.get("neighborhood_statistics")
             if not isinstance(neighborhood_stats, Mapping):
@@ -608,14 +761,17 @@ def review_stage04(
                 and isinstance(segment_events, list)
             ):
                 typed_events = [event for event in segment_events if isinstance(event, Mapping)]
-                if len(typed_events) == len(segment_events):
+                if raw_numbers_ok and len(typed_events) == len(segment_events):
                     operator_audit_ok, operator_audit_detail = validate_stage04_operator_audit(
                         operator_statistics,
                         typed_events,
                         min_calls=min_calls,
-                        segment_length=_as_int(stage04_stats.get("segment_length")),
-                        completed_iterations=_as_int(
-                            raw_axis.get("effective_iterations")
+                        segment_length=_strict_nonnegative_int(
+                            stage04_stats.get("segment_length"), "segment_length"
+                        ),
+                        completed_iterations=_strict_nonnegative_int(
+                            raw_axis.get("effective_iterations"),
+                            "effective_iterations",
                         ),
                     )
 
@@ -648,6 +804,10 @@ def review_stage04(
                 "exact_consistent": exact_consistent,
                 "budget_boundary_ok": budget_boundary_ok,
                 "budget_boundary_detail": budget_boundary_detail,
+                "raw_numbers_ok": raw_numbers_ok,
+                "raw_numbers_detail": raw_numbers_detail,
+                "bundle_identity_ok": bundle_identity_ok,
+                "bundle_identity_detail": bundle_identity_detail,
                 "recomputed_objective_key": (
                     json.dumps(list(objective.key), separators=(",", ":"))
                     if objective is not None
@@ -1029,6 +1189,18 @@ def _gate_replay_consistency(
         if not bool(row.get("valid")):
             failures.append(
                 f"{row['instance']}/{row['seed']}/{row['axis']}: invalid routes"
+            )
+            continue
+        if not bool(row.get("bundle_identity_ok")):
+            failures.append(
+                f"{row['instance']}/{row['seed']}/{row['axis']}: "
+                f"{row.get('bundle_identity_detail')}"
+            )
+            continue
+        if not bool(row.get("raw_numbers_ok")):
+            failures.append(
+                f"{row['instance']}/{row['seed']}/{row['axis']}: "
+                f"{row.get('raw_numbers_detail')}"
             )
             continue
         if not bool(row.get("objective_matches")):
