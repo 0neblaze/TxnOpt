@@ -13,7 +13,7 @@ import time
 import tomllib
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
@@ -259,6 +259,7 @@ def run_stage052(
         "worker_count": worker_count,
         "storage_policy_version": storage.storage_policy_version,
         "backend": "cpu_batch",
+        "optimization_profile": _optimization_profile(selected),
         "repository_revision": revision,
         "repository_dirty": False,
         "configuration_sha256": _sha256(resolved_config),
@@ -393,6 +394,10 @@ def _run_and_persist_shard(
     stage02 = load_stage02_config(_resolve(task.root, config.stage02_config))
     instance = parse_schneider(
         _resolve(task.root, config.benchmark_dir) / f"{task.instance_name}.txt"
+    )
+    instance = replace(
+        instance,
+        distance_backend=_optimization_profile(Stage052Component(task.component)),
     )
     axes = axes_for_scope(task.scope, customer_count=task.customer_count)
     results: dict[str, ALNSResult] = {}
@@ -713,6 +718,18 @@ def _require_clean_repository(root: Path) -> None:
 def _peak_rss_bytes() -> int:
     value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     return value if value > 10_000_000 else value * 1024
+
+
+def _optimization_profile(component: Stage052Component) -> str:
+    if component is Stage052Component.PERF_BASELINE:
+        return "none"
+    if component in {
+        Stage052Component.HOT_PATH,
+        Stage052Component.ARTIFACT_STREAMING,
+        Stage052Component.JOB_PARALLEL,
+    }:
+        return "python"
+    return "native"
 
 
 def _strict_int(value: object, field: str) -> int:

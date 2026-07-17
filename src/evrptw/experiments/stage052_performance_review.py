@@ -118,6 +118,9 @@ def review_stage052(
     gates: dict[str, dict[str, object]] = {
         "exact_scope": {"passed": scope_passed, "detail": scope_detail},
         "replay_consistency": {"passed": replay_passed, "detail": replay_detail},
+        "optimization_profile": _optimization_profile_gate(
+            selected, metadata.get("optimization_profile")
+        ),
     }
     gates.update(
         _component_gates(
@@ -332,6 +335,28 @@ def _component_gates(
             }
         }
     return {}
+
+
+def _optimization_profile_gate(
+    component: Stage052Component, observed: object
+) -> dict[str, object]:
+    expected = (
+        "none"
+        if component is Stage052Component.PERF_BASELINE
+        else "python"
+        if component
+        in {
+            Stage052Component.HOT_PATH,
+            Stage052Component.ARTIFACT_STREAMING,
+            Stage052Component.JOB_PARALLEL,
+        }
+        else "native"
+    )
+    passed = observed == expected
+    return {
+        "passed": passed,
+        "detail": f"expected={expected} observed={observed}",
+    }
 
 
 def _axis_semantics_equal(

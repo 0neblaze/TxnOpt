@@ -101,6 +101,7 @@ def test_instance_lookup_and_distance_matrix_are_stable() -> None:
         "toy",
         (depot, customer),
         Vehicle(100, 10, 1, 1, 1),
+        distance_backend="python",
     )
     assert instance.by_name is instance.by_name
     assert instance.customers is instance.customers
