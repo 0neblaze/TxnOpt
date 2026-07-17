@@ -517,8 +517,11 @@ this repository or one of its subdirectories.
   `stage05.1_best_known_attempt05` is preserved v5 evidence but superseded
   after the Stage 4 v5 prerequisite was withdrawn. Stage 5.1 v6 additionally
   requires the exact Stage 4 Formal identity (`scope=formal`, 144 axes, and a
-  matching review run label) before a new 92-row independent replay may publish
-  `READY_FOR_STAGE05_2`.
+  matching review run label). The accepted v6 evidence is
+  `stage05.1_best_known_attempt06`: its 92-row independent replay passes all
+  five gates and reports `READY_FOR_STAGE05_2`, inheriting the published
+  `stage04_adaptive_weights_attempt15` Formal review. All earlier attempts
+  remain preserved superseded evidence.
 - The artifact registry is
   `experiments/registries/stage05.1_artifact_registry.csv` and the manifest
   is `experiments/manifests/stage05.1_best_known_artifact_manifest.json`.

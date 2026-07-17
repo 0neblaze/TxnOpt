@@ -91,8 +91,9 @@ The v3 evidence `stage05.1_best_known_attempt03` is preserved but superseded
 because its Stage 4 v3 prerequisite was withdrawn. v4 attempt04 is also
 preserved but superseded after the Stage 4 v4 prerequisite was withdrawn.
 `stage05.1_best_known_attempt05` is preserved v5 evidence but superseded after
-the Stage 4 v5 prerequisite was withdrawn. A v6 attempt must require the exact
-Stage 4 Formal identity (Formal scope, 144 axes, and matching review run
-label), then pass all five independent replay gates for exactly 92 unique
-instances before `READY_FOR_STAGE05_2` is republished. No gap field or
-model-inconsistent gap is published.
+the Stage 4 v5 prerequisite was withdrawn. The accepted v6 evidence is
+`stage05.1_best_known_attempt06`: it verifies the exact Stage 4 Formal identity
+of `stage04_adaptive_weights_attempt15` (Formal scope, 144 axes, and matching
+review run label), retains the canonical one-level layout, and passes all five
+independent replay gates for exactly 92 unique instances. Its review status is
+`READY_FOR_STAGE05_2`. No gap field or model-inconsistent gap is published.
