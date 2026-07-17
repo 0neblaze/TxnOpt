@@ -509,9 +509,9 @@ this repository or one of its subdirectories.
   preserved v1 evidence and is superseded for readiness purposes.
 - `stage05.1_best_known_attempt02` remains preserved v2 evidence with a
   canonical single-level 92-instance bundle, but it is superseded by the v3
-  prerequisite and independent-conversion replay requirements. No current
-  Stage 5.1 readiness may be published until a new attempt passes after Stage 4
-  v3 is republished. Attempt01 remains historical nested-layout evidence. The
+  prerequisite and independent-conversion replay requirements; no current
+  Stage 5.1 readiness derives from it. Attempt01 remains historical
+  nested-layout evidence. The
   v3 evidence `stage05.1_best_known_attempt03` is preserved but superseded
   after the Stage 4 v3 prerequisite was withdrawn. v4 attempt04 is also
   preserved but superseded after the Stage 4 v4 prerequisite was withdrawn.
