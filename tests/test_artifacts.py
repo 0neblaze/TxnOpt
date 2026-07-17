@@ -172,6 +172,42 @@ def test_v2_shard_session_appends_axes_before_finalization(tmp_path: Path) -> No
     assert {tuple(row["customer_sequence"]) for row in routes} == {("C1",), ("C2",)}
 
 
+def test_v2_route_ids_do_not_collide_at_the_old_int31_boundary(
+    tmp_path: Path,
+) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt91"
+    run_dir = tmp_path / "results" / run_label
+    writer = ArtifactBundleWriter(
+        run_dir,
+        ArtifactRunContext("stage05.2", "artifact_streaming", run_label),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    routes = {
+        "route:6:C62261": ("C62261",),
+        "route:6:C63036": ("C63036",),
+    }
+    shard.append(route_dictionary=routes, critical_events=())
+    shard.finalize(
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+    )
+    writer.finalize()
+
+    rows = ArtifactReader(run_dir).read_parquet(
+        f"toy/2014/{run_label}_route_dictionary_toy_2014.parquet"
+    )
+    assert len({row["route_id"] for row in rows}) == 2
+    assert all(row["route_id"] > 0x7FFF_FFFF for row in rows)
+
+
 def test_v2_parent_adopts_worker_shards_without_reading_event_rows(tmp_path: Path) -> None:
     run_dir = tmp_path / "results" / "stage05.2_job_parallel_attempt01"
     context = ArtifactRunContext("stage05.2", "job_parallel", "stage05.2_job_parallel_attempt01")

@@ -991,6 +991,13 @@ def _stable_dictionary_id(value: str) -> int:
     return int.from_bytes(digest[:4], "big") & 0x7FFF_FFFF
 
 
+def _stable_route_id(route_key: str) -> int:
+    """Return a deterministic positive int63 ID for high-cardinality routes."""
+
+    digest = hashlib.sha256(f"route:{route_key}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
+
+
 def compact_trace_payload(
     payload: Mapping[str, object],
     *,
@@ -2471,7 +2478,7 @@ class _RegisteredStableRouteIds(Mapping[str, int]):
         self._registered = registered
 
     def __getitem__(self, key: str) -> int:
-        route_id = _stable_dictionary_id(f"route:{key}")
+        route_id = _stable_route_id(key)
         if route_id not in self._registered:
             raise KeyError(key)
         return route_id
@@ -2483,7 +2490,7 @@ class _RegisteredStableRouteIds(Mapping[str, int]):
         return len(self._registered)
 
     def __contains__(self, key: object) -> bool:
-        return isinstance(key, str) and _stable_dictionary_id(f"route:{key}") in self._registered
+        return isinstance(key, str) and _stable_route_id(key) in self._registered
 
 
 class ArtifactV2ShardSession:
@@ -2829,7 +2836,7 @@ class ArtifactV2ShardSession:
             raise ArtifactIntegrityError(
                 f"route dictionary key does not match customer sequence: {key}"
             )
-        route_id = _stable_dictionary_id(f"route:{key}")
+        route_id = _stable_route_id(key)
         route_digest = _payload_sha256(list(sequence))
         previous_digest = self._route_digests.get(route_id)
         if previous_digest is not None:
