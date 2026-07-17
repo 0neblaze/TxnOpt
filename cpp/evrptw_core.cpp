@@ -5,11 +5,35 @@
 #include <vector>
 
 #include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
 namespace py = pybind11;
 
 using Point = std::pair<double, double>;
+
+py::array_t<double> distance_matrix(
+    py::array_t<double, py::array::c_style | py::array::forcecast> points) {
+    const auto input = points.request();
+    if (input.ndim != 2 || input.shape[1] != 2) {
+        throw std::invalid_argument("points must be a contiguous n-by-2 float array");
+    }
+    const auto count = static_cast<std::size_t>(input.shape[0]);
+    py::array_t<double> output({input.shape[0], input.shape[0]});
+    const auto* coordinates = static_cast<const double*>(input.ptr);
+    auto* distances = static_cast<double*>(output.request().ptr);
+    {
+        py::gil_scoped_release release;
+        for (std::size_t row = 0; row < count; ++row) {
+            for (std::size_t column = 0; column < count; ++column) {
+                const auto dx = coordinates[2 * row] - coordinates[2 * column];
+                const auto dy = coordinates[2 * row + 1] - coordinates[2 * column + 1];
+                distances[row * count + column] = std::hypot(dx, dy);
+            }
+        }
+    }
+    return output;
+}
 
 double distance(const Point& first, const Point& second) {
     return std::hypot(first.first - second.first, first.second - second.second);
@@ -49,6 +73,7 @@ double two_opt_delta(
 PYBIND11_MODULE(_core, module) {
     module.doc() = "Native kernels for EVRP-TW route evaluation";
     module.def("route_distance", &route_distance, py::arg("points"), py::arg("route"));
+    module.def("distance_matrix", &distance_matrix, py::arg("points"));
     module.def(
         "two_opt_delta", &two_opt_delta, py::arg("points"), py::arg("route"),
         py::arg("first"), py::arg("second"));

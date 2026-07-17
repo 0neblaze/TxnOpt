@@ -9,6 +9,7 @@ helpers but are never rewritten by this module.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
@@ -23,6 +24,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 ARTIFACT_STORAGE_SCHEMA_VERSION = "artifact-storage-v1"
+ARTIFACT_STORAGE_V2 = "artifact-storage-v2"
+SUPPORTED_STORAGE_POLICIES = frozenset(
+    {ARTIFACT_STORAGE_SCHEMA_VERSION, ARTIFACT_STORAGE_V2}
+)
+V2_PARQUET_ROW_GROUP_SIZE = 65_536
 CURRENT_STORAGE_FORMAT = "parquet_or_json_control"
 LEGACY_STORAGE_FORMAT = "legacy_json_or_jsonl"
 DEFAULT_COMPRESSION = "zstd"
@@ -66,10 +72,11 @@ class ArtifactStorageConfig:
     per_run_max_bytes: int = DEFAULT_PER_RUN_MAX_BYTES
 
     def __post_init__(self) -> None:
-        if self.storage_policy_version != ARTIFACT_STORAGE_SCHEMA_VERSION:
+        if self.storage_policy_version not in SUPPORTED_STORAGE_POLICIES:
             raise ValueError(
                 "unsupported artifact storage policy: "
-                f"{self.storage_policy_version}; expected {ARTIFACT_STORAGE_SCHEMA_VERSION}"
+                f"{self.storage_policy_version}; expected one of "
+                f"{sorted(SUPPORTED_STORAGE_POLICIES)}"
             )
         if self.event_format != "parquet":
             raise ValueError("new experiment evidence must use parquet event storage")
@@ -634,8 +641,99 @@ def _write_parquet(
         compression_level=config.compression_level,
         use_dictionary=True,
         write_statistics=True,
+        row_group_size=(
+            V2_PARQUET_ROW_GROUP_SIZE
+            if config.storage_policy_version == ARTIFACT_STORAGE_V2
+            else None
+        ),
     )
     return table.num_rows, _schema_fingerprint(table.schema)
+
+
+class _StreamingParquetSink:
+    """Bounded row-group writer used by artifact-storage-v2 shards."""
+
+    def __init__(
+        self,
+        path: Path,
+        schema: pa.Schema,
+        config: ArtifactStorageConfig,
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.schema = schema
+        self.config = config
+        self.rows: list[dict[str, object]] = []
+        self.row_count = 0
+        self._writer = pq.ParquetWriter(
+            path,
+            schema,
+            compression=config.compression,
+            compression_level=config.compression_level,
+            use_dictionary=True,
+            write_statistics=True,
+        )
+
+    def append(self, row: Mapping[str, object]) -> None:
+        self.rows.append(dict(row))
+        if len(self.rows) >= V2_PARQUET_ROW_GROUP_SIZE:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.rows:
+            return
+        table = pa.Table.from_pylist(self.rows, schema=self.schema)
+        self._writer.write_table(table, row_group_size=V2_PARQUET_ROW_GROUP_SIZE)
+        self.row_count += table.num_rows
+        self.rows.clear()
+
+    def close(self) -> tuple[int, str]:
+        self.flush()
+        self._writer.close()
+        return self.row_count, _schema_fingerprint(self.schema)
+
+
+def _iter_coalesced_cache_lookup_events(
+    events: Iterable[Mapping[str, object]],
+) -> Iterable[dict[str, object]]:
+    """Streaming equivalent of :func:`_coalesce_cache_lookup_events`."""
+
+    pending: dict[str, object] | None = None
+    for raw_event in events:
+        current = dict(raw_event)
+        if pending is None:
+            pending = current
+            continue
+        same_lookup = all(
+            pending.get(field) == current.get(field)
+            for field in ("route_key", "cache_key_digest", "lane", "iteration", "operator")
+        )
+        if (
+            pending.get("event_type") == "cache_event"
+            and pending.get("operation") == "lookup"
+            and same_lookup
+            and current.get("event_type") == "cache_event"
+            and current.get("operation") in {"hit", "miss"}
+        ):
+            combined = dict(current)
+            combined["operation"] = "lookup_result"
+            combined["lookup_result"] = current["operation"]
+            combined["lookup_current_entries"] = pending.get("current_entries")
+            combined["lookup_current_bytes"] = pending.get("current_bytes")
+            yield combined
+            pending = None
+        else:
+            yield pending
+            pending = current
+    if pending is not None:
+        yield pending
+
+
+def _stable_dictionary_id(value: str) -> int:
+    """Return a deterministic positive int32 ID independent of completion order."""
+
+    digest = hashlib.sha256(value.encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") & 0x7FFF_FFFF
 
 
 def compact_trace_payload(
@@ -968,6 +1066,96 @@ class ArtifactBundleWriter:
         finally:
             self._current_instance = current_instance
 
+    def adopt_v2_shards(
+        self,
+        *,
+        expected_identities: Sequence[tuple[str, int]],
+        require_complete: bool = True,
+    ) -> None:
+        """Adopt worker-owned shards into a parent manifest using metadata only."""
+
+        if self.config.storage_policy_version != ARTIFACT_STORAGE_V2:
+            raise ValueError("only artifact-storage-v2 can adopt worker shards")
+        expected = set(expected_identities)
+        if len(expected) != len(expected_identities):
+            raise ValueError("expected shard identities contain duplicates")
+        discovered: list[tuple[int, str, int, Path, dict[str, Any]]] = []
+        for manifest_path in self.run_dir.glob("*/*/*_shard_manifest_*.json"):
+            payload = _json_read(manifest_path)
+            try:
+                identity = (str(payload["instance"]), int(payload["seed"]))
+                ordinal = int(payload["shard_ordinal"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ArtifactIntegrityError(
+                    f"invalid v2 shard identity: {manifest_path}"
+                ) from error
+            sidecar = manifest_path.with_suffix(".sha256")
+            if not sidecar.is_file() or sidecar.read_text(encoding="utf-8").strip() != _sha256(
+                manifest_path
+            ):
+                raise ArtifactIntegrityError(
+                    f"v2 shard manifest sidecar mismatch: {manifest_path}"
+                )
+            if payload.get("storage_policy_version") != ARTIFACT_STORAGE_V2:
+                raise ArtifactIntegrityError("worker shard does not use artifact-storage-v2")
+            if require_complete and payload.get("evidence_completeness") != "complete":
+                raise ArtifactIntegrityError(f"partial worker shard cannot be adopted: {identity}")
+            discovered.append((ordinal, identity[0], identity[1], manifest_path, payload))
+        identities = {(instance, seed) for _, instance, seed, _, _ in discovered}
+        if identities != expected or len(discovered) != len(expected):
+            raise ArtifactIntegrityError(
+                f"worker shard identity mismatch: expected={sorted(expected)} "
+                f"observed={sorted(identities)}"
+            )
+        ordinals = [item[0] for item in discovered]
+        if len(set(ordinals)) != len(ordinals):
+            raise ArtifactIntegrityError("worker shard ordinals are not unique")
+        current_instance = self._current_instance
+        self._current_instance = None
+        try:
+            for _, _, _, manifest_path, payload in sorted(discovered):
+                artifacts = payload.get("artifacts")
+                if not isinstance(artifacts, list):
+                    raise ArtifactIntegrityError("v2 shard manifest has no artifacts list")
+                for item in artifacts:
+                    if not isinstance(item, Mapping):
+                        raise ArtifactIntegrityError("v2 shard artifact entry is invalid")
+                    path = _safe_artifact_path(self.run_dir, str(item["relative_path"]))
+                    if _sha256(path) != str(item["checksum"]):
+                        raise ArtifactIntegrityError(
+                            f"v2 shard artifact checksum mismatch: {path}"
+                        )
+                    self._record_file(
+                        path,
+                        artifact_type=str(item["artifact_type"]),
+                        artifact_subtype=str(item.get("artifact_subtype", "")),
+                        retention_class=str(item["retention_class"]),
+                        storage_format=str(item["storage_format"]),
+                        compression=str(item["compression"]),
+                        row_count=(
+                            int(item["row_count"])
+                            if item.get("row_count") is not None
+                            else None
+                        ),
+                        schema_fingerprint=str(item.get("schema_fingerprint", "")),
+                    )
+                self._record_file(
+                    manifest_path,
+                    artifact_type="shard_manifest",
+                    retention_class="control",
+                    storage_format="json_control",
+                    compression="none",
+                )
+                self._record_file(
+                    manifest_path.with_suffix(".sha256"),
+                    artifact_type="shard_manifest_sidecar",
+                    retention_class="control",
+                    storage_format="sha256_control",
+                    compression="none",
+                )
+        finally:
+            self._current_instance = current_instance
+
     def write_instance_seed(
         self,
         *,
@@ -981,7 +1169,30 @@ class ArtifactBundleWriter:
         critical_events: Iterable[Mapping[str, object]],
         diagnostic_rows: Iterable[Mapping[str, object]] = (),
         failure_payload: Mapping[str, object] | None = None,
+        shard_ordinal: int | None = None,
+        worker_identity: str | None = None,
     ) -> dict[str, str]:
+        if self.config.storage_policy_version == ARTIFACT_STORAGE_V2:
+            if shard_ordinal is None or shard_ordinal < 0:
+                raise ValueError("artifact-storage-v2 requires a non-negative shard_ordinal")
+            if not worker_identity:
+                raise ValueError("artifact-storage-v2 requires worker_identity")
+            return self._write_instance_seed_v2(
+                instance=instance,
+                seed=seed,
+                shard_ordinal=shard_ordinal,
+                worker_identity=worker_identity,
+                raw_payload=raw_payload,
+                solution_payload=solution_payload,
+                trace_payload=trace_payload,
+                environment_payload=environment_payload,
+                route_dictionary=route_dictionary,
+                critical_events=critical_events,
+                diagnostic_rows=diagnostic_rows,
+                failure_payload=failure_payload,
+            )
+        elif shard_ordinal is not None or worker_identity is not None:
+            raise ValueError("shard identity is available only for artifact-storage-v2")
         self._current_instance = (instance, seed)
         self._instance_bytes = 0
         directory = self.run_dir / instance / str(seed)
@@ -1199,6 +1410,270 @@ class ArtifactBundleWriter:
             raise
         return paths
 
+    def _write_instance_seed_v2(
+        self,
+        *,
+        instance: str,
+        seed: int,
+        shard_ordinal: int,
+        worker_identity: str,
+        raw_payload: Mapping[str, object],
+        solution_payload: Mapping[str, object],
+        trace_payload: Mapping[str, object],
+        environment_payload: Mapping[str, object],
+        route_dictionary: Mapping[str, Sequence[str]],
+        critical_events: Iterable[Mapping[str, object]],
+        diagnostic_rows: Iterable[Mapping[str, object]],
+        failure_payload: Mapping[str, object] | None,
+    ) -> dict[str, str]:
+        """Write one bounded, worker-owned artifact-storage-v2 shard."""
+
+        self._current_instance = (instance, seed)
+        self._instance_bytes = 0
+        self._next_event_id = 1
+        shard_artifact_start = len(self._artifacts)
+        directory = self.run_dir / instance / str(seed)
+        directory.mkdir(parents=True, exist_ok=True)
+        route_rows, route_ids = self._route_rows(route_dictionary)
+        lane_ids: dict[str, int] = {}
+        operator_ids: dict[str, int] = {}
+        paths = canonical_artifact_paths(self.context, instance, seed)
+        event_path = self.run_dir / paths["events"]
+        checks_path = self.run_dir / paths["screening_checks"]
+        diagnostic_path = self.run_dir / paths["diagnostic"]
+        event_sink = _StreamingParquetSink(event_path, EVENTS_SCHEMA, self.config)
+        checks_sink = _StreamingParquetSink(
+            checks_path, SCREENING_CHECKS_SCHEMA, self.config
+        )
+        diagnostic_sink = _StreamingParquetSink(
+            diagnostic_path, DIAGNOSTIC_SCHEMA, self.config
+        )
+        try:
+            paths["raw"] = self._write_json_artifact(
+                directory, "raw", instance, seed, raw_payload
+            )
+            paths["solution"] = self._write_json_artifact(
+                directory, "solution", instance, seed, solution_payload
+            )
+            paths["environment"] = self._write_json_artifact(
+                directory, "environment", instance, seed, environment_payload
+            )
+            route_path = self.run_dir / paths["route_dictionary"]
+            route_count, route_schema = _write_parquet(
+                route_path, route_rows, ROUTE_DICTIONARY_SCHEMA, self.config
+            )
+            self._record_file(
+                route_path,
+                artifact_type="route_dictionary",
+                artifact_subtype="canonical_routes",
+                retention_class="critical",
+                storage_format="parquet",
+                compression=self.config.compression,
+                row_count=route_count,
+                schema_fingerprint=route_schema,
+            )
+            for event in _iter_coalesced_cache_lookup_events(critical_events):
+                lane = str(event.get("lane", ""))
+                operator = str(event.get("operator", ""))
+                lane_ids.setdefault(lane, _stable_dictionary_id(f"lane:{lane}"))
+                operator_ids.setdefault(
+                    operator, _stable_dictionary_id(f"operator:{operator}")
+                )
+                _validate_event_routes(event, route_ids)
+                event_id = self._next_event_id
+                self._next_event_id += 1
+                event_sink.append(
+                    _normalise_event(
+                        event,
+                        event_id=event_id,
+                        route_ids=route_ids,
+                        lane_ids=lane_ids,
+                        operator_ids=operator_ids,
+                    )
+                )
+                checks = event.get("checks")
+                if isinstance(checks, (list, tuple)):
+                    decision_id = _as_int(event.get("decision_id"))
+                    for index, check in enumerate(checks):
+                        if isinstance(check, Mapping):
+                            checks_sink.append(
+                                _normalise_check(
+                                    check,
+                                    event_id=event_id,
+                                    decision_id=decision_id,
+                                    index=index,
+                                )
+                            )
+            for row in diagnostic_rows:
+                diagnostic_sink.append(
+                    self._normalise_diagnostic(row, instance, seed)
+                )
+            event_count, event_schema = event_sink.close()
+            check_count, check_schema = checks_sink.close()
+            diagnostic_count, diagnostic_schema = diagnostic_sink.close()
+            for path, artifact_type, subtype, retention, count, fingerprint in (
+                (event_path, "events", "critical", "critical", event_count, event_schema),
+                (
+                    checks_path,
+                    "events",
+                    "screening_checks",
+                    "critical",
+                    check_count,
+                    check_schema,
+                ),
+                (
+                    diagnostic_path,
+                    "diagnostic",
+                    "aggregated",
+                    "diagnostic",
+                    diagnostic_count,
+                    diagnostic_schema,
+                ),
+            ):
+                self._record_file(
+                    path,
+                    artifact_type=artifact_type,
+                    artifact_subtype=subtype,
+                    retention_class=retention,
+                    storage_format="parquet",
+                    compression=self.config.compression,
+                    row_count=count,
+                    schema_fingerprint=fingerprint,
+                )
+            trace_index = compact_trace_payload(
+                trace_payload,
+                route_dictionary_ref=paths["route_dictionary"],
+                events_ref=paths["events"],
+                screening_checks_ref=paths["screening_checks"],
+                diagnostic_ref=paths["diagnostic"],
+                lane_dictionary=lane_ids,
+                operator_dictionary=operator_ids,
+            )
+            trace_index["event_identity"] = {
+                "shard_ordinal": shard_ordinal,
+                "local_field": "event_id",
+            }
+            trace_index["schema_fingerprints"] = {
+                "route_dictionary": route_schema,
+                "events": event_schema,
+                "screening_checks": check_schema,
+                "diagnostic": diagnostic_schema,
+            }
+            paths["trace"] = self._write_json_artifact(
+                directory, "trace", instance, seed, trace_index
+            )
+            if failure_payload is not None:
+                paths["failure"] = self._write_json_artifact(
+                    directory,
+                    "failure",
+                    instance,
+                    seed,
+                    failure_payload,
+                    retention_class="critical",
+                )
+            self._write_v2_shard_manifest(
+                directory=directory,
+                instance=instance,
+                seed=seed,
+                shard_ordinal=shard_ordinal,
+                worker_identity=worker_identity,
+                artifact_start=shard_artifact_start,
+                evidence_completeness="complete",
+            )
+            paths["shard_manifest"] = str(
+                (
+                    directory
+                    / _canonical_filename(
+                        self.context, "shard_manifest", instance, seed
+                    )
+                ).relative_to(self.run_dir)
+            )
+            return paths
+        except BaseException as error:
+            for sink in (event_sink, checks_sink, diagnostic_sink):
+                with contextlib.suppress(BaseException):
+                    sink.close()
+            failure = {
+                "schema_version": ARTIFACT_STORAGE_V2,
+                "run_label": self.context.run_label,
+                "instance": instance,
+                "seed": seed,
+                "status": "partial",
+                "evidence_completeness": "partial",
+                "failure_reason": str(error),
+            }
+            failure_path = directory / _canonical_filename(
+                self.context, "failure", instance, seed
+            )
+            _json_write(failure_path, failure)
+            self._record_file(
+                failure_path,
+                artifact_type="failure",
+                retention_class="critical",
+                storage_format="json_control",
+                compression="none",
+                enforce_budget=False,
+            )
+            self._write_v2_shard_manifest(
+                directory=directory,
+                instance=instance,
+                seed=seed,
+                shard_ordinal=shard_ordinal,
+                worker_identity=worker_identity,
+                artifact_start=shard_artifact_start,
+                evidence_completeness="partial",
+            )
+            raise
+
+    def _write_v2_shard_manifest(
+        self,
+        *,
+        directory: Path,
+        instance: str,
+        seed: int,
+        shard_ordinal: int,
+        worker_identity: str,
+        artifact_start: int,
+        evidence_completeness: str,
+    ) -> None:
+        shard_artifacts = tuple(self._artifacts[artifact_start:])
+        manifest_path = directory / _canonical_filename(
+            self.context, "shard_manifest", instance, seed
+        )
+        _json_write(
+            manifest_path,
+            {
+                "schema_version": ARTIFACT_STORAGE_V2,
+                "storage_policy_version": ARTIFACT_STORAGE_V2,
+                "run_label": self.context.run_label,
+                "instance": instance,
+                "seed": seed,
+                "shard_ordinal": shard_ordinal,
+                "worker_identity": worker_identity,
+                "event_identity": "shard_ordinal+shard_local_event_id",
+                "evidence_completeness": evidence_completeness,
+                "artifacts": [artifact.to_dict() for artifact in shard_artifacts],
+            },
+        )
+        self._record_file(
+            manifest_path,
+            artifact_type="shard_manifest",
+            retention_class="control",
+            storage_format="json_control",
+            compression="none",
+            enforce_budget=evidence_completeness == "complete",
+        )
+        sidecar_path = manifest_path.with_suffix(".sha256")
+        sidecar_path.write_text(_sha256(manifest_path) + "\n", encoding="utf-8")
+        self._record_file(
+            sidecar_path,
+            artifact_type="shard_manifest_sidecar",
+            retention_class="control",
+            storage_format="sha256_control",
+            compression="none",
+            enforce_budget=evidence_completeness == "complete",
+        )
+
     def finalize(
         self,
         *,
@@ -1229,7 +1704,7 @@ class ArtifactBundleWriter:
         control.mkdir(parents=True, exist_ok=True)
         manifest_path = control / _canonical_filename(self.context, "manifest")
         payload = {
-            "schema_version": ARTIFACT_STORAGE_SCHEMA_VERSION,
+            "schema_version": self.config.storage_policy_version,
             "storage_policy_version": self.config.storage_policy_version,
             "storage_format": CURRENT_STORAGE_FORMAT,
             "policy_compliance": "current",
@@ -1341,6 +1816,7 @@ class ArtifactBundleWriter:
             row_count,
             schema_fingerprint,
             artifact_subtype,
+            self.config.storage_policy_version,
         )
         self._artifacts.append(reference)
         if self._current_instance is not None:
@@ -1454,7 +1930,7 @@ def verify_manifest(run_dir: Path) -> dict[str, Any]:
 
     manifest_path = find_manifest(run_dir)
     manifest = _json_read(manifest_path)
-    if manifest.get("storage_policy_version") != ARTIFACT_STORAGE_SCHEMA_VERSION:
+    if manifest.get("storage_policy_version") not in SUPPORTED_STORAGE_POLICIES:
         raise ArtifactIntegrityError(
             f"unsupported current artifact manifest: {manifest.get('storage_policy_version')}"
         )
@@ -1608,6 +2084,27 @@ class ArtifactReader:
         if schema is not None and _schema_fingerprint(table.schema) != _schema_fingerprint(schema):
             raise ArtifactIntegrityError(f"Parquet schema mismatch: {path}")
         return [dict(row) for row in table.to_pylist()]
+
+    def iter_parquet_batches(
+        self,
+        relative_path: str | Path,
+        *,
+        schema: pa.Schema | None = None,
+        batch_size: int = V2_PARQUET_ROW_GROUP_SIZE,
+    ) -> Iterable[pa.RecordBatch]:
+        """Yield verified Parquet batches without materialising the full table."""
+
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        path = _safe_artifact_path(self.run_dir, Path(relative_path).as_posix())
+        if not path.is_file() or path.suffix != ".parquet":
+            raise ArtifactIntegrityError(f"Parquet artifact is missing: {path}")
+        parquet = pq.ParquetFile(path)
+        if schema is not None and _schema_fingerprint(
+            parquet.schema_arrow
+        ) != _schema_fingerprint(schema):
+            raise ArtifactIntegrityError(f"Parquet schema mismatch: {path}")
+        yield from parquet.iter_batches(batch_size=batch_size)
 
     def read_events(self, relative_path: str | Path) -> list[dict[str, Any]]:
         path = _safe_artifact_path(self.run_dir, Path(relative_path).as_posix())
@@ -1893,7 +2390,7 @@ def storage_format_for_run(run_dir: Path) -> str:
         return "legacy"
     return (
         "current"
-        if manifest.get("storage_policy_version") == ARTIFACT_STORAGE_SCHEMA_VERSION
+        if manifest.get("storage_policy_version") in SUPPORTED_STORAGE_POLICIES
         else "legacy"
     )
 

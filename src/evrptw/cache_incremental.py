@@ -301,7 +301,7 @@ def build_route_propagation_snapshot(
     by_name = instance.by_name
     chain = (instance.depot.name, *values, instance.depot.name)
     edge_distances = tuple(
-        by_name[left].distance_to(by_name[right])
+        instance.distance(left, right)
         for left, right in zip(chain, chain[1:], strict=False)
     )
     current_time = max(0.0, instance.depot.ready_time)

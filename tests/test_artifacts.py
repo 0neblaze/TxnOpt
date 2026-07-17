@@ -45,6 +45,88 @@ def test_new_runs_require_canonical_label_and_enabled_storage() -> None:
         require_current_storage_config("stage032_legacy_attempt01", ArtifactStorageConfig())
 
 
+def test_v2_streams_shards_with_local_event_identity_and_manifest(tmp_path: Path) -> None:
+    run_dir = tmp_path / "results" / "stage05.2_artifact_streaming_attempt01"
+    writer = ArtifactBundleWriter(
+        run_dir,
+        ArtifactRunContext(
+            "stage05.2",
+            "artifact_streaming",
+            "stage05.2_artifact_streaming_attempt01",
+        ),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+    for ordinal, seed in enumerate((2014, 2015)):
+        writer.write_instance_seed(
+            instance="toy",
+            seed=seed,
+            shard_ordinal=ordinal,
+            worker_identity=f"worker-{ordinal}",
+            raw_payload={},
+            solution_payload={},
+            trace_payload={},
+            environment_payload={},
+            route_dictionary={"route:2:C1": ("C1",)},
+            critical_events=[
+                {
+                    "record_type": "route_evaluation",
+                    "event_type": "route_evaluation",
+                    "route_key": "route:2:C1",
+                    "exact_started": True,
+                    "exact_completed": True,
+                }
+            ],
+        )
+    bundle = writer.finalize()
+    reader = ArtifactReader(bundle.run_dir)
+    for seed in (2014, 2015):
+        prefix = f"toy/{seed}/stage05.2_artifact_streaming_attempt01"
+        events = reader.read_events(f"{prefix}_events_toy_{seed}.parquet")
+        assert events[0]["event_id"] == 1
+        shard_manifest = reader.read_json(
+            f"{prefix}_shard_manifest_toy_{seed}.json"
+        )
+        assert shard_manifest["storage_policy_version"] == "artifact-storage-v2"
+        assert shard_manifest["evidence_completeness"] == "complete"
+    batches = list(
+        reader.iter_parquet_batches(
+            "toy/2014/stage05.2_artifact_streaming_attempt01_events_toy_2014.parquet"
+        )
+    )
+    assert sum(batch.num_rows for batch in batches) == 1
+    parquet = pq.ParquetFile(
+        run_dir
+        / "toy/2014/stage05.2_artifact_streaming_attempt01_events_toy_2014.parquet"
+    )
+    assert parquet.metadata.row_group(0).num_rows <= 65_536
+
+
+def test_v2_parent_adopts_worker_shards_without_reading_event_rows(tmp_path: Path) -> None:
+    run_dir = tmp_path / "results" / "stage05.2_job_parallel_attempt01"
+    context = ArtifactRunContext(
+        "stage05.2", "job_parallel", "stage05.2_job_parallel_attempt01"
+    )
+    config = ArtifactStorageConfig(storage_policy_version="artifact-storage-v2")
+    worker = ArtifactBundleWriter(run_dir, context, config)
+    worker.write_instance_seed(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+        route_dictionary={},
+        critical_events=[],
+    )
+    parent = ArtifactBundleWriter(run_dir, context, config)
+    parent.adopt_v2_shards(expected_identities=(("toy", 2014),))
+    bundle = parent.finalize()
+    manifest = verify_manifest(bundle.run_dir)
+    assert any(item["artifact_type"] == "shard_manifest" for item in manifest["artifacts"])
+
+
 def test_writer_uses_canonical_layout_and_manifest_checksums(tmp_path: Path) -> None:
     writer = _writer(tmp_path)
     writer.write_instance_seed(

@@ -1,0 +1,36 @@
+# Stage 5.2 performance governance and stratified benchmark.
+
+[stage05_2]
+schema_version = "stage05.2-performance-v1"
+stage051_manifest = "experiments/manifests/stage05.1_best_known_artifact_manifest.json"
+stage04_config = "configs/stage04_weights.toml"
+stage02_config = "configs/stage02_constraint_guided.toml"
+
+[benchmark]
+directory = "data/schneider"
+
+[runtime]
+max_iterations = 1000
+batch_size = 128
+
+[artifact_storage_v1]
+enabled = true
+storage_policy_version = "artifact-storage-v1"
+event_format = "parquet"
+compression = "zstd"
+compression_level = 3
+critical_evidence = "full"
+diagnostic_evidence = "aggregate"
+per_instance_seed_max_bytes = 2147483648
+per_run_max_bytes = 34359738368
+
+[artifact_storage_v2]
+enabled = true
+storage_policy_version = "artifact-storage-v2"
+event_format = "parquet"
+compression = "zstd"
+compression_level = 3
+critical_evidence = "full"
+diagnostic_evidence = "aggregate"
+per_instance_seed_max_bytes = 2147483648
+per_run_max_bytes = 34359738368

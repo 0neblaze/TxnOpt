@@ -732,14 +732,15 @@ class _Evaluator:
                 ),
             )
         )
-        if self.cache_incremental_enabled and cached is None:
-            self.propagation_snapshots.setdefault(
+        if (
+            self.cache_incremental_enabled
+            and cached is None
+            and sequence not in self.propagation_snapshots
+        ):
+            self.propagation_snapshots[sequence] = build_route_propagation_snapshot(
+                self.instance,
                 sequence,
-                build_route_propagation_snapshot(
-                    self.instance,
-                    sequence,
-                    epsilon=self.screening_config.epsilon,
-                ),
+                epsilon=self.screening_config.epsilon,
             )
         completed = time.perf_counter()
         self.screening_runtime += completed - started
