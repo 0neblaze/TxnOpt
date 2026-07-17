@@ -854,6 +854,33 @@ class Stage03Trace:
             "result_summary": dict(self.result_summary),
         }
 
+    def to_index_dict(self) -> dict[str, object]:
+        """Return scalar trace metadata without copying append-only event lists."""
+
+        return {
+            "config": asdict(self.config),
+            "summary": {
+                "started_calls": self.started_calls,
+                "completed_calls": self.completed_calls,
+                "exact_calls": self.exact_calls,
+                "cache_hits": self.cache_hits,
+                "precomputed_routes": self.precomputed_routes,
+                "deadline_events": self.deadline_events,
+                "interrupted_calls": sum(
+                    record.status == "interrupted_deadline"
+                    for record in self.route_evaluations
+                ),
+                "budget_exhaustions": sum(
+                    event.get("event_type") == "exact_budget_boundary"
+                    for event in self.events
+                ),
+                "route_evaluation_count": len(self.route_evaluations),
+                "operator_call_counts": self.operator_call_counts,
+                "screening": self.screening_counts,
+            },
+            "result_summary": dict(self.result_summary),
+        }
+
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> Stage03Trace:
         trace_schema_version = str(

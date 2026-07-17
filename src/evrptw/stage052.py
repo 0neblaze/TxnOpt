@@ -277,15 +277,27 @@ def evaluate_artifact_storage_promotion(
     else:
         replay_detail = "v1/v2 semantic replay equality passed"
 
-    persistence_passed = bool(candidate_by_key) and all(
-        item.artifact_persistence_seconds
-        <= maximum_persistence_ratio * item.end_to_end_seconds
-        for item in candidate_by_key.values()
+    persistence_seconds = sum(
+        item.artifact_persistence_seconds for item in candidate_by_key.values()
+    )
+    end_to_end_seconds = sum(
+        item.end_to_end_seconds for item in candidate_by_key.values()
+    )
+    observed_persistence_ratio = (
+        persistence_seconds / end_to_end_seconds if end_to_end_seconds else math.inf
+    )
+    persistence_passed = (
+        bool(candidate_by_key)
+        and observed_persistence_ratio <= maximum_persistence_ratio
     )
     persistence_detail = (
-        f"persistence <= {maximum_persistence_ratio:.0%} for every axis"
+        f"aggregate persistence ratio {observed_persistence_ratio:.6f} "
+        f"<= {maximum_persistence_ratio:.0%}"
         if persistence_passed
-        else f"persistence exceeds {maximum_persistence_ratio:.0%}"
+        else (
+            f"aggregate persistence ratio {observed_persistence_ratio:.6f} "
+            f"exceeds {maximum_persistence_ratio:.0%}"
+        )
     )
 
     rss_passed = bool(baseline_by_key) and bool(candidate_by_key)

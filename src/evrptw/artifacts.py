@@ -11,23 +11,23 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import heapq
 import json
 import re
 import shutil
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 ARTIFACT_STORAGE_SCHEMA_VERSION = "artifact-storage-v1"
 ARTIFACT_STORAGE_V2 = "artifact-storage-v2"
-SUPPORTED_STORAGE_POLICIES = frozenset(
-    {ARTIFACT_STORAGE_SCHEMA_VERSION, ARTIFACT_STORAGE_V2}
-)
+SUPPORTED_STORAGE_POLICIES = frozenset({ARTIFACT_STORAGE_SCHEMA_VERSION, ARTIFACT_STORAGE_V2})
 V2_PARQUET_ROW_GROUP_SIZE = 65_536
 CURRENT_STORAGE_FORMAT = "parquet_or_json_control"
 LEGACY_STORAGE_FORMAT = "legacy_json_or_jsonl"
@@ -191,13 +191,9 @@ def require_current_storage_config(
     config: ArtifactStorageConfig | None,
 ) -> ArtifactStorageConfig:
     if not canonical_run_label_is_valid(run_label):
-        raise ValueError(
-            "new experiment runs must use a canonical attemptNN/rerunNN run label"
-        )
+        raise ValueError("new experiment runs must use a canonical attemptNN/rerunNN run label")
     if config is None or not config.enabled:
-        raise ValueError(
-            "new experiment runs require an enabled [artifact_storage] configuration"
-        )
+        raise ValueError("new experiment runs require an enabled [artifact_storage] configuration")
     return config
 
 
@@ -262,6 +258,48 @@ SCREENING_CHECKS_SCHEMA = pa.schema(
         pa.field("value_float", pa.float64()),
         pa.field("value_text", pa.string()),
         pa.field("reason", pa.string()),
+    ]
+)
+
+V2_SCREENING_DECISIONS_SCHEMA = pa.schema(
+    [
+        pa.field("event_id", pa.int64(), nullable=False),
+        pa.field("timestamp_seconds", pa.float64()),
+        pa.field("started_at", pa.float64()),
+        pa.field("completed_at", pa.float64()),
+        pa.field("duration_seconds", pa.float64()),
+        pa.field("lane_id", pa.int32(), nullable=False),
+        pa.field("iteration", pa.int64()),
+        pa.field("operator_id", pa.int32(), nullable=False),
+        pa.field("route_id", pa.int64()),
+        pa.field("status", pa.string()),
+        pa.field("reason", pa.string()),
+        pa.field("decision_id", pa.int64()),
+        pa.field("benchmark_axis", pa.string(), nullable=False),
+        pa.field("demand", pa.float64()),
+        pa.field("distance_increment_lower_bound", pa.float64()),
+        pa.field("distance_lower_bound", pa.float64()),
+        pa.field("exact_call_blocked", pa.bool_()),
+        pa.field("first_failed_check", pa.string()),
+        pa.field("min_time_window_slack", pa.float64()),
+        pa.field("negative_cache_hit", pa.bool_()),
+        pa.field("single_segment_reachable", pa.bool_()),
+        pa.field("structural_energy_lower_bound", pa.float64()),
+        pa.field(
+            "checks",
+            pa.list_(
+                pa.struct(
+                    [
+                        pa.field("check", pa.string(), nullable=False),
+                        pa.field("status", pa.string()),
+                        pa.field("value_bool", pa.bool_()),
+                        pa.field("value_float", pa.float64()),
+                        pa.field("value_text", pa.string()),
+                        pa.field("reason", pa.string()),
+                    ]
+                )
+            ),
+        ),
     ]
 )
 
@@ -404,9 +442,9 @@ def _route_ids(value: object, route_ids: Mapping[str, int]) -> list[int]:
 
 def _event_timestamp(event: Mapping[str, object]) -> float | None:
     for key in ("timestamp_seconds", "started_at", "timestamp"):
-        value = _as_float(event.get(key))
-        if value is not None:
-            return value
+        value = event.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
     return None
 
 
@@ -415,15 +453,8 @@ def _event_type(event: Mapping[str, object]) -> str:
     return str(value)
 
 
-def _normalise_event(
-    event: Mapping[str, object],
-    *,
-    event_id: int,
-    route_ids: Mapping[str, int],
-    lane_ids: Mapping[str, int],
-    operator_ids: Mapping[str, int],
-) -> dict[str, object]:
-    known = {
+_EVENT_KNOWN_FIELDS = frozenset(
+    {
         "event_id",
         "record_type",
         "event_type",
@@ -469,10 +500,27 @@ def _normalise_event(
         "event_index",
         "record_class",
     }
+)
+
+
+def _normalise_event(
+    event: Mapping[str, object],
+    *,
+    event_id: int,
+    route_ids: Mapping[str, int],
+    lane_ids: Mapping[str, int],
+    operator_ids: Mapping[str, int],
+) -> dict[str, object]:
+    if event.get("event_type") == "screening_decision":
+        return _normalise_screening_event(
+            event,
+            event_id=event_id,
+            route_ids=route_ids,
+            lane_ids=lane_ids,
+            operator_ids=operator_ids,
+        )
     route_id = _route_id(event.get("route_id", event.get("route_key")), route_ids)
-    base_route_id = _route_id(
-        event.get("base_route_id", event.get("base_route_key")), route_ids
-    )
+    base_route_id = _route_id(event.get("base_route_id", event.get("base_route_key")), route_ids)
     candidate_route_id = _route_id(
         event.get("candidate_route_id", event.get("candidate_route_key")), route_ids
     )
@@ -485,7 +533,7 @@ def _normalise_event(
     extras = {
         str(key): value
         for key, value in event.items()
-        if key not in known
+        if key not in _EVENT_KNOWN_FIELDS
         and (
             not isinstance(value, (list, tuple, dict))
             or key
@@ -539,18 +587,203 @@ def _normalise_event(
         "evaluation_id": _as_int(event.get("evaluation_id")),
         "decision_id": _as_int(event.get("decision_id")),
         "route_change_status": str(event.get("route_change_status", "")),
-        "propagation_status": str(
-            event.get("propagation_status", event.get("status", ""))
-        ),
-        "extras_json": json.dumps(extras, sort_keys=True, separators=(",", ":"))
-        if extras
-        else "",
+        "propagation_status": str(event.get("propagation_status", event.get("status", ""))),
+        "extras_json": _json_text(extras) if extras else "",
     }
 
 
-def _validate_event_routes(
-    event: Mapping[str, object], route_ids: Mapping[str, int]
-) -> None:
+_SCREENING_EVENT_TEMPLATE: dict[str, object] = {
+    "route_ids": [],
+    "current_route_ids": [],
+    "candidate_route_ids": [],
+    "base_route_id": None,
+    "candidate_route_id": None,
+    "kind": "",
+    "operation": "",
+    "failure_reason": "",
+    "feasible": None,
+    "exact_started": None,
+    "exact_completed": None,
+    "candidate_feasible": None,
+    "accepted": None,
+    "global_best": None,
+    "current_vehicle_count": None,
+    "candidate_vehicle_count": None,
+    "candidate_vehicle_delta": None,
+    "cache_key_digest": "",
+    "evaluation_id": None,
+    "route_change_status": "",
+}
+
+
+def _normalise_screening_event(
+    event: Mapping[str, object],
+    *,
+    event_id: int,
+    route_ids: Mapping[str, int],
+    lane_ids: Mapping[str, int],
+    operator_ids: Mapping[str, int],
+) -> dict[str, object]:
+    extras = {
+        key: event.get(key)
+        for key in (
+            "benchmark_axis",
+            "demand",
+            "distance_increment_lower_bound",
+            "distance_lower_bound",
+            "exact_call_blocked",
+            "first_failed_check",
+            "min_time_window_slack",
+            "negative_cache_hit",
+            "single_segment_reachable",
+            "structural_energy_lower_bound",
+        )
+        if key in event
+    }
+    row = _SCREENING_EVENT_TEMPLATE.copy()
+    row.update(
+        {
+            "event_id": event_id,
+            "record_type": "screening_decision",
+            "event_type": "screening_decision",
+            "timestamp_seconds": _as_float(event.get("started_at")),
+            "started_at": _as_float(event.get("started_at")),
+            "completed_at": _as_float(event.get("completed_at")),
+            "duration_seconds": _as_float(event.get("duration_seconds")),
+            "lane_id": lane_ids[str(event.get("lane", ""))],
+            "iteration": _as_int(event.get("iteration")),
+            "operator_id": operator_ids[str(event.get("operator", ""))],
+            "route_id": _route_id(event.get("route_key"), route_ids),
+            "status": str(event.get("status", "")),
+            "reason": str(event.get("reason", "")),
+            "decision_id": _as_int(event.get("decision_id")),
+            "propagation_status": str(event.get("status", "")),
+            "extras_json": _json_text(extras) if extras else "",
+        }
+    )
+    return row
+
+
+def _normalise_screening_decision_v2(
+    event: Mapping[str, object],
+    *,
+    event_id: int,
+    route_ids: Mapping[str, int],
+    lane_ids: Mapping[str, int],
+    operator_ids: Mapping[str, int],
+) -> dict[str, object]:
+    """Encode high-volume screening decisions without sparse event/JSON overhead."""
+
+    started_at = event.get("started_at")
+    raw_checks = event.get("checks")
+    checks = raw_checks if isinstance(raw_checks, (list, tuple)) else ()
+    return {
+        "event_id": event_id,
+        "timestamp_seconds": started_at,
+        "started_at": started_at,
+        "completed_at": event.get("completed_at"),
+        "duration_seconds": event.get("duration_seconds"),
+        "lane_id": lane_ids[str(event.get("lane", ""))],
+        "iteration": event.get("iteration"),
+        "operator_id": operator_ids[str(event.get("operator", ""))],
+        "route_id": _route_id(event.get("route_key"), route_ids),
+        "status": str(event.get("status", "")),
+        "reason": str(event.get("reason", "")),
+        "decision_id": event.get("decision_id"),
+        "benchmark_axis": str(event.get("benchmark_axis", "")),
+        "demand": event.get("demand"),
+        "distance_increment_lower_bound": event.get("distance_increment_lower_bound"),
+        "distance_lower_bound": event.get("distance_lower_bound"),
+        "exact_call_blocked": event.get("exact_call_blocked"),
+        "first_failed_check": str(event.get("first_failed_check", "")),
+        "min_time_window_slack": event.get("min_time_window_slack"),
+        "negative_cache_hit": event.get("negative_cache_hit"),
+        "single_segment_reachable": event.get("single_segment_reachable"),
+        "structural_energy_lower_bound": event.get("structural_energy_lower_bound"),
+        "checks": _normalise_compact_screening_checks(checks),
+    }
+
+
+def _normalise_compact_screening_checks(
+    checks: Sequence[object],
+) -> list[dict[str, object]]:
+    output: list[dict[str, object]] = []
+    for check in checks:
+        if not isinstance(check, Mapping):
+            continue
+        value = check.get("value")
+        output.append(
+            {
+                "check": str(check.get("check", "")),
+                "status": str(check.get("status", "")),
+                "value_bool": value if isinstance(value, bool) else None,
+                "value_float": (float(value) if isinstance(value, (int, float)) else None),
+                "value_text": value if isinstance(value, str) else None,
+                "reason": str(check.get("reason", "")),
+            }
+        )
+    return output
+
+
+def _json_text(payload: Mapping[str, object]) -> str:
+    return orjson.dumps(payload, option=orjson.OPT_SORT_KEYS).decode("utf-8")
+
+
+def expand_v2_screening_decision(row: Mapping[str, object]) -> dict[str, object]:
+    """Reconstruct the logical EVENTS_SCHEMA row from compact v2 storage."""
+
+    raw_checks = row.get("checks")
+    compact_checks = raw_checks if isinstance(raw_checks, (list, tuple)) else ()
+    extras = {
+        key: row.get(key)
+        for key in (
+            "benchmark_axis",
+            "demand",
+            "distance_increment_lower_bound",
+            "distance_lower_bound",
+            "exact_call_blocked",
+            "first_failed_check",
+            "min_time_window_slack",
+            "negative_cache_hit",
+            "single_segment_reachable",
+            "structural_energy_lower_bound",
+        )
+    }
+    output = _SCREENING_EVENT_TEMPLATE.copy()
+    output.update(
+        {
+            "event_id": row.get("event_id"),
+            "record_type": "screening_decision",
+            "event_type": "screening_decision",
+            "timestamp_seconds": row.get("timestamp_seconds"),
+            "started_at": row.get("started_at"),
+            "completed_at": row.get("completed_at"),
+            "duration_seconds": row.get("duration_seconds"),
+            "lane_id": row.get("lane_id"),
+            "iteration": row.get("iteration"),
+            "operator_id": row.get("operator_id"),
+            "route_id": row.get("route_id"),
+            "status": row.get("status"),
+            "reason": row.get("reason"),
+            "decision_id": row.get("decision_id"),
+            "propagation_status": row.get("status"),
+            "extras_json": _json_text(extras),
+            "embedded_checks": [
+                {
+                    "check": str(check.get("check", "")),
+                    "status": str(check.get("status") or ""),
+                    "value": _check_value(check),
+                    "reason": str(check.get("reason") or ""),
+                }
+                for check in compact_checks
+                if isinstance(check, Mapping)
+            ],
+        }
+    )
+    return output
+
+
+def _validate_event_routes(event: Mapping[str, object], route_ids: Mapping[str, int]) -> None:
     for key in (
         "route_key",
         "base_route_key",
@@ -694,8 +927,17 @@ class _StreamingParquetSink:
         self.rows.clear()
 
     def close(self) -> tuple[int, str]:
-        self.flush()
-        self._writer.close()
+        errors: list[BaseException] = []
+        try:
+            self.flush()
+        except BaseException as error:
+            errors.append(error)
+        try:
+            self._writer.close()
+        except BaseException as error:
+            errors.append(error)
+        if errors:
+            raise BaseExceptionGroup(f"failed to close Parquet sink {self.path}", errors)
         return self.row_count, _schema_fingerprint(self.schema)
 
 
@@ -704,11 +946,14 @@ def _iter_coalesced_cache_lookup_events(
 ) -> Iterable[dict[str, object]]:
     """Streaming equivalent of :func:`_coalesce_cache_lookup_events`."""
 
-    pending: dict[str, object] | None = None
+    pending: Mapping[str, object] | None = None
     for raw_event in events:
-        current = dict(raw_event)
+        current = raw_event
         if pending is None:
-            pending = current
+            if current.get("event_type") == "cache_event" and current.get("operation") == "lookup":
+                pending = current
+            else:
+                yield dict(current) if not isinstance(current, dict) else current
             continue
         same_lookup = all(
             pending.get(field) == current.get(field)
@@ -729,10 +974,14 @@ def _iter_coalesced_cache_lookup_events(
             yield combined
             pending = None
         else:
-            yield pending
-            pending = current
+            yield dict(pending) if not isinstance(pending, dict) else pending
+            if current.get("event_type") == "cache_event" and current.get("operation") == "lookup":
+                pending = current
+            else:
+                yield dict(current) if not isinstance(current, dict) else current
+                pending = None
     if pending is not None:
-        yield pending
+        yield dict(pending) if not isinstance(pending, dict) else pending
 
 
 def _stable_dictionary_id(value: str) -> int:
@@ -793,8 +1042,7 @@ def canonical_artifact_paths(
     directory = f"{instance}/{seed}"
     return {
         artifact_type: (
-            f"{directory}/"
-            f"{_canonical_filename(context, artifact_type, instance, seed, extension)}"
+            f"{directory}/{_canonical_filename(context, artifact_type, instance, seed, extension)}"
         )
         for artifact_type, extension in (
             ("raw", "json"),
@@ -803,6 +1051,7 @@ def canonical_artifact_paths(
             ("events", "parquet"),
             ("route_dictionary", "parquet"),
             ("screening_checks", "parquet"),
+            ("screening_decisions", "parquet"),
             ("diagnostic", "parquet"),
             ("environment", "json"),
             ("failure", "json"),
@@ -903,9 +1152,7 @@ def write_solver_result_bundle(
     else:
         from evrptw.measurement import canonical_route_key
 
-        route_dictionary = {
-            canonical_route_key(tuple(route)): tuple(route) for route in routes
-        }
+        route_dictionary = {canonical_route_key(tuple(route)): tuple(route) for route in routes}
         trace_payload = {
             "trace_schema_version": "solver-result-trace-v1",
             "config": {
@@ -936,9 +1183,7 @@ def write_solver_result_bundle(
             "seed": seed,
             "error_type": type(error).__name__ if error is not None else "",
             "failure_reason": (
-                str(error)
-                if error is not None
-                else str(getattr(result, "failure_reason", ""))
+                str(error) if error is not None else str(getattr(result, "failure_reason", ""))
             ),
             "evidence_completeness": "complete",
         }
@@ -950,9 +1195,7 @@ def write_solver_result_bundle(
             "instance": instance_name,
             "seed": seed,
             "routes": routes,
-            "objective_key": list(
-                getattr(getattr(result, "objective", None), "key", ())
-            ),
+            "objective_key": list(getattr(getattr(result, "objective", None), "key", ())),
         },
         trace_payload=trace_payload,
         environment_payload=dict(environment_payload),
@@ -1001,9 +1244,7 @@ class ArtifactBundleWriter:
     ) -> None:
         control = self.run_dir / "control"
         control.mkdir(parents=True, exist_ok=True)
-        metadata_path = control / _canonical_filename(
-            self.context, "run_metadata"
-        )
+        metadata_path = control / _canonical_filename(self.context, "run_metadata")
         _json_write(metadata_path, {**dict(metadata), "storage_policy": self.config.to_dict()})
         self._record_file(
             metadata_path,
@@ -1101,9 +1342,7 @@ class ArtifactBundleWriter:
             if not sidecar.is_file() or sidecar.read_text(encoding="utf-8").strip() != _sha256(
                 manifest_path
             ):
-                raise ArtifactIntegrityError(
-                    f"v2 shard manifest sidecar mismatch: {manifest_path}"
-                )
+                raise ArtifactIntegrityError(f"v2 shard manifest sidecar mismatch: {manifest_path}")
             if payload.get("storage_policy_version") != ARTIFACT_STORAGE_V2:
                 raise ArtifactIntegrityError("worker shard does not use artifact-storage-v2")
             if require_complete and payload.get("evidence_completeness") != "complete":
@@ -1130,9 +1369,7 @@ class ArtifactBundleWriter:
                         raise ArtifactIntegrityError("v2 shard artifact entry is invalid")
                     path = _safe_artifact_path(self.run_dir, str(item["relative_path"]))
                     if _sha256(path) != str(item["checksum"]):
-                        raise ArtifactIntegrityError(
-                            f"v2 shard artifact checksum mismatch: {path}"
-                        )
+                        raise ArtifactIntegrityError(f"v2 shard artifact checksum mismatch: {path}")
                     self._record_file(
                         path,
                         artifact_type=str(item["artifact_type"]),
@@ -1141,9 +1378,7 @@ class ArtifactBundleWriter:
                         storage_format=str(item["storage_format"]),
                         compression=str(item["compression"]),
                         row_count=(
-                            int(item["row_count"])
-                            if item.get("row_count") is not None
-                            else None
+                            int(item["row_count"]) if item.get("row_count") is not None else None
                         ),
                         schema_fingerprint=str(item.get("schema_fingerprint", "")),
                     )
@@ -1265,24 +1500,32 @@ class ArtifactBundleWriter:
                 solution_payload,
             )
             route_relative = str(
-                (directory / _canonical_filename(
-                    self.context, "route_dictionary", instance, seed, "parquet"
-                )).relative_to(self.run_dir)
+                (
+                    directory
+                    / _canonical_filename(
+                        self.context, "route_dictionary", instance, seed, "parquet"
+                    )
+                ).relative_to(self.run_dir)
             )
             events_relative = str(
-                (directory / _canonical_filename(
-                    self.context, "events", instance, seed, "parquet"
-                )).relative_to(self.run_dir)
+                (
+                    directory
+                    / _canonical_filename(self.context, "events", instance, seed, "parquet")
+                ).relative_to(self.run_dir)
             )
             checks_relative = str(
-                (directory / _canonical_filename(
-                    self.context, "screening_checks", instance, seed, "parquet"
-                )).relative_to(self.run_dir)
+                (
+                    directory
+                    / _canonical_filename(
+                        self.context, "screening_checks", instance, seed, "parquet"
+                    )
+                ).relative_to(self.run_dir)
             )
             diagnostic_relative = str(
-                (directory / _canonical_filename(
-                    self.context, "diagnostic", instance, seed, "parquet"
-                )).relative_to(self.run_dir)
+                (
+                    directory
+                    / _canonical_filename(self.context, "diagnostic", instance, seed, "parquet")
+                ).relative_to(self.run_dir)
             )
             paths["environment"] = self._write_json_artifact(
                 directory,
@@ -1401,9 +1644,7 @@ class ArtifactBundleWriter:
                     "evidence_completeness": "partial",
                     "failure_reason": "artifact byte budget exceeded",
                 }
-            failure_path = directory / _canonical_filename(
-                self.context, "failure", instance, seed
-            )
+            failure_path = directory / _canonical_filename(self.context, "failure", instance, seed)
             _json_write(failure_path, failure_payload)
             self._record_file(
                 failure_path,
@@ -1417,6 +1658,149 @@ class ArtifactBundleWriter:
             self._write_manifest(status="partial", evidence_completeness="partial")
             raise
         return paths
+
+    def open_v2_shard(
+        self,
+        *,
+        instance: str,
+        seed: int,
+        shard_ordinal: int,
+        worker_identity: str,
+    ) -> ArtifactV2ShardSession:
+        """Open one bounded worker-owned v2 shard for incremental appends."""
+
+        if self.config.storage_policy_version != ARTIFACT_STORAGE_V2:
+            raise ValueError("open_v2_shard requires artifact-storage-v2")
+        if shard_ordinal < 0:
+            raise ValueError("artifact-storage-v2 requires a non-negative shard_ordinal")
+        if not worker_identity:
+            raise ValueError("artifact-storage-v2 requires worker_identity")
+        return ArtifactV2ShardSession(
+            self,
+            instance=instance,
+            seed=seed,
+            shard_ordinal=shard_ordinal,
+            worker_identity=worker_identity,
+        )
+
+    def write_v2_failure_shard(
+        self,
+        *,
+        instance: str,
+        seed: int,
+        shard_ordinal: int,
+        worker_identity: str,
+        error: BaseException | str,
+    ) -> None:
+        """Publish a partial shard without overwriting worker fragments."""
+
+        if self.config.storage_policy_version != ARTIFACT_STORAGE_V2:
+            raise ValueError("failure shards require artifact-storage-v2")
+        self._current_instance = (instance, seed)
+        self._instance_bytes = 0
+        artifact_start = len(self._artifacts)
+        directory = self.run_dir / instance / str(seed)
+        directory.mkdir(parents=True, exist_ok=True)
+        failure_path = directory / _canonical_filename(self.context, "failure", instance, seed)
+        manifest_path = directory / _canonical_filename(
+            self.context, "shard_manifest", instance, seed
+        )
+        sidecar_path = manifest_path.with_suffix(".sha256")
+        for path, kind in (
+            (failure_path, "failure"),
+            (manifest_path, "manifest"),
+            (sidecar_path, "manifest_sidecar"),
+        ):
+            self._archive_v2_control_fragment(
+                path,
+                instance=instance,
+                seed=seed,
+                kind=kind,
+            )
+        self._register_v2_partial_fragments(directory)
+        _json_write(
+            failure_path,
+            {
+                "schema_version": ARTIFACT_STORAGE_V2,
+                "run_label": self.context.run_label,
+                "instance": instance,
+                "seed": seed,
+                "status": "partial",
+                "evidence_completeness": "partial",
+                "failure_reason": str(error),
+            },
+        )
+        self._record_file(
+            failure_path,
+            artifact_type="failure",
+            retention_class="critical",
+            storage_format="json_control",
+            compression="none",
+            enforce_budget=False,
+        )
+        self._write_v2_shard_manifest(
+            directory=directory,
+            instance=instance,
+            seed=seed,
+            shard_ordinal=shard_ordinal,
+            worker_identity=worker_identity,
+            artifact_start=artifact_start,
+            evidence_completeness="partial",
+        )
+
+    def _archive_v2_control_fragment(
+        self,
+        path: Path,
+        *,
+        instance: str,
+        seed: int,
+        kind: str,
+    ) -> None:
+        """Preserve an incomplete canonical control file before recovery."""
+
+        if not path.is_file():
+            return
+        relative = path.relative_to(self.run_dir).as_posix()
+        removed_bytes = sum(
+            item.byte_size for item in self._artifacts if item.relative_path == relative
+        )
+        self._artifacts = [item for item in self._artifacts if item.relative_path != relative]
+        self._instance_bytes = max(0, self._instance_bytes - removed_bytes)
+        digest = _sha256(path)
+        fragment = path.parent / (
+            f"{self.context.run_label}_partial_fragment_{kind}_{instance}_{seed}_{digest[:12]}.bin"
+        )
+        suffix = 1
+        while fragment.exists():
+            fragment = path.parent / (
+                f"{self.context.run_label}_partial_fragment_{kind}_"
+                f"{instance}_{seed}_{digest[:12]}_{suffix}.bin"
+            )
+            suffix += 1
+        path.replace(fragment)
+        self._record_partial_fragment(fragment)
+
+    def _register_v2_partial_fragments(self, directory: Path) -> None:
+        registered = {item.relative_path for item in self._artifacts}
+        for fragment in sorted(directory.iterdir()):
+            if not fragment.is_file() or _is_appledouble_path(fragment.relative_to(self.run_dir)):
+                continue
+            relative = fragment.relative_to(self.run_dir).as_posix()
+            if relative in registered:
+                continue
+            self._record_partial_fragment(fragment)
+            registered.add(relative)
+
+    def _record_partial_fragment(self, fragment: Path) -> None:
+        self._record_file(
+            fragment,
+            artifact_type="partial_shard_fragment",
+            artifact_subtype=fragment.name,
+            retention_class="critical",
+            storage_format="binary_partial",
+            compression="unknown",
+            enforce_budget=False,
+        )
 
     def _write_instance_seed_v2(
         self,
@@ -1450,16 +1834,10 @@ class ArtifactBundleWriter:
         checks_path = self.run_dir / paths["screening_checks"]
         diagnostic_path = self.run_dir / paths["diagnostic"]
         event_sink = _StreamingParquetSink(event_path, EVENTS_SCHEMA, self.config)
-        checks_sink = _StreamingParquetSink(
-            checks_path, SCREENING_CHECKS_SCHEMA, self.config
-        )
-        diagnostic_sink = _StreamingParquetSink(
-            diagnostic_path, DIAGNOSTIC_SCHEMA, self.config
-        )
+        checks_sink = _StreamingParquetSink(checks_path, SCREENING_CHECKS_SCHEMA, self.config)
+        diagnostic_sink = _StreamingParquetSink(diagnostic_path, DIAGNOSTIC_SCHEMA, self.config)
         try:
-            paths["raw"] = self._write_json_artifact(
-                directory, "raw", instance, seed, raw_payload
-            )
+            paths["raw"] = self._write_json_artifact(directory, "raw", instance, seed, raw_payload)
             paths["solution"] = self._write_json_artifact(
                 directory, "solution", instance, seed, solution_payload
             )
@@ -1484,9 +1862,7 @@ class ArtifactBundleWriter:
                 lane = str(event.get("lane", ""))
                 operator = str(event.get("operator", ""))
                 lane_ids.setdefault(lane, _stable_dictionary_id(f"lane:{lane}"))
-                operator_ids.setdefault(
-                    operator, _stable_dictionary_id(f"operator:{operator}")
-                )
+                operator_ids.setdefault(operator, _stable_dictionary_id(f"operator:{operator}"))
                 _validate_event_routes(event, route_ids)
                 event_id = self._next_event_id
                 self._next_event_id += 1
@@ -1513,9 +1889,7 @@ class ArtifactBundleWriter:
                                 )
                             )
             for row in diagnostic_rows:
-                diagnostic_sink.append(
-                    self._normalise_diagnostic(row, instance, seed)
-                )
+                diagnostic_sink.append(self._normalise_diagnostic(row, instance, seed))
             event_count, event_schema = event_sink.close()
             check_count, check_schema = checks_sink.close()
             diagnostic_count, diagnostic_schema = diagnostic_sink.close()
@@ -1590,10 +1964,7 @@ class ArtifactBundleWriter:
             )
             paths["shard_manifest"] = str(
                 (
-                    directory
-                    / _canonical_filename(
-                        self.context, "shard_manifest", instance, seed
-                    )
+                    directory / _canonical_filename(self.context, "shard_manifest", instance, seed)
                 ).relative_to(self.run_dir)
             )
             return paths
@@ -1610,9 +1981,7 @@ class ArtifactBundleWriter:
                 "evidence_completeness": "partial",
                 "failure_reason": str(error),
             }
-            failure_path = directory / _canonical_filename(
-                self.context, "failure", instance, seed
-            )
+            failure_path = directory / _canonical_filename(self.context, "failure", instance, seed)
             _json_write(failure_path, failure)
             self._record_file(
                 failure_path,
@@ -1733,8 +2102,7 @@ class ArtifactBundleWriter:
         }
         _json_write(manifest_path, payload)
         sidecar_path = control / (
-            _canonical_filename(self.context, "manifest", extension="json")[:-5]
-            + ".sha256"
+            _canonical_filename(self.context, "manifest", extension="json")[:-5] + ".sha256"
         )
         sidecar_path.write_text(_sha256(manifest_path) + "\n", encoding="utf-8")
         self._manifest_path = manifest_path
@@ -1809,9 +2177,7 @@ class ArtifactBundleWriter:
     ) -> None:
         relative = path.relative_to(self.run_dir).as_posix()
         byte_size = path.stat().st_size
-        self._artifacts = [
-            item for item in self._artifacts if item.relative_path != relative
-        ]
+        self._artifacts = [item for item in self._artifacts if item.relative_path != relative]
         reference = ArtifactReference(
             relative,
             artifact_type,
@@ -1885,40 +2251,99 @@ def build_stage03_critical_events(
     compatible while the persisted representation stops duplicating records.
     """
 
-    rows: list[dict[str, object]] = []
-    route_evaluations = getattr(trace, "route_evaluations", ())
-    for record in route_evaluations:
-        payload = dict(record.__dict__) if hasattr(record, "__dict__") else {}
-        if not payload:
-            from dataclasses import asdict
+    return list(iter_stage03_critical_events(trace, neighborhood_events))
 
-            payload = asdict(record)
-        payload["record_type"] = "route_evaluation"
-        rows.append(payload)
-    for event in getattr(trace, "events", ()):
-        rows.append({**dict(event), "record_type": str(event.get("event_type", "event"))})
-    from dataclasses import asdict
 
-    for decision in getattr(trace, "screening_decisions", ()):
-        payload = asdict(decision)
-        payload["record_type"] = "screening_decision"
-        payload["event_type"] = "screening_decision"
-        rows.append(payload)
-    for propagation in getattr(trace, "incremental_propagations", ()):
-        rows.append({**dict(propagation), "record_type": "incremental_propagation"})
-    rows.extend(
-        {**dict(event), "record_type": "neighborhood_event"}
-        for event in neighborhood_events
+def iter_stage03_critical_events(
+    trace: object,
+    neighborhood_events: Iterable[Mapping[str, object]] = (),
+) -> Iterable[dict[str, object]]:
+    """Yield the critical stream in timestamp order without a full copy/sort."""
+
+    from dataclasses import asdict, fields
+
+    def route_evaluations() -> Iterable[dict[str, object]]:
+        for record in getattr(trace, "route_evaluations", ()):
+            payload = dict(record.__dict__) if hasattr(record, "__dict__") else {}
+            if not payload:
+                payload = asdict(record)
+            payload["record_type"] = "route_evaluation"
+            yield payload
+
+    def trace_events() -> Iterable[dict[str, object]]:
+        for event in getattr(trace, "events", ()):
+            yield {
+                **dict(event),
+                "record_type": str(event.get("event_type", "event")),
+            }
+
+    def screening_decisions() -> Iterable[dict[str, object]]:
+        field_names: tuple[str, ...] | None = None
+        for decision in getattr(trace, "screening_decisions", ()):
+            if field_names is None:
+                field_names = tuple(field.name for field in fields(decision))
+            payload = {name: getattr(decision, name) for name in field_names}
+            payload["checks"] = [
+                {
+                    "check": check.check,
+                    "status": check.status,
+                    "value": check.value,
+                    "reason": check.reason,
+                }
+                for check in decision.checks
+            ]
+            payload["record_type"] = "screening_decision"
+            payload["event_type"] = "screening_decision"
+            yield payload
+
+    def propagations() -> Iterable[dict[str, object]]:
+        for propagation in getattr(trace, "incremental_propagations", ()):
+            yield {
+                **dict(propagation),
+                "record_type": "incremental_propagation",
+            }
+
+    def neighborhood() -> Iterable[dict[str, object]]:
+        for event in neighborhood_events:
+            yield {**dict(event), "record_type": "neighborhood_event"}
+
+    def keyed(
+        stream: Iterable[dict[str, object]], rank: int
+    ) -> Iterable[tuple[bool, float, int, int, dict[str, object]]]:
+        for index, payload in enumerate(stream):
+            timestamp = _event_timestamp(payload)
+            yield (
+                timestamp is None,
+                timestamp or 0.0,
+                rank,
+                index,
+                payload,
+            )
+
+    ordinary = iter(
+        heapq.merge(
+            keyed(route_evaluations(), 0),
+            keyed(trace_events(), 1),
+            keyed(propagations(), 3),
+            keyed(neighborhood(), 4),
+        )
     )
-    ordered = sorted(
-        enumerate(rows),
-        key=lambda item: (
-            _event_timestamp(item[1]) is None,
-            _event_timestamp(item[1]) or 0.0,
-            item[0],
-        ),
-    )
-    return [item[1] for item in ordered]
+    screening = iter(keyed(screening_decisions(), 2))
+    ordinary_item = next(ordinary, None)
+    screening_item = next(screening, None)
+    while ordinary_item is not None and screening_item is not None:
+        if ordinary_item[:4] <= screening_item[:4]:
+            yield ordinary_item[4]
+            ordinary_item = next(ordinary, None)
+        else:
+            yield screening_item[4]
+            screening_item = next(screening, None)
+    while ordinary_item is not None:
+        yield ordinary_item[4]
+        ordinary_item = next(ordinary, None)
+    while screening_item is not None:
+        yield screening_item[4]
+        screening_item = next(screening, None)
 
 
 def find_manifest(run_dir: Path) -> Path:
@@ -2013,14 +2438,11 @@ def verify_manifest(run_dir: Path) -> dict[str, Any]:
         if relative not in listed_paths:
             raise ArtifactIntegrityError(f"unlisted artifact is present: {relative}")
     has_failure = any(
-        isinstance(item, Mapping) and item.get("artifact_type") == "failure"
-        for item in artifacts
+        isinstance(item, Mapping) and item.get("artifact_type") == "failure" for item in artifacts
     )
     expected_failure_status = "present" if has_failure else "not_applicable"
     if artifact_status.get("failure") != expected_failure_status:
-        raise ArtifactIntegrityError(
-            "failure artifact status does not match manifest contents"
-        )
+        raise ArtifactIntegrityError("failure artifact status does not match manifest contents")
     return manifest
 
 
@@ -2040,6 +2462,465 @@ def _verify_legacy_manifest(run_dir: Path) -> dict[str, Any]:
         if not path.is_file() or _sha256(path) != str(expected):
             raise ArtifactIntegrityError(f"legacy artifact checksum mismatch: {relative}")
     return manifest
+
+
+class _RegisteredStableRouteIds(Mapping[str, int]):
+    """Content-derived route IDs backed only by registered ID digests."""
+
+    def __init__(self, registered: Mapping[int, str]) -> None:
+        self._registered = registered
+
+    def __getitem__(self, key: str) -> int:
+        route_id = _stable_dictionary_id(f"route:{key}")
+        if route_id not in self._registered:
+            raise KeyError(key)
+        return route_id
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return len(self._registered)
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and _stable_dictionary_id(f"route:{key}") in self._registered
+
+
+class ArtifactV2ShardSession:
+    """Incremental ``open -> append -> flush -> finalize/abort`` v2 shard.
+
+    The session owns all Parquet writers for one ``(instance, seed)`` shard.
+    Route IDs are content-derived so an axis can be released immediately after
+    it is appended; only ID-to-digest collision state survives across axes.
+    """
+
+    def __init__(
+        self,
+        owner: ArtifactBundleWriter,
+        *,
+        instance: str,
+        seed: int,
+        shard_ordinal: int,
+        worker_identity: str,
+    ) -> None:
+        self._owner = owner
+        self.instance = instance
+        self.seed = seed
+        self.shard_ordinal = shard_ordinal
+        self.worker_identity = worker_identity
+        owner._current_instance = (instance, seed)
+        owner._instance_bytes = 0
+        owner._next_event_id = 1
+        self._artifact_start = len(owner._artifacts)
+        self._directory = owner.run_dir / instance / str(seed)
+        self._directory.mkdir(parents=True, exist_ok=True)
+        self.paths = canonical_artifact_paths(owner.context, instance, seed)
+        self._route_sink = _StreamingParquetSink(
+            owner.run_dir / self.paths["route_dictionary"],
+            ROUTE_DICTIONARY_SCHEMA,
+            owner.config,
+        )
+        self._event_sink = _StreamingParquetSink(
+            owner.run_dir / self.paths["events"], EVENTS_SCHEMA, owner.config
+        )
+        self._checks_sink = _StreamingParquetSink(
+            owner.run_dir / self.paths["screening_checks"],
+            SCREENING_CHECKS_SCHEMA,
+            owner.config,
+        )
+        self._screening_sink = _StreamingParquetSink(
+            owner.run_dir / self.paths["screening_decisions"],
+            V2_SCREENING_DECISIONS_SCHEMA,
+            owner.config,
+        )
+        self._diagnostic_sink = _StreamingParquetSink(
+            owner.run_dir / self.paths["diagnostic"],
+            DIAGNOSTIC_SCHEMA,
+            owner.config,
+        )
+        self._route_digests: dict[int, str] = {}
+        self._route_ids = _RegisteredStableRouteIds(self._route_digests)
+        self._lane_ids: dict[str, int] = {}
+        self._operator_ids: dict[str, int] = {}
+        self._active_sinks: list[_StreamingParquetSink] = []
+        self._max_buffered_groups_observed = 0
+        self._state = "open"
+
+    def append(
+        self,
+        *,
+        route_dictionary: Mapping[str, Sequence[str]],
+        critical_events: Iterable[Mapping[str, object]],
+        diagnostic_rows: Iterable[Mapping[str, object]] = (),
+    ) -> int:
+        """Append one logical axis and return its persisted event-row count."""
+
+        self._require_open()
+        for key, raw_sequence in route_dictionary.items():
+            self._register_route(key, tuple(raw_sequence))
+        if route_dictionary:
+            self._flush_sink(self._route_sink)
+
+        count = 0
+        for event in _iter_coalesced_cache_lookup_events(critical_events):
+            screening_event = event.get("event_type") == "screening_decision"
+            route_keys = (
+                (str(event.get("route_key", "")),)
+                if screening_event
+                else tuple(_event_route_keys(event))
+            )
+            for route_key in route_keys:
+                if not route_key:
+                    continue
+                if route_key not in self._route_ids:
+                    self._register_route(route_key, _route_sequence_from_key(route_key))
+            lane = str(event.get("lane", ""))
+            operator = str(event.get("operator", ""))
+            if lane not in self._lane_ids:
+                self._lane_ids[lane] = _stable_dictionary_id(f"lane:{lane}")
+            if operator not in self._operator_ids:
+                self._operator_ids[operator] = _stable_dictionary_id(f"operator:{operator}")
+            if screening_event:
+                route_key = str(event.get("route_key", ""))
+                if route_key and route_key not in self._route_ids:
+                    raise ArtifactIntegrityError(
+                        f"event refers to an unregistered route key: {route_key}"
+                    )
+            else:
+                _validate_event_routes(event, self._route_ids)
+            event_id = self._owner._next_event_id
+            self._owner._next_event_id += 1
+            normalized_event = (
+                _normalise_screening_decision_v2(
+                    event,
+                    event_id=event_id,
+                    route_ids=self._route_ids,
+                    lane_ids=self._lane_ids,
+                    operator_ids=self._operator_ids,
+                )
+                if screening_event
+                else _normalise_event(
+                    event,
+                    event_id=event_id,
+                    route_ids=self._route_ids,
+                    lane_ids=self._lane_ids,
+                    operator_ids=self._operator_ids,
+                )
+            )
+            if screening_event:
+                self._append_buffered(self._screening_sink, normalized_event)
+            else:
+                self._append_buffered(self._event_sink, normalized_event)
+            checks = event.get("checks")
+            if not screening_event and isinstance(checks, (list, tuple)):
+                decision_id = _as_int(event.get("decision_id"))
+                for index, check in enumerate(checks):
+                    if isinstance(check, Mapping):
+                        self._append_buffered(
+                            self._checks_sink,
+                            _normalise_check(
+                                check,
+                                event_id=event_id,
+                                decision_id=decision_id,
+                                index=index,
+                            ),
+                        )
+            count += 1
+        for row in diagnostic_rows:
+            self._append_buffered(
+                self._diagnostic_sink,
+                self._owner._normalise_diagnostic(row, self.instance, self.seed),
+            )
+        return count
+
+    def flush(self) -> None:
+        """Flush all currently buffered rows without closing the shard."""
+
+        self._require_open()
+        for sink in self._sinks:
+            sink.flush()
+        self._active_sinks.clear()
+
+    def finalize(
+        self,
+        *,
+        raw_payload: Mapping[str, object],
+        solution_payload: Mapping[str, object],
+        trace_payload: Mapping[str, object],
+        environment_payload: Mapping[str, object],
+        failure_payload: Mapping[str, object] | None = None,
+    ) -> dict[str, str]:
+        """Close the shard, publish checksums, and write its complete manifest."""
+
+        self._require_open()
+        try:
+            metadata = self._close_and_record_parquet()
+            self.paths["raw"] = self._owner._write_json_artifact(
+                self._directory, "raw", self.instance, self.seed, raw_payload
+            )
+            self.paths["solution"] = self._owner._write_json_artifact(
+                self._directory, "solution", self.instance, self.seed, solution_payload
+            )
+            self.paths["environment"] = self._owner._write_json_artifact(
+                self._directory,
+                "environment",
+                self.instance,
+                self.seed,
+                environment_payload,
+            )
+            trace_index = compact_trace_payload(
+                trace_payload,
+                route_dictionary_ref=self.paths["route_dictionary"],
+                events_ref=self.paths["events"],
+                screening_checks_ref=self.paths["screening_checks"],
+                diagnostic_ref=self.paths["diagnostic"],
+                lane_dictionary=self._lane_ids,
+                operator_dictionary=self._operator_ids,
+            )
+            trace_index["event_identity"] = {
+                "shard_ordinal": self.shard_ordinal,
+                "local_field": "event_id",
+            }
+            trace_index["schema_fingerprints"] = metadata
+            trace_index["screening_decisions_ref"] = self.paths["screening_decisions"]
+            self.paths["trace"] = self._owner._write_json_artifact(
+                self._directory, "trace", self.instance, self.seed, trace_index
+            )
+            if failure_payload is not None:
+                self.paths["failure"] = self._owner._write_json_artifact(
+                    self._directory,
+                    "failure",
+                    self.instance,
+                    self.seed,
+                    failure_payload,
+                    retention_class="critical",
+                )
+            self._owner._write_v2_shard_manifest(
+                directory=self._directory,
+                instance=self.instance,
+                seed=self.seed,
+                shard_ordinal=self.shard_ordinal,
+                worker_identity=self.worker_identity,
+                artifact_start=self._artifact_start,
+                evidence_completeness="complete",
+            )
+            self.paths["shard_manifest"] = str(
+                (
+                    self._directory
+                    / _canonical_filename(
+                        self._owner.context,
+                        "shard_manifest",
+                        self.instance,
+                        self.seed,
+                    )
+                ).relative_to(self._owner.run_dir)
+            )
+            self._state = "finalized"
+            return dict(self.paths)
+        except BaseException as error:
+            self.abort(error)
+            raise
+
+    def abort(self, error: BaseException | str) -> None:
+        """Close partial files and publish explicit failure evidence."""
+
+        if self._state == "finalized":
+            raise RuntimeError("cannot abort a finalized artifact v2 shard")
+        if self._state == "aborted":
+            return
+        cleanup_errors: list[str] = []
+        if self._state == "open":
+            try:
+                self._close_and_record_parquet()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(str(cleanup_error))
+        failure_path = self._directory / _canonical_filename(
+            self._owner.context, "failure", self.instance, self.seed
+        )
+        manifest_path = self._directory / _canonical_filename(
+            self._owner.context, "shard_manifest", self.instance, self.seed
+        )
+        for path, kind in (
+            (failure_path, "failure"),
+            (manifest_path, "manifest"),
+            (manifest_path.with_suffix(".sha256"), "manifest_sidecar"),
+        ):
+            self._owner._archive_v2_control_fragment(
+                path,
+                instance=self.instance,
+                seed=self.seed,
+                kind=kind,
+            )
+        self._owner._register_v2_partial_fragments(self._directory)
+        _json_write(
+            failure_path,
+            {
+                "schema_version": ARTIFACT_STORAGE_V2,
+                "run_label": self._owner.context.run_label,
+                "instance": self.instance,
+                "seed": self.seed,
+                "status": "partial",
+                "evidence_completeness": "partial",
+                "failure_reason": str(error),
+                "cleanup_failures": cleanup_errors,
+            },
+        )
+        self._owner._record_file(
+            failure_path,
+            artifact_type="failure",
+            retention_class="critical",
+            storage_format="json_control",
+            compression="none",
+            enforce_budget=False,
+        )
+        self._owner._write_v2_shard_manifest(
+            directory=self._directory,
+            instance=self.instance,
+            seed=self.seed,
+            shard_ordinal=self.shard_ordinal,
+            worker_identity=self.worker_identity,
+            artifact_start=self._artifact_start,
+            evidence_completeness="partial",
+        )
+        self._state = "aborted"
+
+    @property
+    def _sinks(self) -> tuple[_StreamingParquetSink, ...]:
+        return (
+            self._route_sink,
+            self._event_sink,
+            self._checks_sink,
+            self._screening_sink,
+            self._diagnostic_sink,
+        )
+
+    @property
+    def max_buffered_groups_observed(self) -> int:
+        """Maximum simultaneously non-empty row-group buffers for this shard."""
+
+        return self._max_buffered_groups_observed
+
+    def _append_buffered(self, sink: _StreamingParquetSink, row: Mapping[str, object]) -> None:
+        if sink not in self._active_sinks and len(self._active_sinks) >= 2:
+            victim = self._active_sinks.pop(0)
+            victim.flush()
+        sink.append(row)
+        if sink.rows:
+            if sink not in self._active_sinks:
+                self._active_sinks.append(sink)
+        elif sink in self._active_sinks:
+            self._active_sinks.remove(sink)
+        self._max_buffered_groups_observed = max(
+            self._max_buffered_groups_observed,
+            len(self._active_sinks),
+        )
+
+    def _flush_sink(self, sink: _StreamingParquetSink) -> None:
+        sink.flush()
+        if sink in self._active_sinks:
+            self._active_sinks.remove(sink)
+
+    def _require_open(self) -> None:
+        if self._state != "open":
+            raise RuntimeError(f"artifact v2 shard session is not open: {self._state}")
+
+    def _register_route(self, key: str, sequence: tuple[str, ...]) -> None:
+        if _route_sequence_from_key(key) != sequence:
+            raise ArtifactIntegrityError(
+                f"route dictionary key does not match customer sequence: {key}"
+            )
+        route_id = _stable_dictionary_id(f"route:{key}")
+        route_digest = _payload_sha256(list(sequence))
+        previous_digest = self._route_digests.get(route_id)
+        if previous_digest is not None:
+            if previous_digest != route_digest:
+                raise ArtifactIntegrityError(f"stable route ID collision for route ID {route_id}")
+            return
+        self._route_digests[route_id] = route_digest
+        self._append_buffered(
+            self._route_sink,
+            {
+                "route_id": route_id,
+                "canonical_route_key": key,
+                "route_digest": route_digest,
+                "customer_sequence": list(sequence),
+            },
+        )
+
+    def _close_and_record_parquet(self) -> dict[str, str]:
+        self._require_open()
+        descriptors = (
+            (
+                self._route_sink,
+                "route_dictionary",
+                "canonical_routes",
+                "critical",
+            ),
+            (self._event_sink, "events", "critical", "critical"),
+            (
+                self._checks_sink,
+                "events",
+                "screening_checks",
+                "critical",
+            ),
+            (
+                self._screening_sink,
+                "events",
+                "screening_decisions_v2",
+                "critical",
+            ),
+            (
+                self._diagnostic_sink,
+                "diagnostic",
+                "aggregated",
+                "diagnostic",
+            ),
+        )
+        closed: list[tuple[_StreamingParquetSink, str, str, str, int, str]] = []
+        errors: list[BaseException] = []
+        for sink, artifact_type, subtype, retention in descriptors:
+            try:
+                count, fingerprint = sink.close()
+                closed.append(
+                    (
+                        sink,
+                        artifact_type,
+                        subtype,
+                        retention,
+                        count,
+                        fingerprint,
+                    )
+                )
+            except BaseException as error:
+                errors.append(error)
+        self._active_sinks.clear()
+        self._state = "parquet_closed"
+        fingerprints: dict[str, str] = {}
+        fingerprint_keys = {
+            "canonical_routes": "route_dictionary",
+            "critical": "events",
+            "screening_checks": "screening_checks",
+            "screening_decisions_v2": "screening_decisions",
+            "aggregated": "diagnostic",
+        }
+        for sink, artifact_type, subtype, retention, count, fingerprint in closed:
+            try:
+                self._owner._record_file(
+                    sink.path,
+                    artifact_type=artifact_type,
+                    artifact_subtype=subtype,
+                    retention_class=retention,
+                    storage_format="parquet",
+                    compression=self._owner.config.compression,
+                    row_count=count,
+                    schema_fingerprint=fingerprint,
+                )
+                fingerprints[fingerprint_keys[subtype]] = fingerprint
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise BaseExceptionGroup("failed to close or register artifact v2 shard sinks", errors)
+        return fingerprints
 
 
 class ArtifactReader:
@@ -2073,17 +2954,13 @@ class ArtifactReader:
             storage_format = CURRENT_STORAGE_FORMAT
         else:
             manifest = (
-                _verify_legacy_manifest(self.run_dir)
-                if verify
-                else _json_read(manifest_path)
+                _verify_legacy_manifest(self.run_dir) if verify else _json_read(manifest_path)
             )
             storage_format = LEGACY_STORAGE_FORMAT
         return ArtifactReadResult(self.run_dir, manifest_path, storage_format, manifest)
 
     def read_json(self, relative_path: str | Path) -> dict[str, Any]:
-        return _json_read(
-            _safe_artifact_path(self.run_dir, Path(relative_path).as_posix())
-        )
+        return _json_read(_safe_artifact_path(self.run_dir, Path(relative_path).as_posix()))
 
     def read_parquet(
         self,
@@ -2115,9 +2992,9 @@ class ArtifactReader:
         if not path.is_file() or path.suffix != ".parquet":
             raise ArtifactIntegrityError(f"Parquet artifact is missing: {path}")
         parquet = pq.ParquetFile(path)
-        if schema is not None and _schema_fingerprint(
-            parquet.schema_arrow
-        ) != _schema_fingerprint(schema):
+        if schema is not None and _schema_fingerprint(parquet.schema_arrow) != _schema_fingerprint(
+            schema
+        ):
             raise ArtifactIntegrityError(f"Parquet schema mismatch: {path}")
         selected_columns = tuple(columns) if columns is not None else None
         if selected_columns is not None:
@@ -2134,7 +3011,16 @@ class ArtifactReader:
     def read_events(self, relative_path: str | Path) -> list[dict[str, Any]]:
         path = _safe_artifact_path(self.run_dir, Path(relative_path).as_posix())
         if path.suffix == ".parquet":
-            return self.read_parquet(path.relative_to(self.run_dir), schema=EVENTS_SCHEMA)
+            parquet_rows = self.read_parquet(path.relative_to(self.run_dir), schema=EVENTS_SCHEMA)
+            compact_path = path.with_name(path.name.replace("_events_", "_screening_decisions_", 1))
+            if compact_path.is_file():
+                compact_rows = self.read_parquet(
+                    compact_path.relative_to(self.run_dir),
+                    schema=V2_SCREENING_DECISIONS_SCHEMA,
+                )
+                parquet_rows.extend(expand_v2_screening_decision(row) for row in compact_rows)
+                parquet_rows.sort(key=lambda row: int(row["event_id"]))
+            return parquet_rows
         if path.suffix == ".jsonl":
             rows: list[dict[str, Any]] = []
             with path.open(encoding="utf-8") as handle:
@@ -2175,41 +3061,37 @@ class ArtifactReader:
             "screening_checks",
             "diagnostic",
         }
-        if (
-            not isinstance(expected_fingerprints, Mapping)
-            or not required_fingerprint_names.issubset(expected_fingerprints)
-        ):
+        compact_screening_ref = index.get("screening_decisions_ref")
+        if compact_screening_ref is not None:
+            required_fingerprint_names.add("screening_decisions")
+        if not isinstance(
+            expected_fingerprints, Mapping
+        ) or not required_fingerprint_names.issubset(expected_fingerprints):
             raise ArtifactIntegrityError("trace schema_fingerprints must be an object")
         for name, reference in (
             ("route_dictionary", index["route_dictionary_ref"]),
             ("events", index["events_ref"]),
             ("screening_checks", index["screening_checks_ref"]),
             ("diagnostic", index["diagnostic_ref"]),
+            ("screening_decisions", compact_screening_ref),
         ):
+            if reference is None:
+                continue
             actual_fingerprint = _schema_fingerprint(
-                pq.ParquetFile(
-                    _safe_artifact_path(self.run_dir, str(reference))
-                ).schema_arrow
+                pq.ParquetFile(_safe_artifact_path(self.run_dir, str(reference))).schema_arrow
             )
             if str(expected_fingerprints.get(name, "")) != actual_fingerprint:
-                raise ArtifactIntegrityError(
-                    f"trace schema fingerprint is invalid for {name}"
-                )
+                raise ArtifactIntegrityError(f"trace schema fingerprint is invalid for {name}")
         route_rows = self.read_parquet(
             str(index["route_dictionary_ref"]), schema=ROUTE_DICTIONARY_SCHEMA
         )
-        route_by_id = {
-            int(row["route_id"]): str(row["canonical_route_key"]) for row in route_rows
-        }
+        route_by_id = {int(row["route_id"]): str(row["canonical_route_key"]) for row in route_rows}
         route_dictionary = {
-            str(row["canonical_route_key"]): tuple(
-                str(value) for value in row["customer_sequence"]
-            )
+            str(row["canonical_route_key"]): tuple(str(value) for value in row["customer_sequence"])
             for row in route_rows
         }
         lane_dictionary = {
-            int(key): str(value)
-            for key, value in dict(index.get("lane_dictionary", {})).items()
+            int(key): str(value) for key, value in dict(index.get("lane_dictionary", {})).items()
         }
         operator_dictionary = {
             int(key): str(value)
@@ -2246,6 +3128,7 @@ class ArtifactReader:
                 lane_dictionary=lane_dictionary,
                 operator_dictionary=operator_dictionary,
             )
+            payload.pop("embedded_checks", None)
             if record_type == "route_evaluation":
                 route_evaluations.append(
                     {
@@ -2263,19 +3146,20 @@ class ArtifactReader:
                     }
                 )
             elif record_type == "screening_decision":
+                embedded_checks = row.get("embedded_checks")
                 screening_decisions.append(
                     {
                         **payload,
                         "decision_id": int(row.get("decision_id") or 0),
                         "route_key": _route_key(route_by_id, row.get("route_id")),
-                        "checks": checks_by_event.get(int(row["event_id"]), []),
+                        "checks": (
+                            embedded_checks
+                            if isinstance(embedded_checks, list)
+                            else checks_by_event.get(int(row["event_id"]), [])
+                        ),
                         "demand": float(extras.get("demand", 0.0)),
-                        "min_time_window_slack": float(
-                            extras.get("min_time_window_slack", 0.0)
-                        ),
-                        "distance_lower_bound": float(
-                            extras.get("distance_lower_bound", 0.0)
-                        ),
+                        "min_time_window_slack": float(extras.get("min_time_window_slack", 0.0)),
+                        "distance_lower_bound": float(extras.get("distance_lower_bound", 0.0)),
                         "distance_increment_lower_bound": extras.get(
                             "distance_increment_lower_bound"
                         ),
@@ -2365,19 +3249,13 @@ def _event_payload(
     }
     payload.update(extras)
     if row.get("lane_id") is not None:
-        payload["lane"] = _dictionary_value(
-            lane_dictionary, row["lane_id"], "lane"
-        )
+        payload["lane"] = _dictionary_value(lane_dictionary, row["lane_id"], "lane")
     if row.get("operator_id") is not None:
-        payload["operator"] = _dictionary_value(
-            operator_dictionary, row["operator_id"], "operator"
-        )
+        payload["operator"] = _dictionary_value(operator_dictionary, row["operator_id"], "operator")
     if row.get("route_id") is not None:
         payload["route_key"] = _route_key(route_by_id, row["route_id"])
     if row.get("route_ids"):
-        payload["route_keys"] = [
-            _route_key(route_by_id, value) for value in row["route_ids"]
-        ]
+        payload["route_keys"] = [_route_key(route_by_id, value) for value in row["route_ids"]]
     if row.get("current_route_ids"):
         payload["current_route_keys"] = [
             _route_key(route_by_id, value) for value in row["current_route_ids"]
@@ -2395,9 +3273,7 @@ def _event_payload(
     return payload
 
 
-def _dictionary_value(
-    dictionary: Mapping[int, str], value: object, field_name: str
-) -> str:
+def _dictionary_value(dictionary: Mapping[int, str], value: object, field_name: str) -> str:
     try:
         return dictionary[int(str(value))]
     except (KeyError, TypeError, ValueError) as error:

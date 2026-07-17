@@ -19,6 +19,7 @@ dependencies = [
   "numba>=0.63,<1",
   "numpy>=2.3,<3",
   "ortools>=9.14,<10",
+  "orjson>=3.11,<4",
   "pandas>=2.3,<4",
   "pyarrow>=18,<24",
   "scipy>=1.16,<2",
@@ -45,6 +46,7 @@ wheel.packages = ["src/evrptw"]
 [tool.ruff]
 line-length = 100
 target-version = "py313"
+extend-exclude = ["._*", "**/._*"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

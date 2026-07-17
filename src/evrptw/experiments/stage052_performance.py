@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
+import gc
 import hashlib
 import json
 import re
@@ -11,7 +13,8 @@ import resource
 import subprocess
 import time
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from multiprocessing import get_context
@@ -26,6 +29,7 @@ from evrptw.artifacts import (
     ArtifactStorageConfig,
     aggregate_diagnostic_events,
     build_stage03_critical_events,
+    iter_stage03_critical_events,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
 from evrptw.environment import collect_environment
@@ -114,6 +118,7 @@ class _ShardTask:
     seed: int
     shard_ordinal: int
     worker_count: int
+    storage: ArtifactStorageConfig
 
 
 def load_stage052_config(path: Path) -> Stage052Config:
@@ -145,13 +150,9 @@ def load_stage052_config(path: Path) -> Stage052Config:
     return config
 
 
-def validate_stage052_run_label(
-    run_label: str, component: Stage052Component | str
-) -> None:
+def validate_stage052_run_label(run_label: str, component: Stage052Component | str) -> None:
     selected = Stage052Component(component)
-    pattern = re.compile(
-        rf"^stage05\.2_{re.escape(selected.value)}_(?:attempt|rerun)[0-9]{{2}}$"
-    )
+    pattern = re.compile(rf"^stage05\.2_{re.escape(selected.value)}_(?:attempt|rerun)[0-9]{{2}}$")
     if pattern.fullmatch(run_label) is None:
         raise ValueError(
             "Stage 5.2 run label must be canonical: "
@@ -159,14 +160,10 @@ def validate_stage052_run_label(
         )
 
 
-def axes_for_scope(
-    scope: str, *, customer_count: int | None = None
-) -> tuple[Stage052Axis, ...]:
+def axes_for_scope(scope: str, *, customer_count: int | None = None) -> tuple[Stage052Axis, ...]:
     if scope == "performance":
         return (
-            Stage052Axis(
-                "fixed_work_control", "fixed_work", 120.0, 100, False
-            ),
+            Stage052Axis("fixed_work_control", "fixed_work", 120.0, 100, False),
             Stage052Axis("fixed_work", "fixed_work", 120.0, 100),
             Stage052Axis("wall_clock_30", "wall_clock", 30.0),
         )
@@ -177,9 +174,7 @@ def axes_for_scope(
             raise ValueError("formal scope requires customer_count")
         return tuple(
             Stage052Axis(f"wall_clock_{budget}", "wall_clock", float(budget))
-            for budget in formal_budget_matrix().budgets_for_customer_count(
-                customer_count
-            )
+            for budget in formal_budget_matrix().budgets_for_customer_count(customer_count)
         )
     raise ValueError(f"unsupported Stage 5.2 scope: {scope}")
 
@@ -194,8 +189,7 @@ def verify_stage051_prerequisite(path: Path) -> dict[str, Any]:
     if (
         payload.get("run_label") != "stage05.1_best_known_attempt06"
         or payload.get("status") != "READY_FOR_STAGE05_2"
-        or payload.get("comparison_baseline")
-        != "stage04_adaptive_weights_attempt15"
+        or payload.get("comparison_baseline") != "stage04_adaptive_weights_attempt15"
     ):
         raise RuntimeError(
             "Stage 5.2 requires accepted stage05.1_best_known_attempt06 "
@@ -228,9 +222,7 @@ def run_stage052(
         raise FileExistsError(resolved_output)
     _require_clean_repository(root)
     config = load_stage052_config(resolved_config)
-    prerequisite = verify_stage051_prerequisite(
-        _resolve(root, config.stage051_manifest)
-    )
+    prerequisite = verify_stage051_prerequisite(_resolve(root, config.stage051_manifest))
     instances, seeds = _scope_identities(scope)
     if selected in {
         Stage052Component.PERF_BASELINE,
@@ -279,20 +271,27 @@ def run_stage052(
         instances=instances,
         seeds=seeds,
         worker_count=worker_count,
+        storage=storage,
     )
     rows: list[dict[str, object]] = []
     try:
         if storage.storage_policy_version == ARTIFACT_STORAGE_V2:
             rows = _run_v2_tasks(tasks, worker_count=worker_count)
             parent_writer.adopt_v2_shards(
-                expected_identities=tuple(
-                    (task.instance_name, task.seed) for task in tasks
-                )
+                expected_identities=tuple((task.instance_name, task.seed) for task in tasks)
             )
         else:
             for task in tasks:
                 rows.extend(_run_and_persist_shard(task, writer=parent_writer))
-    except BaseException:
+    except BaseException as error:
+        if storage.storage_policy_version == ARTIFACT_STORAGE_V2:
+            for task in tasks:
+                _ensure_partial_shard_failure(task, error)
+            with contextlib.suppress(BaseException):
+                parent_writer.adopt_v2_shards(
+                    expected_identities=tuple((task.instance_name, task.seed) for task in tasks),
+                    require_complete=False,
+                )
         parent_writer.finalize(status="partial", evidence_completeness="partial")
         raise
     rows.sort(
@@ -302,9 +301,7 @@ def run_stage052(
             str(row["axis"]),
         )
     )
-    per_run_path = (
-        resolved_output / "control" / f"{run_label}_per_run_results.csv"
-    )
+    per_run_path = resolved_output / "control" / f"{run_label}_per_run_results.csv"
     _write_csv(per_run_path, PER_RUN_FIELDS, rows)
     parent_writer.record_existing_file(
         per_run_path,
@@ -343,6 +340,7 @@ def _build_tasks(
     instances: Sequence[str],
     seeds: Sequence[int],
     worker_count: int,
+    storage: ArtifactStorageConfig,
 ) -> list[_ShardTask]:
     customer_counts = {record.instance: record.customer_count for record in BEST_KNOWN_VALUES}
     tasks: list[_ShardTask] = []
@@ -362,6 +360,7 @@ def _build_tasks(
                 seed=seed,
                 shard_ordinal=ordinal,
                 worker_count=worker_count,
+                storage=storage,
             )
         )
     return tasks
@@ -369,21 +368,70 @@ def _build_tasks(
 
 def _run_v2_tasks(tasks: Sequence[_ShardTask], *, worker_count: int) -> list[dict[str, object]]:
     if worker_count == 1:
-        return [row for task in tasks for row in _run_and_persist_shard(task)]
+        return [row for task in tasks for row in _run_v2_shard_task(task)]
     rows: list[dict[str, object]] = []
-    with ProcessPoolExecutor(
-        max_workers=worker_count,
-        mp_context=get_context("spawn"),
-    ) as executor:
-        futures = {executor.submit(_run_and_persist_shard, task): task for task in tasks}
-        try:
+    futures: dict[Any, _ShardTask] = {}
+    try:
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=get_context("spawn"),
+        ) as executor:
+            futures = {executor.submit(_run_v2_shard_task, task): task for task in tasks}
             for future in as_completed(futures):
                 rows.extend(future.result())
-        except BaseException:
-            for future in futures:
-                future.cancel()
-            raise
+    except BaseException as error:
+        for future in futures:
+            future.cancel()
+        for task in tasks:
+            _ensure_partial_shard_failure(task, error)
+        raise
     return rows
+
+
+def _run_v2_shard_task(task: _ShardTask) -> list[dict[str, object]]:
+    try:
+        return _run_and_persist_shard(task)
+    except BaseException as error:
+        _ensure_partial_shard_failure(task, error)
+        raise
+
+
+def _ensure_partial_shard_failure(task: _ShardTask, error: BaseException | str) -> None:
+    directory = task.run_dir / task.instance_name / str(task.seed)
+    shard_manifest = directory / (
+        f"{task.run_label}_shard_manifest_{task.instance_name}_{task.seed}.json"
+    )
+    sidecar = shard_manifest.with_suffix(".sha256")
+    if shard_manifest.is_file() and sidecar.is_file():
+        try:
+            payload = json.loads(shard_manifest.read_text(encoding="utf-8"))
+            valid = (
+                isinstance(payload, dict)
+                and sidecar.read_text(encoding="utf-8").strip() == _sha256(shard_manifest)
+                and payload.get("storage_policy_version") == ARTIFACT_STORAGE_V2
+                and payload.get("run_label") == task.run_label
+                and payload.get("instance") == task.instance_name
+                and payload.get("seed") == task.seed
+                and payload.get("shard_ordinal") == task.shard_ordinal
+                and payload.get("evidence_completeness") in {"complete", "partial"}
+                and isinstance(payload.get("artifacts"), list)
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            valid = False
+        if valid:
+            return
+    writer = ArtifactBundleWriter(
+        task.run_dir,
+        ArtifactRunContext("stage05.2", task.component, task.run_label),
+        task.storage,
+    )
+    writer.write_v2_failure_shard(
+        instance=task.instance_name,
+        seed=task.seed,
+        shard_ordinal=task.shard_ordinal,
+        worker_identity="failure-recorder",
+        error=error,
+    )
 
 
 def _run_and_persist_shard(
@@ -402,6 +450,20 @@ def _run_and_persist_shard(
         distance_backend=_optimization_profile(Stage052Component(task.component)),
     )
     axes = axes_for_scope(task.scope, customer_count=task.customer_count)
+    storage = (
+        config.v1_storage if task.component in {"perf_baseline", "hot_path"} else config.v2_storage
+    )
+    if storage.storage_policy_version == ARTIFACT_STORAGE_V2:
+        return _run_and_persist_v2_shard(
+            task,
+            writer=writer,
+            config=config,
+            stage04=stage04,
+            stage02=stage02,
+            instance=instance,
+            axes=axes,
+            storage=storage,
+        )
     results: dict[str, ALNSResult] = {}
     solver_times: dict[str, float] = {}
     for axis in axes:
@@ -421,9 +483,7 @@ def _run_and_persist_shard(
             time_limit_seconds=axis.time_limit_seconds,
             operator_profile="stage02_constraint_guided",
             vehicle_operator_config=stage02.vehicle_operator_config,
-            measurement_config=MeasurementConfig(
-                enabled=axis.instrumentation_enabled
-            ),
+            measurement_config=MeasurementConfig(enabled=axis.instrumentation_enabled),
             screening_config=stage04.screening_config,
             cache_incremental_config=stage04.cache_incremental_config,
             backend="cpu_batch",
@@ -432,11 +492,6 @@ def _run_and_persist_shard(
             stage04_config=stage04.stage04_config,
         )
         solver_times[axis.name] = time.perf_counter() - started
-    storage = (
-        config.v1_storage
-        if task.component in {"perf_baseline", "hot_path"}
-        else config.v2_storage
-    )
     shard_writer = writer or ArtifactBundleWriter(
         task.run_dir,
         ArtifactRunContext("stage05.2", task.component, task.run_label),
@@ -490,15 +545,11 @@ def _run_and_persist_shard(
                 "exact_completed_calls": result.exact_completed_calls,
                 "effective_iterations": result.effective_iterations,
                 "batch_launches": batch_launches,
-                "median_batch_occupancy": (
-                    exact_calls / batch_launches if batch_launches else 0.0
-                ),
+                "median_batch_occupancy": (exact_calls / batch_launches if batch_launches else 0.0),
                 "peak_rss_bytes": peak_rss,
                 "vehicle_count": objective.vehicle_count if objective else "",
                 "total_distance": objective.total_distance if objective else "",
-                "total_charging_time": (
-                    objective.total_charging_time if objective else ""
-                ),
+                "total_charging_time": (objective.total_charging_time if objective else ""),
                 "charging_count": objective.charging_count if objective else "",
                 "validator_passed": report.feasible,
                 "semantic_digest": semantic_digests[axis.name],
@@ -507,6 +558,346 @@ def _run_and_persist_shard(
             }
         )
     return rows
+
+
+def _run_and_persist_v2_shard(
+    task: _ShardTask,
+    *,
+    writer: ArtifactBundleWriter | None,
+    config: Stage052Config,
+    stage04: Any,
+    stage02: Any,
+    instance: Instance,
+    axes: Sequence[Stage052Axis],
+    storage: ArtifactStorageConfig,
+) -> list[dict[str, object]]:
+    """Solve, append, and release one axis at a time for storage v2."""
+
+    shard_writer = writer or ArtifactBundleWriter(
+        task.run_dir,
+        ArtifactRunContext("stage05.2", task.component, task.run_label),
+        storage,
+    )
+    shard = shard_writer.open_v2_shard(
+        instance=task.instance_name,
+        seed=task.seed,
+        shard_ordinal=task.shard_ordinal,
+        worker_identity=f"pid-{task.shard_ordinal % max(task.worker_count, 1)}",
+    )
+    raw_axes: dict[str, object] = {}
+    solution_axes: dict[str, object] = {}
+    trace_axes: dict[str, object] = {}
+    drafts: dict[str, dict[str, object]] = {}
+    persistence_by_axis: dict[str, float] = {}
+    event_counts: dict[str, int] = {}
+    failures: list[str] = []
+    try:
+        for axis in axes:
+            solver_started = time.perf_counter()
+            result = _solve_stage052_axis(
+                instance,
+                seed=task.seed,
+                axis=axis,
+                config=config,
+                stage04=stage04,
+                stage02=stage02,
+            )
+            solver_seconds = time.perf_counter() - solver_started
+            trace = result.measurement_trace
+            if trace is None:
+                raise RuntimeError(f"Stage 5.2 {axis.name} result is missing its trace")
+            objective_key = list(result.objective.key) if result.objective else []
+            validation = validate_routes(instance, [list(route) for route in result.routes])
+            reconciliation = trace.reconcile(result)
+            valid = result.feasible and validation.feasible and reconciliation["status"] == "pass"
+            if not valid:
+                failures.append(f"{axis.name}: solver, validator, or trace reconciliation failed")
+            digest = hashlib.sha256()
+            digest.update(
+                json.dumps(
+                    {
+                        "objective_key": objective_key,
+                        "routes": [list(route) for route in result.routes],
+                        "started_calls": result.exact_started_calls,
+                        "completed_calls": result.exact_completed_calls,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            )
+            diagnostic_counts: Counter[tuple[str, str, str, str]] = Counter()
+            route_dictionary = dict(trace.route_dictionary)
+
+            persistence_started = time.perf_counter()
+            event_counts[axis.name] = shard.append(
+                route_dictionary=route_dictionary,
+                critical_events=_iter_stage052_axis_events(
+                    trace=trace,
+                    neighborhood_events=result.neighborhood_events,
+                    route_dictionary=route_dictionary,
+                    axis_name=axis.name,
+                    diagnostic_counts=diagnostic_counts,
+                    digest=digest,
+                ),
+            )
+            shard.flush()
+            diagnostic_rows = [
+                {
+                    "run_label": task.run_label,
+                    "instance": task.instance_name,
+                    "seed": task.seed,
+                    "lane": lane,
+                    "iteration": None,
+                    "operator": operator,
+                    "reason": reason,
+                    "metric": event_type,
+                    "count": count,
+                    "sum_value": None,
+                    "min_value": None,
+                    "max_value": None,
+                }
+                for (lane, operator, reason, event_type), count in sorted(diagnostic_counts.items())
+            ]
+            shard.append(
+                route_dictionary={},
+                critical_events=(),
+                diagnostic_rows=diagnostic_rows,
+            )
+            shard.flush()
+            persistence_by_axis[axis.name] = time.perf_counter() - persistence_started
+            semantic_digest = digest.hexdigest()
+            raw_axes[axis.name] = {
+                "backend": result.charging_backend,
+                "backend_metrics": result.backend_metrics,
+                "objective_key": objective_key,
+                "runtime_seconds": result.runtime_seconds,
+                "effective_iterations": result.effective_iterations,
+                "started_calls": result.exact_started_calls,
+                "completed_calls": result.exact_completed_calls,
+                "termination_reason": result.termination_reason,
+                "semantic_digest": semantic_digest,
+                "trace_reconciliation": reconciliation,
+                "validator_passed": validation.feasible,
+                "valid": valid,
+            }
+            solution_axes[axis.name] = {
+                "routes": [list(route) for route in result.routes],
+                "objective_key": objective_key,
+                "feasible": result.feasible,
+            }
+            trace_axes[axis.name] = trace.to_index_dict()
+            drafts[axis.name] = _stage052_row_draft(
+                task=task,
+                axis=axis,
+                result=result,
+                validation_passed=validation.feasible,
+                solver_seconds=solver_seconds,
+                semantic_digest=semantic_digest,
+                storage=storage,
+            )
+            del result, trace, route_dictionary, diagnostic_rows
+            gc.collect()
+
+        finalize_started = time.perf_counter()
+        shard.finalize(
+            raw_payload={
+                "schema_version": STAGE052_SCHEMA_VERSION,
+                "run_label": task.run_label,
+                "component": task.component,
+                "scope": task.scope,
+                "instance": task.instance_name,
+                "seed": task.seed,
+                "worker_count": task.worker_count,
+                "axes": raw_axes,
+            },
+            solution_payload={
+                "schema_version": STAGE052_SCHEMA_VERSION,
+                "instance": task.instance_name,
+                "seed": task.seed,
+                "axes": solution_axes,
+            },
+            trace_payload={
+                "trace_schema_version": f"{STAGE052_SCHEMA_VERSION}-trace-v1",
+                "axes": trace_axes,
+            },
+            environment_payload={
+                **collect_environment(),
+                "component": task.component,
+                "scope": task.scope,
+                "worker_count": task.worker_count,
+                "peak_rss_bytes": _peak_rss_bytes(),
+            },
+            failure_payload=(
+                {
+                    "schema_version": STAGE052_SCHEMA_VERSION,
+                    "instance": task.instance_name,
+                    "seed": task.seed,
+                    "reasons": failures,
+                    "evidence_completeness": "complete",
+                }
+                if failures
+                else None
+            ),
+        )
+        finalization_seconds = time.perf_counter() - finalize_started
+    except BaseException as error:
+        shard.abort(error)
+        raise
+
+    total_events = sum(event_counts.values())
+    rows: list[dict[str, object]] = []
+    for axis in axes:
+        finalization_share = (
+            finalization_seconds * event_counts[axis.name] / total_events
+            if total_events
+            else finalization_seconds / len(axes)
+        )
+        persistence_seconds = persistence_by_axis[axis.name] + finalization_share
+        row = drafts[axis.name]
+        solver_value = row["solver_seconds"]
+        if not isinstance(solver_value, (int, float)):
+            raise TypeError("solver_seconds must be numeric")
+        row["artifact_persistence_seconds"] = persistence_seconds
+        row["end_to_end_seconds"] = float(solver_value) + persistence_seconds
+        row["peak_rss_bytes"] = _peak_rss_bytes()
+        rows.append(row)
+    return rows
+
+
+def _solve_stage052_axis(
+    instance: Instance,
+    *,
+    seed: int,
+    axis: Stage052Axis,
+    config: Stage052Config,
+    stage04: Any,
+    stage02: Any,
+) -> ALNSResult:
+    exact_deadline = (
+        ExactDeadlineConfig.fixed_exact_calls(
+            axis.exact_call_budget or 100,
+            watchdog_seconds=axis.time_limit_seconds,
+        )
+        if axis.termination_mode == "fixed_work"
+        else ExactDeadlineConfig.wall_clock()
+    )
+    return solve_alns(
+        instance,
+        seed=seed,
+        max_iterations=config.max_iterations,
+        time_limit_seconds=axis.time_limit_seconds,
+        operator_profile="stage02_constraint_guided",
+        vehicle_operator_config=stage02.vehicle_operator_config,
+        measurement_config=MeasurementConfig(enabled=axis.instrumentation_enabled),
+        screening_config=stage04.screening_config,
+        cache_incremental_config=stage04.cache_incremental_config,
+        backend="cpu_batch",
+        batch_size=config.batch_size,
+        exact_deadline_config=exact_deadline,
+        stage04_config=stage04.stage04_config,
+    )
+
+
+def _iter_stage052_axis_events(
+    *,
+    trace: object,
+    neighborhood_events: Iterable[Mapping[str, object]],
+    route_dictionary: dict[str, tuple[str, ...]],
+    axis_name: str,
+    diagnostic_counts: Counter[tuple[str, str, str, str]],
+    digest: Any,
+) -> Iterable[dict[str, object]]:
+    for event in iter_stage03_critical_events(trace, neighborhood_events):
+        record = _route_reference_event(event, route_dictionary, copy_event=False)
+        record["lane"] = f"{axis_name}:{record.get('lane', '')}"
+        record["benchmark_axis"] = axis_name
+        event_type = str(record.get("event_type", record.get("record_type", "event")))
+        if event_type not in {
+            "execution_error",
+            "deadline_boundary",
+            "cache_event",
+            "screening_decision",
+            "route_evaluation",
+            "incremental_propagation",
+        }:
+            diagnostic_counts[
+                (
+                    str(record.get("lane", "")),
+                    str(record.get("operator", "")),
+                    str(record.get("reason", record.get("status", ""))),
+                    event_type,
+                )
+            ] += 1
+        if event_type in {
+            "candidate_state",
+            "cache_event",
+            "exact_budget_boundary",
+        }:
+            digest.update(
+                json.dumps(
+                    {
+                        "event_type": event_type,
+                        "status": record.get("status"),
+                        "accepted": record.get("accepted"),
+                        "global_best": record.get("global_best"),
+                        "operation": record.get("operation"),
+                        "cache_key_digest": record.get("cache_key_digest"),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            )
+        yield record
+
+
+def _stage052_row_draft(
+    *,
+    task: _ShardTask,
+    axis: Stage052Axis,
+    result: ALNSResult,
+    validation_passed: bool,
+    solver_seconds: float,
+    semantic_digest: str,
+    storage: ArtifactStorageConfig,
+) -> dict[str, object]:
+    backend = result.backend_metrics
+    objective = result.objective
+    batch_launches = _strict_int(backend.get("work_batches", 0), "work_batches")
+    exact_calls = _strict_int(backend.get("exact_calls", 0), "exact_calls")
+    return {
+        "instance": task.instance_name,
+        "seed": task.seed,
+        "axis": axis.name,
+        "customer_count": task.customer_count,
+        "component": task.component,
+        "backend": result.charging_backend,
+        "worker_count": task.worker_count,
+        "storage_policy_version": storage.storage_policy_version,
+        "persistence_attribution": "axis_stream_plus_finalization_rows",
+        "solver_seconds": solver_seconds,
+        "artifact_persistence_seconds": 0.0,
+        "end_to_end_seconds": solver_seconds,
+        "screening_seconds": result.screening_statistics.get("screening_runtime_seconds", 0.0),
+        "exact_seconds": backend.get("total_seconds", 0.0),
+        "packing_seconds": backend.get("packing_seconds", 0.0),
+        "unpacking_seconds": backend.get("unpacking_seconds", 0.0),
+        "exact_started_calls": result.exact_started_calls,
+        "exact_completed_calls": result.exact_completed_calls,
+        "effective_iterations": result.effective_iterations,
+        "batch_launches": batch_launches,
+        "median_batch_occupancy": (exact_calls / batch_launches if batch_launches else 0.0),
+        "peak_rss_bytes": 0,
+        "vehicle_count": objective.vehicle_count if objective else "",
+        "total_distance": objective.total_distance if objective else "",
+        "total_charging_time": objective.total_charging_time if objective else "",
+        "charging_count": objective.charging_count if objective else "",
+        "validator_passed": validation_passed,
+        "semantic_digest": semantic_digest,
+        "termination_reason": result.termination_reason,
+        "failure_status": "" if validation_passed else "validator_failed",
+    }
 
 
 def _persist_shard(
@@ -665,10 +1056,12 @@ def _persist_shard(
 def _route_reference_event(
     event: Mapping[str, object],
     route_dictionary: dict[str, tuple[str, ...]],
+    *,
+    copy_event: bool = True,
 ) -> dict[str, object]:
     from evrptw.measurement import canonical_route_key
 
-    output = dict(event)
+    output = dict(event) if copy_event or not isinstance(event, dict) else event
     raw_sequences = output.pop("customer_sequences", None)
     if raw_sequences is None:
         return output
@@ -754,9 +1147,7 @@ def _strict_int(value: object, field: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run one Stage 5.2 component")
-    parser.add_argument(
-        "--config", type=Path, default=Path("configs/stage052_performance.toml")
-    )
+    parser.add_argument("--config", type=Path, default=Path("configs/stage052_performance.toml"))
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--run-label", required=True)
     parser.add_argument(

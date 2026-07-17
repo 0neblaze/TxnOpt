@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import heapq
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +16,10 @@ from evrptw.artifacts import (
     EVENTS_SCHEMA,
     ROUTE_DICTIONARY_SCHEMA,
     SCREENING_CHECKS_SCHEMA,
+    V2_SCREENING_DECISIONS_SCHEMA,
     ArtifactIntegrityError,
     ArtifactReader,
+    expand_v2_screening_decision,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
 from evrptw.experiments.stage052_performance import (
@@ -56,6 +59,88 @@ _C_PREREQUISITE_STATUS = {
 }
 
 
+def _iter_stage052_event_rows(
+    reader: ArtifactReader,
+    *,
+    events_ref: Mapping[str, Any],
+    compact_screening_ref: Mapping[str, Any] | None,
+    event_columns: Sequence[str],
+) -> Iterable[dict[str, object]]:
+    def ordinary_rows() -> Iterable[dict[str, object]]:
+        for batch in reader.iter_parquet_batches(
+            str(events_ref["relative_path"]),
+            schema=EVENTS_SCHEMA,
+            columns=event_columns,
+        ):
+            yield from batch.to_pylist()
+
+    if compact_screening_ref is None:
+        yield from ordinary_rows()
+        return
+
+    def compact_rows() -> Iterable[dict[str, object]]:
+        for batch in reader.iter_parquet_batches(
+            str(compact_screening_ref["relative_path"]),
+            schema=V2_SCREENING_DECISIONS_SCHEMA,
+        ):
+            for row in batch.to_pylist():
+                expanded = expand_v2_screening_decision(row)
+                yield {key: value for key, value in expanded.items() if key in event_columns}
+
+    yield from heapq.merge(
+        ordinary_rows(),
+        compact_rows(),
+        key=lambda row: _strict_int(row.get("event_id"), "event_id"),
+    )
+
+
+def _iter_stage052_check_rows(
+    reader: ArtifactReader,
+    *,
+    checks_ref: Mapping[str, Any],
+    compact_screening_ref: Mapping[str, Any] | None,
+) -> Iterable[dict[str, object]]:
+    def ordinary_rows() -> Iterable[dict[str, object]]:
+        for batch in reader.iter_parquet_batches(
+            str(checks_ref["relative_path"]),
+            schema=SCREENING_CHECKS_SCHEMA,
+        ):
+            yield from batch.to_pylist()
+
+    if compact_screening_ref is None:
+        yield from ordinary_rows()
+        return
+
+    def compact_rows() -> Iterable[dict[str, object]]:
+        for batch in reader.iter_parquet_batches(
+            str(compact_screening_ref["relative_path"]),
+            schema=V2_SCREENING_DECISIONS_SCHEMA,
+            columns=("event_id", "decision_id", "checks"),
+        ):
+            for row in batch.to_pylist():
+                checks = row.get("checks")
+                if not isinstance(checks, list):
+                    continue
+                for index, check in enumerate(checks):
+                    if not isinstance(check, Mapping):
+                        raise ArtifactIntegrityError("compact screening check must be an object")
+                    yield {
+                        "decision_event_id": row.get("event_id"),
+                        "decision_id": row.get("decision_id"),
+                        "check_index": index,
+                        **dict(check),
+                    }
+
+    yield from heapq.merge(
+        ordinary_rows(),
+        compact_rows(),
+        key=lambda row: (
+            _strict_int(row.get("decision_event_id"), "decision_event_id"),
+            _strict_int(row.get("check_index"), "check_index"),
+        ),
+    )
+
+
 def verify_stage052_review_prerequisite(
     raw_dir: Path,
     *,
@@ -85,9 +170,13 @@ def verify_stage052_review_prerequisite(
                 f"expected={expected} observed={payload.get(field)}"
             )
     gates = payload.get("gates")
-    if not isinstance(gates, Mapping) or not gates or any(
-        not isinstance(gate, Mapping) or gate.get("passed") is not True
-        for gate in gates.values()
+    if (
+        not isinstance(gates, Mapping)
+        or not gates
+        or any(
+            not isinstance(gate, Mapping) or gate.get("passed") is not True
+            for gate in gates.values()
+        )
     ):
         raise ValueError("prerequisite review contains a failed or invalid gate")
     files = payload.get("files")
@@ -108,9 +197,7 @@ def replay_stage052_storage_semantics(
     """Recompute storage-comparison digests from raw JSON and streamed events."""
 
     reader = ArtifactReader(raw_dir)
-    artifacts = [
-        item for item in reader.manifest.get("artifacts", []) if isinstance(item, Mapping)
-    ]
+    artifacts = [item for item in reader.manifest.get("artifacts", []) if isinstance(item, Mapping)]
     by_directory: dict[str, dict[tuple[str, str], Mapping[str, Any]]] = {}
     for item in artifacts:
         relative = str(item.get("relative_path", ""))
@@ -125,6 +212,7 @@ def replay_stage052_storage_semantics(
         trace_ref = items.get(("trace", ""))
         route_ref = items.get(("route_dictionary", "canonical_routes"))
         events_ref = items.get(("events", "critical"))
+        compact_screening_ref = items.get(("events", "screening_decisions_v2"))
         checks_ref = items.get(("events", "screening_checks"))
         diagnostic_ref = items.get(("diagnostic", "aggregated"))
         required = (
@@ -139,9 +227,7 @@ def replay_stage052_storage_semantics(
         if all(item is None for item in required):
             continue
         if any(item is None for item in required):
-            raise ArtifactIntegrityError(
-                f"storage replay artifacts are incomplete in {directory}"
-            )
+            raise ArtifactIntegrityError(f"storage replay artifacts are incomplete in {directory}")
         assert raw_ref is not None
         assert solution_ref is not None
         assert trace_ref is not None
@@ -159,13 +245,9 @@ def replay_stage052_storage_semantics(
         if not isinstance(raw_axes, Mapping) or not isinstance(solution_axes, Mapping):
             raise ArtifactIntegrityError(f"storage replay axes are missing in {directory}")
         if set(map(str, raw_axes)) != set(map(str, solution_axes)):
-            raise ArtifactIntegrityError(
-                f"raw/solution axis identity mismatch in {directory}"
-            )
+            raise ArtifactIntegrityError(f"raw/solution axis identity mismatch in {directory}")
         lane_dictionary = _trace_dictionary(trace, "lane_dictionary", directory)
-        operator_dictionary = _trace_dictionary(
-            trace, "operator_dictionary", directory
-        )
+        operator_dictionary = _trace_dictionary(trace, "operator_dictionary", directory)
         route_dictionary: dict[int, dict[str, object]] = {}
         for batch in reader.iter_parquet_batches(
             str(route_ref["relative_path"]),
@@ -189,9 +271,7 @@ def replay_stage052_storage_semantics(
                 "objective_key": list(solution_axis.get("objective_key", [])),
                 "routes": solution_axis.get("routes", []),
                 "started_calls": _strict_int(raw_axis.get("started_calls"), "started_calls"),
-                "completed_calls": _strict_int(
-                    raw_axis.get("completed_calls"), "completed_calls"
-                ),
+                "completed_calls": _strict_int(raw_axis.get("completed_calls"), "completed_calls"),
             }
             axis_hasher = hashlib.sha256()
             axis_hasher.update(_canonical_json_bytes(base) + b"\n")
@@ -209,80 +289,74 @@ def replay_stage052_storage_semantics(
                 "duration_seconds",
             }
         )
-        for batch in reader.iter_parquet_batches(
-            str(events_ref["relative_path"]),
-            schema=EVENTS_SCHEMA,
-            columns=event_columns,
+        previous_event_id = 0
+        for row in _iter_stage052_event_rows(
+            reader,
+            events_ref=events_ref,
+            compact_screening_ref=compact_screening_ref,
+            event_columns=event_columns,
         ):
-            for row in batch.to_pylist():
-                extras_raw = row.get("extras_json")
-                try:
-                    extras = json.loads(extras_raw) if extras_raw else {}
-                except json.JSONDecodeError as error:
-                    raise ArtifactIntegrityError(
-                        f"invalid event extras_json in {directory}"
-                    ) from error
-                if not isinstance(extras, Mapping):
-                    raise ArtifactIntegrityError(
-                        f"event extras_json must be an object in {directory}"
-                    )
-                axis = str(extras.get("benchmark_axis", ""))
-                event_hasher = hashers.get(axis)
-                if event_hasher is None:
-                    raise ArtifactIntegrityError(
-                        f"event has unknown benchmark axis in {directory}: {axis}"
-                    )
-                event_id = _strict_int(row.pop("event_id", None), "event_id")
-                lane_id = _strict_int(row.pop("lane_id", None), "lane_id")
-                operator_id = _strict_int(
-                    row.pop("operator_id", None), "operator_id"
+            event_id = _strict_int(row.get("event_id"), "event_id")
+            if event_id <= previous_event_id:
+                raise ArtifactIntegrityError(f"event IDs are duplicate or unordered in {directory}")
+            previous_event_id = event_id
+            extras_raw = row.get("extras_json")
+            if extras_raw is not None and not isinstance(extras_raw, str):
+                raise ArtifactIntegrityError(f"event extras_json must be text in {directory}")
+            try:
+                extras = json.loads(extras_raw) if extras_raw else {}
+            except json.JSONDecodeError as error:
+                raise ArtifactIntegrityError(f"invalid event extras_json in {directory}") from error
+            if not isinstance(extras, Mapping):
+                raise ArtifactIntegrityError(f"event extras_json must be an object in {directory}")
+            axis = str(extras.get("benchmark_axis", ""))
+            event_hasher = hashers.get(axis)
+            if event_hasher is None:
+                raise ArtifactIntegrityError(
+                    f"event has unknown benchmark axis in {directory}: {axis}"
                 )
-                row.pop("extras_json", None)
-                _replace_event_route_ids(
-                    row,
-                    route_dictionary=route_dictionary,
-                    directory=directory,
-                )
-                event_ordinals[axis] += 1
-                low, high = event_ranges.get(axis, (event_id, event_id))
-                event_ranges[axis] = (min(low, event_id), max(high, event_id))
-                event_payload = {
-                    "record": "event",
-                    "axis_event_ordinal": event_ordinals[axis],
-                    "lane": lane_dictionary.get(lane_id),
-                    "operator": operator_dictionary.get(operator_id),
-                    **row,
-                    "extras": dict(extras),
-                }
-                if event_payload["lane"] is None or event_payload["operator"] is None:
-                    raise ArtifactIntegrityError(
-                        f"event dictionary identity is missing in {directory}"
-                    )
-                event_hasher.update(_canonical_json_bytes(event_payload) + b"\n")
-        for batch in reader.iter_parquet_batches(
-            str(checks_ref["relative_path"]),
-            schema=SCREENING_CHECKS_SCHEMA,
+            row.pop("event_id", None)
+            lane_id = _strict_int(row.pop("lane_id", None), "lane_id")
+            operator_id = _strict_int(row.pop("operator_id", None), "operator_id")
+            row.pop("extras_json", None)
+            _replace_event_route_ids(
+                row,
+                route_dictionary=route_dictionary,
+                directory=directory,
+            )
+            event_ordinals[axis] += 1
+            low, high = event_ranges.get(axis, (event_id, event_id))
+            event_ranges[axis] = (min(low, event_id), max(high, event_id))
+            event_payload = {
+                "record": "event",
+                "axis_event_ordinal": event_ordinals[axis],
+                "lane": lane_dictionary.get(lane_id),
+                "operator": operator_dictionary.get(operator_id),
+                **row,
+                "extras": dict(extras),
+            }
+            if event_payload["lane"] is None or event_payload["operator"] is None:
+                raise ArtifactIntegrityError(f"event dictionary identity is missing in {directory}")
+            event_hasher.update(_canonical_json_bytes(event_payload) + b"\n")
+        for row in _iter_stage052_check_rows(
+            reader,
+            checks_ref=checks_ref,
+            compact_screening_ref=compact_screening_ref,
         ):
-            for row in batch.to_pylist():
-                event_id = _strict_int(
-                    row.get("decision_event_id"), "decision_event_id"
+            event_id = _strict_int(row.get("decision_event_id"), "decision_event_id")
+            matching_axes = [
+                axis for axis, (low, high) in event_ranges.items() if low <= event_id <= high
+            ]
+            if len(matching_axes) != 1:
+                raise ArtifactIntegrityError(
+                    f"screening check event identity is ambiguous in {directory}"
                 )
-                matching_axes = [
-                    axis
-                    for axis, (low, high) in event_ranges.items()
-                    if low <= event_id <= high
-                ]
-                if len(matching_axes) != 1:
-                    raise ArtifactIntegrityError(
-                        f"screening check event identity is ambiguous in {directory}"
-                    )
-                axis = matching_axes[0]
-                payload = dict(row)
-                payload["decision_event_id"] = event_id - event_ranges[axis][0] + 1
-                hashers[axis].update(
-                    _canonical_json_bytes({"record": "screening_check", **payload})
-                    + b"\n"
-                )
+            axis = matching_axes[0]
+            payload = dict(row)
+            payload["decision_event_id"] = event_id - event_ranges[axis][0] + 1
+            hashers[axis].update(
+                _canonical_json_bytes({"record": "screening_check", **payload}) + b"\n"
+            )
         for batch in reader.iter_parquet_batches(
             str(diagnostic_ref["relative_path"]),
             schema=DIAGNOSTIC_SCHEMA,
@@ -298,15 +372,12 @@ def replay_stage052_storage_semantics(
                 payload = dict(row)
                 payload["run_label"] = "<canonical-run-label>"
                 diagnostic_hasher.update(
-                    _canonical_json_bytes({"record": "diagnostic", **payload})
-                    + b"\n"
+                    _canonical_json_bytes({"record": "diagnostic", **payload}) + b"\n"
                 )
         for axis, axis_hasher in hashers.items():
             identity = (instance, seed, axis)
             if identity in output:
-                raise ArtifactIntegrityError(
-                    f"duplicate storage replay identity: {identity}"
-                )
+                raise ArtifactIntegrityError(f"duplicate storage replay identity: {identity}")
             output[identity] = axis_hasher.hexdigest()
     if not output:
         raise ArtifactIntegrityError("storage replay evidence is empty")
@@ -320,12 +391,7 @@ def validate_per_run_scope(
     seeds: Sequence[int],
     axes: Sequence[str],
 ) -> tuple[bool, str]:
-    expected = {
-        (instance, seed, axis)
-        for instance in instances
-        for seed in seeds
-        for axis in axes
-    }
+    expected = {(instance, seed, axis) for instance in instances for seed in seeds for axis in axes}
     observed: list[tuple[str, int, str]] = []
     failures: list[str] = []
     for row in rows:
@@ -386,16 +452,11 @@ def review_stage052(
         scope_passed, scope_detail = _validate_formal_scope(rows, instances, seeds)
     else:
         customer_count = None if scope == "performance" else 5
-        axes = tuple(
-            axis.name
-            for axis in axes_for_scope(scope, customer_count=customer_count)
-        )
+        axes = tuple(axis.name for axis in axes_for_scope(scope, customer_count=customer_count))
         scope_passed, scope_detail = validate_per_run_scope(
             rows, instances=instances, seeds=seeds, axes=axes
         )
-    replay_passed, replay_detail = _replay_solutions(
-        reader, benchmark_dir=benchmark_dir
-    )
+    replay_passed, replay_detail = _replay_solutions(reader, benchmark_dir=benchmark_dir)
     gates: dict[str, dict[str, object]] = {
         "exact_scope": {"passed": scope_passed, "detail": scope_detail},
         "replay_consistency": {"passed": replay_passed, "detail": replay_detail},
@@ -403,8 +464,7 @@ def review_stage052(
             selected, metadata.get("optimization_profile")
         ),
         "persistence_attribution": {
-            "passed": metadata.get("persistence_attribution")
-            == "critical_event_rows",
+            "passed": metadata.get("persistence_attribution") == "critical_event_rows",
             "detail": str(metadata.get("persistence_attribution")),
         },
     }
@@ -435,8 +495,7 @@ def review_stage052(
                 f"**Status: {status}**",
                 "",
                 *[
-                    f"- {name}: {'PASS' if result['passed'] else 'FAIL'} — "
-                    f"{result['detail']}"
+                    f"- {name}: {'PASS' if result['passed'] else 'FAIL'} — {result['detail']}"
                     for name, result in gates.items()
                 ],
                 "",
@@ -481,13 +540,10 @@ def _validate_formal_scope(
         (instance, seed, axis.name)
         for instance in instances
         for seed in seeds
-        for axis in axes_for_scope(
-            "formal", customer_count=_CANONICAL_CUSTOMER_COUNTS[instance]
-        )
+        for axis in axes_for_scope("formal", customer_count=_CANONICAL_CUSTOMER_COUNTS[instance])
     }
     observed = {
-        (str(row["instance"]), _strict_int(row["seed"], "seed"), str(row["axis"]))
-        for row in rows
+        (str(row["instance"]), _strict_int(row["seed"], "seed"), str(row["axis"])) for row in rows
     }
     if len(rows) != len(observed):
         return False, "duplicate formal identity"
@@ -506,9 +562,7 @@ def _validate_formal_scope(
     return True, "exact 2040-run formal identity passed"
 
 
-def _replay_solutions(
-    reader: ArtifactReader, *, benchmark_dir: Path
-) -> tuple[bool, str]:
+def _replay_solutions(reader: ArtifactReader, *, benchmark_dir: Path) -> tuple[bool, str]:
     failures: list[str] = []
     for item in reader.manifest.get("artifacts", []):
         if not isinstance(item, Mapping) or item.get("artifact_type") != "solution":
@@ -641,9 +695,7 @@ def _component_gates(
             _storage_observations(by_component["perf_baseline"]),
             _storage_observations(
                 by_component["hot_path"],
-                semantic_digests=replay_stage052_storage_semantics(
-                    path_by_component["hot_path"]
-                ),
+                semantic_digests=replay_stage052_storage_semantics(path_by_component["hot_path"]),
             ),
             _storage_observations(
                 rows,
@@ -679,19 +731,12 @@ def _component_gates(
         times: dict[int, float] = {}
         rss: dict[int, float] = {}
         for worker_rows in all_rows:
-            workers = {
-                _strict_int(row["worker_count"], "worker_count")
-                for row in worker_rows
-            }
+            workers = {_strict_int(row["worker_count"], "worker_count") for row in worker_rows}
             if len(workers) != 1:
                 return {"worker_selection": {"passed": False, "detail": "mixed worker count"}}
             worker = next(iter(workers))
-            times[worker] = sum(
-                [_strict_float(row["end_to_end_seconds"]) for row in worker_rows]
-            )
-            rss[worker] = max(
-                [_strict_float(row["peak_rss_bytes"]) for row in worker_rows]
-            ) / 2**30
+            times[worker] = sum([_strict_float(row["end_to_end_seconds"]) for row in worker_rows])
+            rss[worker] = max([_strict_float(row["peak_rss_bytes"]) for row in worker_rows]) / 2**30
         try:
             selected = select_worker_count(times, rss)
         except ValueError as error:
@@ -710,9 +755,7 @@ def _component_gates(
     return {}
 
 
-def _optimization_profile_gate(
-    component: Stage052Component, observed: object
-) -> dict[str, object]:
+def _optimization_profile_gate(component: Stage052Component, observed: object) -> dict[str, object]:
     expected = (
         "none"
         if component is Stage052Component.PERF_BASELINE
@@ -732,9 +775,7 @@ def _optimization_profile_gate(
     }
 
 
-def _axis_semantics_equal(
-    rows: Sequence[Mapping[str, object]], left: str, right: str
-) -> bool:
+def _axis_semantics_equal(rows: Sequence[Mapping[str, object]], left: str, right: str) -> bool:
     by_identity = {
         (str(row["instance"]), _strict_int(row["seed"], "seed"), str(row["axis"])): str(
             row["semantic_digest"]
@@ -743,8 +784,7 @@ def _axis_semantics_equal(
     }
     identities = {(key[0], key[1]) for key in by_identity if key[2] == left}
     return bool(identities) and all(
-        by_identity.get((instance, seed, left))
-        == by_identity.get((instance, seed, right))
+        by_identity.get((instance, seed, left)) == by_identity.get((instance, seed, right))
         for instance, seed in identities
     )
 
@@ -790,9 +830,7 @@ def _storage_observations(
                     if semantic_digests is not None
                     else str(row["semantic_digest"])
                 ),
-                artifact_persistence_seconds=_strict_float(
-                    row["artifact_persistence_seconds"]
-                ),
+                artifact_persistence_seconds=_strict_float(row["artifact_persistence_seconds"]),
                 end_to_end_seconds=_strict_float(row["end_to_end_seconds"]),
                 peak_rss_bytes=_strict_int(row["peak_rss_bytes"], "peak_rss_bytes"),
             )
@@ -859,9 +897,7 @@ def _canonical_json_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
-def _trace_dictionary(
-    trace: Mapping[str, object], field: str, directory: str
-) -> dict[int, str]:
+def _trace_dictionary(trace: Mapping[str, object], field: str, directory: str) -> dict[int, str]:
     raw = trace.get(field)
     if not isinstance(raw, Mapping):
         raise ArtifactIntegrityError(f"trace {field} is missing in {directory}")

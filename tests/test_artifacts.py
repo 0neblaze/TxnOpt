@@ -6,6 +6,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 import pytest
 
+import evrptw.artifacts as artifacts_module
 from evrptw.artifacts import (
     ArtifactBudgetExceeded,
     ArtifactBundleWriter,
@@ -83,9 +84,7 @@ def test_v2_streams_shards_with_local_event_identity_and_manifest(tmp_path: Path
         prefix = f"toy/{seed}/stage05.2_artifact_streaming_attempt01"
         events = reader.read_events(f"{prefix}_events_toy_{seed}.parquet")
         assert events[0]["event_id"] == 1
-        shard_manifest = reader.read_json(
-            f"{prefix}_shard_manifest_toy_{seed}.json"
-        )
+        shard_manifest = reader.read_json(f"{prefix}_shard_manifest_toy_{seed}.json")
         assert shard_manifest["storage_policy_version"] == "artifact-storage-v2"
         assert shard_manifest["evidence_completeness"] == "complete"
     batches = list(
@@ -97,17 +96,85 @@ def test_v2_streams_shards_with_local_event_identity_and_manifest(tmp_path: Path
     assert sum(batch.num_rows for batch in batches) == 1
     assert batches[0].schema.names == ["event_id", "event_type"]
     parquet = pq.ParquetFile(
-        run_dir
-        / "toy/2014/stage05.2_artifact_streaming_attempt01_events_toy_2014.parquet"
+        run_dir / "toy/2014/stage05.2_artifact_streaming_attempt01_events_toy_2014.parquet"
     )
     assert parquet.metadata.row_group(0).num_rows <= 65_536
 
 
+def test_v2_shard_session_appends_axes_before_finalization(tmp_path: Path) -> None:
+    run_dir = tmp_path / "results" / "stage05.2_artifact_streaming_attempt02"
+    writer = ArtifactBundleWriter(
+        run_dir,
+        ArtifactRunContext(
+            "stage05.2",
+            "artifact_streaming",
+            "stage05.2_artifact_streaming_attempt02",
+        ),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    shard.append(
+        route_dictionary={"route:2:C1": ("C1",)},
+        critical_events=(
+            {
+                "event_type": "route_evaluation",
+                "benchmark_axis": "fixed_work",
+                "route_key": "route:2:C1",
+            },
+        ),
+        diagnostic_rows=(),
+    )
+    shard.flush()
+    shard.append(
+        route_dictionary={"route:2:C2": ("C2",)},
+        critical_events=(
+            {
+                "event_type": "route_evaluation",
+                "benchmark_axis": "wall_clock_30",
+                "route_key": "route:2:C2",
+            },
+            {
+                "event_type": "screening_decision",
+                "benchmark_axis": "wall_clock_30",
+                "route_key": "route:2:C2",
+                "status": "pass",
+                "decision_id": 1,
+                "checks": ({"check": "capacity", "status": "pass", "value": True},),
+            },
+        ),
+        diagnostic_rows=(),
+    )
+    assert shard.max_buffered_groups_observed <= 2
+    shard.finalize(
+        raw_payload={"axes": {}},
+        solution_payload={"axes": {}},
+        trace_payload={"axes": {}},
+        environment_payload={},
+    )
+    bundle = writer.finalize()
+    with pytest.raises(RuntimeError, match="finalized"):
+        shard.abort("late abort")
+    reader = ArtifactReader(bundle.run_dir)
+    prefix = "toy/2014/stage05.2_artifact_streaming_attempt02"
+    events = reader.read_events(f"{prefix}_events_toy_2014.parquet")
+    assert [event["event_id"] for event in events] == [1, 2, 3]
+    assert [event["event_type"] for event in events] == [
+        "route_evaluation",
+        "route_evaluation",
+        "screening_decision",
+    ]
+    routes = reader.read_parquet(f"{prefix}_route_dictionary_toy_2014.parquet")
+    assert {tuple(row["customer_sequence"]) for row in routes} == {("C1",), ("C2",)}
+
+
 def test_v2_parent_adopts_worker_shards_without_reading_event_rows(tmp_path: Path) -> None:
     run_dir = tmp_path / "results" / "stage05.2_job_parallel_attempt01"
-    context = ArtifactRunContext(
-        "stage05.2", "job_parallel", "stage05.2_job_parallel_attempt01"
-    )
+    context = ArtifactRunContext("stage05.2", "job_parallel", "stage05.2_job_parallel_attempt01")
     config = ArtifactStorageConfig(storage_policy_version="artifact-storage-v2")
     worker = ArtifactBundleWriter(run_dir, context, config)
     worker.write_instance_seed(
@@ -127,6 +194,151 @@ def test_v2_parent_adopts_worker_shards_without_reading_event_rows(tmp_path: Pat
     bundle = parent.finalize()
     manifest = verify_manifest(bundle.run_dir)
     assert any(item["artifact_type"] == "shard_manifest" for item in manifest["artifacts"])
+
+
+def test_v2_abort_closes_every_sink_after_one_close_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "results" / "stage05.2_artifact_streaming_attempt03"
+    writer = ArtifactBundleWriter(
+        run_dir,
+        ArtifactRunContext(
+            "stage05.2",
+            "artifact_streaming",
+            "stage05.2_artifact_streaming_attempt03",
+        ),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    attempted: list[str] = []
+    original_close = artifacts_module._StreamingParquetSink.close
+
+    def injected_close(
+        sink: artifacts_module._StreamingParquetSink,
+    ) -> tuple[int, str]:
+        attempted.append(sink.path.name)
+        if "_events_" in sink.path.name:
+            raise OSError("injected EIO")
+        return original_close(sink)
+
+    monkeypatch.setattr(artifacts_module._StreamingParquetSink, "close", injected_close)
+
+    shard.abort("worker failed")
+
+    assert len(attempted) == 5
+    prefix = run_dir / "toy" / "2014" / "stage05.2_artifact_streaming_attempt03"
+    failure = json.loads(Path(f"{prefix}_failure_toy_2014.json").read_text(encoding="utf-8"))
+    assert failure["cleanup_failures"]
+    manifest = json.loads(
+        Path(f"{prefix}_shard_manifest_toy_2014.json").read_text(encoding="utf-8")
+    )
+    assert manifest["evidence_completeness"] == "partial"
+    assert Path(f"{prefix}_shard_manifest_toy_2014.sha256").is_file()
+    parent = ArtifactBundleWriter(run_dir, writer.context, writer.config)
+    parent.adopt_v2_shards(expected_identities=(("toy", 2014),), require_complete=False)
+    parent.finalize(status="partial", evidence_completeness="partial")
+    verified = verify_manifest(run_dir)
+    assert verified["evidence_completeness"] == "partial"
+
+
+def test_v2_failure_shard_preserves_abrupt_worker_fragment(tmp_path: Path) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt04"
+    run_dir = tmp_path / "results" / run_label
+    context = ArtifactRunContext("stage05.2", "artifact_streaming", run_label)
+    config = ArtifactStorageConfig(storage_policy_version="artifact-storage-v2")
+    directory = run_dir / "toy" / "2014"
+    directory.mkdir(parents=True)
+    fragment = directory / f"{run_label}_events_toy_2014.parquet"
+    fragment.write_bytes(b"abrupt worker fragment")
+    original_failure = directory / f"{run_label}_failure_toy_2014.json"
+    original_failure_bytes = b'{"specific_worker_error":"EIO"}'
+    original_failure.write_bytes(original_failure_bytes)
+
+    writer = ArtifactBundleWriter(run_dir, context, config)
+    writer.write_v2_failure_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="failure-recorder",
+        error="worker process exited",
+    )
+
+    assert fragment.read_bytes() == b"abrupt worker fragment"
+    archived_failures = tuple(directory.glob(f"{run_label}_partial_fragment_failure_*.bin"))
+    assert len(archived_failures) == 1
+    assert archived_failures[0].read_bytes() == original_failure_bytes
+    manifest_path = directory / f"{run_label}_shard_manifest_toy_2014.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["evidence_completeness"] == "partial"
+    assert any(
+        item["artifact_type"] == "partial_shard_fragment"
+        and item["relative_path"] == str(fragment.relative_to(run_dir))
+        for item in manifest["artifacts"]
+    )
+    assert manifest_path.with_suffix(".sha256").is_file()
+
+
+def test_v2_finalize_sidecar_failure_recovers_adoptable_partial_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt05"
+    run_dir = tmp_path / "results" / run_label
+    context = ArtifactRunContext("stage05.2", "artifact_streaming", run_label)
+    config = ArtifactStorageConfig(storage_policy_version="artifact-storage-v2")
+    worker = ArtifactBundleWriter(run_dir, context, config)
+    shard = worker.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    shard.append(
+        route_dictionary={"route:2:C1": ("C1",)},
+        critical_events=({"event_type": "failure_probe", "route_key": "route:2:C1"},),
+    )
+    original_write_text = Path.write_text
+    injected = False
+
+    def fail_first_shard_sidecar(
+        path: Path,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> int:
+        nonlocal injected
+        if not injected and path.name.endswith("_shard_manifest_toy_2014.sha256"):
+            injected = True
+            raise OSError("injected sidecar EIO")
+        return original_write_text(
+            path,
+            data,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+        )
+
+    monkeypatch.setattr(Path, "write_text", fail_first_shard_sidecar)
+    with pytest.raises(OSError, match="sidecar EIO"):
+        shard.finalize(
+            raw_payload={},
+            solution_payload={},
+            trace_payload={},
+            environment_payload={},
+            failure_payload={"specific_failure": "before manifest"},
+        )
+    assert injected
+
+    parent = ArtifactBundleWriter(run_dir, context, config)
+    parent.adopt_v2_shards(expected_identities=(("toy", 2014),), require_complete=False)
+    parent.finalize(status="partial", evidence_completeness="partial")
+    manifest = verify_manifest(run_dir)
+    assert manifest["evidence_completeness"] == "partial"
 
 
 def test_writer_uses_canonical_layout_and_manifest_checksums(tmp_path: Path) -> None:
@@ -158,9 +370,7 @@ def test_writer_uses_canonical_layout_and_manifest_checksums(tmp_path: Path) -> 
                 "route_key": "route:2:C1",
                 "decision_id": 1,
                 "status": "pass",
-                "checks": [
-                    {"check": "capacity", "status": "pass", "value": True}
-                ],
+                "checks": [{"check": "capacity", "status": "pass", "value": True}],
             },
         ],
         diagnostic_rows=[
@@ -176,8 +386,7 @@ def test_writer_uses_canonical_layout_and_manifest_checksums(tmp_path: Path) -> 
 
     instance_dir = result.run_dir / "toy" / "2014"
     assert (
-        instance_dir
-        / "stage03.2_cache_incremental_attempt01_events_toy_2014.parquet"
+        instance_dir / "stage03.2_cache_incremental_attempt01_events_toy_2014.parquet"
     ).is_file()
     assert result.manifest_path.parent.name == "control"
     manifest = verify_manifest(result.run_dir)
@@ -236,10 +445,7 @@ def test_generic_solver_adapter_registers_routes_from_neighborhood_events(
     route_rows = ArtifactReader(bundle.run_dir).read_parquet(
         "toy/2014/stage03.2_cache_incremental_attempt01_route_dictionary_toy_2014.parquet"
     )
-    assert {
-        tuple(row["customer_sequence"])
-        for row in route_rows
-    } == {("C1",), ("C2",)}
+    assert {tuple(row["customer_sequence"]) for row in route_rows} == {("C1",), ("C2",)}
 
 
 def test_writer_preserves_partial_failure_when_budget_is_exceeded(tmp_path: Path) -> None:
@@ -266,9 +472,7 @@ def test_writer_preserves_partial_failure_when_budget_is_exceeded(tmp_path: Path
     )
     assert failure.is_file()
     assert json.loads(failure.read_text(encoding="utf-8"))["evidence_completeness"] == "partial"
-    manifest = verify_manifest(
-        tmp_path / "results" / "stage03.2_cache_incremental_attempt01"
-    )
+    manifest = verify_manifest(tmp_path / "results" / "stage03.2_cache_incremental_attempt01")
     assert manifest["evidence_completeness"] == "partial"
     assert manifest["artifact_status"]["failure"] == "present"
 
@@ -286,8 +490,11 @@ def test_manifest_detects_parquet_tampering(tmp_path: Path) -> None:
         critical_events=[],
     )
     result = writer.finalize()
-    event_path = result.run_dir / "toy" / "2014" / (
-        "stage03.2_cache_incremental_attempt01_events_toy_2014.parquet"
+    event_path = (
+        result.run_dir
+        / "toy"
+        / "2014"
+        / ("stage03.2_cache_incremental_attempt01_events_toy_2014.parquet")
     )
     event_path.write_bytes(event_path.read_bytes() + b"tampered")
     with pytest.raises(ValueError, match="checksum mismatch"):
@@ -347,9 +554,7 @@ def test_event_ids_are_global_and_trace_json_is_an_index(tmp_path: Path) -> None
     )
     assert first[0]["event_id"] == 1
     assert second[0]["event_id"] == 2
-    trace = reader.read_json(
-        "toy/2014/stage03.2_cache_incremental_attempt01_trace_toy_2014.json"
-    )
+    trace = reader.read_json("toy/2014/stage03.2_cache_incremental_attempt01_trace_toy_2014.json")
     assert "events" not in trace
     assert trace["trace_storage_version"] == "stage03-trace-index-v2"
     assert set(trace["schema_fingerprints"]) == {
@@ -358,10 +563,16 @@ def test_event_ids_are_global_and_trace_json_is_an_index(tmp_path: Path) -> None
         "screening_checks",
         "diagnostic",
     }
-    assert pq.ParquetFile(
-        result.run_dir
-        / "toy/2014/stage03.2_cache_incremental_attempt01_events_toy_2014.parquet"
-    ).metadata.row_group(0).column(1).compression == "ZSTD"
+    assert (
+        pq.ParquetFile(
+            result.run_dir
+            / "toy/2014/stage03.2_cache_incremental_attempt01_events_toy_2014.parquet"
+        )
+        .metadata.row_group(0)
+        .column(1)
+        .compression
+        == "ZSTD"
+    )
 
 
 def test_reader_reconstructs_trace_from_current_columns(tmp_path: Path) -> None:
@@ -455,8 +666,11 @@ def test_cache_lookup_and_result_are_one_persisted_event(tmp_path: Path) -> None
         ],
     )
     result = writer.finalize()
-    event_path = result.run_dir / "toy" / "2014" / (
-        "stage03.2_cache_incremental_attempt01_events_toy_2014.parquet"
+    event_path = (
+        result.run_dir
+        / "toy"
+        / "2014"
+        / ("stage03.2_cache_incremental_attempt01_events_toy_2014.parquet")
     )
     rows = pq.read_table(event_path).to_pylist()
     assert len(rows) == 1
@@ -470,9 +684,7 @@ def test_cache_lookup_and_result_are_one_persisted_event(tmp_path: Path) -> None
 def test_event_storage_keeps_explicit_ordering_audit_lists(tmp_path: Path) -> None:
     writer = ArtifactBundleWriter(
         tmp_path / "results" / "stage03.4_control_parallel_attempt01",
-        ArtifactRunContext(
-            "stage03.4", "control_parallel", "stage03.4_control_parallel_attempt01"
-        ),
+        ArtifactRunContext("stage03.4", "control_parallel", "stage03.4_control_parallel_attempt01"),
     )
     writer.write_control(metadata={})
     writer.write_instance_seed(
@@ -496,8 +708,11 @@ def test_event_storage_keeps_explicit_ordering_audit_lists(tmp_path: Path) -> No
         diagnostic_rows=[],
     )
     result = writer.finalize()
-    event_path = result.run_dir / "toy" / "2014" / (
-        "stage03.4_control_parallel_attempt01_events_toy_2014.parquet"
+    event_path = (
+        result.run_dir
+        / "toy"
+        / "2014"
+        / ("stage03.4_control_parallel_attempt01_events_toy_2014.parquet")
     )
     extras = json.loads(pq.read_table(event_path).to_pylist()[0]["extras_json"])
     assert extras["submission_order"] == [0, 1]

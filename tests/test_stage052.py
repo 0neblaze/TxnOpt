@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -12,12 +13,16 @@ from evrptw._core import distance_matrix
 from evrptw.artifacts import (
     ArtifactBundleWriter,
     ArtifactIntegrityError,
+    ArtifactReader,
     ArtifactRunContext,
     ArtifactStorageConfig,
 )
 from evrptw.experiments.stage052_performance import (
     PERFORMANCE_INSTANCES,
     PERFORMANCE_SEEDS,
+    _ensure_partial_shard_failure,
+    _run_v2_shard_task,
+    _ShardTask,
     axes_for_scope,
     validate_stage052_run_label,
     verify_stage051_prerequisite,
@@ -175,16 +180,49 @@ def test_artifact_storage_promotion_enforces_persistence_and_half_rss() -> None:
             peak_rss_bytes=50,
         )
     ]
-    assert not evaluate_artifact_storage_promotion(
-        baseline, predecessor, slow
-    ).persistence_passed
+    assert not evaluate_artifact_storage_promotion(baseline, predecessor, slow).persistence_passed
 
-    memory_heavy = [
-        _storage_observation(policy="artifact-storage-v2", peak_rss_bytes=51)
+    memory_heavy = [_storage_observation(policy="artifact-storage-v2", peak_rss_bytes=51)]
+    assert not evaluate_artifact_storage_promotion(baseline, predecessor, memory_heavy).rss_passed
+
+
+def test_artifact_storage_persistence_gate_uses_run_aggregate() -> None:
+    baseline = [
+        _storage_observation(policy="artifact-storage-v1", peak_rss_bytes=100),
+        replace(
+            _storage_observation(policy="artifact-storage-v1", peak_rss_bytes=100),
+            instance="r101_21",
+        ),
     ]
-    assert not evaluate_artifact_storage_promotion(
-        baseline, predecessor, memory_heavy
-    ).rss_passed
+    predecessor = [
+        _storage_observation(policy="artifact-storage-v1"),
+        replace(
+            _storage_observation(policy="artifact-storage-v1"),
+            instance="r101_21",
+        ),
+    ]
+    candidate = [
+        _storage_observation(
+            policy="artifact-storage-v2",
+            persistence_seconds=0.8,
+            end_to_end_seconds=1.0,
+            peak_rss_bytes=50,
+        ),
+        replace(
+            _storage_observation(
+                policy="artifact-storage-v2",
+                persistence_seconds=1.0,
+                end_to_end_seconds=9.0,
+                peak_rss_bytes=50,
+            ),
+            instance="r101_21",
+        ),
+    ]
+
+    decision = evaluate_artifact_storage_promotion(baseline, predecessor, candidate)
+
+    assert decision.persistence_passed
+    assert "aggregate" in decision.persistence_detail
 
 
 @pytest.mark.parametrize("invalid", (math.nan, math.inf, -math.inf))
@@ -317,8 +355,10 @@ def test_stage052_review_prerequisite_verifies_identity_status_and_files(
     findings = review_dir / "review_findings.csv"
     report.write_text("accepted\n", encoding="utf-8")
     findings.write_text("gate,passed\nall,True\n", encoding="utf-8")
+
     def digest(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
+
     (review_dir / "review_manifest.json").write_text(
         json.dumps(
             {
@@ -390,9 +430,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
             raw_payload={
                 "instance": "c101_21",
                 "seed": 2014,
-                "axes": {
-                    "fixed_work": {"started_calls": 100, "completed_calls": 100}
-                },
+                "axes": {"fixed_work": {"started_calls": 100, "completed_calls": 100}},
             },
             solution_payload={
                 "instance": "c101_21",
@@ -424,9 +462,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
                 },
             ],
             shard_ordinal=0 if policy == "artifact-storage-v2" else None,
-            worker_identity=(
-                "worker-0" if policy == "artifact-storage-v2" else None
-            ),
+            worker_identity=("worker-0" if policy == "artifact-storage-v2" else None),
         )
         writer.finalize()
         return run_dir
@@ -443,7 +479,6 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     )
 
     assert replay_stage052_storage_semantics(v1) == replay_stage052_storage_semantics(v2)
-
     wall_route_only = write(
         "artifact-storage-v2",
         "artifact_streaming",
@@ -460,9 +495,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         "stage05.2_artifact_streaming_attempt98",
         route_evaluation_status="completed_infeasible",
     )
-    assert replay_stage052_storage_semantics(v1) != replay_stage052_storage_semantics(
-        changed_event
-    )
+    assert replay_stage052_storage_semantics(v1) != replay_stage052_storage_semantics(changed_event)
 
     changed_route = write(
         "artifact-storage-v2",
@@ -470,9 +503,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         "stage05.2_artifact_streaming_attempt95",
         fixed_route_customer="C2",
     )
-    assert replay_stage052_storage_semantics(v1) != replay_stage052_storage_semantics(
-        changed_route
-    )
+    assert replay_stage052_storage_semantics(v1) != replay_stage052_storage_semantics(changed_route)
 
     extra_axis = write(
         "artifact-storage-v2",
@@ -492,3 +523,174 @@ def test_native_distance_matrix_matches_worked_euclidean_fixture() -> None:
         [5.0, 0.0, 5.0],
         [10.0, 5.0, 0.0],
     ]
+
+
+def test_storage_replay_expands_compact_v2_screening_decisions(
+    tmp_path: Path,
+) -> None:
+    def payloads() -> tuple[dict[str, object], dict[str, object], list[dict[str, object]]]:
+        raw = {
+            "instance": "c101_21",
+            "seed": 2014,
+            "axes": {"fixed_work": {"started_calls": 0, "completed_calls": 0}},
+        }
+        solution = {
+            "instance": "c101_21",
+            "seed": 2014,
+            "axes": {
+                "fixed_work": {
+                    "routes": [["C1"]],
+                    "objective_key": [1, 10.0, 0.0, 0],
+                }
+            },
+        }
+        events = [
+            {
+                "event_type": "screening_decision",
+                "record_type": "screening_decision",
+                "benchmark_axis": "fixed_work",
+                "route_key": "route:2:C1",
+                "lane": "fixed_work:legacy",
+                "operator": "relocate",
+                "status": "pass",
+                "reason": "",
+                "decision_id": 1,
+                "demand": 1.0,
+                "distance_increment_lower_bound": None,
+                "distance_lower_bound": 2.0,
+                "exact_call_blocked": False,
+                "first_failed_check": "",
+                "min_time_window_slack": 3.0,
+                "negative_cache_hit": False,
+                "single_segment_reachable": True,
+                "structural_energy_lower_bound": 4.0,
+                "checks": [{"check": "capacity", "status": "pass", "value": True}],
+            }
+        ]
+        return raw, solution, events
+
+    v1 = tmp_path / "stage05.2_hot_path_attempt94"
+    v1_writer = ArtifactBundleWriter(
+        v1,
+        ArtifactRunContext("stage05.2", "hot_path", v1.name),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v1"),
+    )
+    raw, solution, events = payloads()
+    v1_writer.write_instance_seed(
+        instance="c101_21",
+        seed=2014,
+        raw_payload=raw,
+        solution_payload=solution,
+        trace_payload={},
+        environment_payload={},
+        route_dictionary={"route:2:C1": ("C1",)},
+        critical_events=events,
+    )
+    v1_writer.finalize()
+
+    v2 = tmp_path / "stage05.2_artifact_streaming_attempt94"
+    v2_writer = ArtifactBundleWriter(
+        v2,
+        ArtifactRunContext("stage05.2", "artifact_streaming", v2.name),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+    raw, solution, events = payloads()
+    shard = v2_writer.open_v2_shard(
+        instance="c101_21",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    shard.append(
+        route_dictionary={"route:2:C1": ("C1",)},
+        critical_events=events,
+    )
+    shard.finalize(
+        raw_payload=raw,
+        solution_payload=solution,
+        trace_payload={},
+        environment_payload={},
+    )
+    v2_writer.finalize()
+
+    assert replay_stage052_storage_semantics(v1) == replay_stage052_storage_semantics(v2)
+    v1_trace = ArtifactReader(v1).reconstruct_trace(
+        "c101_21/2014/stage05.2_hot_path_attempt94_trace_c101_21_2014.json"
+    )
+    v2_trace = ArtifactReader(v2).reconstruct_trace(
+        "c101_21/2014/stage05.2_artifact_streaming_attempt94_trace_c101_21_2014.json"
+    )
+    assert v1_trace["screening_decisions"] == v2_trace["screening_decisions"]
+
+
+def test_v2_pre_open_failure_publishes_partial_shard_evidence(
+    tmp_path: Path,
+) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt93"
+    task = _ShardTask(
+        root=tmp_path,
+        config_path=tmp_path / "missing.toml",
+        run_dir=tmp_path / "results" / run_label,
+        run_label=run_label,
+        component="artifact_streaming",
+        scope="performance",
+        instance_name="c101_21",
+        customer_count=100,
+        seed=2014,
+        shard_ordinal=0,
+        worker_count=1,
+        storage=ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+
+    with pytest.raises(FileNotFoundError):
+        _run_v2_shard_task(task)
+
+    prefix = task.run_dir / "c101_21" / "2014" / run_label
+    failure = Path(f"{prefix}_failure_c101_21_2014.json")
+    manifest = Path(f"{prefix}_shard_manifest_c101_21_2014.json")
+    sidecar = Path(f"{prefix}_shard_manifest_c101_21_2014.sha256")
+    assert failure.is_file()
+    assert sidecar.is_file()
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["evidence_completeness"] == "partial"
+
+
+def test_v2_recovery_replaces_invalid_manifest_and_preserves_it(
+    tmp_path: Path,
+) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt92"
+    task = _ShardTask(
+        root=tmp_path,
+        config_path=tmp_path / "missing.toml",
+        run_dir=tmp_path / "results" / run_label,
+        run_label=run_label,
+        component="artifact_streaming",
+        scope="performance",
+        instance_name="c101_21",
+        customer_count=100,
+        seed=2014,
+        shard_ordinal=0,
+        worker_count=1,
+        storage=ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+    directory = task.run_dir / task.instance_name / str(task.seed)
+    directory.mkdir(parents=True)
+    manifest = directory / (f"{run_label}_shard_manifest_{task.instance_name}_{task.seed}.json")
+    original_manifest = b'{"truncated":true}'
+    manifest.write_bytes(original_manifest)
+    manifest.with_suffix(".sha256").write_text("wrong\n", encoding="utf-8")
+
+    _ensure_partial_shard_failure(task, "worker exited")
+
+    recovered = json.loads(manifest.read_text(encoding="utf-8"))
+    sidecar = manifest.with_suffix(".sha256")
+    assert recovered["evidence_completeness"] == "partial"
+    assert (
+        sidecar.read_text(encoding="utf-8").strip()
+        == hashlib.sha256(manifest.read_bytes()).hexdigest()
+    )
+    archived = tuple(
+        directory.glob(f"{run_label}_partial_fragment_manifest_{task.instance_name}_*.bin")
+    )
+    assert len(archived) == 1
+    assert archived[0].read_bytes() == original_manifest
