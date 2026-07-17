@@ -90,10 +90,12 @@ def test_v2_streams_shards_with_local_event_identity_and_manifest(tmp_path: Path
         assert shard_manifest["evidence_completeness"] == "complete"
     batches = list(
         reader.iter_parquet_batches(
-            "toy/2014/stage05.2_artifact_streaming_attempt01_events_toy_2014.parquet"
+            "toy/2014/stage05.2_artifact_streaming_attempt01_events_toy_2014.parquet",
+            columns=("event_id", "event_type"),
         )
     )
     assert sum(batch.num_rows for batch in batches) == 1
+    assert batches[0].schema.names == ["event_id", "event_type"]
     parquet = pq.ParquetFile(
         run_dir
         / "toy/2014/stage05.2_artifact_streaming_attempt01_events_toy_2014.parquet"

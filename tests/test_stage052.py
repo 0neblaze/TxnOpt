@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import math
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from evrptw._core import distance_matrix
+from evrptw.artifacts import (
+    ArtifactBundleWriter,
+    ArtifactIntegrityError,
+    ArtifactRunContext,
+    ArtifactStorageConfig,
+)
 from evrptw.experiments.stage052_performance import (
     PERFORMANCE_INSTANCES,
     PERFORMANCE_SEEDS,
@@ -12,14 +23,18 @@ from evrptw.experiments.stage052_performance import (
     verify_stage051_prerequisite,
 )
 from evrptw.experiments.stage052_performance_review import (
+    replay_stage052_storage_semantics,
     validate_per_run_scope,
+    verify_stage052_review_prerequisite,
 )
 from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.stage052 import (
     AcceleratorDecision,
+    ArtifactStorageObservation,
     PerformanceObservation,
     Stage052Component,
     decide_accelerator,
+    evaluate_artifact_storage_promotion,
     evaluate_promotion,
     formal_budget_matrix,
     select_worker_count,
@@ -115,6 +130,74 @@ def test_worker_selection_is_fail_fast_and_memory_bounded() -> None:
         select_worker_count({1: 100.0, 2: 80.0, 4: 30.0}, {1: 4, 2: 8, 4: 11})
 
 
+def _storage_observation(
+    *,
+    policy: str,
+    digest: str = "same",
+    persistence_seconds: float = 2.0,
+    end_to_end_seconds: float = 10.0,
+    peak_rss_bytes: int = 50,
+) -> ArtifactStorageObservation:
+    return ArtifactStorageObservation(
+        instance="c101_21",
+        seed=2014,
+        axis="fixed_work",
+        storage_policy_version=policy,
+        semantic_digest=digest,
+        artifact_persistence_seconds=persistence_seconds,
+        end_to_end_seconds=end_to_end_seconds,
+        peak_rss_bytes=peak_rss_bytes,
+    )
+
+
+def test_artifact_storage_promotion_requires_replay_equality() -> None:
+    baseline = [_storage_observation(policy="artifact-storage-v1", peak_rss_bytes=100)]
+    predecessor = [_storage_observation(policy="artifact-storage-v1")]
+    candidate = [_storage_observation(policy="artifact-storage-v2", digest="changed")]
+
+    decision = evaluate_artifact_storage_promotion(baseline, predecessor, candidate)
+
+    assert not decision.replay_equality_passed
+    assert "semantic" in decision.replay_detail
+
+
+def test_artifact_storage_promotion_enforces_persistence_and_half_rss() -> None:
+    baseline = [_storage_observation(policy="artifact-storage-v1", peak_rss_bytes=100)]
+    predecessor = [_storage_observation(policy="artifact-storage-v1")]
+    passing = [_storage_observation(policy="artifact-storage-v2", peak_rss_bytes=50)]
+    decision = evaluate_artifact_storage_promotion(baseline, predecessor, passing)
+    assert decision.passed
+
+    slow = [
+        _storage_observation(
+            policy="artifact-storage-v2",
+            persistence_seconds=3.01,
+            peak_rss_bytes=50,
+        )
+    ]
+    assert not evaluate_artifact_storage_promotion(
+        baseline, predecessor, slow
+    ).persistence_passed
+
+    memory_heavy = [
+        _storage_observation(policy="artifact-storage-v2", peak_rss_bytes=51)
+    ]
+    assert not evaluate_artifact_storage_promotion(
+        baseline, predecessor, memory_heavy
+    ).rss_passed
+
+
+@pytest.mark.parametrize("invalid", (math.nan, math.inf, -math.inf))
+def test_artifact_storage_observation_rejects_non_finite_numbers(
+    invalid: float,
+) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        _storage_observation(
+            policy="artifact-storage-v2",
+            persistence_seconds=invalid,
+        )
+
+
 def test_accelerator_is_skipped_below_occupancy_threshold() -> None:
     decision = decide_accelerator(median_batch_occupancy=31)
     assert decision is AcceleratorDecision.GPU_NOT_JUSTIFIED
@@ -134,7 +217,9 @@ def test_instance_lookup_and_distance_matrix_are_stable() -> None:
     assert instance.distance("D0", "C1") == 5.0
 
 
-def test_stage052_runner_contract_has_canonical_labels_and_axes(tmp_path) -> None:
+def test_stage052_runner_contract_has_canonical_labels_and_axes(
+    tmp_path: Path,
+) -> None:
     validate_stage052_run_label(
         "stage05.2_perf_baseline_attempt01", Stage052Component.PERF_BASELINE
     )
@@ -220,6 +305,183 @@ def test_stage052_reviewer_recomputes_customer_count_identity() -> None:
 
     assert not passed
     assert "customer_count mismatch" in detail
+
+
+def test_stage052_review_prerequisite_verifies_identity_status_and_files(
+    tmp_path: Path,
+) -> None:
+    raw_dir = tmp_path / "stage05.2_hot_path_attempt03"
+    review_dir = raw_dir / "review"
+    review_dir.mkdir(parents=True)
+    report = review_dir / "review_report.md"
+    findings = review_dir / "review_findings.csv"
+    report.write_text("accepted\n", encoding="utf-8")
+    findings.write_text("gate,passed\nall,True\n", encoding="utf-8")
+    def digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    (review_dir / "review_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "stage05.2-review-v1",
+                "run_label": raw_dir.name,
+                "component": "hot_path",
+                "scope": "performance",
+                "status": "READY_FOR_STAGE052_ARTIFACT_STREAMING",
+                "gates": {"all": {"passed": True}},
+                "files": {
+                    report.name: digest(report),
+                    findings.name: digest(findings),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    verify_stage052_review_prerequisite(
+        raw_dir,
+        expected_component="hot_path",
+        expected_status="READY_FOR_STAGE052_ARTIFACT_STREAMING",
+    )
+    report.write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="checksum"):
+        verify_stage052_review_prerequisite(
+            raw_dir,
+            expected_component="hot_path",
+            expected_status="READY_FOR_STAGE052_ARTIFACT_STREAMING",
+        )
+
+
+def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
+    tmp_path: Path,
+) -> None:
+    def write(
+        policy: str,
+        component: str,
+        label: str,
+        *,
+        route_evaluation_status: str = "completed_feasible",
+        extra_solution_axis: bool = False,
+        extra_unreferenced_route: bool = False,
+        fixed_route_customer: str = "C1",
+    ) -> Path:
+        run_dir = tmp_path / label
+        writer = ArtifactBundleWriter(
+            run_dir,
+            ArtifactRunContext("stage05.2", component, label),
+            ArtifactStorageConfig(storage_policy_version=policy),
+        )
+        solution_axes: dict[str, object] = {
+            "fixed_work": {
+                "routes": [["C1"]],
+                "objective_key": [1, 10.0, 0.0, 0],
+            }
+        }
+        if extra_solution_axis:
+            solution_axes["forged_axis"] = {
+                "routes": [["C1"]],
+                "objective_key": [1, 10.0, 0.0, 0],
+            }
+        route_dictionary = {"fixed-route": (fixed_route_customer,)}
+        if extra_unreferenced_route:
+            route_dictionary["wall-only-route"] = ("W1",)
+        writer.write_instance_seed(
+            instance="c101_21",
+            seed=2014,
+            raw_payload={
+                "instance": "c101_21",
+                "seed": 2014,
+                "axes": {
+                    "fixed_work": {"started_calls": 100, "completed_calls": 100}
+                },
+            },
+            solution_payload={
+                "instance": "c101_21",
+                "seed": 2014,
+                "axes": solution_axes,
+            },
+            trace_payload={},
+            environment_payload={},
+            route_dictionary=route_dictionary,
+            critical_events=[
+                {
+                    "event_type": "candidate_state",
+                    "benchmark_axis": "fixed_work",
+                    "status": "rejected",
+                    "accepted": False,
+                    "global_best": False,
+                    "operation": "candidate_rejected",
+                    "cache_key_digest": "abc",
+                },
+                {
+                    "event_type": "route_evaluation",
+                    "benchmark_axis": "fixed_work",
+                    "status": route_evaluation_status,
+                    "kind": "exact_call",
+                    "exact_started": True,
+                    "exact_completed": True,
+                    "evaluation_id": 1,
+                    "route_key": "fixed-route",
+                },
+            ],
+            shard_ordinal=0 if policy == "artifact-storage-v2" else None,
+            worker_identity=(
+                "worker-0" if policy == "artifact-storage-v2" else None
+            ),
+        )
+        writer.finalize()
+        return run_dir
+
+    v1 = write(
+        "artifact-storage-v1",
+        "hot_path",
+        "stage05.2_hot_path_attempt99",
+    )
+    v2 = write(
+        "artifact-storage-v2",
+        "artifact_streaming",
+        "stage05.2_artifact_streaming_attempt99",
+    )
+
+    assert replay_stage052_storage_semantics(v1) == replay_stage052_storage_semantics(v2)
+
+    wall_route_only = write(
+        "artifact-storage-v2",
+        "artifact_streaming",
+        "stage05.2_artifact_streaming_attempt96",
+        extra_unreferenced_route=True,
+    )
+    assert replay_stage052_storage_semantics(v1) == replay_stage052_storage_semantics(
+        wall_route_only
+    )
+
+    changed_event = write(
+        "artifact-storage-v2",
+        "artifact_streaming",
+        "stage05.2_artifact_streaming_attempt98",
+        route_evaluation_status="completed_infeasible",
+    )
+    assert replay_stage052_storage_semantics(v1) != replay_stage052_storage_semantics(
+        changed_event
+    )
+
+    changed_route = write(
+        "artifact-storage-v2",
+        "artifact_streaming",
+        "stage05.2_artifact_streaming_attempt95",
+        fixed_route_customer="C2",
+    )
+    assert replay_stage052_storage_semantics(v1) != replay_stage052_storage_semantics(
+        changed_route
+    )
+
+    extra_axis = write(
+        "artifact-storage-v2",
+        "artifact_streaming",
+        "stage05.2_artifact_streaming_attempt97",
+        extra_solution_axis=True,
+    )
+    with pytest.raises(ArtifactIntegrityError, match="axis identity mismatch"):
+        replay_stage052_storage_semantics(extra_axis)
 
 
 def test_native_distance_matrix_matches_worked_euclidean_fixture() -> None:

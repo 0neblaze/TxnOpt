@@ -8,6 +8,7 @@ call these functions instead of duplicating threshold logic.
 
 from __future__ import annotations
 
+import math
 import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -57,6 +58,52 @@ class PromotionDecision:
     aggregate_median_saving: float
     family_median_savings: Mapping[str, float]
     detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactStorageObservation:
+    instance: str
+    seed: int
+    axis: str
+    storage_policy_version: str
+    semantic_digest: str
+    artifact_persistence_seconds: float
+    end_to_end_seconds: float
+    peak_rss_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.storage_policy_version not in {
+            "artifact-storage-v1",
+            "artifact-storage-v2",
+        }:
+            raise ValueError("unsupported artifact storage policy")
+        if not self.semantic_digest:
+            raise ValueError("semantic_digest is required")
+        if not math.isfinite(self.artifact_persistence_seconds):
+            raise ValueError("artifact_persistence_seconds must be finite")
+        if not math.isfinite(self.end_to_end_seconds):
+            raise ValueError("end_to_end_seconds must be finite")
+        if self.artifact_persistence_seconds < 0.0:
+            raise ValueError("artifact_persistence_seconds cannot be negative")
+        if self.end_to_end_seconds <= 0.0:
+            raise ValueError("end_to_end_seconds must be positive")
+        if self.peak_rss_bytes <= 0:
+            raise ValueError("peak_rss_bytes must be positive")
+
+    @property
+    def identity(self) -> tuple[str, int, str]:
+        return self.instance, self.seed, self.axis
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactStoragePromotionDecision:
+    passed: bool
+    replay_equality_passed: bool
+    persistence_passed: bool
+    rss_passed: bool
+    replay_detail: str
+    persistence_detail: str
+    rss_detail: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +214,105 @@ def evaluate_promotion(
     return PromotionDecision(passed, aggregate, family_medians, detail)
 
 
+def evaluate_artifact_storage_promotion(
+    baseline: Sequence[ArtifactStorageObservation],
+    predecessor: Sequence[ArtifactStorageObservation],
+    candidate: Sequence[ArtifactStorageObservation],
+    *,
+    maximum_persistence_ratio: float = 0.30,
+    maximum_baseline_rss_fraction: float = 0.50,
+) -> ArtifactStoragePromotionDecision:
+    """Evaluate artifact-storage-v2 replay, persistence, and memory gates."""
+
+    if (
+        not math.isfinite(maximum_persistence_ratio)
+        or not 0.0 < maximum_persistence_ratio < 1.0
+    ):
+        raise ValueError("maximum_persistence_ratio must be finite and between 0 and 1")
+    if (
+        not math.isfinite(maximum_baseline_rss_fraction)
+        or not 0.0 < maximum_baseline_rss_fraction <= 1.0
+    ):
+        raise ValueError(
+            "maximum_baseline_rss_fraction must be finite and between 0 and 1"
+        )
+
+    baseline_by_key = _unique_storage_observations(baseline, "baseline")
+    predecessor_by_key = _unique_storage_observations(predecessor, "predecessor")
+    candidate_by_key = _unique_storage_observations(candidate, "candidate")
+    identities_match = (
+        bool(candidate_by_key)
+        and baseline_by_key.keys() == predecessor_by_key.keys()
+        and predecessor_by_key.keys() == candidate_by_key.keys()
+    )
+    policies_match = (
+        all(
+            item.storage_policy_version == "artifact-storage-v1"
+            for item in (*baseline_by_key.values(), *predecessor_by_key.values())
+        )
+        and all(
+            item.storage_policy_version == "artifact-storage-v2"
+            for item in candidate_by_key.values()
+        )
+    )
+    fixed_work_keys = [
+        key for key in candidate_by_key if key[2].startswith("fixed_work")
+    ]
+    semantic_match = (
+        identities_match
+        and bool(fixed_work_keys)
+        and all(
+            predecessor_by_key[key].semantic_digest
+            == candidate_by_key[key].semantic_digest
+            for key in fixed_work_keys
+        )
+    )
+    replay_passed = identities_match and policies_match and semantic_match
+    if not identities_match:
+        replay_detail = "v1/v2 scope identity mismatch"
+    elif not policies_match:
+        replay_detail = "expected v1 baseline/predecessor and v2 candidate"
+    elif not semantic_match:
+        replay_detail = "v1/v2 semantic digest mismatch"
+    else:
+        replay_detail = "v1/v2 semantic replay equality passed"
+
+    persistence_passed = bool(candidate_by_key) and all(
+        item.artifact_persistence_seconds
+        <= maximum_persistence_ratio * item.end_to_end_seconds
+        for item in candidate_by_key.values()
+    )
+    persistence_detail = (
+        f"persistence <= {maximum_persistence_ratio:.0%} for every axis"
+        if persistence_passed
+        else f"persistence exceeds {maximum_persistence_ratio:.0%}"
+    )
+
+    rss_passed = bool(baseline_by_key) and bool(candidate_by_key)
+    baseline_peak = max(
+        (item.peak_rss_bytes for item in baseline_by_key.values()), default=0
+    )
+    candidate_peak = max(
+        (item.peak_rss_bytes for item in candidate_by_key.values()), default=0
+    )
+    rss_limit = baseline_peak * maximum_baseline_rss_fraction
+    rss_passed = rss_passed and candidate_peak <= rss_limit
+    rss_detail = (
+        f"candidate peak RSS {candidate_peak} <= baseline limit {rss_limit:.0f}"
+        if rss_passed
+        else f"candidate peak RSS {candidate_peak} exceeds baseline limit {rss_limit:.0f}"
+    )
+    return ArtifactStoragePromotionDecision(
+        replay_passed and persistence_passed and rss_passed,
+        replay_passed,
+        persistence_passed,
+        rss_passed,
+        replay_detail,
+        persistence_detail,
+        rss_detail,
+    )
+
+
 def select_worker_count(
     end_to_end_seconds: Mapping[int, float],
     aggregate_rss_gib: Mapping[int, float],
@@ -210,6 +356,19 @@ def _unique_observations(
     for observation in observations:
         if observation.identity in result:
             raise ValueError(f"duplicate {label} observation: {observation.identity}")
+        result[observation.identity] = observation
+    return result
+
+
+def _unique_storage_observations(
+    observations: Sequence[ArtifactStorageObservation], label: str
+) -> dict[tuple[str, int, str], ArtifactStorageObservation]:
+    result: dict[tuple[str, int, str], ArtifactStorageObservation] = {}
+    for observation in observations:
+        if observation.identity in result:
+            raise ValueError(
+                f"duplicate {label} storage observation: {observation.identity}"
+            )
         result[observation.identity] = observation
     return result
 

@@ -2105,6 +2105,7 @@ class ArtifactReader:
         *,
         schema: pa.Schema | None = None,
         batch_size: int = V2_PARQUET_ROW_GROUP_SIZE,
+        columns: Sequence[str] | None = None,
     ) -> Iterable[pa.RecordBatch]:
         """Yield verified Parquet batches without materialising the full table."""
 
@@ -2118,7 +2119,17 @@ class ArtifactReader:
             parquet.schema_arrow
         ) != _schema_fingerprint(schema):
             raise ArtifactIntegrityError(f"Parquet schema mismatch: {path}")
-        yield from parquet.iter_batches(batch_size=batch_size)
+        selected_columns = tuple(columns) if columns is not None else None
+        if selected_columns is not None:
+            unknown = set(selected_columns) - set(parquet.schema_arrow.names)
+            if unknown:
+                raise ArtifactIntegrityError(
+                    f"Parquet projection contains unknown columns: {sorted(unknown)}"
+                )
+        yield from parquet.iter_batches(
+            batch_size=batch_size,
+            columns=selected_columns,
+        )
 
     def read_events(self, relative_path: str | Path) -> list[dict[str, Any]]:
         path = _safe_artifact_path(self.run_dir, Path(relative_path).as_posix())

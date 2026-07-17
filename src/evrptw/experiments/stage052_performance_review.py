@@ -10,7 +10,14 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from evrptw.artifacts import ArtifactIntegrityError, ArtifactReader
+from evrptw.artifacts import (
+    DIAGNOSTIC_SCHEMA,
+    EVENTS_SCHEMA,
+    ROUTE_DICTIONARY_SCHEMA,
+    SCREENING_CHECKS_SCHEMA,
+    ArtifactIntegrityError,
+    ArtifactReader,
+)
 from evrptw.best_known import BEST_KNOWN_VALUES
 from evrptw.experiments.stage052_performance import (
     axes_for_scope,
@@ -19,9 +26,11 @@ from evrptw.experiments.stage052_performance import (
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.stage052 import (
+    ArtifactStorageObservation,
     PerformanceObservation,
     Stage052Component,
     decide_accelerator,
+    evaluate_artifact_storage_promotion,
     evaluate_promotion,
     select_worker_count,
 )
@@ -41,6 +50,267 @@ _NEXT_STATUS = {
     Stage052Component.ACCELERATOR_PILOT: "READY_FOR_STAGE052_BENCHMARK",
     Stage052Component.BENCHMARK: "READY_FOR_STAGE05_3",
 }
+_C_PREREQUISITE_STATUS = {
+    "perf_baseline": "READY_FOR_STAGE052_HOT_PATH",
+    "hot_path": "READY_FOR_STAGE052_ARTIFACT_STREAMING",
+}
+
+
+def verify_stage052_review_prerequisite(
+    raw_dir: Path,
+    *,
+    expected_component: str,
+    expected_status: str,
+) -> None:
+    """Verify one accepted Stage 5.2 independent-review identity and its files."""
+
+    manifest_path = raw_dir / "review" / "review_manifest.json"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read prerequisite review manifest: {manifest_path}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("prerequisite review manifest must be an object")
+    expected_identity = {
+        "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
+        "run_label": raw_dir.name,
+        "component": expected_component,
+        "scope": "performance",
+        "status": expected_status,
+    }
+    for field, expected in expected_identity.items():
+        if payload.get(field) != expected:
+            raise ValueError(
+                f"prerequisite review {field} mismatch: "
+                f"expected={expected} observed={payload.get(field)}"
+            )
+    gates = payload.get("gates")
+    if not isinstance(gates, Mapping) or not gates or any(
+        not isinstance(gate, Mapping) or gate.get("passed") is not True
+        for gate in gates.values()
+    ):
+        raise ValueError("prerequisite review contains a failed or invalid gate")
+    files = payload.get("files")
+    if not isinstance(files, Mapping) or set(files) != {
+        "review_findings.csv",
+        "review_report.md",
+    }:
+        raise ValueError("prerequisite review file identity mismatch")
+    for name, expected_checksum in files.items():
+        path = raw_dir / "review" / str(name)
+        if not path.is_file() or _sha256(path) != str(expected_checksum):
+            raise ValueError(f"prerequisite review checksum mismatch: {name}")
+
+
+def replay_stage052_storage_semantics(
+    raw_dir: Path,
+) -> dict[tuple[str, int, str], str]:
+    """Recompute storage-comparison digests from raw JSON and streamed events."""
+
+    reader = ArtifactReader(raw_dir)
+    artifacts = [
+        item for item in reader.manifest.get("artifacts", []) if isinstance(item, Mapping)
+    ]
+    by_directory: dict[str, dict[tuple[str, str], Mapping[str, Any]]] = {}
+    for item in artifacts:
+        relative = str(item.get("relative_path", ""))
+        directory = str(Path(relative).parent)
+        key = (str(item.get("artifact_type", "")), str(item.get("artifact_subtype", "")))
+        by_directory.setdefault(directory, {})[key] = item
+
+    output: dict[tuple[str, int, str], str] = {}
+    for directory, items in sorted(by_directory.items()):
+        raw_ref = items.get(("raw", ""))
+        solution_ref = items.get(("solution", ""))
+        trace_ref = items.get(("trace", ""))
+        route_ref = items.get(("route_dictionary", "canonical_routes"))
+        events_ref = items.get(("events", "critical"))
+        checks_ref = items.get(("events", "screening_checks"))
+        diagnostic_ref = items.get(("diagnostic", "aggregated"))
+        required = (
+            raw_ref,
+            solution_ref,
+            trace_ref,
+            route_ref,
+            events_ref,
+            checks_ref,
+            diagnostic_ref,
+        )
+        if all(item is None for item in required):
+            continue
+        if any(item is None for item in required):
+            raise ArtifactIntegrityError(
+                f"storage replay artifacts are incomplete in {directory}"
+            )
+        assert raw_ref is not None
+        assert solution_ref is not None
+        assert trace_ref is not None
+        assert route_ref is not None
+        assert events_ref is not None
+        assert checks_ref is not None
+        assert diagnostic_ref is not None
+        raw = reader.read_json(str(raw_ref["relative_path"]))
+        solution = reader.read_json(str(solution_ref["relative_path"]))
+        trace = reader.read_json(str(trace_ref["relative_path"]))
+        instance = str(raw.get("instance", solution.get("instance", "")))
+        seed = _strict_int(raw.get("seed", solution.get("seed")), "seed")
+        raw_axes = raw.get("axes")
+        solution_axes = solution.get("axes")
+        if not isinstance(raw_axes, Mapping) or not isinstance(solution_axes, Mapping):
+            raise ArtifactIntegrityError(f"storage replay axes are missing in {directory}")
+        if set(map(str, raw_axes)) != set(map(str, solution_axes)):
+            raise ArtifactIntegrityError(
+                f"raw/solution axis identity mismatch in {directory}"
+            )
+        lane_dictionary = _trace_dictionary(trace, "lane_dictionary", directory)
+        operator_dictionary = _trace_dictionary(
+            trace, "operator_dictionary", directory
+        )
+        route_dictionary: dict[int, dict[str, object]] = {}
+        for batch in reader.iter_parquet_batches(
+            str(route_ref["relative_path"]),
+            schema=ROUTE_DICTIONARY_SCHEMA,
+        ):
+            for row in batch.to_pylist():
+                route_id = _strict_int(row.pop("route_id", None), "route_id")
+                if route_id in route_dictionary:
+                    raise ArtifactIntegrityError(
+                        f"duplicate route dictionary ID in {directory}: {route_id}"
+                    )
+                route_dictionary[route_id] = dict(row)
+        hashers: dict[str, Any] = {}
+        for axis, raw_axis in raw_axes.items():
+            solution_axis = solution_axes.get(axis)
+            if not isinstance(raw_axis, Mapping) or not isinstance(solution_axis, Mapping):
+                raise ArtifactIntegrityError(
+                    f"storage replay axis is invalid: {instance}/{seed}/{axis}"
+                )
+            base = {
+                "objective_key": list(solution_axis.get("objective_key", [])),
+                "routes": solution_axis.get("routes", []),
+                "started_calls": _strict_int(raw_axis.get("started_calls"), "started_calls"),
+                "completed_calls": _strict_int(
+                    raw_axis.get("completed_calls"), "completed_calls"
+                ),
+            }
+            axis_hasher = hashlib.sha256()
+            axis_hasher.update(_canonical_json_bytes(base) + b"\n")
+            hashers[str(axis)] = axis_hasher
+        event_ordinals = {axis: 0 for axis in hashers}
+        event_ranges: dict[str, tuple[int, int]] = {}
+        event_columns = tuple(
+            name
+            for name in EVENTS_SCHEMA.names
+            if name
+            not in {
+                "timestamp_seconds",
+                "started_at",
+                "completed_at",
+                "duration_seconds",
+            }
+        )
+        for batch in reader.iter_parquet_batches(
+            str(events_ref["relative_path"]),
+            schema=EVENTS_SCHEMA,
+            columns=event_columns,
+        ):
+            for row in batch.to_pylist():
+                extras_raw = row.get("extras_json")
+                try:
+                    extras = json.loads(extras_raw) if extras_raw else {}
+                except json.JSONDecodeError as error:
+                    raise ArtifactIntegrityError(
+                        f"invalid event extras_json in {directory}"
+                    ) from error
+                if not isinstance(extras, Mapping):
+                    raise ArtifactIntegrityError(
+                        f"event extras_json must be an object in {directory}"
+                    )
+                axis = str(extras.get("benchmark_axis", ""))
+                event_hasher = hashers.get(axis)
+                if event_hasher is None:
+                    raise ArtifactIntegrityError(
+                        f"event has unknown benchmark axis in {directory}: {axis}"
+                    )
+                event_id = _strict_int(row.pop("event_id", None), "event_id")
+                lane_id = _strict_int(row.pop("lane_id", None), "lane_id")
+                operator_id = _strict_int(
+                    row.pop("operator_id", None), "operator_id"
+                )
+                row.pop("extras_json", None)
+                _replace_event_route_ids(
+                    row,
+                    route_dictionary=route_dictionary,
+                    directory=directory,
+                )
+                event_ordinals[axis] += 1
+                low, high = event_ranges.get(axis, (event_id, event_id))
+                event_ranges[axis] = (min(low, event_id), max(high, event_id))
+                event_payload = {
+                    "record": "event",
+                    "axis_event_ordinal": event_ordinals[axis],
+                    "lane": lane_dictionary.get(lane_id),
+                    "operator": operator_dictionary.get(operator_id),
+                    **row,
+                    "extras": dict(extras),
+                }
+                if event_payload["lane"] is None or event_payload["operator"] is None:
+                    raise ArtifactIntegrityError(
+                        f"event dictionary identity is missing in {directory}"
+                    )
+                event_hasher.update(_canonical_json_bytes(event_payload) + b"\n")
+        for batch in reader.iter_parquet_batches(
+            str(checks_ref["relative_path"]),
+            schema=SCREENING_CHECKS_SCHEMA,
+        ):
+            for row in batch.to_pylist():
+                event_id = _strict_int(
+                    row.get("decision_event_id"), "decision_event_id"
+                )
+                matching_axes = [
+                    axis
+                    for axis, (low, high) in event_ranges.items()
+                    if low <= event_id <= high
+                ]
+                if len(matching_axes) != 1:
+                    raise ArtifactIntegrityError(
+                        f"screening check event identity is ambiguous in {directory}"
+                    )
+                axis = matching_axes[0]
+                payload = dict(row)
+                payload["decision_event_id"] = event_id - event_ranges[axis][0] + 1
+                hashers[axis].update(
+                    _canonical_json_bytes({"record": "screening_check", **payload})
+                    + b"\n"
+                )
+        for batch in reader.iter_parquet_batches(
+            str(diagnostic_ref["relative_path"]),
+            schema=DIAGNOSTIC_SCHEMA,
+        ):
+            for row in batch.to_pylist():
+                lane = str(row.get("lane", ""))
+                axis = lane.split(":", 1)[0]
+                diagnostic_hasher = hashers.get(axis)
+                if diagnostic_hasher is None:
+                    raise ArtifactIntegrityError(
+                        f"diagnostic row has unknown benchmark axis in {directory}: {axis}"
+                    )
+                payload = dict(row)
+                payload["run_label"] = "<canonical-run-label>"
+                diagnostic_hasher.update(
+                    _canonical_json_bytes({"record": "diagnostic", **payload})
+                    + b"\n"
+                )
+        for axis, axis_hasher in hashers.items():
+            identity = (instance, seed, axis)
+            if identity in output:
+                raise ArtifactIntegrityError(
+                    f"duplicate storage replay identity: {identity}"
+                )
+            output[identity] = axis_hasher.hexdigest()
+    if not output:
+        raise ArtifactIntegrityError("storage replay evidence is empty")
+    return output
 
 
 def validate_per_run_scope(
@@ -142,6 +412,7 @@ def review_stage052(
         _component_gates(
             selected,
             rows,
+            raw_dir=raw_dir,
             comparison_dirs=comparison_dirs,
         )
     )
@@ -275,6 +546,7 @@ def _component_gates(
     component: Stage052Component,
     rows: Sequence[Mapping[str, object]],
     *,
+    raw_dir: Path,
     comparison_dirs: Sequence[Path],
 ) -> dict[str, dict[str, object]]:
     if component is Stage052Component.PERF_BASELINE:
@@ -308,16 +580,89 @@ def _component_gates(
             }
         }
     if component is Stage052Component.ARTIFACT_STREAMING:
-        persistence_passed = all(
-            _strict_float(row["artifact_persistence_seconds"])
-            <= 0.30 * _strict_float(row["end_to_end_seconds"])
-            for row in rows
+        if len(comparison_dirs) != 2:
+            return {
+                "storage_prerequisites": {
+                    "passed": False,
+                    "detail": "exactly two comparison directories are required",
+                }
+            }
+        by_component: dict[str, list[dict[str, str]]] = {}
+        path_by_component: dict[str, Path] = {}
+        for path in comparison_dirs:
+            group = _load_per_run(path)
+            components = {str(row["component"]) for row in group}
+            if len(components) != 1:
+                return {
+                    "storage_prerequisites": {
+                        "passed": False,
+                        "detail": "comparison contains mixed component identities",
+                    }
+                }
+            comparison_component = next(iter(components))
+            expected_status = _C_PREREQUISITE_STATUS.get(comparison_component)
+            if expected_status is None:
+                return {
+                    "storage_prerequisites": {
+                        "passed": False,
+                        "detail": f"unexpected comparison component: {comparison_component}",
+                    }
+                }
+            try:
+                verify_stage052_review_prerequisite(
+                    path,
+                    expected_component=comparison_component,
+                    expected_status=expected_status,
+                )
+            except ValueError as error:
+                return {
+                    "storage_prerequisites": {
+                        "passed": False,
+                        "detail": str(error),
+                    }
+                }
+            if comparison_component in by_component:
+                return {
+                    "storage_prerequisites": {
+                        "passed": False,
+                        "detail": f"duplicate comparison component: {comparison_component}",
+                    }
+                }
+            by_component[comparison_component] = group
+            path_by_component[comparison_component] = path
+        if set(by_component) != {"perf_baseline", "hot_path"}:
+            return {
+                "storage_prerequisites": {
+                    "passed": False,
+                    "detail": "perf_baseline and hot_path comparisons are required",
+                }
+            }
+        storage_decision = evaluate_artifact_storage_promotion(
+            _storage_observations(by_component["perf_baseline"]),
+            _storage_observations(
+                by_component["hot_path"],
+                semantic_digests=replay_stage052_storage_semantics(
+                    path_by_component["hot_path"]
+                ),
+            ),
+            _storage_observations(
+                rows,
+                semantic_digests=replay_stage052_storage_semantics(raw_dir),
+            ),
         )
         return {
+            "v1_v2_replay_equality": {
+                "passed": storage_decision.replay_equality_passed,
+                "detail": storage_decision.replay_detail,
+            },
             "persistence_ratio": {
-                "passed": persistence_passed,
-                "detail": "persistence <=30%" if persistence_passed else "persistence exceeds 30%",
-            }
+                "passed": storage_decision.persistence_passed,
+                "detail": storage_decision.persistence_detail,
+            },
+            "peak_rss": {
+                "passed": storage_decision.rss_passed,
+                "detail": storage_decision.rss_detail,
+            },
         }
     if component is Stage052Component.JOB_PARALLEL:
         if len(comparison_dirs) != 2:
@@ -333,16 +678,19 @@ def _component_gates(
         ]
         times: dict[int, float] = {}
         rss: dict[int, float] = {}
-        for group in all_rows:
-            workers = {_strict_int(row["worker_count"], "worker_count") for row in group}
+        for worker_rows in all_rows:
+            workers = {
+                _strict_int(row["worker_count"], "worker_count")
+                for row in worker_rows
+            }
             if len(workers) != 1:
                 return {"worker_selection": {"passed": False, "detail": "mixed worker count"}}
             worker = next(iter(workers))
             times[worker] = sum(
-                [_strict_float(row["end_to_end_seconds"]) for row in group]
+                [_strict_float(row["end_to_end_seconds"]) for row in worker_rows]
             )
             rss[worker] = max(
-                [_strict_float(row["peak_rss_bytes"]) for row in group]
+                [_strict_float(row["peak_rss_bytes"]) for row in worker_rows]
             ) / 2**30
         try:
             selected = select_worker_count(times, rss)
@@ -417,6 +765,43 @@ def _observations(
     ]
 
 
+def _storage_observations(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    semantic_digests: Mapping[tuple[str, int, str], str] | None = None,
+) -> list[ArtifactStorageObservation]:
+    output: list[ArtifactStorageObservation] = []
+    observed_identities: set[tuple[str, int, str]] = set()
+    for row in rows:
+        identity = (
+            str(row["instance"]),
+            _strict_int(row["seed"], "seed"),
+            str(row["axis"]),
+        )
+        observed_identities.add(identity)
+        output.append(
+            ArtifactStorageObservation(
+                instance=identity[0],
+                seed=identity[1],
+                axis=identity[2],
+                storage_policy_version=str(row["storage_policy_version"]),
+                semantic_digest=(
+                    semantic_digests[identity]
+                    if semantic_digests is not None
+                    else str(row["semantic_digest"])
+                ),
+                artifact_persistence_seconds=_strict_float(
+                    row["artifact_persistence_seconds"]
+                ),
+                end_to_end_seconds=_strict_float(row["end_to_end_seconds"]),
+                peak_rss_bytes=_strict_int(row["peak_rss_bytes"], "peak_rss_bytes"),
+            )
+        )
+    if semantic_digests is not None and observed_identities != semantic_digests.keys():
+        raise ArtifactIntegrityError("storage replay identity does not match per-run rows")
+    return output
+
+
 def _load_per_run(raw_dir: Path) -> list[dict[str, str]]:
     reader = ArtifactReader(raw_dir)
     item = _one_artifact(reader, "per_run_results")
@@ -463,6 +848,67 @@ def _strict_bool(value: object) -> bool:
     if isinstance(value, str) and value.lower() in {"true", "false"}:
         return value.lower() == "true"
     return False
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _trace_dictionary(
+    trace: Mapping[str, object], field: str, directory: str
+) -> dict[int, str]:
+    raw = trace.get(field)
+    if not isinstance(raw, Mapping):
+        raise ArtifactIntegrityError(f"trace {field} is missing in {directory}")
+    output: dict[int, str] = {}
+    for raw_key, raw_value in raw.items():
+        key = _strict_int(raw_key, field)
+        if key in output:
+            raise ArtifactIntegrityError(f"trace {field} contains duplicate IDs")
+        output[key] = str(raw_value)
+    return output
+
+
+def _replace_event_route_ids(
+    event: dict[str, object],
+    *,
+    route_dictionary: Mapping[int, Mapping[str, object]],
+    directory: str,
+) -> None:
+    for field in ("route_id", "base_route_id", "candidate_route_id"):
+        raw_value = event.get(field)
+        if raw_value is None:
+            continue
+        route_id = _strict_int(raw_value, field)
+        route = route_dictionary.get(route_id)
+        if route is None:
+            raise ArtifactIntegrityError(
+                f"event references unknown route ID in {directory}: {route_id}"
+            )
+        event[field] = dict(route)
+    for field in ("route_ids", "current_route_ids", "candidate_route_ids"):
+        raw_values = event.get(field)
+        if raw_values is None:
+            continue
+        if not isinstance(raw_values, (list, tuple)):
+            raise ArtifactIntegrityError(
+                f"event route ID collection is invalid in {directory}: {field}"
+            )
+        routes: list[dict[str, object]] = []
+        for raw_value in raw_values:
+            route_id = _strict_int(raw_value, field)
+            route = route_dictionary.get(route_id)
+            if route is None:
+                raise ArtifactIntegrityError(
+                    f"event references unknown route ID in {directory}: {route_id}"
+                )
+            routes.append(dict(route))
+        event[field] = routes
 
 
 def _sha256(path: Path) -> str:
