@@ -448,8 +448,13 @@ this repository or one of its subdirectories.
   `stage04_adaptive_weights_attempt13` are preserved v5 evidence, but are
   superseded: the v6 reviewer adds the missing non-adaptive refinement call
   partition, exact raw/solution/trace axis identity, and fail-fast raw numeric
-  parsing. New v6 Smoke and Formal attempts are required before
-  `READY_FOR_STAGE05` is republished.
+  parsing. The accepted v6 evidence is Smoke
+  `stage04_adaptive_weights_attempt14` (72/72 axes) and Formal
+  `stage04_adaptive_weights_attempt15` (144/144 axes). The formal independent
+  replay reports `READY_FOR_STAGE05`: all six gates pass, including the complete
+  operator/segment audit, six-category reconciliation, exact identity set, and
+  Stage 0 vehicle-count standard-deviation comparison. Earlier evidence remains
+  preserved and cannot be promoted by the v6 reviewer.
 - Stage 4 review products are tracked under `experiments/summaries/` with
   the current accepted Formal attempt prefix; the artifact registry is
   `experiments/registries/stage04_artifact_registry.csv` and the manifest is
