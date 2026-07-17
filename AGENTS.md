@@ -527,7 +527,78 @@ this repository or one of its subdirectories.
   `experiments/registries/stage05.1_artifact_registry.csv` and the manifest
   is `experiments/manifests/stage05.1_best_known_artifact_manifest.json`.
 
-## Experiment Artifact Storage v2
+## Stage 5.2 Performance and Benchmark Policy
+
+- Stage 5.2 starts only from accepted `stage05.1_best_known_attempt06` with
+  review status `READY_FOR_STAGE05_2`, inheriting the accepted Stage 4 Formal
+  identity `stage04_adaptive_weights_attempt15`. It remains one stage with
+  strictly ordered components: `perf_baseline`, `hot_path`,
+  `artifact_streaming`, `job_parallel`, `native_kernels`, optional
+  `accelerator_pilot`, then `benchmark`. Canonical labels are
+  `stage05.2_<component>_attemptNN` or the corresponding `rerunNN`; a later
+  component cannot begin formal evidence before the prior independent review
+  passes.
+- The fixed performance scope is `c101C5`, `c101_21`, `r101_21`, and
+  `rc101_21` with seeds `2014/2015/2016`. Fixed-work is the primary causal
+  axis; wall-clock is the practical axis. Every comparison records solver,
+  artifact-persistence, and end-to-end time, plus phase timings, exact calls,
+  batch occupancy, operator cost, active cores, peak RSS, rows, bytes, and
+  compression time. CPU utilisation, package power, or kernel time alone is
+  not an acceleration result.
+- Each hot-path or native-kernel promotion must preserve fixed-work objective,
+  validator, exact-call ordering, candidate decisions, and cache semantics.
+  Relative to its declared immediate predecessor, the aggregate paired median
+  end-to-end time across all 100-customer cases must improve by at least 15%,
+  and the C, R, or RC family median may not regress by more than 3%. Failed
+  gates retain their raw evidence and may not be passed by lowering the threshold.
+- Python hot-path work must address measured repeated work before architectural
+  acceleration: stable instance lookups and distance matrices, propagation
+  snapshot construction only on misses, changed-route-only ejection-chain
+  screening, auditable safe screening caches, and per-operator work budgets.
+  Native CPU work then moves only profiled screening, propagation, distance,
+  and exact-label kernels into contiguous C++ data paths and releases the GIL
+  only while no Python object is accessed.
+- Stage 5.2 job parallelism is across independent `(instance, seed)` shards,
+  not within one exact-call batch. Test 1/2/4 workers. Two workers require at
+  least 1.5x end-to-end speedup and at most 12 GiB aggregate RSS. Four workers
+  are selected only with at least 2.5x speedup and at most 12 GiB. If two
+  workers pass and four do not, Formal uses two; if two do not pass, the gate
+  is `NOT_READY`. Worker failure aborts the run without serial fallback.
+- GPU/Metal/MPS is conditional. Run the accelerator pilot only if the selected
+  native CPU route-batch occupancy median is at least 32. Promote an
+  accelerator only when fixed-work semantics match, the aggregate paired
+  median across all 100-customer cases is at least 15% faster end-to-end than
+  native CPU, and no C/R/RC family median regresses by over 3%; transfer,
+  kernel, and synchronisation time are reported separately.
+  `GPU_NOT_JUSTIFIED` is a passing decision when these conditions are not met.
+- Before the Formal benchmark, run the complete selected backend/worker/storage
+  pipeline on the fixed 12-instance, three-seed pilot. Formal uses the declared
+  stratified budget: all 92 instances use 10 seeds at 30 seconds; only the 56
+  100-customer instances additionally use 10 seeds at 60 and 300 seconds.
+  This is 2,040 solver runs and 229,200 declared solver seconds before
+  startup, persistence, review, or rerun overhead.
+  Applicable anytime checkpoints are 1/5/10/30/60/120/300 seconds. Small
+  instances do not receive 60/300-second runs. BKS incompatibility remains in
+  force, so Stage 5.2 does not compute or publish gaps.
+- The independent review publishes
+  `experiments/registries/stage05.2_artifact_registry.csv` and
+  `experiments/manifests/stage05.2_performance_benchmark_artifact_manifest.json`
+  only after exact scope, replay, resource, performance, and completeness gates
+  pass, then reports `READY_FOR_STAGE05_3`. Stage 5.3 uses the same selected
+  backend, worker count, and storage policy; fixed-work is its primary ablation
+  axis and wall-clock its practical axis. The exact-charging-removal ablation
+  is the only one with no exact backend.
+- Stage 6 pricing is not forced onto the ALNS backend, but Stage 6 evidence
+  inherits v2 shard/streaming/job-parallel storage. Stage 7 ALNS conversion and
+  validator replay preserve the selected ordered backend semantics. Every new
+  Stage 8 charging model must pass the Stage 5.2 backend-replacement gate before
+  Formal use. Any later scalar hotspot returns through the same profiling,
+  native-CPU, and conditional-accelerator sequence.
+
+The executable workflow and gate table are maintained in
+`docs/stage052_performance_benchmark_workflow.md`.
+
+## Experiment Artifact Storage Policy and v2 Transition
 
 - All new Stage 0–8 runs must use an enabled `[artifact_storage]` configuration
   and the shared `evrptw.artifacts.ArtifactBundleWriter`/`ArtifactReader`; a
@@ -536,15 +607,33 @@ this repository or one of its subdirectories.
 - The old non-canonical Stage 0–2 entry points remain only for historical
   compatibility tests/reproduction when their configuration has no
   `[artifact_storage]`; the shipped new configurations reject those paths.
-- The current policy is `artifact-storage-v1`: Parquet events with Zstandard
-  level 3, complete critical evidence, aggregated diagnostic evidence, 2 GiB
-  per instance/seed, and 32 GiB per run. New physical evidence belongs under
+- The currently implemented policy is `artifact-storage-v1`: Parquet events
+  with Zstandard level 3, complete critical evidence, aggregated diagnostic
+  evidence, 2 GiB per instance/seed, and 32 GiB per run. New physical evidence belongs under
   `results/<run_label>/<instance>/<seed>/` with control metadata and a manifest
   under `control/`.
+- Stage 5.2 must implement and independently accept `artifact-storage-v2`
+  before its pipeline pilot or Formal benchmark. Until that implementation is
+  merged and reviewed, documentation must not describe v2 as an available
+  runtime. v2 preserves v1 reads and adds Parquet row-group streaming, shard
+  manifests/checksums, worker-owned `(instance, seed)` shards, and parent-only
+  control-manifest finalisation.
+- v2 uses 65,536-row Parquet row groups and buffers at most two row groups per
+  writer. A worker writes only its own shard; the parent never merges event
+  rows in memory. Shard-local event identity is deterministic from canonical
+  shard ordinal plus local event ID, so review never depends on worker
+  completion order. Semantic equality is required; byte-identical Parquet is
+  not.
+- v2 promotion requires v1/v2 replay equality for validator, objective,
+  critical events, exact-call and failure semantics; artifact persistence must
+  be at most 30% of end-to-end time and peak RSS at most 50% of the Stage 5.2
+  v1 baseline. Partial shards are retained with explicit completeness and fail
+  immediately; there is no serial persistence fallback.
 - Critical events are never dropped. Ordinary candidates, repeated timings, and
   operator totals may be aggregated into diagnostic Parquet only when replay
   semantics are unchanged. Route sequences are stored once in the route
-  dictionary; events use global `event_id` and integer route IDs.
+  dictionary. v1 events use global `event_id`; v2 events use canonical shard
+  ordinal plus shard-local event ID. Both use integer route IDs.
 - A cache lookup and its immediate hit/miss result are one persisted
   `lookup_result` event; the in-memory evaluator trace may retain the two
   callbacks for debugging, but storage and replay must count the logical lookup

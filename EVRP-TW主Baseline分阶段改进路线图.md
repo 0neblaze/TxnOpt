@@ -106,7 +106,7 @@ results/stage02.3_constraint_guided_rerun09/r101_21/2015/
 | Stage 2.3 | `stage02.3` | `station_pressure`、`time_window_conflict`、`worst_energy_detour`、`shaw_related` |
 | Stage 3.0–3.4 | `stage03.0`–`stage03.4` | `measurement`、`screening`、`cache`、`incremental`、`parallel` |
 | Stage 4 | `stage04` | `adaptive_weights`、`restart`、`intensification` |
-| Stage 5.1–5.3 | `stage05.1`–`stage05.3` | `best_known`、`benchmark`、`ablation` |
+| Stage 5.1–5.3 | `stage05.1`–`stage05.3` | `best_known`、`perf_baseline`、`hot_path`、`artifact_streaming`、`job_parallel`、`native_kernels`、`accelerator_pilot`、`benchmark`、`ablation` |
 | Stage 6.1–6.3 | `stage06.1`–`stage06.3` | `pricing`、`branching`、`validation` |
 | Stage 7 | `stage07` | `solution_schema`、`validator_contract` |
 | Stage 8 | `stage08` | `partial_linear`、`piecewise_linear`、`nonlinear`、`queueing` |
@@ -115,14 +115,21 @@ results/stage02.3_constraint_guided_rerun09/r101_21/2015/
 
 每个阶段进入正式实验或下一阶段前，必须检查：路径标签完整、artifact type 不含糊、run label 唯一、manifest 可重算、历史映射存在、raw-to-summary（原始数据到汇总）一致，并在阶段审查报告中记录结果。
 
-### 7. 数据保存与证据分层规则（artifact-storage-v1，强制）
+### 7. 数据保存与证据分层规则（v1 现状与 v2 迁移，强制）
 
 从本条规则生效后，所有新的 Stage 0–8 runner 都必须在配置中提供
 `[artifact_storage]`，并通过共享 `ArtifactBundleWriter`/`ArtifactReader` 写入和
-回放产物。默认物理格式为 Parquet/Arrow events（Zstandard level 3），critical
+回放产物。当前已实现策略为 `artifact-storage-v1`；Stage 5.2 必须先实现并独立验收
+`artifact-storage-v2`，之后 Stage 5.2 pipeline pilot、正式 benchmark 和后续阶段强制
+使用 v2。默认物理格式为 Parquet/Arrow events（Zstandard level 3），critical
 evidence（关键证据）完整保存，diagnostic evidence（诊断证据）按
 run/lane/iteration/operator/reason 聚合；每个 instance/seed 上限 2 GiB，每个 run
 上限 32 GiB。
+
+v2 在不改写 v1/legacy bytes（历史字节）的前提下新增 65,536-row streaming、最多
+两个 row groups 的 writer buffer、worker-owned `(instance, seed)` shard、shard
+manifest/checksum 和 parent-only control finalisation。完整迁移契约见
+`docs/experiment_artifact_storage.md`。
 
 旧的非 canonical Stage 0–2 调用仅保留给历史兼容复现，且不得使用新的
 `[artifact_storage]` 配置；仓库提供的新配置会拒绝非 canonical output directory 或
@@ -148,9 +155,9 @@ results/<run_label>/
   review/
 ```
 
-`events.parquet` 必须保留全局递增 `event_id`、exact started/completed、screening、
+`events.parquet` 必须保留确定性事件身份、exact started/completed、screening、
 cache、incremental、deadline、failure、accepted candidate 和 global-best 等
-critical events；事件中的 route、lane、operator 使用整数字典编号，完整客户序列只在 route dictionary 保存一次。trace JSON 保存
+critical events；v1 使用全局递增 `event_id`，v2 使用 canonical shard ordinal 加 shard-local event ID；事件中的 route、lane、operator 使用整数字典编号，完整客户序列只在 route dictionary 保存一次。trace JSON 保存
 counters、配置、Parquet 引用和 schema fingerprint，不得重新嵌入完整 events、
 screening decisions 或 route evaluations。diagnostic 聚合不得影响 validator、
 objective、exact-call ordering 或 failure replay。
@@ -497,13 +504,13 @@ Stage 3.0–3.2 raw evidence 保持旧字节和旧路径，只作为 `legacy_com
 
 从 Stage 3.3 开始，凡调用 ALNS exact charging route evaluation（精确充电路径评估）的新代码、测试和实验必须遵守以下规则：
 
-- `cpu_batch` 是唯一默认和正式后端；Stage 3.3–8 的新实验、性能测试、消融实验、回归测试和正式 benchmark 不得运行 `cpu_scalar`。
+- `cpu_batch` 是当前默认和 Stage 3.3–5.1 唯一正式后端；Stage 5.2 以它作为 fixed-work reference，并只允许通过 Stage 5.2 严格替换门槛的后端成为 Stage 5.2–8 的正式后端。所有新实验均不得运行 `cpu_scalar`。
 - `cpu_scalar` 仅允许由 2026-07-14 之前已经存在的 Stage 0–3.2 历史 runner 配合其冻结配置显式调用，且用途只能是复现既有结果；任何新建或新配置的运行不论使用什么 stage label，都不得调用 `cpu_scalar`，也不得用它生成新的阶段证据或作为未来性能对照。
 - 正确性验证使用已冻结的 pilot 一致性证据、golden fixtures（标准结果样本）、小规模 brute-force enumeration（暴力枚举）和统一 validator 重算，不再重复执行耗时的 scalar 对照。
 - `cpu_batch` 不可用、精度冲突、容量溢出或 deadline 状态不一致时必须 fail fast（立即失败），不得自动或静默回退到 `cpu_scalar`。
 - 每次正式运行必须在配置、manifest、environment 和 reviewer 输出中记录 exact backend、batch launches、transition 数、packing/unpacking 时间、exact-call 数和 batch 总耗时，使后端选择与性能收益可审计。
 
-未来候选加速方案只能与 `cpu_batch` 进行相同工作量的配对比较。替换默认后端前，必须使用相同实例、seed、iterations、候选工作量和 screening/cache 设置，并保证 candidate-work hash、route-result hash、objective tuple、validator、exact-call 数和 effective iterations 完全一致；端到端中位耗时必须比 `cpu_batch` 至少下降 10%，至少两个重点大实例族改善，且任何重点大实例族的中位耗时不得退化。只有独立 reviewer 通过后才能替换；未通过时继续使用 `cpu_batch` 并保留完整失败证据。
+Stage 5.2 以前的候选加速方案以 `cpu_batch` 进行相同工作量的配对比较。Stage 5.2 起，替换正式后端前必须使用相同实例、seed、iterations、候选工作量和 screening/cache 设置，并保证 candidate-work hash、route-result hash、objective tuple、validator、exact-call 数和 effective iterations 完全一致；全部 100-customer 配对的总体端到端中位耗时必须至少降低 15%，同时 C、R、RC 任一 family 的 family median 不得回退超过 3%。只有独立 reviewer 通过后才能替换；未通过时继续使用当前 accepted backend 并保留完整失败证据。
 
 #### 3.3 Exact solver 接口与固定工作量诊断
 
@@ -688,7 +695,7 @@ Stage 4 的配置参数记录在 `configs/stage04_weights.toml`；`Stage04Config
 
 本阶段的入口不是“Stage 2 已经足够快”，而是 Stage 3 已完成 exact-call 对账、单线程语义回归和 deadline 复验，Stage 4 已完成固定权重/自适应权重的公平比较。否则扩展 benchmark 只会放大不可解释的运行成本。
 
-Stage 5 的 pilot、完整 benchmark 和所有仍调用 exact charging 的 ablation 统一使用 `cpu_batch`。不得把 `cpu_scalar` 当作消融项、性能基线或回归路径；移除 exact charging 的消融版本不调用任何 exact backend。
+Stage 5.2 必须先以当前已审查的 `cpu_batch` 作为 reference backend（参考后端）完成固定工作量基线，再按本路线图的 gate 选择正式后端、worker 数和存储策略。Stage 5.2 benchmark 与 Stage 5.3 仍调用 exact charging 的 ablation 必须使用同一组经审查配置；不得把 `cpu_scalar` 当作消融项、性能基线或回归路径。移除 exact charging 的消融版本不调用任何 exact backend。
 
 ### 具体任务
 
@@ -714,19 +721,69 @@ Stage 5.1 已完成实现。BKS 数据来自三篇正式发表的期刊文章：
 
 正式运行需要 clean commit 后执行；审查通过后发布 `experiments/registries/stage05.1_artifact_registry.csv` 和 `experiments/manifests/stage05.1_best_known_artifact_manifest.json`，审查状态为 `READY_FOR_STAGE05_2`。
 
-#### 5.2 扩展 benchmark
+#### 5.2 性能治理与扩展 benchmark
 
-本部分产物前缀固定为 `stage05.2_benchmark`，manifest 的 component 记录为 `benchmark`。
+Stage 5.2 保留一个阶段号，但内部必须严格按以下 gate 顺序执行。后一步不得在前一步独立 review 通过前开始正式证据运行。各部分使用独立 component 和 canonical label（规范标签）：
 
-按预先声明的规则扩展：
+- `stage05.2_perf_baseline_attemptNN`；
+- `stage05.2_hot_path_attemptNN`；
+- `stage05.2_artifact_streaming_attemptNN`；
+- `stage05.2_job_parallel_attemptNN`；
+- `stage05.2_native_kernels_attemptNN`；
+- `stage05.2_accelerator_pilot_attemptNN`；
+- `stage05.2_benchmark_attemptNN`。
 
-- 36 个全部 5/10/15-customer 小规模实例；
-- 56 个全部 100-customer 实例，或先按 C/R/RC、type 1/type 2 分层覆盖；
-- 每个随机算法至少 10 个 seed；
-- 使用 30/60/300 秒统一时间预算；
-- 报告 anytime curve（任意时刻性能曲线）。
+完整执行协议见 `docs/stage052_performance_benchmark_workflow.md`。Stage 5.2 的入口必须是 `stage05.1_best_known_attempt06` 的独立审查状态 `READY_FOR_STAGE05_2`，并继承 Stage 4 accepted Formal identity（正式验收身份）`stage04_adaptive_weights_attempt15`。
 
-执行顺序调整为：先用完整 12×3 组合做 pilot，确认 raw-to-summary（原始数据到汇总）重算、timeout 和模型兼容性均通过；再扩展到 56 个 100-customer 实例。任何失败都保留原目录，不缩减失败样本。
+##### 5.2-A 固定工作量性能基线
+
+1. 固定实例 `c101C5`、`c101_21`、`r101_21`、`rc101_21`，固定 seeds `2014/2015/2016`；
+2. 同时记录 fixed-work（固定工作量）和 wall-clock（墙钟时间）轴，但所有因果性能结论以 fixed-work 为主；
+3. 记录 solver、artifact persistence（产物持久化）和 end-to-end（端到端）时间，不能只报告 CPU time 或功耗；
+4. 记录每阶段耗时、exact-call 数、batch occupancy（批次占用）、operator cost（算子成本）、使用核心数、peak RSS（峰值常驻内存）、写入行数/字节数和压缩耗时；
+5. 固定当前 `cpu_batch`、单 worker、`artifact-storage-v1`，形成后续每个 gate 的直接比较基线。
+
+##### 5.2-B 消除 Python 热路径重复工作
+
+按 profiling（性能剖析）证据依次处理：缓存 `Instance` 的 name lookup、depot/customer/station 分组和 distance matrix（距离矩阵）；修复 cache hit 时仍重建 propagation snapshot（传播快照）的 eager evaluation（提前求值）；ejection chain（弹射链）只复查 changed routes（已变路线）；screening cache（筛选缓存）只允许保存可证明安全且可审计的正向结果；为每个 operator 设置耗时和 exact-call 预算。
+
+验收使用 strict performance gate（严格性能门槛）：fixed-work objective、validator、exact-call ordering、candidate decision 和 cache semantics 必须一致；相对 5.2-A，全部 100-customer 配对的总体端到端中位运行时间必须至少降低 15%，同时 C、R、RC 任一 family 的 family median 不得回退超过 3%。未通过时保留证据并定位根因，不得降低门槛或绕过语义检查。
+
+##### 5.2-C Streaming/sharded artifact storage
+
+实现 `artifact-storage-v2`：Parquet row-group streaming（行组流式写入）、按 `(instance, seed)` 分片、worker 只写自己的 shard（分片）、parent 只写 control manifest（控制清单）。固定 row group 为 65,536 rows，writer 最多缓存 2 个 row groups；每个 shard 有独立 manifest、checksum 和 completeness 状态。v1 reader 必须继续可读，历史字节不得移动或改写。
+
+gate：v1/v2 raw replay 的 validator、objective、critical-event、exact-call 和 failure semantics（失败语义）一致；artifact persistence 不得超过 end-to-end 的 30%；peak RSS 不得超过 5.2-A 的 50%。partial shard 必须保留并 fail fast（快速失败），不得静默截断或串行兜底。
+
+##### 5.2-D Job-level parallelism
+
+并行单位是独立 `(instance, seed)` shard，不再在单次 exact-call 内使用 Stage 3.4 已证明低效的四进程路径。以 1/2/4 workers 做固定工作量对照；worker 独占 shard，parent 按 canonical key（规范键）合并 manifest，完成顺序不得改变 replay 顺序或事件身份。
+
+gate：2 workers 相对 1 worker 的端到端 speedup（加速比）至少 1.5×，aggregate RSS（总常驻内存）不超过 12 GiB；只有 4 workers 达到至少 2.5× 且不超过 12 GiB 时才选 4。2 workers 通过而 4 workers 未通过时，正式配置固定为 2；2 workers 未通过时本 gate 为 `NOT_READY`。任何 worker 异常立即终止该 run，不允许隐式串行 fallback（回退）。
+
+##### 5.2-E Native CPU hot kernels
+
+将 profiling 确认的 screening、snapshot propagation、distance lookup、exact label expansion/dominance/heap 等热点迁入 C++ contiguous arrays（连续数组）实现，并在不访问 Python 对象的计算区释放 GIL（全局解释器锁）。不得以大规模重写替代逐热点 fixed-work 对照。
+
+gate：fixed-work 语义必须与 5.2-D selected configuration（选定配置）一致；相对 5.2-D，全部 100-customer 配对的总体端到端中位时间必须再降低至少 15%，同时 C、R、RC 任一 family 的 family median 不得回退超过 3%。
+
+##### 5.2-F Conditional accelerator gate
+
+GPU/Metal/MPS 不是必做目标。只有 native CPU 后端的 route batch occupancy 中位数达到 32 时才执行 `stage05.2_accelerator_pilot_attemptNN`。GPU pilot 必须单独记录 host-to-device、kernel、device-to-host 和 synchronization（同步）时间。
+
+只有 fixed-work 语义完全一致、相对 selected native CPU 的全部 100-customer 配对总体端到端中位时间至少降低 15%，且 C、R、RC 任一 family 的 family median 不回退超过 3% 时，GPU 才能成为正式后端。否则发布 `GPU_NOT_JUSTIFIED` 是通过该 gate 的合法结论，正式 benchmark 继续使用 native CPU；不得保留自动 CPU fallback 来掩盖 accelerator failure（加速器失败）。
+
+##### 5.2-G 分层 benchmark
+
+先执行固定 Stage 0 代表集的 `12 instances × 3 seeds` 完整 pipeline pilot（流程试运行），覆盖正式 backend、worker、streaming writer、reviewer 和 summary generation（汇总生成）。pilot 通过后执行预先声明的分层预算：
+
+- 全部 92 个实例（36 small + 56 100-customer）运行 `10 seeds × 30 seconds`；
+- 仅 56 个 100-customer 实例额外运行 `10 seeds × 60 seconds` 和 `10 seeds × 300 seconds`；
+- small instances 不运行 60/300 秒，避免在 iteration limit（迭代上限）后浪费预算；
+- anytime checkpoints 固定为适用预算内的 `1/5/10/30/60/120/300 seconds`；
+- 任何失败都保留原 shard 和 run label，不缩减失败样本，不用补跑结果覆盖原失败。
+
+BKS 模型不兼容结论继续有效，因此不得计算或发布 gap。正式 review 必须发布 `stage05.2_artifact_registry.csv`、`stage05.2_performance_benchmark_artifact_manifest.json`、逐次结果、分 family/预算汇总、anytime curves、资源与持久化开销表，并且只有全部 replay/gate 通过时报告 `READY_FOR_STAGE05_3`。
 
 #### 5.3 Ablation study（消融实验）
 
@@ -742,13 +799,13 @@ Stage 5.1 已完成实现。BKS 数据来自三篇正式发表的期刊文章：
 - OR-Tools initialization；
 - cheap screening 与缓存。
 
-每个消融版本必须使用相同实例、seed、时间预算和 `cpu_batch` 后端；只有“移除 exact charging”这一项不调用 exact backend。
+每个消融版本必须使用相同实例、seed、时间预算以及 Stage 5.2 选定的 backend、worker 和 artifact-storage-v2 配置。fixed-work 是因果消融的主比较轴，wall-clock 是实际收益的辅助轴；只有“移除 exact charging”这一项不调用 exact backend。
 
 ### 必须产出
 
 - best-known 数据来源与模型兼容性表；
 - 全部逐次结果和自动汇总；
-- gap、车辆数、距离、可行率、运行时间和稳定性表；
+- 模型兼容性、车辆数、距离、可行率、运行时间和稳定性表；当前 BKS 不兼容时禁止创建 gap 列；
 - anytime curves；
 - 消融实验结论；
 - 完整失败、invalid、timeout 和 error 记录。
@@ -775,7 +832,7 @@ Stage 5.1 已完成实现。BKS 数据来自三篇正式发表的期刊文章：
 
 Stage 6 与 ALNS 加速是独立 track（轨道）。BPC 扩容不得阻塞 Stage 3/4，也不得把启发式 incumbent 误写成下界或最优性证明。
 
-ESPPRC/BPC pricing（定价）本身不执行 ALNS exact charging route evaluation，因此不强行套用 `cpu_batch`；但 Stage 6 的 ALNS incumbent warm start 及任何复用 ALNS 路径评估的组件必须使用 `cpu_batch`，不得调用 `cpu_scalar`。
+ESPPRC/BPC pricing（定价）本身不执行 ALNS exact charging route evaluation，因此不强行套用 Stage 5.2 选定的 ALNS 后端；但 Stage 6 的证据持久化继承 `artifact-storage-v2` 的 streaming/shard/job-parallel contract（流式/分片/任务并行契约）。ALNS incumbent warm start 及任何复用 ALNS 路径评估的组件必须使用 Stage 5.2 选定后端，不得调用 `cpu_scalar`。
 
 ### 具体任务
 
@@ -852,7 +909,7 @@ $$
 
 解接口和 validator contract（验证器契约）可以在 Stage 3 的测量轨道中提前开发，但必须先完成 full-recharge（满充）兼容回放，再作为 Stage 8 的模型入口。接口迁移不能改写 Stage 0–2 历史结果。
 
-Stage 7 的 ALNS 输出转换、full-recharge 兼容回放和 validator 集成必须保持 `cpu_batch` 接口及批处理顺序语义；正确性检查使用冻结样本和 validator 重算，不运行 `cpu_scalar`。
+Stage 7 的 ALNS 输出转换、full-recharge 兼容回放和 validator 集成必须保持 Stage 5.2 选定后端的有序批处理语义，并继承 streaming/shard artifact contract；正确性检查使用冻结样本和 validator 重算，不运行 `cpu_scalar`。
 
 ### 具体任务
 
@@ -901,7 +958,7 @@ Stage 7 的 ALNS 输出转换、full-recharge 兼容回放和 validator 集成�
 
 Stage 8 是最后的模型扩展阶段。partial、piecewise-linear 和 nonlinear 结果必须与当前 full-recharge baseline 分目录、分配置、分 validator 报告；不能用模型变化解释成搜索算法收益。
 
-Stage 8 每种新充电模型只要进入 ALNS exact route evaluation，就必须实现兼容的 ordered CPU batch（有序 CPU 批处理）接口，或先按统一替换门槛证明另一后端优于 `cpu_batch`。只有 scalar 实现的模型只能作为开发原型，不得进入正式实验、性能结论或阶段验收。
+Stage 8 每种新充电模型只要进入 ALNS exact route evaluation，就必须实现兼容的 ordered batch（有序批处理）接口，并通过 Stage 5.2 的固定工作量语义、严格性能、streaming/shard 和 independent review gate。只有 scalar 实现的模型只能作为开发原型，不得进入正式实验、性能结论或阶段验收。
 
 ### 具体任务
 
@@ -916,7 +973,7 @@ Stage 8 每种新充电模型只要进入 ALNS exact route evaluation，就必�
 
 - 有独立配置名称和结果目录；
 - 有独立精确子问题或严格离散化误差说明；
-- 有兼容的 ordered CPU batch 接口或已通过独立 reviewer 的更优后端，不允许正式运行回退到 `cpu_scalar`；
+- 有兼容的 ordered batch 接口，并重新通过 Stage 5.2 backend replacement gate（后端替换门槛），不允许正式运行回退到 `cpu_scalar`；
 - 不覆盖当前 full-recharge 结果；
 - 与对应 validator 公式一致；
 - 报告模型复杂度、运行时间和解质量变化；
@@ -956,7 +1013,8 @@ Stage 8 每种新充电模型只要进入 ALNS exact route evaluation，就必�
 11. 正式实验前完成小规模 smoke/replay preflight（冒烟/回放预检），正式运行使用已冻结的 clean commit 和完整 hash manifest；
 12. 所有实验表格从 raw logs 自动生成，failure、invalid、timeout 和 error 不得只存在于终端输出。
 13. 2026-07-14 之后的任何新 ALNS/exact charging 代码、测试和实验，不论 stage label，都必须断言 backend 不是 `cpu_scalar`，并验证错误路径 fail fast、不发生隐式 fallback；唯一例外是使用 2026-07-14 之前既有的 Stage 0–3.2 历史 runner 和冻结配置进行明确标记的历史复现。
-14. 新加速后端的替换测试必须以 `cpu_batch` 为基线，满足相同工作量、结果语义一致、端到端中位节省至少 10% 和重点大实例族不退化。
+14. Stage 5.2 起的新加速后端必须先以当前已选后端为 reference，满足 fixed-work 结果语义一致；全部 100-customer 配对的总体端到端中位时间至少降低 15%，同时 C、R、RC 任一 family 的 family median 不得回退超过 3%。新 scalar hotspot（标量热点）必须返回 Stage 5.2 的 profiling→native CPU→conditional accelerator gate，不得绕过。
+15. Stage 5.2 以后必须分别报告 solver time、artifact persistence time 和 end-to-end time；CPU 利用率、芯片功耗或 kernel time 不能单独作为加速结论。
 
 任何阶段如果使可行率、验证正确性或可复现性退化，应先修复根因，再继续扩展。
 
