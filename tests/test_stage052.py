@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import subprocess
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -48,6 +50,10 @@ from evrptw.stage052 import (
     evaluate_promotion,
     formal_budget_matrix,
     select_worker_count,
+)
+from evrptw.stage052_evidence import (
+    ProcessTreeResourceSampler,
+    verify_stage052_prerequisite,
 )
 
 
@@ -394,6 +400,86 @@ def test_stage052_review_prerequisite_verifies_identity_status_and_files(
             expected_component="hot_path",
             expected_status="READY_FOR_STAGE052_ARTIFACT_STREAMING",
         )
+
+
+def test_stage052_producer_prerequisite_binds_raw_and_review_identity(tmp_path: Path) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt04"
+    raw_dir = tmp_path / run_label
+    config = tmp_path / "stage052.toml"
+    config.write_text("[stage05_2]\nschema_version='test'\n", encoding="utf-8")
+    config_digest = hashlib.sha256(config.read_bytes()).hexdigest()
+    writer = ArtifactBundleWriter(
+        raw_dir,
+        ArtifactRunContext("stage05.2", "artifact_streaming", run_label),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+    writer.write_control(
+        metadata={
+            "run_label": run_label,
+            "component": "artifact_streaming",
+            "scope": "performance",
+            "repository_dirty": False,
+            "repository_revision": "a" * 40,
+            "configuration_sha256": config_digest,
+        },
+        configuration_path=config,
+    )
+    writer.finalize()
+    review_dir = raw_dir / "review"
+    review_dir.mkdir()
+    report = review_dir / "review_report.md"
+    findings = review_dir / "review_findings.csv"
+    report.write_text("accepted\n", encoding="utf-8")
+    findings.write_text("gate,passed\nall,True\n", encoding="utf-8")
+    (review_dir / "review_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "stage05.2-review-v1",
+                "run_label": run_label,
+                "component": "artifact_streaming",
+                "scope": "performance",
+                "status": "READY_FOR_STAGE052_JOB_PARALLEL",
+                "gates": {"all": {"passed": True}},
+                "files": {
+                    report.name: hashlib.sha256(report.read_bytes()).hexdigest(),
+                    findings.name: hashlib.sha256(findings.read_bytes()).hexdigest(),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    identity = verify_stage052_prerequisite(
+        raw_dir,
+        expected_component="artifact_streaming",
+        expected_status="READY_FOR_STAGE052_JOB_PARALLEL",
+        expected_run_label=run_label,
+    )
+    assert identity.run_label == run_label
+    assert identity.repository_revision == "a" * 40
+
+    report.write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(ArtifactIntegrityError, match="checksum"):
+        verify_stage052_prerequisite(
+            raw_dir,
+            expected_component="artifact_streaming",
+            expected_status="READY_FOR_STAGE052_JOB_PARALLEL",
+        )
+
+
+def test_process_tree_resource_summary_includes_live_child() -> None:
+    sampler = ProcessTreeResourceSampler(interval_seconds=0.01)
+    sampler.start()
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; data=bytearray(8_000_000); time.sleep(.12)"],
+    )
+    child.wait(timeout=2.0)
+    summary = sampler.stop()
+
+    assert child.pid in summary.worker_pids
+    assert summary.aggregate_peak_rss_bytes > 8_000_000
+    assert summary.sample_count >= 2
+    assert summary.status == "complete"
 
 
 def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(

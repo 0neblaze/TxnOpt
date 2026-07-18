@@ -38,6 +38,7 @@ from evrptw.stage052 import (
     evaluate_promotion,
     select_worker_count,
 )
+from evrptw.stage052_evidence import verify_stage052_prerequisite
 from evrptw.validation import validate_routes
 
 STAGE052_REVIEW_SCHEMA_VERSION = "stage05.2-review-v1"
@@ -479,6 +480,7 @@ def review_stage052(
     component: Stage052Component | str,
     scope: str,
     comparison_dirs: Sequence[Path] = (),
+    prerequisite_dir: Path | None = None,
 ) -> dict[str, Path]:
     selected = Stage052Component(component)
     validate_stage052_run_label(raw_dir.name, selected)
@@ -512,12 +514,55 @@ def review_stage052(
             "detail": str(metadata.get("persistence_attribution")),
         },
     }
+    prerequisite_contract = {
+        Stage052Component.JOB_PARALLEL: (
+            "artifact_streaming",
+            "READY_FOR_STAGE052_JOB_PARALLEL",
+        ),
+        Stage052Component.NATIVE_KERNELS: (
+            "job_parallel",
+            "READY_FOR_STAGE052_NATIVE_KERNELS",
+        ),
+        Stage052Component.ACCELERATOR_PILOT: (
+            "native_kernels",
+            "READY_FOR_STAGE052_ACCELERATOR_DECISION",
+        ),
+    }.get(selected)
+    if prerequisite_contract is not None:
+        if prerequisite_dir is None:
+            gates["component_prerequisite"] = {
+                "passed": False,
+                "detail": f"{selected.value} requires --prerequisite-dir",
+            }
+        else:
+            try:
+                prerequisite_identity = verify_stage052_prerequisite(
+                    prerequisite_dir,
+                    expected_component=prerequisite_contract[0],
+                    expected_status=prerequisite_contract[1],
+                    expected_run_label=(
+                        "stage05.2_artifact_streaming_attempt04"
+                        if selected is Stage052Component.JOB_PARALLEL
+                        else None
+                    ),
+                )
+            except (ArtifactIntegrityError, ValueError) as error:
+                gates["component_prerequisite"] = {
+                    "passed": False,
+                    "detail": str(error),
+                }
+            else:
+                gates["component_prerequisite"] = {
+                    "passed": True,
+                    "detail": prerequisite_identity.run_label,
+                }
     gates.update(
         _component_gates(
             selected,
             rows,
             raw_dir=raw_dir,
             comparison_dirs=comparison_dirs,
+            prerequisite_dir=prerequisite_dir,
         )
     )
     passed = all(bool(gate["passed"]) for gate in gates.values())
@@ -548,9 +593,7 @@ def review_stage052(
         encoding="utf-8",
     )
     review_manifest_path = review_dir / "review_manifest.json"
-    review_manifest_path.write_text(
-        json.dumps(
-            {
+    review_manifest: dict[str, object] = {
                 "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
                 "run_label": raw_dir.name,
                 "component": selected.value,
@@ -561,11 +604,15 @@ def review_stage052(
                     findings_path.name: _sha256(findings_path),
                     report_path.name: _sha256(report_path),
                 },
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
+            }
+    worker_gate = gates.get("worker_selection", {})
+    if selected is Stage052Component.JOB_PARALLEL and worker_gate.get("passed") is True:
+        review_manifest["selected_workers"] = worker_gate.get("selected_workers")
+        review_manifest["selected_run_label"] = worker_gate.get("selected_run_label")
+        review_manifest["input_runs"] = worker_gate.get("input_runs")
+        review_manifest["resource_metrics"] = worker_gate.get("resource_metrics")
+    review_manifest_path.write_text(
+        json.dumps(review_manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     return {
@@ -646,6 +693,7 @@ def _component_gates(
     *,
     raw_dir: Path,
     comparison_dirs: Sequence[Path],
+    prerequisite_dir: Path | None,
 ) -> dict[str, dict[str, object]]:
     if component is Stage052Component.PERF_BASELINE:
         passed = _axis_semantics_equal(rows, "fixed_work_control", "fixed_work")
@@ -768,24 +816,105 @@ def _component_gates(
                     "detail": "1/2/4-worker evidence required",
                 }
             }
+        evidence_dirs = [*comparison_dirs, raw_dir]
         all_rows: list[Sequence[Mapping[str, object]]] = [
             *(_load_per_run(path) for path in comparison_dirs),
             list(rows),
         ]
         times: dict[int, float] = {}
         rss: dict[int, float] = {}
-        for worker_rows in all_rows:
+        run_by_worker: dict[int, str] = {}
+        revisions: set[str] = set()
+        configurations: set[str] = set()
+        for evidence_dir, worker_rows in zip(evidence_dirs, all_rows, strict=True):
             workers = {_strict_int(row["worker_count"], "worker_count") for row in worker_rows}
             if len(workers) != 1:
                 return {"worker_selection": {"passed": False, "detail": "mixed worker count"}}
             worker = next(iter(workers))
-            times[worker] = sum([_strict_float(row["end_to_end_seconds"]) for row in worker_rows])
-            rss[worker] = max([_strict_float(row["peak_rss_bytes"]) for row in worker_rows]) / 2**30
+            if worker in run_by_worker:
+                return {
+                    "worker_selection": {
+                        "passed": False,
+                        "detail": f"duplicate worker evidence: {worker}",
+                    }
+                }
+            resource = _load_resource_summary(evidence_dir)
+            metadata = _load_metadata(evidence_dir)
+            if _strict_int(resource.get("sample_count"), "sample_count") < 2:
+                return {
+                    "worker_selection": {
+                        "passed": False,
+                        "detail": f"insufficient resource samples for {evidence_dir.name}",
+                    }
+                }
+            times[worker] = _strict_float(resource.get("run_wall_seconds"))
+            rss[worker] = _strict_float(resource.get("aggregate_peak_rss_bytes")) / 2**30
+            run_by_worker[worker] = evidence_dir.name
+            revisions.add(str(metadata.get("repository_revision", "")))
+            configurations.add(str(metadata.get("configuration_sha256", "")))
+        if set(run_by_worker) != {1, 2, 4}:
+            return {
+                "worker_selection": {
+                    "passed": False,
+                    "detail": "worker evidence must contain exactly 1, 2, and 4 workers",
+                }
+            }
+        identity_passed = len(revisions) == 1 and len(configurations) == 1
+        if not identity_passed:
+            return {
+                "worker_identity": {
+                    "passed": False,
+                    "detail": "worker evidence mixes repository revisions or configurations",
+                }
+            }
+        replay_maps = [replay_stage052_storage_semantics(path) for path in evidence_dirs]
+        if prerequisite_dir is not None:
+            replay_maps.insert(0, replay_stage052_storage_semantics(prerequisite_dir))
+        fixed_identities = {
+            identity for identity in replay_maps[0] if identity[2].startswith("fixed_work")
+        }
+        semantics_passed = bool(fixed_identities) and all(
+            {identity for identity in replay if identity[2].startswith("fixed_work")}
+            == fixed_identities
+            and all(replay[identity] == replay_maps[0][identity] for identity in fixed_identities)
+            for replay in replay_maps[1:]
+        )
+        if not semantics_passed:
+            return {
+                "worker_semantics": {
+                    "passed": False,
+                    "detail": "1/2/4-worker fixed-work semantic replay mismatch",
+                }
+            }
         try:
             selected = select_worker_count(times, rss)
         except ValueError as error:
             return {"worker_selection": {"passed": False, "detail": str(error)}}
-        return {"worker_selection": {"passed": True, "detail": f"selected_workers={selected}"}}
+        return {
+            "worker_identity": {
+                "passed": True,
+                "detail": "worker revisions and configurations match",
+            },
+            "worker_semantics": {
+                "passed": True,
+                "detail": "C04 and 1/2/4-worker fixed-work replay equality passed",
+            },
+            "worker_selection": {
+                "passed": True,
+                "detail": f"selected_workers={selected}",
+                "selected_workers": selected,
+                "selected_run_label": run_by_worker[selected],
+                "input_runs": [run_by_worker[worker] for worker in (1, 2, 4)],
+                "resource_metrics": {
+                    str(worker): {
+                        "run_wall_seconds": times[worker],
+                        "aggregate_peak_rss_gib": rss[worker],
+                        "speedup": times[1] / times[worker],
+                    }
+                    for worker in (1, 2, 4)
+                },
+            },
+        }
     if component is Stage052Component.ACCELERATOR_PILOT:
         occupancy = sorted(_strict_float(row["median_batch_occupancy"]) for row in rows)
         median = occupancy[len(occupancy) // 2] if occupancy else 0.0
@@ -797,6 +926,18 @@ def _component_gates(
             }
         }
     return {}
+
+
+def _load_resource_summary(raw_dir: Path) -> dict[str, object]:
+    reader = ArtifactReader(raw_dir)
+    reference = _one_artifact(reader, "resource_summary")
+    return reader.read_json(str(reference["relative_path"]))
+
+
+def _load_metadata(raw_dir: Path) -> dict[str, object]:
+    reader = ArtifactReader(raw_dir)
+    reference = _one_artifact(reader, "manifest_metadata")
+    return reader.read_json(str(reference["relative_path"]))
 
 
 def _optimization_profile_gate(component: Stage052Component, observed: object) -> dict[str, object]:
@@ -1006,6 +1147,7 @@ def main() -> int:
     )
     parser.add_argument("--scope", choices=("performance", "pilot", "formal"), required=True)
     parser.add_argument("--comparison-dir", type=Path, action="append", default=[])
+    parser.add_argument("--prerequisite-dir", type=Path)
     arguments = parser.parse_args()
     outputs = review_stage052(
         raw_dir=arguments.raw_dir,
@@ -1013,6 +1155,7 @@ def main() -> int:
         component=arguments.component,
         scope=arguments.scope,
         comparison_dirs=arguments.comparison_dir,
+        prerequisite_dir=arguments.prerequisite_dir,
     )
     for name, path in outputs.items():
         print(f"{name}: {path}")

@@ -43,6 +43,11 @@ from evrptw.measurement import MeasurementConfig
 from evrptw.models import Instance
 from evrptw.parser import parse_schneider
 from evrptw.stage052 import Stage052Component, formal_budget_matrix
+from evrptw.stage052_evidence import (
+    ProcessTreeResourceSampler,
+    RunResourceSummary,
+    verify_stage052_prerequisite,
+)
 from evrptw.validation import validate_routes
 
 STAGE052_SCHEMA_VERSION = "stage05.2-performance-v1"
@@ -206,6 +211,7 @@ def run_stage052(
     component: Stage052Component | str,
     scope: str,
     worker_count: int = 1,
+    prerequisite_dir: Path | None = None,
 ) -> dict[str, Path]:
     """Execute one canonical Stage 5.2 component attempt."""
 
@@ -223,6 +229,35 @@ def run_stage052(
     _require_clean_repository(root)
     config = load_stage052_config(resolved_config)
     prerequisite = verify_stage051_prerequisite(_resolve(root, config.stage051_manifest))
+    component_prerequisite = None
+    prerequisite_contract = {
+        Stage052Component.JOB_PARALLEL: (
+            "artifact_streaming",
+            "READY_FOR_STAGE052_JOB_PARALLEL",
+        ),
+        Stage052Component.NATIVE_KERNELS: (
+            "job_parallel",
+            "READY_FOR_STAGE052_NATIVE_KERNELS",
+        ),
+        Stage052Component.ACCELERATOR_PILOT: (
+            "native_kernels",
+            "READY_FOR_STAGE052_ACCELERATOR_DECISION",
+        ),
+    }.get(selected)
+    if prerequisite_contract is not None:
+        if prerequisite_dir is None:
+            raise ValueError(f"{selected.value} requires --prerequisite-dir")
+        expected_component, expected_status = prerequisite_contract
+        component_prerequisite = verify_stage052_prerequisite(
+            _resolve(root, prerequisite_dir),
+            expected_component=expected_component,
+            expected_status=expected_status,
+            expected_run_label=(
+                "stage05.2_artifact_streaming_attempt04"
+                if selected is Stage052Component.JOB_PARALLEL
+                else None
+            ),
+        )
     instances, seeds = _scope_identities(scope)
     if selected in {
         Stage052Component.PERF_BASELINE,
@@ -258,6 +293,9 @@ def run_stage052(
         "repository_dirty": False,
         "configuration_sha256": _sha256(resolved_config),
         "stage051_prerequisite": prerequisite,
+        "component_prerequisite": (
+            component_prerequisite.to_dict() if component_prerequisite is not None else None
+        ),
         "environment": collect_environment(),
     }
     parent_writer.write_control(metadata=metadata, configuration_path=resolved_config)
@@ -274,6 +312,18 @@ def run_stage052(
         storage=storage,
     )
     rows: list[dict[str, object]] = []
+    resource_sampler = (
+        ProcessTreeResourceSampler(interval_seconds=0.05)
+        if selected
+        in {
+            Stage052Component.JOB_PARALLEL,
+            Stage052Component.NATIVE_KERNELS,
+            Stage052Component.ACCELERATOR_PILOT,
+        }
+        else None
+    )
+    if resource_sampler is not None:
+        resource_sampler.start()
     try:
         if storage.storage_policy_version == ARTIFACT_STORAGE_V2:
             rows = _run_v2_tasks(tasks, worker_count=worker_count)
@@ -292,6 +342,10 @@ def run_stage052(
                     expected_identities=tuple((task.instance_name, task.seed) for task in tasks),
                     require_complete=False,
                 )
+        if resource_sampler is not None:
+            with contextlib.suppress(BaseException):
+                summary = resource_sampler.stop()
+                _record_resource_summary(parent_writer, summary)
         parent_writer.finalize(status="partial", evidence_completeness="partial")
         raise
     rows.sort(
@@ -310,13 +364,38 @@ def run_stage052(
         storage_format="csv_control",
         row_count=len(rows),
     )
+    resource_summary_path = None
+    if resource_sampler is not None:
+        summary = resource_sampler.stop()
+        resource_summary_path = _record_resource_summary(parent_writer, summary)
     bundle = parent_writer.finalize()
-    return {
+    outputs = {
         "run_dir": bundle.run_dir,
         "per_run_results": per_run_path,
         "manifest": bundle.manifest_path,
         "manifest_sidecar": bundle.manifest_sidecar_path,
     }
+    if resource_summary_path is not None:
+        outputs["resource_summary"] = resource_summary_path
+    return outputs
+
+
+def _record_resource_summary(
+    writer: ArtifactBundleWriter,
+    summary: RunResourceSummary,
+) -> Path:
+    path = writer.run_dir / "control" / f"{writer.context.run_label}_resource_summary.json"
+    path.write_text(
+        json.dumps(summary.to_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    writer.record_existing_file(
+        path,
+        artifact_type="resource_summary",
+        retention_class="control",
+        storage_format="json_control",
+    )
+    return path
 
 
 def _scope_identities(scope: str) -> tuple[tuple[str, ...], tuple[int, ...]]:
@@ -1156,6 +1235,7 @@ def main() -> int:
     )
     parser.add_argument("--scope", choices=("performance", "pilot", "formal"), required=True)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--prerequisite-dir", type=Path)
     arguments = parser.parse_args()
     outputs = run_stage052(
         config_path=arguments.config,
@@ -1164,6 +1244,7 @@ def main() -> int:
         component=arguments.component,
         scope=arguments.scope,
         worker_count=arguments.workers,
+        prerequisite_dir=arguments.prerequisite_dir,
     )
     for name, path in outputs.items():
         print(f"{name}: {path}")
