@@ -641,7 +641,6 @@ def _run_and_persist_v2_shard(
                     digest=digest,
                 ),
             )
-            shard.flush()
             diagnostic_rows = [
                 {
                     "run_label": task.run_label,
@@ -664,7 +663,6 @@ def _run_and_persist_v2_shard(
                 critical_events=(),
                 diagnostic_rows=diagnostic_rows,
             )
-            shard.flush()
             persistence_by_axis[axis.name] = time.perf_counter() - persistence_started
             semantic_digest = digest.hexdigest()
             raw_axes[axis.name] = {
@@ -700,6 +698,7 @@ def _run_and_persist_v2_shard(
             gc.collect()
 
         finalize_started = time.perf_counter()
+        shard.flush()
         shard.finalize(
             raw_payload={
                 "schema_version": STAGE052_SCHEMA_VERSION,

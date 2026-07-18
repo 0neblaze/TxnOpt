@@ -3,12 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+import evrptw.experiments.stage052_performance as stage052_performance
 from evrptw._core import distance_matrix
 from evrptw.artifacts import (
     ArtifactBundleWriter,
@@ -16,11 +19,13 @@ from evrptw.artifacts import (
     ArtifactReader,
     ArtifactRunContext,
     ArtifactStorageConfig,
+    expand_v2_screening_decision,
 )
 from evrptw.experiments.stage052_performance import (
     PERFORMANCE_INSTANCES,
     PERFORMANCE_SEEDS,
     _ensure_partial_shard_failure,
+    _run_and_persist_v2_shard,
     _run_v2_shard_task,
     _ShardTask,
     axes_for_scope,
@@ -403,6 +408,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         extra_solution_axis: bool = False,
         extra_unreferenced_route: bool = False,
         fixed_route_customer: str = "C1",
+        cache_bytes: int = 396,
     ) -> Path:
         run_dir = tmp_path / label
         writer = ArtifactBundleWriter(
@@ -460,6 +466,15 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
                     "evaluation_id": 1,
                     "route_key": "fixed-route",
                 },
+                {
+                    "event_type": "cache_event",
+                    "benchmark_axis": "fixed_work",
+                    "operation": "store",
+                    "cache_key_digest": "abc",
+                    "entry_bytes": cache_bytes,
+                    "current_bytes": cache_bytes,
+                    "current_entries": 1,
+                },
             ],
             shard_ordinal=0 if policy == "artifact-storage-v2" else None,
             worker_identity=("worker-0" if policy == "artifact-storage-v2" else None),
@@ -479,6 +494,15 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     )
 
     assert replay_stage052_storage_semantics(v1) == replay_stage052_storage_semantics(v2)
+    volatile_cache_bytes = write(
+        "artifact-storage-v2",
+        "artifact_streaming",
+        "stage05.2_artifact_streaming_attempt90",
+        cache_bytes=397,
+    )
+    assert replay_stage052_storage_semantics(v1) == replay_stage052_storage_semantics(
+        volatile_cache_bytes
+    )
     wall_route_only = write(
         "artifact-storage-v2",
         "artifact_streaming",
@@ -621,6 +645,155 @@ def test_storage_replay_expands_compact_v2_screening_decisions(
         "c101_21/2014/stage05.2_artifact_streaming_attempt94_trace_c101_21_2014.json"
     )
     assert v1_trace["screening_decisions"] == v2_trace["screening_decisions"]
+
+
+def test_definition_encoded_screening_requires_known_untampered_definition() -> None:
+    definition = {
+        "benchmark_axis": "fixed_work",
+        "checks": [
+            {
+                "check": "capacity",
+                "reason": "",
+                "status": "pass",
+                "value_bool": True,
+                "value_float": 1.0,
+                "value_text": None,
+            }
+        ],
+        "lane_id": 1,
+        "operator_id": 2,
+        "route_id": 3,
+        "status": "pass",
+    }
+    definition_json = json.dumps(definition, sort_keys=True, separators=(",", ":")).encode()
+    definition_id = (
+        int.from_bytes(hashlib.sha256(definition_json).digest()[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
+    )
+    definitions: dict[int, dict[str, object]] = {}
+    first = {
+        "event_id": 1,
+        "definition_id": definition_id,
+        "definition_json": definition_json,
+        "started_at": 1.25,
+        "completed_at": 1.5,
+        "iteration": 4,
+        "decision_id": 9,
+    }
+
+    expanded = expand_v2_screening_decision(first, definitions=definitions)
+    assert expanded["embedded_checks"][0]["value"] is True
+    assert expanded["timestamp_seconds"] == 1.25
+    assert expanded["duration_seconds"] == 0.25
+    second = {**first, "event_id": 2, "definition_json": None}
+    assert expand_v2_screening_decision(second, definitions=definitions)["route_id"] == 3
+
+    with pytest.raises(ArtifactIntegrityError, match="unknown definition"):
+        expand_v2_screening_decision({**second, "definition_id": definition_id + 1}, definitions={})
+    with pytest.raises(ArtifactIntegrityError, match="hash mismatch"):
+        expand_v2_screening_decision({**first, "definition_id": definition_id + 1}, definitions={})
+
+
+def test_v2_final_flush_is_charged_to_persistence_and_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    flush_delay_seconds = 0.03
+
+    class FakeShard:
+        def append(self, **_: object) -> int:
+            return 1
+
+        def flush(self) -> None:
+            time.sleep(flush_delay_seconds)
+
+        def finalize(self, **_: object) -> None:
+            return None
+
+        def abort(self, _: BaseException) -> None:
+            return None
+
+    class FakeWriter:
+        def open_v2_shard(self, **_: object) -> FakeShard:
+            return FakeShard()
+
+    trace = SimpleNamespace(
+        route_dictionary={},
+        reconcile=lambda _result: {"status": "pass"},
+        to_index_dict=lambda: {},
+    )
+    objective = SimpleNamespace(
+        key=(1, 1.0, 0.0, 0),
+        vehicle_count=1,
+        total_distance=1.0,
+        total_charging_time=0.0,
+        charging_count=0,
+    )
+    result = SimpleNamespace(
+        measurement_trace=trace,
+        objective=objective,
+        routes=(("D0", "D0"),),
+        feasible=True,
+        exact_started_calls=1,
+        exact_completed_calls=1,
+        neighborhood_events=(),
+        charging_backend="cpu_batch",
+        backend_metrics={"work_batches": 1, "exact_calls": 1},
+        screening_statistics={},
+        runtime_seconds=0.0,
+        effective_iterations=1,
+        termination_reason="fixed_work_budget",
+    )
+    monkeypatch.setattr(
+        stage052_performance, "_solve_stage052_axis", lambda *args, **kwargs: result
+    )
+    monkeypatch.setattr(
+        stage052_performance,
+        "_iter_stage052_axis_events",
+        lambda **kwargs: iter(()),
+    )
+    monkeypatch.setattr(
+        stage052_performance,
+        "validate_routes",
+        lambda *args, **kwargs: SimpleNamespace(feasible=True),
+    )
+    monkeypatch.setattr(stage052_performance, "collect_environment", lambda: {})
+    monkeypatch.setattr(stage052_performance, "_peak_rss_bytes", lambda: 1)
+
+    axis = stage052_performance.Stage052Axis(
+        name="fixed_work",
+        termination_mode="fixed_work",
+        time_limit_seconds=1.0,
+        exact_call_budget=1,
+    )
+    task = _ShardTask(
+        root=tmp_path,
+        config_path=tmp_path / "unused.toml",
+        run_dir=tmp_path / "results" / "stage05.2_artifact_streaming_attempt94",
+        run_label="stage05.2_artifact_streaming_attempt94",
+        component="artifact_streaming",
+        scope="performance",
+        instance_name="c101C5",
+        customer_count=5,
+        seed=2014,
+        shard_ordinal=0,
+        worker_count=1,
+        storage=ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+
+    rows = _run_and_persist_v2_shard(
+        task,
+        writer=FakeWriter(),  # type: ignore[arg-type]
+        config=SimpleNamespace(),  # type: ignore[arg-type]
+        stage04=SimpleNamespace(),
+        stage02=SimpleNamespace(),
+        instance=SimpleNamespace(),  # type: ignore[arg-type]
+        axes=(axis,),
+        storage=task.storage,
+    )
+
+    persistence = float(rows[0]["artifact_persistence_seconds"])
+    solver_seconds = float(rows[0]["solver_seconds"])
+    assert persistence >= flush_delay_seconds * 0.9
+    assert float(rows[0]["end_to_end_seconds"]) == pytest.approx(solver_seconds + persistence)
 
 
 def test_v2_pre_open_failure_publishes_partial_shard_evidence(

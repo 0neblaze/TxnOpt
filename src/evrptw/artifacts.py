@@ -15,7 +15,7 @@ import heapq
 import json
 import re
 import shutil
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -261,7 +261,7 @@ SCREENING_CHECKS_SCHEMA = pa.schema(
     ]
 )
 
-V2_SCREENING_DECISIONS_SCHEMA = pa.schema(
+V2_SCREENING_DECISIONS_SCHEMA_V1 = pa.schema(
     [
         pa.field("event_id", pa.int64(), nullable=False),
         pa.field("timestamp_seconds", pa.float64()),
@@ -300,6 +300,18 @@ V2_SCREENING_DECISIONS_SCHEMA = pa.schema(
                 )
             ),
         ),
+    ]
+)
+
+V2_SCREENING_DECISIONS_SCHEMA = pa.schema(
+    [
+        pa.field("event_id", pa.int64(), nullable=False),
+        pa.field("definition_id", pa.int64(), nullable=False),
+        pa.field("definition_json", pa.binary()),
+        pa.field("started_at", pa.float64()),
+        pa.field("completed_at", pa.float64()),
+        pa.field("iteration", pa.int64()),
+        pa.field("decision_id", pa.int64()),
     ]
 )
 
@@ -664,46 +676,6 @@ def _normalise_screening_event(
     return row
 
 
-def _normalise_screening_decision_v2(
-    event: Mapping[str, object],
-    *,
-    event_id: int,
-    route_ids: Mapping[str, int],
-    lane_ids: Mapping[str, int],
-    operator_ids: Mapping[str, int],
-) -> dict[str, object]:
-    """Encode high-volume screening decisions without sparse event/JSON overhead."""
-
-    started_at = event.get("started_at")
-    raw_checks = event.get("checks")
-    checks = raw_checks if isinstance(raw_checks, (list, tuple)) else ()
-    return {
-        "event_id": event_id,
-        "timestamp_seconds": started_at,
-        "started_at": started_at,
-        "completed_at": event.get("completed_at"),
-        "duration_seconds": event.get("duration_seconds"),
-        "lane_id": lane_ids[str(event.get("lane", ""))],
-        "iteration": event.get("iteration"),
-        "operator_id": operator_ids[str(event.get("operator", ""))],
-        "route_id": _route_id(event.get("route_key"), route_ids),
-        "status": str(event.get("status", "")),
-        "reason": str(event.get("reason", "")),
-        "decision_id": event.get("decision_id"),
-        "benchmark_axis": str(event.get("benchmark_axis", "")),
-        "demand": event.get("demand"),
-        "distance_increment_lower_bound": event.get("distance_increment_lower_bound"),
-        "distance_lower_bound": event.get("distance_lower_bound"),
-        "exact_call_blocked": event.get("exact_call_blocked"),
-        "first_failed_check": str(event.get("first_failed_check", "")),
-        "min_time_window_slack": event.get("min_time_window_slack"),
-        "negative_cache_hit": event.get("negative_cache_hit"),
-        "single_segment_reachable": event.get("single_segment_reachable"),
-        "structural_energy_lower_bound": event.get("structural_energy_lower_bound"),
-        "checks": _normalise_compact_screening_checks(checks),
-    }
-
-
 def _normalise_compact_screening_checks(
     checks: Sequence[object],
 ) -> list[dict[str, object]]:
@@ -729,13 +701,66 @@ def _json_text(payload: Mapping[str, object]) -> str:
     return orjson.dumps(payload, option=orjson.OPT_SORT_KEYS).decode("utf-8")
 
 
-def expand_v2_screening_decision(row: Mapping[str, object]) -> dict[str, object]:
-    """Reconstruct the logical EVENTS_SCHEMA row from compact v2 storage."""
+def expand_v2_screening_decision(
+    row: Mapping[str, object],
+    *,
+    definitions: dict[int, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Reconstruct one logical event from legacy or definition-encoded v2 storage."""
 
-    raw_checks = row.get("checks")
+    expanded_row: Mapping[str, object] = row
+    if "definition_id" in row:
+        if definitions is None:
+            raise ArtifactIntegrityError(
+                "definition-encoded screening rows require definition state"
+            )
+        raw_definition_id = row.get("definition_id")
+        if isinstance(raw_definition_id, bool) or not isinstance(raw_definition_id, int):
+            raise ArtifactIntegrityError("screening definition_id must be an integer")
+        definition_json = row.get("definition_json")
+        if definition_json:
+            if not isinstance(definition_json, (bytes, bytearray, memoryview, str)):
+                raise ArtifactIntegrityError("screening definition_json must be binary or text")
+            try:
+                definition = orjson.loads(definition_json)
+            except orjson.JSONDecodeError as error:
+                raise ArtifactIntegrityError("screening definition_json is invalid") from error
+            if not isinstance(definition, dict):
+                raise ArtifactIntegrityError("screening definition must be an object")
+            canonical = orjson.dumps(definition, option=orjson.OPT_SORT_KEYS)
+            expected_id = (
+                int.from_bytes(hashlib.sha256(canonical).digest()[:8], "big")
+                & 0x7FFF_FFFF_FFFF_FFFF
+            )
+            if expected_id != raw_definition_id:
+                raise ArtifactIntegrityError("screening definition hash mismatch")
+            previous = definitions.get(raw_definition_id)
+            if previous is not None and previous != definition:
+                raise ArtifactIntegrityError("screening definition ID collision")
+            definitions[raw_definition_id] = definition
+        definition = definitions.get(raw_definition_id)
+        if definition is None:
+            raise ArtifactIntegrityError("screening row references an unknown definition")
+        combined_row = {**definition, **dict(row)}
+        started_at = combined_row.get("started_at")
+        completed_at = combined_row.get("completed_at")
+        if isinstance(started_at, (int, float)) and isinstance(completed_at, (int, float)):
+            combined_row["timestamp_seconds"] = started_at
+            combined_row["duration_seconds"] = completed_at - started_at
+        expanded_row = combined_row
+
+    raw_checks = expanded_row.get("checks")
+    checks_json = expanded_row.get("checks_json")
+    if checks_json:
+        if not isinstance(checks_json, (bytes, bytearray, memoryview, str)):
+            raise ArtifactIntegrityError("compact screening checks_json must be binary or text")
+        try:
+            raw_checks = orjson.loads(checks_json)
+        except orjson.JSONDecodeError as error:
+            raise ArtifactIntegrityError("compact screening checks_json is invalid") from error
     compact_checks = raw_checks if isinstance(raw_checks, (list, tuple)) else ()
     extras = {
-        key: row.get(key)
+        key: expanded_row.get(key)
         for key in (
             "benchmark_axis",
             "demand",
@@ -752,21 +777,21 @@ def expand_v2_screening_decision(row: Mapping[str, object]) -> dict[str, object]
     output = _SCREENING_EVENT_TEMPLATE.copy()
     output.update(
         {
-            "event_id": row.get("event_id"),
+            "event_id": expanded_row.get("event_id"),
             "record_type": "screening_decision",
             "event_type": "screening_decision",
-            "timestamp_seconds": row.get("timestamp_seconds"),
-            "started_at": row.get("started_at"),
-            "completed_at": row.get("completed_at"),
-            "duration_seconds": row.get("duration_seconds"),
-            "lane_id": row.get("lane_id"),
-            "iteration": row.get("iteration"),
-            "operator_id": row.get("operator_id"),
-            "route_id": row.get("route_id"),
-            "status": row.get("status"),
-            "reason": row.get("reason"),
-            "decision_id": row.get("decision_id"),
-            "propagation_status": row.get("status"),
+            "timestamp_seconds": expanded_row.get("timestamp_seconds"),
+            "started_at": expanded_row.get("started_at"),
+            "completed_at": expanded_row.get("completed_at"),
+            "duration_seconds": expanded_row.get("duration_seconds"),
+            "lane_id": expanded_row.get("lane_id"),
+            "iteration": expanded_row.get("iteration"),
+            "operator_id": expanded_row.get("operator_id"),
+            "route_id": expanded_row.get("route_id"),
+            "status": expanded_row.get("status"),
+            "reason": expanded_row.get("reason"),
+            "decision_id": expanded_row.get("decision_id"),
+            "propagation_status": expanded_row.get("status"),
             "extras_json": _json_text(extras),
             "embedded_checks": [
                 {
@@ -909,8 +934,8 @@ class _StreamingParquetSink:
             schema,
             compression=config.compression,
             compression_level=config.compression_level,
-            use_dictionary=True,
-            write_statistics=True,
+            use_dictionary=not schema.equals(V2_SCREENING_DECISIONS_SCHEMA),
+            write_statistics=not schema.equals(V2_SCREENING_DECISIONS_SCHEMA),
         )
 
     def append(self, row: Mapping[str, object]) -> None:
@@ -2549,6 +2574,10 @@ class ArtifactV2ShardSession:
         self._route_ids = _RegisteredStableRouteIds(self._route_digests)
         self._lane_ids: dict[str, int] = {}
         self._operator_ids: dict[str, int] = {}
+        self._screening_definition_cache: OrderedDict[
+            tuple[object, ...], tuple[int, bytes, str]
+        ] = OrderedDict()
+        self._screening_definition_digests: dict[int, str] = {}
         self._active_sinks: list[_StreamingParquetSink] = []
         self._max_buffered_groups_observed = 0
         self._state = "open"
@@ -2571,16 +2600,15 @@ class ArtifactV2ShardSession:
         count = 0
         for event in _iter_coalesced_cache_lookup_events(critical_events):
             screening_event = event.get("event_type") == "screening_decision"
-            route_keys = (
-                (str(event.get("route_key", "")),)
-                if screening_event
-                else tuple(_event_route_keys(event))
-            )
-            for route_key in route_keys:
-                if not route_key:
-                    continue
-                if route_key not in self._route_ids:
+            if screening_event:
+                route_key = str(event.get("route_key", ""))
+                screening_route_id = _stable_route_id(route_key) if route_key else None
+                if screening_route_id is not None and screening_route_id not in self._route_digests:
                     self._register_route(route_key, _route_sequence_from_key(route_key))
+            else:
+                for route_key in _event_route_keys(event):
+                    if route_key and route_key not in self._route_ids:
+                        self._register_route(route_key, _route_sequence_from_key(route_key))
             lane = str(event.get("lane", ""))
             operator = str(event.get("operator", ""))
             if lane not in self._lane_ids:
@@ -2588,8 +2616,7 @@ class ArtifactV2ShardSession:
             if operator not in self._operator_ids:
                 self._operator_ids[operator] = _stable_dictionary_id(f"operator:{operator}")
             if screening_event:
-                route_key = str(event.get("route_key", ""))
-                if route_key and route_key not in self._route_ids:
+                if screening_route_id is not None and screening_route_id not in self._route_digests:
                     raise ArtifactIntegrityError(
                         f"event refers to an unregistered route key: {route_key}"
                     )
@@ -2598,12 +2625,12 @@ class ArtifactV2ShardSession:
             event_id = self._owner._next_event_id
             self._owner._next_event_id += 1
             normalized_event = (
-                _normalise_screening_decision_v2(
+                self._screening_decision_row(
                     event,
                     event_id=event_id,
-                    route_ids=self._route_ids,
-                    lane_ids=self._lane_ids,
-                    operator_ids=self._operator_ids,
+                    route_id=screening_route_id,
+                    lane_id=self._lane_ids[lane],
+                    operator_id=self._operator_ids[operator],
                 )
                 if screening_event
                 else _normalise_event(
@@ -2827,6 +2854,104 @@ class ArtifactV2ShardSession:
         if sink in self._active_sinks:
             self._active_sinks.remove(sink)
 
+    def _screening_decision_row(
+        self,
+        event: Mapping[str, object],
+        *,
+        event_id: int,
+        route_id: int | None,
+        lane_id: int,
+        operator_id: int,
+    ) -> dict[str, object]:
+        raw_checks = event.get("checks")
+        checks = raw_checks if isinstance(raw_checks, (list, tuple)) else ()
+        checks_key = tuple(
+            (
+                str(check.get("check", "")),
+                str(check.get("status", "")),
+                check.get("value"),
+                str(check.get("reason", "")),
+            )
+            for check in checks
+            if isinstance(check, Mapping)
+        )
+        definition_key = (
+            lane_id,
+            operator_id,
+            route_id,
+            str(event.get("status", "")),
+            str(event.get("reason", "")),
+            str(event.get("benchmark_axis", "")),
+            event.get("demand"),
+            event.get("distance_increment_lower_bound"),
+            event.get("distance_lower_bound"),
+            event.get("exact_call_blocked"),
+            str(event.get("first_failed_check", "")),
+            event.get("min_time_window_slack"),
+            event.get("negative_cache_hit"),
+            event.get("single_segment_reachable"),
+            event.get("structural_energy_lower_bound"),
+            checks_key,
+        )
+        cached = self._screening_definition_cache.get(definition_key)
+        first_occurrence = False
+        if cached is None:
+            checks_json = orjson.dumps(
+                _normalise_compact_screening_checks(checks),
+                option=orjson.OPT_SORT_KEYS,
+            )
+            definition = {
+                "lane_id": lane_id,
+                "operator_id": operator_id,
+                "route_id": route_id,
+                "status": definition_key[3],
+                "reason": definition_key[4],
+                "benchmark_axis": definition_key[5],
+                "demand": definition_key[6],
+                "distance_increment_lower_bound": definition_key[7],
+                "distance_lower_bound": definition_key[8],
+                "exact_call_blocked": definition_key[9],
+                "first_failed_check": definition_key[10],
+                "min_time_window_slack": definition_key[11],
+                "negative_cache_hit": definition_key[12],
+                "single_segment_reachable": definition_key[13],
+                "structural_energy_lower_bound": definition_key[14],
+                "checks": orjson.Fragment(checks_json),
+            }
+            definition_json = orjson.dumps(definition, option=orjson.OPT_SORT_KEYS)
+            definition_id = (
+                int.from_bytes(hashlib.sha256(definition_json).digest()[:8], "big")
+                & 0x7FFF_FFFF_FFFF_FFFF
+            )
+            cached = (
+                definition_id,
+                definition_json,
+                hashlib.sha256(definition_json).hexdigest(),
+            )
+            self._screening_definition_cache[definition_key] = cached
+            if len(self._screening_definition_cache) > V2_PARQUET_ROW_GROUP_SIZE:
+                self._screening_definition_cache.popitem(last=False)
+            previous_digest = self._screening_definition_digests.get(definition_id)
+            if previous_digest is not None and previous_digest != cached[2]:
+                raise ArtifactIntegrityError(
+                    f"screening definition ID collision for ID {definition_id}"
+                )
+            first_occurrence = previous_digest is None
+            self._screening_definition_digests[definition_id] = cached[2]
+        else:
+            self._screening_definition_cache.move_to_end(definition_key)
+        definition_id, definition_json, _ = cached
+        started_at = event.get("started_at")
+        return {
+            "event_id": event_id,
+            "definition_id": definition_id,
+            "definition_json": definition_json if first_occurrence else None,
+            "started_at": started_at,
+            "completed_at": event.get("completed_at"),
+            "iteration": event.get("iteration"),
+            "decision_id": event.get("decision_id"),
+        }
+
     def _require_open(self) -> None:
         if self._state != "open":
             raise RuntimeError(f"artifact v2 shard session is not open: {self._state}")
@@ -2983,6 +3108,12 @@ class ArtifactReader:
             raise ArtifactIntegrityError(f"Parquet schema mismatch: {path}")
         return [dict(row) for row in table.to_pylist()]
 
+    def parquet_schema(self, relative_path: str | Path) -> pa.Schema:
+        path = _safe_artifact_path(self.run_dir, Path(relative_path).as_posix())
+        if not path.is_file() or path.suffix != ".parquet":
+            raise ArtifactIntegrityError(f"Parquet artifact is missing: {path}")
+        return pq.ParquetFile(path).schema_arrow
+
     def iter_parquet_batches(
         self,
         relative_path: str | Path,
@@ -3021,11 +3152,26 @@ class ArtifactReader:
             parquet_rows = self.read_parquet(path.relative_to(self.run_dir), schema=EVENTS_SCHEMA)
             compact_path = path.with_name(path.name.replace("_events_", "_screening_decisions_", 1))
             if compact_path.is_file():
+                compact_schema = self.parquet_schema(compact_path.relative_to(self.run_dir))
+                if not any(
+                    compact_schema.equals(schema)
+                    for schema in (
+                        V2_SCREENING_DECISIONS_SCHEMA,
+                        V2_SCREENING_DECISIONS_SCHEMA_V1,
+                    )
+                ):
+                    raise ArtifactIntegrityError(
+                        f"unsupported compact screening schema: {compact_path}"
+                    )
                 compact_rows = self.read_parquet(
                     compact_path.relative_to(self.run_dir),
-                    schema=V2_SCREENING_DECISIONS_SCHEMA,
+                    schema=compact_schema,
                 )
-                parquet_rows.extend(expand_v2_screening_decision(row) for row in compact_rows)
+                definitions: dict[int, dict[str, object]] = {}
+                parquet_rows.extend(
+                    expand_v2_screening_decision(row, definitions=definitions)
+                    for row in compact_rows
+                )
                 parquet_rows.sort(key=lambda row: int(row["event_id"]))
             return parquet_rows
         if path.suffix == ".jsonl":

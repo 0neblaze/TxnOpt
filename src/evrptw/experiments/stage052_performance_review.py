@@ -17,6 +17,7 @@ from evrptw.artifacts import (
     ROUTE_DICTIONARY_SCHEMA,
     SCREENING_CHECKS_SCHEMA,
     V2_SCREENING_DECISIONS_SCHEMA,
+    V2_SCREENING_DECISIONS_SCHEMA_V1,
     ArtifactIntegrityError,
     ArtifactReader,
     expand_v2_screening_decision,
@@ -79,12 +80,23 @@ def _iter_stage052_event_rows(
         return
 
     def compact_rows() -> Iterable[dict[str, object]]:
+        relative = str(compact_screening_ref["relative_path"])
+        compact_schema = reader.parquet_schema(relative)
+        if not any(
+            compact_schema.equals(schema)
+            for schema in (
+                V2_SCREENING_DECISIONS_SCHEMA,
+                V2_SCREENING_DECISIONS_SCHEMA_V1,
+            )
+        ):
+            raise ArtifactIntegrityError("unsupported compact screening schema")
+        definitions: dict[int, dict[str, object]] = {}
         for batch in reader.iter_parquet_batches(
-            str(compact_screening_ref["relative_path"]),
-            schema=V2_SCREENING_DECISIONS_SCHEMA,
+            relative,
+            schema=compact_schema,
         ):
             for row in batch.to_pylist():
-                expanded = expand_v2_screening_decision(row)
+                expanded = expand_v2_screening_decision(row, definitions=definitions)
                 yield {key: value for key, value in expanded.items() if key in event_columns}
 
     yield from heapq.merge(
@@ -112,13 +124,24 @@ def _iter_stage052_check_rows(
         return
 
     def compact_rows() -> Iterable[dict[str, object]]:
+        relative = str(compact_screening_ref["relative_path"])
+        compact_schema = reader.parquet_schema(relative)
+        if not any(
+            compact_schema.equals(schema)
+            for schema in (
+                V2_SCREENING_DECISIONS_SCHEMA,
+                V2_SCREENING_DECISIONS_SCHEMA_V1,
+            )
+        ):
+            raise ArtifactIntegrityError("unsupported compact screening schema")
+        definitions: dict[int, dict[str, object]] = {}
         for batch in reader.iter_parquet_batches(
-            str(compact_screening_ref["relative_path"]),
-            schema=V2_SCREENING_DECISIONS_SCHEMA,
-            columns=("event_id", "decision_id", "checks"),
+            relative,
+            schema=compact_schema,
         ):
             for row in batch.to_pylist():
-                checks = row.get("checks")
+                expanded = expand_v2_screening_decision(row, definitions=definitions)
+                checks = expanded.get("embedded_checks")
                 if not isinstance(checks, list):
                     continue
                 for index, check in enumerate(checks):
@@ -128,7 +151,20 @@ def _iter_stage052_check_rows(
                         "decision_event_id": row.get("event_id"),
                         "decision_id": row.get("decision_id"),
                         "check_index": index,
-                        **dict(check),
+                        "check": str(check.get("check", "")),
+                        "status": str(check.get("status", "")),
+                        "value_bool": (
+                            check.get("value") if isinstance(check.get("value"), bool) else None
+                        ),
+                        "value_float": (
+                            float(check["value"])
+                            if isinstance(check.get("value"), (int, float))
+                            else None
+                        ),
+                        "value_text": (
+                            check.get("value") if isinstance(check.get("value"), str) else None
+                        ),
+                        "reason": str(check.get("reason", "")),
                     }
 
     yield from heapq.merge(
@@ -309,6 +345,14 @@ def replay_stage052_storage_semantics(
                 raise ArtifactIntegrityError(f"invalid event extras_json in {directory}") from error
             if not isinstance(extras, Mapping):
                 raise ArtifactIntegrityError(f"event extras_json must be an object in {directory}")
+            canonical_extras = dict(extras)
+            if row.get("event_type") == "cache_event":
+                for volatile_byte_field in (
+                    "current_bytes",
+                    "entry_bytes",
+                    "lookup_current_bytes",
+                ):
+                    canonical_extras.pop(volatile_byte_field, None)
             axis = str(extras.get("benchmark_axis", ""))
             event_hasher = hashers.get(axis)
             if event_hasher is None:
@@ -333,7 +377,7 @@ def replay_stage052_storage_semantics(
                 "lane": lane_dictionary.get(lane_id),
                 "operator": operator_dictionary.get(operator_id),
                 **row,
-                "extras": dict(extras),
+                "extras": canonical_extras,
             }
             if event_payload["lane"] is None or event_payload["operator"] is None:
                 raise ArtifactIntegrityError(f"event dictionary identity is missing in {directory}")

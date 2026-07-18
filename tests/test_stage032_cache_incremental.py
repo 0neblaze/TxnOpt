@@ -11,6 +11,7 @@ from evrptw.cache_incremental import (
     StationReachabilityIndex,
     build_route_propagation_snapshot,
     canonical_instance_hash,
+    estimate_cache_entry_bytes,
     incremental_route_propagation,
 )
 from evrptw.charging import ChargingSubproblemResult
@@ -66,10 +67,15 @@ def test_route_cache_key_contains_instance_sequence_configuration_and_objective(
     assert key.charging_configuration_version == "charging-a"
     assert key.objective_schema_version == "vehicles,distance,charging_time,charging_count"
     assert key.digest != cache.make_key(("C2", "C1")).digest
-    assert key.digest != RouteEvaluationCache(
-        instance,
-        replace(config, instance_hash="instance-b"),
-    ).make_key(("C1", "C2")).digest
+    assert (
+        key.digest
+        != RouteEvaluationCache(
+            instance,
+            replace(config, instance_hash="instance-b"),
+        )
+        .make_key(("C1", "C2"))
+        .digest
+    )
 
 
 def test_stage032_runner_labels_are_canonical_and_non_overlapping() -> None:
@@ -100,6 +106,14 @@ def test_route_cache_reuses_feasible_and_infeasible_results() -> None:
     assert not infeasible_hit.result.feasible
     assert cache.statistics.hits == 2
     assert cache.statistics.misses == 2
+
+
+def test_cache_entry_size_excludes_volatile_runtime() -> None:
+    result = _result(feasible=True)
+
+    assert estimate_cache_entry_bytes(result) == estimate_cache_entry_bytes(
+        replace(result, runtime_seconds=123.456789)
+    )
 
 
 def test_route_cache_lru_eviction_is_observable_and_bounded() -> None:

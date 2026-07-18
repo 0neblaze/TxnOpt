@@ -122,7 +122,9 @@ class RouteCacheStatistics:
 def estimate_cache_entry_bytes(result: ChargingSubproblemResult) -> int:
     """Estimate memory using a stable serialized payload plus object overhead."""
 
-    payload = json.dumps(asdict(result), sort_keys=True, separators=(",", ":"))
+    stable_result = asdict(result)
+    stable_result.pop("runtime_seconds")
+    payload = json.dumps(stable_result, sort_keys=True, separators=(",", ":"))
     return 128 + len(payload.encode("utf-8"))
 
 
@@ -204,12 +206,9 @@ class RouteEvaluationCache:
             self.statistics.bytes_current -= previous[1]
             self.statistics.entries_current -= 1
         evicted: list[RouteCacheKey] = []
-        while (
-            self._entries
-            and (
-                self.statistics.entries_current >= self.config.max_entries
-                or self.statistics.bytes_current + entry_bytes > self.config.max_memory_bytes
-            )
+        while self._entries and (
+            self.statistics.entries_current >= self.config.max_entries
+            or self.statistics.bytes_current + entry_bytes > self.config.max_memory_bytes
         ):
             old_key, (_old_result, old_bytes) = self._entries.popitem(last=False)
             self.statistics.bytes_current -= old_bytes
@@ -301,8 +300,7 @@ def build_route_propagation_snapshot(
     by_name = instance.by_name
     chain = (instance.depot.name, *values, instance.depot.name)
     edge_distances = tuple(
-        instance.distance(left, right)
-        for left, right in zip(chain, chain[1:], strict=False)
+        instance.distance(left, right) for left, right in zip(chain, chain[1:], strict=False)
     )
     current_time = max(0.0, instance.depot.ready_time)
     earliest: list[float] = [current_time]
@@ -471,10 +469,7 @@ def incremental_route_propagation(
             latest_arrival - origin.distance_to(destination) / instance.vehicle.average_velocity
         )
         latest_departures[index] = latest_departure
-        if (
-            origin.kind is NodeType.CUSTOMER
-            and latest_departure < origin.ready_time - epsilon
-        ):
+        if origin.kind is NodeType.CUSTOMER and latest_departure < origin.ready_time - epsilon:
             backward_feasible = False
 
     latest_customer_arrivals: dict[str, float] = {}
