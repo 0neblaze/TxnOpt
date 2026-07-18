@@ -29,6 +29,7 @@ from evrptw.experiments.stage052_performance import (
     _ensure_partial_shard_failure,
     _run_and_persist_v2_shard,
     _run_v2_shard_task,
+    _run_v2_tasks,
     _ShardTask,
     axes_for_scope,
     validate_stage052_run_label,
@@ -53,6 +54,8 @@ from evrptw.stage052 import (
 )
 from evrptw.stage052_evidence import (
     ProcessTreeResourceSampler,
+    collect_performance_provenance,
+    validate_worker_ownership,
     verify_stage052_prerequisite,
 )
 
@@ -144,6 +147,10 @@ def test_worker_selection_is_fail_fast_and_memory_bounded() -> None:
     assert select_worker_count({1: 100.0, 2: 60.0, 4: 50.0}, {1: 4, 2: 8, 4: 11}) == 2
     with pytest.raises(ValueError, match="NOT_READY"):
         select_worker_count({1: 100.0, 2: 80.0, 4: 30.0}, {1: 4, 2: 8, 4: 11})
+    with pytest.raises(ValueError, match="finite"):
+        select_worker_count({1: 100.0, 2: math.nan, 4: 30.0}, {1: 4, 2: 8, 4: 11})
+    with pytest.raises(ValueError, match="finite"):
+        select_worker_count({1: 100.0, 2: 60.0, 4: 30.0}, {1: 4, 2: math.inf, 4: 11})
 
 
 def _storage_observation(
@@ -468,7 +475,12 @@ def test_stage052_producer_prerequisite_binds_raw_and_review_identity(tmp_path: 
 
 
 def test_process_tree_resource_summary_includes_live_child() -> None:
-    sampler = ProcessTreeResourceSampler(interval_seconds=0.01)
+    sampler = ProcessTreeResourceSampler(
+        run_label="stage05.2_job_parallel_attempt99",
+        component="job_parallel",
+        configured_worker_count=2,
+        interval_seconds=0.01,
+    )
     sampler.start()
     child = subprocess.Popen(
         [sys.executable, "-c", "import time; data=bytearray(8_000_000); time.sleep(.12)"],
@@ -476,10 +488,174 @@ def test_process_tree_resource_summary_includes_live_child() -> None:
     child.wait(timeout=2.0)
     summary = sampler.stop()
 
-    assert child.pid in summary.worker_pids
+    assert child.pid in summary.descendant_pids
     assert summary.aggregate_peak_rss_bytes > 8_000_000
     assert summary.sample_count >= 2
     assert summary.status == "complete"
+
+
+def test_worker_ownership_requires_actual_sampled_pids() -> None:
+    resource = {
+        "schema_version": "stage05.2-run-resource-v2",
+        "run_label": "stage05.2_job_parallel_attempt99",
+        "component": "job_parallel",
+        "configured_worker_count": 2,
+        "measurement_scope": "task_scheduling_through_parent_control_preparation",
+        "status": "complete",
+        "run_wall_seconds": 10.0,
+        "sample_interval_seconds": 0.05,
+        "aggregate_peak_rss_bytes": 1024,
+        "mean_active_cores": 1.5,
+        "peak_active_cores": 2.0,
+        "sample_count": 200,
+        "parent_pid": 100,
+        "descendant_pids": [201, 202, 301],
+    }
+    manifests = [
+        {
+            "run_label": "stage05.2_job_parallel_attempt99",
+            "evidence_completeness": "complete",
+            "shard_ordinal": 0,
+            "worker_identity": "pid-201",
+        },
+        {
+            "run_label": "stage05.2_job_parallel_attempt99",
+            "evidence_completeness": "complete",
+            "shard_ordinal": 1,
+            "worker_identity": "pid-202",
+        },
+        {
+            "run_label": "stage05.2_job_parallel_attempt99",
+            "evidence_completeness": "complete",
+            "shard_ordinal": 2,
+            "worker_identity": "pid-201",
+        },
+    ]
+    passed, _, owners = validate_worker_ownership(
+        resource,
+        manifests,
+        expected_workers=2,
+        expected_run_label="stage05.2_job_parallel_attempt99",
+        expected_component="job_parallel",
+    )
+    assert passed
+    assert owners == (201, 202)
+
+    fake = [{**manifests[0], "worker_identity": "pid-0"}, *manifests[1:]]
+    passed, detail, _ = validate_worker_ownership(
+        resource,
+        fake,
+        expected_workers=2,
+        expected_run_label="stage05.2_job_parallel_attempt99",
+        expected_component="job_parallel",
+    )
+    assert not passed
+    assert "not observed" in detail
+
+    parent_owned = [{**manifests[0], "worker_identity": "pid-100"}, *manifests[1:]]
+    passed, detail, _ = validate_worker_ownership(
+        resource,
+        parent_owned,
+        expected_workers=2,
+        expected_run_label="stage05.2_job_parallel_attempt99",
+        expected_component="job_parallel",
+    )
+    assert not passed
+    assert "not observed" in detail
+
+
+def test_parallel_pool_terminates_all_workers_before_recording_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeProcess:
+        pid = 999
+
+        def terminate(self) -> None:
+            events.append("terminate")
+
+        def join(self, *, timeout: float) -> None:
+            events.append(f"join:{timeout}")
+
+        def is_alive(self) -> bool:
+            return False
+
+    class FakeFuture:
+        def result(self) -> object:
+            raise RuntimeError("worker failed")
+
+        def cancel(self) -> None:
+            events.append("cancel")
+
+    class FailingExecutor:
+        def __init__(self, **_: object) -> None:
+            self._processes = {1: FakeProcess()}
+
+        def submit(self, *_: object) -> FakeFuture:
+            return FakeFuture()
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool = False) -> None:
+            events.append(f"shutdown:{wait}:{cancel_futures}")
+
+    tasks = [SimpleNamespace(instance_name="c101C5", seed=2014)]
+    monkeypatch.setattr(stage052_performance, "ProcessPoolExecutor", FailingExecutor)
+    monkeypatch.setattr(stage052_performance, "get_context", lambda _: object())
+    monkeypatch.setattr(stage052_performance, "as_completed", lambda futures: iter(futures))
+    monkeypatch.setattr(
+        stage052_performance,
+        "_ensure_partial_shard_failure",
+        lambda *_: events.append("failure_evidence"),
+    )
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        _run_v2_tasks(tasks, worker_count=2)  # type: ignore[arg-type]
+
+    assert events == [
+        "cancel",
+        "terminate",
+        "join:2.0",
+        "shutdown:True:True",
+        "failure_evidence",
+    ]
+
+
+def test_performance_provenance_records_inputs_without_secret_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance = tmp_path / "instance.txt"
+    stage02 = tmp_path / "stage02.toml"
+    stage04 = tmp_path / "stage04.toml"
+    instance.write_text("instance", encoding="utf-8")
+    stage02.write_text("stage02", encoding="utf-8")
+    stage04.write_text("stage04", encoding="utf-8")
+    native_extension = tmp_path / "_core.so"
+    native_extension.write_bytes(b"native")
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    monkeypatch.setenv("SECRET_TOKEN", "must-not-be-recorded")
+
+    provenance = collect_performance_provenance(
+        instance_paths={"c101C5": instance},
+        stage02_config_path=stage02,
+        stage04_config_path=stage04,
+        max_iterations=1000,
+        batch_size=128,
+        runtime_environment={
+            "python": {"version": "3.13.13", "implementation": "CPython"},
+            "system": {"platform": "macOS", "machine": "arm64", "cpu_count": 10},
+            "packages": {"numpy": "2.4.1"},
+            "native_extension": str(native_extension),
+        },
+    )
+
+    assert provenance["instance_sha256"] == {
+        "c101C5": hashlib.sha256(instance.read_bytes()).hexdigest()
+    }
+    environment = provenance["environment_variables"]
+    assert isinstance(environment, dict)
+    assert environment["PYTHONHASHSEED"] == "0"
+    assert "SECRET_TOKEN" not in environment
+    assert provenance["fallback_allowed"] is False
 
 
 def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(

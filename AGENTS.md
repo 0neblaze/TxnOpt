@@ -575,6 +575,13 @@ this repository or one of its subdirectories.
   are selected only with at least 2.5x speedup and at most 12 GiB. If two
   workers pass and four do not, Formal uses two; if two do not pass, the gate
   is `NOT_READY`. Worker failure aborts the run without serial fallback.
+  Initial D attempts 01--03 are immutable non-promotable evidence: their
+  numerical speed/RSS gates passed, but their shard manifests used synthetic
+  worker labels rather than actual PIDs. Corrected D evidence starts at
+  attempt04 and uses resource schema v2, exact worker-PID ownership, complete
+  36-axis raw/solution/trace replay, and independently verified machine,
+  instance, configuration, power, and environment provenance. No worker count
+  is selected until the complete independent review passes.
 - GPU/Metal/MPS is conditional. Run the accelerator pilot only if the selected
   native CPU route-batch occupancy median is at least 32. Promote an
   accelerator only when fixed-work semantics match, the aggregate paired

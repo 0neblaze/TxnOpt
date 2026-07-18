@@ -119,4 +119,10 @@ Stage 0 frozen baseline、Stage 2/3 历史证据和已发布 v1 bundle 不做物
 
 每个新 run 必须检查 canonical label、attempt/rerun 唯一性、artifact type、control 配置、manifest 与 sidecar、source/config/instance/environment/reference provenance、Parquet schema fingerprint、row count、byte size、shard identity 和 raw-to-summary consistency。独立 reviewer 必须先验证 run/shard manifest，再 replay raw solution、events、trace index、route dictionary、validator 和 objective。
 
+Stage 5.2 D 以后，worker-owned shard 的 `worker_identity` 必须是实际执行进程 PID，
+并且可在同一 run 的 50 ms process-tree resource samples 中找到；多 worker 运行禁止
+把 parent PID 当作 shard owner。resource summary、raw/solution/trace 和 per-run CSV
+必须拥有完全相同的 canonical scope，任何缺失、重复、partial 或 fallback 标记均
+fail fast（快速失败）。
+
 Stage 5.2 以后，报告必须分列 solver time、artifact persistence time 和 end-to-end time；CPU 使用率、芯片功耗、kernel time 或压缩比不能单独构成加速结论。

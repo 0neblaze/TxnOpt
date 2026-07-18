@@ -7,10 +7,12 @@ import csv
 import hashlib
 import heapq
 import json
+import math
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from evrptw import _core as native_core
 from evrptw.artifacts import (
     DIAGNOSTIC_SCHEMA,
     EVENTS_SCHEMA,
@@ -23,7 +25,10 @@ from evrptw.artifacts import (
     expand_v2_screening_decision,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
+from evrptw.environment import collect_environment
 from evrptw.experiments.stage052_performance import (
+    PERFORMANCE_INSTANCES,
+    PERFORMANCE_SEEDS,
     axes_for_scope,
     validate_stage052_run_label,
 )
@@ -38,7 +43,11 @@ from evrptw.stage052 import (
     evaluate_promotion,
     select_worker_count,
 )
-from evrptw.stage052_evidence import verify_stage052_prerequisite
+from evrptw.stage052_evidence import (
+    Stage052PrerequisiteIdentity,
+    validate_worker_ownership,
+    verify_stage052_prerequisite,
+)
 from evrptw.validation import validate_routes
 
 STAGE052_REVIEW_SCHEMA_VERSION = "stage05.2-review-v1"
@@ -58,6 +67,16 @@ _NEXT_STATUS = {
 _C_PREREQUISITE_STATUS = {
     "perf_baseline": "READY_FOR_STAGE052_HOT_PATH",
     "hot_path": "READY_FOR_STAGE052_ARTIFACT_STREAMING",
+}
+_PERFORMANCE_ENVIRONMENT_VARIABLES = {
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "OMP_PLACES",
+    "OMP_PROC_BIND",
+    "OPENBLAS_NUM_THREADS",
+    "PYTHONHASHSEED",
+    "VECLIB_MAXIMUM_THREADS",
 }
 
 
@@ -514,6 +533,7 @@ def review_stage052(
             "detail": str(metadata.get("persistence_attribution")),
         },
     }
+    prerequisite_identity: Stage052PrerequisiteIdentity | None = None
     prerequisite_contract = {
         Stage052Component.JOB_PARALLEL: (
             "artifact_streaming",
@@ -552,9 +572,15 @@ def review_stage052(
                     "detail": str(error),
                 }
             else:
+                bound_prerequisite = metadata.get("component_prerequisite")
+                binding_passed = bound_prerequisite == prerequisite_identity.to_dict()
                 gates["component_prerequisite"] = {
-                    "passed": True,
-                    "detail": prerequisite_identity.run_label,
+                    "passed": binding_passed,
+                    "detail": (
+                        prerequisite_identity.run_label
+                        if binding_passed
+                        else "producer metadata is not bound to the reviewed prerequisite"
+                    ),
                 }
     gates.update(
         _component_gates(
@@ -563,10 +589,21 @@ def review_stage052(
             raw_dir=raw_dir,
             comparison_dirs=comparison_dirs,
             prerequisite_dir=prerequisite_dir,
+            prerequisite_identity=prerequisite_identity,
+            benchmark_dir=benchmark_dir,
         )
     )
     passed = all(bool(gate["passed"]) for gate in gates.values())
     status = _NEXT_STATUS[selected] if passed else NOT_READY
+    if selected is Stage052Component.JOB_PARALLEL and not passed:
+        worker_gate = gates.get("worker_selection")
+        if isinstance(worker_gate, dict) and worker_gate.get("passed") is True:
+            gates["worker_selection"] = {
+                "passed": True,
+                "detail": (
+                    "worker thresholds passed; selection withheld because review is NOT_READY"
+                ),
+            }
     review_dir = raw_dir / "review"
     review_dir.mkdir(parents=True, exist_ok=True)
     findings_path = review_dir / "review_findings.csv"
@@ -574,7 +611,13 @@ def review_stage052(
         writer = csv.DictWriter(handle, fieldnames=("gate", "passed", "detail"))
         writer.writeheader()
         for gate, result in gates.items():
-            writer.writerow({"gate": gate, **result})
+            writer.writerow(
+                {
+                    "gate": gate,
+                    "passed": result.get("passed"),
+                    "detail": result.get("detail"),
+                }
+            )
     report_path = review_dir / "review_report.md"
     report_path.write_text(
         "\n".join(
@@ -606,7 +649,11 @@ def review_stage052(
                 },
             }
     worker_gate = gates.get("worker_selection", {})
-    if selected is Stage052Component.JOB_PARALLEL and worker_gate.get("passed") is True:
+    if (
+        passed
+        and selected is Stage052Component.JOB_PARALLEL
+        and worker_gate.get("passed") is True
+    ):
         review_manifest["selected_workers"] = worker_gate.get("selected_workers")
         review_manifest["selected_run_label"] = worker_gate.get("selected_run_label")
         review_manifest["input_runs"] = worker_gate.get("input_runs")
@@ -694,6 +741,8 @@ def _component_gates(
     raw_dir: Path,
     comparison_dirs: Sequence[Path],
     prerequisite_dir: Path | None,
+    prerequisite_identity: Stage052PrerequisiteIdentity | None,
+    benchmark_dir: Path,
 ) -> dict[str, dict[str, object]]:
     if component is Stage052Component.PERF_BASELINE:
         passed = _axis_semantics_equal(rows, "fixed_work_control", "fixed_work")
@@ -826,6 +875,8 @@ def _component_gates(
         run_by_worker: dict[int, str] = {}
         revisions: set[str] = set()
         configurations: set[str] = set()
+        provenance_signatures: set[str] = set()
+        owners_by_worker: dict[int, tuple[int, ...]] = {}
         for evidence_dir, worker_rows in zip(evidence_dirs, all_rows, strict=True):
             workers = {_strict_int(row["worker_count"], "worker_count") for row in worker_rows}
             if len(workers) != 1:
@@ -840,6 +891,33 @@ def _component_gates(
                 }
             resource = _load_resource_summary(evidence_dir)
             metadata = _load_metadata(evidence_dir)
+            contract_passed, contract_detail = validate_job_parallel_evidence_contract(
+                evidence_dir,
+                expected_workers=worker,
+                expected_prerequisite=prerequisite_identity,
+                benchmark_dir=benchmark_dir,
+            )
+            if not contract_passed:
+                return {
+                    "comparison_completeness": {
+                        "passed": False,
+                        "detail": f"{evidence_dir.name}: {contract_detail}",
+                    }
+                }
+            ownership_passed, ownership_detail, owners = validate_worker_ownership(
+                resource,
+                _load_shard_manifests(evidence_dir),
+                expected_workers=worker,
+                expected_run_label=evidence_dir.name,
+                expected_component=Stage052Component.JOB_PARALLEL.value,
+            )
+            if not ownership_passed:
+                return {
+                    "worker_ownership": {
+                        "passed": False,
+                        "detail": f"{evidence_dir.name}: {ownership_detail}",
+                    }
+                }
             if _strict_int(resource.get("sample_count"), "sample_count") < 2:
                 return {
                     "worker_selection": {
@@ -850,8 +928,10 @@ def _component_gates(
             times[worker] = _strict_float(resource.get("run_wall_seconds"))
             rss[worker] = _strict_float(resource.get("aggregate_peak_rss_bytes")) / 2**30
             run_by_worker[worker] = evidence_dir.name
+            owners_by_worker[worker] = owners
             revisions.add(str(metadata.get("repository_revision", "")))
             configurations.add(str(metadata.get("configuration_sha256", "")))
+            provenance_signatures.add(_performance_provenance_signature(metadata))
         if set(run_by_worker) != {1, 2, 4}:
             return {
                 "worker_selection": {
@@ -859,12 +939,19 @@ def _component_gates(
                     "detail": "worker evidence must contain exactly 1, 2, and 4 workers",
                 }
             }
-        identity_passed = len(revisions) == 1 and len(configurations) == 1
+        identity_passed = (
+            len(revisions) == 1
+            and len(configurations) == 1
+            and len(provenance_signatures) == 1
+        )
         if not identity_passed:
             return {
                 "worker_identity": {
                     "passed": False,
-                    "detail": "worker evidence mixes repository revisions or configurations",
+                    "detail": (
+                        "worker evidence mixes repository revisions, configurations, "
+                        "or invariant performance provenance"
+                    ),
                 }
             }
         replay_maps = [replay_stage052_storage_semantics(path) for path in evidence_dirs]
@@ -891,13 +978,24 @@ def _component_gates(
         except ValueError as error:
             return {"worker_selection": {"passed": False, "detail": str(error)}}
         return {
+            "comparison_completeness": {
+                "passed": True,
+                "detail": "all 1/2/4-worker bundles contain the exact complete 36-axis scope",
+            },
             "worker_identity": {
                 "passed": True,
-                "detail": "worker revisions and configurations match",
+                "detail": "worker revisions, configurations, and provenance match",
             },
             "worker_semantics": {
                 "passed": True,
                 "detail": "C04 and 1/2/4-worker fixed-work replay equality passed",
+            },
+            "worker_ownership": {
+                "passed": True,
+                "detail": "all shards are bound to sampled executor PIDs",
+                "owners": {
+                    str(worker): list(owners_by_worker[worker]) for worker in (1, 2, 4)
+                },
             },
             "worker_selection": {
                 "passed": True,
@@ -938,6 +1036,478 @@ def _load_metadata(raw_dir: Path) -> dict[str, object]:
     reader = ArtifactReader(raw_dir)
     reference = _one_artifact(reader, "manifest_metadata")
     return reader.read_json(str(reference["relative_path"]))
+
+
+def _load_shard_manifests(raw_dir: Path) -> list[dict[str, object]]:
+    reader = ArtifactReader(raw_dir)
+    references = [
+        item
+        for item in reader.manifest.get("artifacts", [])
+        if isinstance(item, Mapping) and item.get("artifact_type") == "shard_manifest"
+    ]
+    if not references:
+        raise ArtifactIntegrityError("worker evidence has no shard manifests")
+    return [reader.read_json(str(reference["relative_path"])) for reference in references]
+
+
+def validate_job_parallel_evidence_contract(
+    raw_dir: Path,
+    *,
+    expected_workers: int,
+    expected_prerequisite: Stage052PrerequisiteIdentity | None,
+    benchmark_dir: Path,
+) -> tuple[bool, str]:
+    """Validate one complete D comparison bundle before it can affect speedup."""
+
+    if expected_prerequisite is None:
+        return False, "reviewed C04 prerequisite identity is missing"
+    try:
+        reader = ArtifactReader(raw_dir)
+        rows = _load_per_run(raw_dir)
+        metadata = _load_metadata(raw_dir)
+        shard_manifests = _load_shard_manifests(raw_dir)
+    except (ArtifactIntegrityError, OSError, ValueError, TypeError) as error:
+        return False, str(error)
+    manifest = reader.manifest
+    if (
+        manifest.get("evidence_completeness") != "complete"
+        or manifest.get("status") != "complete"
+        or manifest.get("artifact_status") != {"failure": "not_applicable"}
+        or manifest.get("component") != Stage052Component.JOB_PARALLEL.value
+        or manifest.get("run_label") != raw_dir.name
+        or manifest.get("storage_policy_version") != "artifact-storage-v2"
+    ):
+        return False, "parent manifest identity, status, or completeness is invalid"
+    expected_metadata = {
+        "run_label": raw_dir.name,
+        "component": Stage052Component.JOB_PARALLEL.value,
+        "scope": "performance",
+        "instances": list(PERFORMANCE_INSTANCES),
+        "seeds": list(PERFORMANCE_SEEDS),
+        "worker_count": expected_workers,
+        "storage_policy_version": "artifact-storage-v2",
+        "backend": "cpu_batch",
+        "repository_dirty": False,
+        "component_prerequisite": expected_prerequisite.to_dict(),
+    }
+    for field, expected in expected_metadata.items():
+        if metadata.get(field) != expected:
+            return (
+                False,
+                f"metadata {field} mismatch: expected={expected} observed={metadata.get(field)}",
+            )
+    config_reference = _one_artifact(reader, "config")
+    if metadata.get("configuration_sha256") != config_reference.get("checksum"):
+        return False, "metadata configuration hash is not bound to the config artifact"
+    axes = tuple(axis.name for axis in axes_for_scope("performance"))
+    scope_passed, scope_detail = validate_per_run_scope(
+        rows,
+        instances=PERFORMANCE_INSTANCES,
+        seeds=PERFORMANCE_SEEDS,
+        axes=axes,
+    )
+    if not scope_passed:
+        return False, scope_detail
+    replay_passed, replay_detail = _replay_solutions(reader, benchmark_dir=benchmark_dir)
+    if not replay_passed:
+        return False, replay_detail
+    for row in rows:
+        expected_row_fields = {
+            "component": Stage052Component.JOB_PARALLEL.value,
+            "backend": "cpu_batch",
+            "worker_count": str(expected_workers),
+            "storage_policy_version": "artifact-storage-v2",
+        }
+        for field, expected in expected_row_fields.items():
+            if str(row.get(field, "")) != expected:
+                return False, f"per-run {field} mismatch"
+    expected_shards = {
+        (instance, seed) for instance in PERFORMANCE_INSTANCES for seed in PERFORMANCE_SEEDS
+    }
+    observed_shards: set[tuple[str, int]] = set()
+    ordinals: set[int] = set()
+    for shard in shard_manifests:
+        try:
+            identity = (str(shard["instance"]), _strict_int(shard["seed"], "seed"))
+            ordinal = _strict_int(shard["shard_ordinal"], "shard_ordinal")
+        except (KeyError, TypeError, ValueError) as error:
+            return False, str(error)
+        if identity in observed_shards or ordinal in ordinals:
+            return False, "duplicate shard identity or ordinal"
+        observed_shards.add(identity)
+        ordinals.add(ordinal)
+        artifacts = shard.get("artifacts")
+        if not isinstance(artifacts, list):
+            return False, "shard artifacts are invalid"
+        if (
+            shard.get("run_label") != raw_dir.name
+            or shard.get("evidence_completeness") != "complete"
+            or shard.get("storage_policy_version") != "artifact-storage-v2"
+            or any(
+                isinstance(item, Mapping) and item.get("artifact_type") == "failure"
+                for item in artifacts
+            )
+        ):
+            return False, "shard identity, completeness, storage, or failure status is invalid"
+    if observed_shards != expected_shards or ordinals != set(range(len(expected_shards))):
+        return False, "missing or extra shard identity/ordinal"
+    axis_artifacts_passed, axis_artifacts_detail = _validate_job_parallel_axis_artifacts(
+        reader,
+        raw_dir=raw_dir,
+        expected_workers=expected_workers,
+        expected_shards=expected_shards,
+        expected_axes=set(axes),
+    )
+    if not axis_artifacts_passed:
+        return False, axis_artifacts_detail
+    provenance_passed, provenance_detail = _validate_performance_provenance(
+        metadata, benchmark_dir=benchmark_dir
+    )
+    if not provenance_passed:
+        return False, provenance_detail
+    return True, "complete canonical D evidence contract passed"
+
+
+def _validate_job_parallel_axis_artifacts(
+    reader: ArtifactReader,
+    *,
+    raw_dir: Path,
+    expected_workers: int,
+    expected_shards: set[tuple[str, int]],
+    expected_axes: set[str],
+) -> tuple[bool, str]:
+    payloads: dict[str, dict[tuple[str, int], Mapping[str, object]]] = {
+        artifact_type: {} for artifact_type in ("raw", "solution", "trace")
+    }
+    for artifact_type, by_identity in payloads.items():
+        references = [
+            item
+            for item in reader.manifest.get("artifacts", [])
+            if isinstance(item, Mapping) and item.get("artifact_type") == artifact_type
+        ]
+        if len(references) != len(expected_shards):
+            return False, f"expected {len(expected_shards)} complete {artifact_type} artifacts"
+        for reference in references:
+            relative = str(reference.get("relative_path", ""))
+            parts = Path(relative).parts
+            try:
+                identity = (parts[0], _strict_int(parts[1], "seed"))
+            except (IndexError, TypeError, ValueError) as error:
+                return False, f"invalid {artifact_type} artifact identity: {error}"
+            if (
+                identity not in expected_shards
+                or identity in by_identity
+                or reference.get("evidence_completeness") != "complete"
+            ):
+                return False, f"duplicate, extra, or partial {artifact_type} artifact"
+            payload = reader.read_json(relative)
+            if not isinstance(payload, Mapping):
+                return False, f"{artifact_type} payload must be an object"
+            by_identity[identity] = payload
+        if set(by_identity) != expected_shards:
+            return False, f"missing {artifact_type} shard identity"
+
+    for identity in sorted(expected_shards):
+        raw = payloads["raw"][identity]
+        solution = payloads["solution"][identity]
+        trace = payloads["trace"][identity]
+        raw_identity = {
+            "run_label": raw_dir.name,
+            "component": Stage052Component.JOB_PARALLEL.value,
+            "scope": "performance",
+            "instance": identity[0],
+            "seed": identity[1],
+            "worker_count": expected_workers,
+        }
+        if any(raw.get(field) != expected for field, expected in raw_identity.items()):
+            return False, f"raw producer identity mismatch for {identity}"
+        if solution.get("instance") != identity[0] or solution.get("seed") != identity[1]:
+            return False, f"solution identity mismatch for {identity}"
+        raw_axes = raw.get("axes")
+        solution_axes = solution.get("axes")
+        trace_axes = trace.get("axes")
+        if not all(isinstance(value, Mapping) for value in (raw_axes, solution_axes, trace_axes)):
+            return False, f"raw/solution/trace axes are invalid for {identity}"
+        assert isinstance(raw_axes, Mapping)
+        assert isinstance(solution_axes, Mapping)
+        assert isinstance(trace_axes, Mapping)
+        if any(set(value) != expected_axes for value in (raw_axes, solution_axes, trace_axes)):
+            return False, f"raw/solution/trace axis identity mismatch for {identity}"
+        for axis in sorted(expected_axes):
+            raw_axis = raw_axes[axis]
+            solution_axis = solution_axes[axis]
+            trace_axis = trace_axes[axis]
+            if not all(
+                isinstance(value, Mapping)
+                for value in (raw_axis, solution_axis, trace_axis)
+            ):
+                return False, f"invalid axis payload for {identity}/{axis}"
+            assert isinstance(raw_axis, Mapping)
+            assert isinstance(solution_axis, Mapping)
+            assert isinstance(trace_axis, Mapping)
+            reconciliation = raw_axis.get("trace_reconciliation")
+            if not isinstance(reconciliation, Mapping):
+                return False, f"trace reconciliation missing for {identity}/{axis}"
+            checks = reconciliation.get("checks")
+            if (
+                raw_axis.get("valid") is not True
+                or raw_axis.get("validator_passed") is not True
+                or solution_axis.get("feasible") is not True
+                or reconciliation.get("status") != "pass"
+                or not isinstance(checks, Mapping)
+                or not checks
+                or any(value is not True for value in checks.values())
+                or raw_axis.get("objective_key") != solution_axis.get("objective_key")
+            ):
+                return False, f"raw validity/reconciliation failed for {identity}/{axis}"
+            result_summary = trace_axis.get("result_summary")
+            if not isinstance(result_summary, Mapping):
+                return False, f"trace result summary missing for {identity}/{axis}"
+            raw_to_trace = {
+                "started_calls": "exact_started_calls",
+                "completed_calls": "exact_completed_calls",
+                "effective_iterations": "effective_iterations",
+                "termination_reason": "termination_reason",
+            }
+            if any(
+                raw_axis.get(raw_field) != result_summary.get(trace_field)
+                for raw_field, trace_field in raw_to_trace.items()
+            ):
+                return False, f"raw/trace reconciliation mismatch for {identity}/{axis}"
+    return True, "exact raw/solution/trace 36-axis identity and reconciliation passed"
+
+
+def _validate_performance_provenance(
+    metadata: Mapping[str, object],
+    *,
+    benchmark_dir: Path,
+) -> tuple[bool, str]:
+    provenance = metadata.get("performance_provenance")
+    if not isinstance(provenance, Mapping):
+        return False, "performance provenance is missing"
+    if provenance.get("schema_version") != "stage05.2-performance-provenance-v1":
+        return False, "performance provenance schema is invalid"
+    instance_hashes = provenance.get("instance_sha256")
+    if not isinstance(instance_hashes, Mapping) or set(instance_hashes) != set(
+        PERFORMANCE_INSTANCES
+    ):
+        return False, "instance hash identity is incomplete"
+    if any(
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in instance_hashes.values()
+    ):
+        return False, "instance hash value is invalid"
+    expected_hashes = {
+        instance: _sha256(benchmark_dir / f"{instance}.txt")
+        for instance in PERFORMANCE_INSTANCES
+    }
+    if dict(instance_hashes) != expected_hashes:
+        return False, "instance hashes do not match the reviewed benchmark inputs"
+    required = {
+        "warm_start",
+        "operator_surface",
+        "fixed_work_contract",
+        "worker_affinity",
+        "environment_variables",
+        "background_load",
+        "power_mode",
+        "runtime_signature",
+        "failure_policy",
+        "fallback_allowed",
+    }
+    if not required.issubset(provenance):
+        return False, "performance provenance fields are incomplete"
+    if provenance.get("warm_start") != {"enabled": False, "source": None}:
+        return False, "D warm-start contract is invalid"
+    fixed_work = provenance.get("fixed_work_contract")
+    if fixed_work != {
+        "exact_call_budget": 100,
+        "watchdog_seconds": 120.0,
+        "max_iterations": 1000,
+        "batch_size": 128,
+        "backend": "cpu_batch",
+    }:
+        return False, "fixed-work contract is invalid"
+    operator_surface = provenance.get("operator_surface")
+    repository_root = benchmark_dir.resolve().parents[1]
+    expected_operator_hashes = {
+        "stage02_config_sha256": _sha256(
+            repository_root / "configs" / "stage02_constraint_guided.toml"
+        ),
+        "stage04_config_sha256": _sha256(
+            repository_root / "configs" / "stage04_weights.toml"
+        ),
+    }
+    if (
+        not isinstance(operator_surface, Mapping)
+        or operator_surface.get("operator_profile") != "stage02_constraint_guided"
+        or any(
+            not isinstance(operator_surface.get(field), str)
+            or operator_surface.get(field) != expected
+            for field, expected in expected_operator_hashes.items()
+        )
+    ):
+        return False, "operator surface provenance is invalid"
+    affinity = provenance.get("worker_affinity")
+    if not isinstance(affinity, Mapping) or not isinstance(
+        affinity.get("supported"), bool
+    ):
+        return False, "worker affinity provenance is invalid"
+    cpu_ids = affinity.get("cpu_ids")
+    if (
+        not isinstance(cpu_ids, list)
+        or any(not isinstance(value, int) or isinstance(value, bool) for value in cpu_ids)
+        or cpu_ids != sorted(set(cpu_ids))
+    ):
+        return False, "worker affinity CPU identity is invalid"
+    environment_variables = provenance.get("environment_variables")
+    if (
+        not isinstance(environment_variables, Mapping)
+        or set(environment_variables) != _PERFORMANCE_ENVIRONMENT_VARIABLES
+        or any(
+            value is not None and not isinstance(value, str)
+            for value in environment_variables.values()
+        )
+    ):
+        return False, "performance environment variables are invalid"
+    background = provenance.get("background_load")
+    if not isinstance(background, Mapping):
+        return False, "background-load provenance is invalid"
+    load_average = background.get("load_average")
+    statuses = background.get("process_status_counts")
+    if (
+        not isinstance(load_average, list)
+        or len(load_average) != 3
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+            for value in load_average
+        )
+        or not isinstance(statuses, Mapping)
+        or not statuses
+        or any(
+            not isinstance(key, str)
+            or not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            for key, value in statuses.items()
+        )
+    ):
+        return False, "background-load provenance is invalid"
+    power_mode = provenance.get("power_mode")
+    if (
+        not isinstance(power_mode, Mapping)
+        or power_mode.get("available") is not True
+        or power_mode.get("source") not in {"AC Power", "Battery Power"}
+        or power_mode.get("low_power_mode") not in {0, 1}
+    ):
+        return False, "power-mode provenance is invalid"
+    environment = metadata.get("environment")
+    runtime_signature = provenance.get("runtime_signature")
+    if not isinstance(environment, Mapping) or not isinstance(runtime_signature, Mapping):
+        return False, "runtime provenance is invalid"
+    python = environment.get("python")
+    system = environment.get("system")
+    packages = environment.get("packages")
+    native_extension = environment.get("native_extension")
+    current_native_path = Path(str(native_core.__file__)).resolve()
+    if (
+        not isinstance(python, Mapping)
+        or not isinstance(system, Mapping)
+        or not isinstance(packages, Mapping)
+        or not isinstance(native_extension, str)
+        or Path(native_extension).resolve() != current_native_path
+        or not current_native_path.is_file()
+    ):
+        return False, "runtime environment identity is invalid"
+    expected_runtime_signature = {
+        "python": {
+            "version": python.get("version"),
+            "implementation": python.get("implementation"),
+        },
+        "system": dict(system),
+        "packages": dict(sorted((str(key), value) for key, value in packages.items())),
+        "native_extension_sha256": _sha256(current_native_path),
+    }
+    if dict(runtime_signature) != expected_runtime_signature:
+        return False, "runtime signature does not match the captured environment"
+    current_environment = collect_environment()
+    current_python = current_environment.get("python")
+    current_system = current_environment.get("system")
+    current_packages = current_environment.get("packages")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (current_python, current_system, current_packages)
+    ):
+        return False, "reviewer runtime environment is incomplete"
+    assert isinstance(current_python, Mapping)
+    assert isinstance(current_system, Mapping)
+    assert isinstance(current_packages, Mapping)
+    recorded_python = {
+        "version": python.get("version"),
+        "implementation": python.get("implementation"),
+    }
+    reviewed_python = {
+        "version": current_python.get("version"),
+        "implementation": current_python.get("implementation"),
+    }
+    if (
+        not all(isinstance(value, str) and value for value in recorded_python.values())
+        or recorded_python != reviewed_python
+    ):
+        return False, "Python runtime identity does not match the reviewer"
+    required_system_fields = {
+        "platform",
+        "machine",
+        "processor",
+        "cpu_count",
+        "gpu_used",
+    }
+    if (
+        not required_system_fields.issubset(system)
+        or dict(system) != dict(current_system)
+        or not isinstance(system.get("platform"), str)
+        or not str(system.get("platform"))
+        or not isinstance(system.get("machine"), str)
+        or not str(system.get("machine"))
+        or not isinstance(system.get("cpu_count"), int)
+        or isinstance(system.get("cpu_count"), bool)
+        or int(system.get("cpu_count", 0)) <= 0
+    ):
+        return False, "system runtime identity does not match the reviewer"
+    if not packages or dict(packages) != dict(current_packages):
+        return False, "package runtime identity does not match the reviewer"
+    if provenance.get("failure_policy") != "abort_all_workers_without_fallback":
+        return False, "worker failure policy is invalid"
+    if provenance.get("fallback_allowed") is not False:
+        return False, "fallback must be disabled"
+    return True, "performance provenance passed"
+
+
+def _performance_provenance_signature(metadata: Mapping[str, object]) -> str:
+    provenance = metadata.get("performance_provenance")
+    if not isinstance(provenance, Mapping):
+        return "<missing>"
+    invariant_fields = (
+        "schema_version",
+        "instance_sha256",
+        "warm_start",
+        "operator_surface",
+        "fixed_work_contract",
+        "worker_affinity",
+        "environment_variables",
+        "power_mode",
+        "runtime_signature",
+        "failure_policy",
+        "fallback_allowed",
+    )
+    return hashlib.sha256(
+        _canonical_json_bytes({field: provenance.get(field) for field in invariant_fields})
+    ).hexdigest()
 
 
 def _optimization_profile_gate(component: Stage052Component, observed: object) -> dict[str, object]:

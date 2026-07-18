@@ -333,8 +333,14 @@ def select_worker_count(
 
     if set(end_to_end_seconds) != {1, 2, 4} or set(aggregate_rss_gib) != {1, 2, 4}:
         raise ValueError("worker evidence must contain exactly 1, 2, and 4 workers")
-    if any(value <= 0.0 for value in end_to_end_seconds.values()):
-        raise ValueError("worker end-to-end times must be positive")
+    if any(
+        not math.isfinite(value) or value <= 0.0 for value in end_to_end_seconds.values()
+    ):
+        raise ValueError("worker end-to-end times must be finite and positive")
+    if any(
+        not math.isfinite(value) or value <= 0.0 for value in aggregate_rss_gib.values()
+    ):
+        raise ValueError("worker aggregate RSS values must be finite and positive")
     baseline = end_to_end_seconds[1]
     two_passes = baseline / end_to_end_seconds[2] >= 1.5 and aggregate_rss_gib[2] <= 12.0
     if not two_passes:

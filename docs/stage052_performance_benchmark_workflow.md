@@ -103,6 +103,21 @@ attempt01--03 保持为失败或 partial evidence，D 只能从 attempt04 进入
 - 4 workers 未过而 2 workers 通过：Formal 固定 2 workers；
 - 2 workers 未过：D 为 `NOT_READY`，先定位调度、写盘、内存或 oversubscription（过度订阅）根因。
 
+`RunResourceSummary` v2 的 `run_wall_seconds` 精确定义为从 task scheduling
+（任务调度）开始，经过全部 shard completion（分片完成）和 parent adoption，直到
+per-run control preparation（逐运行控制工件准备）完成；preflight 和 summary 自身的
+manifest finalisation 不混入该并行阶段 speedup。它同时记录 parent/descendant PID、
+真实 shard owner PID、50 ms process-tree samples、aggregate RSS 和 active cores。
+reviewer 对 1/2/4-worker 三个 bundle 分别要求 exact 36-axis raw/solution/trace replay，
+并独立核对 C04 identity、instance/config/native-extension checksum、Python/package/
+machine identity、affinity、non-secret performance environment variables、background
+load 和 power mode。
+
+`stage05.2_job_parallel_attempt01`--`attempt03` 的数值门槛虽然通过，但 shard
+manifest 记录的是按 ordinal 推算的 synthetic PID（合成进程标识），无法证明真实
+worker ownership，因此永久保留为不可晋级证据。修正后的正式序列从 attempt04
+开始；独立 review 通过前不得发布 selected worker count。
+
 ## E. Native CPU kernels
 
 只迁移 profiling 已证明占主导的路径：screening、propagation snapshot、distance lookup、exact label expansion/dominance/heap。数据边界使用 contiguous integer/float arrays；C++ 核心计算可释放 GIL，但进入 Python callback、异常构造或对象访问前必须重新持有 GIL。

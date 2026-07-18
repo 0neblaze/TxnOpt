@@ -8,6 +8,7 @@ import csv
 import gc
 import hashlib
 import json
+import os
 import re
 import resource
 import subprocess
@@ -46,6 +47,7 @@ from evrptw.stage052 import Stage052Component, formal_budget_matrix
 from evrptw.stage052_evidence import (
     ProcessTreeResourceSampler,
     RunResourceSummary,
+    collect_performance_provenance,
     verify_stage052_prerequisite,
 )
 from evrptw.validation import validate_routes
@@ -277,6 +279,7 @@ def run_stage052(
     context = ArtifactRunContext("stage05.2", selected.value, run_label)
     parent_writer = ArtifactBundleWriter(resolved_output, context, storage)
     revision = _git(root, "rev-parse", "HEAD")
+    environment = collect_environment()
     metadata = {
         "schema_version": STAGE052_SCHEMA_VERSION,
         "run_label": run_label,
@@ -296,7 +299,18 @@ def run_stage052(
         "component_prerequisite": (
             component_prerequisite.to_dict() if component_prerequisite is not None else None
         ),
-        "environment": collect_environment(),
+        "performance_provenance": collect_performance_provenance(
+            instance_paths={
+                instance: _resolve(root, config.benchmark_dir) / f"{instance}.txt"
+                for instance in instances
+            },
+            stage02_config_path=_resolve(root, config.stage02_config),
+            stage04_config_path=_resolve(root, config.stage04_config),
+            max_iterations=config.max_iterations,
+            batch_size=config.batch_size,
+            runtime_environment=environment,
+        ),
+        "environment": environment,
     }
     parent_writer.write_control(metadata=metadata, configuration_path=resolved_config)
     tasks = _build_tasks(
@@ -313,7 +327,12 @@ def run_stage052(
     )
     rows: list[dict[str, object]] = []
     resource_sampler = (
-        ProcessTreeResourceSampler(interval_seconds=0.05)
+        ProcessTreeResourceSampler(
+            run_label=run_label,
+            component=selected.value,
+            configured_worker_count=worker_count,
+            interval_seconds=0.05,
+        )
         if selected
         in {
             Stage052Component.JOB_PARALLEL,
@@ -449,22 +468,67 @@ def _run_v2_tasks(tasks: Sequence[_ShardTask], *, worker_count: int) -> list[dic
     if worker_count == 1:
         return [row for task in tasks for row in _run_v2_shard_task(task)]
     rows: list[dict[str, object]] = []
+    executor = ProcessPoolExecutor(
+        max_workers=worker_count,
+        mp_context=get_context("spawn"),
+    )
     futures: dict[Any, _ShardTask] = {}
     try:
-        with ProcessPoolExecutor(
-            max_workers=worker_count,
-            mp_context=get_context("spawn"),
-        ) as executor:
-            futures = {executor.submit(_run_v2_shard_task, task): task for task in tasks}
-            for future in as_completed(futures):
-                rows.extend(future.result())
+        futures = {executor.submit(_run_v2_shard_task, task): task for task in tasks}
+        for future in as_completed(futures):
+            rows.extend(future.result())
     except BaseException as error:
         for future in futures:
             future.cancel()
+        abort_error: BaseException | None = None
+        try:
+            _abort_process_executor(executor)
+        except BaseException as observed_abort_error:
+            abort_error = observed_abort_error
+        failure_error: BaseException = error
+        if abort_error is not None:
+            failure_error = RuntimeError(
+                f"worker failure {type(error).__name__}: {error}; "
+                f"process-pool abort failure {type(abort_error).__name__}: {abort_error}"
+            )
         for task in tasks:
-            _ensure_partial_shard_failure(task, error)
+            _ensure_partial_shard_failure(task, failure_error)
+        if abort_error is not None:
+            raise failure_error from error
         raise
+    executor.shutdown(wait=True)
     return rows
+
+
+def _abort_process_executor(executor: ProcessPoolExecutor) -> None:
+    """Terminate every live executor process and verify that none survived."""
+
+    processes = getattr(executor, "_processes", None)
+    if not isinstance(processes, Mapping) or not processes:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise RuntimeError("executor process identities are unavailable during abort")
+    workers = tuple(processes.values())
+    termination_errors: list[str] = []
+    for process in workers:
+        try:
+            process.terminate()
+        except BaseException as error:
+            termination_errors.append(f"pid={getattr(process, 'pid', '?')}: {error}")
+    for process in workers:
+        try:
+            process.join(timeout=2.0)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=2.0)
+            if process.is_alive():
+                termination_errors.append(
+                    f"pid={getattr(process, 'pid', '?')}: survived terminate and kill"
+                )
+        except BaseException as error:
+            termination_errors.append(f"pid={getattr(process, 'pid', '?')}: {error}")
+    executor.shutdown(wait=not termination_errors, cancel_futures=True)
+    if termination_errors:
+        raise RuntimeError("; ".join(termination_errors))
 
 
 def _run_v2_shard_task(task: _ShardTask) -> list[dict[str, object]]:
@@ -661,7 +725,7 @@ def _run_and_persist_v2_shard(
         instance=task.instance_name,
         seed=task.seed,
         shard_ordinal=task.shard_ordinal,
-        worker_identity=f"pid-{task.shard_ordinal % max(task.worker_count, 1)}",
+        worker_identity=f"pid-{os.getpid()}",
     )
     raw_axes: dict[str, object] = {}
     solution_axes: dict[str, object] = {}
