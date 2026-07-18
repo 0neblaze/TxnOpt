@@ -25,6 +25,16 @@ Stage 5.2 先修复已测得的工程瓶颈，再扩大实验规模。它不是�
 
 任何失败或被中断的运行使用新 `attemptNN`/`rerunNN`，原 shard、manifest 和 failure evidence 不得覆盖。F 可以以 `GPU_NOT_JUSTIFIED` 通过；A–E 和 G 不得跳过。
 
+当前已验收的 A–F chain（证据链）依次为
+`stage05.2_perf_baseline_attempt04`、`stage05.2_hot_path_attempt03`、
+`stage05.2_artifact_streaming_attempt04`、D04/D05/D06 selection sequence、
+`stage05.2_native_kernels_attempt03` 和
+`stage05.2_accelerator_pilot_attempt01`。当前 selected configuration（选定配置）
+为 4 workers、`artifact-storage-v2`、`native_cpu`（有序 `cpu_batch` exact backend
+加完整 native-kernel profile）。F 的审查状态为
+`READY_FOR_STAGE052_BENCHMARK`；这只开放 G，不代表 Stage 5.2 已完成或已达到
+`READY_FOR_STAGE05_3`。
+
 ## 统一测量合同
 
 性能 gate 的固定 scope 为 `c101C5`、`c101_21`、`r101_21`、`rc101_21` × seeds `2014/2015/2016`。同一 comparison pair（对照对）必须固定：
@@ -127,7 +137,7 @@ worker ownership，因此永久保留为不可晋级证据。修正后的正式�
 
 selection review 选择 `selected_workers=4`，状态为
 `READY_FOR_STAGE052_NATIVE_KERNELS`。Component E 必须绑定 attempt06 的 selection
-identity；此处不构成 Component E 或 F 已完成的声明。
+identity。
 
 ## E. Native CPU kernels
 
@@ -135,17 +145,43 @@ identity；此处不构成 Component E 或 F 已完成的声明。
 
 每个 kernel 先做 frozen fixture、small brute-force（小规模暴力枚举）和 fixed-work differential test（差分测试），再进入完整性能 scope。E 的组合实现必须相对 D 的 accepted configuration 再通过严格 15%/3% 门槛。
 
+E01 保持为 immutable、non-promotable failed producer evidence（不可变、不可晋级的
+生产器失败证据）：producer 仅有 35/36 axes valid，
+`rc101_21/2016/wall_clock_30` 的 unique-route reconciliation 失败，因此未进入
+independent review。E02 完成 36 axes，但 independent reviewer 正式发布
+`NOT_READY`：storage replay 检出 Python 3.13 compensated sum（补偿求和）与 C++
+普通 `+=` 相差 1 ULP。根因修复没有修改旧证据，而是在 clean commit
+`ca766a035a1c5413c61277f50d6904e3de7f238f` 上创建 E03。
+
+accepted E evidence 为 `stage05.2_native_kernels_attempt03`：4 workers、
+`artifact-storage-v2`、`cpu_batch` ordered exact backend 和完整
+`stage05.2-native-kernels-v1` profile。producer 36/36 axes valid，native/protocol
+fallback 均为 0，`run_wall_seconds=178.7190`，aggregate peak RSS 为
+8,728,821,760 bytes。independent reviewer 证明 D06/E03 的 24 个 fixed-work axes
+streaming replay 完全一致；100-customer end-to-end saving 为 aggregate 68.9735%，
+C 76.9780%，R 64.2989%，RC 68.9735%。全部 gate 通过，状态为
+`READY_FOR_STAGE052_ACCELERATOR_DECISION`。
+
 ## F. Conditional accelerator pilot
 
 只有 E 后 median route batch occupancy ≥ 32 才启动。否则直接发布带证据的 `GPU_NOT_JUSTIFIED`。pilot 必须记录 packing、host-to-device、kernel、device-to-host、synchronisation 和 total end-to-end time。
 
 GPU/Metal/MPS promotion 同时要求：fixed-work 语义一致；相对 E selected native CPU，全部 100-customer 配对的总体端到端中位时间至少降低 15%；C、R、RC 任一 family 的 family median 回退不超过 3%。任一条件失败即保留 native CPU。正式 runner 不得设置隐式 CPU fallback。
 
+accepted F evidence 为 decision-only
+`stage05.2_accelerator_pilot_attempt01`。runner 从 accepted E03 raw evidence 重算
+3 families × 3 seeds 的九个 fixed-work occupancy；九项均为 1.0，overall median
+为 1.0，低于阈值 32。因此没有安装或调用 GPU framework，也没有生成 GPU solver
+rows。decision artifact 明确记录 `GPU_NOT_JUSTIFIED`、`gpu_rows_present=false` 和
+`fallback_used=false`。independent reviewer 重新计算全部九项并通过 exclusive
+decision-only schema（互斥仅决策模式）；selected backend 为 `native_cpu`，状态为
+`READY_FOR_STAGE052_BENCHMARK`。
+
 ## G. Pipeline pilot 与正式分层预算
 
 ### Pipeline pilot
 
-先用固定 Stage 0 representative set（代表集）执行 `12 instances × 3 seeds`，完整走过 selected backend、selected worker count、artifact-storage-v2、failure handling、independent replay、summary generation 和 registry/manifest publication dry run（发布演练）。所有 36 bundles 完整且 review 通过后才开放 Formal。
+先用固定 Stage 0 representative set（代表集）执行 `12 instances × 3 seeds`，完整走过 selected backend、selected worker count、artifact-storage-v2、failure handling、independent replay、summary generation 和 registry/manifest publication dry run（发布演练）。当前 G 的固定入口是 F01 选择的 `native_cpu`、4 workers 和 `artifact-storage-v2`。所有 36 bundles 完整且 review 通过后才开放 Formal。
 
 ### Formal budget matrix
 

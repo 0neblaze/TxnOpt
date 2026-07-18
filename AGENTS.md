@@ -588,6 +588,21 @@ this repository or one of its subdirectories.
   130.6914 s, 5.4178 GiB, 3.110x speedup). The independent selection review
   selects 4 workers and reports `READY_FOR_STAGE052_NATIVE_KERNELS`; Component
   E must bind that exact selection identity.
+- Component E is accepted as `stage05.2_native_kernels_attempt03` on clean
+  commit `ca766a035a1c5413c61277f50d6904e3de7f238f`, with 4 workers,
+  artifact-storage-v2, the ordered `cpu_batch` exact backend, and the complete
+  `stage05.2-native-kernels-v1` configuration for distance, screening,
+  propagation, and exact charging. Its independent review passes all 36 axes,
+  all 24 D/native fixed-work storage replays, and the no-fallback contract. The
+  100-customer paired median end-to-end savings are 68.9735% aggregate,
+  76.9780% C, 64.2989% R, and 68.9735% RC; aggregate peak RSS is
+  8,728,821,760 bytes. The review reports
+  `READY_FOR_STAGE052_ACCELERATOR_DECISION`. Attempt01 remains immutable,
+  non-promotable failed producer evidence: 35 of 36 axes were valid, while
+  `rc101_21/2016/wall_clock_30` failed unique-route reconciliation, so it did
+  not enter independent review. Attempt02 completed all 36 axes but its
+  independent reviewer published `NOT_READY` after exposing a one-ULP
+  Python/native compensated-summation mismatch. Neither is promotable.
 - GPU/Metal/MPS is conditional. Run the accelerator pilot only if the selected
   native CPU route-batch occupancy median is at least 32. Promote an
   accelerator only when fixed-work semantics match, the aggregate paired
@@ -595,6 +610,16 @@ this repository or one of its subdirectories.
   native CPU, and no C/R/RC family median regresses by over 3%; transfer,
   kernel, and synchronisation time are reported separately.
   `GPU_NOT_JUSTIFIED` is a passing decision when these conditions are not met.
+- Component F is accepted as decision-only
+  `stage05.2_accelerator_pilot_attempt01`. Its independent reviewer recomputes
+  the nine 100-customer fixed-work occupancies from accepted E raw evidence;
+  every value and the overall median are 1.0, below the threshold of 32. The
+  mutually exclusive artifact schema contains no GPU solver rows and records
+  `fallback_used=false`. The accepted decision is `GPU_NOT_JUSTIFIED`, the
+  selected backend is `native_cpu`, and the review reports
+  `READY_FOR_STAGE052_BENCHMARK`. This opens Component G only; Stage 5.2 is not
+  `READY_FOR_STAGE05_3` until the 36-bundle pipeline pilot and 2,040-run Formal
+  benchmark independently pass and are published.
 - Before the Formal benchmark, run the complete selected backend/worker/storage
   pipeline on the fixed 12-instance, three-seed pilot. Formal uses the declared
   stratified budget: all 92 instances use 10 seeds at 30 seconds; only the 56

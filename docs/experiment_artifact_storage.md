@@ -11,6 +11,15 @@
 pilot、正式 benchmark 的存储策略；`artifact-storage-v1` 继续作为历史读取与
 性能对照策略，不做物理迁移。
 
+当前 D–F accepted chain（已验收证据链）继续使用该 v2 policy：D04/D05/D06
+selection review 选择 4 workers；`stage05.2_native_kernels_attempt03` 的 36 axes
+全部使用 v2 worker-owned shards，并通过 24-axis D/native streaming replay
+equality；`stage05.2_accelerator_pilot_attempt01` 是合格的 decision-only bundle，
+按互斥 schema 只含 control metadata、config 与 accelerator decision，不伪造 solver
+shard 或 GPU row。F01 选择 `native_cpu` 并报告
+`READY_FOR_STAGE052_BENCHMARK`。后续 Component G 必须固定使用 4 workers、
+`native_cpu` 和 `artifact-storage-v2`；不得因为 F 是 decision-only 而退回 v1。
+
 v1/v2 的固定策略为：
 
 | 字段 | 固定值 |
