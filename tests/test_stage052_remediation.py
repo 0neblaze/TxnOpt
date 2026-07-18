@@ -22,6 +22,7 @@ from evrptw.experiments.stage052_performance_review import _validate_c05_remedia
 from evrptw.stage052_evidence import Stage052PrerequisiteIdentity
 from evrptw.stage052_remediation import (
     Stage052RemediationConfig,
+    _validate_source_storage,
     remediate_stage052_artifacts,
     replay_stage052_bundle_semantics,
 )
@@ -236,6 +237,27 @@ def test_signed_e03_not_ready_bundle_is_streamed_to_equal_v3_child(
     assert "screening_definitions_v3" in subtypes
     assert "screening_occurrences_v3" in subtypes
     assert "screening_decisions_v2" not in subtypes
+
+
+def test_remediation_infers_legacy_v2_schema_from_signed_artifact_subtypes() -> None:
+    source = type(
+        "LegacyReader",
+        (),
+        {
+            "manifest": {
+                "storage_policy_version": "artifact-storage-v2",
+                "storage_policy": {"storage_policy_version": "artifact-storage-v2"},
+                "artifacts": [
+                    {
+                        "artifact_type": "events",
+                        "artifact_subtype": "screening_decisions_v2",
+                    }
+                ],
+            }
+        },
+    )()
+
+    _validate_source_storage(source)
 
 
 def test_remediation_reader_scratch_stays_on_child_staging_volume(

@@ -490,9 +490,25 @@ def _validate_source_storage(reader: ArtifactReader) -> None:
     policy = reader.manifest.get("storage_policy")
     if not isinstance(policy, Mapping):
         raise ArtifactIntegrityError("E03 source lacks a storage policy")
+    declared_schema = policy.get("screening_schema_version")
+    artifacts = reader.manifest.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ArtifactIntegrityError("E03 source artifact registry is invalid")
+    observed_schemas = {
+        str(item.get("artifact_subtype"))
+        for item in artifacts
+        if isinstance(item, Mapping)
+        and item.get("artifact_type") == "events"
+        and str(item.get("artifact_subtype", "")).startswith("screening_decisions_v")
+    }
+    schema_matches = (
+        observed_schemas <= {SCREENING_DECISIONS_V2}
+        if declared_schema == SCREENING_DECISIONS_V2
+        else declared_schema is None and observed_schemas == {SCREENING_DECISIONS_V2}
+    )
     if (
         reader.manifest.get("storage_policy_version") != ARTIFACT_STORAGE_V2
-        or policy.get("screening_schema_version") != SCREENING_DECISIONS_V2
+        or not schema_matches
     ):
         raise ArtifactIntegrityError(
             "E03 remediation requires historical artifact-storage-v2 with screening_decisions_v2"
