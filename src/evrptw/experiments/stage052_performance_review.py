@@ -40,6 +40,7 @@ from evrptw.experiments.stage052_performance import (
     load_stage052_config,
     validate_stage052_run_label,
 )
+from evrptw.measurement import COMPLETED_UNIQUE_ROUTE_SEMANTICS
 from evrptw.native_kernels import NativeKernelConfig
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
@@ -1323,6 +1324,9 @@ def _audit_native_execution(
                 checks = (
                     reconciliation.get("checks") if isinstance(reconciliation, Mapping) else None
                 )
+                reconciliation_expected = (
+                    reconciliation.get("expected") if isinstance(reconciliation, Mapping) else None
+                )
                 if (
                     raw_axis.get("valid") is not True
                     or raw_axis.get("validator_passed") is not True
@@ -1333,6 +1337,9 @@ def _audit_native_execution(
                     or not isinstance(checks, Mapping)
                     or not checks
                     or any(value is not True for value in checks.values())
+                    or not isinstance(reconciliation_expected, Mapping)
+                    or reconciliation_expected.get("unique_route_semantics")
+                    != COMPLETED_UNIQUE_ROUTE_SEMANTICS
                 ):
                     raise ArtifactIntegrityError(
                         f"native validity/trace reconciliation failed: {axis_identity}"
@@ -1342,6 +1349,14 @@ def _audit_native_execution(
                 if not isinstance(backend, Mapping) or not isinstance(result_summary, Mapping):
                     raise ArtifactIntegrityError(
                         f"native backend/result summary is missing: {axis_identity}"
+                    )
+                if (
+                    raw_axis.get("unique_route_semantics") != COMPLETED_UNIQUE_ROUTE_SEMANTICS
+                    or result_summary.get("unique_route_semantics")
+                    != COMPLETED_UNIQUE_ROUTE_SEMANTICS
+                ):
+                    raise ArtifactIntegrityError(
+                        f"native unique-route semantics are missing: {axis_identity}"
                     )
                 screening = result_summary.get("screening_statistics")
                 incremental = result_summary.get("cache_incremental_statistics")
@@ -1442,6 +1457,7 @@ def _audit_native_execution(
                     "started_calls": result_summary.get("exact_started_calls"),
                     "completed_calls": result_summary.get("exact_completed_calls"),
                     "effective_iterations": result_summary.get("effective_iterations"),
+                    "unique_route_semantics": result_summary.get("unique_route_semantics"),
                     "termination_reason": result_summary.get("termination_reason"),
                 }
                 if any(

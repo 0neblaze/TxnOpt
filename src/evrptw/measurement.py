@@ -18,9 +18,9 @@ CACHE_INCREMENTAL_TRACE_SCHEMA_VERSION = "stage03-trace-v2"
 EXACT_DEADLINE_TRACE_SCHEMA_VERSION = "stage03-trace-v3"
 CANDIDATE_CONTROL_TRACE_SCHEMA_VERSION = "stage03-trace-v4"
 SCREENING_SCHEMA_VERSION = "stage031-screening-v1"
-ROUTE_EVALUATION_KINDS = frozenset(
-    {"exact_call", "cache_hit", "precomputed_route"}
-)
+LEGACY_UNIQUE_ROUTE_SEMANTICS = "started_lane_identity_legacy_v1"
+COMPLETED_UNIQUE_ROUTE_SEMANTICS = "completed_cache_owner_identity_v2"
+ROUTE_EVALUATION_KINDS = frozenset({"exact_call", "cache_hit", "precomputed_route"})
 
 
 def canonical_route_key(sequence: tuple[str, ...] | list[str]) -> str:
@@ -231,9 +231,7 @@ class Stage03Trace:
             and self.screening_config.enabled
             and not self.config.record_route_dictionary
         ):
-            raise ValueError(
-                "Stage 3.1 screening requires record_route_dictionary=True"
-            )
+            raise ValueError("Stage 3.1 screening requires record_route_dictionary=True")
 
     def _offset(self, value: float | None = None) -> float:
         return (time.perf_counter() if value is None else value) - self.started_at_perf
@@ -274,9 +272,7 @@ class Stage03Trace:
             raise ValueError(f"unsupported route evaluation kind: {kind}")
         key = self.register_route(sequence)
         started = self._offset() if started_at is None else started_at
-        completed = (
-            self._offset() if completed_at is None and exact_completed else completed_at
-        )
+        completed = self._offset() if completed_at is None and exact_completed else completed_at
         duration = max(0.0, (completed - started) if completed is not None else 0.0)
         resolved_status = status
         if not resolved_status:
@@ -553,6 +549,7 @@ class Stage03Trace:
                 "cache_hits",
                 "cache_misses",
                 "unique_route_evaluations",
+                "unique_route_semantics",
                 "iterations",
                 "effective_iterations",
                 "exact_started_calls",
@@ -564,14 +561,10 @@ class Stage03Trace:
                 "route_result_hash",
             )
             self.result_summary = {
-                field: getattr(result, field)
-                for field in fields
-                if hasattr(result, field)
+                field: getattr(result, field) for field in fields if hasattr(result, field)
             }
             if hasattr(result, "screening_statistics"):
-                self.result_summary["screening_statistics"] = cast(
-                    Any, result
-                ).screening_statistics
+                self.result_summary["screening_statistics"] = cast(Any, result).screening_statistics
             if hasattr(result, "cache_incremental_statistics"):
                 self.result_summary["cache_incremental_statistics"] = cast(
                     Any, result
@@ -668,11 +661,54 @@ class Stage03Trace:
         )
         expected_cache_hits = int(result.cache_hits)
         expected_unique = int(result.unique_route_evaluations)
-        exact_route_keys = {
-            (record.lane, record.route_key)
+        expected_cache_incremental = getattr(result, "cache_incremental_statistics", {})
+        candidate_pending_cache_hits = sum(
+            event.get("event_type") == "cache_event"
+            and event.get("operation") == "candidate_pending_hit"
+            for event in self.events
+        )
+        expected_route_evaluation_cache_hits = expected_cache_hits + (
+            candidate_pending_cache_hits
+            if isinstance(expected_cache_incremental, dict) and bool(expected_cache_incremental)
+            else 0
+        )
+        unique_route_semantics = str(
+            getattr(
+                result,
+                "unique_route_semantics",
+                LEGACY_UNIQUE_ROUTE_SEMANTICS,
+            )
+        )
+        supported_unique_route_semantics = unique_route_semantics in {
+            LEGACY_UNIQUE_ROUTE_SEMANTICS,
+            COMPLETED_UNIQUE_ROUTE_SEMANTICS,
+        }
+        legacy_started_unique_semantics = unique_route_semantics == LEGACY_UNIQUE_ROUTE_SEMANTICS
+        identity_records = (
+            record
             for record in self.route_evaluations
             if record.kind == "exact_call"
-        }
+            and (
+                record.exact_started if legacy_started_unique_semantics else record.exact_completed
+            )
+        )
+        if legacy_started_unique_semantics:
+            exact_route_keys: set[str | tuple[str, str]] = {
+                (record.lane, record.route_key) for record in identity_records
+            }
+        elif (
+            self.cache_incremental_config is not None
+            and self.cache_incremental_config.shared_across_lanes
+        ):
+            exact_route_keys = {record.route_key for record in identity_records}
+        else:
+            exact_route_keys = {
+                (
+                    "legacy" if record.lane == "initialization" else record.lane,
+                    record.route_key,
+                )
+                for record in identity_records
+            }
         operator_call_counts: dict[str, dict[str, int]] = {}
         expected_operator_calls: dict[str, dict[str, int]] = {}
         for group, statistics in (
@@ -697,8 +733,7 @@ class Stage03Trace:
         legacy_candidate_states = [
             event
             for event in self.events
-            if event.get("event_type") == "candidate_state"
-            and event.get("lane") == "legacy"
+            if event.get("event_type") == "candidate_state" and event.get("lane") == "legacy"
         ]
         accepted_legacy = sum(event.get("accepted") is True for event in legacy_candidate_states)
         rejected_legacy = sum(
@@ -720,7 +755,9 @@ class Stage03Trace:
             "started_calls_not_less_than_completed": self.started_calls >= self.completed_calls,
             "completed_calls_equal_result": self.completed_calls == expected_calls,
             "exact_calls_equal_result": self.exact_calls == expected_started_calls,
-            "cache_hits_equal_result": self.cache_hits == expected_cache_hits,
+            "unique_route_semantics_supported": supported_unique_route_semantics,
+            "route_evaluation_cache_hits_equal_result": self.cache_hits
+            == expected_route_evaluation_cache_hits,
             "unique_routes_equal_result": len(exact_route_keys) == expected_unique,
             "operator_calls_equal_result": operator_call_counts == expected_operator_calls,
             "legacy_candidate_states_equal_effective_iterations": len(legacy_candidate_states)
@@ -741,15 +778,12 @@ class Stage03Trace:
                 "screening_cache_hits",
                 "screening_exact_call_blocked",
             ):
-                checks[f"{field_name}_equal_result"] = (
-                    int(cast(Any, observed_screening.get(field_name, 0)))
-                    == int(cast(Any, expected_screening.get(field_name, 0)))
-                )
-            checks["screening_reason_counts_equal_result"] = (
-                observed_screening.get("screening_reason_counts", {})
-                == expected_screening.get("screening_reason_counts", {})
-            )
-        expected_cache_incremental = getattr(result, "cache_incremental_statistics", {})
+                checks[f"{field_name}_equal_result"] = int(
+                    cast(Any, observed_screening.get(field_name, 0))
+                ) == int(cast(Any, expected_screening.get(field_name, 0)))
+            checks["screening_reason_counts_equal_result"] = observed_screening.get(
+                "screening_reason_counts", {}
+            ) == expected_screening.get("screening_reason_counts", {})
         if isinstance(expected_cache_incremental, dict) and expected_cache_incremental:
             observed_cache_incremental = self.cache_incremental_counts
             expected_cache_incremental = cast(dict[str, Any], expected_cache_incremental)
@@ -763,10 +797,9 @@ class Stage03Trace:
                 "incremental_propagations",
                 "incremental_fallbacks",
             ):
-                checks[f"{field_name}_equal_result"] = (
-                    int(observed_cache_incremental.get(field_name, 0))
-                    == int(expected_cache_incremental.get(field_name, 0))
-                )
+                checks[f"cache_incremental_{field_name}_equal_result"] = int(
+                    observed_cache_incremental.get(field_name, 0)
+                ) == int(expected_cache_incremental.get(field_name, 0))
         return {
             "status": "pass" if all(checks.values()) else "fail",
             "checks": checks,
@@ -775,8 +808,11 @@ class Stage03Trace:
                 "completed_calls": self.completed_calls,
                 "exact_calls": self.exact_calls,
                 "cache_hits": self.cache_hits,
+                "candidate_pending_cache_hits": candidate_pending_cache_hits,
+                "result_cache_hits": expected_cache_hits,
                 "precomputed_routes": self.precomputed_routes,
                 "unique_route_evaluations": len(exact_route_keys),
+                "unique_route_semantics": unique_route_semantics,
                 "operator_calls": operator_call_counts,
                 "legacy_candidate_states": len(legacy_candidate_states),
                 "accepted_moves": accepted_legacy,
@@ -787,8 +823,11 @@ class Stage03Trace:
             },
             "expected": {
                 "charging_subproblem_calls": expected_calls,
-                "cache_hits": expected_cache_hits,
+                "cache_hits": expected_route_evaluation_cache_hits,
+                "candidate_pending_cache_hits": candidate_pending_cache_hits,
+                "result_cache_hits": expected_cache_hits,
                 "unique_route_evaluations": expected_unique,
+                "unique_route_semantics": unique_route_semantics,
                 "operator_calls": expected_operator_calls,
                 "accepted_moves": int(result.accepted_moves),
                 "rejected_moves": int(result.rejected_moves),
@@ -815,12 +854,10 @@ class Stage03Trace:
                 "precomputed_routes": self.precomputed_routes,
                 "deadline_events": self.deadline_events,
                 "interrupted_calls": sum(
-                    record.status == "interrupted_deadline"
-                    for record in self.route_evaluations
+                    record.status == "interrupted_deadline" for record in self.route_evaluations
                 ),
                 "budget_exhaustions": sum(
-                    event.get("event_type") == "exact_budget_boundary"
-                    for event in self.events
+                    event.get("event_type") == "exact_budget_boundary" for event in self.events
                 ),
                 "route_evaluation_count": len(self.route_evaluations),
                 "operator_call_counts": self.operator_call_counts,
@@ -847,9 +884,7 @@ class Stage03Trace:
                 else None
             ),
             "incremental_propagations": list(self.incremental_propagations),
-            "screening_decisions": [
-                asdict(decision) for decision in self.screening_decisions
-            ],
+            "screening_decisions": [asdict(decision) for decision in self.screening_decisions],
             "finished_at": self.finished_at,
             "result_summary": dict(self.result_summary),
         }
@@ -867,12 +902,10 @@ class Stage03Trace:
                 "precomputed_routes": self.precomputed_routes,
                 "deadline_events": self.deadline_events,
                 "interrupted_calls": sum(
-                    record.status == "interrupted_deadline"
-                    for record in self.route_evaluations
+                    record.status == "interrupted_deadline" for record in self.route_evaluations
                 ),
                 "budget_exhaustions": sum(
-                    event.get("event_type") == "exact_budget_boundary"
-                    for event in self.events
+                    event.get("event_type") == "exact_budget_boundary" for event in self.events
                 ),
                 "route_evaluation_count": len(self.route_evaluations),
                 "operator_call_counts": self.operator_call_counts,
@@ -883,9 +916,7 @@ class Stage03Trace:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> Stage03Trace:
-        trace_schema_version = str(
-            payload.get("trace_schema_version", TRACE_SCHEMA_VERSION)
-        )
+        trace_schema_version = str(payload.get("trace_schema_version", TRACE_SCHEMA_VERSION))
         config_payload = payload.get("config", {})
         config = MeasurementConfig(**config_payload)
         trace = cls(config)
@@ -899,23 +930,17 @@ class Stage03Trace:
                 evaluation_id=int(item["evaluation_id"]),
                 route_key=str(item["route_key"]),
                 lane=str(item["lane"]),
-                iteration=(
-                    None if item.get("iteration") is None else int(item["iteration"])
-                ),
+                iteration=(None if item.get("iteration") is None else int(item["iteration"])),
                 operator=str(item["operator"]),
                 kind=str(item["kind"]),
                 started_at=float(item["started_at"]),
                 completed_at=(
-                    None
-                    if item.get("completed_at") is None
-                    else float(item["completed_at"])
+                    None if item.get("completed_at") is None else float(item["completed_at"])
                 ),
                 duration_seconds=float(item["duration_seconds"]),
                 exact_started=bool(item["exact_started"]),
                 exact_completed=bool(item["exact_completed"]),
-                feasible=(
-                    None if item.get("feasible") is None else bool(item["feasible"])
-                ),
+                feasible=(None if item.get("feasible") is None else bool(item["feasible"])),
                 failure_reason=str(item.get("failure_reason", "")),
                 labels_generated=int(item.get("labels_generated", 0)),
                 labels_expanded=int(item.get("labels_expanded", 0)),
@@ -948,9 +973,7 @@ class Stage03Trace:
             trace.trace_schema_version = EXACT_DEADLINE_TRACE_SCHEMA_VERSION
         candidate_control_payload = payload.get("candidate_control_config")
         if isinstance(candidate_control_payload, dict):
-            trace.candidate_control_config = CandidateControlConfig(
-                **candidate_control_payload
-            )
+            trace.candidate_control_config = CandidateControlConfig(**candidate_control_payload)
             trace.trace_schema_version = CANDIDATE_CONTROL_TRACE_SCHEMA_VERSION
         trace.incremental_propagations = [
             dict(item) for item in payload.get("incremental_propagations", [])
@@ -960,9 +983,7 @@ class Stage03Trace:
                 decision_id=int(item["decision_id"]),
                 route_key=str(item["route_key"]),
                 lane=str(item["lane"]),
-                iteration=(
-                    None if item.get("iteration") is None else int(item["iteration"])
-                ),
+                iteration=(None if item.get("iteration") is None else int(item["iteration"])),
                 operator=str(item["operator"]),
                 status=str(item["status"]),
                 first_failed_check=str(item.get("first_failed_check", "")),
@@ -991,9 +1012,7 @@ class Stage03Trace:
                     else float(item["distance_increment_lower_bound"])
                 ),
                 single_segment_reachable=bool(item.get("single_segment_reachable", False)),
-                structural_energy_lower_bound=float(
-                    item.get("structural_energy_lower_bound", 0.0)
-                ),
+                structural_energy_lower_bound=float(item.get("structural_energy_lower_bound", 0.0)),
                 negative_cache_hit=bool(item.get("negative_cache_hit", False)),
                 exact_call_blocked=bool(item.get("exact_call_blocked", False)),
                 started_at=float(item.get("started_at", 0.0)),

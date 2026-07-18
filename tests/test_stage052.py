@@ -181,12 +181,16 @@ def test_native_execution_audit_cross_checks_per_run_raw_and_trace(tmp_path: Pat
                         "started_calls": 5,
                         "completed_calls": 5,
                         "effective_iterations": 3,
+                        "unique_route_semantics": "completed_cache_owner_identity_v2",
                         "termination_reason": "exact_call_budget_exhausted",
                         "validator_passed": True,
                         "valid": True,
                         "trace_reconciliation": {
                             "status": "pass",
                             "checks": {"calls": True},
+                            "expected": {
+                                "unique_route_semantics": ("completed_cache_owner_identity_v2")
+                            },
                         },
                     }
                 },
@@ -223,6 +227,7 @@ def test_native_execution_audit_cross_checks_per_run_raw_and_trace(tmp_path: Pat
                             "exact_started_calls": 5,
                             "exact_completed_calls": 5,
                             "effective_iterations": 3,
+                            "unique_route_semantics": ("completed_cache_owner_identity_v2"),
                             "termination_reason": "exact_call_budget_exhausted",
                         }
                     }
@@ -1997,6 +2002,7 @@ def test_v2_final_flush_is_charged_to_persistence_and_end_to_end(
         screening_statistics={},
         runtime_seconds=0.0,
         effective_iterations=1,
+        unique_route_semantics="completed_cache_owner_identity_v2",
         termination_reason="fixed_work_budget",
     )
     monkeypatch.setattr(

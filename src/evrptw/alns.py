@@ -31,6 +31,7 @@ from evrptw.cpu_batch import (
 )
 from evrptw.exact_deadline import ExactCallController, ExactDeadlineConfig
 from evrptw.measurement import (
+    COMPLETED_UNIQUE_ROUTE_SEMANTICS,
     CheapScreeningConfig,
     MeasurementConfig,
     ScreeningCheckTrace,
@@ -167,6 +168,7 @@ class ALNSResult:
     cache_hits: int = 0
     cache_misses: int = 0
     unique_route_evaluations: int = 0
+    unique_route_semantics: str = COMPLETED_UNIQUE_ROUTE_SEMANTICS
     effective_iterations: int = 0
     removal_tier_counts: dict[str, int] = field(default_factory=dict)
     maximum_stagnation: int = 0
@@ -1034,8 +1036,6 @@ class _Evaluator:
         else:
             started_offset = 0.0
         try:
-            self.evaluated_routes.add(sequence)
-            self.evaluated_route_keys.add((self.lane, sequence))
             if self.backend is ExactChargingBackend.CPU_SCALAR:
                 result = solve_exact_charging(self.instance, sequence)
                 self.backend_metrics.work_batches += 1
@@ -1076,6 +1076,9 @@ class _Evaluator:
             completed_on_error = (
                 error.completed_exact_calls if isinstance(error, ExactBatchDeadlineExceeded) else 0
             )
+            if completed_on_error == 1:
+                self.evaluated_routes.add(sequence)
+                self.evaluated_route_keys.add((self.lane, sequence))
             if self.exact_call_controller is not None:
                 self.exact_call_controller.complete(completed_on_error)
                 self.exact_call_controller.interrupt(1 - completed_on_error)
@@ -1109,6 +1112,8 @@ class _Evaluator:
                     exact_route_evaluations=error.completed_exact_calls,
                 ) from error
             raise
+        self.evaluated_routes.add(sequence)
+        self.evaluated_route_keys.add((self.lane, sequence))
         if self.exact_call_controller is not None:
             self.exact_call_controller.complete(1)
         transactional_deadline = (
@@ -1516,6 +1521,10 @@ class _Evaluator:
                 if isinstance(error, ExactBatchDeadlineExceeded)
                 else set()
             )
+            for index in completed_indices:
+                sequence = active_sequences[index]
+                self.evaluated_routes.add(sequence)
+                self.evaluated_route_keys.add((self.lane, sequence))
             if self.exact_call_controller is not None:
                 self.exact_call_controller.complete(len(completed_indices))
                 self.exact_call_controller.interrupt(len(active_sequences) - len(completed_indices))
@@ -1538,6 +1547,11 @@ class _Evaluator:
                         exact_completed=index in completed_indices,
                         feasible=None,
                         failure_reason=f"{type(error).__name__}: {error}",
+                        cache_key_digest=(
+                            self.route_cache.make_key(sequence).digest
+                            if self.route_cache is not None
+                            else ""
+                        ),
                         route_change_status=route_change_status,
                     )
             if isinstance(error, ExactBatchDeadlineExceeded):
@@ -1560,13 +1574,13 @@ class _Evaluator:
             self.exact_call_controller is not None and batch_completed >= self.deadline
         )
         for sequence, result in zip(active_sequences, batch.results, strict=True):
-            cache_key_digest = ""
+            cache_key_digest = (
+                self.route_cache.make_key(sequence).digest if self.route_cache is not None else ""
+            )
             if self.exact_call_controller is not None and not (
                 partial_budget_batch or transactional_deadline
             ):
                 self.pending_candidate_cache[sequence] = result
-                if self.route_cache is not None:
-                    cache_key_digest = self.route_cache.make_key(sequence).digest
             elif (
                 not partial_budget_batch
                 and not transactional_deadline
@@ -3445,7 +3459,7 @@ def _solve_alns(
             else sum(item.calls for item in lane_evaluators)
         ),
         unique_route_evaluations=(
-            exact_call_controller.started_calls
+            _completed_unique_route_evaluations(lane_evaluators)
             if exact_call_controller is not None
             else _cache_statistics(lane_route_caches)["unique_route_evaluations"]
             if cache_enabled
@@ -4772,7 +4786,7 @@ def _failed_result(
             else evaluator.calls
         ),
         unique_route_evaluations=(
-            exact_controller.started_calls
+            _completed_unique_route_evaluations((evaluator,))
             if exact_controller is not None
             else _cache_statistics([evaluator.route_cache])["unique_route_evaluations"]
             if evaluator.cache_incremental_enabled
@@ -4910,6 +4924,24 @@ def _cache_statistics(
         totals["bytes_peak"] += statistics.bytes_peak
         totals["unique_route_evaluations"] += statistics.unique_keys_seen
     return totals
+
+
+def _completed_unique_route_evaluations(
+    evaluators: tuple[_Evaluator, ...],
+) -> int:
+    """Count completed exact route identities using the cache ownership boundary."""
+
+    route_caches = [evaluator.route_cache for evaluator in evaluators]
+    shared_cache = (
+        bool(route_caches)
+        and all(cache is not None for cache in route_caches)
+        and len({id(cache) for cache in route_caches}) == 1
+    )
+    if shared_cache:
+        return len(
+            {sequence for evaluator in evaluators for sequence in evaluator.evaluated_routes}
+        )
+    return sum(len(evaluator.evaluated_routes) for evaluator in evaluators)
 
 
 def _aggregate_cache_incremental_statistics(

@@ -142,9 +142,9 @@ def test_fixed_exact_call_budget_stops_at_cap_and_keeps_complete_incumbent() -> 
     assert result.measurement_trace.completed_calls == 10
     assert result.unique_route_evaluations == len(
         {
-            (record.lane, record.route_key)
+            record.route_key
             for record in result.measurement_trace.route_evaluations
-            if record.kind == "exact_call" and record.exact_started
+            if record.kind == "exact_call" and record.exact_completed
         }
     )
     assert result.measurement_trace.reconcile(result)["status"] == "pass"
@@ -186,6 +186,68 @@ def test_fixed_exact_call_budget_stops_at_cap_and_keeps_complete_incumbent() -> 
     } <= {"completed_feasible", "completed_infeasible"}
 
 
+@pytest.mark.parametrize("shared_across_lanes", [True, False])
+def test_lru_evictions_keep_calls_and_unique_routes_distinct(
+    shared_across_lanes: bool,
+) -> None:
+    result = solve_alns(
+        _instance(),
+        seed=2014,
+        max_iterations=1000,
+        time_limit_seconds=10.0,
+        operator_profile="stage02_constraint_guided",
+        measurement_config=MeasurementConfig(),
+        screening_config=CheapScreeningConfig(),
+        cache_incremental_config=CacheIncrementalConfig(
+            enabled=True,
+            max_entries=1,
+            max_memory_bytes=1_000_000,
+            shared_across_lanes=shared_across_lanes,
+        ),
+        backend="cpu_batch",
+        exact_deadline_config=ExactDeadlineConfig.fixed_exact_calls(
+            28,
+            watchdog_seconds=10.0,
+        ),
+    )
+
+    trace = result.measurement_trace
+    assert trace is not None
+    completed_records = [
+        record
+        for record in trace.route_evaluations
+        if record.kind == "exact_call" and record.exact_completed
+    ]
+    completed_identities = {
+        (
+            record.route_key
+            if shared_across_lanes
+            else (
+                "legacy" if record.lane == "initialization" else record.lane,
+                record.route_key,
+            )
+        )
+        for record in completed_records
+    }
+
+    assert result.charging_subproblem_calls == 28
+    assert result.unique_route_evaluations == len(completed_identities)
+    assert result.unique_route_evaluations < result.charging_subproblem_calls
+    assert all(record.cache_key_digest for record in completed_records)
+    assert any(
+        event.get("event_type") == "candidate_cache_rollback"
+        and event.get("reason") == "partial_exact_call_budget_batch"
+        for event in trace.events
+    )
+    reconciliation = trace.reconcile(result)
+    assert reconciliation["status"] == "pass"
+    checks = reconciliation["checks"]
+    assert checks["route_evaluation_cache_hits_equal_result"] is True
+    assert checks["cache_incremental_cache_hits_equal_result"] is True
+    assert "cache_hits_equal_result" not in checks
+    assert reconciliation["observed"]["cache_hits"] == reconciliation["expected"]["cache_hits"]
+
+
 def test_cpu_batch_checkpoint_reports_auditable_interruption(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -213,6 +275,70 @@ def test_cpu_batch_checkpoint_reports_auditable_interruption(
     assert error.metrics.checkpoint_count > 0
     assert error.metrics.packing_seconds >= 0.0
     assert error.metrics.unpacking_seconds >= 0.0
+
+
+def test_batch_interruption_counts_only_completed_route_identities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exact_config = ExactDeadlineConfig.fixed_exact_calls(2, watchdog_seconds=10.0)
+    cache_config = CacheIncrementalConfig(
+        enabled=True,
+        max_entries=1,
+        max_memory_bytes=1_000_000,
+    )
+    trace = Stage03Trace(
+        MeasurementConfig(),
+        cache_incremental_config=cache_config,
+        exact_deadline_config=exact_config,
+    )
+    evaluator = alns_module._Evaluator(
+        _instance(),
+        deadline=float("inf"),
+        measurement_trace=trace,
+        cache_incremental_config=cache_config,
+        route_cache=alns_module.RouteEvaluationCache(_instance(), cache_config),
+        backend="cpu_batch",
+        exact_call_controller=alns_module.ExactCallController(exact_config),
+    )
+    metrics = alns_module.BackendMetrics(
+        "cpu_batch",
+        8,
+        total_seconds=0.01,
+        work_batches=1,
+        exact_calls=2,
+        batch_launches=1,
+        started_calls=2,
+        completed_calls=1,
+        interrupted_calls=1,
+        launch_occupancies=[2],
+    )
+
+    def interrupt(*args: object, **kwargs: object) -> object:
+        raise ExactBatchDeadlineExceeded(
+            started_exact_calls=2,
+            completed_exact_calls=1,
+            metrics=metrics,
+            completed_indices=(1,),
+        )
+
+    monkeypatch.setattr(alns_module, "solve_exact_charging_batch", interrupt)
+
+    with pytest.raises(alns_module._TimeLimitReached):
+        evaluator._solve_uncached_batch((("C1",), ("C2",)), "changed")
+
+    result = alns_module._failed_result(0.0, evaluator, "interrupted batch")
+    exact_records = [record for record in trace.route_evaluations if record.kind == "exact_call"]
+    completed_records = [record for record in exact_records if record.exact_completed]
+
+    assert result.exact_started_calls == 2
+    assert result.exact_completed_calls == 1
+    assert result.exact_interrupted_calls == 1
+    assert result.unique_route_evaluations == 1
+    assert evaluator.evaluated_routes == {("C2",)}
+    assert len(exact_records) == 2
+    assert [record.route_key for record in completed_records] == [trace.register_route(("C2",))]
+    assert all(record.cache_key_digest for record in exact_records)
+    assert trace.reconcile(result)["status"] == "pass"
 
 
 def test_stage033_paired_diagnostic_uses_only_cpu_batch() -> None:

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 import evrptw.alns as alns_module
 from evrptw.alns import MeasurementConfig, Stage03ExecutionError, Stage03Trace, solve_alns
+from evrptw.cache_incremental import CacheIncrementalConfig
+from evrptw.exact_deadline import ExactDeadlineConfig
 from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.neighborhoods import OperatorProfile
 from evrptw.objective import SolutionObjective
@@ -69,6 +73,76 @@ def test_stage03_trace_keeps_canonical_route_dictionary_and_call_states() -> Non
     }
 
 
+@pytest.mark.parametrize(
+    ("declared_semantics", "expected_unique", "expected_status"),
+    [
+        (None, 2, "pass"),
+        ("completed_cache_owner_identity_v2", 1, "pass"),
+        ("completed_cache_owner_identity_v2", 2, "fail"),
+        ("forged_semantics", 1, "fail"),
+    ],
+)
+def test_trace_reconcile_preserves_legacy_interrupted_unique_semantics(
+    declared_semantics: str | None,
+    expected_unique: int,
+    expected_status: str,
+) -> None:
+    trace = Stage03Trace(
+        MeasurementConfig(),
+        cache_incremental_config=CacheIncrementalConfig(enabled=True),
+        exact_deadline_config=ExactDeadlineConfig.wall_clock(),
+    )
+    trace.record_route_evaluation(
+        ("C1",),
+        lane="legacy",
+        iteration=1,
+        operator="relocate",
+        kind="exact_call",
+        exact_started=True,
+        exact_completed=True,
+        feasible=True,
+        failure_reason="",
+        cache_key_digest="completed-digest",
+    )
+    trace.record_route_evaluation(
+        ("C2",),
+        lane="legacy",
+        iteration=1,
+        operator="relocate",
+        kind="exact_call",
+        exact_started=True,
+        exact_completed=False,
+        feasible=None,
+        failure_reason="ExactBatchDeadlineExceeded",
+        status="interrupted_deadline",
+    )
+    result_fields = {
+        "charging_subproblem_calls": 1,
+        "exact_started_calls": 2,
+        "cache_hits": 0,
+        "unique_route_evaluations": expected_unique,
+        "destroy_statistics": {},
+        "repair_statistics": {},
+        "neighborhood_statistics": {},
+        "effective_iterations": 0,
+        "accepted_moves": 0,
+        "rejected_moves": 0,
+        "improving_moves": 0,
+        "screening_statistics": {},
+        "cache_incremental_statistics": {},
+    }
+    if declared_semantics is not None:
+        result_fields["unique_route_semantics"] = declared_semantics
+    result = SimpleNamespace(**result_fields)
+
+    reconciliation = trace.reconcile(result)
+
+    assert reconciliation["status"] == expected_status
+    assert reconciliation["expected"]["unique_route_semantics"] == (
+        declared_semantics or "started_lane_identity_legacy_v1"
+    )
+
+
 def test_stage03_trace_records_precomputed_routes_and_deadline_boundaries() -> None:
     trace = Stage03Trace(MeasurementConfig())
     trace.record_route_evaluation(
@@ -126,12 +200,15 @@ def test_measurement_is_opt_in_and_reconciles_exact_calls() -> None:
     assert trace.cache_hits == measured.cache_hits
     assert trace.reconcile(measured)["status"] == "pass"
     assert measured.objective is not None
-    assert measured.objective.key == SolutionObjective(
-        measured.vehicle_count,
-        measured.objective.total_distance,
-        measured.objective.total_charging_time,
-        measured.objective.charging_count,
-    ).key
+    assert (
+        measured.objective.key
+        == SolutionObjective(
+            measured.vehicle_count,
+            measured.objective.total_distance,
+            measured.objective.total_charging_time,
+            measured.objective.charging_count,
+        ).key
+    )
 
 
 def test_accepted_stage03_candidate_has_complete_vehicle_first_state() -> None:
@@ -174,7 +251,4 @@ def test_measured_execution_failure_keeps_partial_trace(monkeypatch: pytest.Monk
         )
 
     assert caught.value.trace.finished_at is not None
-    assert any(
-        event.get("event_type") == "execution_error"
-        for event in caught.value.trace.events
-    )
+    assert any(event.get("event_type") == "execution_error" for event in caught.value.trace.events)
