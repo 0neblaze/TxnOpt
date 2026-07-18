@@ -82,6 +82,16 @@ B 的最终组合必须通过严格性能门槛，单项收益和组合收益都
 - timeout、byte-budget、writer error 和 worker failure 均保留 partial shard 并 fail fast；
 - reviewer 不读取全量 events 到一个 Python list，不依赖 worker completion order。
 
+当前 accepted evidence（已验收证据）为
+`stage05.2_artifact_streaming_attempt04`，其独立审查状态为
+`READY_FOR_STAGE052_JOB_PARALLEL`。固定 4 instances × 3 seeds 共 36 axes
+全部通过 exact scope、validator/objective replay 和 Python optimization
+profile；其中 24 个 fixed-work axes 通过 v1/v2 semantic equality。最终
+row-group flush、Zstandard level 1 压缩、磁盘写入与 control finalisation
+均计入后，aggregate persistence ratio 为 24.8546%；peak RSS 为
+2,565,537,792 bytes，低于 A 阶段 4,357,382,144-byte 上限。
+attempt01--03 保持为失败或 partial evidence，D 只能从 attempt04 进入。
+
 ## D. Job-level parallelism
 
 并行独立 `(instance, seed)` shard，依次评估 1、2、4 workers。禁止复用“单候选内部四进程 exact-call”作为正式方案，也禁止 worker error 后转串行。

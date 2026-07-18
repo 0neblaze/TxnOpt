@@ -1,19 +1,24 @@
-# 实验产物存储规则：v1 现状与 v2 迁移契约
+# 实验产物存储规则：v2 已验收策略与 v1 兼容
 
 本规则适用于 Stage 0–8 的实验产物。它只约束 artifact persistence（产物持久化），不改变 ALNS、`evrptw.objective`、统一 validator（验证器）、vehicle-first acceptance（车辆数优先接受规则）或 exact charging（精确充电子问题）的算法语义。
 
 ## 当前可用状态
 
-仓库当前实现的是 `artifact-storage-v1`，定义在 `src/evrptw/artifacts.py`。Stage 5.2 必须实现并独立验收 `artifact-storage-v2`，通过后才能用于 Stage 5.2 pipeline pilot（流程试运行）、正式 benchmark 及后续阶段。v2 实现完成前，runner 不得接受 v2 配置，也不得把本文的迁移契约写成已具备的运行能力。
+仓库当前已实现并独立验收 `artifact-storage-v2`，定义在
+`src/evrptw/artifacts.py`。accepted evidence 为
+`stage05.2_artifact_streaming_attempt04`，独立审查状态为
+`READY_FOR_STAGE052_JOB_PARALLEL`。v2 是 Stage 5.2 Component D 及后续 pipeline
+pilot、正式 benchmark 的存储策略；`artifact-storage-v1` 继续作为历史读取与
+性能对照策略，不做物理迁移。
 
-当前 v1 固定策略为：
+v1/v2 的固定策略为：
 
 | 字段 | 固定值 |
 | --- | --- |
-| `storage_policy_version` | `artifact-storage-v1` |
+| `storage_policy_version` | `artifact-storage-v1` 或 `artifact-storage-v2` |
 | `event_format` | `parquet` |
 | `compression` | `zstd` |
-| `compression_level` | `3` |
+| `compression_level` | v1 为 `3`；accepted v2 为 `1` |
 | `critical_evidence` | `full` |
 | `diagnostic_evidence` | `aggregate` |
 | `per_instance_seed_max_bytes` | `2 GiB` |
@@ -55,7 +60,10 @@ v1 不要求 shard manifest（分片清单）；最后两项由 v2 新增。`fai
 
 普通成功候选、普通 rejected candidate、重复 route timing、operator call 总量和按 `run/lane/iteration/operator/reason` 的诊断数据可以进入 `diagnostic.parquet` 聚合。聚合不得删除或改变 critical event，也不得影响 validator、objective、exact-call ordering 或 failure replay。route sequence 只在 `route_dictionary.parquet` 保存一次；事件使用整数 route/lane/operator ID。
 
-Parquet 使用明确 Arrow schema（Arrow 模式）、Zstandard level 3 和 dictionary encoding（字典编码）。lane/operator 字典写入 trace index，route 字典写入独立 route dictionary；v2 streaming 不得改变这些编码和索引语义。
+Parquet 使用明确 Arrow schema（Arrow 模式）和 dictionary encoding（字典编码）；
+v1 使用 Zstandard level 3，accepted v2 使用 level 1。lane/operator 字典写入
+trace index，route 字典写入独立 route dictionary；v2 streaming 不得改变这些
+编码和索引语义。
 
 一个 cache lookup 及其紧随的 hit/miss 结果在物理事件文件中只保存一条 `lookup_result`。旧 JSON/JSONL 事件仍按其原始双事件语义读取。`trace.json` 是 trace index（轨迹索引），只保存 counters、配置、字典、Parquet 引用及 schema fingerprint，不重复嵌入完整事件集合。
 
@@ -96,7 +104,12 @@ v2 event identity 由 canonical shard ordinal（规范分片序号）和 shard-l
 5. partial/timeout/worker failure 都产生可校验 shard manifest 并 fail fast；
 6. independent reviewer 从 raw shard 重算所有汇总，不信任 runner 自报计数。
 
-未通过时继续使用 v1 做诊断，不得进入 Stage 5.2 pipeline pilot 或正式 benchmark，也不得把未验收 v2 写成默认策略。
+已验收的 attempt04 在完整计入最终 row-group flush、压缩、磁盘写入和 control
+finalisation 后，artifact persistence ratio 为 24.8546%，peak RSS 为
+2,565,537,792 bytes（上限 4,357,382,144 bytes）。全部 36 axes 通过 scope、
+validator/objective replay；其中 24 个 fixed-work axes 的 v1/v2 replay
+equality 全部通过。attempt01--03 保持为失败或 partial evidence。
+后续组件若破坏这些门槛必须标记 `NOT_READY`，不得退回隐式 v1 fallback 或降低阈值。
 
 ## 历史兼容
 

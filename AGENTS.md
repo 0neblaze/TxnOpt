@@ -558,6 +558,17 @@ this repository or one of its subdirectories.
   Native CPU work then moves only profiled screening, propagation, distance,
   and exact-label kernels into contiguous C++ data paths and releases the GIL
   only while no Python object is accessed.
+- The accepted ordered A--C evidence is `stage05.2_perf_baseline_attempt04`,
+  `stage05.2_hot_path_attempt03`, and
+  `stage05.2_artifact_streaming_attempt04`. The Component C independent replay
+  reports `READY_FOR_STAGE052_JOB_PARALLEL`: all 36 axes pass exact scope,
+  validator/objective replay, and the Python optimisation-profile gate; the 24
+  fixed-work axes also pass v1/v2 semantic equality. Its fully attributed
+  artifact-persistence ratio is 24.8546% (including final row-group flush and
+  control finalisation), and peak RSS is 2,565,537,792 bytes against the
+  4,357,382,144-byte limit.
+  Attempts 01--03 remain immutable failed or partial evidence. Component D
+  must use artifact-storage-v2 and cannot weaken or reinterpret these gates.
 - Stage 5.2 job parallelism is across independent `(instance, seed)` shards,
   not within one exact-call batch. Test 1/2/4 workers. Two workers require at
   least 1.5x end-to-end speedup and at most 12 GiB aggregate RSS. Four workers
@@ -607,17 +618,18 @@ The executable workflow and gate table are maintained in
 - The old non-canonical Stage 0–2 entry points remain only for historical
   compatibility tests/reproduction when their configuration has no
   `[artifact_storage]`; the shipped new configurations reject those paths.
-- The currently implemented policy is `artifact-storage-v1`: Parquet events
-  with Zstandard level 3, complete critical evidence, aggregated diagnostic
-  evidence, 2 GiB per instance/seed, and 32 GiB per run. New physical evidence belongs under
+- The current accepted Stage 5.2 policy is `artifact-storage-v2`; v1 remains
+  readable for historical and comparison evidence. Both use Parquet events,
+  complete critical evidence, aggregated diagnostic evidence, 2 GiB per
+  instance/seed, and 32 GiB per run. Historical v1 uses Zstandard level 3;
+  accepted v2 uses Zstandard level 1. New physical evidence belongs under
   `results/<run_label>/<instance>/<seed>/` with control metadata and a manifest
   under `control/`.
-- Stage 5.2 must implement and independently accept `artifact-storage-v2`
-  before its pipeline pilot or Formal benchmark. Until that implementation is
-  merged and reviewed, documentation must not describe v2 as an available
-  runtime. v2 preserves v1 reads and adds Parquet row-group streaming, shard
-  manifests/checksums, worker-owned `(instance, seed)` shards, and parent-only
-  control-manifest finalisation.
+- `artifact-storage-v2` was independently accepted in
+  `stage05.2_artifact_streaming_attempt04` with review status
+  `READY_FOR_STAGE052_JOB_PARALLEL`. It preserves v1 reads and adds Parquet
+  row-group streaming, shard manifests/checksums, worker-owned
+  `(instance, seed)` shards, and parent-only control-manifest finalisation.
 - v2 uses 65,536-row Parquet row groups and buffers at most two row groups per
   writer. A worker writes only its own shard; the parent never merges event
   rows in memory. Shard-local event identity is deterministic from canonical
