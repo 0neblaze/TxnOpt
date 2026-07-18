@@ -18,6 +18,7 @@ from evrptw.charging import ChargingSubproblemResult
 from evrptw.experiments.stage03_measurement import _validate_stage032_run_label
 from evrptw.measurement import CheapScreeningConfig, MeasurementConfig, Stage03Trace
 from evrptw.models import Instance, Node, NodeType, Vehicle
+from evrptw.native_kernels import NativeKernelConfig, NativeKernelRuntime
 from evrptw.neighborhoods import repair_vehicle_reduction_refinement
 
 
@@ -166,6 +167,60 @@ def test_incremental_propagation_reports_time_window_failure_and_fallback() -> N
     assert rejected.first_failed_check == "forward_time_window"
     assert fallback.status == "fallback"
     assert fallback.first_failed_check == "route_structure"
+
+
+def test_native_incremental_wrapper_matches_python_and_records_invocation() -> None:
+    instance = _instance()
+    base = build_route_propagation_snapshot(instance, ("C1", "C2"))
+    runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+
+    expected = incremental_route_propagation(instance, base, ("C1", "C3"))
+    actual = incremental_route_propagation(
+        instance,
+        base,
+        ("C1", "C3"),
+        native_runtime=runtime,
+    )
+
+    assert actual == expected
+    assert runtime.propagation_invocations == 1
+    assert runtime.fallback_count == 0
+
+
+def test_native_incremental_wrapper_fails_fast_when_core_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = _instance()
+    base = build_route_propagation_snapshot(instance, ("C1", "C2"))
+    runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+
+    def fail(_function_name: str) -> object:
+        raise RuntimeError("native propagation failed")
+
+    monkeypatch.setattr("evrptw.cache_incremental._require_native_core", fail)
+
+    with pytest.raises(RuntimeError, match="native propagation failed"):
+        incremental_route_propagation(
+            instance,
+            base,
+            ("C1", "C3"),
+            native_runtime=runtime,
+        )
+
+    assert runtime.fallback_count == 0
+
+
+def test_native_incremental_context_is_reused_across_calls() -> None:
+    instance = _instance()
+    base = build_route_propagation_snapshot(instance, ("C1", "C2"))
+    runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+    context_identity = id(runtime.context)
+
+    incremental_route_propagation(instance, base, ("C1", "C3"), native_runtime=runtime)
+    incremental_route_propagation(instance, base, ("C2", "C3"), native_runtime=runtime)
+
+    assert id(runtime.context) == context_identity
+    assert runtime.propagation_invocations == 2
 
 
 def test_refinement_uses_precomputed_current_route_without_unchanged_exact_call() -> None:

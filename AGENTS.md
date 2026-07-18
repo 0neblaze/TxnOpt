@@ -580,8 +580,14 @@ this repository or one of its subdirectories.
   worker labels rather than actual PIDs. Corrected D evidence starts at
   attempt04 and uses resource schema v2, exact worker-PID ownership, complete
   36-axis raw/solution/trace replay, and independently verified machine,
-  instance, configuration, power, and environment provenance. No worker count
-  is selected until the complete independent review passes.
+  instance, configuration, power, and environment provenance. The corrected
+  sequence is accepted as `stage05.2_job_parallel_attempt04` (1 worker,
+  406.5132 s, 2.2379 GiB aggregate RSS),
+  `stage05.2_job_parallel_attempt05` (2 workers, 223.4358 s, 4.0124 GiB,
+  1.819x speedup), and `stage05.2_job_parallel_attempt06` (4 workers,
+  130.6914 s, 5.4178 GiB, 3.110x speedup). The independent selection review
+  selects 4 workers and reports `READY_FOR_STAGE052_NATIVE_KERNELS`; Component
+  E must bind that exact selection identity.
 - GPU/Metal/MPS is conditional. Run the accelerator pilot only if the selected
   native CPU route-batch occupancy median is at least 32. Promote an
   accelerator only when fixed-work semantics match, the aggregate paired

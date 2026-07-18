@@ -13,6 +13,16 @@ directory = "data/schneider"
 max_iterations = 1000
 batch_size = 128
 
+[native_kernels]
+enabled = true
+exact_charging = true
+screening = true
+propagation = true
+distance_matrix = true
+abi_version = "stage05.2-native-kernels-v1"
+context_policy = "pack_once_per_solve"
+failure_policy = "fail_fast_no_fallback"
+
 [artifact_storage_v1]
 enabled = true
 storage_policy_version = "artifact-storage-v1"

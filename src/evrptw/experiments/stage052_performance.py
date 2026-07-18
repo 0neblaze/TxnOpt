@@ -8,9 +8,11 @@ import csv
 import gc
 import hashlib
 import json
+import math
 import os
 import re
 import resource
+import statistics
 import subprocess
 import time
 import tomllib
@@ -26,6 +28,7 @@ from evrptw.alns import ALNSResult, solve_alns
 from evrptw.artifacts import (
     ARTIFACT_STORAGE_V2,
     ArtifactBundleWriter,
+    ArtifactReader,
     ArtifactRunContext,
     ArtifactStorageConfig,
     aggregate_diagnostic_events,
@@ -42,6 +45,7 @@ from evrptw.experiments.stage02_route_reduction import (
 from evrptw.experiments.stage04_weights import load_stage04_config
 from evrptw.measurement import MeasurementConfig
 from evrptw.models import Instance
+from evrptw.native_kernels import NativeKernelConfig
 from evrptw.parser import parse_schneider
 from evrptw.stage052 import Stage052Component, formal_budget_matrix
 from evrptw.stage052_evidence import (
@@ -49,6 +53,7 @@ from evrptw.stage052_evidence import (
     RunResourceSummary,
     abort_process_executor,
     collect_performance_provenance,
+    verify_job_parallel_selection,
     verify_stage052_prerequisite,
 )
 from evrptw.validation import validate_routes
@@ -75,6 +80,14 @@ PER_RUN_FIELDS = (
     "exact_seconds",
     "packing_seconds",
     "unpacking_seconds",
+    "native_kernel_seconds",
+    "native_invocations",
+    "native_fallbacks",
+    "native_screening_seconds",
+    "native_screening_invocations",
+    "native_propagation_seconds",
+    "native_propagation_invocations",
+    "native_protocol_fallbacks",
     "exact_started_calls",
     "exact_completed_calls",
     "effective_iterations",
@@ -109,6 +122,7 @@ class Stage052Config:
     stage02_config: Path
     max_iterations: int
     batch_size: int
+    native_kernels: NativeKernelConfig
     v1_storage: ArtifactStorageConfig
     v2_storage: ArtifactStorageConfig
 
@@ -144,6 +158,7 @@ def load_stage052_config(path: Path) -> Stage052Config:
             stage02_config=Path(str(stage["stage02_config"])),
             max_iterations=int(runtime["max_iterations"]),
             batch_size=int(runtime["batch_size"]),
+            native_kernels=NativeKernelConfig(**dict(payload["native_kernels"])),
             v1_storage=v1,
             v2_storage=v2,
         )
@@ -233,6 +248,8 @@ def run_stage052(
     config = load_stage052_config(resolved_config)
     prerequisite = verify_stage051_prerequisite(_resolve(root, config.stage051_manifest))
     component_prerequisite = None
+    job_parallel_selection = None
+    accelerator_decision_payload: dict[str, object] | None = None
     prerequisite_contract = {
         Stage052Component.JOB_PARALLEL: (
             "artifact_streaming",
@@ -261,6 +278,39 @@ def run_stage052(
                 else None
             ),
         )
+        if selected is Stage052Component.NATIVE_KERNELS:
+            job_parallel_selection = verify_job_parallel_selection(
+                _resolve(root, prerequisite_dir), component_prerequisite
+            )
+            if worker_count != job_parallel_selection.selected_workers:
+                raise ValueError(
+                    "native_kernels worker_count must equal the independently selected "
+                    f"D worker count ({job_parallel_selection.selected_workers})"
+                )
+        if selected is Stage052Component.ACCELERATOR_PILOT:
+            if scope != "performance":
+                raise ValueError("accelerator_pilot decision uses performance scope")
+            prerequisite_path = _resolve(root, prerequisite_dir)
+            predecessor_metadata = _stage052_metadata(prerequisite_path)
+            predecessor_workers = _strict_int(
+                predecessor_metadata.get("worker_count"), "worker_count"
+            )
+            if worker_count != predecessor_workers:
+                raise ValueError(
+                    "accelerator_pilot worker_count must equal the accepted E worker count "
+                    f"({predecessor_workers})"
+                )
+            if predecessor_metadata.get("native_kernel_config") != NativeKernelConfig().to_dict():
+                raise ValueError("accelerator_pilot requires complete accepted native kernels")
+            accelerator_decision_payload = _accelerator_decision_inputs(
+                prerequisite_path,
+                prerequisite=component_prerequisite,
+            )
+            if _strict_float(accelerator_decision_payload["median_batch_occupancy"]) >= 32.0:
+                raise RuntimeError(
+                    "route-batch occupancy requires a real Metal pilot; "
+                    "decision-only evidence is forbidden"
+                )
     instances, seeds = _scope_identities(scope)
     if selected in {
         Stage052Component.PERF_BASELINE,
@@ -292,6 +342,16 @@ def run_stage052(
         "storage_policy_version": storage.storage_policy_version,
         "backend": "cpu_batch",
         "optimization_profile": _optimization_profile(selected),
+        "native_kernel_config": (
+            config.native_kernels.to_dict()
+            if selected
+            in {
+                Stage052Component.NATIVE_KERNELS,
+                Stage052Component.ACCELERATOR_PILOT,
+                Stage052Component.BENCHMARK,
+            }
+            else None
+        ),
         "persistence_attribution": "critical_event_rows",
         "repository_revision": revision,
         "repository_dirty": False,
@@ -299,6 +359,12 @@ def run_stage052(
         "stage051_prerequisite": prerequisite,
         "component_prerequisite": (
             component_prerequisite.to_dict() if component_prerequisite is not None else None
+        ),
+        "job_parallel_selection": (
+            job_parallel_selection.to_dict() if job_parallel_selection is not None else None
+        ),
+        "accelerator_decision_mode": (
+            "decision_only" if accelerator_decision_payload is not None else None
         ),
         "performance_provenance": collect_performance_provenance(
             instance_paths={
@@ -314,6 +380,25 @@ def run_stage052(
         "environment": environment,
     }
     parent_writer.write_control(metadata=metadata, configuration_path=resolved_config)
+    if accelerator_decision_payload is not None:
+        decision_path = resolved_output / "control" / f"{run_label}_accelerator_decision.json"
+        decision_path.write_text(
+            json.dumps(accelerator_decision_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        parent_writer.record_existing_file(
+            decision_path,
+            artifact_type="accelerator_decision",
+            retention_class="control",
+            storage_format="json_control",
+        )
+        bundle = parent_writer.finalize()
+        return {
+            "run_dir": bundle.run_dir,
+            "accelerator_decision": decision_path,
+            "manifest": bundle.manifest_path,
+            "manifest_sidecar": bundle.manifest_sidecar_path,
+        }
     tasks = _build_tasks(
         root=root,
         config_path=resolved_config,
@@ -375,6 +460,7 @@ def run_stage052(
             str(row["axis"]),
         )
     )
+    timing_evidence_path = _record_timing_evidence(parent_writer, rows)
     per_run_path = resolved_output / "control" / f"{run_label}_per_run_results.csv"
     _write_csv(per_run_path, PER_RUN_FIELDS, rows)
     parent_writer.record_existing_file(
@@ -397,6 +483,8 @@ def run_stage052(
     }
     if resource_summary_path is not None:
         outputs["resource_summary"] = resource_summary_path
+    if timing_evidence_path is not None:
+        outputs["timing_evidence"] = timing_evidence_path
     return outputs
 
 
@@ -416,6 +504,158 @@ def _record_resource_summary(
         storage_format="json_control",
     )
     return path
+
+
+def _record_timing_evidence(
+    writer: ArtifactBundleWriter,
+    rows: Sequence[Mapping[str, object]],
+) -> Path | None:
+    timings = [row.get("_timing_evidence") for row in rows]
+    if all(value is None for value in timings):
+        return None
+    if any(not isinstance(value, Mapping) for value in timings):
+        raise RuntimeError("Stage 5.2 timing evidence is incomplete")
+    path = writer.run_dir / "control" / f"{writer.context.run_label}_timing_evidence.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "stage05.2-timing-evidence-v1",
+                "run_label": writer.context.run_label,
+                "component": writer.context.component,
+                "rows": timings,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    writer.record_existing_file(
+        path,
+        artifact_type="timing_evidence",
+        retention_class="control",
+        storage_format="json_control",
+        row_count=len(timings),
+    )
+    return path
+
+
+def _stage052_metadata(raw_dir: Path) -> dict[str, object]:
+    reader = ArtifactReader(raw_dir)
+    references = [
+        item
+        for item in reader.manifest.get("artifacts", [])
+        if isinstance(item, dict) and item.get("artifact_type") == "manifest_metadata"
+    ]
+    if len(references) != 1:
+        raise ValueError("Stage 5.2 predecessor must contain one metadata artifact")
+    payload = reader.read_json(str(references[0]["relative_path"]))
+    if not isinstance(payload, dict):
+        raise TypeError("Stage 5.2 predecessor metadata must be an object")
+    return payload
+
+
+def _accelerator_decision_inputs(
+    raw_dir: Path,
+    *,
+    prerequisite: object,
+) -> dict[str, object]:
+    """Recompute the nine E fixed-work occupancy values without GPU execution."""
+
+    reader = ArtifactReader(raw_dir)
+    references = [
+        item
+        for item in reader.manifest.get("artifacts", [])
+        if isinstance(item, dict) and item.get("artifact_type") == "raw"
+    ]
+    expected = {
+        (instance, seed)
+        for instance in ("c101_21", "r101_21", "rc101_21")
+        for seed in PERFORMANCE_SEEDS
+    }
+    expected_all = {
+        (instance, seed) for instance in PERFORMANCE_INSTANCES for seed in PERFORMANCE_SEEDS
+    }
+    values: dict[tuple[str, int], float] = {}
+    observed_all: set[tuple[str, int]] = set()
+    for reference in references:
+        raw = reader.read_json(str(reference.get("relative_path", "")))
+        if not isinstance(raw, Mapping):
+            raise TypeError("accepted E raw payload must be an object")
+        identity = (str(raw.get("instance", "")), _strict_int(raw.get("seed"), "seed"))
+        if identity in observed_all:
+            raise ValueError(f"duplicate E raw occupancy identity: {identity}")
+        observed_all.add(identity)
+        if (
+            raw.get("component") != Stage052Component.NATIVE_KERNELS.value
+            or raw.get("scope") != "performance"
+        ):
+            raise ValueError(f"invalid E raw occupancy source: {identity}")
+        if identity not in expected:
+            continue
+        axes = raw.get("axes")
+        fixed = axes.get("fixed_work") if isinstance(axes, Mapping) else None
+        if (
+            not isinstance(fixed, Mapping)
+            or fixed.get("validator_passed") is not True
+            or fixed.get("valid") is not True
+        ):
+            raise ValueError(f"invalid E fixed-work raw axis: {identity}")
+        backend = fixed.get("backend_metrics")
+        if not isinstance(backend, Mapping):
+            raise ValueError(f"missing E raw backend metrics: {identity}")
+        exact_calls = _strict_int(backend.get("exact_calls"), "exact_calls")
+        batch_launches = _strict_int(backend.get("batch_launches"), "batch_launches")
+        raw_occupancies = backend.get("launch_occupancies")
+        if not isinstance(raw_occupancies, list):
+            raise ValueError(f"missing E raw launch occupancies: {identity}")
+        occupancies = [_strict_int(value, "launch_occupancy") for value in raw_occupancies]
+        if (
+            exact_calls <= 0
+            or batch_launches <= 0
+            or any(value <= 0 for value in occupancies)
+            or len(occupancies) != batch_launches
+            or sum(occupancies) != exact_calls
+        ):
+            raise ValueError(f"invalid E raw occupancy counters: {identity}")
+        values[identity] = statistics.median(occupancies)
+    if observed_all != expected_all:
+        raise ValueError(
+            f"E raw shard scope mismatch: expected={sorted(expected_all)} "
+            f"observed={sorted(observed_all)}"
+        )
+    if set(values) != expected:
+        raise ValueError(
+            f"E occupancy scope mismatch: expected={sorted(expected)} observed={sorted(values)}"
+        )
+    ordered = [
+        {
+            "instance": instance,
+            "seed": seed,
+            "axis": "fixed_work",
+            "median_batch_occupancy": values[(instance, seed)],
+        }
+        for instance, seed in sorted(values)
+    ]
+    median = statistics.median(values.values())
+    if median >= 32.0:
+        raise RuntimeError(
+            "median route count per exact launch requires a real Metal pilot; "
+            "GPU_NOT_JUSTIFIED decision-only evidence is forbidden"
+        )
+    prerequisite_dict: dict[str, object] = getattr(prerequisite, "to_dict", lambda: {})()
+    return {
+        "schema_version": "stage05.2-accelerator-decision-v1",
+        "decision_mode": "decision_only",
+        "decision": "GPU_NOT_JUSTIFIED",
+        "threshold": 32.0,
+        "median_batch_occupancy": median,
+        "input_count": len(ordered),
+        "inputs": ordered,
+        "native_prerequisite": prerequisite_dict,
+        "gpu_rows_present": False,
+        "fallback_used": False,
+    }
 
 
 def _scope_identities(scope: str) -> tuple[tuple[str, ...], tuple[int, ...]]:
@@ -603,6 +843,9 @@ def _run_and_persist_shard(
             batch_size=config.batch_size,
             exact_deadline_config=exact_deadline,
             stage04_config=stage04.stage04_config,
+            native_kernel_config=(
+                config.native_kernels if instance.distance_backend == "native" else None
+            ),
         )
         solver_times[axis.name] = time.perf_counter() - started
     shard_writer = writer or ArtifactBundleWriter(
@@ -627,8 +870,7 @@ def _run_and_persist_shard(
         backend = result.backend_metrics
         objective = result.objective
         report = validate_routes(instance, [list(route) for route in result.routes])
-        batch_launches = _strict_int(backend.get("work_batches", 0), "work_batches")
-        exact_calls = _strict_int(backend.get("exact_calls", 0), "exact_calls")
+        batch_launches, median_batch_occupancy = _launch_occupancy_summary(backend)
         persistence_share = (
             persistence_seconds * event_counts[axis.name] / total_events
             if total_events
@@ -654,11 +896,29 @@ def _run_and_persist_shard(
                 "exact_seconds": backend.get("total_seconds", 0.0),
                 "packing_seconds": backend.get("packing_seconds", 0.0),
                 "unpacking_seconds": backend.get("unpacking_seconds", 0.0),
+                "native_kernel_seconds": backend.get("native_kernel_seconds", 0.0),
+                "native_invocations": backend.get("native_invocations", 0),
+                "native_fallbacks": backend.get("native_fallbacks", 0),
+                "native_screening_seconds": result.screening_statistics.get(
+                    "native_screening_seconds", 0.0
+                ),
+                "native_screening_invocations": result.screening_statistics.get(
+                    "native_screening_invocations", 0
+                ),
+                "native_propagation_seconds": result.screening_statistics.get(
+                    "native_propagation_seconds", 0.0
+                ),
+                "native_propagation_invocations": result.screening_statistics.get(
+                    "native_propagation_invocations", 0
+                ),
+                "native_protocol_fallbacks": result.screening_statistics.get(
+                    "native_protocol_fallbacks", 0
+                ),
                 "exact_started_calls": result.exact_started_calls,
                 "exact_completed_calls": result.exact_completed_calls,
                 "effective_iterations": result.effective_iterations,
                 "batch_launches": batch_launches,
-                "median_batch_occupancy": (exact_calls / batch_launches if batch_launches else 0.0),
+                "median_batch_occupancy": median_batch_occupancy,
                 "peak_rss_bytes": peak_rss,
                 "vehicle_count": objective.vehicle_count if objective else "",
                 "total_distance": objective.total_distance if objective else "",
@@ -701,12 +961,13 @@ def _run_and_persist_v2_shard(
     solution_axes: dict[str, object] = {}
     trace_axes: dict[str, object] = {}
     drafts: dict[str, dict[str, object]] = {}
-    persistence_by_axis: dict[str, float] = {}
+    timing_by_axis: dict[str, dict[str, int]] = {}
     event_counts: dict[str, int] = {}
     failures: list[str] = []
     try:
         for axis in axes:
-            solver_started = time.perf_counter()
+            axis_started_ns = time.perf_counter_ns()
+            solver_started_ns = axis_started_ns
             result = _solve_stage052_axis(
                 instance,
                 seed=task.seed,
@@ -715,7 +976,8 @@ def _run_and_persist_v2_shard(
                 stage04=stage04,
                 stage02=stage02,
             )
-            solver_seconds = time.perf_counter() - solver_started
+            solver_completed_ns = time.perf_counter_ns()
+            solver_seconds = (solver_completed_ns - solver_started_ns) / 1_000_000_000
             trace = result.measurement_trace
             if trace is None:
                 raise RuntimeError(f"Stage 5.2 {axis.name} result is missing its trace")
@@ -742,7 +1004,6 @@ def _run_and_persist_v2_shard(
             diagnostic_counts: Counter[tuple[str, str, str, str]] = Counter()
             route_dictionary = dict(trace.route_dictionary)
 
-            persistence_started = time.perf_counter()
             event_counts[axis.name] = shard.append(
                 route_dictionary=route_dictionary,
                 critical_events=_iter_stage052_axis_events(
@@ -776,7 +1037,6 @@ def _run_and_persist_v2_shard(
                 critical_events=(),
                 diagnostic_rows=diagnostic_rows,
             )
-            persistence_by_axis[axis.name] = time.perf_counter() - persistence_started
             semantic_digest = digest.hexdigest()
             raw_axes[axis.name] = {
                 "backend": result.charging_backend,
@@ -803,14 +1063,21 @@ def _run_and_persist_v2_shard(
                 axis=axis,
                 result=result,
                 validation_passed=validation.feasible,
+                axis_valid=valid,
                 solver_seconds=solver_seconds,
                 semantic_digest=semantic_digest,
                 storage=storage,
             )
             del result, trace, route_dictionary, diagnostic_rows
             gc.collect()
+            timing_by_axis[axis.name] = {
+                "axis_started_ns": axis_started_ns,
+                "solver_started_ns": solver_started_ns,
+                "solver_completed_ns": solver_completed_ns,
+                "axis_completed_ns": time.perf_counter_ns(),
+            }
 
-        finalize_started = time.perf_counter()
+        finalize_started_ns = time.perf_counter_ns()
         shard.flush()
         shard.finalize(
             raw_payload={
@@ -852,7 +1119,8 @@ def _run_and_persist_v2_shard(
                 else None
             ),
         )
-        finalization_seconds = time.perf_counter() - finalize_started
+        finalize_completed_ns = time.perf_counter_ns()
+        finalization_seconds = (finalize_completed_ns - finalize_started_ns) / 1_000_000_000
     except BaseException as error:
         shard.abort(error)
         raise
@@ -865,14 +1133,31 @@ def _run_and_persist_v2_shard(
             if total_events
             else finalization_seconds / len(axes)
         )
-        persistence_seconds = persistence_by_axis[axis.name] + finalization_share
+        timing = timing_by_axis[axis.name]
+        post_solver_seconds = (
+            timing["axis_completed_ns"] - timing["solver_completed_ns"]
+        ) / 1_000_000_000
+        persistence_seconds = post_solver_seconds + finalization_share
         row = drafts[axis.name]
         solver_value = row["solver_seconds"]
         if not isinstance(solver_value, (int, float)):
             raise TypeError("solver_seconds must be numeric")
         row["artifact_persistence_seconds"] = persistence_seconds
-        row["end_to_end_seconds"] = float(solver_value) + persistence_seconds
+        row["end_to_end_seconds"] = (
+            timing["axis_completed_ns"] - timing["axis_started_ns"]
+        ) / 1_000_000_000 + finalization_share
         row["peak_rss_bytes"] = _peak_rss_bytes()
+        row["_timing_evidence"] = {
+            "instance": task.instance_name,
+            "seed": task.seed,
+            "axis": axis.name,
+            **timing,
+            "finalize_started_ns": finalize_started_ns,
+            "finalize_completed_ns": finalize_completed_ns,
+            "axis_event_count": event_counts[axis.name],
+            "total_event_count": total_events,
+            "axis_count": len(axes),
+        }
         rows.append(row)
     return rows
 
@@ -908,6 +1193,9 @@ def _solve_stage052_axis(
         batch_size=config.batch_size,
         exact_deadline_config=exact_deadline,
         stage04_config=stage04.stage04_config,
+        native_kernel_config=(
+            config.native_kernels if instance.distance_backend == "native" else None
+        ),
     )
 
 
@@ -970,14 +1258,14 @@ def _stage052_row_draft(
     axis: Stage052Axis,
     result: ALNSResult,
     validation_passed: bool,
+    axis_valid: bool,
     solver_seconds: float,
     semantic_digest: str,
     storage: ArtifactStorageConfig,
 ) -> dict[str, object]:
     backend = result.backend_metrics
     objective = result.objective
-    batch_launches = _strict_int(backend.get("work_batches", 0), "work_batches")
-    exact_calls = _strict_int(backend.get("exact_calls", 0), "exact_calls")
+    batch_launches, median_batch_occupancy = _launch_occupancy_summary(backend)
     return {
         "instance": task.instance_name,
         "seed": task.seed,
@@ -995,11 +1283,29 @@ def _stage052_row_draft(
         "exact_seconds": backend.get("total_seconds", 0.0),
         "packing_seconds": backend.get("packing_seconds", 0.0),
         "unpacking_seconds": backend.get("unpacking_seconds", 0.0),
+        "native_kernel_seconds": backend.get("native_kernel_seconds", 0.0),
+        "native_invocations": backend.get("native_invocations", 0),
+        "native_fallbacks": backend.get("native_fallbacks", 0),
+        "native_screening_seconds": result.screening_statistics.get(
+            "native_screening_seconds", 0.0
+        ),
+        "native_screening_invocations": result.screening_statistics.get(
+            "native_screening_invocations", 0
+        ),
+        "native_propagation_seconds": result.screening_statistics.get(
+            "native_propagation_seconds", 0.0
+        ),
+        "native_propagation_invocations": result.screening_statistics.get(
+            "native_propagation_invocations", 0
+        ),
+        "native_protocol_fallbacks": result.screening_statistics.get(
+            "native_protocol_fallbacks", 0
+        ),
         "exact_started_calls": result.exact_started_calls,
         "exact_completed_calls": result.exact_completed_calls,
         "effective_iterations": result.effective_iterations,
         "batch_launches": batch_launches,
-        "median_batch_occupancy": (exact_calls / batch_launches if batch_launches else 0.0),
+        "median_batch_occupancy": median_batch_occupancy,
         "peak_rss_bytes": 0,
         "vehicle_count": objective.vehicle_count if objective else "",
         "total_distance": objective.total_distance if objective else "",
@@ -1008,7 +1314,7 @@ def _stage052_row_draft(
         "validator_passed": validation_passed,
         "semantic_digest": semantic_digest,
         "termination_reason": result.termination_reason,
-        "failure_status": "" if validation_passed else "validator_failed",
+        "failure_status": ("" if axis_valid else "solver_validator_or_trace_reconciliation_failed"),
     }
 
 
@@ -1247,6 +1553,24 @@ def _optimization_profile(component: Stage052Component) -> str:
     return "native"
 
 
+def _launch_occupancy_summary(backend: Mapping[str, object]) -> tuple[int, float]:
+    """Return the real per-launch median, never an exact-calls/launches mean."""
+
+    batch_launches = _strict_int(backend.get("batch_launches", 0), "batch_launches")
+    exact_calls = _strict_int(backend.get("exact_calls", 0), "exact_calls")
+    raw = backend.get("launch_occupancies")
+    if not isinstance(raw, list):
+        raise TypeError("launch_occupancies must be a list")
+    occupancies = [_strict_int(value, "launch_occupancy") for value in raw]
+    if any(value <= 0 for value in occupancies):
+        raise ValueError("launch occupancies must be positive")
+    if len(occupancies) != batch_launches or sum(occupancies) != exact_calls:
+        raise ValueError(
+            "launch occupancy count/sum must reconcile with batch_launches and exact_calls"
+        )
+    return batch_launches, statistics.median(occupancies) if occupancies else 0.0
+
+
 def _strict_int(value: object, field: str) -> int:
     if isinstance(value, bool):
         raise TypeError(f"{field} must be an integer")
@@ -1255,6 +1579,20 @@ def _strict_int(value: object, field: str) -> int:
     if isinstance(value, str) and value.lstrip("-").isdigit():
         return int(value)
     raise TypeError(f"{field} must be an integer")
+
+
+def _strict_float(value: object) -> float:
+    if isinstance(value, bool):
+        raise TypeError("numeric value cannot be boolean")
+    if isinstance(value, (int, float, str)):
+        try:
+            number = float(value)
+        except ValueError as error:
+            raise TypeError("numeric value must be parseable") from error
+        if not math.isfinite(number):
+            raise ValueError("numeric value must be finite")
+        return number
+    raise TypeError("numeric value must be a number")
 
 
 def main() -> int:

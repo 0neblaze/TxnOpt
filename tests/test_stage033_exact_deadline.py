@@ -100,8 +100,10 @@ def test_single_route_batch_deadline_is_a_candidate_stop(
         "cpu_batch",
         8,
         exact_calls=1,
+        batch_launches=1,
         started_calls=1,
         interrupted_calls=1,
+        launch_occupancies=[1],
     )
 
     def interrupt(*args: object, **kwargs: object) -> object:
@@ -117,9 +119,7 @@ def test_single_route_batch_deadline_is_a_candidate_stop(
         _instance(),
         deadline=float("inf"),
         backend="cpu_batch",
-        exact_call_controller=alns_module.ExactCallController(
-            ExactDeadlineConfig.wall_clock()
-        ),
+        exact_call_controller=alns_module.ExactCallController(ExactDeadlineConfig.wall_clock()),
     )
 
     with pytest.raises(alns_module._TimeLimitReached):
@@ -180,7 +180,8 @@ def test_fixed_exact_call_budget_stops_at_cap_and_keeps_complete_incumbent() -> 
         result.measurement_trace.to_dict()
     )
     assert {
-        record.status for record in result.measurement_trace.route_evaluations
+        record.status
+        for record in result.measurement_trace.route_evaluations
         if record.kind == "exact_call"
     } <= {"completed_feasible", "completed_infeasible"}
 

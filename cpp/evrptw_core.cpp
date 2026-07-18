@@ -1,16 +1,57 @@
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <queue>
 #include <stdexcept>
+#include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
-#include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
 namespace py = pybind11;
 
 using Point = std::pair<double, double>;
+
+template <typename T>
+py::array checked_array(py::handle array, const char* name, int expected_ndim) {
+    if (!py::isinstance<py::array>(array)) {
+        throw std::invalid_argument(std::string(name) + " must be a NumPy array");
+    }
+    auto value = py::reinterpret_borrow<py::array>(array);
+    if (!py::dtype::of<T>().is(value.dtype())) {
+        throw std::invalid_argument(std::string(name) + " must have the requested numeric dtype");
+    }
+    auto info = value.request();
+    if (info.ndim != expected_ndim) {
+        throw std::invalid_argument(std::string(name) + " has an unexpected number of dimensions");
+    }
+    if ((value.flags() & py::array::c_style) == 0) {
+        throw std::invalid_argument(std::string(name) + " must be C-contiguous");
+    }
+    return value;
+}
+
+template <typename T>
+const T* checked_data(const py::array& array) {
+    return static_cast<const T*>(array.request().ptr);
+}
+
+template <typename T>
+T* checked_data(py::array_t<T>& array) {
+    return static_cast<T*>(array.request().ptr);
+}
+
+double distance(const Point& first, const Point& second) {
+    return std::hypot(first.first - second.first, first.second - second.second);
+}
 
 py::array_t<double> distance_matrix(
     py::array_t<double, py::array::c_style | py::array::forcecast> points) {
@@ -33,10 +74,6 @@ py::array_t<double> distance_matrix(
         }
     }
     return output;
-}
-
-double distance(const Point& first, const Point& second) {
-    return std::hypot(first.first - second.first, first.second - second.second);
 }
 
 double route_distance(const std::vector<Point>& points, const std::vector<std::size_t>& route) {
@@ -70,6 +107,1342 @@ double two_opt_delta(
     return after - before;
 }
 
+namespace {
+
+constexpr double exact_epsilon = 1e-9;
+constexpr std::int64_t depot_kind = 0;
+constexpr std::int64_t customer_kind = 1;
+constexpr std::int64_t station_kind = 2;
+constexpr std::int64_t feasible_status = 0;
+constexpr std::int64_t infeasible_status = 1;
+constexpr std::int64_t interrupted_status = 2;
+constexpr std::int64_t no_failure_reason = 0;
+constexpr std::int64_t no_feasible_pattern_reason = 1;
+constexpr std::int64_t deadline_reason = 2;
+
+struct ExactLabel {
+    std::int64_t progress;
+    std::int64_t node;
+    double elapsed_time;
+    double battery;
+    double distance;
+    double total_energy;
+    double charged_energy;
+    double charging_time;
+    std::int64_t parent;
+    bool live;
+};
+
+struct ExactQueueEntry {
+    double distance;
+    double elapsed_time;
+    std::int64_t negative_progress;
+    std::int64_t serial;
+    std::size_t label_index;
+};
+
+struct ExactQueueLater {
+    bool operator()(const ExactQueueEntry& left, const ExactQueueEntry& right) const {
+        return std::tie(left.distance, left.elapsed_time, left.negative_progress, left.serial)
+            > std::tie(right.distance, right.elapsed_time, right.negative_progress, right.serial);
+    }
+};
+
+struct ExactSearchState {
+    std::vector<std::int64_t> order;
+    std::vector<ExactLabel> labels;
+    std::vector<std::vector<std::size_t>> state_labels;
+    std::priority_queue<ExactQueueEntry, std::vector<ExactQueueEntry>, ExactQueueLater> queue;
+    std::optional<ExactLabel> best;
+    std::int64_t generated = 1;
+    std::int64_t expanded = 0;
+    std::int64_t pruned = 0;
+    std::int64_t serial = 1;
+    bool completed = false;
+    bool interrupted = false;
+};
+
+struct ExactRequest {
+    std::size_t route;
+    std::size_t label_index;
+    std::int64_t destination;
+    std::int64_t progress;
+};
+
+struct ExactBatchOutput {
+    std::vector<std::int64_t> path_offsets;
+    std::vector<std::int64_t> path_indices;
+    std::vector<std::int64_t> statuses;
+    std::vector<std::int64_t> reasons;
+    std::vector<double> metrics;
+    std::vector<std::int64_t> label_counters;
+    std::vector<std::int64_t> batch_counters;
+};
+
+bool exact_dominates(const ExactLabel& left, const ExactLabel& right) {
+    const bool no_worse = left.elapsed_time <= right.elapsed_time + exact_epsilon
+        && left.battery + exact_epsilon >= right.battery
+        && left.distance <= right.distance + exact_epsilon;
+    const bool strictly_better = left.elapsed_time < right.elapsed_time - exact_epsilon
+        || left.battery > right.battery + exact_epsilon
+        || left.distance < right.distance - exact_epsilon;
+    return no_worse && strictly_better;
+}
+
+bool exact_better_terminal(const ExactLabel& candidate, const ExactLabel& incumbent) {
+    return std::tie(candidate.distance, candidate.elapsed_time)
+        < std::tie(incumbent.distance, incumbent.elapsed_time);
+}
+
+std::optional<std::size_t> pop_live_exact_label(ExactSearchState& state) {
+    while (!state.queue.empty()) {
+        const auto entry = state.queue.top();
+        state.queue.pop();
+        if (state.labels[entry.label_index].live) {
+            return entry.label_index;
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<std::int64_t> reconstruct_exact_path(
+    const ExactSearchState& state,
+    const ExactLabel& terminal) {
+    std::vector<std::int64_t> reversed;
+    reversed.push_back(terminal.node);
+    auto parent = terminal.parent;
+    while (parent >= 0) {
+        const auto& label = state.labels[static_cast<std::size_t>(parent)];
+        reversed.push_back(label.node);
+        parent = label.parent;
+    }
+    std::reverse(reversed.begin(), reversed.end());
+    return reversed;
+}
+
+ExactBatchOutput run_exact_charging_batch(
+    const std::int64_t* node_kinds,
+    const double* ready,
+    const double* due,
+    const double* service,
+    const double* distances,
+    const double* vehicle,
+    const std::int64_t* order_offsets,
+    const std::int64_t* order_indices,
+    std::size_t node_count,
+    std::size_t route_count,
+    std::int64_t depot,
+    const std::vector<std::int64_t>& stations,
+    double deadline_remaining,
+    std::int64_t batch_size) {
+    const auto started = std::chrono::steady_clock::now();
+    ExactBatchOutput output;
+    output.path_offsets.assign(route_count + 1, 0);
+    output.statuses.assign(route_count, interrupted_status);
+    output.reasons.assign(route_count, deadline_reason);
+    output.metrics.assign(route_count * 4, 0.0);
+    output.label_counters.assign(route_count * 3, 0);
+    output.batch_counters.assign(10, 0);
+    output.batch_counters[0] = static_cast<std::int64_t>(route_count);
+    output.batch_counters[1] = static_cast<std::int64_t>(route_count);
+    output.batch_counters[4] = route_count == 0 ? 0 : 1;
+    output.batch_counters[8] = route_count == 0 ? 0 : 1;
+    output.batch_counters[9] = batch_size;
+
+    const auto deadline_expired = [&]() {
+        ++output.batch_counters[7];
+        if (std::isinf(deadline_remaining) && deadline_remaining > 0.0) {
+            return false;
+        }
+        const auto elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        return elapsed >= std::max(0.0, deadline_remaining);
+    };
+    if (deadline_expired()) {
+        output.batch_counters[3] = static_cast<std::int64_t>(route_count);
+        return output;
+    }
+
+    std::vector<ExactSearchState> states(route_count);
+    for (std::size_t route = 0; route < route_count; ++route) {
+        if (deadline_expired()) {
+            output.batch_counters[3] = static_cast<std::int64_t>(route_count);
+            return output;
+        }
+        auto& state = states[route];
+        const auto begin = order_offsets[route];
+        const auto end = order_offsets[route + 1];
+        if (end > begin) {
+            state.order.assign(order_indices + begin, order_indices + end);
+        }
+        state.state_labels.resize((state.order.size() + 1) * node_count);
+        state.labels.push_back(ExactLabel{
+            0,
+            depot,
+            std::max(0.0, ready[depot]),
+            vehicle[0],
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            -1,
+            true,
+        });
+        state.state_labels[static_cast<std::size_t>(depot)].push_back(0);
+        state.queue.push(ExactQueueEntry{0.0, std::max(0.0, ready[depot]), 0, 0, 0});
+    }
+
+    bool deadline_hit = deadline_expired();
+    while (!deadline_hit) {
+        std::vector<ExactRequest> requests;
+        bool progressed = false;
+        for (std::size_t route = 0; route < route_count; ++route) {
+            auto& state = states[route];
+            if (state.completed) {
+                continue;
+            }
+            const auto live_index = pop_live_exact_label(state);
+            if (!live_index.has_value()) {
+                state.completed = true;
+                continue;
+            }
+            const auto& label = state.labels[*live_index];
+            if (state.best.has_value()
+                && label.distance >= state.best->distance - exact_epsilon) {
+                ++state.pruned;
+                progressed = true;
+                continue;
+            }
+            ++state.expanded;
+            progressed = true;
+            if (label.progress < static_cast<std::int64_t>(state.order.size())) {
+                requests.push_back(ExactRequest{
+                    route,
+                    *live_index,
+                    state.order[static_cast<std::size_t>(label.progress)],
+                    label.progress + 1,
+                });
+            } else {
+                requests.push_back(ExactRequest{route, *live_index, depot, label.progress});
+            }
+            for (const auto station : stations) {
+                if (station != label.node) {
+                    requests.push_back(ExactRequest{
+                        route,
+                        *live_index,
+                        station,
+                        label.progress,
+                    });
+                }
+            }
+        }
+        deadline_hit = deadline_expired();
+        if (deadline_hit) {
+            break;
+        }
+        if (requests.empty()) {
+            if (!progressed) {
+                break;
+            }
+            continue;
+        }
+
+        for (std::size_t offset = 0; offset < requests.size();
+             offset += static_cast<std::size_t>(batch_size)) {
+            deadline_hit = deadline_expired();
+            if (deadline_hit) {
+                break;
+            }
+            const auto chunk_end = std::min(
+                requests.size(), offset + static_cast<std::size_t>(batch_size));
+            ++output.batch_counters[5];
+            output.batch_counters[6] += static_cast<std::int64_t>(chunk_end - offset);
+            for (std::size_t request_index = offset; request_index < chunk_end; ++request_index) {
+                const auto& request = requests[request_index];
+                auto& state = states[request.route];
+                const auto& label = state.labels[request.label_index];
+                const auto destination = request.destination;
+                ++state.generated;
+                const auto leg_distance = distances[
+                    static_cast<std::size_t>(label.node) * node_count
+                    + static_cast<std::size_t>(destination)];
+                const auto energy = leg_distance * vehicle[2];
+                if (energy > label.battery + exact_epsilon) {
+                    ++state.pruned;
+                    continue;
+                }
+                auto battery = std::max(0.0, label.battery - energy);
+                auto elapsed = std::max(
+                    label.elapsed_time + leg_distance / vehicle[4], ready[destination]);
+                if (elapsed > due[destination] + exact_epsilon) {
+                    ++state.pruned;
+                    continue;
+                }
+                double charged = 0.0;
+                double charging_time = 0.0;
+                if (node_kinds[destination] == customer_kind) {
+                    elapsed += service[destination];
+                } else if (node_kinds[destination] == station_kind) {
+                    charged = vehicle[0] - battery;
+                    charging_time = charged * vehicle[3];
+                    elapsed += charging_time;
+                    if (elapsed > due[destination] + exact_epsilon) {
+                        ++state.pruned;
+                        continue;
+                    }
+                    battery = vehicle[0];
+                }
+                ExactLabel candidate{
+                    request.progress,
+                    destination,
+                    elapsed,
+                    battery,
+                    label.distance + leg_distance,
+                    label.total_energy + energy,
+                    label.charged_energy + charged,
+                    label.charging_time + charging_time,
+                    static_cast<std::int64_t>(request.label_index),
+                    true,
+                };
+                if (request.progress == static_cast<std::int64_t>(state.order.size())
+                    && node_kinds[destination] == depot_kind) {
+                    if (!state.best.has_value()
+                        || exact_better_terminal(candidate, *state.best)) {
+                        state.best = candidate;
+                    }
+                    continue;
+                }
+
+                const auto group_index = static_cast<std::size_t>(request.progress) * node_count
+                    + static_cast<std::size_t>(destination);
+                auto& current = state.state_labels[group_index];
+                bool dominated = false;
+                for (const auto existing_index : current) {
+                    if (exact_dominates(state.labels[existing_index], candidate)) {
+                        dominated = true;
+                        break;
+                    }
+                }
+                if (dominated) {
+                    ++state.pruned;
+                    continue;
+                }
+                std::vector<std::size_t> survivors;
+                survivors.reserve(current.size() + 1);
+                for (const auto existing_index : current) {
+                    if (exact_dominates(candidate, state.labels[existing_index])) {
+                        state.labels[existing_index].live = false;
+                        ++state.pruned;
+                    } else {
+                        survivors.push_back(existing_index);
+                    }
+                }
+                const auto candidate_index = state.labels.size();
+                state.labels.push_back(candidate);
+                survivors.push_back(candidate_index);
+                current = std::move(survivors);
+                ++state.serial;
+                state.queue.push(ExactQueueEntry{
+                    candidate.distance,
+                    candidate.elapsed_time,
+                    -candidate.progress,
+                    state.serial,
+                    candidate_index,
+                });
+            }
+        }
+    }
+
+    for (std::size_t route = 0; route < route_count; ++route) {
+        auto& state = states[route];
+        if (!state.completed && deadline_hit) {
+            state.interrupted = true;
+        } else if (!state.completed) {
+            state.completed = true;
+        }
+        output.label_counters[route * 3] = state.generated;
+        output.label_counters[route * 3 + 1] = state.expanded;
+        output.label_counters[route * 3 + 2] = state.pruned;
+        if (state.interrupted) {
+            continue;
+        }
+        ++output.batch_counters[2];
+        if (!state.best.has_value()) {
+            output.statuses[route] = infeasible_status;
+            output.reasons[route] = no_feasible_pattern_reason;
+            output.metrics[route * 4] = std::numeric_limits<double>::infinity();
+            continue;
+        }
+        output.statuses[route] = feasible_status;
+        output.reasons[route] = no_failure_reason;
+        output.metrics[route * 4] = state.best->distance;
+        output.metrics[route * 4 + 1] = state.best->total_energy;
+        output.metrics[route * 4 + 2] = state.best->charged_energy;
+        output.metrics[route * 4 + 3] = state.best->charging_time;
+        const auto path = reconstruct_exact_path(state, *state.best);
+        output.path_indices.insert(output.path_indices.end(), path.begin(), path.end());
+        output.path_offsets[route + 1] = static_cast<std::int64_t>(output.path_indices.size());
+    }
+    for (std::size_t route = 0; route < route_count; ++route) {
+        if (output.path_offsets[route + 1] == 0) {
+            output.path_offsets[route + 1] = output.path_offsets[route];
+        }
+    }
+    output.batch_counters[3] = static_cast<std::int64_t>(route_count) - output.batch_counters[2];
+    return output;
+}
+
+}  // namespace
+
+py::tuple exact_charging_batch_numeric(
+    py::handle node_kind,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle vehicle,
+    py::handle order_offsets,
+    py::handle order_indices,
+    py::handle deadline_remaining,
+    py::handle batch_size) {
+    auto kind_array = checked_array<std::int64_t>(node_kind, "node_kind", 1);
+    auto ready_array = checked_array<double>(ready_time, "ready_time", 1);
+    auto due_array = checked_array<double>(due_date, "due_date", 1);
+    auto service_array = checked_array<double>(service_time, "service_time", 1);
+    auto distance_array = checked_array<double>(distance, "distance", 2);
+    auto vehicle_array = checked_array<double>(vehicle, "vehicle", 1);
+    auto offsets_array = checked_array<std::int64_t>(order_offsets, "order_offsets", 1);
+    auto indices_array = checked_array<std::int64_t>(order_indices, "order_indices", 1);
+    auto deadline_array = checked_array<double>(deadline_remaining, "deadline_remaining", 1);
+    auto batch_size_array = checked_array<std::int64_t>(batch_size, "batch_size", 1);
+    const auto kind_info = kind_array.request();
+    const auto ready_info = ready_array.request();
+    const auto due_info = due_array.request();
+    const auto service_info = service_array.request();
+    const auto distance_info = distance_array.request();
+    const auto vehicle_info = vehicle_array.request();
+    const auto offsets_info = offsets_array.request();
+    const auto indices_info = indices_array.request();
+    const auto deadline_info = deadline_array.request();
+    const auto batch_size_info = batch_size_array.request();
+    const auto node_count = static_cast<std::size_t>(kind_info.shape[0]);
+    if (node_count == 0) {
+        throw std::invalid_argument("node arrays must not be empty");
+    }
+    if (ready_info.shape[0] != kind_info.shape[0] || due_info.shape[0] != kind_info.shape[0]
+        || service_info.shape[0] != kind_info.shape[0]) {
+        throw std::invalid_argument("node metadata arrays must share one length");
+    }
+    if (distance_info.shape[0] != kind_info.shape[0]
+        || distance_info.shape[1] != kind_info.shape[0]) {
+        throw std::invalid_argument("distance must have shape (n, n)");
+    }
+    if (vehicle_info.shape[0] != 5) {
+        throw std::invalid_argument("vehicle must have shape (5,)");
+    }
+    if (offsets_info.shape[0] == 0) {
+        throw std::invalid_argument("order_offsets must contain at least the initial zero");
+    }
+    if (deadline_info.shape[0] != 1) {
+        throw std::invalid_argument("deadline_remaining must have shape (1,)");
+    }
+    if (batch_size_info.shape[0] != 1) {
+        throw std::invalid_argument("batch_size must have shape (1,)");
+    }
+
+    const auto* kinds = checked_data<std::int64_t>(kind_array);
+    const auto* ready = checked_data<double>(ready_array);
+    const auto* due = checked_data<double>(due_array);
+    const auto* service = checked_data<double>(service_array);
+    const auto* distances = checked_data<double>(distance_array);
+    const auto* vehicle_values = checked_data<double>(vehicle_array);
+    const auto* offsets = checked_data<std::int64_t>(offsets_array);
+    const auto* indices = checked_data<std::int64_t>(indices_array);
+    const auto* deadline = checked_data<double>(deadline_array);
+    const auto* batch = checked_data<std::int64_t>(batch_size_array);
+    if (batch[0] <= 0) {
+        throw std::invalid_argument("batch_size must be positive");
+    }
+    if (std::isnan(deadline[0])) {
+        throw std::invalid_argument("deadline_remaining must not be NaN");
+    }
+    if (!std::isfinite(vehicle_values[0]) || vehicle_values[0] < 0.0
+        || !std::isfinite(vehicle_values[2]) || vehicle_values[2] < 0.0
+        || !std::isfinite(vehicle_values[3]) || vehicle_values[3] < 0.0
+        || !std::isfinite(vehicle_values[4]) || vehicle_values[4] <= 0.0) {
+        throw std::invalid_argument("vehicle contains invalid exact-charging parameters");
+    }
+    std::int64_t depot = -1;
+    std::vector<std::int64_t> stations;
+    for (std::size_t node = 0; node < node_count; ++node) {
+        if (kinds[node] != depot_kind && kinds[node] != customer_kind
+            && kinds[node] != station_kind) {
+            throw std::invalid_argument("node_kind contains an unknown code");
+        }
+        if (kinds[node] == depot_kind) {
+            if (depot >= 0) {
+                throw std::invalid_argument("node_kind must contain exactly one depot");
+            }
+            depot = static_cast<std::int64_t>(node);
+        } else if (kinds[node] == station_kind) {
+            stations.push_back(static_cast<std::int64_t>(node));
+        }
+        if (!std::isfinite(ready[node]) || !std::isfinite(due[node])
+            || !std::isfinite(service[node])) {
+            throw std::invalid_argument("node metadata must contain finite values");
+        }
+        for (std::size_t destination = 0; destination < node_count; ++destination) {
+            const auto leg = distances[node * node_count + destination];
+            if (!std::isfinite(leg) || leg < 0.0) {
+                throw std::invalid_argument("distance must contain finite non-negative values");
+            }
+        }
+    }
+    if (depot < 0) {
+        throw std::invalid_argument("node_kind must contain exactly one depot");
+    }
+    const auto route_count = static_cast<std::size_t>(offsets_info.shape[0] - 1);
+    if (offsets[0] != 0
+        || offsets[route_count] != static_cast<std::int64_t>(indices_info.shape[0])) {
+        throw std::invalid_argument("order_offsets must span order_indices exactly");
+    }
+    for (std::size_t route = 0; route < route_count; ++route) {
+        if (offsets[route] < 0 || offsets[route] > offsets[route + 1]) {
+            throw std::invalid_argument("order_offsets must be monotone");
+        }
+        std::vector<bool> seen(node_count, false);
+        for (auto position = offsets[route]; position < offsets[route + 1]; ++position) {
+            const auto node = indices[position];
+            if (node < 0 || static_cast<std::size_t>(node) >= node_count
+                || kinds[node] != customer_kind) {
+                throw std::invalid_argument("order_indices must contain customer node indices");
+            }
+            if (seen[static_cast<std::size_t>(node)]) {
+                throw std::invalid_argument("each customer order must be duplicate-free");
+            }
+            seen[static_cast<std::size_t>(node)] = true;
+        }
+    }
+
+    ExactBatchOutput result;
+    {
+        py::gil_scoped_release release;
+        result = run_exact_charging_batch(
+            kinds,
+            ready,
+            due,
+            service,
+            distances,
+            vehicle_values,
+            offsets,
+            indices,
+            node_count,
+            route_count,
+            depot,
+            stations,
+            deadline[0],
+            batch[0]);
+    }
+
+    py::array_t<std::int64_t> path_offsets_array(result.path_offsets.size());
+    py::array_t<std::int64_t> path_indices_array(result.path_indices.size());
+    py::array_t<std::int64_t> status_array(result.statuses.size());
+    py::array_t<std::int64_t> reason_array(result.reasons.size());
+    py::array_t<double> metrics_array(
+        std::vector<py::ssize_t>{static_cast<py::ssize_t>(route_count), 4});
+    py::array_t<std::int64_t> counters_array(
+        std::vector<py::ssize_t>{static_cast<py::ssize_t>(route_count), 3});
+    py::array_t<std::int64_t> batch_counters_array(result.batch_counters.size());
+    std::copy(result.path_offsets.begin(), result.path_offsets.end(), checked_data(path_offsets_array));
+    std::copy(result.path_indices.begin(), result.path_indices.end(), checked_data(path_indices_array));
+    std::copy(result.statuses.begin(), result.statuses.end(), checked_data(status_array));
+    std::copy(result.reasons.begin(), result.reasons.end(), checked_data(reason_array));
+    std::copy(result.metrics.begin(), result.metrics.end(), checked_data(metrics_array));
+    std::copy(result.label_counters.begin(), result.label_counters.end(), checked_data(counters_array));
+    std::copy(
+        result.batch_counters.begin(),
+        result.batch_counters.end(),
+        checked_data(batch_counters_array));
+    return py::make_tuple(
+        std::move(path_offsets_array),
+        std::move(path_indices_array),
+        std::move(status_array),
+        std::move(reason_array),
+        std::move(metrics_array),
+        std::move(counters_array),
+        std::move(batch_counters_array));
+}
+
+namespace {
+
+constexpr std::int64_t screen_reason_none = 0;
+constexpr std::int64_t screen_reason_structure = 1;
+constexpr std::int64_t screen_reason_capacity = 2;
+constexpr std::int64_t screen_reason_forward = 3;
+constexpr std::int64_t screen_reason_backward = 4;
+constexpr std::int64_t screen_reason_slack = 5;
+constexpr std::int64_t screen_reason_energy = 6;
+constexpr std::int64_t screen_reason_structural_energy = 7;
+constexpr std::int64_t screen_reason_legacy_time = 8;
+constexpr std::int64_t screen_reason_legacy_energy = 9;
+constexpr std::int64_t check_structure = 1;
+constexpr std::int64_t check_capacity = 2;
+constexpr std::int64_t check_forward = 3;
+constexpr std::int64_t check_backward = 4;
+constexpr std::int64_t check_slack = 5;
+constexpr std::int64_t check_distance = 6;
+constexpr std::int64_t check_energy = 7;
+constexpr std::int64_t check_structural_energy = 8;
+constexpr std::int64_t check_fail = 0;
+constexpr std::int64_t check_pass = 1;
+constexpr std::int64_t check_recorded = 2;
+
+struct ScreenOutput {
+    std::vector<std::int64_t> codes = std::vector<std::int64_t>(16, 0);
+    std::vector<double> metrics = std::vector<double>(15, 0.0);
+};
+
+void append_screen_event(
+    ScreenOutput& output,
+    std::int64_t check,
+    std::int64_t status,
+    double value) {
+    const auto count = static_cast<std::size_t>(output.codes[7]);
+    if (count >= 8) {
+        throw std::logic_error("screening emitted more than eight canonical check events");
+    }
+    output.codes[8 + count] = check * 10 + status;
+    output.metrics[7 + count] = value;
+    output.codes[7] += 1;
+}
+
+void reject_screen(
+    ScreenOutput& output,
+    std::int64_t reason,
+    std::int64_t failed_check,
+    double value) {
+    output.codes[0] = 0;
+    output.codes[1] = reason;
+    output.codes[2] = failed_check;
+    append_screen_event(output, failed_check, check_fail, value);
+}
+
+ScreenOutput run_screen_route(
+    const std::int64_t* kinds,
+    const double* demands,
+    const double* ready,
+    const double* due,
+    const double* service,
+    const double* distances,
+    const std::uint8_t* reachable,
+    const double* vehicle,
+    const std::int64_t* route,
+    std::size_t route_size,
+    std::size_t node_count,
+    std::int64_t depot,
+    const std::vector<std::int64_t>& recharge_nodes,
+    const double* options,
+    const double* incremental) {
+    ScreenOutput output;
+    const bool full = options[0] >= 0.5;
+    const auto epsilon = options[1];
+    const bool has_reference = options[3] >= 0.5;
+    const bool use_incremental = incremental[0] >= 0.5;
+    output.codes[4] = 0;
+    output.codes[5] = full ? 1 : 0;
+    output.codes[6] = use_incremental ? 1 : 0;
+    output.codes[3] = full ? 0 : 1;
+    output.metrics[4] = has_reference
+        ? 0.0
+        : std::numeric_limits<double>::quiet_NaN();
+
+    bool known_sequence = true;
+    bool customer_sequence = true;
+    bool duplicate_free = true;
+    std::vector<bool> seen(node_count, false);
+    for (std::size_t position = 0; position < route_size; ++position) {
+        const auto node = route[position];
+        if (node < 0 || static_cast<std::size_t>(node) >= node_count) {
+            known_sequence = false;
+            customer_sequence = false;
+            continue;
+        }
+        if (kinds[node] != customer_kind) {
+            customer_sequence = false;
+        }
+        if (seen[static_cast<std::size_t>(node)]) {
+            duplicate_free = false;
+        }
+        seen[static_cast<std::size_t>(node)] = true;
+    }
+
+    double distance_lower_bound = 0.0;
+    if (use_incremental) {
+        distance_lower_bound = incremental[1];
+    } else if (known_sequence) {
+        auto origin = depot;
+        for (std::size_t position = 0; position < route_size; ++position) {
+            const auto destination = route[position];
+            distance_lower_bound += distances[
+                static_cast<std::size_t>(origin) * node_count
+                + static_cast<std::size_t>(destination)];
+            origin = destination;
+        }
+        distance_lower_bound += distances[
+            static_cast<std::size_t>(origin) * node_count + static_cast<std::size_t>(depot)];
+    }
+    output.metrics[3] = distance_lower_bound;
+    if (has_reference) {
+        output.metrics[4] = distance_lower_bound - options[2];
+    }
+    if (!full) {
+        output.metrics[3] = 0.0;
+        output.metrics[4] = std::numeric_limits<double>::quiet_NaN();
+    }
+    if (!known_sequence || !customer_sequence) {
+        output.codes[3] = 0;
+        output.metrics[0] = 0.0;
+        output.metrics[1] = 0.0;
+        if (full) {
+            reject_screen(output, screen_reason_structure, check_structure, 0.0);
+        } else {
+            output.codes[1] = screen_reason_structure;
+            output.codes[2] = check_structure;
+        }
+        return output;
+    }
+
+    double demand = 0.0;
+    for (std::size_t position = 0; position < route_size; ++position) {
+        demand += demands[route[position]];
+    }
+    output.metrics[0] = demand;
+    if (demand > vehicle[1] + epsilon) {
+        output.codes[3] = 0;
+        if (full) {
+            reject_screen(output, screen_reason_capacity, check_capacity, demand);
+        } else {
+            output.codes[1] = screen_reason_capacity;
+            output.codes[2] = check_capacity;
+        }
+        return output;
+    }
+
+    auto current_time = std::max(0.0, ready[depot]);
+    if (!full) {
+        auto origin = depot;
+        for (std::size_t position = 0; position <= route_size; ++position) {
+            const auto destination = position < route_size ? route[position] : depot;
+            current_time += distances[
+                static_cast<std::size_t>(origin) * node_count
+                + static_cast<std::size_t>(destination)] / vehicle[4];
+            current_time = std::max(current_time, ready[destination]);
+            if (kinds[destination] == customer_kind) {
+                if (current_time > due[destination] + epsilon) {
+                    output.codes[1] = screen_reason_legacy_time;
+                    output.codes[2] = check_forward;
+                    output.metrics[1] = current_time;
+                    return output;
+                }
+                current_time += service[destination];
+            }
+            origin = destination;
+        }
+        output.metrics[1] = current_time;
+        origin = depot;
+        for (std::size_t position = 0; position <= route_size; ++position) {
+            const auto destination = position < route_size ? route[position] : depot;
+            if (reachable[
+                    static_cast<std::size_t>(origin) * node_count
+                    + static_cast<std::size_t>(destination)] == 0U) {
+                output.codes[1] = screen_reason_legacy_energy;
+                output.codes[2] = check_energy;
+                return output;
+            }
+            origin = destination;
+        }
+        output.codes[0] = 1;
+        output.codes[3] = 1;
+        output.codes[4] = 1;
+        output.metrics[6] = 1.0;
+        return output;
+    }
+
+    output.codes[3] = 1;
+    output.codes[4] = 1;
+    output.metrics[6] = 1.0;
+    append_screen_event(
+        output, check_structure, check_pass, duplicate_free ? 1.0 : 0.0);
+    if (!duplicate_free) {
+        reject_screen(output, screen_reason_structure, check_structure, 0.0);
+        return output;
+    }
+    append_screen_event(output, check_capacity, check_pass, demand);
+
+    auto min_slack = std::numeric_limits<double>::infinity();
+    std::vector<double> earliest(node_count, 0.0);
+    std::vector<bool> has_earliest(node_count, false);
+    if (use_incremental) {
+        current_time = incremental[3];
+        min_slack = incremental[2];
+        if (incremental[4] < 0.5) {
+            output.metrics[1] = current_time;
+            output.metrics[2] = min_slack;
+            reject_screen(output, screen_reason_forward, check_forward, min_slack);
+            return output;
+        }
+    } else {
+        auto origin = depot;
+        for (std::size_t position = 0; position <= route_size; ++position) {
+            const auto destination = position < route_size ? route[position] : depot;
+            current_time += distances[
+                static_cast<std::size_t>(origin) * node_count
+                + static_cast<std::size_t>(destination)] / vehicle[4];
+            current_time = std::max(current_time, ready[destination]);
+            if (kinds[destination] == customer_kind) {
+                earliest[static_cast<std::size_t>(destination)] = current_time;
+                has_earliest[static_cast<std::size_t>(destination)] = true;
+                const auto slack = due[destination] - current_time;
+                min_slack = std::min(min_slack, slack);
+                if (slack < -epsilon) {
+                    output.metrics[1] = current_time;
+                    output.metrics[2] = slack;
+                    reject_screen(output, screen_reason_forward, check_forward, slack);
+                    return output;
+                }
+                current_time += service[destination];
+            } else if (kinds[destination] == depot_kind) {
+                const auto slack = due[destination] - current_time;
+                min_slack = std::min(min_slack, slack);
+                if (slack < -epsilon) {
+                    output.metrics[1] = current_time;
+                    output.metrics[2] = slack;
+                    reject_screen(output, screen_reason_forward, check_forward, slack);
+                    return output;
+                }
+            }
+            origin = destination;
+        }
+    }
+    append_screen_event(output, check_forward, check_pass, current_time);
+
+    if (use_incremental) {
+        if (incremental[5] < 0.5) {
+            output.metrics[1] = current_time;
+            output.metrics[2] = min_slack;
+            reject_screen(output, screen_reason_backward, check_backward, min_slack);
+            return output;
+        }
+    } else {
+        auto latest_departure = due[depot];
+        std::vector<double> latest(node_count, 0.0);
+        std::vector<bool> has_latest(node_count, false);
+        for (std::size_t reverse = route_size + 1; reverse-- > 0;) {
+            const auto origin = reverse == 0 ? depot : route[reverse - 1];
+            const auto destination = reverse < route_size ? route[reverse] : depot;
+            double latest_arrival = 0.0;
+            if (kinds[destination] == customer_kind) {
+                latest_arrival = std::min(
+                    due[destination], latest_departure - service[destination]);
+                latest[static_cast<std::size_t>(destination)] = latest_arrival;
+                has_latest[static_cast<std::size_t>(destination)] = true;
+            } else {
+                latest_arrival = std::min(due[destination], latest_departure);
+            }
+            latest_departure = latest_arrival - distances[
+                static_cast<std::size_t>(origin) * node_count
+                + static_cast<std::size_t>(destination)] / vehicle[4];
+        }
+        for (std::size_t node = 0; node < node_count; ++node) {
+            if (has_earliest[node] && has_latest[node]) {
+                const auto slack = latest[node] - earliest[node];
+                min_slack = std::min(min_slack, slack);
+                if (slack < -epsilon) {
+                    output.metrics[1] = current_time;
+                    output.metrics[2] = slack;
+                    reject_screen(output, screen_reason_backward, check_backward, slack);
+                    return output;
+                }
+            }
+        }
+    }
+    const auto reported_slack = std::isfinite(min_slack) ? min_slack : 0.0;
+    append_screen_event(output, check_backward, check_pass, reported_slack);
+    if (min_slack < -epsilon) {
+        output.metrics[1] = current_time;
+        output.metrics[2] = min_slack;
+        reject_screen(output, screen_reason_slack, check_slack, min_slack);
+        return output;
+    }
+    append_screen_event(output, check_slack, check_pass, reported_slack);
+    append_screen_event(output, check_distance, check_recorded, distance_lower_bound);
+
+    auto origin = depot;
+    for (std::size_t position = 0; position <= route_size; ++position) {
+        const auto destination = position < route_size ? route[position] : depot;
+        if (reachable[
+                static_cast<std::size_t>(origin) * node_count
+                + static_cast<std::size_t>(destination)] == 0U) {
+            output.codes[3] = 0;
+            output.codes[4] = 0;
+            output.metrics[1] = current_time;
+            output.metrics[2] = reported_slack;
+            output.metrics[6] = 0.0;
+            reject_screen(output, screen_reason_energy, check_energy, 0.0);
+            return output;
+        }
+        origin = destination;
+    }
+    output.codes[3] = 1;
+    output.codes[4] = 1;
+    append_screen_event(output, check_energy, check_pass, 1.0);
+
+    double structural_energy = 0.0;
+    for (std::size_t position = 0; position < route_size; ++position) {
+        const auto customer = route[position];
+        auto to_customer = std::numeric_limits<double>::infinity();
+        auto from_customer = std::numeric_limits<double>::infinity();
+        for (const auto recharge : recharge_nodes) {
+            to_customer = std::min(
+                to_customer,
+                distances[static_cast<std::size_t>(recharge) * node_count
+                    + static_cast<std::size_t>(customer)]);
+            from_customer = std::min(
+                from_customer,
+                distances[static_cast<std::size_t>(customer) * node_count
+                    + static_cast<std::size_t>(recharge)]);
+        }
+        structural_energy = std::max(
+            structural_energy, (to_customer + from_customer) * vehicle[2]);
+    }
+    output.metrics[5] = structural_energy;
+    if (structural_energy > vehicle[0] + epsilon) {
+        output.metrics[1] = current_time;
+        output.metrics[2] = reported_slack;
+        reject_screen(
+            output,
+            screen_reason_structural_energy,
+            check_structural_energy,
+            structural_energy);
+        return output;
+    }
+    append_screen_event(output, check_structural_energy, check_pass, structural_energy);
+    output.codes[0] = 1;
+    output.codes[1] = screen_reason_none;
+    output.codes[2] = 0;
+    output.metrics[1] = current_time;
+    output.metrics[2] = reported_slack;
+    output.metrics[6] = 1.0;
+    return output;
+}
+
+struct PropagationOutput {
+    std::vector<std::int64_t> codes = std::vector<std::int64_t>(10, 0);
+    std::vector<double> metrics = std::vector<double>(3, 0.0);
+};
+
+PropagationOutput run_incremental_propagation(
+    const std::int64_t* kinds,
+    const double* ready,
+    const double* due,
+    const double* service,
+    const double* distances,
+    const double* vehicle,
+    const std::int64_t* base_chain,
+    std::size_t base_size,
+    const std::int64_t* candidate_chain,
+    std::size_t candidate_size,
+    const double* base_edges,
+    const double* base_earliest,
+    const double* base_latest,
+    std::size_t node_count,
+    double epsilon) {
+    PropagationOutput output;
+    auto valid_candidate = candidate_size >= 2 && candidate_chain[0] >= 0
+        && static_cast<std::size_t>(candidate_chain[0]) < node_count
+        && candidate_chain[candidate_size - 1] == candidate_chain[0];
+    if (valid_candidate) {
+        valid_candidate = kinds[candidate_chain[0]] == depot_kind;
+    }
+    std::vector<bool> seen(node_count, false);
+    if (valid_candidate) {
+        for (std::size_t position = 1; position + 1 < candidate_size; ++position) {
+            const auto node = candidate_chain[position];
+            if (node < 0 || static_cast<std::size_t>(node) >= node_count
+                || kinds[node] != customer_kind
+                || seen[static_cast<std::size_t>(node)]) {
+                valid_candidate = false;
+                break;
+            }
+            seen[static_cast<std::size_t>(node)] = true;
+        }
+    }
+    if (!valid_candidate) {
+        output.codes[0] = 1;
+        output.codes[1] = 2;
+        output.codes[2] = 1;
+        return output;
+    }
+
+    const bool unchanged = base_size == candidate_size
+        && std::equal(base_chain, base_chain + base_size, candidate_chain);
+    if (unchanged) {
+        output.codes[0] = 0;
+        output.codes[1] = 1;
+        output.codes[3] = 1;
+        output.codes[4] = 1;
+        output.codes[5] = static_cast<std::int64_t>(base_size - 1);
+        output.codes[9] = 1;
+        output.metrics[0] = 0.0;
+        for (std::size_t edge = 0; edge + 1 < base_size; ++edge) {
+            output.metrics[0] += base_edges[edge];
+        }
+        output.metrics[1] = std::numeric_limits<double>::infinity();
+        for (std::size_t position = 1; position + 1 < base_size; ++position) {
+            const auto node = base_chain[position];
+            const auto latest_arrival = std::min(
+                due[node], base_latest[position] - service[node]);
+            output.metrics[1] = std::min(
+                output.metrics[1], latest_arrival - base_earliest[position]);
+        }
+        if (!std::isfinite(output.metrics[1])) {
+            output.metrics[1] = 0.0;
+        }
+        output.metrics[2] = base_earliest[base_size - 1];
+        return output;
+    }
+
+    std::size_t prefix_nodes = 0;
+    while (prefix_nodes < base_size && prefix_nodes < candidate_size
+           && base_chain[prefix_nodes] == candidate_chain[prefix_nodes]) {
+        ++prefix_nodes;
+    }
+    std::size_t suffix_nodes = 0;
+    while (suffix_nodes < base_size - prefix_nodes
+           && suffix_nodes < candidate_size - prefix_nodes
+           && base_chain[base_size - 1 - suffix_nodes]
+               == candidate_chain[candidate_size - 1 - suffix_nodes]) {
+        ++suffix_nodes;
+    }
+    const auto candidate_suffix_start = candidate_size - suffix_nodes;
+    const auto prefix_edges = prefix_nodes > 0 ? prefix_nodes - 1 : 0;
+    const auto suffix_edges = suffix_nodes > 0 ? suffix_nodes - 1 : 0;
+    const auto candidate_edges = candidate_size - 1;
+    const auto middle_start = prefix_nodes > 0 ? prefix_nodes - 1 : 0;
+    const auto middle_end = std::max(middle_start, candidate_suffix_start - 1);
+    double total_distance = 0.0;
+    for (std::size_t edge = middle_start;
+         edge <= middle_end && edge + 1 < candidate_size;
+         ++edge) {
+        total_distance += distances[
+            static_cast<std::size_t>(candidate_chain[edge]) * node_count
+            + static_cast<std::size_t>(candidate_chain[edge + 1])];
+    }
+    for (std::size_t edge = 0; edge < prefix_edges; ++edge) {
+        total_distance += base_edges[edge];
+    }
+    for (std::size_t edge = 0; edge < suffix_edges; ++edge) {
+        total_distance += base_edges[base_size - 2 - edge];
+    }
+
+    std::vector<double> earliest(candidate_size, 0.0);
+    earliest[0] = std::max(0.0, ready[candidate_chain[0]]);
+    const auto forward_start = prefix_nodes > 0 ? prefix_nodes - 1 : 0;
+    if (prefix_nodes > 0 && prefix_nodes <= base_size) {
+        std::copy(base_earliest, base_earliest + prefix_nodes, earliest.begin());
+    }
+    auto current_time = earliest[forward_start];
+    if (kinds[candidate_chain[forward_start]] == customer_kind) {
+        current_time += service[candidate_chain[forward_start]];
+    }
+    bool forward_feasible = true;
+    for (std::size_t edge = forward_start; edge + 1 < candidate_size; ++edge) {
+        const auto destination = candidate_chain[edge + 1];
+        current_time += distances[
+            static_cast<std::size_t>(candidate_chain[edge]) * node_count
+            + static_cast<std::size_t>(destination)] / vehicle[4];
+        current_time = std::max(current_time, ready[destination]);
+        earliest[edge + 1] = current_time;
+        if (current_time > due[destination] + epsilon) {
+            forward_feasible = false;
+        }
+        if (kinds[destination] == customer_kind) {
+            current_time += service[destination];
+        }
+    }
+
+    std::vector<double> latest(candidate_size, 0.0);
+    latest[candidate_size - 1] = due[candidate_chain[candidate_size - 1]];
+    const auto backward_start = candidate_suffix_start;
+    if (suffix_nodes > 0 && candidate_suffix_start < base_size) {
+        std::copy(
+            base_latest + (base_size - suffix_nodes),
+            base_latest + base_size,
+            latest.begin() + static_cast<std::ptrdiff_t>(candidate_suffix_start));
+    }
+    auto latest_departure = latest[backward_start];
+    bool backward_feasible = true;
+    for (std::size_t reverse = backward_start; reverse-- > 0;) {
+        const auto origin = candidate_chain[reverse];
+        const auto destination = candidate_chain[reverse + 1];
+        const auto latest_arrival = kinds[destination] == customer_kind
+            ? std::min(due[destination], latest_departure - service[destination])
+            : std::min(due[destination], latest_departure);
+        latest_departure = latest_arrival - distances[
+            static_cast<std::size_t>(origin) * node_count
+            + static_cast<std::size_t>(destination)] / vehicle[4];
+        latest[reverse] = latest_departure;
+        if (kinds[origin] == customer_kind
+            && latest_departure < ready[origin] - epsilon) {
+            backward_feasible = false;
+        }
+    }
+
+    auto min_slack = std::numeric_limits<double>::infinity();
+    for (std::size_t position = 1; position + 1 < candidate_size; ++position) {
+        const auto node = candidate_chain[position];
+        const auto latest_arrival = std::min(
+            due[node], latest[position] - service[node]);
+        min_slack = std::min(min_slack, latest_arrival - earliest[position]);
+    }
+    if (!std::isfinite(min_slack)) {
+        min_slack = 0.0;
+    }
+    output.codes[0] = 0;
+    output.codes[1] = 0;
+    output.codes[3] = forward_feasible ? 1 : 0;
+    output.codes[4] = backward_feasible ? 1 : 0;
+    output.codes[5] = static_cast<std::int64_t>(prefix_edges);
+    output.codes[6] = static_cast<std::int64_t>(suffix_edges);
+    output.codes[7] = static_cast<std::int64_t>(candidate_edges - prefix_edges);
+    output.codes[8] = static_cast<std::int64_t>(candidate_edges - suffix_edges);
+    output.codes[9] = forward_feasible && backward_feasible ? 1 : 0;
+    if (!forward_feasible) {
+        output.codes[1] = 3;
+        output.codes[2] = 2;
+    } else if (!backward_feasible) {
+        output.codes[1] = 4;
+        output.codes[2] = 3;
+    } else if (min_slack < -epsilon) {
+        output.codes[1] = 5;
+        output.codes[2] = 4;
+    }
+    output.metrics[0] = total_distance;
+    output.metrics[1] = min_slack;
+    output.metrics[2] = current_time;
+    return output;
+}
+
+}  // namespace
+
+py::tuple screen_routes_numeric(
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle route_indices,
+    py::handle options,
+    py::handle incremental) {
+    auto kind_array = checked_array<std::int64_t>(node_kind, "node_kind", 1);
+    auto demand_array = checked_array<double>(demand, "demand", 1);
+    auto ready_array = checked_array<double>(ready_time, "ready_time", 1);
+    auto due_array = checked_array<double>(due_date, "due_date", 1);
+    auto service_array = checked_array<double>(service_time, "service_time", 1);
+    auto distance_array = checked_array<double>(distance, "distance", 2);
+    auto reachable_array = checked_array<std::uint8_t>(reachable, "reachable", 2);
+    auto vehicle_array = checked_array<double>(vehicle, "vehicle", 1);
+    auto route_array = checked_array<std::int64_t>(route_indices, "route_indices", 1);
+    auto options_array = checked_array<double>(options, "options", 1);
+    auto incremental_array = checked_array<double>(incremental, "incremental", 1);
+    const auto kind_info = kind_array.request();
+    const auto node_count = static_cast<std::size_t>(kind_info.shape[0]);
+    if (node_count == 0 || demand_array.request().shape[0] != kind_info.shape[0]
+        || ready_array.request().shape[0] != kind_info.shape[0]
+        || due_array.request().shape[0] != kind_info.shape[0]
+        || service_array.request().shape[0] != kind_info.shape[0]) {
+        throw std::invalid_argument("screening node arrays must share one non-zero length");
+    }
+    if (distance_array.request().shape[0] != kind_info.shape[0]
+        || distance_array.request().shape[1] != kind_info.shape[0]
+        || reachable_array.request().shape[0] != kind_info.shape[0]
+        || reachable_array.request().shape[1] != kind_info.shape[0]) {
+        throw std::invalid_argument("distance and reachable must have shape (n, n)");
+    }
+    if (vehicle_array.request().shape[0] != 5) {
+        throw std::invalid_argument("vehicle must have shape (5,)");
+    }
+    if (options_array.request().shape[0] != 4) {
+        throw std::invalid_argument("options must have shape (4,)");
+    }
+    if (incremental_array.request().shape[0] != 6) {
+        throw std::invalid_argument("incremental must have shape (6,)");
+    }
+    const auto* kinds = checked_data<std::int64_t>(kind_array);
+    const auto* demands = checked_data<double>(demand_array);
+    const auto* ready = checked_data<double>(ready_array);
+    const auto* due = checked_data<double>(due_array);
+    const auto* service = checked_data<double>(service_array);
+    const auto* distances = checked_data<double>(distance_array);
+    const auto* reachable_values = checked_data<std::uint8_t>(reachable_array);
+    const auto* vehicle_values = checked_data<double>(vehicle_array);
+    const auto* route = checked_data<std::int64_t>(route_array);
+    const auto* option_values = checked_data<double>(options_array);
+    const auto* incremental_values = checked_data<double>(incremental_array);
+    const auto route_size = static_cast<std::size_t>(route_array.request().shape[0]);
+    if (option_values[1] <= 0.0 || !std::isfinite(option_values[1])) {
+        throw std::invalid_argument("screening epsilon must be finite and positive");
+    }
+    std::int64_t depot = -1;
+    std::vector<std::int64_t> recharge_nodes;
+    for (std::size_t node = 0; node < node_count; ++node) {
+        if (kinds[node] == depot_kind) {
+            if (depot >= 0) {
+                throw std::invalid_argument("node_kind must contain exactly one depot");
+            }
+            depot = static_cast<std::int64_t>(node);
+            recharge_nodes.push_back(depot);
+        } else if (kinds[node] == station_kind) {
+            recharge_nodes.push_back(static_cast<std::int64_t>(node));
+        } else if (kinds[node] != customer_kind) {
+            throw std::invalid_argument("node_kind contains an unknown code");
+        }
+    }
+    if (depot < 0) {
+        throw std::invalid_argument("node_kind must contain exactly one depot");
+    }
+    ScreenOutput result;
+    {
+        py::gil_scoped_release release;
+        result = run_screen_route(
+            kinds,
+            demands,
+            ready,
+            due,
+            service,
+            distances,
+            reachable_values,
+            vehicle_values,
+            route,
+            route_size,
+            node_count,
+            depot,
+            recharge_nodes,
+            option_values,
+            incremental_values);
+    }
+    py::array_t<std::int64_t> codes(result.codes.size());
+    py::array_t<double> metrics(result.metrics.size());
+    std::copy(result.codes.begin(), result.codes.end(), checked_data(codes));
+    std::copy(result.metrics.begin(), result.metrics.end(), checked_data(metrics));
+    return py::make_tuple(std::move(codes), std::move(metrics));
+}
+
+py::tuple propagate_routes_numeric(
+    py::handle node_kind,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle vehicle,
+    py::handle base_chain,
+    py::handle candidate_chain,
+    py::handle base_edge_distances,
+    py::handle base_earliest_arrivals,
+    py::handle base_latest_departures,
+    py::handle epsilon) {
+    auto kind_array = checked_array<std::int64_t>(node_kind, "node_kind", 1);
+    auto ready_array = checked_array<double>(ready_time, "ready_time", 1);
+    auto due_array = checked_array<double>(due_date, "due_date", 1);
+    auto service_array = checked_array<double>(service_time, "service_time", 1);
+    auto distance_array = checked_array<double>(distance, "distance", 2);
+    auto vehicle_array = checked_array<double>(vehicle, "vehicle", 1);
+    auto base_array = checked_array<std::int64_t>(base_chain, "base_chain", 1);
+    auto candidate_array = checked_array<std::int64_t>(candidate_chain, "candidate_chain", 1);
+    auto edges_array = checked_array<double>(base_edge_distances, "base_edge_distances", 1);
+    auto earliest_array = checked_array<double>(
+        base_earliest_arrivals, "base_earliest_arrivals", 1);
+    auto latest_array = checked_array<double>(
+        base_latest_departures, "base_latest_departures", 1);
+    auto epsilon_array = checked_array<double>(epsilon, "epsilon", 1);
+    const auto node_count = static_cast<std::size_t>(kind_array.request().shape[0]);
+    const auto base_size = static_cast<std::size_t>(base_array.request().shape[0]);
+    const auto candidate_size = static_cast<std::size_t>(candidate_array.request().shape[0]);
+    if (node_count == 0 || ready_array.request().shape[0] != kind_array.request().shape[0]
+        || due_array.request().shape[0] != kind_array.request().shape[0]
+        || service_array.request().shape[0] != kind_array.request().shape[0]) {
+        throw std::invalid_argument("propagation node arrays must share one non-zero length");
+    }
+    if (distance_array.request().shape[0] != kind_array.request().shape[0]
+        || distance_array.request().shape[1] != kind_array.request().shape[0]) {
+        throw std::invalid_argument("distance must have shape (n, n)");
+    }
+    if (vehicle_array.request().shape[0] != 5) {
+        throw std::invalid_argument("vehicle must have shape (5,)");
+    }
+    if (base_size < 2 || edges_array.request().shape[0] != static_cast<py::ssize_t>(base_size - 1)
+        || earliest_array.request().shape[0] != static_cast<py::ssize_t>(base_size)
+        || latest_array.request().shape[0] != static_cast<py::ssize_t>(base_size)) {
+        throw std::invalid_argument("base snapshot arrays have inconsistent lengths");
+    }
+    if (candidate_size < 2) {
+        throw std::invalid_argument("candidate_chain must contain depot endpoints");
+    }
+    if (epsilon_array.request().shape[0] != 1
+        || checked_data<double>(epsilon_array)[0] <= 0.0
+        || !std::isfinite(checked_data<double>(epsilon_array)[0])) {
+        throw std::invalid_argument("epsilon must have shape (1,) and be finite and positive");
+    }
+    const auto* kinds = checked_data<std::int64_t>(kind_array);
+    const auto* base = checked_data<std::int64_t>(base_array);
+    for (std::size_t position = 0; position < base_size; ++position) {
+        if (base[position] < 0 || static_cast<std::size_t>(base[position]) >= node_count
+            || ((position == 0 || position + 1 == base_size)
+                    ? kinds[base[position]] != depot_kind
+                    : kinds[base[position]] != customer_kind)) {
+            throw std::invalid_argument("base_chain is not a canonical customer route chain");
+        }
+    }
+    const auto* ready = checked_data<double>(ready_array);
+    const auto* due = checked_data<double>(due_array);
+    const auto* service = checked_data<double>(service_array);
+    const auto* distances = checked_data<double>(distance_array);
+    const auto* vehicle_values = checked_data<double>(vehicle_array);
+    const auto* candidate = checked_data<std::int64_t>(candidate_array);
+    const auto* edges = checked_data<double>(edges_array);
+    const auto* earliest = checked_data<double>(earliest_array);
+    const auto* latest = checked_data<double>(latest_array);
+    const auto epsilon_value = checked_data<double>(epsilon_array)[0];
+    PropagationOutput result;
+    {
+        py::gil_scoped_release release;
+        result = run_incremental_propagation(
+            kinds,
+            ready,
+            due,
+            service,
+            distances,
+            vehicle_values,
+            base,
+            base_size,
+            candidate,
+            candidate_size,
+            edges,
+            earliest,
+            latest,
+            node_count,
+            epsilon_value);
+    }
+    py::array_t<std::int64_t> codes(result.codes.size());
+    py::array_t<double> metrics(result.metrics.size());
+    std::copy(result.codes.begin(), result.codes.end(), checked_data(codes));
+    std::copy(result.metrics.begin(), result.metrics.end(), checked_data(metrics));
+    return py::make_tuple(std::move(codes), std::move(metrics));
+}
+
 PYBIND11_MODULE(_core, module) {
     module.doc() = "Native kernels for EVRP-TW route evaluation";
     module.def("route_distance", &route_distance, py::arg("points"), py::arg("route"));
@@ -77,4 +1450,46 @@ PYBIND11_MODULE(_core, module) {
     module.def(
         "two_opt_delta", &two_opt_delta, py::arg("points"), py::arg("route"),
         py::arg("first"), py::arg("second"));
+    module.def(
+        "exact_charging_batch_numeric",
+        &exact_charging_batch_numeric,
+        py::arg("node_kind"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("vehicle"),
+        py::arg("order_offsets"),
+        py::arg("order_indices"),
+        py::arg("deadline_remaining"),
+        py::arg("batch_size"));
+    module.def(
+        "screen_routes_numeric",
+        &screen_routes_numeric,
+        py::arg("node_kind"),
+        py::arg("demand"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("reachable"),
+        py::arg("vehicle"),
+        py::arg("route_indices"),
+        py::arg("options"),
+        py::arg("incremental"));
+    module.def(
+        "propagate_routes_numeric",
+        &propagate_routes_numeric,
+        py::arg("node_kind"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("vehicle"),
+        py::arg("base_chain"),
+        py::arg("candidate_chain"),
+        py::arg("base_edge_distances"),
+        py::arg("base_earliest_arrivals"),
+        py::arg("base_latest_departures"),
+        py::arg("epsilon"));
 }

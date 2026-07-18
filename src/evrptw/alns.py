@@ -39,6 +39,7 @@ from evrptw.measurement import (
     route_result_fields,
 )
 from evrptw.models import Instance, Node
+from evrptw.native_kernels import NativeKernelConfig, NativeKernelRuntime
 from evrptw.neighborhoods import (
     ConstraintRemovalOperator,
     NeighborhoodEvent,
@@ -79,6 +80,7 @@ __all__ = (
     "CheapScreeningConfig",
     "ExactDeadlineConfig",
     "MeasurementConfig",
+    "NativeKernelConfig",
     "Stage03ExecutionError",
     "Stage03Trace",
     "Stage04Config",
@@ -261,6 +263,7 @@ class _Evaluator:
         exact_call_controller: ExactCallController | None = None,
         candidate_control_runtime: CandidateControlRuntime | None = None,
         incumbent_route_ledger: _IncumbentRouteLedger | None = None,
+        native_runtime: NativeKernelRuntime | None = None,
     ) -> None:
         self.instance = instance
         self.deadline = deadline
@@ -287,6 +290,7 @@ class _Evaluator:
         self.exact_call_controller = exact_call_controller
         self.candidate_control_runtime = candidate_control_runtime
         self.incumbent_route_ledger = incumbent_route_ledger
+        self.native_runtime = native_runtime
         self.pending_candidate_cache: dict[tuple[str, ...], ChargingSubproblemResult] = {}
         self.backend_metrics = BackendMetrics(self.backend.value, batch_size)
         self.reachability_index = (
@@ -547,7 +551,12 @@ class _Evaluator:
         def candidate_screen(sequence: tuple[str, ...]) -> ScreeningResult:
             decision = screen_cache.get(sequence)
             if decision is None:
-                decision = screen_route_candidate(self.instance, sequence, full=True)
+                decision = screen_route_candidate(
+                    self.instance,
+                    sequence,
+                    full=True,
+                    native_runtime=self.native_runtime,
+                )
                 screen_cache[sequence] = decision
             return decision
 
@@ -699,6 +708,7 @@ class _Evaluator:
                 base_snapshot,
                 sequence,
                 epsilon=self.screening_config.epsilon,
+                native_runtime=self.native_runtime,
             )
             if incremental_metrics.status == "fallback":
                 self.incremental_fallbacks += 1
@@ -730,6 +740,7 @@ class _Evaluator:
                     and incremental_metrics.status == "incremental"
                     else None
                 ),
+                native_runtime=self.native_runtime,
             )
         )
         if (
@@ -1030,6 +1041,10 @@ class _Evaluator:
                 self.backend_metrics.work_batches += 1
                 self.backend_metrics.transition_batches += 1
                 self.backend_metrics.exact_calls += 1
+                self.backend_metrics.batch_launches += 1
+                self.backend_metrics.started_calls += 1
+                self.backend_metrics.completed_calls += 1
+                self.backend_metrics.launch_occupancies.append(1)
                 self.backend_metrics.transitions += max(0, result.labels_generated - 1)
                 self.backend_metrics.total_seconds += result.runtime_seconds
                 self.backend_metrics.label_management_seconds += result.runtime_seconds
@@ -1051,6 +1066,7 @@ class _Evaluator:
                         backend=self.backend,
                         batch_size=self.batch_size,
                         deadline=self.deadline,
+                        native_runtime=self.native_runtime,
                     )
                 )
                 result = batch.results[0]
@@ -1344,7 +1360,11 @@ class _Evaluator:
             lower_bound = 0.0
             if self.screening_config is not None:
                 screen = (
-                    screen_route_candidate(self.instance, sequence)
+                    screen_route_candidate(
+                        self.instance,
+                        sequence,
+                        native_runtime=self.native_runtime,
+                    )
                     if prescreened
                     else self.screen(sequence, operator=self.operator)
                 )
@@ -1486,6 +1506,7 @@ class _Evaluator:
                     backend=self.backend,
                     batch_size=self.batch_size,
                     deadline=self.deadline,
+                    native_runtime=self.native_runtime,
                 )
             )
         except BaseException as error:
@@ -1726,6 +1747,7 @@ def _solve_alns(
     initial_customer_sequences: tuple[tuple[str, ...], ...] | None = None,
     initial_solution_provenance: Mapping[str, object] | None = None,
     stage04_config: Stage04Config | None = None,
+    native_kernel_config: NativeKernelConfig | None = None,
 ) -> ALNSResult:
     if max_iterations <= 0:
         raise ValueError("max_iterations must be positive")
@@ -1796,6 +1818,11 @@ def _solve_alns(
     incumbent_route_ledger = (
         _IncumbentRouteLedger() if candidate_control_runtime is not None else None
     )
+    native_runtime = (
+        NativeKernelRuntime.build(instance, native_kernel_config)
+        if native_kernel_config is not None
+        else None
+    )
     evaluator = _Evaluator(
         instance,
         deadline=legacy_deadline
@@ -1814,6 +1841,7 @@ def _solve_alns(
         exact_call_controller=exact_call_controller,
         candidate_control_runtime=candidate_control_runtime,
         incumbent_route_ledger=incumbent_route_ledger,
+        native_runtime=native_runtime,
     )
     quality_evaluator = _Evaluator(
         instance,
@@ -1833,6 +1861,7 @@ def _solve_alns(
         exact_call_controller=exact_call_controller,
         candidate_control_runtime=candidate_control_runtime,
         incumbent_route_ledger=incumbent_route_ledger,
+        native_runtime=native_runtime,
     )
     # The constraint lane is the explicit slice after the legacy/quality lane,
     # not an unbounded second 30-second budget.  Spell out the endpoint so the
@@ -1854,6 +1883,7 @@ def _solve_alns(
         exact_call_controller=exact_call_controller,
         candidate_control_runtime=candidate_control_runtime,
         incumbent_route_ledger=incumbent_route_ledger,
+        native_runtime=native_runtime,
     )
     try:
         with evaluator.measurement_context(
@@ -1960,9 +1990,7 @@ def _solve_alns(
     removal_tier_counts = {tier.value: 0 for tier in RemovalTier}
 
     # ── Stage 4 adaptive weights and search control ──────────────
-    stage04_enabled = (
-        stage04_config is not None and stage04_config.enabled
-    )
+    stage04_enabled = stage04_config is not None and stage04_config.enabled
     stage04_events: list[dict[str, object]] = []
     temperature_history: list[tuple[int, float]] = []
     reheat_count = 0
@@ -1986,17 +2014,19 @@ def _solve_alns(
                 1.0, current.objective.total_distance * stage04_config.temperature_fallback_fraction
             )
         if not stage04_config.fixed_weights:
-            stage04_events.append({
-                "type": "stage04_config",
-                "segment_length": stage04_config.segment_length,
-                "min_calls_per_operator": stage04_config.min_calls_per_operator,
-                "auto_temperature": stage04_config.auto_temperature,
-                "initial_temperature": initial_temperature,
-                "reheat_enabled": stage04_config.reheat_enabled,
-                "restart_enabled": stage04_config.restart_enabled,
-                "intensification_enabled": stage04_config.intensification_enabled,
-                "fixed_weights": stage04_config.fixed_weights,
-            })
+            stage04_events.append(
+                {
+                    "type": "stage04_config",
+                    "segment_length": stage04_config.segment_length,
+                    "min_calls_per_operator": stage04_config.min_calls_per_operator,
+                    "auto_temperature": stage04_config.auto_temperature,
+                    "initial_temperature": initial_temperature,
+                    "reheat_enabled": stage04_config.reheat_enabled,
+                    "restart_enabled": stage04_config.restart_enabled,
+                    "intensification_enabled": stage04_config.intensification_enabled,
+                    "fixed_weights": stage04_config.fixed_weights,
+                }
+            )
             temperature_history.append((0, initial_temperature))
     else:
         initial_temperature = max(1.0, current.objective.total_distance * 0.05)
@@ -2074,12 +2104,8 @@ def _solve_alns(
                 destroy_stats[destroy_name].rejected += 1
                 repair_stats[repair_name].rejected += 1
                 if stage04_enabled and stage04_config is not None:
-                    _stage04_accumulate(
-                        destroy_stats[destroy_name], stage04_config.reward_rejected
-                    )
-                    _stage04_accumulate(
-                        repair_stats[repair_name], stage04_config.reward_rejected
-                    )
+                    _stage04_accumulate(destroy_stats[destroy_name], stage04_config.reward_rejected)
+                    _stage04_accumulate(repair_stats[repair_name], stage04_config.reward_rejected)
                 break
         else:
             selected_neighborhood = _select_stage02_neighborhood(
@@ -2429,10 +2455,7 @@ def _solve_alns(
                     OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
                 )
                 and not main_lane_timed_out
-                and not (
-                    exact_call_controller is not None
-                    and exact_call_controller.budget_reached
-                )
+                and not (exact_call_controller is not None and exact_call_controller.budget_reached)
             ):
                 shadow_neighborhood = _quality_shadow_neighborhood(iteration)
                 if shadow_neighborhood:
@@ -2585,18 +2608,18 @@ def _solve_alns(
                             )
                             _stage04_accumulate(shadow_statistics, reward)
                         else:
-                            reward = 8.0 if shadow_global_best_improved else (
-                                4.0
-                                if quality_comparison is ObjectiveComparison.BETTER
-                                else 1.0
+                            reward = (
+                                8.0
+                                if shadow_global_best_improved
+                                else (
+                                    4.0 if quality_comparison is ObjectiveComparison.BETTER else 1.0
+                                )
                             )
                             _update_weight(shadow_statistics, reward)
                     else:
                         shadow_statistics.rejected += 1
                         if stage04_enabled and stage04_config is not None:
-                            _stage04_accumulate(
-                                shadow_statistics, stage04_config.reward_rejected
-                            )
+                            _stage04_accumulate(shadow_statistics, stage04_config.reward_rejected)
                         else:
                             _update_weight(shadow_statistics, 0.0)
                     if measurement_trace is not None and shadow_candidate is not None:
@@ -2629,12 +2652,13 @@ def _solve_alns(
                             reason="quality shadow probe",
                         )
 
-            if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED and (
-                iteration < len(_CONSTRAINT_REMOVAL_ORDER)
-                or iteration % vehicle_config.exploration_period == 0
-            ) and not (
-                exact_call_controller is not None
-                and exact_call_controller.budget_reached
+            if (
+                profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED
+                and (
+                    iteration < len(_CONSTRAINT_REMOVAL_ORDER)
+                    or iteration % vehicle_config.exploration_period == 0
+                )
+                and not (exact_call_controller is not None and exact_call_controller.budget_reached)
             ):
                 constraint_operator = _select_constraint_operator(
                     iteration,
@@ -2730,8 +2754,7 @@ def _solve_alns(
                         random_draw=0.0,
                     )
                     and not (
-                        exact_call_controller is not None
-                        and exact_call_controller.budget_reached
+                        exact_call_controller is not None and exact_call_controller.budget_reached
                     )
                 )
                 lane_vehicle_reduction = bool(
@@ -2861,13 +2884,9 @@ def _solve_alns(
                 if repair_name:
                     repair_stats[repair_name].rejected += 1
                 if stage04_enabled and stage04_config is not None:
-                    _stage04_accumulate(
-                        neighborhood_stats[selected_neighborhood], reward_rejected
-                    )
+                    _stage04_accumulate(neighborhood_stats[selected_neighborhood], reward_rejected)
                     if destroy_name:
-                        _stage04_accumulate(
-                            destroy_stats[destroy_name], reward_rejected
-                        )
+                        _stage04_accumulate(destroy_stats[destroy_name], reward_rejected)
                     if repair_name:
                         _stage04_accumulate(repair_stats[repair_name], reward_rejected)
             break
@@ -2953,9 +2972,7 @@ def _solve_alns(
                 if repair_name:
                     repair_stats[repair_name].rejected += 1
                 if stage04_enabled and stage04_config is not None:
-                    _stage04_accumulate(
-                        neighborhood_stats[selected_neighborhood], reward_rejected
-                    )
+                    _stage04_accumulate(neighborhood_stats[selected_neighborhood], reward_rejected)
                     if destroy_name:
                         _stage04_accumulate(destroy_stats[destroy_name], reward_rejected)
                     if repair_name:
@@ -3003,13 +3020,15 @@ def _solve_alns(
             ):
                 reheat_floor = initial_temperature * stage04_config.reheat_factor
                 reheat_count += 1
-                stage04_events.append({
-                    "type": "stage04_reheat",
-                    "iteration": iteration,
-                    "reheat_count": reheat_count,
-                    "reheat_floor": reheat_floor,
-                    "stagnation_iterations": stagnation_iterations,
-                })
+                stage04_events.append(
+                    {
+                        "type": "stage04_reheat",
+                        "iteration": iteration,
+                        "reheat_count": reheat_count,
+                        "reheat_floor": reheat_floor,
+                        "stagnation_iterations": stagnation_iterations,
+                    }
+                )
                 temperature_history.append((iteration, reheat_floor))
 
             # ── Stage 4 stagnation restart (reject path) ─────────
@@ -3025,19 +3044,18 @@ def _solve_alns(
                 stagnation_iterations = 0
                 restart_count += 1
                 reheat_floor = initial_temperature * stage04_config.reheat_factor
-                if (
-                    stage04_config.intensification_enabled
-                    and not intensification_active
-                ):
+                if stage04_config.intensification_enabled and not intensification_active:
                     intensification_active = True
                     intensification_remaining = stage04_config.intensification_iterations
-                stage04_events.append({
-                    "type": "stage04_restart",
-                    "iteration": iteration,
-                    "restart_count": restart_count,
-                    "intensification": intensification_active,
-                    "stagnation_at_trigger": stagnation_iterations,
-                })
+                stage04_events.append(
+                    {
+                        "type": "stage04_restart",
+                        "iteration": iteration,
+                        "restart_count": restart_count,
+                        "intensification": intensification_active,
+                        "stagnation_at_trigger": stagnation_iterations,
+                    }
+                )
 
             # ── Stage 4 acceptance-rate tracking (reject path) ────
             if stage04_enabled:
@@ -3146,9 +3164,7 @@ def _solve_alns(
                 destroy_stats[destroy_name].accepted_vehicle_reductions += 1
                 repair_stats[repair_name].accepted_vehicle_reductions += 1
             else:
-                neighborhood_stats[
-                    selected_neighborhood
-                ].accepted_vehicle_reductions += 1
+                neighborhood_stats[selected_neighborhood].accepted_vehicle_reductions += 1
                 if destroy_name:
                     destroy_stats[destroy_name].accepted_vehicle_reductions += 1
                 if repair_name:
@@ -3162,8 +3178,7 @@ def _solve_alns(
         if best.objective is None:
             raise RuntimeError("feasible ALNS incumbent is missing its objective")
         is_new_global_best = (
-            compare_objectives(candidate.objective, best.objective)
-            is ObjectiveComparison.BETTER
+            compare_objectives(candidate.objective, best.objective) is ObjectiveComparison.BETTER
         )
         if is_new_global_best:
             best = candidate
@@ -3184,9 +3199,7 @@ def _solve_alns(
 
         # ── Differentiated reward computation ────────────────────
         if stage04_enabled and stage04_config is not None:
-            comparison_str = (
-                "better" if is_better else ("equal" if is_equal else "worse")
-            )
+            comparison_str = "better" if is_better else ("equal" if is_equal else "worse")
             reward = stage04_config.reward_for(
                 accepted=True,
                 comparison=comparison_str,
@@ -3282,13 +3295,15 @@ def _solve_alns(
         ):
             reheat_floor = initial_temperature * stage04_config.reheat_factor
             reheat_count += 1
-            stage04_events.append({
-                "type": "stage04_reheat",
-                "iteration": iteration,
-                "reheat_count": reheat_count,
-                "reheat_floor": reheat_floor,
-                "stagnation_iterations": stagnation_iterations,
-            })
+            stage04_events.append(
+                {
+                    "type": "stage04_reheat",
+                    "iteration": iteration,
+                    "reheat_count": reheat_count,
+                    "reheat_floor": reheat_floor,
+                    "stagnation_iterations": stagnation_iterations,
+                }
+            )
             temperature_history.append((iteration, reheat_floor))
 
         # ── Stage 4 stagnation restart ───────────────────────────
@@ -3304,19 +3319,18 @@ def _solve_alns(
             stagnation_iterations = 0
             restart_count += 1
             reheat_floor = initial_temperature * stage04_config.reheat_factor
-            if (
-                stage04_config.intensification_enabled
-                and not intensification_active
-            ):
+            if stage04_config.intensification_enabled and not intensification_active:
                 intensification_active = True
                 intensification_remaining = stage04_config.intensification_iterations
-            stage04_events.append({
-                "type": "stage04_restart",
-                "iteration": iteration,
-                "restart_count": restart_count,
-                "intensification": intensification_active,
-                "stagnation_at_trigger": stagnation_iterations,
-            })
+            stage04_events.append(
+                {
+                    "type": "stage04_restart",
+                    "iteration": iteration,
+                    "restart_count": restart_count,
+                    "intensification": intensification_active,
+                    "stagnation_at_trigger": stagnation_iterations,
+                }
+            )
 
         # ── Stage 4 incumbent intensification ────────────────────
         if intensification_active:
@@ -3324,10 +3338,12 @@ def _solve_alns(
                 intensification_remaining -= 1
             else:
                 intensification_active = False
-                stage04_events.append({
-                    "type": "stage04_intensification_end",
-                    "iteration": iteration,
-                })
+                stage04_events.append(
+                    {
+                        "type": "stage04_intensification_end",
+                        "iteration": iteration,
+                    }
+                )
 
         # ── Stage 4 acceptance-rate tracking ─────────────────────
         if stage04_enabled:
@@ -3341,17 +3357,14 @@ def _solve_alns(
             and fixed_exact_calls
             and exact_call_controller is not None
         ):
-            if (
-                exact_call_controller.started_calls == round_started_calls
-            ):
+            if exact_call_controller.started_calls == round_started_calls:
                 no_exact_rounds += 1
             else:
                 no_exact_rounds = 0
             if (
                 effective_iterations
                 >= candidate_control_runtime.config.min_iterations_before_exhaustion
-                and no_exact_rounds
-                >= candidate_control_runtime.config.fixed_work_exhaustion_rounds
+                and no_exact_rounds >= candidate_control_runtime.config.fixed_work_exhaustion_rounds
             ):
                 candidate_exhausted = True
                 break
@@ -3449,7 +3462,10 @@ def _solve_alns(
             for name in _CONSTRAINT_REMOVAL_ORDER
             if name in neighborhood_stats
         },
-        screening_statistics=_aggregate_screening_statistics(lane_evaluators),
+        screening_statistics=_aggregate_screening_statistics(
+            lane_evaluators,
+            native_runtime=native_runtime,
+        ),
         cache_incremental_statistics=_aggregate_cache_incremental_statistics(
             lane_evaluators,
             cache_incremental_config,
@@ -3494,9 +3510,7 @@ def _solve_alns(
                 "restart_count": restart_count,
                 "intensification_active": intensification_active,
                 "acceptance_rate": (
-                    sum(acceptance_window) / len(acceptance_window)
-                    if acceptance_window
-                    else 0.0
+                    sum(acceptance_window) / len(acceptance_window) if acceptance_window else 0.0
                 ),
                 "segment_length": (
                     stage04_config.segment_length
@@ -3563,6 +3577,7 @@ def solve_alns(
     initial_customer_sequences: tuple[tuple[str, ...], ...] | None = None,
     initial_solution_provenance: Mapping[str, object] | None = None,
     stage04_config: Stage04Config | None = None,
+    native_kernel_config: NativeKernelConfig | None = None,
 ) -> ALNSResult:
     """Solve ALNS with opt-in Stage 3.0--3.4 and Stage 4 evaluation layers."""
 
@@ -3574,6 +3589,16 @@ def solve_alns(
     candidate_control_enabled = (
         candidate_control_config is not None and candidate_control_config.enabled
     )
+    if (
+        native_kernel_config is not None
+        and ExactChargingBackend(backend) is not ExactChargingBackend.CPU_BATCH
+    ):
+        raise ValueError("native exact charging requires the cpu_batch backend")
+    if native_kernel_config is not None and candidate_control_enabled:
+        raise ValueError(
+            "native kernels cannot be combined with candidate-control workers without "
+            "an explicit native worker protocol"
+        )
     if initial_customer_sequences is not None:
         if not candidate_control_enabled:
             raise ValueError("an inherited initial solution requires candidate control")
@@ -3653,6 +3678,7 @@ def solve_alns(
                 initial_customer_sequences=initial_customer_sequences,
                 initial_solution_provenance=initial_solution_provenance,
                 stage04_config=stage04_config,
+                native_kernel_config=native_kernel_config,
             )
         finally:
             if candidate_control_runtime is not None:
@@ -3690,6 +3716,7 @@ def solve_alns(
             initial_customer_sequences=initial_customer_sequences,
             initial_solution_provenance=initial_solution_provenance,
             stage04_config=stage04_config,
+            native_kernel_config=native_kernel_config,
         )
     except BaseException as error:
         if candidate_control_runtime is not None:
@@ -4208,11 +4235,7 @@ def _estimate_initial_temperature(
             candidate = evaluator.solution(candidate_sequences)
         except _TimeLimitReached:
             continue
-        if (
-            candidate.feasible
-            and candidate.objective is not None
-            and current.objective is not None
-        ):
+        if candidate.feasible and candidate.objective is not None and current.objective is not None:
             delta = candidate.objective.total_distance - current.objective.total_distance
             if delta > 0:
                 distance_deltas.append(delta)
@@ -4247,15 +4270,17 @@ def _apply_stage04_segment_update(
     for name, stats in all_stats.items():
         role = name.partition(":")[0] if ":" in name else "unspecified"
         if stats.segment_calls < config.min_calls_per_operator:
-            events.append({
-                "type": "stage04_segment_skip",
-                "operator": name,
-                "role": role,
-                "iteration": iteration,
-                "segment_calls": stats.segment_calls,
-                "segment_reward_sum": stats.segment_reward_sum,
-                "minimum_calls": config.min_calls_per_operator,
-            })
+            events.append(
+                {
+                    "type": "stage04_segment_skip",
+                    "operator": name,
+                    "role": role,
+                    "iteration": iteration,
+                    "segment_calls": stats.segment_calls,
+                    "segment_reward_sum": stats.segment_reward_sum,
+                    "minimum_calls": config.min_calls_per_operator,
+                }
+            )
             stats.segment_calls = 0
             stats.segment_reward_sum = 0.0
             continue
@@ -4267,16 +4292,18 @@ def _apply_stage04_segment_update(
         )
         stats.weight = new_weight
         stats.weight_history.append((iteration, new_weight))
-        events.append({
-            "type": "stage04_segment_update",
-            "operator": name,
-            "role": role,
-            "iteration": iteration,
-            "old_weight": old_weight,
-            "new_weight": new_weight,
-            "segment_calls": stats.segment_calls,
-            "segment_reward_sum": stats.segment_reward_sum,
-        })
+        events.append(
+            {
+                "type": "stage04_segment_update",
+                "operator": name,
+                "role": role,
+                "iteration": iteration,
+                "old_weight": old_weight,
+                "new_weight": new_weight,
+                "segment_calls": stats.segment_calls,
+                "segment_reward_sum": stats.segment_reward_sum,
+            }
+        )
         stats.segment_calls = 0
         stats.segment_reward_sum = 0.0
 
@@ -4297,17 +4324,15 @@ def _stage04_adaptive_weight_statistics(
 
     selected: dict[str, OperatorStatistics] = {}
     if profile is not OperatorProfile.BASELINE:
-        selected.update({
-            f"neighborhood:{name}": stats
-            for name, stats in neighborhood_statistics.items()
-            if name != "vehicle_reduction_refinement"
-        })
-    selected.update({
-        f"destroy:{name}": stats for name, stats in destroy_statistics.items()
-    })
-    selected.update({
-        f"repair:{name}": stats for name, stats in repair_statistics.items()
-    })
+        selected.update(
+            {
+                f"neighborhood:{name}": stats
+                for name, stats in neighborhood_statistics.items()
+                if name != "vehicle_reduction_refinement"
+            }
+        )
+    selected.update({f"destroy:{name}": stats for name, stats in destroy_statistics.items()})
+    selected.update({f"repair:{name}": stats for name, stats in repair_statistics.items()})
     return selected
 
 
@@ -4501,14 +4526,18 @@ def _constraint_lane_step(
     constraint_budget = min(
         config.constraint_probe_exact_evaluation_budget,
         {
-            ConstraintRemovalOperator.STATION_PRESSURE.value:
-                config.station_pressure_exact_evaluation_budget,
-            ConstraintRemovalOperator.TIME_WINDOW_CONFLICT.value:
-                config.time_window_conflict_exact_evaluation_budget,
-            ConstraintRemovalOperator.WORST_ENERGY_DETOUR.value:
-                config.worst_energy_detour_exact_evaluation_budget,
-            ConstraintRemovalOperator.SHAW_RELATED.value:
-                config.shaw_related_exact_evaluation_budget,
+            ConstraintRemovalOperator.STATION_PRESSURE.value: (
+                config.station_pressure_exact_evaluation_budget
+            ),
+            ConstraintRemovalOperator.TIME_WINDOW_CONFLICT.value: (
+                config.time_window_conflict_exact_evaluation_budget
+            ),
+            ConstraintRemovalOperator.WORST_ENERGY_DETOUR.value: (
+                config.worst_energy_detour_exact_evaluation_budget
+            ),
+            ConstraintRemovalOperator.SHAW_RELATED.value: (
+                config.shaw_related_exact_evaluation_budget
+            ),
         }[operator],
     )
     before_calls = evaluator.calls
@@ -4808,6 +4837,8 @@ def _aggregate_backend_metrics(
 
 def _aggregate_screening_statistics(
     evaluators: tuple[_Evaluator, ...],
+    *,
+    native_runtime: NativeKernelRuntime | None = None,
 ) -> dict[str, object]:
     reason_counts: dict[str, int] = {}
     total_runtime = 0.0
@@ -4825,10 +4856,14 @@ def _aggregate_screening_statistics(
         total_runtime += float(statistics["screening_runtime_seconds"])
         for reason, count in dict(statistics["screening_reason_counts"]).items():
             reason_counts[str(reason)] = reason_counts.get(str(reason), 0) + int(count)
+    native_statistics: dict[str, int | float] = (
+        native_runtime.statistics() if native_runtime is not None else {}
+    )
     return {
         **totals,
         "screening_runtime_seconds": total_runtime,
         "screening_reason_counts": dict(sorted(reason_counts.items())),
+        **native_statistics,
     }
 
 

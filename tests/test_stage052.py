@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -27,22 +28,34 @@ from evrptw.artifacts import (
 from evrptw.experiments.stage052_performance import (
     PERFORMANCE_INSTANCES,
     PERFORMANCE_SEEDS,
+    _accelerator_decision_inputs,
     _ensure_partial_shard_failure,
+    _launch_occupancy_summary,
     _run_and_persist_v2_shard,
     _run_v2_shard_task,
     _run_v2_tasks,
     _ShardTask,
     axes_for_scope,
+    load_stage052_config,
     validate_stage052_run_label,
     verify_stage051_prerequisite,
 )
 from evrptw.experiments.stage052_performance_review import (
+    _audit_native_execution,
+    _prerequisite_binding_matches,
+    _prior_review_manifest_hashes,
+    _recompute_native_occupancies,
+    _validate_native_shard_manifest_scope,
     replay_stage052_storage_semantics,
     replay_stage052_storage_semantics_many,
     validate_per_run_scope,
     verify_stage052_review_prerequisite,
 )
+from evrptw.experiments.stage052_performance_review import (
+    _strict_float as _review_strict_float,
+)
 from evrptw.models import Instance, Node, NodeType, Vehicle
+from evrptw.native_kernels import NATIVE_KERNEL_ABI_VERSION, NativeKernelConfig
 from evrptw.stage052 import (
     AcceleratorDecision,
     ArtifactStorageObservation,
@@ -55,9 +68,12 @@ from evrptw.stage052 import (
     select_worker_count,
 )
 from evrptw.stage052_evidence import (
+    JobParallelSelectionIdentity,
     ProcessTreeResourceSampler,
+    Stage052PrerequisiteIdentity,
     collect_performance_provenance,
     validate_worker_ownership,
+    verify_job_parallel_selection,
     verify_stage052_prerequisite,
 )
 
@@ -89,6 +105,478 @@ def test_stage052_components_have_one_strict_order() -> None:
         "accelerator_pilot",
         "benchmark",
     )
+
+
+def test_native_kernel_config_is_explicit_complete_and_serializable() -> None:
+    config = NativeKernelConfig()
+    assert config.to_dict() == {
+        "enabled": True,
+        "exact_charging": True,
+        "screening": True,
+        "propagation": True,
+        "distance_matrix": True,
+        "abi_version": NATIVE_KERNEL_ABI_VERSION,
+        "context_policy": "pack_once_per_solve",
+        "failure_policy": "fail_fast_no_fallback",
+    }
+    with pytest.raises(ValueError, match="pass None"):
+        NativeKernelConfig(enabled=False)
+    with pytest.raises(ValueError, match="complete native kernel set"):
+        NativeKernelConfig(screening=False)
+    with pytest.raises(ValueError, match="ABI"):
+        NativeKernelConfig(abi_version="stale")
+    with pytest.raises(ValueError, match="must not fall back"):
+        NativeKernelConfig(failure_policy="fallback")
+
+
+def test_stage052_config_declares_the_complete_native_kernel_profile() -> None:
+    config = load_stage052_config(Path("configs/stage052_performance.toml"))
+    assert config.native_kernels == NativeKernelConfig()
+
+
+def test_native_execution_audit_cross_checks_per_run_raw_and_trace(tmp_path: Path) -> None:
+    run_label = "stage05.2_native_kernels_attempt99"
+    raw_dir = tmp_path / run_label
+    writer = ArtifactBundleWriter(
+        raw_dir,
+        ArtifactRunContext("stage05.2", "native_kernels", run_label),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+    writer.write_control(metadata={"run_label": run_label})
+    shard = raw_dir / "c101_21" / "2014"
+    shard.mkdir(parents=True)
+    backend = {
+        "native_invocations": 2,
+        "work_batches": 2,
+        "batch_launches": 2,
+        "exact_calls": 5,
+        "completed_calls": 5,
+        "launch_occupancies": [1, 4],
+        "native_fallbacks": 0,
+        "native_kernel_seconds": 0.1,
+    }
+    screening = {
+        "screening_calls": 10,
+        "screening_cache_hits": 2,
+        "native_screening_invocations": 8,
+        "native_screening_seconds": 0.2,
+        "native_propagation_invocations": 3,
+        "native_propagation_seconds": 0.05,
+        "native_protocol_fallbacks": 0,
+    }
+    incremental = {"incremental_propagations": 2, "incremental_fallbacks": 1}
+    raw_path = shard / f"{run_label}_raw_c101_21_2014.json"
+    raw_path.write_text(
+        json.dumps(
+            {
+                "run_label": run_label,
+                "component": "native_kernels",
+                "scope": "performance",
+                "instance": "c101_21",
+                "seed": 2014,
+                "axes": {
+                    "fixed_work": {
+                        "backend_metrics": backend,
+                        "objective_key": [1, 0.0, 0.0, 0],
+                        "started_calls": 5,
+                        "completed_calls": 5,
+                        "effective_iterations": 3,
+                        "termination_reason": "exact_call_budget_exhausted",
+                        "validator_passed": True,
+                        "valid": True,
+                        "trace_reconciliation": {
+                            "status": "pass",
+                            "checks": {"calls": True},
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    solution_path = shard / f"{run_label}_solution_c101_21_2014.json"
+    solution_path.write_text(
+        json.dumps(
+            {
+                "instance": "c101_21",
+                "seed": 2014,
+                "axes": {
+                    "fixed_work": {
+                        "objective_key": [1, 0.0, 0.0, 0],
+                        "feasible": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    trace_path = shard / f"{run_label}_trace_c101_21_2014.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "event_identity": {"shard_ordinal": 3, "local_field": "event_id"},
+                "axes": {
+                    "fixed_work": {
+                        "result_summary": {
+                            "screening_statistics": screening,
+                            "cache_incremental_statistics": incremental,
+                            "exact_started_calls": 5,
+                            "exact_completed_calls": 5,
+                            "effective_iterations": 3,
+                            "termination_reason": "exact_call_budget_exhausted",
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    timing_path = raw_dir / "control" / f"{run_label}_timing_evidence.json"
+    timing_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "stage05.2-timing-evidence-v1",
+                "run_label": run_label,
+                "component": "native_kernels",
+                "rows": [
+                    {
+                        "instance": "c101_21",
+                        "seed": 2014,
+                        "axis": "fixed_work",
+                        "axis_started_ns": 1_000_000_000,
+                        "solver_started_ns": 1_000_000_000,
+                        "solver_completed_ns": 1_100_000_000,
+                        "axis_completed_ns": 1_120_000_000,
+                        "finalize_started_ns": 3_000_000_000,
+                        "finalize_completed_ns": 3_030_000_000,
+                        "axis_event_count": 2,
+                        "total_event_count": 2,
+                        "axis_count": 1,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    writer.record_existing_file(raw_path, artifact_type="raw")
+    writer.record_existing_file(solution_path, artifact_type="solution")
+    writer.record_existing_file(trace_path, artifact_type="trace")
+    writer.record_existing_file(timing_path, artifact_type="timing_evidence")
+    bundle = writer.finalize()
+    row = {
+        "instance": "c101_21",
+        "seed": 2014,
+        "axis": "fixed_work",
+        "native_invocations": 2,
+        "native_fallbacks": 0,
+        "native_kernel_seconds": 0.1,
+        "native_screening_invocations": 8,
+        "native_screening_seconds": 0.2,
+        "native_propagation_invocations": 3,
+        "native_propagation_seconds": 0.05,
+        "native_protocol_fallbacks": 0,
+        "batch_launches": 2,
+        "exact_started_calls": 5,
+        "exact_completed_calls": 5,
+        "median_batch_occupancy": 2.5,
+        "solver_seconds": 0.1,
+        "artifact_persistence_seconds": 0.05,
+        "end_to_end_seconds": 0.15,
+    }
+
+    passed, detail = _audit_native_execution(raw_dir, [row])
+    assert passed, detail
+
+    forged = {**row, "native_screening_invocations": 9}
+    passed, detail = _audit_native_execution(raw_dir, [forged])
+    assert not passed
+    assert "binding mismatch" in detail
+
+    forged_timing = {**row, "end_to_end_seconds": 0.01}
+    passed, detail = _audit_native_execution(raw_dir, [forged_timing])
+    assert not passed
+    assert "binding mismatch" in detail
+
+    trace_payload = json.loads(trace_path.read_text(encoding="utf-8"))
+    trace_payload["event_identity"]["shard_ordinal"] = 4
+    trace_path.write_text(json.dumps(trace_payload), encoding="utf-8")
+    manifest_payload = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+    trace_relative = trace_path.relative_to(raw_dir).as_posix()
+    trace_reference = next(
+        item for item in manifest_payload["artifacts"] if item["relative_path"] == trace_relative
+    )
+    trace_reference["checksum"] = hashlib.sha256(trace_path.read_bytes()).hexdigest()
+    trace_reference["byte_size"] = trace_path.stat().st_size
+    bundle.manifest_path.write_text(json.dumps(manifest_payload), encoding="utf-8")
+    bundle.manifest_sidecar_path.write_text(
+        hashlib.sha256(bundle.manifest_path.read_bytes()).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+    passed, detail = _audit_native_execution(raw_dir, [row])
+    assert not passed
+    assert "trace event identity" in detail
+
+
+def test_native_timing_rejects_overlapping_axes_and_early_finalization() -> None:
+    axes = ("fixed_work_control", "fixed_work", "wall_clock_30")
+    timings = [
+        {
+            "axis": axis,
+            "axis_started_ns": 1_000 + index * 200,
+            "axis_completed_ns": 1_100 + index * 200,
+            "finalize_started_ns": 2_000,
+        }
+        for index, axis in enumerate(axes)
+    ]
+    stage052_review._validate_native_shard_timing_order(("c101_21", 2014), timings)
+
+    overlapping = copy.deepcopy(timings)
+    overlapping[1]["axis_started_ns"] = 1_050
+    with pytest.raises(ArtifactIntegrityError, match="overlap"):
+        stage052_review._validate_native_shard_timing_order(("c101_21", 2014), overlapping)
+
+    early_finalize = copy.deepcopy(timings)
+    for timing in early_finalize:
+        timing["finalize_started_ns"] = 1_450
+    with pytest.raises(ArtifactIntegrityError, match="precedes"):
+        stage052_review._validate_native_shard_timing_order(("c101_21", 2014), early_finalize)
+
+
+@pytest.mark.parametrize("invalid", (math.nan, math.inf, -math.inf, "nan"))
+def test_reviewer_rejects_non_finite_native_and_performance_numbers(invalid: object) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        _review_strict_float(invalid)
+
+
+def test_native_shard_manifest_scope_binds_complete_worker_artifacts_to_parent(
+    tmp_path: Path,
+) -> None:
+    run_label = "stage05.2_native_kernels_attempt01"
+    schema = (
+        ("route_dictionary", "canonical_routes"),
+        ("events", "critical"),
+        ("events", "screening_checks"),
+        ("events", "screening_decisions_v2"),
+        ("diagnostic", "aggregated"),
+        ("raw", ""),
+        ("solution", ""),
+        ("environment", ""),
+        ("trace", ""),
+    )
+    manifests: list[dict[str, object]] = []
+    parent_artifacts: list[dict[str, object]] = []
+    for ordinal, (instance, seed) in enumerate(
+        (instance, seed) for instance in PERFORMANCE_INSTANCES for seed in PERFORMANCE_SEEDS
+    ):
+        artifacts = [
+            {
+                "artifact_type": artifact_type,
+                "artifact_subtype": subtype,
+                "relative_path": (
+                    f"{instance}/{seed}/{run_label}_{artifact_type}_{index}_{instance}_{seed}.json"
+                ),
+                "checksum": f"{ordinal * len(schema) + index:064x}",
+                "evidence_completeness": "complete",
+                "storage_policy_version": "artifact-storage-v2",
+            }
+            for index, (artifact_type, subtype) in enumerate(schema)
+        ]
+        parent_artifacts.extend(copy.deepcopy(artifacts))
+        manifest = {
+            "schema_version": "artifact-storage-v2",
+            "run_label": run_label,
+            "instance": instance,
+            "seed": seed,
+            "shard_ordinal": ordinal,
+            "event_identity": "shard_ordinal+shard_local_event_id",
+            "evidence_completeness": "complete",
+            "storage_policy_version": "artifact-storage-v2",
+            "artifacts": artifacts,
+        }
+        manifests.append(manifest)
+        directory = tmp_path / instance / str(seed)
+        directory.mkdir(parents=True)
+        manifest_path = directory / f"{run_label}_shard_manifest_{instance}_{seed}.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        sidecar_path = manifest_path.with_suffix(".sha256")
+        sidecar_path.write_text(manifest_sha256 + "\n", encoding="utf-8")
+        for artifact_type, path in (
+            ("shard_manifest", manifest_path),
+            ("shard_manifest_sidecar", sidecar_path),
+        ):
+            parent_artifacts.append(
+                {
+                    "artifact_type": artifact_type,
+                    "artifact_subtype": "",
+                    "relative_path": path.relative_to(tmp_path).as_posix(),
+                    "checksum": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "byte_size": path.stat().st_size,
+                    "evidence_completeness": "complete",
+                    "storage_policy_version": "artifact-storage-v2",
+                }
+            )
+
+    passed, detail = _validate_native_shard_manifest_scope(
+        manifests,
+        raw_dir=tmp_path,
+        run_label=run_label,
+        parent_artifacts=parent_artifacts,
+    )
+    assert passed, detail
+
+    swapped_ordinals = copy.deepcopy(manifests)
+    swapped_ordinals[0]["shard_ordinal"] = 1
+    swapped_ordinals[1]["shard_ordinal"] = 0
+    passed, detail = _validate_native_shard_manifest_scope(
+        swapped_ordinals,
+        raw_dir=tmp_path,
+        run_label=run_label,
+        parent_artifacts=parent_artifacts,
+    )
+    assert not passed
+    assert "identity" in detail
+
+    missing_schema = copy.deepcopy(manifests)
+    missing_schema[0].pop("schema_version")
+    passed, detail = _validate_native_shard_manifest_scope(
+        missing_schema,
+        raw_dir=tmp_path,
+        run_label=run_label,
+        parent_artifacts=parent_artifacts,
+    )
+    assert not passed
+    assert "identity" in detail
+
+    wrong_event_identity = copy.deepcopy(manifests)
+    wrong_event_identity[0]["event_identity"] = "event_id"
+    passed, detail = _validate_native_shard_manifest_scope(
+        wrong_event_identity,
+        raw_dir=tmp_path,
+        run_label=run_label,
+        parent_artifacts=parent_artifacts,
+    )
+    assert not passed
+    assert "identity" in detail
+
+    empty = copy.deepcopy(manifests)
+    empty[0]["artifacts"] = []
+    passed, detail = _validate_native_shard_manifest_scope(
+        empty,
+        raw_dir=tmp_path,
+        run_label=run_label,
+        parent_artifacts=parent_artifacts,
+    )
+    assert not passed
+    assert "schema" in detail
+
+    passed, detail = _validate_native_shard_manifest_scope(
+        manifests[:-1],
+        raw_dir=tmp_path,
+        run_label=run_label,
+        parent_artifacts=parent_artifacts,
+    )
+    assert not passed
+    assert "count" in detail
+
+    duplicate = copy.deepcopy(manifests)
+    duplicate_artifacts = duplicate[0]["artifacts"]
+    assert isinstance(duplicate_artifacts, list)
+    duplicate_artifacts.append(copy.deepcopy(duplicate_artifacts[0]))
+    passed, detail = _validate_native_shard_manifest_scope(
+        duplicate,
+        raw_dir=tmp_path,
+        run_label=run_label,
+        parent_artifacts=parent_artifacts,
+    )
+    assert not passed
+    assert "schema" in detail
+
+    cross_shard = copy.deepcopy(manifests)
+    cross_artifacts = cross_shard[0]["artifacts"]
+    assert isinstance(cross_artifacts, list) and isinstance(cross_artifacts[0], dict)
+    cross_artifacts[0]["relative_path"] = str(parent_artifacts[-1]["relative_path"])
+    passed, detail = _validate_native_shard_manifest_scope(
+        cross_shard,
+        raw_dir=tmp_path,
+        run_label=run_label,
+        parent_artifacts=parent_artifacts,
+    )
+    assert not passed
+    assert "path" in detail
+
+    checksum_mismatch = copy.deepcopy(manifests)
+    mismatch_artifacts = checksum_mismatch[0]["artifacts"]
+    assert isinstance(mismatch_artifacts, list) and isinstance(mismatch_artifacts[0], dict)
+    mismatch_artifacts[0]["checksum"] = "f" * 64
+    passed, detail = _validate_native_shard_manifest_scope(
+        checksum_mismatch,
+        raw_dir=tmp_path,
+        run_label=run_label,
+        parent_artifacts=parent_artifacts,
+    )
+    assert not passed
+    assert "parent manifest" in detail
+
+    first_instance, first_seed = PERFORMANCE_INSTANCES[0], PERFORMANCE_SEEDS[0]
+    first_manifest = (
+        tmp_path
+        / first_instance
+        / str(first_seed)
+        / f"{run_label}_shard_manifest_{first_instance}_{first_seed}.json"
+    )
+    first_sidecar = first_manifest.with_suffix(".sha256")
+    canonical_sidecar = first_sidecar.read_text(encoding="utf-8")
+    first_sidecar.unlink()
+    passed, detail = _validate_native_shard_manifest_scope(
+        manifests,
+        raw_dir=tmp_path,
+        run_label=run_label,
+        parent_artifacts=parent_artifacts,
+    )
+    assert not passed
+    assert "cannot be read" in detail
+    first_sidecar.write_text(canonical_sidecar, encoding="utf-8")
+
+    def with_rebound_sidecar(content: str) -> list[dict[str, object]]:
+        first_sidecar.write_text(content, encoding="utf-8")
+        rebound = copy.deepcopy(parent_artifacts)
+        relative = first_sidecar.relative_to(tmp_path).as_posix()
+        reference = next(item for item in rebound if item["relative_path"] == relative)
+        reference["checksum"] = hashlib.sha256(first_sidecar.read_bytes()).hexdigest()
+        reference["byte_size"] = first_sidecar.stat().st_size
+        return rebound
+
+    mismatched_parent = with_rebound_sidecar("0" * 64 + "\n")
+    passed, detail = _validate_native_shard_manifest_scope(
+        manifests,
+        raw_dir=tmp_path,
+        run_label=run_label,
+        parent_artifacts=mismatched_parent,
+    )
+    assert not passed
+    assert "sidecar binding" in detail
+
+    second_instance, second_seed = PERFORMANCE_INSTANCES[0], PERFORMANCE_SEEDS[1]
+    second_manifest = (
+        tmp_path
+        / second_instance
+        / str(second_seed)
+        / f"{run_label}_shard_manifest_{second_instance}_{second_seed}.json"
+    )
+    wrong_pair_parent = with_rebound_sidecar(
+        hashlib.sha256(second_manifest.read_bytes()).hexdigest() + "\n"
+    )
+    passed, detail = _validate_native_shard_manifest_scope(
+        manifests,
+        raw_dir=tmp_path,
+        run_label=run_label,
+        parent_artifacts=wrong_pair_parent,
+    )
+    assert not passed
+    assert "sidecar binding" in detail
 
 
 def test_formal_budget_matrix_is_the_declared_2040_runs() -> None:
@@ -261,6 +749,81 @@ def test_accelerator_is_skipped_below_occupancy_threshold() -> None:
     assert decision is AcceleratorDecision.GPU_NOT_JUSTIFIED
 
 
+def test_launch_occupancy_uses_the_true_median_not_the_arithmetic_mean() -> None:
+    launches, median = _launch_occupancy_summary(
+        {
+            "batch_launches": 5,
+            "exact_calls": 98,
+            "launch_occupancies": [32, 32, 32, 1, 1],
+        }
+    )
+
+    assert launches == 5
+    assert median == 32
+    assert median != pytest.approx(98 / 5)
+
+
+def test_accelerator_decision_recomputes_exactly_nine_e_occupancies(
+    tmp_path: Path,
+) -> None:
+    run_label = "stage05.2_native_kernels_attempt01"
+    raw_dir = tmp_path / run_label
+    writer = ArtifactBundleWriter(
+        raw_dir,
+        ArtifactRunContext("stage05.2", "native_kernels", run_label),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+    writer.write_control(metadata={"run_label": run_label})
+    values = iter(range(1, 10))
+    expected_values: list[float] = []
+    for instance in PERFORMANCE_INSTANCES:
+        for seed in PERFORMANCE_SEEDS:
+            occupancy = 1 if instance == "c101C5" else next(values)
+            launch_occupancies = [occupancy, occupancy, 100] if occupancy == 9 else [occupancy]
+            if instance != "c101C5":
+                expected_values.append(float(occupancy))
+            shard = raw_dir / instance / str(seed)
+            shard.mkdir(parents=True)
+            raw_path = shard / f"{run_label}_raw_{instance}_{seed}.json"
+            raw_path.write_text(
+                json.dumps(
+                    {
+                        "instance": instance,
+                        "seed": seed,
+                        "component": "native_kernels",
+                        "scope": "performance",
+                        "axes": {
+                            "fixed_work": {
+                                "validator_passed": True,
+                                "valid": True,
+                                "backend_metrics": {
+                                    "exact_calls": sum(launch_occupancies),
+                                    "batch_launches": len(launch_occupancies),
+                                    "launch_occupancies": launch_occupancies,
+                                },
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            writer.record_existing_file(raw_path, artifact_type="raw")
+    writer.finalize()
+
+    payload = _accelerator_decision_inputs(
+        raw_dir,
+        prerequisite=SimpleNamespace(to_dict=lambda: {"run_label": run_label}),
+    )
+    assert payload["decision"] == "GPU_NOT_JUSTIFIED"
+    assert payload["median_batch_occupancy"] == pytest.approx(5.0)
+    assert payload["input_count"] == 9
+    assert payload["gpu_rows_present"] is False
+    independently_recomputed, independent_median = _recompute_native_occupancies(raw_dir)
+    assert independently_recomputed == payload["inputs"]
+    assert independent_median == pytest.approx(5.0)
+    assert [item["median_batch_occupancy"] for item in payload["inputs"]] == expected_values
+
+
 def test_instance_lookup_and_distance_matrix_are_stable() -> None:
     depot = Node("D0", NodeType.DEPOT, 0, 0, 0, 0, 100, 0)
     customer = Node("C1", NodeType.CUSTOMER, 3, 4, 1, 0, 100, 0)
@@ -369,8 +932,13 @@ def test_stage052_review_prerequisite_verifies_identity_status_and_files(
     tmp_path: Path,
 ) -> None:
     raw_dir = tmp_path / "stage05.2_hot_path_attempt03"
+    bundle = ArtifactBundleWriter(
+        raw_dir,
+        ArtifactRunContext("stage05.2", "hot_path", raw_dir.name),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v1"),
+    ).finalize()
     review_dir = raw_dir / "review"
-    review_dir.mkdir(parents=True)
+    review_dir.mkdir()
     report = review_dir / "review_report.md"
     findings = review_dir / "review_findings.csv"
     report.write_text("accepted\n", encoding="utf-8")
@@ -387,6 +955,7 @@ def test_stage052_review_prerequisite_verifies_identity_status_and_files(
                 "component": "hot_path",
                 "scope": "performance",
                 "status": "READY_FOR_STAGE052_ARTIFACT_STREAMING",
+                "raw_manifest_sha256": digest(bundle.manifest_path),
                 "gates": {"all": {"passed": True}},
                 "files": {
                     report.name: digest(report),
@@ -411,6 +980,165 @@ def test_stage052_review_prerequisite_verifies_identity_status_and_files(
         )
 
 
+@pytest.mark.parametrize(
+    ("attempt", "status", "lineage", "message"),
+    (
+        (91, "NOT_READY", None, "accepted prior"),
+        (92, "READY_FOR_STAGE052_ARTIFACT_STREAMING", ["b" * 64], "already has lineage"),
+    ),
+)
+def test_review_lineage_rejects_failed_or_self_declared_prior_hashes(
+    tmp_path: Path,
+    attempt: int,
+    status: str,
+    lineage: list[str] | None,
+    message: str,
+) -> None:
+    run_label = f"stage05.2_hot_path_attempt{attempt:02d}"
+    raw_dir = tmp_path / run_label
+    ArtifactBundleWriter(
+        raw_dir,
+        ArtifactRunContext("stage05.2", "hot_path", run_label),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v1"),
+    ).finalize()
+    review_dir = raw_dir / "review"
+    review_dir.mkdir()
+    report = review_dir / "review_report.md"
+    findings = review_dir / "review_findings.csv"
+    report.write_text("review\n", encoding="utf-8")
+    findings.write_text("gate,passed\nall,True\n", encoding="utf-8")
+    payload: dict[str, object] = {
+        "schema_version": "stage05.2-review-v1",
+        "run_label": run_label,
+        "component": "hot_path",
+        "scope": "performance",
+        "status": status,
+        "gates": {"all": {"passed": True}},
+        "files": {
+            report.name: hashlib.sha256(report.read_bytes()).hexdigest(),
+            findings.name: hashlib.sha256(findings.read_bytes()).hexdigest(),
+        },
+    }
+    if lineage is not None:
+        payload["review_manifest_lineage_sha256"] = lineage
+    (review_dir / "review_manifest.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match=message):
+        _prior_review_manifest_hashes(raw_dir)
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ("review_findings.csv", "review_report.md", "review_manifest"),
+)
+def test_review_generation_publish_failure_preserves_and_archives_prior_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    run_label = "stage05.2_hot_path_attempt89"
+    raw_dir = tmp_path / failure_stage / run_label
+    bundle = ArtifactBundleWriter(
+        raw_dir,
+        ArtifactRunContext("stage05.2", "hot_path", run_label),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v1"),
+    ).finalize()
+    review_dir = raw_dir / "review"
+    review_dir.mkdir()
+    report = review_dir / "review_report.md"
+    findings = review_dir / "review_findings.csv"
+    report.write_text("accepted prior\n", encoding="utf-8")
+    findings.write_text("gate,passed\nall,True\n", encoding="utf-8")
+    prior_manifest = review_dir / "review_manifest.json"
+    prior_manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": "stage05.2-review-v1",
+                "run_label": run_label,
+                "component": "hot_path",
+                "scope": "performance",
+                "status": "READY_FOR_STAGE052_ARTIFACT_STREAMING",
+                "raw_manifest_sha256": hashlib.sha256(
+                    bundle.manifest_path.read_bytes()
+                ).hexdigest(),
+                "gates": {"all": {"passed": True}},
+                "files": {
+                    findings.name: hashlib.sha256(findings.read_bytes()).hexdigest(),
+                    report.name: hashlib.sha256(report.read_bytes()).hexdigest(),
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    prior_bytes = {
+        "review_manifest.json": prior_manifest.read_bytes(),
+        findings.name: findings.read_bytes(),
+        report.name: report.read_bytes(),
+    }
+    prior_sha256 = hashlib.sha256(prior_manifest.read_bytes()).hexdigest()
+    lineage = _prior_review_manifest_hashes(raw_dir)
+    assert lineage == [prior_sha256]
+
+    original_write = stage052_review._write_fsync
+
+    def fail_at_selected_stage(path: Path, payload: bytes) -> None:
+        if failure_stage in path.name:
+            raise OSError(f"injected {failure_stage} publication failure")
+        original_write(path, payload)
+
+    monkeypatch.setattr(stage052_review, "_write_fsync", fail_at_selected_stage)
+    manifest = {
+        "schema_version": "stage05.2-review-v1",
+        "run_label": run_label,
+        "component": "hot_path",
+        "scope": "performance",
+        "status": "READY_FOR_STAGE052_ARTIFACT_STREAMING",
+        "raw_manifest_sha256": hashlib.sha256(bundle.manifest_path.read_bytes()).hexdigest(),
+        "review_manifest_lineage_sha256": lineage,
+        "gates": {"all": {"passed": True}},
+    }
+    with pytest.raises(OSError, match="injected"):
+        stage052_review._publish_review_generation(
+            review_dir=review_dir,
+            findings=b"gate,passed,detail\nall,True,re-reviewed\n",
+            report=b"accepted re-review\n",
+            manifest=manifest,
+        )
+
+    assert prior_manifest.read_bytes() == prior_bytes["review_manifest.json"]
+    assert findings.read_bytes() == prior_bytes[findings.name]
+    assert report.read_bytes() == prior_bytes[report.name]
+    verify_stage052_review_prerequisite(
+        raw_dir,
+        expected_component="hot_path",
+        expected_status="READY_FOR_STAGE052_ARTIFACT_STREAMING",
+    )
+    archive = review_dir / "history" / prior_sha256
+    assert {path.name for path in archive.iterdir()} == set(prior_bytes)
+    assert all((archive / name).read_bytes() == payload for name, payload in prior_bytes.items())
+
+    monkeypatch.setattr(stage052_review, "_write_fsync", original_write)
+    published = stage052_review._publish_review_generation(
+        review_dir=review_dir,
+        findings=b"gate,passed,detail\nall,True,re-reviewed\n",
+        report=b"accepted re-review\n",
+        manifest=manifest,
+    )
+    assert published["review_manifest"] == prior_manifest
+    assert "generations" in published["review_findings"].parts
+    verify_stage052_review_prerequisite(
+        raw_dir,
+        expected_component="hot_path",
+        expected_status="READY_FOR_STAGE052_ARTIFACT_STREAMING",
+    )
+    assert findings.read_bytes() == prior_bytes[findings.name]
+    assert report.read_bytes() == prior_bytes[report.name]
+
+
 def test_stage052_producer_prerequisite_binds_raw_and_review_identity(tmp_path: Path) -> None:
     run_label = "stage05.2_artifact_streaming_attempt04"
     raw_dir = tmp_path / run_label
@@ -433,7 +1161,7 @@ def test_stage052_producer_prerequisite_binds_raw_and_review_identity(tmp_path: 
         },
         configuration_path=config,
     )
-    writer.finalize()
+    bundle = writer.finalize()
     review_dir = raw_dir / "review"
     review_dir.mkdir()
     report = review_dir / "review_report.md"
@@ -448,6 +1176,9 @@ def test_stage052_producer_prerequisite_binds_raw_and_review_identity(tmp_path: 
                 "component": "artifact_streaming",
                 "scope": "performance",
                 "status": "READY_FOR_STAGE052_JOB_PARALLEL",
+                "raw_manifest_sha256": hashlib.sha256(
+                    bundle.manifest_path.read_bytes()
+                ).hexdigest(),
                 "gates": {"all": {"passed": True}},
                 "files": {
                     report.name: hashlib.sha256(report.read_bytes()).hexdigest(),
@@ -467,13 +1198,151 @@ def test_stage052_producer_prerequisite_binds_raw_and_review_identity(tmp_path: 
     assert identity.run_label == run_label
     assert identity.repository_revision == "a" * 40
 
-    report.write_text("tampered\n", encoding="utf-8")
+    review_path = review_dir / "review_manifest.json"
+    lineage = _prior_review_manifest_hashes(raw_dir)
+    assert len(lineage) == 1
+    prior_review_sha256 = lineage[0]
+    stronger_review = json.loads(review_path.read_text(encoding="utf-8"))
+    stronger_review.pop("files")
+    stronger_review["review_manifest_lineage_sha256"] = lineage
+    stage052_review._publish_review_generation(
+        review_dir=review_dir,
+        findings=findings.read_bytes(),
+        report=report.read_bytes(),
+        manifest=stronger_review,
+    )
+    current_identity = verify_stage052_prerequisite(
+        raw_dir,
+        expected_component="artifact_streaming",
+        expected_status="READY_FOR_STAGE052_JOB_PARALLEL",
+    )
+    assert _prerequisite_binding_matches(identity.to_dict(), current_identity, raw_dir)
+
+    archive = review_dir / "history" / prior_review_sha256
+    missing_archive = archive.with_name(f"{archive.name}.missing")
+    archive.rename(missing_archive)
+    assert not _prerequisite_binding_matches(identity.to_dict(), current_identity, raw_dir)
+    missing_archive.rename(archive)
+
+    archived_report = archive / "review_report.md"
+    accepted_archived_report = archived_report.read_bytes()
+    archived_report.write_text("tampered archive\n", encoding="utf-8")
+    assert not _prerequisite_binding_matches(identity.to_dict(), current_identity, raw_dir)
+    archived_report.write_bytes(accepted_archived_report)
+
+    accepted_current_manifest = review_path.read_bytes()
+    current_review = json.loads(review_path.read_text(encoding="utf-8"))
+    current_review["review_manifest_lineage_sha256"] = [prior_review_sha256, "b" * 64]
+    review_path.write_text(json.dumps(current_review), encoding="utf-8")
+    assert not _prerequisite_binding_matches(identity.to_dict(), current_identity, raw_dir)
+    review_path.write_bytes(accepted_current_manifest)
+
+    current_review = json.loads(review_path.read_text(encoding="utf-8"))
+    published_report = review_dir / next(
+        name for name in current_review["files"] if name.endswith("review_report.md")
+    )
+    accepted_report = published_report.read_bytes()
+    published_report.write_text("tampered\n", encoding="utf-8")
     with pytest.raises(ArtifactIntegrityError, match="checksum"):
         verify_stage052_prerequisite(
             raw_dir,
             expected_component="artifact_streaming",
             expected_status="READY_FOR_STAGE052_JOB_PARALLEL",
         )
+    published_report.write_bytes(accepted_report)
+    manifest_payload = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+    manifest_payload["post_review_mutation"] = True
+    bundle.manifest_path.write_text(json.dumps(manifest_payload), encoding="utf-8")
+    bundle.manifest_sidecar_path.write_text(
+        hashlib.sha256(bundle.manifest_path.read_bytes()).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ArtifactIntegrityError, match="stale"):
+        verify_stage052_prerequisite(
+            raw_dir,
+            expected_component="artifact_streaming",
+            expected_status="READY_FOR_STAGE052_JOB_PARALLEL",
+        )
+
+
+def test_job_parallel_selection_is_recomputed_and_binds_selected_run(tmp_path: Path) -> None:
+    metrics = {
+        "1": {
+            "run_wall_seconds": 100.0,
+            "aggregate_peak_rss_gib": 2.0,
+            "speedup": 1.0,
+        },
+        "2": {
+            "run_wall_seconds": 60.0,
+            "aggregate_peak_rss_gib": 4.0,
+            "speedup": 100.0 / 60.0,
+        },
+        "4": {
+            "run_wall_seconds": 35.0,
+            "aggregate_peak_rss_gib": 6.0,
+            "speedup": 100.0 / 35.0,
+        },
+    }
+    inputs = [
+        "stage05.2_job_parallel_attempt04",
+        "stage05.2_job_parallel_attempt05",
+        "stage05.2_job_parallel_attempt06",
+    ]
+    input_raw_manifest_sha256: dict[str, str] = {}
+    for run_label in inputs:
+        bundle = ArtifactBundleWriter(
+            tmp_path / run_label,
+            ArtifactRunContext("stage05.2", "job_parallel", run_label),
+            ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+        ).finalize()
+        input_raw_manifest_sha256[run_label] = hashlib.sha256(
+            bundle.manifest_path.read_bytes()
+        ).hexdigest()
+    raw_dir = tmp_path / inputs[2]
+    review_dir = raw_dir / "review"
+    review_dir.mkdir()
+    selection = {
+        "passed": True,
+        "selected_workers": 4,
+        "selected_run_label": inputs[2],
+        "input_runs": inputs,
+        "input_raw_manifest_sha256": input_raw_manifest_sha256,
+        "resource_metrics": metrics,
+    }
+    review = {
+        "selected_workers": 4,
+        "selected_run_label": inputs[2],
+        "input_runs": inputs,
+        "input_raw_manifest_sha256": input_raw_manifest_sha256,
+        "resource_metrics": metrics,
+        "gates": {"worker_selection": selection},
+    }
+    review_path = review_dir / "review_manifest.json"
+    review_path.write_text(json.dumps(review), encoding="utf-8")
+    digest = hashlib.sha256(review_path.read_bytes()).hexdigest()
+    prerequisite = Stage052PrerequisiteIdentity(
+        run_label=raw_dir.name,
+        component="job_parallel",
+        status="READY_FOR_STAGE052_NATIVE_KERNELS",
+        repository_revision="a" * 40,
+        configuration_sha256="b" * 64,
+        raw_manifest_sha256=input_raw_manifest_sha256[inputs[2]],
+        review_manifest_sha256=digest,
+    )
+
+    observed = verify_job_parallel_selection(raw_dir, prerequisite)
+    assert isinstance(observed, JobParallelSelectionIdentity)
+    assert observed.selected_workers == 4
+    assert observed.selected_run_label == inputs[2]
+
+    review["selected_run_label"] = inputs[1]
+    review_path.write_text(json.dumps(review), encoding="utf-8")
+    tampered = replace(
+        prerequisite,
+        review_manifest_sha256=hashlib.sha256(review_path.read_bytes()).hexdigest(),
+    )
+    with pytest.raises(ArtifactIntegrityError, match="does not recompute"):
+        verify_job_parallel_selection(raw_dir, tampered)
 
 
 def test_process_tree_resource_summary_includes_live_child() -> None:
@@ -659,9 +1528,7 @@ def test_parallel_replay_aborts_siblings_on_first_failure(
     )
 
     with pytest.raises(ArtifactIntegrityError, match="tampered replay"):
-        replay_stage052_storage_semantics_many(
-            (Path("tampered"), Path("healthy")), max_workers=2
-        )
+        replay_stage052_storage_semantics_many((Path("tampered"), Path("healthy")), max_workers=2)
 
     assert events == ["cancel", "cancel", "abort"]
 
@@ -702,6 +1569,56 @@ def test_performance_provenance_records_inputs_without_secret_environment(
     assert environment["PYTHONHASHSEED"] == "0"
     assert "SECRET_TOKEN" not in environment
     assert provenance["fallback_allowed"] is False
+
+
+def test_runtime_signature_allows_historical_python_binary_but_binds_native_profile() -> None:
+    environment = {
+        "python": {"version": "3.13.13", "implementation": "CPython"},
+        "system": {"machine": "arm64"},
+        "packages": {"numpy": "2.4.6"},
+        "native_extension": "/historical/evrptw/_core.cpython-313-darwin.so",
+    }
+    historical_signature = {
+        "python": environment["python"],
+        "system": environment["system"],
+        "packages": environment["packages"],
+        "native_extension_sha256": "a" * 64,
+    }
+    passed, detail = stage052_review._validate_captured_runtime_signature(
+        environment=environment,
+        runtime_signature=historical_signature,
+        optimization_profile="python",
+    )
+    assert passed, detail
+
+    passed, detail = stage052_review._validate_captured_runtime_signature(
+        environment=environment,
+        runtime_signature=historical_signature,
+        optimization_profile="native",
+    )
+    assert not passed
+    assert "reviewer extension" in detail
+
+    current_extension = Path(stage052_review.native_core.__file__).resolve()
+    current_environment = {**environment, "native_extension": str(current_extension)}
+    current_signature = {
+        **historical_signature,
+        "native_extension_sha256": hashlib.sha256(current_extension.read_bytes()).hexdigest(),
+    }
+    passed, detail = stage052_review._validate_captured_runtime_signature(
+        environment=current_environment,
+        runtime_signature=current_signature,
+        optimization_profile="native",
+    )
+    assert passed, detail
+
+    malformed = {**historical_signature, "native_extension_sha256": "not-a-hash"}
+    passed, _ = stage052_review._validate_captured_runtime_signature(
+        environment=environment,
+        runtime_signature=malformed,
+        optimization_profile="python",
+    )
+    assert not passed
 
 
 def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
@@ -830,9 +1747,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         route_evaluation_status="completed_infeasible",
     )
     assert replay_stage052_storage_semantics(v1) != replay_stage052_storage_semantics(changed_event)
-    ordered_replays = replay_stage052_storage_semantics_many(
-        (changed_event, v1), max_workers=2
-    )
+    ordered_replays = replay_stage052_storage_semantics_many((changed_event, v1), max_workers=2)
     assert ordered_replays == [
         replay_stage052_storage_semantics(changed_event),
         replay_stage052_storage_semantics(v1),
@@ -1014,6 +1929,7 @@ def test_v2_final_flush_is_charged_to_persistence_and_end_to_end(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     flush_delay_seconds = 0.03
+    postprocess_delay_seconds = 0.02
 
     class FakeShard:
         def append(self, **_: object) -> int:
@@ -1032,9 +1948,13 @@ def test_v2_final_flush_is_charged_to_persistence_and_end_to_end(
         def open_v2_shard(self, **_: object) -> FakeShard:
             return FakeShard()
 
+    def delayed_reconcile(_: object) -> dict[str, str]:
+        time.sleep(postprocess_delay_seconds)
+        return {"status": "pass"}
+
     trace = SimpleNamespace(
         route_dictionary={},
-        reconcile=lambda _result: {"status": "pass"},
+        reconcile=delayed_reconcile,
         to_index_dict=lambda: {},
     )
     objective = SimpleNamespace(
@@ -1053,7 +1973,12 @@ def test_v2_final_flush_is_charged_to_persistence_and_end_to_end(
         exact_completed_calls=1,
         neighborhood_events=(),
         charging_backend="cpu_batch",
-        backend_metrics={"work_batches": 1, "exact_calls": 1},
+        backend_metrics={
+            "work_batches": 1,
+            "batch_launches": 1,
+            "exact_calls": 1,
+            "launch_occupancies": [1],
+        },
         screening_statistics={},
         runtime_seconds=0.0,
         effective_iterations=1,
@@ -1109,7 +2034,21 @@ def test_v2_final_flush_is_charged_to_persistence_and_end_to_end(
 
     persistence = float(rows[0]["artifact_persistence_seconds"])
     solver_seconds = float(rows[0]["solver_seconds"])
-    assert persistence >= flush_delay_seconds * 0.9
+    timing = rows[0]["_timing_evidence"]
+    assert isinstance(timing, dict)
+    recomputed_solver = (
+        timing["solver_completed_ns"] - timing["solver_started_ns"]
+    ) / 1_000_000_000
+    recomputed_post_solver = (
+        timing["axis_completed_ns"] - timing["solver_completed_ns"]
+    ) / 1_000_000_000
+    recomputed_finalize = (
+        timing["finalize_completed_ns"] - timing["finalize_started_ns"]
+    ) / 1_000_000_000
+    assert timing["axis_started_ns"] == timing["solver_started_ns"]
+    assert persistence >= (flush_delay_seconds + postprocess_delay_seconds) * 0.9
+    assert solver_seconds == pytest.approx(recomputed_solver)
+    assert persistence == pytest.approx(recomputed_post_solver + recomputed_finalize)
     assert float(rows[0]["end_to_end_seconds"]) == pytest.approx(solver_seconds + persistence)
 
 

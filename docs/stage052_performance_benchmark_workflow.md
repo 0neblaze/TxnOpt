@@ -116,7 +116,18 @@ load 和 power mode。
 `stage05.2_job_parallel_attempt01`--`attempt03` 的数值门槛虽然通过，但 shard
 manifest 记录的是按 ordinal 推算的 synthetic PID（合成进程标识），无法证明真实
 worker ownership，因此永久保留为不可晋级证据。修正后的正式序列从 attempt04
-开始；独立 review 通过前不得发布 selected worker count。
+开始并已通过独立 review：
+
+- `stage05.2_job_parallel_attempt04`：1 worker，`run_wall_seconds=406.5132`，
+  aggregate RSS 为 2.2379 GiB；
+- `stage05.2_job_parallel_attempt05`：2 workers，`run_wall_seconds=223.4358`，
+  aggregate RSS 为 4.0124 GiB，相对 attempt04 speedup 为 1.819x；
+- `stage05.2_job_parallel_attempt06`：4 workers，`run_wall_seconds=130.6914`，
+  aggregate RSS 为 5.4178 GiB，相对 attempt04 speedup 为 3.110x。
+
+selection review 选择 `selected_workers=4`，状态为
+`READY_FOR_STAGE052_NATIVE_KERNELS`。Component E 必须绑定 attempt06 的 selection
+identity；此处不构成 Component E 或 F 已完成的声明。
 
 ## E. Native CPU kernels
 

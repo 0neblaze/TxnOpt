@@ -2,17 +2,31 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
-from typing import Literal
+from typing import Any, Literal
+
+import numpy as np
 
 from evrptw.charging import ChargingSubproblemResult
 from evrptw.measurement import canonical_route_key
 from evrptw.models import Instance, NodeType
+from evrptw.native_kernels import NativeKernelRuntime
 from evrptw.objective import OBJECTIVE_SCHEMA_VERSION
 
 CACHE_INCREMENTAL_SCHEMA_VERSION = "stage032-cache-incremental-v1"
 _EPSILON = 1e-9
+
+
+def _require_native_core(function_name: str) -> Any:
+    try:
+        from evrptw import _core as native_core
+    except Exception as error:
+        raise RuntimeError(
+            f"{function_name} requested native numeric protocol but evrptw._core is unavailable"
+        ) from error
+    return native_core
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,7 +368,18 @@ def incremental_route_propagation(
     candidate_sequence: tuple[str, ...] | list[str],
     *,
     epsilon: float = _EPSILON,
+    native_runtime: NativeKernelRuntime | None = None,
 ) -> IncrementalPropagationResult:
+    if epsilon <= 0.0:
+        raise ValueError("propagation epsilon must be positive")
+    if native_runtime is not None:
+        return _native_incremental_route_propagation(
+            instance,
+            base,
+            tuple(candidate_sequence),
+            epsilon=epsilon,
+            native_runtime=native_runtime,
+        )
     candidate = tuple(candidate_sequence)
     if base.sequence == candidate:
         return IncrementalPropagationResult(
@@ -514,6 +539,122 @@ def incremental_route_propagation(
         suffix_edges,
         max(0, candidate_edges - prefix_edges),
         max(0, candidate_edges - suffix_edges),
+    )
+
+
+_PROPAGATION_REASONS = {
+    0: "incremental_propagation",
+    1: "unchanged_route",
+    2: "route_structure_requires_full_propagation",
+    3: "forward_time_window_prefilter",
+    4: "backward_time_window_prefilter",
+    5: "time_window_slack_prefilter",
+}
+_PROPAGATION_FAILED_CHECKS = {
+    0: "",
+    1: "route_structure",
+    2: "forward_time_window",
+    3: "backward_time_window",
+    4: "time_window_slack",
+}
+
+
+def _native_incremental_route_propagation(
+    instance: Instance,
+    base: RoutePropagationSnapshot,
+    candidate: tuple[str, ...],
+    *,
+    epsilon: float,
+    native_runtime: NativeKernelRuntime,
+) -> IncrementalPropagationResult:
+    native_core = _require_native_core("incremental_route_propagation")
+    context = native_runtime.context
+    context.assert_matches(instance)
+    try:
+        base_chain = np.ascontiguousarray(
+            [context.name_to_index[name] for name in base.chain],
+            dtype=np.int64,
+        )
+    except KeyError as error:
+        raise ValueError("base propagation snapshot contains an unknown node") from error
+    depot_index = context.name_to_index[instance.depot.name]
+    candidate_chain = np.ascontiguousarray(
+        [
+            depot_index,
+            *(context.name_to_index.get(name, -1) for name in candidate),
+            depot_index,
+        ],
+        dtype=np.int64,
+    )
+    base_edges = np.ascontiguousarray(base.edge_distances, dtype=np.float64)
+    base_earliest = np.ascontiguousarray(base.earliest_arrivals, dtype=np.float64)
+    base_latest = np.ascontiguousarray(base.latest_departures, dtype=np.float64)
+    epsilon_array = np.ascontiguousarray([epsilon], dtype=np.float64)
+    started = time.perf_counter()
+    try:
+        payload = native_core.propagate_routes_numeric(
+            context.node_kind,
+            context.ready_time,
+            context.due_date,
+            context.service_time,
+            context.distance,
+            context.vehicle,
+            base_chain,
+            candidate_chain,
+            base_edges,
+            base_earliest,
+            base_latest,
+            epsilon_array,
+        )
+    finally:
+        native_runtime.record_propagation(time.perf_counter() - started)
+    if not isinstance(payload, tuple) or len(payload) != 2:
+        raise RuntimeError("native propagation returned an invalid result tuple")
+    codes_raw, metrics_raw = payload
+    if (
+        not isinstance(codes_raw, np.ndarray)
+        or codes_raw.dtype != np.dtype(np.int64)
+        or codes_raw.shape != (10,)
+        or not codes_raw.flags.c_contiguous
+    ):
+        raise RuntimeError("native propagation codes must be C-contiguous int64 with shape (10,)")
+    if (
+        not isinstance(metrics_raw, np.ndarray)
+        or metrics_raw.dtype != np.dtype(np.float64)
+        or metrics_raw.shape != (3,)
+        or not metrics_raw.flags.c_contiguous
+    ):
+        raise RuntimeError(
+            "native propagation metrics must be C-contiguous float64 with shape (3,)"
+        )
+    status_code = int(codes_raw[0])
+    reason_code = int(codes_raw[1])
+    failed_code = int(codes_raw[2])
+    if (
+        status_code not in {0, 1}
+        or reason_code not in _PROPAGATION_REASONS
+        or failed_code not in _PROPAGATION_FAILED_CHECKS
+        or any(int(codes_raw[index]) not in {0, 1} for index in (3, 4, 9))
+    ):
+        raise RuntimeError("native propagation returned an unknown status/reason code")
+    if bool(codes_raw[9]) != (bool(codes_raw[3]) and bool(codes_raw[4])):
+        raise RuntimeError("native propagation accepted flag is inconsistent")
+    status: Literal["incremental", "fallback"] = "fallback" if status_code == 1 else "incremental"
+    return IncrementalPropagationResult(
+        status,
+        _PROPAGATION_REASONS[reason_code],
+        base.sequence,
+        candidate,
+        float(metrics_raw[0]),
+        float(metrics_raw[1]),
+        float(metrics_raw[2]),
+        bool(codes_raw[3]),
+        bool(codes_raw[4]),
+        _PROPAGATION_FAILED_CHECKS[failed_code],
+        int(codes_raw[5]),
+        int(codes_raw[6]),
+        int(codes_raw[7]),
+        int(codes_raw[8]),
     )
 
 

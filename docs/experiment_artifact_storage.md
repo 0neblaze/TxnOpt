@@ -124,5 +124,15 @@ Stage 5.2 D 以后，worker-owned shard 的 `worker_identity` 必须是实际执
 把 parent PID 当作 shard owner。resource summary、raw/solution/trace 和 per-run CSV
 必须拥有完全相同的 canonical scope，任何缺失、重复、partial 或 fallback 标记均
 fail fast（快速失败）。
+reviewer 还必须验证 canonical `(instance, seed) → shard_ordinal` 映射、每个 shard
+manifest 与专属 sidecar 的双向 SHA-256 绑定，以及 trace index 中相同的复合 event
+identity。性能 axis 必须按配置顺序串行且互不重叠，finalization 只能在最后一个
+axis 完成后开始。
+
+Stage 5.2 re-review（重新审查）不得原地覆盖受 manifest 保护的 report/findings。
+新 report 与 findings 先写入 `review/generations/<content-sha256>/` 并完成 fsync，
+最后只原子替换 `review_manifest.json` 这一可信指针；旧 accepted review 的 manifest、
+report 和 findings 按旧 manifest SHA-256 归档到 `review/history/`。发布中断时旧
+manifest 及其引用文件仍保持可验证，orphan generation（孤立审查代次）不参与门槛。
 
 Stage 5.2 以后，报告必须分列 solver time、artifact persistence time 和 end-to-end time；CPU 使用率、芯片功耗、kernel time 或压缩比不能单独构成加速结论。

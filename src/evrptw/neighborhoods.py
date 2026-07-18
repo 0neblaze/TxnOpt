@@ -4,11 +4,15 @@ import hashlib
 import json
 import math
 import random
+import time
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
-from typing import Protocol, cast
+from functools import lru_cache
+from typing import Any, Protocol, cast
+
+import numpy as np
 
 from evrptw.cache_incremental import (
     IncrementalPropagationResult,
@@ -17,6 +21,7 @@ from evrptw.cache_incremental import (
 from evrptw.charging import ChargingSubproblemResult
 from evrptw.measurement import ScreeningCheckTrace
 from evrptw.models import Instance, NodeType
+from evrptw.native_kernels import NativeKernelRuntime
 from evrptw.objective import SolutionObjective
 
 CustomerSequence = tuple[str, ...]
@@ -186,6 +191,264 @@ class VehicleOperatorConfig:
 _DEFAULT_VEHICLE_OPERATOR_CONFIG = VehicleOperatorConfig()
 
 
+@lru_cache(maxsize=1)
+def _native_core() -> object | None:
+    try:
+        from evrptw import _core as native_core
+    except Exception:
+        return None
+    return native_core
+
+
+def _require_native_core(function_name: str) -> Any:
+    native_core = _native_core()
+    if native_core is None:
+        raise RuntimeError(
+            f"{function_name} requested native numeric protocol but evrptw._core is unavailable"
+        )
+    return native_core
+
+
+_SCREEN_REASONS = {
+    0: "",
+    1: "route_structure_prefilter",
+    2: "capacity_prefilter",
+    3: "forward_time_window_prefilter",
+    4: "backward_time_window_prefilter",
+    5: "time_window_slack_prefilter",
+    6: "single_segment_energy_prefilter",
+    7: "structural_energy_prefilter",
+    8: "time_window_prefilter",
+    9: "energy_prefilter",
+}
+_SCREEN_CHECK_NAMES = {
+    1: "route_structure",
+    2: "capacity_lower_bound",
+    3: "forward_time_window",
+    4: "backward_time_window",
+    5: "time_window_slack",
+    6: "shortest_distance_lower_bound",
+    7: "single_segment_battery_reachability",
+    8: "structural_energy_lower_bound",
+}
+_SCREEN_CHECK_STATUS = {0: "fail", 1: "pass", 2: "recorded"}
+_SCREEN_PASS_EXPLANATIONS = {
+    1: "ordered customer sequence with no non-customer nodes",
+    2: "customer demand does not exceed vehicle capacity",
+    3: "direct-leg earliest-arrival propagation",
+    4: "latest-arrival backward propagation",
+    5: "non-negative optimistic slack",
+    6: "safe metric only; never a rejection criterion",
+    7: "optimistic depot/station frontier reachability",
+    8: "optimistic recharge-node/customer/recharge-node bound",
+}
+
+
+def _strict_native_result_array(
+    value: object,
+    *,
+    name: str,
+    dtype: np.dtype[Any],
+    shape: tuple[int, ...],
+) -> np.ndarray:
+    if not isinstance(value, np.ndarray):
+        raise RuntimeError(f"native {name} must be a NumPy array")
+    if value.dtype != dtype or value.shape != shape or not value.flags.c_contiguous:
+        raise RuntimeError(f"native {name} must be C-contiguous {dtype} with shape {shape}")
+    return value
+
+
+def _screen_failure_explanation(
+    check_id: int,
+    *,
+    event_count: int,
+) -> str:
+    if check_id == 1:
+        return (
+            "sequence contains unknown or non-customer nodes"
+            if event_count == 1
+            else "route_structure_prefilter"
+        )
+    if check_id == 2:
+        return "customer demand exceeds vehicle capacity"
+    return {
+        3: "forward_time_window_prefilter",
+        4: "backward_time_window_prefilter",
+        5: "time_window_slack_prefilter",
+        7: "single_segment_energy_prefilter",
+        8: "structural_energy_prefilter",
+    }.get(check_id, "")
+
+
+def _screen_numeric_result(
+    instance: Instance,
+    sequence: CustomerSequence,
+    *,
+    full: bool,
+    reference_distance: float | None,
+    epsilon: float,
+    reachability_index: StationReachabilityIndex | None,
+    incremental_metrics: IncrementalPropagationResult | None,
+    native_runtime: NativeKernelRuntime,
+) -> ScreeningResult:
+    native_core = _require_native_core("screen_route_candidate")
+    context = native_runtime.context
+    context.assert_matches(instance)
+    if not math.isclose(epsilon, context.reachability_epsilon, rel_tol=0.0, abs_tol=0.0):
+        raise ValueError("native screening epsilon must match the packed reachability epsilon")
+    if reachability_index is not None:
+        if reachability_index.instance is not instance:
+            raise ValueError("reachability index does not match native screening instance")
+        if not math.isclose(
+            reachability_index.epsilon,
+            context.reachability_epsilon,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ):
+            raise ValueError("reachability index epsilon does not match native context")
+    route_indices = np.ascontiguousarray(
+        [context.name_to_index.get(name, -1) for name in sequence],
+        dtype=np.int64,
+    )
+    options = np.ascontiguousarray(
+        [
+            1.0 if full else 0.0,
+            epsilon,
+            float(reference_distance or 0.0),
+            1.0 if reference_distance is not None else 0.0,
+        ],
+        dtype=np.float64,
+    )
+    use_incremental = (
+        incremental_metrics is not None and incremental_metrics.status == "incremental"
+    )
+    incremental_values = (
+        (
+            incremental_metrics.distance_lower_bound,
+            incremental_metrics.min_time_window_slack,
+            incremental_metrics.finish_time,
+            incremental_metrics.forward_feasible,
+            incremental_metrics.backward_feasible,
+        )
+        if incremental_metrics is not None and use_incremental
+        else (0.0, 0.0, 0.0, False, False)
+    )
+    incremental = np.ascontiguousarray(
+        [
+            1.0 if use_incremental else 0.0,
+            incremental_values[0],
+            incremental_values[1],
+            incremental_values[2],
+            1.0 if incremental_values[3] else 0.0,
+            1.0 if incremental_values[4] else 0.0,
+        ],
+        dtype=np.float64,
+    )
+    started = time.perf_counter()
+    try:
+        payload = native_core.screen_routes_numeric(
+            context.node_kind,
+            context.demand,
+            context.ready_time,
+            context.due_date,
+            context.service_time,
+            context.distance,
+            (
+                context.reachable
+                if full and reachability_index is not None
+                else context.legacy_reachable
+            ),
+            context.vehicle,
+            route_indices,
+            options,
+            incremental,
+        )
+    finally:
+        native_runtime.record_screening(time.perf_counter() - started)
+    if not isinstance(payload, tuple) or len(payload) != 2:
+        raise RuntimeError("native screening returned an invalid result tuple")
+    codes = _strict_native_result_array(
+        payload[0], name="screening codes", dtype=np.dtype(np.int64), shape=(16,)
+    )
+    metrics = _strict_native_result_array(
+        payload[1], name="screening metrics", dtype=np.dtype(np.float64), shape=(15,)
+    )
+    reason_code = int(codes[1])
+    first_failed_code = int(codes[2])
+    if reason_code not in _SCREEN_REASONS or first_failed_code not in {
+        0,
+        *_SCREEN_CHECK_NAMES,
+    }:
+        raise RuntimeError("native screening returned an unknown reason/check code")
+    accepted = bool(codes[0])
+    reason = _SCREEN_REASONS[reason_code]
+    if not full:
+        return ScreeningResult(
+            accepted,
+            reason,
+            float(metrics[0]),
+            float(metrics[1]),
+            bool(codes[4]),
+        )
+
+    event_count = int(codes[7])
+    if event_count < 0 or event_count > 8:
+        raise RuntimeError("native screening returned an invalid event count")
+    checks: list[ScreeningCheckTrace] = []
+    energy_check_seen = False
+    for position in range(event_count):
+        event_code = int(codes[8 + position])
+        check_id, status_id = divmod(event_code, 10)
+        if check_id not in _SCREEN_CHECK_NAMES or status_id not in _SCREEN_CHECK_STATUS:
+            raise RuntimeError("native screening returned an unknown check event")
+        status = _SCREEN_CHECK_STATUS[status_id]
+        raw_value = float(metrics[7 + position])
+        value: float | bool = bool(raw_value) if check_id in {1, 7} else raw_value
+        explanation = (
+            _screen_failure_explanation(check_id, event_count=event_count)
+            if status == "fail"
+            else _SCREEN_PASS_EXPLANATIONS[check_id]
+        )
+        checks.append(
+            ScreeningCheckTrace(
+                _SCREEN_CHECK_NAMES[check_id],
+                status,
+                value,
+                explanation,
+            )
+        )
+        energy_check_seen = energy_check_seen or check_id == 7
+    if reachability_index is not None and energy_check_seen:
+        chain = (instance.depot.name, *sequence, instance.depot.name)
+        query_count = 0
+        for left, right in zip(chain, chain[1:], strict=False):
+            query_count += 1
+            left_index = context.name_to_index[left]
+            right_index = context.name_to_index[right]
+            if not bool(context.reachable[left_index, right_index]):
+                break
+        reachability_index.queries += query_count
+    distance_increment = float(metrics[4])
+    if math.isnan(distance_increment):
+        distance_increment_value: float | None = None
+    else:
+        distance_increment_value = distance_increment
+    return ScreeningResult(
+        accepted,
+        reason,
+        float(metrics[0]),
+        float(metrics[1]),
+        bool(codes[4]),
+        tuple(checks),
+        _SCREEN_CHECK_NAMES.get(first_failed_code, ""),
+        float(metrics[2]),
+        float(metrics[3]),
+        distance_increment_value,
+        bool(codes[3]),
+        float(metrics[5]),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class NeighborhoodEvent:
     operator: str
@@ -313,6 +576,7 @@ def screen_route_candidate(
     epsilon: float = _EPSILON,
     reachability_index: StationReachabilityIndex | None = None,
     incremental_metrics: IncrementalPropagationResult | None = None,
+    native_runtime: NativeKernelRuntime | None = None,
 ) -> ScreeningResult:
     """Run safe, optimistic checks before exact charging evaluation.
 
@@ -324,6 +588,17 @@ def screen_route_candidate(
 
     if epsilon <= 0.0:
         raise ValueError("screening epsilon must be positive")
+    if native_runtime is not None:
+        return _screen_numeric_result(
+            instance,
+            sequence,
+            full=full,
+            reference_distance=reference_distance,
+            epsilon=epsilon,
+            reachability_index=reachability_index,
+            incremental_metrics=incremental_metrics,
+            native_runtime=native_runtime,
+        )
     by_name = instance.by_name
     known_sequence = all(name in by_name for name in sequence)
     if known_sequence and not (
@@ -341,9 +616,7 @@ def screen_route_candidate(
     if incremental_metrics is not None and incremental_metrics.status == "incremental":
         distance_lower_bound = incremental_metrics.distance_lower_bound
     distance_increment_lower_bound = (
-        None
-        if reference_distance is None
-        else distance_lower_bound - reference_distance
+        None if reference_distance is None else distance_lower_bound - reference_distance
     )
     unknown = [name for name in sequence if name not in by_name]
     if unknown or any(by_name[name].kind is not NodeType.CUSTOMER for name in sequence):
@@ -425,11 +698,7 @@ def screen_route_candidate(
             first_failed_check,
             min_slack if math.isfinite(min_slack) else 0.0,
             distance_lower_bound,
-            (
-                None
-                if reference_distance is None
-                else distance_lower_bound - reference_distance
-            ),
+            (None if reference_distance is None else distance_lower_bound - reference_distance),
             single_segment_reachable,
             structural_energy_lower_bound,
         )
@@ -511,8 +780,7 @@ def screen_route_candidate(
             else:
                 latest_arrival = min(destination.due_date, latest_departure)
             latest_departure = (
-                latest_arrival
-                - origin.distance_to(destination) / instance.vehicle.average_velocity
+                latest_arrival - origin.distance_to(destination) / instance.vehicle.average_velocity
             )
         for customer_name, earliest in earliest_arrivals.items():
             slack = latest_arrivals[customer_name] - earliest
@@ -665,14 +933,12 @@ def _route_batch_with_status(
     backend = getattr(evaluator, "backend", None)
     backend_name = getattr(backend, "value", backend)
     if callable(route_batch) and (
-        backend_name != "cpu_scalar"
-        or bool(getattr(evaluator, "batch_work_enabled", False))
+        backend_name != "cpu_scalar" or bool(getattr(evaluator, "batch_work_enabled", False))
     ):
         results = route_batch(ordered, route_change_status=route_change_status)
         return tuple(cast(ChargingSubproblemResult, result) for result in results)
     return tuple(
-        _route_with_status(evaluator, sequence, route_change_status)
-        for sequence in ordered
+        _route_with_status(evaluator, sequence, route_change_status) for sequence in ordered
     )
 
 
@@ -713,9 +979,7 @@ def _legacy_screen_route_candidate(
         current_time = max(current_time, destination.ready_time)
         if destination.kind is NodeType.CUSTOMER:
             if current_time > destination.due_date + _EPSILON:
-                return ScreeningResult(
-                    False, "time_window_prefilter", demand, current_time, False
-                )
+                return ScreeningResult(False, "time_window_prefilter", demand, current_time, False)
             current_time += destination.service_time
 
     for origin_name, destination_name in zip(chain, chain[1:], strict=False):
@@ -824,8 +1088,10 @@ def propose_constraint_removal(
     all_customers = [name for sequence in sequences for name in sequence]
     if len(set(all_customers)) != len(all_customers):
         raise ValueError("constraint removal requires unique customer coverage")
-    if any(name not in instance.by_name or instance.by_name[name].kind is not NodeType.CUSTOMER
-           for name in all_customers):
+    if any(
+        name not in instance.by_name or instance.by_name[name].kind is not NodeType.CUSTOMER
+        for name in all_customers
+    ):
         raise ValueError("constraint removal requires customer-only route sequences")
     if len(all_customers) <= 1 or selection.requested_count <= 0:
         event = NeighborhoodEvent(
@@ -863,13 +1129,9 @@ def propose_constraint_removal(
             for sequence in sequences
             if precomputed_routes is None or sequence not in precomputed_routes
         ]
-        pending_results = iter(
-            _route_batch_with_status(evaluator, pending, "unchanged")
-        )
+        pending_results = iter(_route_batch_with_status(evaluator, pending, "unchanged"))
         for route_index, sequence in enumerate(sequences):
-            used_precomputed = (
-                precomputed_routes is not None and sequence in precomputed_routes
-            )
+            used_precomputed = precomputed_routes is not None and sequence in precomputed_routes
             result = (
                 precomputed_routes[sequence]
                 if precomputed_routes is not None and used_precomputed
@@ -903,9 +1165,7 @@ def propose_constraint_removal(
                 selected_operator,
                 anchor=anchor,
             )
-            scores.extend(
-                (name, score, route_index) for name, score in route_scores.items()
-            )
+            scores.extend((name, score, route_index) for name, score in route_scores.items())
     except RouteEvaluationDeadlineExceeded:
         events.append(
             NeighborhoodEvent(
@@ -957,8 +1217,7 @@ def propose_constraint_removal(
     chosen = tuple(item[0] for item in ordered[:actual_count])
     chosen_set = set(chosen)
     partial = tuple(
-        tuple(name for name in sequence if name not in chosen_set)
-        for sequence in sequences
+        tuple(name for name in sequence if name not in chosen_set) for sequence in sequences
     )
     partial = tuple(sequence for sequence in partial if sequence)
     affected = tuple(
@@ -1058,14 +1317,8 @@ def _station_pressure_scores(
         for position, name in enumerate(path)
         if instance.by_name[name].kind is NodeType.CUSTOMER
     ]
-    station_count = sum(
-        instance.by_name[name].kind is NodeType.STATION for name in path
-    )
-    route_pressure = (
-        2.0 * station_count
-        + result.charged_energy
-        + 10.0 * result.charging_time
-    )
+    station_count = sum(instance.by_name[name].kind is NodeType.STATION for name in path)
+    route_pressure = 2.0 * station_count + result.charged_energy + 10.0 * result.charging_time
     output: dict[str, float] = {}
     for index, (_position, customer) in enumerate(customer_positions):
         left = customer_positions[index - 1][0] if index else 0
@@ -1077,11 +1330,10 @@ def _station_pressure_scores(
         local_path = path[left : right + 1]
         local_distance = _path_distance(instance, local_path)
         direct_distance = instance.by_name[path[left]].distance_to(instance.by_name[path[right]])
-        local_stations = sum(
-            instance.by_name[name].kind is NodeType.STATION for name in local_path
-        )
+        local_stations = sum(instance.by_name[name].kind is NodeType.STATION for name in local_path)
         output[customer] = (
-            local_distance - direct_distance
+            local_distance
+            - direct_distance
             + 2.0 * local_stations
             + route_pressure / max(1, len(customer_positions))
         )
@@ -1252,9 +1504,7 @@ def repair_vehicle_reduction_refinement(
                 for customer in pending
             }
             feasible_customers = [
-                customer
-                for customer, options in options_by_customer.items()
-                if options
+                customer for customer, options in options_by_customer.items() if options
             ]
             if not feasible_customers:
                 return RepairResult(
@@ -1270,8 +1520,7 @@ def repair_vehicle_reduction_refinement(
                     (
                         float("inf")
                         if len(options_by_customer[item]) < 2
-                        else options_by_customer[item][1][0]
-                        - options_by_customer[item][0][0]
+                        else options_by_customer[item][1][0] - options_by_customer[item][0][0]
                     ),
                     item,
                 ),
@@ -1467,9 +1716,7 @@ def propose_route_elimination(
         )
 
     if not events:
-        events.append(
-            NeighborhoodEvent("route_elimination", "failed", "no_candidate_route")
-        )
+        events.append(NeighborhoodEvent("route_elimination", "failed", "no_candidate_route"))
     return MoveProposal("route_elimination", None, tuple(events))
 
 
@@ -1502,9 +1749,7 @@ def _propose_controlled_route_elimination(
             ),
         )
         profile_plans = (repair.sequences,) if repair.sequences is not None else ()
-        feasible_plans = tuple(
-            plan for plan in profile_plans if len(plan) == len(sequences) - 1
-        )
+        feasible_plans = tuple(plan for plan in profile_plans if len(plan) == len(sequences) - 1)
         if not feasible_plans:
             events.append(
                 NeighborhoodEvent(
@@ -1557,6 +1802,8 @@ def _propose_controlled_route_elimination(
         )
     )
     return MoveProposal("route_elimination", selected, tuple(events))
+
+
 def propose_route_merge(
     instance: Instance,
     sequences: RouteSequences,
@@ -1576,9 +1823,7 @@ def propose_route_merge(
         0 if _is_cached_route(evaluator, sequence) else 1 for sequence in sequences
     ]
     profile_results = _route_batch_with_status(evaluator, sequences, "unchanged")
-    for index, (sequence, result) in enumerate(
-        zip(sequences, profile_results, strict=True)
-    ):
+    for index, (sequence, result) in enumerate(zip(sequences, profile_results, strict=True)):
         exact_delta = profile_exact_deltas[index]
         if not result.feasible:
             events.append(
@@ -1636,11 +1881,7 @@ def propose_route_merge(
     for _, left, right in pairs:
         for source, target in ((left, right), (right, left)):
             for position in range(len(target.sequence) + 1):
-                merged = (
-                    target.sequence[:position]
-                    + source.sequence
-                    + target.sequence[position:]
-                )
+                merged = target.sequence[:position] + source.sequence + target.sequence[position:]
                 screen = _screen_with_evaluator(instance, evaluator, merged)
                 if not screen.accepted:
                     events.append(
@@ -1874,9 +2115,7 @@ def _controlled_merge_orders(
     for source, target in ((left, right), (right, left)):
         for position in range(len(target.sequence) + 1):
             add(
-                target.sequence[:position]
-                + source.sequence
-                + target.sequence[position:],
+                target.sequence[:position] + source.sequence + target.sequence[position:],
                 source.sequence,
             )
     return tuple(output)
@@ -2114,9 +2353,7 @@ def propose_route_segment_destroy(
             break
 
     if not events:
-        events.append(
-            NeighborhoodEvent(operator, "failed", "no_route_with_segment_length")
-        )
+        events.append(NeighborhoodEvent(operator, "failed", "no_route_with_segment_length"))
     return MoveProposal(operator, None, tuple(events))
 
 
@@ -2159,12 +2396,16 @@ def propose_ejection_chain(
     best: tuple[SolutionObjective, RouteSequences, int, tuple[int, ...]] | None = None
 
     initial_states = [
-        (tuple(
-            sequence[:position] + sequence[position + 1 :]
-            if index == source_index
-            else sequence
-            for index, sequence in enumerate(sequences)
-        ), customer, 0)
+        (
+            tuple(
+                sequence[:position] + sequence[position + 1 :]
+                if index == source_index
+                else sequence
+                for index, sequence in enumerate(sequences)
+            ),
+            customer,
+            0,
+        )
         for source_index, sequence in enumerate(sequences)
         if len(sequence) > 1
         for position, customer in enumerate(sequence)
@@ -2400,9 +2641,7 @@ def _search_controlled_candidate_plans(
             continue
         plans.append(candidate)
         descriptions[candidate] = description
-        pool_digest.update(
-            json.dumps(candidate, separators=(",", ":")).encode()
-        )
+        pool_digest.update(json.dumps(candidate, separators=(",", ":")).encode())
 
     events: list[NeighborhoodEvent] = [
         NeighborhoodEvent(
@@ -2453,11 +2692,7 @@ def _relocate_candidates(sequences: RouteSequences) -> Iterable[_CandidateDescri
                 if target_index == source_index:
                     continue
                 for target_position in range(len(target) + 1):
-                    target_with = (
-                        target[:target_position]
-                        + (customer,)
-                        + target[target_position:]
-                    )
+                    target_with = target[:target_position] + (customer,) + target[target_position:]
                     yield_changes = _ordered_changes(
                         (source_index, source_without), (target_index, target_with)
                     )
@@ -2473,15 +2708,9 @@ def _swap_candidates(sequences: RouteSequences) -> Iterable[_CandidateDescriptio
             right = sequences[right_index]
             for left_position, left_customer in enumerate(left):
                 for right_position, right_customer in enumerate(right):
-                    new_left = (
-                        left[:left_position]
-                        + (right_customer,)
-                        + left[left_position + 1 :]
-                    )
+                    new_left = left[:left_position] + (right_customer,) + left[left_position + 1 :]
                     new_right = (
-                        right[:right_position]
-                        + (left_customer,)
-                        + right[right_position + 1 :]
+                        right[:right_position] + (left_customer,) + right[right_position + 1 :]
                     )
                     yield _CandidateDescription(
                         _ordered_changes(
@@ -2533,9 +2762,7 @@ def _evaluate_changed_candidate(
     if len({index for index, _ in changes}) != len(changes):
         return _CandidateEvaluation(None, "duplicate_changed_route", False, 0)
     for index, sequence in changes:
-        base_sequence = (
-            base_sequences[index] if 0 <= index < len(base_sequences) else None
-        )
+        base_sequence = base_sequences[index] if 0 <= index < len(base_sequences) else None
         screen = _screen_with_evaluator(
             instance,
             evaluator,
@@ -2545,9 +2772,7 @@ def _evaluate_changed_candidate(
         )
         if not screen.accepted:
             return _CandidateEvaluation(None, screen.reason, False, 0)
-    required = sum(
-        not _is_cached_route(evaluator, sequence) for _, sequence in changes
-    )
+    required = sum(not _is_cached_route(evaluator, sequence) for _, sequence in changes)
     if exact_used + required > budget:
         return _CandidateEvaluation(
             None,
@@ -2608,11 +2833,8 @@ def _base_route_results(
     backend = getattr(evaluator, "backend", None)
     backend_name = getattr(backend, "value", backend)
     if (
-        backend_name == "cpu_scalar"
-        and not bool(getattr(evaluator, "batch_work_enabled", False))
-    ) or not callable(
-        getattr(evaluator, "route_batch", None)
-    ):
+        backend_name == "cpu_scalar" and not bool(getattr(evaluator, "batch_work_enabled", False))
+    ) or not callable(getattr(evaluator, "route_batch", None)):
         return tuple(
             precomputed_routes[sequence]
             if precomputed_routes is not None and sequence in precomputed_routes
@@ -2824,9 +3046,7 @@ def _candidate_control_repair_pass(
         *,
         base: CustomerSequence = (),
     ) -> ScreeningResult:
-        reference_distance = (
-            _route_sequence_distance(instance, (base,)) if base else None
-        )
+        reference_distance = _route_sequence_distance(instance, (base,)) if base else None
         decision = screen_route_candidate(
             instance,
             sequence,
@@ -2835,9 +3055,7 @@ def _candidate_control_repair_pass(
         )
         key = f"{'pass' if decision.accepted else 'rejected'}:{decision.reason}"
         screening_counts[key] += 1
-        screening_digest.update(
-            json.dumps((key, sequence), separators=(",", ":")).encode()
-        )
+        screening_digest.update(json.dumps((key, sequence), separators=(",", ":")).encode())
         return decision
 
     def output(result: RepairResult) -> RepairResult:
@@ -2847,15 +3065,12 @@ def _candidate_control_repair_pass(
         return result
 
     while pending:
-        options: list[
-            tuple[float, str, int, int, CustomerSequence]
-        ] = []
+        options: list[tuple[float, str, int, int, CustomerSequence]] = []
         for customer in pending:
             for route_index, base in enumerate(sequences):
                 if (
                     route_change_limit is not None
-                    and
-                    route_index not in changed_route_indices
+                    and route_index not in changed_route_indices
                     and len(changed_route_indices) >= route_change_limit
                 ):
                     continue
@@ -2875,9 +3090,7 @@ def _candidate_control_repair_pass(
                         if screen.distance_increment_lower_bound is not None
                         else screen.distance_lower_bound
                     )
-                    options.append(
-                        (score, customer, route_index, position, candidate)
-                    )
+                    options.append((score, customer, route_index, position, candidate))
         if options:
             _score, customer, route_index, _position, candidate = min(options)
             sequences[route_index] = candidate
@@ -2885,16 +3098,12 @@ def _candidate_control_repair_pass(
             pending.remove(customer)
             continue
         if not allow_new_routes:
-            return output(
-                RepairResult(None, new_routes, 0, "no_existing_route_insertion")
-            )
+            return output(RepairResult(None, new_routes, 0, "no_existing_route_insertion"))
         customer = min(pending)
         singleton = (customer,)
         screen = screened(singleton)
         if not screen.accepted:
-            return output(
-                RepairResult(None, new_routes, 0, "new_singleton_route_infeasible")
-            )
+            return output(RepairResult(None, new_routes, 0, "new_singleton_route_infeasible"))
         sequences.append(singleton)
         pending.remove(customer)
         new_routes += 1

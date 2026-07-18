@@ -21,9 +21,7 @@ from evrptw.artifacts import ArtifactIntegrityError, ArtifactReader
 
 STAGE052_REVIEW_SCHEMA_VERSION = "stage05.2-review-v1"
 STAGE052_RESOURCE_SCHEMA_VERSION = "stage05.2-run-resource-v2"
-STAGE052_RESOURCE_MEASUREMENT_SCOPE = (
-    "task_scheduling_through_parent_control_preparation"
-)
+STAGE052_RESOURCE_MEASUREMENT_SCOPE = "task_scheduling_through_parent_control_preparation"
 _PERFORMANCE_ENVIRONMENT_VARIABLES = (
     "MKL_NUM_THREADS",
     "NUMEXPR_NUM_THREADS",
@@ -40,6 +38,41 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def verify_stage052_review_files(
+    raw_dir: Path,
+    review: Mapping[str, object],
+) -> dict[str, Path]:
+    """Verify legacy or immutable-generation review file references."""
+
+    files = review.get("files")
+    if not isinstance(files, Mapping) or len(files) != 2:
+        raise ArtifactIntegrityError("prerequisite review file identity mismatch")
+    relative_paths = tuple(str(value) for value in files)
+    legacy = set(relative_paths) == {"review_findings.csv", "review_report.md"}
+    if not legacy:
+        parsed = [Path(value) for value in relative_paths]
+        if (
+            {path.name for path in parsed} != {"review_findings.csv", "review_report.md"}
+            or any(len(path.parts) != 3 or path.parts[0] != "generations" for path in parsed)
+            or len({path.parts[1] for path in parsed}) != 1
+        ):
+            raise ArtifactIntegrityError("prerequisite review file identity mismatch")
+        generation = parsed[0].parts[1]
+        if len(generation) != 64 or any(
+            character not in "0123456789abcdef" for character in generation
+        ):
+            raise ArtifactIntegrityError("prerequisite review generation identity is invalid")
+    review_dir = (raw_dir / "review").resolve()
+    verified: dict[str, Path] = {}
+    for relative, checksum in files.items():
+        relative_text = str(relative)
+        path = (review_dir / relative_text).resolve()
+        if review_dir not in path.parents or not path.is_file() or _sha256(path) != str(checksum):
+            raise ArtifactIntegrityError(f"prerequisite review checksum mismatch: {relative_text}")
+        verified[relative_text] = path
+    return verified
+
+
 @dataclass(frozen=True, slots=True)
 class Stage052PrerequisiteIdentity:
     run_label: str
@@ -52,6 +85,154 @@ class Stage052PrerequisiteIdentity:
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class JobParallelSelectionIdentity:
+    """Reviewed D selection consumed by every Stage 5.2 E producer."""
+
+    selected_workers: int
+    selected_run_label: str
+    input_runs: tuple[str, str, str]
+    run_wall_seconds: tuple[float, float, float]
+    aggregate_peak_rss_gib: tuple[float, float, float]
+    speedups: tuple[float, float, float]
+    input_raw_manifest_sha256: tuple[str, str, str]
+    review_manifest_sha256: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "selected_workers": self.selected_workers,
+            "selected_run_label": self.selected_run_label,
+            "input_runs": list(self.input_runs),
+            "resource_metrics": {
+                str(worker): {
+                    "run_wall_seconds": self.run_wall_seconds[index],
+                    "aggregate_peak_rss_gib": self.aggregate_peak_rss_gib[index],
+                    "speedup": self.speedups[index],
+                }
+                for index, worker in enumerate((1, 2, 4))
+            },
+            "input_raw_manifest_sha256": {
+                run_label: self.input_raw_manifest_sha256[index]
+                for index, run_label in enumerate(self.input_runs)
+            },
+            "review_manifest_sha256": self.review_manifest_sha256,
+        }
+
+
+def verify_job_parallel_selection(
+    raw_dir: Path,
+    prerequisite: Stage052PrerequisiteIdentity,
+) -> JobParallelSelectionIdentity:
+    """Recompute the accepted 1/2/4-worker choice from the signed D review."""
+
+    if (
+        prerequisite.run_label != raw_dir.resolve().name
+        or prerequisite.component != "job_parallel"
+        or prerequisite.status != "READY_FOR_STAGE052_NATIVE_KERNELS"
+    ):
+        raise ArtifactIntegrityError("job-parallel selection prerequisite identity mismatch")
+    review_path = raw_dir.resolve() / "review" / "review_manifest.json"
+    if _sha256(review_path) != prerequisite.review_manifest_sha256:
+        raise ArtifactIntegrityError("job-parallel selection review checksum mismatch")
+    try:
+        review = json.loads(review_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ArtifactIntegrityError("cannot read job-parallel selection review") from error
+    selected = review.get("selected_workers")
+    selected_run = review.get("selected_run_label")
+    input_runs = review.get("input_runs")
+    metrics = review.get("resource_metrics")
+    raw_manifest_hashes = review.get("input_raw_manifest_sha256")
+    if isinstance(selected, bool) or selected not in {2, 4}:
+        raise ArtifactIntegrityError("job-parallel selected_workers must be 2 or 4")
+    if (
+        not isinstance(input_runs, list)
+        or len(input_runs) != 3
+        or not all(isinstance(item, str) for item in input_runs)
+        or len(set(input_runs)) != 3
+    ):
+        raise ArtifactIntegrityError("job-parallel input_runs must contain three unique labels")
+    pattern = re.compile(r"^stage05\.2_job_parallel_(?:attempt|rerun)[0-9]{2}$")
+    if any(pattern.fullmatch(item) is None for item in input_runs):
+        raise ArtifactIntegrityError("job-parallel input run label is not canonical")
+    if not isinstance(metrics, dict) or set(metrics) != {"1", "2", "4"}:
+        raise ArtifactIntegrityError("job-parallel resource metrics must contain 1/2/4 workers")
+    if (
+        not isinstance(raw_manifest_hashes, dict)
+        or set(raw_manifest_hashes) != set(input_runs)
+        or any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in raw_manifest_hashes.values()
+        )
+    ):
+        raise ArtifactIntegrityError("job-parallel input raw manifest hashes are invalid")
+    for run_label in input_runs:
+        selected_dir = raw_dir.parent / run_label
+        selected_reader = ArtifactReader(selected_dir)
+        if _sha256(selected_reader.result.manifest_path) != raw_manifest_hashes[run_label]:
+            raise ArtifactIntegrityError(
+                f"job-parallel selection is stale for input raw manifest: {run_label}"
+            )
+    times: list[float] = []
+    rss: list[float] = []
+    speedups: list[float] = []
+    for worker in (1, 2, 4):
+        item = metrics[str(worker)]
+        if not isinstance(item, dict):
+            raise ArtifactIntegrityError("job-parallel resource metric must be an object")
+        try:
+            values = tuple(
+                float(item[field])
+                for field in (
+                    "run_wall_seconds",
+                    "aggregate_peak_rss_gib",
+                    "speedup",
+                )
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ArtifactIntegrityError("invalid job-parallel resource metric") from error
+        if any(not math.isfinite(value) or value <= 0.0 for value in values):
+            raise ArtifactIntegrityError("job-parallel resource metric must be finite and positive")
+        times.append(values[0])
+        rss.append(values[1])
+        speedups.append(values[2])
+    from evrptw.stage052 import select_worker_count
+
+    recomputed = select_worker_count(
+        dict(zip((1, 2, 4), times, strict=True)),
+        dict(zip((1, 2, 4), rss, strict=True)),
+    )
+    expected_selected_run = input_runs[(1, 2, 4).index(recomputed)]
+    if selected != recomputed or selected_run != expected_selected_run:
+        raise ArtifactIntegrityError("job-parallel top-level selection does not recompute")
+    gate = review.get("gates", {}).get("worker_selection")
+    if not isinstance(gate, dict) or any(
+        gate.get(field) != review.get(field)
+        for field in (
+            "selected_workers",
+            "selected_run_label",
+            "input_runs",
+            "resource_metrics",
+            "input_raw_manifest_sha256",
+        )
+    ):
+        raise ArtifactIntegrityError("job-parallel selection gate/top-level mismatch")
+    return JobParallelSelectionIdentity(
+        selected_workers=recomputed,
+        selected_run_label=expected_selected_run,
+        input_runs=tuple(input_runs),  # type: ignore[arg-type]
+        run_wall_seconds=tuple(times),  # type: ignore[arg-type]
+        aggregate_peak_rss_gib=tuple(rss),  # type: ignore[arg-type]
+        speedups=tuple(speedups),  # type: ignore[arg-type]
+        input_raw_manifest_sha256=tuple(
+            str(raw_manifest_hashes[run_label]) for run_label in input_runs
+        ),  # type: ignore[arg-type]
+        review_manifest_sha256=prerequisite.review_manifest_sha256,
+    )
 
 
 def verify_stage052_prerequisite(
@@ -94,25 +275,18 @@ def verify_stage052_prerequisite(
         not isinstance(gates, dict)
         or not gates
         or any(
-            not isinstance(gate, dict) or gate.get("passed") is not True
-            for gate in gates.values()
+            not isinstance(gate, dict) or gate.get("passed") is not True for gate in gates.values()
         )
     ):
         raise ArtifactIntegrityError("prerequisite review contains a failed or invalid gate")
-    files = review.get("files")
-    if not isinstance(files, dict) or set(files) != {
-        "review_findings.csv",
-        "review_report.md",
-    }:
-        raise ArtifactIntegrityError("prerequisite review file identity mismatch")
-    for name, checksum in files.items():
-        path = raw_dir / "review" / str(name)
-        if not path.is_file() or _sha256(path) != str(checksum):
-            raise ArtifactIntegrityError(f"prerequisite review checksum mismatch: {name}")
+    verify_stage052_review_files(raw_dir, review)
 
     reader = ArtifactReader(raw_dir)
     if reader.manifest.get("evidence_completeness") != "complete":
         raise ArtifactIntegrityError("prerequisite raw evidence is partial")
+    current_raw_manifest_sha256 = _sha256(reader.result.manifest_path)
+    if review.get("raw_manifest_sha256") != current_raw_manifest_sha256:
+        raise ArtifactIntegrityError("prerequisite review is stale for the current raw manifest")
     metadata_items = [
         item
         for item in reader.manifest.get("artifacts", [])
@@ -139,14 +313,13 @@ def verify_stage052_prerequisite(
     revision = str(metadata.get("repository_revision", ""))
     if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision):
         raise ArtifactIntegrityError("prerequisite repository revision is invalid")
-    manifest_path = raw_dir / "control" / f"{raw_dir.name}_manifest.json"
     return Stage052PrerequisiteIdentity(
         run_label=raw_dir.name,
         component=expected_component,
         status=expected_status,
         repository_revision=revision,
         configuration_sha256=config_checksum,
-        raw_manifest_sha256=_sha256(manifest_path),
+        raw_manifest_sha256=current_raw_manifest_sha256,
         review_manifest_sha256=_sha256(review_manifest_path),
     )
 
@@ -333,28 +506,18 @@ def validate_worker_ownership(
         normalized_values["run_wall_seconds"] <= 0.0
         or normalized_values["sample_interval_seconds"] != 0.05
         or normalized_values["aggregate_peak_rss_bytes"] <= 0.0
-        or normalized_values["peak_active_cores"]
-        < normalized_values["mean_active_cores"]
+        or normalized_values["peak_active_cores"] < normalized_values["mean_active_cores"]
     ):
         return False, "resource timing, RSS, or active-core values are invalid", ()
     sample_count = resource_summary.get("sample_count")
-    if (
-        not isinstance(sample_count, int)
-        or isinstance(sample_count, bool)
-        or sample_count < 2
-    ):
+    if not isinstance(sample_count, int) or isinstance(sample_count, bool) or sample_count < 2:
         return False, "resource sample_count is invalid", ()
     parent_pid = resource_summary.get("parent_pid")
     descendants = resource_summary.get("descendant_pids")
-    if (
-        not isinstance(parent_pid, int)
-        or isinstance(parent_pid, bool)
-        or parent_pid <= 0
-    ):
+    if not isinstance(parent_pid, int) or isinstance(parent_pid, bool) or parent_pid <= 0:
         return False, "resource parent_pid is invalid", ()
     if not isinstance(descendants, list) or any(
-        not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
-        for pid in descendants
+        not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 for pid in descendants
     ):
         return False, "resource descendant_pids are invalid", ()
     if len(descendants) != len(set(descendants)) or parent_pid in descendants:
@@ -445,9 +608,7 @@ def collect_performance_provenance(
         process_statuses[status] = process_statuses.get(status, 0) + 1
     return {
         "schema_version": "stage05.2-performance-provenance-v1",
-        "instance_sha256": {
-            name: _sha256(path) for name, path in sorted(instance_paths.items())
-        },
+        "instance_sha256": {name: _sha256(path) for name, path in sorted(instance_paths.items())},
         "warm_start": {"enabled": False, "source": None},
         "operator_surface": {
             "operator_profile": "stage02_constraint_guided",

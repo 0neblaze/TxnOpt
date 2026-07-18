@@ -6,8 +6,13 @@ import argparse
 import csv
 import hashlib
 import heapq
+import io
 import json
 import math
+import os
+import shutil
+import statistics
+import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
@@ -32,8 +37,10 @@ from evrptw.experiments.stage052_performance import (
     PERFORMANCE_INSTANCES,
     PERFORMANCE_SEEDS,
     axes_for_scope,
+    load_stage052_config,
     validate_stage052_run_label,
 )
+from evrptw.native_kernels import NativeKernelConfig
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.stage052 import (
@@ -46,10 +53,13 @@ from evrptw.stage052 import (
     select_worker_count,
 )
 from evrptw.stage052_evidence import (
+    JobParallelSelectionIdentity,
     Stage052PrerequisiteIdentity,
     abort_process_executor,
     validate_worker_ownership,
+    verify_job_parallel_selection,
     verify_stage052_prerequisite,
+    verify_stage052_review_files,
 )
 from evrptw.validation import validate_routes
 
@@ -238,16 +248,13 @@ def verify_stage052_review_prerequisite(
         )
     ):
         raise ValueError("prerequisite review contains a failed or invalid gate")
-    files = payload.get("files")
-    if not isinstance(files, Mapping) or set(files) != {
-        "review_findings.csv",
-        "review_report.md",
-    }:
-        raise ValueError("prerequisite review file identity mismatch")
-    for name, expected_checksum in files.items():
-        path = raw_dir / "review" / str(name)
-        if not path.is_file() or _sha256(path) != str(expected_checksum):
-            raise ValueError(f"prerequisite review checksum mismatch: {name}")
+    try:
+        verify_stage052_review_files(raw_dir, payload)
+    except ArtifactIntegrityError as error:
+        raise ValueError(str(error)) from error
+    raw_manifest_path = ArtifactReader(raw_dir).result.manifest_path
+    if payload.get("raw_manifest_sha256") != _sha256(raw_manifest_path):
+        raise ValueError("prerequisite review is stale for the current raw manifest")
 
 
 def replay_stage052_storage_semantics(
@@ -539,6 +546,166 @@ def validate_per_run_scope(
     return not failures, "; ".join(failures) if failures else "exact scope passed"
 
 
+def _render_review_findings(gates: Mapping[str, Mapping[str, object]]) -> bytes:
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=("gate", "passed", "detail"))
+    writer.writeheader()
+    for gate, result in gates.items():
+        writer.writerow(
+            {
+                "gate": gate,
+                "passed": result.get("passed"),
+                "detail": result.get("detail"),
+            }
+        )
+    return output.getvalue().encode("utf-8")
+
+
+def _render_review_report(
+    *,
+    run_label: str,
+    status: str,
+    gates: Mapping[str, Mapping[str, object]],
+) -> bytes:
+    return "\n".join(
+        [
+            f"# Stage 5.2 Review — {run_label}",
+            "",
+            f"**Status: {status}**",
+            "",
+            *[
+                f"- {name}: {'PASS' if result['passed'] else 'FAIL'} — {result['detail']}"
+                for name, result in gates.items()
+            ],
+            "",
+        ]
+    ).encode("utf-8")
+
+
+def _write_fsync(path: Path, payload: bytes) -> None:
+    with path.open("xb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _publish_review_generation(
+    *,
+    review_dir: Path,
+    findings: bytes,
+    report: bytes,
+    manifest: Mapping[str, object],
+) -> dict[str, Path]:
+    """Publish immutable review files behind one atomic manifest pointer."""
+
+    review_dir.mkdir(parents=True, exist_ok=True)
+    generation_id = hashlib.sha256(findings + b"\0" + report).hexdigest()
+    generations_dir = review_dir / "generations"
+    generations_dir.mkdir(exist_ok=True)
+    generation_dir = generations_dir / generation_id
+    findings_path = generation_dir / "review_findings.csv"
+    report_path = generation_dir / "review_report.md"
+    temporary_generation = generations_dir / f".{generation_id}.{uuid.uuid4().hex}.tmp"
+    if generation_dir.exists():
+        if (
+            not generation_dir.is_dir()
+            or not findings_path.is_file()
+            or findings_path.read_bytes() != findings
+            or not report_path.is_file()
+            or report_path.read_bytes() != report
+            or {path.name for path in generation_dir.iterdir()}
+            != {"review_findings.csv", "review_report.md"}
+        ):
+            raise ArtifactIntegrityError("review generation identity collision")
+    else:
+        temporary_generation.mkdir()
+        try:
+            _write_fsync(temporary_generation / findings_path.name, findings)
+            _write_fsync(temporary_generation / report_path.name, report)
+            _fsync_directory(temporary_generation)
+            os.replace(temporary_generation, generation_dir)
+            _fsync_directory(generations_dir)
+        finally:
+            if temporary_generation.exists():
+                shutil.rmtree(temporary_generation)
+
+    manifest_payload = dict(manifest)
+    manifest_payload["files"] = {
+        findings_path.relative_to(review_dir).as_posix(): hashlib.sha256(findings).hexdigest(),
+        report_path.relative_to(review_dir).as_posix(): hashlib.sha256(report).hexdigest(),
+    }
+    manifest_bytes = (json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    manifest_path = review_dir / "review_manifest.json"
+    temporary_manifest = review_dir / f".review_manifest.{uuid.uuid4().hex}.tmp"
+    try:
+        _write_fsync(temporary_manifest, manifest_bytes)
+        os.replace(temporary_manifest, manifest_path)
+        _fsync_directory(review_dir)
+    finally:
+        temporary_manifest.unlink(missing_ok=True)
+    return {
+        "review_report": report_path,
+        "review_findings": findings_path,
+        "review_manifest": manifest_path,
+    }
+
+
+def _archive_prior_review_generation(
+    raw_dir: Path,
+    *,
+    manifest_path: Path,
+    manifest_payload: Mapping[str, object],
+) -> str:
+    """Archive the accepted prior review before its atomic pointer is superseded."""
+
+    prior_sha256 = _sha256(manifest_path)
+    verified_files = verify_stage052_review_files(raw_dir, manifest_payload)
+    archived_payloads = {
+        "review_manifest.json": manifest_path.read_bytes(),
+        **{relative: path.read_bytes() for relative, path in verified_files.items()},
+    }
+    history_dir = raw_dir / "review" / "history"
+    history_dir.mkdir(exist_ok=True)
+    archive_dir = history_dir / prior_sha256
+    if archive_dir.exists():
+        if (
+            not archive_dir.is_dir()
+            or {
+                path.relative_to(archive_dir).as_posix()
+                for path in archive_dir.rglob("*")
+                if path.is_file()
+            }
+            != set(archived_payloads)
+            or any(
+                (archive_dir / name).read_bytes() != payload
+                for name, payload in archived_payloads.items()
+            )
+        ):
+            raise ArtifactIntegrityError("prior review archive identity collision")
+        return prior_sha256
+    temporary = history_dir / f".{prior_sha256}.{uuid.uuid4().hex}.tmp"
+    temporary.mkdir()
+    try:
+        for name, payload in archived_payloads.items():
+            (temporary / name).parent.mkdir(parents=True, exist_ok=True)
+            _write_fsync(temporary / name, payload)
+        _fsync_directory(temporary)
+        os.replace(temporary, archive_dir)
+        _fsync_directory(history_dir)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return prior_sha256
+
+
 def review_stage052(
     *,
     raw_dir: Path,
@@ -550,10 +717,22 @@ def review_stage052(
 ) -> dict[str, Path]:
     selected = Stage052Component(component)
     validate_stage052_run_label(raw_dir.name, selected)
+    review_lineage = _prior_review_manifest_hashes(raw_dir)
     reader = ArtifactReader(raw_dir)
     manifest = reader.manifest
     if manifest.get("evidence_completeness") != "complete":
         raise ArtifactIntegrityError("partial Stage 5.2 evidence cannot be reviewed")
+    if selected is Stage052Component.ACCELERATOR_PILOT and any(
+        isinstance(item, dict) and item.get("artifact_type") == "accelerator_decision"
+        for item in manifest.get("artifacts", [])
+    ):
+        return _review_accelerator_decision_only(
+            raw_dir=raw_dir,
+            reader=reader,
+            benchmark_dir=benchmark_dir,
+            scope=scope,
+            prerequisite_dir=prerequisite_dir,
+        )
     per_run_ref = _one_artifact(reader, "per_run_results")
     rows = _read_csv(raw_dir / str(per_run_ref["relative_path"]))
     metadata_ref = _one_artifact(reader, "manifest_metadata")
@@ -581,6 +760,7 @@ def review_stage052(
         },
     }
     prerequisite_identity: Stage052PrerequisiteIdentity | None = None
+    job_parallel_selection: JobParallelSelectionIdentity | None = None
     prerequisite_contract = {
         Stage052Component.JOB_PARALLEL: (
             "artifact_streaming",
@@ -620,7 +800,11 @@ def review_stage052(
                 }
             else:
                 bound_prerequisite = metadata.get("component_prerequisite")
-                binding_passed = bound_prerequisite == prerequisite_identity.to_dict()
+                binding_passed = _prerequisite_binding_matches(
+                    bound_prerequisite,
+                    prerequisite_identity,
+                    prerequisite_dir,
+                )
                 gates["component_prerequisite"] = {
                     "passed": binding_passed,
                     "detail": (
@@ -629,6 +813,34 @@ def review_stage052(
                         else "producer metadata is not bound to the reviewed prerequisite"
                     ),
                 }
+                if selected is Stage052Component.NATIVE_KERNELS:
+                    try:
+                        job_parallel_selection = verify_job_parallel_selection(
+                            prerequisite_dir, prerequisite_identity
+                        )
+                    except (ArtifactIntegrityError, ValueError) as error:
+                        gates["job_parallel_selection"] = {
+                            "passed": False,
+                            "detail": str(error),
+                        }
+                    else:
+                        selected_worker_rows = {
+                            _strict_int(row["worker_count"], "worker_count") for row in rows
+                        }
+                        binding_passed = metadata.get(
+                            "job_parallel_selection"
+                        ) == job_parallel_selection.to_dict() and selected_worker_rows == {
+                            job_parallel_selection.selected_workers
+                        }
+                        gates["job_parallel_selection"] = {
+                            "passed": binding_passed,
+                            "detail": (
+                                f"selected_workers={job_parallel_selection.selected_workers}; "
+                                f"selected_run={job_parallel_selection.selected_run_label}"
+                                if binding_passed
+                                else "native producer is not bound to D selected workers/run"
+                            ),
+                        }
     gates.update(
         _component_gates(
             selected,
@@ -637,6 +849,7 @@ def review_stage052(
             comparison_dirs=comparison_dirs,
             prerequisite_dir=prerequisite_dir,
             prerequisite_identity=prerequisite_identity,
+            job_parallel_selection=job_parallel_selection,
             benchmark_dir=benchmark_dir,
         )
     )
@@ -652,68 +865,675 @@ def review_stage052(
                 ),
             }
     review_dir = raw_dir / "review"
-    review_dir.mkdir(parents=True, exist_ok=True)
-    findings_path = review_dir / "review_findings.csv"
-    with findings_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=("gate", "passed", "detail"))
-        writer.writeheader()
-        for gate, result in gates.items():
-            writer.writerow(
-                {
-                    "gate": gate,
-                    "passed": result.get("passed"),
-                    "detail": result.get("detail"),
-                }
-            )
-    report_path = review_dir / "review_report.md"
-    report_path.write_text(
-        "\n".join(
-            [
-                f"# Stage 5.2 Review — {raw_dir.name}",
-                "",
-                f"**Status: {status}**",
-                "",
-                *[
-                    f"- {name}: {'PASS' if result['passed'] else 'FAIL'} — {result['detail']}"
-                    for name, result in gates.items()
-                ],
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    review_manifest_path = review_dir / "review_manifest.json"
     review_manifest: dict[str, object] = {
-                "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
-                "run_label": raw_dir.name,
-                "component": selected.value,
-                "scope": scope,
-                "status": status,
-                "gates": gates,
-                "files": {
-                    findings_path.name: _sha256(findings_path),
-                    report_path.name: _sha256(report_path),
-                },
-            }
+        "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
+        "run_label": raw_dir.name,
+        "component": selected.value,
+        "scope": scope,
+        "status": status,
+        "raw_manifest_sha256": _sha256(reader.result.manifest_path),
+        "review_manifest_lineage_sha256": review_lineage,
+        "gates": gates,
+    }
     worker_gate = gates.get("worker_selection", {})
-    if (
-        passed
-        and selected is Stage052Component.JOB_PARALLEL
-        and worker_gate.get("passed") is True
-    ):
+    if passed and selected is Stage052Component.JOB_PARALLEL and worker_gate.get("passed") is True:
         review_manifest["selected_workers"] = worker_gate.get("selected_workers")
         review_manifest["selected_run_label"] = worker_gate.get("selected_run_label")
         review_manifest["input_runs"] = worker_gate.get("input_runs")
+        review_manifest["input_raw_manifest_sha256"] = worker_gate.get("input_raw_manifest_sha256")
         review_manifest["resource_metrics"] = worker_gate.get("resource_metrics")
-    review_manifest_path.write_text(
-        json.dumps(review_manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    if (
+        passed
+        and selected is Stage052Component.NATIVE_KERNELS
+        and job_parallel_selection is not None
+    ):
+        review_manifest["selected_workers"] = job_parallel_selection.selected_workers
+        review_manifest["performance_predecessor"] = job_parallel_selection.selected_run_label
+        review_manifest["native_configuration"] = NativeKernelConfig().to_dict()
+    return _publish_review_generation(
+        review_dir=review_dir,
+        findings=_render_review_findings(gates),
+        report=_render_review_report(run_label=raw_dir.name, status=status, gates=gates),
+        manifest=review_manifest,
     )
-    return {
-        "review_report": report_path,
-        "review_findings": findings_path,
-        "review_manifest": review_manifest_path,
+
+
+def _review_accelerator_decision_only(
+    *,
+    raw_dir: Path,
+    reader: ArtifactReader,
+    benchmark_dir: Path,
+    scope: str,
+    prerequisite_dir: Path | None,
+) -> dict[str, Path]:
+    """Independently recompute a below-threshold F decision without GPU rows."""
+
+    del benchmark_dir
+    review_lineage = _prior_review_manifest_hashes(raw_dir)
+    gates: dict[str, dict[str, object]] = {}
+    artifacts = [item for item in reader.manifest.get("artifacts", []) if isinstance(item, dict)]
+    artifact_types = [str(item.get("artifact_type", "")) for item in artifacts]
+    allowed = {"manifest_metadata", "config", "accelerator_decision"}
+    mutually_exclusive = (
+        set(artifact_types) == allowed
+        and artifact_types.count("manifest_metadata") == 1
+        and artifact_types.count("config") == 1
+        and artifact_types.count("accelerator_decision") == 1
+    )
+    gates["mutually_exclusive_schema"] = {
+        "passed": mutually_exclusive,
+        "detail": (
+            "decision-only artifact set contains no solver/GPU rows"
+            if mutually_exclusive
+            else f"decision-only artifact set is invalid: {artifact_types}"
+        ),
     }
+    metadata = reader.read_json(str(_one_artifact(reader, "manifest_metadata")["relative_path"]))
+    metadata_passed = (
+        scope == "performance"
+        and metadata.get("scope") == "performance"
+        and metadata.get("component") == Stage052Component.ACCELERATOR_PILOT.value
+        and metadata.get("optimization_profile") == "native"
+        and metadata.get("native_kernel_config") == NativeKernelConfig().to_dict()
+        and metadata.get("accelerator_decision_mode") == "decision_only"
+    )
+    gates["decision_metadata"] = {
+        "passed": metadata_passed,
+        "detail": "decision-only native metadata passed" if metadata_passed else "invalid metadata",
+    }
+    prerequisite_identity: Stage052PrerequisiteIdentity | None = None
+    if prerequisite_dir is None:
+        gates["component_prerequisite"] = {
+            "passed": False,
+            "detail": "accelerator decision requires accepted E prerequisite",
+        }
+    else:
+        try:
+            prerequisite_identity = verify_stage052_prerequisite(
+                prerequisite_dir,
+                expected_component=Stage052Component.NATIVE_KERNELS.value,
+                expected_status="READY_FOR_STAGE052_ACCELERATOR_DECISION",
+            )
+        except (ArtifactIntegrityError, ValueError) as error:
+            gates["component_prerequisite"] = {"passed": False, "detail": str(error)}
+        else:
+            binding_passed = _prerequisite_binding_matches(
+                metadata.get("component_prerequisite"),
+                prerequisite_identity,
+                prerequisite_dir,
+            )
+            gates["component_prerequisite"] = {
+                "passed": binding_passed,
+                "detail": (
+                    prerequisite_identity.run_label
+                    if binding_passed
+                    else "decision metadata is not bound to accepted E"
+                ),
+            }
+    decision = reader.read_json(str(_one_artifact(reader, "accelerator_decision")["relative_path"]))
+    expected_keys = {
+        "schema_version",
+        "decision_mode",
+        "decision",
+        "threshold",
+        "median_batch_occupancy",
+        "input_count",
+        "inputs",
+        "native_prerequisite",
+        "gpu_rows_present",
+        "fallback_used",
+    }
+    schema_passed = (
+        set(decision) == expected_keys
+        and decision.get("schema_version") == "stage05.2-accelerator-decision-v1"
+        and decision.get("decision_mode") == "decision_only"
+        and decision.get("decision") == "GPU_NOT_JUSTIFIED"
+        and decision.get("threshold") == 32.0
+        and decision.get("input_count") == 9
+        and decision.get("gpu_rows_present") is False
+        and decision.get("fallback_used") is False
+        and prerequisite_identity is not None
+        and decision.get("native_prerequisite") == prerequisite_identity.to_dict()
+    )
+    gates["decision_schema"] = {
+        "passed": schema_passed,
+        "detail": "exclusive decision-only schema passed" if schema_passed else "invalid schema",
+    }
+    recomputed_inputs: list[dict[str, object]] = []
+    recomputed_median = math.inf
+    if prerequisite_identity is not None and prerequisite_dir is not None:
+        try:
+            recomputed_inputs, recomputed_median = _recompute_native_occupancies(prerequisite_dir)
+        except (ArtifactIntegrityError, KeyError, TypeError, ValueError) as error:
+            gates["occupancy_recomputation"] = {
+                "passed": False,
+                "detail": str(error),
+            }
+        else:
+            observed_median = _strict_float(decision.get("median_batch_occupancy"))
+            occupancy_passed = (
+                decision.get("inputs") == recomputed_inputs
+                and math.isclose(observed_median, recomputed_median, rel_tol=0.0, abs_tol=1e-12)
+                and recomputed_median < 32.0
+            )
+            gates["occupancy_recomputation"] = {
+                "passed": occupancy_passed,
+                "detail": (
+                    f"median={recomputed_median:.12g} < 32"
+                    if occupancy_passed
+                    else "decision inputs/median do not match accepted E evidence"
+                ),
+            }
+    else:
+        gates["occupancy_recomputation"] = {
+            "passed": False,
+            "detail": "accepted E evidence is unavailable",
+        }
+    passed = all(bool(gate["passed"]) for gate in gates.values())
+    status = _NEXT_STATUS[Stage052Component.ACCELERATOR_PILOT] if passed else NOT_READY
+    review_dir = raw_dir / "review"
+    manifest = {
+        "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
+        "run_label": raw_dir.name,
+        "component": Stage052Component.ACCELERATOR_PILOT.value,
+        "scope": scope,
+        "status": status,
+        "raw_manifest_sha256": _sha256(reader.result.manifest_path),
+        "review_manifest_lineage_sha256": review_lineage,
+        "accelerator_decision": "GPU_NOT_JUSTIFIED" if passed else "NOT_READY",
+        "selected_backend": "native_cpu" if passed else None,
+        "gates": gates,
+    }
+    return _publish_review_generation(
+        review_dir=review_dir,
+        findings=_render_review_findings(gates),
+        report=_render_review_report(run_label=raw_dir.name, status=status, gates=gates),
+        manifest=manifest,
+    )
+
+
+def _recompute_native_occupancies(raw_dir: Path) -> tuple[list[dict[str, object]], float]:
+    reader = ArtifactReader(raw_dir)
+    expected = {
+        (instance, seed)
+        for instance in ("c101_21", "r101_21", "rc101_21")
+        for seed in PERFORMANCE_SEEDS
+    }
+    expected_all = {
+        (instance, seed) for instance in PERFORMANCE_INSTANCES for seed in PERFORMANCE_SEEDS
+    }
+    values: dict[tuple[str, int], float] = {}
+    observed_all: set[tuple[str, int]] = set()
+    references = [
+        item
+        for item in reader.manifest.get("artifacts", [])
+        if isinstance(item, Mapping) and item.get("artifact_type") == "raw"
+    ]
+    for reference in references:
+        raw = reader.read_json(str(reference.get("relative_path", "")))
+        if not isinstance(raw, Mapping):
+            raise ArtifactIntegrityError("E occupancy raw payload must be an object")
+        identity = (str(raw.get("instance", "")), _strict_int(raw.get("seed"), "seed"))
+        if identity in observed_all:
+            raise ArtifactIntegrityError(f"duplicate E raw occupancy identity: {identity}")
+        observed_all.add(identity)
+        if (
+            raw.get("component") != Stage052Component.NATIVE_KERNELS.value
+            or raw.get("scope") != "performance"
+        ):
+            raise ArtifactIntegrityError(f"invalid E raw occupancy source: {identity}")
+        if identity not in expected:
+            continue
+        axes = raw.get("axes")
+        fixed = axes.get("fixed_work") if isinstance(axes, Mapping) else None
+        if (
+            not isinstance(fixed, Mapping)
+            or fixed.get("validator_passed") is not True
+            or fixed.get("valid") is not True
+        ):
+            raise ArtifactIntegrityError(f"invalid E fixed-work raw axis: {identity}")
+        backend = fixed.get("backend_metrics")
+        if not isinstance(backend, Mapping):
+            raise ArtifactIntegrityError(f"missing E raw backend metrics: {identity}")
+        exact_calls = _strict_int(backend.get("exact_calls"), "exact_calls")
+        batch_launches = _strict_int(backend.get("batch_launches"), "batch_launches")
+        raw_occupancies = backend.get("launch_occupancies")
+        if not isinstance(raw_occupancies, list):
+            raise ArtifactIntegrityError(f"missing E raw launch occupancies: {identity}")
+        occupancies = [_strict_int(value, "launch_occupancy") for value in raw_occupancies]
+        if (
+            exact_calls <= 0
+            or batch_launches <= 0
+            or any(value <= 0 for value in occupancies)
+            or len(occupancies) != batch_launches
+            or sum(occupancies) != exact_calls
+        ):
+            raise ArtifactIntegrityError(f"invalid E raw occupancy counters: {identity}")
+        values[identity] = statistics.median(occupancies)
+    if observed_all != expected_all:
+        raise ArtifactIntegrityError("accepted E raw shard scope is not exactly 12 bundles")
+    if set(values) != expected:
+        raise ArtifactIntegrityError("accepted E occupancy scope is not exactly 9 values")
+    inputs = [
+        {
+            "instance": instance,
+            "seed": seed,
+            "axis": "fixed_work",
+            "median_batch_occupancy": values[(instance, seed)],
+        }
+        for instance, seed in sorted(values)
+    ]
+    return inputs, statistics.median(values.values())
+
+
+def _validate_native_shard_timing_order(
+    shard: tuple[str, int],
+    shard_timings: Sequence[Mapping[str, object]],
+) -> None:
+    declared_order = tuple(axis.name for axis in axes_for_scope("performance"))
+    by_axis = {str(timing.get("axis", "")): timing for timing in shard_timings}
+    if len(by_axis) != len(shard_timings) or not set(by_axis).issubset(declared_order):
+        raise ArtifactIntegrityError(f"native shard timing axis identity is invalid: {shard}")
+    ordered = [by_axis[name] for name in declared_order if name in by_axis]
+    for previous, current in zip(ordered, ordered[1:], strict=False):
+        previous_completed = _strict_int(previous.get("axis_completed_ns"), "axis_completed_ns")
+        current_started = _strict_int(current.get("axis_started_ns"), "axis_started_ns")
+        if previous_completed > current_started:
+            raise ArtifactIntegrityError(f"native shard timing axes overlap: {shard}")
+    finalization_starts = {
+        _strict_int(timing.get("finalize_started_ns"), "finalize_started_ns") for timing in ordered
+    }
+    if len(finalization_starts) != 1 or (
+        ordered
+        and max(
+            _strict_int(timing.get("axis_completed_ns"), "axis_completed_ns") for timing in ordered
+        )
+        > next(iter(finalization_starts))
+    ):
+        raise ArtifactIntegrityError(f"native shard finalization precedes axis completion: {shard}")
+
+
+def _audit_native_execution(
+    raw_dir: Path,
+    rows: Sequence[Mapping[str, object]],
+) -> tuple[bool, str]:
+    """Cross-check native counters against raw backend and trace-derived work."""
+
+    try:
+        reader = ArtifactReader(raw_dir)
+        manifest = reader.manifest
+        if (
+            manifest.get("run_label") != raw_dir.name
+            or manifest.get("component") != Stage052Component.NATIVE_KERNELS.value
+            or manifest.get("status") != "complete"
+            or manifest.get("evidence_completeness") != "complete"
+            or manifest.get("storage_policy_version") != "artifact-storage-v2"
+            or manifest.get("artifact_status") != {"failure": "not_applicable"}
+        ):
+            raise ArtifactIntegrityError("native parent manifest is not complete and canonical")
+        if any(
+            isinstance(item, Mapping) and item.get("artifact_type") == "failure"
+            for item in manifest.get("artifacts", [])
+        ):
+            raise ArtifactIntegrityError("native evidence contains a shard failure artifact")
+        row_by_axis: dict[tuple[str, int, str], Mapping[str, object]] = {}
+        for row in rows:
+            identity = (
+                str(row["instance"]),
+                _strict_int(row["seed"], "seed"),
+                str(row["axis"]),
+            )
+            if identity in row_by_axis:
+                raise ArtifactIntegrityError(f"duplicate native per-run identity: {identity}")
+            row_by_axis[identity] = row
+
+        payloads: dict[str, dict[tuple[str, int], Mapping[str, object]]] = {
+            "raw": {},
+            "solution": {},
+            "trace": {},
+        }
+        for artifact_type, by_shard in payloads.items():
+            references = [
+                item
+                for item in reader.manifest.get("artifacts", [])
+                if isinstance(item, Mapping) and item.get("artifact_type") == artifact_type
+            ]
+            for reference in references:
+                relative = str(reference.get("relative_path", ""))
+                parts = Path(relative).parts
+                shard_identity = (parts[0], _strict_int(parts[1], "seed"))
+                if shard_identity in by_shard:
+                    raise ArtifactIntegrityError(
+                        f"duplicate native {artifact_type} shard: {shard_identity}"
+                    )
+                payload = reader.read_json(relative)
+                if not isinstance(payload, Mapping):
+                    raise ArtifactIntegrityError(
+                        f"native {artifact_type} payload is not an object: {shard_identity}"
+                    )
+                by_shard[shard_identity] = payload
+        expected_shards = {(identity[0], identity[1]) for identity in row_by_axis}
+        canonical_ordinals = {
+            identity: ordinal
+            for ordinal, identity in enumerate(
+                (instance, seed) for instance in PERFORMANCE_INSTANCES for seed in PERFORMANCE_SEEDS
+            )
+        }
+        if any(set(by_shard) != expected_shards for by_shard in payloads.values()):
+            raise ArtifactIntegrityError("native raw/trace shard scope mismatch")
+
+        timing_reference = _one_artifact(reader, "timing_evidence")
+        timing_payload = reader.read_json(str(timing_reference["relative_path"]))
+        raw_timing_rows = timing_payload.get("rows")
+        if (
+            timing_payload.get("schema_version") != "stage05.2-timing-evidence-v1"
+            or timing_payload.get("run_label") != raw_dir.name
+            or timing_payload.get("component") != Stage052Component.NATIVE_KERNELS.value
+            or not isinstance(raw_timing_rows, list)
+        ):
+            raise ArtifactIntegrityError("native timing evidence identity is invalid")
+        timing_by_axis: dict[tuple[str, int, str], Mapping[str, object]] = {}
+        for timing in raw_timing_rows:
+            if not isinstance(timing, Mapping):
+                raise ArtifactIntegrityError("native timing evidence row is invalid")
+            timing_identity = (
+                str(timing.get("instance", "")),
+                _strict_int(timing.get("seed"), "seed"),
+                str(timing.get("axis", "")),
+            )
+            if timing_identity in timing_by_axis:
+                raise ArtifactIntegrityError(f"duplicate native timing identity: {timing_identity}")
+            timing_by_axis[timing_identity] = timing
+        if set(timing_by_axis) != set(row_by_axis):
+            raise ArtifactIntegrityError("native timing/per-run scope mismatch")
+        for shard in expected_shards:
+            shard_timings = [
+                timing for identity, timing in timing_by_axis.items() if identity[:2] == shard
+            ]
+            _validate_native_shard_timing_order(shard, shard_timings)
+            totals = {
+                (
+                    _strict_int(timing.get("finalize_started_ns"), "finalize_started_ns"),
+                    _strict_int(timing.get("finalize_completed_ns"), "finalize_completed_ns"),
+                    _strict_int(timing.get("total_event_count"), "total_event_count"),
+                    _strict_int(timing.get("axis_count"), "axis_count"),
+                )
+                for timing in shard_timings
+            }
+            if len(totals) != 1:
+                raise ArtifactIntegrityError(f"native shard timing totals disagree: {shard}")
+            _start, _completed, total_events, axis_count = next(iter(totals))
+            if axis_count != len(shard_timings) or total_events != sum(
+                _strict_int(timing.get("axis_event_count"), "axis_event_count")
+                for timing in shard_timings
+            ):
+                raise ArtifactIntegrityError(f"native shard timing allocation is invalid: {shard}")
+
+        audited: set[tuple[str, int, str]] = set()
+        for shard in sorted(expected_shards):
+            raw_payload = payloads["raw"][shard]
+            solution_payload = payloads["solution"][shard]
+            trace_payload = payloads["trace"][shard]
+            event_identity = trace_payload.get("event_identity")
+            if (
+                raw_payload.get("run_label") != raw_dir.name
+                or raw_payload.get("component") != Stage052Component.NATIVE_KERNELS.value
+                or raw_payload.get("scope") != "performance"
+                or raw_payload.get("instance") != shard[0]
+                or raw_payload.get("seed") != shard[1]
+                or solution_payload.get("instance") != shard[0]
+                or solution_payload.get("seed") != shard[1]
+                or not isinstance(event_identity, Mapping)
+                or event_identity
+                != {
+                    "shard_ordinal": canonical_ordinals.get(shard),
+                    "local_field": "event_id",
+                }
+            ):
+                raise ArtifactIntegrityError(
+                    f"native shard producer or trace event identity mismatch: {shard}"
+                )
+            raw_axes = raw_payload.get("axes")
+            solution_axes = solution_payload.get("axes")
+            trace_axes = trace_payload.get("axes")
+            if not all(
+                isinstance(value, Mapping) for value in (raw_axes, solution_axes, trace_axes)
+            ):
+                raise ArtifactIntegrityError(f"native raw/solution/trace axes are missing: {shard}")
+            assert isinstance(raw_axes, Mapping)
+            assert isinstance(solution_axes, Mapping)
+            assert isinstance(trace_axes, Mapping)
+            if set(raw_axes) != set(solution_axes) or set(raw_axes) != set(trace_axes):
+                raise ArtifactIntegrityError(f"native raw/solution/trace axis mismatch: {shard}")
+            for axis, raw_axis in raw_axes.items():
+                axis_identity = (shard[0], shard[1], str(axis))
+                current_row = row_by_axis.get(axis_identity)
+                solution_axis = solution_axes.get(axis)
+                trace_axis = trace_axes.get(axis)
+                if (
+                    current_row is None
+                    or not isinstance(raw_axis, Mapping)
+                    or not isinstance(solution_axis, Mapping)
+                    or not isinstance(trace_axis, Mapping)
+                ):
+                    raise ArtifactIntegrityError(
+                        f"native axis evidence is incomplete: {axis_identity}"
+                    )
+                reconciliation = raw_axis.get("trace_reconciliation")
+                checks = (
+                    reconciliation.get("checks") if isinstance(reconciliation, Mapping) else None
+                )
+                if (
+                    raw_axis.get("valid") is not True
+                    or raw_axis.get("validator_passed") is not True
+                    or solution_axis.get("feasible") is not True
+                    or raw_axis.get("objective_key") != solution_axis.get("objective_key")
+                    or not isinstance(reconciliation, Mapping)
+                    or reconciliation.get("status") != "pass"
+                    or not isinstance(checks, Mapping)
+                    or not checks
+                    or any(value is not True for value in checks.values())
+                ):
+                    raise ArtifactIntegrityError(
+                        f"native validity/trace reconciliation failed: {axis_identity}"
+                    )
+                backend = raw_axis.get("backend_metrics")
+                result_summary = trace_axis.get("result_summary")
+                if not isinstance(backend, Mapping) or not isinstance(result_summary, Mapping):
+                    raise ArtifactIntegrityError(
+                        f"native backend/result summary is missing: {axis_identity}"
+                    )
+                screening = result_summary.get("screening_statistics")
+                incremental = result_summary.get("cache_incremental_statistics")
+                if not isinstance(screening, Mapping) or not isinstance(incremental, Mapping):
+                    raise ArtifactIntegrityError(
+                        f"native screening/incremental summary is missing: {axis_identity}"
+                    )
+
+                exact_invocations = _strict_int(
+                    backend.get("native_invocations"), "native_invocations"
+                )
+                exact_calls = _strict_int(backend.get("exact_calls"), "exact_calls")
+                work_batches = _strict_int(backend.get("work_batches"), "work_batches")
+                batch_launches = _strict_int(backend.get("batch_launches"), "batch_launches")
+                raw_occupancies = backend.get("launch_occupancies")
+                if not isinstance(raw_occupancies, list):
+                    raise ArtifactIntegrityError(
+                        f"native launch occupancies are missing: {axis_identity}"
+                    )
+                launch_occupancies = [
+                    _strict_int(value, "launch_occupancy") for value in raw_occupancies
+                ]
+                exact_fallbacks = _strict_int(backend.get("native_fallbacks"), "native_fallbacks")
+                exact_seconds = _strict_float(backend.get("native_kernel_seconds"))
+                if (
+                    exact_invocations <= 0
+                    or exact_calls <= 0
+                    or exact_invocations != work_batches
+                    or exact_invocations != batch_launches
+                    or len(launch_occupancies) != batch_launches
+                    or any(value <= 0 for value in launch_occupancies)
+                    or sum(launch_occupancies) != exact_calls
+                    or exact_fallbacks != 0
+                    or exact_seconds <= 0.0
+                ):
+                    raise ArtifactIntegrityError(
+                        f"native exact counters do not reconcile: {axis_identity}"
+                    )
+
+                screening_calls = _strict_int(screening.get("screening_calls"), "screening_calls")
+                screening_cache_hits = _strict_int(
+                    screening.get("screening_cache_hits"), "screening_cache_hits"
+                )
+                screen_invocations = _strict_int(
+                    screening.get("native_screening_invocations"),
+                    "native_screening_invocations",
+                )
+                screen_seconds = _strict_float(screening.get("native_screening_seconds"))
+                expected_screen_invocations = screening_calls - screening_cache_hits
+                if (
+                    screen_invocations <= 0
+                    or screen_invocations != expected_screen_invocations
+                    or screen_seconds <= 0.0
+                ):
+                    raise ArtifactIntegrityError(
+                        f"native screening counters do not reconcile: {axis_identity}"
+                    )
+
+                propagation_invocations = _strict_int(
+                    screening.get("native_propagation_invocations"),
+                    "native_propagation_invocations",
+                )
+                propagation_seconds = _strict_float(screening.get("native_propagation_seconds"))
+                expected_propagation_invocations = _strict_int(
+                    incremental.get("incremental_propagations"),
+                    "incremental_propagations",
+                ) + _strict_int(
+                    incremental.get("incremental_fallbacks"),
+                    "incremental_fallbacks",
+                )
+                protocol_fallbacks = _strict_int(
+                    screening.get("native_protocol_fallbacks"),
+                    "native_protocol_fallbacks",
+                )
+                if (
+                    propagation_invocations <= 0
+                    or propagation_invocations != expected_propagation_invocations
+                    or propagation_seconds <= 0.0
+                    or protocol_fallbacks != 0
+                ):
+                    raise ArtifactIntegrityError(
+                        f"native propagation counters do not reconcile: {axis_identity}"
+                    )
+
+                integer_bindings = {
+                    "native_invocations": exact_invocations,
+                    "native_fallbacks": exact_fallbacks,
+                    "native_screening_invocations": screen_invocations,
+                    "native_propagation_invocations": propagation_invocations,
+                    "native_protocol_fallbacks": protocol_fallbacks,
+                    "batch_launches": work_batches,
+                    "exact_started_calls": exact_calls,
+                    "exact_completed_calls": _strict_int(
+                        backend.get("completed_calls"), "completed_calls"
+                    ),
+                }
+                raw_trace_bindings = {
+                    "started_calls": result_summary.get("exact_started_calls"),
+                    "completed_calls": result_summary.get("exact_completed_calls"),
+                    "effective_iterations": result_summary.get("effective_iterations"),
+                    "termination_reason": result_summary.get("termination_reason"),
+                }
+                if any(
+                    raw_axis.get(field) != expected
+                    for field, expected in raw_trace_bindings.items()
+                ):
+                    raise ArtifactIntegrityError(
+                        f"native raw/trace summary mismatch: {axis_identity}"
+                    )
+                float_bindings = {
+                    "native_kernel_seconds": exact_seconds,
+                    "native_screening_seconds": screen_seconds,
+                    "native_propagation_seconds": propagation_seconds,
+                    "median_batch_occupancy": statistics.median(launch_occupancies),
+                }
+                timing = timing_by_axis[axis_identity]
+                solver_started_ns = _strict_int(
+                    timing.get("solver_started_ns"), "solver_started_ns"
+                )
+                solver_completed_ns = _strict_int(
+                    timing.get("solver_completed_ns"), "solver_completed_ns"
+                )
+                axis_started_ns = _strict_int(timing.get("axis_started_ns"), "axis_started_ns")
+                axis_completed_ns = _strict_int(
+                    timing.get("axis_completed_ns"), "axis_completed_ns"
+                )
+                finalize_started_ns = _strict_int(
+                    timing.get("finalize_started_ns"), "finalize_started_ns"
+                )
+                finalize_completed_ns = _strict_int(
+                    timing.get("finalize_completed_ns"), "finalize_completed_ns"
+                )
+                axis_event_count = _strict_int(timing.get("axis_event_count"), "axis_event_count")
+                total_event_count = _strict_int(
+                    timing.get("total_event_count"), "total_event_count"
+                )
+                axis_count = _strict_int(timing.get("axis_count"), "axis_count")
+                if (
+                    axis_started_ns != solver_started_ns
+                    or solver_completed_ns <= solver_started_ns
+                    or axis_completed_ns < solver_completed_ns
+                    or finalize_completed_ns <= finalize_started_ns
+                    or axis_event_count < 0
+                    or total_event_count < 0
+                    or axis_count <= 0
+                ):
+                    raise ArtifactIntegrityError(
+                        f"native monotonic timing interval is invalid: {axis_identity}"
+                    )
+                solver_seconds = (solver_completed_ns - solver_started_ns) / 1_000_000_000
+                post_solver_seconds = (axis_completed_ns - solver_completed_ns) / 1_000_000_000
+                finalization_seconds = (finalize_completed_ns - finalize_started_ns) / 1_000_000_000
+                finalization_share = (
+                    finalization_seconds * axis_event_count / total_event_count
+                    if total_event_count
+                    else finalization_seconds / axis_count
+                )
+                persistence_seconds = post_solver_seconds + finalization_share
+                float_bindings.update(
+                    {
+                        "solver_seconds": solver_seconds,
+                        "artifact_persistence_seconds": persistence_seconds,
+                        "end_to_end_seconds": (
+                            (axis_completed_ns - axis_started_ns) / 1_000_000_000
+                            + finalization_share
+                        ),
+                    }
+                )
+                if any(
+                    _strict_int(current_row.get(field), field) != expected
+                    for field, expected in integer_bindings.items()
+                ) or any(
+                    not math.isclose(
+                        _strict_float(current_row.get(field)),
+                        expected,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                    for field, expected in float_bindings.items()
+                ):
+                    raise ArtifactIntegrityError(
+                        f"native per-run/raw/trace binding mismatch: {axis_identity}"
+                    )
+                audited.add(axis_identity)
+        if audited != set(row_by_axis):
+            raise ArtifactIntegrityError("native execution audit did not cover every axis")
+    except (ArtifactIntegrityError, IndexError, KeyError, TypeError, ValueError) as error:
+        return False, str(error)
+    return (
+        True,
+        f"{len(audited)} axes reconcile per-run, raw backend, and trace-derived native work",
+    )
 
 
 def _validate_formal_scope(
@@ -789,6 +1609,7 @@ def _component_gates(
     comparison_dirs: Sequence[Path],
     prerequisite_dir: Path | None,
     prerequisite_identity: Stage052PrerequisiteIdentity | None,
+    job_parallel_selection: JobParallelSelectionIdentity | None,
     benchmark_dir: Path,
 ) -> dict[str, dict[str, object]]:
     if component is Stage052Component.PERF_BASELINE:
@@ -801,10 +1622,7 @@ def _component_gates(
                 else "instrumentation changed fixed-work semantics",
             }
         }
-    if component in {
-        Stage052Component.HOT_PATH,
-        Stage052Component.NATIVE_KERNELS,
-    }:
+    if component in {Stage052Component.HOT_PATH, Stage052Component.NATIVE_KERNELS}:
         if len(comparison_dirs) != 1:
             return {
                 "performance_promotion": {
@@ -812,15 +1630,135 @@ def _component_gates(
                     "detail": "one predecessor required",
                 }
             }
+        if component is Stage052Component.NATIVE_KERNELS:
+            if job_parallel_selection is None:
+                return {
+                    "native_configuration": {
+                        "passed": False,
+                        "detail": "accepted D worker selection is required",
+                    }
+                }
+            comparison = comparison_dirs[0].resolve()
+            expected_comparison = (
+                prerequisite_dir.resolve().parent / job_parallel_selection.selected_run_label
+                if prerequisite_dir is not None
+                else None
+            )
+            if (
+                prerequisite_dir is None
+                or expected_comparison is None
+                or comparison != expected_comparison
+            ):
+                return {
+                    "native_predecessor": {
+                        "passed": False,
+                        "detail": (
+                            "comparison path is not the exact reviewed D selected prerequisite"
+                        ),
+                    }
+                }
+            selected_index = job_parallel_selection.input_runs.index(
+                job_parallel_selection.selected_run_label
+            )
+            if (
+                _sha256(ArtifactReader(comparison).result.manifest_path)
+                != (job_parallel_selection.input_raw_manifest_sha256[selected_index])
+            ):
+                return {
+                    "native_predecessor": {
+                        "passed": False,
+                        "detail": "selected D raw manifest is not bound to its selection review",
+                    }
+                }
+            metadata = _load_metadata(raw_dir)
+            if metadata.get("native_kernel_config") != NativeKernelConfig().to_dict():
+                return {
+                    "native_configuration": {
+                        "passed": False,
+                        "detail": "complete opt-in native kernel configuration is required",
+                    }
+                }
+            if prerequisite_identity is None:
+                return {
+                    "native_producer_contract": {
+                        "passed": False,
+                        "detail": "reviewed D prerequisite identity is missing",
+                    }
+                }
+            producer_passed, producer_detail = _validate_native_evidence_contract(
+                raw_dir,
+                metadata=metadata,
+                prerequisite=prerequisite_identity,
+                selection=job_parallel_selection,
+                benchmark_dir=benchmark_dir,
+            )
+            if not producer_passed:
+                return {
+                    "native_producer_contract": {
+                        "passed": False,
+                        "detail": producer_detail,
+                    }
+                }
+            observable_native, native_detail = _audit_native_execution(raw_dir, rows)
+            if not observable_native:
+                return {
+                    "native_execution": {
+                        "passed": False,
+                        "detail": native_detail,
+                    }
+                }
+            replay_maps = replay_stage052_storage_semantics_many((comparison, raw_dir))
+            fixed_identities = {
+                identity for identity in replay_maps[0] if identity[2].startswith("fixed_work")
+            }
+            replay_equal = (
+                len(fixed_identities) == 24
+                and {
+                    identity for identity in replay_maps[1] if identity[2].startswith("fixed_work")
+                }
+                == fixed_identities
+                and all(
+                    replay_maps[0][identity] == replay_maps[1][identity]
+                    for identity in fixed_identities
+                )
+            )
+            if not replay_equal:
+                return {
+                    "native_fixed_work_differential": {
+                        "passed": False,
+                        "detail": "24 fixed-work axes do not replay identically",
+                    }
+                }
         previous = _observations(_load_per_run(comparison_dirs[0]), axis="fixed_work")
         candidate = _observations(rows, axis="fixed_work")
         decision = evaluate_promotion(previous, candidate)
-        return {
+        gates = {
             "performance_promotion": {
                 "passed": decision.passed,
-                "detail": decision.detail,
+                "detail": (
+                    f"{decision.detail}; aggregate={decision.aggregate_median_saving:.6f}; "
+                    f"families={dict(decision.family_median_savings)}"
+                ),
             }
         }
+        if component is Stage052Component.NATIVE_KERNELS:
+            gates["native_fixed_work_differential"] = {
+                "passed": True,
+                "detail": "D selected run and native candidate replay equally on 24 axes",
+            }
+            gates["native_configuration"] = {
+                "passed": True,
+                "detail": NativeKernelConfig().abi_version,
+            }
+            gates["native_execution"] = {
+                "passed": True,
+                "detail": native_detail,
+            }
+            gates["native_producer_contract"] = {
+                "passed": True,
+                "detail": producer_detail,
+            }
+        return gates
     if component is Stage052Component.ARTIFACT_STREAMING:
         if len(comparison_dirs) != 2:
             return {
@@ -923,6 +1861,7 @@ def _component_gates(
         revisions: set[str] = set()
         configurations: set[str] = set()
         provenance_signatures: set[str] = set()
+        raw_manifest_hashes: dict[str, str] = {}
         owners_by_worker: dict[int, tuple[int, ...]] = {}
         for evidence_dir, worker_rows in zip(evidence_dirs, all_rows, strict=True):
             workers = {_strict_int(row["worker_count"], "worker_count") for row in worker_rows}
@@ -975,6 +1914,9 @@ def _component_gates(
             times[worker] = _strict_float(resource.get("run_wall_seconds"))
             rss[worker] = _strict_float(resource.get("aggregate_peak_rss_bytes")) / 2**30
             run_by_worker[worker] = evidence_dir.name
+            raw_manifest_hashes[evidence_dir.name] = _sha256(
+                ArtifactReader(evidence_dir).result.manifest_path
+            )
             owners_by_worker[worker] = owners
             revisions.add(str(metadata.get("repository_revision", "")))
             configurations.add(str(metadata.get("configuration_sha256", "")))
@@ -987,9 +1929,7 @@ def _component_gates(
                 }
             }
         identity_passed = (
-            len(revisions) == 1
-            and len(configurations) == 1
-            and len(provenance_signatures) == 1
+            len(revisions) == 1 and len(configurations) == 1 and len(provenance_signatures) == 1
         )
         if not identity_passed:
             return {
@@ -1002,9 +1942,7 @@ def _component_gates(
                 }
             }
         replay_dirs = (
-            [prerequisite_dir, *evidence_dirs]
-            if prerequisite_dir is not None
-            else evidence_dirs
+            [prerequisite_dir, *evidence_dirs] if prerequisite_dir is not None else evidence_dirs
         )
         replay_maps = replay_stage052_storage_semantics_many(replay_dirs)
         fixed_identities = {
@@ -1043,9 +1981,7 @@ def _component_gates(
             "worker_ownership": {
                 "passed": True,
                 "detail": "all shards are bound to sampled executor PIDs",
-                "owners": {
-                    str(worker): list(owners_by_worker[worker]) for worker in (1, 2, 4)
-                },
+                "owners": {str(worker): list(owners_by_worker[worker]) for worker in (1, 2, 4)},
             },
             "worker_selection": {
                 "passed": True,
@@ -1053,6 +1989,10 @@ def _component_gates(
                 "selected_workers": selected,
                 "selected_run_label": run_by_worker[selected],
                 "input_runs": [run_by_worker[worker] for worker in (1, 2, 4)],
+                "input_raw_manifest_sha256": {
+                    run_by_worker[worker]: raw_manifest_hashes[run_by_worker[worker]]
+                    for worker in (1, 2, 4)
+                },
                 "resource_metrics": {
                     str(worker): {
                         "run_wall_seconds": times[worker],
@@ -1100,6 +2040,257 @@ def _load_shard_manifests(raw_dir: Path) -> list[dict[str, object]]:
     return [reader.read_json(str(reference["relative_path"])) for reference in references]
 
 
+def _validate_native_evidence_contract(
+    raw_dir: Path,
+    *,
+    metadata: Mapping[str, object],
+    prerequisite: Stage052PrerequisiteIdentity,
+    selection: JobParallelSelectionIdentity,
+    benchmark_dir: Path,
+) -> tuple[bool, str]:
+    """Validate E control, configuration, provenance, resources, and ownership."""
+
+    try:
+        reader = ArtifactReader(raw_dir)
+        config_reference = _one_artifact(reader, "config")
+        resource = _load_resource_summary(raw_dir)
+        shard_manifests = _load_shard_manifests(raw_dir)
+        config = load_stage052_config(raw_dir / str(config_reference["relative_path"]))
+    except (ArtifactIntegrityError, KeyError, OSError, TypeError, ValueError) as error:
+        return False, str(error)
+    manifest = reader.manifest
+    if (
+        manifest.get("run_label") != raw_dir.name
+        or manifest.get("component") != Stage052Component.NATIVE_KERNELS.value
+        or manifest.get("status") != "complete"
+        or manifest.get("evidence_completeness") != "complete"
+        or manifest.get("storage_policy_version") != "artifact-storage-v2"
+        or manifest.get("artifact_status") != {"failure": "not_applicable"}
+    ):
+        return False, "native parent manifest identity or completeness is invalid"
+    expected_metadata = {
+        "run_label": raw_dir.name,
+        "component": Stage052Component.NATIVE_KERNELS.value,
+        "scope": "performance",
+        "instances": list(PERFORMANCE_INSTANCES),
+        "seeds": list(PERFORMANCE_SEEDS),
+        "worker_count": selection.selected_workers,
+        "storage_policy_version": "artifact-storage-v2",
+        "backend": "cpu_batch",
+        "optimization_profile": "native",
+        "native_kernel_config": NativeKernelConfig().to_dict(),
+        "persistence_attribution": "critical_event_rows",
+        "repository_dirty": False,
+        "component_prerequisite": prerequisite.to_dict(),
+        "job_parallel_selection": selection.to_dict(),
+    }
+    for field, expected in expected_metadata.items():
+        if metadata.get(field) != expected:
+            return False, f"native metadata {field} mismatch"
+    revision = metadata.get("repository_revision")
+    if (
+        not isinstance(revision, str)
+        or len(revision) != 40
+        or any(character not in "0123456789abcdef" for character in revision)
+    ):
+        return False, "native repository revision is invalid"
+    if metadata.get("configuration_sha256") != config_reference.get("checksum"):
+        return False, "native configuration checksum is not bound to the config artifact"
+    if (
+        config.native_kernels != NativeKernelConfig()
+        or config.v2_storage.storage_policy_version != "artifact-storage-v2"
+        or config.max_iterations != 1000
+        or config.batch_size != 128
+    ):
+        return False, "native configuration contract is invalid"
+    provenance_passed, provenance_detail = _validate_performance_provenance(
+        metadata, benchmark_dir=benchmark_dir
+    )
+    if not provenance_passed:
+        return False, provenance_detail
+    shards_passed, shards_detail = _validate_native_shard_manifest_scope(
+        shard_manifests,
+        raw_dir=raw_dir,
+        run_label=raw_dir.name,
+        parent_artifacts=[
+            item for item in manifest.get("artifacts", []) if isinstance(item, Mapping)
+        ],
+    )
+    if not shards_passed:
+        return False, shards_detail
+    ownership_passed, ownership_detail, _owners = validate_worker_ownership(
+        resource,
+        shard_manifests,
+        expected_workers=selection.selected_workers,
+        expected_run_label=raw_dir.name,
+        expected_component=Stage052Component.NATIVE_KERNELS.value,
+    )
+    if not ownership_passed:
+        return False, ownership_detail
+    return True, "native config, provenance, runtime, resources, and shard ownership passed"
+
+
+def _validate_native_shard_manifest_scope(
+    shard_manifests: Sequence[Mapping[str, object]],
+    *,
+    raw_dir: Path,
+    run_label: str,
+    parent_artifacts: Sequence[Mapping[str, object]],
+) -> tuple[bool, str]:
+    expected_artifact_schema = {
+        ("route_dictionary", "canonical_routes"),
+        ("events", "critical"),
+        ("events", "screening_checks"),
+        ("events", "screening_decisions_v2"),
+        ("diagnostic", "aggregated"),
+        ("raw", ""),
+        ("solution", ""),
+        ("environment", ""),
+        ("trace", ""),
+    }
+    expected_shards = {
+        (instance, seed) for instance in PERFORMANCE_INSTANCES for seed in PERFORMANCE_SEEDS
+    }
+    expected_ordinal_by_identity = {
+        identity: ordinal
+        for ordinal, identity in enumerate(
+            (instance, seed) for instance in PERFORMANCE_INSTANCES for seed in PERFORMANCE_SEEDS
+        )
+    }
+    parent_by_path: dict[str, Mapping[str, object]] = {}
+    for artifact in parent_artifacts:
+        relative = str(artifact.get("relative_path", ""))
+        if not relative or relative in parent_by_path:
+            return False, "native parent manifest contains an invalid or duplicate path"
+        parent_by_path[relative] = artifact
+    observed_shards: set[tuple[str, int]] = set()
+    ordinals: set[int] = set()
+    shard_artifact_paths: set[str] = set()
+    expected_control_paths: set[str] = set()
+    if len(shard_manifests) != len(expected_shards):
+        return False, "native shard manifest count is incomplete"
+    for shard in shard_manifests:
+        try:
+            identity = (str(shard["instance"]), _strict_int(shard["seed"], "seed"))
+            ordinal = _strict_int(shard["shard_ordinal"], "shard_ordinal")
+        except (KeyError, TypeError, ValueError) as error:
+            return False, str(error)
+        artifacts = shard.get("artifacts")
+        if (
+            identity not in expected_shards
+            or identity in observed_shards
+            or ordinal in ordinals
+            or ordinal != expected_ordinal_by_identity.get(identity)
+            or shard.get("schema_version") != "artifact-storage-v2"
+            or shard.get("run_label") != run_label
+            or shard.get("evidence_completeness") != "complete"
+            or shard.get("storage_policy_version") != "artifact-storage-v2"
+            or shard.get("event_identity") != "shard_ordinal+shard_local_event_id"
+            or not isinstance(artifacts, list)
+            or any(
+                isinstance(item, Mapping) and item.get("artifact_type") == "failure"
+                for item in artifacts
+            )
+        ):
+            return False, "native shard identity, ordinal, completeness, or failure is invalid"
+        artifact_keys: set[tuple[str, str]] = set()
+        for artifact in artifacts:
+            if not isinstance(artifact, Mapping):
+                return False, "native shard artifact reference is invalid"
+            key = (
+                str(artifact.get("artifact_type", "")),
+                str(artifact.get("artifact_subtype", "")),
+            )
+            relative = str(artifact.get("relative_path", ""))
+            parts = Path(relative).parts
+            if (
+                key in artifact_keys
+                or relative in shard_artifact_paths
+                or len(parts) < 3
+                or parts[:2] != (identity[0], str(identity[1]))
+                or artifact.get("evidence_completeness") != "complete"
+                or artifact.get("storage_policy_version") != "artifact-storage-v2"
+            ):
+                return False, "native shard artifact schema, path, or completeness is invalid"
+            parent = parent_by_path.get(relative)
+            if parent is None or dict(parent) != dict(artifact):
+                return False, "native shard artifact is not bound to the parent manifest"
+            artifact_keys.add(key)
+            shard_artifact_paths.add(relative)
+        if artifact_keys != expected_artifact_schema:
+            return False, "native shard artifact schema is incomplete or contains extras"
+        shard_directory = Path(identity[0]) / str(identity[1])
+        manifest_relative = (
+            shard_directory / f"{run_label}_shard_manifest_{identity[0]}_{identity[1]}.json"
+        ).as_posix()
+        sidecar_relative = Path(manifest_relative).with_suffix(".sha256").as_posix()
+        manifest_reference = parent_by_path.get(manifest_relative)
+        sidecar_reference = parent_by_path.get(sidecar_relative)
+        if (
+            manifest_reference is None
+            or manifest_reference.get("artifact_type") != "shard_manifest"
+            or str(manifest_reference.get("artifact_subtype", "")) != ""
+            or sidecar_reference is None
+            or sidecar_reference.get("artifact_type") != "shard_manifest_sidecar"
+            or str(sidecar_reference.get("artifact_subtype", "")) != ""
+        ):
+            return False, "native shard manifest or sidecar canonical parent reference is missing"
+        manifest_path = raw_dir / manifest_relative
+        sidecar_path = raw_dir / sidecar_relative
+        try:
+            manifest_bytes = manifest_path.read_bytes()
+            on_disk_manifest = json.loads(manifest_bytes)
+            sidecar_text = sidecar_path.read_text(encoding="utf-8").strip()
+            sidecar_bytes = sidecar_path.read_bytes()
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            return False, f"native shard manifest or sidecar cannot be read: {error}"
+        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+        sidecar_sha256 = hashlib.sha256(sidecar_bytes).hexdigest()
+        if (
+            not isinstance(on_disk_manifest, Mapping)
+            or dict(on_disk_manifest) != dict(shard)
+            or manifest_reference.get("checksum") != manifest_sha256
+            or manifest_reference.get("byte_size") != len(manifest_bytes)
+            or sidecar_text != manifest_sha256
+            or sidecar_reference.get("checksum") != sidecar_sha256
+            or sidecar_reference.get("byte_size") != len(sidecar_bytes)
+            or manifest_reference.get("evidence_completeness") != "complete"
+            or sidecar_reference.get("evidence_completeness") != "complete"
+            or manifest_reference.get("storage_policy_version") != "artifact-storage-v2"
+            or sidecar_reference.get("storage_policy_version") != "artifact-storage-v2"
+        ):
+            return False, "native shard manifest or sidecar binding is invalid"
+        expected_control_paths.update({manifest_relative, sidecar_relative})
+        observed_shards.add(identity)
+        ordinals.add(ordinal)
+    if observed_shards != expected_shards or ordinals != set(range(len(expected_shards))):
+        return False, "native shard identities or ordinals are incomplete"
+    parent_shard_paths: set[str] = set()
+    for relative, artifact in parent_by_path.items():
+        parts = Path(relative).parts
+        if len(parts) < 3:
+            continue
+        try:
+            identity = (parts[0], _strict_int(parts[1], "seed"))
+        except (TypeError, ValueError):
+            continue
+        if identity in expected_shards and artifact.get("artifact_type") not in {
+            "shard_manifest",
+            "shard_manifest_sidecar",
+        }:
+            parent_shard_paths.add(relative)
+    if parent_shard_paths != shard_artifact_paths:
+        return False, "native parent/shard artifact path sets are not bidirectionally equal"
+    observed_control_paths = {
+        relative
+        for relative, artifact in parent_by_path.items()
+        if artifact.get("artifact_type") in {"shard_manifest", "shard_manifest_sidecar"}
+    }
+    if observed_control_paths != expected_control_paths:
+        return False, "native shard manifest control paths are not exactly canonical"
+    return True, "exact 12 native shard manifests and ordinals passed"
+
+
 def validate_job_parallel_evidence_contract(
     raw_dir: Path,
     *,
@@ -1138,7 +2329,6 @@ def validate_job_parallel_evidence_contract(
         "storage_policy_version": "artifact-storage-v2",
         "backend": "cpu_batch",
         "repository_dirty": False,
-        "component_prerequisite": expected_prerequisite.to_dict(),
     }
     for field, expected in expected_metadata.items():
         if metadata.get(field) != expected:
@@ -1146,6 +2336,13 @@ def validate_job_parallel_evidence_contract(
                 False,
                 f"metadata {field} mismatch: expected={expected} observed={metadata.get(field)}",
             )
+    prerequisite_dir = raw_dir.parent / expected_prerequisite.run_label
+    if not _prerequisite_binding_matches(
+        metadata.get("component_prerequisite"),
+        expected_prerequisite,
+        prerequisite_dir,
+    ):
+        return False, "job-parallel metadata is not bound to the reviewed C prerequisite"
     config_reference = _one_artifact(reader, "config")
     if metadata.get("configuration_sha256") != config_reference.get("checksum"):
         return False, "metadata configuration hash is not bound to the config artifact"
@@ -1174,6 +2371,12 @@ def validate_job_parallel_evidence_contract(
     expected_shards = {
         (instance, seed) for instance in PERFORMANCE_INSTANCES for seed in PERFORMANCE_SEEDS
     }
+    expected_ordinal_by_identity = {
+        identity: ordinal
+        for ordinal, identity in enumerate(
+            (instance, seed) for instance in PERFORMANCE_INSTANCES for seed in PERFORMANCE_SEEDS
+        )
+    }
     observed_shards: set[tuple[str, int]] = set()
     ordinals: set[int] = set()
     for shard in shard_manifests:
@@ -1182,7 +2385,11 @@ def validate_job_parallel_evidence_contract(
             ordinal = _strict_int(shard["shard_ordinal"], "shard_ordinal")
         except (KeyError, TypeError, ValueError) as error:
             return False, str(error)
-        if identity in observed_shards or ordinal in ordinals:
+        if (
+            identity in observed_shards
+            or ordinal in ordinals
+            or ordinal != expected_ordinal_by_identity.get(identity)
+        ):
             return False, "duplicate shard identity or ordinal"
         observed_shards.add(identity)
         ordinals.add(ordinal)
@@ -1191,8 +2398,10 @@ def validate_job_parallel_evidence_contract(
             return False, "shard artifacts are invalid"
         if (
             shard.get("run_label") != raw_dir.name
+            or shard.get("schema_version") != "artifact-storage-v2"
             or shard.get("evidence_completeness") != "complete"
             or shard.get("storage_policy_version") != "artifact-storage-v2"
+            or shard.get("event_identity") != "shard_ordinal+shard_local_event_id"
             or any(
                 isinstance(item, Mapping) and item.get("artifact_type") == "failure"
                 for item in artifacts
@@ -1229,6 +2438,12 @@ def _validate_job_parallel_axis_artifacts(
     payloads: dict[str, dict[tuple[str, int], Mapping[str, object]]] = {
         artifact_type: {} for artifact_type in ("raw", "solution", "trace")
     }
+    canonical_ordinals = {
+        identity: ordinal
+        for ordinal, identity in enumerate(
+            (instance, seed) for instance in PERFORMANCE_INSTANCES for seed in PERFORMANCE_SEEDS
+        )
+    }
     for artifact_type, by_identity in payloads.items():
         references = [
             item
@@ -1261,6 +2476,7 @@ def _validate_job_parallel_axis_artifacts(
         raw = payloads["raw"][identity]
         solution = payloads["solution"][identity]
         trace = payloads["trace"][identity]
+        event_identity = trace.get("event_identity")
         raw_identity = {
             "run_label": raw_dir.name,
             "component": Stage052Component.JOB_PARALLEL.value,
@@ -1273,6 +2489,11 @@ def _validate_job_parallel_axis_artifacts(
             return False, f"raw producer identity mismatch for {identity}"
         if solution.get("instance") != identity[0] or solution.get("seed") != identity[1]:
             return False, f"solution identity mismatch for {identity}"
+        if event_identity != {
+            "shard_ordinal": canonical_ordinals.get(identity),
+            "local_field": "event_id",
+        }:
+            return False, f"trace event identity mismatch for {identity}"
         raw_axes = raw.get("axes")
         solution_axes = solution.get("axes")
         trace_axes = trace.get("axes")
@@ -1288,8 +2509,7 @@ def _validate_job_parallel_axis_artifacts(
             solution_axis = solution_axes[axis]
             trace_axis = trace_axes[axis]
             if not all(
-                isinstance(value, Mapping)
-                for value in (raw_axis, solution_axis, trace_axis)
+                isinstance(value, Mapping) for value in (raw_axis, solution_axis, trace_axis)
             ):
                 return False, f"invalid axis payload for {identity}/{axis}"
             assert isinstance(raw_axis, Mapping)
@@ -1327,6 +2547,52 @@ def _validate_job_parallel_axis_artifacts(
     return True, "exact raw/solution/trace 36-axis identity and reconciliation passed"
 
 
+def _validate_captured_runtime_signature(
+    *,
+    environment: Mapping[str, object],
+    runtime_signature: Mapping[str, object],
+    optimization_profile: object,
+) -> tuple[bool, str]:
+    python = environment.get("python")
+    system = environment.get("system")
+    packages = environment.get("packages")
+    native_extension = environment.get("native_extension")
+    native_sha256 = runtime_signature.get("native_extension_sha256")
+    if (
+        not isinstance(python, Mapping)
+        or not isinstance(system, Mapping)
+        or not isinstance(packages, Mapping)
+        or not isinstance(native_extension, str)
+        or not native_extension
+        or not isinstance(native_sha256, str)
+        or len(native_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in native_sha256)
+    ):
+        return False, "runtime environment identity is invalid"
+    expected_runtime_signature = {
+        "python": {
+            "version": python.get("version"),
+            "implementation": python.get("implementation"),
+        },
+        "system": dict(system),
+        "packages": dict(sorted((str(key), value) for key, value in packages.items())),
+        "native_extension_sha256": native_sha256,
+    }
+    if dict(runtime_signature) != expected_runtime_signature:
+        return False, "runtime signature does not match the captured environment"
+    if optimization_profile == "native":
+        current_native_path = Path(str(native_core.__file__)).resolve()
+        if (
+            Path(native_extension).resolve() != current_native_path
+            or not current_native_path.is_file()
+            or native_sha256 != _sha256(current_native_path)
+        ):
+            return False, "native runtime signature does not match the reviewer extension"
+    elif optimization_profile != "python":
+        return False, "performance runtime optimization profile is invalid"
+    return True, "captured runtime signature passed"
+
+
 def _validate_performance_provenance(
     metadata: Mapping[str, object],
     *,
@@ -1350,8 +2616,7 @@ def _validate_performance_provenance(
     ):
         return False, "instance hash value is invalid"
     expected_hashes = {
-        instance: _sha256(benchmark_dir / f"{instance}.txt")
-        for instance in PERFORMANCE_INSTANCES
+        instance: _sha256(benchmark_dir / f"{instance}.txt") for instance in PERFORMANCE_INSTANCES
     }
     if dict(instance_hashes) != expected_hashes:
         return False, "instance hashes do not match the reviewed benchmark inputs"
@@ -1386,9 +2651,7 @@ def _validate_performance_provenance(
         "stage02_config_sha256": _sha256(
             repository_root / "configs" / "stage02_constraint_guided.toml"
         ),
-        "stage04_config_sha256": _sha256(
-            repository_root / "configs" / "stage04_weights.toml"
-        ),
+        "stage04_config_sha256": _sha256(repository_root / "configs" / "stage04_weights.toml"),
     }
     if (
         not isinstance(operator_surface, Mapping)
@@ -1401,9 +2664,7 @@ def _validate_performance_provenance(
     ):
         return False, "operator surface provenance is invalid"
     affinity = provenance.get("worker_affinity")
-    if not isinstance(affinity, Mapping) or not isinstance(
-        affinity.get("supported"), bool
-    ):
+    if not isinstance(affinity, Mapping) or not isinstance(affinity.get("supported"), bool):
         return False, "worker affinity provenance is invalid"
     cpu_ids = affinity.get("cpu_ids")
     if (
@@ -1460,38 +2721,28 @@ def _validate_performance_provenance(
     runtime_signature = provenance.get("runtime_signature")
     if not isinstance(environment, Mapping) or not isinstance(runtime_signature, Mapping):
         return False, "runtime provenance is invalid"
+    runtime_passed, runtime_detail = _validate_captured_runtime_signature(
+        environment=environment,
+        runtime_signature=runtime_signature,
+        optimization_profile=metadata.get("optimization_profile"),
+    )
+    if not runtime_passed:
+        return False, runtime_detail
     python = environment.get("python")
     system = environment.get("system")
     packages = environment.get("packages")
-    native_extension = environment.get("native_extension")
-    current_native_path = Path(str(native_core.__file__)).resolve()
     if (
         not isinstance(python, Mapping)
         or not isinstance(system, Mapping)
         or not isinstance(packages, Mapping)
-        or not isinstance(native_extension, str)
-        or Path(native_extension).resolve() != current_native_path
-        or not current_native_path.is_file()
     ):
         return False, "runtime environment identity is invalid"
-    expected_runtime_signature = {
-        "python": {
-            "version": python.get("version"),
-            "implementation": python.get("implementation"),
-        },
-        "system": dict(system),
-        "packages": dict(sorted((str(key), value) for key, value in packages.items())),
-        "native_extension_sha256": _sha256(current_native_path),
-    }
-    if dict(runtime_signature) != expected_runtime_signature:
-        return False, "runtime signature does not match the captured environment"
     current_environment = collect_environment()
     current_python = current_environment.get("python")
     current_system = current_environment.get("system")
     current_packages = current_environment.get("packages")
     if not all(
-        isinstance(value, Mapping)
-        for value in (current_python, current_system, current_packages)
+        isinstance(value, Mapping) for value in (current_python, current_system, current_packages)
     ):
         return False, "reviewer runtime environment is incomplete"
     assert isinstance(current_python, Mapping)
@@ -1681,7 +2932,13 @@ def _strict_float(value: object) -> float:
     if isinstance(value, bool):
         raise TypeError("numeric value cannot be boolean")
     if isinstance(value, (int, float, str)):
-        return float(value)
+        try:
+            number = float(value)
+        except ValueError as error:
+            raise TypeError("numeric value must be parseable") from error
+        if not math.isfinite(number):
+            raise ValueError("numeric value must be finite")
+        return number
     raise TypeError("numeric value is invalid")
 
 
@@ -1754,6 +3011,209 @@ def _replace_event_route_ids(
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _prior_review_manifest_hashes(raw_dir: Path) -> list[str]:
+    """Preserve accepted review identity while publishing a stronger re-review."""
+
+    path = raw_dir / "review" / "review_manifest.json"
+    if not path.is_file():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ArtifactIntegrityError("cannot read prior Stage 5.2 review manifest") from error
+    raw_lineage = payload.get("review_manifest_lineage_sha256")
+    if raw_lineage is not None and raw_lineage != []:
+        raise ArtifactIntegrityError(
+            "prior Stage 5.2 review already has lineage and cannot be overwritten"
+        )
+    try:
+        component = Stage052Component(str(payload.get("component", "")))
+    except ValueError as error:
+        raise ArtifactIntegrityError("prior Stage 5.2 review component is invalid") from error
+    expected_identity = {
+        "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
+        "run_label": raw_dir.name,
+        "component": component.value,
+        "scope": "performance",
+        "status": _NEXT_STATUS[component],
+    }
+    if any(payload.get(field) != expected for field, expected in expected_identity.items()):
+        raise ArtifactIntegrityError("only an accepted prior Stage 5.2 review may be superseded")
+    gates = payload.get("gates")
+    if (
+        not isinstance(gates, Mapping)
+        or not gates
+        or any(
+            not isinstance(gate, Mapping) or gate.get("passed") is not True
+            for gate in gates.values()
+        )
+    ):
+        raise ArtifactIntegrityError("prior Stage 5.2 review gates are not accepted")
+    verify_stage052_review_files(raw_dir, payload)
+    current_raw_sha256 = _sha256(ArtifactReader(raw_dir).result.manifest_path)
+    prior_raw_sha256 = payload.get("raw_manifest_sha256")
+    if prior_raw_sha256 is not None and prior_raw_sha256 != current_raw_sha256:
+        raise ArtifactIntegrityError("prior Stage 5.2 review is stale for the current raw manifest")
+    return [
+        _archive_prior_review_generation(
+            raw_dir,
+            manifest_path=path,
+            manifest_payload=payload,
+        )
+    ]
+
+
+def _review_lineage_archive_matches(
+    prerequisite_dir: Path,
+    current: Stage052PrerequisiteIdentity,
+    prior_sha256: str,
+) -> bool:
+    if len(prior_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in prior_sha256
+    ):
+        return False
+    current_manifest_path = prerequisite_dir / "review" / "review_manifest.json"
+    archive_dir = prerequisite_dir / "review" / "history" / prior_sha256
+    archive_manifest_path = archive_dir / "review_manifest.json"
+    try:
+        current_payload = json.loads(current_manifest_path.read_text(encoding="utf-8"))
+        archive_bytes = archive_manifest_path.read_bytes()
+        archive_payload = json.loads(archive_bytes)
+        verify_stage052_review_files(prerequisite_dir, current_payload)
+    except (OSError, json.JSONDecodeError):
+        return False
+    except ArtifactIntegrityError:
+        return False
+    expected_current_identity = {
+        "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
+        "run_label": current.run_label,
+        "component": current.component,
+        "scope": "performance",
+        "status": current.status,
+    }
+    current_gates = current_payload.get("gates") if isinstance(current_payload, Mapping) else None
+    if (
+        not isinstance(current_payload, Mapping)
+        or any(
+            current_payload.get(field) != expected
+            for field, expected in expected_current_identity.items()
+        )
+        or _sha256(current_manifest_path) != current.review_manifest_sha256
+        or current_payload.get("raw_manifest_sha256") != current.raw_manifest_sha256
+        or current_payload.get("review_manifest_lineage_sha256") != [prior_sha256]
+        or not isinstance(current_gates, Mapping)
+        or not current_gates
+        or any(
+            not isinstance(gate, Mapping) or gate.get("passed") is not True
+            for gate in current_gates.values()
+        )
+        or not isinstance(archive_payload, Mapping)
+        or hashlib.sha256(archive_bytes).hexdigest() != prior_sha256
+        or not archive_dir.is_dir()
+    ):
+        return False
+    expected_archive_identity = {
+        "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
+        "run_label": current.run_label,
+        "component": current.component,
+        "scope": "performance",
+        "status": current.status,
+    }
+    if any(
+        archive_payload.get(field) != expected
+        for field, expected in expected_archive_identity.items()
+    ):
+        return False
+    archived_raw_sha256 = archive_payload.get("raw_manifest_sha256")
+    archived_lineage = archive_payload.get("review_manifest_lineage_sha256")
+    if (archived_lineage is not None and archived_lineage != []) or (
+        archived_raw_sha256 is not None and archived_raw_sha256 != current.raw_manifest_sha256
+    ):
+        return False
+    gates = archive_payload.get("gates")
+    files = archive_payload.get("files")
+    if (
+        not isinstance(gates, Mapping)
+        or not gates
+        or any(
+            not isinstance(gate, Mapping) or gate.get("passed") is not True
+            for gate in gates.values()
+        )
+        or not isinstance(files, Mapping)
+        or len(files) != 2
+    ):
+        return False
+    archived_review_paths = tuple(Path(str(name)) for name in files)
+    legacy_files = {path.as_posix() for path in archived_review_paths} == {
+        "review_findings.csv",
+        "review_report.md",
+    }
+    generation_files = (
+        {path.name for path in archived_review_paths} == {"review_findings.csv", "review_report.md"}
+        and all(
+            len(path.parts) == 3
+            and path.parts[0] == "generations"
+            and len(path.parts[1]) == 64
+            and all(character in "0123456789abcdef" for character in path.parts[1])
+            for path in archived_review_paths
+        )
+        and len({path.parts[1] for path in archived_review_paths}) == 1
+    )
+    if not legacy_files and not generation_files:
+        return False
+    relative_files = {"review_manifest.json", *(str(name) for name in files)}
+    observed_files = {
+        path.relative_to(archive_dir).as_posix()
+        for path in archive_dir.rglob("*")
+        if path.is_file()
+    }
+    if observed_files != relative_files:
+        return False
+    for name, checksum in files.items():
+        relative = Path(str(name))
+        archived_file = (archive_dir / relative).resolve()
+        if (
+            archive_dir.resolve() not in archived_file.parents
+            or not archived_file.is_file()
+            or _sha256(archived_file) != str(checksum)
+        ):
+            return False
+    return True
+
+
+def _prerequisite_binding_matches(
+    bound: object,
+    current: Stage052PrerequisiteIdentity,
+    prerequisite_dir: Path,
+) -> bool:
+    """Accept an immutable producer's prior review hash only through signed lineage."""
+
+    expected = current.to_dict()
+    if bound == expected:
+        return True
+    if not isinstance(bound, Mapping) or set(bound) != set(expected):
+        return False
+    if any(
+        bound.get(field) != value
+        for field, value in expected.items()
+        if field != "review_manifest_sha256"
+    ):
+        return False
+    try:
+        review = json.loads(
+            (prerequisite_dir / "review" / "review_manifest.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return False
+    prior_sha256 = bound.get("review_manifest_sha256")
+    lineage = review.get("review_manifest_lineage_sha256")
+    return (
+        isinstance(prior_sha256, str)
+        and lineage == [prior_sha256]
+        and _review_lineage_archive_matches(prerequisite_dir, current, prior_sha256)
+    )
 
 
 def main() -> int:

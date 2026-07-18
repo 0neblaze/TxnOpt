@@ -11,10 +11,12 @@ from evrptw.alns import (
     _Evaluator,
     solve_alns,
 )
+from evrptw.cache_incremental import StationReachabilityIndex
 from evrptw.experiments.stage03_measurement import _scope_instances, load_config
 from evrptw.experiments.stage03_measurement_review import _screening_trace_ok
 from evrptw.measurement import Stage03Trace
 from evrptw.models import Instance, Node, NodeType, Vehicle
+from evrptw.native_kernels import NativeKernelConfig, NativeKernelRuntime
 from evrptw.neighborhoods import screen_route_candidate
 from evrptw.parser import parse_schneider
 
@@ -76,8 +78,7 @@ def test_negative_screening_cache_blocks_exact_and_records_independent_hits() ->
     instance = replace(
         _instance(),
         nodes=tuple(
-            replace(node, due_date=0.1) if node.name == "C2" else node
-            for node in _instance().nodes
+            replace(node, due_date=0.1) if node.name == "C2" else node for node in _instance().nodes
         ),
     )
     trace = Stage03Trace(MeasurementConfig(), screening_config=CheapScreeningConfig())
@@ -154,8 +155,7 @@ def test_stage031_replay_rejects_tampered_negative_cache_semantics() -> None:
     instance = replace(
         _instance(),
         nodes=tuple(
-            replace(node, due_date=0.1) if node.name == "C2" else node
-            for node in _instance().nodes
+            replace(node, due_date=0.1) if node.name == "C2" else node for node in _instance().nodes
         ),
     )
     trace = Stage03Trace(MeasurementConfig(), screening_config=CheapScreeningConfig())
@@ -190,3 +190,126 @@ def test_real_c5_feasible_route_is_not_rejected_by_full_screen() -> None:
         full=True,
     )
     assert result.accepted
+
+
+def test_native_screening_wrapper_matches_python_and_records_invocation() -> None:
+    instance = _instance()
+    runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+
+    expected = screen_route_candidate(instance, ("C1", "C2"), full=True)
+    actual = screen_route_candidate(
+        instance,
+        ("C1", "C2"),
+        full=True,
+        native_runtime=runtime,
+    )
+
+    assert actual == expected
+    assert runtime.screening_invocations == 1
+    assert runtime.fallback_count == 0
+
+
+def test_native_single_segment_energy_rejection_matches_python_event_schema() -> None:
+    instance = Instance(
+        "native_energy_rejection",
+        (
+            Node("D0", NodeType.DEPOT, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0),
+            Node("C1", NodeType.CUSTOMER, 5.0, 0.0, 1.0, 0.0, 100.0, 0.0),
+        ),
+        Vehicle(4.0, 10.0, 1.0, 0.1, 1.0),
+    )
+    runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+
+    expected = screen_route_candidate(instance, ("C1",), full=True)
+    actual = screen_route_candidate(
+        instance,
+        ("C1",),
+        full=True,
+        native_runtime=runtime,
+    )
+
+    assert actual == expected
+    assert not actual.energy_reachable
+    assert actual.reason == "single_segment_energy_prefilter"
+    assert actual.checks[-1].reason == "single_segment_energy_prefilter"
+
+
+@pytest.mark.parametrize(
+    ("full", "with_index"),
+    ((False, False), (False, True), (True, False), (True, True)),
+)
+def test_native_screening_uses_the_same_recharge_frontier_as_python(
+    full: bool,
+    with_index: bool,
+) -> None:
+    instance = Instance(
+        "native_depot_frontier",
+        (
+            Node("D0", NodeType.DEPOT, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0),
+            Node("F1", NodeType.STATION, 4.0, 0.0, 0.0, 0.0, 100.0, 0.0),
+            Node("C1", NodeType.CUSTOMER, -4.0, 0.0, 1.0, 0.0, 100.0, 0.0),
+            Node("C2", NodeType.CUSTOMER, 8.0, 0.0, 1.0, 0.0, 100.0, 0.0),
+        ),
+        Vehicle(5.0, 10.0, 1.0, 0.1, 1.0),
+    )
+    index = StationReachabilityIndex(instance) if with_index else None
+    runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+
+    expected = screen_route_candidate(
+        instance,
+        ("C1", "C2"),
+        full=full,
+        reachability_index=index,
+    )
+    native_index = StationReachabilityIndex(instance) if with_index else None
+    actual = screen_route_candidate(
+        instance,
+        ("C1", "C2"),
+        full=full,
+        reachability_index=native_index,
+        native_runtime=runtime,
+    )
+
+    assert actual == expected
+    if not full:
+        assert actual.reason == "energy_prefilter"
+    elif not with_index:
+        assert actual.reason == "single_segment_energy_prefilter"
+
+
+def test_native_screening_wrapper_fails_fast_on_invalid_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = _instance()
+    runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+
+    class BrokenCore:
+        def screen_routes_numeric(self, *_args: object) -> tuple[object, object]:
+            return ([], [])
+
+    monkeypatch.setattr("evrptw.neighborhoods._native_core", lambda: BrokenCore())
+
+    with pytest.raises(RuntimeError, match="screening codes"):
+        screen_route_candidate(
+            instance,
+            ("C1",),
+            full=True,
+            native_runtime=runtime,
+        )
+
+    assert runtime.screening_invocations == 1
+    assert runtime.fallback_count == 0
+
+
+def test_native_screening_context_is_packed_once_per_solve() -> None:
+    instance = _instance()
+    runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+    context_identity = id(runtime.context)
+
+    screen_route_candidate(instance, ("C1",), full=True, native_runtime=runtime)
+    screen_route_candidate(instance, ("C2",), full=True, native_runtime=runtime)
+
+    assert id(runtime.context) == context_identity
+    assert runtime.screening_invocations == 2
+    assert runtime.claim_context_packing_seconds() > 0.0
+    assert runtime.claim_context_packing_seconds() == 0.0
