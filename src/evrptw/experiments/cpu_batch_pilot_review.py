@@ -16,6 +16,7 @@ from evrptw.measurement import canonical_route_key
 from evrptw.models import NodeType
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
+from evrptw.repository import repository_root
 from evrptw.validation import validate_routes
 
 SCHEMA_VERSION = "cpu-batch-pilot-v1"
@@ -37,7 +38,7 @@ class ReviewConfig:
 
     @classmethod
     def defaults(cls, root: Path | None = None) -> ReviewConfig:
-        resolved = root or Path(__file__).resolve().parents[3]
+        resolved = root or repository_root()
         return cls(
             root=resolved,
             benchmark_dir=resolved / "data" / "schneider",

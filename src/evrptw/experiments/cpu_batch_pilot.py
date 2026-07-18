@@ -26,6 +26,7 @@ from evrptw.experiments.stage02_route_reduction import load_config as load_stage
 from evrptw.measurement import CheapScreeningConfig, MeasurementConfig, canonical_route_key
 from evrptw.models import Instance
 from evrptw.parser import parse_schneider
+from evrptw.repository import repository_root
 from evrptw.validation import validate_routes
 
 SCHEMA_VERSION = "cpu-batch-pilot-v1"
@@ -57,7 +58,7 @@ class PilotConfig:
 
     @classmethod
     def defaults(cls, root: Path | None = None) -> PilotConfig:
-        resolved_root = root or Path(__file__).resolve().parents[3]
+        resolved_root = root or repository_root()
         return cls(
             root=resolved_root,
             benchmark_dir=resolved_root / "data" / "schneider",

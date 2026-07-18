@@ -39,6 +39,7 @@ from evrptw.measurement import COMPLETED_UNIQUE_ROUTE_SEMANTICS
 from evrptw.native_kernels import NativeKernelConfig
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
+from evrptw.repository import repository_root as find_repository_root
 from evrptw.stage052 import (
     ArtifactPersistenceObservation,
     ArtifactStorageObservation,
@@ -2835,7 +2836,7 @@ def _validate_stage052_runtime_identity(
     revision = metadata.get("repository_revision")
     if not isinstance(observed, Mapping) or not isinstance(revision, str):
         return False, "current Stage 5.2 evidence is missing its frozen runtime identity"
-    root = Path(__file__).resolve().parents[3]
+    root = find_repository_root()
     try:
         current = verify_stage052_runtime_identity(
             root / "configs" / "stage052_runtime_identity.local.json",
@@ -2858,7 +2859,7 @@ def _validate_stage052_staging_root_identity(
 ) -> tuple[bool, str]:
     """Independently bind C--F raw evidence to the live external results volume."""
 
-    repository_root = Path(__file__).resolve().parents[3] if root is None else root.resolve()
+    repository_root = find_repository_root() if root is None else root.resolve()
     local_locator_path = (
         repository_root / "configs/stage052_storage_roots.local.toml"
         if locator_path is None

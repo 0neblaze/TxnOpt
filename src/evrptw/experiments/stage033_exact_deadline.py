@@ -39,6 +39,7 @@ from evrptw.measurement import CheapScreeningConfig, MeasurementConfig, canonica
 from evrptw.models import Instance
 from evrptw.neighborhoods import VehicleOperatorConfig
 from evrptw.parser import parse_schneider
+from evrptw.repository import repository_root
 
 STAGE033_SCHEMA_VERSION = "stage033-exact-deadline-v1"
 STAGE033_RUN_LABEL = re.compile(
@@ -358,7 +359,7 @@ def run_stage033(
 ) -> dict[str, Path]:
     """Generate immutable paired Stage 3.3 evidence."""
 
-    root = Path(__file__).resolve().parents[3]
+    root = repository_root()
     resolved_config = _resolve(root, config_path)
     resolved_output = _resolve(root, output_dir)
     validate_stage033_run_label(run_label)

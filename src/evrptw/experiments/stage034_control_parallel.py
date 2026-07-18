@@ -37,6 +37,7 @@ from evrptw.measurement import CheapScreeningConfig, MeasurementConfig
 from evrptw.models import Instance, NodeType
 from evrptw.neighborhoods import VehicleOperatorConfig
 from evrptw.parser import parse_schneider
+from evrptw.repository import repository_root
 
 STAGE034_SCHEMA_VERSION = "stage034-control-parallel-v1"
 STAGE034_RUN_LABEL = re.compile(r"stage03\.4_control_parallel_(?:attempt|rerun)[0-9]{2}")
@@ -202,7 +203,7 @@ def run_stage034(
     run_label: str,
     smoke_review_dir: Path | None = None,
 ) -> dict[str, Path]:
-    root = Path(__file__).resolve().parents[3]
+    root = repository_root()
     resolved_config = _resolve(root, config_path)
     resolved_output = _resolve(root, output_dir)
     validate_stage034_run_label(run_label)

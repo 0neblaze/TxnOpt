@@ -50,6 +50,7 @@ from evrptw.objective import (
     compare_objectives,
 )
 from evrptw.parser import parse_schneider
+from evrptw.repository import repository_root
 from evrptw.validation import validate_routes
 
 SCHEMA_VERSION = "1"
@@ -1513,7 +1514,7 @@ def _assert_unique_run_label(root: Path, run_label: str) -> None:
 
 
 def _repository_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+    return repository_root()
 
 
 def _resolve(root: Path, path: Path | None) -> Path:

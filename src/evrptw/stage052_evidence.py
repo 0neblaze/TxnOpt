@@ -20,6 +20,7 @@ from typing import Any
 import psutil  # type: ignore[import-untyped]
 
 from evrptw.artifacts import ArtifactIntegrityError, ArtifactReader, signed_sidecar_matches
+from evrptw.repository import repository_root
 from evrptw.stage052 import Stage052PrerequisiteRequirement
 
 STAGE052_REVIEW_SCHEMA_VERSION = "stage05.2-review-v1"
@@ -1198,7 +1199,8 @@ def verify_stage052_evidence_input(
     observed_runtime = metadata.get("runtime_identity")
     if not isinstance(observed_runtime, Mapping):
         raise ArtifactIntegrityError("current-chain prerequisite has no frozen runtime identity")
-    runtime_path = Path(__file__).resolve().parents[2] / (
+    root = repository_root()
+    runtime_path = root / (
         "configs/stage052_runtime_identity.local.json"
     )
     try:
@@ -1214,7 +1216,6 @@ def verify_stage052_evidence_input(
         raise ArtifactIntegrityError(
             "current-chain prerequisite runtime differs from the active frozen wheel"
         )
-    root = Path(__file__).resolve().parents[2]
     verify_stage052_storage_root_binding(
         metadata,
         locator_path=root / "configs/stage052_storage_roots.local.toml",

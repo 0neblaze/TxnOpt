@@ -40,6 +40,7 @@ from evrptw.objective import (
     count_charging_visits,
 )
 from evrptw.parser import parse_schneider
+from evrptw.repository import repository_root
 from evrptw.validation import SolutionReport, validate_routes
 
 SCHEMA_VERSION = "1"
@@ -2391,7 +2392,7 @@ def _reference_revision(root: Path) -> str | None:
 
 
 def _repository_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+    return repository_root()
 
 
 def _resolve(root: Path, path: Path) -> Path:

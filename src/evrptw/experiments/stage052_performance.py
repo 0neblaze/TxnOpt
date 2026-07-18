@@ -56,6 +56,7 @@ from evrptw.measurement import (
 from evrptw.models import Instance
 from evrptw.native_kernels import NativeKernelConfig
 from evrptw.parser import parse_schneider
+from evrptw.repository import repository_root
 from evrptw.stage052 import (
     PerformanceObservation,
     Stage052Component,
@@ -438,7 +439,7 @@ def run_stage052(
     contract = stage052_contract(selected, scope)
     if worker_count not in {1, 2, 4}:
         raise ValueError("Stage 5.2 worker_count must be 1, 2, or 4")
-    root = Path(__file__).resolve().parents[3]
+    root = repository_root()
     resolved_config = _resolve(root, config_path)
     resolved_output = _resolve(root, output_dir)
     if resolved_output != root / "results" / run_label:

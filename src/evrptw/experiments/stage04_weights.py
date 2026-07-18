@@ -58,6 +58,7 @@ from evrptw.models import Instance
 from evrptw.neighborhoods import VehicleOperatorConfig
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
+from evrptw.repository import repository_root
 from evrptw.stage04 import Stage04Config, with_fixed_weights
 
 STAGE04_SCHEMA_VERSION = "stage04-adaptive-weights-v6"
@@ -624,7 +625,7 @@ def run_stage04_weights(
         Canonical label matching ``stage04_adaptive_weights_(attempt|rerun)NN``.
     """
 
-    root = Path(__file__).resolve().parents[3]
+    root = repository_root()
     resolved_config = _resolve(root, config_path)
     resolved_output = _resolve(root, output_dir)
     validate_stage04_run_label(run_label)
