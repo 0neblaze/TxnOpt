@@ -1,0 +1,18 @@
+# Copy this file to stage052_storage_roots.local.toml and replace every
+# REPLACE_* value with the identity observed on the benchmark Mac.  The local
+# file is ignored because it contains machine-specific absolute paths.
+
+[roots.transfer_staging]
+absolute_path = "/Volumes/TRANSFER/FURP-2026-Yiyang-GUO-EVRP-TW/results"
+device_uuid = "REPLACE_WITH_TRANSFER_DEVICE_UUID"
+filesystem = "REPLACE_WITH_TRANSFER_FILESYSTEM"
+
+[roots.transfer_archive]
+absolute_path = "/Volumes/TRANSFER/FURP-2026-Yiyang-GUO-EVRP-TW-results"
+device_uuid = "REPLACE_WITH_TRANSFER_DEVICE_UUID"
+filesystem = "REPLACE_WITH_TRANSFER_FILESYSTEM"
+
+[roots.internal_archive]
+absolute_path = "/Users/guoyiyang/Documents/Codex/FURP-2026-Yiyang-GUO-EVRP-TW-results"
+device_uuid = "REPLACE_WITH_INTERNAL_DEVICE_UUID"
+filesystem = "apfs"

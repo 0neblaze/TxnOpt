@@ -13,10 +13,13 @@ import contextlib
 import hashlib
 import heapq
 import json
+import os
 import re
 import shutil
+import sqlite3
+import tempfile
 from collections import Counter, OrderedDict
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -28,7 +31,19 @@ import pyarrow.parquet as pq
 ARTIFACT_STORAGE_SCHEMA_VERSION = "artifact-storage-v1"
 ARTIFACT_STORAGE_V2 = "artifact-storage-v2"
 SUPPORTED_STORAGE_POLICIES = frozenset({ARTIFACT_STORAGE_SCHEMA_VERSION, ARTIFACT_STORAGE_V2})
+SCREENING_DECISIONS_V1 = "screening_decisions_v1"
+SCREENING_DECISIONS_V2 = "screening_decisions_v2"
+SCREENING_DECISIONS_V3 = "screening_decisions_v3"
+SUPPORTED_SCREENING_SCHEMAS = frozenset(
+    {SCREENING_DECISIONS_V1, SCREENING_DECISIONS_V2, SCREENING_DECISIONS_V3}
+)
 V2_PARQUET_ROW_GROUP_SIZE = 65_536
+ROUTE_IDENTITY_HOT_CACHE_ENTRIES = 1_024
+ROUTE_IDENTITY_COUNTER_NAMESPACES = 16
+MAX_SCREENING_CHECKS_PER_DECISION = 8
+UNIQUE_ROUTE_IDENTITY_SEMANTICS = frozenset(
+    {"legacy_started", "completed_shared", "completed_lane"}
+)
 CURRENT_STORAGE_FORMAT = "parquet_or_json_control"
 LEGACY_STORAGE_FORMAT = "legacy_json_or_jsonl"
 DEFAULT_COMPRESSION = "zstd"
@@ -57,6 +72,148 @@ class ArtifactIntegrityError(ValueError):
     """Raised when a manifest, checksum, or schema record is invalid."""
 
 
+def signed_sidecar_matches(path: Path, sidecar: Path | None = None) -> bool:
+    """Accept a stable digest or a two-generation crash-transition sidecar."""
+
+    sidecar_path = path.with_suffix(".sha256") if sidecar is None else sidecar
+    if not path.is_file() or not sidecar_path.is_file():
+        return False
+    try:
+        digests = tuple(
+            line.strip()
+            for line in sidecar_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    except (OSError, UnicodeDecodeError):
+        return False
+    if (
+        not 1 <= len(digests) <= 2
+        or len(set(digests)) != len(digests)
+        or any(
+            len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            for digest in digests
+        )
+    ):
+        return False
+    return _sha256(path) in digests
+
+
+def atomic_write_signed_json(
+    path: Path,
+    payload: Mapping[str, object],
+    *,
+    _replace: Callable[[Path, Path], None] = os.replace,
+) -> tuple[Path, Path]:
+    """Crash-consistently replace one JSON object and its SHA-256 sidecar."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    sidecar = path.with_suffix(".sha256")
+    temporary_sidecar = sidecar.with_name(f".{sidecar.name}.{os.getpid()}.tmp")
+    final_sidecar = sidecar.with_name(f".{sidecar.name}.{os.getpid()}.final.tmp")
+    if temporary.exists() or temporary_sidecar.exists() or final_sidecar.exists():
+        raise FileExistsError("artifact atomic-write temporary file already exists")
+    previous_payload: bytes | None = None
+    previous_sidecar: bytes | None = None
+    if path.exists() != sidecar.exists():
+        raise ArtifactIntegrityError(
+            "signed JSON payload and sidecar must either both exist or both be absent"
+        )
+    if path.is_file() and sidecar.is_file():
+        candidate_payload = path.read_bytes()
+        candidate_sidecar = sidecar.read_bytes()
+        if not signed_sidecar_matches(path, sidecar):
+            raise ArtifactIntegrityError("existing signed JSON generation is invalid")
+        previous_payload = candidate_payload
+        previous_sidecar = candidate_sidecar
+    previous_digest = (
+        hashlib.sha256(previous_payload).hexdigest()
+        if previous_payload is not None
+        else None
+    )
+    transition_digests = tuple(
+        dict.fromkeys(
+            item for item in (previous_digest, digest) if item is not None
+        )
+    )
+    payload_replaced = False
+    sidecar_replaced = False
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with temporary_sidecar.open("x", encoding="utf-8") as handle:
+            handle.write("".join(f"{item}\n" for item in transition_digests))
+            handle.flush()
+            os.fsync(handle.fileno())
+        _replace(temporary_sidecar, sidecar)
+        sidecar_replaced = True
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _replace(temporary, path)
+        payload_replaced = True
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        with final_sidecar.open("x", encoding="utf-8") as handle:
+            handle.write(digest + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _replace(final_sidecar, sidecar)
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except BaseException:
+        if payload_replaced or sidecar_replaced:
+            if previous_payload is None or previous_sidecar is None:
+                path.unlink(missing_ok=True)
+                sidecar.unlink(missing_ok=True)
+            else:
+                rollback_payload = path.with_name(f".{path.name}.{os.getpid()}.rollback")
+                rollback_sidecar = sidecar.with_name(
+                    f".{sidecar.name}.{os.getpid()}.rollback"
+                )
+                try:
+                    with rollback_payload.open("xb") as handle:
+                        handle.write(previous_payload)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    with rollback_sidecar.open("xb") as handle:
+                        handle.write(previous_sidecar)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(rollback_payload, path)
+                    os.replace(rollback_sidecar, sidecar)
+                    descriptor = os.open(path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                finally:
+                    rollback_payload.unlink(missing_ok=True)
+                    rollback_sidecar.unlink(missing_ok=True)
+        raise
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+        if temporary_sidecar.exists():
+            temporary_sidecar.unlink()
+        if final_sidecar.exists():
+            final_sidecar.unlink()
+    return path, sidecar
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactStorageConfig:
     """Immutable storage policy used by all new experiment bundles."""
@@ -68,10 +225,21 @@ class ArtifactStorageConfig:
     compression_level: int = DEFAULT_COMPRESSION_LEVEL
     critical_evidence: str = "full"
     diagnostic_evidence: str = "aggregate"
+    screening_schema_version: str = ""
     per_instance_seed_max_bytes: int = DEFAULT_PER_INSTANCE_SEED_MAX_BYTES
     per_run_max_bytes: int = DEFAULT_PER_RUN_MAX_BYTES
 
     def __post_init__(self) -> None:
+        if not self.screening_schema_version:
+            object.__setattr__(
+                self,
+                "screening_schema_version",
+                (
+                    SCREENING_DECISIONS_V2
+                    if self.storage_policy_version == ARTIFACT_STORAGE_V2
+                    else SCREENING_DECISIONS_V1
+                ),
+            )
         if self.storage_policy_version not in SUPPORTED_STORAGE_POLICIES:
             raise ValueError(
                 "unsupported artifact storage policy: "
@@ -88,6 +256,21 @@ class ArtifactStorageConfig:
             raise ValueError("critical evidence must use the full retention policy")
         if self.diagnostic_evidence != "aggregate":
             raise ValueError("diagnostic evidence must use the aggregate retention policy")
+        if self.screening_schema_version not in SUPPORTED_SCREENING_SCHEMAS:
+            raise ValueError(
+                "unsupported physical screening schema: "
+                f"{self.screening_schema_version}; expected one of "
+                f"{sorted(SUPPORTED_SCREENING_SCHEMAS)}"
+            )
+        expected_screening_schemas = (
+            {SCREENING_DECISIONS_V2, SCREENING_DECISIONS_V3}
+            if self.storage_policy_version == ARTIFACT_STORAGE_V2
+            else {SCREENING_DECISIONS_V1, SCREENING_DECISIONS_V2}
+        )
+        if self.screening_schema_version not in expected_screening_schemas:
+            raise ValueError(
+                f"{self.storage_policy_version} does not support {self.screening_schema_version}"
+            )
         if self.per_instance_seed_max_bytes <= 0 or self.per_run_max_bytes <= 0:
             raise ValueError("artifact byte budgets must be positive")
         if self.per_instance_seed_max_bytes > self.per_run_max_bytes:
@@ -102,6 +285,7 @@ class ArtifactStorageConfig:
             "compression_level": self.compression_level,
             "critical_evidence": self.critical_evidence,
             "diagnostic_evidence": self.diagnostic_evidence,
+            "screening_schema_version": self.screening_schema_version,
             "per_instance_seed_max_bytes": self.per_instance_seed_max_bytes,
             "per_run_max_bytes": self.per_run_max_bytes,
         }
@@ -315,6 +499,54 @@ V2_SCREENING_DECISIONS_SCHEMA = pa.schema(
     ]
 )
 
+V3_SCREENING_DEFINITIONS_SCHEMA = pa.schema(
+    [
+        pa.field("definition_id", pa.int64(), nullable=False),
+        pa.field("lane_id", pa.int32(), nullable=False),
+        pa.field("operator_id", pa.int32(), nullable=False),
+        pa.field("route_id", pa.int64()),
+        pa.field("status", pa.string()),
+        pa.field("reason", pa.string()),
+        pa.field("benchmark_axis", pa.string(), nullable=False),
+        pa.field("demand", pa.float64()),
+        pa.field("distance_increment_lower_bound", pa.float64()),
+        pa.field("distance_lower_bound", pa.float64()),
+        pa.field("exact_call_blocked", pa.bool_()),
+        pa.field("first_failed_check", pa.string()),
+        pa.field("min_time_window_slack", pa.float64()),
+        pa.field("negative_cache_hit", pa.bool_()),
+        pa.field("single_segment_reachable", pa.bool_()),
+        pa.field("structural_energy_lower_bound", pa.float64()),
+        pa.field(
+            "checks",
+            pa.list_(
+                pa.struct(
+                    [
+                        pa.field("check", pa.string(), nullable=False),
+                        pa.field("status", pa.string()),
+                        pa.field("value_bool", pa.bool_()),
+                        pa.field("value_float", pa.float64()),
+                        pa.field("value_text", pa.string()),
+                        pa.field("reason", pa.string()),
+                    ]
+                )
+            ),
+            nullable=False,
+        ),
+    ]
+)
+
+V3_SCREENING_OCCURRENCES_SCHEMA = pa.schema(
+    [
+        pa.field("event_id", pa.int64(), nullable=False),
+        pa.field("definition_id", pa.int64(), nullable=False),
+        pa.field("started_at", pa.float64()),
+        pa.field("completed_at", pa.float64()),
+        pa.field("iteration", pa.int64()),
+        pa.field("decision_id", pa.int64()),
+    ]
+)
+
 DIAGNOSTIC_SCHEMA = pa.schema(
     [
         pa.field("run_label", pa.string(), nullable=False),
@@ -329,6 +561,30 @@ DIAGNOSTIC_SCHEMA = pa.schema(
         pa.field("sum_value", pa.float64()),
         pa.field("min_value", pa.float64()),
         pa.field("max_value", pa.float64()),
+    ]
+)
+
+ANYTIME_CHECKPOINT_SCHEMA = pa.schema(
+    [
+        pa.field("instance", pa.string(), nullable=False),
+        pa.field("seed", pa.int64(), nullable=False),
+        pa.field("axis_budget_seconds", pa.int64(), nullable=False),
+        pa.field("checkpoint_seconds", pa.int64(), nullable=False),
+        pa.field(
+            "objective_key",
+            pa.struct(
+                [
+                    pa.field("vehicle_count", pa.int64(), nullable=False),
+                    pa.field("total_distance", pa.float64(), nullable=False),
+                    pa.field("total_charging_time", pa.float64(), nullable=False),
+                    pa.field("charging_count", pa.int64(), nullable=False),
+                ]
+            ),
+            nullable=False,
+        ),
+        pa.field("source", pa.string(), nullable=False),
+        pa.field("incumbent_completed_at_seconds", pa.float64(), nullable=False),
+        pa.field("incumbent_iteration", pa.int64()),
     ]
 )
 
@@ -409,6 +665,12 @@ def _schema_fingerprint(schema: pa.Schema) -> str:
         for field in schema
     ]
     return _payload_sha256(fields)
+
+
+def artifact_schema_fingerprint(schema: pa.Schema) -> str:
+    """Return the canonical logical fingerprint used by artifact descriptors."""
+
+    return _schema_fingerprint(schema)
 
 
 def _as_int(value: object) -> int | None:
@@ -531,16 +793,16 @@ def _normalise_event(
             lane_ids=lane_ids,
             operator_ids=operator_ids,
         )
-    route_id = _route_id(event.get("route_id", event.get("route_key")), route_ids)
-    base_route_id = _route_id(event.get("base_route_id", event.get("base_route_key")), route_ids)
+    route_id = _route_id(event.get("route_key", event.get("route_id")), route_ids)
+    base_route_id = _route_id(event.get("base_route_key", event.get("base_route_id")), route_ids)
     candidate_route_id = _route_id(
-        event.get("candidate_route_id", event.get("candidate_route_key")), route_ids
+        event.get("candidate_route_key", event.get("candidate_route_id")), route_ids
     )
     current_route_ids = _route_ids(
-        event.get("current_route_ids", event.get("current_route_keys")), route_ids
+        event.get("current_route_keys", event.get("current_route_ids")), route_ids
     )
     candidate_route_ids = _route_ids(
-        event.get("candidate_route_ids", event.get("candidate_route_keys")), route_ids
+        event.get("candidate_route_keys", event.get("candidate_route_ids")), route_ids
     )
     extras = {
         str(key): value
@@ -576,7 +838,7 @@ def _normalise_event(
         "iteration": _as_int(event.get("iteration")),
         "operator_id": operator_ids[str(event.get("operator", ""))],
         "route_id": route_id,
-        "route_ids": _route_ids(event.get("route_ids", event.get("route_keys")), route_ids),
+        "route_ids": _route_ids(event.get("route_keys", event.get("route_ids")), route_ids),
         "current_route_ids": current_route_ids,
         "candidate_route_ids": candidate_route_ids,
         "base_route_id": base_route_id,
@@ -684,21 +946,208 @@ def _normalise_compact_screening_checks(
         if not isinstance(check, Mapping):
             continue
         value = check.get("value")
+        already_compact = any(
+            field in check for field in ("value_bool", "value_float", "value_text")
+        )
         output.append(
             {
                 "check": str(check.get("check", "")),
                 "status": str(check.get("status", "")),
-                "value_bool": value if isinstance(value, bool) else None,
-                "value_float": (float(value) if isinstance(value, (int, float)) else None),
-                "value_text": value if isinstance(value, str) else None,
+                "value_bool": (
+                    _as_bool(check.get("value_bool"))
+                    if already_compact
+                    else value
+                    if isinstance(value, bool)
+                    else None
+                ),
+                "value_float": (
+                    _as_float(check.get("value_float"))
+                    if already_compact
+                    else float(value)
+                    if isinstance(value, (int, float))
+                    else None
+                ),
+                "value_text": (
+                    str(check["value_text"])
+                    if already_compact and check.get("value_text") is not None
+                    else value
+                    if isinstance(value, str)
+                    else None
+                ),
                 "reason": str(check.get("reason", "")),
             }
         )
     return output
 
 
+def _normalise_screening_definition(
+    payload: Mapping[str, object],
+    *,
+    lane_id: int | None = None,
+    operator_id: int | None = None,
+    route_id: int | None = None,
+) -> dict[str, object]:
+    raw_checks = payload.get("checks")
+    checks = raw_checks if isinstance(raw_checks, (list, tuple)) else ()
+    if len(checks) > MAX_SCREENING_CHECKS_PER_DECISION:
+        raise ArtifactIntegrityError(
+            "one screening decision exceeds the fixed eight-check domain"
+        )
+    resolved_lane_id = lane_id if lane_id is not None else _as_int(payload.get("lane_id"))
+    resolved_operator_id = (
+        operator_id if operator_id is not None else _as_int(payload.get("operator_id"))
+    )
+    if resolved_lane_id is None or resolved_operator_id is None:
+        raise ArtifactIntegrityError("screening definition requires lane and operator IDs")
+    return {
+        "lane_id": resolved_lane_id,
+        "operator_id": resolved_operator_id,
+        "route_id": route_id if route_id is not None else _as_int(payload.get("route_id")),
+        "status": str(payload.get("status") or ""),
+        "reason": str(payload.get("reason") or ""),
+        "benchmark_axis": str(payload.get("benchmark_axis") or ""),
+        "demand": _as_float(payload.get("demand")),
+        "distance_increment_lower_bound": _as_float(payload.get("distance_increment_lower_bound")),
+        "distance_lower_bound": _as_float(payload.get("distance_lower_bound")),
+        "exact_call_blocked": _as_bool(payload.get("exact_call_blocked")),
+        "first_failed_check": str(payload.get("first_failed_check") or ""),
+        "min_time_window_slack": _as_float(payload.get("min_time_window_slack")),
+        "negative_cache_hit": _as_bool(payload.get("negative_cache_hit")),
+        "single_segment_reachable": _as_bool(payload.get("single_segment_reachable")),
+        "structural_energy_lower_bound": _as_float(payload.get("structural_energy_lower_bound")),
+        "checks": _normalise_compact_screening_checks(checks),
+    }
+
+
+def _screening_definition_identity(definition: Mapping[str, object]) -> tuple[int, bytes, str]:
+    definition_json = orjson.dumps(definition, option=orjson.OPT_SORT_KEYS)
+    digest = hashlib.sha256(definition_json).digest()
+    definition_id = int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
+    return definition_id, definition_json, digest.hex()
+
+
+class _BoundedScreeningDefinitionStore:
+    """Disk-backed definitions with a bounded in-process LRU hot set."""
+
+    def __init__(self, *, cache_entries: int, scratch_root: Path | None = None) -> None:
+        if cache_entries <= 0:
+            raise ValueError("definition cache_entries must be positive")
+        if scratch_root is not None:
+            scratch_root.mkdir(parents=True, exist_ok=True)
+        self._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="evrptw-screening-definitions-",
+            dir=scratch_root,
+        )
+        database_path = Path(self._temporary_directory.name) / "definitions.sqlite3"
+        self._connection = sqlite3.connect(database_path)
+        self._connection.execute("PRAGMA journal_mode=OFF")
+        self._connection.execute("PRAGMA synchronous=OFF")
+        self._connection.execute("PRAGMA cache_size=-2048")
+        self._connection.execute(
+            "CREATE TABLE definitions (definition_id INTEGER PRIMARY KEY, payload BLOB NOT NULL)"
+        )
+        self._cache_entries = cache_entries
+        self._cache: OrderedDict[int, dict[str, object]] = OrderedDict()
+        self._closed = False
+
+    def __enter__(self) -> _BoundedScreeningDefinitionStore:
+        return self
+
+    def __exit__(
+        self,
+        _exception_type: object,
+        _exception: object,
+        _traceback: object,
+    ) -> None:
+        self.close()
+
+    def register(
+        self,
+        definition_id: int,
+        definition: Mapping[str, object],
+        *,
+        allow_identical_existing: bool,
+    ) -> bool:
+        expected_id, encoded, _ = _screening_definition_identity(definition)
+        if expected_id != definition_id:
+            raise ArtifactIntegrityError("screening definition hash mismatch")
+        existing = self._connection.execute(
+            "SELECT payload FROM definitions WHERE definition_id = ?",
+            (definition_id,),
+        ).fetchone()
+        if existing is not None:
+            existing_payload = bytes(existing[0])
+            if existing_payload != encoded:
+                raise ArtifactIntegrityError("screening definition ID collision")
+            if not allow_identical_existing:
+                raise ArtifactIntegrityError("duplicate screening definition ID")
+            inserted = False
+        else:
+            self._connection.execute(
+                "INSERT INTO definitions(definition_id, payload) VALUES (?, ?)",
+                (definition_id, encoded),
+            )
+            inserted = True
+        self._remember(definition_id, dict(definition))
+        return inserted
+
+    def resolve(self, definition_id: int) -> dict[str, object]:
+        cached = self._cache.get(definition_id)
+        if cached is not None:
+            self._cache.move_to_end(definition_id)
+            return cached
+        stored = self._connection.execute(
+            "SELECT payload FROM definitions WHERE definition_id = ?",
+            (definition_id,),
+        ).fetchone()
+        if stored is None:
+            raise ArtifactIntegrityError("screening row references an unknown definition")
+        try:
+            decoded = orjson.loads(bytes(stored[0]))
+        except orjson.JSONDecodeError as error:
+            raise ArtifactIntegrityError("stored screening definition is invalid") from error
+        if not isinstance(decoded, dict):
+            raise ArtifactIntegrityError("stored screening definition must be an object")
+        definition = cast(dict[str, object], decoded)
+        self._remember(definition_id, definition)
+        return definition
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._connection.close()
+        self._temporary_directory.cleanup()
+        self._cache.clear()
+        self._closed = True
+
+    def _remember(self, definition_id: int, definition: dict[str, object]) -> None:
+        self._cache[definition_id] = definition
+        self._cache.move_to_end(definition_id)
+        if len(self._cache) > self._cache_entries:
+            self._cache.popitem(last=False)
+
+
 def _json_text(payload: Mapping[str, object]) -> str:
     return orjson.dumps(payload, option=orjson.OPT_SORT_KEYS).decode("utf-8")
+
+
+def _screening_definition_id_from_row(row: Mapping[str, object]) -> int:
+    raw_definition_id = row.get("definition_id")
+    if isinstance(raw_definition_id, bool) or not isinstance(raw_definition_id, int):
+        raise ArtifactIntegrityError("screening definition_id must be an integer")
+    return raw_definition_id
+
+
+def _decode_screening_definition_json(value: object) -> dict[str, object]:
+    if not isinstance(value, (bytes, bytearray, memoryview, str)):
+        raise ArtifactIntegrityError("screening definition_json must be binary or text")
+    try:
+        definition = orjson.loads(value)
+    except orjson.JSONDecodeError as error:
+        raise ArtifactIntegrityError("screening definition_json is invalid") from error
+    if not isinstance(definition, dict):
+        raise ArtifactIntegrityError("screening definition must be an object")
+    return cast(dict[str, object], definition)
 
 
 def expand_v2_screening_decision(
@@ -714,19 +1163,10 @@ def expand_v2_screening_decision(
             raise ArtifactIntegrityError(
                 "definition-encoded screening rows require definition state"
             )
-        raw_definition_id = row.get("definition_id")
-        if isinstance(raw_definition_id, bool) or not isinstance(raw_definition_id, int):
-            raise ArtifactIntegrityError("screening definition_id must be an integer")
+        raw_definition_id = _screening_definition_id_from_row(row)
         definition_json = row.get("definition_json")
         if definition_json:
-            if not isinstance(definition_json, (bytes, bytearray, memoryview, str)):
-                raise ArtifactIntegrityError("screening definition_json must be binary or text")
-            try:
-                definition = orjson.loads(definition_json)
-            except orjson.JSONDecodeError as error:
-                raise ArtifactIntegrityError("screening definition_json is invalid") from error
-            if not isinstance(definition, dict):
-                raise ArtifactIntegrityError("screening definition must be an object")
+            definition = _decode_screening_definition_json(definition_json)
             canonical = orjson.dumps(definition, option=orjson.OPT_SORT_KEYS)
             expected_id = (
                 int.from_bytes(hashlib.sha256(canonical).digest()[:8], "big")
@@ -738,17 +1178,30 @@ def expand_v2_screening_decision(
             if previous is not None and previous != definition:
                 raise ArtifactIntegrityError("screening definition ID collision")
             definitions[raw_definition_id] = definition
-        definition = definitions.get(raw_definition_id)
-        if definition is None:
+        resolved_definition = definitions.get(raw_definition_id)
+        if resolved_definition is None:
             raise ArtifactIntegrityError("screening row references an unknown definition")
-        combined_row = {**definition, **dict(row)}
-        started_at = combined_row.get("started_at")
-        completed_at = combined_row.get("completed_at")
-        if isinstance(started_at, (int, float)) and isinstance(completed_at, (int, float)):
-            combined_row["timestamp_seconds"] = started_at
-            combined_row["duration_seconds"] = completed_at - started_at
-        expanded_row = combined_row
+        expanded_row = _combine_screening_definition_occurrence(resolved_definition, row)
 
+    return _expand_screening_decision_row(expanded_row)
+
+
+def _combine_screening_definition_occurrence(
+    definition: Mapping[str, object],
+    occurrence: Mapping[str, object],
+) -> dict[str, object]:
+    combined = {**definition, **dict(occurrence)}
+    started_at = combined.get("started_at")
+    completed_at = combined.get("completed_at")
+    if isinstance(started_at, (int, float)) and isinstance(completed_at, (int, float)):
+        combined["timestamp_seconds"] = started_at
+        combined["duration_seconds"] = completed_at - started_at
+    return combined
+
+
+def _expand_screening_decision_row(
+    expanded_row: Mapping[str, object],
+) -> dict[str, object]:
     raw_checks = expanded_row.get("checks")
     checks_json = expanded_row.get("checks_json")
     if checks_json:
@@ -759,6 +1212,10 @@ def expand_v2_screening_decision(
         except orjson.JSONDecodeError as error:
             raise ArtifactIntegrityError("compact screening checks_json is invalid") from error
     compact_checks = raw_checks if isinstance(raw_checks, (list, tuple)) else ()
+    if len(compact_checks) > MAX_SCREENING_CHECKS_PER_DECISION:
+        raise ArtifactIntegrityError(
+            "one screening decision exceeds the fixed eight-check domain"
+        )
     extras = {
         key: expanded_row.get(key)
         for key in (
@@ -806,6 +1263,42 @@ def expand_v2_screening_decision(
         }
     )
     return output
+
+
+def register_v3_screening_definition(
+    row: Mapping[str, object],
+    *,
+    definitions: dict[int, dict[str, object]],
+) -> None:
+    """Validate and register one typed ``screening_decisions_v3`` definition."""
+
+    raw_definition_id = row.get("definition_id")
+    if isinstance(raw_definition_id, bool) or not isinstance(raw_definition_id, int):
+        raise ArtifactIntegrityError("screening definition_id must be an integer")
+    definition = _normalise_screening_definition(row)
+    expected_id, _, _ = _screening_definition_identity(definition)
+    if expected_id != raw_definition_id:
+        raise ArtifactIntegrityError("screening definition hash mismatch")
+    previous = definitions.get(raw_definition_id)
+    if previous is not None:
+        raise ArtifactIntegrityError("duplicate screening definition ID")
+    definitions[raw_definition_id] = definition
+
+
+def expand_v3_screening_decision(
+    row: Mapping[str, object],
+    *,
+    definitions: Mapping[int, dict[str, object]],
+) -> dict[str, object]:
+    """Expand one v3 occurrence using an independently loaded definition table."""
+
+    raw_definition_id = row.get("definition_id")
+    if isinstance(raw_definition_id, bool) or not isinstance(raw_definition_id, int):
+        raise ArtifactIntegrityError("screening definition_id must be an integer")
+    definition = definitions.get(raw_definition_id)
+    if definition is None:
+        raise ArtifactIntegrityError("screening row references an unknown definition")
+    return _expand_screening_decision_row(_combine_screening_definition_occurrence(definition, row))
 
 
 def _validate_event_routes(event: Mapping[str, object], route_ids: Mapping[str, int]) -> None:
@@ -897,7 +1390,8 @@ def _write_parquet(
     config: ArtifactStorageConfig,
 ) -> tuple[int, str]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.Table.from_pylist([dict(row) for row in rows], schema=schema)
+    columns = [pa.array((row.get(field.name) for row in rows), type=field.type) for field in schema]
+    table = pa.Table.from_arrays(columns, schema=schema)
     pq.write_table(
         table,
         path,
@@ -914,8 +1408,31 @@ def _write_parquet(
     return table.num_rows, _schema_fingerprint(table.schema)
 
 
+def _normalise_anytime_checkpoint(row: Mapping[str, object]) -> dict[str, object]:
+    objective = row.get("objective_key")
+    if not isinstance(objective, (list, tuple)) or len(objective) != 4:
+        raise ArtifactIntegrityError(
+            "anytime checkpoint objective_key must contain four components"
+        )
+    return {
+        "instance": row.get("instance"),
+        "seed": row.get("seed"),
+        "axis_budget_seconds": row.get("axis_budget_seconds"),
+        "checkpoint_seconds": row.get("checkpoint_seconds"),
+        "objective_key": {
+            "vehicle_count": objective[0],
+            "total_distance": objective[1],
+            "total_charging_time": objective[2],
+            "charging_count": objective[3],
+        },
+        "source": row.get("source"),
+        "incumbent_completed_at_seconds": row.get("incumbent_completed_at_seconds"),
+        "incumbent_iteration": row.get("incumbent_iteration"),
+    }
+
+
 class _StreamingParquetSink:
-    """Bounded row-group writer used by artifact-storage-v2 shards."""
+    """Bounded typed-column row-group writer for artifact-storage-v2 shards."""
 
     def __init__(
         self,
@@ -927,29 +1444,45 @@ class _StreamingParquetSink:
         self.path = path
         self.schema = schema
         self.config = config
-        self.rows: list[dict[str, object]] = []
+        self._columns: tuple[list[object], ...] = tuple([] for _ in schema)
+        self._buffered_row_count = 0
         self.row_count = 0
+        high_volume_compact = schema.equals(V2_SCREENING_DECISIONS_SCHEMA) or schema.equals(
+            V3_SCREENING_OCCURRENCES_SCHEMA
+        )
         self._writer = pq.ParquetWriter(
             path,
             schema,
             compression=config.compression,
             compression_level=config.compression_level,
-            use_dictionary=not schema.equals(V2_SCREENING_DECISIONS_SCHEMA),
-            write_statistics=not schema.equals(V2_SCREENING_DECISIONS_SCHEMA),
+            use_dictionary=not high_volume_compact,
+            write_statistics=not high_volume_compact,
         )
 
     def append(self, row: Mapping[str, object]) -> None:
-        self.rows.append(dict(row))
-        if len(self.rows) >= V2_PARQUET_ROW_GROUP_SIZE:
+        for field, column in zip(self.schema, self._columns, strict=True):
+            column.append(row.get(field.name))
+        self._buffered_row_count += 1
+        if self._buffered_row_count >= V2_PARQUET_ROW_GROUP_SIZE:
             self.flush()
 
+    @property
+    def buffered_row_count(self) -> int:
+        return self._buffered_row_count
+
     def flush(self) -> None:
-        if not self.rows:
+        if self._buffered_row_count == 0:
             return
-        table = pa.Table.from_pylist(self.rows, schema=self.schema)
+        arrays = [
+            pa.array(column, type=field.type)
+            for field, column in zip(self.schema, self._columns, strict=True)
+        ]
+        table = pa.Table.from_arrays(arrays, schema=self.schema)
         self._writer.write_table(table, row_group_size=V2_PARQUET_ROW_GROUP_SIZE)
         self.row_count += table.num_rows
-        self.rows.clear()
+        for column in self._columns:
+            column.clear()
+        self._buffered_row_count = 0
 
     def close(self) -> tuple[int, str]:
         errors: list[BaseException] = []
@@ -1084,6 +1617,8 @@ def canonical_artifact_paths(
             ("route_dictionary", "parquet"),
             ("screening_checks", "parquet"),
             ("screening_decisions", "parquet"),
+            ("screening_definitions", "parquet"),
+            ("screening_occurrences", "parquet"),
             ("diagnostic", "parquet"),
             ("environment", "json"),
             ("failure", "json"),
@@ -1852,6 +2387,26 @@ class ArtifactBundleWriter:
     ) -> dict[str, str]:
         """Write one bounded, worker-owned artifact-storage-v2 shard."""
 
+        if self.config.screening_schema_version == SCREENING_DECISIONS_V3:
+            shard = self.open_v2_shard(
+                instance=instance,
+                seed=seed,
+                shard_ordinal=shard_ordinal,
+                worker_identity=worker_identity,
+            )
+            shard.append(
+                route_dictionary=route_dictionary,
+                critical_events=critical_events,
+                diagnostic_rows=diagnostic_rows,
+            )
+            return shard.finalize(
+                raw_payload=raw_payload,
+                solution_payload=solution_payload,
+                trace_payload=trace_payload,
+                environment_payload=environment_payload,
+                failure_payload=failure_payload,
+            )
+
         self._current_instance = (instance, seed)
         self._instance_bytes = 0
         self._next_event_id = 1
@@ -2185,9 +2740,15 @@ class ArtifactBundleWriter:
     ) -> str:
         path = directory / _canonical_filename(self.context, artifact_type, instance, seed)
         _json_write(path, payload)
+        artifact_subtype = (
+            "compact_index_v1"
+            if artifact_type == "trace" and self.context.component == "benchmark"
+            else ""
+        )
         self._record_file(
             path,
             artifact_type=artifact_type,
+            artifact_subtype=artifact_subtype,
             retention_class=retention_class,
             storage_format="json_control" if artifact_type == "environment" else "json",
             compression="none",
@@ -2416,7 +2977,10 @@ def verify_manifest(run_dir: Path) -> dict[str, Any]:
         raise ArtifactIntegrityError(
             "current artifact manifest storage policy is invalid"
         ) from error
-    if policy.to_dict() != dict(policy_payload):
+    canonical_policy = policy.to_dict()
+    legacy_policy = dict(canonical_policy)
+    legacy_policy.pop("screening_schema_version")
+    if dict(policy_payload) not in (canonical_policy, legacy_policy):
         raise ArtifactIntegrityError("current artifact manifest storage policy is not canonical")
     artifact_status = manifest.get("artifact_status")
     if not isinstance(artifact_status, Mapping):
@@ -2459,6 +3023,10 @@ def verify_manifest(run_dir: Path) -> dict[str, Any]:
             expected_schema = str(item.get("schema_fingerprint", ""))
             if expected_schema and _schema_fingerprint(parquet.schema_arrow) != expected_schema:
                 raise ArtifactIntegrityError(f"artifact schema fingerprint mismatch: {relative}")
+    post_manifest_envelope_paths = _verify_post_manifest_persistence_envelopes(
+        run_dir,
+        run_label=str(manifest.get("run_label", "")),
+    )
     for path in run_dir.rglob("*"):
         if not path.is_file() or path in {manifest_path, sidecar}:
             continue
@@ -2466,6 +3034,8 @@ def verify_manifest(run_dir: Path) -> dict[str, Any]:
         if _is_appledouble_path(path.relative_to(run_dir)):
             continue
         if relative == "review" or relative.startswith("review/"):
+            continue
+        if relative in post_manifest_envelope_paths:
             continue
         if relative not in listed_paths:
             raise ArtifactIntegrityError(f"unlisted artifact is present: {relative}")
@@ -2476,6 +3046,258 @@ def verify_manifest(run_dir: Path) -> dict[str, Any]:
     if artifact_status.get("failure") != expected_failure_status:
         raise ArtifactIntegrityError("failure artifact status does not match manifest contents")
     return manifest
+
+
+def _verify_post_manifest_persistence_envelopes(
+    run_dir: Path,
+    *,
+    run_label: str,
+) -> set[str]:
+    """Verify the narrow signed envelope written after the primary manifest.
+
+    It cannot be listed by the primary manifest without creating a self-reference.
+    No other post-manifest file is exempted from the unlisted-artifact check.
+    """
+
+    if not run_label.startswith("stage05.2_"):
+        return set()
+    control = run_dir / "control"
+    batch_match = re.fullmatch(r"batch[0-9]{4}", run_dir.name)
+    is_batch_root = batch_match is not None and run_dir.parent.name == run_label
+    expected_subject = run_dir.name if is_batch_root else None
+    expected_stem = (
+        f"{run_label}_{expected_subject}_persistence_attribution"
+        if expected_subject is not None
+        else f"{run_label}_persistence_attribution"
+    )
+    candidates = (
+        [
+            path
+            for path in control.glob(f"{run_label}*_persistence_attribution.*")
+            if path.is_file()
+        ]
+        if control.is_dir()
+        else []
+    )
+    allowed_names = {f"{expected_stem}.json", f"{expected_stem}.sha256"}
+    if any(path.name not in allowed_names for path in candidates):
+        raise ArtifactIntegrityError(
+            "post-manifest persistence attribution does not match the directory role"
+        )
+    stems = {path.name.rsplit(".", 1)[0] for path in candidates}
+    verified: set[str] = set()
+    campaign_attribution: Mapping[str, object] | None = None
+    for stem in stems:
+        payload_path = control / f"{stem}.json"
+        sidecar_path = control / f"{stem}.sha256"
+        if not payload_path.is_file() or not sidecar_path.is_file():
+            raise ArtifactIntegrityError(
+                "post-manifest persistence attribution must include JSON and sidecar"
+            )
+        if not signed_sidecar_matches(payload_path, sidecar_path):
+            raise ArtifactIntegrityError("persistence attribution sidecar hash mismatch")
+        try:
+            attribution = json.loads(payload_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ArtifactIntegrityError("persistence attribution JSON is invalid") from error
+        if not isinstance(attribution, Mapping) or attribution.get("run_label") != run_label:
+            raise ArtifactIntegrityError("persistence attribution identity is invalid")
+        if expected_subject is not None and attribution.get("subject_id") != expected_subject:
+            raise ArtifactIntegrityError("persistence attribution batch identity is invalid")
+        if expected_subject is None:
+            campaign_attribution = attribution
+        verified.update(
+            {
+                payload_path.relative_to(run_dir).as_posix(),
+                sidecar_path.relative_to(run_dir).as_posix(),
+            }
+        )
+    batch_payload = run_dir / "batch_persistence_envelope.json"
+    batch_sidecar = run_dir / "batch_persistence_envelope.sha256"
+    batch_envelope_payload: Mapping[str, object] | None = None
+    if batch_payload.exists() or batch_sidecar.exists():
+        if expected_subject is None:
+            raise ArtifactIntegrityError(
+                "batch persistence envelope is only valid at a canonical batch root"
+            )
+        if not batch_payload.is_file() or not batch_sidecar.is_file():
+            raise ArtifactIntegrityError(
+                "batch persistence envelope must include JSON and sidecar"
+            )
+        if not signed_sidecar_matches(batch_payload, batch_sidecar):
+            raise ArtifactIntegrityError("batch persistence envelope sidecar hash mismatch")
+        try:
+            decoded_payload = json.loads(batch_payload.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ArtifactIntegrityError("batch persistence envelope JSON is invalid") from error
+        if (
+            not isinstance(decoded_payload, Mapping)
+            or decoded_payload.get("schema_version")
+            != "stage05.2-batch-persistence-envelope-v1"
+            or decoded_payload.get("run_label") != run_label
+            or decoded_payload.get("batch_id") != expected_subject
+        ):
+            raise ArtifactIntegrityError("batch persistence envelope identity is invalid")
+        batch_envelope_payload = decoded_payload
+        verified.update(
+            {
+                batch_payload.relative_to(run_dir).as_posix(),
+                batch_sidecar.relative_to(run_dir).as_posix(),
+            }
+        )
+    batch_manifest = run_dir / "batch_manifest.json"
+    batch_manifest_sidecar = run_dir / "batch_manifest.sha256"
+    if batch_envelope_payload is not None and not (
+        batch_manifest.is_file() and batch_manifest_sidecar.is_file()
+    ):
+        raise ArtifactIntegrityError(
+            "batch persistence envelope requires the archived batch manifest"
+        )
+    if batch_manifest.exists() or batch_manifest_sidecar.exists():
+        if expected_subject is None:
+            raise ArtifactIntegrityError(
+                "batch manifest envelope is only valid at a canonical batch root"
+            )
+        if not batch_manifest.is_file() or not batch_manifest_sidecar.is_file():
+            raise ArtifactIntegrityError("batch manifest must include JSON and sidecar")
+        manifest_sha = _sha256(batch_manifest)
+        if not signed_sidecar_matches(batch_manifest, batch_manifest_sidecar):
+            raise ArtifactIntegrityError("batch manifest sidecar hash mismatch")
+        try:
+            batch_state = json.loads(batch_manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ArtifactIntegrityError("batch manifest JSON is invalid") from error
+        expected_fields = {
+            "schema_version",
+            "run_label",
+            "batch_id",
+            "status",
+            "root_alias",
+            "archive_root_alias",
+            "logical_path",
+            "volume_identity",
+            "shard_ids",
+            "estimated_bytes",
+            "checksum_sha256",
+            "actual_bytes",
+            "row_count",
+            "physical_schema",
+            "resource_summary_sha256",
+            "persistence_attribution_sha256",
+            "control_persistence_seconds",
+            "persistence_ratio",
+            "shard_manifest_sha256_by_id",
+            "shard_actual_bytes_by_id",
+            "transfer_mode",
+            "archive_transfer_seconds",
+            "failure_reason",
+        }
+        root_alias = batch_state.get("root_alias") if isinstance(batch_state, Mapping) else None
+        volume = batch_state.get("volume_identity") if isinstance(batch_state, Mapping) else None
+        status = batch_state.get("status") if isinstance(batch_state, Mapping) else None
+        transfer_mode = (
+            batch_state.get("transfer_mode") if isinstance(batch_state, Mapping) else None
+        )
+        archive_seconds = (
+            batch_state.get("archive_transfer_seconds")
+            if isinstance(batch_state, Mapping)
+            else None
+        )
+        if (
+            not isinstance(batch_state, Mapping)
+            or set(batch_state) != expected_fields
+            or batch_state.get("schema_version") != "stage05.2-batch-manifest-v1"
+            or batch_state.get("run_label") != run_label
+            or batch_state.get("batch_id") != expected_subject
+            or status not in {"verified", "archived"}
+            or batch_state.get("logical_path") != f"{run_label}/{expected_subject}"
+            or not isinstance(root_alias, str)
+            or not isinstance(volume, Mapping)
+            or set(volume) != {"device_uuid", "filesystem"}
+            or not all(isinstance(value, str) and value for value in volume.values())
+            or batch_state.get("failure_reason") is not None
+            or (
+                status == "verified"
+                and (transfer_mode is not None or archive_seconds is not None)
+            )
+            or (
+                status == "archived"
+                and (
+                    root_alias != batch_state.get("archive_root_alias")
+                    or transfer_mode
+                    not in {"same_volume_atomic_rename", "cross_volume_verified_copy"}
+                    or isinstance(archive_seconds, bool)
+                    or not isinstance(archive_seconds, int | float)
+                    or archive_seconds < 0
+                )
+            )
+            or (batch_envelope_payload is not None and status != "archived")
+        ):
+            raise ArtifactIntegrityError("batch manifest identity/status/root is invalid")
+        if (
+            batch_envelope_payload is not None
+            and batch_envelope_payload.get("archived_manifest_sha256") != manifest_sha
+        ):
+            raise ArtifactIntegrityError(
+                "batch persistence envelope does not bind the archived batch manifest"
+            )
+        verified.update(
+            {
+                batch_manifest.relative_to(run_dir).as_posix(),
+                batch_manifest_sidecar.relative_to(run_dir).as_posix(),
+            }
+        )
+    campaign_manifest = run_dir / "campaign_manifest.json"
+    campaign_sidecar = run_dir / "campaign_manifest.sha256"
+    if campaign_manifest.exists() or campaign_sidecar.exists():
+        if expected_subject is not None or not run_label.startswith("stage05.2_benchmark_"):
+            raise ArtifactIntegrityError(
+                "campaign manifest envelope is only valid at a benchmark campaign root"
+            )
+        if not campaign_manifest.is_file() or not campaign_sidecar.is_file():
+            raise ArtifactIntegrityError("campaign manifest must include JSON and sidecar")
+        if not signed_sidecar_matches(campaign_manifest, campaign_sidecar):
+            raise ArtifactIntegrityError("campaign manifest sidecar hash mismatch")
+        try:
+            campaign_state = json.loads(campaign_manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ArtifactIntegrityError("campaign manifest JSON is invalid") from error
+        if (
+            not isinstance(campaign_state, Mapping)
+            or campaign_state.get("schema_version")
+            != "stage05.2-campaign-manifest-v1"
+            or campaign_state.get("run_label") != run_label
+            or campaign_state.get("status") not in {"planned", "complete", "failed"}
+        ):
+            raise ArtifactIntegrityError("campaign manifest identity/status is invalid")
+        if campaign_state.get("status") == "complete":
+            primary_manifest_path = find_manifest(run_dir)
+            persistence_ratio = (
+                campaign_attribution.get("persistence_ratio")
+                if campaign_attribution is not None
+                else None
+            )
+            if (
+                campaign_attribution is None
+                or campaign_attribution.get("subject_id") != "campaign"
+                or campaign_attribution.get("primary_manifest_relative_path")
+                != primary_manifest_path.relative_to(run_dir).as_posix()
+                or campaign_attribution.get("primary_manifest_sha256")
+                != _sha256(primary_manifest_path)
+                or isinstance(persistence_ratio, bool)
+                or not isinstance(persistence_ratio, int | float)
+                or not 0.0 <= float(persistence_ratio) <= 0.30
+            ):
+                raise ArtifactIntegrityError(
+                    "complete campaign is not committed after a passing attribution gate"
+                )
+        verified.update(
+            {
+                campaign_manifest.relative_to(run_dir).as_posix(),
+                campaign_sidecar.relative_to(run_dir).as_posix(),
+            }
+        )
+    return verified
 
 
 def _verify_legacy_manifest(run_dir: Path) -> dict[str, Any]:
@@ -2516,6 +3338,268 @@ class _RegisteredStableRouteIds(Mapping[str, int]):
 
     def __contains__(self, key: object) -> bool:
         return isinstance(key, str) and _stable_route_id(key) in self._registered
+
+
+class _DiskBackedRouteKeyStore(Mapping[int, str]):
+    """Bounded-memory, exact route-ID dictionary for streamed replay."""
+
+    def __init__(
+        self,
+        *,
+        scratch_root: Path | None,
+        cache_entries: int = ROUTE_IDENTITY_HOT_CACHE_ENTRIES,
+    ) -> None:
+        if cache_entries <= 0:
+            raise ValueError("route key cache_entries must be positive")
+        if scratch_root is not None:
+            scratch_root.mkdir(parents=True, exist_ok=True)
+        self._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="evrptw-route-key-replay-",
+            dir=scratch_root,
+        )
+        database_path = Path(self._temporary_directory.name) / "routes.sqlite3"
+        self._connection = sqlite3.connect(database_path)
+        self._connection.execute("PRAGMA journal_mode=OFF")
+        self._connection.execute("PRAGMA synchronous=OFF")
+        self._connection.execute("PRAGMA temp_store=FILE")
+        self._connection.execute("PRAGMA cache_size=-2048")
+        self._connection.execute(
+            "CREATE TABLE routes ("
+            "route_id INTEGER PRIMARY KEY, canonical_route_key TEXT NOT NULL UNIQUE"
+            ")"
+        )
+        self._cache_entries = cache_entries
+        self._cache: OrderedDict[int, str] = OrderedDict()
+        self._route_count = 0
+        self._closed = False
+
+    def register(
+        self,
+        row: Mapping[str, object],
+        *,
+        require_canonical_key: bool,
+    ) -> None:
+        raw_route_id = row.get("route_id")
+        if (
+            isinstance(raw_route_id, bool)
+            or not isinstance(raw_route_id, int)
+            or raw_route_id <= 0
+        ):
+            raise ArtifactIntegrityError("route dictionary ID must be a positive integer")
+        route_key = row.get("canonical_route_key")
+        raw_sequence = row.get("customer_sequence")
+        route_digest = row.get("route_digest")
+        if not isinstance(route_key, str) or not route_key:
+            raise ArtifactIntegrityError("route dictionary key must be non-empty text")
+        if not isinstance(raw_sequence, list) or any(
+            not isinstance(customer, str) for customer in raw_sequence
+        ):
+            raise ArtifactIntegrityError("route dictionary sequence must be a string list")
+        sequence = tuple(raw_sequence)
+        if require_canonical_key and _route_sequence_from_key(route_key) != sequence:
+            raise ArtifactIntegrityError("route dictionary key/sequence mismatch")
+        if route_digest != _payload_sha256(list(sequence)):
+            raise ArtifactIntegrityError("route dictionary digest mismatch")
+        try:
+            self._connection.execute(
+                "INSERT INTO routes(route_id, canonical_route_key) VALUES (?, ?)",
+                (raw_route_id, route_key),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ArtifactIntegrityError(
+                "route dictionary IDs and keys must be unique"
+            ) from error
+        self._route_count += 1
+        self._remember(raw_route_id, route_key)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._connection.close()
+        self._temporary_directory.cleanup()
+        self._cache.clear()
+        self._closed = True
+
+    def __getitem__(self, route_id: int) -> str:
+        cached = self._cache.get(route_id)
+        if cached is not None:
+            self._cache.move_to_end(route_id)
+            return cached
+        stored = self._connection.execute(
+            "SELECT canonical_route_key FROM routes WHERE route_id = ?",
+            (route_id,),
+        ).fetchone()
+        if stored is None:
+            raise KeyError(route_id)
+        route_key = str(stored[0])
+        self._remember(route_id, route_key)
+        return route_key
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return self._route_count
+
+    def _remember(self, route_id: int, route_key: str) -> None:
+        self._cache[route_id] = route_key
+        self._cache.move_to_end(route_id)
+        if len(self._cache) > self._cache_entries:
+            self._cache.popitem(last=False)
+
+
+class _DiskBackedRouteIdentityStore(Mapping[int, str]):
+    """Exact route/call identity state with a fixed-size in-process hot set.
+
+    Stage 5.2 may observe more unique routes than one Parquet row group.  The
+    collision state therefore lives in SQLite on the shard's own volume.  The
+    database is runtime scratch only and is removed before the shard manifest
+    is sealed.
+    """
+
+    def __init__(
+        self,
+        *,
+        scratch_root: Path,
+        cache_entries: int = ROUTE_IDENTITY_HOT_CACHE_ENTRIES,
+    ) -> None:
+        if cache_entries <= 0:
+            raise ValueError("route identity cache_entries must be positive")
+        scratch_root.mkdir(parents=True, exist_ok=True)
+        self._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="evrptw-route-identities-",
+            dir=scratch_root,
+        )
+        self._database_path = Path(self._temporary_directory.name) / "identities.sqlite3"
+        self._connection = sqlite3.connect(self._database_path)
+        self._connection.execute("PRAGMA journal_mode=OFF")
+        self._connection.execute("PRAGMA synchronous=OFF")
+        self._connection.execute("PRAGMA temp_store=MEMORY")
+        self._connection.execute("PRAGMA cache_size=-2048")
+        self._connection.execute(
+            "CREATE TABLE routes (route_id INTEGER PRIMARY KEY, digest TEXT NOT NULL)"
+        )
+        self._connection.execute(
+            "CREATE TABLE unique_identities ("
+            "axis TEXT NOT NULL, semantics TEXT NOT NULL, identity_digest BLOB NOT NULL, "
+            "payload BLOB NOT NULL, PRIMARY KEY(axis, semantics, identity_digest)) WITHOUT ROWID"
+        )
+        self._cache_entries = cache_entries
+        self._route_cache: OrderedDict[int, str] = OrderedDict()
+        self._unique_counts: Counter[tuple[str, str]] = Counter()
+        self._route_count = 0
+        self._closed = False
+
+    @property
+    def scratch_path(self) -> Path:
+        return Path(self._temporary_directory.name)
+
+    @property
+    def hot_entries(self) -> int:
+        return len(self._route_cache) + len(self._unique_counts)
+
+    @property
+    def hot_entry_limit(self) -> int:
+        return self._cache_entries + ROUTE_IDENTITY_COUNTER_NAMESPACES
+
+    def register_route(self, route_id: int, route_digest: str) -> bool:
+        try:
+            previous = self[route_id]
+        except KeyError:
+            previous = None
+        if previous is not None:
+            if previous != route_digest:
+                raise ArtifactIntegrityError(
+                    f"stable route ID collision for route ID {route_id}"
+                )
+            return False
+        self._connection.execute(
+            "INSERT INTO routes(route_id, digest) VALUES (?, ?)",
+            (route_id, route_digest),
+        )
+        self._route_count += 1
+        self._remember_route(route_id, route_digest)
+        return True
+
+    def register_unique_identity(
+        self,
+        *,
+        axis: str,
+        semantics: str,
+        identity: tuple[str, ...],
+    ) -> bool:
+        if semantics not in UNIQUE_ROUTE_IDENTITY_SEMANTICS:
+            raise ValueError(f"unsupported unique route identity semantics: {semantics}")
+        encoded = orjson.dumps(identity)
+        digest = hashlib.sha256(encoded).digest()
+        existing = self._connection.execute(
+            "SELECT payload FROM unique_identities "
+            "WHERE axis = ? AND semantics = ? AND identity_digest = ?",
+            (axis, semantics, digest),
+        ).fetchone()
+        if existing is not None:
+            if bytes(existing[0]) != encoded:
+                raise ArtifactIntegrityError("unique route identity SHA-256 collision")
+            return False
+        namespace = (axis, semantics)
+        if (
+            namespace not in self._unique_counts
+            and len(self._unique_counts) >= ROUTE_IDENTITY_COUNTER_NAMESPACES
+        ):
+            raise ArtifactIntegrityError("unique route identity counter namespace bound exceeded")
+        self._connection.execute(
+            "INSERT INTO unique_identities(axis, semantics, identity_digest, payload) "
+            "VALUES (?, ?, ?, ?)",
+            (axis, semantics, digest, encoded),
+        )
+        self._unique_counts[namespace] += 1
+        return True
+
+    def unique_identity_count(self, *, axis: str, semantics: str) -> int:
+        return int(self._unique_counts[(axis, semantics)])
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._connection.close()
+        self._temporary_directory.cleanup()
+        self._route_cache.clear()
+        self._closed = True
+
+    def __getitem__(self, route_id: int) -> str:
+        cached = self._route_cache.get(route_id)
+        if cached is not None:
+            self._route_cache.move_to_end(route_id)
+            return cached
+        stored = self._connection.execute(
+            "SELECT digest FROM routes WHERE route_id = ?", (route_id,)
+        ).fetchone()
+        if stored is None:
+            raise KeyError(route_id)
+        digest = str(stored[0])
+        self._remember_route(route_id, digest)
+        return digest
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return self._route_count
+
+    def __contains__(self, route_id: object) -> bool:
+        if isinstance(route_id, bool) or not isinstance(route_id, int):
+            return False
+        try:
+            self[route_id]
+        except KeyError:
+            return False
+        return True
+
+    def _remember_route(self, route_id: int, digest: str) -> None:
+        self._route_cache[route_id] = digest
+        self._route_cache.move_to_end(route_id)
+        if len(self._route_cache) > self._cache_entries:
+            self._route_cache.popitem(last=False)
 
 
 class ArtifactV2ShardSession:
@@ -2560,24 +3644,39 @@ class ArtifactV2ShardSession:
             SCREENING_CHECKS_SCHEMA,
             owner.config,
         )
-        self._screening_sink = _StreamingParquetSink(
-            owner.run_dir / self.paths["screening_decisions"],
-            V2_SCREENING_DECISIONS_SCHEMA,
-            owner.config,
-        )
+        self._screening_sink: _StreamingParquetSink | None = None
+        self._screening_definitions_sink: _StreamingParquetSink | None = None
+        self._screening_occurrences_sink: _StreamingParquetSink | None = None
+        if owner.config.screening_schema_version == SCREENING_DECISIONS_V3:
+            self._screening_definitions_sink = _StreamingParquetSink(
+                owner.run_dir / self.paths["screening_definitions"],
+                V3_SCREENING_DEFINITIONS_SCHEMA,
+                owner.config,
+            )
+            self._screening_occurrences_sink = _StreamingParquetSink(
+                owner.run_dir / self.paths["screening_occurrences"],
+                V3_SCREENING_OCCURRENCES_SCHEMA,
+                owner.config,
+            )
+        else:
+            self._screening_sink = _StreamingParquetSink(
+                owner.run_dir / self.paths["screening_decisions"],
+                V2_SCREENING_DECISIONS_SCHEMA,
+                owner.config,
+            )
         self._diagnostic_sink = _StreamingParquetSink(
             owner.run_dir / self.paths["diagnostic"],
             DIAGNOSTIC_SCHEMA,
             owner.config,
         )
-        self._route_digests: dict[int, str] = {}
+        self._route_digests = _DiskBackedRouteIdentityStore(scratch_root=self._directory)
         self._route_ids = _RegisteredStableRouteIds(self._route_digests)
         self._lane_ids: dict[str, int] = {}
         self._operator_ids: dict[str, int] = {}
         self._screening_definition_cache: OrderedDict[
             tuple[object, ...], tuple[int, bytes, str]
         ] = OrderedDict()
-        self._screening_definition_digests: dict[int, str] = {}
+        self._screening_definition_store: _BoundedScreeningDefinitionStore | None = None
         self._active_sinks: list[_StreamingParquetSink] = []
         self._max_buffered_groups_observed = 0
         self._state = "open"
@@ -2622,6 +3721,7 @@ class ArtifactV2ShardSession:
                     )
             else:
                 _validate_event_routes(event, self._route_ids)
+            self._register_unique_route_evaluation_identity(event)
             event_id = self._owner._next_event_id
             self._owner._next_event_id += 1
             normalized_event = (
@@ -2642,7 +3742,14 @@ class ArtifactV2ShardSession:
                 )
             )
             if screening_event:
-                self._append_buffered(self._screening_sink, normalized_event)
+                screening_sink = (
+                    self._screening_occurrences_sink
+                    if self._screening_occurrences_sink is not None
+                    else self._screening_sink
+                )
+                if screening_sink is None:
+                    raise RuntimeError("screening occurrence sink is unavailable")
+                self._append_buffered(screening_sink, normalized_event)
             else:
                 self._append_buffered(self._event_sink, normalized_event)
             checks = event.get("checks")
@@ -2683,6 +3790,7 @@ class ArtifactV2ShardSession:
         trace_payload: Mapping[str, object],
         environment_payload: Mapping[str, object],
         failure_payload: Mapping[str, object] | None = None,
+        anytime_checkpoints: Sequence[Mapping[str, object]] = (),
     ) -> dict[str, str]:
         """Close the shard, publish checksums, and write its complete manifest."""
 
@@ -2702,6 +3810,41 @@ class ArtifactV2ShardSession:
                 self.seed,
                 environment_payload,
             )
+            if anytime_checkpoints:
+                if self._owner.context.component != "benchmark":
+                    raise ArtifactIntegrityError(
+                        "anytime checkpoint artifacts are reserved for benchmark shards"
+                    )
+                if len(anytime_checkpoints) > 16:
+                    raise ArtifactIntegrityError(
+                        "one benchmark shard may contain at most 16 anytime checkpoints"
+                    )
+                checkpoint_path = self._directory / _canonical_filename(
+                    self._owner.context,
+                    "anytime_checkpoints",
+                    self.instance,
+                    self.seed,
+                    "parquet",
+                )
+                checkpoint_count, checkpoint_schema = _write_parquet(
+                    checkpoint_path,
+                    tuple(_normalise_anytime_checkpoint(row) for row in anytime_checkpoints),
+                    ANYTIME_CHECKPOINT_SCHEMA,
+                    self._owner.config,
+                )
+                self._owner._record_file(
+                    checkpoint_path,
+                    artifact_type="anytime_checkpoints",
+                    artifact_subtype="checkpoint_v1",
+                    retention_class="critical",
+                    storage_format="parquet",
+                    compression=self._owner.config.compression,
+                    row_count=checkpoint_count,
+                    schema_fingerprint=checkpoint_schema,
+                )
+                self.paths["anytime_checkpoints"] = str(
+                    checkpoint_path.relative_to(self._owner.run_dir)
+                )
             trace_index = compact_trace_payload(
                 trace_payload,
                 route_dictionary_ref=self.paths["route_dictionary"],
@@ -2716,7 +3859,12 @@ class ArtifactV2ShardSession:
                 "local_field": "event_id",
             }
             trace_index["schema_fingerprints"] = metadata
-            trace_index["screening_decisions_ref"] = self.paths["screening_decisions"]
+            trace_index["screening_schema_version"] = self._owner.config.screening_schema_version
+            if self._owner.config.screening_schema_version == SCREENING_DECISIONS_V3:
+                trace_index["screening_definitions_ref"] = self.paths["screening_definitions"]
+                trace_index["screening_occurrences_ref"] = self.paths["screening_occurrences"]
+            else:
+                trace_index["screening_decisions_ref"] = self.paths["screening_decisions"]
             self.paths["trace"] = self._owner._write_json_artifact(
                 self._directory, "trace", self.instance, self.seed, trace_index
             )
@@ -2820,12 +3968,18 @@ class ArtifactV2ShardSession:
 
     @property
     def _sinks(self) -> tuple[_StreamingParquetSink, ...]:
-        return (
-            self._route_sink,
-            self._event_sink,
-            self._checks_sink,
-            self._screening_sink,
-            self._diagnostic_sink,
+        return tuple(
+            sink
+            for sink in (
+                self._route_sink,
+                self._event_sink,
+                self._checks_sink,
+                self._screening_sink,
+                self._screening_definitions_sink,
+                self._screening_occurrences_sink,
+                self._diagnostic_sink,
+            )
+            if sink is not None
         )
 
     @property
@@ -2834,12 +3988,30 @@ class ArtifactV2ShardSession:
 
         return self._max_buffered_groups_observed
 
+    @property
+    def unique_route_hot_entries(self) -> int:
+        return self._route_digests.hot_entries
+
+    @property
+    def unique_route_hot_entry_limit(self) -> int:
+        return self._route_digests.hot_entry_limit
+
+    @property
+    def unique_route_scratch_path(self) -> Path:
+        return self._route_digests.scratch_path
+
+    def unique_route_identity_count(self, semantics: str, axis: str) -> int:
+        return self._route_digests.unique_identity_count(
+            axis=axis,
+            semantics=semantics,
+        )
+
     def _append_buffered(self, sink: _StreamingParquetSink, row: Mapping[str, object]) -> None:
         if sink not in self._active_sinks and len(self._active_sinks) >= 2:
             victim = self._active_sinks.pop(0)
             victim.flush()
         sink.append(row)
-        if sink.rows:
+        if sink.buffered_row_count:
             if sink not in self._active_sinks:
                 self._active_sinks.append(sink)
         elif sink in self._active_sinks:
@@ -2863,89 +4035,85 @@ class ArtifactV2ShardSession:
         lane_id: int,
         operator_id: int,
     ) -> dict[str, object]:
-        raw_checks = event.get("checks")
-        checks = raw_checks if isinstance(raw_checks, (list, tuple)) else ()
-        checks_key = tuple(
-            (
-                str(check.get("check", "")),
-                str(check.get("status", "")),
-                check.get("value"),
-                str(check.get("reason", "")),
-            )
-            for check in checks
-            if isinstance(check, Mapping)
+        definition = _normalise_screening_definition(
+            event,
+            lane_id=lane_id,
+            operator_id=operator_id,
+            route_id=route_id,
         )
-        definition_key = (
-            lane_id,
-            operator_id,
-            route_id,
-            str(event.get("status", "")),
-            str(event.get("reason", "")),
-            str(event.get("benchmark_axis", "")),
-            event.get("demand"),
-            event.get("distance_increment_lower_bound"),
-            event.get("distance_lower_bound"),
-            event.get("exact_call_blocked"),
-            str(event.get("first_failed_check", "")),
-            event.get("min_time_window_slack"),
-            event.get("negative_cache_hit"),
-            event.get("single_segment_reachable"),
-            event.get("structural_energy_lower_bound"),
-            checks_key,
+        raw_definition_checks = definition["checks"]
+        if not isinstance(raw_definition_checks, list):
+            raise ArtifactIntegrityError("normalized screening checks must be a list")
+        definition_key: tuple[object, ...] = (
+            definition["lane_id"],
+            definition["operator_id"],
+            definition["route_id"],
+            definition["status"],
+            definition["reason"],
+            definition["benchmark_axis"],
+            definition["demand"],
+            definition["distance_increment_lower_bound"],
+            definition["distance_lower_bound"],
+            definition["exact_call_blocked"],
+            definition["first_failed_check"],
+            definition["min_time_window_slack"],
+            definition["negative_cache_hit"],
+            definition["single_segment_reachable"],
+            definition["structural_energy_lower_bound"],
+            tuple(
+                (
+                    check.get("check"),
+                    check.get("status"),
+                    check.get("value_bool"),
+                    check.get("value_float"),
+                    check.get("value_text"),
+                    check.get("reason"),
+                )
+                for check in raw_definition_checks
+                if isinstance(check, Mapping)
+            ),
         )
         cached = self._screening_definition_cache.get(definition_key)
         first_occurrence = False
         if cached is None:
-            checks_json = orjson.dumps(
-                _normalise_compact_screening_checks(checks),
-                option=orjson.OPT_SORT_KEYS,
-            )
-            definition = {
-                "lane_id": lane_id,
-                "operator_id": operator_id,
-                "route_id": route_id,
-                "status": definition_key[3],
-                "reason": definition_key[4],
-                "benchmark_axis": definition_key[5],
-                "demand": definition_key[6],
-                "distance_increment_lower_bound": definition_key[7],
-                "distance_lower_bound": definition_key[8],
-                "exact_call_blocked": definition_key[9],
-                "first_failed_check": definition_key[10],
-                "min_time_window_slack": definition_key[11],
-                "negative_cache_hit": definition_key[12],
-                "single_segment_reachable": definition_key[13],
-                "structural_energy_lower_bound": definition_key[14],
-                "checks": orjson.Fragment(checks_json),
-            }
-            definition_json = orjson.dumps(definition, option=orjson.OPT_SORT_KEYS)
-            definition_id = (
-                int.from_bytes(hashlib.sha256(definition_json).digest()[:8], "big")
-                & 0x7FFF_FFFF_FFFF_FFFF
+            definition_id, definition_json, definition_digest = _screening_definition_identity(
+                definition
             )
             cached = (
                 definition_id,
                 definition_json,
-                hashlib.sha256(definition_json).hexdigest(),
+                definition_digest,
             )
             self._screening_definition_cache[definition_key] = cached
             if len(self._screening_definition_cache) > V2_PARQUET_ROW_GROUP_SIZE:
                 self._screening_definition_cache.popitem(last=False)
-            previous_digest = self._screening_definition_digests.get(definition_id)
-            if previous_digest is not None and previous_digest != cached[2]:
-                raise ArtifactIntegrityError(
-                    f"screening definition ID collision for ID {definition_id}"
+            if self._screening_definition_store is None:
+                self._screening_definition_store = _BoundedScreeningDefinitionStore(
+                    cache_entries=1,
+                    scratch_root=self._directory,
                 )
-            first_occurrence = previous_digest is None
-            self._screening_definition_digests[definition_id] = cached[2]
+            first_occurrence = self._screening_definition_store.register(
+                definition_id,
+                definition,
+                allow_identical_existing=True,
+            )
         else:
             self._screening_definition_cache.move_to_end(definition_key)
         definition_id, definition_json, _ = cached
+        if first_occurrence and self._screening_definitions_sink is not None:
+            self._append_buffered(
+                self._screening_definitions_sink,
+                {"definition_id": definition_id, **definition},
+            )
         started_at = event.get("started_at")
         return {
             "event_id": event_id,
             "definition_id": definition_id,
-            "definition_json": definition_json if first_occurrence else None,
+            **(
+                {"definition_json": definition_json if first_occurrence else None}
+                if self._screening_sink is not None
+                else {}
+            ),
             "started_at": started_at,
             "completed_at": event.get("completed_at"),
             "iteration": event.get("iteration"),
@@ -2956,19 +4124,48 @@ class ArtifactV2ShardSession:
         if self._state != "open":
             raise RuntimeError(f"artifact v2 shard session is not open: {self._state}")
 
+    def _register_unique_route_evaluation_identity(
+        self,
+        event: Mapping[str, object],
+    ) -> None:
+        if (
+            event.get("event_type") != "route_evaluation"
+            or event.get("kind") != "exact_call"
+        ):
+            return
+        axis = str(event.get("benchmark_axis", ""))
+        route_key = str(event.get("route_key", ""))
+        lane = str(event.get("lane", ""))
+        axis_lane_prefix = f"{axis}:"
+        if axis and lane.startswith(axis_lane_prefix):
+            lane = lane[len(axis_lane_prefix) :]
+        if event.get("exact_started") is True:
+            self._route_digests.register_unique_identity(
+                axis=axis,
+                semantics="legacy_started",
+                identity=(lane, route_key),
+            )
+        if event.get("exact_completed") is True:
+            self._route_digests.register_unique_identity(
+                axis=axis,
+                semantics="completed_shared",
+                identity=(route_key,),
+            )
+            self._route_digests.register_unique_identity(
+                axis=axis,
+                semantics="completed_lane",
+                identity=("legacy" if lane == "initialization" else lane, route_key),
+            )
+
     def _register_route(self, key: str, sequence: tuple[str, ...]) -> None:
-        if _route_sequence_from_key(key) != sequence:
+        if key.startswith("route:") and _route_sequence_from_key(key) != sequence:
             raise ArtifactIntegrityError(
                 f"route dictionary key does not match customer sequence: {key}"
             )
         route_id = _stable_route_id(key)
         route_digest = _payload_sha256(list(sequence))
-        previous_digest = self._route_digests.get(route_id)
-        if previous_digest is not None:
-            if previous_digest != route_digest:
-                raise ArtifactIntegrityError(f"stable route ID collision for route ID {route_id}")
+        if not self._route_digests.register_route(route_id, route_digest):
             return
-        self._route_digests[route_id] = route_digest
         self._append_buffered(
             self._route_sink,
             {
@@ -2981,7 +4178,7 @@ class ArtifactV2ShardSession:
 
     def _close_and_record_parquet(self) -> dict[str, str]:
         self._require_open()
-        descriptors = (
+        descriptors = [
             (
                 self._route_sink,
                 "route_dictionary",
@@ -2996,18 +4193,40 @@ class ArtifactV2ShardSession:
                 "critical",
             ),
             (
-                self._screening_sink,
-                "events",
-                "screening_decisions_v2",
-                "critical",
-            ),
-            (
                 self._diagnostic_sink,
                 "diagnostic",
                 "aggregated",
                 "diagnostic",
             ),
-        )
+        ]
+        if self._screening_sink is not None:
+            descriptors.append(
+                (
+                    self._screening_sink,
+                    "events",
+                    SCREENING_DECISIONS_V2,
+                    "critical",
+                )
+            )
+        else:
+            if self._screening_definitions_sink is None or self._screening_occurrences_sink is None:
+                raise RuntimeError("screening_decisions_v3 sinks are incomplete")
+            descriptors.extend(
+                (
+                    (
+                        self._screening_definitions_sink,
+                        "events",
+                        "screening_definitions_v3",
+                        "critical",
+                    ),
+                    (
+                        self._screening_occurrences_sink,
+                        "events",
+                        "screening_occurrences_v3",
+                        "critical",
+                    ),
+                )
+            )
         closed: list[tuple[_StreamingParquetSink, str, str, str, int, str]] = []
         errors: list[BaseException] = []
         for sink, artifact_type, subtype, retention in descriptors:
@@ -3025,6 +4244,15 @@ class ArtifactV2ShardSession:
                 )
             except BaseException as error:
                 errors.append(error)
+        if self._screening_definition_store is not None:
+            try:
+                self._screening_definition_store.close()
+            except BaseException as error:
+                errors.append(error)
+        try:
+            self._route_digests.close()
+        except BaseException as error:
+            errors.append(error)
         self._active_sinks.clear()
         self._state = "parquet_closed"
         fingerprints: dict[str, str] = {}
@@ -3032,7 +4260,9 @@ class ArtifactV2ShardSession:
             "canonical_routes": "route_dictionary",
             "critical": "events",
             "screening_checks": "screening_checks",
-            "screening_decisions_v2": "screening_decisions",
+            SCREENING_DECISIONS_V2: "screening_decisions",
+            "screening_definitions_v3": "screening_definitions",
+            "screening_occurrences_v3": "screening_occurrences",
             "aggregated": "diagnostic",
         }
         for sink, artifact_type, subtype, retention, count, fingerprint in closed:
@@ -3146,12 +4376,294 @@ class ArtifactReader:
             columns=selected_columns,
         )
 
+    def iter_parquet_rows(
+        self,
+        relative_path: str | Path,
+        *,
+        schema: pa.Schema | None = None,
+        batch_size: int = V2_PARQUET_ROW_GROUP_SIZE,
+        columns: Sequence[str] | None = None,
+    ) -> Iterable[dict[str, object]]:
+        """Yield row mappings from bounded Arrow batches without ``to_pylist``."""
+
+        for batch in self.iter_parquet_batches(
+            relative_path,
+            schema=schema,
+            batch_size=batch_size,
+            columns=columns,
+        ):
+            names = batch.schema.names
+            arrays = tuple(batch.column(index) for index in range(batch.num_columns))
+            for row_index in range(batch.num_rows):
+                yield {
+                    name: array[row_index].as_py()
+                    for name, array in zip(names, arrays, strict=True)
+                }
+
+    def iter_events(
+        self,
+        relative_path: str | Path,
+        *,
+        batch_size: int = V2_PARQUET_ROW_GROUP_SIZE,
+        scratch_root: Path | None = None,
+    ) -> Iterable[dict[str, object]]:
+        """Stream writer-acceptable logical events across v1, v2, v3, and legacy.
+
+        Ordinary event rows and physical screening streams are individually
+        ordered by ``event_id`` and merged without materialising the event
+        collection. Definition state is disk-backed and bounded; callers that
+        bind active writes to a staging volume can provide ``scratch_root``.
+        Omitting it preserves the historical system-temporary-directory
+        behaviour.
+        """
+
+        path = _safe_artifact_path(self.run_dir, Path(relative_path).as_posix())
+        if path.suffix == ".jsonl":
+            with path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    if not isinstance(item, dict):
+                        raise ArtifactIntegrityError(f"legacy event row is not an object: {path}")
+                    payload = item.get("payload")
+                    logical = payload if isinstance(payload, dict) else item
+                    yield dict(logical)
+            return
+        if path.suffix != ".parquet":
+            raise ArtifactIntegrityError(f"unsupported event artifact: {path}")
+
+        trace_path = path.with_name(path.name.replace("_events_", "_trace_", 1)).with_suffix(
+            ".json"
+        )
+        if not trace_path.is_file():
+            raise ArtifactIntegrityError(f"event trace index is missing: {trace_path}")
+        trace_index = self.read_json(trace_path.relative_to(self.run_dir))
+        lane_dictionary = {
+            int(key): str(value)
+            for key, value in dict(trace_index.get("lane_dictionary", {})).items()
+        }
+        operator_dictionary = {
+            int(key): str(value)
+            for key, value in dict(trace_index.get("operator_dictionary", {})).items()
+        }
+        route_dictionary_ref = trace_index.get("route_dictionary_ref")
+        if not isinstance(route_dictionary_ref, str) or not route_dictionary_ref:
+            raise ArtifactIntegrityError("event trace index lacks a route dictionary reference")
+        route_by_id = _DiskBackedRouteKeyStore(scratch_root=scratch_root)
+        try:
+            for route_row in self.iter_parquet_rows(
+                route_dictionary_ref,
+                schema=ROUTE_DICTIONARY_SCHEMA,
+                batch_size=batch_size,
+            ):
+                route_by_id.register(
+                    route_row,
+                    require_canonical_key=(
+                        trace_index.get("screening_schema_version")
+                        == SCREENING_DECISIONS_V3
+                    ),
+                )
+
+            checks_path = path.with_name(
+                path.name.replace("_events_", "_screening_checks_", 1)
+            )
+            ordinary_rows = self._iter_events_with_checks(
+                path.relative_to(self.run_dir),
+                checks_path=(
+                    checks_path.relative_to(self.run_dir)
+                    if checks_path.is_file()
+                    else None
+                ),
+                batch_size=batch_size,
+            )
+            screening_rows = self._iter_physical_screening_events(
+                path,
+                batch_size=batch_size,
+                scratch_root=scratch_root,
+            )
+            merged = heapq.merge(
+                ordinary_rows,
+                screening_rows,
+                key=lambda row: _required_event_id(row),
+            )
+            previous_event_id = 0
+            for physical_row in merged:
+                event_id = _required_event_id(physical_row)
+                if event_id <= previous_event_id:
+                    raise ArtifactIntegrityError(
+                        "event IDs must be unique and strictly increasing"
+                    )
+                previous_event_id = event_id
+                yield _writer_event_mapping(
+                    physical_row,
+                    route_by_id=route_by_id,
+                    lane_dictionary=lane_dictionary,
+                    operator_dictionary=operator_dictionary,
+                )
+        finally:
+            route_by_id.close()
+
+    def _iter_events_with_checks(
+        self,
+        relative_path: str | Path,
+        *,
+        checks_path: str | Path | None,
+        batch_size: int,
+    ) -> Iterable[dict[str, object]]:
+        rows = self.iter_parquet_rows(
+            relative_path,
+            schema=EVENTS_SCHEMA,
+            batch_size=batch_size,
+        )
+        if checks_path is None:
+            yield from rows
+            return
+        check_groups = iter(
+            _group_screening_checks(
+                self.iter_parquet_rows(
+                    checks_path,
+                    schema=SCREENING_CHECKS_SCHEMA,
+                    batch_size=batch_size,
+                )
+            )
+        )
+        current_group = next(check_groups, None)
+        for row in rows:
+            event_id = _required_event_id(row)
+            if current_group is not None and current_group[0] < event_id:
+                raise ArtifactIntegrityError("screening check refers to an unknown event")
+            if current_group is not None and current_group[0] == event_id:
+                row["embedded_checks"] = current_group[1]
+                current_group = next(check_groups, None)
+            yield row
+        if current_group is not None:
+            raise ArtifactIntegrityError("screening check refers to an unknown event")
+
+    def _iter_physical_screening_events(
+        self,
+        events_path: Path,
+        *,
+        batch_size: int,
+        scratch_root: Path | None,
+    ) -> Iterable[dict[str, object]]:
+        compact_path = events_path.with_name(
+            events_path.name.replace("_events_", "_screening_decisions_", 1)
+        )
+        definitions_path = events_path.with_name(
+            events_path.name.replace("_events_", "_screening_definitions_", 1)
+        )
+        occurrences_path = events_path.with_name(
+            events_path.name.replace("_events_", "_screening_occurrences_", 1)
+        )
+        v3_present = definitions_path.is_file() or occurrences_path.is_file()
+        if v3_present and compact_path.is_file():
+            raise ArtifactIntegrityError("ambiguous compact screening artifacts")
+        if v3_present:
+            if not definitions_path.is_file() or not occurrences_path.is_file():
+                raise ArtifactIntegrityError(
+                    "screening_decisions_v3 requires definitions and occurrences"
+                )
+            with _BoundedScreeningDefinitionStore(
+                cache_entries=min(batch_size, V2_PARQUET_ROW_GROUP_SIZE),
+                scratch_root=scratch_root,
+            ) as definitions:
+                for row in self.iter_parquet_rows(
+                    definitions_path.relative_to(self.run_dir),
+                    schema=V3_SCREENING_DEFINITIONS_SCHEMA,
+                    batch_size=batch_size,
+                ):
+                    raw_definition_id = row.get("definition_id")
+                    if isinstance(raw_definition_id, bool) or not isinstance(
+                        raw_definition_id, int
+                    ):
+                        raise ArtifactIntegrityError("screening definition_id must be an integer")
+                    definitions.register(
+                        raw_definition_id,
+                        _normalise_screening_definition(row),
+                        allow_identical_existing=False,
+                    )
+                for row in self.iter_parquet_rows(
+                    occurrences_path.relative_to(self.run_dir),
+                    schema=V3_SCREENING_OCCURRENCES_SCHEMA,
+                    batch_size=batch_size,
+                ):
+                    definition_id = _screening_definition_id_from_row(row)
+                    yield _expand_screening_decision_row(
+                        _combine_screening_definition_occurrence(
+                            definitions.resolve(definition_id),
+                            row,
+                        )
+                    )
+            return
+        if not compact_path.is_file():
+            return
+        compact_schema = self.parquet_schema(compact_path.relative_to(self.run_dir))
+        if not any(
+            compact_schema.equals(schema)
+            for schema in (V2_SCREENING_DECISIONS_SCHEMA, V2_SCREENING_DECISIONS_SCHEMA_V1)
+        ):
+            raise ArtifactIntegrityError(f"unsupported compact screening schema: {compact_path}")
+        compact_rows = self.iter_parquet_rows(
+            compact_path.relative_to(self.run_dir),
+            schema=compact_schema,
+            batch_size=batch_size,
+        )
+        if compact_schema.equals(V2_SCREENING_DECISIONS_SCHEMA_V1):
+            for row in compact_rows:
+                yield _expand_screening_decision_row(row)
+            return
+        with _BoundedScreeningDefinitionStore(
+            cache_entries=min(batch_size, V2_PARQUET_ROW_GROUP_SIZE),
+            scratch_root=scratch_root,
+        ) as definitions_v2:
+            for row in compact_rows:
+                definition_id = _screening_definition_id_from_row(row)
+                definition_json = row.get("definition_json")
+                if definition_json:
+                    definition = _decode_screening_definition_json(definition_json)
+                    definitions_v2.register(
+                        definition_id,
+                        definition,
+                        allow_identical_existing=True,
+                    )
+                definition = definitions_v2.resolve(definition_id)
+                yield _expand_screening_decision_row(
+                    _combine_screening_definition_occurrence(definition, row)
+                )
+
     def read_events(self, relative_path: str | Path) -> list[dict[str, Any]]:
         path = _safe_artifact_path(self.run_dir, Path(relative_path).as_posix())
         if path.suffix == ".parquet":
             parquet_rows = self.read_parquet(path.relative_to(self.run_dir), schema=EVENTS_SCHEMA)
             compact_path = path.with_name(path.name.replace("_events_", "_screening_decisions_", 1))
-            if compact_path.is_file():
+            definitions_path = path.with_name(
+                path.name.replace("_events_", "_screening_definitions_", 1)
+            )
+            occurrences_path = path.with_name(
+                path.name.replace("_events_", "_screening_occurrences_", 1)
+            )
+            if definitions_path.is_file() or occurrences_path.is_file():
+                if not definitions_path.is_file() or not occurrences_path.is_file():
+                    raise ArtifactIntegrityError(
+                        "screening_decisions_v3 requires definitions and occurrences"
+                    )
+                definitions_v3: dict[int, dict[str, object]] = {}
+                for row in self.read_parquet(
+                    definitions_path.relative_to(self.run_dir),
+                    schema=V3_SCREENING_DEFINITIONS_SCHEMA,
+                ):
+                    register_v3_screening_definition(row, definitions=definitions_v3)
+                occurrence_rows = self.read_parquet(
+                    occurrences_path.relative_to(self.run_dir),
+                    schema=V3_SCREENING_OCCURRENCES_SCHEMA,
+                )
+                parquet_rows.extend(
+                    expand_v3_screening_decision(row, definitions=definitions_v3)
+                    for row in occurrence_rows
+                )
+                parquet_rows.sort(key=lambda row: int(row["event_id"]))
+            elif compact_path.is_file():
                 compact_schema = self.parquet_schema(compact_path.relative_to(self.run_dir))
                 if not any(
                     compact_schema.equals(schema)
@@ -3167,9 +4679,9 @@ class ArtifactReader:
                     compact_path.relative_to(self.run_dir),
                     schema=compact_schema,
                 )
-                definitions: dict[int, dict[str, object]] = {}
+                definitions_v2: dict[int, dict[str, object]] = {}
                 parquet_rows.extend(
-                    expand_v2_screening_decision(row, definitions=definitions)
+                    expand_v2_screening_decision(row, definitions=definitions_v2)
                     for row in compact_rows
                 )
                 parquet_rows.sort(key=lambda row: int(row["event_id"]))
@@ -3215,8 +4727,16 @@ class ArtifactReader:
             "diagnostic",
         }
         compact_screening_ref = index.get("screening_decisions_ref")
+        screening_definitions_ref = index.get("screening_definitions_ref")
+        screening_occurrences_ref = index.get("screening_occurrences_ref")
         if compact_screening_ref is not None:
             required_fingerprint_names.add("screening_decisions")
+        if screening_definitions_ref is not None or screening_occurrences_ref is not None:
+            if screening_definitions_ref is None or screening_occurrences_ref is None:
+                raise ArtifactIntegrityError(
+                    "trace v3 screening references require definitions and occurrences"
+                )
+            required_fingerprint_names.update({"screening_definitions", "screening_occurrences"})
         if not isinstance(
             expected_fingerprints, Mapping
         ) or not required_fingerprint_names.issubset(expected_fingerprints):
@@ -3227,6 +4747,8 @@ class ArtifactReader:
             ("screening_checks", index["screening_checks_ref"]),
             ("diagnostic", index["diagnostic_ref"]),
             ("screening_decisions", compact_screening_ref),
+            ("screening_definitions", screening_definitions_ref),
+            ("screening_occurrences", screening_occurrences_ref),
         ):
             if reference is None:
                 continue
@@ -3343,6 +4865,91 @@ class ArtifactReader:
         rebuilt["events"] = trace_events
         rebuilt["neighborhood_events"] = neighborhood_events
         return rebuilt
+
+
+def _required_event_id(row: Mapping[str, object]) -> int:
+    value = row.get("event_id")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ArtifactIntegrityError("event_id must be a positive integer")
+    return value
+
+
+def _group_screening_checks(
+    rows: Iterable[Mapping[str, object]],
+) -> Iterable[tuple[int, list[dict[str, object]]]]:
+    current_event_id: int | None = None
+    current_checks: list[dict[str, object]] = []
+    expected_index = 0
+    for row in rows:
+        raw_event_id = row.get("decision_event_id")
+        if isinstance(raw_event_id, bool) or not isinstance(raw_event_id, int):
+            raise ArtifactIntegrityError("screening check event ID must be an integer")
+        if current_event_id is None or raw_event_id != current_event_id:
+            if current_event_id is not None:
+                if raw_event_id < current_event_id:
+                    raise ArtifactIntegrityError("screening checks are not event ordered")
+                yield current_event_id, current_checks
+            current_event_id = raw_event_id
+            current_checks = []
+            expected_index = 0
+        raw_index = row.get("check_index")
+        if isinstance(raw_index, bool) or not isinstance(raw_index, int):
+            raise ArtifactIntegrityError("screening check_index must be an integer")
+        if raw_index != expected_index:
+            raise ArtifactIntegrityError("screening check indexes must be contiguous")
+        if raw_index >= 8:
+            raise ArtifactIntegrityError(
+                "one screening decision exceeds the fixed eight-check domain"
+            )
+        expected_index += 1
+        current_checks.append(
+            {
+                "check": str(row.get("check") or ""),
+                "status": str(row.get("status") or ""),
+                "value": _check_value(row),
+                "reason": str(row.get("reason") or ""),
+            }
+        )
+    if current_event_id is not None:
+        yield current_event_id, current_checks
+
+
+def _writer_event_mapping(
+    row: Mapping[str, object],
+    *,
+    route_by_id: Mapping[int, str],
+    lane_dictionary: Mapping[int, str],
+    operator_dictionary: Mapping[int, str],
+) -> dict[str, object]:
+    """Convert a physical event row into a mapping accepted by the writer."""
+
+    output = _event_payload(
+        row,
+        route_by_id,
+        _decode_extras(row.get("extras_json")),
+        lane_dictionary=lane_dictionary,
+        operator_dictionary=operator_dictionary,
+    )
+    output["event_id"] = _required_event_id(row)
+    output["record_type"] = str(row.get("record_type") or row.get("event_type") or "event")
+    output.pop("embedded_checks", None)
+    output.pop("definition_id", None)
+    output.pop("definition_json", None)
+    for field_name in (
+        "route_id",
+        "route_ids",
+        "current_route_ids",
+        "candidate_route_ids",
+        "base_route_id",
+        "candidate_route_id",
+    ):
+        value = row.get(field_name)
+        if value is not None:
+            output[field_name] = value
+    raw_checks = row.get("embedded_checks")
+    if isinstance(raw_checks, list):
+        output["checks"] = [dict(check) for check in raw_checks if isinstance(check, Mapping)]
+    return output
 
 
 def _check_value(row: Mapping[str, Any]) -> object:

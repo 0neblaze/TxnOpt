@@ -538,111 +538,77 @@ this repository or one of its subdirectories.
   `stage05.2_<component>_attemptNN` or the corresponding `rerunNN`; a later
   component cannot begin formal evidence before the prior independent review
   passes.
-- The fixed performance scope is `c101C5`, `c101_21`, `r101_21`, and
-  `rc101_21` with seeds `2014/2015/2016`. Fixed-work is the primary causal
-  axis; wall-clock is the practical axis. Every comparison records solver,
-  artifact-persistence, and end-to-end time, plus phase timings, exact calls,
-  batch occupancy, operator cost, active cores, peak RSS, rows, bytes, and
-  compression time. CPU utilisation, package power, or kernel time alone is
-  not an acceleration result.
-- Each hot-path or native-kernel promotion must preserve fixed-work objective,
-  validator, exact-call ordering, candidate decisions, and cache semantics.
-  Relative to its declared immediate predecessor, the aggregate paired median
-  end-to-end time across all 100-customer cases must improve by at least 15%,
-  and the C, R, or RC family median may not regress by more than 3%. Failed
-  gates retain their raw evidence and may not be passed by lowering the threshold.
-- Python hot-path work must address measured repeated work before architectural
-  acceleration: stable instance lookups and distance matrices, propagation
-  snapshot construction only on misses, changed-route-only ejection-chain
-  screening, auditable safe screening caches, and per-operator work budgets.
-  Native CPU work then moves only profiled screening, propagation, distance,
-  and exact-label kernels into contiguous C++ data paths and releases the GIL
-  only while no Python object is accessed.
-- The accepted ordered A--C evidence is `stage05.2_perf_baseline_attempt04`,
-  `stage05.2_hot_path_attempt03`, and
-  `stage05.2_artifact_streaming_attempt04`. The Component C independent replay
-  reports `READY_FOR_STAGE052_JOB_PARALLEL`: all 36 axes pass exact scope,
-  validator/objective replay, and the Python optimisation-profile gate; the 24
-  fixed-work axes also pass v1/v2 semantic equality. Its fully attributed
-  artifact-persistence ratio is 24.8546% (including final row-group flush and
-  control finalisation), and peak RSS is 2,565,537,792 bytes against the
-  4,357,382,144-byte limit.
-  Attempts 01--03 remain immutable failed or partial evidence. Component D
-  must use artifact-storage-v2 and cannot weaken or reinterpret these gates.
-- Stage 5.2 job parallelism is across independent `(instance, seed)` shards,
-  not within one exact-call batch. Test 1/2/4 workers. Two workers require at
-  least 1.5x end-to-end speedup and at most 12 GiB aggregate RSS. Four workers
-  are selected only with at least 2.5x speedup and at most 12 GiB. If two
-  workers pass and four do not, Formal uses two; if two do not pass, the gate
-  is `NOT_READY`. Worker failure aborts the run without serial fallback.
-  Initial D attempts 01--03 are immutable non-promotable evidence: their
-  numerical speed/RSS gates passed, but their shard manifests used synthetic
-  worker labels rather than actual PIDs. Corrected D evidence starts at
-  attempt04 and uses resource schema v2, exact worker-PID ownership, complete
-  36-axis raw/solution/trace replay, and independently verified machine,
-  instance, configuration, power, and environment provenance. The corrected
-  sequence is accepted as `stage05.2_job_parallel_attempt04` (1 worker,
-  406.5132 s, 2.2379 GiB aggregate RSS),
-  `stage05.2_job_parallel_attempt05` (2 workers, 223.4358 s, 4.0124 GiB,
-  1.819x speedup), and `stage05.2_job_parallel_attempt06` (4 workers,
-  130.6914 s, 5.4178 GiB, 3.110x speedup). The independent selection review
-  selects 4 workers and reports `READY_FOR_STAGE052_NATIVE_KERNELS`; Component
-  E must bind that exact selection identity.
-- Component E is accepted as `stage05.2_native_kernels_attempt03` on clean
-  commit `ca766a035a1c5413c61277f50d6904e3de7f238f`, with 4 workers,
-  artifact-storage-v2, the ordered `cpu_batch` exact backend, and the complete
-  `stage05.2-native-kernels-v1` configuration for distance, screening,
-  propagation, and exact charging. Its independent review passes all 36 axes,
-  all 24 D/native fixed-work storage replays, and the no-fallback contract. The
-  100-customer paired median end-to-end savings are 68.9735% aggregate,
-  76.9780% C, 64.2989% R, and 68.9735% RC; aggregate peak RSS is
-  8,728,821,760 bytes. The review reports
-  `READY_FOR_STAGE052_ACCELERATOR_DECISION`. Attempt01 remains immutable,
-  non-promotable failed producer evidence: 35 of 36 axes were valid, while
-  `rc101_21/2016/wall_clock_30` failed unique-route reconciliation, so it did
-  not enter independent review. Attempt02 completed all 36 axes but its
-  independent reviewer published `NOT_READY` after exposing a one-ULP
-  Python/native compensated-summation mismatch. Neither is promotable.
-- GPU/Metal/MPS is conditional. Run the accelerator pilot only if the selected
-  native CPU route-batch occupancy median is at least 32. Promote an
-  accelerator only when fixed-work semantics match, the aggregate paired
-  median across all 100-customer cases is at least 15% faster end-to-end than
-  native CPU, and no C/R/RC family median regresses by over 3%; transfer,
-  kernel, and synchronisation time are reported separately.
-  `GPU_NOT_JUSTIFIED` is a passing decision when these conditions are not met.
-- Component F is accepted as decision-only
-  `stage05.2_accelerator_pilot_attempt01`. Its independent reviewer recomputes
-  the nine 100-customer fixed-work occupancies from accepted E raw evidence;
-  every value and the overall median are 1.0, below the threshold of 32. The
-  mutually exclusive artifact schema contains no GPU solver rows and records
-  `fallback_used=false`. The accepted decision is `GPU_NOT_JUSTIFIED`, the
-  selected backend is `native_cpu`, and the review reports
-  `READY_FOR_STAGE052_BENCHMARK`. This opens Component G only; Stage 5.2 is not
-  `READY_FOR_STAGE05_3` until the 36-bundle pipeline pilot and 2,040-run Formal
-  benchmark independently pass and are published.
-- Before the Formal benchmark, run the complete selected backend/worker/storage
-  pipeline on the fixed 12-instance, three-seed pilot. Formal uses the declared
-  stratified budget: all 92 instances use 10 seeds at 30 seconds; only the 56
-  100-customer instances additionally use 10 seeds at 60 and 300 seconds.
-  This is 2,040 solver runs and 229,200 declared solver seconds before
-  startup, persistence, review, or rerun overhead.
-  Applicable anytime checkpoints are 1/5/10/30/60/120/300 seconds. Small
-  instances do not receive 60/300-second runs. BKS incompatibility remains in
-  force, so Stage 5.2 does not compute or publish gaps.
-- The independent review publishes
-  `experiments/registries/stage05.2_artifact_registry.csv` and
-  `experiments/manifests/stage05.2_performance_benchmark_artifact_manifest.json`
-  only after exact scope, replay, resource, performance, and completeness gates
-  pass, then reports `READY_FOR_STAGE05_3`. Stage 5.3 uses the same selected
-  backend, worker count, and storage policy; fixed-work is its primary ablation
-  axis and wall-clock its practical axis. The exact-charging-removal ablation
-  is the only one with no exact backend.
-- Stage 6 pricing is not forced onto the ALNS backend, but Stage 6 evidence
-  inherits v2 shard/streaming/job-parallel storage. Stage 7 ALNS conversion and
-  validator replay preserve the selected ordered backend semantics. Every new
-  Stage 8 charging model must pass the Stage 5.2 backend-replacement gate before
-  Formal use. Any later scalar hotspot returns through the same profiling,
-  native-CPU, and conditional-accelerator sequence.
+- The previously accepted-looking C04/D04--D06/E03/F01 chain is historical and
+  cannot open Component G. The authoritative E03 persistence replay is
+  50.1646%, above the 30% hard gate; E03 must be re-reviewed as `NOT_READY`,
+  which also invalidates F01. Existing raw evidence and every prior review
+  generation remain immutable and visible.
+- The only current remediation chain is
+  `stage05.2_artifact_streaming_attempt05` ->
+  `stage05.2_job_parallel_attempt07/08/09` ->
+  `stage05.2_native_kernels_attempt04` ->
+  `stage05.2_accelerator_pilot_attempt02` ->
+  `stage05.2_benchmark_attempt01` Pilot ->
+  `stage05.2_benchmark_attempt02` Formal. A failed or interrupted run consumes
+  its label and the next unused attempt/rerun is required; shards may never be
+  imported across attempts.
+- C05 keeps storage policy `artifact-storage-v2` but uses physical schema
+  `screening_decisions_v3`: typed bounded Parquet streams split screening
+  definitions from occurrences, preserve 65,536-row groups and at most two
+  non-empty buffer groups, and retain v1, old-v2, v3, and legacy reads. The
+  canonical semantic digest is calculated over expanded logical events, so
+  physical definition IDs and compression layout cannot change replay.
+- C05 binds B03, historical C04, and E03 as a signed `NOT_READY` remediation
+  input. It must replay all E03 events without semantic drift and reduce the
+  fully attributed persistence ratio to at most 30%; peak worker RSS remains
+  capped at 4,357,382,144 bytes. C05 and every later component require the same
+  clean commit and frozen non-editable Python 3.13 wheel runtime.
+- D07/D08/D09 run 1/2/4 workers on the fixed four-instance, three-seed scope.
+  Two workers require at least 1.5x speedup and at most 12 GiB aggregate RSS;
+  four workers are selected only at 2.5x and at most 12 GiB. Selection is a
+  replayed result, never a hard-coded value. Worker ownership uses real PIDs
+  and cumulative process CPU samples; worker failure aborts without fallback.
+- E04 binds only the new D selection. All 24 fixed-work axes must preserve
+  Python/native objective, validator, exact ordering, candidate/cache/event
+  semantics, with zero native/protocol fallback. Aggregate 100-customer paired
+  median end-to-end improvement must be at least 15%, no C/R/RC family may
+  regress by more than 3%, persistence must be at most 30%, each worker RSS at
+  most 4,357,382,144 bytes, and process-tree RSS at most 12 GiB.
+- F02 binds only E04. It independently recomputes the nine 100-customer route
+  batch occupancies. Median below 32 publishes the mutually exclusive
+  decision-only `GPU_NOT_JUSTIFIED`; median at least 32 requires the registered
+  Metal helper, exact fixed-work equality, at least 15% aggregate improvement,
+  and no family regression over 3%. Missing helper, fallback, or an unaudited
+  campaign adapter is `NOT_READY`.
+- G01 is exactly 12 instances x 3 seeds x one 30-second axis and must exercise
+  real resource sampling, worker/batch/archive failure recovery, bounded raw
+  replay, 1/5/10/30-second anytime checkpoints, all configured archive roots,
+  and interrupted publication recovery. Only independent review may report
+  `READY_FOR_STAGE052_FORMAL_BENCHMARK`.
+- G02 contains exactly 920 indivisible `(instance, seed)` shards: 360 small
+  30-second axes plus 560 large 30/60/300-second axes, for 2,040 runs, 229,200
+  declared solver seconds, and 10,400 anytime rows. Large wall-clock axes use
+  `max_iterations=None`; small axes retain 1,000 iterations and carry their
+  final incumbent forward to applicable checkpoints.
+- Campaign active writes use only
+  `/Volumes/TRANSFER/FURP-2026-Yiyang-GUO-EVRP-TW/results`. Verified batches may
+  archive to `/Volumes/TRANSFER/FURP-2026-Yiyang-GUO-EVRP-TW-results` or
+  `/Users/guoyiyang/Documents/Codex/FURP-2026-Yiyang-GUO-EVRP-TW-results`.
+  Local absolute paths live only in the ignored root locator; tracked evidence
+  stores aliases and volume identities. The external volume always preserves
+  20 GiB safety plus 32 GiB active workspace, and internal APFS preserves 50
+  GiB. Batch target/hard cap is 24/32 GiB and shard hard cap is 2 GiB.
+- Formal review uses bounded Arrow batches and streaming iterators and rejects
+  full-shard `to_pylist()`, `read_events()`, or `reconstruct_trace()`. It
+  independently verifies exact campaign geometry, bidirectional descriptors,
+  objective/validator and exact/cache/candidate/deadline semantics, resource
+  and persistence gates, power/load/root/runtime provenance, BKS incompatibility,
+  and the absence of gap columns.
+- The registry, trusted manifest, and versioned review products are published
+  only after G02 raw replay reports `READY_FOR_STAGE05_3`. Publication is a
+  generation transaction whose trusted manifest is replaced last; no producer,
+  runner, or documentation may claim Stage 5.2 completion before both review
+  and tracked publication pass.
 
 The executable workflow and gate table are maintained in
 `docs/stage052_performance_benchmark_workflow.md`.
@@ -656,20 +622,22 @@ The executable workflow and gate table are maintained in
 - The old non-canonical Stage 0–2 entry points remain only for historical
   compatibility tests/reproduction when their configuration has no
   `[artifact_storage]`; the shipped new configurations reject those paths.
-- The current accepted Stage 5.2 policy is `artifact-storage-v2`; v1 remains
-  readable for historical and comparison evidence. Both use Parquet events,
+- The current Stage 5.2 storage policy remains `artifact-storage-v2`, while the
+  current-chain physical schema is `screening_decisions_v3`; v1, old v2, v3,
+  and legacy evidence remain readable. These formats use Parquet events,
   complete critical evidence, aggregated diagnostic evidence, 2 GiB per
   instance/seed, and 32 GiB per run. Historical v1 uses Zstandard level 3;
   accepted v2 uses Zstandard level 1. New physical evidence belongs under
   `results/<run_label>/<instance>/<seed>/` with control metadata and a manifest
   under `control/`.
-- `artifact-storage-v2` was independently accepted in
-  `stage05.2_artifact_streaming_attempt04` with review status
-  `READY_FOR_STAGE052_JOB_PARALLEL`. It preserves v1 reads and adds Parquet
-  row-group streaming, shard manifests/checksums, worker-owned
+- `stage05.2_artifact_streaming_attempt04` is preserved historical old-v2
+  evidence, not a current prerequisite. The current storage amendment is C05;
+  it preserves v1/old-v2 reads and adds typed v3 definitions/occurrences,
+  bounded Parquet streams, shard manifests/checksums, worker-owned
   `(instance, seed)` shards, and parent-only control-manifest finalisation.
-- v2 uses 65,536-row Parquet row groups and buffers at most two row groups per
-  writer. A worker writes only its own shard; the parent never merges event
+- Current v3 physical writers use 65,536-row Parquet row groups and buffer at
+  most two non-empty row groups per family. A worker writes only its own shard;
+  the parent never merges event
   rows in memory. Shard-local event identity is deterministic from canonical
   shard ordinal plus local event ID, so review never depends on worker
   completion order. Semantic equality is required; byte-identical Parquet is

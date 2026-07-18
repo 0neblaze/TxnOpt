@@ -115,13 +115,14 @@ results/stage02.3_constraint_guided_rerun09/r101_21/2015/
 
 每个阶段进入正式实验或下一阶段前，必须检查：路径标签完整、artifact type 不含糊、run label 唯一、manifest 可重算、历史映射存在、raw-to-summary（原始数据到汇总）一致，并在阶段审查报告中记录结果。
 
-### 7. 数据保存与证据分层规则（v1 现状与 v2 迁移，强制）
+### 7. 数据保存与证据分层规则（v2 policy 与 v3 physical schema，强制）
 
 从本条规则生效后，所有新的 Stage 0–8 runner 都必须在配置中提供
 `[artifact_storage]`，并通过共享 `ArtifactBundleWriter`/`ArtifactReader` 写入和
-回放产物。当前已实现策略为 `artifact-storage-v1`；Stage 5.2 必须先实现并独立验收
-`artifact-storage-v2`，之后 Stage 5.2 pipeline pilot、正式 benchmark 和后续阶段强制
-使用 v2。默认物理格式为 Parquet/Arrow events（Zstandard level 3），critical
+回放产物。当前 storage policy 为 `artifact-storage-v2`；Stage 5.2 当前修订从 C05
+开始使用 `screening_decisions_v3` physical schema，并继续读取 v1、旧 v2 与 legacy
+evidence。Stage 5.2 pipeline pilot、正式 benchmark 和后续阶段强制使用经当前链独立
+审查通过的 v2/v3 组合。默认物理格式为 Parquet/Arrow events，critical
 evidence（关键证据）完整保存，diagnostic evidence（诊断证据）按
 run/lane/iteration/operator/reason 聚合；每个 instance/seed 上限 2 GiB，每个 run
 上限 32 GiB。
@@ -734,6 +735,10 @@ Stage 5.2 保留一个阶段号，但内部必须严格按以下 gate 顺序执�
 - `stage05.2_benchmark_attemptNN`。
 
 完整执行协议见 `docs/stage052_performance_benchmark_workflow.md`。Stage 5.2 的入口必须是 `stage05.1_best_known_attempt06` 的独立审查状态 `READY_FOR_STAGE05_2`，并继承 Stage 4 accepted Formal identity（正式验收身份）`stage04_adaptive_weights_attempt15`。
+
+当前修订证据链固定为 C05 -> D07/D08/D09 -> E04 -> F02 -> G01 Pilot -> G02
+Formal。C04/D04--D06/E03/F01 保留为历史 raw/review；E03 的完整 persistence ratio
+为 50.1646%，超过 30% 硬门槛，因此 E03/F01 不得继续作为 G 的 prerequisite。
 
 ##### 5.2-A 固定工作量性能基线
 

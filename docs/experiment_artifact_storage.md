@@ -1,30 +1,27 @@
-# 实验产物存储规则：v2 已验收策略与 v1 兼容
+# 实验产物存储规则：v2 policy、v3 physical schema 与历史兼容
 
 本规则适用于 Stage 0–8 的实验产物。它只约束 artifact persistence（产物持久化），不改变 ALNS、`evrptw.objective`、统一 validator（验证器）、vehicle-first acceptance（车辆数优先接受规则）或 exact charging（精确充电子问题）的算法语义。
 
 ## 当前可用状态
 
-仓库当前已实现并独立验收 `artifact-storage-v2`，定义在
-`src/evrptw/artifacts.py`。accepted evidence 为
-`stage05.2_artifact_streaming_attempt04`，独立审查状态为
-`READY_FOR_STAGE052_JOB_PARALLEL`。v2 是 Stage 5.2 Component D 及后续 pipeline
-pilot、正式 benchmark 的存储策略；`artifact-storage-v1` 继续作为历史读取与
-性能对照策略，不做物理迁移。
+仓库保留 `artifact-storage-v2` 作为 storage policy（存储策略），定义在
+`src/evrptw/artifacts.py`；当前修订把新物理证据升级为
+`screening_decisions_v3`。C04 与其 D04--D06/E03/F01 后继链只作为旧 physical
+schema（物理模式）的历史证据。E03 的完整 persistence replay（持久化回放）为
+50.1646%，超过 30% 硬门槛，因此旧 accepted review 不得继续充当 prerequisite。
 
-当前 D–F accepted chain（已验收证据链）继续使用该 v2 policy：D04/D05/D06
-selection review 选择 4 workers；`stage05.2_native_kernels_attempt03` 的 36 axes
-全部使用 v2 worker-owned shards，并通过 24-axis D/native streaming replay
-equality；`stage05.2_accelerator_pilot_attempt01` 是合格的 decision-only bundle，
-按互斥 schema 只含 control metadata、config 与 accelerator decision，不伪造 solver
-shard 或 GPU row。F01 选择 `native_cpu` 并报告
-`READY_FOR_STAGE052_BENCHMARK`。后续 Component G 必须固定使用 4 workers、
-`native_cpu` 和 `artifact-storage-v2`；不得因为 F 是 decision-only 而退回 v1。
+当前证据链从 `stage05.2_artifact_streaming_attempt05` 重新开始，随后依次为
+D07/D08/D09、E04、F02、G01 Pilot 与 G02 Formal。所有组件必须绑定同一 clean
+commit（干净提交）和 frozen wheel runtime（冻结 wheel 运行时）；实际 selected
+workers/backend 只能由新 review 决定，文档不得预写为 4 workers 或假定 F02
+必然选择 `native_cpu`。
 
 v1/v2 的固定策略为：
 
 | 字段 | 固定值 |
 | --- | --- |
 | `storage_policy_version` | `artifact-storage-v1` 或 `artifact-storage-v2` |
+| `screening_schema_version` | 新 evidence 固定 `screening_decisions_v3`；旧 v2 保持可读 |
 | `event_format` | `parquet` |
 | `compression` | `zstd` |
 | `compression_level` | v1 为 `3`；accepted v2 为 `1` |
@@ -61,7 +58,13 @@ results/<run_label>/
   review/
 ```
 
-v1 不要求 shard manifest（分片清单）；最后两项由 v2 新增。`failure` 不适用时可以不生成，但 manifest 必须记录 `artifact_status.failure=not_applicable`。所有 raw evidence（原始证据）只写入 Git-ignored `results/`；tracked summary（受 Git 跟踪的汇总）只能由独立 reviewer 在 raw replay（原始证据回放）通过后发布。
+v1 不要求 shard manifest（分片清单）；最后两项由 v2 新增。G01/G02 在顶层
+canonical run 下增加 `batch0001` 等内部 batch 目录，并通过 signed campaign/batch
+manifest（签名活动/批次清单）登记 logical path、root alias、volume identity、byte
+count 与 checksum；batch 不得伪装成新 attempt。`failure` 不适用时可以不生成，但
+manifest 必须记录 `artifact_status.failure=not_applicable`。所有 raw evidence（原始
+证据）只写入 Git-ignored `results/`；tracked summary（受 Git 跟踪的汇总）只能由
+独立 reviewer 在 raw replay（原始证据回放）通过后发布。
 
 ## Critical evidence 与索引
 
@@ -81,10 +84,10 @@ trace index，route 字典写入独立 route dictionary；v2 streaming 不得改
 ### Streaming writer
 
 - Parquet row group 固定为 65,536 rows；单 writer 最多同时缓存 2 个 row groups；
-- event、route dictionary、screening checks 和 diagnostic stream 分别增量 flush，不得先在 Python list 中累积全量 run；
+- event、route dictionary、screening definitions、screening occurrences 和 diagnostic stream 分别使用 typed column buffers（类型化列缓冲）增量 flush，不得使用 dict-per-row 热点或先在 Python list 中累积全量 run；
 - `ArtifactStorageConfig(storage_policy_version="artifact-storage-v2")` 只在 v2 writer/reader、配置校验和测试全部落地后开放；
 - writer 生命周期必须覆盖 `open shard → append → flush → finalize/abort`，异常路径也要关闭 writer 并生成 partial manifest；
-- reader 同时支持 v1 bundle、v2 shard bundle 和 immutable legacy bundle。
+- reader 同时支持 v1 bundle、旧 v2 shard、v3 physical schema 和 immutable legacy bundle，并以 streaming k-way merge（流式多路归并）恢复历史排序。
 
 ### Shard ownership
 
@@ -113,12 +116,11 @@ v2 event identity 由 canonical shard ordinal（规范分片序号）和 shard-l
 5. partial/timeout/worker failure 都产生可校验 shard manifest 并 fail fast；
 6. independent reviewer 从 raw shard 重算所有汇总，不信任 runner 自报计数。
 
-已验收的 attempt04 在完整计入最终 row-group flush、压缩、磁盘写入和 control
-finalisation 后，artifact persistence ratio 为 24.8546%，peak RSS 为
-2,565,537,792 bytes（上限 4,357,382,144 bytes）。全部 36 axes 通过 scope、
-validator/objective replay；其中 24 个 fixed-work axes 的 v1/v2 replay
-equality 全部通过。attempt01--03 保持为失败或 partial evidence。
-后续组件若破坏这些门槛必须标记 `NOT_READY`，不得退回隐式 v1 fallback 或降低阈值。
+C04 的旧 review generation 与原始字节保持不可变，但不再是当前 D 的入口。C05
+除原 36-axis scope 和 24 fixed-work equality 外，还必须 remediation replay（整改
+回放）E03 全部事件，证明 expanded logical semantics（展开逻辑语义）完全一致，并
+使 `new_persistence / (verified_E03_solver + new_persistence) <= 30%`。后续组件若
+破坏这些门槛必须标记 `NOT_READY`，不得退回隐式 v1 fallback 或降低阈值。
 
 ## 历史兼容
 

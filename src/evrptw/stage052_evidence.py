@@ -3,25 +3,39 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import psutil  # type: ignore[import-untyped]
 
-from evrptw.artifacts import ArtifactIntegrityError, ArtifactReader
+from evrptw.artifacts import ArtifactIntegrityError, ArtifactReader, signed_sidecar_matches
+from evrptw.stage052 import Stage052PrerequisiteRequirement
 
 STAGE052_REVIEW_SCHEMA_VERSION = "stage05.2-review-v1"
-STAGE052_RESOURCE_SCHEMA_VERSION = "stage05.2-run-resource-v2"
+STAGE052_RESOURCE_SCHEMA_VERSION = "stage05.2-run-resource-v3"
+STAGE052_LEGACY_RESOURCE_SCHEMA_VERSION = "stage05.2-run-resource-v2"
+STAGE052_RUNTIME_IDENTITY_SCHEMA_VERSION = "stage05.2-runtime-identity-v1"
+STAGE052_STORAGE_ROOT_BINDING_SCHEMA_VERSION = "stage05.2-storage-root-binding-v1"
+STAGE052_PERSISTENCE_ATTRIBUTION_SCHEMA_VERSION = (
+    "stage05.2-persistence-attribution-v1"
+)
 STAGE052_RESOURCE_MEASUREMENT_SCOPE = "task_scheduling_through_parent_control_preparation"
+STAGE052_PERSISTENCE_EXCLUSIONS = (
+    "archive_transfer",
+    "persistence_attribution_envelope_self_observation",
+    "campaign_success_commit_after_gate",
+)
 _PERFORMANCE_ENVIRONMENT_VARIABLES = (
     "MKL_NUM_THREADS",
     "NUMEXPR_NUM_THREADS",
@@ -34,8 +48,639 @@ _PERFORMANCE_ENVIRONMENT_VARIABLES = (
 )
 
 
+def _finite_non_negative(value: object, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{field} must be numeric")
+    result = float(value)
+    if not math.isfinite(result) or result < 0.0:
+        raise ValueError(f"{field} must be finite and non-negative")
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class PersistenceInterval:
+    """One serial active-write interval measured by a monotonic clock."""
+
+    label: str
+    started_ns: int
+    completed_ns: int
+
+    def __post_init__(self) -> None:
+        if not self.label:
+            raise ValueError("persistence interval label is required")
+        if (
+            isinstance(self.started_ns, bool)
+            or not isinstance(self.started_ns, int)
+            or isinstance(self.completed_ns, bool)
+            or not isinstance(self.completed_ns, int)
+            or self.started_ns < 0
+            or self.completed_ns < self.started_ns
+        ):
+            raise ValueError("persistence interval monotonic bounds are invalid")
+
+    @property
+    def seconds(self) -> float:
+        return (self.completed_ns - self.started_ns) / 1_000_000_000
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "label": self.label,
+            "started_ns": self.started_ns,
+            "completed_ns": self.completed_ns,
+            "duration_seconds": self.seconds,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> PersistenceInterval:
+        if set(payload) != {
+            "label",
+            "started_ns",
+            "completed_ns",
+            "duration_seconds",
+        }:
+            raise ValueError("persistence interval schema is invalid")
+        label = payload.get("label")
+        started = payload.get("started_ns")
+        completed = payload.get("completed_ns")
+        if (
+            not isinstance(label, str)
+            or isinstance(started, bool)
+            or not isinstance(started, int)
+            or isinstance(completed, bool)
+            or not isinstance(completed, int)
+        ):
+            raise ValueError("persistence interval fields are invalid")
+        interval = cls(label=label, started_ns=started, completed_ns=completed)
+        duration = _finite_non_negative(payload.get("duration_seconds"), "duration_seconds")
+        if not math.isclose(duration, interval.seconds, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("persistence interval duration does not match its bounds")
+        return interval
+
+
+@dataclass(frozen=True, slots=True)
+class Stage052PersistenceAttribution:
+    """Signed boundary between solver work and every primary active write.
+
+    The primary artifact manifest is sealed before this attribution envelope is
+    written, so the envelope can bind the completed manifest without a
+    self-referential timing cycle.  Only the envelope itself and archive transfer
+    are excluded from promotion timing.
+    """
+
+    run_label: str
+    component: str
+    scope: str
+    subject_id: str
+    primary_manifest_relative_path: str
+    primary_manifest_sha256: str
+    solver_seconds: float
+    shard_persistence_seconds: float
+    control_intervals: tuple[PersistenceInterval, ...]
+    excluded_operations: tuple[str, ...] = STAGE052_PERSISTENCE_EXCLUSIONS
+
+    def __post_init__(self) -> None:
+        if not all((self.run_label, self.component, self.scope, self.subject_id)):
+            raise ValueError("persistence attribution identity is incomplete")
+        if (
+            not self.primary_manifest_relative_path
+            or re.fullmatch(r"[0-9a-f]{64}", self.primary_manifest_sha256) is None
+        ):
+            raise ValueError("persistence attribution manifest binding is invalid")
+        solver = _finite_non_negative(self.solver_seconds, "solver_seconds")
+        shard = _finite_non_negative(
+            self.shard_persistence_seconds,
+            "shard_persistence_seconds",
+        )
+        object.__setattr__(self, "solver_seconds", solver)
+        object.__setattr__(self, "shard_persistence_seconds", shard)
+        if self.excluded_operations != STAGE052_PERSISTENCE_EXCLUSIONS:
+            raise ValueError("persistence attribution exclusions are not canonical")
+        if len({interval.label for interval in self.control_intervals}) != len(
+            self.control_intervals
+        ):
+            raise ValueError("persistence interval labels must be unique")
+        previous_completed: int | None = None
+        for interval in self.control_intervals:
+            if previous_completed is not None and interval.started_ns < previous_completed:
+                raise ValueError("persistence control intervals overlap or are unordered")
+            previous_completed = interval.completed_ns
+        if self.solver_seconds + self.total_persistence_seconds <= 0.0:
+            raise ValueError("persistence attribution denominator must be positive")
+
+    @property
+    def control_persistence_seconds(self) -> float:
+        return sum(interval.seconds for interval in self.control_intervals)
+
+    @property
+    def total_persistence_seconds(self) -> float:
+        return self.shard_persistence_seconds + self.control_persistence_seconds
+
+    @property
+    def persistence_ratio(self) -> float:
+        return self.total_persistence_seconds / (
+            self.solver_seconds + self.total_persistence_seconds
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": STAGE052_PERSISTENCE_ATTRIBUTION_SCHEMA_VERSION,
+            "run_label": self.run_label,
+            "component": self.component,
+            "scope": self.scope,
+            "subject_id": self.subject_id,
+            "primary_manifest_relative_path": self.primary_manifest_relative_path,
+            "primary_manifest_sha256": self.primary_manifest_sha256,
+            "solver_seconds": self.solver_seconds,
+            "shard_persistence_seconds": self.shard_persistence_seconds,
+            "control_intervals": [interval.to_dict() for interval in self.control_intervals],
+            "control_persistence_seconds": self.control_persistence_seconds,
+            "total_persistence_seconds": self.total_persistence_seconds,
+            "persistence_ratio": self.persistence_ratio,
+            "maximum_persistence_ratio": 0.30,
+            "excluded_operations": list(self.excluded_operations),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> Stage052PersistenceAttribution:
+        expected = {
+            "schema_version",
+            "run_label",
+            "component",
+            "scope",
+            "subject_id",
+            "primary_manifest_relative_path",
+            "primary_manifest_sha256",
+            "solver_seconds",
+            "shard_persistence_seconds",
+            "control_intervals",
+            "control_persistence_seconds",
+            "total_persistence_seconds",
+            "persistence_ratio",
+            "maximum_persistence_ratio",
+            "excluded_operations",
+        }
+        if set(payload) != expected:
+            raise ValueError("persistence attribution schema is invalid")
+        if payload.get("schema_version") != STAGE052_PERSISTENCE_ATTRIBUTION_SCHEMA_VERSION:
+            raise ValueError("persistence attribution version is invalid")
+        strings = {
+            field: payload.get(field)
+            for field in (
+                "run_label",
+                "component",
+                "scope",
+                "subject_id",
+                "primary_manifest_relative_path",
+                "primary_manifest_sha256",
+            )
+        }
+        if any(not isinstance(value, str) for value in strings.values()):
+            raise ValueError("persistence attribution identity fields are invalid")
+        raw_intervals = payload.get("control_intervals")
+        raw_exclusions = payload.get("excluded_operations")
+        if not isinstance(raw_intervals, list) or not isinstance(raw_exclusions, list):
+            raise ValueError("persistence attribution collections are invalid")
+        intervals = tuple(
+            PersistenceInterval.from_dict(interval)
+            for interval in raw_intervals
+            if isinstance(interval, Mapping)
+        )
+        if len(intervals) != len(raw_intervals) or any(
+            not isinstance(value, str) for value in raw_exclusions
+        ):
+            raise ValueError("persistence attribution collection members are invalid")
+        attribution = cls(
+            run_label=str(strings["run_label"]),
+            component=str(strings["component"]),
+            scope=str(strings["scope"]),
+            subject_id=str(strings["subject_id"]),
+            primary_manifest_relative_path=str(strings["primary_manifest_relative_path"]),
+            primary_manifest_sha256=str(strings["primary_manifest_sha256"]),
+            solver_seconds=_finite_non_negative(payload.get("solver_seconds"), "solver_seconds"),
+            shard_persistence_seconds=_finite_non_negative(
+                payload.get("shard_persistence_seconds"),
+                "shard_persistence_seconds",
+            ),
+            control_intervals=intervals,
+            excluded_operations=tuple(raw_exclusions),
+        )
+        observed = (
+            _finite_non_negative(
+                payload.get("control_persistence_seconds"),
+                "control_persistence_seconds",
+            ),
+            _finite_non_negative(
+                payload.get("total_persistence_seconds"),
+                "total_persistence_seconds",
+            ),
+            _finite_non_negative(payload.get("persistence_ratio"), "persistence_ratio"),
+            _finite_non_negative(
+                payload.get("maximum_persistence_ratio"),
+                "maximum_persistence_ratio",
+            ),
+        )
+        expected_values = (
+            attribution.control_persistence_seconds,
+            attribution.total_persistence_seconds,
+            attribution.persistence_ratio,
+            0.30,
+        )
+        if any(
+            not math.isclose(left, right, rel_tol=0.0, abs_tol=1e-12)
+            for left, right in zip(observed, expected_values, strict=True)
+        ):
+            raise ValueError("persistence attribution derived totals are invalid")
+        return attribution
+
+
+@dataclass(frozen=True, slots=True)
+class BatchPersistenceEnvelope:
+    """Final non-self-referential timing seal for one archived batch state."""
+
+    run_label: str
+    batch_id: str
+    base_attribution_sha256: str
+    verified_manifest_sha256: str
+    archived_manifest_sha256: str
+    solver_seconds: float
+    base_persistence_seconds: float
+    state_intervals: tuple[PersistenceInterval, ...]
+
+    def __post_init__(self) -> None:
+        if not self.run_label or re.fullmatch(r"batch[0-9]{4}", self.batch_id) is None:
+            raise ValueError("batch persistence envelope identity is invalid")
+        if any(
+            re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for digest in (
+                self.base_attribution_sha256,
+                self.verified_manifest_sha256,
+                self.archived_manifest_sha256,
+            )
+        ):
+            raise ValueError("batch persistence envelope hashes are invalid")
+        object.__setattr__(
+            self,
+            "solver_seconds",
+            _finite_non_negative(self.solver_seconds, "solver_seconds"),
+        )
+        object.__setattr__(
+            self,
+            "base_persistence_seconds",
+            _finite_non_negative(
+                self.base_persistence_seconds,
+                "base_persistence_seconds",
+            ),
+        )
+        if tuple(interval.label for interval in self.state_intervals) != (
+            "verified_batch_manifest_write",
+            "archived_batch_manifest_write",
+        ):
+            raise ValueError("batch persistence state intervals are incomplete")
+        if self.state_intervals[1].started_ns < self.state_intervals[0].completed_ns:
+            raise ValueError("batch persistence state intervals overlap")
+        if self.solver_seconds + self.total_persistence_seconds <= 0.0:
+            raise ValueError("batch persistence envelope denominator must be positive")
+
+    @property
+    def state_persistence_seconds(self) -> float:
+        return sum(interval.seconds for interval in self.state_intervals)
+
+    @property
+    def total_persistence_seconds(self) -> float:
+        return self.base_persistence_seconds + self.state_persistence_seconds
+
+    @property
+    def persistence_ratio(self) -> float:
+        return self.total_persistence_seconds / (
+            self.solver_seconds + self.total_persistence_seconds
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": "stage05.2-batch-persistence-envelope-v1",
+            "run_label": self.run_label,
+            "batch_id": self.batch_id,
+            "base_attribution_sha256": self.base_attribution_sha256,
+            "verified_manifest_sha256": self.verified_manifest_sha256,
+            "archived_manifest_sha256": self.archived_manifest_sha256,
+            "solver_seconds": self.solver_seconds,
+            "base_persistence_seconds": self.base_persistence_seconds,
+            "state_intervals": [interval.to_dict() for interval in self.state_intervals],
+            "state_persistence_seconds": self.state_persistence_seconds,
+            "total_persistence_seconds": self.total_persistence_seconds,
+            "persistence_ratio": self.persistence_ratio,
+            "maximum_persistence_ratio": 0.30,
+            "excluded_operations": list(STAGE052_PERSISTENCE_EXCLUSIONS),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> BatchPersistenceEnvelope:
+        expected = {
+            "schema_version",
+            "run_label",
+            "batch_id",
+            "base_attribution_sha256",
+            "verified_manifest_sha256",
+            "archived_manifest_sha256",
+            "solver_seconds",
+            "base_persistence_seconds",
+            "state_intervals",
+            "state_persistence_seconds",
+            "total_persistence_seconds",
+            "persistence_ratio",
+            "maximum_persistence_ratio",
+            "excluded_operations",
+        }
+        if set(payload) != expected or payload.get("schema_version") != (
+            "stage05.2-batch-persistence-envelope-v1"
+        ):
+            raise ValueError("batch persistence envelope schema is invalid")
+        raw_intervals = payload.get("state_intervals")
+        if not isinstance(raw_intervals, list) or len(raw_intervals) != 2:
+            raise ValueError("batch persistence envelope intervals are invalid")
+        intervals = tuple(
+            PersistenceInterval.from_dict(value)
+            for value in raw_intervals
+            if isinstance(value, Mapping)
+        )
+        if len(intervals) != 2:
+            raise ValueError("batch persistence envelope interval member is invalid")
+        string_fields = (
+            "run_label",
+            "batch_id",
+            "base_attribution_sha256",
+            "verified_manifest_sha256",
+            "archived_manifest_sha256",
+        )
+        if any(not isinstance(payload.get(field), str) for field in string_fields):
+            raise ValueError("batch persistence envelope identity fields are invalid")
+        envelope = cls(
+            run_label=str(payload["run_label"]),
+            batch_id=str(payload["batch_id"]),
+            base_attribution_sha256=str(payload["base_attribution_sha256"]),
+            verified_manifest_sha256=str(payload["verified_manifest_sha256"]),
+            archived_manifest_sha256=str(payload["archived_manifest_sha256"]),
+            solver_seconds=_finite_non_negative(payload.get("solver_seconds"), "solver_seconds"),
+            base_persistence_seconds=_finite_non_negative(
+                payload.get("base_persistence_seconds"),
+                "base_persistence_seconds",
+            ),
+            state_intervals=intervals,  # type: ignore[arg-type]
+        )
+        observed = (
+            _finite_non_negative(
+                payload.get("state_persistence_seconds"),
+                "state_persistence_seconds",
+            ),
+            _finite_non_negative(
+                payload.get("total_persistence_seconds"),
+                "total_persistence_seconds",
+            ),
+            _finite_non_negative(payload.get("persistence_ratio"), "persistence_ratio"),
+            _finite_non_negative(
+                payload.get("maximum_persistence_ratio"),
+                "maximum_persistence_ratio",
+            ),
+        )
+        expected_values = (
+            envelope.state_persistence_seconds,
+            envelope.total_persistence_seconds,
+            envelope.persistence_ratio,
+            0.30,
+        )
+        if any(
+            not math.isclose(left, right, rel_tol=0.0, abs_tol=1e-12)
+            for left, right in zip(observed, expected_values, strict=True)
+        ) or payload.get("excluded_operations") != list(STAGE052_PERSISTENCE_EXCLUSIONS):
+            raise ValueError("batch persistence envelope totals/exclusions are invalid")
+        return envelope
+
+
+def _dependency_versions() -> dict[str, str]:
+    versions: dict[str, str] = {}
+    for distribution in importlib.metadata.distributions():
+        raw_name = distribution.metadata.get("Name")
+        if raw_name:
+            versions[str(raw_name).lower()] = distribution.version
+    return dict(sorted(versions.items()))
+
+
+def _distribution_is_editable() -> bool:
+    try:
+        distribution = importlib.metadata.distribution("evrptw-reproduction")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise RuntimeError("evrptw-reproduction is not installed") from error
+    direct_url = distribution.read_text("direct_url.json")
+    if direct_url is None:
+        return False
+    try:
+        payload = json.loads(direct_url)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("installed distribution direct_url.json is invalid") from error
+    directory = payload.get("dir_info") if isinstance(payload, Mapping) else None
+    return isinstance(directory, Mapping) and directory.get("editable") is True
+
+
+def _installed_distribution_digest() -> str:
+    try:
+        distribution = importlib.metadata.distribution("evrptw-reproduction")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise RuntimeError("evrptw-reproduction is not installed") from error
+    files = distribution.files
+    if files is None:
+        raise RuntimeError("installed distribution has no file inventory")
+    digest = hashlib.sha256()
+    observed = 0
+    for relative in sorted(files, key=str):
+        path = Path(str(distribution.locate_file(relative)))
+        if not path.is_file():
+            continue
+        digest.update(str(relative).encode("utf-8") + b"\0")
+        digest.update(_sha256(path).encode("ascii") + b"\n")
+        observed += 1
+    if observed == 0:
+        raise RuntimeError("installed distribution file inventory is empty")
+    return digest.hexdigest()
+
+
+def _runtime_identity_payload(
+    *,
+    wheel_path: Path,
+    repository_revision: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    from evrptw import _core as native_core
+
+    if re.fullmatch(r"[0-9a-f]{40}", repository_revision) is None:
+        raise ValueError("repository_revision must be a full Git SHA-1")
+    resolved_wheel = wheel_path.resolve()
+    if not resolved_wheel.is_file():
+        raise FileNotFoundError(resolved_wheel)
+    if sys.version_info[:2] != (3, 13):
+        raise RuntimeError("Stage 5.2 evidence requires Python 3.13")
+    editable = _distribution_is_editable()
+    if editable:
+        raise RuntimeError("Stage 5.2 evidence requires a non-editable wheel installation")
+    python_executable = Path(sys.executable).resolve()
+    native_extension = Path(str(native_core.__file__)).resolve()
+    if not python_executable.is_file() or not native_extension.is_file():
+        raise RuntimeError("Python or native extension runtime file is unavailable")
+    dependencies = _dependency_versions()
+    dependency_bytes = json.dumps(
+        dependencies,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    tracked: dict[str, object] = {
+        "schema_version": STAGE052_RUNTIME_IDENTITY_SCHEMA_VERSION,
+        "repository_revision": repository_revision,
+        "wheel_filename": resolved_wheel.name,
+        "wheel_sha256": _sha256(resolved_wheel),
+        "python_version": sys.version.split()[0],
+        "python_executable_sha256": _sha256(python_executable),
+        "native_extension_sha256": _sha256(native_extension),
+        "dependency_versions": dependencies,
+        "dependency_manifest_sha256": hashlib.sha256(dependency_bytes).hexdigest(),
+        "installed_distribution_sha256": _installed_distribution_digest(),
+        "installed_editable": editable,
+    }
+    local = {
+        **tracked,
+        "wheel_path": str(resolved_wheel),
+        "python_executable": str(python_executable),
+        "native_extension": str(native_extension),
+    }
+    return tracked, local
+
+
+def create_stage052_runtime_identity(
+    *,
+    output_path: Path,
+    wheel_path: Path,
+    repository_revision: str,
+) -> dict[str, object]:
+    """Freeze one local non-editable Python/native/wheel runtime identity."""
+
+    tracked, local = _runtime_identity_payload(
+        wheel_path=wheel_path,
+        repository_revision=repository_revision,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(local, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return tracked
+
+
+def verify_stage052_runtime_identity(
+    path: Path,
+    *,
+    expected_repository_revision: str,
+) -> dict[str, object]:
+    """Verify the current process exactly matches a frozen local wheel runtime."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot read Stage 5.2 runtime identity: {path}") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("Stage 5.2 runtime identity must be an object")
+    wheel_path = payload.get("wheel_path")
+    if not isinstance(wheel_path, str) or not wheel_path:
+        raise RuntimeError("Stage 5.2 runtime identity wheel_path is missing")
+    tracked, current_local = _runtime_identity_payload(
+        wheel_path=Path(wheel_path),
+        repository_revision=expected_repository_revision,
+    )
+    for field, expected in current_local.items():
+        observed = payload.get(field)
+        if observed != expected:
+            label = field.replace("_sha256", " hash")
+            raise RuntimeError(
+                f"Stage 5.2 runtime identity {label} mismatch: "
+                f"expected={expected!r} observed={observed!r}"
+            )
+    if set(payload) != set(current_local):
+        raise RuntimeError("Stage 5.2 runtime identity contains unknown or missing fields")
+    return tracked
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def stage052_storage_root_binding(
+    *,
+    alias: str,
+    volume: Mapping[str, object],
+) -> dict[str, object]:
+    """Build the path-free staging-volume identity embedded in raw evidence."""
+
+    if re.fullmatch(r"[a-z][a-z0-9_]*", alias) is None:
+        raise ValueError("Stage 5.2 staging root alias is invalid")
+    if set(volume) != {"device_uuid", "filesystem"}:
+        raise ValueError("Stage 5.2 staging root volume fields are invalid")
+    device_uuid = volume.get("device_uuid")
+    filesystem = volume.get("filesystem")
+    if (
+        not isinstance(device_uuid, str)
+        or not device_uuid
+        or not isinstance(filesystem, str)
+        or not filesystem
+    ):
+        raise ValueError("Stage 5.2 staging root volume identity is invalid")
+    return {
+        "schema_version": STAGE052_STORAGE_ROOT_BINDING_SCHEMA_VERSION,
+        "alias": alias,
+        "volume": {
+            "device_uuid": device_uuid,
+            "filesystem": filesystem,
+        },
+    }
+
+
+def verify_stage052_storage_root_binding(
+    metadata: Mapping[str, object],
+    *,
+    locator_path: Path,
+    expected_alias: str,
+) -> dict[str, object]:
+    """Verify a path-free raw binding against the ignored local root locator."""
+
+    from evrptw.stage052_campaign import StorageRootLocator
+
+    observed = metadata.get("staging_root")
+    if not isinstance(observed, Mapping) or set(observed) != {
+        "schema_version",
+        "alias",
+        "volume",
+    }:
+        raise ArtifactIntegrityError("Stage 5.2 staging root binding is missing or invalid")
+    if observed.get("schema_version") != STAGE052_STORAGE_ROOT_BINDING_SCHEMA_VERSION:
+        raise ArtifactIntegrityError("Stage 5.2 staging root binding schema is invalid")
+    alias = observed.get("alias")
+    volume = observed.get("volume")
+    if alias != expected_alias or not isinstance(volume, Mapping):
+        raise ArtifactIntegrityError("Stage 5.2 staging root alias or volume is invalid")
+    try:
+        normalized = stage052_storage_root_binding(alias=expected_alias, volume=volume)
+        locator = StorageRootLocator.from_toml(locator_path)
+        configured = locator.resolve(expected_alias)
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        raise ArtifactIntegrityError(
+            "Stage 5.2 staging root local binding cannot be verified"
+        ) from error
+    if normalized != dict(observed) or normalized["volume"] != configured.volume.to_dict():
+        raise ArtifactIntegrityError(
+            "Stage 5.2 staging root identity does not match the local locator"
+        )
+    return normalized
 
 
 def verify_stage052_review_files(
@@ -45,12 +690,76 @@ def verify_stage052_review_files(
     """Verify legacy or immutable-generation review file references."""
 
     files = review.get("files")
-    if not isinstance(files, Mapping) or len(files) != 2:
+    if not isinstance(files, Mapping):
         raise ArtifactIntegrityError("prerequisite review file identity mismatch")
     relative_paths = tuple(str(value) for value in files)
-    legacy = set(relative_paths) == {"review_findings.csv", "review_report.md"}
-    if not legacy:
+    campaign_review = review.get("schema_version") == "stage05.2-campaign-review-v1"
+    expected_campaign_names = {
+        "per_run_results.csv",
+        "family_summary.csv",
+        "budget_summary.csv",
+        "anytime_summary.csv",
+        "resource_summary.csv",
+        "persistence_summary.csv",
+        "performance_gates.csv",
+        "gpu_decision.json",
+        "failure_analysis.csv",
+        "review_findings.csv",
+        "review_report.md",
+    }
+    campaign_publication_files: Mapping[str, object] | None = None
+    if campaign_review:
+        expected_campaign_files = {
+            "per_run_results": "per_run_results.csv",
+            "family_summary": "family_summary.csv",
+            "budget_summary": "budget_summary.csv",
+            "anytime_summary": "anytime_summary.csv",
+            "resource_summary": "resource_summary.csv",
+            "persistence_summary": "persistence_summary.csv",
+            "performance_gates": "performance_gates.csv",
+            "gpu_decision": "gpu_decision.json",
+            "failure_analysis": "failure_analysis.csv",
+            "review_findings": "review_findings.csv",
+            "review_report": "review_report.md",
+        }
         parsed = [Path(value) for value in relative_paths]
+        if (
+            len(parsed) != len(expected_campaign_names)
+            or {path.name for path in parsed} != expected_campaign_names
+            or any(len(path.parts) != 3 or path.parts[0] != "generations" for path in parsed)
+            or len({path.parts[1] for path in parsed}) != 1
+        ):
+            raise ArtifactIntegrityError("campaign review file identity mismatch")
+        generation = parsed[0].parts[1]
+        if re.fullmatch(r"[0-9a-f]{64}", generation) is None:
+            raise ArtifactIntegrityError("campaign review generation identity is invalid")
+        publication_files = review.get("publication_files")
+        if not isinstance(publication_files, Mapping) or set(publication_files) != set(
+            expected_campaign_files
+        ):
+            raise ArtifactIntegrityError("campaign review publication file set is invalid")
+        published: dict[str, str] = {}
+        for key, item in publication_files.items():
+            if not isinstance(item, Mapping) or set(item) != {"relative_path", "sha256"}:
+                raise ArtifactIntegrityError("campaign review publication file is invalid")
+            relative_path = item.get("relative_path")
+            checksum = item.get("sha256")
+            if not isinstance(relative_path, str) or not isinstance(checksum, str):
+                raise ArtifactIntegrityError("campaign review publication identity is invalid")
+            if Path(relative_path).name != expected_campaign_files[str(key)]:
+                raise ArtifactIntegrityError(
+                    "campaign review publication key/filename mapping is invalid"
+                )
+            published[relative_path] = checksum
+        if published != {str(path): str(checksum) for path, checksum in files.items()}:
+            raise ArtifactIntegrityError("campaign review files/publication_files differ")
+        campaign_publication_files = publication_files
+    else:
+        if len(files) != 2:
+            raise ArtifactIntegrityError("prerequisite review file identity mismatch")
+        legacy = set(relative_paths) == {"review_findings.csv", "review_report.md"}
+        parsed = [] if legacy else [Path(value) for value in relative_paths]
+    if not campaign_review and parsed:
         if (
             {path.name for path in parsed} != {"review_findings.csv", "review_report.md"}
             or any(len(path.parts) != 3 or path.parts[0] != "generations" for path in parsed)
@@ -70,7 +779,76 @@ def verify_stage052_review_files(
         if review_dir not in path.parents or not path.is_file() or _sha256(path) != str(checksum):
             raise ArtifactIntegrityError(f"prerequisite review checksum mismatch: {relative_text}")
         verified[relative_text] = path
+    if campaign_publication_files is not None:
+        digest = hashlib.sha256()
+        for key in sorted(campaign_publication_files):
+            item = campaign_publication_files[key]
+            assert isinstance(item, Mapping)
+            relative_path = str(item["relative_path"])
+            digest.update(key.encode("utf-8") + b"\0" + verified[relative_path].read_bytes())
+        generation = next(iter(Path(path).parts[1] for path in verified))
+        if digest.hexdigest() != generation:
+            raise ArtifactIntegrityError("campaign review generation digest does not replay")
+    elif parsed:
+        by_name = {path.name: verified[path.as_posix()] for path in parsed}
+        generation = parsed[0].parts[1]
+        generation_digest = hashlib.sha256(
+            by_name["review_findings.csv"].read_bytes()
+            + b"\0"
+            + by_name["review_report.md"].read_bytes()
+        ).hexdigest()
+        if generation_digest != generation:
+            raise ArtifactIntegrityError("prerequisite review generation digest does not replay")
     return verified
+
+
+_CAMPAIGN_COMMON_GATES = frozenset(
+    {
+        "accepted_prerequisite",
+        "batch_shard_artifact_replay",
+        "bks_model_compatibility",
+        "campaign_geometry",
+        "campaign_identity",
+        "campaign_planning_replay",
+        "event_evidence",
+        "instance_input_hashes",
+        "persistence_ratio",
+        "power_load",
+        "resource_limits",
+        "runtime_provenance",
+        "storage_root_roles",
+        "storage_roots",
+        "unique_shard_identity",
+    }
+)
+CAMPAIGN_PILOT_GATES = _CAMPAIGN_COMMON_GATES | {
+    "pilot_campaign_drills",
+    "publication_dry_run",
+}
+CAMPAIGN_FORMAL_GATES = _CAMPAIGN_COMMON_GATES | {
+    "pilot_archive_root_coverage",
+    "rolling_capacity_replay",
+}
+
+
+def verify_stage052_campaign_gate_set(
+    review: Mapping[str, object],
+    *,
+    scope: str,
+) -> None:
+    """Require the exact independent campaign gate surface for READY evidence."""
+
+    expected = CAMPAIGN_PILOT_GATES if scope == "pilot" else CAMPAIGN_FORMAL_GATES
+    if scope not in {"pilot", "formal"}:
+        raise ArtifactIntegrityError("campaign review gate scope is invalid")
+    gates = review.get("gates")
+    if not isinstance(gates, Mapping) or set(gates) != set(expected):
+        raise ArtifactIntegrityError("campaign review mandatory gate set is incomplete")
+    if any(
+        not isinstance(gate, Mapping) or gate.get("passed") is not True
+        for gate in gates.values()
+    ):
+        raise ArtifactIntegrityError("campaign review contains a failed or invalid gate")
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +860,7 @@ class Stage052PrerequisiteIdentity:
     configuration_sha256: str
     raw_manifest_sha256: str
     review_manifest_sha256: str
+    scope: str = "performance"
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -130,6 +909,7 @@ def verify_job_parallel_selection(
     if (
         prerequisite.run_label != raw_dir.resolve().name
         or prerequisite.component != "job_parallel"
+        or prerequisite.scope != "performance"
         or prerequisite.status != "READY_FOR_STAGE052_NATIVE_KERNELS"
     ):
         raise ArtifactIntegrityError("job-parallel selection prerequisite identity mismatch")
@@ -224,7 +1004,7 @@ def verify_job_parallel_selection(
     return JobParallelSelectionIdentity(
         selected_workers=recomputed,
         selected_run_label=expected_selected_run,
-        input_runs=tuple(input_runs),  # type: ignore[arg-type]
+        input_runs=tuple(input_runs),
         run_wall_seconds=tuple(times),  # type: ignore[arg-type]
         aggregate_peak_rss_gib=tuple(rss),  # type: ignore[arg-type]
         speedups=tuple(speedups),  # type: ignore[arg-type]
@@ -239,12 +1019,20 @@ def verify_stage052_prerequisite(
     raw_dir: Path,
     *,
     expected_component: str,
-    expected_status: str,
+    expected_status: str | None = None,
+    allowed_statuses: Sequence[str] = (),
     expected_run_label: str | None = None,
+    expected_scope: str = "performance",
+    require_passed_review: bool = True,
 ) -> Stage052PrerequisiteIdentity:
     """Verify an accepted Stage 5.2 producer and independent review bundle."""
 
     raw_dir = raw_dir.resolve()
+    if expected_status is not None and allowed_statuses:
+        raise ValueError("use expected_status or allowed_statuses, not both")
+    statuses = (expected_status,) if expected_status is not None else tuple(allowed_statuses)
+    if not statuses:
+        raise ValueError("at least one prerequisite review status is required")
     if expected_run_label is not None and raw_dir.name != expected_run_label:
         raise ArtifactIntegrityError(
             f"prerequisite run label mismatch: expected={expected_run_label} "
@@ -257,12 +1045,16 @@ def verify_stage052_prerequisite(
         raise ArtifactIntegrityError(
             f"cannot read prerequisite review manifest: {review_manifest_path}"
         ) from error
+    expected_schema = (
+        "stage05.2-campaign-review-v1"
+        if expected_component == "benchmark" and expected_scope in {"pilot", "formal"}
+        else STAGE052_REVIEW_SCHEMA_VERSION
+    )
     expected_review = {
-        "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
+        "schema_version": expected_schema,
         "run_label": raw_dir.name,
         "component": expected_component,
-        "scope": "performance",
-        "status": expected_status,
+        "scope": expected_scope,
     }
     for field, expected in expected_review.items():
         if review.get(field) != expected:
@@ -270,15 +1062,25 @@ def verify_stage052_prerequisite(
                 f"prerequisite review {field} mismatch: "
                 f"expected={expected} observed={review.get(field)}"
             )
+    observed_status = str(review.get("status", ""))
+    if observed_status not in statuses:
+        raise ArtifactIntegrityError(
+            "prerequisite review status mismatch: "
+            f"expected one of {list(statuses)} observed={observed_status}"
+        )
     gates = review.get("gates")
     if (
         not isinstance(gates, dict)
         or not gates
-        or any(
-            not isinstance(gate, dict) or gate.get("passed") is not True for gate in gates.values()
+        or (
+            require_passed_review
+            and any(
+                not isinstance(gate, dict) or gate.get("passed") is not True
+                for gate in gates.values()
+            )
         )
     ):
-        raise ArtifactIntegrityError("prerequisite review contains a failed or invalid gate")
+        raise ArtifactIntegrityError("prerequisite review contains an invalid gate set")
     verify_stage052_review_files(raw_dir, review)
 
     reader = ArtifactReader(raw_dir)
@@ -303,10 +1105,27 @@ def verify_stage052_prerequisite(
     if (
         metadata.get("run_label") != raw_dir.name
         or metadata.get("component") != expected_component
-        or metadata.get("scope") != "performance"
+        or metadata.get("scope") != expected_scope
         or metadata.get("repository_dirty") is not False
     ):
         raise ArtifactIntegrityError("prerequisite producer identity mismatch")
+    if metadata.get("persistence_attribution") == "primary_active_writes_v1":
+        attribution_path = (
+            raw_dir / "control" / f"{raw_dir.name}_persistence_attribution.json"
+        )
+        attribution_sidecar = attribution_path.with_suffix(".sha256")
+        if (
+            not attribution_path.is_file()
+            or not attribution_sidecar.is_file()
+            or review.get("persistence_attribution_sha256")
+            != _sha256(attribution_path)
+            or review.get("persistence_attribution_sidecar_sha256")
+            != _sha256(attribution_sidecar)
+            or not signed_sidecar_matches(attribution_path, attribution_sidecar)
+        ):
+            raise ArtifactIntegrityError(
+                "prerequisite review is stale for the persistence attribution envelope"
+            )
     config_checksum = str(config_items[0].get("checksum", ""))
     if metadata.get("configuration_sha256") != config_checksum:
         raise ArtifactIntegrityError("prerequisite configuration checksum mismatch")
@@ -316,12 +1135,92 @@ def verify_stage052_prerequisite(
     return Stage052PrerequisiteIdentity(
         run_label=raw_dir.name,
         component=expected_component,
-        status=expected_status,
+        status=observed_status,
         repository_revision=revision,
         configuration_sha256=config_checksum,
         raw_manifest_sha256=current_raw_manifest_sha256,
         review_manifest_sha256=_sha256(review_manifest_path),
+        scope=expected_scope,
     )
+
+
+def verify_stage052_evidence_input(
+    raw_dir: Path,
+    requirement: Stage052PrerequisiteRequirement,
+) -> Stage052PrerequisiteIdentity:
+    """Verify one named contract input, including signed NOT_READY remediation input."""
+
+    identity = verify_stage052_prerequisite(
+        raw_dir,
+        expected_component=requirement.component.value,
+        allowed_statuses=requirement.allowed_statuses,
+        expected_run_label=requirement.exact_run_label,
+        expected_scope=requirement.scope,
+        require_passed_review=requirement.requires_passed_review,
+    )
+    if not requirement.requires_current_chain_identity:
+        return identity
+
+    review_path = raw_dir.resolve() / "review" / "review_manifest.json"
+    try:
+        review_payload = json.loads(review_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ArtifactIntegrityError("current-chain review manifest is unreadable") from error
+    if not isinstance(review_payload, Mapping):
+        raise ArtifactIntegrityError("current-chain review manifest is invalid")
+    current_review_files = verify_stage052_review_files(raw_dir.resolve(), review_payload)
+    if any(
+        len(Path(relative).parts) != 3
+        or Path(relative).parts[0] != "generations"
+        for relative in current_review_files
+    ):
+        raise ArtifactIntegrityError(
+            "current-chain prerequisite requires an immutable review generation"
+        )
+    reader = ArtifactReader(raw_dir.resolve())
+    metadata_items = [
+        item
+        for item in reader.manifest.get("artifacts", ())
+        if isinstance(item, Mapping) and item.get("artifact_type") == "manifest_metadata"
+    ]
+    if len(metadata_items) != 1:
+        raise ArtifactIntegrityError("current-chain prerequisite metadata is incomplete")
+    metadata = reader.read_json(str(metadata_items[0].get("relative_path", "")))
+    expected_fields = {
+        "backend": "cpu_batch",
+        "storage_policy_version": "artifact-storage-v2",
+        "screening_schema_version": "screening_decisions_v3",
+    }
+    if any(metadata.get(field) != expected for field, expected in expected_fields.items()):
+        raise ArtifactIntegrityError(
+            "prerequisite is historical evidence, not the current v3/cpu_batch chain"
+        )
+    observed_runtime = metadata.get("runtime_identity")
+    if not isinstance(observed_runtime, Mapping):
+        raise ArtifactIntegrityError("current-chain prerequisite has no frozen runtime identity")
+    runtime_path = Path(__file__).resolve().parents[2] / (
+        "configs/stage052_runtime_identity.local.json"
+    )
+    try:
+        verified_runtime = verify_stage052_runtime_identity(
+            runtime_path,
+            expected_repository_revision=identity.repository_revision,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ArtifactIntegrityError(
+            "current-chain prerequisite runtime identity cannot be verified"
+        ) from error
+    if dict(observed_runtime) != verified_runtime:
+        raise ArtifactIntegrityError(
+            "current-chain prerequisite runtime differs from the active frozen wheel"
+        )
+    root = Path(__file__).resolve().parents[2]
+    verify_stage052_storage_root_binding(
+        metadata,
+        locator_path=root / "configs/stage052_storage_roots.local.toml",
+        expected_alias="transfer_staging",
+    )
+    return identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,14 +1235,22 @@ class RunResourceSummary:
     parent_pid: int
     descendant_pids: tuple[int, ...]
     aggregate_peak_rss_bytes: int
+    process_peak_rss_bytes: tuple[tuple[int, int], ...]
     mean_active_cores: float
     peak_active_cores: float
+    load1_min: float
+    load1_mean: float
+    load1_max: float
+    load1_sample_count: int
     sample_count: int
     status: str
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
         payload["descendant_pids"] = list(self.descendant_pids)
+        payload["process_peak_rss_bytes"] = {
+            str(pid): peak for pid, peak in self.process_peak_rss_bytes
+        }
         return payload
 
 
@@ -373,6 +1280,8 @@ class ProcessTreeResourceSampler:
         self._started = 0.0
         self._peak_rss = 0
         self._active_core_samples: list[float] = []
+        self._process_peak_rss: dict[int, int] = {}
+        self._load1_samples: list[float] = []
         self._descendant_pids: set[int] = set()
         self._sample_count = 0
         self._error: BaseException | None = None
@@ -406,12 +1315,19 @@ class ProcessTreeResourceSampler:
             parent_pid=self.parent_pid,
             descendant_pids=tuple(sorted(self._descendant_pids)),
             aggregate_peak_rss_bytes=self._peak_rss,
+            process_peak_rss_bytes=tuple(sorted(self._process_peak_rss.items())),
             mean_active_cores=(
                 sum(self._active_core_samples) / len(self._active_core_samples)
                 if self._active_core_samples
                 else 0.0
             ),
             peak_active_cores=max(self._active_core_samples, default=0.0),
+            load1_min=min(self._load1_samples, default=0.0),
+            load1_mean=(
+                sum(self._load1_samples) / len(self._load1_samples) if self._load1_samples else 0.0
+            ),
+            load1_max=max(self._load1_samples, default=0.0),
+            load1_sample_count=len(self._load1_samples),
             sample_count=self._sample_count,
             status="complete",
         )
@@ -428,13 +1344,19 @@ class ProcessTreeResourceSampler:
                 for process in processes:
                     try:
                         with process.oneshot():
-                            rss += int(process.memory_info().rss)
+                            process_rss = int(process.memory_info().rss)
+                            rss += process_rss
+                            self._process_peak_rss[process.pid] = max(
+                                self._process_peak_rss.get(process.pid, 0),
+                                process_rss,
+                            )
                             times = process.cpu_times()
                             cpu += float(times.user + times.system)
                     except (psutil.NoSuchProcess, psutil.ZombieProcess):
                         continue
                 self._peak_rss = max(self._peak_rss, rss)
                 self._sample_count += 1
+                self._load1_samples.append(float(os.getloadavg()[0]))
                 if previous_wall is not None and previous_cpu is not None and now > previous_wall:
                     self._active_core_samples.append(
                         max(0.0, (cpu - previous_cpu) / (now - previous_wall))
@@ -462,7 +1384,11 @@ def validate_worker_ownership(
 ) -> tuple[bool, str, tuple[int, ...]]:
     """Validate actual shard-owner PIDs against the sampled process tree."""
 
-    if resource_summary.get("schema_version") != STAGE052_RESOURCE_SCHEMA_VERSION:
+    schema_version = resource_summary.get("schema_version")
+    if schema_version not in {
+        STAGE052_LEGACY_RESOURCE_SCHEMA_VERSION,
+        STAGE052_RESOURCE_SCHEMA_VERSION,
+    }:
         return False, "unsupported resource summary schema", ()
     resource_identity = (
         resource_summary.get("run_label"),
@@ -522,6 +1448,37 @@ def validate_worker_ownership(
         return False, "resource descendant_pids are invalid", ()
     if len(descendants) != len(set(descendants)) or parent_pid in descendants:
         return False, "resource process identities are duplicate", ()
+    if schema_version == STAGE052_RESOURCE_SCHEMA_VERSION:
+        process_peaks = resource_summary.get("process_peak_rss_bytes")
+        if not isinstance(process_peaks, Mapping):
+            return False, "resource process_peak_rss_bytes is invalid", ()
+        try:
+            normalized_peaks = {int(str(pid)): int(peak) for pid, peak in process_peaks.items()}
+        except (TypeError, ValueError):
+            return False, "resource process_peak_rss_bytes is invalid", ()
+        if set(normalized_peaks) != {parent_pid, *descendants} or any(
+            peak <= 0 for peak in normalized_peaks.values()
+        ):
+            return False, "resource process peak identities or values are invalid", ()
+        load_values = tuple(
+            resource_summary.get(field) for field in ("load1_min", "load1_mean", "load1_max")
+        )
+        normalized_load_values: list[float] = []
+        for value in load_values:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0.0
+            ):
+                return False, "resource load1 summary is invalid", ()
+            normalized_load_values.append(float(value))
+        if not (
+            normalized_load_values[0] <= normalized_load_values[1] <= normalized_load_values[2]
+        ):
+            return False, "resource load1 summary is invalid", ()
+        if resource_summary.get("load1_sample_count") != sample_count:
+            return False, "resource load1 sample count does not reconcile", ()
     allowed_pids = {parent_pid} if expected_workers == 1 else set(descendants)
     owners: set[int] = set()
     ordinals: set[int] = set()

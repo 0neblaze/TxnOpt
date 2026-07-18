@@ -25,15 +25,18 @@ Stage 5.2 先修复已测得的工程瓶颈，再扩大实验规模。它不是�
 
 任何失败或被中断的运行使用新 `attemptNN`/`rerunNN`，原 shard、manifest 和 failure evidence 不得覆盖。F 可以以 `GPU_NOT_JUSTIFIED` 通过；A–E 和 G 不得跳过。
 
-当前已验收的 A–F chain（证据链）依次为
-`stage05.2_perf_baseline_attempt04`、`stage05.2_hot_path_attempt03`、
-`stage05.2_artifact_streaming_attempt04`、D04/D05/D06 selection sequence、
-`stage05.2_native_kernels_attempt03` 和
-`stage05.2_accelerator_pilot_attempt01`。当前 selected configuration（选定配置）
-为 4 workers、`artifact-storage-v2`、`native_cpu`（有序 `cpu_batch` exact backend
-加完整 native-kernel profile）。F 的审查状态为
-`READY_FOR_STAGE052_BENCHMARK`；这只开放 G，不代表 Stage 5.2 已完成或已达到
-`READY_FOR_STAGE05_3`。
+当前 A/B 历史证据保留，但 C04/D04--D06/E03/F01 不再构成可晋级的 current
+chain（当前证据链）。E03 的完整 artifact persistence ratio（工件持久化占比）为
+50.1646%，超过 30% 硬门槛；E03 必须发布新的 `NOT_READY` review generation，F01
+也因 prerequisite 失效成为 `NOT_READY`。旧 raw 和旧 review generation 均保持
+不可变。
+
+唯一当前链为 C05 -> D07/D08/D09 -> E04 -> F02 -> G01 Pilot -> G02 Formal。
+它们必须绑定同一个 clean implementation commit、内置盘全新 Python 3.13
+non-editable wheel runtime（非可编辑 wheel 运行时）、外置 staging volume 和
+`screening_decisions_v3`。任何 producer/storage/native/config 语义变化都从受影响的
+最早 component 重跑；只有 reviewer-only 修复可以复用同一 raw 生成新 review
+generation。
 
 ## 统一测量合同
 
@@ -92,15 +95,12 @@ B 的最终组合必须通过严格性能门槛，单项收益和组合收益都
 - timeout、byte-budget、writer error 和 worker failure 均保留 partial shard 并 fail fast；
 - reviewer 不读取全量 events 到一个 Python list，不依赖 worker completion order。
 
-当前 accepted evidence（已验收证据）为
-`stage05.2_artifact_streaming_attempt04`，其独立审查状态为
-`READY_FOR_STAGE052_JOB_PARALLEL`。固定 4 instances × 3 seeds 共 36 axes
-全部通过 exact scope、validator/objective replay 和 Python optimization
-profile；其中 24 个 fixed-work axes 通过 v1/v2 semantic equality。最终
-row-group flush、Zstandard level 1 压缩、磁盘写入与 control finalisation
-均计入后，aggregate persistence ratio 为 24.8546%；peak RSS 为
-2,565,537,792 bytes，低于 A 阶段 4,357,382,144-byte 上限。
-attempt01--03 保持为失败或 partial evidence，D 只能从 attempt04 进入。
+C04 是旧 physical schema 的历史证据，不能直接进入新 D。C05 固定标签为
+`stage05.2_artifact_streaming_attempt05`，保持 v2 policy 但使用
+`screening_decisions_v3` definitions/occurrences 分表、typed buffers、bounded
+streaming merge 和跨 v1/旧v2/v3/legacy reader。除 36 axes 与 24 fixed-work
+semantic equality 外，C05 必须 replay E03 全部事件，保持 canonical semantic
+digest 完全相同，并把重新归因后的 persistence ratio 降至 30% 以内。
 
 ## D. Job-level parallelism
 
@@ -123,21 +123,10 @@ reviewer 对 1/2/4-worker 三个 bundle 分别要求 exact 36-axis raw/solution/
 machine identity、affinity、non-secret performance environment variables、background
 load 和 power mode。
 
-`stage05.2_job_parallel_attempt01`--`attempt03` 的数值门槛虽然通过，但 shard
-manifest 记录的是按 ordinal 推算的 synthetic PID（合成进程标识），无法证明真实
-worker ownership，因此永久保留为不可晋级证据。修正后的正式序列从 attempt04
-开始并已通过独立 review：
-
-- `stage05.2_job_parallel_attempt04`：1 worker，`run_wall_seconds=406.5132`，
-  aggregate RSS 为 2.2379 GiB；
-- `stage05.2_job_parallel_attempt05`：2 workers，`run_wall_seconds=223.4358`，
-  aggregate RSS 为 4.0124 GiB，相对 attempt04 speedup 为 1.819x；
-- `stage05.2_job_parallel_attempt06`：4 workers，`run_wall_seconds=130.6914`，
-  aggregate RSS 为 5.4178 GiB，相对 attempt04 speedup 为 3.110x。
-
-selection review 选择 `selected_workers=4`，状态为
-`READY_FOR_STAGE052_NATIVE_KERNELS`。Component E 必须绑定 attempt06 的 selection
-identity。
+D01--D06 都保留为历史证据；当前序列必须重新运行 D07（1 worker）、D08（2
+workers）和 D09（4 workers）。reviewer 从 cumulative per-PID CPU samples、真实
+worker ownership、完整 shard identity 与 36-axis replay 重算 speedup/RSS 后选择
+worker count，不得沿用或硬编码历史的 4 workers。
 
 ## E. Native CPU kernels
 
@@ -153,14 +142,10 @@ independent review。E02 完成 36 axes，但 independent reviewer 正式发布
 普通 `+=` 相差 1 ULP。根因修复没有修改旧证据，而是在 clean commit
 `ca766a035a1c5413c61277f50d6904e3de7f238f` 上创建 E03。
 
-accepted E evidence 为 `stage05.2_native_kernels_attempt03`：4 workers、
-`artifact-storage-v2`、`cpu_batch` ordered exact backend 和完整
-`stage05.2-native-kernels-v1` profile。producer 36/36 axes valid，native/protocol
-fallback 均为 0，`run_wall_seconds=178.7190`，aggregate peak RSS 为
-8,728,821,760 bytes。independent reviewer 证明 D06/E03 的 24 个 fixed-work axes
-streaming replay 完全一致；100-customer end-to-end saving 为 aggregate 68.9735%，
-C 76.9780%，R 64.2989%，RC 68.9735%。全部 gate 通过，状态为
-`READY_FOR_STAGE052_ACCELERATOR_DECISION`。
+E03 的旧 accepted review 必须撤回为 `NOT_READY`，不得被 E04/F02 引用。E04 只
+绑定新 D selection，并重新执行 24 fixed-work Python/native equality、15%/3%
+performance gate、30% persistence、每 worker 4,357,382,144-byte RSS、process-tree
+12-GiB RSS 和 zero-fallback gate。
 
 ## F. Conditional accelerator pilot
 
@@ -168,20 +153,28 @@ C 76.9780%，R 64.2989%，RC 68.9735%。全部 gate 通过，状态为
 
 GPU/Metal/MPS promotion 同时要求：fixed-work 语义一致；相对 E selected native CPU，全部 100-customer 配对的总体端到端中位时间至少降低 15%；C、R、RC 任一 family 的 family median 回退不超过 3%。任一条件失败即保留 native CPU。正式 runner 不得设置隐式 CPU fallback。
 
-accepted F evidence 为 decision-only
-`stage05.2_accelerator_pilot_attempt01`。runner 从 accepted E03 raw evidence 重算
-3 families × 3 seeds 的九个 fixed-work occupancy；九项均为 1.0，overall median
-为 1.0，低于阈值 32。因此没有安装或调用 GPU framework，也没有生成 GPU solver
-rows。decision artifact 明确记录 `GPU_NOT_JUSTIFIED`、`gpu_rows_present=false` 和
-`fallback_used=false`。independent reviewer 重新计算全部九项并通过 exclusive
-decision-only schema（互斥仅决策模式）；selected backend 为 `native_cpu`，状态为
-`READY_FOR_STAGE052_BENCHMARK`。
+F01 因 E03 prerequisite 失效而成为历史 `NOT_READY`。F02 只接受 E04 raw/review
+identity，并独立重算九个 occupancy；median <32 才允许 decision-only
+`GPU_NOT_JUSTIFIED`，median >=32 则必须执行 registered Metal helper（已登记 Metal
+辅助程序）并通过语义相等与 15%/3% 门槛。缺失 helper、CPU fallback 或缺少经过审查
+的 G campaign adapter 均为 `NOT_READY`。
 
 ## G. Pipeline pilot 与正式分层预算
 
 ### Pipeline pilot
 
-先用固定 Stage 0 representative set（代表集）执行 `12 instances × 3 seeds`，完整走过 selected backend、selected worker count、artifact-storage-v2、failure handling、independent replay、summary generation 和 registry/manifest publication dry run（发布演练）。当前 G 的固定入口是 F01 选择的 `native_cpu`、4 workers 和 `artifact-storage-v2`。所有 36 bundles 完整且 review 通过后才开放 Formal。
+G01 使用固定 Stage 0 representative set（代表集）执行 `12 instances × 3 seeds`
+与一个 30 秒 axis。它必须完整走过 F02 实际选择的 backend/worker、真实 failure
+recovery、resource sampling、bounded raw replay、1/5/10/30-second anytime、所有
+archive root 和 interrupted publication dry run。所有 36 bundles 完整且独立 review
+报告 `READY_FOR_STAGE052_FORMAL_BENCHMARK` 后才开放 Formal。
+
+Campaign active writes 固定在外置
+`/Volumes/TRANSFER/FURP-2026-Yiyang-GUO-EVRP-TW/results`。归档根为外置
+`/Volumes/TRANSFER/FURP-2026-Yiyang-GUO-EVRP-TW-results` 与内置
+`/Users/guoyiyang/Documents/Codex/FURP-2026-Yiyang-GUO-EVRP-TW-results`；绝对路径只
+存在 ignored locator。next-fit partitioning 的 target/hard cap 为 24/32 GiB，单
+shard hard cap 2 GiB，并持续保留外置 20+32 GiB 与内置 50 GiB reserve。
 
 ### Formal budget matrix
 

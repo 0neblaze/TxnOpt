@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
-import heapq
 import io
 import json
 import math
@@ -13,7 +12,7 @@ import os
 import shutil
 import statistics
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
 from pathlib import Path
@@ -22,14 +21,10 @@ from typing import Any
 from evrptw import _core as native_core
 from evrptw.artifacts import (
     DIAGNOSTIC_SCHEMA,
-    EVENTS_SCHEMA,
     ROUTE_DICTIONARY_SCHEMA,
-    SCREENING_CHECKS_SCHEMA,
-    V2_SCREENING_DECISIONS_SCHEMA,
-    V2_SCREENING_DECISIONS_SCHEMA_V1,
     ArtifactIntegrityError,
     ArtifactReader,
-    expand_v2_screening_decision,
+    signed_sidecar_matches,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
 from evrptw.environment import collect_environment
@@ -45,22 +40,40 @@ from evrptw.native_kernels import NativeKernelConfig
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.stage052 import (
+    ArtifactPersistenceObservation,
     ArtifactStorageObservation,
     PerformanceObservation,
     Stage052Component,
     decide_accelerator,
-    evaluate_artifact_storage_promotion,
+    evaluate_artifact_persistence,
     evaluate_promotion,
     select_worker_count,
+    stage052_contract,
 )
+from evrptw.stage052_accelerator import (
+    MetalPilotStatus,
+    audit_metal_pilot_result,
+    campaign_execution_adapter_gate,
+)
+from evrptw.stage052_campaign import StorageRootLocator, VolumeIdentity
+from evrptw.stage052_campaign_runner import probe_volume_identity
 from evrptw.stage052_evidence import (
+    STAGE052_RESOURCE_SCHEMA_VERSION,
     JobParallelSelectionIdentity,
+    Stage052PersistenceAttribution,
     Stage052PrerequisiteIdentity,
     abort_process_executor,
     validate_worker_ownership,
     verify_job_parallel_selection,
-    verify_stage052_prerequisite,
+    verify_stage052_evidence_input,
     verify_stage052_review_files,
+    verify_stage052_runtime_identity,
+    verify_stage052_storage_root_binding,
+)
+from evrptw.stage052_remediation import (
+    E03_EVENT_COUNT,
+    E03_SHARD_COUNT,
+    E03_SOLVER_ROW_COUNT,
 )
 from evrptw.validation import validate_routes
 
@@ -68,15 +81,6 @@ STAGE052_REVIEW_SCHEMA_VERSION = "stage05.2-review-v1"
 NOT_READY = "NOT_READY"
 _CANONICAL_CUSTOMER_COUNTS = {
     record.instance: record.customer_count for record in BEST_KNOWN_VALUES
-}
-_NEXT_STATUS = {
-    Stage052Component.PERF_BASELINE: "READY_FOR_STAGE052_HOT_PATH",
-    Stage052Component.HOT_PATH: "READY_FOR_STAGE052_ARTIFACT_STREAMING",
-    Stage052Component.ARTIFACT_STREAMING: "READY_FOR_STAGE052_JOB_PARALLEL",
-    Stage052Component.JOB_PARALLEL: "READY_FOR_STAGE052_NATIVE_KERNELS",
-    Stage052Component.NATIVE_KERNELS: "READY_FOR_STAGE052_ACCELERATOR_DECISION",
-    Stage052Component.ACCELERATOR_PILOT: "READY_FOR_STAGE052_BENCHMARK",
-    Stage052Component.BENCHMARK: "READY_FOR_STAGE05_3",
 }
 _C_PREREQUISITE_STATUS = {
     "perf_baseline": "READY_FOR_STAGE052_HOT_PATH",
@@ -92,123 +96,175 @@ _PERFORMANCE_ENVIRONMENT_VARIABLES = {
     "PYTHONHASHSEED",
     "VECLIB_MAXIMUM_THREADS",
 }
+_PER_WORKER_STORAGE_RSS_LIMIT_BYTES = 4_357_382_144
+_PROCESS_TREE_RSS_LIMIT_BYTES = 12 * 1024 * 1024 * 1024
 
 
-def _iter_stage052_event_rows(
-    reader: ArtifactReader,
+def _audit_primary_persistence(
+    raw_dir: Path,
+    rows: Sequence[Mapping[str, object]],
     *,
-    events_ref: Mapping[str, Any],
-    compact_screening_ref: Mapping[str, Any] | None,
-    event_columns: Sequence[str],
-) -> Iterable[dict[str, object]]:
-    def ordinary_rows() -> Iterable[dict[str, object]]:
-        for batch in reader.iter_parquet_batches(
-            str(events_ref["relative_path"]),
-            schema=EVENTS_SCHEMA,
-            columns=event_columns,
+    component: Stage052Component,
+    scope: str = "performance",
+    subject_id: str = "run",
+) -> tuple[bool, str]:
+    """Recompute shard/control persistence from signed monotonic evidence."""
+
+    try:
+        reader = ArtifactReader(raw_dir)
+        timing_reference = _one_artifact(reader, "timing_evidence")
+        timing_payload = reader.read_json(str(timing_reference["relative_path"]))
+        timing_rows = timing_payload.get("rows")
+        if (
+            timing_payload.get("schema_version") != "stage05.2-timing-evidence-v1"
+            or timing_payload.get("run_label") != raw_dir.name
+            or timing_payload.get("component") != component.value
+            or not isinstance(timing_rows, list)
         ):
-            yield from batch.to_pylist()
-
-    if compact_screening_ref is None:
-        yield from ordinary_rows()
-        return
-
-    def compact_rows() -> Iterable[dict[str, object]]:
-        relative = str(compact_screening_ref["relative_path"])
-        compact_schema = reader.parquet_schema(relative)
-        if not any(
-            compact_schema.equals(schema)
-            for schema in (
-                V2_SCREENING_DECISIONS_SCHEMA,
-                V2_SCREENING_DECISIONS_SCHEMA_V1,
+            raise ArtifactIntegrityError("persistence timing evidence identity is invalid")
+        per_run = {
+            (
+                str(row.get("instance", "")),
+                _strict_int(row.get("seed"), "seed"),
+                str(row.get("axis", "")),
+            ): row
+            for row in rows
+        }
+        if len(per_run) != len(rows):
+            raise ArtifactIntegrityError("persistence per-run identity is duplicate")
+        audited_solver = 0.0
+        audited_shard_persistence = 0.0
+        observed_timing: set[tuple[str, int, str]] = set()
+        for raw_timing in timing_rows:
+            if not isinstance(raw_timing, Mapping):
+                raise ArtifactIntegrityError("persistence timing row is invalid")
+            identity = (
+                str(raw_timing.get("instance", "")),
+                _strict_int(raw_timing.get("seed"), "seed"),
+                str(raw_timing.get("axis", "")),
             )
-        ):
-            raise ArtifactIntegrityError("unsupported compact screening schema")
-        definitions: dict[int, dict[str, object]] = {}
-        for batch in reader.iter_parquet_batches(
-            relative,
-            schema=compact_schema,
-        ):
-            for row in batch.to_pylist():
-                expanded = expand_v2_screening_decision(row, definitions=definitions)
-                yield {key: value for key, value in expanded.items() if key in event_columns}
-
-    yield from heapq.merge(
-        ordinary_rows(),
-        compact_rows(),
-        key=lambda row: _strict_int(row.get("event_id"), "event_id"),
-    )
-
-
-def _iter_stage052_check_rows(
-    reader: ArtifactReader,
-    *,
-    checks_ref: Mapping[str, Any],
-    compact_screening_ref: Mapping[str, Any] | None,
-) -> Iterable[dict[str, object]]:
-    def ordinary_rows() -> Iterable[dict[str, object]]:
-        for batch in reader.iter_parquet_batches(
-            str(checks_ref["relative_path"]),
-            schema=SCREENING_CHECKS_SCHEMA,
-        ):
-            yield from batch.to_pylist()
-
-    if compact_screening_ref is None:
-        yield from ordinary_rows()
-        return
-
-    def compact_rows() -> Iterable[dict[str, object]]:
-        relative = str(compact_screening_ref["relative_path"])
-        compact_schema = reader.parquet_schema(relative)
-        if not any(
-            compact_schema.equals(schema)
-            for schema in (
-                V2_SCREENING_DECISIONS_SCHEMA,
-                V2_SCREENING_DECISIONS_SCHEMA_V1,
+            if identity in observed_timing or identity not in per_run:
+                raise ArtifactIntegrityError("persistence timing/per-run scope mismatch")
+            observed_timing.add(identity)
+            solver_started_ns = _strict_int(
+                raw_timing.get("solver_started_ns"), "solver_started_ns"
             )
-        ):
-            raise ArtifactIntegrityError("unsupported compact screening schema")
-        definitions: dict[int, dict[str, object]] = {}
-        for batch in reader.iter_parquet_batches(
-            relative,
-            schema=compact_schema,
-        ):
-            for row in batch.to_pylist():
-                expanded = expand_v2_screening_decision(row, definitions=definitions)
-                checks = expanded.get("embedded_checks")
-                if not isinstance(checks, list):
-                    continue
-                for index, check in enumerate(checks):
-                    if not isinstance(check, Mapping):
-                        raise ArtifactIntegrityError("compact screening check must be an object")
-                    yield {
-                        "decision_event_id": row.get("event_id"),
-                        "decision_id": row.get("decision_id"),
-                        "check_index": index,
-                        "check": str(check.get("check", "")),
-                        "status": str(check.get("status", "")),
-                        "value_bool": (
-                            check.get("value") if isinstance(check.get("value"), bool) else None
-                        ),
-                        "value_float": (
-                            float(check["value"])
-                            if isinstance(check.get("value"), (int, float))
-                            else None
-                        ),
-                        "value_text": (
-                            check.get("value") if isinstance(check.get("value"), str) else None
-                        ),
-                        "reason": str(check.get("reason", "")),
-                    }
+            solver_completed_ns = _strict_int(
+                raw_timing.get("solver_completed_ns"), "solver_completed_ns"
+            )
+            finalize_started_ns = _strict_int(
+                raw_timing.get("finalize_started_ns"), "finalize_started_ns"
+            )
+            finalize_completed_ns = _strict_int(
+                raw_timing.get("finalize_completed_ns"), "finalize_completed_ns"
+            )
+            live_ns = _strict_int(
+                raw_timing.get("live_stream_persistence_ns"),
+                "live_stream_persistence_ns",
+            )
+            event_count = _strict_int(raw_timing.get("axis_event_count"), "axis_event_count")
+            total_event_count = _strict_int(
+                raw_timing.get("total_event_count"), "total_event_count"
+            )
+            axis_count = _strict_int(raw_timing.get("axis_count"), "axis_count")
+            if (
+                solver_completed_ns <= solver_started_ns
+                or finalize_completed_ns < finalize_started_ns
+                or live_ns < 0
+                or live_ns > solver_completed_ns - solver_started_ns
+                or event_count < 0
+                or total_event_count < 0
+                or axis_count <= 0
+            ):
+                raise ArtifactIntegrityError("persistence monotonic interval is invalid")
+            solver_seconds = (
+                solver_completed_ns - solver_started_ns - live_ns
+            ) / 1_000_000_000
+            finalization_seconds = (
+                finalize_completed_ns - finalize_started_ns
+            ) / 1_000_000_000
+            finalization_share = (
+                finalization_seconds * event_count / total_event_count
+                if total_event_count
+                else finalization_seconds / axis_count
+            )
+            persistence_seconds = finalization_share + live_ns / 1_000_000_000
+            row = per_run[identity]
+            if not math.isclose(
+                _strict_float(row.get("solver_seconds")),
+                solver_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ) or not math.isclose(
+                _strict_float(row.get("artifact_persistence_seconds")),
+                persistence_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise ArtifactIntegrityError("per-run persistence differs from timing evidence")
+            audited_solver += solver_seconds
+            audited_shard_persistence += persistence_seconds
+        if observed_timing != set(per_run):
+            raise ArtifactIntegrityError("persistence timing evidence is incomplete")
 
-    yield from heapq.merge(
-        ordinary_rows(),
-        compact_rows(),
-        key=lambda row: (
-            _strict_int(row.get("decision_event_id"), "decision_event_id"),
-            _strict_int(row.get("check_index"), "check_index"),
-        ),
-    )
+        suffix = "" if subject_id == "run" else f"_{subject_id}"
+        attribution_path = (
+            raw_dir / "control" / f"{raw_dir.name}{suffix}_persistence_attribution.json"
+        )
+        sidecar_path = attribution_path.with_suffix(".sha256")
+        if (
+            not attribution_path.is_file()
+            or not sidecar_path.is_file()
+            or not signed_sidecar_matches(attribution_path, sidecar_path)
+        ):
+            raise ArtifactIntegrityError("signed persistence attribution is missing or invalid")
+        raw_attribution = json.loads(attribution_path.read_text(encoding="utf-8"))
+        if not isinstance(raw_attribution, Mapping):
+            raise ArtifactIntegrityError("persistence attribution must be an object")
+        attribution = Stage052PersistenceAttribution.from_dict(raw_attribution)
+        required_control_labels = {
+            "parent_write_control",
+            "parent_timing_and_per_run_control",
+            "parent_resource_control",
+            "parent_primary_manifest_finalize",
+        }
+        if {interval.label for interval in attribution.control_intervals} != (
+            required_control_labels
+        ):
+            raise ArtifactIntegrityError(
+                "persistence attribution is missing a required parent active-write interval"
+            )
+        manifest_path = raw_dir / attribution.primary_manifest_relative_path
+        if (
+            attribution.run_label != raw_dir.name
+            or attribution.component != component.value
+            or attribution.scope != scope
+            or attribution.subject_id != subject_id
+            or manifest_path.resolve() != reader.result.manifest_path.resolve()
+            or _sha256(manifest_path) != attribution.primary_manifest_sha256
+        ):
+            raise ArtifactIntegrityError("persistence attribution manifest identity mismatch")
+        if not math.isclose(
+            attribution.solver_seconds,
+            audited_solver,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ) or not math.isclose(
+            attribution.shard_persistence_seconds,
+            audited_shard_persistence,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ArtifactIntegrityError("persistence attribution totals do not replay")
+        passed = attribution.persistence_ratio <= 0.30
+        return (
+            passed,
+            "independent primary active-write ratio="
+            f"{attribution.persistence_ratio:.9f}; control_seconds="
+            f"{attribution.control_persistence_seconds:.9f}",
+        )
+    except (ArtifactIntegrityError, OSError, TypeError, ValueError) as error:
+        return False, str(error)
 
 
 def verify_stage052_review_prerequisite(
@@ -216,6 +272,7 @@ def verify_stage052_review_prerequisite(
     *,
     expected_component: str,
     expected_status: str,
+    expected_scope: str = "performance",
 ) -> None:
     """Verify one accepted Stage 5.2 independent-review identity and its files."""
 
@@ -230,7 +287,7 @@ def verify_stage052_review_prerequisite(
         "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
         "run_label": raw_dir.name,
         "component": expected_component,
-        "scope": "performance",
+        "scope": expected_scope,
         "status": expected_status,
     }
     for field, expected in expected_identity.items():
@@ -279,7 +336,6 @@ def replay_stage052_storage_semantics(
         trace_ref = items.get(("trace", ""))
         route_ref = items.get(("route_dictionary", "canonical_routes"))
         events_ref = items.get(("events", "critical"))
-        compact_screening_ref = items.get(("events", "screening_decisions_v2"))
         checks_ref = items.get(("events", "screening_checks"))
         diagnostic_ref = items.get(("diagnostic", "aggregated"))
         required = (
@@ -313,20 +369,17 @@ def replay_stage052_storage_semantics(
             raise ArtifactIntegrityError(f"storage replay axes are missing in {directory}")
         if set(map(str, raw_axes)) != set(map(str, solution_axes)):
             raise ArtifactIntegrityError(f"raw/solution axis identity mismatch in {directory}")
-        lane_dictionary = _trace_dictionary(trace, "lane_dictionary", directory)
-        operator_dictionary = _trace_dictionary(trace, "operator_dictionary", directory)
         route_dictionary: dict[int, dict[str, object]] = {}
-        for batch in reader.iter_parquet_batches(
+        for row in reader.iter_parquet_rows(
             str(route_ref["relative_path"]),
             schema=ROUTE_DICTIONARY_SCHEMA,
         ):
-            for row in batch.to_pylist():
-                route_id = _strict_int(row.pop("route_id", None), "route_id")
-                if route_id in route_dictionary:
-                    raise ArtifactIntegrityError(
-                        f"duplicate route dictionary ID in {directory}: {route_id}"
-                    )
-                route_dictionary[route_id] = dict(row)
+            route_id = _strict_int(row.pop("route_id", None), "route_id")
+            if route_id in route_dictionary:
+                raise ArtifactIntegrityError(
+                    f"duplicate route dictionary ID in {directory}: {route_id}"
+                )
+            route_dictionary[route_id] = dict(row)
         hashers: dict[str, Any] = {}
         for axis, raw_axis in raw_axes.items():
             solution_axis = solution_axes.get(axis)
@@ -334,121 +387,77 @@ def replay_stage052_storage_semantics(
                 raise ArtifactIntegrityError(
                     f"storage replay axis is invalid: {instance}/{seed}/{axis}"
                 )
-            base = {
-                "objective_key": list(solution_axis.get("objective_key", [])),
-                "routes": solution_axis.get("routes", []),
-                "started_calls": _strict_int(raw_axis.get("started_calls"), "started_calls"),
-                "completed_calls": _strict_int(raw_axis.get("completed_calls"), "completed_calls"),
-            }
+            base = _canonical_axis_semantics(
+                raw_axis=raw_axis,
+                solution_axis=solution_axis,
+                trace=trace,
+                axis=str(axis),
+            )
             axis_hasher = hashlib.sha256()
             axis_hasher.update(_canonical_json_bytes(base) + b"\n")
             hashers[str(axis)] = axis_hasher
         event_ordinals = {axis: 0 for axis in hashers}
-        event_ranges: dict[str, tuple[int, int]] = {}
-        event_columns = tuple(
-            name
-            for name in EVENTS_SCHEMA.names
-            if name
-            not in {
-                "timestamp_seconds",
-                "started_at",
-                "completed_at",
-                "duration_seconds",
-            }
-        )
         previous_event_id = 0
-        for row in _iter_stage052_event_rows(
-            reader,
-            events_ref=events_ref,
-            compact_screening_ref=compact_screening_ref,
-            event_columns=event_columns,
-        ):
+        for logical_event in reader.iter_events(str(events_ref["relative_path"])):
+            row = dict(logical_event)
             event_id = _strict_int(row.get("event_id"), "event_id")
             if event_id <= previous_event_id:
                 raise ArtifactIntegrityError(f"event IDs are duplicate or unordered in {directory}")
             previous_event_id = event_id
-            extras_raw = row.get("extras_json")
-            if extras_raw is not None and not isinstance(extras_raw, str):
-                raise ArtifactIntegrityError(f"event extras_json must be text in {directory}")
-            try:
-                extras = json.loads(extras_raw) if extras_raw else {}
-            except json.JSONDecodeError as error:
-                raise ArtifactIntegrityError(f"invalid event extras_json in {directory}") from error
-            if not isinstance(extras, Mapping):
-                raise ArtifactIntegrityError(f"event extras_json must be an object in {directory}")
-            canonical_extras = dict(extras)
             if row.get("event_type") == "cache_event":
                 for volatile_byte_field in (
                     "current_bytes",
                     "entry_bytes",
                     "lookup_current_bytes",
                 ):
-                    canonical_extras.pop(volatile_byte_field, None)
-            axis = str(extras.get("benchmark_axis", ""))
+                    row.pop(volatile_byte_field, None)
+            axis = str(row.get("benchmark_axis", ""))
             event_hasher = hashers.get(axis)
             if event_hasher is None:
                 raise ArtifactIntegrityError(
                     f"event has unknown benchmark axis in {directory}: {axis}"
                 )
             row.pop("event_id", None)
-            lane_id = _strict_int(row.pop("lane_id", None), "lane_id")
-            operator_id = _strict_int(row.pop("operator_id", None), "operator_id")
-            row.pop("extras_json", None)
+            row.pop("definition_id", None)
+            for volatile_time_field in (
+                "timestamp_seconds",
+                "started_at",
+                "completed_at",
+                "duration_seconds",
+            ):
+                row.pop(volatile_time_field, None)
             _replace_event_route_ids(
                 row,
                 route_dictionary=route_dictionary,
                 directory=directory,
             )
             event_ordinals[axis] += 1
-            low, high = event_ranges.get(axis, (event_id, event_id))
-            event_ranges[axis] = (min(low, event_id), max(high, event_id))
             event_payload = {
                 "record": "event",
                 "axis_event_ordinal": event_ordinals[axis],
-                "lane": lane_dictionary.get(lane_id),
-                "operator": operator_dictionary.get(operator_id),
                 **row,
-                "extras": canonical_extras,
             }
-            if event_payload["lane"] is None or event_payload["operator"] is None:
+            if not isinstance(event_payload.get("lane"), str) or not isinstance(
+                event_payload.get("operator"), str
+            ):
                 raise ArtifactIntegrityError(f"event dictionary identity is missing in {directory}")
             event_hasher.update(_canonical_json_bytes(event_payload) + b"\n")
-        for row in _iter_stage052_check_rows(
-            reader,
-            checks_ref=checks_ref,
-            compact_screening_ref=compact_screening_ref,
-        ):
-            event_id = _strict_int(row.get("decision_event_id"), "decision_event_id")
-            matching_axes = [
-                axis for axis, (low, high) in event_ranges.items() if low <= event_id <= high
-            ]
-            if len(matching_axes) != 1:
-                raise ArtifactIntegrityError(
-                    f"screening check event identity is ambiguous in {directory}"
-                )
-            axis = matching_axes[0]
-            payload = dict(row)
-            payload["decision_event_id"] = event_id - event_ranges[axis][0] + 1
-            hashers[axis].update(
-                _canonical_json_bytes({"record": "screening_check", **payload}) + b"\n"
-            )
-        for batch in reader.iter_parquet_batches(
+        for row in reader.iter_parquet_rows(
             str(diagnostic_ref["relative_path"]),
             schema=DIAGNOSTIC_SCHEMA,
         ):
-            for row in batch.to_pylist():
-                lane = str(row.get("lane", ""))
-                axis = lane.split(":", 1)[0]
-                diagnostic_hasher = hashers.get(axis)
-                if diagnostic_hasher is None:
-                    raise ArtifactIntegrityError(
-                        f"diagnostic row has unknown benchmark axis in {directory}: {axis}"
-                    )
-                payload = dict(row)
-                payload["run_label"] = "<canonical-run-label>"
-                diagnostic_hasher.update(
-                    _canonical_json_bytes({"record": "diagnostic", **payload}) + b"\n"
+            lane = str(row.get("lane", ""))
+            axis = lane.split(":", 1)[0]
+            diagnostic_hasher = hashers.get(axis)
+            if diagnostic_hasher is None:
+                raise ArtifactIntegrityError(
+                    f"diagnostic row has unknown benchmark axis in {directory}: {axis}"
                 )
+            payload = dict(row)
+            payload["run_label"] = "<canonical-run-label>"
+            diagnostic_hasher.update(
+                _canonical_json_bytes({"record": "diagnostic", **payload}) + b"\n"
+            )
         for axis, axis_hasher in hashers.items():
             identity = (instance, seed, axis)
             if identity in output:
@@ -457,6 +466,76 @@ def replay_stage052_storage_semantics(
     if not output:
         raise ArtifactIntegrityError("storage replay evidence is empty")
     return output
+
+
+_NON_SEMANTIC_STORAGE_FIELDS = frozenset(
+    {
+        "semantic_digest",
+        "runtime_seconds",
+        "screening_runtime_seconds",
+        "total_seconds",
+        "packing_seconds",
+        "unpacking_seconds",
+        "native_kernel_seconds",
+        "native_screening_seconds",
+        "native_propagation_seconds",
+        "timestamp_seconds",
+        "started_at",
+        "completed_at",
+        "duration_seconds",
+        "current_bytes",
+        "entry_bytes",
+        "lookup_current_bytes",
+        "trace_storage_version",
+        "route_dictionary_ref",
+        "events_ref",
+        "screening_checks_ref",
+        "screening_decisions_ref",
+        "screening_definitions_ref",
+        "screening_occurrences_ref",
+        "diagnostic_ref",
+        "lane_dictionary",
+        "operator_dictionary",
+        "schema_fingerprints",
+        "screening_schema_version",
+        "event_identity",
+    }
+)
+
+
+def _canonical_semantic_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_semantic_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in _NON_SEMANTIC_STORAGE_FIELDS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_semantic_value(item) for item in value]
+    return value
+
+
+def _canonical_axis_semantics(
+    *,
+    raw_axis: Mapping[str, object],
+    solution_axis: Mapping[str, object],
+    trace: Mapping[str, object],
+    axis: str,
+) -> dict[str, object]:
+    _strict_int(raw_axis.get("started_calls"), "started_calls")
+    _strict_int(raw_axis.get("completed_calls"), "completed_calls")
+    trace_axes = trace.get("axes")
+    trace_axis: object = {}
+    if isinstance(trace_axes, Mapping):
+        trace_axis = trace_axes.get(axis, {})
+        if not isinstance(trace_axis, Mapping):
+            raise ArtifactIntegrityError(f"trace axis is invalid: {axis}")
+    return {
+        "record": "axis_semantics",
+        "raw": _canonical_semantic_value(raw_axis),
+        "solution": _canonical_semantic_value(solution_axis),
+        "trace": _canonical_semantic_value(trace_axis),
+    }
 
 
 def replay_stage052_storage_semantics_many(
@@ -715,12 +794,42 @@ def review_stage052(
     scope: str,
     comparison_dirs: Sequence[Path] = (),
     prerequisite_dir: Path | None = None,
+    prerequisite_dirs: Mapping[str, Path] | None = None,
 ) -> dict[str, Path]:
     selected = Stage052Component(component)
+    contract = stage052_contract(selected, scope)
+    supplied_prerequisites = dict(prerequisite_dirs or {})
+    if prerequisite_dir is not None:
+        if supplied_prerequisites:
+            raise ValueError("use prerequisite_dir or prerequisite_dirs, not both")
+        if len(contract.prerequisites) != 1:
+            raise ValueError(f"{selected.value} requires named prerequisite role bindings")
+        supplied_prerequisites[contract.prerequisites[0].role] = prerequisite_dir
+    expected_roles = {requirement.role for requirement in contract.prerequisites}
+    if set(supplied_prerequisites) != expected_roles:
+        raise ValueError(
+            "Stage 5.2 prerequisite roles mismatch: "
+            f"expected={sorted(expected_roles)} observed={sorted(supplied_prerequisites)}"
+        )
     validate_stage052_run_label(raw_dir.name, selected)
     review_lineage = _prior_review_manifest_hashes(raw_dir)
     reader = ArtifactReader(raw_dir)
     manifest = reader.manifest
+    artifact_types = {
+        str(item.get("artifact_type"))
+        for item in manifest.get("artifacts", [])
+        if isinstance(item, Mapping)
+    }
+    if (
+        selected is Stage052Component.ACCELERATOR_PILOT
+        and "metal_pilot" in artifact_types
+    ):
+        return _review_accelerator_metal_pilot(
+            raw_dir=raw_dir,
+            reader=reader,
+            scope=scope,
+            prerequisite_dir=supplied_prerequisites[contract.prerequisites[0].role],
+        )
     if manifest.get("evidence_completeness") != "complete":
         raise ArtifactIntegrityError("partial Stage 5.2 evidence cannot be reviewed")
     if selected is Stage052Component.ACCELERATOR_PILOT and any(
@@ -732,7 +841,7 @@ def review_stage052(
             reader=reader,
             benchmark_dir=benchmark_dir,
             scope=scope,
-            prerequisite_dir=prerequisite_dir,
+            prerequisite_dir=supplied_prerequisites[contract.prerequisites[0].role],
         )
     per_run_ref = _one_artifact(reader, "per_run_results")
     rows = _read_csv(raw_dir / str(per_run_ref["relative_path"]))
@@ -756,106 +865,144 @@ def review_stage052(
             selected, metadata.get("optimization_profile")
         ),
         "persistence_attribution": {
-            "passed": metadata.get("persistence_attribution") == "critical_event_rows",
+            "passed": metadata.get("persistence_attribution")
+            == "primary_active_writes_v1",
             "detail": str(metadata.get("persistence_attribution")),
         },
     }
-    prerequisite_identity: Stage052PrerequisiteIdentity | None = None
-    job_parallel_selection: JobParallelSelectionIdentity | None = None
-    prerequisite_contract = {
-        Stage052Component.JOB_PARALLEL: (
-            "artifact_streaming",
-            "READY_FOR_STAGE052_JOB_PARALLEL",
-        ),
-        Stage052Component.NATIVE_KERNELS: (
-            "job_parallel",
-            "READY_FOR_STAGE052_NATIVE_KERNELS",
-        ),
-        Stage052Component.ACCELERATOR_PILOT: (
-            "native_kernels",
-            "READY_FOR_STAGE052_ACCELERATOR_DECISION",
-        ),
-    }.get(selected)
-    if prerequisite_contract is not None:
-        if prerequisite_dir is None:
-            gates["component_prerequisite"] = {
+    if selected in {
+        Stage052Component.ARTIFACT_STREAMING,
+        Stage052Component.JOB_PARALLEL,
+        Stage052Component.NATIVE_KERNELS,
+        Stage052Component.ACCELERATOR_PILOT,
+        Stage052Component.BENCHMARK,
+    }:
+        runtime_passed, runtime_detail = _validate_stage052_runtime_identity(metadata)
+        gates["runtime_identity"] = {
+            "passed": runtime_passed,
+            "detail": runtime_detail,
+        }
+    if selected in {
+        Stage052Component.ARTIFACT_STREAMING,
+        Stage052Component.JOB_PARALLEL,
+        Stage052Component.NATIVE_KERNELS,
+        Stage052Component.ACCELERATOR_PILOT,
+    }:
+        staging_passed, staging_detail = _validate_stage052_staging_root_identity(metadata)
+        gates["staging_root_identity"] = {
+            "passed": staging_passed,
+            "detail": staging_detail,
+        }
+    if selected in {
+        Stage052Component.JOB_PARALLEL,
+        Stage052Component.NATIVE_KERNELS,
+        Stage052Component.ARTIFACT_STREAMING,
+    }:
+        persistence_passed, persistence_detail = _audit_primary_persistence(
+            raw_dir,
+            rows,
+            component=selected,
+            scope=scope,
+        )
+        gates["persistence_ratio"] = {
+            "passed": persistence_passed,
+            "detail": persistence_detail,
+        }
+    if selected in {
+        Stage052Component.ARTIFACT_STREAMING,
+        Stage052Component.JOB_PARALLEL,
+        Stage052Component.NATIVE_KERNELS,
+        Stage052Component.BENCHMARK,
+    }:
+        observed_workers = {_strict_int(row.get("worker_count"), "worker_count") for row in rows}
+        if len(observed_workers) != 1:
+            gates["resource_limits"] = {
                 "passed": False,
-                "detail": f"{selected.value} requires --prerequisite-dir",
+                "detail": "per-run rows contain mixed worker counts",
             }
         else:
-            try:
-                prerequisite_identity = verify_stage052_prerequisite(
-                    prerequisite_dir,
-                    expected_component=prerequisite_contract[0],
-                    expected_status=prerequisite_contract[1],
-                    expected_run_label=(
-                        "stage05.2_artifact_streaming_attempt04"
-                        if selected is Stage052Component.JOB_PARALLEL
-                        else None
-                    ),
-                )
-            except (ArtifactIntegrityError, ValueError) as error:
-                gates["component_prerequisite"] = {
-                    "passed": False,
-                    "detail": str(error),
-                }
-            else:
-                bound_prerequisite = metadata.get("component_prerequisite")
-                binding_passed = _prerequisite_binding_matches(
-                    bound_prerequisite,
-                    prerequisite_identity,
-                    prerequisite_dir,
-                )
-                gates["component_prerequisite"] = {
-                    "passed": binding_passed,
-                    "detail": (
-                        prerequisite_identity.run_label
-                        if binding_passed
-                        else "producer metadata is not bound to the reviewed prerequisite"
-                    ),
-                }
-                if selected is Stage052Component.NATIVE_KERNELS:
-                    try:
-                        job_parallel_selection = verify_job_parallel_selection(
-                            prerequisite_dir, prerequisite_identity
-                        )
-                    except (ArtifactIntegrityError, ValueError) as error:
-                        gates["job_parallel_selection"] = {
-                            "passed": False,
-                            "detail": str(error),
-                        }
-                    else:
-                        selected_worker_rows = {
-                            _strict_int(row["worker_count"], "worker_count") for row in rows
-                        }
-                        binding_passed = metadata.get(
-                            "job_parallel_selection"
-                        ) == job_parallel_selection.to_dict() and selected_worker_rows == {
-                            job_parallel_selection.selected_workers
-                        }
-                        gates["job_parallel_selection"] = {
-                            "passed": binding_passed,
-                            "detail": (
-                                f"selected_workers={job_parallel_selection.selected_workers}; "
-                                f"selected_run={job_parallel_selection.selected_run_label}"
-                                if binding_passed
-                                else "native producer is not bound to D selected workers/run"
-                            ),
-                        }
+            resource_passed, resource_detail = _validate_resource_limits(
+                raw_dir,
+                component=selected,
+                expected_workers=next(iter(observed_workers)),
+            )
+            gates["resource_limits"] = {
+                "passed": resource_passed,
+                "detail": resource_detail,
+            }
+    prerequisite_identity: Stage052PrerequisiteIdentity | None = None
+    prerequisite_identities: dict[str, Stage052PrerequisiteIdentity] = {}
+    job_parallel_selection: JobParallelSelectionIdentity | None = None
+    bound_inputs = metadata.get("component_prerequisites")
+    bound_input_map = bound_inputs if isinstance(bound_inputs, Mapping) else {}
+    for requirement in contract.prerequisites:
+        input_dir = supplied_prerequisites[requirement.role]
+        gate_name = f"prerequisite_{requirement.role}"
+        try:
+            identity = verify_stage052_evidence_input(input_dir, requirement)
+        except (ArtifactIntegrityError, ValueError) as error:
+            gates[gate_name] = {"passed": False, "detail": str(error)}
+            continue
+        prerequisite_identities[requirement.role] = identity
+        bound = bound_input_map.get(requirement.role)
+        if len(contract.prerequisites) == 1 and bound is None:
+            bound = metadata.get("component_prerequisite")
+        binding_passed = _prerequisite_binding_matches(bound, identity, input_dir)
+        gates[gate_name] = {
+            "passed": binding_passed,
+            "detail": (
+                identity.run_label
+                if binding_passed
+                else "producer metadata is not bound to the reviewed prerequisite role"
+            ),
+        }
+    if len(prerequisite_identities) == 1:
+        prerequisite_identity = next(iter(prerequisite_identities.values()))
+    primary_prerequisite_dir = (
+        next(iter(supplied_prerequisites.values())) if len(supplied_prerequisites) == 1 else None
+    )
+    if selected is Stage052Component.NATIVE_KERNELS and prerequisite_identity is not None:
+        assert primary_prerequisite_dir is not None
+        try:
+            job_parallel_selection = verify_job_parallel_selection(
+                primary_prerequisite_dir, prerequisite_identity
+            )
+        except (ArtifactIntegrityError, ValueError) as error:
+            gates["job_parallel_selection"] = {"passed": False, "detail": str(error)}
+        else:
+            selected_worker_rows = {
+                _strict_int(row["worker_count"], "worker_count") for row in rows
+            }
+            binding_passed = metadata.get(
+                "job_parallel_selection"
+            ) == job_parallel_selection.to_dict() and selected_worker_rows == {
+                job_parallel_selection.selected_workers
+            }
+            gates["job_parallel_selection"] = {
+                "passed": binding_passed,
+                "detail": (
+                    f"selected_workers={job_parallel_selection.selected_workers}; "
+                    f"selected_run={job_parallel_selection.selected_run_label}"
+                    if binding_passed
+                    else "native producer is not bound to D selected workers/run"
+                ),
+            }
     gates.update(
         _component_gates(
             selected,
             rows,
             raw_dir=raw_dir,
             comparison_dirs=comparison_dirs,
-            prerequisite_dir=prerequisite_dir,
+            prerequisite_dir=primary_prerequisite_dir,
             prerequisite_identity=prerequisite_identity,
+            prerequisite_dirs=supplied_prerequisites,
+            prerequisite_identities=prerequisite_identities,
             job_parallel_selection=job_parallel_selection,
             benchmark_dir=benchmark_dir,
         )
     )
     passed = all(bool(gate["passed"]) for gate in gates.values())
-    status = _NEXT_STATUS[selected] if passed else NOT_READY
+    status = contract.next_status if passed else NOT_READY
     if selected is Stage052Component.JOB_PARALLEL and not passed:
         worker_gate = gates.get("worker_selection")
         if isinstance(worker_gate, dict) and worker_gate.get("passed") is True:
@@ -876,6 +1023,21 @@ def review_stage052(
         "review_manifest_lineage_sha256": review_lineage,
         "gates": gates,
     }
+    if selected in {
+        Stage052Component.ARTIFACT_STREAMING,
+        Stage052Component.JOB_PARALLEL,
+        Stage052Component.NATIVE_KERNELS,
+    } and metadata.get("persistence_attribution") == "primary_active_writes_v1":
+        attribution_path = (
+            raw_dir / "control" / f"{raw_dir.name}_persistence_attribution.json"
+        )
+        attribution_sidecar = attribution_path.with_suffix(".sha256")
+        if not attribution_path.is_file() or not attribution_sidecar.is_file():
+            raise ArtifactIntegrityError("reviewed persistence attribution envelope is missing")
+        review_manifest["persistence_attribution_sha256"] = _sha256(attribution_path)
+        review_manifest["persistence_attribution_sidecar_sha256"] = _sha256(
+            attribution_sidecar
+        )
     worker_gate = gates.get("worker_selection", {})
     if passed and selected is Stage052Component.JOB_PARALLEL and worker_gate.get("passed") is True:
         review_manifest["selected_workers"] = worker_gate.get("selected_workers")
@@ -899,6 +1061,296 @@ def review_stage052(
     )
 
 
+def _review_accelerator_metal_pilot(
+    *,
+    raw_dir: Path,
+    reader: ArtifactReader,
+    scope: str,
+    prerequisite_dir: Path,
+) -> dict[str, Path]:
+    """Replay complete or explicit partial Metal pilot evidence."""
+
+    contract = stage052_contract(Stage052Component.ACCELERATOR_PILOT, scope)
+    review_lineage = _prior_review_manifest_hashes(raw_dir)
+    gates: dict[str, dict[str, object]] = {}
+    artifacts = [item for item in reader.manifest.get("artifacts", []) if isinstance(item, dict)]
+    artifact_types = [str(item.get("artifact_type", "")) for item in artifacts]
+    expected_artifacts = {"manifest_metadata", "config", "metal_pilot"}
+    artifact_gate = (
+        set(artifact_types) == expected_artifacts
+        and all(artifact_types.count(item) == 1 for item in expected_artifacts)
+    )
+    gates["metal_pilot_artifact_schema"] = {
+        "passed": artifact_gate,
+        "detail": (
+            "exclusive Metal pilot artifact set passed"
+            if artifact_gate
+            else str(artifact_types)
+        ),
+    }
+    metadata = reader.read_json(str(_one_artifact(reader, "manifest_metadata")["relative_path"]))
+    artifact = reader.read_json(str(_one_artifact(reader, "metal_pilot")["relative_path"]))
+    prerequisite_identity: Stage052PrerequisiteIdentity | None = None
+    try:
+        prerequisite_identity = verify_stage052_evidence_input(
+            prerequisite_dir,
+            contract.prerequisites[0],
+        )
+    except (ArtifactIntegrityError, ValueError) as error:
+        gates["component_prerequisite"] = {"passed": False, "detail": str(error)}
+    else:
+        binding = _prerequisite_binding_matches(
+            metadata.get("component_prerequisite"), prerequisite_identity, prerequisite_dir
+        )
+        gates["component_prerequisite"] = {
+            "passed": binding,
+            "detail": prerequisite_identity.run_label if binding else "E binding mismatch",
+        }
+    wrapper_passed = (
+        isinstance(artifact, Mapping)
+        and set(artifact)
+        == {
+            "schema_version",
+            "occupancy_input_count",
+            "occupancy_inputs",
+            "native_prerequisite",
+            "pilot",
+        }
+        and artifact.get("schema_version") == "stage05.2-accelerator-pilot-artifact-v1"
+        and artifact.get("occupancy_input_count") == 9
+        and prerequisite_identity is not None
+        and artifact.get("native_prerequisite") == prerequisite_identity.to_dict()
+    )
+    gates["metal_pilot_wrapper"] = {
+        "passed": wrapper_passed,
+        "detail": "Metal pilot wrapper passed" if wrapper_passed else "invalid wrapper",
+    }
+    expected_native: tuple[PerformanceObservation, ...] = ()
+    audited = None
+    if prerequisite_identity is not None:
+        try:
+            occupancy_inputs, occupancy_median = _recompute_native_occupancies(prerequisite_dir)
+            expected_native = _recompute_native_performance_observations(prerequisite_dir)
+            pilot_payload = artifact.get("pilot") if isinstance(artifact, Mapping) else None
+            if not isinstance(pilot_payload, Mapping):
+                raise ValueError("Metal pilot payload is missing")
+            if artifact.get("occupancy_inputs") != occupancy_inputs:
+                raise ValueError("Metal pilot occupancy inputs do not match accepted E")
+            if not math.isclose(
+                _strict_float(pilot_payload.get("median_batch_occupancy")),
+                occupancy_median,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError("Metal pilot occupancy median does not match accepted E")
+            if occupancy_median < 32.0:
+                raise ValueError("Metal pilot artifact is forbidden below occupancy 32")
+            audited = audit_metal_pilot_result(
+                pilot_payload,
+                expected_native=expected_native,
+            )
+        except (ArtifactIntegrityError, KeyError, TypeError, ValueError) as error:
+            gates["independent_metal_replay"] = {"passed": False, "detail": str(error)}
+        else:
+            gates["independent_metal_replay"] = {
+                "passed": True,
+                "detail": (
+                    audited.decision.value
+                    if audited.decision is not None
+                    else audited.failure_code or "partial"
+                ),
+            }
+    else:
+        gates["independent_metal_replay"] = {
+            "passed": False,
+            "detail": "accepted E prerequisite is unavailable",
+        }
+    selected_workers: int | None = None
+    try:
+        selected_workers = _strict_int(metadata.get("worker_count"), "worker_count")
+        prerequisite_review = json.loads(
+            (prerequisite_dir / "review" / "review_manifest.json").read_text(encoding="utf-8")
+        )
+        expected_workers = _strict_int(prerequisite_review.get("selected_workers"), "workers")
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
+        gates["worker_selection"] = {"passed": False, "detail": str(error)}
+    else:
+        worker_passed = selected_workers in {2, 4} and selected_workers == expected_workers
+        gates["worker_selection"] = {
+            "passed": worker_passed,
+            "detail": f"selected_workers={selected_workers}",
+        }
+    complete = audited is not None and audited.status is MetalPilotStatus.COMPLETE
+    runtime = audited.runtime_identity if audited is not None else None
+    helper_path = (
+        Path(str(runtime.get("helper_path")))
+        if isinstance(runtime, Mapping) and isinstance(runtime.get("helper_path"), str)
+        else None
+    )
+    runtime_passed = (
+        complete
+        and isinstance(runtime, Mapping)
+        and runtime.get("runtime") == "subprocess-metal-helper"
+        and runtime.get("production_evidence_eligible") is True
+        and isinstance(runtime.get("helper_sha256"), str)
+        and len(str(runtime.get("helper_sha256"))) == 64
+        and all(
+            character in "0123456789abcdef"
+            for character in str(runtime.get("helper_sha256"))
+        )
+        and helper_path is not None
+        and helper_path.is_absolute()
+        and helper_path.is_file()
+        and _sha256(helper_path) == runtime.get("helper_sha256")
+        and runtime.get("protocol_schema_version") == "stage05.2-metal-helper-v1"
+    )
+    gates["real_metal_runtime"] = {
+        "passed": runtime_passed,
+        "detail": (
+            "explicit Metal helper identity passed"
+            if runtime_passed
+            else (
+                audited.failure_detail
+                if audited is not None and audited.failure_detail
+                else "complete production Metal runtime evidence is unavailable"
+            )
+        ),
+    }
+    campaign_adapter_passed, campaign_adapter_detail = (
+        campaign_execution_adapter_gate(audited)
+        if audited is not None
+        else (False, "campaign execution selection is unavailable")
+    )
+    gates["campaign_execution_adapter"] = {
+        "passed": campaign_adapter_passed,
+        "detail": campaign_adapter_detail,
+    }
+    expected_backend = (
+        audited.selected_backend if audited is not None and complete else None
+    )
+    expected_profile = "metal" if expected_backend == "metal" else "native"
+    metadata_passed = (
+        scope == "performance"
+        and metadata.get("scope") == scope
+        and metadata.get("component") == Stage052Component.ACCELERATOR_PILOT.value
+        and metadata.get("backend") == "cpu_batch"
+        and metadata.get("execution_backend") == expected_backend
+        and metadata.get("optimization_profile") == (expected_profile if complete else None)
+        and metadata.get("accelerator_decision_mode") == "metal_pilot"
+        and metadata.get("native_kernel_config") == NativeKernelConfig().to_dict()
+    )
+    gates["metal_pilot_metadata"] = {
+        "passed": metadata_passed,
+        "detail": "Metal pilot metadata passed" if metadata_passed else "metadata mismatch",
+    }
+    runtime_identity_passed, runtime_identity_detail = _validate_stage052_runtime_identity(metadata)
+    gates["runtime_identity"] = {
+        "passed": runtime_identity_passed,
+        "detail": runtime_identity_detail,
+    }
+    staging_passed, staging_detail = _validate_stage052_staging_root_identity(metadata)
+    gates["staging_root_identity"] = {"passed": staging_passed, "detail": staging_detail}
+    completeness_passed = (
+        complete and reader.manifest.get("evidence_completeness") == "complete"
+    )
+    gates["evidence_completeness"] = {
+        "passed": completeness_passed,
+        "detail": str(reader.manifest.get("evidence_completeness")),
+    }
+    passed = all(bool(gate["passed"]) for gate in gates.values())
+    status = contract.next_status if passed else NOT_READY
+    decision = audited.decision.value if audited and audited.decision else "NOT_READY"
+    selected_backend = audited.selected_backend if passed and audited else None
+    review_dir = raw_dir / "review"
+    review_manifest = {
+        "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
+        "run_label": raw_dir.name,
+        "component": Stage052Component.ACCELERATOR_PILOT.value,
+        "scope": scope,
+        "status": status,
+        "raw_manifest_sha256": _sha256(reader.result.manifest_path),
+        "review_manifest_lineage_sha256": review_lineage,
+        "accelerator_decision": decision,
+        "selected_backend": selected_backend,
+        "selected_exact_backend": "cpu_batch" if passed else None,
+        "selected_workers": selected_workers if passed else None,
+        "selected_optimization_profile": expected_profile if passed else None,
+        "native_configuration": NativeKernelConfig().to_dict() if passed else None,
+        "metal_runtime_identity": (
+            dict(runtime) if passed and isinstance(runtime, Mapping) else None
+        ),
+        "gates": gates,
+    }
+    return _publish_review_generation(
+        review_dir=review_dir,
+        findings=_render_review_findings(gates),
+        report=_render_review_report(run_label=raw_dir.name, status=status, gates=gates),
+        manifest=review_manifest,
+    )
+
+
+def _recompute_native_performance_observations(
+    raw_dir: Path,
+) -> tuple[PerformanceObservation, ...]:
+    reader = ArtifactReader(raw_dir)
+    observations: dict[tuple[str, int], PerformanceObservation] = {}
+    expected = {
+        (instance, seed)
+        for instance in ("c101_21", "r101_21", "rc101_21")
+        for seed in PERFORMANCE_SEEDS
+    }
+    raw_semantics: dict[tuple[str, int], str] = {}
+    for raw_reference in reader.manifest.get("artifacts", []):
+        if (
+            not isinstance(raw_reference, Mapping)
+            or raw_reference.get("artifact_type") != "raw"
+        ):
+            continue
+        raw = reader.read_json(str(raw_reference.get("relative_path", "")))
+        if not isinstance(raw, Mapping):
+            raise ArtifactIntegrityError("E raw payload must be an object")
+        identity = (
+            str(raw.get("instance", "")),
+            _strict_int(raw.get("seed"), "seed"),
+        )
+        if identity not in expected:
+            continue
+        axes = raw.get("axes")
+        fixed = axes.get("fixed_work") if isinstance(axes, Mapping) else None
+        semantic_digest = fixed.get("semantic_digest") if isinstance(fixed, Mapping) else None
+        if (
+            identity in raw_semantics
+            or not isinstance(semantic_digest, str)
+            or not semantic_digest
+        ):
+            raise ArtifactIntegrityError(f"invalid E raw semantic identity: {identity}")
+        raw_semantics[identity] = semantic_digest
+    reference = _one_artifact(reader, "per_run_results")
+    for row in _read_csv(raw_dir / str(reference["relative_path"])):
+        identity = (str(row.get("instance", "")), _strict_int(row.get("seed"), "seed"))
+        if identity not in expected:
+            continue
+        if row.get("axis") != "fixed_work":
+            continue
+        if identity in observations:
+            raise ArtifactIntegrityError(f"duplicate E performance identity: {identity}")
+        observations[identity] = PerformanceObservation(
+            instance=identity[0],
+            seed=identity[1],
+            customer_count=100,
+            end_to_end_seconds=_strict_float(row.get("end_to_end_seconds")),
+            semantic_digest=str(row.get("semantic_digest", "")),
+        )
+    if set(observations) != expected:
+        raise ArtifactIntegrityError("E Metal-pilot performance scope is incomplete")
+    if set(raw_semantics) != expected or any(
+        observations[identity].semantic_digest != raw_semantics[identity]
+        for identity in expected
+    ):
+        raise ArtifactIntegrityError("E raw/per-run semantic evidence disagrees")
+    return tuple(observations[identity] for identity in sorted(observations))
+
+
 def _review_accelerator_decision_only(
     *,
     raw_dir: Path,
@@ -910,6 +1362,7 @@ def _review_accelerator_decision_only(
     """Independently recompute a below-threshold F decision without GPU rows."""
 
     del benchmark_dir
+    contract = stage052_contract(Stage052Component.ACCELERATOR_PILOT, scope)
     review_lineage = _prior_review_manifest_hashes(raw_dir)
     gates: dict[str, dict[str, object]] = {}
     artifacts = [item for item in reader.manifest.get("artifacts", []) if isinstance(item, dict)]
@@ -934,6 +1387,8 @@ def _review_accelerator_decision_only(
         scope == "performance"
         and metadata.get("scope") == "performance"
         and metadata.get("component") == Stage052Component.ACCELERATOR_PILOT.value
+        and metadata.get("backend") == "cpu_batch"
+        and metadata.get("execution_backend") == "native_cpu"
         and metadata.get("optimization_profile") == "native"
         and metadata.get("native_kernel_config") == NativeKernelConfig().to_dict()
         and metadata.get("accelerator_decision_mode") == "decision_only"
@@ -941,6 +1396,16 @@ def _review_accelerator_decision_only(
     gates["decision_metadata"] = {
         "passed": metadata_passed,
         "detail": "decision-only native metadata passed" if metadata_passed else "invalid metadata",
+    }
+    runtime_passed, runtime_detail = _validate_stage052_runtime_identity(metadata)
+    gates["runtime_identity"] = {
+        "passed": runtime_passed,
+        "detail": runtime_detail,
+    }
+    staging_passed, staging_detail = _validate_stage052_staging_root_identity(metadata)
+    gates["staging_root_identity"] = {
+        "passed": staging_passed,
+        "detail": staging_detail,
     }
     prerequisite_identity: Stage052PrerequisiteIdentity | None = None
     if prerequisite_dir is None:
@@ -950,24 +1415,49 @@ def _review_accelerator_decision_only(
         }
     else:
         try:
-            prerequisite_identity = verify_stage052_prerequisite(
+            prerequisite_identity = verify_stage052_evidence_input(
                 prerequisite_dir,
-                expected_component=Stage052Component.NATIVE_KERNELS.value,
-                expected_status="READY_FOR_STAGE052_ACCELERATOR_DECISION",
+                contract.prerequisites[0],
             )
         except (ArtifactIntegrityError, ValueError) as error:
             gates["component_prerequisite"] = {"passed": False, "detail": str(error)}
         else:
-            binding_passed = _prerequisite_binding_matches(
-                metadata.get("component_prerequisite"),
-                prerequisite_identity,
-                prerequisite_dir,
+            try:
+                prerequisite_review = json.loads(
+                    (prerequisite_dir / "review" / "review_manifest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                expected_workers = _strict_int(
+                    prerequisite_review.get("selected_workers"),
+                    "selected_workers",
+                )
+                observed_workers = _strict_int(
+                    metadata.get("worker_count"),
+                    "worker_count",
+                )
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
+                gates["component_prerequisite"] = {
+                    "passed": False,
+                    "detail": str(error),
+                }
+                prerequisite_identity = None
+                expected_workers = -1
+                observed_workers = -2
+            binding_passed = (
+                prerequisite_identity is not None
+                and _prerequisite_binding_matches(
+                    metadata.get("component_prerequisite"),
+                    prerequisite_identity,
+                    prerequisite_dir,
+                )
+                and expected_workers == observed_workers
             )
             gates["component_prerequisite"] = {
                 "passed": binding_passed,
                 "detail": (
                     prerequisite_identity.run_label
-                    if binding_passed
+                    if binding_passed and prerequisite_identity is not None
                     else "decision metadata is not bound to accepted E"
                 ),
             }
@@ -976,6 +1466,8 @@ def _review_accelerator_decision_only(
         "schema_version",
         "decision_mode",
         "decision",
+        "selected_backend",
+        "selected_exact_backend",
         "threshold",
         "median_batch_occupancy",
         "input_count",
@@ -989,6 +1481,8 @@ def _review_accelerator_decision_only(
         and decision.get("schema_version") == "stage05.2-accelerator-decision-v1"
         and decision.get("decision_mode") == "decision_only"
         and decision.get("decision") == "GPU_NOT_JUSTIFIED"
+        and decision.get("selected_backend") == "native_cpu"
+        and decision.get("selected_exact_backend") == "cpu_batch"
         and decision.get("threshold") == 32.0
         and decision.get("input_count") == 9
         and decision.get("gpu_rows_present") is False
@@ -1031,7 +1525,26 @@ def _review_accelerator_decision_only(
             "detail": "accepted E evidence is unavailable",
         }
     passed = all(bool(gate["passed"]) for gate in gates.values())
-    status = _NEXT_STATUS[Stage052Component.ACCELERATOR_PILOT] if passed else NOT_READY
+    status = contract.next_status if passed else NOT_READY
+    selected_workers: int | None = None
+    try:
+        selected_workers = _strict_int(metadata.get("worker_count"), "worker_count")
+    except (TypeError, ValueError):
+        passed = False
+        status = NOT_READY
+        gates["worker_selection"] = {
+            "passed": False,
+            "detail": "decision metadata worker_count is invalid",
+        }
+    else:
+        worker_passed = selected_workers in {2, 4}
+        gates["worker_selection"] = {
+            "passed": worker_passed,
+            "detail": f"selected_workers={selected_workers}",
+        }
+        if not worker_passed:
+            passed = False
+            status = NOT_READY
     review_dir = raw_dir / "review"
     manifest = {
         "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
@@ -1043,6 +1556,10 @@ def _review_accelerator_decision_only(
         "review_manifest_lineage_sha256": review_lineage,
         "accelerator_decision": "GPU_NOT_JUSTIFIED" if passed else "NOT_READY",
         "selected_backend": "native_cpu" if passed else None,
+        "selected_exact_backend": "cpu_batch" if passed else None,
+        "selected_workers": selected_workers if passed else None,
+        "selected_optimization_profile": "native" if passed else None,
+        "native_configuration": NativeKernelConfig().to_dict() if passed else None,
         "gates": gates,
     }
     return _publish_review_generation(
@@ -1491,6 +2008,10 @@ def _audit_native_execution(
                     timing.get("finalize_completed_ns"), "finalize_completed_ns"
                 )
                 axis_event_count = _strict_int(timing.get("axis_event_count"), "axis_event_count")
+                live_stream_persistence_ns = _strict_int(
+                    timing.get("live_stream_persistence_ns"),
+                    "live_stream_persistence_ns",
+                )
                 total_event_count = _strict_int(
                     timing.get("total_event_count"), "total_event_count"
                 )
@@ -1500,6 +2021,9 @@ def _audit_native_execution(
                     or solver_completed_ns <= solver_started_ns
                     or axis_completed_ns < solver_completed_ns
                     or finalize_completed_ns <= finalize_started_ns
+                    or live_stream_persistence_ns < 0
+                    or live_stream_persistence_ns
+                    > solver_completed_ns - solver_started_ns
                     or axis_event_count < 0
                     or total_event_count < 0
                     or axis_count <= 0
@@ -1507,15 +2031,21 @@ def _audit_native_execution(
                     raise ArtifactIntegrityError(
                         f"native monotonic timing interval is invalid: {axis_identity}"
                     )
-                solver_seconds = (solver_completed_ns - solver_started_ns) / 1_000_000_000
-                post_solver_seconds = (axis_completed_ns - solver_completed_ns) / 1_000_000_000
-                finalization_seconds = (finalize_completed_ns - finalize_started_ns) / 1_000_000_000
+                solver_seconds = (
+                    solver_completed_ns - solver_started_ns - live_stream_persistence_ns
+                ) / 1_000_000_000
+                finalization_seconds = (
+                    finalize_completed_ns - finalize_started_ns
+                ) / 1_000_000_000
                 finalization_share = (
                     finalization_seconds * axis_event_count / total_event_count
                     if total_event_count
                     else finalization_seconds / axis_count
                 )
-                persistence_seconds = post_solver_seconds + finalization_share
+                persistence_seconds = (
+                    finalization_share
+                    + live_stream_persistence_ns / 1_000_000_000
+                )
                 float_bindings.update(
                     {
                         "solver_seconds": solver_seconds,
@@ -1625,6 +2155,8 @@ def _component_gates(
     comparison_dirs: Sequence[Path],
     prerequisite_dir: Path | None,
     prerequisite_identity: Stage052PrerequisiteIdentity | None,
+    prerequisite_dirs: Mapping[str, Path],
+    prerequisite_identities: Mapping[str, Stage052PrerequisiteIdentity],
     job_parallel_selection: JobParallelSelectionIdentity | None,
     benchmark_dir: Path,
 ) -> dict[str, dict[str, object]]:
@@ -1776,86 +2308,87 @@ def _component_gates(
             }
         return gates
     if component is Stage052Component.ARTIFACT_STREAMING:
-        if len(comparison_dirs) != 2:
+        expected_roles = {
+            "hot_path_predecessor",
+            "historical_storage",
+            "remediation_source",
+        }
+        if (
+            comparison_dirs
+            or set(prerequisite_dirs) != expected_roles
+            or set(prerequisite_identities) != expected_roles
+        ):
             return {
                 "storage_prerequisites": {
                     "passed": False,
-                    "detail": "exactly two comparison directories are required",
+                    "detail": "C05 requires exactly the named B03/C04/E03 inputs",
                 }
             }
-        by_component: dict[str, list[dict[str, str]]] = {}
-        path_by_component: dict[str, Path] = {}
-        for path in comparison_dirs:
-            group = _load_per_run(path)
-            components = {str(row["component"]) for row in group}
-            if len(components) != 1:
-                return {
-                    "storage_prerequisites": {
-                        "passed": False,
-                        "detail": "comparison contains mixed component identities",
-                    }
-                }
-            comparison_component = next(iter(components))
-            expected_status = _C_PREREQUISITE_STATUS.get(comparison_component)
-            if expected_status is None:
-                return {
-                    "storage_prerequisites": {
-                        "passed": False,
-                        "detail": f"unexpected comparison component: {comparison_component}",
-                    }
-                }
-            try:
-                verify_stage052_review_prerequisite(
-                    path,
-                    expected_component=comparison_component,
-                    expected_status=expected_status,
-                )
-            except ValueError as error:
-                return {
-                    "storage_prerequisites": {
-                        "passed": False,
-                        "detail": str(error),
-                    }
-                }
-            if comparison_component in by_component:
-                return {
-                    "storage_prerequisites": {
-                        "passed": False,
-                        "detail": f"duplicate comparison component: {comparison_component}",
-                    }
-                }
-            by_component[comparison_component] = group
-            path_by_component[comparison_component] = path
-        if set(by_component) != {"perf_baseline", "hot_path"}:
-            return {
-                "storage_prerequisites": {
-                    "passed": False,
-                    "detail": "perf_baseline and hot_path comparisons are required",
-                }
-            }
-        storage_decision = evaluate_artifact_storage_promotion(
-            _storage_observations(by_component["perf_baseline"]),
-            _storage_observations(
-                by_component["hot_path"],
-                semantic_digests=replay_stage052_storage_semantics(path_by_component["hot_path"]),
-            ),
-            _storage_observations(
-                rows,
-                semantic_digests=replay_stage052_storage_semantics(raw_dir),
-            ),
+        predecessor_dir = prerequisite_dirs["hot_path_predecessor"]
+        historical_dir = prerequisite_dirs["historical_storage"]
+        remediation_source = prerequisite_dirs["remediation_source"]
+        current_storage_policy = ArtifactReader(raw_dir).manifest.get("storage_policy")
+        historical_storage_policy = ArtifactReader(historical_dir).manifest.get("storage_policy")
+        physical_schema_passed = (
+            isinstance(current_storage_policy, Mapping)
+            and current_storage_policy.get("screening_schema_version") == "screening_decisions_v3"
+            and isinstance(historical_storage_policy, Mapping)
+            and historical_storage_policy.get("screening_schema_version")
+            == "screening_decisions_v2"
+        )
+        replay_maps = replay_stage052_storage_semantics_many(
+            (predecessor_dir, raw_dir),
+            max_workers=2,
+        )
+        predecessor_fixed = {
+            identity: digest
+            for identity, digest in replay_maps[0].items()
+            if identity[2].startswith("fixed_work")
+        }
+        current_fixed = {
+            identity: digest
+            for identity, digest in replay_maps[1].items()
+            if identity[2].startswith("fixed_work")
+        }
+        replay_equal = (
+            len(predecessor_fixed) == 24
+            and set(current_fixed) == set(predecessor_fixed)
+            and current_fixed == predecessor_fixed
+        )
+        persistence_passed, persistence_detail = _audit_primary_persistence(
+            raw_dir,
+            rows,
+            component=Stage052Component.ARTIFACT_STREAMING,
+        )
+        remediation_passed, remediation_detail = _validate_c05_remediation(
+            raw_dir,
+            source_dir=remediation_source,
+            source_identity=prerequisite_identities["remediation_source"],
         )
         return {
-            "v1_v2_replay_equality": {
-                "passed": storage_decision.replay_equality_passed,
-                "detail": storage_decision.replay_detail,
+            "storage_schema_amendment": {
+                "passed": physical_schema_passed,
+                "detail": (
+                    "historical C04 screening_decisions_v2 preserved; C05 uses v3"
+                    if physical_schema_passed
+                    else "C04/C05 physical screening schemas are invalid"
+                ),
+            },
+            "v1_v3_replay_equality": {
+                "passed": replay_equal,
+                "detail": (
+                    "24 B03/C05 fixed-work axes have exact canonical equality"
+                    if replay_equal
+                    else "24 B03/C05 fixed-work axes do not replay identically"
+                ),
             },
             "persistence_ratio": {
-                "passed": storage_decision.persistence_passed,
-                "detail": storage_decision.persistence_detail,
+                "passed": persistence_passed,
+                "detail": persistence_detail,
             },
-            "peak_rss": {
-                "passed": storage_decision.rss_passed,
-                "detail": storage_decision.rss_detail,
+            "e03_full_remediation": {
+                "passed": remediation_passed,
+                "detail": remediation_detail,
             },
         }
     if component is Stage052Component.JOB_PARALLEL:
@@ -1904,6 +2437,30 @@ def _component_gates(
                     "comparison_completeness": {
                         "passed": False,
                         "detail": f"{evidence_dir.name}: {contract_detail}",
+                    }
+                }
+            resource_limits_passed, resource_limits_detail = _validate_resource_limits(
+                evidence_dir,
+                component=Stage052Component.JOB_PARALLEL,
+                expected_workers=worker,
+            )
+            if not resource_limits_passed:
+                return {
+                    "resource_limits": {
+                        "passed": False,
+                        "detail": f"{evidence_dir.name}: {resource_limits_detail}",
+                    }
+                }
+            persistence_passed, persistence_detail = _audit_primary_persistence(
+                evidence_dir,
+                worker_rows,
+                component=Stage052Component.JOB_PARALLEL,
+            )
+            if not persistence_passed:
+                return {
+                    "persistence_ratio": {
+                        "passed": False,
+                        "detail": f"{evidence_dir.name}: {persistence_detail}",
                     }
                 }
             ownership_passed, ownership_detail, owners = validate_worker_ownership(
@@ -1999,6 +2556,14 @@ def _component_gates(
                 "detail": "all shards are bound to sampled executor PIDs",
                 "owners": {str(worker): list(owners_by_worker[worker]) for worker in (1, 2, 4)},
             },
+            "resource_limits": {
+                "passed": True,
+                "detail": "all 1/2/4-worker bundles pass per-worker and aggregate RSS",
+            },
+            "persistence_ratio": {
+                "passed": True,
+                "detail": "all 1/2/4-worker bundles have aggregate persistence <= 30%",
+            },
             "worker_selection": {
                 "passed": True,
                 "detail": f"selected_workers={selected}",
@@ -2032,16 +2597,303 @@ def _component_gates(
     return {}
 
 
+def _logical_event_count(reader: ArtifactReader) -> int:
+    total = 0
+    for item in reader.manifest.get("artifacts", ()):
+        if not isinstance(item, Mapping) or item.get("artifact_type") != "events":
+            continue
+        if item.get("artifact_subtype") not in {
+            "critical",
+            "screening_decisions_v2",
+            "screening_occurrences_v3",
+        }:
+            continue
+        total += _strict_int(item.get("row_count"), "event row_count")
+    return total
+
+
+def _validate_c05_remediation(
+    raw_dir: Path,
+    *,
+    source_dir: Path,
+    source_identity: Stage052PrerequisiteIdentity,
+) -> tuple[bool, str]:
+    try:
+        parent = ArtifactReader(raw_dir)
+        summary_ref = _one_artifact(parent, "remediation_summary")
+        child_manifest_ref = _one_artifact(parent, "remediation_child_manifest")
+        child_sidecar_ref = _one_artifact(
+            parent,
+            "remediation_child_manifest_sidecar",
+        )
+        summary = parent.read_json(str(summary_ref["relative_path"]))
+        child_manifest_path = raw_dir / str(child_manifest_ref["relative_path"])
+        child_sidecar_path = raw_dir / str(child_sidecar_ref["relative_path"])
+        child_dir = child_manifest_path.parent.parent
+        child = ArtifactReader(child_dir)
+        source = ArtifactReader(source_dir)
+    except (ArtifactIntegrityError, KeyError, OSError, TypeError, ValueError) as error:
+        return False, str(error)
+    if (
+        child.manifest.get("run_label") != raw_dir.name
+        or child.manifest.get("evidence_completeness") != "complete"
+        or child.manifest.get("status") != "complete"
+    ):
+        return False, "remediation child is not a complete C05 bundle"
+    child_policy = child.manifest.get("storage_policy")
+    if (
+        not isinstance(child_policy, Mapping)
+        or child_policy.get("screening_schema_version") != "screening_decisions_v3"
+    ):
+        return False, "remediation child does not use screening_decisions_v3"
+    child_descriptors = child.manifest.get("artifacts")
+    parent_descriptors = parent.manifest.get("artifacts")
+    if not isinstance(child_descriptors, list) or not isinstance(parent_descriptors, list):
+        return False, "remediation parent/child artifact descriptors are invalid"
+    expected_nested = {
+        (child_dir / str(item.get("relative_path", "")))
+        .relative_to(raw_dir)
+        .as_posix(): item
+        for item in child_descriptors
+        if isinstance(item, Mapping)
+    }
+    observed_nested = {
+        str(item.get("relative_path", "")): item
+        for item in parent_descriptors
+        if isinstance(item, Mapping)
+        and item.get("artifact_type") == "remediation_child_payload"
+    }
+    if set(observed_nested) != set(expected_nested) or any(
+        observed_nested[relative].get("checksum") != nested.get("checksum")
+        or observed_nested[relative].get("byte_size") != nested.get("byte_size")
+        or observed_nested[relative].get("row_count") != nested.get("row_count")
+        or observed_nested[relative].get("schema_fingerprint")
+        != nested.get("schema_fingerprint")
+        for relative, nested in expected_nested.items()
+    ):
+        return False, "remediation child payload closure is incomplete or stale"
+    child_manifest_sha256 = _sha256(child_manifest_path)
+    if (
+        child_manifest_ref.get("relative_path")
+        != child_manifest_path.relative_to(raw_dir).as_posix()
+        or child_sidecar_ref.get("relative_path")
+        != child_sidecar_path.relative_to(raw_dir).as_posix()
+        or child_manifest_ref.get("artifact_subtype") != source_identity.run_label
+        or child_sidecar_ref.get("artifact_subtype") != source_identity.run_label
+        or child_manifest_ref.get("storage_format") != "json_control"
+        or child_sidecar_ref.get("storage_format") != "sha256_control"
+        or child_manifest_ref.get("checksum") != child_manifest_sha256
+        or child_manifest_ref.get("byte_size") != child_manifest_path.stat().st_size
+        or child_sidecar_ref.get("checksum") != _sha256(child_sidecar_path)
+        or child_sidecar_ref.get("byte_size") != child_sidecar_path.stat().st_size
+        or not signed_sidecar_matches(child_manifest_path, child_sidecar_path)
+    ):
+        return False, "remediation child manifest/sidecar binding failed"
+    source_event_count = _logical_event_count(source)
+    child_event_count = _logical_event_count(child)
+    source_rows = _load_per_run(source_dir)
+    solver_seconds = sum(_strict_float(row.get("solver_seconds")) for row in source_rows)
+    try:
+        observed_solver_seconds = _strict_float(summary.get("verified_solver_seconds"))
+        persistence_seconds = _strict_float(summary.get("artifact_persistence_seconds"))
+        observed_ratio = _strict_float(summary.get("persistence_ratio"))
+    except (TypeError, ValueError) as error:
+        return False, str(error)
+    persistence = evaluate_artifact_persistence(
+        (
+            ArtifactPersistenceObservation(
+                solver_seconds=solver_seconds,
+                artifact_persistence_seconds=persistence_seconds,
+            ),
+        )
+    )
+    shard_count = sum(
+        1
+        for item in child.manifest.get("artifacts", ())
+        if isinstance(item, Mapping) and item.get("artifact_type") == "shard_manifest"
+    )
+    identity_passed = (
+        summary.get("source_run_label") == source_identity.run_label
+        and summary.get("child_run_label") == raw_dir.name
+        and summary.get("source_raw_manifest_sha256") == source_identity.raw_manifest_sha256
+        and summary.get("source_review_manifest_sha256") == source_identity.review_manifest_sha256
+        and _sha256(source.result.manifest_path) == source_identity.raw_manifest_sha256
+    )
+    counts_passed = (
+        len(source_rows) == E03_SOLVER_ROW_COUNT
+        and shard_count == E03_SHARD_COUNT
+        and source_event_count == child_event_count == E03_EVENT_COUNT
+        and summary.get("source_event_count") == E03_EVENT_COUNT
+        and summary.get("child_event_count") == E03_EVENT_COUNT
+        and summary.get("shard_count") == E03_SHARD_COUNT
+    )
+    summary_digest_equal = (
+        isinstance(summary.get("source_semantic_digest"), str)
+        and len(str(summary.get("source_semantic_digest"))) == 64
+        and summary.get("source_semantic_digest") == summary.get("child_semantic_digest")
+    )
+    ratio_passed = (
+        math.isclose(observed_solver_seconds, solver_seconds, rel_tol=0.0, abs_tol=1e-9)
+        and math.isclose(observed_ratio, persistence.ratio, rel_tol=0.0, abs_tol=1e-12)
+        and summary.get("persistence_passed") is True
+        and persistence.passed
+    )
+    if not (identity_passed and counts_passed and summary_digest_equal and ratio_passed):
+        return False, (
+            "remediation summary mismatch: "
+            f"identity={identity_passed} counts={counts_passed} "
+            f"digest={summary_digest_equal} ratio={ratio_passed}"
+        )
+    try:
+        replayed = replay_stage052_storage_semantics_many(
+            (source_dir, child_dir),
+            max_workers=2,
+        )
+    except (ArtifactIntegrityError, RuntimeError, TypeError, ValueError) as error:
+        return False, str(error)
+    if (
+        len(replayed[0]) != E03_SOLVER_ROW_COUNT
+        or set(replayed[0]) != set(replayed[1])
+        or replayed[0] != replayed[1]
+    ):
+        return False, "E03 source and C05 remediation child semantics differ"
+    return (
+        True,
+        f"{E03_EVENT_COUNT} events and {E03_SOLVER_ROW_COUNT} axes replay equally; "
+        f"new persistence ratio={persistence.ratio:.6f}",
+    )
+
+
 def _load_resource_summary(raw_dir: Path) -> dict[str, object]:
     reader = ArtifactReader(raw_dir)
     reference = _one_artifact(reader, "resource_summary")
     return reader.read_json(str(reference["relative_path"]))
 
 
+def _validate_resource_limits(
+    raw_dir: Path,
+    *,
+    component: Stage052Component,
+    expected_workers: int,
+) -> tuple[bool, str]:
+    try:
+        resource = _load_resource_summary(raw_dir)
+        shard_manifests = _load_shard_manifests(raw_dir)
+    except (ArtifactIntegrityError, KeyError, OSError, TypeError, ValueError) as error:
+        return False, str(error)
+    if resource.get("schema_version") != STAGE052_RESOURCE_SCHEMA_VERSION:
+        return False, "current evidence requires stage05.2-run-resource-v3"
+    ownership_passed, ownership_detail, owners = validate_worker_ownership(
+        resource,
+        shard_manifests,
+        expected_workers=expected_workers,
+        expected_run_label=raw_dir.name,
+        expected_component=component.value,
+    )
+    if not ownership_passed:
+        return False, ownership_detail
+    raw_peaks = resource.get("process_peak_rss_bytes")
+    if not isinstance(raw_peaks, Mapping):
+        return False, "process_peak_rss_bytes is missing"
+    try:
+        process_peaks = {
+            int(str(pid)): _strict_int(peak, "peak_rss") for pid, peak in raw_peaks.items()
+        }
+        aggregate_peak = _strict_int(
+            resource.get("aggregate_peak_rss_bytes"), "aggregate_peak_rss_bytes"
+        )
+    except (TypeError, ValueError) as error:
+        return False, str(error)
+    oversized_workers = {
+        pid: process_peaks.get(pid, 0)
+        for pid in owners
+        if process_peaks.get(pid, 0) > _PER_WORKER_STORAGE_RSS_LIMIT_BYTES
+    }
+    if oversized_workers:
+        return False, f"per-worker RSS exceeds limit: {oversized_workers}"
+    if aggregate_peak > _PROCESS_TREE_RSS_LIMIT_BYTES:
+        return False, (
+            f"process-tree aggregate RSS {aggregate_peak} exceeds {_PROCESS_TREE_RSS_LIMIT_BYTES}"
+        )
+    return (
+        True,
+        f"per-worker RSS <= {_PER_WORKER_STORAGE_RSS_LIMIT_BYTES}; "
+        f"aggregate RSS {aggregate_peak} <= {_PROCESS_TREE_RSS_LIMIT_BYTES}",
+    )
+
+
 def _load_metadata(raw_dir: Path) -> dict[str, object]:
     reader = ArtifactReader(raw_dir)
     reference = _one_artifact(reader, "manifest_metadata")
     return reader.read_json(str(reference["relative_path"]))
+
+
+def _validate_stage052_runtime_identity(
+    metadata: Mapping[str, object],
+) -> tuple[bool, str]:
+    observed = metadata.get("runtime_identity")
+    revision = metadata.get("repository_revision")
+    if not isinstance(observed, Mapping) or not isinstance(revision, str):
+        return False, "current Stage 5.2 evidence is missing its frozen runtime identity"
+    root = Path(__file__).resolve().parents[3]
+    try:
+        current = verify_stage052_runtime_identity(
+            root / "configs" / "stage052_runtime_identity.local.json",
+            expected_repository_revision=revision,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        return False, str(error)
+    if dict(observed) != current:
+        return False, "raw runtime identity does not match the verified local wheel runtime"
+    return True, "wheel, Python, native extension, and dependency hashes passed"
+
+
+def _validate_stage052_staging_root_identity(
+    metadata: Mapping[str, object],
+    *,
+    root: Path | None = None,
+    locator_path: Path | None = None,
+    expected_alias: str = "transfer_staging",
+    volume_probe: Callable[[Path], VolumeIdentity] | None = None,
+) -> tuple[bool, str]:
+    """Independently bind C--F raw evidence to the live external results volume."""
+
+    repository_root = Path(__file__).resolve().parents[3] if root is None else root.resolve()
+    local_locator_path = (
+        repository_root / "configs/stage052_storage_roots.local.toml"
+        if locator_path is None
+        else locator_path
+    )
+    try:
+        binding = verify_stage052_storage_root_binding(
+            metadata,
+            locator_path=local_locator_path,
+            expected_alias=expected_alias,
+        )
+        locator = StorageRootLocator.from_toml(local_locator_path)
+        staging = locator.resolve(expected_alias)
+        if staging.absolute_path.resolve() != (repository_root / "results").resolve():
+            return False, "configured staging root is not this repository's results root"
+        locator.verify_all(
+            probe_volume_identity if volume_probe is None else volume_probe,
+            (expected_alias,),
+        )
+    except (
+        ArtifactIntegrityError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        return False, str(error)
+    volume = binding["volume"]
+    assert isinstance(volume, Mapping)
+    return (
+        True,
+        f"{expected_alias} live volume identity passed: "
+        f"{volume.get('device_uuid')}/{volume.get('filesystem')}",
+    )
 
 
 def _load_shard_manifests(raw_dir: Path) -> list[dict[str, object]]:
@@ -2075,6 +2927,7 @@ def _validate_native_evidence_contract(
     except (ArtifactIntegrityError, KeyError, OSError, TypeError, ValueError) as error:
         return False, str(error)
     manifest = reader.manifest
+    storage_policy = manifest.get("storage_policy")
     if (
         manifest.get("run_label") != raw_dir.name
         or manifest.get("component") != Stage052Component.NATIVE_KERNELS.value
@@ -2082,6 +2935,8 @@ def _validate_native_evidence_contract(
         or manifest.get("evidence_completeness") != "complete"
         or manifest.get("storage_policy_version") != "artifact-storage-v2"
         or manifest.get("artifact_status") != {"failure": "not_applicable"}
+        or not isinstance(storage_policy, Mapping)
+        or storage_policy.get("screening_schema_version") != "screening_decisions_v3"
     ):
         return False, "native parent manifest identity or completeness is invalid"
     expected_metadata = {
@@ -2092,6 +2947,7 @@ def _validate_native_evidence_contract(
         "seeds": list(PERFORMANCE_SEEDS),
         "worker_count": selection.selected_workers,
         "storage_policy_version": "artifact-storage-v2",
+        "screening_schema_version": "screening_decisions_v3",
         "backend": "cpu_batch",
         "optimization_profile": "native",
         "native_kernel_config": NativeKernelConfig().to_dict(),
@@ -2115,6 +2971,7 @@ def _validate_native_evidence_contract(
     if (
         config.native_kernels != NativeKernelConfig()
         or config.v2_storage.storage_policy_version != "artifact-storage-v2"
+        or config.v2_storage.screening_schema_version != "screening_decisions_v3"
         or config.max_iterations != 1000
         or config.batch_size != 128
     ):
@@ -2157,7 +3014,8 @@ def _validate_native_shard_manifest_scope(
         ("route_dictionary", "canonical_routes"),
         ("events", "critical"),
         ("events", "screening_checks"),
-        ("events", "screening_decisions_v2"),
+        ("events", "screening_definitions_v3"),
+        ("events", "screening_occurrences_v3"),
         ("diagnostic", "aggregated"),
         ("raw", ""),
         ("solution", ""),
@@ -2317,7 +3175,7 @@ def validate_job_parallel_evidence_contract(
     """Validate one complete D comparison bundle before it can affect speedup."""
 
     if expected_prerequisite is None:
-        return False, "reviewed C04 prerequisite identity is missing"
+        return False, "reviewed C05 prerequisite identity is missing"
     try:
         reader = ArtifactReader(raw_dir)
         rows = _load_per_run(raw_dir)
@@ -2335,6 +3193,12 @@ def validate_job_parallel_evidence_contract(
         or manifest.get("storage_policy_version") != "artifact-storage-v2"
     ):
         return False, "parent manifest identity, status, or completeness is invalid"
+    storage_policy = manifest.get("storage_policy")
+    if (
+        not isinstance(storage_policy, Mapping)
+        or storage_policy.get("screening_schema_version") != "screening_decisions_v3"
+    ):
+        return False, "current D evidence requires screening_decisions_v3"
     expected_metadata = {
         "run_label": raw_dir.name,
         "component": Stage052Component.JOB_PARALLEL.value,
@@ -2343,6 +3207,7 @@ def validate_job_parallel_evidence_contract(
         "seeds": list(PERFORMANCE_SEEDS),
         "worker_count": expected_workers,
         "storage_policy_version": "artifact-storage-v2",
+        "screening_schema_version": "screening_decisions_v3",
         "backend": "cpu_batch",
         "repository_dirty": False,
     }
@@ -2440,6 +3305,12 @@ def validate_job_parallel_evidence_contract(
     )
     if not provenance_passed:
         return False, provenance_detail
+    runtime_passed, runtime_detail = _validate_stage052_runtime_identity(metadata)
+    if not runtime_passed:
+        return False, runtime_detail
+    staging_passed, staging_detail = _validate_stage052_staging_root_identity(metadata)
+    if not staging_passed:
+        return False, staging_detail
     return True, "complete canonical D evidence contract passed"
 
 
@@ -3048,12 +3919,17 @@ def _prior_review_manifest_hashes(raw_dir: Path) -> list[str]:
         component = Stage052Component(str(payload.get("component", "")))
     except ValueError as error:
         raise ArtifactIntegrityError("prior Stage 5.2 review component is invalid") from error
+    scope = str(payload.get("scope", ""))
+    try:
+        contract = stage052_contract(component, scope)
+    except ValueError as error:
+        raise ArtifactIntegrityError("prior Stage 5.2 review scope is invalid") from error
     expected_identity = {
         "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
         "run_label": raw_dir.name,
         "component": component.value,
-        "scope": "performance",
-        "status": _NEXT_STATUS[component],
+        "scope": scope,
+        "status": contract.next_status,
     }
     if any(payload.get(field) != expected for field, expected in expected_identity.items()):
         raise ArtifactIntegrityError("only an accepted prior Stage 5.2 review may be superseded")
@@ -3244,7 +4120,16 @@ def main() -> int:
     parser.add_argument("--scope", choices=("performance", "pilot", "formal"), required=True)
     parser.add_argument("--comparison-dir", type=Path, action="append", default=[])
     parser.add_argument("--prerequisite-dir", type=Path)
+    parser.add_argument("--prerequisite", action="append", default=[])
     arguments = parser.parse_args()
+    named_prerequisites: dict[str, Path] = {}
+    for value in arguments.prerequisite:
+        role, separator, raw_path = str(value).partition("=")
+        if not separator or not role or not raw_path:
+            parser.error("--prerequisite must use ROLE=PATH")
+        if role in named_prerequisites:
+            parser.error(f"duplicate prerequisite role: {role}")
+        named_prerequisites[role] = Path(raw_path)
     outputs = review_stage052(
         raw_dir=arguments.raw_dir,
         benchmark_dir=arguments.benchmark_dir,
@@ -3252,6 +4137,7 @@ def main() -> int:
         scope=arguments.scope,
         comparison_dirs=arguments.comparison_dir,
         prerequisite_dir=arguments.prerequisite_dir,
+        prerequisite_dirs=named_prerequisites,
     )
     for name, path in outputs.items():
         print(f"{name}: {path}")

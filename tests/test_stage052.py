@@ -16,6 +16,7 @@ import pytest
 
 import evrptw.experiments.stage052_performance as stage052_performance
 import evrptw.experiments.stage052_performance_review as stage052_review
+import evrptw.stage052_evidence as stage052_evidence
 from evrptw._core import distance_matrix
 from evrptw.artifacts import (
     ArtifactBundleWriter,
@@ -28,6 +29,7 @@ from evrptw.artifacts import (
 from evrptw.experiments.stage052_performance import (
     PERFORMANCE_INSTANCES,
     PERFORMANCE_SEEDS,
+    Stage052Axis,
     _accelerator_decision_inputs,
     _ensure_partial_shard_failure,
     _launch_occupancy_summary,
@@ -35,6 +37,8 @@ from evrptw.experiments.stage052_performance import (
     _run_v2_shard_task,
     _run_v2_tasks,
     _ShardTask,
+    _stage052_anytime_checkpoints,
+    _verify_performance_staging_root,
     axes_for_scope,
     load_stage052_config,
     validate_stage052_run_label,
@@ -46,6 +50,7 @@ from evrptw.experiments.stage052_performance_review import (
     _prior_review_manifest_hashes,
     _recompute_native_occupancies,
     _validate_native_shard_manifest_scope,
+    _validate_stage052_staging_root_identity,
     replay_stage052_storage_semantics,
     replay_stage052_storage_semantics_many,
     validate_per_run_scope,
@@ -58,24 +63,76 @@ from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.native_kernels import NATIVE_KERNEL_ABI_VERSION, NativeKernelConfig
 from evrptw.stage052 import (
     AcceleratorDecision,
+    ArtifactPersistenceObservation,
     ArtifactStorageObservation,
     PerformanceObservation,
     Stage052Component,
     decide_accelerator,
+    evaluate_artifact_persistence,
     evaluate_artifact_storage_promotion,
     evaluate_promotion,
     formal_budget_matrix,
     select_worker_count,
+    stage052_contract,
 )
+from evrptw.stage052_campaign import VolumeIdentity
 from evrptw.stage052_evidence import (
     JobParallelSelectionIdentity,
+    PersistenceInterval,
     ProcessTreeResourceSampler,
+    Stage052PersistenceAttribution,
     Stage052PrerequisiteIdentity,
     collect_performance_provenance,
+    create_stage052_runtime_identity,
+    stage052_storage_root_binding,
     validate_worker_ownership,
     verify_job_parallel_selection,
+    verify_stage052_evidence_input,
     verify_stage052_prerequisite,
+    verify_stage052_runtime_identity,
+    verify_stage052_storage_root_binding,
 )
+
+
+def test_persistence_attribution_recomputes_monotonic_control_intervals() -> None:
+    attribution = Stage052PersistenceAttribution(
+        run_label="stage05.2_artifact_streaming_attempt05",
+        component="artifact_streaming",
+        scope="performance",
+        subject_id="run",
+        primary_manifest_relative_path="control/manifest.json",
+        primary_manifest_sha256="a" * 64,
+        solver_seconds=8.0,
+        shard_persistence_seconds=1.0,
+        control_intervals=(
+            PersistenceInterval("write_control", 10, 500_000_010),
+            PersistenceInterval("finalize", 600_000_010, 1_100_000_010),
+        ),
+    )
+
+    replayed = Stage052PersistenceAttribution.from_dict(attribution.to_dict())
+
+    assert replayed.control_persistence_seconds == pytest.approx(1.0)
+    assert replayed.total_persistence_seconds == pytest.approx(2.0)
+    assert replayed.persistence_ratio == pytest.approx(0.2)
+
+
+def test_persistence_attribution_rejects_overlapping_control_intervals() -> None:
+    with pytest.raises(ValueError, match="overlap"):
+        Stage052PersistenceAttribution(
+            run_label="stage05.2_artifact_streaming_attempt05",
+            component="artifact_streaming",
+            scope="performance",
+            subject_id="run",
+            primary_manifest_relative_path="control/manifest.json",
+            primary_manifest_sha256="a" * 64,
+            solver_seconds=8.0,
+            shard_persistence_seconds=1.0,
+            control_intervals=(
+                PersistenceInterval("first", 10, 20),
+                PersistenceInterval("second", 19, 30),
+            ),
+        )
 
 
 def _observation(
@@ -107,6 +164,387 @@ def test_stage052_components_have_one_strict_order() -> None:
     )
 
 
+def test_stage052_contract_requires_an_accepted_pilot_before_formal() -> None:
+    pilot = stage052_contract(Stage052Component.BENCHMARK, "pilot")
+    formal = stage052_contract(Stage052Component.BENCHMARK, "formal")
+
+    assert pilot.prerequisite_component is Stage052Component.ACCELERATOR_PILOT
+    assert pilot.prerequisite_status == "READY_FOR_STAGE052_BENCHMARK"
+    assert pilot.next_status == "READY_FOR_STAGE052_FORMAL_BENCHMARK"
+    assert formal.prerequisite_component is Stage052Component.BENCHMARK
+    assert formal.prerequisite_status == "READY_FOR_STAGE052_FORMAL_BENCHMARK"
+    assert formal.next_status == "READY_FOR_STAGE05_3"
+    assert pilot.required_backend == formal.required_backend == "cpu_batch"
+    assert pilot.storage_policy_version == formal.storage_policy_version == ("artifact-storage-v2")
+    assert (
+        pilot.screening_schema_version
+        == formal.screening_schema_version
+        == ("screening_decisions_v3")
+    )
+
+
+def test_stage052_storage_amendment_contract_binds_all_named_inputs() -> None:
+    contract = stage052_contract(Stage052Component.ARTIFACT_STREAMING, "performance")
+    requirements = {requirement.role: requirement for requirement in contract.prerequisites}
+
+    assert tuple(requirements) == (
+        "hot_path_predecessor",
+        "historical_storage",
+        "remediation_source",
+    )
+    assert requirements["hot_path_predecessor"].exact_run_label == ("stage05.2_hot_path_attempt03")
+    assert requirements["hot_path_predecessor"].allowed_statuses == (
+        "READY_FOR_STAGE052_ARTIFACT_STREAMING",
+    )
+    assert requirements["historical_storage"].exact_run_label == (
+        "stage05.2_artifact_streaming_attempt04"
+    )
+    assert requirements["historical_storage"].requires_passed_review
+    assert requirements["remediation_source"].exact_run_label == (
+        "stage05.2_native_kernels_attempt03"
+    )
+    assert requirements["remediation_source"].allowed_statuses == ("NOT_READY",)
+    assert not requirements["remediation_source"].requires_passed_review
+    assert not any(
+        requirement.requires_current_chain_identity for requirement in requirements.values()
+    )
+
+
+def test_stage052_current_chain_prerequisites_reject_historical_physical_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    contracts = (
+        stage052_contract(Stage052Component.JOB_PARALLEL, "performance"),
+        stage052_contract(Stage052Component.NATIVE_KERNELS, "performance"),
+        stage052_contract(Stage052Component.ACCELERATOR_PILOT, "performance"),
+        stage052_contract(Stage052Component.BENCHMARK, "pilot"),
+        stage052_contract(Stage052Component.BENCHMARK, "formal"),
+    )
+    assert all(contract.prerequisites[0].requires_current_chain_identity for contract in contracts)
+    requirement = contracts[0].prerequisites[0]
+    identity = Stage052PrerequisiteIdentity(
+        run_label="stage05.2_artifact_streaming_attempt04",
+        component="artifact_streaming",
+        status="READY_FOR_STAGE052_JOB_PARALLEL",
+        repository_revision="a" * 40,
+        configuration_sha256="b" * 64,
+        raw_manifest_sha256="c" * 64,
+        review_manifest_sha256="d" * 64,
+        scope="performance",
+    )
+
+    monkeypatch.setattr(
+        stage052_evidence,
+        "verify_stage052_prerequisite",
+        lambda *_args, **_kwargs: identity,
+    )
+    review_dir = tmp_path / "review"
+    review_dir.mkdir()
+    (review_dir / "review_manifest.json").write_text("{}\n", encoding="utf-8")
+    immutable_review = f"generations/{'e' * 64}/review_report.md"
+    monkeypatch.setattr(
+        stage052_evidence,
+        "verify_stage052_review_files",
+        lambda *_args, **_kwargs: {immutable_review: tmp_path / immutable_review},
+    )
+
+    class HistoricalReader:
+        manifest = {
+            "artifacts": [
+                {
+                    "artifact_type": "manifest_metadata",
+                    "relative_path": "control/metadata.json",
+                }
+            ]
+        }
+
+        def __init__(self, _path: Path) -> None:
+            pass
+
+        def read_json(self, _relative_path: str) -> dict[str, object]:
+            return {
+                "backend": "cpu_batch",
+                "storage_policy_version": "artifact-storage-v2",
+                "screening_schema_version": "screening_decisions_v2",
+            }
+
+    monkeypatch.setattr(stage052_evidence, "ArtifactReader", HistoricalReader)
+
+    with pytest.raises(ArtifactIntegrityError, match="historical evidence"):
+        verify_stage052_evidence_input(tmp_path, requirement)
+
+
+def test_stage052_storage_root_binding_is_path_free_and_matches_local_locator(
+    tmp_path: Path,
+) -> None:
+    locator_path = tmp_path / "stage052_storage_roots.local.toml"
+    locator_path.write_text(
+        """
+[roots.transfer_staging]
+absolute_path = "/Volumes/TRANSFER/project/results"
+device_uuid = "transfer-uuid"
+filesystem = "ExFAT"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    metadata = {
+        "staging_root": stage052_storage_root_binding(
+            alias="transfer_staging",
+            volume={"device_uuid": "transfer-uuid", "filesystem": "ExFAT"},
+        )
+    }
+
+    binding = verify_stage052_storage_root_binding(
+        metadata,
+        locator_path=locator_path,
+        expected_alias="transfer_staging",
+    )
+
+    assert binding == metadata["staging_root"]
+    assert "/Volumes/TRANSFER" not in json.dumps(binding, sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    "staging_root",
+    (
+        None,
+        {
+            "schema_version": "stage05.2-storage-root-binding-v1",
+            "alias": "transfer_staging",
+            "volume": {"device_uuid": "wrong", "filesystem": "ExFAT"},
+        },
+        {
+            "schema_version": "stage05.2-storage-root-binding-v1",
+            "alias": "transfer_staging",
+            "volume": {
+                "device_uuid": "transfer-uuid",
+                "filesystem": "ExFAT",
+                "absolute_path": "/Volumes/TRANSFER/project/results",
+            },
+        },
+    ),
+)
+def test_stage052_storage_root_binding_rejects_missing_mismatched_or_pathful_identity(
+    staging_root: object,
+    tmp_path: Path,
+) -> None:
+    locator_path = tmp_path / "stage052_storage_roots.local.toml"
+    locator_path.write_text(
+        """
+[roots.transfer_staging]
+absolute_path = "/Volumes/TRANSFER/project/results"
+device_uuid = "transfer-uuid"
+filesystem = "ExFAT"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="staging root"):
+        verify_stage052_storage_root_binding(
+            {"staging_root": staging_root},
+            locator_path=locator_path,
+            expected_alias="transfer_staging",
+        )
+
+
+def test_performance_producer_verifies_exact_staging_path_and_live_volume(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    results = root / "results"
+    results.mkdir(parents=True)
+    locator_path = root / "configs" / "stage052_storage_roots.local.toml"
+    locator_path.parent.mkdir()
+    locator_path.write_text(
+        f"""
+[roots.transfer_staging]
+absolute_path = "{results}"
+device_uuid = "transfer-uuid"
+filesystem = "ExFAT"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    binding = _verify_performance_staging_root(
+        root=root,
+        locator_path=locator_path,
+        staging_alias="transfer_staging",
+        output_dir=results / "stage05.2_artifact_streaming_attempt05",
+        volume_probe=lambda _path: VolumeIdentity("transfer-uuid", "ExFAT"),
+    )
+
+    assert binding["alias"] == "transfer_staging"
+    assert "absolute_path" not in json.dumps(binding)
+
+
+def test_performance_producer_rejects_wrong_staging_volume(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    results = root / "results"
+    results.mkdir(parents=True)
+    locator_path = root / "storage.local.toml"
+    locator_path.write_text(
+        f"""
+[roots.transfer_staging]
+absolute_path = "{results}"
+device_uuid = "transfer-uuid"
+filesystem = "ExFAT"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="volume identity mismatch"):
+        _verify_performance_staging_root(
+            root=root,
+            locator_path=locator_path,
+            staging_alias="transfer_staging",
+            output_dir=results / "stage05.2_job_parallel_attempt07",
+            volume_probe=lambda _path: VolumeIdentity("internal-uuid", "APFS"),
+        )
+
+
+def test_performance_reviewer_independently_reprobes_staging_volume(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    results = root / "results"
+    results.mkdir(parents=True)
+    locator_path = root / "storage.local.toml"
+    locator_path.write_text(
+        f"""
+[roots.transfer_staging]
+absolute_path = "{results}"
+device_uuid = "transfer-uuid"
+filesystem = "ExFAT"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    metadata = {
+        "staging_root": stage052_storage_root_binding(
+            alias="transfer_staging",
+            volume={"device_uuid": "transfer-uuid", "filesystem": "ExFAT"},
+        )
+    }
+
+    passed, detail = _validate_stage052_staging_root_identity(
+        metadata,
+        root=root,
+        locator_path=locator_path,
+        expected_alias="transfer_staging",
+        volume_probe=lambda _path: VolumeIdentity("transfer-uuid", "ExFAT"),
+    )
+    changed, changed_detail = _validate_stage052_staging_root_identity(
+        metadata,
+        root=root,
+        locator_path=locator_path,
+        expected_alias="transfer_staging",
+        volume_probe=lambda _path: VolumeIdentity("other-uuid", "APFS"),
+    )
+
+    assert passed
+    assert "transfer_staging" in detail
+    assert not changed
+    assert "mismatch" in changed_detail
+
+
+def test_stage052_remediation_input_accepts_only_the_signed_not_ready_review(
+    tmp_path: Path,
+) -> None:
+    requirement = stage052_contract(
+        Stage052Component.ARTIFACT_STREAMING, "performance"
+    ).prerequisites[-1]
+    raw_dir = tmp_path / "stage05.2_native_kernels_attempt03"
+    config = tmp_path / "stage052.toml"
+    config.write_text("[stage05_2]\nschema_version='test'\n", encoding="utf-8")
+    config_digest = hashlib.sha256(config.read_bytes()).hexdigest()
+    writer = ArtifactBundleWriter(
+        raw_dir,
+        ArtifactRunContext("stage05.2", "native_kernels", raw_dir.name),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+    writer.write_control(
+        metadata={
+            "run_label": raw_dir.name,
+            "component": "native_kernels",
+            "scope": "performance",
+            "repository_dirty": False,
+            "repository_revision": "a" * 40,
+            "configuration_sha256": config_digest,
+        },
+        configuration_path=config,
+    )
+    bundle = writer.finalize()
+    review_dir = raw_dir / "review"
+    review_dir.mkdir()
+    report = review_dir / "review_report.md"
+    findings = review_dir / "review_findings.csv"
+    report.write_text("NOT_READY: persistence exceeded 30%\n", encoding="utf-8")
+    findings.write_text("gate,passed\npersistence_ratio,False\n", encoding="utf-8")
+    review_manifest = review_dir / "review_manifest.json"
+    review_manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": "stage05.2-review-v1",
+                "run_label": raw_dir.name,
+                "component": "native_kernels",
+                "scope": "performance",
+                "status": "NOT_READY",
+                "raw_manifest_sha256": hashlib.sha256(
+                    bundle.manifest_path.read_bytes()
+                ).hexdigest(),
+                "gates": {"persistence_ratio": {"passed": False}},
+                "files": {
+                    findings.name: hashlib.sha256(findings.read_bytes()).hexdigest(),
+                    report.name: hashlib.sha256(report.read_bytes()).hexdigest(),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    identity = verify_stage052_evidence_input(raw_dir, requirement)
+
+    assert identity.run_label == raw_dir.name
+    assert identity.status == "NOT_READY"
+    assert identity.scope == "performance"
+
+
+def test_artifact_persistence_gate_rejects_the_measured_e03_ratio() -> None:
+    decision = evaluate_artifact_persistence(
+        (
+            ArtifactPersistenceObservation(
+                solver_seconds=280.766185035,
+                artifact_persistence_seconds=282.621038503,
+            ),
+        )
+    )
+
+    assert decision.ratio == pytest.approx(0.5016461621692021)
+    assert not decision.passed
+    assert "exceeds 30%" in decision.detail
+
+
+def test_artifact_persistence_gate_uses_verified_solver_plus_new_persistence() -> None:
+    decision = evaluate_artifact_persistence(
+        (
+            ArtifactPersistenceObservation(
+                solver_seconds=280.766185035,
+                artifact_persistence_seconds=100.0,
+            ),
+        )
+    )
+
+    assert decision.ratio == pytest.approx(100.0 / (280.766185035 + 100.0))
+    assert decision.passed
+
+
 def test_native_kernel_config_is_explicit_complete_and_serializable() -> None:
     config = NativeKernelConfig()
     assert config.to_dict() == {
@@ -132,6 +570,8 @@ def test_native_kernel_config_is_explicit_complete_and_serializable() -> None:
 def test_stage052_config_declares_the_complete_native_kernel_profile() -> None:
     config = load_stage052_config(Path("configs/stage052_performance.toml"))
     assert config.native_kernels == NativeKernelConfig()
+    assert config.v2_storage.screening_schema_version == "screening_decisions_v3"
+    assert config.runtime_identity_manifest == Path("configs/stage052_runtime_identity.local.json")
 
 
 def test_native_execution_audit_cross_checks_per_run_raw_and_trace(tmp_path: Path) -> None:
@@ -251,6 +691,7 @@ def test_native_execution_audit_cross_checks_per_run_raw_and_trace(tmp_path: Pat
                         "axis_started_ns": 1_000_000_000,
                         "solver_started_ns": 1_000_000_000,
                         "solver_completed_ns": 1_100_000_000,
+                        "live_stream_persistence_ns": 10_000_000,
                         "axis_completed_ns": 1_120_000_000,
                         "finalize_started_ns": 3_000_000_000,
                         "finalize_completed_ns": 3_030_000_000,
@@ -284,8 +725,8 @@ def test_native_execution_audit_cross_checks_per_run_raw_and_trace(tmp_path: Pat
         "exact_started_calls": 5,
         "exact_completed_calls": 5,
         "median_batch_occupancy": 2.5,
-        "solver_seconds": 0.1,
-        "artifact_persistence_seconds": 0.05,
+        "solver_seconds": 0.09,
+        "artifact_persistence_seconds": 0.04,
         "end_to_end_seconds": 0.15,
     }
 
@@ -361,7 +802,8 @@ def test_native_shard_manifest_scope_binds_complete_worker_artifacts_to_parent(
         ("route_dictionary", "canonical_routes"),
         ("events", "critical"),
         ("events", "screening_checks"),
-        ("events", "screening_decisions_v2"),
+        ("events", "screening_definitions_v3"),
+        ("events", "screening_occurrences_v3"),
         ("diagnostic", "aggregated"),
         ("raw", ""),
         ("solution", ""),
@@ -863,6 +1305,10 @@ def test_stage052_runner_contract_has_canonical_labels_and_axes(
         "wall_clock_60",
         "wall_clock_300",
     )
+    assert axes_for_scope("pilot", customer_count=5)[0].max_iterations == 1000
+    assert axes_for_scope("pilot", customer_count=100)[0].max_iterations is None
+    assert axes_for_scope("formal", customer_count=15)[0].max_iterations == 1000
+    assert all(axis.max_iterations is None for axis in axes_for_scope("formal", customer_count=100))
 
     publication = tmp_path / "stage051.json"
     publication.write_text(
@@ -872,6 +1318,105 @@ def test_stage052_runner_contract_has_canonical_labels_and_axes(
         encoding="utf-8",
     )
     assert verify_stage051_prerequisite(publication)["status"] == "READY_FOR_STAGE05_2"
+
+
+def test_stage052_runner_checkpoints_use_only_completed_global_best_events() -> None:
+    result = SimpleNamespace(
+        measurement_trace=SimpleNamespace(
+            events=[
+                {
+                    "event_type": "candidate_state",
+                    "timestamp_seconds": 0.5,
+                    "iteration": 0,
+                    "accepted": False,
+                    "global_best": False,
+                    "current_objective_key": [3, 120.0, 4.0, 2],
+                    "candidate_objective_key": [3, 130.0, 4.0, 2],
+                },
+                {
+                    "event_type": "candidate_state",
+                    "timestamp_seconds": 1.0,
+                    "iteration": 1,
+                    "accepted": True,
+                    "global_best": True,
+                    "current_objective_key": [3, 120.0, 4.0, 2],
+                    "candidate_objective_key": [2, 110.0, 3.0, 1],
+                },
+                {
+                    "event_type": "candidate_state",
+                    "timestamp_seconds": 5.0001,
+                    "iteration": 2,
+                    "accepted": True,
+                    "global_best": True,
+                    "current_objective_key": [2, 110.0, 3.0, 1],
+                    "candidate_objective_key": [2, 100.0, 2.0, 1],
+                },
+            ]
+        ),
+        initial_routes=(("D0", "C1", "D0"),),
+        initial_objective=SimpleNamespace(key=(3, 120.0, 4.0, 2)),
+        objective=SimpleNamespace(key=(2, 100.0, 2.0, 1)),
+        termination_reason="wall_clock_deadline",
+        runtime_seconds=30.0,
+    )
+
+    checkpoints = _stage052_anytime_checkpoints(
+        result,
+        instance_name="c101_21",
+        seed=2014,
+        axis=Stage052Axis("wall_clock_30", "wall_clock", 30.0, max_iterations=None),
+    )
+
+    assert tuple(item.checkpoint_seconds for item in checkpoints) == (1, 5, 10, 30)
+    assert checkpoints[0].objective_key == (2, 110.0, 3.0, 1)
+    assert checkpoints[1].objective_key == (2, 110.0, 3.0, 1)
+    assert checkpoints[2].objective_key == (2, 100.0, 2.0, 1)
+
+
+def test_stage052_iteration_limit_carry_uses_explicit_completion_timestamp() -> None:
+    result = SimpleNamespace(
+        measurement_trace=SimpleNamespace(
+            events=[
+                {
+                    "event_type": "candidate_state",
+                    "timestamp_seconds": 0.5,
+                    "iteration": 0,
+                    "accepted": False,
+                    "global_best": False,
+                    "current_objective_key": [3, 120.0, 4.0, 2],
+                    "candidate_objective_key": [3, 130.0, 4.0, 2],
+                },
+                {
+                    "event_type": "candidate_state",
+                    "timestamp_seconds": 0.8,
+                    "iteration": 1,
+                    "accepted": True,
+                    "global_best": True,
+                    "current_objective_key": [3, 120.0, 4.0, 2],
+                    "candidate_objective_key": [2, 100.0, 2.0, 1],
+                },
+            ]
+        ),
+        initial_routes=(("D0", "C1", "D0"),),
+        initial_objective=SimpleNamespace(key=(3, 120.0, 4.0, 2)),
+        objective=SimpleNamespace(key=(2, 100.0, 2.0, 1)),
+        termination_reason="iteration_limit",
+        iteration_limit_completed_at_seconds=5.1,
+        runtime_seconds=5.2,
+    )
+
+    checkpoints = _stage052_anytime_checkpoints(
+        result,
+        instance_name="c101C5",
+        seed=2014,
+        axis=Stage052Axis("wall_clock_30", "wall_clock", 30.0, max_iterations=1000),
+    )
+
+    assert tuple(item.source for item in checkpoints[:2]) == (
+        "accepted_global_best",
+        "accepted_global_best",
+    )
+    assert checkpoints[2].source == "final_incumbent_carry_forward"
 
 
 def test_stage052_reviewer_rejects_duplicate_or_missing_axes() -> None:
@@ -1285,6 +1830,90 @@ def test_stage052_producer_prerequisite_binds_raw_and_review_identity(tmp_path: 
         )
 
 
+def test_prerequisite_rejects_replaced_persistence_envelope(tmp_path: Path) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt95"
+    raw_dir = tmp_path / run_label
+    config = tmp_path / "stage052.toml"
+    config.write_text("[stage05_2]\nschema_version='test'\n", encoding="utf-8")
+    config_digest = hashlib.sha256(config.read_bytes()).hexdigest()
+    writer = ArtifactBundleWriter(
+        raw_dir,
+        ArtifactRunContext("stage05.2", "artifact_streaming", run_label),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+    writer.write_control(
+        metadata={
+            "run_label": run_label,
+            "component": "artifact_streaming",
+            "scope": "performance",
+            "repository_dirty": False,
+            "repository_revision": "a" * 40,
+            "configuration_sha256": config_digest,
+            "persistence_attribution": "primary_active_writes_v1",
+        },
+        configuration_path=config,
+    )
+    bundle = writer.finalize()
+    attribution = raw_dir / "control" / f"{run_label}_persistence_attribution.json"
+    attribution.write_text(
+        json.dumps({"ratio": 0.2, "run_label": run_label}) + "\n",
+        encoding="utf-8",
+    )
+    attribution_digest = hashlib.sha256(attribution.read_bytes()).hexdigest()
+    sidecar = attribution.with_suffix(".sha256")
+    sidecar.write_text(attribution_digest + "\n", encoding="utf-8")
+    review_dir = raw_dir / "review"
+    review_dir.mkdir()
+    report = review_dir / "review_report.md"
+    findings = review_dir / "review_findings.csv"
+    report.write_text("accepted\n", encoding="utf-8")
+    findings.write_text("gate,passed\nall,True\n", encoding="utf-8")
+    (review_dir / "review_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "stage05.2-review-v1",
+                "run_label": run_label,
+                "component": "artifact_streaming",
+                "scope": "performance",
+                "status": "READY_FOR_STAGE052_JOB_PARALLEL",
+                "raw_manifest_sha256": hashlib.sha256(
+                    bundle.manifest_path.read_bytes()
+                ).hexdigest(),
+                "persistence_attribution_sha256": attribution_digest,
+                "persistence_attribution_sidecar_sha256": hashlib.sha256(
+                    sidecar.read_bytes()
+                ).hexdigest(),
+                "gates": {"all": {"passed": True}},
+                "files": {
+                    report.name: hashlib.sha256(report.read_bytes()).hexdigest(),
+                    findings.name: hashlib.sha256(findings.read_bytes()).hexdigest(),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    verify_stage052_prerequisite(
+        raw_dir,
+        expected_component="artifact_streaming",
+        expected_status="READY_FOR_STAGE052_JOB_PARALLEL",
+    )
+
+    attribution.write_text(
+        json.dumps({"ratio": 0.2, "replaced": True, "run_label": run_label}) + "\n",
+        encoding="utf-8",
+    )
+    sidecar.write_text(
+        hashlib.sha256(attribution.read_bytes()).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ArtifactIntegrityError, match="persistence attribution"):
+        verify_stage052_prerequisite(
+            raw_dir,
+            expected_component="artifact_streaming",
+            expected_status="READY_FOR_STAGE052_JOB_PARALLEL",
+        )
+
+
 def test_job_parallel_selection_is_recomputed_and_binds_selected_run(tmp_path: Path) -> None:
     metrics = {
         "1": {
@@ -1381,6 +2010,9 @@ def test_process_tree_resource_summary_includes_live_child() -> None:
 
     assert child.pid in summary.descendant_pids
     assert summary.aggregate_peak_rss_bytes > 8_000_000
+    assert dict(summary.process_peak_rss_bytes)[child.pid] > 8_000_000
+    assert summary.load1_sample_count == summary.sample_count
+    assert 0.0 <= summary.load1_min <= summary.load1_mean <= summary.load1_max
     assert summary.sample_count >= 2
     assert summary.status == "complete"
 
@@ -1591,6 +2223,56 @@ def test_performance_provenance_records_inputs_without_secret_environment(
     assert provenance["fallback_allowed"] is False
 
 
+def test_stage052_runtime_identity_binds_wheel_python_native_and_dependencies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel = tmp_path / "evrptw_reproduction-0.1.0-cp313-cp313-macosx.whl"
+    wheel.write_bytes(b"wheel-under-test")
+    manifest = tmp_path / "stage052_runtime.local.json"
+    monkeypatch.setattr(stage052_evidence, "_distribution_is_editable", lambda: False)
+
+    created = create_stage052_runtime_identity(
+        output_path=manifest,
+        wheel_path=wheel,
+        repository_revision="a" * 40,
+    )
+    verified = verify_stage052_runtime_identity(
+        manifest,
+        expected_repository_revision="a" * 40,
+    )
+
+    assert verified == created
+    assert verified["wheel_sha256"] == hashlib.sha256(wheel.read_bytes()).hexdigest()
+    assert "wheel_path" not in verified
+    assert "python_executable" not in verified
+    assert verified["installed_editable"] is False
+    monkeypatch.setattr(
+        stage052_review,
+        "verify_stage052_runtime_identity",
+        lambda *_args, **_kwargs: verified,
+    )
+    passed, detail = stage052_review._validate_stage052_runtime_identity(
+        {"repository_revision": "a" * 40, "runtime_identity": verified}
+    )
+    assert passed, detail
+    passed, detail = stage052_review._validate_stage052_runtime_identity(
+        {
+            "repository_revision": "a" * 40,
+            "runtime_identity": {**verified, "wheel_sha256": "0" * 64},
+        }
+    )
+    assert not passed
+    assert "does not match" in detail
+
+    wheel.write_bytes(b"tampered")
+    with pytest.raises(RuntimeError, match="wheel hash"):
+        verify_stage052_runtime_identity(
+            manifest,
+            expected_repository_revision="a" * 40,
+        )
+
+
 def test_runtime_signature_allows_historical_python_binary_but_binds_native_profile() -> None:
     environment = {
         "python": {"version": "3.13.13", "implementation": "CPython"},
@@ -1654,12 +2336,16 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         extra_unreferenced_route: bool = False,
         fixed_route_customer: str = "C1",
         cache_bytes: int = 396,
+        screening_schema_version: str = "screening_decisions_v2",
     ) -> Path:
         run_dir = tmp_path / label
+        storage_kwargs: dict[str, object] = {"storage_policy_version": policy}
+        if policy == "artifact-storage-v2":
+            storage_kwargs["screening_schema_version"] = screening_schema_version
         writer = ArtifactBundleWriter(
             run_dir,
             ArtifactRunContext("stage05.2", component, label),
-            ArtifactStorageConfig(storage_policy_version=policy),
+            ArtifactStorageConfig(**storage_kwargs),
         )
         solution_axes: dict[str, object] = {
             "fixed_work": {
@@ -1672,9 +2358,10 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
                 "routes": [["C1"]],
                 "objective_key": [1, 10.0, 0.0, 0],
             }
-        route_dictionary = {"fixed-route": (fixed_route_customer,)}
+        fixed_route_key = "route:2:C1"
+        route_dictionary = {fixed_route_key: (fixed_route_customer,)}
         if extra_unreferenced_route:
-            route_dictionary["wall-only-route"] = ("W1",)
+            route_dictionary["route:2:W1"] = ("W1",)
         writer.write_instance_seed(
             instance="c101_21",
             seed=2014,
@@ -1709,7 +2396,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
                     "exact_started": True,
                     "exact_completed": True,
                     "evaluation_id": 1,
-                    "route_key": "fixed-route",
+                        "route_key": fixed_route_key,
                 },
                 {
                     "event_type": "cache_event",
@@ -1737,8 +2424,15 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         "artifact_streaming",
         "stage05.2_artifact_streaming_attempt99",
     )
+    v3 = write(
+        "artifact-storage-v2",
+        "artifact_streaming",
+        "stage05.2_artifact_streaming_attempt91",
+        screening_schema_version="screening_decisions_v3",
+    )
 
     assert replay_stage052_storage_semantics(v1) == replay_stage052_storage_semantics(v2)
+    assert replay_stage052_storage_semantics(v1) == replay_stage052_storage_semantics(v3)
     parallel_replays = replay_stage052_storage_semantics_many((v1, v2), max_workers=2)
     assert parallel_replays[0] == parallel_replays[1]
     volatile_cache_bytes = write(
@@ -1889,7 +2583,36 @@ def test_storage_replay_expands_compact_v2_screening_decisions(
     )
     v2_writer.finalize()
 
+    v3 = tmp_path / "stage05.2_artifact_streaming_attempt93"
+    v3_writer = ArtifactBundleWriter(
+        v3,
+        ArtifactRunContext("stage05.2", "artifact_streaming", v3.name),
+        ArtifactStorageConfig(
+            storage_policy_version="artifact-storage-v2",
+            screening_schema_version="screening_decisions_v3",
+        ),
+    )
+    raw, solution, events = payloads()
+    v3_shard = v3_writer.open_v2_shard(
+        instance="c101_21",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    v3_shard.append(
+        route_dictionary={"route:2:C1": ("C1",)},
+        critical_events=events,
+    )
+    v3_shard.finalize(
+        raw_payload=raw,
+        solution_payload=solution,
+        trace_payload={},
+        environment_payload={},
+    )
+    v3_writer.finalize()
+
     assert replay_stage052_storage_semantics(v1) == replay_stage052_storage_semantics(v2)
+    assert replay_stage052_storage_semantics(v1) == replay_stage052_storage_semantics(v3)
     v1_trace = ArtifactReader(v1).reconstruct_trace(
         "c101_21/2014/stage05.2_hot_path_attempt94_trace_c101_21_2014.json"
     )
@@ -1945,14 +2668,18 @@ def test_definition_encoded_screening_requires_known_untampered_definition() -> 
         expand_v2_screening_decision({**first, "definition_id": definition_id + 1}, definitions={})
 
 
-def test_v2_final_flush_is_charged_to_persistence_and_end_to_end(
+def test_v2_only_active_writes_are_charged_to_persistence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     flush_delay_seconds = 0.03
     postprocess_delay_seconds = 0.02
+    live_append_delay_seconds = 0.025
 
     class FakeShard:
-        def append(self, **_: object) -> int:
+        def append(self, **kwargs: object) -> int:
+            critical_events = kwargs.get("critical_events")
+            if isinstance(critical_events, tuple) and critical_events:
+                time.sleep(live_append_delay_seconds)
             return 1
 
         def flush(self) -> None:
@@ -2005,9 +2732,21 @@ def test_v2_final_flush_is_charged_to_persistence_and_end_to_end(
         unique_route_semantics="completed_cache_owner_identity_v2",
         termination_reason="fixed_work_budget",
     )
-    monkeypatch.setattr(
-        stage052_performance, "_solve_stage052_axis", lambda *args, **kwargs: result
-    )
+    def solve_with_live_event(*_args: object, **kwargs: object) -> object:
+        sink = kwargs["trace_sink"]
+        assert isinstance(sink, stage052_performance._Stage052TraceStreamSink)
+        sink.append_event(
+            {
+                "event_type": "execution_error",
+                "lane": "legacy",
+                "iteration": 1,
+                "operator": "test",
+                "reason": "timing-only fixture",
+            }
+        )
+        return result
+
+    monkeypatch.setattr(stage052_performance, "_solve_stage052_axis", solve_with_live_event)
     monkeypatch.setattr(
         stage052_performance,
         "_iter_stage052_axis_events",
@@ -2058,7 +2797,9 @@ def test_v2_final_flush_is_charged_to_persistence_and_end_to_end(
     timing = rows[0]["_timing_evidence"]
     assert isinstance(timing, dict)
     recomputed_solver = (
-        timing["solver_completed_ns"] - timing["solver_started_ns"]
+        timing["solver_completed_ns"]
+        - timing["solver_started_ns"]
+        - timing["live_stream_persistence_ns"]
     ) / 1_000_000_000
     recomputed_post_solver = (
         timing["axis_completed_ns"] - timing["solver_completed_ns"]
@@ -2067,10 +2808,18 @@ def test_v2_final_flush_is_charged_to_persistence_and_end_to_end(
         timing["finalize_completed_ns"] - timing["finalize_started_ns"]
     ) / 1_000_000_000
     assert timing["axis_started_ns"] == timing["solver_started_ns"]
-    assert persistence >= (flush_delay_seconds + postprocess_delay_seconds) * 0.9
+    assert persistence >= (flush_delay_seconds + live_append_delay_seconds) * 0.9
+    assert persistence < (
+        flush_delay_seconds + postprocess_delay_seconds + live_append_delay_seconds
+    ) * 1.2
     assert solver_seconds == pytest.approx(recomputed_solver)
-    assert persistence == pytest.approx(recomputed_post_solver + recomputed_finalize)
-    assert float(rows[0]["end_to_end_seconds"]) == pytest.approx(solver_seconds + persistence)
+    assert persistence == pytest.approx(
+        recomputed_finalize + timing["live_stream_persistence_ns"] / 1_000_000_000
+    )
+    assert recomputed_post_solver >= postprocess_delay_seconds * 0.9
+    assert float(rows[0]["end_to_end_seconds"]) == pytest.approx(
+        solver_seconds + persistence + recomputed_post_solver
+    )
 
 
 def test_v2_pre_open_failure_publishes_partial_shard_evidence(

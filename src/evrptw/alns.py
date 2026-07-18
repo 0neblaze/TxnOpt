@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import itertools
 import math
 import random
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, cast
@@ -195,6 +196,10 @@ class ALNSResult:
     stage04_weight_history: dict[str, list[tuple[int, float]]] = field(default_factory=dict)
     stage04_temperature_history: tuple[tuple[int, float], ...] = ()
     stage04_event_log: tuple[dict[str, object], ...] = ()
+    initial_routes: tuple[tuple[str, ...], ...] = ()
+    initial_customer_sequences: tuple[tuple[str, ...], ...] = ()
+    initial_objective: SolutionObjective | None = None
+    iteration_limit_completed_at_seconds: float | None = None
 
     @property
     def objective_value(self) -> float:
@@ -1740,11 +1745,37 @@ class _TimeLimitReached(RouteEvaluationDeadlineExceeded):
     pass
 
 
+class _NeighborhoodEventStream(list[dict[str, object]]):
+    """Historical list by default; zero-retention live stream when a sink is set."""
+
+    def __init__(
+        self,
+        sink: Callable[[Mapping[str, object]], None] | None = None,
+    ) -> None:
+        super().__init__()
+        self._sink = sink
+        self.emitted_count = 0
+
+    def append(self, event: dict[str, object]) -> None:
+        if self._sink is None:
+            super().append(event)
+        else:
+            self._sink(event)
+            self.emitted_count += 1
+
+    def extend(self, events: Iterable[dict[str, object]]) -> None:
+        if self._sink is None:
+            super().extend(events)
+            return
+        for event in events:
+            self.append(event)
+
+
 def _solve_alns(
     instance: Instance,
     *,
     seed: int,
-    max_iterations: int = 2_000,
+    max_iterations: int | None = 2_000,
     time_limit_seconds: float = 60.0,
     removal_fraction: float = 0.2,
     operator_profile: OperatorProfile | str = OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
@@ -1762,8 +1793,9 @@ def _solve_alns(
     initial_solution_provenance: Mapping[str, object] | None = None,
     stage04_config: Stage04Config | None = None,
     native_kernel_config: NativeKernelConfig | None = None,
+    neighborhood_event_sink: Callable[[Mapping[str, object]], None] | None = None,
 ) -> ALNSResult:
-    if max_iterations <= 0:
+    if max_iterations is not None and max_iterations <= 0:
         raise ValueError("max_iterations must be positive")
     if time_limit_seconds <= 0:
         raise ValueError("time_limit_seconds must be positive")
@@ -1776,6 +1808,8 @@ def _solve_alns(
         and exact_call_controller.config.mode == "exact_call_budget"
     )
     batch_work_enabled = termination_mode == "fixed_work" or fixed_exact_calls
+    if max_iterations is None and batch_work_enabled:
+        raise ValueError("max_iterations=None requires wall_clock termination")
     profile = OperatorProfile(operator_profile)
     vehicle_config = vehicle_operator_config or VehicleOperatorConfig()
     cache_enabled = cache_incremental_config is not None and cache_incremental_config.enabled
@@ -1967,6 +2001,9 @@ def _solve_alns(
     quality_evaluator.remember_incumbent(current)
     constraint_evaluator.remember_incumbent(current)
 
+    initial_routes = tuple(result.route for result in current.charging)
+    initial_customer_sequences = current.sequences
+    initial_objective = current.objective
     best = current
     quality_probe_current = current
     quality_probe_best = current
@@ -1992,12 +2029,13 @@ def _solve_alns(
     refinement_stats = OperatorStatistics()
     if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED:
         neighborhood_stats["vehicle_reduction_refinement"] = refinement_stats
-    neighborhood_events: list[dict[str, object]] = []
+    neighborhood_events = _NeighborhoodEventStream(neighborhood_event_sink)
     accepted = 0
     improved = 0
     rejected = 0
     completed_iterations = 0
     effective_iterations = 0
+    last_effective_iteration_completed_at_seconds: float | None = None
     stagnation_iterations = 0
     maximum_stagnation = 0
     global_best_reset_pending = False
@@ -2048,7 +2086,10 @@ def _solve_alns(
     watchdog_triggered = False
     candidate_exhausted = False
     no_exact_rounds = 0
-    for iteration in range(max_iterations):
+    iteration_numbers: Iterator[int] = (
+        iter(range(max_iterations)) if max_iterations is not None else itertools.count()
+    )
+    for iteration in iteration_numbers:
         if exact_call_controller is not None and exact_call_controller.budget_reached:
             evaluator._record_exact_budget_boundary()
             break
@@ -2906,14 +2947,19 @@ def _solve_alns(
             break
 
         previous_current = current
+        cooling_progress = (
+            iteration / max_iterations
+            if max_iterations is not None
+            else min(1.0, (time.perf_counter() - started) / time_limit_seconds)
+        )
         if stage04_enabled:
-            cooled = initial_temperature * max(0.001, 1.0 - iteration / max_iterations)
+            cooled = initial_temperature * max(0.001, 1.0 - cooling_progress)
             reheat_floor *= 0.99
             temperature = max(cooled, reheat_floor)
             if iteration % 10 == 0:
                 temperature_history.append((iteration, temperature))
         else:
-            temperature = initial_temperature * max(0.001, 1.0 - iteration / max_iterations)
+            temperature = initial_temperature * max(0.001, 1.0 - cooling_progress)
         quality_candidate_is_worse = (
             profile
             in (
@@ -3366,6 +3412,7 @@ def _solve_alns(
                 acceptance_window.pop(0)
 
         effective_iterations += 1
+        last_effective_iteration_completed_at_seconds = time.perf_counter() - started
         if (
             candidate_control_runtime is not None
             and fixed_exact_calls
@@ -3390,6 +3437,7 @@ def _solve_alns(
     budget_reached = exact_call_controller is not None and exact_call_controller.budget_reached
     if (
         fixed_watchdog_mode
+        and max_iterations is not None
         and effective_iterations < max_iterations
         and not budget_reached
         and not candidate_exhausted
@@ -3409,6 +3457,7 @@ def _solve_alns(
     if candidate_control_runtime is not None:
         candidate_control_runtime.finish_round()
     exact_statistics = exact_call_controller.to_dict() if exact_call_controller is not None else {}
+    solve_completed_at = time.perf_counter()
     termination_reason = (
         "exact_call_budget_exhausted"
         if exact_call_controller is not None and exact_call_controller.budget_reached
@@ -3417,7 +3466,7 @@ def _solve_alns(
         else "watchdog_exhausted"
         if watchdog_triggered
         else "wall_clock_deadline"
-        if time.perf_counter() >= overall_deadline
+        if solve_completed_at >= overall_deadline
         else "iteration_limit"
     )
     return ALNSResult(
@@ -3435,7 +3484,7 @@ def _solve_alns(
         rejected_moves=rejected,
         first_feasible_time=first_feasible_time,
         best_time=best_time,
-        runtime_seconds=time.perf_counter() - started,
+        runtime_seconds=solve_completed_at - started,
         charging_subproblem_calls=sum(item.calls for item in lane_evaluators),
         charging_subproblem_time=sum(item.runtime for item in lane_evaluators),
         charging_labels_generated=sum(item.labels_generated for item in lane_evaluators),
@@ -3567,6 +3616,14 @@ def _solve_alns(
         ),
         stage04_temperature_history=tuple(temperature_history),
         stage04_event_log=tuple(stage04_events),
+        initial_routes=initial_routes,
+        initial_customer_sequences=initial_customer_sequences,
+        initial_objective=initial_objective,
+        iteration_limit_completed_at_seconds=(
+            last_effective_iteration_completed_at_seconds
+            if termination_reason == "iteration_limit"
+            else None
+        ),
     )
 
 
@@ -3574,7 +3631,7 @@ def solve_alns(
     instance: Instance,
     *,
     seed: int,
-    max_iterations: int = 2_000,
+    max_iterations: int | None = 2_000,
     time_limit_seconds: float = 60.0,
     removal_fraction: float = 0.2,
     operator_profile: OperatorProfile | str = OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
@@ -3592,9 +3649,19 @@ def solve_alns(
     initial_solution_provenance: Mapping[str, object] | None = None,
     stage04_config: Stage04Config | None = None,
     native_kernel_config: NativeKernelConfig | None = None,
+    neighborhood_event_sink: Callable[[Mapping[str, object]], None] | None = None,
 ) -> ALNSResult:
-    """Solve ALNS with opt-in Stage 3.0--3.4 and Stage 4 evaluation layers."""
+    """Solve ALNS with opt-in Stage 3.0--3.4 and Stage 4 evaluation layers.
 
+    ``max_iterations=None`` selects wall-clock-only termination and therefore
+    cannot be combined with fixed-work or fixed exact-call semantics.
+    """
+
+    if max_iterations is None and (
+        termination_mode != "wall_clock"
+        or (exact_deadline_config is not None and exact_deadline_config.mode == "exact_call_budget")
+    ):
+        raise ValueError("max_iterations=None requires wall_clock termination")
     if (
         exact_deadline_config is not None
         and ExactChargingBackend(backend) is not ExactChargingBackend.CPU_BATCH
@@ -3693,6 +3760,7 @@ def solve_alns(
                 initial_solution_provenance=initial_solution_provenance,
                 stage04_config=stage04_config,
                 native_kernel_config=native_kernel_config,
+                neighborhood_event_sink=neighborhood_event_sink,
             )
         finally:
             if candidate_control_runtime is not None:
@@ -3731,6 +3799,7 @@ def solve_alns(
             initial_solution_provenance=initial_solution_provenance,
             stage04_config=stage04_config,
             native_kernel_config=native_kernel_config,
+            neighborhood_event_sink=neighborhood_event_sink,
         )
     except BaseException as error:
         if candidate_control_runtime is not None:

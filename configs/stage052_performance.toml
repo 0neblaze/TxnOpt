@@ -12,6 +12,12 @@ directory = "data/schneider"
 [runtime]
 max_iterations = 1000
 batch_size = 128
+identity_manifest = "configs/stage052_runtime_identity.local.json"
+
+[campaign]
+storage_root_locator = "configs/stage052_storage_roots.local.toml"
+staging_root_alias = "transfer_staging"
+archive_root_aliases = ["transfer_archive", "internal_archive"]
 
 [native_kernels]
 enabled = true
@@ -22,6 +28,11 @@ distance_matrix = true
 abi_version = "stage05.2-native-kernels-v1"
 context_policy = "pack_once_per_solve"
 failure_policy = "fail_fast_no_fallback"
+
+# Optional fail-fast Metal pilot adapter.  Set `metal_helper_path` only to an
+# executable implementing stage05.2-metal-helper-v1; absence is explicit
+# PARTIAL/NOT_READY whenever the accepted E occupancy median is at least 32.
+[accelerator]
 
 [artifact_storage_v1]
 enabled = true
@@ -37,6 +48,7 @@ per_run_max_bytes = 34359738368
 [artifact_storage_v2]
 enabled = true
 storage_policy_version = "artifact-storage-v2"
+screening_schema_version = "screening_decisions_v3"
 event_format = "parquet"
 compression = "zstd"
 compression_level = 1

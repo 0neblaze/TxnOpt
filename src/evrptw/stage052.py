@@ -32,6 +32,279 @@ class AcceleratorDecision(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class Stage052PrerequisiteRequirement:
+    """One named and independently verifiable input to a component lane."""
+
+    role: str
+    component: Stage052Component
+    scope: str
+    allowed_statuses: tuple[str, ...]
+    exact_run_label: str | None = None
+    requires_passed_review: bool = True
+    requires_current_chain_identity: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.role or not self.allowed_statuses:
+            raise ValueError("prerequisite role and allowed_statuses are required")
+
+
+@dataclass(frozen=True, slots=True)
+class Stage052Contract:
+    """Single source of truth for one current Stage 5.2 component/scope lane."""
+
+    component: Stage052Component
+    scope: str
+    prerequisites: tuple[Stage052PrerequisiteRequirement, ...]
+    required_backend: str
+    worker_policy: str
+    storage_policy_version: str
+    screening_schema_version: str
+    native_profile: str
+    next_status: str
+
+    @property
+    def prerequisite_component(self) -> Stage052Component | None:
+        """Compatibility view for lanes with one primary predecessor."""
+
+        return self.prerequisites[0].component if self.prerequisites else None
+
+    @property
+    def prerequisite_status(self) -> str | None:
+        """Compatibility view for a predecessor with one allowed status."""
+
+        if not self.prerequisites or len(self.prerequisites[0].allowed_statuses) != 1:
+            return None
+        return self.prerequisites[0].allowed_statuses[0]
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactPersistenceObservation:
+    """Verified solver work paired with newly measured persistence work."""
+
+    solver_seconds: float
+    artifact_persistence_seconds: float
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.solver_seconds) or self.solver_seconds <= 0.0:
+            raise ValueError("solver_seconds must be finite and positive")
+        if (
+            not math.isfinite(self.artifact_persistence_seconds)
+            or self.artifact_persistence_seconds < 0.0
+        ):
+            raise ValueError("artifact_persistence_seconds must be finite and non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactPersistenceDecision:
+    passed: bool
+    ratio: float
+    maximum_ratio: float
+    detail: str
+
+
+_CURRENT_COMPONENT_CONTRACTS: Mapping[
+    tuple[Stage052Component, str],
+    tuple[
+        tuple[Stage052PrerequisiteRequirement, ...],
+        str,
+        str,
+        str,
+        str,
+        str,
+    ],
+] = {
+    (Stage052Component.PERF_BASELINE, "performance"): (
+        (),
+        "single",
+        "artifact-storage-v1",
+        "screening_decisions_v1",
+        "none",
+        "READY_FOR_STAGE052_HOT_PATH",
+    ),
+    (Stage052Component.HOT_PATH, "performance"): (
+        (
+            Stage052PrerequisiteRequirement(
+                "performance_baseline",
+                Stage052Component.PERF_BASELINE,
+                "performance",
+                ("READY_FOR_STAGE052_HOT_PATH",),
+                "stage05.2_perf_baseline_attempt04",
+            ),
+        ),
+        "single",
+        "artifact-storage-v1",
+        "screening_decisions_v1",
+        "none",
+        "READY_FOR_STAGE052_ARTIFACT_STREAMING",
+    ),
+    (Stage052Component.ARTIFACT_STREAMING, "performance"): (
+        (
+            Stage052PrerequisiteRequirement(
+                "hot_path_predecessor",
+                Stage052Component.HOT_PATH,
+                "performance",
+                ("READY_FOR_STAGE052_ARTIFACT_STREAMING",),
+                "stage05.2_hot_path_attempt03",
+            ),
+            Stage052PrerequisiteRequirement(
+                "historical_storage",
+                Stage052Component.ARTIFACT_STREAMING,
+                "performance",
+                ("READY_FOR_STAGE052_JOB_PARALLEL",),
+                "stage05.2_artifact_streaming_attempt04",
+            ),
+            Stage052PrerequisiteRequirement(
+                "remediation_source",
+                Stage052Component.NATIVE_KERNELS,
+                "performance",
+                ("NOT_READY",),
+                "stage05.2_native_kernels_attempt03",
+                requires_passed_review=False,
+            ),
+        ),
+        "single",
+        "artifact-storage-v2",
+        "screening_decisions_v3",
+        "none",
+        "READY_FOR_STAGE052_JOB_PARALLEL",
+    ),
+    (Stage052Component.JOB_PARALLEL, "performance"): (
+        (
+            Stage052PrerequisiteRequirement(
+                "storage_amendment",
+                Stage052Component.ARTIFACT_STREAMING,
+                "performance",
+                ("READY_FOR_STAGE052_JOB_PARALLEL",),
+                requires_current_chain_identity=True,
+            ),
+        ),
+        "selection_1_2_4",
+        "artifact-storage-v2",
+        "screening_decisions_v3",
+        "none",
+        "READY_FOR_STAGE052_NATIVE_KERNELS",
+    ),
+    (Stage052Component.NATIVE_KERNELS, "performance"): (
+        (
+            Stage052PrerequisiteRequirement(
+                "worker_selection",
+                Stage052Component.JOB_PARALLEL,
+                "performance",
+                ("READY_FOR_STAGE052_NATIVE_KERNELS",),
+                requires_current_chain_identity=True,
+            ),
+        ),
+        "selected",
+        "artifact-storage-v2",
+        "screening_decisions_v3",
+        "stage05.2-native-kernels-v1",
+        "READY_FOR_STAGE052_ACCELERATOR_DECISION",
+    ),
+    (Stage052Component.ACCELERATOR_PILOT, "performance"): (
+        (
+            Stage052PrerequisiteRequirement(
+                "native_selection",
+                Stage052Component.NATIVE_KERNELS,
+                "performance",
+                ("READY_FOR_STAGE052_ACCELERATOR_DECISION",),
+                requires_current_chain_identity=True,
+            ),
+        ),
+        "selected",
+        "artifact-storage-v2",
+        "screening_decisions_v3",
+        "stage05.2-native-kernels-v1",
+        "READY_FOR_STAGE052_BENCHMARK",
+    ),
+    (Stage052Component.BENCHMARK, "pilot"): (
+        (
+            Stage052PrerequisiteRequirement(
+                "accelerator_decision",
+                Stage052Component.ACCELERATOR_PILOT,
+                "performance",
+                ("READY_FOR_STAGE052_BENCHMARK",),
+                requires_current_chain_identity=True,
+            ),
+        ),
+        "selected",
+        "artifact-storage-v2",
+        "screening_decisions_v3",
+        "stage05.2-native-kernels-v1",
+        "READY_FOR_STAGE052_FORMAL_BENCHMARK",
+    ),
+    (Stage052Component.BENCHMARK, "formal"): (
+        (
+            Stage052PrerequisiteRequirement(
+                "campaign_pilot",
+                Stage052Component.BENCHMARK,
+                "pilot",
+                ("READY_FOR_STAGE052_FORMAL_BENCHMARK",),
+                requires_current_chain_identity=True,
+            ),
+        ),
+        "selected",
+        "artifact-storage-v2",
+        "screening_decisions_v3",
+        "stage05.2-native-kernels-v1",
+        "READY_FOR_STAGE05_3",
+    ),
+}
+
+
+def stage052_contract(
+    component: Stage052Component | str,
+    scope: str,
+) -> Stage052Contract:
+    """Return the current producer/reviewer contract for one execution lane."""
+
+    selected = Stage052Component(component)
+    try:
+        prerequisites, workers, storage, screening, native_profile, next_status = (
+            _CURRENT_COMPONENT_CONTRACTS[(selected, scope)]
+        )
+    except KeyError as error:
+        raise ValueError(
+            f"unsupported Stage 5.2 component/scope: {selected.value}/{scope}"
+        ) from error
+    return Stage052Contract(
+        component=selected,
+        scope=scope,
+        prerequisites=prerequisites,
+        required_backend="cpu_batch",
+        worker_policy=workers,
+        storage_policy_version=storage,
+        screening_schema_version=screening,
+        native_profile=native_profile,
+        next_status=next_status,
+    )
+
+
+def evaluate_artifact_persistence(
+    observations: Sequence[ArtifactPersistenceObservation],
+    *,
+    maximum_ratio: float = 0.30,
+) -> ArtifactPersistenceDecision:
+    """Evaluate persistence against verified solver plus new persistence time."""
+
+    if not math.isfinite(maximum_ratio) or not 0.0 < maximum_ratio < 1.0:
+        raise ValueError("maximum_ratio must be finite and between 0 and 1")
+    if not observations:
+        return ArtifactPersistenceDecision(
+            False,
+            math.inf,
+            maximum_ratio,
+            "persistence evidence is empty",
+        )
+    solver_seconds = sum(item.solver_seconds for item in observations)
+    persistence_seconds = sum(item.artifact_persistence_seconds for item in observations)
+    ratio = persistence_seconds / (solver_seconds + persistence_seconds)
+    passed = ratio <= maximum_ratio
+    relation = "<=" if passed else "exceeds"
+    detail = f"aggregate persistence ratio {ratio:.6f} {relation} {maximum_ratio:.0%}"
+    return ArtifactPersistenceDecision(passed, ratio, maximum_ratio, detail)
+
+
+@dataclass(frozen=True, slots=True)
 class PerformanceObservation:
     instance: str
     seed: int
@@ -159,8 +432,7 @@ def evaluate_promotion(
     semantic_failures = [
         key
         for key in previous_by_key
-        if previous_by_key[key].semantic_digest
-        != candidate_by_key[key].semantic_digest
+        if previous_by_key[key].semantic_digest != candidate_by_key[key].semantic_digest
     ]
     if semantic_failures:
         return PromotionDecision(
@@ -224,18 +496,13 @@ def evaluate_artifact_storage_promotion(
 ) -> ArtifactStoragePromotionDecision:
     """Evaluate artifact-storage-v2 replay, persistence, and memory gates."""
 
-    if (
-        not math.isfinite(maximum_persistence_ratio)
-        or not 0.0 < maximum_persistence_ratio < 1.0
-    ):
+    if not math.isfinite(maximum_persistence_ratio) or not 0.0 < maximum_persistence_ratio < 1.0:
         raise ValueError("maximum_persistence_ratio must be finite and between 0 and 1")
     if (
         not math.isfinite(maximum_baseline_rss_fraction)
         or not 0.0 < maximum_baseline_rss_fraction <= 1.0
     ):
-        raise ValueError(
-            "maximum_baseline_rss_fraction must be finite and between 0 and 1"
-        )
+        raise ValueError("maximum_baseline_rss_fraction must be finite and between 0 and 1")
 
     baseline_by_key = _unique_storage_observations(baseline, "baseline")
     predecessor_by_key = _unique_storage_observations(predecessor, "predecessor")
@@ -245,25 +512,18 @@ def evaluate_artifact_storage_promotion(
         and baseline_by_key.keys() == predecessor_by_key.keys()
         and predecessor_by_key.keys() == candidate_by_key.keys()
     )
-    policies_match = (
-        all(
-            item.storage_policy_version == "artifact-storage-v1"
-            for item in (*baseline_by_key.values(), *predecessor_by_key.values())
-        )
-        and all(
-            item.storage_policy_version == "artifact-storage-v2"
-            for item in candidate_by_key.values()
-        )
+    policies_match = all(
+        item.storage_policy_version == "artifact-storage-v1"
+        for item in (*baseline_by_key.values(), *predecessor_by_key.values())
+    ) and all(
+        item.storage_policy_version == "artifact-storage-v2" for item in candidate_by_key.values()
     )
-    fixed_work_keys = [
-        key for key in candidate_by_key if key[2].startswith("fixed_work")
-    ]
+    fixed_work_keys = [key for key in candidate_by_key if key[2].startswith("fixed_work")]
     semantic_match = (
         identities_match
         and bool(fixed_work_keys)
         and all(
-            predecessor_by_key[key].semantic_digest
-            == candidate_by_key[key].semantic_digest
+            predecessor_by_key[key].semantic_digest == candidate_by_key[key].semantic_digest
             for key in fixed_work_keys
         )
     )
@@ -280,15 +540,12 @@ def evaluate_artifact_storage_promotion(
     persistence_seconds = sum(
         item.artifact_persistence_seconds for item in candidate_by_key.values()
     )
-    end_to_end_seconds = sum(
-        item.end_to_end_seconds for item in candidate_by_key.values()
-    )
+    end_to_end_seconds = sum(item.end_to_end_seconds for item in candidate_by_key.values())
     observed_persistence_ratio = (
         persistence_seconds / end_to_end_seconds if end_to_end_seconds else math.inf
     )
     persistence_passed = (
-        bool(candidate_by_key)
-        and observed_persistence_ratio <= maximum_persistence_ratio
+        bool(candidate_by_key) and observed_persistence_ratio <= maximum_persistence_ratio
     )
     persistence_detail = (
         f"aggregate persistence ratio {observed_persistence_ratio:.6f} "
@@ -301,12 +558,8 @@ def evaluate_artifact_storage_promotion(
     )
 
     rss_passed = bool(baseline_by_key) and bool(candidate_by_key)
-    baseline_peak = max(
-        (item.peak_rss_bytes for item in baseline_by_key.values()), default=0
-    )
-    candidate_peak = max(
-        (item.peak_rss_bytes for item in candidate_by_key.values()), default=0
-    )
+    baseline_peak = max((item.peak_rss_bytes for item in baseline_by_key.values()), default=0)
+    candidate_peak = max((item.peak_rss_bytes for item in candidate_by_key.values()), default=0)
     rss_limit = baseline_peak * maximum_baseline_rss_fraction
     rss_passed = rss_passed and candidate_peak <= rss_limit
     rss_detail = (
@@ -333,13 +586,9 @@ def select_worker_count(
 
     if set(end_to_end_seconds) != {1, 2, 4} or set(aggregate_rss_gib) != {1, 2, 4}:
         raise ValueError("worker evidence must contain exactly 1, 2, and 4 workers")
-    if any(
-        not math.isfinite(value) or value <= 0.0 for value in end_to_end_seconds.values()
-    ):
+    if any(not math.isfinite(value) or value <= 0.0 for value in end_to_end_seconds.values()):
         raise ValueError("worker end-to-end times must be finite and positive")
-    if any(
-        not math.isfinite(value) or value <= 0.0 for value in aggregate_rss_gib.values()
-    ):
+    if any(not math.isfinite(value) or value <= 0.0 for value in aggregate_rss_gib.values()):
         raise ValueError("worker aggregate RSS values must be finite and positive")
     baseline = end_to_end_seconds[1]
     two_passes = baseline / end_to_end_seconds[2] >= 1.5 and aggregate_rss_gib[2] <= 12.0
@@ -384,9 +633,7 @@ def _unique_storage_observations(
     result: dict[tuple[str, int, str], ArtifactStorageObservation] = {}
     for observation in observations:
         if observation.identity in result:
-            raise ValueError(
-                f"duplicate {label} storage observation: {observation.identity}"
-            )
+            raise ValueError(f"duplicate {label} storage observation: {observation.identity}")
         result[observation.identity] = observation
     return result
 
