@@ -1130,6 +1130,15 @@ def test_review_generation_publish_failure_preserves_and_archives_prior_review(
     )
     assert published["review_manifest"] == prior_manifest
     assert "generations" in published["review_findings"].parts
+    (published["review_findings"].parent / "._review_findings.csv").write_bytes(
+        b"AppleDouble metadata"
+    )
+    stage052_review._publish_review_generation(
+        review_dir=review_dir,
+        findings=b"gate,passed,detail\nall,True,re-reviewed\n",
+        report=b"accepted re-review\n",
+        manifest=manifest,
+    )
     verify_stage052_review_prerequisite(
         raw_dir,
         expected_component="hot_path",
@@ -1219,6 +1228,12 @@ def test_stage052_producer_prerequisite_binds_raw_and_review_identity(tmp_path: 
     assert _prerequisite_binding_matches(identity.to_dict(), current_identity, raw_dir)
 
     archive = review_dir / "history" / prior_review_sha256
+    (archive / "._review_report.md").write_bytes(b"AppleDouble metadata")
+    assert _prerequisite_binding_matches(identity.to_dict(), current_identity, raw_dir)
+    unexpected = archive / "unexpected.txt"
+    unexpected.write_text("not AppleDouble\n", encoding="utf-8")
+    assert not _prerequisite_binding_matches(identity.to_dict(), current_identity, raw_dir)
+    unexpected.unlink()
     missing_archive = archive.with_name(f"{archive.name}.missing")
     archive.rename(missing_archive)
     assert not _prerequisite_binding_matches(identity.to_dict(), current_identity, raw_dir)

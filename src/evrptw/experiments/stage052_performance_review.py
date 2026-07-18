@@ -621,7 +621,7 @@ def _publish_review_generation(
             or findings_path.read_bytes() != findings
             or not report_path.is_file()
             or report_path.read_bytes() != report
-            or {path.name for path in generation_dir.iterdir()}
+            or {path.name for path in generation_dir.iterdir() if not path.name.startswith("._")}
             != {"review_findings.csv", "review_report.md"}
         ):
             raise ArtifactIntegrityError("review generation identity collision")
@@ -681,7 +681,7 @@ def _archive_prior_review_generation(
             or {
                 path.relative_to(archive_dir).as_posix()
                 for path in archive_dir.rglob("*")
-                if path.is_file()
+                if path.is_file() and not path.name.startswith("._")
             }
             != set(archived_payloads)
             or any(
@@ -3167,7 +3167,7 @@ def _review_lineage_archive_matches(
     observed_files = {
         path.relative_to(archive_dir).as_posix()
         for path in archive_dir.rglob("*")
-        if path.is_file()
+        if path.is_file() and not path.name.startswith("._")
     }
     if observed_files != relative_files:
         return False
