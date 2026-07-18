@@ -9,6 +9,8 @@ import heapq
 import json
 import math
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +47,7 @@ from evrptw.stage052 import (
 )
 from evrptw.stage052_evidence import (
     Stage052PrerequisiteIdentity,
+    abort_process_executor,
     validate_worker_ownership,
     verify_stage052_prerequisite,
 )
@@ -446,6 +449,50 @@ def replay_stage052_storage_semantics(
     if not output:
         raise ArtifactIntegrityError("storage replay evidence is empty")
     return output
+
+
+def replay_stage052_storage_semantics_many(
+    raw_dirs: Sequence[Path],
+    *,
+    max_workers: int = 4,
+) -> list[dict[tuple[str, int, str], str]]:
+    """Replay independent bundles concurrently without changing per-bundle ordering."""
+
+    if not raw_dirs:
+        raise ValueError("at least one Stage 5.2 replay directory is required")
+    if max_workers <= 0:
+        raise ValueError("replay max_workers must be positive")
+    if len(raw_dirs) == 1:
+        return [replay_stage052_storage_semantics(raw_dirs[0])]
+    worker_count = min(max_workers, len(raw_dirs))
+    executor = ProcessPoolExecutor(
+        max_workers=worker_count,
+        mp_context=get_context("spawn"),
+    )
+    futures: dict[Any, int] = {}
+    results: list[dict[tuple[str, int, str], str] | None] = [None] * len(raw_dirs)
+    try:
+        futures = {
+            executor.submit(replay_stage052_storage_semantics, raw_dir): index
+            for index, raw_dir in enumerate(raw_dirs)
+        }
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    except BaseException as error:
+        for future in futures:
+            future.cancel()
+        try:
+            abort_process_executor(executor)
+        except BaseException as abort_error:
+            raise RuntimeError(
+                f"replay failure {type(error).__name__}: {error}; "
+                f"process-pool abort failure {type(abort_error).__name__}: {abort_error}"
+            ) from error
+        raise
+    executor.shutdown(wait=True)
+    if any(result is None for result in results):
+        raise RuntimeError("parallel Stage 5.2 replay returned an incomplete result set")
+    return [result for result in results if result is not None]
 
 
 def validate_per_run_scope(
@@ -954,9 +1001,12 @@ def _component_gates(
                     ),
                 }
             }
-        replay_maps = [replay_stage052_storage_semantics(path) for path in evidence_dirs]
-        if prerequisite_dir is not None:
-            replay_maps.insert(0, replay_stage052_storage_semantics(prerequisite_dir))
+        replay_dirs = (
+            [prerequisite_dir, *evidence_dirs]
+            if prerequisite_dir is not None
+            else evidence_dirs
+        )
+        replay_maps = replay_stage052_storage_semantics_many(replay_dirs)
         fixed_identities = {
             identity for identity in replay_maps[0] if identity[2].startswith("fixed_work")
         }

@@ -47,6 +47,7 @@ from evrptw.stage052 import Stage052Component, formal_budget_matrix
 from evrptw.stage052_evidence import (
     ProcessTreeResourceSampler,
     RunResourceSummary,
+    abort_process_executor,
     collect_performance_provenance,
     verify_stage052_prerequisite,
 )
@@ -482,7 +483,7 @@ def _run_v2_tasks(tasks: Sequence[_ShardTask], *, worker_count: int) -> list[dic
             future.cancel()
         abort_error: BaseException | None = None
         try:
-            _abort_process_executor(executor)
+            abort_process_executor(executor)
         except BaseException as observed_abort_error:
             abort_error = observed_abort_error
         failure_error: BaseException = error
@@ -498,37 +499,6 @@ def _run_v2_tasks(tasks: Sequence[_ShardTask], *, worker_count: int) -> list[dic
         raise
     executor.shutdown(wait=True)
     return rows
-
-
-def _abort_process_executor(executor: ProcessPoolExecutor) -> None:
-    """Terminate every live executor process and verify that none survived."""
-
-    processes = getattr(executor, "_processes", None)
-    if not isinstance(processes, Mapping) or not processes:
-        executor.shutdown(wait=False, cancel_futures=True)
-        raise RuntimeError("executor process identities are unavailable during abort")
-    workers = tuple(processes.values())
-    termination_errors: list[str] = []
-    for process in workers:
-        try:
-            process.terminate()
-        except BaseException as error:
-            termination_errors.append(f"pid={getattr(process, 'pid', '?')}: {error}")
-    for process in workers:
-        try:
-            process.join(timeout=2.0)
-            if process.is_alive():
-                process.kill()
-                process.join(timeout=2.0)
-            if process.is_alive():
-                termination_errors.append(
-                    f"pid={getattr(process, 'pid', '?')}: survived terminate and kill"
-                )
-        except BaseException as error:
-            termination_errors.append(f"pid={getattr(process, 'pid', '?')}: {error}")
-    executor.shutdown(wait=not termination_errors, cancel_futures=True)
-    if termination_errors:
-        raise RuntimeError("; ".join(termination_errors))
 
 
 def _run_v2_shard_task(task: _ShardTask) -> list[dict[str, object]]:

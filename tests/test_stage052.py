@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 import evrptw.experiments.stage052_performance as stage052_performance
+import evrptw.experiments.stage052_performance_review as stage052_review
 from evrptw._core import distance_matrix
 from evrptw.artifacts import (
     ArtifactBundleWriter,
@@ -37,6 +38,7 @@ from evrptw.experiments.stage052_performance import (
 )
 from evrptw.experiments.stage052_performance_review import (
     replay_stage052_storage_semantics,
+    replay_stage052_storage_semantics_many,
     validate_per_run_scope,
     verify_stage052_review_prerequisite,
 )
@@ -620,6 +622,50 @@ def test_parallel_pool_terminates_all_workers_before_recording_failure(
     ]
 
 
+def test_parallel_replay_aborts_siblings_on_first_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeFuture:
+        def __init__(self, *, fails: bool) -> None:
+            self.fails = fails
+
+        def result(self) -> dict[tuple[str, int, str], str]:
+            if self.fails:
+                raise ArtifactIntegrityError("tampered replay")
+            return {("c101C5", 2014, "fixed_work"): "ok"}
+
+        def cancel(self) -> None:
+            events.append("cancel")
+
+    class FakeExecutor:
+        def __init__(self, **_: object) -> None:
+            return None
+
+        def submit(self, _: object, raw_dir: Path) -> FakeFuture:
+            return FakeFuture(fails=raw_dir.name == "tampered")
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool = False) -> None:
+            events.append(f"shutdown:{wait}:{cancel_futures}")
+
+    monkeypatch.setattr(stage052_review, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(stage052_review, "get_context", lambda _: object())
+    monkeypatch.setattr(stage052_review, "as_completed", lambda futures: iter(futures))
+    monkeypatch.setattr(
+        stage052_review,
+        "abort_process_executor",
+        lambda _: events.append("abort"),
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="tampered replay"):
+        replay_stage052_storage_semantics_many(
+            (Path("tampered"), Path("healthy")), max_workers=2
+        )
+
+    assert events == ["cancel", "cancel", "abort"]
+
+
 def test_performance_provenance_records_inputs_without_secret_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -756,6 +802,8 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     )
 
     assert replay_stage052_storage_semantics(v1) == replay_stage052_storage_semantics(v2)
+    parallel_replays = replay_stage052_storage_semantics_many((v1, v2), max_workers=2)
+    assert parallel_replays[0] == parallel_replays[1]
     volatile_cache_bytes = write(
         "artifact-storage-v2",
         "artifact_streaming",
@@ -782,6 +830,13 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         route_evaluation_status="completed_infeasible",
     )
     assert replay_stage052_storage_semantics(v1) != replay_stage052_storage_semantics(changed_event)
+    ordered_replays = replay_stage052_storage_semantics_many(
+        (changed_event, v1), max_workers=2
+    )
+    assert ordered_replays == [
+        replay_stage052_storage_semantics(changed_event),
+        replay_stage052_storage_semantics(v1),
+    ]
 
     changed_route = write(
         "artifact-storage-v2",

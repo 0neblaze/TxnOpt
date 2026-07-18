@@ -388,6 +388,37 @@ def validate_worker_ownership(
     return True, "actual shard worker ownership passed", tuple(sorted(owners))
 
 
+def abort_process_executor(executor: Any) -> None:
+    """Terminate every live executor process and verify that none survived."""
+
+    processes = getattr(executor, "_processes", None)
+    if not isinstance(processes, Mapping) or not processes:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise RuntimeError("executor process identities are unavailable during abort")
+    workers = tuple(processes.values())
+    termination_errors: list[str] = []
+    for process in workers:
+        try:
+            process.terminate()
+        except BaseException as error:
+            termination_errors.append(f"pid={getattr(process, 'pid', '?')}: {error}")
+    for process in workers:
+        try:
+            process.join(timeout=2.0)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=2.0)
+            if process.is_alive():
+                termination_errors.append(
+                    f"pid={getattr(process, 'pid', '?')}: survived terminate and kill"
+                )
+        except BaseException as error:
+            termination_errors.append(f"pid={getattr(process, 'pid', '?')}: {error}")
+    executor.shutdown(wait=not termination_errors, cancel_futures=True)
+    if termination_errors:
+        raise RuntimeError("; ".join(termination_errors))
+
+
 def collect_performance_provenance(
     *,
     instance_paths: Mapping[str, Path],
