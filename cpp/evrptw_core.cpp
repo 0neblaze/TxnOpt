@@ -120,6 +120,34 @@ constexpr std::int64_t no_failure_reason = 0;
 constexpr std::int64_t no_feasible_pattern_reason = 1;
 constexpr std::int64_t deadline_reason = 2;
 
+class PythonFloatSum {
+public:
+    void add(double value) {
+        // Match CPython 3.13's float-specialized sum() exactly.  Stage 5.2
+        // compares native and Python raw evidence bit-for-bit, so ordinary
+        // left-to-right += accumulation is not semantically equivalent.
+        const auto next = total_ + value;
+        if (std::fabs(total_) >= std::fabs(value)) {
+            compensation_ += (total_ - next) + value;
+        } else {
+            compensation_ += (value - next) + total_;
+        }
+        total_ = next;
+    }
+
+    [[nodiscard]] double value() const {
+        auto result = total_;
+        if (compensation_ != 0.0 && std::isfinite(compensation_)) {
+            result += compensation_;
+        }
+        return result;
+    }
+
+private:
+    double total_ = 0.0;
+    double compensation_ = 0.0;
+};
+
 struct ExactLabel {
     std::int64_t progress;
     std::int64_t node;
@@ -780,16 +808,19 @@ ScreenOutput run_screen_route(
     if (use_incremental) {
         distance_lower_bound = incremental[1];
     } else if (known_sequence) {
+        PythonFloatSum distance_sum;
         auto origin = depot;
         for (std::size_t position = 0; position < route_size; ++position) {
             const auto destination = route[position];
-            distance_lower_bound += distances[
+            distance_sum.add(distances[
                 static_cast<std::size_t>(origin) * node_count
-                + static_cast<std::size_t>(destination)];
+                + static_cast<std::size_t>(destination)]);
             origin = destination;
         }
-        distance_lower_bound += distances[
-            static_cast<std::size_t>(origin) * node_count + static_cast<std::size_t>(depot)];
+        distance_sum.add(distances[
+            static_cast<std::size_t>(origin) * node_count
+            + static_cast<std::size_t>(depot)]);
+        distance_lower_bound = distance_sum.value();
     }
     output.metrics[3] = distance_lower_bound;
     if (has_reference) {
@@ -812,10 +843,11 @@ ScreenOutput run_screen_route(
         return output;
     }
 
-    double demand = 0.0;
+    PythonFloatSum demand_sum;
     for (std::size_t position = 0; position < route_size; ++position) {
-        demand += demands[route[position]];
+        demand_sum.add(demands[route[position]]);
     }
+    const auto demand = demand_sum.value();
     output.metrics[0] = demand;
     if (demand > vehicle[1] + epsilon) {
         output.codes[3] = 0;
@@ -1093,10 +1125,11 @@ PropagationOutput run_incremental_propagation(
         output.codes[4] = 1;
         output.codes[5] = static_cast<std::int64_t>(base_size - 1);
         output.codes[9] = 1;
-        output.metrics[0] = 0.0;
+        PythonFloatSum distance_sum;
         for (std::size_t edge = 0; edge + 1 < base_size; ++edge) {
-            output.metrics[0] += base_edges[edge];
+            distance_sum.add(base_edges[edge]);
         }
+        output.metrics[0] = distance_sum.value();
         output.metrics[1] = std::numeric_limits<double>::infinity();
         for (std::size_t position = 1; position + 1 < base_size; ++position) {
             const auto node = base_chain[position];
@@ -1130,19 +1163,29 @@ PropagationOutput run_incremental_propagation(
     const auto candidate_edges = candidate_size - 1;
     const auto middle_start = prefix_nodes > 0 ? prefix_nodes - 1 : 0;
     const auto middle_end = std::max(middle_start, candidate_suffix_start - 1);
-    double total_distance = 0.0;
+    PythonFloatSum middle_distance_sum;
     for (std::size_t edge = middle_start;
          edge <= middle_end && edge + 1 < candidate_size;
          ++edge) {
-        total_distance += distances[
+        middle_distance_sum.add(distances[
             static_cast<std::size_t>(candidate_chain[edge]) * node_count
-            + static_cast<std::size_t>(candidate_chain[edge + 1])];
+            + static_cast<std::size_t>(candidate_chain[edge + 1])]);
     }
-    for (std::size_t edge = 0; edge < prefix_edges; ++edge) {
-        total_distance += base_edges[edge];
+    auto total_distance = middle_distance_sum.value();
+    if (prefix_edges > 0) {
+        PythonFloatSum prefix_distance_sum;
+        for (std::size_t edge = 0; edge < prefix_edges; ++edge) {
+            prefix_distance_sum.add(base_edges[edge]);
+        }
+        total_distance += prefix_distance_sum.value();
     }
-    for (std::size_t edge = 0; edge < suffix_edges; ++edge) {
-        total_distance += base_edges[base_size - 2 - edge];
+    if (suffix_edges > 0) {
+        PythonFloatSum suffix_distance_sum;
+        const auto suffix_start = base_size - 1 - suffix_edges;
+        for (std::size_t edge = suffix_start; edge + 1 < base_size; ++edge) {
+            suffix_distance_sum.add(base_edges[edge]);
+        }
+        total_distance += suffix_distance_sum.value();
     }
 
     std::vector<double> earliest(candidate_size, 0.0);

@@ -206,8 +206,7 @@ def test_exact_charging_batch_numeric_randomized_differential() -> None:
         coordinates[0] = (0.0, 0.0)
         nodes = [Node("D0", NodeType.DEPOT, *coordinates[0], 0.0, 0.0, 500.0, 0.0)]
         nodes.extend(
-            Node(f"F{i}", NodeType.STATION, *coordinates[i], 0.0, 0.0, 500.0, 0.0)
-            for i in (1, 2)
+            Node(f"F{i}", NodeType.STATION, *coordinates[i], 0.0, 0.0, 500.0, 0.0) for i in (1, 2)
         )
         nodes.extend(
             Node(f"C{i}", NodeType.CUSTOMER, *coordinates[i], 1.0, 0.0, 500.0, 0.25)
@@ -279,9 +278,7 @@ def test_exact_charging_batch_numeric_stable_tie_order_matches_python() -> None:
     assert route[1] == "F1"
     np.testing.assert_array_equal(
         native[5],
-        np.asarray(
-            [[expected.labels_generated, expected.labels_expanded, expected.labels_pruned]]
-        ),
+        np.asarray([[expected.labels_generated, expected.labels_expanded, expected.labels_pruned]]),
     )
 
 
@@ -296,9 +293,7 @@ def test_exact_charging_batch_numeric_rechecks_station_due_after_recharge() -> N
     np.testing.assert_array_equal(native[3], np.asarray([1], dtype=np.int64))
     np.testing.assert_array_equal(
         native[5],
-        np.asarray(
-            [[expected.labels_generated, expected.labels_expanded, expected.labels_pruned]]
-        ),
+        np.asarray([[expected.labels_generated, expected.labels_expanded, expected.labels_pruned]]),
     )
 
 
@@ -517,8 +512,7 @@ def test_screen_routes_numeric_frozen_and_failure_differential() -> None:
     tight = Instance(
         instance.name,
         tuple(
-            replace(node, due_date=7.0) if node.name == "C1" else node
-            for node in instance.nodes
+            replace(node, due_date=7.0) if node.name == "C1" else node for node in instance.nodes
         ),
         instance.vehicle,
         distance_backend="python",
@@ -559,6 +553,78 @@ def test_screen_routes_numeric_randomized_python_differential() -> None:
             tuple(names[: int(random.integers(0, 5))]),
             reference_distance=float(random.uniform(0.0, 30.0)),
         )
+
+
+def test_native_route_totals_match_python_compensated_sum_bit_exactly() -> None:
+    node_kind = np.asarray([0, 1, 1], dtype=np.int64)
+    zeros = np.zeros(3, dtype=np.float64)
+    due = np.full(3, 1e30, dtype=np.float64)
+    distance = np.zeros((3, 3), dtype=np.float64)
+    distance[0, 1] = 1e16
+    distance[1, 2] = 1.0
+    distance[2, 0] = 1.0
+    distance[0, 2] = 1e16
+    distance[2, 1] = 1.0
+    distance[1, 0] = 1.0
+    vehicle = np.asarray([1e30, 1e30, 1.0, 0.1, 1e30], dtype=np.float64)
+    expected = sum((1e16, 1.0, 1.0))
+
+    _codes, screening_metrics = screen_routes_numeric(
+        node_kind,
+        np.asarray([0.0, 1.0, 1.0], dtype=np.float64),
+        zeros,
+        due,
+        zeros,
+        distance,
+        np.ones((3, 3), dtype=np.uint8),
+        vehicle,
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([1.0, 1e-9, 0.0, 0.0], dtype=np.float64),
+        np.zeros(6, dtype=np.float64),
+    )
+    assert float(screening_metrics[3]).hex() == expected.hex()
+
+    propagation_inputs = (
+        node_kind,
+        zeros,
+        due,
+        zeros,
+        distance,
+        vehicle,
+        np.asarray([0, 1, 2, 0], dtype=np.int64),
+        np.asarray([0, 2, 1, 0], dtype=np.int64),
+        np.asarray([1e16, 1.0, 1.0], dtype=np.float64),
+        np.zeros(4, dtype=np.float64),
+        np.full(4, 1e30, dtype=np.float64),
+        np.asarray([1e-9], dtype=np.float64),
+    )
+    _codes, changed_metrics = propagate_routes_numeric(*propagation_inputs)
+    assert float(changed_metrics[0]).hex() == expected.hex()
+
+    unchanged_inputs = list(propagation_inputs)
+    unchanged_inputs[7] = unchanged_inputs[6]
+    _codes, unchanged_metrics = propagate_routes_numeric(*unchanged_inputs)
+    assert float(unchanged_metrics[0]).hex() == expected.hex()
+
+    suffix_values = (1e16, 1.0, 1e-16, 1e-16)
+    suffix_node_kind = np.asarray([0, 1, 1, 1, 1, 1, 1], dtype=np.int64)
+    suffix_distance = np.zeros((7, 7), dtype=np.float64)
+    suffix_inputs = (
+        suffix_node_kind,
+        np.zeros(7, dtype=np.float64),
+        np.full(7, 1e30, dtype=np.float64),
+        np.zeros(7, dtype=np.float64),
+        suffix_distance,
+        vehicle,
+        np.asarray([0, 1, 2, 3, 4, 5, 0], dtype=np.int64),
+        np.asarray([0, 6, 2, 3, 4, 5, 0], dtype=np.int64),
+        np.asarray([0.0, 0.0, *suffix_values], dtype=np.float64),
+        np.zeros(7, dtype=np.float64),
+        np.full(7, 1e30, dtype=np.float64),
+        np.asarray([1e-9], dtype=np.float64),
+    )
+    _codes, suffix_metrics = propagate_routes_numeric(*suffix_inputs)
+    assert float(suffix_metrics[0]).hex() == sum(suffix_values).hex()
 
 
 def test_screen_routes_numeric_consumes_incremental_result_without_python_replay() -> None:
