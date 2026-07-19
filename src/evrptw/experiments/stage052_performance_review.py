@@ -3108,7 +3108,7 @@ def _validate_native_evidence_contract(
         "backend": "cpu_batch",
         "optimization_profile": "native",
         "native_kernel_config": NativeKernelConfig().to_dict(),
-        "persistence_attribution": "critical_event_rows",
+        "persistence_attribution": "primary_active_writes_v1",
         "repository_dirty": False,
         "component_prerequisite": prerequisite.to_dict(),
         "job_parallel_selection": selection.to_dict(),

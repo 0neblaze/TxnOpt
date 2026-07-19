@@ -45,7 +45,9 @@ ROUTE_ID_RESOLUTION_CACHE_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
 SCREENING_DEFINITION_HOT_CACHE_ENTRIES = 524_288
 ROUTE_IDENTITY_COUNTER_NAMESPACES = 16
 MAX_SCREENING_CHECKS_PER_DECISION = 8
-LIVE_SCREENING_TRANSACTION_ROWS = 1_024
+# Keep live definition/occurrence transactions below one 65,536-row Parquet
+# group while amortising collision checks and typed-column appends.
+LIVE_SCREENING_TRANSACTION_ROWS = 8_192
 UNIQUE_ROUTE_IDENTITY_SEMANTICS = frozenset(
     {"legacy_started", "completed_shared", "completed_lane"}
 )

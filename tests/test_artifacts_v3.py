@@ -1521,7 +1521,7 @@ def test_v3_row_groups_and_simultaneous_buffers_stay_bounded(tmp_path: Path) -> 
         ),
     )
     assert shard.max_buffered_groups_observed <= 2
-    assert shard.max_pending_screening_transaction_rows_observed <= 1_024
+    assert shard.max_pending_screening_transaction_rows_observed <= 8_192
     shard.finalize(
         raw_payload={},
         solution_payload={},
