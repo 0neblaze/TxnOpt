@@ -677,6 +677,8 @@ def artifact_schema_fingerprint(schema: pa.Schema) -> str:
 def _as_int(value: object) -> int | None:
     if value is None or isinstance(value, bool):
         return None
+    if isinstance(value, int):
+        return value
     try:
         return int(str(value))
     except (TypeError, ValueError):
@@ -686,6 +688,8 @@ def _as_int(value: object) -> int | None:
 def _as_float(value: object) -> float | None:
     if value is None or isinstance(value, bool):
         return None
+    if isinstance(value, (int, float)):
+        return float(value)
     try:
         return float(str(value))
     except (TypeError, ValueError):
@@ -939,6 +943,33 @@ def _normalise_screening_event(
     return row
 
 
+def _compact_screening_check_key(check: Mapping[str, object]) -> tuple[object, ...]:
+    value = check.get("value")
+    already_compact = any(
+        field in check for field in ("value_bool", "value_float", "value_text")
+    )
+    return (
+        str(check.get("check", "")),
+        str(check.get("status", "")),
+        _as_bool(check.get("value_bool"))
+        if already_compact
+        else value
+        if isinstance(value, bool)
+        else None,
+        _as_float(check.get("value_float"))
+        if already_compact
+        else float(value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+        else None,
+        str(check["value_text"])
+        if already_compact and check.get("value_text") is not None
+        else value
+        if isinstance(value, str)
+        else None,
+        str(check.get("reason", "")),
+    )
+
+
 def _normalise_compact_screening_checks(
     checks: Sequence[object],
 ) -> list[dict[str, object]]:
@@ -946,39 +977,108 @@ def _normalise_compact_screening_checks(
     for check in checks:
         if not isinstance(check, Mapping):
             continue
-        value = check.get("value")
-        already_compact = any(
-            field in check for field in ("value_bool", "value_float", "value_text")
+        name, status, value_bool, value_float, value_text, reason = (
+            _compact_screening_check_key(check)
         )
         output.append(
             {
-                "check": str(check.get("check", "")),
-                "status": str(check.get("status", "")),
-                "value_bool": (
-                    _as_bool(check.get("value_bool"))
-                    if already_compact
-                    else value
-                    if isinstance(value, bool)
-                    else None
-                ),
-                "value_float": (
-                    _as_float(check.get("value_float"))
-                    if already_compact
-                    else float(value)
-                    if isinstance(value, (int, float))
-                    else None
-                ),
-                "value_text": (
-                    str(check["value_text"])
-                    if already_compact and check.get("value_text") is not None
-                    else value
-                    if isinstance(value, str)
-                    else None
-                ),
-                "reason": str(check.get("reason", "")),
+                "check": name,
+                "status": status,
+                "value_bool": value_bool,
+                "value_float": value_float,
+                "value_text": value_text,
+                "reason": reason,
             }
         )
     return output
+
+
+@dataclass(frozen=True, slots=True)
+class _PrecomputedScreeningDefinition:
+    """Trusted typed cache-key tail produced by the live measurement bridge."""
+
+    tail: tuple[object, ...]
+
+
+def _screening_definition_cache_key(
+    payload: Mapping[str, object],
+    *,
+    lane_id: int,
+    operator_id: int,
+    route_id: int | None,
+) -> tuple[object, ...]:
+    precomputed = payload.get("_precomputed_screening_definition")
+    if isinstance(precomputed, _PrecomputedScreeningDefinition):
+        return (lane_id, operator_id, route_id, *precomputed.tail)
+    raw_checks = payload.get("checks")
+    checks = raw_checks if isinstance(raw_checks, (list, tuple)) else ()
+    if len(checks) > MAX_SCREENING_CHECKS_PER_DECISION:
+        raise ArtifactIntegrityError(
+            "one screening decision exceeds the fixed eight-check domain"
+        )
+    return (
+        lane_id,
+        operator_id,
+        route_id,
+        str(payload.get("status") or ""),
+        str(payload.get("reason") or ""),
+        str(payload.get("benchmark_axis") or ""),
+        _as_float(payload.get("demand")),
+        _as_float(payload.get("distance_increment_lower_bound")),
+        _as_float(payload.get("distance_lower_bound")),
+        _as_bool(payload.get("exact_call_blocked")),
+        str(payload.get("first_failed_check") or ""),
+        _as_float(payload.get("min_time_window_slack")),
+        _as_bool(payload.get("negative_cache_hit")),
+        _as_bool(payload.get("single_segment_reachable")),
+        _as_float(payload.get("structural_energy_lower_bound")),
+        tuple(
+            _compact_screening_check_key(check)
+            for check in checks
+            if isinstance(check, Mapping)
+        ),
+    )
+
+
+def _screening_definition_from_cache_key(
+    definition_key: tuple[object, ...],
+) -> dict[str, object]:
+    raw_checks = definition_key[15]
+    if not isinstance(raw_checks, tuple):
+        raise ArtifactIntegrityError("screening definition cache key checks are invalid")
+    checks: list[dict[str, object]] = []
+    for raw_check in raw_checks:
+        if not isinstance(raw_check, tuple) or len(raw_check) != 6:
+            raise ArtifactIntegrityError("screening definition cache check is invalid")
+        name, status, value_bool, value_float, value_text, reason = raw_check
+        checks.append(
+            {
+                "check": name,
+                "status": status,
+                "value_bool": value_bool,
+                "value_float": value_float,
+                "value_text": value_text,
+                "reason": reason,
+            }
+        )
+    return {
+        "lane_id": definition_key[0],
+        "operator_id": definition_key[1],
+        "route_id": definition_key[2],
+        "status": definition_key[3],
+        "reason": definition_key[4],
+        "benchmark_axis": definition_key[5],
+        "demand": definition_key[6],
+        "distance_increment_lower_bound": definition_key[7],
+        "distance_lower_bound": definition_key[8],
+        "exact_call_blocked": definition_key[9],
+        "first_failed_check": definition_key[10],
+        "min_time_window_slack": definition_key[11],
+        "negative_cache_hit": definition_key[12],
+        "single_segment_reachable": definition_key[13],
+        "structural_energy_lower_bound": definition_key[14],
+        "checks": checks,
+    }
 
 
 def _normalise_screening_definition(
@@ -4149,6 +4249,12 @@ class ArtifactV2ShardSession:
         return self._max_pending_screening_transaction_rows_observed
 
     @property
+    def scratch_directory(self) -> Path:
+        """Measured-volume directory for bounded live-stream scratch files."""
+
+        return self._directory
+
+    @property
     def unique_route_hot_entries(self) -> int:
         return self._route_digests.hot_entries
 
@@ -4195,47 +4301,29 @@ class ArtifactV2ShardSession:
         lane_id: int,
         operator_id: int,
     ) -> tuple[dict[str, object], dict[str, object] | None]:
-        definition = _normalise_screening_definition(
+        definition_key = _screening_definition_cache_key(
             event,
             lane_id=lane_id,
             operator_id=operator_id,
             route_id=route_id,
         )
-        raw_definition_checks = definition["checks"]
-        if not isinstance(raw_definition_checks, list):
-            raise ArtifactIntegrityError("normalized screening checks must be a list")
-        definition_key: tuple[object, ...] = (
-            definition["lane_id"],
-            definition["operator_id"],
-            definition["route_id"],
-            definition["status"],
-            definition["reason"],
-            definition["benchmark_axis"],
-            definition["demand"],
-            definition["distance_increment_lower_bound"],
-            definition["distance_lower_bound"],
-            definition["exact_call_blocked"],
-            definition["first_failed_check"],
-            definition["min_time_window_slack"],
-            definition["negative_cache_hit"],
-            definition["single_segment_reachable"],
-            definition["structural_energy_lower_bound"],
-            tuple(
-                (
-                    check.get("check"),
-                    check.get("status"),
-                    check.get("value_bool"),
-                    check.get("value_float"),
-                    check.get("value_text"),
-                    check.get("reason"),
-                )
-                for check in raw_definition_checks
-                if isinstance(check, Mapping)
-            ),
-        )
         cached = self._screening_definition_cache.get(definition_key)
         first_occurrence = False
+        definition: dict[str, object] | None = None
         if cached is None:
+            definition = (
+                _screening_definition_from_cache_key(definition_key)
+                if isinstance(
+                    event.get("_precomputed_screening_definition"),
+                    _PrecomputedScreeningDefinition,
+                )
+                else _normalise_screening_definition(
+                    event,
+                    lane_id=lane_id,
+                    operator_id=operator_id,
+                    route_id=route_id,
+                )
+            )
             definition_id, definition_json, definition_digest = _screening_definition_identity(
                 definition
             )
@@ -4262,7 +4350,9 @@ class ArtifactV2ShardSession:
         definition_id, definition_json, _ = cached
         definition_row = (
             {"definition_id": definition_id, **definition}
-            if first_occurrence and self._screening_definitions_sink is not None
+            if first_occurrence
+            and definition is not None
+            and self._screening_definitions_sink is not None
             else None
         )
         started_at = event.get("started_at")

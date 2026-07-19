@@ -460,6 +460,14 @@ class BatchPersistenceEnvelope:
 def _dependency_versions() -> dict[str, str]:
     versions: dict[str, str] = {}
     for distribution in importlib.metadata.distributions():
+        # macOS stores extended attributes as AppleDouble ``._*`` entries on
+        # ExFAT.  A copied ``._foo.dist-info`` directory matches Python's
+        # distribution-name pattern but contains binary Finder metadata, not
+        # package metadata.  Reject that namespace explicitly; decoding errors
+        # from any real distribution still fail fast.
+        distribution_path = getattr(distribution, "_path", None)
+        if distribution_path is not None and Path(distribution_path).name.startswith("._"):
+            continue
         raw_name = distribution.metadata.get("Name")
         if raw_name:
             versions[str(raw_name).lower()] = distribution.version

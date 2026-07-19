@@ -628,6 +628,13 @@ def _canonical_axis_semantics(
         normalized_trace_axis.setdefault(
             "unique_route_semantics", "completed_cache_owner_identity_v2"
         )
+        result_summary = normalized_trace_axis.get("result_summary")
+        if isinstance(result_summary, Mapping):
+            normalized_result_summary = dict(result_summary)
+            normalized_result_summary.setdefault(
+                "unique_route_semantics", "completed_cache_owner_identity_v2"
+            )
+            normalized_trace_axis["result_summary"] = normalized_result_summary
         streamed_counts = normalized_trace_axis.get("streamed_record_counts")
         if streamed_counts is not None and (
             not isinstance(streamed_counts, Mapping)

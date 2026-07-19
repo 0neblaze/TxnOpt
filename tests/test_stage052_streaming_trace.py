@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from evrptw import artifacts as artifact_module
 from evrptw.alns import _NeighborhoodEventStream
 from evrptw.artifacts import ArtifactBundleWriter, ArtifactRunContext, ArtifactStorageConfig
 from evrptw.experiments import stage052_performance
@@ -179,6 +181,11 @@ class _RecordingShard:
         self.events: list[dict[str, object]] = []
         self.flushes = 0
         self.append_calls = 0
+        self._scratch = tempfile.TemporaryDirectory()
+
+    @property
+    def scratch_directory(self) -> Path:
+        return Path(self._scratch.name)
 
     def append(
         self,
@@ -271,6 +278,71 @@ def test_stage052_stream_counts_follow_coalesced_physical_events() -> None:
     }
 
 
+def test_precomputed_screening_definition_matches_mapping_normalization() -> None:
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+        buffer_rows=1,
+    )
+    decision = ScreeningDecision(
+        decision_id=1,
+        route_key="route:2:C1",
+        lane="legacy",
+        iteration=1,
+        operator="repair",
+        status="rejected",
+        first_failed_check="capacity",
+        reason="capacity",
+        checks=(
+            ScreeningCheckTrace("structure", "pass", True),
+            ScreeningCheckTrace("capacity", "fail", 2.5, "capacity"),
+        ),
+        demand=2.5,
+        min_time_window_slack=1.0,
+        distance_lower_bound=3.0,
+        distance_increment_lower_bound=None,
+        single_segment_reachable=True,
+        structural_energy_lower_bound=4.0,
+        negative_cache_hit=False,
+        exact_call_blocked=True,
+        started_at=0.1,
+        completed_at=0.2,
+        duration_seconds=0.1,
+    )
+
+    sink.append_screening_decision(decision)
+    streamed = shard.events[0]
+    key = artifact_module._screening_definition_cache_key(  # noqa: SLF001
+        streamed,
+        lane_id=11,
+        operator_id=12,
+        route_id=13,
+    )
+    precomputed = artifact_module._screening_definition_from_cache_key(key)  # noqa: SLF001
+    mapping_payload = {
+        **streamed,
+        "checks": tuple(
+            {
+                "check": check.check,
+                "status": check.status,
+                "value": check.value,
+                "reason": check.reason,
+            }
+            for check in decision.checks
+        ),
+    }
+    mapping_payload.pop("_precomputed_screening_definition")
+    normalized = artifact_module._normalise_screening_definition(  # noqa: SLF001
+        mapping_payload,
+        lane_id=11,
+        operator_id=12,
+        route_id=13,
+    )
+
+    assert precomputed == normalized
+
+
 def test_stage052_trace_sink_flushes_bounded_event_batches() -> None:
     shard = _RecordingShard()
     sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
@@ -298,6 +370,40 @@ def test_stage052_trace_sink_flushes_bounded_event_batches() -> None:
     sink.finish()
     assert shard.append_calls == 2
     assert len(shard.events) == 5
+
+
+def test_neighborhood_events_use_measured_volume_spool_until_canonical_merge() -> None:
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="wall_clock_300",
+        buffer_rows=4,
+    )
+
+    for iteration in range(17):
+        sink.append_neighborhood_event(
+            {
+                "event_type": "neighborhood_event",
+                "lane": "legacy",
+                "iteration": iteration,
+                "operator": "relocate",
+                "status": "rejected",
+            }
+        )
+
+    scratch_path = sink._neighborhood_spool_path  # noqa: SLF001
+    assert scratch_path is not None
+    assert scratch_path.is_relative_to(shard.scratch_directory)
+    assert scratch_path.is_file()
+    assert sink._event_buffer == []  # noqa: SLF001
+    assert shard.events == []
+
+    sink.finish()
+
+    assert len(shard.events) == 17
+    assert all(event["record_type"] == "neighborhood_event" for event in shard.events)
+    sink.close()
+    assert not scratch_path.exists()
 
 
 def test_stage052_trace_sink_does_not_replay_a_failed_batch() -> None:
@@ -328,6 +434,34 @@ def test_stage052_trace_sink_does_not_replay_a_failed_batch() -> None:
     sink.close()
 
     assert shard.append_calls == 1
+
+
+def test_spool_cleanup_failure_still_publishes_partial_shard_abort() -> None:
+    original = RuntimeError("solver failed")
+
+    class FailingStream:
+        def discard_pending(self) -> None:
+            raise OSError("spool unlink failed")
+
+    class RecordingAbortShard:
+        def __init__(self) -> None:
+            self.aborted_with: BaseException | None = None
+
+        def abort(self, error: BaseException) -> None:
+            self.aborted_with = error
+
+    shard = RecordingAbortShard()
+
+    with pytest.raises(BaseExceptionGroup, match="cleanup also failed") as caught:
+        stage052_performance._abort_v2_shard_after_failure(  # noqa: SLF001
+            shard,
+            active_trace_stream=FailingStream(),  # type: ignore[arg-type]
+            original_error=original,
+        )
+
+    assert shard.aborted_with is original
+    assert caught.value.exceptions[0] is original
+    assert isinstance(caught.value.exceptions[1], OSError)
 
 
 def test_neighborhood_event_stream_externalizes_more_than_a_row_group() -> None:

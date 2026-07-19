@@ -2447,6 +2447,31 @@ def test_storage_digest_ignores_derived_producer_instrumentation() -> None:
     )
 
     assert current_semantics == historical_semantics
+
+    historical_trace_semantics = stage052_review._canonical_axis_semantics(
+        raw_axis={**historical, "started_calls": 100, "completed_calls": 100},
+        solution_axis={"objective_key": [2, 10.0, 0.0, 0]},
+        trace={"axes": {"fixed_work": {"result_summary": {"exact_calls": 100}}}},
+        axis="fixed_work",
+    )
+    current_trace_semantics = stage052_review._canonical_axis_semantics(
+        raw_axis={**historical, "started_calls": 100, "completed_calls": 100},
+        solution_axis={"objective_key": [2, 10.0, 0.0, 0]},
+        trace={
+            "axes": {
+                "fixed_work": {
+                    "unique_route_semantics": "completed_cache_owner_identity_v2",
+                    "result_summary": {
+                        "exact_calls": 100,
+                        "unique_route_semantics": "completed_cache_owner_identity_v2",
+                    },
+                }
+            }
+        },
+        axis="fixed_work",
+    )
+
+    assert current_trace_semantics == historical_trace_semantics
     backend_metrics = current["backend_metrics"]
     assert isinstance(backend_metrics, dict)
     backend_metrics["native_fallbacks"] = 1

@@ -15,6 +15,7 @@ import resource
 import shutil
 import statistics
 import subprocess
+import tempfile
 import time
 import tomllib
 from collections import Counter
@@ -25,6 +26,8 @@ from multiprocessing import get_context
 from pathlib import Path
 from typing import Any, Protocol
 
+import orjson
+
 from evrptw.alns import ALNSResult, solve_alns
 from evrptw.artifacts import (
     ARTIFACT_STORAGE_V2,
@@ -33,6 +36,7 @@ from evrptw.artifacts import (
     ArtifactReader,
     ArtifactRunContext,
     ArtifactStorageConfig,
+    _PrecomputedScreeningDefinition,
     aggregate_diagnostic_events,
     atomic_write_signed_json,
     build_stage03_critical_events,
@@ -3205,6 +3209,9 @@ def _run_and_persist_shard(
 
 
 class _Stage052StreamingShard(Protocol):
+    @property
+    def scratch_directory(self) -> Path: ...
+
     def append(
         self,
         *,
@@ -3216,6 +3223,29 @@ class _Stage052StreamingShard(Protocol):
     def flush(self) -> None: ...
 
 
+def _abort_v2_shard_after_failure(
+    shard: Any,
+    *,
+    active_trace_stream: _Stage052TraceStreamSink | None,
+    original_error: BaseException,
+) -> None:
+    cleanup_errors: list[BaseException] = []
+    if active_trace_stream is not None:
+        try:
+            active_trace_stream.discard_pending()
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+    try:
+        shard.abort(original_error)
+    except BaseException as abort_error:
+        cleanup_errors.append(abort_error)
+    if cleanup_errors:
+        raise BaseExceptionGroup(
+            "Stage 5.2 shard failed and cleanup also failed",
+            [original_error, *cleanup_errors],
+        ) from original_error
+
+
 class _Stage052TraceStreamSink(MeasurementTraceSink):
     """Bridge live measurement callbacks into one open typed Parquet shard."""
 
@@ -3224,7 +3254,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         *,
         shard: _Stage052StreamingShard,
         axis_name: str,
-        buffer_rows: int = 1_024,
+        buffer_rows: int = 65_536,
     ) -> None:
         if isinstance(buffer_rows, bool) or not isinstance(buffer_rows, int) or buffer_rows <= 0:
             raise ValueError("trace stream buffer_rows must be a positive integer")
@@ -3236,6 +3266,9 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._persisted_family_counts: Counter[str] = Counter()
         self.diagnostic_counts: Counter[tuple[str, str, str, str]] = Counter()
         self._pending_cache_lookup: dict[str, object] | None = None
+        self._neighborhood_spool: Any | None = None
+        self._neighborhood_spool_path: Path | None = None
+        self._neighborhood_read_offset = 0
         self._semantic_event_digest = hashlib.sha256()
         self._initial_objective_key: ObjectiveKey | None = None
         self._visible_global_bests: dict[int, AcceptedGlobalBest] = {}
@@ -3276,14 +3309,36 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             "completed_at": decision.completed_at,
             "duration_seconds": decision.duration_seconds,
         }
-        payload["checks"] = tuple(
-            {
-                "check": check.check,
-                "status": check.status,
-                "value": check.value,
-                "reason": check.reason,
-            }
+        compact_checks = tuple(
+            (
+                check.check,
+                check.status,
+                check.value if isinstance(check.value, bool) else None,
+                float(check.value)
+                if isinstance(check.value, (int, float))
+                and not isinstance(check.value, bool)
+                else None,
+                check.value if isinstance(check.value, str) else None,
+                check.reason,
+            )
             for check in decision.checks
+        )
+        payload["_precomputed_screening_definition"] = _PrecomputedScreeningDefinition(
+            (
+                decision.status,
+                decision.reason,
+                self.axis_name,
+                decision.demand,
+                decision.distance_increment_lower_bound,
+                decision.distance_lower_bound,
+                decision.exact_call_blocked,
+                decision.first_failed_check,
+                decision.min_time_window_slack,
+                decision.negative_cache_hit,
+                decision.single_segment_reachable,
+                decision.structural_energy_lower_bound,
+                compact_checks,
+            )
         )
         payload["record_type"] = "screening_decision"
         payload["event_type"] = "screening_decision"
@@ -3304,15 +3359,21 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         for raw_event in events:
             payload = _route_reference_event(raw_event, route_dictionary)
             payload["record_type"] = "neighborhood_event"
-            self._queue_owned(payload)
+            self._spool_neighborhood_event(payload)
 
     def append_neighborhood_event(self, event: Mapping[str, object]) -> None:
         payload = _route_reference_event(event, {})
         payload["record_type"] = "neighborhood_event"
-        self._queue_owned(payload)
+        self._spool_neighborhood_event(payload)
 
     def finish(self) -> None:
         self._flush_pending_lookup()
+        started_ns = time.perf_counter_ns()
+        try:
+            self._flush_event_buffer()
+        finally:
+            self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
+        self._drain_neighborhood_spool()
         started_ns = time.perf_counter_ns()
         try:
             self._flush_event_buffer()
@@ -3323,6 +3384,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         if self._closed:
             return
         self.finish()
+        self._close_neighborhood_spool()
         self._closed = True
 
     def discard_pending(self) -> None:
@@ -3330,7 +3392,66 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
 
         self._pending_cache_lookup = None
         self._event_buffer.clear()
+        self._close_neighborhood_spool()
         self._closed = True
+
+    def _spool_neighborhood_event(self, event: Mapping[str, object]) -> None:
+        if self._closed:
+            raise RuntimeError("cannot append to a closed Stage 5.2 trace stream")
+        started_ns = time.perf_counter_ns()
+        try:
+            if self._neighborhood_spool is None:
+                scratch_directory = self._shard.scratch_directory
+                scratch_directory.mkdir(parents=True, exist_ok=True)
+                descriptor, raw_path = tempfile.mkstemp(
+                    prefix="evrptw-neighborhood-",
+                    suffix=".jsonl",
+                    dir=scratch_directory,
+                )
+                self._neighborhood_spool_path = Path(raw_path)
+                self._neighborhood_spool = os.fdopen(descriptor, "w+b")
+            self._neighborhood_spool.write(orjson.dumps(dict(event)) + b"\n")
+        finally:
+            self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
+
+    def _drain_neighborhood_spool(self) -> None:
+        spool = self._neighborhood_spool
+        if spool is None:
+            return
+        started_ns = time.perf_counter_ns()
+        spool.flush()
+        spool.seek(self._neighborhood_read_offset)
+        self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
+        while True:
+            started_ns = time.perf_counter_ns()
+            line = spool.readline()
+            if not line:
+                self._neighborhood_read_offset = spool.tell()
+                spool.seek(0, os.SEEK_END)
+                self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
+                return
+            payload = orjson.loads(line)
+            if not isinstance(payload, dict):
+                raise RuntimeError("neighborhood scratch record is not a JSON object")
+            self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
+            self._queue_owned(payload)
+
+    def _close_neighborhood_spool(self) -> None:
+        errors: list[BaseException] = []
+        if self._neighborhood_spool is not None:
+            try:
+                self._neighborhood_spool.close()
+            except BaseException as error:
+                errors.append(error)
+            self._neighborhood_spool = None
+        if self._neighborhood_spool_path is not None:
+            try:
+                self._neighborhood_spool_path.unlink(missing_ok=True)
+            except BaseException as error:
+                errors.append(error)
+            self._neighborhood_spool_path = None
+        if errors:
+            raise BaseExceptionGroup("failed to clean neighborhood scratch stream", errors)
 
     def semantic_digest(self, base_payload: Mapping[str, object]) -> str:
         self.finish()
@@ -3771,15 +3892,11 @@ def _run_and_persist_v2_shard(
         finalize_completed_ns = time.perf_counter_ns()
         finalization_seconds = (finalize_completed_ns - finalize_started_ns) / 1_000_000_000
     except BaseException as error:
-        if active_trace_stream is not None:
-            active_trace_stream.discard_pending()
-        try:
-            shard.abort(error)
-        except BaseException as abort_error:
-            raise BaseExceptionGroup(
-                "Stage 5.2 shard failed and abort cleanup also failed",
-                [error, abort_error],
-            ) from error
+        _abort_v2_shard_after_failure(
+            shard,
+            active_trace_stream=active_trace_stream,
+            original_error=error,
+        )
         raise
 
     total_events = sum(event_counts.values())
@@ -3861,6 +3978,10 @@ def _solve_stage052_axis(
         native_kernel_config=(
             config.native_kernels if instance.distance_backend == "native" else None
         ),
+        # Neighborhood events do not carry timestamps.  Stream them to the
+        # measured-volume scratch spool and merge them after the timestamped
+        # trace families so v3 preserves the accepted v1 canonical order
+        # without retaining an unbounded in-process list.
         neighborhood_event_sink=(
             trace_sink.append_neighborhood_event
             if isinstance(trace_sink, _Stage052TraceStreamSink)

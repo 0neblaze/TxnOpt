@@ -63,6 +63,19 @@ class ExactBatchDeadlineExceeded(RuntimeError):
         self.completed_indices = completed_indices
         super().__init__("CPU exact-charging batch deadline exceeded")
 
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        """Preserve structured deadline evidence across spawned workers."""
+
+        return (
+            _restore_exact_batch_deadline_exceeded,
+            (
+                self.started_exact_calls,
+                self.completed_exact_calls,
+                self.metrics,
+                self.completed_indices,
+            ),
+        )
+
 
 @dataclass(slots=True)
 class BackendMetrics:
@@ -152,6 +165,20 @@ class BackendMetrics:
             "native_fallbacks": self.native_fallbacks,
             "launch_occupancies": list(self.launch_occupancies),
         }
+
+
+def _restore_exact_batch_deadline_exceeded(
+    started_exact_calls: int,
+    completed_exact_calls: int,
+    metrics: BackendMetrics,
+    completed_indices: tuple[int, ...],
+) -> ExactBatchDeadlineExceeded:
+    return ExactBatchDeadlineExceeded(
+        started_exact_calls=started_exact_calls,
+        completed_exact_calls=completed_exact_calls,
+        metrics=metrics,
+        completed_indices=completed_indices,
+    )
 
 
 @dataclass(frozen=True, slots=True)

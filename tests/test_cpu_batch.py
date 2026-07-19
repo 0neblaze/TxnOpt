@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import pickle
 import random
 from dataclasses import replace
 
@@ -51,6 +52,31 @@ def _signature(result: object) -> tuple[object, ...]:
         charging.labels_pruned,
         charging.failure_reason,
     )
+
+
+def test_exact_batch_deadline_exception_round_trips_across_process_boundary() -> None:
+    metrics = BackendMetrics(
+        "cpu_batch",
+        8,
+        started_calls=3,
+        completed_calls=2,
+        interrupted_calls=1,
+    )
+    original = ExactBatchDeadlineExceeded(
+        started_exact_calls=3,
+        completed_exact_calls=2,
+        metrics=metrics,
+        completed_indices=(0, 2),
+    )
+
+    restored = pickle.loads(pickle.dumps(original))
+
+    assert isinstance(restored, ExactBatchDeadlineExceeded)
+    assert restored.started_exact_calls == 3
+    assert restored.completed_exact_calls == 2
+    assert restored.interrupted_exact_calls == 1
+    assert restored.metrics.to_dict() == metrics.to_dict()
+    assert restored.completed_indices == (0, 2)
 
 
 def test_cpu_batch_matches_scalar_and_exposes_only_cpu_backends() -> None:
