@@ -1567,6 +1567,19 @@ class _StreamingParquetSink:
         if self._buffered_row_count >= V2_PARQUET_ROW_GROUP_SIZE:
             self.flush()
 
+    def append_values(self, values: Sequence[object]) -> None:
+        """Append one schema-ordered row without constructing a row mapping."""
+
+        if len(values) != len(self._columns):
+            raise ArtifactIntegrityError(
+                f"typed row width does not match sink schema for {self.path}"
+            )
+        for column, value in zip(self._columns, values, strict=True):
+            column.append(value)
+        self._buffered_row_count += 1
+        if self._buffered_row_count >= V2_PARQUET_ROW_GROUP_SIZE:
+            self.flush()
+
     def append_batch(self, batch: pa.RecordBatch) -> None:
         """Append one schema-identical Arrow batch without row materialization."""
 
@@ -3840,7 +3853,7 @@ class ArtifactV2ShardSession:
 
         count = 0
         pending_screening_definitions: list[dict[str, object]] = []
-        pending_screening_occurrences: list[dict[str, object]] = []
+        pending_screening_occurrences: list[tuple[object, ...]] = []
 
         def flush_screening_transaction() -> None:
             if self._screening_definitions_sink is None:
@@ -3854,7 +3867,7 @@ class ArtifactV2ShardSession:
             for definition in definitions:
                 self._append_buffered(self._screening_definitions_sink, definition)
             for occurrence in occurrences:
-                self._append_buffered(self._screening_occurrences_sink, occurrence)
+                self._append_buffered_values(self._screening_occurrences_sink, occurrence)
 
         for event in _iter_coalesced_cache_lookup_events(critical_events):
             screening_event = event.get("event_type") == "screening_decision"
@@ -3909,12 +3922,16 @@ class ArtifactV2ShardSession:
                 if screening_sink is None:
                     raise RuntimeError("screening occurrence sink is unavailable")
                 if self._screening_definitions_sink is not None:
+                    if not isinstance(normalized_event, tuple):
+                        raise RuntimeError("v3 screening occurrence must be a typed row")
                     pending_screening_occurrences.append(normalized_event)
                     self._max_pending_screening_transaction_rows_observed = max(
                         self._max_pending_screening_transaction_rows_observed,
                         len(pending_screening_occurrences),
                     )
                 else:
+                    if not isinstance(normalized_event, Mapping):
+                        raise RuntimeError("v2 screening occurrence must be a row mapping")
                     self._append_buffered(screening_sink, normalized_event)
                 if screening_definition is not None:
                     pending_screening_definitions.append(screening_definition)
@@ -3924,6 +3941,8 @@ class ArtifactV2ShardSession:
                 ):
                     flush_screening_transaction()
             else:
+                if not isinstance(normalized_event, Mapping):
+                    raise RuntimeError("critical event must be a row mapping")
                 self._append_buffered(self._event_sink, normalized_event)
             checks = event.get("checks")
             if not screening_event and isinstance(checks, (list, tuple)):
@@ -4287,6 +4306,25 @@ class ArtifactV2ShardSession:
             len(self._active_sinks),
         )
 
+    def _append_buffered_values(
+        self,
+        sink: _StreamingParquetSink,
+        values: Sequence[object],
+    ) -> None:
+        if sink not in self._active_sinks and len(self._active_sinks) >= 2:
+            victim = self._active_sinks.pop(0)
+            victim.flush()
+        sink.append_values(values)
+        if sink.buffered_row_count:
+            if sink not in self._active_sinks:
+                self._active_sinks.append(sink)
+        elif sink in self._active_sinks:
+            self._active_sinks.remove(sink)
+        self._max_buffered_groups_observed = max(
+            self._max_buffered_groups_observed,
+            len(self._active_sinks),
+        )
+
     def _flush_sink(self, sink: _StreamingParquetSink) -> None:
         sink.flush()
         if sink in self._active_sinks:
@@ -4300,7 +4338,7 @@ class ArtifactV2ShardSession:
         route_id: int | None,
         lane_id: int,
         operator_id: int,
-    ) -> tuple[dict[str, object], dict[str, object] | None]:
+    ) -> tuple[tuple[object, ...] | dict[str, object], dict[str, object] | None]:
         definition_key = _screening_definition_cache_key(
             event,
             lane_id=lane_id,
@@ -4356,6 +4394,18 @@ class ArtifactV2ShardSession:
             else None
         )
         started_at = event.get("started_at")
+        if self._screening_sink is None:
+            return (
+                (
+                    event_id,
+                    definition_id,
+                    started_at,
+                    event.get("completed_at"),
+                    event.get("iteration"),
+                    event.get("decision_id"),
+                ),
+                definition_row,
+            )
         return (
             {
                 "event_id": event_id,

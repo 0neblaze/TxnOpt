@@ -1099,6 +1099,40 @@ def test_v3_row_groups_and_simultaneous_buffers_stay_bounded(tmp_path: Path) -> 
     ] == [65_536, 1]
 
 
+def test_v3_occurrences_append_schema_ordered_values_without_row_mappings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_append = artifacts_module._StreamingParquetSink.append  # noqa: SLF001
+
+    def reject_occurrence_mapping(
+        sink: artifacts_module._StreamingParquetSink,  # noqa: SLF001
+        row: dict[str, object],
+    ) -> None:
+        if sink.schema.equals(V3_SCREENING_OCCURRENCES_SCHEMA):
+            raise AssertionError("v3 occurrence hotspot constructed a row mapping")
+        original_append(sink, row)
+
+    monkeypatch.setattr(
+        artifacts_module._StreamingParquetSink,  # noqa: SLF001
+        "append",
+        reject_occurrence_mapping,
+    )
+    writer = _v3_writer(tmp_path, attempt=92)
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+
+    assert shard.append(
+        route_dictionary={"route:2:C1": ("C1",)},
+        critical_events=(_screening_event(decision_id=9, started_at=1.25),),
+    ) == 1
+    shard.abort("typed occurrence test complete")
+
+
 def test_v3_write_instance_seed_uses_the_same_physical_schema(tmp_path: Path) -> None:
     writer = _v3_writer(tmp_path, attempt=92)
     paths = writer.write_instance_seed(
