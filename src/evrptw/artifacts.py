@@ -21,8 +21,9 @@ import tempfile
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, overload
 
 import orjson
 import pyarrow as pa
@@ -38,7 +39,10 @@ SUPPORTED_SCREENING_SCHEMAS = frozenset(
     {SCREENING_DECISIONS_V1, SCREENING_DECISIONS_V2, SCREENING_DECISIONS_V3}
 )
 V2_PARQUET_ROW_GROUP_SIZE = 65_536
-ROUTE_IDENTITY_HOT_CACHE_ENTRIES = 1_024
+ROUTE_IDENTITY_HOT_CACHE_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
+ROUTE_IDENTITY_MEMORY_ENTRIES = 262_144
+ROUTE_ID_RESOLUTION_CACHE_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
+SCREENING_DEFINITION_HOT_CACHE_ENTRIES = 524_288
 ROUTE_IDENTITY_COUNTER_NAMESPACES = 16
 MAX_SCREENING_CHECKS_PER_DECISION = 8
 LIVE_SCREENING_TRANSACTION_ROWS = 1_024
@@ -781,33 +785,391 @@ _EVENT_KNOWN_FIELDS = frozenset(
     }
 )
 
+_NEIGHBORHOOD_EXTRA_FIELDS = (
+    "aggregate_count",
+    "benchmark_axis",
+    "candidate_objective_key",
+    "candidate_pool_hash",
+    "chain_depth",
+    "constraint_category",
+    "distance_improvement",
+    "exact_route_evaluations",
+    "new_routes_created",
+    "prefilter_passed",
+    "ranking_score",
+    "removal_size_actual",
+    "removal_size_requested",
+    "removal_tier",
+    "removal_trigger",
+    "reset_observed",
+    "segment_length",
+    "selection_rank",
+    "stagnation_iterations",
+    "track",
+    "vehicle_reduction",
+)
+_NEIGHBORHOOD_EXCLUDED_COLLECTION_FIELDS = frozenset(
+    {
+        "affected_route_indices",
+        "candidate_customer_sequence",
+        "candidate_route_sequences",
+        "removed_customers",
+        "route_indices",
+    }
+)
+_MISSING_NEIGHBORHOOD_EXTRA = object()
+_NEIGHBORHOOD_EXTRAS_CACHE_ENTRIES = 65_536
+_NEIGHBORHOOD_TEMPLATE_FIELDS = (
+    "record_type",
+    "timestamp_seconds",
+    "started_at",
+    "completed_at",
+    "duration_seconds",
+    "lane",
+    "operator",
+    "status",
+    "kind",
+    "operation",
+    "reason",
+    "failure_reason",
+    "feasible",
+    "exact_started",
+    "exact_completed",
+    "candidate_feasible",
+    "accepted",
+    "global_best",
+    "current_vehicle_count",
+    "candidate_vehicle_count",
+    "candidate_vehicle_delta",
+    "cache_key_digest",
+    "evaluation_id",
+    "decision_id",
+    "route_change_status",
+    "propagation_status",
+)
+_NEIGHBORHOOD_TEMPLATE_CACHE_ENTRIES = 65_536
+_NEIGHBORHOOD_CORE_FIELDS = frozenset(
+    {
+        "event_id",
+        "record_type",
+        "event_type",
+        "timestamp_seconds",
+        "started_at",
+        "completed_at",
+        "duration_seconds",
+        "lane",
+        "iteration",
+        "operator",
+        "status",
+        "kind",
+        "operation",
+        "reason",
+        "failure_reason",
+        "feasible",
+        "exact_started",
+        "exact_completed",
+        "candidate_feasible",
+        "accepted",
+        "global_best",
+        "current_vehicle_count",
+        "candidate_vehicle_count",
+        "candidate_vehicle_delta",
+        "cache_key_digest",
+        "evaluation_id",
+        "decision_id",
+        "route_change_status",
+        "propagation_status",
+    }
+)
+_NEIGHBORHOOD_FAST_FIELDS = (
+    _NEIGHBORHOOD_CORE_FIELDS
+    | frozenset(_NEIGHBORHOOD_EXTRA_FIELDS)
+    | _NEIGHBORHOOD_EXCLUDED_COLLECTION_FIELDS
+)
+_SPARSE_EVENT_COMMON_FIELDS = frozenset(
+    {
+        "benchmark_axis",
+        "cache_key_digest",
+        "completed_at",
+        "duration_seconds",
+        "event_type",
+        "iteration",
+        "lane",
+        "operator",
+        "record_type",
+        "route_key",
+        "started_at",
+        "status",
+        "timestamp_seconds",
+    }
+)
+_CACHE_EVENT_EXTRA_FIELDS = (
+    "benchmark_axis",
+    "current_bytes",
+    "current_entries",
+    "entry_bytes",
+    "lookup_current_bytes",
+    "lookup_current_entries",
+    "lookup_result",
+)
+_CACHE_EVENT_FAST_FIELDS = _SPARSE_EVENT_COMMON_FIELDS | frozenset(
+    {
+        "operation",
+        *_CACHE_EVENT_EXTRA_FIELDS,
+    }
+)
+_ROUTE_EVALUATION_EXTRA_FIELDS = (
+    "benchmark_axis",
+    "deadline_boundary",
+    "labels_expanded",
+    "labels_generated",
+    "labels_pruned",
+)
+_ROUTE_EVALUATION_FAST_FIELDS = _SPARSE_EVENT_COMMON_FIELDS | frozenset(
+    {
+        "evaluation_id",
+        "exact_completed",
+        "exact_started",
+        "failure_reason",
+        "feasible",
+        "kind",
+        "route_change_status",
+        *_ROUTE_EVALUATION_EXTRA_FIELDS,
+    }
+)
 
-def _normalise_event(
+
+def _normalise_neighborhood_event_values(
+    event: Mapping[str, object],
+    *,
+    event_id: int,
+    lane_ids: Mapping[str, int],
+    operator_ids: Mapping[str, int],
+    extras_cache: dict[tuple[object, ...], str] | None = None,
+    row_cache: dict[tuple[object, ...], tuple[object, ...]] | None = None,
+) -> tuple[object, ...]:
+    get = event.get
+    extra_values = tuple(
+        get(key, _MISSING_NEIGHBORHOOD_EXTRA) for key in _NEIGHBORHOOD_EXTRA_FIELDS
+    )
+    row_cache_key = (
+        tuple(get(key, _MISSING_NEIGHBORHOOD_EXTRA) for key in _NEIGHBORHOOD_TEMPLATE_FIELDS),
+        extra_values,
+    )
+    cached_row: tuple[object, ...] | None = None
+    if row_cache is not None:
+        with contextlib.suppress(TypeError):
+            cached_row = row_cache.get(row_cache_key)
+    if cached_row is not None:
+        return (
+            event_id,
+            *cached_row[1:8],
+            _as_int(get("iteration")),
+            *cached_row[9:],
+        )
+    status = str(get("status", ""))
+    extras_json: str | None = None
+    if extras_cache is not None:
+        try:
+            extras_json = extras_cache.get(extra_values)
+        except TypeError:
+            extras_json = None
+    if extras_json is None:
+        extras = {
+            key: value
+            for key, value in zip(_NEIGHBORHOOD_EXTRA_FIELDS, extra_values, strict=True)
+            if value is not _MISSING_NEIGHBORHOOD_EXTRA
+        }
+        extras_json = _json_text(extras) if extras else ""
+        if extras_cache is not None:
+            with contextlib.suppress(TypeError):
+                extras_cache[extra_values] = extras_json
+            if len(extras_cache) > _NEIGHBORHOOD_EXTRAS_CACHE_ENTRIES:
+                extras_cache.pop(next(iter(extras_cache)))
+    row: tuple[object, ...] = (
+        event_id,
+        str(get("record_type", "neighborhood_event")),
+        "neighborhood_event",
+        _event_timestamp(event),
+        _as_float(get("started_at")),
+        _as_float(get("completed_at")),
+        _as_float(get("duration_seconds")),
+        lane_ids[str(get("lane", ""))],
+        _as_int(get("iteration")),
+        operator_ids[str(get("operator", ""))],
+        None,
+        [],
+        [],
+        [],
+        None,
+        None,
+        status,
+        str(get("kind", "")),
+        str(get("operation", "")),
+        str(get("reason", "")),
+        str(get("failure_reason", "")),
+        _as_bool(get("feasible")),
+        _as_bool(get("exact_started")),
+        _as_bool(get("exact_completed")),
+        _as_bool(get("candidate_feasible")),
+        _as_bool(get("accepted")),
+        _as_bool(get("global_best")),
+        _as_int(get("current_vehicle_count")),
+        _as_int(get("candidate_vehicle_count")),
+        _as_int(get("candidate_vehicle_delta")),
+        str(get("cache_key_digest", "")),
+        _as_int(get("evaluation_id")),
+        _as_int(get("decision_id")),
+        str(get("route_change_status", "")),
+        str(get("propagation_status", status)),
+        extras_json,
+    )
+    if row_cache is not None:
+        with contextlib.suppress(TypeError):
+            row_cache[row_cache_key] = row
+        if len(row_cache) > _NEIGHBORHOOD_TEMPLATE_CACHE_ENTRIES:
+            row_cache.pop(next(iter(row_cache)))
+    return row
+
+
+def _normalise_sparse_route_event_values(
     event: Mapping[str, object],
     *,
     event_id: int,
     route_ids: Mapping[str, int],
     lane_ids: Mapping[str, int],
     operator_ids: Mapping[str, int],
-) -> dict[str, object]:
-    if event.get("event_type") == "screening_decision":
-        return _normalise_screening_event(
+    extra_fields: Sequence[str],
+) -> tuple[object, ...]:
+    get = event.get
+    event_type = str(get("event_type", ""))
+    status = str(get("status", ""))
+    extras = {key: get(key) for key in extra_fields if key in event}
+    return (
+        event_id,
+        str(get("record_type", event_type)),
+        event_type,
+        _event_timestamp(event),
+        _as_float(get("started_at")),
+        _as_float(get("completed_at")),
+        _as_float(get("duration_seconds")),
+        lane_ids[str(get("lane", ""))],
+        _as_int(get("iteration")),
+        operator_ids[str(get("operator", ""))],
+        _route_id(get("route_key"), route_ids),
+        [],
+        [],
+        [],
+        None,
+        None,
+        status,
+        str(get("kind", "")),
+        str(get("operation", "")),
+        str(get("reason", "")),
+        str(get("failure_reason", "")),
+        _as_bool(get("feasible")),
+        _as_bool(get("exact_started")),
+        _as_bool(get("exact_completed")),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        str(get("cache_key_digest", "")),
+        _as_int(get("evaluation_id")),
+        None,
+        str(get("route_change_status", "")),
+        str(get("propagation_status", status)),
+        _json_text(extras) if extras else "",
+    )
+
+
+def _normalise_event_values(
+    event: Mapping[str, object],
+    *,
+    event_id: int,
+    route_ids: Mapping[str, int],
+    lane_ids: Mapping[str, int],
+    operator_ids: Mapping[str, int],
+    neighborhood_extras_cache: dict[tuple[object, ...], str] | None = None,
+    neighborhood_row_cache: dict[
+        tuple[object, ...], tuple[object, ...]
+    ] | None = None,
+) -> tuple[object, ...]:
+    if (
+        event.get("event_type", event.get("record_type")) == "neighborhood_event"
+        and event.keys() <= _NEIGHBORHOOD_FAST_FIELDS
+    ):
+        return _normalise_neighborhood_event_values(
+            event,
+            event_id=event_id,
+            lane_ids=lane_ids,
+            operator_ids=operator_ids,
+            extras_cache=neighborhood_extras_cache,
+            row_cache=neighborhood_row_cache,
+        )
+    if (
+        event.get("event_type") == "cache_event"
+        and event.keys() <= _CACHE_EVENT_FAST_FIELDS
+    ):
+        return _normalise_sparse_route_event_values(
+            event,
+            event_id=event_id,
+            route_ids=route_ids,
+            lane_ids=lane_ids,
+            operator_ids=operator_ids,
+            extra_fields=_CACHE_EVENT_EXTRA_FIELDS,
+        )
+    if (
+        event.get("event_type") == "route_evaluation"
+        and event.keys() <= _ROUTE_EVALUATION_FAST_FIELDS
+    ):
+        return _normalise_sparse_route_event_values(
+            event,
+            event_id=event_id,
+            route_ids=route_ids,
+            lane_ids=lane_ids,
+            operator_ids=operator_ids,
+            extra_fields=_ROUTE_EVALUATION_EXTRA_FIELDS,
+        )
+    return _normalise_general_event_values(
+        event,
+        event_id=event_id,
+        route_ids=route_ids,
+        lane_ids=lane_ids,
+        operator_ids=operator_ids,
+    )
+
+
+def _normalise_general_event_values(
+    event: Mapping[str, object],
+    *,
+    event_id: int,
+    route_ids: Mapping[str, int],
+    lane_ids: Mapping[str, int],
+    operator_ids: Mapping[str, int],
+) -> tuple[object, ...]:
+    get = event.get
+    if get("event_type") == "screening_decision":
+        row = _normalise_screening_event(
             event,
             event_id=event_id,
             route_ids=route_ids,
             lane_ids=lane_ids,
             operator_ids=operator_ids,
         )
-    route_id = _route_id(event.get("route_key", event.get("route_id")), route_ids)
-    base_route_id = _route_id(event.get("base_route_key", event.get("base_route_id")), route_ids)
+        return tuple(row.get(name) for name in EVENTS_SCHEMA.names)
+    route_id = _route_id(get("route_key", get("route_id")), route_ids)
+    base_route_id = _route_id(get("base_route_key", get("base_route_id")), route_ids)
     candidate_route_id = _route_id(
-        event.get("candidate_route_key", event.get("candidate_route_id")), route_ids
+        get("candidate_route_key", get("candidate_route_id")), route_ids
     )
     current_route_ids = _route_ids(
-        event.get("current_route_keys", event.get("current_route_ids")), route_ids
+        get("current_route_keys", get("current_route_ids")), route_ids
     )
     candidate_route_ids = _route_ids(
-        event.get("candidate_route_keys", event.get("candidate_route_ids")), route_ids
+        get("candidate_route_keys", get("candidate_route_ids")), route_ids
     )
     extras = {
         str(key): value
@@ -829,46 +1191,65 @@ def _normalise_event(
             }
         )
     }
-    if event.get("record_class"):
+    if get("record_class"):
         extras["record_class"] = event["record_class"]
-    return {
-        "event_id": event_id,
-        "record_type": str(event.get("record_type", _event_type(event))),
-        "event_type": _event_type(event),
-        "timestamp_seconds": _event_timestamp(event),
-        "started_at": _as_float(event.get("started_at")),
-        "completed_at": _as_float(event.get("completed_at")),
-        "duration_seconds": _as_float(event.get("duration_seconds")),
-        "lane_id": lane_ids[str(event.get("lane", ""))],
-        "iteration": _as_int(event.get("iteration")),
-        "operator_id": operator_ids[str(event.get("operator", ""))],
-        "route_id": route_id,
-        "route_ids": _route_ids(event.get("route_keys", event.get("route_ids")), route_ids),
-        "current_route_ids": current_route_ids,
-        "candidate_route_ids": candidate_route_ids,
-        "base_route_id": base_route_id,
-        "candidate_route_id": candidate_route_id,
-        "status": str(event.get("status", "")),
-        "kind": str(event.get("kind", "")),
-        "operation": str(event.get("operation", "")),
-        "reason": str(event.get("reason", "")),
-        "failure_reason": str(event.get("failure_reason", "")),
-        "feasible": _as_bool(event.get("feasible")),
-        "exact_started": _as_bool(event.get("exact_started")),
-        "exact_completed": _as_bool(event.get("exact_completed")),
-        "candidate_feasible": _as_bool(event.get("candidate_feasible")),
-        "accepted": _as_bool(event.get("accepted")),
-        "global_best": _as_bool(event.get("global_best")),
-        "current_vehicle_count": _as_int(event.get("current_vehicle_count")),
-        "candidate_vehicle_count": _as_int(event.get("candidate_vehicle_count")),
-        "candidate_vehicle_delta": _as_int(event.get("candidate_vehicle_delta")),
-        "cache_key_digest": str(event.get("cache_key_digest", "")),
-        "evaluation_id": _as_int(event.get("evaluation_id")),
-        "decision_id": _as_int(event.get("decision_id")),
-        "route_change_status": str(event.get("route_change_status", "")),
-        "propagation_status": str(event.get("propagation_status", event.get("status", ""))),
-        "extras_json": _json_text(extras) if extras else "",
-    }
+    event_type = _event_type(event)
+    return (
+        event_id,
+        str(get("record_type", event_type)),
+        event_type,
+        _event_timestamp(event),
+        _as_float(get("started_at")),
+        _as_float(get("completed_at")),
+        _as_float(get("duration_seconds")),
+        lane_ids[str(get("lane", ""))],
+        _as_int(get("iteration")),
+        operator_ids[str(get("operator", ""))],
+        route_id,
+        _route_ids(get("route_keys", get("route_ids")), route_ids),
+        current_route_ids,
+        candidate_route_ids,
+        base_route_id,
+        candidate_route_id,
+        str(get("status", "")),
+        str(get("kind", "")),
+        str(get("operation", "")),
+        str(get("reason", "")),
+        str(get("failure_reason", "")),
+        _as_bool(get("feasible")),
+        _as_bool(get("exact_started")),
+        _as_bool(get("exact_completed")),
+        _as_bool(get("candidate_feasible")),
+        _as_bool(get("accepted")),
+        _as_bool(get("global_best")),
+        _as_int(get("current_vehicle_count")),
+        _as_int(get("candidate_vehicle_count")),
+        _as_int(get("candidate_vehicle_delta")),
+        str(get("cache_key_digest", "")),
+        _as_int(get("evaluation_id")),
+        _as_int(get("decision_id")),
+        str(get("route_change_status", "")),
+        str(get("propagation_status", get("status", ""))),
+        _json_text(extras) if extras else "",
+    )
+
+
+def _normalise_event(
+    event: Mapping[str, object],
+    *,
+    event_id: int,
+    route_ids: Mapping[str, int],
+    lane_ids: Mapping[str, int],
+    operator_ids: Mapping[str, int],
+) -> dict[str, object]:
+    values = _normalise_event_values(
+        event,
+        event_id=event_id,
+        route_ids=route_ids,
+        lane_ids=lane_ids,
+        operator_ids=operator_ids,
+    )
+    return dict(zip(EVENTS_SCHEMA.names, values, strict=True))
 
 
 _SCREENING_EVENT_TEMPLATE: dict[str, object] = {
@@ -998,6 +1379,30 @@ class _PrecomputedScreeningDefinition:
     """Trusted typed cache-key tail produced by the live measurement bridge."""
 
     tail: tuple[object, ...]
+    cache_hash: int = dataclass_field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cache_hash", hash(self.tail))
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingScreeningDefinition:
+    definition_id: int
+    encoded: bytes
+    payload: dict[str, object]
+    row: tuple[object, ...]
+
+
+type _BufferedScreeningDecision = tuple[
+    int,
+    str,
+    str,
+    int | None,
+    str,
+    float,
+    float,
+    _PrecomputedScreeningDefinition,
+]
 
 
 def _screening_definition_cache_key(
@@ -1128,25 +1533,21 @@ def _screening_definition_identity(definition: Mapping[str, object]) -> tuple[in
 
 
 class _BoundedScreeningDefinitionStore:
-    """Disk-backed definitions with a bounded in-process LRU hot set."""
+    """Exact bounded definition identity store with fail-fast disk spill."""
 
     def __init__(self, *, cache_entries: int, scratch_root: Path | None = None) -> None:
         if cache_entries <= 0:
             raise ValueError("definition cache_entries must be positive")
         if scratch_root is not None:
             scratch_root.mkdir(parents=True, exist_ok=True)
+        self._scratch_root = scratch_root
         self._temporary_directory = tempfile.TemporaryDirectory(
             prefix="evrptw-screening-definitions-",
             dir=scratch_root,
         )
-        database_path = Path(self._temporary_directory.name) / "definitions.sqlite3"
-        self._connection = sqlite3.connect(database_path)
-        self._connection.execute("PRAGMA journal_mode=OFF")
-        self._connection.execute("PRAGMA synchronous=OFF")
-        self._connection.execute("PRAGMA cache_size=-2048")
-        self._connection.execute(
-            "CREATE TABLE definitions (definition_id INTEGER PRIMARY KEY, payload BLOB NOT NULL)"
-        )
+        self._connection: sqlite3.Connection | None = None
+        self._encoded_memory: dict[int, bytes] = {}
+        self._encoded_memory_entries = SCREENING_DEFINITION_HOT_CACHE_ENTRIES
         self._cache_entries = cache_entries
         self._cache: OrderedDict[int, dict[str, object]] = OrderedDict()
         self._closed = False
@@ -1168,43 +1569,149 @@ class _BoundedScreeningDefinitionStore:
         definition: Mapping[str, object],
         *,
         allow_identical_existing: bool,
+        encoded: bytes | None = None,
     ) -> bool:
-        expected_id, encoded, _ = _screening_definition_identity(definition)
+        if encoded is None:
+            expected_id, encoded, _ = _screening_definition_identity(definition)
+        else:
+            digest = hashlib.sha256(encoded).digest()
+            expected_id = int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
         if expected_id != definition_id:
             raise ArtifactIntegrityError("screening definition hash mismatch")
-        existing = self._connection.execute(
-            "SELECT payload FROM definitions WHERE definition_id = ?",
-            (definition_id,),
-        ).fetchone()
-        if existing is not None:
+        if self._connection is None:
+            existing_payload = self._encoded_memory.get(definition_id)
+            if existing_payload is not None:
+                if existing_payload != encoded:
+                    raise ArtifactIntegrityError("screening definition ID collision")
+                if not allow_identical_existing:
+                    raise ArtifactIntegrityError("duplicate screening definition ID")
+                self._remember(definition_id, dict(definition))
+                return False
+            if len(self._encoded_memory) < self._encoded_memory_entries:
+                self._encoded_memory[definition_id] = encoded
+                self._remember(definition_id, dict(definition))
+                return True
+            self._spill_encoded_memory()
+        connection = self._require_connection()
+        inserted = (
+            connection.execute(
+                "INSERT OR IGNORE INTO definitions(definition_id, payload) VALUES (?, ?)",
+                (definition_id, encoded),
+            ).rowcount
+            == 1
+        )
+        if not inserted:
+            existing = connection.execute(
+                "SELECT payload FROM definitions WHERE definition_id = ?",
+                (definition_id,),
+            ).fetchone()
+            if existing is None:
+                raise ArtifactIntegrityError("screening definition insert was not observable")
             existing_payload = bytes(existing[0])
             if existing_payload != encoded:
                 raise ArtifactIntegrityError("screening definition ID collision")
             if not allow_identical_existing:
                 raise ArtifactIntegrityError("duplicate screening definition ID")
-            inserted = False
-        else:
-            self._connection.execute(
-                "INSERT INTO definitions(definition_id, payload) VALUES (?, ?)",
-                (definition_id, encoded),
-            )
-            inserted = True
         self._remember(definition_id, dict(definition))
         return inserted
+
+    def register_many(
+        self,
+        definitions: Sequence[_PendingScreeningDefinition],
+    ) -> frozenset[int]:
+        """Register one bounded transaction with batched collision checks."""
+
+        unique: dict[int, _PendingScreeningDefinition] = {}
+        for definition in definitions:
+            previous = unique.get(definition.definition_id)
+            if previous is not None and previous.encoded != definition.encoded:
+                raise ArtifactIntegrityError("screening definition ID collision")
+            unique[definition.definition_id] = definition
+        if self._connection is None:
+            existing_memory = {
+                definition_id: self._encoded_memory[definition_id]
+                for definition_id in unique
+                if definition_id in self._encoded_memory
+            }
+            for definition_id, payload in existing_memory.items():
+                if payload != unique[definition_id].encoded:
+                    raise ArtifactIntegrityError("screening definition ID collision")
+            inserted_memory = tuple(
+                definition
+                for definition_id, definition in unique.items()
+                if definition_id not in existing_memory
+            )
+            if (
+                len(self._encoded_memory) + len(inserted_memory)
+                <= self._encoded_memory_entries
+            ):
+                self._encoded_memory.update(
+                    {
+                        definition.definition_id: definition.encoded
+                        for definition in inserted_memory
+                    }
+                )
+                return frozenset(
+                    definition.definition_id for definition in inserted_memory
+                )
+            self._spill_encoded_memory()
+        connection = self._require_connection()
+        existing: dict[int, bytes] = {}
+        identifiers = tuple(unique)
+        for offset in range(0, len(identifiers), 900):
+            chunk = identifiers[offset : offset + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            for definition_id, payload in connection.execute(
+                f"SELECT definition_id, payload FROM definitions "  # noqa: S608
+                f"WHERE definition_id IN ({placeholders})",
+                chunk,
+            ):
+                existing[int(definition_id)] = bytes(payload)
+        for definition_id, payload in existing.items():
+            if payload != unique[definition_id].encoded:
+                raise ArtifactIntegrityError("screening definition ID collision")
+        inserted = tuple(
+            definition
+            for definition_id, definition in unique.items()
+            if definition_id not in existing
+        )
+        try:
+            connection.executemany(
+                "INSERT INTO definitions(definition_id, payload) VALUES (?, ?)",
+                (
+                    (definition.definition_id, definition.encoded)
+                    for definition in inserted
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ArtifactIntegrityError("screening definition batch insert failed") from error
+        return frozenset(definition.definition_id for definition in inserted)
 
     def resolve(self, definition_id: int) -> dict[str, object]:
         cached = self._cache.get(definition_id)
         if cached is not None:
             self._cache.move_to_end(definition_id)
             return cached
-        stored = self._connection.execute(
+        encoded = self._encoded_memory.get(definition_id)
+        if encoded is not None:
+            stored_payload = encoded
+        else:
+            connection = self._connection
+            if connection is None:
+                raise ArtifactIntegrityError(
+                    "screening row references an unknown definition"
+                )
+            stored = connection.execute(
             "SELECT payload FROM definitions WHERE definition_id = ?",
             (definition_id,),
-        ).fetchone()
-        if stored is None:
-            raise ArtifactIntegrityError("screening row references an unknown definition")
+            ).fetchone()
+            if stored is None:
+                raise ArtifactIntegrityError(
+                    "screening row references an unknown definition"
+                )
+            stored_payload = bytes(stored[0])
         try:
-            decoded = orjson.loads(bytes(stored[0]))
+            decoded = orjson.loads(stored_payload)
         except orjson.JSONDecodeError as error:
             raise ArtifactIntegrityError("stored screening definition is invalid") from error
         if not isinstance(decoded, dict):
@@ -1216,8 +1723,10 @@ class _BoundedScreeningDefinitionStore:
     def close(self) -> None:
         if self._closed:
             return
-        self._connection.close()
+        if self._connection is not None:
+            self._connection.close()
         self._temporary_directory.cleanup()
+        self._encoded_memory.clear()
         self._cache.clear()
         self._closed = True
 
@@ -1226,6 +1735,34 @@ class _BoundedScreeningDefinitionStore:
         self._cache.move_to_end(definition_id)
         if len(self._cache) > self._cache_entries:
             self._cache.popitem(last=False)
+
+    def _spill_encoded_memory(self) -> None:
+        if self._connection is not None:
+            return
+        database_path = Path(self._temporary_directory.name) / "definitions.sqlite3"
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.execute("PRAGMA journal_mode=OFF")
+            connection.execute("PRAGMA synchronous=OFF")
+            connection.execute("PRAGMA cache_size=-2048")
+            connection.execute(
+                "CREATE TABLE definitions "
+                "(definition_id INTEGER PRIMARY KEY, payload BLOB NOT NULL)"
+            )
+            connection.executemany(
+                "INSERT INTO definitions(definition_id, payload) VALUES (?, ?)",
+                self._encoded_memory.items(),
+            )
+        except BaseException:
+            connection.close()
+            raise
+        self._connection = connection
+        self._encoded_memory.clear()
+
+    def _require_connection(self) -> sqlite3.Connection:
+        if self._connection is None:
+            raise RuntimeError("screening definition store has not spilled to disk")
+        return self._connection
 
 
 def _json_text(payload: Mapping[str, object]) -> str:
@@ -1580,13 +2117,23 @@ class _StreamingParquetSink:
         if self._buffered_row_count >= V2_PARQUET_ROW_GROUP_SIZE:
             self.flush()
 
-    def append_value_rows(self, rows: Sequence[Sequence[object]]) -> None:
+    def append_value_rows(
+        self,
+        rows: Sequence[Sequence[object]],
+        *,
+        trusted_width: bool = False,
+    ) -> None:
         """Append schema-ordered rows by extending typed columns per transaction."""
 
         if not rows:
             return
         width = len(self._columns)
-        if any(len(row) != width for row in rows):
+        invalid_width = (
+            len(rows[0]) != width
+            if trusted_width
+            else any(len(row) != width for row in rows)
+        )
+        if invalid_width:
             raise ArtifactIntegrityError(
                 f"typed row width does not match sink schema for {self.path}"
             )
@@ -1650,13 +2197,31 @@ class _StreamingParquetSink:
         return self.row_count, _schema_fingerprint(self.schema)
 
 
+@overload
 def _iter_coalesced_cache_lookup_events(
     events: Iterable[Mapping[str, object]],
-) -> Iterable[dict[str, object]]:
+) -> Iterable[dict[str, object]]: ...
+
+
+@overload
+def _iter_coalesced_cache_lookup_events(
+    events: Iterable[Mapping[str, object] | _BufferedScreeningDecision],
+) -> Iterable[dict[str, object] | _BufferedScreeningDecision]: ...
+
+
+def _iter_coalesced_cache_lookup_events(
+    events: Iterable[Mapping[str, object] | _BufferedScreeningDecision],
+) -> Iterable[dict[str, object] | _BufferedScreeningDecision]:
     """Streaming equivalent of :func:`_coalesce_cache_lookup_events`."""
 
     pending: Mapping[str, object] | None = None
     for raw_event in events:
+        if isinstance(raw_event, tuple):
+            if pending is not None:
+                yield dict(pending) if not isinstance(pending, dict) else pending
+                pending = None
+            yield raw_event
+            continue
         current = raw_event
         if pending is None:
             if current.get("event_type") == "cache_event" and current.get("operation") == "lookup":
@@ -3638,9 +4203,12 @@ class _DiskBackedRouteIdentityStore(Mapping[int, str]):
         *,
         scratch_root: Path,
         cache_entries: int = ROUTE_IDENTITY_HOT_CACHE_ENTRIES,
+        memory_entries: int = ROUTE_IDENTITY_MEMORY_ENTRIES,
     ) -> None:
         if cache_entries <= 0:
             raise ValueError("route identity cache_entries must be positive")
+        if memory_entries <= 0:
+            raise ValueError("route identity memory_entries must be positive")
         scratch_root.mkdir(parents=True, exist_ok=True)
         self._temporary_directory = tempfile.TemporaryDirectory(
             prefix="evrptw-route-identities-",
@@ -3661,6 +4229,9 @@ class _DiskBackedRouteIdentityStore(Mapping[int, str]):
             "payload BLOB NOT NULL, PRIMARY KEY(axis, semantics, identity_digest)) WITHOUT ROWID"
         )
         self._cache_entries = cache_entries
+        self._memory_entries = memory_entries
+        self._route_memory: dict[int, str] = {}
+        self._routes_spilled = False
         self._route_cache: OrderedDict[int, str] = OrderedDict()
         self._unique_counts: Counter[tuple[str, str]] = Counter()
         self._route_count = 0
@@ -3672,13 +4243,30 @@ class _DiskBackedRouteIdentityStore(Mapping[int, str]):
 
     @property
     def hot_entries(self) -> int:
-        return len(self._route_cache) + len(self._unique_counts)
+        return len(self._route_memory) + len(self._route_cache) + len(self._unique_counts)
 
     @property
     def hot_entry_limit(self) -> int:
-        return self._cache_entries + ROUTE_IDENTITY_COUNTER_NAMESPACES
+        return (
+            self._memory_entries
+            + self._cache_entries
+            + ROUTE_IDENTITY_COUNTER_NAMESPACES
+        )
 
     def register_route(self, route_id: int, route_digest: str) -> bool:
+        if not self._routes_spilled:
+            previous = self._route_memory.get(route_id)
+            if previous is not None:
+                if previous != route_digest:
+                    raise ArtifactIntegrityError(
+                        f"stable route ID collision for route ID {route_id}"
+                    )
+                return False
+            if len(self._route_memory) < self._memory_entries:
+                self._route_memory[route_id] = route_digest
+                self._route_count += 1
+                return True
+            self._spill_route_memory()
         try:
             previous = self[route_id]
         except KeyError:
@@ -3739,10 +4327,14 @@ class _DiskBackedRouteIdentityStore(Mapping[int, str]):
             return
         self._connection.close()
         self._temporary_directory.cleanup()
+        self._route_memory.clear()
         self._route_cache.clear()
         self._closed = True
 
     def __getitem__(self, route_id: int) -> str:
+        in_memory = self._route_memory.get(route_id)
+        if in_memory is not None:
+            return in_memory
         cached = self._route_cache.get(route_id)
         if cached is not None:
             self._route_cache.move_to_end(route_id)
@@ -3776,6 +4368,16 @@ class _DiskBackedRouteIdentityStore(Mapping[int, str]):
         self._route_cache.move_to_end(route_id)
         if len(self._route_cache) > self._cache_entries:
             self._route_cache.popitem(last=False)
+
+    def _spill_route_memory(self) -> None:
+        if self._routes_spilled:
+            return
+        self._connection.executemany(
+            "INSERT INTO routes(route_id, digest) VALUES (?, ?)",
+            self._route_memory.items(),
+        )
+        self._route_memory.clear()
+        self._routes_spilled = True
 
 
 class ArtifactV2ShardSession:
@@ -3847,92 +4449,174 @@ class ArtifactV2ShardSession:
         )
         self._route_digests = _DiskBackedRouteIdentityStore(scratch_root=self._directory)
         self._route_ids = _RegisteredStableRouteIds(self._route_digests)
+        self._resolved_route_ids: OrderedDict[str, int] = OrderedDict()
         self._lane_ids: dict[str, int] = {}
         self._operator_ids: dict[str, int] = {}
-        self._screening_definition_cache: OrderedDict[
-            tuple[object, ...], tuple[int, bytes, str]
-        ] = OrderedDict()
+        self._screening_definition_cache: dict[
+            tuple[object, ...], tuple[object, int, bytes, str]
+        ] = {}
+        self._neighborhood_extras_cache: dict[tuple[object, ...], str] = {}
+        self._neighborhood_row_cache: dict[
+            tuple[object, ...], tuple[object, ...]
+        ] = {}
         self._screening_definition_store: _BoundedScreeningDefinitionStore | None = None
+        self._pending_route_rows: list[tuple[object, ...]] = []
+        self._pending_check_rows: list[tuple[object, ...]] = []
         self._active_sinks: list[_StreamingParquetSink] = []
         self._max_buffered_groups_observed = 0
         self._max_pending_screening_transaction_rows_observed = 0
         self._state = "open"
 
+    @property
+    def screening_schema_version(self) -> str:
+        return self._owner.config.screening_schema_version
+
     def append(
         self,
         *,
         route_dictionary: Mapping[str, Sequence[str]],
-        critical_events: Iterable[Mapping[str, object]],
+        critical_events: Iterable[Mapping[str, object] | _BufferedScreeningDecision],
         diagnostic_rows: Iterable[Mapping[str, object]] = (),
+        cache_lookups_coalesced: bool = False,
     ) -> int:
         """Append one logical axis and return its persisted event-row count."""
 
         self._require_open()
         for key, raw_sequence in route_dictionary.items():
             self._register_route(key, tuple(raw_sequence))
-        if route_dictionary:
-            self._flush_sink(self._route_sink)
 
         count = 0
-        pending_screening_definitions: list[dict[str, object]] = []
+        pending_event_rows: list[tuple[object, ...]] = []
+        pending_screening_definitions: list[_PendingScreeningDefinition] = []
         pending_screening_occurrences: list[tuple[object, ...]] = []
 
         def flush_screening_transaction() -> None:
+            nonlocal pending_screening_definitions, pending_screening_occurrences
             if self._screening_definitions_sink is None:
                 return
             if self._screening_occurrences_sink is None:
                 raise RuntimeError("screening occurrence sink is unavailable")
-            definitions = tuple(pending_screening_definitions)
-            occurrences = tuple(pending_screening_occurrences)
-            pending_screening_definitions.clear()
-            pending_screening_occurrences.clear()
-            for definition in definitions:
-                self._append_buffered(self._screening_definitions_sink, definition)
-            self._append_buffered_value_rows(self._screening_occurrences_sink, occurrences)
+            candidates = pending_screening_definitions
+            occurrences = pending_screening_occurrences
+            pending_screening_definitions = []
+            pending_screening_occurrences = []
+            if candidates:
+                if self._screening_definition_store is None:
+                    raise RuntimeError("screening definition store is unavailable")
+                inserted_ids = self._screening_definition_store.register_many(candidates)
+                definitions = tuple(
+                    candidate.row
+                    for candidate in candidates
+                    if candidate.definition_id in inserted_ids
+                )
+                self._append_buffered_value_rows(
+                    self._screening_definitions_sink,
+                    definitions,
+                )
+            self._append_buffered_value_rows(
+                self._screening_occurrences_sink,
+                occurrences,
+                trusted_width=True,
+            )
 
-        for event in _iter_coalesced_cache_lookup_events(critical_events):
-            screening_event = event.get("event_type") == "screening_decision"
+        def flush_event_transaction() -> None:
+            rows = tuple(pending_event_rows)
+            pending_event_rows.clear()
+            self._append_buffered_value_rows(self._event_sink, rows)
+
+        next_event_id = self._owner._next_event_id
+        events = (
+            critical_events
+            if cache_lookups_coalesced
+            else _iter_coalesced_cache_lookup_events(critical_events)
+        )
+        for event in events:
+            if isinstance(event, tuple):
+                if self._screening_definitions_sink is None:
+                    raise RuntimeError("buffered screening decisions require v3 storage")
+                event_id = next_event_id
+                next_event_id += 1
+                compact_key = (event[2], event[4], event[1], id(event[7]))
+                cached_entry = self._screening_definition_cache.get(compact_key)
+                if cached_entry is None:
+                    occurrence, definition = self._buffered_screening_decision_row(
+                        event,
+                        event_id=event_id,
+                        cache_key=compact_key,
+                    )
+                else:
+                    occurrence = (
+                        event_id,
+                        cached_entry[1],
+                        event[5],
+                        event[6],
+                        event[3],
+                        event[0],
+                    )
+                    definition = None
+                pending_screening_occurrences.append(occurrence)
+                if definition is not None:
+                    pending_screening_definitions.append(definition)
+                pending_count = len(pending_screening_occurrences)
+                if pending_count > self._max_pending_screening_transaction_rows_observed:
+                    self._max_pending_screening_transaction_rows_observed = pending_count
+                if pending_count >= LIVE_SCREENING_TRANSACTION_ROWS:
+                    flush_screening_transaction()
+                count += 1
+                continue
+            event_get = event.get
+            event_type = event_get("event_type")
+            screening_event = event_type == "screening_decision"
             if screening_event:
-                route_key = str(event.get("route_key", ""))
-                screening_route_id = _stable_route_id(route_key) if route_key else None
-                if screening_route_id is not None and screening_route_id not in self._route_digests:
-                    self._register_route(route_key, _route_sequence_from_key(route_key))
+                route_key = str(event_get("route_key", ""))
+                screening_route_id = self._resolve_route_id(route_key) if route_key else None
             else:
+                event_route_ids: dict[str, int] = {}
                 for route_key in _event_route_keys(event):
-                    if route_key and route_key not in self._route_ids:
-                        self._register_route(route_key, _route_sequence_from_key(route_key))
-            lane = str(event.get("lane", ""))
-            operator = str(event.get("operator", ""))
+                    if route_key:
+                        route_id = self._resolve_route_id(route_key)
+                        if route_id not in self._route_digests:
+                            self._register_route(
+                                route_key,
+                                _route_sequence_from_key(route_key),
+                                route_id=route_id,
+                                validate_key=False,
+                            )
+                        event_route_ids[route_key] = route_id
+            lane = str(event_get("lane", ""))
+            operator = str(event_get("operator", ""))
             if lane not in self._lane_ids:
                 self._lane_ids[lane] = _stable_dictionary_id(f"lane:{lane}")
             if operator not in self._operator_ids:
                 self._operator_ids[operator] = _stable_dictionary_id(f"operator:{operator}")
-            if screening_event:
-                if screening_route_id is not None and screening_route_id not in self._route_digests:
-                    raise ArtifactIntegrityError(
-                        f"event refers to an unregistered route key: {route_key}"
-                    )
-            else:
-                _validate_event_routes(event, self._route_ids)
-            self._register_unique_route_evaluation_identity(event)
-            event_id = self._owner._next_event_id
-            self._owner._next_event_id += 1
-            screening_definition: dict[str, object] | None = None
+            if not screening_event:
+                _validate_event_routes(event, event_route_ids)
+            if (
+                event_type == "route_evaluation"
+                and event_get("kind") == "exact_call"
+            ):
+                self._register_unique_route_evaluation_identity(event)
+            event_id = next_event_id
+            next_event_id += 1
+            screening_definition: _PendingScreeningDefinition | None = None
             if screening_event:
                 normalized_event, screening_definition = self._screening_decision_row(
                     event,
                     event_id=event_id,
+                    route_key=route_key,
                     route_id=screening_route_id,
                     lane_id=self._lane_ids[lane],
                     operator_id=self._operator_ids[operator],
                 )
             else:
-                normalized_event = _normalise_event(
+                normalized_event = _normalise_event_values(
                     event,
                     event_id=event_id,
-                    route_ids=self._route_ids,
+                    route_ids=event_route_ids,
                     lane_ids=self._lane_ids,
                     operator_ids=self._operator_ids,
+                    neighborhood_extras_cache=self._neighborhood_extras_cache,
+                    neighborhood_row_cache=self._neighborhood_row_cache,
                 )
             if screening_event:
                 screening_sink = (
@@ -3962,31 +4646,96 @@ class ArtifactV2ShardSession:
                 ):
                     flush_screening_transaction()
             else:
-                if not isinstance(normalized_event, Mapping):
-                    raise RuntimeError("critical event must be a row mapping")
-                self._append_buffered(self._event_sink, normalized_event)
-            checks = event.get("checks")
+                if not isinstance(normalized_event, tuple):
+                    raise RuntimeError("critical event must be a typed row")
+                pending_event_rows.append(normalized_event)
+                if len(pending_event_rows) >= V2_PARQUET_ROW_GROUP_SIZE:
+                    flush_event_transaction()
+            checks = event_get("checks")
             if not screening_event and isinstance(checks, (list, tuple)):
-                decision_id = _as_int(event.get("decision_id"))
+                decision_id = _as_int(event_get("decision_id"))
                 for index, check in enumerate(checks):
                     if isinstance(check, Mapping):
-                        self._append_buffered(
-                            self._checks_sink,
-                            _normalise_check(
-                                check,
-                                event_id=event_id,
-                                decision_id=decision_id,
-                                index=index,
-                            ),
+                        normalized_check = _normalise_check(
+                            check,
+                            event_id=event_id,
+                            decision_id=decision_id,
+                            index=index,
                         )
+                        self._pending_check_rows.append(
+                            tuple(
+                                normalized_check.get(name)
+                                for name in SCREENING_CHECKS_SCHEMA.names
+                            )
+                        )
+                        if len(self._pending_check_rows) >= V2_PARQUET_ROW_GROUP_SIZE:
+                            self._flush_pending_check_rows()
             count += 1
+        self._owner._next_event_id = next_event_id
         flush_screening_transaction()
+        flush_event_transaction()
         for row in diagnostic_rows:
             self._append_buffered(
                 self._diagnostic_sink,
                 self._owner._normalise_diagnostic(row, self.instance, self.seed),
             )
         return count
+
+    def _buffered_screening_decision_row(
+        self,
+        event: _BufferedScreeningDecision,
+        event_id: int,
+        cache_key: tuple[object, ...],
+    ) -> tuple[tuple[object, ...], _PendingScreeningDefinition | None]:
+        precomputed = event[7]
+        lane = event[2]
+        operator = event[4]
+        if lane not in self._lane_ids:
+            self._lane_ids[lane] = _stable_dictionary_id(f"lane:{lane}")
+        if operator not in self._operator_ids:
+            self._operator_ids[operator] = _stable_dictionary_id(f"operator:{operator}")
+        route_id = self._resolve_route_id(event[1])
+        lane_id = self._lane_ids[lane]
+        operator_id = self._operator_ids[operator]
+        definition_key = (lane_id, operator_id, route_id, *precomputed.tail)
+        if route_id not in self._route_digests:
+            sequence = _route_sequence_from_key(event[1])
+            self._register_route(
+                event[1],
+                sequence,
+                route_id=route_id,
+                validate_key=False,
+            )
+        definition = _screening_definition_from_cache_key(definition_key)
+        definition_id, definition_json, definition_digest = (
+            _screening_definition_identity(definition)
+        )
+        self._screening_definition_cache[cache_key] = (
+            precomputed,
+            definition_id,
+            definition_json,
+            definition_digest,
+        )
+        if len(self._screening_definition_cache) > SCREENING_DEFINITION_HOT_CACHE_ENTRIES:
+            self._screening_definition_cache.pop(next(iter(self._screening_definition_cache)))
+        if self._screening_definition_store is None:
+            self._screening_definition_store = _BoundedScreeningDefinitionStore(
+                cache_entries=1,
+                scratch_root=self._directory,
+            )
+        pending = _PendingScreeningDefinition(
+            definition_id=definition_id,
+            encoded=definition_json,
+            payload=definition,
+            row=(
+                definition_id,
+                *(definition[name] for name in V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]),
+            ),
+        )
+        return (
+            (event_id, definition_id, event[5], event[6], event[3], event[0]),
+            pending,
+        )
 
     def append_transcoded_v2_batches(
         self,
@@ -4072,6 +4821,7 @@ class ArtifactV2ShardSession:
         """Flush all currently buffered rows without closing the shard."""
 
         self._require_open()
+        self._flush_pending_auxiliary_rows()
         for sink in self._sinks:
             sink.flush()
         self._active_sinks.clear()
@@ -4331,13 +5081,15 @@ class ArtifactV2ShardSession:
         self,
         sink: _StreamingParquetSink,
         rows: Sequence[Sequence[object]],
+        *,
+        trusted_width: bool = False,
     ) -> None:
         if not rows:
             return
         if sink not in self._active_sinks and len(self._active_sinks) >= 2:
             victim = self._active_sinks.pop(0)
             victim.flush()
-        sink.append_value_rows(rows)
+        sink.append_value_rows(rows, trusted_width=trusted_width)
         if sink.buffered_row_count:
             if sink not in self._active_sinks:
                 self._active_sinks.append(sink)
@@ -4358,26 +5110,48 @@ class ArtifactV2ShardSession:
         event: Mapping[str, object],
         *,
         event_id: int,
+        route_key: str,
         route_id: int | None,
         lane_id: int,
         operator_id: int,
-    ) -> tuple[tuple[object, ...] | dict[str, object], dict[str, object] | None]:
-        definition_key = _screening_definition_cache_key(
-            event,
-            lane_id=lane_id,
-            operator_id=operator_id,
-            route_id=route_id,
+    ) -> tuple[
+        tuple[object, ...] | dict[str, object],
+        _PendingScreeningDefinition | None,
+    ]:
+        event_get = event.get
+        precomputed = (
+            event_get("_precomputed_screening_definition")
+            if self._screening_definitions_sink is not None
+            else None
         )
-        cached = self._screening_definition_cache.get(definition_key)
+        cache_key: tuple[object, ...]
+        definition_key: tuple[object, ...]
+        if isinstance(precomputed, _PrecomputedScreeningDefinition):
+            definition_key = (lane_id, operator_id, route_id, *precomputed.tail)
+            compact_key = (lane_id, operator_id, route_id, precomputed.cache_hash)
+            cache_key = compact_key
+            cached_entry = self._screening_definition_cache.get(compact_key)
+            if cached_entry is not None and cached_entry[0] != precomputed.tail:
+                cache_key = definition_key
+                cached_entry = self._screening_definition_cache.get(definition_key)
+        else:
+            definition_key = _screening_definition_cache_key(
+                event,
+                lane_id=lane_id,
+                operator_id=operator_id,
+                route_id=route_id,
+            )
+            cache_key = definition_key
+            cached_entry = self._screening_definition_cache.get(definition_key)
+        cached = cached_entry[1:] if cached_entry is not None else None
         first_occurrence = False
         definition: dict[str, object] | None = None
         if cached is None:
+            if route_id is not None and route_id not in self._route_digests:
+                self._register_route(route_key, _route_sequence_from_key(route_key))
             definition = (
                 _screening_definition_from_cache_key(definition_key)
-                if isinstance(
-                    event.get("_precomputed_screening_definition"),
-                    _PrecomputedScreeningDefinition,
-                )
+                if isinstance(precomputed, _PrecomputedScreeningDefinition)
                 else _normalise_screening_definition(
                     event,
                     lane_id=lane_id,
@@ -4393,39 +5167,54 @@ class ArtifactV2ShardSession:
                 definition_json,
                 definition_digest,
             )
-            self._screening_definition_cache[definition_key] = cached
-            if len(self._screening_definition_cache) > V2_PARQUET_ROW_GROUP_SIZE:
-                self._screening_definition_cache.popitem(last=False)
+            self._screening_definition_cache[cache_key] = (
+                precomputed.tail
+                if isinstance(precomputed, _PrecomputedScreeningDefinition)
+                else None,
+                *cached,
+            )
+            if (
+                len(self._screening_definition_cache)
+                > SCREENING_DEFINITION_HOT_CACHE_ENTRIES
+            ):
+                self._screening_definition_cache.pop(next(iter(self._screening_definition_cache)))
             if self._screening_definition_store is None:
                 self._screening_definition_store = _BoundedScreeningDefinitionStore(
                     cache_entries=1,
                     scratch_root=self._directory,
                 )
-            first_occurrence = self._screening_definition_store.register(
-                definition_id,
-                definition,
-                allow_identical_existing=True,
-            )
-        else:
-            self._screening_definition_cache.move_to_end(definition_key)
+            if self._screening_sink is not None:
+                first_occurrence = self._screening_definition_store.register(
+                    definition_id,
+                    definition,
+                    allow_identical_existing=True,
+                    encoded=definition_json,
+                )
         definition_id, definition_json, _ = cached
         definition_row = (
-            {"definition_id": definition_id, **definition}
-            if first_occurrence
-            and definition is not None
+            _PendingScreeningDefinition(
+                definition_id=definition_id,
+                encoded=definition_json,
+                payload=definition,
+                row=(
+                    definition_id,
+                    *(definition[name] for name in V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]),
+                ),
+            )
+            if definition is not None
             and self._screening_definitions_sink is not None
             else None
         )
-        started_at = event.get("started_at")
+        started_at = event_get("started_at")
         if self._screening_sink is None:
             return (
                 (
                     event_id,
                     definition_id,
                     started_at,
-                    event.get("completed_at"),
-                    event.get("iteration"),
-                    event.get("decision_id"),
+                    event_get("completed_at"),
+                    event_get("iteration"),
+                    event_get("decision_id"),
                 ),
                 definition_row,
             )
@@ -4439,9 +5228,9 @@ class ArtifactV2ShardSession:
                     else {}
                 ),
                 "started_at": started_at,
-                "completed_at": event.get("completed_at"),
-                "iteration": event.get("iteration"),
-                "decision_id": event.get("decision_id"),
+                "completed_at": event_get("completed_at"),
+                "iteration": event_get("iteration"),
+                "decision_id": event_get("decision_id"),
             },
             definition_row,
         )
@@ -4483,27 +5272,60 @@ class ArtifactV2ShardSession:
                 identity=("legacy" if lane == "initialization" else lane, route_key),
             )
 
-    def _register_route(self, key: str, sequence: tuple[str, ...]) -> None:
-        if key.startswith("route:") and _route_sequence_from_key(key) != sequence:
+    def _register_route(
+        self,
+        key: str,
+        sequence: tuple[str, ...],
+        *,
+        route_id: int | None = None,
+        validate_key: bool = True,
+    ) -> None:
+        if validate_key and key.startswith("route:") and _route_sequence_from_key(key) != sequence:
             raise ArtifactIntegrityError(
                 f"route dictionary key does not match customer sequence: {key}"
             )
-        route_id = _stable_route_id(key)
+        resolved_route_id = self._resolve_route_id(key) if route_id is None else route_id
         route_digest = _payload_sha256(list(sequence))
-        if not self._route_digests.register_route(route_id, route_digest):
+        if not self._route_digests.register_route(resolved_route_id, route_digest):
             return
-        self._append_buffered(
-            self._route_sink,
-            {
-                "route_id": route_id,
-                "canonical_route_key": key,
-                "route_digest": route_digest,
-                "customer_sequence": list(sequence),
-            },
+        self._pending_route_rows.append(
+            (
+                resolved_route_id,
+                key,
+                route_digest,
+                list(sequence),
+            )
         )
+        if len(self._pending_route_rows) >= V2_PARQUET_ROW_GROUP_SIZE:
+            self._flush_pending_route_rows()
+
+    def _resolve_route_id(self, key: str) -> int:
+        cached = self._resolved_route_ids.get(key)
+        if cached is not None:
+            return cached
+        route_id = _stable_route_id(key)
+        self._resolved_route_ids[key] = route_id
+        if len(self._resolved_route_ids) > ROUTE_ID_RESOLUTION_CACHE_ENTRIES:
+            self._resolved_route_ids.popitem(last=False)
+        return route_id
+
+    def _flush_pending_route_rows(self) -> None:
+        rows = tuple(self._pending_route_rows)
+        self._pending_route_rows.clear()
+        self._append_buffered_value_rows(self._route_sink, rows)
+
+    def _flush_pending_check_rows(self) -> None:
+        rows = tuple(self._pending_check_rows)
+        self._pending_check_rows.clear()
+        self._append_buffered_value_rows(self._checks_sink, rows)
+
+    def _flush_pending_auxiliary_rows(self) -> None:
+        self._flush_pending_route_rows()
+        self._flush_pending_check_rows()
 
     def _close_and_record_parquet(self) -> dict[str, str]:
         self._require_open()
+        self._flush_pending_auxiliary_rows()
         descriptors = [
             (
                 self._route_sink,

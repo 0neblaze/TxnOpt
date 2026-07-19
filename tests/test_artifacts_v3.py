@@ -13,6 +13,7 @@ import pytest
 
 import evrptw.artifacts as artifacts_module
 from evrptw.artifacts import (
+    EVENTS_SCHEMA,
     V2_SCREENING_DECISIONS_SCHEMA_V1,
     V3_SCREENING_DEFINITIONS_SCHEMA,
     V3_SCREENING_OCCURRENCES_SCHEMA,
@@ -76,6 +77,391 @@ def _screening_event(*, decision_id: int, started_at: float) -> dict[str, object
             },
         ),
     }
+
+
+def _pending_definition(value: int) -> artifacts_module._PendingScreeningDefinition:
+    payload: dict[str, object] = {"value": value}
+    definition_id, encoded, _ = artifacts_module._screening_definition_identity(payload)
+    return artifacts_module._PendingScreeningDefinition(
+        definition_id=definition_id,
+        encoded=encoded,
+        payload=payload,
+        row=(definition_id, value),
+    )
+
+
+def test_neighborhood_fast_normalizer_matches_general_logical_row() -> None:
+    event: dict[str, object] = {
+        "event_type": "neighborhood_event",
+        "record_type": "neighborhood_event",
+        "lane": "wall_clock_30:constraint",
+        "iteration": 7,
+        "operator": "relocate",
+        "status": "feasible_candidate",
+        "reason": "exact_charging_feasible",
+        "candidate_feasible": True,
+        "accepted": False,
+        "candidate_vehicle_delta": 0,
+        "prefilter_passed": True,
+        "exact_route_evaluations": 2,
+        "selection_rank": 1,
+        "track": "legacy",
+        "vehicle_reduction": False,
+        "distance_improvement": False,
+        "candidate_objective_key": (2, 10.0, 0.0, 0),
+        "route_indices": (0,),
+        "affected_route_indices": (0,),
+        "removed_customers": ("C1",),
+        "candidate_customer_sequence": ("C1",),
+        "candidate_route_sequences": (("C1",),),
+        "benchmark_axis": "wall_clock_30",
+    }
+    lane_ids = {"wall_clock_30:constraint": 11}
+    operator_ids = {"relocate": 12}
+
+    fast = artifacts_module._normalise_event_values(  # noqa: SLF001
+        event,
+        event_id=9,
+        route_ids={},
+        lane_ids=lane_ids,
+        operator_ids=operator_ids,
+    )
+    general = artifacts_module._normalise_general_event_values(  # noqa: SLF001
+        event,
+        event_id=9,
+        route_ids={},
+        lane_ids=lane_ids,
+        operator_ids=operator_ids,
+    )
+
+    assert fast == general
+
+
+def test_neighborhood_fast_normalizer_infers_missing_event_type() -> None:
+    event: dict[str, object] = {
+        "record_type": "neighborhood_event",
+        "lane": "legacy",
+        "iteration": 7,
+        "operator": "relocate",
+        "status": "prefilter_rejected",
+        "reason": "forward_time_window_prefilter",
+        "candidate_feasible": False,
+        "prefilter_passed": False,
+        "exact_route_evaluations": 0,
+        "candidate_objective_key": (4, 123.0, 0.0, 0),
+        "accepted": False,
+        "vehicle_reduction": False,
+        "distance_improvement": False,
+        "route_indices": (0,),
+        "affected_route_indices": (0,),
+    }
+    lane_ids = {"legacy": 11}
+    operator_ids = {"relocate": 13}
+
+    fast = artifacts_module._normalise_event_values(  # noqa: SLF001
+        event,
+        event_id=17,
+        route_ids={},
+        lane_ids=lane_ids,
+        operator_ids=operator_ids,
+    )
+    general = artifacts_module._normalise_general_event_values(  # noqa: SLF001
+        event,
+        event_id=17,
+        route_ids={},
+        lane_ids=lane_ids,
+        operator_ids=operator_ids,
+    )
+
+    assert fast == general
+
+
+def test_neighborhood_extras_cache_preserves_absent_and_null_fields() -> None:
+    base: dict[str, object] = {
+        "record_type": "neighborhood_event",
+        "lane": "legacy",
+        "operator": "relocate",
+    }
+    cache: dict[tuple[object, ...], str] = {}
+    absent = artifacts_module._normalise_event_values(  # noqa: SLF001
+        base,
+        event_id=1,
+        route_ids={},
+        lane_ids={"legacy": 11},
+        operator_ids={"relocate": 13},
+        neighborhood_extras_cache=cache,
+    )
+    explicit_null = artifacts_module._normalise_event_values(  # noqa: SLF001
+        {**base, "candidate_pool_hash": None},
+        event_id=2,
+        route_ids={},
+        lane_ids={"legacy": 11},
+        operator_ids={"relocate": 13},
+        neighborhood_extras_cache=cache,
+    )
+
+    assert absent[-1] == ""
+    assert json.loads(str(explicit_null[-1])) == {"candidate_pool_hash": None}
+    assert len(cache) == 2
+
+
+def test_neighborhood_row_cache_replays_dynamic_event_id_and_iteration() -> None:
+    base: dict[str, object] = {
+        "record_type": "neighborhood_event",
+        "lane": "legacy",
+        "operator": "relocate",
+        "status": "prefilter_rejected",
+        "reason": "forward_time_window_prefilter",
+        "candidate_objective_key": (),
+        "accepted": False,
+    }
+    cache: dict[tuple[object, ...], tuple[object, ...]] = {}
+    first = artifacts_module._normalise_event_values(  # noqa: SLF001
+        {**base, "iteration": 3},
+        event_id=1,
+        route_ids={},
+        lane_ids={"legacy": 11},
+        operator_ids={"relocate": 13},
+        neighborhood_row_cache=cache,
+    )
+    second_event = {**base, "iteration": 99}
+    second = artifacts_module._normalise_event_values(  # noqa: SLF001
+        second_event,
+        event_id=2,
+        route_ids={},
+        lane_ids={"legacy": 11},
+        operator_ids={"relocate": 13},
+        neighborhood_row_cache=cache,
+    )
+    expected = artifacts_module._normalise_general_event_values(  # noqa: SLF001
+        second_event,
+        event_id=2,
+        route_ids={},
+        lane_ids={"legacy": 11},
+        operator_ids={"relocate": 13},
+    )
+
+    assert first[0] == 1
+    assert first[8] == 3
+    assert second == expected
+    assert len(cache) == 1
+
+
+def test_route_identity_store_delays_sqlite_spill_and_remains_bounded(
+    tmp_path: Path,
+) -> None:
+    store = artifacts_module._DiskBackedRouteIdentityStore(  # noqa: SLF001
+        scratch_root=tmp_path,
+        cache_entries=2,
+        memory_entries=2,
+    )
+    try:
+        assert store.register_route(1, "a")
+        assert store.register_route(2, "b")
+        assert not store._routes_spilled  # noqa: SLF001
+        assert store[1] == "a"
+        assert store.hot_entries <= store.hot_entry_limit
+        assert store.register_route(3, "c")
+        assert store._routes_spilled  # noqa: SLF001
+        assert store[1] == "a"
+        assert store[3] == "c"
+        with pytest.raises(ArtifactIntegrityError, match="stable route ID collision"):
+            store.register_route(1, "forged")
+        assert store.hot_entries <= store.hot_entry_limit
+    finally:
+        store.close()
+
+
+def test_neighborhood_unknown_field_falls_back_to_general_normalizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = {
+        "event_type": "neighborhood_event",
+        "record_type": "neighborhood_event",
+        "lane": "constraint",
+        "operator": "relocate",
+        "future_scalar": "must-survive",
+    }
+    called = False
+    original = artifacts_module._normalise_general_event_values  # noqa: SLF001
+
+    def recording_general(*args: object, **kwargs: object) -> tuple[object, ...]:
+        nonlocal called
+        called = True
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        artifacts_module,
+        "_normalise_general_event_values",
+        recording_general,
+    )
+    row = artifacts_module._normalise_event_values(  # noqa: SLF001
+        event,
+        event_id=1,
+        route_ids={},
+        lane_ids={"constraint": 2},
+        operator_ids={"relocate": 3},
+    )
+
+    assert called
+    assert json.loads(str(row[-1]))["future_scalar"] == "must-survive"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("route_key", "route:2:C1"),
+        ("route_keys", ("route:2:C1",)),
+        ("record_class", "failure"),
+    ],
+)
+def test_neighborhood_identity_fields_use_general_normalizer(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    event: dict[str, object] = {
+        "event_type": "neighborhood_event",
+        "record_type": "neighborhood_event",
+        "lane": "constraint",
+        "operator": "relocate",
+        field: value,
+    }
+    called = False
+    original = artifacts_module._normalise_general_event_values  # noqa: SLF001
+
+    def recording_general(*args: object, **kwargs: object) -> tuple[object, ...]:
+        nonlocal called
+        called = True
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        artifacts_module,
+        "_normalise_general_event_values",
+        recording_general,
+    )
+    artifacts_module._normalise_event_values(  # noqa: SLF001
+        event,
+        event_id=1,
+        route_ids={"route:2:C1": 17},
+        lane_ids={"constraint": 2},
+        operator_ids={"relocate": 3},
+    )
+
+    assert called
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {
+            "event_type": "cache_event",
+            "record_type": "cache_event",
+            "timestamp_seconds": 0.1,
+            "lane": "constraint",
+            "operator": "relocate",
+            "route_key": "route:2:C1",
+            "operation": "lookup_result",
+            "cache_key_digest": "abc",
+            "current_entries": 2,
+            "current_bytes": 3,
+            "lookup_current_entries": 1,
+            "lookup_current_bytes": 2,
+            "lookup_result": "hit",
+            "benchmark_axis": "wall_clock_30",
+        },
+        {
+            "event_type": "route_evaluation",
+            "record_type": "route_evaluation",
+            "started_at": 0.1,
+            "completed_at": 0.2,
+            "duration_seconds": 0.1,
+            "lane": "constraint",
+            "operator": "relocate",
+            "route_key": "route:2:C1",
+            "status": "completed_feasible",
+            "kind": "exact_call",
+            "feasible": True,
+            "exact_started": True,
+            "exact_completed": True,
+            "cache_key_digest": "abc",
+            "evaluation_id": 7,
+            "route_change_status": "changed",
+            "labels_generated": 10,
+            "labels_expanded": 8,
+            "labels_pruned": 2,
+            "deadline_boundary": "",
+            "benchmark_axis": "wall_clock_30",
+        },
+    ],
+)
+def test_sparse_route_event_fast_normalizer_matches_general(
+    event: dict[str, object],
+) -> None:
+    route_ids = {"route:2:C1": 10}
+    lane_ids = {"constraint": 11}
+    operator_ids = {"relocate": 12}
+    keywords = {
+        "event_id": 9,
+        "route_ids": route_ids,
+        "lane_ids": lane_ids,
+        "operator_ids": operator_ids,
+    }
+
+    assert artifacts_module._normalise_event_values(  # noqa: SLF001
+        event, **keywords  # type: ignore[arg-type]
+    ) == artifacts_module._normalise_general_event_values(  # noqa: SLF001
+        event, **keywords  # type: ignore[arg-type]
+    )
+
+
+def test_screening_definition_store_spills_and_detects_disk_collisions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(artifacts_module, "SCREENING_DEFINITION_HOT_CACHE_ENTRIES", 2)
+    definitions = tuple(_pending_definition(value) for value in range(3))
+    with artifacts_module._BoundedScreeningDefinitionStore(  # noqa: SLF001
+        cache_entries=1,
+        scratch_root=tmp_path,
+    ) as store:
+        assert store.register_many(definitions) == frozenset(
+            definition.definition_id for definition in definitions
+        )
+        assert store.resolve(definitions[0].definition_id) == {"value": 0}
+        forged = artifacts_module._PendingScreeningDefinition(  # noqa: SLF001
+            definition_id=definitions[0].definition_id,
+            encoded=b'{"value":999}',
+            payload={"value": 999},
+            row=(definitions[0].definition_id, 999),
+        )
+        with pytest.raises(ArtifactIntegrityError, match="ID collision"):
+            store.register_many((forged,))
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_screening_definition_store_cleans_scratch_after_spill_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(artifacts_module, "SCREENING_DEFINITION_HOT_CACHE_ENTRIES", 1)
+
+    def fail_connect(_path: object) -> object:
+        raise OSError("simulated scratch failure")
+
+    monkeypatch.setattr(artifacts_module.sqlite3, "connect", fail_connect)
+    store = artifacts_module._BoundedScreeningDefinitionStore(  # noqa: SLF001
+        cache_entries=1,
+        scratch_root=tmp_path,
+    )
+    try:
+        with pytest.raises(OSError, match="simulated scratch failure"):
+            store.register_many((_pending_definition(1), _pending_definition(2)))
+    finally:
+        store.close()
+
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_trace_dictionary_ids_must_be_unique_canonical_decimals() -> None:
@@ -208,6 +594,65 @@ def test_v3_writer_rejects_more_than_eight_screening_checks(tmp_path: Path) -> N
 
     shard.abort("expected screening-domain rejection")
     writer.finalize(status="partial", evidence_completeness="partial")
+
+
+def test_v2_writer_ignores_private_precomputed_screening_tail(tmp_path: Path) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt93"
+    writer = ArtifactBundleWriter(
+        tmp_path / run_label,
+        ArtifactRunContext("stage05.2", "artifact_streaming", run_label),
+        ArtifactStorageConfig(
+            storage_policy_version="artifact-storage-v2",
+            screening_schema_version="screening_decisions_v2",
+        ),
+    )
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    visible = _screening_event(decision_id=9, started_at=1.25)
+    visible["_precomputed_screening_definition"] = (
+        artifacts_module._PrecomputedScreeningDefinition(  # noqa: SLF001
+            (
+                "forged",
+                "forged",
+                "forged_axis",
+                999.0,
+                None,
+                999.0,
+                True,
+                "forged",
+                -999.0,
+                True,
+                False,
+                999.0,
+                (),
+            )
+        )
+    )
+    shard.append(
+        route_dictionary={"route:2:C1": ("C1",)},
+        critical_events=(visible,),
+    )
+    shard.finalize(
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+    )
+    bundle = writer.finalize()
+
+    rows = list(
+        ArtifactReader(bundle.run_dir).iter_events(
+            f"toy/2014/{run_label}_events_toy_2014.parquet"
+        )
+    )
+
+    assert rows[0]["status"] == visible["status"]
+    assert rows[0]["demand"] == visible["demand"]
+    assert rows[0]["checks"] == list(visible["checks"])
 
 
 def test_reader_accepts_pre_amendment_v2_manifest_without_physical_schema_field(
@@ -1190,6 +1635,93 @@ def test_empty_v3_screening_transaction_does_not_flush_other_sinks(tmp_path: Pat
         parquet.metadata.row_group(index).num_rows
         for index in range(parquet.metadata.num_row_groups)
     ] == [3]
+
+
+def test_v3_events_append_schema_ordered_batches_without_row_mappings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_append = artifacts_module._StreamingParquetSink.append  # noqa: SLF001
+    original_append_values = artifacts_module._StreamingParquetSink.append_values  # noqa: SLF001
+
+    def reject_event_mapping(
+        sink: artifacts_module._StreamingParquetSink,  # noqa: SLF001
+        row: dict[str, object],
+    ) -> None:
+        if sink.schema.equals(EVENTS_SCHEMA):
+            raise AssertionError("v3 event hotspot constructed a row mapping")
+        original_append(sink, row)
+
+    def reject_individual_event_values(
+        sink: artifacts_module._StreamingParquetSink,  # noqa: SLF001
+        values: tuple[object, ...],
+    ) -> None:
+        if sink.schema.equals(EVENTS_SCHEMA):
+            raise AssertionError("v3 event hotspot appended one row at a time")
+        original_append_values(sink, values)
+
+    monkeypatch.setattr(artifacts_module._StreamingParquetSink, "append", reject_event_mapping)  # noqa: SLF001
+    monkeypatch.setattr(  # noqa: SLF001
+        artifacts_module._StreamingParquetSink,
+        "append_values",
+        reject_individual_event_values,
+    )
+    writer = _v3_writer(tmp_path, attempt=94)
+    shard = writer.open_v2_shard(
+        instance="toy", seed=2014, shard_ordinal=0, worker_identity="worker-0"
+    )
+
+    shard.append(
+        route_dictionary={"route:2:C1": ("C1",)},
+        critical_events=(
+            {
+                "event_type": "route_evaluation",
+                "route_key": "route:2:C1",
+                "lane": "legacy",
+                "operator": "relocate",
+                "iteration": 3,
+                "exact_started": True,
+            },
+        ),
+    )
+    shard.abort("typed event batch test complete")
+
+
+def test_repeated_v3_screening_definition_skips_route_store_rechecks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_contains = artifacts_module._DiskBackedRouteIdentityStore.__contains__  # noqa: SLF001
+    calls = 0
+
+    def count_contains(
+        store: artifacts_module._DiskBackedRouteIdentityStore,  # noqa: SLF001
+        route_id: object,
+    ) -> bool:
+        nonlocal calls
+        calls += 1
+        return original_contains(store, route_id)
+
+    monkeypatch.setattr(  # noqa: SLF001
+        artifacts_module._DiskBackedRouteIdentityStore,
+        "__contains__",
+        count_contains,
+    )
+    writer = _v3_writer(tmp_path, attempt=95)
+    shard = writer.open_v2_shard(
+        instance="toy", seed=2014, shard_ordinal=0, worker_identity="worker-0"
+    )
+
+    shard.append(
+        route_dictionary={},
+        critical_events=(
+            _screening_event(decision_id=9, started_at=1.25),
+            _screening_event(decision_id=10, started_at=2.25),
+        ),
+    )
+
+    assert calls == 1
+    shard.abort("screening route-cache test complete")
 
 
 def test_v3_write_instance_seed_uses_the_same_physical_schema(tmp_path: Path) -> None:

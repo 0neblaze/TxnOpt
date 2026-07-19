@@ -36,6 +36,7 @@ from evrptw.artifacts import (
     ArtifactReader,
     ArtifactRunContext,
     ArtifactStorageConfig,
+    _BufferedScreeningDecision,
     _PrecomputedScreeningDefinition,
     aggregate_diagnostic_events,
     atomic_write_signed_json,
@@ -3210,14 +3211,18 @@ def _run_and_persist_shard(
 
 class _Stage052StreamingShard(Protocol):
     @property
+    def screening_schema_version(self) -> str: ...
+
+    @property
     def scratch_directory(self) -> Path: ...
 
     def append(
         self,
         *,
         route_dictionary: Mapping[str, Sequence[str]],
-        critical_events: Iterable[Mapping[str, object]],
+        critical_events: Iterable[Mapping[str, object] | _BufferedScreeningDecision],
         diagnostic_rows: Iterable[Mapping[str, object]] = (),
+        cache_lookups_coalesced: bool = False,
     ) -> int: ...
 
     def flush(self) -> None: ...
@@ -3255,15 +3260,24 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         shard: _Stage052StreamingShard,
         axis_name: str,
         buffer_rows: int = 65_536,
+        neighborhood_buffer_rows: int = 524_288,
     ) -> None:
         if isinstance(buffer_rows, bool) or not isinstance(buffer_rows, int) or buffer_rows <= 0:
             raise ValueError("trace stream buffer_rows must be a positive integer")
+        if (
+            isinstance(neighborhood_buffer_rows, bool)
+            or not isinstance(neighborhood_buffer_rows, int)
+            or neighborhood_buffer_rows <= 0
+        ):
+            raise ValueError("neighborhood_buffer_rows must be a positive integer")
         self._shard = shard
         self.axis_name = axis_name
         self._buffer_rows = buffer_rows
-        self._event_buffer: list[dict[str, object]] = []
+        self._neighborhood_buffer_rows = neighborhood_buffer_rows
+        self._event_buffer: list[dict[str, object] | _BufferedScreeningDecision] = []
         self.event_count = 0
         self._persisted_family_counts: Counter[str] = Counter()
+        self._screening_decision_count = 0
         self.diagnostic_counts: Counter[tuple[str, str, str, str]] = Counter()
         self._pending_cache_lookup: dict[str, object] | None = None
         self._neighborhood_buffer: list[dict[str, object]] = []
@@ -3271,64 +3285,135 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._neighborhood_spool_path: Path | None = None
         self._neighborhood_read_offset = 0
         self._semantic_event_digest = hashlib.sha256()
+        self._screening_tail_cache: dict[
+            tuple[object, ...], _PrecomputedScreeningDefinition
+        ] = {}
+        self._negative_screening_tail_cache: dict[
+            str, tuple[tuple[object, ...], _PrecomputedScreeningDefinition]
+        ] = {}
         self._initial_objective_key: ObjectiveKey | None = None
         self._visible_global_bests: dict[int, AcceptedGlobalBest] = {}
         self._last_candidate_timestamp = 0.0
         self.persistence_nanoseconds = 0
         self._closed = False
+        self._screening_schema_version = getattr(
+            shard, "screening_schema_version", "screening_decisions_v3"
+        )
 
     def append_route_evaluation(self, record: RouteEvaluationTrace) -> None:
-        payload = {field.name: getattr(record, field.name) for field in fields(record)}
-        payload["record_type"] = "route_evaluation"
-        payload["event_type"] = "route_evaluation"
-        self._queue_owned(payload)
+        started_ns = time.perf_counter_ns()
+        previously_recorded_ns = self.persistence_nanoseconds
+        try:
+            payload = {field.name: getattr(record, field.name) for field in fields(record)}
+            payload["record_type"] = "route_evaluation"
+            payload["event_type"] = "route_evaluation"
+            self._queue_owned(payload)
+        finally:
+            nested_ns = self.persistence_nanoseconds - previously_recorded_ns
+            elapsed_ns = time.perf_counter_ns() - started_ns
+            self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
 
     def append_event(self, event: Mapping[str, object]) -> None:
-        payload = dict(event)
-        payload["record_type"] = str(event.get("event_type", "event"))
-        self._queue_owned(payload)
+        started_ns = time.perf_counter_ns()
+        previously_recorded_ns = self.persistence_nanoseconds
+        try:
+            payload = dict(event)
+            payload["record_type"] = str(event.get("event_type", "event"))
+            self._queue_owned(payload)
+        finally:
+            nested_ns = self.persistence_nanoseconds - previously_recorded_ns
+            elapsed_ns = time.perf_counter_ns() - started_ns
+            self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
 
     def append_screening_decision(self, decision: ScreeningDecision) -> None:
-        payload = {
-            "decision_id": decision.decision_id,
-            "route_key": decision.route_key,
-            "lane": decision.lane,
-            "iteration": decision.iteration,
-            "operator": decision.operator,
-            "status": decision.status,
-            "first_failed_check": decision.first_failed_check,
-            "reason": decision.reason,
-            "demand": decision.demand,
-            "min_time_window_slack": decision.min_time_window_slack,
-            "distance_lower_bound": decision.distance_lower_bound,
-            "distance_increment_lower_bound": decision.distance_increment_lower_bound,
-            "single_segment_reachable": decision.single_segment_reachable,
-            "structural_energy_lower_bound": decision.structural_energy_lower_bound,
-            "negative_cache_hit": decision.negative_cache_hit,
-            "exact_call_blocked": decision.exact_call_blocked,
-            "started_at": decision.started_at,
-            "completed_at": decision.completed_at,
-            "duration_seconds": decision.duration_seconds,
-        }
-        compact_checks = tuple(
-            (
-                check.check,
-                check.status,
-                check.value if isinstance(check.value, bool) else None,
-                float(check.value)
-                if isinstance(check.value, (int, float))
-                and not isinstance(check.value, bool)
-                else None,
-                check.value if isinstance(check.value, str) else None,
-                check.reason,
+        started_ns = time.perf_counter_ns()
+        if self._screening_schema_version == "screening_decisions_v3":
+            try:
+                self._append_screening_decision(decision)
+            finally:
+                elapsed_ns = time.perf_counter_ns() - started_ns
+                self.persistence_nanoseconds += elapsed_ns
+            return
+        previously_recorded_ns = self.persistence_nanoseconds
+        try:
+            self._append_screening_decision(decision)
+        finally:
+            nested_ns = self.persistence_nanoseconds - previously_recorded_ns
+            elapsed_ns = time.perf_counter_ns() - started_ns
+            self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
+
+    def _append_screening_decision(self, decision: ScreeningDecision) -> None:
+        if self._screening_schema_version != "screening_decisions_v3":
+            self._queue_owned(
+                {
+                    "decision_id": decision.decision_id,
+                    "route_key": decision.route_key,
+                    "lane": decision.lane,
+                    "iteration": decision.iteration,
+                    "operator": decision.operator,
+                    "status": decision.status,
+                    "first_failed_check": decision.first_failed_check,
+                    "reason": decision.reason,
+                    "demand": decision.demand,
+                    "min_time_window_slack": decision.min_time_window_slack,
+                    "distance_lower_bound": decision.distance_lower_bound,
+                    "distance_increment_lower_bound": (
+                        decision.distance_increment_lower_bound
+                    ),
+                    "single_segment_reachable": decision.single_segment_reachable,
+                    "structural_energy_lower_bound": (
+                        decision.structural_energy_lower_bound
+                    ),
+                    "negative_cache_hit": decision.negative_cache_hit,
+                    "exact_call_blocked": decision.exact_call_blocked,
+                    "started_at": decision.started_at,
+                    "completed_at": decision.completed_at,
+                    "duration_seconds": decision.duration_seconds,
+                    "checks": tuple(
+                        {
+                            "check": check.check,
+                            "status": check.status,
+                            "value": check.value,
+                            "reason": check.reason,
+                        }
+                        for check in decision.checks
+                    ),
+                    "record_type": "screening_decision",
+                    "event_type": "screening_decision",
+                }
             )
-            for check in decision.checks
+            return
+        negative_cached = (
+            self._negative_screening_tail_cache.get(decision.route_key)
+            if decision.negative_cache_hit
+            else None
         )
-        payload["_precomputed_screening_definition"] = _PrecomputedScreeningDefinition(
-            (
+        tail_key: tuple[object, ...] | None = None
+        precomputed: _PrecomputedScreeningDefinition | None
+        if negative_cached is not None:
+            cached_tail = negative_cached[0]
+            if not (
+                cached_tail[0] == decision.status
+                and cached_tail[1] == decision.reason
+                and cached_tail[2] == decision.demand
+                and cached_tail[3] == decision.distance_increment_lower_bound
+                and cached_tail[4] == decision.distance_lower_bound
+                and cached_tail[5] == decision.exact_call_blocked
+                and cached_tail[6] == decision.first_failed_check
+                and cached_tail[7] == decision.min_time_window_slack
+                and cached_tail[8] == decision.negative_cache_hit
+                and cached_tail[9] == decision.single_segment_reachable
+                and cached_tail[10] == decision.structural_energy_lower_bound
+                and cached_tail[11] == decision.checks
+            ):
+                raise RuntimeError(
+                    "negative screening cache returned inconsistent evidence for one route"
+                )
+            precomputed = negative_cached[1]
+        else:
+            tail_key = (
                 decision.status,
                 decision.reason,
-                self.axis_name,
                 decision.demand,
                 decision.distance_increment_lower_bound,
                 decision.distance_lower_bound,
@@ -3338,18 +3423,86 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                 decision.negative_cache_hit,
                 decision.single_segment_reachable,
                 decision.structural_energy_lower_bound,
-                compact_checks,
+                decision.checks,
             )
-        )
-        payload["record_type"] = "screening_decision"
-        payload["event_type"] = "screening_decision"
-        self._queue_owned(payload)
+            precomputed = (
+                None
+                if decision.negative_cache_hit
+                else self._screening_tail_cache.get(tail_key)
+            )
+        if precomputed is None:
+            if tail_key is None:
+                raise AssertionError("uncached screening evidence requires a complete tail key")
+            compact_checks = tuple(
+                (
+                    check.check,
+                    check.status,
+                    check.value if isinstance(check.value, bool) else None,
+                    float(check.value)
+                    if isinstance(check.value, (int, float))
+                    and not isinstance(check.value, bool)
+                    else None,
+                    check.value if isinstance(check.value, str) else None,
+                    check.reason,
+                )
+                for check in decision.checks
+            )
+            precomputed = _PrecomputedScreeningDefinition(
+                (
+                    tail_key[0],
+                    tail_key[1],
+                    self.axis_name,
+                    *tail_key[2:-1],
+                    compact_checks,
+                )
+            )
+            if decision.negative_cache_hit:
+                self._negative_screening_tail_cache[decision.route_key] = (
+                    tail_key,
+                    precomputed,
+                )
+                if len(self._negative_screening_tail_cache) > 262_144:
+                    self._negative_screening_tail_cache.pop(
+                        next(iter(self._negative_screening_tail_cache))
+                    )
+            else:
+                self._screening_tail_cache[tail_key] = precomputed
+                if len(self._screening_tail_cache) > 262_144:
+                    self._screening_tail_cache.pop(next(iter(self._screening_tail_cache)))
+        if self._screening_schema_version == "screening_decisions_v3":
+            if self._pending_cache_lookup is not None:
+                self._flush_pending_lookup()
+            self._event_buffer.append(
+                (
+                    decision.decision_id,
+                    decision.route_key,
+                    f"{self.axis_name}:{decision.lane}",
+                    decision.iteration,
+                    decision.operator,
+                    decision.started_at,
+                    decision.completed_at,
+                    precomputed,
+                )
+            )
+            if len(self._event_buffer) >= self._buffer_rows:
+                self._flush_event_buffer()
+            self._screening_decision_count += 1
+            self.event_count += 1
+            return
+        raise AssertionError("v3 screening decisions must use the typed append path")
 
     def append_incremental_propagation(self, propagation: Mapping[str, object]) -> None:
-        payload = dict(propagation)
-        payload["record_type"] = "incremental_propagation"
-        payload["event_type"] = "incremental_propagation"
-        self._queue_owned(payload)
+        started_ns = time.perf_counter_ns()
+        previously_recorded_ns = self.persistence_nanoseconds
+        try:
+            payload = dict(propagation)
+            payload["record_type"] = "incremental_propagation"
+            payload["event_type"] = "incremental_propagation"
+            self._queue_owned(payload)
+        finally:
+            nested_ns = self.persistence_nanoseconds - previously_recorded_ns
+            elapsed_ns = time.perf_counter_ns() - started_ns
+            self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
 
     def append_neighborhood_events(
         self,
@@ -3357,29 +3510,42 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         *,
         route_dictionary: dict[str, tuple[str, ...]],
     ) -> None:
-        for raw_event in events:
-            payload = _route_reference_event(raw_event, route_dictionary)
-            payload["record_type"] = "neighborhood_event"
-            self._spool_neighborhood_event(payload)
+        started_ns = time.perf_counter_ns()
+        previously_recorded_ns = self.persistence_nanoseconds
+        try:
+            for raw_event in events:
+                payload = _route_reference_event(raw_event, route_dictionary)
+                payload["record_type"] = "neighborhood_event"
+                self._spool_neighborhood_event(payload)
+        finally:
+            nested_ns = self.persistence_nanoseconds - previously_recorded_ns
+            elapsed_ns = time.perf_counter_ns() - started_ns
+            self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
 
     def append_neighborhood_event(self, event: Mapping[str, object]) -> None:
-        payload = _route_reference_event(event, {})
-        payload["record_type"] = "neighborhood_event"
-        self._spool_neighborhood_event(payload)
+        started_ns = time.perf_counter_ns()
+        previously_recorded_ns = self.persistence_nanoseconds
+        try:
+            payload = _route_reference_event(event, {})
+            payload["record_type"] = "neighborhood_event"
+            self._spool_neighborhood_event(payload)
+        finally:
+            nested_ns = self.persistence_nanoseconds - previously_recorded_ns
+            elapsed_ns = time.perf_counter_ns() - started_ns
+            self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
 
     def finish(self) -> None:
-        self._flush_pending_lookup()
         started_ns = time.perf_counter_ns()
+        previously_recorded_ns = self.persistence_nanoseconds
         try:
+            self._flush_pending_lookup()
+            self._flush_event_buffer()
+            self._drain_neighborhood_spool()
             self._flush_event_buffer()
         finally:
-            self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
-        self._drain_neighborhood_spool()
-        started_ns = time.perf_counter_ns()
-        try:
-            self._flush_event_buffer()
-        finally:
-            self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
+            nested_ns = self.persistence_nanoseconds - previously_recorded_ns
+            elapsed_ns = time.perf_counter_ns() - started_ns
+            self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
 
     def close(self) -> None:
         if self._closed:
@@ -3401,10 +3567,10 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             raise RuntimeError("cannot append to a closed Stage 5.2 trace stream")
         started_ns = time.perf_counter_ns()
         try:
-            owned = dict(event)
+            owned = event if isinstance(event, dict) else dict(event)
             if (
                 self._neighborhood_spool is None
-                and len(self._neighborhood_buffer) < self._buffer_rows
+                and len(self._neighborhood_buffer) < self._neighborhood_buffer_rows
             ):
                 self._neighborhood_buffer.append(owned)
                 return
@@ -3530,7 +3696,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
 
     @property
     def persisted_family_counts(self) -> dict[str, int]:
-        return {
+        output = {
             family: self._persisted_family_counts[family]
             for family in (
                 "events",
@@ -3539,6 +3705,8 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                 "screening_decisions",
             )
         }
+        output["screening_decisions"] += self._screening_decision_count
+        return output
 
     def diagnostic_rows(
         self,
@@ -3640,6 +3808,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         persisted = self._shard.append(
             route_dictionary={},
             critical_events=pending,
+            cache_lookups_coalesced=True,
         )
         if persisted != len(pending):
             raise RuntimeError(
@@ -3861,15 +4030,25 @@ def _run_and_persist_v2_shard(
                 storage=storage,
             )
             trace_stream.close()
-            live_persistence_ns_by_axis[axis.name] = trace_stream.persistence_nanoseconds
             active_trace_stream = None
+            artifact_preparation_completed_ns = time.perf_counter_ns()
+            postsolve_artifact_preparation_ns = (
+                artifact_preparation_completed_ns - solver_completed_ns
+            )
+            live_persistence_ns_by_axis[axis.name] = (
+                solver_persistence_ns + postsolve_artifact_preparation_ns
+            )
             del result, trace, route_dictionary, diagnostic_rows
             gc.collect()
+            axis_completed_ns = time.perf_counter_ns()
             timing_by_axis[axis.name] = {
                 "axis_started_ns": axis_started_ns,
                 "solver_started_ns": solver_started_ns,
                 "solver_completed_ns": solver_completed_ns,
-                "axis_completed_ns": time.perf_counter_ns(),
+                "artifact_preparation_completed_ns": artifact_preparation_completed_ns,
+                "axis_completed_ns": axis_completed_ns,
+                "postsolve_artifact_preparation_ns": postsolve_artifact_preparation_ns,
+                "post_artifact_gc_ns": axis_completed_ns - artifact_preparation_completed_ns,
             }
 
         finalize_started_ns = time.perf_counter_ns()
@@ -3949,10 +4128,10 @@ def _run_and_persist_v2_shard(
             if total_events
             else finalization_seconds / len(axes)
         )
-        # Validation, reconciliation, checkpoint construction, and GC are
-        # post-solve computation rather than artifact persistence.  Only the
-        # live stream writes and the final shard flush/seal are charged to the
-        # persistence promotion gate.
+        # The persistence gate includes every callback preparation step, all
+        # post-solve artifact construction, and the final shard flush/seal.
+        # Explicit GC remains visible in end-to-end timing but is not artifact
+        # construction, encoding, or I/O.
         timing = timing_by_axis[axis.name]
         persistence_seconds = finalization_share
         persistence_seconds += live_persistence_ns_by_axis[axis.name] / 1_000_000_000

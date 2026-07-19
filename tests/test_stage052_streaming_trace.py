@@ -4,6 +4,7 @@ import os
 import tempfile
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -12,7 +13,12 @@ import pytest
 
 from evrptw import artifacts as artifact_module
 from evrptw.alns import _NeighborhoodEventStream
-from evrptw.artifacts import ArtifactBundleWriter, ArtifactRunContext, ArtifactStorageConfig
+from evrptw.artifacts import (
+    ArtifactBundleWriter,
+    ArtifactReader,
+    ArtifactRunContext,
+    ArtifactStorageConfig,
+)
 from evrptw.experiments import stage052_performance
 from evrptw.measurement import (
     MeasurementConfig,
@@ -179,11 +185,16 @@ def test_stream_sink_is_runtime_only_and_never_serialized() -> None:
 
 
 class _RecordingShard:
-    def __init__(self) -> None:
+    def __init__(self, screening_schema_version: str = "screening_decisions_v3") -> None:
         self.events: list[dict[str, object]] = []
         self.flushes = 0
         self.append_calls = 0
+        self._screening_schema_version = screening_schema_version
         self._scratch = tempfile.TemporaryDirectory()
+
+    @property
+    def screening_schema_version(self) -> str:
+        return self._screening_schema_version
 
     @property
     def scratch_directory(self) -> Path:
@@ -195,10 +206,28 @@ class _RecordingShard:
         route_dictionary: Mapping[str, object],
         critical_events: object,
         diagnostic_rows: object = (),
+        cache_lookups_coalesced: bool = False,
     ) -> int:
-        del route_dictionary, diagnostic_rows
+        del route_dictionary, diagnostic_rows, cache_lookups_coalesced
         self.append_calls += 1
-        rows = [dict(row) for row in critical_events]  # type: ignore[union-attr]
+        rows = [
+            {
+                "decision_id": row[0],
+                "route_key": row[1],
+                "lane": row[2],
+                "iteration": row[3],
+                "operator": row[4],
+                "started_at": row[5],
+                "completed_at": row[6],
+                "benchmark_axis": row[7].tail[2],
+                "record_type": "screening_decision",
+                "event_type": "screening_decision",
+                "_precomputed_screening_definition": row[7],
+            }
+            if isinstance(row, tuple)
+            else dict(row)
+            for row in critical_events  # type: ignore[union-attr]
+        ]
         self.events.extend(rows)
         return len(rows)
 
@@ -251,6 +280,38 @@ def test_stage052_trace_sink_appends_to_open_shard_before_solver_returns() -> No
     assert sink.persisted_family_counts["events"] == 1
 
 
+def test_repeated_route_timings_and_exact_calls_are_retained() -> None:
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+        buffer_rows=1,
+    )
+    common = {
+        "evaluation_id": 1,
+        "route_key": "route:2:C1",
+        "lane": "legacy",
+        "iteration": 1,
+        "operator": "repair",
+        "started_at": 0.1,
+        "completed_at": 0.2,
+        "duration_seconds": 0.1,
+        "exact_started": False,
+        "exact_completed": False,
+        "feasible": True,
+        "failure_reason": "",
+    }
+    sink.append_route_evaluation(RouteEvaluationTrace(**common, kind="cache_hit"))
+    sink.append_route_evaluation(
+        RouteEvaluationTrace(
+            **{**common, "evaluation_id": 2, "exact_started": True, "exact_completed": True},
+            kind="exact_call",
+        )
+    )
+
+    assert [event["kind"] for event in shard.events] == ["cache_hit", "exact_call"]
+
+
 def test_stage052_stream_counts_follow_coalesced_physical_events() -> None:
     shard = _RecordingShard()
     sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
@@ -278,6 +339,40 @@ def test_stage052_stream_counts_follow_coalesced_physical_events() -> None:
         "route_evaluations": 0,
         "screening_decisions": 0,
     }
+
+
+def test_neighborhood_rejections_and_failures_are_retained_in_order() -> None:
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+        buffer_rows=1,
+    )
+
+    sink.append_neighborhood_event(
+        {
+            "event_type": "neighborhood_event",
+            "lane": "legacy",
+            "operator": "relocate",
+            "status": "prefilter_rejected",
+            "reason": "forward_time_window_prefilter",
+        }
+    )
+    sink.append_neighborhood_event(
+        {
+            "event_type": "neighborhood_event",
+            "lane": "legacy",
+            "operator": "relocate",
+            "status": "failed",
+            "reason": "evaluation_budget_exhausted",
+        }
+    )
+    sink.finish()
+
+    assert [event["status"] for event in shard.events] == [
+        "prefilter_rejected",
+        "failed",
+    ]
 
 
 def test_precomputed_screening_definition_matches_mapping_normalization() -> None:
@@ -324,6 +419,18 @@ def test_precomputed_screening_definition_matches_mapping_normalization() -> Non
     precomputed = artifact_module._screening_definition_from_cache_key(key)  # noqa: SLF001
     mapping_payload = {
         **streamed,
+        "status": decision.status,
+        "reason": decision.reason,
+        "benchmark_axis": "fixed_work",
+        "demand": decision.demand,
+        "distance_increment_lower_bound": decision.distance_increment_lower_bound,
+        "distance_lower_bound": decision.distance_lower_bound,
+        "exact_call_blocked": decision.exact_call_blocked,
+        "first_failed_check": decision.first_failed_check,
+        "min_time_window_slack": decision.min_time_window_slack,
+        "negative_cache_hit": decision.negative_cache_hit,
+        "single_segment_reachable": decision.single_segment_reachable,
+        "structural_energy_lower_bound": decision.structural_energy_lower_bound,
         "checks": tuple(
             {
                 "check": check.check,
@@ -345,12 +452,267 @@ def test_precomputed_screening_definition_matches_mapping_normalization() -> Non
     assert precomputed == normalized
 
 
+def test_v2_screening_bridge_retains_the_complete_legacy_payload() -> None:
+    shard = _RecordingShard("screening_decisions_v2")
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+        buffer_rows=1,
+    )
+    decision = ScreeningDecision(
+        decision_id=1,
+        route_key="route:2:C1",
+        lane="legacy",
+        iteration=1,
+        operator="repair",
+        status="rejected",
+        first_failed_check="capacity",
+        reason="capacity",
+        checks=(ScreeningCheckTrace("capacity", "fail", 2.5, "capacity"),),
+        demand=2.5,
+        min_time_window_slack=1.0,
+        distance_lower_bound=3.0,
+        distance_increment_lower_bound=None,
+        single_segment_reachable=True,
+        structural_energy_lower_bound=4.0,
+        negative_cache_hit=False,
+        exact_call_blocked=True,
+        started_at=0.1,
+        completed_at=0.2,
+        duration_seconds=0.1,
+    )
+
+    sink.append_screening_decision(decision)
+
+    assert len(shard.events) == 1
+    streamed = shard.events[0]
+    assert streamed["status"] == "rejected"
+    assert streamed["first_failed_check"] == "capacity"
+    assert streamed["duration_seconds"] == pytest.approx(0.1)
+    assert streamed["checks"] == (
+        {"check": "capacity", "status": "fail", "value": 2.5, "reason": "capacity"},
+    )
+
+
+def test_v2_screening_bridge_roundtrips_through_the_real_writer(tmp_path: Path) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt95"
+    writer = ArtifactBundleWriter(
+        tmp_path / "results" / run_label,
+        ArtifactRunContext("stage05.2", "artifact_streaming", run_label),
+        ArtifactStorageConfig(
+            storage_policy_version="artifact-storage-v2",
+            screening_schema_version="screening_decisions_v2",
+        ),
+    )
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,
+        axis_name="fixed_work",
+        buffer_rows=1,
+    )
+    decision = ScreeningDecision(
+        decision_id=1,
+        route_key="route:2:C1",
+        lane="legacy",
+        iteration=1,
+        operator="repair",
+        status="rejected",
+        first_failed_check="capacity",
+        reason="capacity",
+        checks=(ScreeningCheckTrace("capacity", "fail", 9.0, "capacity"),),
+        demand=9.0,
+        min_time_window_slack=1.0,
+        distance_lower_bound=3.0,
+        distance_increment_lower_bound=None,
+        single_segment_reachable=True,
+        structural_energy_lower_bound=4.0,
+        negative_cache_hit=False,
+        exact_call_blocked=True,
+        started_at=0.1,
+        completed_at=0.2,
+        duration_seconds=0.1,
+    )
+    sink.append_screening_decision(decision)
+    sink.finish()
+    shard.finalize(
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+    )
+    bundle = writer.finalize()
+
+    rows = list(
+        ArtifactReader(bundle.run_dir).iter_events(
+            f"toy/2014/{run_label}_events_toy_2014.parquet"
+        )
+    )
+    assert rows[0]["status"] == "rejected"
+    assert rows[0]["demand"] == pytest.approx(9.0)
+    assert rows[0]["checks"] == [
+        {"check": "capacity", "status": "fail", "value": 9.0, "reason": "capacity"}
+    ]
+
+
+def test_active_write_is_charged_to_persistence_timing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+        buffer_rows=1,
+    )
+    original_append = shard.append
+
+    def delayed_append(**kwargs: object) -> int:
+        time.sleep(0.01)
+        return original_append(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(shard, "append", delayed_append)
+
+    sink.append_event(
+        {
+            "event_type": "candidate_state",
+            "lane": "legacy",
+            "operator": "repair",
+            "timestamp_seconds": 0.1,
+            "current_objective_key": [1, 2.0, 3.0, 4],
+        }
+    )
+
+    assert sink.persistence_nanoseconds >= 9_000_000
+
+
+def test_callback_artifact_preparation_is_charged_to_persistence_timing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+        buffer_rows=100,
+    )
+    original = stage052_performance._route_reference_event  # noqa: SLF001
+
+    def delayed_route_reference(*args: object, **kwargs: object) -> dict[str, object]:
+        time.sleep(0.01)
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        stage052_performance,
+        "_route_reference_event",
+        delayed_route_reference,
+    )
+
+    sink.append_neighborhood_event(
+        {
+            "event_type": "neighborhood_event",
+            "lane": "legacy",
+            "operator": "relocate",
+            "status": "failed",
+        }
+    )
+
+    assert sink.persistence_nanoseconds >= 9_000_000
+
+
+def test_screening_identity_is_charged_to_persistence_timing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+        buffer_rows=100,
+    )
+    original_definition = stage052_performance._PrecomputedScreeningDefinition  # noqa: SLF001
+
+    def delayed_definition(*args: object, **kwargs: object) -> object:
+        time.sleep(0.01)
+        return original_definition(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        stage052_performance,
+        "_PrecomputedScreeningDefinition",
+        delayed_definition,
+    )
+    decision = ScreeningDecision(
+        decision_id=1,
+        route_key="route:2:C1",
+        lane="legacy",
+        iteration=1,
+        operator="repair",
+        status="rejected",
+        first_failed_check="capacity",
+        reason="capacity",
+        checks=(ScreeningCheckTrace("capacity", "fail", 2.5, "capacity"),),
+        demand=2.5,
+        min_time_window_slack=1.0,
+        distance_lower_bound=3.0,
+        distance_increment_lower_bound=None,
+        single_segment_reachable=True,
+        structural_energy_lower_bound=4.0,
+        negative_cache_hit=False,
+        exact_call_blocked=True,
+        started_at=0.1,
+        completed_at=0.2,
+        duration_seconds=0.1,
+    )
+
+    sink.append_screening_decision(decision)
+
+    assert sink.persistence_nanoseconds >= 9_000_000
+
+
+def test_negative_screening_tail_cache_fails_on_route_evidence_drift() -> None:
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+        buffer_rows=100,
+    )
+    base = ScreeningDecision(
+        decision_id=1,
+        route_key="route:2:C1",
+        lane="legacy",
+        iteration=1,
+        operator="repair",
+        status="negative_cache_hit",
+        first_failed_check="capacity",
+        reason="capacity",
+        checks=(ScreeningCheckTrace("negative_sequence_cache", "hit", True, "reused"),),
+        demand=2.5,
+        min_time_window_slack=1.0,
+        distance_lower_bound=3.0,
+        distance_increment_lower_bound=None,
+        single_segment_reachable=True,
+        structural_energy_lower_bound=4.0,
+        negative_cache_hit=True,
+        exact_call_blocked=True,
+        started_at=0.1,
+        completed_at=0.2,
+        duration_seconds=0.1,
+    )
+    sink.append_screening_decision(base)
+    sink.append_screening_decision(base)
+
+    with pytest.raises(RuntimeError, match="inconsistent evidence"):
+        sink.append_screening_decision(replace(base, decision_id=2, demand=9.0))
+
+
 def test_stage052_trace_sink_flushes_bounded_event_batches() -> None:
     shard = _RecordingShard()
     sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
         shard=shard,  # type: ignore[arg-type]
         axis_name="wall_clock_300",
         buffer_rows=4,
+        neighborhood_buffer_rows=4,
     )
 
     for iteration in range(5):
@@ -389,7 +751,7 @@ def test_small_neighborhood_stream_stays_in_bounded_memory_until_canonical_merge
                 "lane": "legacy",
                 "iteration": iteration,
                 "operator": "relocate",
-                "status": "rejected",
+                "status": "failed",
             }
         )
 
@@ -416,6 +778,7 @@ def test_large_neighborhood_stream_spills_to_measured_volume_until_canonical_mer
         shard=shard,  # type: ignore[arg-type]
         axis_name="wall_clock_300",
         buffer_rows=4,
+        neighborhood_buffer_rows=4,
     )
 
     for iteration in range(17):
@@ -425,7 +788,7 @@ def test_large_neighborhood_stream_spills_to_measured_volume_until_canonical_mer
                 "lane": "legacy",
                 "iteration": iteration,
                 "operator": "relocate",
-                "status": "rejected",
+                "status": "failed",
             }
         )
 
@@ -480,14 +843,16 @@ def test_spool_close_and_unlink_are_charged_to_persistence() -> None:
         shard=shard,  # type: ignore[arg-type]
         axis_name="fixed_work",
         buffer_rows=1,
+        neighborhood_buffer_rows=1,
     )
     for iteration in range(2):
         sink.append_neighborhood_event(
-            {
-                "event_type": "neighborhood_event",
-                "lane": "legacy",
-                "iteration": iteration,
-            }
+                {
+                    "event_type": "neighborhood_event",
+                    "lane": "legacy",
+                    "iteration": iteration,
+                    "status": "failed",
+                }
         )
     scratch_path = sink._neighborhood_spool_path  # noqa: SLF001
     assert scratch_path is not None
@@ -521,11 +886,16 @@ def test_fdopen_failure_closes_descriptor_and_removes_scratch_file(
         shard=_RecordingShard(),  # type: ignore[arg-type]
         axis_name="fixed_work",
         buffer_rows=1,
+        neighborhood_buffer_rows=1,
     )
-    sink.append_neighborhood_event({"event_type": "neighborhood_event"})
+    sink.append_neighborhood_event(
+        {"event_type": "neighborhood_event", "status": "failed"}
+    )
 
     with pytest.raises(OSError, match="fdopen failure"):
-        sink.append_neighborhood_event({"event_type": "neighborhood_event"})
+        sink.append_neighborhood_event(
+            {"event_type": "neighborhood_event", "status": "failed"}
+        )
 
     assert len(descriptors) == len(paths) == 1
     with pytest.raises(OSError):

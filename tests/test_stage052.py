@@ -2876,7 +2876,7 @@ def test_definition_encoded_screening_requires_known_untampered_definition() -> 
         expand_v2_screening_decision({**first, "definition_id": definition_id + 1}, definitions={})
 
 
-def test_v2_only_active_writes_are_charged_to_persistence(
+def test_v2_all_artifact_preparation_is_charged_without_gc_or_double_counting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     flush_delay_seconds = 0.03
@@ -3020,15 +3020,16 @@ def test_v2_only_active_writes_are_charged_to_persistence(
         timing["finalize_completed_ns"] - timing["finalize_started_ns"]
     ) / 1_000_000_000
     assert timing["axis_started_ns"] == timing["solver_started_ns"]
-    assert persistence >= (
-        flush_delay_seconds + live_append_delay_seconds + diagnostic_append_delay_seconds
-    ) * 0.9
-    assert persistence < (
+    expected_charged_delays = (
         flush_delay_seconds
         + postprocess_delay_seconds
         + live_append_delay_seconds
         + diagnostic_append_delay_seconds
-    ) * 1.2
+    )
+    assert persistence >= expected_charged_delays * 0.9
+    assert persistence < (
+        expected_charged_delays * 2.0
+    )
     assert solver_seconds == pytest.approx(recomputed_solver)
     assert persistence == pytest.approx(
         recomputed_finalize + timing["live_stream_persistence_ns"] / 1_000_000_000
@@ -3038,6 +3039,12 @@ def test_v2_only_active_writes_are_charged_to_persistence(
         timing["live_stream_persistence_ns"]
         - timing["solver_interleaved_persistence_ns"]
     ) / 1_000_000_000
+    assert postsolve_persistence == pytest.approx(
+        timing["postsolve_artifact_preparation_ns"] / 1_000_000_000
+    )
+    assert timing["post_artifact_gc_ns"] == (
+        timing["axis_completed_ns"] - timing["artifact_preparation_completed_ns"]
+    )
     assert float(rows[0]["end_to_end_seconds"]) == pytest.approx(
         solver_seconds + persistence + recomputed_post_solver - postsolve_persistence
     )
