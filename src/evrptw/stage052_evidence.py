@@ -426,7 +426,7 @@ class BatchPersistenceEnvelope:
                 payload.get("base_persistence_seconds"),
                 "base_persistence_seconds",
             ),
-            state_intervals=intervals,  # type: ignore[arg-type]
+            state_intervals=intervals,
         )
         observed = (
             _finite_non_negative(
@@ -1346,13 +1346,16 @@ class ProcessTreeResourceSampler:
                     try:
                         with process.oneshot():
                             process_rss = int(process.memory_info().rss)
+                            times = process.cpu_times()
+                            process_cpu = float(times.user + times.system)
                             rss += process_rss
+                            cpu += process_cpu
                             self._process_peak_rss[process.pid] = max(
                                 self._process_peak_rss.get(process.pid, 0),
                                 process_rss,
                             )
-                            times = process.cpu_times()
-                            cpu += float(times.user + times.system)
+                            if process.pid != self.parent_pid:
+                                self._descendant_pids.add(process.pid)
                     except (psutil.NoSuchProcess, psutil.ZombieProcess):
                         continue
                 self._peak_rss = max(self._peak_rss, rss)
@@ -1371,7 +1374,6 @@ class ProcessTreeResourceSampler:
     def _processes(self) -> list[Any]:
         parent = psutil.Process(self.parent_pid)
         children = parent.children(recursive=True)
-        self._descendant_pids.update(process.pid for process in children)
         return [parent, *children]
 
 

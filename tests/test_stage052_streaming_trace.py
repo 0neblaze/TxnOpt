@@ -178,6 +178,7 @@ class _RecordingShard:
     def __init__(self) -> None:
         self.events: list[dict[str, object]] = []
         self.flushes = 0
+        self.append_calls = 0
 
     def append(
         self,
@@ -187,6 +188,7 @@ class _RecordingShard:
         diagnostic_rows: object = (),
     ) -> int:
         del route_dictionary, diagnostic_rows
+        self.append_calls += 1
         rows = [dict(row) for row in critical_events]  # type: ignore[union-attr]
         self.events.extend(rows)
         return len(rows)
@@ -217,6 +219,7 @@ def test_stage052_trace_sink_appends_to_open_shard_before_solver_returns() -> No
         failure_reason="",
     )
 
+    sink.finish()
     assert len(shard.events) == 1
     assert shard.events[0]["benchmark_axis"] == "wall_clock_300"
     assert shard.events[0]["record_type"] == "route_evaluation"
@@ -231,9 +234,69 @@ def test_stage052_trace_sink_appends_to_open_shard_before_solver_returns() -> No
             "status": "accepted",
         }
     )
+    sink.finish()
 
     assert len(shard.events) == 2
     assert shard.events[-1]["record_type"] == "neighborhood_event"
+
+
+def test_stage052_trace_sink_flushes_bounded_event_batches() -> None:
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="wall_clock_300",
+        buffer_rows=4,
+    )
+
+    for iteration in range(5):
+        sink.append_event(
+            {
+                "event_type": "candidate_state",
+                "lane": "legacy",
+                "iteration": iteration,
+                "operator": "repair",
+                "timestamp_seconds": float(iteration),
+                "accepted": False,
+                "global_best": False,
+                "current_objective_key": [2, 10.0, 0.0, 0],
+            }
+        )
+
+    assert shard.append_calls == 1
+    assert len(shard.events) == 4
+    sink.finish()
+    assert shard.append_calls == 2
+    assert len(shard.events) == 5
+
+
+def test_stage052_trace_sink_does_not_replay_a_failed_batch() -> None:
+    class PartiallyFailingShard(_RecordingShard):
+        def append(self, **kwargs: object) -> int:
+            self.append_calls += 1
+            raise OSError("injected partial write failure")
+
+    shard = PartiallyFailingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="wall_clock_300",
+        buffer_rows=1,
+    )
+
+    with pytest.raises(OSError, match="partial write failure"):
+        sink.append_event(
+            {
+                "event_type": "candidate_state",
+                "lane": "legacy",
+                "iteration": 1,
+                "operator": "repair",
+                "timestamp_seconds": 1.0,
+                "current_objective_key": [2, 10.0, 0.0, 0],
+            }
+        )
+    sink.discard_pending()
+    sink.close()
+
+    assert shard.append_calls == 1
 
 
 def test_neighborhood_event_stream_externalizes_more_than_a_row_group() -> None:

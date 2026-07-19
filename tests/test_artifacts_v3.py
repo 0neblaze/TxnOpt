@@ -78,6 +78,14 @@ def _screening_event(*, decision_id: int, started_at: float) -> dict[str, object
     }
 
 
+def test_trace_dictionary_ids_must_be_unique_canonical_decimals() -> None:
+    with pytest.raises(ArtifactIntegrityError, match="duplicate or invalid"):
+        artifacts_module._invert_trace_dictionary(  # noqa: SLF001
+            {"1": "legacy", "01": "constraint"},
+            "lane",
+        )
+
+
 def test_screening_check_group_has_a_fixed_eight_check_bound() -> None:
     rows = (
         {
@@ -599,6 +607,60 @@ def test_v1_definition_json_v2_and_v3_expand_to_equal_logical_screening_events(
     assert logical[0] == logical[1] == logical[2]
 
 
+def test_v3_transcodes_old_v2_arrow_batches_without_logical_drift(tmp_path: Path) -> None:
+    source, source_trace_ref = _write_schema_bundle(
+        tmp_path,
+        run_label="stage05.2_artifact_streaming_attempt87",
+        config=ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+    source_items = {
+        (str(item.get("artifact_type")), str(item.get("artifact_subtype"))): item
+        for item in source.manifest["artifacts"]
+        if isinstance(item, dict) and str(item.get("relative_path", "")).startswith("toy/2014/")
+    }
+    child_writer = _v3_writer(tmp_path, attempt=88)
+    child = child_writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+
+    def batches(artifact_type: str, subtype: str) -> object:
+        reference = source_items[(artifact_type, subtype)]
+        return pq.ParquetFile(source.run_dir / reference["relative_path"]).iter_batches(
+            batch_size=65_536
+        )
+
+    source_trace = source.read_json(source_trace_ref)
+    child.append_transcoded_v2_batches(
+        route_batches=batches("route_dictionary", "canonical_routes"),
+        critical_event_batches=batches("events", "critical"),
+        screening_check_batches=batches("events", "screening_checks"),
+        screening_decision_batches=batches("events", "screening_decisions_v2"),
+        diagnostic_batches=batches("diagnostic", "aggregated"),
+        lane_dictionary=source_trace["lane_dictionary"],
+        operator_dictionary=source_trace["operator_dictionary"],
+    )
+    child.finalize(
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+    )
+    child_reader = ArtifactReader(child_writer.finalize().run_dir)
+    source_events_ref = source_trace_ref.replace("_trace_", "_events_").replace(
+        ".json", ".parquet"
+    )
+    child_events_ref = (
+        f"toy/2014/{child_writer.context.run_label}_events_toy_2014.parquet"
+    )
+
+    assert list(source.iter_events(source_events_ref)) == list(
+        child_reader.iter_events(child_events_ref)
+    )
+
+
 def test_iter_events_streams_v1_checks_as_writer_input(tmp_path: Path) -> None:
     reader, trace_ref = _write_schema_bundle(
         tmp_path,
@@ -1014,6 +1076,7 @@ def test_v3_row_groups_and_simultaneous_buffers_stay_bounded(tmp_path: Path) -> 
         ),
     )
     assert shard.max_buffered_groups_observed <= 2
+    assert shard.max_pending_screening_transaction_rows_observed <= 1_024
     shard.finalize(
         raw_payload={},
         solution_payload={},

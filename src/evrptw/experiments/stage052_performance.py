@@ -3219,9 +3219,19 @@ class _Stage052StreamingShard(Protocol):
 class _Stage052TraceStreamSink(MeasurementTraceSink):
     """Bridge live measurement callbacks into one open typed Parquet shard."""
 
-    def __init__(self, *, shard: _Stage052StreamingShard, axis_name: str) -> None:
+    def __init__(
+        self,
+        *,
+        shard: _Stage052StreamingShard,
+        axis_name: str,
+        buffer_rows: int = 1_024,
+    ) -> None:
+        if isinstance(buffer_rows, bool) or not isinstance(buffer_rows, int) or buffer_rows <= 0:
+            raise ValueError("trace stream buffer_rows must be a positive integer")
         self._shard = shard
         self.axis_name = axis_name
+        self._buffer_rows = buffer_rows
+        self._event_buffer: list[dict[str, object]] = []
         self.event_count = 0
         self.diagnostic_counts: Counter[tuple[str, str, str, str]] = Counter()
         self._pending_cache_lookup: dict[str, object] | None = None
@@ -3236,18 +3246,34 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         payload = {field.name: getattr(record, field.name) for field in fields(record)}
         payload["record_type"] = "route_evaluation"
         payload["event_type"] = "route_evaluation"
-        self._queue(payload)
+        self._queue_owned(payload)
 
     def append_event(self, event: Mapping[str, object]) -> None:
         payload = dict(event)
         payload["record_type"] = str(event.get("event_type", "event"))
-        self._queue(payload)
+        self._queue_owned(payload)
 
     def append_screening_decision(self, decision: ScreeningDecision) -> None:
         payload = {
-            field.name: getattr(decision, field.name)
-            for field in fields(decision)
-            if field.name != "checks"
+            "decision_id": decision.decision_id,
+            "route_key": decision.route_key,
+            "lane": decision.lane,
+            "iteration": decision.iteration,
+            "operator": decision.operator,
+            "status": decision.status,
+            "first_failed_check": decision.first_failed_check,
+            "reason": decision.reason,
+            "demand": decision.demand,
+            "min_time_window_slack": decision.min_time_window_slack,
+            "distance_lower_bound": decision.distance_lower_bound,
+            "distance_increment_lower_bound": decision.distance_increment_lower_bound,
+            "single_segment_reachable": decision.single_segment_reachable,
+            "structural_energy_lower_bound": decision.structural_energy_lower_bound,
+            "negative_cache_hit": decision.negative_cache_hit,
+            "exact_call_blocked": decision.exact_call_blocked,
+            "started_at": decision.started_at,
+            "completed_at": decision.completed_at,
+            "duration_seconds": decision.duration_seconds,
         }
         payload["checks"] = tuple(
             {
@@ -3260,13 +3286,13 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         )
         payload["record_type"] = "screening_decision"
         payload["event_type"] = "screening_decision"
-        self._queue(payload)
+        self._queue_owned(payload)
 
     def append_incremental_propagation(self, propagation: Mapping[str, object]) -> None:
         payload = dict(propagation)
         payload["record_type"] = "incremental_propagation"
         payload["event_type"] = "incremental_propagation"
-        self._queue(payload)
+        self._queue_owned(payload)
 
     def append_neighborhood_events(
         self,
@@ -3277,20 +3303,32 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         for raw_event in events:
             payload = _route_reference_event(raw_event, route_dictionary)
             payload["record_type"] = "neighborhood_event"
-            self._queue(payload)
+            self._queue_owned(payload)
 
     def append_neighborhood_event(self, event: Mapping[str, object]) -> None:
         payload = _route_reference_event(event, {})
         payload["record_type"] = "neighborhood_event"
-        self._queue(payload)
+        self._queue_owned(payload)
 
     def finish(self) -> None:
         self._flush_pending_lookup()
+        started_ns = time.perf_counter_ns()
+        try:
+            self._flush_event_buffer()
+        finally:
+            self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
 
     def close(self) -> None:
         if self._closed:
             return
         self.finish()
+        self._closed = True
+
+    def discard_pending(self) -> None:
+        """Discard an uncommitted callback batch after a shard append failure."""
+
+        self._pending_cache_lookup = None
+        self._event_buffer.clear()
         self._closed = True
 
     def semantic_digest(self, base_payload: Mapping[str, object]) -> str:
@@ -3350,9 +3388,11 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             }
 
     def _queue(self, raw_event: Mapping[str, object]) -> None:
+        self._queue_owned(dict(raw_event))
+
+    def _queue_owned(self, event: dict[str, object]) -> None:
         if self._closed:
             raise RuntimeError("cannot append to a closed Stage 5.2 trace stream")
-        event = dict(raw_event)
         event["lane"] = f"{self.axis_name}:{event.get('lane', '')}"
         event["benchmark_axis"] = self.axis_name
         if event.get("event_type") == "cache_event" and event.get("operation") == "lookup":
@@ -3376,8 +3416,9 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                 and event.get("event_type") == "cache_event"
                 and event.get("operation") in {"hit", "miss"}
             ):
+                lookup_result = event.get("operation")
                 event["operation"] = "lookup_result"
-                event["lookup_result"] = raw_event.get("operation")
+                event["lookup_result"] = lookup_result
                 event["lookup_current_entries"] = pending.get("current_entries")
                 event["lookup_current_bytes"] = pending.get("current_bytes")
                 self._pending_cache_lookup = None
@@ -3395,16 +3436,28 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
     def _append(self, event: dict[str, object]) -> None:
         started_ns = time.perf_counter_ns()
         try:
-            self._observe(event)
-            persisted = self._shard.append(
-                route_dictionary={},
-                critical_events=(event,),
-            )
+            if event.get("event_type") != "screening_decision":
+                self._observe(event)
+            self._event_buffer.append(event)
+            if len(self._event_buffer) >= self._buffer_rows:
+                self._flush_event_buffer()
         finally:
             self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
-        if persisted != 1:
-            raise RuntimeError("Stage 5.2 trace sink did not persist exactly one logical event")
         self.event_count += 1
+
+    def _flush_event_buffer(self) -> None:
+        if not self._event_buffer:
+            return
+        pending = tuple(self._event_buffer)
+        self._event_buffer.clear()
+        persisted = self._shard.append(
+            route_dictionary={},
+            critical_events=pending,
+        )
+        if persisted != len(pending):
+            raise RuntimeError(
+                "Stage 5.2 trace sink did not persist its complete logical event batch"
+            )
 
     def _observe(self, event: Mapping[str, object]) -> None:
         event_type = str(event.get("event_type", event.get("record_type", "event")))
@@ -3490,6 +3543,7 @@ def _run_and_persist_v2_shard(
     drafts: dict[str, dict[str, object]] = {}
     timing_by_axis: dict[str, dict[str, int]] = {}
     live_persistence_ns_by_axis: dict[str, int] = {}
+    solver_persistence_ns_by_axis: dict[str, int] = {}
     event_counts: dict[str, int] = {}
     failures: list[str] = []
     active_trace_stream: _Stage052TraceStreamSink | None = None
@@ -3508,13 +3562,14 @@ def _run_and_persist_v2_shard(
                 stage02=stage02,
                 trace_sink=trace_stream,
             )
+            trace_stream.finish()
             solver_completed_ns = time.perf_counter_ns()
-            live_persistence_ns = trace_stream.persistence_nanoseconds
-            live_persistence_ns_by_axis[axis.name] = live_persistence_ns
+            solver_persistence_ns = trace_stream.persistence_nanoseconds
+            solver_persistence_ns_by_axis[axis.name] = solver_persistence_ns
             solver_elapsed_ns = solver_completed_ns - solver_started_ns
-            if live_persistence_ns > solver_elapsed_ns:
+            if solver_persistence_ns > solver_elapsed_ns:
                 raise RuntimeError("live trace persistence exceeds measured solver wall time")
-            solver_seconds = (solver_elapsed_ns - live_persistence_ns) / 1_000_000_000
+            solver_seconds = (solver_elapsed_ns - solver_persistence_ns) / 1_000_000_000
             trace = result.measurement_trace
             if trace is None:
                 raise RuntimeError(f"Stage 5.2 {axis.name} result is missing its trace")
@@ -3538,11 +3593,18 @@ def _run_and_persist_v2_shard(
                     seed=task.seed,
                 )
             )
-            shard.append(
-                route_dictionary={},
-                critical_events=(),
-                diagnostic_rows=diagnostic_rows,
-            )
+            diagnostic_persistence_started_ns = time.perf_counter_ns()
+            try:
+                shard.append(
+                    route_dictionary={},
+                    critical_events=(),
+                    diagnostic_rows=diagnostic_rows,
+                )
+            finally:
+                trace_stream.persistence_nanoseconds += (
+                    time.perf_counter_ns() - diagnostic_persistence_started_ns
+                )
+            live_persistence_ns_by_axis[axis.name] = trace_stream.persistence_nanoseconds
             semantic_digest = trace_stream.semantic_digest(
                 {
                     "objective_key": objective_key,
@@ -3684,8 +3746,14 @@ def _run_and_persist_v2_shard(
         finalization_seconds = (finalize_completed_ns - finalize_started_ns) / 1_000_000_000
     except BaseException as error:
         if active_trace_stream is not None:
-            active_trace_stream.close()
-        shard.abort(error)
+            active_trace_stream.discard_pending()
+        try:
+            shard.abort(error)
+        except BaseException as abort_error:
+            raise BaseExceptionGroup(
+                "Stage 5.2 shard failed and abort cleanup also failed",
+                [error, abort_error],
+            ) from error
         raise
 
     total_events = sum(event_counts.values())
@@ -3721,6 +3789,7 @@ def _run_and_persist_v2_shard(
             "finalize_completed_ns": finalize_completed_ns,
             "axis_event_count": event_counts[axis.name],
             "live_stream_persistence_ns": live_persistence_ns_by_axis[axis.name],
+            "solver_interleaved_persistence_ns": solver_persistence_ns_by_axis[axis.name],
             "total_event_count": total_events,
             "axis_count": len(axes),
         }

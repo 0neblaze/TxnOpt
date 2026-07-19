@@ -936,6 +936,10 @@ class Stage03Trace:
         }
 
     def reconcile(self, result: _MeasuredResult) -> dict[str, object]:
+        stream_sink = cast(Any, self.config.stream_sink)
+        finish_stream = getattr(stream_sink, "finish", None)
+        if callable(finish_stream):
+            finish_stream()
         expected_calls = int(result.charging_subproblem_calls)
         expected_started_calls = int(
             getattr(result, "exact_started_calls", expected_calls) or expected_calls

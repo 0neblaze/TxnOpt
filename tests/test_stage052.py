@@ -2017,6 +2017,49 @@ def test_process_tree_resource_summary_includes_live_child() -> None:
     assert summary.status == "complete"
 
 
+def test_process_tree_resource_summary_excludes_half_sampled_transient_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        def __init__(self, pid: int, *, disappears_before_cpu: bool = False) -> None:
+            self.pid = pid
+            self.disappears_before_cpu = disappears_before_cpu
+
+        def oneshot(self) -> FakeProcess:
+            return self
+
+        def __enter__(self) -> FakeProcess:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def memory_info(self) -> SimpleNamespace:
+            return SimpleNamespace(rss=1024)
+
+        def cpu_times(self) -> SimpleNamespace:
+            if self.disappears_before_cpu:
+                raise stage052_evidence.psutil.NoSuchProcess(self.pid)
+            return SimpleNamespace(user=0.1, system=0.1)
+
+    sampler = ProcessTreeResourceSampler(
+        run_label="stage05.2_job_parallel_attempt99",
+        component="job_parallel",
+        configured_worker_count=1,
+        interval_seconds=0.01,
+    )
+    parent = FakeProcess(sampler.parent_pid)
+    transient = FakeProcess(999_999, disappears_before_cpu=True)
+    monkeypatch.setattr(sampler, "_processes", lambda: [parent, transient])
+
+    sampler.start()
+    time.sleep(0.03)
+    summary = sampler.stop()
+
+    assert transient.pid not in summary.descendant_pids
+    assert transient.pid not in dict(summary.process_peak_rss_bytes)
+
+
 def test_worker_ownership_requires_actual_sampled_pids() -> None:
     resource = {
         "schema_version": "stage05.2-run-resource-v2",
@@ -2321,6 +2364,146 @@ def test_runtime_signature_allows_historical_python_binary_but_binds_native_prof
         optimization_profile="python",
     )
     assert not passed
+
+
+def test_reviewer_infers_historical_v2_screening_schema_from_artifacts() -> None:
+    reader = SimpleNamespace(
+        manifest={
+            "storage_policy": {"storage_policy_version": "artifact-storage-v2"},
+            "artifacts": [
+                {
+                    "artifact_type": "events",
+                    "artifact_subtype": "screening_decisions_v2",
+                }
+            ],
+        }
+    )
+
+    assert stage052_review._screening_schema_version(reader) == "screening_decisions_v2"
+
+
+def test_reviewer_rejects_declared_and_physical_screening_schema_mismatch() -> None:
+    mismatch = SimpleNamespace(
+        manifest={
+            "storage_policy": {"screening_schema_version": "screening_decisions_v2"},
+            "artifacts": [
+                {"artifact_type": "events", "artifact_subtype": "screening_definitions_v3"},
+                {"artifact_type": "events", "artifact_subtype": "screening_occurrences_v3"},
+            ],
+        }
+    )
+    mixed = SimpleNamespace(
+        manifest={
+            "storage_policy": {},
+            "artifacts": [
+                {"artifact_type": "events", "artifact_subtype": "screening_decisions_v2"},
+                {"artifact_type": "events", "artifact_subtype": "screening_definitions_v3"},
+                {"artifact_type": "events", "artifact_subtype": "screening_occurrences_v3"},
+            ],
+        }
+    )
+
+    assert stage052_review._screening_schema_version(mismatch) is None
+    assert stage052_review._screening_schema_version(mixed) is None
+
+
+def test_storage_digest_ignores_derived_producer_instrumentation() -> None:
+    historical = {
+        "objective_key": [2, 10.0, 0.0, 0],
+        "backend_metrics": {"exact_calls": 100},
+    }
+    current = {
+        **historical,
+        "anytime_checkpoints": [],
+        "initial_objective_key": [],
+        "iteration_limit_completed_at_seconds": 0.75,
+        "trace_reconciliation": {"status": "pass", "checks": {"new_name": True}},
+        "unique_route_semantics": "completed_cache_owner_identity_v2",
+        "backend_metrics": {
+            "exact_calls": 100,
+            "label_management_seconds": 0.5,
+            "transition_seconds": 0.1,
+            "launch_occupancies": [1, 2],
+            "native_invocations": 0,
+            "native_fallbacks": 0,
+        },
+    }
+
+    historical_semantics = stage052_review._canonical_axis_semantics(
+        raw_axis={**historical, "started_calls": 100, "completed_calls": 100},
+        solution_axis={"objective_key": [2, 10.0, 0.0, 0]},
+        trace={},
+        axis="fixed_work",
+    )
+    current_semantics = stage052_review._canonical_axis_semantics(
+        raw_axis={**current, "started_calls": 100, "completed_calls": 100},
+        solution_axis={
+            "objective_key": [2, 10.0, 0.0, 0],
+            "initial_objective_key": [],
+            "initial_routes": [],
+        },
+        trace={},
+        axis="fixed_work",
+    )
+
+    assert current_semantics == historical_semantics
+    backend_metrics = current["backend_metrics"]
+    assert isinstance(backend_metrics, dict)
+    backend_metrics["native_fallbacks"] = 1
+    fallback_semantics = stage052_review._canonical_axis_semantics(
+        raw_axis={**current, "started_calls": 100, "completed_calls": 100},
+        solution_axis={"objective_key": [2, 10.0, 0.0, 0]},
+        trace={},
+        axis="fixed_work",
+    )
+    assert fallback_semantics != historical_semantics
+    mutated_semantics = stage052_review._canonical_axis_semantics(
+        raw_axis={
+            **current,
+            "started_calls": 100,
+            "completed_calls": 100,
+            "unique_route_semantics": "started_lane_identity_legacy_v1",
+        },
+        solution_axis={"objective_key": [2, 10.0, 0.0, 0]},
+        trace={},
+        axis="fixed_work",
+    )
+    assert mutated_semantics != historical_semantics
+    with pytest.raises(ArtifactIntegrityError, match="reconciliation did not pass"):
+        stage052_review._canonical_axis_semantics(
+            raw_axis={
+                **current,
+                "started_calls": 100,
+                "completed_calls": 100,
+                "trace_reconciliation": {"status": "fail", "checks": {"x": False}},
+            },
+            solution_axis={"objective_key": [2, 10.0, 0.0, 0]},
+            trace={},
+            axis="fixed_work",
+        )
+
+
+def test_streamed_record_counts_must_match_independent_replay() -> None:
+    observed = {
+        "events": 3,
+        "incremental_propagations": 1,
+        "route_evaluations": 2,
+        "screening_decisions": 4,
+    }
+    stage052_review._validate_streamed_record_counts(observed, observed)
+
+    with pytest.raises(ArtifactIntegrityError, match="do not match"):
+        stage052_review._validate_streamed_record_counts(
+            {**observed, "screening_decisions": 999},
+            observed,
+        )
+    with pytest.raises(ArtifactIntegrityError, match="do not match"):
+        stage052_review._validate_streamed_record_counts(
+            {"events": 3},
+            observed,
+        )
+    with pytest.raises(ArtifactIntegrityError, match="required for v3"):
+        stage052_review._validate_streamed_record_counts(None, observed, required=True)
 
 
 def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
@@ -2674,13 +2857,17 @@ def test_v2_only_active_writes_are_charged_to_persistence(
     flush_delay_seconds = 0.03
     postprocess_delay_seconds = 0.02
     live_append_delay_seconds = 0.025
+    diagnostic_append_delay_seconds = 0.015
 
     class FakeShard:
         def append(self, **kwargs: object) -> int:
             critical_events = kwargs.get("critical_events")
             if isinstance(critical_events, tuple) and critical_events:
                 time.sleep(live_append_delay_seconds)
-            return 1
+            diagnostic_rows = kwargs.get("diagnostic_rows")
+            if isinstance(diagnostic_rows, tuple) and diagnostic_rows:
+                time.sleep(diagnostic_append_delay_seconds)
+            return len(critical_events) if isinstance(critical_events, tuple) else 0
 
         def flush(self) -> None:
             time.sleep(flush_delay_seconds)
@@ -2737,7 +2924,7 @@ def test_v2_only_active_writes_are_charged_to_persistence(
         assert isinstance(sink, stage052_performance._Stage052TraceStreamSink)
         sink.append_event(
             {
-                "event_type": "execution_error",
+                "event_type": "timing_diagnostic",
                 "lane": "legacy",
                 "iteration": 1,
                 "operator": "test",
@@ -2799,7 +2986,7 @@ def test_v2_only_active_writes_are_charged_to_persistence(
     recomputed_solver = (
         timing["solver_completed_ns"]
         - timing["solver_started_ns"]
-        - timing["live_stream_persistence_ns"]
+        - timing["solver_interleaved_persistence_ns"]
     ) / 1_000_000_000
     recomputed_post_solver = (
         timing["axis_completed_ns"] - timing["solver_completed_ns"]
@@ -2808,17 +2995,26 @@ def test_v2_only_active_writes_are_charged_to_persistence(
         timing["finalize_completed_ns"] - timing["finalize_started_ns"]
     ) / 1_000_000_000
     assert timing["axis_started_ns"] == timing["solver_started_ns"]
-    assert persistence >= (flush_delay_seconds + live_append_delay_seconds) * 0.9
+    assert persistence >= (
+        flush_delay_seconds + live_append_delay_seconds + diagnostic_append_delay_seconds
+    ) * 0.9
     assert persistence < (
-        flush_delay_seconds + postprocess_delay_seconds + live_append_delay_seconds
+        flush_delay_seconds
+        + postprocess_delay_seconds
+        + live_append_delay_seconds
+        + diagnostic_append_delay_seconds
     ) * 1.2
     assert solver_seconds == pytest.approx(recomputed_solver)
     assert persistence == pytest.approx(
         recomputed_finalize + timing["live_stream_persistence_ns"] / 1_000_000_000
     )
     assert recomputed_post_solver >= postprocess_delay_seconds * 0.9
+    postsolve_persistence = (
+        timing["live_stream_persistence_ns"]
+        - timing["solver_interleaved_persistence_ns"]
+    ) / 1_000_000_000
     assert float(rows[0]["end_to_end_seconds"]) == pytest.approx(
-        solver_seconds + persistence + recomputed_post_solver
+        solver_seconds + persistence + recomputed_post_solver - postsolve_persistence
     )
 
 

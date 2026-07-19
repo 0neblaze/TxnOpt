@@ -163,6 +163,10 @@ def _audit_primary_persistence(
                 raw_timing.get("live_stream_persistence_ns"),
                 "live_stream_persistence_ns",
             )
+            solver_live_ns = _strict_int(
+                raw_timing.get("solver_interleaved_persistence_ns", live_ns),
+                "solver_interleaved_persistence_ns",
+            )
             event_count = _strict_int(raw_timing.get("axis_event_count"), "axis_event_count")
             total_event_count = _strict_int(
                 raw_timing.get("total_event_count"), "total_event_count"
@@ -172,14 +176,16 @@ def _audit_primary_persistence(
                 solver_completed_ns <= solver_started_ns
                 or finalize_completed_ns < finalize_started_ns
                 or live_ns < 0
-                or live_ns > solver_completed_ns - solver_started_ns
+                or solver_live_ns < 0
+                or solver_live_ns > live_ns
+                or solver_live_ns > solver_completed_ns - solver_started_ns
                 or event_count < 0
                 or total_event_count < 0
                 or axis_count <= 0
             ):
                 raise ArtifactIntegrityError("persistence monotonic interval is invalid")
             solver_seconds = (
-                solver_completed_ns - solver_started_ns - live_ns
+                solver_completed_ns - solver_started_ns - solver_live_ns
             ) / 1_000_000_000
             finalization_seconds = (
                 finalize_completed_ns - finalize_started_ns
@@ -398,6 +404,15 @@ def replay_stage052_storage_semantics(
             axis_hasher.update(_canonical_json_bytes(base) + b"\n")
             hashers[str(axis)] = axis_hasher
         event_ordinals = {axis: 0 for axis in hashers}
+        event_family_counts = {
+            axis: {
+                "events": 0,
+                "incremental_propagations": 0,
+                "route_evaluations": 0,
+                "screening_decisions": 0,
+            }
+            for axis in hashers
+        }
         previous_event_id = 0
         for logical_event in reader.iter_events(str(events_ref["relative_path"])):
             row = dict(logical_event)
@@ -420,6 +435,17 @@ def replay_stage052_storage_semantics(
                 )
             row.pop("event_id", None)
             row.pop("definition_id", None)
+            event_type = str(row.get("event_type", ""))
+            family = (
+                "route_evaluations"
+                if event_type == "route_evaluation"
+                else "screening_decisions"
+                if event_type == "screening_decision"
+                else "incremental_propagations"
+                if event_type == "incremental_propagation"
+                else "events"
+            )
+            event_family_counts[axis][family] += 1
             for volatile_time_field in (
                 "timestamp_seconds",
                 "started_at",
@@ -443,6 +469,19 @@ def replay_stage052_storage_semantics(
             ):
                 raise ArtifactIntegrityError(f"event dictionary identity is missing in {directory}")
             event_hasher.update(_canonical_json_bytes(event_payload) + b"\n")
+        trace_axes = trace.get("axes")
+        if isinstance(trace_axes, Mapping):
+            for axis, observed_counts in event_family_counts.items():
+                trace_axis = trace_axes.get(axis)
+                if isinstance(trace_axis, Mapping):
+                    _validate_streamed_record_counts(
+                        trace_axis.get("streamed_record_counts"),
+                        observed_counts,
+                        required=(
+                            trace.get("screening_schema_version")
+                            == "screening_decisions_v3"
+                        ),
+                    )
         for row in reader.iter_parquet_rows(
             str(diagnostic_ref["relative_path"]),
             schema=DIAGNOSTIC_SCHEMA,
@@ -484,9 +523,17 @@ _NON_SEMANTIC_STORAGE_FIELDS = frozenset(
         "started_at",
         "completed_at",
         "duration_seconds",
+        "label_management_seconds",
+        "transition_seconds",
         "current_bytes",
         "entry_bytes",
         "lookup_current_bytes",
+        "bytes_current",
+        "bytes_peak",
+        "iteration_limit_completed_at_seconds",
+        "launch_occupancies",
+        "trace_reconciliation",
+        "streamed_record_counts",
         "trace_storage_version",
         "route_dictionary_ref",
         "events_ref",
@@ -502,6 +549,28 @@ _NON_SEMANTIC_STORAGE_FIELDS = frozenset(
         "event_identity",
     }
 )
+
+
+def _validate_streamed_record_counts(
+    recorded: object,
+    observed: Mapping[str, int],
+    *,
+    required: bool = False,
+) -> None:
+    """Reconcile derived stream counters against independently replayed events."""
+
+    if recorded is None:
+        if required:
+            raise ArtifactIntegrityError("streamed record counts are required for v3 evidence")
+        return
+    if not isinstance(recorded, Mapping):
+        raise ArtifactIntegrityError("streamed record counts are invalid")
+    normalized = {
+        str(key): _strict_int(value, f"streamed_record_counts.{key}")
+        for key, value in recorded.items()
+    }
+    if normalized != dict(observed):
+        raise ArtifactIntegrityError("streamed record counts do not match replayed events")
 
 
 def _canonical_semantic_value(value: object) -> object:
@@ -523,18 +592,56 @@ def _canonical_axis_semantics(
     trace: Mapping[str, object],
     axis: str,
 ) -> dict[str, object]:
-    _strict_int(raw_axis.get("started_calls"), "started_calls")
-    _strict_int(raw_axis.get("completed_calls"), "completed_calls")
+    normalized_raw_axis = dict(raw_axis)
+    normalized_raw_axis.setdefault("anytime_checkpoints", [])
+    normalized_raw_axis.setdefault("initial_objective_key", [])
+    normalized_raw_axis.setdefault(
+        "unique_route_semantics", "completed_cache_owner_identity_v2"
+    )
+    reconciliation = normalized_raw_axis.get("trace_reconciliation")
+    if reconciliation is not None:
+        if not isinstance(reconciliation, Mapping) or reconciliation.get("status") != "pass":
+            raise ArtifactIntegrityError("trace reconciliation did not pass")
+        checks = reconciliation.get("checks")
+        if not isinstance(checks, Mapping) or not checks or not all(
+            value is True for value in checks.values()
+        ):
+            raise ArtifactIntegrityError("trace reconciliation checks are incomplete")
+    raw_backend = normalized_raw_axis.get("backend_metrics")
+    if isinstance(raw_backend, Mapping):
+        normalized_backend = dict(raw_backend)
+        normalized_backend.setdefault("native_invocations", 0)
+        normalized_backend.setdefault("native_fallbacks", 0)
+        normalized_raw_axis["backend_metrics"] = normalized_backend
+    normalized_solution_axis = dict(solution_axis)
+    normalized_solution_axis.setdefault("initial_objective_key", [])
+    normalized_solution_axis.setdefault("initial_routes", [])
+    _strict_int(normalized_raw_axis.get("started_calls"), "started_calls")
+    _strict_int(normalized_raw_axis.get("completed_calls"), "completed_calls")
     trace_axes = trace.get("axes")
     trace_axis: object = {}
     if isinstance(trace_axes, Mapping):
-        trace_axis = trace_axes.get(axis, {})
-        if not isinstance(trace_axis, Mapping):
+        candidate_trace_axis = trace_axes.get(axis, {})
+        if not isinstance(candidate_trace_axis, Mapping):
             raise ArtifactIntegrityError(f"trace axis is invalid: {axis}")
+        normalized_trace_axis = dict(candidate_trace_axis)
+        normalized_trace_axis.setdefault(
+            "unique_route_semantics", "completed_cache_owner_identity_v2"
+        )
+        streamed_counts = normalized_trace_axis.get("streamed_record_counts")
+        if streamed_counts is not None and (
+            not isinstance(streamed_counts, Mapping)
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in streamed_counts.values()
+            )
+        ):
+            raise ArtifactIntegrityError("streamed record counts are invalid")
+        trace_axis = normalized_trace_axis
     return {
         "record": "axis_semantics",
-        "raw": _canonical_semantic_value(raw_axis),
-        "solution": _canonical_semantic_value(solution_axis),
+        "raw": _canonical_semantic_value(normalized_raw_axis),
+        "solution": _canonical_semantic_value(normalized_solution_axis),
         "trace": _canonical_semantic_value(trace_axis),
     }
 
@@ -581,6 +688,40 @@ def replay_stage052_storage_semantics_many(
     if any(result is None for result in results):
         raise RuntimeError("parallel Stage 5.2 replay returned an incomplete result set")
     return [result for result in results if result is not None]
+
+
+def _screening_schema_version(reader: ArtifactReader) -> str | None:
+    """Return a schema only when declaration and physical artifacts agree."""
+
+    policy = reader.manifest.get("storage_policy")
+    declared: str | None = None
+    if isinstance(policy, Mapping):
+        raw_declared = policy.get("screening_schema_version")
+        if isinstance(raw_declared, str):
+            declared = raw_declared
+    artifacts = reader.manifest.get("artifacts")
+    if not isinstance(artifacts, list):
+        return None
+    subtypes = {
+        str(item.get("artifact_subtype"))
+        for item in artifacts
+        if isinstance(item, Mapping)
+        and item.get("artifact_type") == "events"
+    }
+    observed: set[str] = {
+        subtype
+        for subtype in subtypes
+        if subtype in {"screening_decisions_v1", "screening_decisions_v2"}
+    }
+    v3_parts = {"screening_definitions_v3", "screening_occurrences_v3"}
+    if v3_parts <= subtypes:
+        observed.add("screening_decisions_v3")
+    elif v3_parts & subtypes:
+        return None
+    if len(observed) != 1:
+        return None
+    physical = next(iter(observed))
+    return physical if declared is None or declared == physical else None
 
 
 def validate_per_run_scope(
@@ -2013,6 +2154,13 @@ def _audit_native_execution(
                     timing.get("live_stream_persistence_ns"),
                     "live_stream_persistence_ns",
                 )
+                solver_interleaved_persistence_ns = _strict_int(
+                    timing.get(
+                        "solver_interleaved_persistence_ns",
+                        live_stream_persistence_ns,
+                    ),
+                    "solver_interleaved_persistence_ns",
+                )
                 total_event_count = _strict_int(
                     timing.get("total_event_count"), "total_event_count"
                 )
@@ -2023,7 +2171,9 @@ def _audit_native_execution(
                     or axis_completed_ns < solver_completed_ns
                     or finalize_completed_ns <= finalize_started_ns
                     or live_stream_persistence_ns < 0
-                    or live_stream_persistence_ns
+                    or solver_interleaved_persistence_ns < 0
+                    or solver_interleaved_persistence_ns > live_stream_persistence_ns
+                    or solver_interleaved_persistence_ns
                     > solver_completed_ns - solver_started_ns
                     or axis_event_count < 0
                     or total_event_count < 0
@@ -2033,7 +2183,9 @@ def _audit_native_execution(
                         f"native monotonic timing interval is invalid: {axis_identity}"
                     )
                 solver_seconds = (
-                    solver_completed_ns - solver_started_ns - live_stream_persistence_ns
+                    solver_completed_ns
+                    - solver_started_ns
+                    - solver_interleaved_persistence_ns
                 ) / 1_000_000_000
                 finalization_seconds = (
                     finalize_completed_ns - finalize_started_ns
@@ -2328,14 +2480,11 @@ def _component_gates(
         predecessor_dir = prerequisite_dirs["hot_path_predecessor"]
         historical_dir = prerequisite_dirs["historical_storage"]
         remediation_source = prerequisite_dirs["remediation_source"]
-        current_storage_policy = ArtifactReader(raw_dir).manifest.get("storage_policy")
-        historical_storage_policy = ArtifactReader(historical_dir).manifest.get("storage_policy")
+        current_reader = ArtifactReader(raw_dir)
+        historical_reader = ArtifactReader(historical_dir)
         physical_schema_passed = (
-            isinstance(current_storage_policy, Mapping)
-            and current_storage_policy.get("screening_schema_version") == "screening_decisions_v3"
-            and isinstance(historical_storage_policy, Mapping)
-            and historical_storage_policy.get("screening_schema_version")
-            == "screening_decisions_v2"
+            _screening_schema_version(current_reader) == "screening_decisions_v3"
+            and _screening_schema_version(historical_reader) == "screening_decisions_v2"
         )
         replay_maps = replay_stage052_storage_semantics_many(
             (predecessor_dir, raw_dir),

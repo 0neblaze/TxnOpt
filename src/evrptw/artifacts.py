@@ -41,6 +41,7 @@ V2_PARQUET_ROW_GROUP_SIZE = 65_536
 ROUTE_IDENTITY_HOT_CACHE_ENTRIES = 1_024
 ROUTE_IDENTITY_COUNTER_NAMESPACES = 16
 MAX_SCREENING_CHECKS_PER_DECISION = 8
+LIVE_SCREENING_TRANSACTION_ROWS = 1_024
 UNIQUE_ROUTE_IDENTITY_SEMANTICS = frozenset(
     {"legacy_started", "completed_shared", "completed_lane"}
 )
@@ -1466,6 +1467,21 @@ class _StreamingParquetSink:
         if self._buffered_row_count >= V2_PARQUET_ROW_GROUP_SIZE:
             self.flush()
 
+    def append_batch(self, batch: pa.RecordBatch) -> None:
+        """Append one schema-identical Arrow batch without row materialization."""
+
+        if not batch.schema.equals(self.schema, check_metadata=False):
+            raise ArtifactIntegrityError(
+                f"Arrow batch schema does not match sink schema for {self.path}"
+            )
+        self.flush()
+        offset = 0
+        while offset < batch.num_rows:
+            current = batch.slice(offset, V2_PARQUET_ROW_GROUP_SIZE)
+            self._writer.write_batch(current, row_group_size=V2_PARQUET_ROW_GROUP_SIZE)
+            self.row_count += current.num_rows
+            offset += current.num_rows
+
     @property
     def buffered_row_count(self) -> int:
         return self._buffered_row_count
@@ -1547,6 +1563,31 @@ def _stable_dictionary_id(value: str) -> int:
 
     digest = hashlib.sha256(value.encode("utf-8")).digest()
     return int.from_bytes(digest[:4], "big") & 0x7FFF_FFFF
+
+
+def _invert_trace_dictionary(
+    payload: Mapping[str, object],
+    kind: str,
+) -> dict[str, int]:
+    output: dict[str, int] = {}
+    seen_ids: set[int] = set()
+    for raw_id, raw_value in payload.items():
+        if not isinstance(raw_value, str) or not raw_value:
+            raise ArtifactIntegrityError(f"{kind} dictionary value is invalid")
+        try:
+            dictionary_id = int(raw_id)
+        except ValueError as error:
+            raise ArtifactIntegrityError(f"{kind} dictionary ID is invalid") from error
+        if (
+            dictionary_id <= 0
+            or raw_id != str(dictionary_id)
+            or dictionary_id in seen_ids
+            or raw_value in output
+        ):
+            raise ArtifactIntegrityError(f"{kind} dictionary is duplicate or invalid")
+        seen_ids.add(dictionary_id)
+        output[raw_value] = dictionary_id
+    return output
 
 
 def _stable_route_id(route_key: str) -> int:
@@ -3679,6 +3720,7 @@ class ArtifactV2ShardSession:
         self._screening_definition_store: _BoundedScreeningDefinitionStore | None = None
         self._active_sinks: list[_StreamingParquetSink] = []
         self._max_buffered_groups_observed = 0
+        self._max_pending_screening_transaction_rows_observed = 0
         self._state = "open"
 
     def append(
@@ -3697,6 +3739,23 @@ class ArtifactV2ShardSession:
             self._flush_sink(self._route_sink)
 
         count = 0
+        pending_screening_definitions: list[dict[str, object]] = []
+        pending_screening_occurrences: list[dict[str, object]] = []
+
+        def flush_screening_transaction() -> None:
+            if self._screening_definitions_sink is None:
+                return
+            if self._screening_occurrences_sink is None:
+                raise RuntimeError("screening occurrence sink is unavailable")
+            definitions = tuple(pending_screening_definitions)
+            occurrences = tuple(pending_screening_occurrences)
+            pending_screening_definitions.clear()
+            pending_screening_occurrences.clear()
+            for definition in definitions:
+                self._append_buffered(self._screening_definitions_sink, definition)
+            for occurrence in occurrences:
+                self._append_buffered(self._screening_occurrences_sink, occurrence)
+
         for event in _iter_coalesced_cache_lookup_events(critical_events):
             screening_event = event.get("event_type") == "screening_decision"
             if screening_event:
@@ -3724,23 +3783,23 @@ class ArtifactV2ShardSession:
             self._register_unique_route_evaluation_identity(event)
             event_id = self._owner._next_event_id
             self._owner._next_event_id += 1
-            normalized_event = (
-                self._screening_decision_row(
+            screening_definition: dict[str, object] | None = None
+            if screening_event:
+                normalized_event, screening_definition = self._screening_decision_row(
                     event,
                     event_id=event_id,
                     route_id=screening_route_id,
                     lane_id=self._lane_ids[lane],
                     operator_id=self._operator_ids[operator],
                 )
-                if screening_event
-                else _normalise_event(
+            else:
+                normalized_event = _normalise_event(
                     event,
                     event_id=event_id,
                     route_ids=self._route_ids,
                     lane_ids=self._lane_ids,
                     operator_ids=self._operator_ids,
                 )
-            )
             if screening_event:
                 screening_sink = (
                     self._screening_occurrences_sink
@@ -3749,7 +3808,21 @@ class ArtifactV2ShardSession:
                 )
                 if screening_sink is None:
                     raise RuntimeError("screening occurrence sink is unavailable")
-                self._append_buffered(screening_sink, normalized_event)
+                if self._screening_definitions_sink is not None:
+                    pending_screening_occurrences.append(normalized_event)
+                    self._max_pending_screening_transaction_rows_observed = max(
+                        self._max_pending_screening_transaction_rows_observed,
+                        len(pending_screening_occurrences),
+                    )
+                else:
+                    self._append_buffered(screening_sink, normalized_event)
+                if screening_definition is not None:
+                    pending_screening_definitions.append(screening_definition)
+                if (
+                    len(pending_screening_occurrences)
+                    >= LIVE_SCREENING_TRANSACTION_ROWS
+                ):
+                    flush_screening_transaction()
             else:
                 self._append_buffered(self._event_sink, normalized_event)
             checks = event.get("checks")
@@ -3767,12 +3840,93 @@ class ArtifactV2ShardSession:
                             ),
                         )
             count += 1
+        flush_screening_transaction()
         for row in diagnostic_rows:
             self._append_buffered(
                 self._diagnostic_sink,
                 self._owner._normalise_diagnostic(row, self.instance, self.seed),
             )
         return count
+
+    def append_transcoded_v2_batches(
+        self,
+        *,
+        route_batches: Iterable[pa.RecordBatch],
+        critical_event_batches: Iterable[pa.RecordBatch],
+        screening_check_batches: Iterable[pa.RecordBatch],
+        screening_decision_batches: Iterable[pa.RecordBatch],
+        diagnostic_batches: Iterable[pa.RecordBatch],
+        lane_dictionary: Mapping[str, object],
+        operator_dictionary: Mapping[str, object],
+    ) -> None:
+        """Transcode a verified old-v2 shard into v3 using Arrow batches.
+
+        Old-v2 already stores non-screening families in the current typed
+        schemas.  Those columns therefore remain columnar.  Only the sparse
+        first-occurrence definition JSON is decoded; the high-volume
+        occurrence stream is selected and written without dict-per-row work.
+        """
+
+        self._require_open()
+        if (
+            self._screening_definitions_sink is None
+            or self._screening_occurrences_sink is None
+            or self._screening_sink is not None
+        ):
+            raise RuntimeError("old-v2 Arrow transcoding requires screening_decisions_v3")
+        self._lane_ids = _invert_trace_dictionary(lane_dictionary, "lane")
+        self._operator_ids = _invert_trace_dictionary(operator_dictionary, "operator")
+        for batch in route_batches:
+            self._route_sink.append_batch(batch)
+        for batch in critical_event_batches:
+            self._event_sink.append_batch(batch)
+        for batch in screening_check_batches:
+            self._checks_sink.append_batch(batch)
+        if self._screening_definition_store is None:
+            self._screening_definition_store = _BoundedScreeningDefinitionStore(
+                cache_entries=1,
+                scratch_root=self._directory,
+            )
+        occurrence_fields = [field.name for field in V3_SCREENING_OCCURRENCES_SCHEMA]
+        for batch in screening_decision_batches:
+            if not batch.schema.equals(V2_SCREENING_DECISIONS_SCHEMA, check_metadata=False):
+                raise ArtifactIntegrityError("old-v2 screening decision schema is invalid")
+            definition_ids = batch.column(
+                batch.schema.get_field_index("definition_id")
+            ).to_pylist()
+            definition_payloads = batch.column(
+                batch.schema.get_field_index("definition_json")
+            ).to_pylist()
+            for definition_id, encoded in zip(
+                definition_ids,
+                definition_payloads,
+                strict=True,
+            ):
+                if encoded is None:
+                    continue
+                if isinstance(definition_id, bool) or not isinstance(definition_id, int):
+                    raise ArtifactIntegrityError("old-v2 definition ID is invalid")
+                try:
+                    definition = orjson.loads(encoded)
+                except orjson.JSONDecodeError as error:
+                    raise ArtifactIntegrityError(
+                        "old-v2 screening definition JSON is invalid"
+                    ) from error
+                if not isinstance(definition, dict):
+                    raise ArtifactIntegrityError("old-v2 screening definition is not an object")
+                first = self._screening_definition_store.register(
+                    definition_id,
+                    definition,
+                    allow_identical_existing=True,
+                )
+                if first:
+                    self._append_buffered(
+                        self._screening_definitions_sink,
+                        {"definition_id": definition_id, **definition},
+                    )
+            self._screening_occurrences_sink.append_batch(batch.select(occurrence_fields))
+        for batch in diagnostic_batches:
+            self._diagnostic_sink.append_batch(batch)
 
     def flush(self) -> None:
         """Flush all currently buffered rows without closing the shard."""
@@ -3989,6 +4143,12 @@ class ArtifactV2ShardSession:
         return self._max_buffered_groups_observed
 
     @property
+    def max_pending_screening_transaction_rows_observed(self) -> int:
+        """Maximum bounded definition/occurrence transaction staged in Python."""
+
+        return self._max_pending_screening_transaction_rows_observed
+
+    @property
     def unique_route_hot_entries(self) -> int:
         return self._route_digests.hot_entries
 
@@ -4034,7 +4194,7 @@ class ArtifactV2ShardSession:
         route_id: int | None,
         lane_id: int,
         operator_id: int,
-    ) -> dict[str, object]:
+    ) -> tuple[dict[str, object], dict[str, object] | None]:
         definition = _normalise_screening_definition(
             event,
             lane_id=lane_id,
@@ -4100,25 +4260,28 @@ class ArtifactV2ShardSession:
         else:
             self._screening_definition_cache.move_to_end(definition_key)
         definition_id, definition_json, _ = cached
-        if first_occurrence and self._screening_definitions_sink is not None:
-            self._append_buffered(
-                self._screening_definitions_sink,
-                {"definition_id": definition_id, **definition},
-            )
+        definition_row = (
+            {"definition_id": definition_id, **definition}
+            if first_occurrence and self._screening_definitions_sink is not None
+            else None
+        )
         started_at = event.get("started_at")
-        return {
-            "event_id": event_id,
-            "definition_id": definition_id,
-            **(
-                {"definition_json": definition_json if first_occurrence else None}
-                if self._screening_sink is not None
-                else {}
-            ),
-            "started_at": started_at,
-            "completed_at": event.get("completed_at"),
-            "iteration": event.get("iteration"),
-            "decision_id": event.get("decision_id"),
-        }
+        return (
+            {
+                "event_id": event_id,
+                "definition_id": definition_id,
+                **(
+                    {"definition_json": definition_json if first_occurrence else None}
+                    if self._screening_sink is not None
+                    else {}
+                ),
+                "started_at": started_at,
+                "completed_at": event.get("completed_at"),
+                "iteration": event.get("iteration"),
+                "decision_id": event.get("decision_id"),
+            },
+            definition_row,
+        )
 
     def _require_open(self) -> None:
         if self._state != "open":

@@ -19,6 +19,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import pyarrow.parquet as pq
+
 from evrptw.artifacts import (
     ARTIFACT_STORAGE_V2,
     SCREENING_DECISIONS_V2,
@@ -182,6 +184,8 @@ class _SourceShard:
     seed: int
     route_dictionary_ref: str
     events_ref: str
+    screening_checks_ref: str
+    screening_decisions_ref: str | None
     diagnostic_ref: str
     raw_ref: str
     solution_ref: str
@@ -209,8 +213,11 @@ class _SemanticAccumulator:
     def __init__(self) -> None:
         self._digest = hashlib.sha256()
         self.count = 0
+        self._current_shard: tuple[str, int] | None = None
+        self._streamed_counts: dict[tuple[str, int, str], dict[str, int]] = {}
 
     def begin_shard(self, instance: str, seed: int) -> None:
+        self._current_shard = (instance, seed)
         self._digest.update(
             _canonical_json_bytes(
                 {"record_type": "shard_identity", "instance": instance, "seed": seed}
@@ -256,6 +263,30 @@ class _SemanticAccumulator:
         physical = dict(event)
         logical = _canonical_logical_event(physical, route_key_by_id=route_key_by_id)
         self._observe_record("event", logical)
+        if self._current_shard is None:
+            raise RuntimeError("semantic event observed before shard identity")
+        axis = str(logical.get("benchmark_axis", ""))
+        identity = (*self._current_shard, axis)
+        counts = self._streamed_counts.setdefault(
+            identity,
+            {
+                "events": 0,
+                "incremental_propagations": 0,
+                "route_evaluations": 0,
+                "screening_decisions": 0,
+            },
+        )
+        event_type = str(logical.get("event_type", ""))
+        family = (
+            "route_evaluations"
+            if event_type == "route_evaluation"
+            else "screening_decisions"
+            if event_type == "screening_decision"
+            else "incremental_propagations"
+            if event_type == "incremental_propagation"
+            else "events"
+        )
+        counts[family] += 1
         self.count += 1
         return logical
 
@@ -266,6 +297,19 @@ class _SemanticAccumulator:
     @property
     def hexdigest(self) -> str:
         return self._digest.hexdigest()
+
+    def streamed_counts(self, instance: str, seed: int, axis: str) -> dict[str, int]:
+        return dict(
+            self._streamed_counts.get(
+                (instance, seed, axis),
+                {
+                    "events": 0,
+                    "incremental_propagations": 0,
+                    "route_evaluations": 0,
+                    "screening_decisions": 0,
+                },
+            )
+        )
 
 
 def remediate_stage052_artifacts(
@@ -319,7 +363,12 @@ def remediate_stage052_artifacts(
         ),
         selected.storage_config(),
     )
-    source_accumulator = _SemanticAccumulator()
+    source_accumulator = _stream_bundle_semantics(
+        source_reader,
+        expected_identities={(shard.instance, shard.seed) for shard in shards},
+        batch_size=selected.batch_size,
+        scratch_root=child_dir,
+    )
     child_complete = False
     try:
         writer.write_control(
@@ -337,15 +386,9 @@ def remediate_stage052_artifacts(
         )
         persistence_started = time.perf_counter()
         for ordinal, shard in enumerate(shards):
-            source_accumulator.begin_shard(shard.instance, shard.seed)
             payloads = _read_logical_shard_payloads(source_reader, shard)
-            source_accumulator.observe_shard_payloads(payloads)
-            route_dictionary = _read_route_dictionary(
-                source_reader,
-                shard.route_dictionary_ref,
-                batch_size=selected.batch_size,
-            )
-            source_accumulator.observe_route_dictionary(route_dictionary.routes)
+            physical_trace = source_reader.read_json(shard.trace_ref)
+            lane_dictionary, operator_dictionary = _trace_dictionaries(physical_trace)
             session = writer.open_v2_shard(
                 instance=shard.instance,
                 seed=shard.seed,
@@ -353,29 +396,63 @@ def remediate_stage052_artifacts(
                 worker_identity="remediation-worker-0",
             )
             try:
-                session.append(
-                    route_dictionary=route_dictionary.routes,
-                    critical_events=_observed_events(
-                        source_reader.iter_events(
+                if shard.screening_decisions_ref is not None:
+                    session.append_transcoded_v2_batches(
+                        route_batches=_parquet_batches(
+                            source_reader,
+                            shard.route_dictionary_ref,
+                            selected.batch_size,
+                        ),
+                        critical_event_batches=_parquet_batches(
+                            source_reader,
+                            shard.events_ref,
+                            selected.batch_size,
+                        ),
+                        screening_check_batches=_parquet_batches(
+                            source_reader,
+                            shard.screening_checks_ref,
+                            selected.batch_size,
+                        ),
+                        screening_decision_batches=_parquet_batches(
+                            source_reader,
+                            shard.screening_decisions_ref,
+                            selected.batch_size,
+                        ),
+                        diagnostic_batches=_parquet_batches(
+                            source_reader,
+                            shard.diagnostic_ref,
+                            selected.batch_size,
+                        ),
+                        lane_dictionary=lane_dictionary,
+                        operator_dictionary=operator_dictionary,
+                    )
+                else:
+                    route_dictionary = _read_route_dictionary(
+                        source_reader,
+                        shard.route_dictionary_ref,
+                        batch_size=selected.batch_size,
+                    )
+                    session.append(
+                        route_dictionary=route_dictionary.routes,
+                        critical_events=source_reader.iter_events(
                             shard.events_ref,
                             batch_size=selected.batch_size,
                             scratch_root=child_dir,
                         ),
-                        source_accumulator,
-                        route_key_by_id=route_dictionary.key_by_id,
-                    ),
-                    diagnostic_rows=_observed_diagnostics(
-                        source_reader.iter_parquet_rows(
+                        diagnostic_rows=source_reader.iter_parquet_rows(
                             shard.diagnostic_ref,
                             batch_size=selected.batch_size,
                         ),
-                        source_accumulator,
-                    ),
-                )
+                    )
                 session.finalize(
                     raw_payload=payloads.raw,
                     solution_payload=payloads.solution,
-                    trace_payload=payloads.trace,
+                    trace_payload=_trace_with_streamed_counts(
+                        payloads.trace,
+                        source_accumulator,
+                        instance=shard.instance,
+                        seed=shard.seed,
+                    ),
                     environment_payload=payloads.environment,
                     failure_payload=payloads.failure,
                 )
@@ -596,6 +673,16 @@ def _source_shards(reader: ArtifactReader) -> tuple[_SourceShard, ...]:
                     artifact_type="events",
                     artifact_subtype="critical",
                 ),
+                screening_checks_ref=_single_ref(
+                    items,
+                    artifact_type="events",
+                    artifact_subtype="screening_checks",
+                ),
+                screening_decisions_ref=_optional_ref(
+                    items,
+                    artifact_type="events",
+                    artifact_subtype=SCREENING_DECISIONS_V2,
+                ),
                 diagnostic_ref=_single_ref(
                     items,
                     artifact_type="diagnostic",
@@ -634,13 +721,39 @@ def _optional_ref(
     items: Iterable[Mapping[str, Any]],
     *,
     artifact_type: str,
+    artifact_subtype: str | None = None,
 ) -> str | None:
     references = [
-        str(item["relative_path"]) for item in items if item.get("artifact_type") == artifact_type
+        str(item["relative_path"])
+        for item in items
+        if item.get("artifact_type") == artifact_type
+        and (artifact_subtype is None or item.get("artifact_subtype") == artifact_subtype)
     ]
     if len(references) > 1:
         raise ArtifactIntegrityError(f"E03 shard contains duplicate {artifact_type} artifacts")
     return references[0] if references else None
+
+
+def _parquet_batches(
+    reader: ArtifactReader,
+    relative_path: str,
+    batch_size: int,
+) -> Iterable[Any]:
+    yield from pq.ParquetFile(reader.run_dir / relative_path).iter_batches(
+        batch_size=batch_size
+    )
+
+
+def _trace_dictionaries(
+    trace: Mapping[str, object],
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    lane_dictionary = trace.get("lane_dictionary")
+    operator_dictionary = trace.get("operator_dictionary")
+    if not isinstance(lane_dictionary, Mapping) or not isinstance(
+        operator_dictionary, Mapping
+    ):
+        raise ArtifactIntegrityError("old-v2 trace dictionaries are invalid")
+    return lane_dictionary, operator_dictionary
 
 
 def _read_route_dictionary(
@@ -817,7 +930,47 @@ def _logical_trace_payload(payload: Mapping[str, object]) -> dict[str, object]:
         "screening_schema_version",
         "event_identity",
     }
-    return {key: value for key, value in payload.items() if key not in physical_fields}
+    logical = {key: value for key, value in payload.items() if key not in physical_fields}
+    axes = logical.get("axes")
+    if isinstance(axes, Mapping):
+        logical["axes"] = {
+            str(axis): {
+                key: value
+                for key, value in axis_payload.items()
+                if key != "streamed_record_counts"
+            }
+            if isinstance(axis_payload, Mapping)
+            else axis_payload
+            for axis, axis_payload in axes.items()
+        }
+    return logical
+
+
+def _trace_with_streamed_counts(
+    trace: Mapping[str, object],
+    accumulator: _SemanticAccumulator,
+    *,
+    instance: str,
+    seed: int,
+) -> dict[str, object]:
+    output = dict(trace)
+    axes = trace.get("axes")
+    if not isinstance(axes, Mapping):
+        raise ArtifactIntegrityError("remediation trace axes are missing")
+    output["axes"] = {
+        str(axis): {
+            **dict(axis_payload),
+            "streamed_record_counts": accumulator.streamed_counts(
+                instance,
+                seed,
+                str(axis),
+            ),
+        }
+        if isinstance(axis_payload, Mapping)
+        else axis_payload
+        for axis, axis_payload in axes.items()
+    }
+    return output
 
 
 def _canonical_json_bytes(value: object) -> bytes:
