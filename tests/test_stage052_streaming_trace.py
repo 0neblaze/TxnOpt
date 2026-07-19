@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import tempfile
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
@@ -372,7 +374,43 @@ def test_stage052_trace_sink_flushes_bounded_event_batches() -> None:
     assert len(shard.events) == 5
 
 
-def test_neighborhood_events_use_measured_volume_spool_until_canonical_merge() -> None:
+def test_small_neighborhood_stream_stays_in_bounded_memory_until_canonical_merge() -> None:
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="wall_clock_300",
+        buffer_rows=4,
+    )
+
+    for iteration in range(4):
+        sink.append_neighborhood_event(
+            {
+                "event_type": "neighborhood_event",
+                "lane": "legacy",
+                "iteration": iteration,
+                "operator": "relocate",
+                "status": "rejected",
+            }
+        )
+
+    assert sink._neighborhood_spool_path is None  # noqa: SLF001
+    assert len(sink._neighborhood_buffer) == 4  # noqa: SLF001
+    assert sink._event_buffer == []  # noqa: SLF001
+    assert shard.events == []
+
+    sink.finish()
+
+    assert len(shard.events) == 4
+    assert all(event["record_type"] == "neighborhood_event" for event in shard.events)
+    assert [event["iteration"] for event in shard.events] == list(range(4))
+    assert sink.event_count == 4
+    assert sink.persisted_family_counts["events"] == 4
+    assert sink._neighborhood_buffer == []  # noqa: SLF001
+    sink.finish()
+    assert len(shard.events) == 4
+
+
+def test_large_neighborhood_stream_spills_to_measured_volume_until_canonical_merge() -> None:
     shard = _RecordingShard()
     sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
         shard=shard,  # type: ignore[arg-type]
@@ -395,6 +433,7 @@ def test_neighborhood_events_use_measured_volume_spool_until_canonical_merge() -
     assert scratch_path is not None
     assert scratch_path.is_relative_to(shard.scratch_directory)
     assert scratch_path.is_file()
+    assert sink._neighborhood_buffer == []  # noqa: SLF001
     assert sink._event_buffer == []  # noqa: SLF001
     assert shard.events == []
 
@@ -404,6 +443,94 @@ def test_neighborhood_events_use_measured_volume_spool_until_canonical_merge() -
     assert all(event["record_type"] == "neighborhood_event" for event in shard.events)
     sink.close()
     assert not scratch_path.exists()
+
+
+def test_memory_neighborhood_drain_preparation_is_charged_to_persistence() -> None:
+    class SlowIterationList(list[dict[str, object]]):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            time.sleep(0.02)
+            return super().__iter__()
+
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+        buffer_rows=4,
+    )
+    sink._neighborhood_buffer = SlowIterationList(  # noqa: SLF001
+        [
+            {
+                "event_type": "neighborhood_event",
+                "record_type": "neighborhood_event",
+                "lane": "legacy",
+                "iteration": 1,
+            }
+        ]
+    )
+
+    before = sink.persistence_nanoseconds
+    sink.finish()
+
+    assert sink.persistence_nanoseconds - before >= 15_000_000
+
+
+def test_spool_close_and_unlink_are_charged_to_persistence() -> None:
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+        buffer_rows=1,
+    )
+    for iteration in range(2):
+        sink.append_neighborhood_event(
+            {
+                "event_type": "neighborhood_event",
+                "lane": "legacy",
+                "iteration": iteration,
+            }
+        )
+    scratch_path = sink._neighborhood_spool_path  # noqa: SLF001
+    assert scratch_path is not None
+    before = sink.persistence_nanoseconds
+
+    sink.discard_pending()
+
+    assert sink.persistence_nanoseconds > before
+    assert not scratch_path.exists()
+
+
+def test_fdopen_failure_closes_descriptor_and_removes_scratch_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptors: list[int] = []
+    paths: list[Path] = []
+    original_mkstemp = tempfile.mkstemp
+
+    def recording_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        descriptor, raw_path = original_mkstemp(*args, **kwargs)
+        descriptors.append(descriptor)
+        paths.append(Path(raw_path))
+        return descriptor, raw_path
+
+    def failing_fdopen(*_args: object, **_kwargs: object) -> object:
+        raise OSError("injected fdopen failure")
+
+    monkeypatch.setattr(stage052_performance.tempfile, "mkstemp", recording_mkstemp)
+    monkeypatch.setattr(stage052_performance.os, "fdopen", failing_fdopen)
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=_RecordingShard(),  # type: ignore[arg-type]
+        axis_name="fixed_work",
+        buffer_rows=1,
+    )
+    sink.append_neighborhood_event({"event_type": "neighborhood_event"})
+
+    with pytest.raises(OSError, match="fdopen failure"):
+        sink.append_neighborhood_event({"event_type": "neighborhood_event"})
+
+    assert len(descriptors) == len(paths) == 1
+    with pytest.raises(OSError):
+        os.fstat(descriptors[0])
+    assert not paths[0].exists()
 
 
 def test_stage052_trace_sink_does_not_replay_a_failed_batch() -> None:

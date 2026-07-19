@@ -3266,6 +3266,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._persisted_family_counts: Counter[str] = Counter()
         self.diagnostic_counts: Counter[tuple[str, str, str, str]] = Counter()
         self._pending_cache_lookup: dict[str, object] | None = None
+        self._neighborhood_buffer: list[dict[str, object]] = []
         self._neighborhood_spool: Any | None = None
         self._neighborhood_spool_path: Path | None = None
         self._neighborhood_read_offset = 0
@@ -3400,6 +3401,13 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             raise RuntimeError("cannot append to a closed Stage 5.2 trace stream")
         started_ns = time.perf_counter_ns()
         try:
+            owned = dict(event)
+            if (
+                self._neighborhood_spool is None
+                and len(self._neighborhood_buffer) < self._buffer_rows
+            ):
+                self._neighborhood_buffer.append(owned)
+                return
             if self._neighborhood_spool is None:
                 scratch_directory = self._shard.scratch_directory
                 scratch_directory.mkdir(parents=True, exist_ok=True)
@@ -3409,14 +3417,43 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                     dir=scratch_directory,
                 )
                 self._neighborhood_spool_path = Path(raw_path)
-                self._neighborhood_spool = os.fdopen(descriptor, "w+b")
-            self._neighborhood_spool.write(orjson.dumps(dict(event)) + b"\n")
+                try:
+                    self._neighborhood_spool = os.fdopen(descriptor, "w+b")
+                except BaseException as error:
+                    cleanup_errors: list[BaseException] = []
+                    try:
+                        os.close(descriptor)
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
+                    try:
+                        self._neighborhood_spool_path.unlink(missing_ok=True)
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
+                    self._neighborhood_spool_path = None
+                    if cleanup_errors:
+                        raise BaseExceptionGroup(
+                            "failed to open and clean neighborhood scratch stream",
+                            [error, *cleanup_errors],
+                        ) from error
+                    raise
+                for buffered in self._neighborhood_buffer:
+                    self._neighborhood_spool.write(orjson.dumps(buffered) + b"\n")
+                self._neighborhood_buffer.clear()
+            self._neighborhood_spool.write(orjson.dumps(owned) + b"\n")
         finally:
             self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
 
     def _drain_neighborhood_spool(self) -> None:
         spool = self._neighborhood_spool
         if spool is None:
+            started_ns = time.perf_counter_ns()
+            try:
+                pending = tuple(self._neighborhood_buffer)
+                self._neighborhood_buffer.clear()
+            finally:
+                self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
+            for payload in pending:
+                self._queue_owned(payload)
             return
         started_ns = time.perf_counter_ns()
         spool.flush()
@@ -3438,18 +3475,23 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
 
     def _close_neighborhood_spool(self) -> None:
         errors: list[BaseException] = []
-        if self._neighborhood_spool is not None:
-            try:
-                self._neighborhood_spool.close()
-            except BaseException as error:
-                errors.append(error)
-            self._neighborhood_spool = None
-        if self._neighborhood_spool_path is not None:
-            try:
-                self._neighborhood_spool_path.unlink(missing_ok=True)
-            except BaseException as error:
-                errors.append(error)
-            self._neighborhood_spool_path = None
+        started_ns = time.perf_counter_ns()
+        try:
+            self._neighborhood_buffer.clear()
+            if self._neighborhood_spool is not None:
+                try:
+                    self._neighborhood_spool.close()
+                except BaseException as error:
+                    errors.append(error)
+                self._neighborhood_spool = None
+            if self._neighborhood_spool_path is not None:
+                try:
+                    self._neighborhood_spool_path.unlink(missing_ok=True)
+                except BaseException as error:
+                    errors.append(error)
+                self._neighborhood_spool_path = None
+        finally:
+            self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
         if errors:
             raise BaseExceptionGroup("failed to clean neighborhood scratch stream", errors)
 
@@ -3749,7 +3791,6 @@ def _run_and_persist_v2_shard(
                 trace_stream.persistence_nanoseconds += (
                     time.perf_counter_ns() - diagnostic_persistence_started_ns
                 )
-            live_persistence_ns_by_axis[axis.name] = trace_stream.persistence_nanoseconds
             semantic_digest = trace_stream.semantic_digest(
                 {
                     "objective_key": objective_key,
@@ -3820,6 +3861,7 @@ def _run_and_persist_v2_shard(
                 storage=storage,
             )
             trace_stream.close()
+            live_persistence_ns_by_axis[axis.name] = trace_stream.persistence_nanoseconds
             active_trace_stream = None
             del result, trace, route_dictionary, diagnostic_rows
             gc.collect()
