@@ -1104,6 +1104,7 @@ def test_v3_occurrences_append_schema_ordered_values_without_row_mappings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original_append = artifacts_module._StreamingParquetSink.append  # noqa: SLF001
+    original_append_values = artifacts_module._StreamingParquetSink.append_values  # noqa: SLF001
 
     def reject_occurrence_mapping(
         sink: artifacts_module._StreamingParquetSink,  # noqa: SLF001
@@ -1113,10 +1114,23 @@ def test_v3_occurrences_append_schema_ordered_values_without_row_mappings(
             raise AssertionError("v3 occurrence hotspot constructed a row mapping")
         original_append(sink, row)
 
+    def reject_individual_occurrence_values(
+        sink: artifacts_module._StreamingParquetSink,  # noqa: SLF001
+        values: tuple[object, ...],
+    ) -> None:
+        if sink.schema.equals(V3_SCREENING_OCCURRENCES_SCHEMA):
+            raise AssertionError("v3 occurrence hotspot appended one row at a time")
+        original_append_values(sink, values)
+
     monkeypatch.setattr(
         artifacts_module._StreamingParquetSink,  # noqa: SLF001
         "append",
         reject_occurrence_mapping,
+    )
+    monkeypatch.setattr(
+        artifacts_module._StreamingParquetSink,  # noqa: SLF001
+        "append_values",
+        reject_individual_occurrence_values,
     )
     writer = _v3_writer(tmp_path, attempt=92)
     shard = writer.open_v2_shard(
@@ -1131,6 +1145,51 @@ def test_v3_occurrences_append_schema_ordered_values_without_row_mappings(
         critical_events=(_screening_event(decision_id=9, started_at=1.25),),
     ) == 1
     shard.abort("typed occurrence test complete")
+
+
+def test_empty_v3_screening_transaction_does_not_flush_other_sinks(tmp_path: Path) -> None:
+    writer = _v3_writer(tmp_path, attempt=93)
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    event = {
+        "event_type": "route_evaluation",
+        "route_key": "route:2:C1",
+        "lane": "legacy",
+        "operator": "relocate",
+        "iteration": 3,
+        "exact_started": True,
+        "checks": (
+            {"check": "capacity", "status": "pass", "value": True, "reason": ""},
+        ),
+    }
+    for index in range(3):
+        shard.append(
+            route_dictionary={"route:2:C1": ("C1",)} if index == 0 else {},
+            critical_events=(event,),
+        )
+    shard.finalize(
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+    )
+    bundle = writer.finalize()
+    events_path = (
+        bundle.run_dir
+        / "toy"
+        / "2014"
+        / f"{writer.context.run_label}_events_toy_2014.parquet"
+    )
+    parquet = pq.ParquetFile(events_path)
+
+    assert [
+        parquet.metadata.row_group(index).num_rows
+        for index in range(parquet.metadata.num_row_groups)
+    ] == [3]
 
 
 def test_v3_write_instance_seed_uses_the_same_physical_schema(tmp_path: Path) -> None:

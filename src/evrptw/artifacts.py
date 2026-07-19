@@ -1580,6 +1580,28 @@ class _StreamingParquetSink:
         if self._buffered_row_count >= V2_PARQUET_ROW_GROUP_SIZE:
             self.flush()
 
+    def append_value_rows(self, rows: Sequence[Sequence[object]]) -> None:
+        """Append schema-ordered rows by extending typed columns per transaction."""
+
+        if not rows:
+            return
+        width = len(self._columns)
+        if any(len(row) != width for row in rows):
+            raise ArtifactIntegrityError(
+                f"typed row width does not match sink schema for {self.path}"
+            )
+        offset = 0
+        while offset < len(rows):
+            available = V2_PARQUET_ROW_GROUP_SIZE - self._buffered_row_count
+            chunk = rows[offset : offset + available]
+            for column, values in zip(self._columns, zip(*chunk, strict=True), strict=True):
+                column.extend(values)
+            appended = len(chunk)
+            self._buffered_row_count += appended
+            offset += appended
+            if self._buffered_row_count == V2_PARQUET_ROW_GROUP_SIZE:
+                self.flush()
+
     def append_batch(self, batch: pa.RecordBatch) -> None:
         """Append one schema-identical Arrow batch without row materialization."""
 
@@ -3866,8 +3888,7 @@ class ArtifactV2ShardSession:
             pending_screening_occurrences.clear()
             for definition in definitions:
                 self._append_buffered(self._screening_definitions_sink, definition)
-            for occurrence in occurrences:
-                self._append_buffered_values(self._screening_occurrences_sink, occurrence)
+            self._append_buffered_value_rows(self._screening_occurrences_sink, occurrences)
 
         for event in _iter_coalesced_cache_lookup_events(critical_events):
             screening_event = event.get("event_type") == "screening_decision"
@@ -4306,15 +4327,17 @@ class ArtifactV2ShardSession:
             len(self._active_sinks),
         )
 
-    def _append_buffered_values(
+    def _append_buffered_value_rows(
         self,
         sink: _StreamingParquetSink,
-        values: Sequence[object],
+        rows: Sequence[Sequence[object]],
     ) -> None:
+        if not rows:
+            return
         if sink not in self._active_sinks and len(self._active_sinks) >= 2:
             victim = self._active_sinks.pop(0)
             victim.flush()
-        sink.append_values(values)
+        sink.append_value_rows(rows)
         if sink.buffered_row_count:
             if sink not in self._active_sinks:
                 self._active_sinks.append(sink)
