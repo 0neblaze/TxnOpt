@@ -3233,6 +3233,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._buffer_rows = buffer_rows
         self._event_buffer: list[dict[str, object]] = []
         self.event_count = 0
+        self._persisted_family_counts: Counter[str] = Counter()
         self.diagnostic_counts: Counter[tuple[str, str, str, str]] = Counter()
         self._pending_cache_lookup: dict[str, object] | None = None
         self._semantic_event_digest = hashlib.sha256()
@@ -3364,6 +3365,18 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
     def last_candidate_timestamp(self) -> float:
         return self._last_candidate_timestamp
 
+    @property
+    def persisted_family_counts(self) -> dict[str, int]:
+        return {
+            family: self._persisted_family_counts[family]
+            for family in (
+                "events",
+                "incremental_propagations",
+                "route_evaluations",
+                "screening_decisions",
+            )
+        }
+
     def diagnostic_rows(
         self,
         *,
@@ -3443,6 +3456,17 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                 self._flush_event_buffer()
         finally:
             self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
+        event_type = str(event.get("event_type", ""))
+        family = (
+            "route_evaluations"
+            if event_type == "route_evaluation"
+            else "screening_decisions"
+            if event_type == "screening_decision"
+            else "incremental_propagations"
+            if event_type == "incremental_propagation"
+            else "events"
+        )
+        self._persisted_family_counts[family] += 1
         self.event_count += 1
 
     def _flush_event_buffer(self) -> None:
@@ -3661,7 +3685,9 @@ def _run_and_persist_v2_shard(
                 "initial_objective_key": initial_objective_key,
                 "feasible": result.feasible,
             }
-            trace_axes[axis.name] = trace.to_index_dict()
+            trace_axis = trace.to_index_dict()
+            trace_axis["streamed_record_counts"] = trace_stream.persisted_family_counts
+            trace_axes[axis.name] = trace_axis
             drafts[axis.name] = _stage052_row_draft(
                 task=task,
                 axis=axis,

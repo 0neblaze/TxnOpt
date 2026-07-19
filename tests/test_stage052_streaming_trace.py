@@ -224,6 +224,7 @@ def test_stage052_trace_sink_appends_to_open_shard_before_solver_returns() -> No
     assert shard.events[0]["benchmark_axis"] == "wall_clock_300"
     assert shard.events[0]["record_type"] == "route_evaluation"
     assert sink.event_count == 1
+    assert sink.persisted_family_counts["route_evaluations"] == 1
 
     sink.append_neighborhood_event(
         {
@@ -238,6 +239,36 @@ def test_stage052_trace_sink_appends_to_open_shard_before_solver_returns() -> No
 
     assert len(shard.events) == 2
     assert shard.events[-1]["record_type"] == "neighborhood_event"
+    assert sink.persisted_family_counts["events"] == 1
+
+
+def test_stage052_stream_counts_follow_coalesced_physical_events() -> None:
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+    )
+    common = {
+        "event_type": "cache_event",
+        "lane": "legacy",
+        "iteration": 1,
+        "operator": "repair",
+        "route_key": "route:2:C1",
+        "cache_key_digest": "a" * 64,
+    }
+
+    sink.append_event({**common, "operation": "lookup"})
+    sink.append_event({**common, "operation": "hit"})
+    sink.finish()
+
+    assert len(shard.events) == 1
+    assert shard.events[0]["operation"] == "lookup_result"
+    assert sink.persisted_family_counts == {
+        "events": 1,
+        "incremental_propagations": 0,
+        "route_evaluations": 0,
+        "screening_decisions": 0,
+    }
 
 
 def test_stage052_trace_sink_flushes_bounded_event_batches() -> None:
