@@ -2448,6 +2448,54 @@ def test_storage_digest_ignores_derived_producer_instrumentation() -> None:
 
     assert current_semantics == historical_semantics
 
+    native_trace = {
+        "axes": {
+            "fixed_work": {
+                "result_summary": {
+                    "screening_statistics": {
+                        "native_screening_invocations": 0,
+                        "native_propagation_invocations": 0,
+                        "native_protocol_fallbacks": 0,
+                    }
+                }
+            }
+        }
+    }
+    native_observability_baseline = stage052_review._canonical_axis_semantics(
+        raw_axis={**current, "started_calls": 100, "completed_calls": 100},
+        solution_axis={"objective_key": [2, 10.0, 0.0, 0]},
+        trace=native_trace,
+        axis="fixed_work",
+    )
+    native_observability_semantics = stage052_review._canonical_axis_semantics(
+        raw_axis={
+            **current,
+            "started_calls": 100,
+            "completed_calls": 100,
+            "backend_metrics": {
+                **current["backend_metrics"],
+                "checkpoint_count": 824,
+                "native_invocations": 12,
+            },
+        },
+        solution_axis={"objective_key": [2, 10.0, 0.0, 0]},
+        trace={
+            "axes": {
+                "fixed_work": {
+                    "result_summary": {
+                        "screening_statistics": {
+                            "native_screening_invocations": 4499,
+                            "native_propagation_invocations": 17,
+                            "native_protocol_fallbacks": 0,
+                        }
+                    }
+                }
+            }
+        },
+        axis="fixed_work",
+    )
+    assert native_observability_semantics == native_observability_baseline
+
     historical_trace_semantics = stage052_review._canonical_axis_semantics(
         raw_axis={**historical, "started_calls": 100, "completed_calls": 100},
         solution_axis={"objective_key": [2, 10.0, 0.0, 0]},

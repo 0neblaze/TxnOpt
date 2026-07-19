@@ -615,6 +615,12 @@ def _payload_sha256(payload: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _route_sequence_sha256(sequence: tuple[str, ...]) -> str:
+    """Hash a canonical route sequence without the general JSON fallback path."""
+
+    return hashlib.sha256(orjson.dumps(sequence)).hexdigest()
+
+
 def _json_write(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -4337,6 +4343,8 @@ class _DiskBackedRouteIdentityStore(Mapping[int, str]):
         in_memory = self._route_memory.get(route_id)
         if in_memory is not None:
             return in_memory
+        if not self._routes_spilled:
+            raise KeyError(route_id)
         cached = self._route_cache.get(route_id)
         if cached is not None:
             self._route_cache.move_to_end(route_id)
@@ -5287,7 +5295,7 @@ class ArtifactV2ShardSession:
                 f"route dictionary key does not match customer sequence: {key}"
             )
         resolved_route_id = self._resolve_route_id(key) if route_id is None else route_id
-        route_digest = _payload_sha256(list(sequence))
+        route_digest = _route_sequence_sha256(sequence)
         if not self._route_digests.register_route(resolved_route_id, route_digest):
             return
         self._pending_route_rows.append(

@@ -532,6 +532,10 @@ _NON_SEMANTIC_STORAGE_FIELDS = frozenset(
         "bytes_peak",
         "iteration_limit_completed_at_seconds",
         "launch_occupancies",
+        "checkpoint_count",
+        "native_invocations",
+        "native_screening_invocations",
+        "native_propagation_invocations",
         "trace_reconciliation",
         "streamed_record_counts",
         "trace_storage_version",
@@ -634,6 +638,13 @@ def _canonical_axis_semantics(
             normalized_result_summary.setdefault(
                 "unique_route_semantics", "completed_cache_owner_identity_v2"
             )
+            screening_statistics = normalized_result_summary.get("screening_statistics")
+            if isinstance(screening_statistics, Mapping):
+                normalized_screening_statistics = dict(screening_statistics)
+                normalized_screening_statistics.setdefault("native_protocol_fallbacks", 0)
+                normalized_result_summary["screening_statistics"] = (
+                    normalized_screening_statistics
+                )
             normalized_trace_axis["result_summary"] = normalized_result_summary
         streamed_counts = normalized_trace_axis.get("streamed_record_counts")
         if streamed_counts is not None and (

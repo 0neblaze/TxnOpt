@@ -272,6 +272,31 @@ def test_route_identity_store_delays_sqlite_spill_and_remains_bounded(
         store.close()
 
 
+def test_route_identity_store_does_not_query_sqlite_before_spill(
+    tmp_path: Path,
+) -> None:
+    store = artifacts_module._DiskBackedRouteIdentityStore(  # noqa: SLF001
+        scratch_root=tmp_path,
+        cache_entries=2,
+        memory_entries=2,
+    )
+    statements: list[str] = []
+    store._connection.set_trace_callback(statements.append)  # noqa: SLF001
+    try:
+        assert 999 not in store
+        assert not any("SELECT digest FROM routes" in statement for statement in statements)
+    finally:
+        store.close()
+
+
+def test_route_sequence_digest_matches_canonical_payload_digest() -> None:
+    sequence = ("C1", "客户-2", "RC/3")
+
+    assert artifacts_module._route_sequence_sha256(sequence) == (  # noqa: SLF001
+        artifacts_module._payload_sha256(list(sequence))  # noqa: SLF001
+    )
+
+
 def test_neighborhood_unknown_field_falls_back_to_general_normalizer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
