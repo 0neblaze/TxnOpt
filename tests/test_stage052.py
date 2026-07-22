@@ -3208,6 +3208,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         component: str,
         label: str,
         *,
+        axis: str = "fixed_work",
         route_evaluation_status: str = "completed_feasible",
         extra_solution_axis: bool = False,
         extra_unreferenced_route: bool = False,
@@ -3226,7 +3227,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
             ArtifactStorageConfig(**storage_kwargs),
         )
         solution_axes: dict[str, object] = {
-            "fixed_work": {
+            axis: {
                 "routes": [["C1"]],
                 "objective_key": [1, 10.0, 0.0, 0],
             }
@@ -3243,7 +3244,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         repeated_events = [
             {
                 "event_type": "candidate_state",
-                "benchmark_axis": "fixed_work",
+                "benchmark_axis": axis,
                 "status": "rejected",
                 "accepted": False,
                 "global_best": False,
@@ -3258,7 +3259,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
             raw_payload={
                 "instance": "c101_21",
                 "seed": 2014,
-                "axes": {"fixed_work": {"started_calls": 100, "completed_calls": 100}},
+                "axes": {axis: {"started_calls": 100, "completed_calls": 100}},
             },
             solution_payload={
                 "instance": "c101_21",
@@ -3271,7 +3272,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
             critical_events=[
                 {
                     "event_type": "candidate_state",
-                    "benchmark_axis": "fixed_work",
+                    "benchmark_axis": axis,
                     "status": "rejected",
                     "accepted": False,
                     "global_best": False,
@@ -3280,7 +3281,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
                 },
                 {
                     "event_type": "route_evaluation",
-                    "benchmark_axis": "fixed_work",
+                    "benchmark_axis": axis,
                     "status": route_evaluation_status,
                     "kind": "exact_call",
                     "exact_started": True,
@@ -3290,7 +3291,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
                 },
                 {
                     "event_type": "cache_event",
-                    "benchmark_axis": "fixed_work",
+                    "benchmark_axis": axis,
                     "operation": "store",
                     "cache_key_digest": "abc",
                     "entry_bytes": cache_bytes,
@@ -3375,6 +3376,29 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     streamed_mismatches = tmp_path / "streamed-mismatches.csv"
     write_semantic_mismatches(changed_event, (v1,), streamed_mismatches)
     assert streamed_mismatches.read_bytes() == ("\n".join(mismatch_lines) + "\n").encode()
+
+    wall_clock_prior = write(
+        "artifact-storage-v2",
+        "hot_path",
+        "stage05.2_hot_path_attempt88",
+        axis="wall_clock_30",
+    )
+    wall_clock_candidate = write(
+        "artifact-storage-v2",
+        "hot_path",
+        "stage05.2_hot_path_attempt89",
+        axis="wall_clock_30",
+        route_evaluation_status="completed_infeasible",
+    )
+    summarized_wall_clock = render_semantic_mismatches(
+        wall_clock_candidate,
+        (wall_clock_prior,),
+        detailed_axis_prefixes=("fixed_work",),
+    ).decode().splitlines()
+    assert len(summarized_wall_clock) == 2
+    assert summarized_wall_clock[1].startswith(
+        "c101_21,2014,wall_clock_30,-1,axis_digest_summary,"
+    )
     ordered_replays = replay_stage052_storage_semantics_many((changed_event, v1))
     assert ordered_replays == [
         replay_stage052_storage_semantics(changed_event),

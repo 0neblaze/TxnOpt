@@ -1,0 +1,655 @@
+from __future__ import annotations
+
+import csv
+import json
+import os
+import threading
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+import evrptw.stage052_retention as retention
+from evrptw.stage052_retention import (
+    RetentionIntegrityError,
+    Stage052RetentionPolicy,
+    archive_stage052_inventory,
+    audit_stage052_runs,
+    load_retention_inventory,
+    resolve_retained_run,
+    write_retention_inventory,
+    write_retention_registry,
+)
+
+
+def _run(
+    root: Path,
+    run_label: str,
+    *,
+    status: str,
+    completeness: str,
+    prerequisite: str | None = None,
+) -> Path:
+    run = root / run_label
+    control = run / "control"
+    control.mkdir(parents=True)
+    payload = {
+        "run_label": run_label,
+        "status": status,
+        "evidence_completeness": completeness,
+        "source_commit": "a" * 40,
+    }
+    if prerequisite is not None:
+        payload["prerequisite_run_label"] = prerequisite
+    (control / f"{run_label}_manifest.json").write_text(
+        json.dumps(payload, sort_keys=True),
+        encoding="utf-8",
+    )
+    (run / "events.parquet").write_bytes(f"events:{run_label}".encode())
+    return run
+
+
+def _policy() -> Stage052RetentionPolicy:
+    return Stage052RetentionPolicy(
+        archive_root_alias="d_archive",
+        archive_relative_base="stage05.2/history",
+    )
+
+
+def _directory_bytes(path: Path) -> int:
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def test_audit_records_status_identity_size_and_prerequisites(tmp_path: Path) -> None:
+    source = tmp_path / "results"
+    prerequisite = "stage05.2_hot_path_attempt03"
+    _run(
+        source,
+        "stage05.2_artifact_streaming_attempt05",
+        status="NOT_READY",
+        completeness="partial",
+        prerequisite=prerequisite,
+    )
+
+    inventory = audit_stage052_runs(
+        source,
+        _policy(),
+        created_at_utc="2026-07-23T12:00:00Z",
+    )
+
+    assert inventory.schema_version == "stage05.2-retention-inventory-v1"
+    assert inventory.directory_count == 1
+    assert inventory.total_bytes > 0
+    record = inventory.records[0]
+    assert record.run_label == "stage05.2_artifact_streaming_attempt05"
+    assert record.component == "artifact_streaming"
+    assert record.status == "NOT_READY"
+    assert record.evidence_completeness == "partial"
+    assert record.source_commit == "a" * 40
+    assert record.prerequisite_run_labels == (prerequisite,)
+    assert record.file_count == 2
+    assert len(record.tree_sha256) == 64
+    assert record.disposition == "planned_archive"
+
+
+def test_repository_config_declares_single_current_retention_policy() -> None:
+    repository = Path(__file__).resolve().parents[1]
+
+    policy = Stage052RetentionPolicy.from_toml(
+        repository / "configs" / "stage052_performance.toml"
+    )
+
+    assert policy == _policy()
+
+
+def test_audit_uses_run_status_not_nested_prerequisite_status(tmp_path: Path) -> None:
+    source = tmp_path / "results"
+    run_label = "stage05.2_perf_baseline_attempt03"
+    run = _run(source, run_label, status="complete", completeness="complete")
+    metadata = {
+        "run_label": run_label,
+        "repository_revision": "b" * 40,
+        "stage051_prerequisite": {"status": "READY_FOR_STAGE05_2"},
+    }
+    (run / "control" / f"{run_label}_run_metadata.json").write_text(
+        json.dumps(metadata),
+        encoding="utf-8",
+    )
+    review = run / "review"
+    review.mkdir()
+    (review / "review_manifest.json").write_text(
+        json.dumps({"run_label": run_label, "status": "READY_FOR_STAGE052_HOT_PATH"}),
+        encoding="utf-8",
+    )
+
+    record = audit_stage052_runs(source, _policy()).records[0]
+
+    assert record.status == "READY_FOR_STAGE052_HOT_PATH"
+    assert record.source_commit == "a" * 40 + "|" + "b" * 40
+
+
+@pytest.mark.parametrize(
+    ("status", "completeness"),
+    [
+        ("READY_FOR_STAGE052_JOB_PARALLEL", "complete"),
+        ("NOT_READY", "complete"),
+        ("failed", "partial"),
+        ("partial", "partial"),
+        ("complete", "complete"),
+        ("active", "partial"),
+        ("accepted", "complete"),
+    ],
+)
+def test_archive_moves_every_terminal_status_after_verification(
+    tmp_path: Path,
+    status: str,
+    completeness: str,
+) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    run = _run(
+        source,
+        "stage05.2_native_kernels_attempt07",
+        status=status,
+        completeness=completeness,
+    )
+    inventory = audit_stage052_runs(
+        source,
+        _policy(),
+        allow_unsealed=status == "active",
+        expected_directory_count=1 if status == "active" else None,
+        expected_total_bytes=_directory_bytes(run) if status == "active" else None,
+    )
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+
+    archived = archive_stage052_inventory(
+        inventory_path,
+        inventory_sha256=inventory_sha256,
+        archive_root=archive,
+    )
+
+    destination = archive / "stage05.2/history" / run.name
+    assert not run.exists()
+    assert destination.is_dir()
+    assert archived[0].disposition == "archived"
+    assert archived[0].verification_status == "verified"
+    assert archived[0].tree_sha256 == inventory.records[0].tree_sha256
+
+    repeated = archive_stage052_inventory(
+        inventory_path,
+        inventory_sha256=inventory_sha256,
+        archive_root=archive,
+    )
+    assert repeated[0].disposition == "already_archived"
+    assert repeated[0].verification_status == "verified"
+
+
+@pytest.mark.parametrize("status", ["active", "in_progress"])
+def test_audit_rejects_active_run_without_explicit_historical_override(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    source = tmp_path / "results"
+    _run(
+        source,
+        "stage05.2_hot_path_attempt03",
+        status=status,
+        completeness="partial",
+    )
+
+    with pytest.raises(RetentionIntegrityError, match="not sealed"):
+        audit_stage052_runs(source, _policy())
+
+    with pytest.raises(RetentionIntegrityError, match="requires expected"):
+        audit_stage052_runs(source, _policy(), allow_unsealed=True)
+
+
+def test_archive_rejects_stale_inventory_without_removing_source(tmp_path: Path) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    run = _run(
+        source,
+        "stage05.2_job_parallel_attempt18",
+        status="READY_FOR_STAGE052_NATIVE_KERNELS",
+        completeness="complete",
+    )
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+    (run / "events.parquet").write_bytes(b"changed after audit")
+
+    with pytest.raises(RetentionIntegrityError, match="changed after audit"):
+        archive_stage052_inventory(
+            inventory_path,
+            inventory_sha256=inventory_sha256,
+            archive_root=archive,
+        )
+
+    assert run.is_dir()
+    assert not (archive / "stage05.2/history" / run.name).exists()
+
+
+def test_archive_preflights_all_records_before_moving_any_source(tmp_path: Path) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    first = _run(
+        source,
+        "stage05.2_artifact_streaming_attempt05",
+        status="complete",
+        completeness="complete",
+    )
+    stale = _run(
+        source,
+        "stage05.2_native_kernels_attempt07",
+        status="failed",
+        completeness="partial",
+    )
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+    (stale / "events.parquet").write_bytes(b"changed after audit")
+
+    with pytest.raises(RetentionIntegrityError, match="changed after audit"):
+        archive_stage052_inventory(
+            inventory_path,
+            inventory_sha256=inventory_sha256,
+            archive_root=archive,
+        )
+
+    assert first.is_dir()
+    assert stale.is_dir()
+    assert not (archive / "stage05.2/history" / first.name).exists()
+
+
+def test_interrupted_move_retains_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    run = _run(
+        source,
+        "stage05.2_job_parallel_attempt18",
+        status="complete",
+        completeness="complete",
+    )
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+    real_replace = os.replace
+
+    def interrupted_replace(source_path: Path | str, destination_path: Path | str) -> None:
+        if Path(source_path) == run:
+            raise OSError("simulated move interruption")
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(retention.os, "replace", interrupted_replace)
+
+    with pytest.raises(OSError, match="simulated move interruption"):
+        archive_stage052_inventory(
+            inventory_path,
+            inventory_sha256=inventory_sha256,
+            archive_root=archive,
+        )
+
+    assert run.is_dir()
+    assert not (archive / "stage05.2/history" / run.name).exists()
+
+
+def test_cross_volume_archive_copies_verifies_then_removes_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    run = _run(
+        source,
+        "stage05.2_job_parallel_attempt18",
+        status="complete",
+        completeness="complete",
+    )
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+    monkeypatch.setattr(retention, "_same_volume", lambda _source, _target: False)
+
+    records = archive_stage052_inventory(
+        inventory_path,
+        inventory_sha256=inventory_sha256,
+        archive_root=archive,
+    )
+
+    assert not run.exists()
+    assert (archive / "stage05.2/history" / run.name / "events.parquet").is_file()
+    assert records[0].disposition == "archived"
+
+
+def test_cross_volume_copy_interruption_is_safely_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    run = _run(
+        source,
+        "stage05.2_job_parallel_attempt18",
+        status="complete",
+        completeness="complete",
+    )
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+    monkeypatch.setattr(retention, "_same_volume", lambda _source, _target: False)
+    real_copytree = retention.shutil.copytree
+
+    def interrupted_copytree(source_path: Path, destination_path: Path, **_: object) -> None:
+        destination_path.mkdir(parents=True)
+        (destination_path / "partial").write_text("partial", encoding="utf-8")
+        raise OSError("simulated copy interruption")
+
+    monkeypatch.setattr(retention.shutil, "copytree", interrupted_copytree)
+    with pytest.raises(OSError, match="simulated copy interruption"):
+        archive_stage052_inventory(
+            inventory_path,
+            inventory_sha256=inventory_sha256,
+            archive_root=archive,
+        )
+    assert run.is_dir()
+
+    monkeypatch.setattr(retention.shutil, "copytree", real_copytree)
+    records = archive_stage052_inventory(
+        inventory_path,
+        inventory_sha256=inventory_sha256,
+        archive_root=archive,
+    )
+    assert records[0].verification_status == "verified"
+    assert not run.exists()
+
+
+def test_cross_volume_late_source_write_is_not_deleted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    run = _run(
+        source,
+        "stage05.2_job_parallel_attempt18",
+        status="complete",
+        completeness="complete",
+    )
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+    monkeypatch.setattr(retention, "_same_volume", lambda _source, _target: False)
+    real_copytree = retention.shutil.copytree
+
+    def copy_then_write(
+        source_path: Path,
+        destination_path: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> Path:
+        copied = real_copytree(source_path, destination_path, *args, **kwargs)
+        if source_path == run:
+            (source_path / "late-write").write_text(
+                "writer was still active", encoding="utf-8"
+            )
+        return copied
+
+    monkeypatch.setattr(retention.shutil, "copytree", copy_then_write)
+
+    with pytest.raises(RetentionIntegrityError, match="source changed during"):
+        archive_stage052_inventory(
+            inventory_path,
+            inventory_sha256=inventory_sha256,
+            archive_root=archive,
+        )
+
+    assert (run / "late-write").is_file()
+    assert (archive / "stage05.2/history" / run.name).is_dir()
+
+
+def test_cross_volume_cleanup_interruption_uses_isolated_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    run = _run(
+        source,
+        "stage05.2_job_parallel_attempt18",
+        status="complete",
+        completeness="complete",
+    )
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+    monkeypatch.setattr(retention, "_same_volume", lambda _source, _target: False)
+    real_rmtree = retention.shutil.rmtree
+
+    def interrupted_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+        if ".retention-cleanup." in path.name:
+            raise OSError("simulated cleanup interruption")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(retention.shutil, "rmtree", interrupted_cleanup)
+    with pytest.raises(OSError, match="simulated cleanup interruption"):
+        archive_stage052_inventory(
+            inventory_path,
+            inventory_sha256=inventory_sha256,
+            archive_root=archive,
+        )
+    assert not run.exists()
+    assert any(".retention-cleanup." in path.name for path in source.iterdir())
+
+    monkeypatch.setattr(retention.shutil, "rmtree", real_rmtree)
+    records = archive_stage052_inventory(
+        inventory_path,
+        inventory_sha256=inventory_sha256,
+        archive_root=archive,
+    )
+    assert records[0].verification_status == "verified"
+    assert not any(".retention-cleanup." in path.name for path in source.iterdir())
+
+
+def test_archive_rejects_different_destination_without_removing_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    run = _run(
+        source,
+        "stage05.2_perf_baseline_attempt04",
+        status="READY_FOR_STAGE052_HOT_PATH",
+        completeness="complete",
+    )
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+    destination = archive / "stage05.2/history" / run.name
+    destination.mkdir(parents=True)
+    (destination / "unrelated").write_text("collision", encoding="utf-8")
+
+    with pytest.raises(RetentionIntegrityError, match="archive destination collision"):
+        archive_stage052_inventory(
+            inventory_path,
+            inventory_sha256=inventory_sha256,
+            archive_root=archive,
+        )
+
+    assert run.is_dir()
+    assert (destination / "unrelated").is_file()
+
+
+def test_signed_inventory_rejects_tampering(tmp_path: Path) -> None:
+    source = tmp_path / "results"
+    _run(
+        source,
+        "stage05.2_hot_path_attempt03",
+        status="READY_FOR_STAGE052_ARTIFACT_STREAMING",
+        completeness="complete",
+    )
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+    inventory_path.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(RetentionIntegrityError, match="inventory SHA-256 mismatch"):
+        load_retention_inventory(
+            inventory_path,
+            expected_sha256=inventory_sha256,
+        )
+
+
+def test_registry_is_lightweight_path_free_and_deterministic(tmp_path: Path) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    _run(
+        source,
+        "stage05.2_accelerator_pilot_attempt01",
+        status="NOT_READY",
+        completeness="complete",
+    )
+    inventory = audit_stage052_runs(
+        source,
+        _policy(),
+        created_at_utc="2026-07-23T12:00:00Z",
+    )
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+    records = archive_stage052_inventory(
+        inventory_path,
+        inventory_sha256=inventory_sha256,
+        archive_root=archive,
+        archived_at_utc="2026-07-23T12:30:00Z",
+    )
+    registry = tmp_path / "stage05.2_retention_registry.csv"
+
+    write_retention_registry(registry, records)
+
+    with registry.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["archive_root_alias"] == "d_archive"
+    assert rows[0]["archive_relative_path"].startswith("stage05.2/history/")
+    assert rows[0]["archived_at_utc"] == "2026-07-23T12:30:00Z"
+    assert str(tmp_path) not in registry.read_text(encoding="utf-8")
+
+
+def test_registry_alias_resolves_archived_prerequisite_and_review(tmp_path: Path) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    run = _run(
+        source,
+        "stage05.2_native_kernels_attempt07",
+        status="accepted",
+        completeness="complete",
+    )
+    review = run / "review"
+    review.mkdir()
+    (review / "review_manifest.json").write_text(
+        json.dumps({"run_label": run.name, "status": "accepted"}),
+        encoding="utf-8",
+    )
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+    records = archive_stage052_inventory(
+        inventory_path,
+        inventory_sha256=inventory_sha256,
+        archive_root=archive,
+    )
+    registry = tmp_path / "stage05.2_retention_registry.csv"
+    write_retention_registry(registry, records)
+
+    resolved = resolve_retained_run(
+        run.name,
+        registry_path=registry,
+        archive_roots={"d_archive": archive},
+    )
+
+    assert json.loads(
+        (resolved / "control" / f"{run.name}_manifest.json").read_text(encoding="utf-8")
+    )["run_label"] == run.name
+    assert json.loads(
+        (resolved / "review" / "review_manifest.json").read_text(encoding="utf-8")
+    )["run_label"] == run.name
+
+
+def test_registry_merges_new_runs_without_losing_history(tmp_path: Path) -> None:
+    registry = tmp_path / "stage05.2_retention_registry.csv"
+    first_source = tmp_path / "first-results"
+    second_source = tmp_path / "second-results"
+    archive = tmp_path / "archive"
+    first = _run(
+        first_source,
+        "stage05.2_hot_path_attempt03",
+        status="complete",
+        completeness="complete",
+    )
+    second = _run(
+        second_source,
+        "stage05.2_native_kernels_attempt07",
+        status="NOT_READY",
+        completeness="complete",
+    )
+
+    archived_records = []
+    for source in (first_source, second_source):
+        inventory = audit_stage052_runs(source, _policy())
+        inventory_path = tmp_path / f"{source.name}.json"
+        inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+        records = archive_stage052_inventory(
+            inventory_path,
+            inventory_sha256=inventory_sha256,
+            archive_root=archive,
+        )
+        write_retention_registry(registry, records)
+        archived_records.extend(records)
+
+    with registry.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["run_label"] for row in rows] == sorted((first.name, second.name))
+
+    conflicting = replace(archived_records[0], tree_sha256="f" * 64)
+    with pytest.raises(RetentionIntegrityError, match="registry identity conflict"):
+        write_retention_registry(registry, (conflicting,))
+
+
+def test_concurrent_registry_merges_do_not_lose_rows(tmp_path: Path) -> None:
+    archive = tmp_path / "archive"
+    records = []
+    for index, component in enumerate(("hot_path", "native_kernels"), start=1):
+        source = tmp_path / f"results-{index}"
+        _run(
+            source,
+            f"stage05.2_{component}_attempt0{index}",
+            status="complete",
+            completeness="complete",
+        )
+        inventory = audit_stage052_runs(source, _policy())
+        inventory_path = tmp_path / f"inventory-{index}.json"
+        inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+        records.append(
+            archive_stage052_inventory(
+                inventory_path,
+                inventory_sha256=inventory_sha256,
+                archive_root=archive,
+            )[0]
+        )
+    registry = tmp_path / "registry.csv"
+    failures: list[BaseException] = []
+
+    def publish(record: retention.RetentionRecord) -> None:
+        try:
+            write_retention_registry(registry, (record,))
+        except BaseException as error:
+            failures.append(error)
+
+    threads = [threading.Thread(target=publish, args=(record,)) for record in records]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not failures
+    with registry.open(newline="", encoding="utf-8") as handle:
+        assert len(list(csv.DictReader(handle))) == 2

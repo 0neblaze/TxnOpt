@@ -9,6 +9,7 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 import sqlite3
 import statistics
@@ -82,6 +83,10 @@ from evrptw.stage052_remediation import (
     E03_EVENT_COUNT,
     E03_SHARD_COUNT,
     E03_SOLVER_ROW_COUNT,
+)
+from evrptw.stage052_retention import (
+    load_retention_registry,
+    resolve_retained_run_from_locator,
 )
 from evrptw.stage052_review_service import (
     ReviewProcessMemoryGuard,
@@ -1156,6 +1161,8 @@ def _compare_semantic_records_against_spool(
 def render_semantic_mismatches(
     raw_dir: Path,
     comparison_dirs: Sequence[Path],
+    *,
+    detailed_axis_prefixes: Sequence[str] | None = None,
 ) -> bytes:
     """Return field-addressable digest differences from independent raw replay."""
 
@@ -1166,7 +1173,12 @@ def render_semantic_mismatches(
         lineterminator="\n",
     )
     writer.writeheader()
-    _write_semantic_mismatch_rows(output, raw_dir, comparison_dirs)
+    _write_semantic_mismatch_rows(
+        output,
+        raw_dir,
+        comparison_dirs,
+        detailed_axis_prefixes=detailed_axis_prefixes,
+    )
     return output.getvalue().encode("utf-8")
 
 
@@ -1174,6 +1186,8 @@ def write_semantic_mismatches(
     raw_dir: Path,
     comparison_dirs: Sequence[Path],
     output_path: Path,
+    *,
+    detailed_axis_prefixes: Sequence[str] | None = None,
 ) -> None:
     """Stream field-addressable differences to a fsynced CSV outside Python memory."""
 
@@ -1184,7 +1198,12 @@ def write_semantic_mismatches(
             lineterminator="\n",
         )
         writer.writeheader()
-        _write_semantic_mismatch_rows(output, raw_dir, comparison_dirs)
+        _write_semantic_mismatch_rows(
+            output,
+            raw_dir,
+            comparison_dirs,
+            detailed_axis_prefixes=detailed_axis_prefixes,
+        )
         output.flush()
         os.fsync(output.fileno())
 
@@ -1193,6 +1212,8 @@ def _write_semantic_mismatch_rows(
     output: Any,
     raw_dir: Path,
     comparison_dirs: Sequence[Path],
+    *,
+    detailed_axis_prefixes: Sequence[str] | None,
 ) -> None:
     if not comparison_dirs:
         return
@@ -1206,21 +1227,50 @@ def _write_semantic_mismatch_rows(
         }
         if not mismatched:
             continue
+        detailed = (
+            mismatched
+            if detailed_axis_prefixes is None
+            else {
+                identity
+                for identity in mismatched
+                if any(identity[2].startswith(prefix) for prefix in detailed_axis_prefixes)
+            }
+        )
+        summary_writer = csv.DictWriter(
+            output,
+            fieldnames=_SEMANTIC_MISMATCH_FIELDS,
+            lineterminator="\n",
+        )
+        for identity in sorted(mismatched - detailed):
+            instance, seed, axis = identity
+            summary_writer.writerow(
+                {
+                    "instance": instance,
+                    "seed": seed,
+                    "axis": axis,
+                    "ordinal": -1,
+                    "field": "axis_digest_summary",
+                    "left_digest": prior.get(identity, "<missing>"),
+                    "right_digest": current.get(identity, "<missing>"),
+                }
+            )
+        if not detailed:
+            continue
         with _semantic_record_spool() as connection:
             _spool_semantic_records(
                 connection,
                 raw_dir=comparison_dir,
-                identities=mismatched,
+                identities=detailed,
             )
-            with _semantic_mismatch_fragments(mismatched) as (writers, paths, handles):
+            with _semantic_mismatch_fragments(detailed) as (writers, paths, handles):
                 _compare_semantic_records_against_spool(
                     connection,
                     raw_dir=raw_dir,
-                    identities=mismatched,
+                    identities=detailed,
                     writers=writers,
                     handles=handles,
                 )
-                for identity in sorted(mismatched):
+                for identity in sorted(detailed):
                     with paths[identity].open("r", encoding="utf-8", newline="") as fragment:
                         _copy_text_stream_bounded(fragment, output)
 
@@ -1924,6 +1974,7 @@ def review_stage052(
             raw_dir,
             semantic_comparisons,
             semantic_mismatches_path,
+            detailed_axis_prefixes=("fixed_work",),
         )
         return _publish_review_generation(
             review_dir=review_dir,
@@ -3308,15 +3359,9 @@ def _component_gates(
                     }
                 }
             comparison = comparison_dirs[0].resolve()
-            expected_comparison = (
-                prerequisite_dir.resolve().parent / job_parallel_selection.selected_run_label
-                if prerequisite_dir is not None
-                else None
-            )
             if (
                 prerequisite_dir is None
-                or expected_comparison is None
-                or comparison != expected_comparison
+                or comparison.name != job_parallel_selection.selected_run_label
             ):
                 return {
                     "native_predecessor": {
@@ -3545,6 +3590,7 @@ def _component_gates(
                 evidence_dir,
                 expected_workers=worker,
                 expected_prerequisite=prerequisite_identity,
+                prerequisite_dir=prerequisite_dir,
                 benchmark_dir=benchmark_dir,
             )
             if not contract_passed:
@@ -4318,11 +4364,12 @@ def validate_job_parallel_evidence_contract(
     *,
     expected_workers: int,
     expected_prerequisite: Stage052PrerequisiteIdentity | None,
+    prerequisite_dir: Path | None,
     benchmark_dir: Path,
 ) -> tuple[bool, str]:
     """Validate one complete D comparison bundle before it can affect speedup."""
 
-    if expected_prerequisite is None:
+    if expected_prerequisite is None or prerequisite_dir is None:
         return False, "reviewed C05 prerequisite identity is missing"
     try:
         reader = ArtifactReader(raw_dir)
@@ -4365,7 +4412,6 @@ def validate_job_parallel_evidence_contract(
                 False,
                 f"metadata {field} mismatch: expected={expected} observed={metadata.get(field)}",
             )
-    prerequisite_dir = raw_dir.parent / expected_prerequisite.run_label
     if not _prerequisite_binding_matches(
         metadata.get("component_prerequisite"),
         expected_prerequisite,
@@ -5352,12 +5398,73 @@ def main() -> int:
     parser.add_argument("--comparison-dir", type=Path, action="append", default=[])
     parser.add_argument("--prerequisite-dir", type=Path)
     parser.add_argument("--prerequisite", action="append", default=[])
+    parser.add_argument(
+        "--retention-registry",
+        type=Path,
+        default=Path("experiments/registries/stage05.2_retention_registry.csv"),
+    )
+    parser.add_argument(
+        "--storage-root-locator",
+        type=Path,
+        default=Path("configs/stage052_storage_roots.local.toml"),
+    )
     parser.add_argument("--progress-log", type=Path, required=True)
     parser.add_argument("--max-aggregate-rss-gib", type=float, default=5.5)
     arguments = parser.parse_args()
     if arguments.max_aggregate_rss_gib <= 0.0:
         parser.error("--max-aggregate-rss-gib must be positive")
-    raw_root = arguments.raw_dir.resolve()
+    repository = find_repository_root()
+
+    def resolve_input(path: Path) -> Path:
+        ordinary = path if path.is_absolute() else repository / path
+        if ordinary.exists():
+            return ordinary.resolve()
+        if re.fullmatch(
+            r"stage05\.2_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}",
+            path.as_posix(),
+        ):
+            return resolve_retained_run_from_locator(
+                path.as_posix(),
+                registry_path=(repository / arguments.retention_registry).resolve(),
+                storage_root_locator_path=(
+                    repository / arguments.storage_root_locator
+                ).resolve(),
+            )
+        return ordinary.resolve()
+
+    ordinary_raw = (
+        arguments.raw_dir
+        if arguments.raw_dir.is_absolute()
+        else repository / arguments.raw_dir
+    )
+    if not ordinary_raw.is_dir():
+        parser.error(
+            "--raw-dir must be an active directory; archived runs are read-only "
+            "comparison/prerequisite inputs"
+        )
+    raw_root = ordinary_raw.resolve()
+    registry_path = (repository / arguments.retention_registry).resolve()
+    locator_path = (repository / arguments.storage_root_locator).resolve()
+    if not registry_path.is_file() or not locator_path.is_file():
+        parser.error("retention registry and storage-root locator are required")
+    locator = StorageRootLocator.from_toml(locator_path)
+    for record in load_retention_registry(registry_path):
+        if record.run_label != raw_root.name:
+            continue
+        registered_path = locator.resolve(record.archive_root_alias).absolute_path.joinpath(
+            *Path(record.archive_relative_path).parts
+        )
+        if registered_path.resolve() == raw_root:
+            parser.error(
+                "--raw-dir cannot be immutable archived evidence; use it only as a "
+                "comparison or prerequisite"
+            )
+    comparison_dirs = [resolve_input(path) for path in arguments.comparison_dir]
+    prerequisite_dir = (
+        resolve_input(arguments.prerequisite_dir)
+        if arguments.prerequisite_dir is not None
+        else None
+    )
     progress_path = arguments.progress_log.resolve()
     if progress_path == raw_root or raw_root in progress_path.parents:
         parser.error("--progress-log must be outside immutable raw evidence")
@@ -5371,7 +5478,7 @@ def main() -> int:
             parser.error("--prerequisite must use ROLE=PATH")
         if role in named_prerequisites:
             parser.error(f"duplicate prerequisite role: {role}")
-        named_prerequisites[role] = Path(raw_path)
+        named_prerequisites[role] = resolve_input(Path(raw_path))
     progress.emit(
         "review_start",
         raw_dir=str(raw_root),
@@ -5386,12 +5493,12 @@ def main() -> int:
     try:
         with guard:
             outputs = review_stage052(
-                raw_dir=arguments.raw_dir,
+                raw_dir=raw_root,
                 benchmark_dir=arguments.benchmark_dir,
                 component=arguments.component,
                 scope=arguments.scope,
-                comparison_dirs=arguments.comparison_dir,
-                prerequisite_dir=arguments.prerequisite_dir,
+                comparison_dirs=comparison_dirs,
+                prerequisite_dir=prerequisite_dir,
                 prerequisite_dirs=named_prerequisites,
             )
     except BaseException as error:

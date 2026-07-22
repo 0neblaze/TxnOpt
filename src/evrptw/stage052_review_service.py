@@ -41,6 +41,9 @@ _SERVICE_BASE_PATHS = (
     "/bin",
 )
 _FORMAL_SERVICE_EXECUTABLES = ("nvidia-smi", "powershell.exe", "wsl.exe")
+_PERFORMANCE_REVIEW_MODULE = "evrptw.experiments.stage052_performance_review"
+_CAMPAIGN_REVIEW_MODULE = "evrptw.experiments.stage052_campaign_review"
+_ALLOWED_REVIEW_MODULES = frozenset({_PERFORMANCE_REVIEW_MODULE, _CAMPAIGN_REVIEW_MODULE})
 
 
 class ReviewMemoryLimitExceeded(RuntimeError):
@@ -388,13 +391,16 @@ def _option_values(command: Sequence[str], option: str) -> list[str]:
     return values
 
 
-def _reviewer_install_identity(reviewer_python: Path) -> dict[str, str]:
+def _reviewer_install_identity(reviewer_python: Path, module_name: str) -> dict[str, str]:
     script = """
+import importlib
 import importlib.metadata as metadata
 import json
 from pathlib import Path
+import sys
 from urllib.parse import unquote, urlparse
-import evrptw.experiments.stage052_performance_review as reviewer
+
+reviewer = importlib.import_module(sys.argv[1])
 
 distribution = metadata.distribution("evrptw-reproduction")
 direct_url = json.loads(distribution.read_text("direct_url.json") or "{}")
@@ -405,7 +411,7 @@ print(json.dumps({
 }, sort_keys=True))
 """
     result = subprocess.run(
-        (str(reviewer_python), "-I", "-c", script),
+        (str(reviewer_python), "-I", "-c", script, module_name),
         check=True,
         capture_output=True,
         text=True,
@@ -494,38 +500,54 @@ def _validate_formal_execution_envelope(config: ReviewServiceConfig) -> dict[str
     command_python = _absolute_executable(Path(config.command[0]))
     if command_python != reviewer_python:
         raise RuntimeError("review command does not use the frozen reviewer Python")
-    expected_prefix = (
-        str(config.command[0]),
-        "-I",
-        "-m",
-        "evrptw.experiments.stage052_performance_review",
-    )
-    if config.command[:4] != expected_prefix:
+    expected_prefix = (str(config.command[0]), "-I", "-m")
+    if config.command[:3] != expected_prefix or len(config.command) < 4:
+        raise RuntimeError("review command must invoke the isolated Stage 5.2 reviewer module")
+    module_name = config.command[3]
+    if module_name not in _ALLOWED_REVIEW_MODULES:
         raise RuntimeError("review command must invoke the isolated Stage 5.2 reviewer module")
     if not config.log_directory.resolve().is_relative_to(DEFAULT_LOG_ROOT.resolve()):
         raise RuntimeError("formal review logs must use the fixed Stage 5.2 log root")
 
     raw_directory = config.raw_manifest.resolve(strict=True).parent.parent
-    raw_values = _option_values(config.command, "--raw-dir")
-    if len(raw_values) != 1 or Path(raw_values[0]).resolve(strict=True) != raw_directory:
-        raise RuntimeError("review command raw directory does not match raw manifest")
-    comparison_values = _option_values(config.command, "--comparison-dir")
-    if len(comparison_values) < 1:
-        raise RuntimeError("formal review command requires a comparison directory")
-    for value in comparison_values:
-        Path(value).resolve(strict=True)
-    prerequisite_values = _option_values(config.command, "--prerequisite")
-    if len(prerequisite_values) < 1:
-        raise RuntimeError("formal review command requires prerequisite identity")
-    for value in prerequisite_values:
-        role, separator, raw_path = value.partition("=")
-        if not role or not separator or not raw_path:
-            raise RuntimeError("formal review prerequisite identity is invalid")
-        Path(raw_path).resolve(strict=True)
-    component_values = _option_values(config.command, "--component")
     scope_values = _option_values(config.command, "--scope")
-    if len(component_values) != 1 or len(scope_values) != 1:
-        raise RuntimeError("formal review command requires one component and one scope")
+    if len(scope_values) != 1:
+        raise RuntimeError("formal review command requires one scope")
+    if module_name == _PERFORMANCE_REVIEW_MODULE:
+        raw_values = _option_values(config.command, "--raw-dir")
+        if len(raw_values) != 1 or Path(raw_values[0]).resolve(strict=True) != raw_directory:
+            raise RuntimeError("review command raw directory does not match raw manifest")
+        component_values = _option_values(config.command, "--component")
+        if len(component_values) != 1:
+            raise RuntimeError("performance review command requires one component")
+        component = component_values[0]
+        comparison_values = _option_values(config.command, "--comparison-dir")
+        if component in {"hot_path", "job_parallel", "native_kernels"} and not comparison_values:
+            raise RuntimeError("performance review command requires a comparison directory")
+        for value in comparison_values:
+            Path(value).resolve(strict=True)
+        prerequisite_values = _option_values(config.command, "--prerequisite")
+        if component != "perf_baseline" and not prerequisite_values:
+            raise RuntimeError("performance review command requires prerequisite identity")
+        for value in prerequisite_values:
+            role, separator, raw_path = value.partition("=")
+            if not role or not separator or not raw_path:
+                raise RuntimeError("formal review prerequisite identity is invalid")
+            Path(raw_path).resolve(strict=True)
+    else:
+        campaign_values = _option_values(config.command, "--campaign-dir")
+        if (
+            len(campaign_values) != 1
+            or Path(campaign_values[0]).resolve(strict=True) != raw_directory
+        ):
+            raise RuntimeError("campaign review directory does not match raw manifest")
+        if _option_values(config.command, "--comparison-dir"):
+            raise RuntimeError("campaign review command cannot accept comparison directories")
+        prerequisite_values = _option_values(config.command, "--prerequisite-dir")
+        if len(prerequisite_values) != 1:
+            raise RuntimeError("campaign review command requires one prerequisite directory")
+        Path(prerequisite_values[0]).resolve(strict=True)
+        component = "benchmark"
     progress_values = _option_values(config.command, "--progress-log")
     if config.progress_log is None or len(progress_values) != 1:
         raise RuntimeError("formal review command requires exactly one progress log")
@@ -541,7 +563,7 @@ def _validate_formal_execution_envelope(config: ReviewServiceConfig) -> dict[str
         raise RuntimeError("raw manifest must be a JSON object")
     if manifest.get("run_label") != config.run_label:
         raise RuntimeError("raw manifest run label does not match service config")
-    if manifest.get("component") != component_values[0]:
+    if manifest.get("component") != component:
         raise RuntimeError("raw manifest component does not match review command")
     if manifest.get("status") != "complete" or manifest.get("evidence_completeness") != "complete":
         raise RuntimeError("formal reviewer requires complete raw evidence")
@@ -569,7 +591,7 @@ def _validate_formal_execution_envelope(config: ReviewServiceConfig) -> dict[str
     )
     wheel_path = config.wheel_path.resolve(strict=True)
     provenance_path = _verify_wheel_provenance(config, wheel_path)
-    install = _reviewer_install_identity(reviewer_python)
+    install = _reviewer_install_identity(reviewer_python, module_name)
     parsed_url = urlparse(install["direct_url"])
     installed_from = (
         Path(unquote(parsed_url.path)).resolve() if parsed_url.scheme == "file" else None
@@ -586,6 +608,7 @@ def _validate_formal_execution_envelope(config: ReviewServiceConfig) -> dict[str
     )
     return {
         "producer_repository_revision": producer_revision,
+        "reviewer_module_name": module_name,
         "reviewer_module_path": str(module_path),
         "reviewer_distribution_root": str(distribution_root),
         "reviewer_install_url": install["direct_url"],
@@ -611,6 +634,7 @@ def _initial_receipt(config: ReviewServiceConfig) -> dict[str, object]:
         "reviewer_revision": config.reviewer_revision,
         "producer_repository_revision": None,
         "reviewer_module_path": None,
+        "reviewer_module_name": None,
         "reviewer_distribution_root": None,
         "reviewer_install_url": None,
         "reviewer_installed_distribution_digest": None,

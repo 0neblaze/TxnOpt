@@ -5,16 +5,14 @@
 ## 当前可用状态
 
 仓库保留 `artifact-storage-v2` 作为 storage policy（存储策略），定义在
-`src/evrptw/artifacts.py`；当前修订把新物理证据升级为
-`screening_decisions_v3`。C04 与其 D04--D06/E03/F01 后继链只作为旧 physical
-schema（物理模式）的历史证据。E03 的完整 persistence replay（持久化回放）为
-50.1646%，超过 30% 硬门槛，因此旧 accepted review 不得继续充当 prerequisite。
+`src/evrptw/artifacts.py`；当前物理证据使用 `screening_decisions_v3`，并继续读取
+v1、旧 v2 与 legacy evidence。Stage 5.2 只维护一套当前代码，A--G 是顺序 gate，
+不是独立版本。具体 attempt 的历史状态、失败原因和 prerequisite 关系记录在 raw
+manifest、retention registry（保留登记表）和 change log，不硬编码进长期政策。
 
-当前证据链从 `stage05.2_artifact_streaming_attempt05` 重新开始，随后依次为
-D07/D08/D09、E04、F02、G01 Pilot 与 G02 Formal。所有组件必须绑定同一 clean
-commit（干净提交）和 frozen wheel runtime（冻结 wheel 运行时）；实际 selected
-workers/backend 只能由新 review 决定，文档不得预写为 4 workers 或假定 F02
-必然选择 `native_cpu`。
+所有 gate 必须绑定经过审查的直接 predecessor、clean commit（干净提交）和 frozen
+wheel runtime（冻结 wheel 运行时）；actual selected workers/backend 只能由当前 raw
+review 决定。`attemptNN`/`rerunNN` 是唯一运行身份，不是代码版本。
 
 v1/v2 的固定策略为：
 
@@ -58,13 +56,15 @@ results/<run_label>/
   review/
 ```
 
-v1 不要求 shard manifest（分片清单）；最后两项由 v2 新增。G01/G02 在顶层
-canonical run 下增加 `batch0001` 等内部 batch 目录，并通过 signed campaign/batch
+v1 不要求 shard manifest（分片清单）；最后两项由 v2 新增。Stage 5.2 Pilot/Formal
+在顶层 canonical run 下增加 `batch0001` 等内部 batch 目录，并通过 signed campaign/batch
 manifest（签名活动/批次清单）登记 logical path、root alias、volume identity、byte
 count 与 checksum；batch 不得伪装成新 attempt。`failure` 不适用时可以不生成，但
 manifest 必须记录 `artifact_status.failure=not_applicable`。所有 raw evidence（原始
-证据）只写入 Git-ignored `results/`；tracked summary（受 Git 跟踪的汇总）只能由
-独立 reviewer 在 raw replay（原始证据回放）通过后发布。
+证据）先写入 Git-ignored active staging root；运行封存后由 retention interface
+校验完整 tree SHA-256 和字节数，并移入
+`d_archive/stage05.2/history/<run_label>/`。tracked summary（受 Git 跟踪的汇总）只能
+由独立 reviewer 在 raw replay（原始证据回放）通过后发布。
 
 ## Critical evidence 与索引
 
@@ -103,7 +103,12 @@ v2 event identity 由 canonical shard ordinal（规范分片序号）和 shard-l
 
 ### 中断、超限和失败
 
-达到 shard 或 run byte budget 时，writer 必须 flush/close 当前 row group，保留已完成的 raw、solution、event、environment 和 failure evidence，将 shard 与 run 标记为 `evidence_completeness=partial`，写入 manifest/sidecar 后立即抛出错误。不得静默截断、覆盖、删除 partial shard，或使用 serial fallback（串行兜底）。partial、timeout、failure 和 manifest error 均禁止发布 summary。
+达到 shard 或 run byte budget 时，writer 必须 flush/close 当前 row group，封存已完成的
+raw、solution、event、environment 和 failure evidence，将 shard 与 run 标记为
+`evidence_completeness=partial`，写入 manifest/sidecar 后立即抛出错误。不得静默截断、
+覆盖或使用 serial fallback（串行兜底）。partial、timeout、failure 和 manifest error
+均禁止发布科学 summary；其 sealed directory 经 retention audit 后移入外部归档，
+不在工作区无限累积。
 
 ## v2 替换门槛
 
@@ -116,15 +121,36 @@ v2 event identity 由 canonical shard ordinal（规范分片序号）和 shard-l
 5. partial/timeout/worker failure 都产生可校验 shard manifest 并 fail fast；
 6. independent reviewer 从 raw shard 重算所有汇总，不信任 runner 自报计数。
 
-C04 的旧 review generation 与原始字节保持不可变，但不再是当前 D 的入口。C05
-除原 36-axis scope 和 24 fixed-work equality 外，还必须 remediation replay（整改
-回放）E03 全部事件，证明 expanded logical semantics（展开逻辑语义）完全一致，并
-使 `new_persistence / (verified_E03_solver + new_persistence) <= 30%`。后续组件若
-破坏这些门槛必须标记 `NOT_READY`，不得退回隐式 v1 fallback 或降低阈值。
+当前 C 运行必须完成声明的 performance scope 与 fixed-work equality，证明 expanded
+logical semantics（展开逻辑语义）完全一致，并满足 30% persistence 门槛。任何旧
+physical schema、remediation source 或失败 predecessor 的关系只由 manifest、
+retention registry 和 change log 保存。后续 gate 若破坏这些门槛必须标记
+`NOT_READY`，不得退回隐式 v1 fallback 或降低阈值。
 
 ## 历史兼容
 
 Stage 0 frozen baseline、Stage 2/3 历史证据和已发布 v1 bundle 不做物理迁移、不压缩、不移动、不重写。它们继续通过 legacy/v1 reader 读取，并在 registry 中保留其真实 `storage_format`、`retention_class`、`policy_compliance`、dirty、failure 和 publication 状态。logical mapping（逻辑映射）不代表复制或移动。
+
+## Stage 5.2 retention policy
+
+- `Stage052RetentionPolicy` 固定 `workspace_full_evidence=active_only`，complete 与 failed
+  run 均执行 `archive`。
+- audit inventory 记录 run label、component、状态、completeness、source commit、
+  prerequisite identities、文件数、总字节数和 tree SHA-256，并使用独立 sidecar 签名。
+- archive 必须显式绑定 inventory SHA-256，并由 ignored storage-root locator 验证 alias
+  与 volume identity。同 volume 使用校验后的原子移动；跨 volume 先复制到目标卷隐藏
+  临时目录，完整复验后在目标卷原子落位，最后才清理源。源目录在 audit 后发生变化、
+  目标内容不同或迁移后复验失败时均 fail fast，且不得删除源数据。
+- active/unsealed run 默认不能进入 inventory；仅改造前历史迁移可显式 override，并同时
+  绑定预期目录数和总字节数。registry 更新必须按 run label 原子合并，禁止覆盖历史行。
+- 轻量 `stage05.2_retention_registry.csv` 只记录 archive alias 和相对路径，不记录本机
+  绝对路径。详细实现变更追加到 `docs/stage052_change_log.md`。
+- prerequisite/review 以 run label 调用 `resolve_retained_run`，由 registry 和本地
+  storage-root locator 解析 archive alias；返回现有 runner/reviewer 前再次核对文件数、
+  字节数和 tree SHA-256。调用方不得自行拼接或在 tracked 文件中保存绝对归档路径。
+- 归档目录只能作为只读 comparison/prerequisite/replay 输入；reviewer 不得把新的 review
+  generation 写回已登记的归档 tree，否则会破坏 registry checksum。需发布新 generation
+  的 raw 必须留在 active root，发布并封存后再归档。
 
 ## 正式运行前 preflight
 

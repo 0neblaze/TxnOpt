@@ -289,6 +289,121 @@ def test_formal_launcher_rejects_arbitrary_command_before_systemd(tmp_path: Path
     assert receipt["stop_reason"] == "preflight_failed"
 
 
+def test_formal_launcher_accepts_isolated_campaign_reviewer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_label = "stage05.2_benchmark_attempt99"
+    raw_dir = tmp_path / "raw" / run_label
+    control = raw_dir / "control"
+    control.mkdir(parents=True)
+    raw_manifest = control / f"{run_label}_manifest.json"
+    raw_manifest.write_text(
+        json.dumps(
+            {
+                "run_label": run_label,
+                "component": "benchmark",
+                "status": "complete",
+                "evidence_completeness": "complete",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (control / f"{run_label}_run_metadata.json").write_text(
+        '{"source_snapshot":{"allowed_untracked_sha256":{}}}\n',
+        encoding="utf-8",
+    )
+    prerequisite = tmp_path / "stage05.2_accelerator_pilot_attempt99"
+    prerequisite.mkdir()
+    benchmark_dir = tmp_path / "benchmark"
+    benchmark_dir.mkdir()
+    bks_path = tmp_path / "bks.csv"
+    bks_path.write_text("instance\n", encoding="utf-8")
+    storage_roots = tmp_path / "roots.toml"
+    storage_roots.write_text("[roots]\n", encoding="utf-8")
+    registry = tmp_path / "retention.csv"
+    registry.write_text("schema_version\n", encoding="utf-8")
+    wheel = tmp_path / "reviewer.whl"
+    wheel.write_bytes(b"reviewer-wheel")
+    log_root = tmp_path / "review-logs"
+    log_directory = log_root / run_label / "20260723T000000Z"
+    progress_log = log_directory / "progress.jsonl"
+    command = (
+        sys.executable,
+        "-I",
+        "-m",
+        "evrptw.experiments.stage052_campaign_review",
+        "--campaign-dir",
+        str(raw_dir),
+        "--benchmark-dir",
+        str(benchmark_dir),
+        "--bks-path",
+        str(bks_path),
+        "--scope",
+        "pilot",
+        "--prerequisite-dir",
+        str(prerequisite),
+        "--storage-roots",
+        str(storage_roots),
+        "--retention-registry",
+        str(registry),
+        "--progress-log",
+        str(progress_log),
+        "--max-aggregate-rss-gib",
+        "5.5",
+    )
+    config = ReviewServiceConfig(
+        unit="stage052-review-campaign-test",
+        run_label=run_label,
+        command=command,
+        reviewer_python=Path(sys.executable),
+        reviewer_revision="1" * 40,
+        working_directory=Path.cwd(),
+        log_directory=log_directory,
+        raw_manifest=raw_manifest,
+        wheel_path=wheel,
+        service_execution_path="/usr/bin:/usr/lib/wsl/lib:/mnt/c/WINDOWS/System32",
+        progress_log=progress_log,
+        max_aggregate_rss_bytes=int(5.5 * 1024**3),
+    )
+    install_root = tmp_path / "installed"
+    module_path = install_root / "evrptw/experiments/stage052_campaign_review.py"
+    monkeypatch.setattr(review_service, "DEFAULT_LOG_ROOT", log_root)
+    monkeypatch.setattr(review_service, "_require_clean_repository", lambda *_args, **_kw: "2" * 40)
+    monkeypatch.setattr(review_service, "_verify_wheel_provenance", lambda *_: wheel)
+    monkeypatch.setattr(
+        review_service,
+        "_reviewer_install_identity",
+        lambda _python, _module: {
+            "module_path": str(module_path),
+            "distribution_root": str(install_root),
+            "direct_url": wheel.resolve().as_uri(),
+        },
+    )
+    monkeypatch.setattr(
+        review_service,
+        "_verify_installed_distribution_matches_wheel",
+        lambda *_: "3" * 64,
+    )
+    observed: list[tuple[str, ...]] = []
+
+    def run(command: tuple[str, ...], *, check: bool) -> subprocess.CompletedProcess[str]:
+        assert check
+        observed.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(review_service.subprocess, "run", run)
+
+    launch_review_service(config)
+
+    assert observed and observed[0][0] == "systemd-run"
+    receipt = json.loads((log_directory / "review_execution.json").read_text())
+    assert receipt["reviewer_module_name"] == (
+        "evrptw.experiments.stage052_campaign_review"
+    )
+
+
 def test_reviewer_revision_is_bound_to_wheel_and_installed_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

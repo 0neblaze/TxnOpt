@@ -120,9 +120,11 @@ from evrptw.stage052_evidence import (
 )
 from evrptw.stage052_platform import peak_rss_bytes
 from evrptw.stage052_remediation import Stage052RemediationResult
+from evrptw.stage052_retention import resolve_retained_run_from_locator
 from evrptw.validation import validate_routes
 
 STAGE052_SCHEMA_VERSION = "stage05.2-performance-v1"
+_RETENTION_REGISTRY = Path("experiments/registries/stage05.2_retention_registry.csv")
 PERFORMANCE_INSTANCES = ("c101C5", "c101_21", "r101_21", "rc101_21")
 PERFORMANCE_SEEDS = (2014, 2015, 2016)
 FORMAL_SEEDS = tuple(range(2014, 2024))
@@ -444,6 +446,7 @@ def run_stage052(
     worker_count: int = 1,
     prerequisite_dir: Path | None = None,
     prerequisite_dirs: Mapping[str, Path] | None = None,
+    retention_registry_path: Path = _RETENTION_REGISTRY,
 ) -> dict[str, Path]:
     """Execute one canonical Stage 5.2 component attempt."""
 
@@ -490,7 +493,21 @@ def run_stage052(
             )
         identities: dict[str, Any] = {}
         for requirement in contract.prerequisites:
-            resolved_input = _resolve(root, supplied[requirement.role])
+            supplied_input = supplied[requirement.role]
+            ordinary_input = _resolve(root, supplied_input)
+            if ordinary_input.exists():
+                resolved_input = ordinary_input
+            elif re.fullmatch(
+                r"stage05\.2_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}",
+                supplied_input.as_posix(),
+            ):
+                resolved_input = resolve_retained_run_from_locator(
+                    supplied_input.as_posix(),
+                    registry_path=_resolve(root, retention_registry_path),
+                    storage_root_locator_path=_resolve(root, config.storage_root_locator),
+                )
+            else:
+                resolved_input = ordinary_input
             resolved_prerequisite_dirs[requirement.role] = resolved_input
             identities[requirement.role] = verify_stage052_evidence_input(
                 resolved_input,

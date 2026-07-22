@@ -531,73 +531,73 @@ this repository or one of its subdirectories.
 
 - Stage 5.2 starts only from accepted `stage05.1_best_known_attempt06` with
   review status `READY_FOR_STAGE05_2`, inheriting the accepted Stage 4 Formal
-  identity `stage04_adaptive_weights_attempt15`. It remains one stage with
-  strictly ordered components: `perf_baseline`, `hot_path`,
-  `artifact_streaming`, `job_parallel`, `native_kernels`, optional
-  `accelerator_pilot`, then `benchmark`. Canonical labels are
-  `stage05.2_<component>_attemptNN` or the corresponding `rerunNN`; a later
-  component cannot begin formal evidence before the prior independent review
-  passes.
-- The previously accepted-looking C04/D04--D06/E03/F01 chain is historical and
-  cannot open Component G. The authoritative E03 persistence replay is
-  50.1646%, above the 30% hard gate; E03 must be re-reviewed as `NOT_READY`,
-  which also invalidates F01. Existing raw evidence and every prior review
-  generation remain immutable and visible.
-- The only current remediation chain is
-  `stage05.2_artifact_streaming_attempt05` ->
-  `stage05.2_job_parallel_attempt07/08/09` ->
-  `stage05.2_native_kernels_attempt04` ->
-  `stage05.2_accelerator_pilot_attempt02` ->
-  `stage05.2_benchmark_attempt01` Pilot ->
-  `stage05.2_benchmark_attempt02` Formal. A failed or interrupted run consumes
-  its label and the next unused attempt/rerun is required; shards may never be
-  imported across attempts.
-- C05 keeps storage policy `artifact-storage-v2` but uses physical schema
-  `screening_decisions_v3`: typed bounded Parquet streams split screening
-  definitions from occurrences, preserve 65,536-row groups and at most two
-  non-empty buffer groups, and retain v1, old-v2, v3, and legacy reads. The
-  canonical semantic digest is calculated over expanded logical events, so
-  physical definition IDs and compression layout cannot change replay.
-- C05 binds B03, historical C04, and E03 as a signed `NOT_READY` remediation
-  input. It must replay all E03 events without semantic drift and reduce the
-  fully attributed persistence ratio to at most 30%; peak worker RSS remains
-  capped at 4,357,382,144 bytes. C05 and every later component require the same
-  clean commit and frozen non-editable Python 3.13 wheel runtime.
-- D07/D08/D09 run 1/2/4 workers on the fixed four-instance, three-seed scope.
-  Two workers require at least 1.5x speedup and at most 12 GiB aggregate RSS;
-  four workers are selected only at 2.5x and at most 12 GiB. Selection is a
-  replayed result, never a hard-coded value. Worker ownership uses real PIDs
-  and cumulative process CPU samples; worker failure aborts without fallback.
-- E04 binds only the new D selection. All 24 fixed-work axes must preserve
-  Python/native objective, validator, exact ordering, candidate/cache/event
-  semantics, with zero native/protocol fallback. Aggregate 100-customer paired
-  median end-to-end improvement must be at least 15%, no C/R/RC family may
-  regress by more than 3%, persistence must be at most 30%, each worker RSS at
-  most 4,357,382,144 bytes, and process-tree RSS at most 12 GiB.
-- F02 binds only E04. It independently recomputes the nine 100-customer route
-  batch occupancies. Median below 32 publishes the mutually exclusive
-  decision-only `GPU_NOT_JUSTIFIED`; median at least 32 requires the registered
-  Metal helper, exact fixed-work equality, at least 15% aggregate improvement,
-  and no family regression over 3%. Missing helper, fallback, or an unaudited
-  campaign adapter is `NOT_READY`.
-- G01 is exactly 12 instances x 3 seeds x one 30-second axis and must exercise
-  real resource sampling, worker/batch/archive failure recovery, bounded raw
-  replay, 1/5/10/30-second anytime checkpoints, all configured archive roots,
-  and interrupted publication recovery. Only independent review may report
-  `READY_FOR_STAGE052_FORMAL_BENCHMARK`.
-- G02 contains exactly 920 indivisible `(instance, seed)` shards: 360 small
-  30-second axes plus 560 large 30/60/300-second axes, for 2,040 runs, 229,200
-  declared solver seconds, and 10,400 anytime rows. Large wall-clock axes use
-  `max_iterations=None`; small axes retain 1,000 iterations and carry their
-  final incumbent forward to applicable checkpoints.
-- Campaign active writes use only
-  `/Volumes/TRANSFER/FURP-2026-Yiyang-GUO-EVRP-TW/results`. Verified batches may
-  archive to `/Volumes/TRANSFER/FURP-2026-Yiyang-GUO-EVRP-TW-results` or
-  `/Users/guoyiyang/Documents/Codex/FURP-2026-Yiyang-GUO-EVRP-TW-results`.
-  Local absolute paths live only in the ignored root locator; tracked evidence
-  stores aliases and volume identities. The external volume always preserves
-  20 GiB safety plus 32 GiB active workspace, and internal APFS preserves 50
-  GiB. Batch target/hard cap is 24/32 GiB and shard hard cap is 2 GiB.
+  identity `stage04_adaptive_weights_attempt15`. It is one continuously
+  maintained implementation. A--G are ordered evidence gates inside that one
+  implementation: `perf_baseline`, `hot_path`, `artifact_streaming`,
+  `job_parallel`, `native_kernels`, optional `accelerator_pilot`, then
+  `benchmark`; they are not separately maintained software versions.
+- `stage05.2_<component>_attemptNN` and `rerunNN` are unique run identities,
+  not version names. A failed or interrupted run consumes its label and shards
+  may never be imported into another run, but bulky evidence need not remain in
+  the repository workspace. Current-chain truth comes from signed manifests,
+  prerequisite references, and `stage05.2_retention_registry.csv`, never from a
+  hard-coded attempt number in policy documentation.
+- Full Stage 5.2 evidence exists in the active staging root only while it is
+  being produced or reviewed. Complete, partial, failed, `NOT_READY`, and
+  superseded runs are checksum-verified and archived under the configured
+  `d_archive` alias at `stage05.2/history/<run_label>/`; the workspace retains
+  only the signed retention inventory, lightweight registry, change log, and
+  independently published summaries. Archive failure or identity mismatch
+  retains the source and fails immediately.
+- Retention audit rejects active, planned, unknown, or otherwise unsealed runs
+  by default. The one-time pre-redesign historical override must bind the
+  expected directory count and byte count. Same-volume archival uses atomic
+  rename; cross-volume archival copies to a hidden target-volume temporary
+  directory, verifies the full identity, atomically publishes it on that
+  volume, and only then removes the source. Registry updates merge by immutable
+  run identity and may never replace unrelated historical rows.
+- Archived prerequisite or review input is resolved by run label through
+  `stage05.2_retention_registry.csv` plus the local storage-root locator. The
+  resolver must recheck the registered file count, byte count, and tree SHA-256
+  before returning a path to an existing runner or reviewer; policy files and
+  callers must not embed the machine-local archive path.
+- A registered archive tree is immutable. Reviewers may consume it as a
+  comparison, prerequisite, or replay input, but may not publish a new review
+  generation inside it. A run that still needs review publication remains in
+  the active root until that generation is sealed, then it is archived.
+- `artifact-storage-v2` with physical schema `screening_decisions_v3` uses
+  typed bounded Parquet streams, 65,536-row groups, at most two non-empty buffer
+  groups, and compatible v1/old-v2/v3/legacy reads. Canonical semantic digests
+  are computed over expanded logical events, so physical IDs and compression
+  layout cannot change replay. Persistence is at most 30% of end-to-end time
+  and peak RSS is at most 50% of the Stage 5.2 v1 baseline.
+- Job-parallel selection compares 1/2/4 workers on the fixed four-instance,
+  three-seed scope. Two workers require at least 1.5x speedup and at most 12 GiB
+  aggregate RSS; four workers are selected only at 2.5x and at most 12 GiB.
+  Worker ownership uses real PIDs and cumulative process CPU samples; worker
+  failure aborts without fallback.
+- Native-kernel promotion must preserve Python/native objective, validator,
+  exact ordering, candidate/cache/event semantics, and zero fallback across all
+  fixed-work axes. Aggregate 100-customer paired median end-to-end improvement
+  must be at least 15%, no C/R/RC family may regress by more than 3%,
+  persistence must remain at most 30%, each worker RSS at most 4,357,382,144
+  bytes, and process-tree RSS at most 12 GiB.
+- The accelerator gate independently recomputes 100-customer batch occupancy.
+  Median below 32 publishes `GPU_NOT_JUSTIFIED`; median at least 32 requires the
+  registered helper, exact fixed-work equality, at least 15% aggregate
+  improvement, and no family regression over 3%. Missing helper, fallback, or
+  an unaudited campaign adapter is `NOT_READY`.
+- The pipeline pilot is exactly 12 instances x 3 seeds x one 30-second axis and
+  exercises resource sampling, failure recovery, bounded replay, 1/5/10/30
+  second anytime checkpoints, configured archive roots, and interrupted
+  publication recovery. Formal contains exactly 920 indivisible
+  `(instance, seed)` shards, 2,040 runs, 229,200 declared solver seconds, and
+  10,400 anytime rows. Only independent review may open Formal or report
+  `READY_FOR_STAGE05_3`.
+- Local absolute paths live only in the ignored storage-root locator. Tracked
+  evidence records aliases, relative archive paths, volume identities, run
+  status, source revision, prerequisite identities, byte count, and checksum.
+  Batch target/hard cap remains 24/32 GiB and shard hard cap remains 2 GiB.
 - Formal review uses bounded Arrow batches and streaming iterators and rejects
   full-shard `to_pylist()`, `read_events()`, or `reconstruct_trace()`. It
   independently verifies exact campaign geometry, bidirectional descriptors,
@@ -608,7 +608,9 @@ this repository or one of its subdirectories.
   never accumulate a complete axis or bundle of event dictionaries. Multiple
   raw bundles are replayed strictly in input order, one fresh spawned process
   per bundle; the parent retains digest maps only. Field-level mismatch output
-  is generated only for unequal axes through a disk-backed temporary spool.
+  is generated only for unequal fixed-work axes through a disk-backed temporary
+  spool. Unequal wall-clock axes emit one aggregate digest row per
+  `(instance, seed, axis)` instead of expanding expected trajectory differences.
   The spool stores one compressed canonical record per row and expands fields
   only while comparing; per-field database rows are forbidden because they
   amplify disk usage and cgroup page cache. Only the comparison bundle may be
@@ -635,7 +637,11 @@ this repository or one of its subdirectories.
   cgroup peak accounting is a hard receipt failure and must never be silently
   represented as zero. Reviewer logs are operational evidence outside immutable
   raw bundles and do not alter the
-  scientific review schema or readiness gates.
+  scientific review schema or readiness gates. The only allowlisted scientific
+  entry points are `evrptw.experiments.stage052_performance_review` and
+  `evrptw.experiments.stage052_campaign_review`; their raw/prerequisite command
+  envelopes are validated separately and both use the external progress log
+  plus the 5.5-GiB internal process-tree guard.
   The launcher must resolve and freeze the service `PATH` for `nvidia-smi`,
   `powershell.exe`, and `wsl.exe`, record it in the execution receipt, and fail
   before launch if any required interoperability tool is unavailable; it must
@@ -651,8 +657,8 @@ this repository or one of its subdirectories.
   explicit retry. Its hash belongs in `review_retry_history_sha256`, not the
   accepted-review lineage; every retry archive remains a prerequisite-time
   manifest/raw/file-hash gate and may never be deleted or silently replaced.
-- The registry, trusted manifest, and versioned review products are published
-  only after G02 raw replay reports `READY_FOR_STAGE05_3`. Publication is a
+- The registry, trusted manifest, and content-addressed review products are
+  published only after Formal raw replay reports `READY_FOR_STAGE05_3`. Publication is a
   generation transaction whose trusted manifest is replaced last; no producer,
   runner, or documentation may claim Stage 5.2 completion before both review
   and tracked publication pass.
@@ -670,18 +676,20 @@ The executable workflow and gate table are maintained in
   compatibility tests/reproduction when their configuration has no
   `[artifact_storage]`; the shipped new configurations reject those paths.
 - The current Stage 5.2 storage policy remains `artifact-storage-v2`, while the
-  current-chain physical schema is `screening_decisions_v3`; v1, old v2, v3,
+  current physical schema is `screening_decisions_v3`; v1, old v2, v3,
   and legacy evidence remain readable. These formats use Parquet events,
   complete critical evidence, aggregated diagnostic evidence, 2 GiB per
   instance/seed, and 32 GiB per run. Historical v1 uses Zstandard level 3;
-  accepted v2 uses Zstandard level 1. New physical evidence belongs under
-  `results/<run_label>/<instance>/<seed>/` with control metadata and a manifest
-  under `control/`.
-- `stage05.2_artifact_streaming_attempt04` is preserved historical old-v2
-  evidence, not a current prerequisite. The current storage amendment is C05;
-  it preserves v1/old-v2 reads and adds typed v3 definitions/occurrences,
-  bounded Parquet streams, shard manifests/checksums, worker-owned
-  `(instance, seed)` shards, and parent-only control-manifest finalisation.
+  accepted v2 uses Zstandard level 1. New physical evidence is created below
+  the active staging root as `<run_label>/<instance>/<seed>/`, with control
+  metadata and a manifest under `control/`, then moved intact to the configured
+  archive after checksum verification.
+- Stage 5.2 preserves v1/old-v2 reads and uses typed v3
+  definitions/occurrences, bounded Parquet streams, shard
+  manifests/checksums, worker-owned `(instance, seed)` shards, and parent-only
+  control-manifest finalisation. Attempt-specific remediation history belongs
+  in manifests, the retention registry, and the change log rather than this
+  standing policy.
 - Current v3 physical writers use 65,536-row Parquet row groups and buffer at
   most two non-empty row groups per family. A worker writes only its own shard;
   the parent never merges event
@@ -692,8 +700,8 @@ The executable workflow and gate table are maintained in
 - v2 promotion requires v1/v2 replay equality for validator, objective,
   critical events, exact-call and failure semantics; artifact persistence must
   be at most 30% of end-to-end time and peak RSS at most 50% of the Stage 5.2
-  v1 baseline. Partial shards are retained with explicit completeness and fail
-  immediately; there is no serial persistence fallback.
+  v1 baseline. Partial shards are sealed with explicit completeness, fail
+  immediately, and are then archived; there is no serial persistence fallback.
 - Critical events are never dropped. Ordinary candidates, repeated timings, and
   operator totals may be aggregated into diagnostic Parquet only when replay
   semantics are unchanged. Route sequences are stored once in the route
@@ -707,10 +715,11 @@ The executable workflow and gate table are maintained in
 - Event rows use integer route/lane/operator IDs; the trace index carries the
   lane/operator dictionaries and the route dictionary remains the sole store
   for complete customer sequences.
-- A byte-budget violation must retain completed raw/solution/event/environment/
+- A byte-budget violation must seal completed raw/solution/event/environment/
   failure evidence, write `evidence_completeness=partial`, update the manifest
-  and sidecar, then fail immediately. Partial, timeout, failure, and manifest
-  error bundles cannot publish summaries.
+  and sidecar, then fail immediately. The sealed run is checksum-verified and
+  archived instead of accumulating in the workspace. Partial, timeout,
+  failure, and manifest-error bundles cannot publish scientific summaries.
 - Historical Stage 0 frozen artifacts and Stage 3.0–3.2 raw evidence are
   immutable and remain `legacy_json_or_jsonl`, `legacy`, and
   `legacy_compatible`. Compatibility mappings are registry views only; they do

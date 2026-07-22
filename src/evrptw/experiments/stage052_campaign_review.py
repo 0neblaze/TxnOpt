@@ -75,6 +75,11 @@ from evrptw.stage052_evidence import (
     verify_stage052_review_files,
     verify_stage052_source_snapshot,
 )
+from evrptw.stage052_retention import (
+    load_retention_registry,
+    resolve_retained_run_from_locator,
+)
+from evrptw.stage052_review_service import ReviewProcessMemoryGuard, ReviewProgressLog
 from evrptw.validation import validate_routes
 
 NOT_READY = "NOT_READY"
@@ -4331,14 +4336,97 @@ def main() -> int:
     parser.add_argument("--scope", choices=("pilot", "formal"), required=True)
     parser.add_argument("--prerequisite-dir", type=Path, required=True)
     parser.add_argument("--storage-roots", type=Path, required=True)
+    parser.add_argument(
+        "--retention-registry",
+        type=Path,
+        default=Path("experiments/registries/stage05.2_retention_registry.csv"),
+    )
+    parser.add_argument("--progress-log", type=Path, required=True)
+    parser.add_argument("--max-aggregate-rss-gib", type=float, default=5.5)
     arguments = parser.parse_args()
-    outputs = review_stage052_campaign(
-        campaign_dir=arguments.campaign_dir,
-        benchmark_dir=arguments.benchmark_dir,
-        bks_path=arguments.bks_path,
+    if arguments.max_aggregate_rss_gib <= 0.0:
+        parser.error("--max-aggregate-rss-gib must be positive")
+    root = repository_root()
+    campaign_dir = (
+        arguments.campaign_dir
+        if arguments.campaign_dir.is_absolute()
+        else root / arguments.campaign_dir
+    ).resolve()
+    registry_path = (root / arguments.retention_registry).resolve()
+    locator_path = (root / arguments.storage_roots).resolve()
+    if not registry_path.is_file() or not locator_path.is_file():
+        parser.error("retention registry and storage-root locator are required")
+    locator = StorageRootLocator.from_toml(locator_path)
+    for record in load_retention_registry(registry_path):
+        if record.run_label != campaign_dir.name:
+            continue
+        registered_path = locator.resolve(record.archive_root_alias).absolute_path.joinpath(
+            *Path(record.archive_relative_path).parts
+        )
+        if registered_path.resolve() == campaign_dir:
+            parser.error(
+                "--campaign-dir cannot be immutable archived evidence; archived runs "
+                "are read-only prerequisite/replay inputs"
+            )
+    ordinary_prerequisite = (
+        arguments.prerequisite_dir
+        if arguments.prerequisite_dir.is_absolute()
+        else root / arguments.prerequisite_dir
+    )
+    prerequisite_dir = (
+        ordinary_prerequisite.resolve()
+        if ordinary_prerequisite.exists()
+        else resolve_retained_run_from_locator(
+            arguments.prerequisite_dir.as_posix(),
+            registry_path=(root / arguments.retention_registry).resolve(),
+            storage_root_locator_path=(root / arguments.storage_roots).resolve(),
+        )
+    )
+    progress_path = arguments.progress_log.resolve()
+    if progress_path == campaign_dir or campaign_dir in progress_path.parents:
+        parser.error("--progress-log must be outside immutable raw evidence")
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    progress = ReviewProgressLog(progress_path)
+    guard = ReviewProcessMemoryGuard(
+        limit_bytes=int(arguments.max_aggregate_rss_gib * 1024**3),
+        progress=progress,
+    )
+    previous_progress = os.environ.get("STAGE052_REVIEW_PROGRESS_LOG")
+    os.environ["STAGE052_REVIEW_PROGRESS_LOG"] = str(progress_path)
+    progress.emit(
+        "campaign_review_start",
+        campaign_dir=str(campaign_dir),
         scope=arguments.scope,
-        prerequisite_dir=arguments.prerequisite_dir,
-        locator=StorageRootLocator.from_toml(arguments.storage_roots),
+    )
+    try:
+        with guard:
+            outputs = review_stage052_campaign(
+                campaign_dir=campaign_dir,
+                benchmark_dir=arguments.benchmark_dir,
+                bks_path=arguments.bks_path,
+                scope=arguments.scope,
+                prerequisite_dir=prerequisite_dir,
+                locator=locator,
+            )
+    except BaseException as error:
+        progress.emit(
+            "campaign_review_failed",
+            error_type=type(error).__name__,
+            error=str(error),
+            aggregate_peak_rss_bytes=guard.peak_rss_bytes,
+            aggregate_peak_swap_bytes=guard.peak_swap_bytes,
+        )
+        raise
+    finally:
+        if previous_progress is None:
+            os.environ.pop("STAGE052_REVIEW_PROGRESS_LOG", None)
+        else:
+            os.environ["STAGE052_REVIEW_PROGRESS_LOG"] = previous_progress
+    progress.emit(
+        "campaign_review_complete",
+        outputs={key: str(path) for key, path in outputs.items()},
+        aggregate_peak_rss_bytes=guard.peak_rss_bytes,
+        aggregate_peak_swap_bytes=guard.peak_swap_bytes,
     )
     for key, path in outputs.items():
         print(f"{key}: {path}")

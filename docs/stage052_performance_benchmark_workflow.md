@@ -11,7 +11,10 @@ Stage 5.2 先修复已测得的工程瓶颈，再扩大实验规模。它不是�
 - main repository（主仓库）使用 clean commit，Stage 0 frozen baseline 与历史 raw evidence 未改写；
 - 本文件、`AGENTS.md`、路线图和 `docs/experiment_artifact_storage.md` 的规则一致。
 
-## Canonical components
+## 单一版本与 Canonical gates
+
+Stage 5.2 只维护一套当前代码。下表 A--G 是同一实现内部必须依次通过的 gate
+（门槛），不是七个软件版本，也不得复制成七套长期维护的实现。
 
 | 顺序 | Component | Canonical label | 目标 |
 | --- | --- | --- | --- |
@@ -23,20 +26,23 @@ Stage 5.2 先修复已测得的工程瓶颈，再扩大实验规模。它不是�
 | F | `accelerator_pilot` | `stage05.2_accelerator_pilot_attemptNN` | 条件式 GPU/Metal/MPS 决策 |
 | G | `benchmark` | `stage05.2_benchmark_attemptNN` | 执行 pilot 和分层正式实验 |
 
-任何失败或被中断的运行使用新 `attemptNN`/`rerunNN`，原 shard、manifest 和 failure evidence 不得覆盖。F 可以以 `GPU_NOT_JUSTIFIED` 通过；A–E 和 G 不得跳过。
+`attemptNN`/`rerunNN` 只表示唯一运行身份，不表示代码版本。失败或中断后使用新的
+运行身份，原 shard 不得拼入新运行；但 sealed raw evidence（已封存原始证据）不在
+仓库工作区无限累积，而是在 checksum（校验和）验证后移入配置的外部归档。
+F 可以以 `GPU_NOT_JUSTIFIED` 通过；A--E 和 G 不得跳过。
 
-当前 A/B 历史证据保留，但 C04/D04--D06/E03/F01 不再构成可晋级的 current
-chain（当前证据链）。E03 的完整 artifact persistence ratio（工件持久化占比）为
-50.1646%，超过 30% 硬门槛；E03 必须发布新的 `NOT_READY` review generation，F01
-也因 prerequisite 失效成为 `NOT_READY`。旧 raw 和旧 review generation 均保持
-不可变。
+current chain（当前证据链）由 signed manifest（签名清单）、prerequisite identity
+（先决身份）和 `experiments/registries/stage05.2_retention_registry.csv` 共同确定。
+政策文档不得硬编码某次 attempt 为永久 current。producer/storage/native/config
+语义变化仍从受影响的最早 gate 重跑；reviewer-only 修复可以复用同一 raw，但每个
+review generation 继续保持内容寻址和不可变。
 
-唯一当前链为 C05 -> D07/D08/D09 -> E04 -> F02 -> G01 Pilot -> G02 Formal。
-它们必须绑定同一个 clean implementation commit、内置盘全新 Python 3.13
-non-editable wheel runtime（非可编辑 wheel 运行时）、外置 staging volume 和
-`screening_decisions_v3`。任何 producer/storage/native/config 语义变化都从受影响的
-最早 component 重跑；只有 reviewer-only 修复可以复用同一 raw 生成新 review
-generation。
+归档后的 run 以 run label 交给 `resolve_retained_run`；该接口根据 registry 中的
+archive alias 和本机 ignored storage-root locator 定位目录，重新验证文件数、字节数与
+tree SHA-256 后，才把普通 `Path` 交给现有 prerequisite verifier 或 reviewer。仍标记为
+active 的目录必须先确认 producer/reviewer 已停止并完成稳定 audit，不能边写边迁移。
+registry 以 run label 增量合并，已存在 identity 只有完全一致时才幂等；任何 checksum、
+bytes、component 或 prerequisite 冲突立即失败，不能用新一轮 archive 覆盖历史行。
 
 ## 统一测量合同
 
@@ -95,12 +101,11 @@ B 的最终组合必须通过严格性能门槛，单项收益和组合收益都
 - timeout、byte-budget、writer error 和 worker failure 均保留 partial shard 并 fail fast；
 - reviewer 不读取全量 events 到一个 Python list，不依赖 worker completion order。
 
-C04 是旧 physical schema 的历史证据，不能直接进入新 D。C05 固定标签为
-`stage05.2_artifact_streaming_attempt05`，保持 v2 policy 但使用
-`screening_decisions_v3` definitions/occurrences 分表、typed buffers、bounded
-streaming merge 和跨 v1/旧v2/v3/legacy reader。除 36 axes 与 24 fixed-work
-semantic equality 外，C05 必须 replay E03 全部事件，保持 canonical semantic
-digest 完全相同，并把重新归因后的 persistence ratio 降至 30% 以内。
+当前 C 实现保持 v2 policy，并使用 `screening_decisions_v3`
+definitions/occurrences 分表、typed buffers、bounded streaming merge 和跨
+v1/旧v2/v3/legacy reader。任何 C 运行必须通过 36 axes、fixed-work semantic
+equality 和 30% persistence gate；旧 physical schema 或失败 remediation（补救）
+关系只记录在 manifest、retention registry 和 change log 中。
 
 ## D. Job-level parallelism
 
@@ -119,33 +124,23 @@ per-run control preparation（逐运行控制工件准备）完成；preflight �
 manifest finalisation 不混入该并行阶段 speedup。它同时记录 parent/descendant PID、
 真实 shard owner PID、50 ms process-tree samples、aggregate RSS 和 active cores。
 reviewer 对 1/2/4-worker 三个 bundle 分别要求 exact 36-axis raw/solution/trace replay，
-并独立核对 C04 identity、instance/config/native-extension checksum、Python/package/
+并独立核对当前 accepted C identity、instance/config/native-extension checksum、Python/package/
 machine identity、affinity、non-secret performance environment variables、background
 load 和 power mode。
 
-D01--D06 都保留为历史证据；当前序列必须重新运行 D07（1 worker）、D08（2
-workers）和 D09（4 workers）。reviewer 从 cumulative per-PID CPU samples、真实
-worker ownership、完整 shard identity 与 36-axis replay 重算 speedup/RSS 后选择
-worker count，不得沿用或硬编码历史的 4 workers。
+每次 D selection 必须使用三个新的唯一运行身份分别执行 1/2/4 workers。reviewer
+从 cumulative per-PID CPU samples、真实 worker ownership、完整 shard identity 与
+36-axis replay 重算 speedup/RSS 后选择 worker count，不得沿用或硬编码历史结论。
 
 ## E. Native CPU kernels
 
 只迁移 profiling 已证明占主导的路径：screening、propagation snapshot、distance lookup、exact label expansion/dominance/heap。数据边界使用 contiguous integer/float arrays；C++ 核心计算可释放 GIL，但进入 Python callback、异常构造或对象访问前必须重新持有 GIL。
 
-每个 kernel 先做 frozen fixture、small brute-force（小规模暴力枚举）和 fixed-work differential test（差分测试），再进入完整性能 scope。E 的组合实现必须相对 D 的 accepted configuration 再通过严格 15%/3% 门槛。
-
-E01 保持为 immutable、non-promotable failed producer evidence（不可变、不可晋级的
-生产器失败证据）：producer 仅有 35/36 axes valid，
-`rc101_21/2016/wall_clock_30` 的 unique-route reconciliation 失败，因此未进入
-independent review。E02 完成 36 axes，但 independent reviewer 正式发布
-`NOT_READY`：storage replay 检出 Python 3.13 compensated sum（补偿求和）与 C++
-普通 `+=` 相差 1 ULP。根因修复没有修改旧证据，而是在 clean commit
-`ca766a035a1c5413c61277f50d6904e3de7f238f` 上创建 E03。
-
-E03 的旧 accepted review 必须撤回为 `NOT_READY`，不得被 E04/F02 引用。E04 只
-绑定新 D selection，并重新执行 24 fixed-work Python/native equality、15%/3%
-performance gate、30% persistence、每 worker 4,357,382,144-byte RSS、process-tree
-12-GiB RSS 和 zero-fallback gate。
+每个 kernel 先做 frozen fixture、small brute-force（小规模暴力枚举）和 fixed-work
+differential test（差分测试），再进入完整性能 scope。E 的组合实现只绑定当前
+accepted D selection，并重新执行 Python/native equality、15%/3% performance、30%
+persistence、每 worker 4,357,382,144-byte RSS、process-tree 12-GiB RSS 和
+zero-fallback gate。旧 E 失败原因进入 change log，不进入长期政策正文。
 
 ## F. Conditional accelerator pilot
 
@@ -153,28 +148,25 @@ performance gate、30% persistence、每 worker 4,357,382,144-byte RSS、process
 
 GPU/Metal/MPS promotion 同时要求：fixed-work 语义一致；相对 E selected native CPU，全部 100-customer 配对的总体端到端中位时间至少降低 15%；C、R、RC 任一 family 的 family median 回退不超过 3%。任一条件失败即保留 native CPU。正式 runner 不得设置隐式 CPU fallback。
 
-F01 因 E03 prerequisite 失效而成为历史 `NOT_READY`。F02 只接受 E04 raw/review
-identity，并独立重算九个 occupancy；median <32 才允许 decision-only
-`GPU_NOT_JUSTIFIED`，median >=32 则必须执行 registered Metal helper（已登记 Metal
-辅助程序）并通过语义相等与 15%/3% 门槛。缺失 helper、CPU fallback 或缺少经过审查
-的 G campaign adapter 均为 `NOT_READY`。
+F 只接受当前 E raw/review identity，并独立重算 occupancy；median <32 才允许
+decision-only `GPU_NOT_JUSTIFIED`，median >=32 则必须执行 registered helper 并
+通过语义相等与 15%/3% 门槛。缺失 helper、CPU fallback 或缺少经过审查的 G
+campaign adapter 均为 `NOT_READY`。
 
 ## G. Pipeline pilot 与正式分层预算
 
 ### Pipeline pilot
 
-G01 使用固定 Stage 0 representative set（代表集）执行 `12 instances × 3 seeds`
-与一个 30 秒 axis。它必须完整走过 F02 实际选择的 backend/worker、真实 failure
+Pilot 使用固定 Stage 0 representative set（代表集）执行 `12 instances × 3 seeds`
+与一个 30 秒 axis。它必须完整走过当前 F gate 实际选择的 backend/worker、真实 failure
 recovery、resource sampling、bounded raw replay、1/5/10/30-second anytime、所有
 archive root 和 interrupted publication dry run。所有 36 bundles 完整且独立 review
 报告 `READY_FOR_STAGE052_FORMAL_BENCHMARK` 后才开放 Formal。
 
-Campaign active writes 固定在外置
-`/Volumes/TRANSFER/FURP-2026-Yiyang-GUO-EVRP-TW/results`。归档根为外置
-`/Volumes/TRANSFER/FURP-2026-Yiyang-GUO-EVRP-TW-results` 与内置
-`/Users/guoyiyang/Documents/Codex/FURP-2026-Yiyang-GUO-EVRP-TW-results`；绝对路径只
-存在 ignored locator。next-fit partitioning 的 target/hard cap 为 24/32 GiB，单
-shard hard cap 2 GiB，并持续保留外置 20+32 GiB 与内置 50 GiB reserve。
+Campaign active writes 与归档目标只通过 ignored root locator（忽略的根目录定位器）
+中的 `wsl_staging` 和 `d_archive` aliases 解析。绝对路径不得写入 tracked artifact。
+next-fit partitioning 的 target/hard cap 为 24/32 GiB，单 shard hard cap 2 GiB，并
+持续满足 locator 声明的容量 reserve。
 
 ### Formal budget matrix
 
@@ -187,17 +179,38 @@ shard hard cap 2 GiB，并持续保留外置 20+32 GiB 与内置 50 GiB reserve�
 
 anytime checkpoints 为预算范围内的 `1/5/10/30/60/120/300 s`。small instances 在 30 秒或 iteration limit 后结束，不为矩阵对称性浪费 60/300 秒。随机 seeds 在 Formal 前冻结并写入 config/manifest；不得按结果更换。
 
+## Retention 与变更日志
+
+- `python -m evrptw.stage052_retention audit` 只读枚举 Stage 5.2 运行，记录状态、
+  completeness、source commit、prerequisite run labels、文件数、字节数和完整 tree
+  SHA-256，并生成带 sidecar 的 inventory。
+- `python -m evrptw.stage052_retention archive` 必须显式绑定 inventory SHA-256。
+  同盘目标使用原子迁移；跨盘先写目标卷隐藏临时目录，复验后在目标卷原子落位，再
+  清理 source。source 漂移、目标冲突或校验失败均保留 source 并 fail fast；中断留下
+  的临时副本可在源完整时安全重建并重试。
+- 完整 raw 保存在 `d_archive/stage05.2/history/<run_label>/`。仓库只跟踪
+  `experiments/registries/stage05.2_retention_registry.csv`、最终科学汇总和
+  `docs/stage052_change_log.md`；registry 不记录本机绝对路径。
+- change log 按时间追加原因、修改范围、行为与证据影响、验证结果、失效运行和新运行
+  identity。后续改进直接进入当前 Stage 5.2 实现，不复制新版本目录或模块。
+
 ## Review 与发布
 
 independent reviewer 必须从 raw shards 重算：exact scope identity、validator/objective、event/cache/exact-call、deadline/budget、worker/shard completeness、resource limits、严格性能 gate、anytime 汇总和模型兼容性。BKS compatibility 仍为 `False`，因此不创建 gap 列。
+
+已进入 retention registry 的归档目录是 immutable review input（不可变审查输入），可
+作为 comparison/prerequisite 读取，但不能再作为写入 review generation 的 `raw_dir`。
+需要产生新 review generation 时，目标 raw 必须仍位于 active root；封存完成后再归档。
 
 ### Reviewer 内存与后台运行合同
 
 storage semantic replay（存储语义重放）必须在读取 canonical record（规范记录）时
 直接更新每个 axis 的 SHA-256；禁止构建完整的 per-axis event list（逐轴事件列表）。
 多个 raw bundle 严格按输入顺序处理，每个 bundle 使用一个新的 `spawn` 子进程，父
-进程只接收小型 digest map（摘要映射）。只有 axis digest 不一致时才执行字段级重放，
-并使用 ext4 上的临时 SQLite spool；spool 每条 canonical record 只保存一行压缩
+进程只接收小型 digest map（摘要映射）。只有需要 exact equality 的 fixed-work axis
+digest 不一致时才执行字段级重放；wall-clock axis 的预期 trajectory 差异只写一条
+aggregate digest row（聚合摘要行），不得展开为数十 GiB 的逐事件差异。字段级重放使用
+ext4 上的临时 SQLite spool；spool 每条 canonical record 只保存一行压缩
 payload 和 digest，比较时才展开字段，禁止按每个 field 写一行造成磁盘与 cgroup
 page-cache 放大。spool 只保存 comparison bundle（对照证据）；candidate bundle（候选
 证据）边读边按主键 point lookup（点查询）和比较，不得同时保存两套完整 payload。
@@ -249,10 +262,15 @@ service 还必须配置 `ExecStopPost` 外部收尾器；即使 `MemoryMax` 直�
 - `... stage052_review_service stop --unit <unit>`：停止完整 control group；
 - `... stage052_review_service receipt --log-dir <dir>`：读取最终执行回执。
 
-正式启动必须传入 reviewer wheel 对应的完整 `--reviewer-revision`、frozen
+service 只允许 `evrptw.experiments.stage052_performance_review` 与
+`evrptw.experiments.stage052_campaign_review` 两个 isolated module（隔离模块），并分别
+验证 raw、comparison/prerequisite、scope 和 run label。两者都必须使用外部 progress
+log 与 5.5-GiB 内部 process-tree guard。正式启动必须传入 reviewer wheel 对应的完整
+`--reviewer-revision`、frozen
 non-editable wheel、clean working directory、raw manifest 和完整 reviewer command。
-reviewer command 必须包含 raw/comparison/prerequisite identity，并固定通过该 wheel
-所在 venv 的 Python 使用 `-I -m evrptw.experiments.stage052_performance_review` 启动；
+reviewer command 必须包含该 reviewer 类型要求的 raw、comparison/prerequisite 与
+scope identity，并固定通过该 wheel 所在 venv 的 Python 使用 `-I -m` 启动 allowlisted
+module；
 launcher 会核对 installed distribution 的 `direct_url.json`、module path、wheel
 逐文件内容、由 clean build source 生成的 `.whl.reviewer-provenance.json`、wheel
 path/hash、raw run label 以及 clean producer snapshot，然后自动追加外部 progress log
@@ -263,6 +281,7 @@ path/hash、raw run label 以及 clean producer snapshot，然后自动追加外
 必须发布：
 
 - `experiments/registries/stage05.2_artifact_registry.csv`；
+- `experiments/registries/stage05.2_retention_registry.csv`；
 - `experiments/manifests/stage05.2_performance_benchmark_artifact_manifest.json`；
 - per-run、per-family、per-budget、anytime、resource 和 persistence summaries；
 - performance gate、GPU decision、failure analysis 和 review report。

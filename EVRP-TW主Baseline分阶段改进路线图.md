@@ -59,7 +59,7 @@ results/<stage_id>_<component>_<attempt_or_rerun>/<instance>/<seed>/
 其中：
 
 - `<component>` 是子阶段或算子，例如 `route_elimination`、`relocate`、`station_pressure`；
-- `<attempt_or_rerun>` 必须使用 `attemptNN` 或 `rerunNN`，不得使用含义不明的 `final`、`new` 或 `latest`；
+- `<attempt_or_rerun>` 必须使用 `attemptNN` 或 `rerunNN`，不得使用含义不明的 `final`、`new` 或 `latest`；它是唯一运行身份，不是软件版本号；
 - `<artifact_type>` 必须明确，例如 `config`、`raw`、`solution`、`events`、`failure_cases`、`environment`、`manifest`、`summary`、`review`、`readiness`、`test` 或 `doc`。
 
 规范示例：
@@ -93,7 +93,7 @@ results/stage02.3_constraint_guided_rerun09/r101_21/2015/
 - 同时服务多个阶段的 `alns.py`、`neighborhoods.py`、`objective.py`、validator 和公共测试不得为了贴标签而改名；它们通过 profile、operator registry（算子注册表）、source hash 和 manifest 标记所属阶段。
 - Stage 0 冻结目录、历史结果和 checksum 不得重命名、覆盖或移动；只能在 artifact registry（产物登记表）中增加 `stage00` 标签和旧路径映射。
 - 已存在的 `stage02_*` 历史路径属于 legacy artifact（历史产物），必须保留；新实验必须使用 canonical `stage02.1`、`stage02.2` 或 `stage02.3` 标签，并在 manifest 中记录旧路径与新标签的对应关系。
-- 失败轮次、timeout、invalid、infeasible 和 error 产物不得删除或改名为成功结果；修复后必须使用新的 `attemptNN` 或 `rerunNN`。
+- 失败轮次、timeout、invalid、infeasible 和 error 必须先封存 manifest、状态、失败原因和 checksum，修复后使用新的 `attemptNN` 或 `rerunNN`。Stage 5.2 的大型 raw 由 retention interface 校验后迁出工作区，轻量 registry 必须保留其归档身份；不得未经归档直接删除或改名为成功结果。
 
 ### 5. 阶段覆盖表
 
@@ -119,8 +119,8 @@ results/stage02.3_constraint_guided_rerun09/r101_21/2015/
 
 从本条规则生效后，所有新的 Stage 0–8 runner 都必须在配置中提供
 `[artifact_storage]`，并通过共享 `ArtifactBundleWriter`/`ArtifactReader` 写入和
-回放产物。当前 storage policy 为 `artifact-storage-v2`；Stage 5.2 当前修订从 C05
-开始使用 `screening_decisions_v3` physical schema，并继续读取 v1、旧 v2 与 legacy
+回放产物。当前 storage policy 为 `artifact-storage-v2`；Stage 5.2 当前实现使用
+`screening_decisions_v3` physical schema，并继续读取 v1、旧 v2 与 legacy
 evidence。Stage 5.2 pipeline pilot、正式 benchmark 和后续阶段强制使用经当前链独立
 审查通过的 v2/v3 组合。默认物理格式为 Parquet/Arrow events，critical
 evidence（关键证据）完整保存，diagnostic evidence（诊断证据）按
@@ -724,7 +724,10 @@ Stage 5.1 已完成实现。BKS 数据来自三篇正式发表的期刊文章：
 
 #### 5.2 性能治理与扩展 benchmark
 
-Stage 5.2 保留一个阶段号，但内部必须严格按以下 gate 顺序执行。后一步不得在前一步独立 review 通过前开始正式证据运行。各部分使用独立 component 和 canonical label（规范标签）：
+Stage 5.2 只维护一套持续迭代的当前代码，内部严格按以下 gate 顺序执行。A--G 是同一
+实现内的验证步骤，不是七个长期版本；后一步不得在前一步独立 review 通过前开始正式
+证据运行。各部分使用独立 component，`attemptNN/rerunNN` 仅作为 canonical run
+identity（规范运行身份）：
 
 - `stage05.2_perf_baseline_attemptNN`；
 - `stage05.2_hot_path_attemptNN`；
@@ -736,9 +739,10 @@ Stage 5.2 保留一个阶段号，但内部必须严格按以下 gate 顺序执�
 
 完整执行协议见 `docs/stage052_performance_benchmark_workflow.md`。Stage 5.2 的入口必须是 `stage05.1_best_known_attempt06` 的独立审查状态 `READY_FOR_STAGE05_2`，并继承 Stage 4 accepted Formal identity（正式验收身份）`stage04_adaptive_weights_attempt15`。
 
-当前修订证据链固定为 C05 -> D07/D08/D09 -> E04 -> F02 -> G01 Pilot -> G02
-Formal。C04/D04--D06/E03/F01 保留为历史 raw/review；E03 的完整 persistence ratio
-为 50.1646%，超过 30% 硬门槛，因此 E03/F01 不得继续作为 G 的 prerequisite。
+current chain（当前证据链）由 signed manifest、prerequisite identity 和
+`experiments/registries/stage05.2_retention_registry.csv` 确定，不在路线图中硬编码某次
+attempt。旧运行的状态、失败原因、历史关系和 archive location（归档位置）进入
+registry 与 change log；只有当前 accepted predecessor 可以打开下一 gate。
 
 ##### 5.2-A 固定工作量性能基线
 
@@ -752,13 +756,13 @@ Formal。C04/D04--D06/E03/F01 保留为历史 raw/review；E03 的完整 persist
 
 按 profiling（性能剖析）证据依次处理：缓存 `Instance` 的 name lookup、depot/customer/station 分组和 distance matrix（距离矩阵）；修复 cache hit 时仍重建 propagation snapshot（传播快照）的 eager evaluation（提前求值）；ejection chain（弹射链）只复查 changed routes（已变路线）；screening cache（筛选缓存）只允许保存可证明安全且可审计的正向结果；为每个 operator 设置耗时和 exact-call 预算。
 
-验收使用 strict performance gate（严格性能门槛）：fixed-work objective、validator、exact-call ordering、candidate decision 和 cache semantics 必须一致；相对 5.2-A，全部 100-customer 配对的总体端到端中位运行时间必须至少降低 15%，同时 C、R、RC 任一 family 的 family median 不得回退超过 3%。未通过时保留证据并定位根因，不得降低门槛或绕过语义检查。
+验收使用 strict performance gate（严格性能门槛）：fixed-work objective、validator、exact-call ordering、candidate decision 和 cache semantics 必须一致；相对 5.2-A，全部 100-customer 配对的总体端到端中位运行时间必须至少降低 15%，同时 C、R、RC 任一 family 的 family median 不得回退超过 3%。未通过时封存证据、记录根因并归档，不得降低门槛或绕过语义检查。
 
 ##### 5.2-C Streaming/sharded artifact storage
 
 实现 `artifact-storage-v2`：Parquet row-group streaming（行组流式写入）、按 `(instance, seed)` 分片、worker 只写自己的 shard（分片）、parent 只写 control manifest（控制清单）。固定 row group 为 65,536 rows，writer 最多缓存 2 个 row groups；每个 shard 有独立 manifest、checksum 和 completeness 状态。v1 reader 必须继续可读，历史字节不得移动或改写。
 
-gate：v1/v2 raw replay 的 validator、objective、critical-event、exact-call 和 failure semantics（失败语义）一致；artifact persistence 不得超过 end-to-end 的 30%；peak RSS 不得超过 5.2-A 的 50%。partial shard 必须保留并 fail fast（快速失败），不得静默截断或串行兜底。
+gate：v1/v2 raw replay 的 validator、objective、critical-event、exact-call 和 failure semantics（失败语义）一致；artifact persistence 不得超过 end-to-end 的 30%；peak RSS 不得超过 5.2-A 的 50%。partial shard 必须封存、fail fast（快速失败）并在 checksum 验证后归档，不得静默截断或串行兜底。
 
 ##### 5.2-D Job-level parallelism
 
@@ -774,7 +778,9 @@ gate：fixed-work 语义必须与 5.2-D selected configuration（选定配置）
 
 ##### 5.2-F Conditional accelerator gate
 
-GPU/Metal/MPS 不是必做目标。只有 native CPU 后端的 route batch occupancy 中位数达到 32 时才执行 `stage05.2_accelerator_pilot_attemptNN`。GPU pilot 必须单独记录 host-to-device、kernel、device-to-host 和 synchronization（同步）时间。
+GPU/Metal/MPS 不是必做目标。只有当前 accepted native CPU 后端的 route batch
+occupancy 中位数达到 32 时才执行新的 accelerator pilot run。GPU pilot 必须单独记录
+host-to-device、kernel、device-to-host 和 synchronization（同步）时间。
 
 只有 fixed-work 语义完全一致、相对 selected native CPU 的全部 100-customer 配对总体端到端中位时间至少降低 15%，且 C、R、RC 任一 family 的 family median 不回退超过 3% 时，GPU 才能成为正式后端。否则发布 `GPU_NOT_JUSTIFIED` 是通过该 gate 的合法结论，正式 benchmark 继续使用 native CPU；不得保留自动 CPU fallback 来掩盖 accelerator failure（加速器失败）。
 
@@ -786,7 +792,26 @@ GPU/Metal/MPS 不是必做目标。只有 native CPU 后端的 route batch occup
 - 仅 56 个 100-customer 实例额外运行 `10 seeds × 60 seconds` 和 `10 seeds × 300 seconds`；
 - small instances 不运行 60/300 秒，避免在 iteration limit（迭代上限）后浪费预算；
 - anytime checkpoints 固定为适用预算内的 `1/5/10/30/60/120/300 seconds`；
-- 任何失败都保留原 shard 和 run label，不缩减失败样本，不用补跑结果覆盖原失败。
+- 任何失败都先封存原 shard、manifest 和 run label，再校验归档；不缩减失败样本，
+  不用补跑结果覆盖原失败，也不让大型失败 raw 在仓库工作区无限累积。
+
+##### 跨 A--G 的版本与 retention 治理
+
+这是一条横跨 A--G 的治理规则，不新增第八个性能 gate：
+
+1. Stage 5.2 源码始终只有一套 current implementation（当前实现），后续改进直接修改；
+2. `python -m evrptw.stage052_retention audit` 生成带 SHA-256 sidecar 的只读 inventory；
+3. `archive` 必须绑定 inventory hash，逐目录核对文件数、字节数和 tree SHA-256 后才迁移；
+4. complete、partial、failed、`NOT_READY` 和 superseded raw 均归档到
+   `d_archive/stage05.2/history/<run_label>/`；
+5. 仓库只保留轻量 retention registry、变更日志和独立审查发布的科学汇总；
+6. `docs/stage052_change_log.md` 持续追加修改原因、影响范围、证据影响、验证结果和
+   相关运行身份，不复制新的版本目录；
+7. 归档 run 通过 registry 的 run label 与 archive alias 解析，重新核对文件数、字节数
+   和 tree SHA-256 后再作为 prerequisite/review 输入，tracked 文档不写本机绝对路径；
+8. active/unsealed 默认拒绝归档，registry 按 immutable run identity（不可变运行身份）
+   增量合并。同盘使用原子移动；跨盘先复制到目标卷临时目录，完整复验并原子落位后才
+   清理源目录。
 
 BKS 模型不兼容结论继续有效，因此不得计算或发布 gap。正式 review 必须发布 `stage05.2_artifact_registry.csv`、`stage05.2_performance_benchmark_artifact_manifest.json`、逐次结果、分 family/预算汇总、anytime curves、资源与持久化开销表，并且只有全部 replay/gate 通过时报告 `READY_FOR_STAGE05_3`。
 
