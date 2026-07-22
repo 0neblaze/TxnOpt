@@ -191,6 +191,36 @@ anytime checkpoints 为预算范围内的 `1/5/10/30/60/120/300 s`。small insta
 
 independent reviewer 必须从 raw shards 重算：exact scope identity、validator/objective、event/cache/exact-call、deadline/budget、worker/shard completeness、resource limits、严格性能 gate、anytime 汇总和模型兼容性。BKS compatibility 仍为 `False`，因此不创建 gap 列。
 
+### Reviewer 内存与后台运行合同
+
+storage semantic replay（存储语义重放）必须在读取 canonical record（规范记录）时
+直接更新每个 axis 的 SHA-256；禁止构建完整的 per-axis event list（逐轴事件列表）。
+多个 raw bundle 严格按输入顺序处理，每个 bundle 使用一个新的 `spawn` 子进程，父
+进程只接收小型 digest map（摘要映射）。只有 axis digest 不一致时才执行字段级重放，
+并使用 ext4 上的临时 SQLite spool；成功或失败后都删除临时数据。
+
+Windows/WSL2 formal reviewer 固定通过
+`python -m evrptw.stage052_review_service launch` 启动 transient
+`systemd --user` service。service 固定使用 `MemoryHigh=5G`、`MemoryMax=6G`、
+`MemorySwapMax=2G`、`KillMode=control-group`、`Restart=no` 和 `OOMPolicy=stop`；
+reviewer 自身在 aggregate RSS 达到 5.5 GiB 时先行失败。每次运行在
+`/home/oneblaze/stage052-review-logs/<run-label>/<UTC timestamp>/` 保留
+`progress.jsonl`、`service.log` 和 `review_execution.json`。这些是 operational
+evidence（运行证据），不写入 immutable raw manifest，也不改变 review gate。
+
+固定操作入口为：
+
+- `... stage052_review_service status --unit <unit>`：查看状态；
+- `... stage052_review_service follow --unit <unit>`：跟踪 journal；
+- `... stage052_review_service stop --unit <unit>`：停止完整 control group；
+- `... stage052_review_service receipt --log-dir <dir>`：读取最终执行回执。
+
+正式启动必须传入 frozen non-editable wheel、clean working directory、raw manifest
+和完整 reviewer command。reviewer command 必须包含 raw/comparison/prerequisite
+identity；launcher 自动追加外部 progress log 和 5.5-GiB 内部上限。Codex 只启动和
+轮询 service，不持有 reviewer 生命周期。超限、worker failure 或 service interruption
+不得自动重试；只有显式的新 review generation 才能再次运行。
+
 必须发布：
 
 - `experiments/registries/stage05.2_artifact_registry.csv`；

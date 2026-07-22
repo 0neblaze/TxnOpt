@@ -7,6 +7,7 @@ import math
 import subprocess
 import sys
 import time
+import tracemalloc
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -2545,7 +2546,7 @@ def test_parallel_pool_terminates_all_workers_before_recording_failure(
     ]
 
 
-def test_parallel_replay_aborts_siblings_on_first_failure(
+def test_serial_replay_aborts_current_bundle_on_first_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
@@ -2574,7 +2575,6 @@ def test_parallel_replay_aborts_siblings_on_first_failure(
 
     monkeypatch.setattr(stage052_review, "ProcessPoolExecutor", FakeExecutor)
     monkeypatch.setattr(stage052_review, "get_context", lambda _: object())
-    monkeypatch.setattr(stage052_review, "as_completed", lambda futures: iter(futures))
     monkeypatch.setattr(
         stage052_review,
         "abort_process_executor",
@@ -2582,9 +2582,9 @@ def test_parallel_replay_aborts_siblings_on_first_failure(
     )
 
     with pytest.raises(ArtifactIntegrityError, match="tampered replay"):
-        replay_stage052_storage_semantics_many((Path("tampered"), Path("healthy")), max_workers=2)
+        replay_stage052_storage_semantics_many((Path("tampered"), Path("healthy")))
 
-    assert events == ["cancel", "cancel", "abort"]
+    assert events == ["cancel", "abort"]
 
 
 def test_performance_provenance_records_inputs_without_secret_environment(
@@ -2968,6 +2968,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         fixed_route_customer: str = "C1",
         cache_bytes: int = 396,
         screening_schema_version: str = "screening_decisions_v2",
+        repeated_event_count: int = 0,
     ) -> Path:
         run_dir = tmp_path / label
         storage_kwargs: dict[str, object] = {"storage_policy_version": policy}
@@ -2993,6 +2994,18 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         route_dictionary = {fixed_route_key: (fixed_route_customer,)}
         if extra_unreferenced_route:
             route_dictionary["route:2:W1"] = ("W1",)
+        repeated_events = [
+            {
+                "event_type": "candidate_state",
+                "benchmark_axis": "fixed_work",
+                "status": "rejected",
+                "accepted": False,
+                "global_best": False,
+                "operation": "candidate_rejected",
+                "cache_key_digest": f"repeat-{index}",
+            }
+            for index in range(repeated_event_count)
+        ]
         writer.write_instance_seed(
             instance="c101_21",
             seed=2014,
@@ -3038,6 +3051,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
                     "current_bytes": cache_bytes,
                     "current_entries": 1,
                 },
+                *repeated_events,
             ],
             shard_ordinal=0 if policy == "artifact-storage-v2" else None,
             worker_identity=("worker-0" if policy == "artifact-storage-v2" else None),
@@ -3064,8 +3078,8 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
 
     assert replay_stage052_storage_semantics(v1) == replay_stage052_storage_semantics(v2)
     assert replay_stage052_storage_semantics(v1) == replay_stage052_storage_semantics(v3)
-    parallel_replays = replay_stage052_storage_semantics_many((v1, v2), max_workers=2)
-    assert parallel_replays[0] == parallel_replays[1]
+    serial_replays = replay_stage052_storage_semantics_many((v1, v2))
+    assert serial_replays[0] == serial_replays[1]
     volatile_cache_bytes = write(
         "artifact-storage-v2",
         "artifact_streaming",
@@ -3099,7 +3113,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     assert mismatch_lines[1].startswith(
         "c101_21,2014,fixed_work,2,event.propagation_status,"
     )
-    ordered_replays = replay_stage052_storage_semantics_many((changed_event, v1), max_workers=2)
+    ordered_replays = replay_stage052_storage_semantics_many((changed_event, v1))
     assert ordered_replays == [
         replay_stage052_storage_semantics(changed_event),
         replay_stage052_storage_semantics(v1),
@@ -3121,6 +3135,18 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     )
     with pytest.raises(ArtifactIntegrityError, match="axis identity mismatch"):
         replay_stage052_storage_semantics(extra_axis)
+
+    memory_fixture = write(
+        "artifact-storage-v2",
+        "artifact_streaming",
+        "stage05.2_artifact_streaming_attempt89",
+        repeated_event_count=20_000,
+    )
+    tracemalloc.start()
+    replay_stage052_storage_semantics(memory_fixture)
+    _, peak_bytes = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak_bytes < 8 * 1024 * 1024, peak_bytes
 
 
 def test_native_distance_matrix_matches_worked_euclidean_fixture() -> None:

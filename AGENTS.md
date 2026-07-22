@@ -604,6 +604,18 @@ this repository or one of its subdirectories.
   objective/validator and exact/cache/candidate/deadline semantics, resource
   and persistence gates, power/load/root/runtime provenance, BKS incompatibility,
   and the absence of gap columns.
+- Stage 5.2 storage replay hashes canonical records as they are read. It must
+  never accumulate a complete axis or bundle of event dictionaries. Multiple
+  raw bundles are replayed strictly in input order, one fresh spawned process
+  per bundle; the parent retains digest maps only. Field-level mismatch output
+  is generated only for unequal axes through a disk-backed temporary spool.
+- On the Windows/WSL2 formal host, long-running Stage 5.2 reviewers must run as
+  transient `systemd --user` services rather than Codex desktop child
+  processes. The service uses `MemoryHigh=5G`, `MemoryMax=6G`,
+  `MemorySwapMax=2G`, no restart/fallback, an internal 5.5-GiB aggregate-RSS
+  stop, external progress logs, and a sealed execution receipt. Reviewer logs
+  are operational evidence outside immutable raw bundles and do not alter the
+  scientific review schema or readiness gates.
 - The registry, trusted manifest, and versioned review products are published
   only after G02 raw replay reports `READY_FOR_STAGE05_3`. Publication is a
   generation transaction whose trusted manifest is replaced last; no producer,

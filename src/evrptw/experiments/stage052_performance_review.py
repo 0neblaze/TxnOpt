@@ -10,11 +10,14 @@ import json
 import math
 import os
 import shutil
+import sqlite3
 import statistics
 import subprocess
+import tempfile
 import uuid
-from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
 from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
@@ -79,6 +82,10 @@ from evrptw.stage052_remediation import (
     E03_SHARD_COUNT,
     E03_SOLVER_ROW_COUNT,
 )
+from evrptw.stage052_review_service import (
+    ReviewProcessMemoryGuard,
+    ReviewProgressLog,
+)
 from evrptw.validation import validate_routes
 
 STAGE052_REVIEW_SCHEMA_VERSION = "stage05.2-review-v1"
@@ -102,6 +109,13 @@ _PERFORMANCE_ENVIRONMENT_VARIABLES = {
 }
 _PER_WORKER_STORAGE_RSS_LIMIT_BYTES = 4_357_382_144
 _PROCESS_TREE_RSS_LIMIT_BYTES = 12 * 1024 * 1024 * 1024
+_REVIEW_PROGRESS_ENV = "STAGE052_REVIEW_PROGRESS_LOG"
+
+
+def _emit_review_progress(event: str, **details: object) -> None:
+    path = os.environ.get(_REVIEW_PROGRESS_ENV)
+    if path:
+        ReviewProgressLog(Path(path)).emit(event, **details)
 
 
 def _audit_primary_persistence(
@@ -325,11 +339,17 @@ def verify_stage052_review_prerequisite(
         raise ValueError("prerequisite review is stale for the current raw manifest")
 
 
-def _replay_stage052_storage_semantic_records(
-    raw_dir: Path,
-) -> dict[tuple[str, int, str], tuple[dict[str, object], ...]]:
-    """Recompute ordered canonical semantic records from raw storage."""
+StorageReplayIdentity = tuple[str, int, str]
+StorageReplayConsumer = Callable[[StorageReplayIdentity, Mapping[str, object]], None]
 
+
+def _visit_stage052_storage_semantic_records(
+    raw_dir: Path,
+    consume: StorageReplayConsumer,
+) -> set[StorageReplayIdentity]:
+    """Validate and stream ordered canonical semantic records from raw storage."""
+
+    _emit_review_progress("storage_replay_start", raw_dir=str(raw_dir.resolve()))
     reader = ArtifactReader(raw_dir)
     artifacts = [item for item in reader.manifest.get("artifacts", []) if isinstance(item, Mapping)]
     by_directory: dict[str, dict[tuple[str, str], Mapping[str, Any]]] = {}
@@ -339,8 +359,14 @@ def _replay_stage052_storage_semantic_records(
         key = (str(item.get("artifact_type", "")), str(item.get("artifact_subtype", "")))
         by_directory.setdefault(directory, {})[key] = item
 
-    output: dict[tuple[str, int, str], tuple[dict[str, object], ...]] = {}
+    identities: set[StorageReplayIdentity] = set()
     for directory, items in sorted(by_directory.items()):
+        _emit_review_progress(
+            "storage_shard_start",
+            raw_dir=str(raw_dir.resolve()),
+            shard_directory=directory,
+        )
+        shard_record_count = 0
         raw_ref = items.get(("raw", ""))
         solution_ref = items.get(("solution", ""))
         trace_ref = items.get(("trace", ""))
@@ -390,7 +416,7 @@ def _replay_stage052_storage_semantic_records(
                     f"duplicate route dictionary ID in {directory}: {route_id}"
                 )
             route_dictionary[route_id] = dict(row)
-        records_by_axis: dict[str, list[dict[str, object]]] = {}
+        identities_by_axis: dict[str, StorageReplayIdentity] = {}
         for axis, raw_axis in raw_axes.items():
             solution_axis = solution_axes.get(axis)
             if not isinstance(raw_axis, Mapping) or not isinstance(solution_axis, Mapping):
@@ -403,8 +429,14 @@ def _replay_stage052_storage_semantic_records(
                 trace=trace,
                 axis=str(axis),
             )
-            records_by_axis[str(axis)] = [base]
-        event_ordinals = {axis: 0 for axis in records_by_axis}
+            identity = (instance, seed, str(axis))
+            if identity in identities:
+                raise ArtifactIntegrityError(f"duplicate storage replay identity: {identity}")
+            identities.add(identity)
+            identities_by_axis[str(axis)] = identity
+            consume(identity, base)
+            shard_record_count += 1
+        event_ordinals = {axis: 0 for axis in identities_by_axis}
         event_family_counts = {
             axis: {
                 "events": 0,
@@ -412,7 +444,7 @@ def _replay_stage052_storage_semantic_records(
                 "route_evaluations": 0,
                 "screening_decisions": 0,
             }
-            for axis in records_by_axis
+            for axis in identities_by_axis
         }
         previous_event_id = 0
         for logical_event in reader.iter_events(str(events_ref["relative_path"])):
@@ -429,8 +461,8 @@ def _replay_stage052_storage_semantic_records(
                 ):
                     row.pop(volatile_byte_field, None)
             axis = str(row.get("benchmark_axis", ""))
-            axis_records = records_by_axis.get(axis)
-            if axis_records is None:
+            event_identity = identities_by_axis.get(axis)
+            if event_identity is None:
                 raise ArtifactIntegrityError(
                     f"event has unknown benchmark axis in {directory}: {axis}"
                 )
@@ -469,7 +501,8 @@ def _replay_stage052_storage_semantic_records(
                 event_payload.get("operator"), str
             ):
                 raise ArtifactIntegrityError(f"event dictionary identity is missing in {directory}")
-            axis_records.append(event_payload)
+            consume(event_identity, event_payload)
+            shard_record_count += 1
         trace_axes = trace.get("axes")
         if isinstance(trace_axes, Mapping):
             for axis, observed_counts in event_family_counts.items():
@@ -489,36 +522,45 @@ def _replay_stage052_storage_semantic_records(
         ):
             lane = str(row.get("lane", ""))
             axis = lane.split(":", 1)[0]
-            axis_records = records_by_axis.get(axis)
-            if axis_records is None:
+            diagnostic_identity = identities_by_axis.get(axis)
+            if diagnostic_identity is None:
                 raise ArtifactIntegrityError(
                     f"diagnostic row has unknown benchmark axis in {directory}: {axis}"
                 )
             payload = dict(row)
             payload["run_label"] = "<canonical-run-label>"
-            axis_records.append({"record": "diagnostic", **payload})
-        for axis, axis_records in records_by_axis.items():
-            identity = (instance, seed, axis)
-            if identity in output:
-                raise ArtifactIntegrityError(f"duplicate storage replay identity: {identity}")
-            output[identity] = tuple(axis_records)
-    if not output:
+            consume(diagnostic_identity, {"record": "diagnostic", **payload})
+            shard_record_count += 1
+        route_dictionary.clear()
+        _emit_review_progress(
+            "storage_shard_complete",
+            raw_dir=str(raw_dir.resolve()),
+            shard_directory=directory,
+            record_count=shard_record_count,
+        )
+    if not identities:
         raise ArtifactIntegrityError("storage replay evidence is empty")
-    return output
+    _emit_review_progress(
+        "storage_replay_complete",
+        raw_dir=str(raw_dir.resolve()),
+        identity_count=len(identities),
+    )
+    return identities
 
 
 def replay_stage052_storage_semantics(
     raw_dir: Path,
-) -> dict[tuple[str, int, str], str]:
+) -> dict[StorageReplayIdentity, str]:
     """Recompute storage-comparison digests from canonical semantic records."""
 
-    output: dict[tuple[str, int, str], str] = {}
-    for identity, records in _replay_stage052_storage_semantic_records(raw_dir).items():
-        hasher = hashlib.sha256()
-        for record in records:
-            hasher.update(_canonical_json_bytes(record) + b"\n")
-        output[identity] = hasher.hexdigest()
-    return output
+    hashers: dict[StorageReplayIdentity, Any] = {}
+
+    def consume(identity: StorageReplayIdentity, record: Mapping[str, object]) -> None:
+        hasher = hashers.setdefault(identity, hashlib.sha256())
+        hasher.update(_canonical_json_bytes(record) + b"\n")
+
+    identities = _visit_stage052_storage_semantic_records(raw_dir, consume)
+    return {identity: hashers[identity].hexdigest() for identity in sorted(identities)}
 
 
 _NON_SEMANTIC_STORAGE_FIELDS = frozenset(
@@ -679,46 +721,117 @@ def _canonical_axis_semantics(
 
 def replay_stage052_storage_semantics_many(
     raw_dirs: Sequence[Path],
-    *,
-    max_workers: int = 4,
-) -> list[dict[tuple[str, int, str], str]]:
-    """Replay independent bundles concurrently without changing per-bundle ordering."""
+) -> list[dict[StorageReplayIdentity, str]]:
+    """Replay bundles serially in fresh spawned workers, preserving input order."""
 
     if not raw_dirs:
         raise ValueError("at least one Stage 5.2 replay directory is required")
-    if max_workers <= 0:
-        raise ValueError("replay max_workers must be positive")
-    if len(raw_dirs) == 1:
-        return [replay_stage052_storage_semantics(raw_dirs[0])]
-    worker_count = min(max_workers, len(raw_dirs))
-    executor = ProcessPoolExecutor(
-        max_workers=worker_count,
-        mp_context=get_context("spawn"),
-    )
-    futures: dict[Any, int] = {}
-    results: list[dict[tuple[str, int, str], str] | None] = [None] * len(raw_dirs)
-    try:
-        futures = {
-            executor.submit(replay_stage052_storage_semantics, raw_dir): index
-            for index, raw_dir in enumerate(raw_dirs)
-        }
-        for future in as_completed(futures):
-            results[futures[future]] = future.result()
-    except BaseException as error:
-        for future in futures:
-            future.cancel()
+    results: list[dict[StorageReplayIdentity, str]] = []
+    for raw_dir in raw_dirs:
+        _emit_review_progress("bundle_replay_start", raw_dir=str(raw_dir.resolve()))
+        executor = ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=get_context("spawn"),
+            max_tasks_per_child=1,
+        )
+        future = executor.submit(replay_stage052_storage_semantics, raw_dir)
         try:
-            abort_process_executor(executor)
-        except BaseException as abort_error:
-            raise RuntimeError(
-                f"replay failure {type(error).__name__}: {error}; "
-                f"process-pool abort failure {type(abort_error).__name__}: {abort_error}"
+            results.append(future.result())
+            _emit_review_progress("bundle_replay_complete", raw_dir=str(raw_dir.resolve()))
+        except BaseException as error:
+            _emit_review_progress(
+                "bundle_replay_failed",
+                raw_dir=str(raw_dir.resolve()),
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+            future.cancel()
+            try:
+                abort_process_executor(executor)
+            except BaseException as abort_error:
+                raise RuntimeError(
+                    f"replay failure {type(error).__name__}: {error}; "
+                    f"process-pool abort failure {type(abort_error).__name__}: {abort_error}"
+                ) from error
+            raise
+        executor.shutdown(wait=True)
+    return results
+
+
+@contextmanager
+def _semantic_field_digest_spool() -> Iterator[sqlite3.Connection]:
+    configured_root = os.environ.get("STAGE052_REVIEW_TMPDIR")
+    root = Path(configured_root).resolve() if configured_root else None
+    if root is not None and (not root.is_dir() or not os.access(root, os.W_OK)):
+        raise RuntimeError(f"Stage 5.2 review temporary root is not writable: {root}")
+    with tempfile.TemporaryDirectory(prefix="stage052-review-fields-", dir=root) as directory:
+        connection = sqlite3.connect(Path(directory) / "semantic_fields.sqlite3")
+        try:
+            connection.execute("PRAGMA journal_mode=OFF")
+            connection.execute("PRAGMA synchronous=OFF")
+            connection.execute("PRAGMA temp_store=FILE")
+            connection.execute(
+                """
+                CREATE TABLE field_digests (
+                    bundle INTEGER NOT NULL,
+                    instance TEXT NOT NULL,
+                    seed INTEGER NOT NULL,
+                    axis TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    field TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    PRIMARY KEY (bundle, instance, seed, axis, ordinal, field)
+                ) WITHOUT ROWID
+                """
+            )
+            yield connection
+        finally:
+            connection.close()
+
+
+def _spool_semantic_field_digests(
+    connection: sqlite3.Connection,
+    *,
+    bundle: int,
+    raw_dir: Path,
+    identities: set[StorageReplayIdentity],
+) -> None:
+    ordinals: dict[StorageReplayIdentity, int] = {}
+
+    def consume(identity: StorageReplayIdentity, record: Mapping[str, object]) -> None:
+        if identity not in identities:
+            return
+        ordinal = ordinals.get(identity, 0)
+        ordinals[identity] = ordinal + 1
+        flattened: list[tuple[str, object]] = []
+        _flatten_semantic_fields(
+            record,
+            prefix=str(record.get("record", "record")),
+            output=flattened,
+        )
+        try:
+            connection.executemany(
+                "INSERT INTO field_digests VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    (
+                        bundle,
+                        identity[0],
+                        identity[1],
+                        identity[2],
+                        ordinal,
+                        field,
+                        hashlib.sha256(_canonical_json_bytes(value)).hexdigest(),
+                    )
+                    for field, value in flattened
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ArtifactIntegrityError(
+                f"duplicate semantic field location: {identity}/{ordinal}"
             ) from error
-        raise
-    executor.shutdown(wait=True)
-    if any(result is None for result in results):
-        raise RuntimeError("parallel Stage 5.2 replay returned an incomplete result set")
-    return [result for result in results if result is not None]
+
+    _visit_stage052_storage_semantic_records(raw_dir, consume)
+    connection.commit()
 
 
 def render_semantic_mismatches(
@@ -744,45 +857,85 @@ def render_semantic_mismatches(
     writer.writeheader()
     if not comparison_dirs:
         return output.getvalue().encode("utf-8")
-    current = _replay_stage052_storage_semantic_records(raw_dir)
+    current = replay_stage052_storage_semantics_many((raw_dir,))[0]
     for comparison_dir in comparison_dirs:
-        prior = _replay_stage052_storage_semantic_records(comparison_dir)
-        for identity in sorted(set(prior) | set(current)):
-            left_fields = _semantic_record_field_digests(prior.get(identity, ()))
-            right_fields = _semantic_record_field_digests(current.get(identity, ()))
-            for location in sorted(set(left_fields) | set(right_fields)):
-                left = left_fields.get(location, "<missing>")
-                right = right_fields.get(location, "<missing>")
-                if left == right:
-                    continue
+        prior = replay_stage052_storage_semantics_many((comparison_dir,))[0]
+        mismatched = {
+            identity
+            for identity in set(prior) | set(current)
+            if prior.get(identity) != current.get(identity)
+        }
+        if not mismatched:
+            continue
+        with _semantic_field_digest_spool() as connection:
+            _spool_semantic_field_digests(
+                connection,
+                bundle=0,
+                raw_dir=comparison_dir,
+                identities=mismatched,
+            )
+            _spool_semantic_field_digests(
+                connection,
+                bundle=1,
+                raw_dir=raw_dir,
+                identities=mismatched,
+            )
+            rows = connection.execute(
+                """
+                WITH locations AS (
+                    SELECT instance, seed, axis, ordinal, field
+                    FROM field_digests WHERE bundle = 0
+                    UNION
+                    SELECT instance, seed, axis, ordinal, field
+                    FROM field_digests WHERE bundle = 1
+                )
+                SELECT
+                    locations.instance,
+                    locations.seed,
+                    locations.axis,
+                    locations.ordinal,
+                    locations.field,
+                    COALESCE(previous.digest, '<missing>'),
+                    COALESCE(current.digest, '<missing>')
+                FROM locations
+                LEFT JOIN field_digests AS previous
+                  ON previous.bundle = 0
+                 AND previous.instance = locations.instance
+                 AND previous.seed = locations.seed
+                 AND previous.axis = locations.axis
+                 AND previous.ordinal = locations.ordinal
+                 AND previous.field = locations.field
+                LEFT JOIN field_digests AS current
+                  ON current.bundle = 1
+                 AND current.instance = locations.instance
+                 AND current.seed = locations.seed
+                 AND current.axis = locations.axis
+                 AND current.ordinal = locations.ordinal
+                 AND current.field = locations.field
+                WHERE previous.digest IS NULL
+                   OR current.digest IS NULL
+                   OR previous.digest != current.digest
+                ORDER BY
+                    locations.instance,
+                    locations.seed,
+                    locations.axis,
+                    locations.ordinal,
+                    locations.field
+                """
+            )
+            for instance, seed, axis, ordinal, field, left, right in rows:
                 writer.writerow(
                     {
-                        "instance": identity[0],
-                        "seed": identity[1],
-                        "axis": identity[2],
-                        "ordinal": location[0],
-                        "field": location[1],
+                        "instance": instance,
+                        "seed": seed,
+                        "axis": axis,
+                        "ordinal": ordinal,
+                        "field": field,
                         "left_digest": left,
                         "right_digest": right,
                     }
                 )
     return output.getvalue().encode("utf-8")
-
-
-def _semantic_record_field_digests(
-    records: Sequence[Mapping[str, object]],
-) -> dict[tuple[int, str], str]:
-    output: dict[tuple[int, str], str] = {}
-    for ordinal, record in enumerate(records):
-        record_type = str(record.get("record", "record"))
-        flattened: list[tuple[str, object]] = []
-        _flatten_semantic_fields(record, prefix=record_type, output=flattened)
-        for field, value in flattened:
-            key = (ordinal, field)
-            if key in output:
-                raise ArtifactIntegrityError(f"duplicate semantic field location: {key}")
-            output[key] = hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
-    return output
 
 
 def _flatten_semantic_fields(
@@ -957,6 +1110,7 @@ def _publish_review_generation(
 ) -> dict[str, Path]:
     """Publish immutable review files behind one atomic manifest pointer."""
 
+    _emit_review_progress("review_publication_start", review_dir=str(review_dir.resolve()))
     review_dir.mkdir(parents=True, exist_ok=True)
     generation_id = hashlib.sha256(
         findings + b"\0" + report + b"\0" + semantic_mismatches
@@ -1011,12 +1165,18 @@ def _publish_review_generation(
         _fsync_directory(review_dir)
     finally:
         temporary_manifest.unlink(missing_ok=True)
-    return {
+    outputs = {
         "review_report": report_path,
         "review_findings": findings_path,
         "semantic_mismatches": mismatches_path,
         "review_manifest": manifest_path,
     }
+    _emit_review_progress(
+        "review_publication_complete",
+        review_dir=str(review_dir.resolve()),
+        generation_id=generation_id,
+    )
+    return outputs
 
 
 def _archive_prior_review_generation(
@@ -2925,7 +3085,6 @@ def _component_gates(
         )
         replay_maps = replay_stage052_storage_semantics_many(
             (predecessor_dir, raw_dir),
-            max_workers=2,
         )
         predecessor_fixed = {
             identity: digest
@@ -3338,7 +3497,6 @@ def _validate_c05_remediation(
     try:
         replayed = replay_stage052_storage_semantics_many(
             (source_dir, child_dir),
-            max_workers=2,
         )
     except (ArtifactIntegrityError, RuntimeError, TypeError, ValueError) as error:
         return False, str(error)
@@ -4738,7 +4896,18 @@ def main() -> int:
     parser.add_argument("--comparison-dir", type=Path, action="append", default=[])
     parser.add_argument("--prerequisite-dir", type=Path)
     parser.add_argument("--prerequisite", action="append", default=[])
+    parser.add_argument("--progress-log", type=Path, required=True)
+    parser.add_argument("--max-aggregate-rss-gib", type=float, default=5.5)
     arguments = parser.parse_args()
+    if arguments.max_aggregate_rss_gib <= 0.0:
+        parser.error("--max-aggregate-rss-gib must be positive")
+    raw_root = arguments.raw_dir.resolve()
+    progress_path = arguments.progress_log.resolve()
+    if progress_path == raw_root or raw_root in progress_path.parents:
+        parser.error("--progress-log must be outside immutable raw evidence")
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    os.environ[_REVIEW_PROGRESS_ENV] = str(progress_path)
+    progress = ReviewProgressLog(progress_path)
     named_prerequisites: dict[str, Path] = {}
     for value in arguments.prerequisite:
         role, separator, raw_path = str(value).partition("=")
@@ -4747,14 +4916,42 @@ def main() -> int:
         if role in named_prerequisites:
             parser.error(f"duplicate prerequisite role: {role}")
         named_prerequisites[role] = Path(raw_path)
-    outputs = review_stage052(
-        raw_dir=arguments.raw_dir,
-        benchmark_dir=arguments.benchmark_dir,
+    progress.emit(
+        "review_start",
+        raw_dir=str(raw_root),
         component=arguments.component,
         scope=arguments.scope,
-        comparison_dirs=arguments.comparison_dir,
-        prerequisite_dir=arguments.prerequisite_dir,
-        prerequisite_dirs=named_prerequisites,
+        max_aggregate_rss_gib=arguments.max_aggregate_rss_gib,
+    )
+    guard = ReviewProcessMemoryGuard(
+        limit_bytes=int(arguments.max_aggregate_rss_gib * 1024**3),
+        progress=progress,
+    )
+    try:
+        with guard:
+            outputs = review_stage052(
+                raw_dir=arguments.raw_dir,
+                benchmark_dir=arguments.benchmark_dir,
+                component=arguments.component,
+                scope=arguments.scope,
+                comparison_dirs=arguments.comparison_dir,
+                prerequisite_dir=arguments.prerequisite_dir,
+                prerequisite_dirs=named_prerequisites,
+            )
+    except BaseException as error:
+        progress.emit(
+            "review_failed",
+            error_type=type(error).__name__,
+            error=str(error),
+            aggregate_peak_rss_bytes=guard.peak_rss_bytes,
+            aggregate_peak_swap_bytes=guard.peak_swap_bytes,
+        )
+        raise
+    progress.emit(
+        "review_complete",
+        aggregate_peak_rss_bytes=guard.peak_rss_bytes,
+        aggregate_peak_swap_bytes=guard.peak_swap_bytes,
+        outputs={name: str(path) for name, path in outputs.items()},
     )
     for name, path in outputs.items():
         print(f"{name}: {path}")
