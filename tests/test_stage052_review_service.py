@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -248,3 +249,42 @@ def test_reviewer_revision_is_bound_to_wheel_and_installed_files(
         handle.write(b"replacement")
     with pytest.raises(RuntimeError, match="provenance does not match"):
         review_service._verify_wheel_provenance(config, wheel)
+
+
+def test_formal_source_allows_only_raw_bound_local_files(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    tracked = source / "tracked.txt"
+    tracked.write_text("tracked\n", encoding="utf-8")
+    subprocess.run(("git", "init", "-q"), cwd=source, check=True)
+    subprocess.run(("git", "add", "tracked.txt"), cwd=source, check=True)
+    subprocess.run(
+        (
+            "git",
+            "-c",
+            "user.name=Stage052 Test",
+            "-c",
+            "user.email=stage052@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ),
+        cwd=source,
+        check=True,
+    )
+    local = source / "local.json"
+    local.write_text('{"bound":true}\n', encoding="utf-8")
+    digest = hashlib.sha256(local.read_bytes()).hexdigest()
+
+    revision = review_service._require_clean_repository(
+        source,
+        allowed_untracked_sha256={"local.json": digest},
+    )
+
+    assert len(revision) == 40
+    local.write_text('{"bound":false}\n', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="unapproved local files"):
+        review_service._require_clean_repository(
+            source,
+            allowed_untracked_sha256={"local.json": digest},
+        )

@@ -305,7 +305,11 @@ def _repository_revision(working_directory: Path) -> str:
     return result.stdout.strip()
 
 
-def _require_clean_repository(working_directory: Path) -> str:
+def _require_clean_repository(
+    working_directory: Path,
+    *,
+    allowed_untracked_sha256: dict[str, str] | None = None,
+) -> str:
     revision = _repository_revision(working_directory)
     status = subprocess.run(
         ("git", "status", "--porcelain"),
@@ -314,8 +318,19 @@ def _require_clean_repository(working_directory: Path) -> str:
         capture_output=True,
         text=True,
     )
-    if status.stdout:
-        raise RuntimeError("formal reviewer working directory is not clean")
+    allowed = allowed_untracked_sha256 or {}
+    for line in status.stdout.splitlines():
+        if not line.startswith("?? "):
+            raise RuntimeError("formal reviewer working directory has tracked changes")
+        relative = line[3:]
+        expected_digest = allowed.get(relative)
+        candidate = working_directory / relative
+        if (
+            expected_digest is None
+            or not candidate.is_file()
+            or _sha256(candidate) != expected_digest
+        ):
+            raise RuntimeError("formal reviewer working directory has unapproved local files")
     return revision
 
 
@@ -489,7 +504,27 @@ def _validate_formal_execution_envelope(config: ReviewServiceConfig) -> dict[str
     if manifest.get("status") != "complete" or manifest.get("evidence_completeness") != "complete":
         raise RuntimeError("formal reviewer requires complete raw evidence")
 
-    producer_revision = _require_clean_repository(config.working_directory)
+    metadata_path = raw_directory / "control" / f"{config.run_label}_run_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    source_snapshot = metadata.get("source_snapshot") if isinstance(metadata, dict) else None
+    allowed_payload = (
+        source_snapshot.get("allowed_untracked_sha256")
+        if isinstance(source_snapshot, dict)
+        else None
+    )
+    allowed_untracked = (
+        {
+            str(path): str(digest)
+            for path, digest in allowed_payload.items()
+            if isinstance(path, str) and isinstance(digest, str)
+        }
+        if isinstance(allowed_payload, dict)
+        else {}
+    )
+    producer_revision = _require_clean_repository(
+        config.working_directory,
+        allowed_untracked_sha256=allowed_untracked,
+    )
     wheel_path = config.wheel_path.resolve(strict=True)
     provenance_path = _verify_wheel_provenance(config, wheel_path)
     install = _reviewer_install_identity(reviewer_python)
