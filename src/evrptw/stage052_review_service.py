@@ -42,6 +42,10 @@ class ReviewServiceInterrupted(RuntimeError):
     """Raised when systemd or an operator interrupts the receipt supervisor."""
 
 
+class ReviewResourceAccountingError(RuntimeError):
+    """Raised when systemd cannot provide authoritative cgroup peak memory."""
+
+
 @dataclass(frozen=True, slots=True)
 class ReviewProgressLog:
     """Append-only fsynced JSONL progress for reviewer and spawned workers."""
@@ -592,6 +596,8 @@ def _initial_receipt(config: ReviewServiceConfig) -> dict[str, object]:
         "duration_seconds": None,
         "aggregate_peak_rss_bytes": 0,
         "aggregate_peak_swap_bytes": 0,
+        "cgroup_memory_peak_status": "pending",
+        "cgroup_memory_peak_error": None,
         "max_aggregate_rss_bytes": config.max_aggregate_rss_bytes,
         "systemd_memory_high": SYSTEMD_MEMORY_HIGH,
         "systemd_memory_max": SYSTEMD_MEMORY_MAX,
@@ -727,7 +733,7 @@ def supervise_review(config: ReviewServiceConfig) -> int:
     return int(exit_code)
 
 
-def _systemd_memory_peaks(unit: str) -> tuple[int | None, int | None]:
+def _systemd_memory_peaks(unit: str) -> tuple[int, int]:
     try:
         result = subprocess.run(
             (
@@ -742,14 +748,20 @@ def _systemd_memory_peaks(unit: str) -> tuple[int | None, int | None]:
             capture_output=True,
             text=True,
         )
-    except (OSError, subprocess.CalledProcessError):
-        return None, None
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ReviewResourceAccountingError(
+            f"cannot read systemd memory accounting for {unit}: {error}"
+        ) from error
     values: dict[str, int] = {}
     for line in result.stdout.splitlines():
         key, separator, raw_value = line.partition("=")
         if separator and raw_value.isdigit():
             values[key] = int(raw_value)
-    return values.get("MemoryPeak"), values.get("MemorySwapPeak")
+    if "MemoryPeak" not in values or "MemorySwapPeak" not in values:
+        raise ReviewResourceAccountingError(
+            f"systemd memory accounting is incomplete for {unit}: {result.stdout!r}"
+        )
+    return values["MemoryPeak"], values["MemorySwapPeak"]
 
 
 def _receipt_nonnegative_int(value: object) -> int:
@@ -785,13 +797,21 @@ def finalize_review_execution(config: ReviewServiceConfig) -> None:
     if not receipt["raw_manifest_unchanged"]:
         receipt["status"] = "failed"
         receipt["stop_reason"] = "raw_manifest_changed"
-    memory_peak, swap_peak = _systemd_memory_peaks(config.unit)
-    receipt["aggregate_peak_rss_bytes"] = max(
-        _receipt_nonnegative_int(receipt.get("aggregate_peak_rss_bytes")), memory_peak or 0
-    )
-    receipt["aggregate_peak_swap_bytes"] = max(
-        _receipt_nonnegative_int(receipt.get("aggregate_peak_swap_bytes")), swap_peak or 0
-    )
+    try:
+        memory_peak, swap_peak = _systemd_memory_peaks(config.unit)
+        receipt["cgroup_memory_peak_status"] = "verified"
+        receipt["aggregate_peak_rss_bytes"] = max(
+            _receipt_nonnegative_int(receipt.get("aggregate_peak_rss_bytes")), memory_peak
+        )
+        receipt["aggregate_peak_swap_bytes"] = max(
+            _receipt_nonnegative_int(receipt.get("aggregate_peak_swap_bytes")), swap_peak
+        )
+    except ReviewResourceAccountingError as error:
+        receipt["cgroup_memory_peak_status"] = "unavailable"
+        receipt["cgroup_memory_peak_error"] = str(error)
+        receipt["status"] = "failed"
+        if receipt["stop_reason"] != "raw_manifest_changed":
+            receipt["stop_reason"] = "resource_accounting_unavailable"
     service_log = config.log_directory / "service.log"
     receipt["service_log_sha256"] = _sha256(service_log) if service_log.is_file() else None
     receipt["progress_log_sha256"] = (

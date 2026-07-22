@@ -211,6 +211,8 @@ service 还必须配置 `ExecStopPost` 外部收尾器；即使 `MemoryMax` 直�
 与 supervisor，收尾器仍从 systemd 的 `SERVICE_RESULT/EXIT_CODE/EXIT_STATUS` 封存
 失败回执，并重新计算 raw manifest、service/progress log hash 以及读取 cgroup
 `MemoryPeak/MemorySwapPeak`。回执只有 `finalized=true` 才是最终状态。
+任一 cgroup peak 无法读取时，回执必须标记
+`resource_accounting_unavailable` 并失败，禁止以 `0` 静默代替。
 
 固定操作入口为：
 

@@ -66,6 +66,7 @@ def test_review_supervisor_writes_receipt_and_preserves_raw_manifest(
         "_validate_formal_execution_envelope",
         lambda _: {"producer_repository_revision": "2" * 40},
     )
+    monkeypatch.setattr(review_service, "_systemd_memory_peaks", lambda _: (123, 0))
 
     exit_code = supervise_review(config)
     monkeypatch.setenv("SERVICE_RESULT", "success")
@@ -192,7 +193,7 @@ def test_exec_stop_post_rehashes_raw_manifest_after_supervisor_is_killed(
         "_validate_formal_execution_envelope",
         lambda _: {"producer_repository_revision": "2" * 40},
     )
-    monkeypatch.setattr(review_service, "_systemd_memory_peaks", lambda _: (None, None))
+    monkeypatch.setattr(review_service, "_systemd_memory_peaks", lambda _: (0, 0))
     review_service._prepare_review_execution(config)
     config.raw_manifest.write_text('{"tampered":true}\n', encoding="utf-8")
     monkeypatch.setenv("SERVICE_RESULT", "oom-kill")
@@ -205,6 +206,34 @@ def test_exec_stop_post_rehashes_raw_manifest_after_supervisor_is_killed(
     assert receipt["stop_reason"] == "raw_manifest_changed"
     assert receipt["raw_manifest_unchanged"] is False
     assert receipt["raw_manifest_sha256_after"] != receipt["raw_manifest_sha256_before"]
+
+
+def test_exec_stop_post_fails_when_cgroup_peaks_are_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, limit_bytes=int(5.5 * 1024**3))
+    monkeypatch.setattr(
+        review_service,
+        "_validate_formal_execution_envelope",
+        lambda _: {"producer_repository_revision": "2" * 40},
+    )
+    review_service._prepare_review_execution(config)
+
+    def unavailable(_: str) -> tuple[int, int]:
+        raise review_service.ReviewResourceAccountingError("MemoryPeak unavailable")
+
+    monkeypatch.setattr(review_service, "_systemd_memory_peaks", unavailable)
+    monkeypatch.setenv("SERVICE_RESULT", "oom-kill")
+
+    finalize_review_execution(config)
+
+    receipt = json.loads((config.log_directory / "review_execution.json").read_text())
+    assert receipt["status"] == "failed"
+    assert receipt["finalized"] is True
+    assert receipt["stop_reason"] == "resource_accounting_unavailable"
+    assert receipt["cgroup_memory_peak_status"] == "unavailable"
+    assert "MemoryPeak unavailable" in receipt["cgroup_memory_peak_error"]
 
 
 def test_formal_launcher_rejects_arbitrary_command_before_systemd(tmp_path: Path) -> None:
