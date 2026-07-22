@@ -50,6 +50,9 @@ def _config(tmp_path: Path, *, limit_bytes: int) -> ReviewServiceConfig:
         log_directory=tmp_path / "logs",
         raw_manifest=raw_manifest,
         wheel_path=wheel,
+        service_execution_path=(
+            "/usr/bin:/usr/lib/wsl/lib:/mnt/c/WINDOWS/System32"
+        ),
         progress_log=progress_log,
         max_aggregate_rss_bytes=limit_bytes,
         sample_interval_seconds=0.01,
@@ -81,9 +84,44 @@ def test_review_supervisor_writes_receipt_and_preserves_raw_manifest(
     assert receipt["stop_reason"] == "process_exit"
     assert receipt["raw_manifest_sha256_before"] == receipt["raw_manifest_sha256_after"]
     assert receipt["wheel_sha256"]
+    assert receipt["service_execution_path"] == config.service_execution_path
     assert receipt["progress_log_sha256"]
     assert receipt["aggregate_peak_rss_bytes"] > 0
     assert "review complete" in (config.log_directory / "service.log").read_text()
+
+
+def test_service_execution_path_binds_wsl_interoperability_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locations = {
+        "nvidia-smi": "/usr/lib/wsl/lib/nvidia-smi",
+        "powershell.exe": "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe",
+        "wsl.exe": "/mnt/c/WINDOWS/System32/wsl.exe",
+    }
+    monkeypatch.setattr(review_service.shutil, "which", locations.get)
+
+    service_path = review_service._service_execution_path()
+
+    assert service_path.split(os.pathsep) == [
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+        "/usr/lib/wsl/lib",
+        "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0",
+        "/mnt/c/WINDOWS/System32",
+    ]
+
+
+def test_service_execution_path_fails_closed_when_a_formal_tool_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(review_service.shutil, "which", lambda _: None)
+
+    with pytest.raises(FileNotFoundError, match="nvidia-smi"):
+        review_service._service_execution_path()
 
 
 def test_review_supervisor_terminates_process_tree_at_memory_limit(
@@ -145,6 +183,9 @@ def test_review_launcher_applies_fixed_systemd_process_tree_limits(
     assert "--property=KillMode=control-group" in command
     assert "--property=Restart=no" in command
     assert "--property=OOMPolicy=stop" in command
+    assert (
+        "--setenv=PATH=/usr/bin:/usr/lib/wsl/lib:/mnt/c/WINDOWS/System32" in command
+    )
     assert any(item.startswith("--property=ExecStopPost=") for item in command)
 
 

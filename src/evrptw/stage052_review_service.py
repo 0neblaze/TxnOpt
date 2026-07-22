@@ -32,6 +32,15 @@ SYSTEMD_MEMORY_HIGH = "5G"
 SYSTEMD_MEMORY_MAX = "6G"
 SYSTEMD_MEMORY_SWAP_MAX = "2G"
 _UNIT_PATTERN = re.compile(r"^[A-Za-z0-9_.@-]+$")
+_SERVICE_BASE_PATHS = (
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+)
+_FORMAL_SERVICE_EXECUTABLES = ("nvidia-smi", "powershell.exe", "wsl.exe")
 
 
 class ReviewMemoryLimitExceeded(RuntimeError):
@@ -165,6 +174,22 @@ def _absolute_executable(path: Path) -> Path:
     return absolute
 
 
+def _service_execution_path() -> str:
+    """Freeze the Linux and WSL interoperability tools needed by formal replay."""
+
+    directories = list(_SERVICE_BASE_PATHS)
+    for executable in _FORMAL_SERVICE_EXECUTABLES:
+        resolved = shutil.which(executable)
+        if resolved is None:
+            raise FileNotFoundError(
+                f"formal reviewer service executable is unavailable: {executable}"
+            )
+        parent = str(Path(resolved).absolute().parent)
+        if parent not in directories:
+            directories.append(parent)
+    return os.pathsep.join(directories)
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -192,6 +217,7 @@ class ReviewServiceConfig:
     log_directory: Path
     raw_manifest: Path
     wheel_path: Path
+    service_execution_path: str
     progress_log: Path | None = None
     max_aggregate_rss_bytes: int = DEFAULT_MAX_AGGREGATE_RSS_BYTES
     sample_interval_seconds: float = 0.1
@@ -205,6 +231,8 @@ class ReviewServiceConfig:
             raise ValueError("review service command must be non-empty")
         if not re.fullmatch(r"[0-9a-f]{40}", self.reviewer_revision):
             raise ValueError("reviewer revision must be a full Git SHA-1")
+        if not self.service_execution_path:
+            raise ValueError("review service execution PATH must be non-empty")
         if self.max_aggregate_rss_bytes <= 0:
             raise ValueError("review service RSS limit must be positive")
         if self.sample_interval_seconds <= 0.0:
@@ -241,6 +269,7 @@ class ReviewServiceConfig:
             log_directory=Path(str(payload["log_directory"])),
             raw_manifest=Path(str(payload["raw_manifest"])),
             wheel_path=Path(str(payload["wheel_path"])),
+            service_execution_path=str(payload["service_execution_path"]),
             progress_log=(
                 Path(str(payload["progress_log"]))
                 if payload.get("progress_log") is not None
@@ -578,6 +607,7 @@ def _initial_receipt(config: ReviewServiceConfig) -> dict[str, object]:
         "command": list(config.command),
         "working_directory": str(config.working_directory.resolve()),
         "python_executable": str(_absolute_executable(config.reviewer_python)),
+        "service_execution_path": config.service_execution_path,
         "reviewer_revision": config.reviewer_revision,
         "producer_repository_revision": None,
         "reviewer_module_path": None,
@@ -866,6 +896,7 @@ def launch_review_service(config: ReviewServiceConfig) -> None:
         "--property=OOMPolicy=stop",
         f"--property=ExecStopPost={finalizer}",
         f"--property=WorkingDirectory={config.working_directory.resolve()}",
+        f"--setenv=PATH={config.service_execution_path}",
         f"--setenv=STAGE052_REVIEW_TMPDIR={temporary_root.resolve()}",
         str(_absolute_executable(config.reviewer_python)),
         "-I",
@@ -960,6 +991,7 @@ def main() -> int:
             log_directory=log_directory,
             raw_manifest=arguments.raw_manifest,
             wheel_path=arguments.wheel_path,
+            service_execution_path=_service_execution_path(),
             progress_log=progress_log,
             max_aggregate_rss_bytes=int(arguments.max_aggregate_rss_gib * 1024**3),
         )

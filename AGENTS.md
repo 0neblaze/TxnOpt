@@ -636,6 +636,10 @@ this repository or one of its subdirectories.
   represented as zero. Reviewer logs are operational evidence outside immutable
   raw bundles and do not alter the
   scientific review schema or readiness gates.
+  The launcher must resolve and freeze the service `PATH` for `nvidia-smi`,
+  `powershell.exe`, and `wsl.exe`, record it in the execution receipt, and fail
+  before launch if any required interoperability tool is unavailable; it must
+  not rely on an interactive shell's inherited `PATH`.
 - The registry, trusted manifest, and versioned review products are published
   only after G02 raw replay reports `READY_FOR_STAGE05_3`. Publication is a
   generation transaction whose trusted manifest is replaced last; no producer,
