@@ -272,11 +272,18 @@ reviewer command 必须包含该 reviewer 类型要求的 raw、comparison/prere
 scope identity，并固定通过该 wheel 所在 venv 的 Python 使用 `-I -m` 启动 allowlisted
 module；
 launcher 会核对 installed distribution 的 `direct_url.json`、module path、wheel
-逐文件内容、由 clean build source 生成的 `.whl.reviewer-provenance.json`、wheel
+逐文件内容、wheel 中全部 tracked Python/native/build input 与 clean revision 的绑定、
+以及 no-cache clean rebuild（无缓存干净重建）的逐 member 一致性；由
+clean build source 生成的 `.whl.reviewer-provenance.json`、wheel
 path/hash、raw run label 以及 clean producer snapshot，然后自动追加外部 progress log
 和 5.5-GiB 内部上限。Codex 只启动和
 轮询 service，不持有 reviewer 生命周期。超限、worker failure 或 service interruption
 不得自动重试；只有显式的新 review generation 才能再次运行。
+`--max-aggregate-rss-gib` 在 formal launch 中固定为 5.5，不得放宽。launcher 只接受
+`ArtifactReader` 解析出的 canonical signed raw manifest。科学 reviewer 写出的 READY 在
+`ExecStopPost` 完成前只是 provisional（暂定）；只有成功 receipt 已绑定当前
+review-manifest SHA-256、raw manifest 未变化且 cgroup peaks 可用时，后续 prerequisite
+verifier 才能消费该 READY。
 
 必须发布：
 

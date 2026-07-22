@@ -642,6 +642,13 @@ this repository or one of its subdirectories.
   `evrptw.experiments.stage052_campaign_review`; their raw/prerequisite command
   envelopes are validated separately and both use the external progress log
   plus the 5.5-GiB internal process-tree guard.
+  The internal limit is not operator-configurable for formal review. Launch
+  also requires the exact canonical signed raw manifest, a reviewer wheel whose
+  tracked Python/native/build inputs match the declared clean revision and whose
+  native-containing wheel matches a fresh no-cache rebuild byte-for-byte, and
+  a receipt path owned by the transient service. A READY review is consumable
+  only after `ExecStopPost` copies a finalized successful receipt, verified
+  cgroup peaks, and the current review-manifest hash into `review/`.
   The launcher must resolve and freeze the service `PATH` for `nvidia-smi`,
   `powershell.exe`, and `wsl.exe`, record it in the execution receipt, and fail
   before launch if any required interoperability tool is unavailable; it must

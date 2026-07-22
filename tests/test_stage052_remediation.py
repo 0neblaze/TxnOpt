@@ -165,6 +165,7 @@ def _write_signed_source(
         "component": "native_kernels",
         "scope": "performance",
         "status": status,
+        "review_execution_required": True,
         "raw_manifest_sha256": _sha256(bundle.manifest_path),
         "gates": {"persistence_ratio": {"passed": status != "NOT_READY"}},
         "files": {
@@ -172,8 +173,24 @@ def _write_signed_source(
             report.name: _sha256(report),
         },
     }
-    (review_dir / "review_manifest.json").write_text(
+    review_manifest = review_dir / "review_manifest.json"
+    review_manifest.write_text(
         json.dumps(review, sort_keys=True),
+        encoding="utf-8",
+    )
+    (review_dir / "review_execution.json").write_text(
+        json.dumps(
+            {
+                "run_label": SOURCE_RUN_LABEL,
+                "finalized": True,
+                "status": "completed",
+                "systemd_service_result": "success",
+                "cgroup_memory_peak_status": "verified",
+                "raw_manifest_unchanged": True,
+                "review_manifest_sha256": _sha256(review_manifest),
+            },
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
     return source_dir
@@ -352,6 +369,10 @@ def test_remediation_rejects_a_stale_signed_review_before_writing(
     review = json.loads(review_manifest.read_text(encoding="utf-8"))
     review["raw_manifest_sha256"] = "0" * 64
     review_manifest.write_text(json.dumps(review, sort_keys=True), encoding="utf-8")
+    execution_path = source_dir / "review" / "review_execution.json"
+    execution = json.loads(execution_path.read_text(encoding="utf-8"))
+    execution["review_manifest_sha256"] = _sha256(review_manifest)
+    execution_path.write_text(json.dumps(execution, sort_keys=True), encoding="utf-8")
     child_dir = tmp_path / "results" / "c05" / "remediation" / SOURCE_RUN_LABEL
 
     with pytest.raises(ArtifactIntegrityError, match="stale"):

@@ -116,6 +116,7 @@ _PERFORMANCE_ENVIRONMENT_VARIABLES = {
 _PER_WORKER_STORAGE_RSS_LIMIT_BYTES = 4_357_382_144
 _PROCESS_TREE_RSS_LIMIT_BYTES = 12 * 1024 * 1024 * 1024
 _REVIEW_PROGRESS_ENV = "STAGE052_REVIEW_PROGRESS_LOG"
+_REVIEW_EXECUTION_ENV = "STAGE052_REVIEW_EXECUTION_RECEIPT"
 
 
 def _emit_review_progress(event: str, **details: object) -> None:
@@ -825,7 +826,10 @@ def _spool_semantic_records(
     *,
     raw_dir: Path,
     identities: set[StorageReplayIdentity],
+    release_interval_records: int | None = None,
 ) -> None:
+    if release_interval_records is None:
+        release_interval_records = _SQLITE_CACHE_RELEASE_INTERVAL_RECORDS
     ordinals: dict[StorageReplayIdentity, int] = {}
     processed_records = 0
 
@@ -853,7 +857,7 @@ def _spool_semantic_records(
                 f"duplicate semantic record location: {identity}/{ordinal}"
             ) from error
         processed_records += 1
-        if processed_records % _SQLITE_CACHE_RELEASE_INTERVAL_RECORDS == 0:
+        if processed_records % release_interval_records == 0:
             page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
             page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
             _release_sqlite_page_cache(connection)
@@ -876,6 +880,46 @@ def _spool_semantic_records(
         record_count=sum(ordinals.values()),
         spool_bytes=page_count * page_size,
     )
+
+
+def _create_semantic_spool(connection: sqlite3.Connection) -> None:
+    connection.execute("PRAGMA journal_mode=OFF")
+    connection.execute("PRAGMA synchronous=OFF")
+    connection.execute("PRAGMA temp_store=FILE")
+    connection.execute("PRAGMA cache_size=-8192")
+    connection.execute("PRAGMA mmap_size=0")
+    connection.execute(
+        """
+        CREATE TABLE semantic_records (
+            instance TEXT NOT NULL,
+            seed INTEGER NOT NULL,
+            axis TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            digest TEXT NOT NULL,
+            payload BLOB NOT NULL,
+            PRIMARY KEY (instance, seed, axis, ordinal)
+        ) WITHOUT ROWID
+        """
+    )
+
+
+def _spool_semantic_records_worker(
+    spool_path: Path,
+    raw_dir: Path,
+    identities: tuple[StorageReplayIdentity, ...],
+    release_interval_records: int,
+) -> None:
+    connection = sqlite3.connect(spool_path)
+    try:
+        _create_semantic_spool(connection)
+        _spool_semantic_records(
+            connection,
+            raw_dir=raw_dir,
+            identities=set(identities),
+            release_interval_records=release_interval_records,
+        )
+    finally:
+        connection.close()
 
 
 def _semantic_field_digests(payload: bytes | None) -> dict[str, str]:
@@ -1073,6 +1117,8 @@ def _compare_semantic_records_against_spool(
     identities: set[StorageReplayIdentity],
     writers: Mapping[StorageReplayIdentity, csv.DictWriter[str]],
     handles: Mapping[StorageReplayIdentity, Any],
+    cache_release_interval_bytes: int = _CACHE_RELEASE_INTERVAL_BYTES,
+    release_interval_records: int = _SQLITE_CACHE_RELEASE_INTERVAL_RECORDS,
 ) -> None:
     ordinals: dict[StorageReplayIdentity, int] = {identity: 0 for identity in identities}
     processed_records = 0
@@ -1093,7 +1139,7 @@ def _compare_semantic_records_against_spool(
             writers[identity], key, left_payload, right_payload
         )
         fragment_bytes_since_release += int(handle.tell()) - before
-        if fragment_bytes_since_release >= _CACHE_RELEASE_INTERVAL_BYTES:
+        if fragment_bytes_since_release >= cache_release_interval_bytes:
             for fragment_handle in handles.values():
                 _flush_sync_and_drop_file_cache(fragment_handle)
             fragment_bytes_since_release = 0
@@ -1125,7 +1171,7 @@ def _compare_semantic_records_against_spool(
                     zlib.compress(right_payload, level=1),
                 )
         processed_records += 1
-        if processed_records % _SQLITE_CACHE_RELEASE_INTERVAL_RECORDS == 0:
+        if processed_records % release_interval_records == 0:
             _drop_file_page_cache(spool_handle)
 
     try:
@@ -1140,7 +1186,7 @@ def _compare_semantic_records_against_spool(
                 left_payload,
                 None,
             )
-            if tail_records % _SQLITE_CACHE_RELEASE_INTERVAL_RECORDS == 0:
+            if tail_records % release_interval_records == 0:
                 _drop_file_page_cache(spool_handle)
         for handle in handles.values():
             _flush_sync_and_drop_file_cache(handle)
@@ -1156,6 +1202,65 @@ def _compare_semantic_records_against_spool(
         record_count=sum(ordinals.values()),
         spool_bytes=page_count * page_size,
     )
+
+
+def _compare_semantic_records_worker(
+    spool_path: Path,
+    raw_dir: Path,
+    identities: tuple[StorageReplayIdentity, ...],
+    fragment_paths: tuple[tuple[StorageReplayIdentity, Path], ...],
+    cache_release_interval_bytes: int,
+    release_interval_records: int,
+) -> None:
+    connection = sqlite3.connect(spool_path)
+    handles: dict[StorageReplayIdentity, Any] = {}
+    writers: dict[StorageReplayIdentity, csv.DictWriter[str]] = {}
+    try:
+        for identity, path in fragment_paths:
+            handle = path.open("x", encoding="utf-8", newline="")
+            handles[identity] = handle
+            writers[identity] = csv.DictWriter(
+                handle,
+                fieldnames=_SEMANTIC_MISMATCH_FIELDS,
+                lineterminator="\n",
+            )
+        _compare_semantic_records_against_spool(
+            connection,
+            raw_dir=raw_dir,
+            identities=set(identities),
+            writers=writers,
+            handles=handles,
+            cache_release_interval_bytes=cache_release_interval_bytes,
+            release_interval_records=release_interval_records,
+        )
+    finally:
+        for handle in handles.values():
+            handle.close()
+        connection.close()
+
+
+def _run_semantic_field_worker(function: Any, *arguments: object) -> None:
+    executor: ProcessPoolExecutor | None = None
+    future: Future[None] | None = None
+    try:
+        executor = ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=get_context("spawn"),
+            max_tasks_per_child=1,
+        )
+        future = executor.submit(function, *arguments)
+        future.result()
+    except BaseException:
+        if future is not None:
+            future.cancel()
+        if executor is not None:
+            try:
+                abort_process_executor(executor)
+            except BaseException:
+                executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    assert executor is not None
+    executor.shutdown(wait=True)
 
 
 def render_semantic_mismatches(
@@ -1256,23 +1361,37 @@ def _write_semantic_mismatch_rows(
             )
         if not detailed:
             continue
-        with _semantic_record_spool() as connection:
-            _spool_semantic_records(
-                connection,
-                raw_dir=comparison_dir,
-                identities=detailed,
+        temporary_root = _review_temporary_root()
+        with tempfile.TemporaryDirectory(
+            prefix="stage052-review-field-workers-",
+            dir=temporary_root,
+        ) as directory:
+            worker_root = Path(directory)
+            spool_path = worker_root / "semantic_fields.sqlite3"
+            ordered_identities = tuple(sorted(detailed))
+            _run_semantic_field_worker(
+                _spool_semantic_records_worker,
+                spool_path,
+                comparison_dir,
+                ordered_identities,
+                _SQLITE_CACHE_RELEASE_INTERVAL_RECORDS,
             )
-            with _semantic_mismatch_fragments(detailed) as (writers, paths, handles):
-                _compare_semantic_records_against_spool(
-                    connection,
-                    raw_dir=raw_dir,
-                    identities=detailed,
-                    writers=writers,
-                    handles=handles,
-                )
-                for identity in sorted(detailed):
-                    with paths[identity].open("r", encoding="utf-8", newline="") as fragment:
-                        _copy_text_stream_bounded(fragment, output)
+            fragment_paths = tuple(
+                (identity, worker_root / f"{index:04d}.csv")
+                for index, identity in enumerate(ordered_identities)
+            )
+            _run_semantic_field_worker(
+                _compare_semantic_records_worker,
+                spool_path,
+                raw_dir,
+                ordered_identities,
+                fragment_paths,
+                _CACHE_RELEASE_INTERVAL_BYTES,
+                _SQLITE_CACHE_RELEASE_INTERVAL_RECORDS,
+            )
+            for _identity, path in fragment_paths:
+                with path.open("r", encoding="utf-8", newline="") as fragment:
+                    _copy_text_stream_bounded(fragment, output)
 
 
 def _flatten_semantic_fields(
@@ -1545,6 +1664,8 @@ def _publish_review_generation(
                 shutil.rmtree(temporary_generation)
 
     manifest_payload = dict(manifest)
+    if os.environ.get(_REVIEW_EXECUTION_ENV):
+        manifest_payload["review_execution_required"] = True
     manifest_payload["files"] = {
         findings_path.relative_to(review_dir).as_posix(): hashlib.sha256(findings).hexdigest(),
         report_path.relative_to(review_dir).as_posix(): hashlib.sha256(report).hexdigest(),
@@ -5175,11 +5296,6 @@ def _prior_review_manifest_history(raw_dir: Path) -> tuple[list[str], list[str]]
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ArtifactIntegrityError("cannot read prior Stage 5.2 review manifest") from error
-    raw_lineage = payload.get("review_manifest_lineage_sha256")
-    if raw_lineage is not None and raw_lineage != []:
-        raise ArtifactIntegrityError(
-            "prior Stage 5.2 review already has lineage and cannot be overwritten"
-        )
     try:
         component = Stage052Component(str(payload.get("component", "")))
     except ValueError as error:
@@ -5224,13 +5340,59 @@ def _prior_review_manifest_history(raw_dir: Path) -> tuple[list[str], list[str]]
         scope=scope,
         raw_manifest_sha256=current_raw_sha256,
     )
+    raw_lineage = payload.get("review_manifest_lineage_sha256", [])
+    if not isinstance(raw_lineage, list) or any(
+        not isinstance(item, str)
+        or re.fullmatch(r"[0-9a-f]{64}", item) is None
+        for item in raw_lineage
+    ):
+        raise ArtifactIntegrityError("prior Stage 5.2 accepted-review lineage is invalid")
+    lineage = [str(item) for item in raw_lineage]
+    if len(lineage) != len(set(lineage)):
+        raise ArtifactIntegrityError("prior Stage 5.2 accepted-review lineage is duplicated")
+    for manifest_sha256 in lineage:
+        archive_dir = raw_dir / "review" / "history" / manifest_sha256
+        manifest_path = archive_dir / "review_manifest.json"
+        try:
+            manifest_bytes = manifest_path.read_bytes()
+            archived_payload = json.loads(manifest_bytes)
+        except (OSError, json.JSONDecodeError) as error:
+            raise ArtifactIntegrityError(
+                "cannot read prior Stage 5.2 accepted-review archive"
+            ) from error
+        if (
+            not isinstance(archived_payload, Mapping)
+            or hashlib.sha256(manifest_bytes).hexdigest() != manifest_sha256
+            or archived_payload.get("schema_version") != STAGE052_REVIEW_SCHEMA_VERSION
+            or archived_payload.get("run_label") != raw_dir.name
+            or archived_payload.get("component") != component.value
+            or archived_payload.get("scope") != scope
+            or archived_payload.get("status") != contract.next_status
+            or archived_payload.get("raw_manifest_sha256") not in {None, current_raw_sha256}
+        ):
+            raise ArtifactIntegrityError("prior Stage 5.2 accepted-review archive is invalid")
+        archived_files = archived_payload.get("files")
+        if not isinstance(archived_files, Mapping) or not archived_files:
+            raise ArtifactIntegrityError("prior Stage 5.2 accepted-review files are invalid")
+        expected_files = {"review_manifest.json", *(str(name) for name in archived_files)}
+        observed_files = {
+            item.relative_to(archive_dir).as_posix()
+            for item in archive_dir.rglob("*")
+            if item.is_file() and not item.name.startswith("._")
+        }
+        if observed_files != expected_files or any(
+            not (archive_dir / str(name)).is_file()
+            or _sha256(archive_dir / str(name)) != str(checksum)
+            for name, checksum in archived_files.items()
+        ):
+            raise ArtifactIntegrityError("prior Stage 5.2 accepted-review files are invalid")
     archived = _archive_prior_review_generation(
         raw_dir,
         manifest_path=path,
         manifest_payload=payload,
     )
     if accepted:
-        return [archived], retry_history
+        return [*lineage, archived], retry_history
     return [], [*retry_history, archived]
 
 
@@ -5271,7 +5433,8 @@ def _review_lineage_archive_matches(
         )
         or _sha256(current_manifest_path) != current.review_manifest_sha256
         or current_payload.get("raw_manifest_sha256") != current.raw_manifest_sha256
-        or current_payload.get("review_manifest_lineage_sha256") != [prior_sha256]
+        or not isinstance(current_payload.get("review_manifest_lineage_sha256"), list)
+        or prior_sha256 not in current_payload.get("review_manifest_lineage_sha256", [])
         or not isinstance(current_gates, Mapping)
         or not current_gates
         or any(
@@ -5296,8 +5459,11 @@ def _review_lineage_archive_matches(
     ):
         return False
     archived_raw_sha256 = archive_payload.get("raw_manifest_sha256")
-    archived_lineage = archive_payload.get("review_manifest_lineage_sha256")
-    if (archived_lineage is not None and archived_lineage != []) or (
+    archived_lineage = archive_payload.get("review_manifest_lineage_sha256", [])
+    current_lineage = current_payload.get("review_manifest_lineage_sha256")
+    assert isinstance(current_lineage, list)
+    prior_index = current_lineage.index(prior_sha256)
+    if archived_lineage != current_lineage[:prior_index] or (
         archived_raw_sha256 is not None and archived_raw_sha256 != current.raw_manifest_sha256
     ):
         return False
@@ -5311,26 +5477,11 @@ def _review_lineage_archive_matches(
             for gate in gates.values()
         )
         or not isinstance(files, Mapping)
-        or len(files) != 2
+        or not files
     ):
         return False
     archived_review_paths = tuple(Path(str(name)) for name in files)
-    legacy_files = {path.as_posix() for path in archived_review_paths} == {
-        "review_findings.csv",
-        "review_report.md",
-    }
-    generation_files = (
-        {path.name for path in archived_review_paths} == {"review_findings.csv", "review_report.md"}
-        and all(
-            len(path.parts) == 3
-            and path.parts[0] == "generations"
-            and len(path.parts[1]) == 64
-            and all(character in "0123456789abcdef" for character in path.parts[1])
-            for path in archived_review_paths
-        )
-        and len({path.parts[1] for path in archived_review_paths}) == 1
-    )
-    if not legacy_files and not generation_files:
+    if any(path.is_absolute() or ".." in path.parts for path in archived_review_paths):
         return False
     relative_files = {"review_manifest.json", *(str(name) for name in files)}
     observed_files = {
@@ -5409,6 +5560,7 @@ def main() -> int:
         default=Path("configs/stage052_storage_roots.local.toml"),
     )
     parser.add_argument("--progress-log", type=Path, required=True)
+    parser.add_argument("--review-execution-receipt", type=Path, required=True)
     parser.add_argument("--max-aggregate-rss-gib", type=float, default=5.5)
     arguments = parser.parse_args()
     if arguments.max_aggregate_rss_gib <= 0.0:
@@ -5470,6 +5622,7 @@ def main() -> int:
         parser.error("--progress-log must be outside immutable raw evidence")
     progress_path.parent.mkdir(parents=True, exist_ok=True)
     os.environ[_REVIEW_PROGRESS_ENV] = str(progress_path)
+    os.environ[_REVIEW_EXECUTION_ENV] = str(arguments.review_execution_receipt.resolve())
     progress = ReviewProgressLog(progress_path)
     named_prerequisites: dict[str, Path] = {}
     for value in arguments.prerequisite:

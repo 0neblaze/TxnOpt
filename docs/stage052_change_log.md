@@ -8,6 +8,19 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：C 前独立审查加固
+
+- 原因：从固定点 `7f0944e` 的双重独立 code review 发现 canonical raw、wheel source、
+  fresh-process field replay、systemd receipt、retention registry preflight 和追加式 review
+  lineage 存在可导致无效正式证据的路径。
+- 修改：formal reviewer 固定 5.5-GiB 内部上限，绑定 canonical signed manifest，校验 wheel
+  与 clean revision 的 tracked Python source；field-level mismatch 的 comparison/candidate
+  replay 分别使用 fresh spawned process；`ExecStopPost` 把成功 receipt 与当前 review hash
+  绑定后 READY 才可消费。retention 在移动 source 前持锁预检 registry，current status 不再
+  被历史 NOT_READY 覆盖；accepted/retry lineage 支持追加且接受合法三文件 generation。
+- 证据影响：A10/B04 的既有 raw 不改写，但 B04 必须用新 reviewer 重新审查并生成 receipt
+  binding；C–G 只能从本修复后的 clean commit 启动。
+
 ## 2026-07-23：单一版本与外部证据归档
 
 - 基准源码 revision：`1faf761`（本次修改保持未提交状态）。

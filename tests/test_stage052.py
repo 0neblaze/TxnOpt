@@ -104,6 +104,26 @@ from evrptw.stage052_evidence import (
 )
 
 
+def _bind_successful_review_execution(review_manifest: Path) -> None:
+    raw_dir = review_manifest.parent.parent
+    (review_manifest.parent / "review_execution.json").write_text(
+        json.dumps(
+            {
+                "run_label": raw_dir.name,
+                "finalized": True,
+                "status": "completed",
+                "systemd_service_result": "success",
+                "cgroup_memory_peak_status": "verified",
+                "raw_manifest_unchanged": True,
+                "review_manifest_sha256": hashlib.sha256(
+                    review_manifest.read_bytes()
+                ).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_source_snapshot_requires_clean_ext4_and_read_only_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1943,7 +1963,8 @@ def test_stage052_review_prerequisite_verifies_identity_status_and_files(
     def digest(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
-    (review_dir / "review_manifest.json").write_text(
+    review_manifest = review_dir / "review_manifest.json"
+    review_manifest.write_text(
         json.dumps(
             {
                 "schema_version": "stage05.2-review-v1",
@@ -1976,7 +1997,7 @@ def test_stage052_review_prerequisite_verifies_identity_status_and_files(
         )
 
 
-def test_review_lineage_rejects_self_declared_prior_hashes(tmp_path: Path) -> None:
+def test_review_lineage_accepts_verified_append_only_prior_hashes(tmp_path: Path) -> None:
     run_label = "stage05.2_hot_path_attempt92"
     raw_dir = tmp_path / run_label
     ArtifactBundleWriter(
@@ -2002,14 +2023,58 @@ def test_review_lineage_rejects_self_declared_prior_hashes(tmp_path: Path) -> No
             findings.name: hashlib.sha256(findings.read_bytes()).hexdigest(),
         },
     }
-    payload["review_manifest_lineage_sha256"] = ["b" * 64]
     (review_dir / "review_manifest.json").write_text(
         json.dumps(payload),
         encoding="utf-8",
     )
+    first_lineage, _ = _prior_review_manifest_history(raw_dir)
+    payload.pop("files")
+    payload["review_manifest_lineage_sha256"] = first_lineage
+    stage052_review._publish_review_generation(
+        review_dir=review_dir,
+        findings=b"gate,passed\nall,True\n",
+        report=b"second review\n",
+        manifest=payload,
+    )
 
-    with pytest.raises(ArtifactIntegrityError, match="already has lineage"):
-        _prior_review_manifest_history(raw_dir)
+    second_lineage, retry_history = _prior_review_manifest_history(raw_dir)
+
+    assert retry_history == []
+    assert second_lineage[:1] == first_lineage
+    assert len(second_lineage) == 2
+
+
+def test_prerequisite_receipt_must_bind_finalized_service_and_current_review(
+    tmp_path: Path,
+) -> None:
+    raw_dir = tmp_path / "stage05.2_hot_path_attempt87"
+    review_dir = raw_dir / "review"
+    review_dir.mkdir(parents=True)
+    review_manifest = review_dir / "review_manifest.json"
+    review_manifest.write_text('{"status":"READY"}\n', encoding="utf-8")
+    receipt = {
+        "run_label": raw_dir.name,
+        "finalized": True,
+        "status": "completed",
+        "systemd_service_result": "success",
+        "cgroup_memory_peak_status": "verified",
+        "raw_manifest_unchanged": True,
+        "review_manifest_sha256": hashlib.sha256(
+            review_manifest.read_bytes()
+        ).hexdigest(),
+    }
+    execution = review_dir / "review_execution.json"
+    execution.write_text(json.dumps(receipt), encoding="utf-8")
+
+    assert stage052_evidence.verify_stage052_review_execution_receipt(
+        raw_dir, review_manifest
+    )["status"] == "completed"
+    receipt["cgroup_memory_peak_status"] = "unavailable"
+    execution.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ArtifactIntegrityError, match="execution receipt is invalid"):
+        stage052_evidence.verify_stage052_review_execution_receipt(
+            raw_dir, review_manifest
+        )
 
 
 def test_failed_review_is_archived_as_explicit_retry_history(tmp_path: Path) -> None:
@@ -2314,7 +2379,8 @@ def test_stage052_producer_prerequisite_binds_raw_and_review_identity(tmp_path: 
     findings = review_dir / "review_findings.csv"
     report.write_text("accepted\n", encoding="utf-8")
     findings.write_text("gate,passed\nall,True\n", encoding="utf-8")
-    (review_dir / "review_manifest.json").write_text(
+    review_manifest = review_dir / "review_manifest.json"
+    review_manifest.write_text(
         json.dumps(
             {
                 "schema_version": "stage05.2-review-v1",
@@ -2322,6 +2388,7 @@ def test_stage052_producer_prerequisite_binds_raw_and_review_identity(tmp_path: 
                 "component": "artifact_streaming",
                 "scope": "performance",
                 "status": "READY_FOR_STAGE052_JOB_PARALLEL",
+                "review_execution_required": True,
                 "raw_manifest_sha256": hashlib.sha256(
                     bundle.manifest_path.read_bytes()
                 ).hexdigest(),
@@ -2334,6 +2401,7 @@ def test_stage052_producer_prerequisite_binds_raw_and_review_identity(tmp_path: 
         ),
         encoding="utf-8",
     )
+    _bind_successful_review_execution(review_manifest)
 
     identity = verify_stage052_prerequisite(
         raw_dir,
@@ -2358,6 +2426,7 @@ def test_stage052_producer_prerequisite_binds_raw_and_review_identity(tmp_path: 
         report=report.read_bytes(),
         manifest=stronger_review,
     )
+    _bind_successful_review_execution(review_path)
     current_identity = verify_stage052_prerequisite(
         raw_dir,
         expected_component="artifact_streaming",
@@ -2456,7 +2525,8 @@ def test_prerequisite_rejects_replaced_persistence_envelope(tmp_path: Path) -> N
     findings = review_dir / "review_findings.csv"
     report.write_text("accepted\n", encoding="utf-8")
     findings.write_text("gate,passed\nall,True\n", encoding="utf-8")
-    (review_dir / "review_manifest.json").write_text(
+    review_manifest = review_dir / "review_manifest.json"
+    review_manifest.write_text(
         json.dumps(
             {
                 "schema_version": "stage05.2-review-v1",
@@ -2464,6 +2534,7 @@ def test_prerequisite_rejects_replaced_persistence_envelope(tmp_path: Path) -> N
                 "component": "artifact_streaming",
                 "scope": "performance",
                 "status": "READY_FOR_STAGE052_JOB_PARALLEL",
+                "review_execution_required": True,
                 "raw_manifest_sha256": hashlib.sha256(
                     bundle.manifest_path.read_bytes()
                 ).hexdigest(),
@@ -2480,6 +2551,7 @@ def test_prerequisite_rejects_replaced_persistence_envelope(tmp_path: Path) -> N
         ),
         encoding="utf-8",
     )
+    _bind_successful_review_execution(review_manifest)
     verify_stage052_prerequisite(
         raw_dir,
         expected_component="artifact_streaming",
@@ -3374,8 +3446,22 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         "c101_21,2014,fixed_work,2,event.propagation_status,"
     )
     streamed_mismatches = tmp_path / "streamed-mismatches.csv"
+    field_progress = tmp_path / "field-progress.jsonl"
+    monkeypatch.setenv("STAGE052_REVIEW_PROGRESS_LOG", str(field_progress))
     write_semantic_mismatches(changed_event, (v1,), streamed_mismatches)
     assert streamed_mismatches.read_bytes() == ("\n".join(mismatch_lines) + "\n").encode()
+    field_events = [
+        json.loads(line)
+        for line in field_progress.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["event"]
+        in {"semantic_spool_bundle_complete", "semantic_stream_bundle_complete"}
+    ]
+    assert {event["event"] for event in field_events} == {
+        "semantic_spool_bundle_complete",
+        "semantic_stream_bundle_complete",
+    }
+    assert len({event["pid"] for event in field_events}) == 2
+    assert all(event["pid"] != os.getpid() for event in field_events)
 
     wall_clock_prior = write(
         "artifact-storage-v2",

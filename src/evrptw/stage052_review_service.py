@@ -12,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -23,6 +24,8 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 import psutil  # type: ignore[import-untyped]
+
+from evrptw.artifacts import ArtifactIntegrityError, ArtifactReader
 
 REVIEW_EXECUTION_SCHEMA_VERSION = "stage05.2-review-execution-v1"
 REVIEWER_WHEEL_PROVENANCE_SCHEMA_VERSION = "stage05.2-reviewer-wheel-provenance-v1"
@@ -44,6 +47,7 @@ _FORMAL_SERVICE_EXECUTABLES = ("nvidia-smi", "powershell.exe", "wsl.exe")
 _PERFORMANCE_REVIEW_MODULE = "evrptw.experiments.stage052_performance_review"
 _CAMPAIGN_REVIEW_MODULE = "evrptw.experiments.stage052_campaign_review"
 _ALLOWED_REVIEW_MODULES = frozenset({_PERFORMANCE_REVIEW_MODULE, _CAMPAIGN_REVIEW_MODULE})
+_REVIEW_EXECUTION_OPTION = "--review-execution-receipt"
 
 
 class ReviewMemoryLimitExceeded(RuntimeError):
@@ -429,6 +433,98 @@ def _wheel_provenance_path(wheel_path: Path) -> Path:
     return wheel_path.with_suffix(f"{wheel_path.suffix}.reviewer-provenance.json")
 
 
+def _verify_wheel_source_matches_revision(wheel_path: Path, repository: Path) -> str:
+    """Bind tracked Python, native, and build inputs to the clean revision."""
+
+    result = subprocess.run(
+        (
+            "git",
+            "ls-files",
+            "-z",
+            "--",
+            "src/evrptw",
+            "cpp",
+            "CMakeLists.txt",
+            "pyproject.toml",
+        ),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+    relative_sources = tuple(
+        Path(raw.decode("utf-8"))
+        for raw in result.stdout.split(b"\0")
+        if raw
+    )
+    if not relative_sources:
+        raise RuntimeError("clean reviewer source contains no tracked Python modules")
+    aggregate = hashlib.sha256(b"stage05.2-reviewer-source-v1\0")
+    with zipfile.ZipFile(wheel_path) as archive:
+        members = set(archive.namelist())
+        for relative in sorted(relative_sources, key=lambda path: path.as_posix()):
+            source = (repository / relative).read_bytes()
+            if relative.parts[:2] == ("src", "evrptw") and relative.suffix in {
+                ".py",
+                ".pyi",
+            }:
+                member = Path(*relative.parts[1:]).as_posix()
+                if member not in members:
+                    raise RuntimeError(f"reviewer wheel omits clean source module: {relative}")
+                if archive.read(member) != source:
+                    raise RuntimeError(f"reviewer wheel does not match clean source: {relative}")
+            aggregate.update(relative.as_posix().encode("utf-8"))
+            aggregate.update(b"\0")
+            aggregate.update(hashlib.sha256(source).digest())
+    return aggregate.hexdigest()
+
+
+def _wheel_member_digests(wheel_path: Path) -> dict[str, str]:
+    with zipfile.ZipFile(wheel_path) as archive:
+        return {
+            member: hashlib.sha256(archive.read(member)).hexdigest()
+            for member in sorted(archive.namelist())
+            if not member.endswith("/") and not member.endswith(".dist-info/RECORD")
+        }
+
+
+def _verify_wheel_rebuild_matches_revision(wheel_path: Path, repository: Path) -> str:
+    """Rebuild the clean revision and require every wheel member, including native, to match."""
+
+    temporary_parent = Path("/tmp") if Path("/tmp").is_dir() else None
+    with tempfile.TemporaryDirectory(
+        prefix="stage052-reviewer-rebuild-",
+        dir=temporary_parent,
+    ) as directory:
+        wheel_directory = Path(directory)
+        subprocess.run(
+            (
+                str(_absolute_executable(Path(sys.executable))),
+                "-m",
+                "pip",
+                "wheel",
+                "--no-deps",
+                "--no-build-isolation",
+                "--no-cache-dir",
+                "--wheel-dir",
+                str(wheel_directory),
+                str(repository.resolve()),
+            ),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        rebuilt = tuple(wheel_directory.glob("*.whl"))
+        if len(rebuilt) != 1:
+            raise RuntimeError("clean reviewer rebuild did not produce exactly one wheel")
+        declared = _wheel_member_digests(wheel_path)
+        observed = _wheel_member_digests(rebuilt[0])
+        if declared != observed:
+            raise RuntimeError("reviewer wheel does not match clean native/source rebuild")
+        return hashlib.sha256(
+            json.dumps(declared, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+
 def seal_reviewer_wheel(wheel_path: Path, reviewer_revision: str) -> Path:
     """Bind a clean reviewer source revision to one immutable wheel digest."""
 
@@ -438,6 +534,8 @@ def seal_reviewer_wheel(wheel_path: Path, reviewer_revision: str) -> Path:
     if observed_revision != reviewer_revision:
         raise RuntimeError("reviewer revision does not match the clean build source")
     wheel = wheel_path.resolve(strict=True)
+    source_digest = _verify_wheel_source_matches_revision(wheel, Path.cwd())
+    rebuild_digest = _verify_wheel_rebuild_matches_revision(wheel, Path.cwd())
     provenance_path = _wheel_provenance_path(wheel)
     _atomic_json(
         provenance_path,
@@ -446,6 +544,8 @@ def seal_reviewer_wheel(wheel_path: Path, reviewer_revision: str) -> Path:
             "reviewer_revision": reviewer_revision,
             "wheel_filename": wheel.name,
             "wheel_sha256": _sha256(wheel),
+            "reviewer_source_sha256": source_digest,
+            "reviewer_rebuild_sha256": rebuild_digest,
             "sealed_at": _utc_now(),
         },
     )
@@ -465,6 +565,18 @@ def _verify_wheel_provenance(config: ReviewServiceConfig, wheel_path: Path) -> P
     }
     if any(payload.get(key) != value for key, value in expected.items()):
         raise RuntimeError("reviewer wheel provenance does not match revision and wheel")
+    source_digest = payload.get("reviewer_source_sha256")
+    if (
+        not isinstance(source_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_digest) is None
+    ):
+        raise RuntimeError("reviewer wheel provenance source attestation is invalid")
+    rebuild_digest = payload.get("reviewer_rebuild_sha256")
+    if (
+        not isinstance(rebuild_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", rebuild_digest) is None
+    ):
+        raise RuntimeError("reviewer wheel provenance rebuild attestation is invalid")
     return provenance_path
 
 
@@ -493,6 +605,17 @@ def _verify_installed_distribution_matches_wheel(
     return aggregate.hexdigest()
 
 
+def _canonical_raw_directory(raw_manifest: Path) -> Path:
+    raw_directory = raw_manifest.resolve(strict=True).parent.parent
+    try:
+        canonical_manifest = ArtifactReader(raw_directory).result.manifest_path.resolve()
+    except ArtifactIntegrityError as error:
+        raise RuntimeError("raw manifest is not the canonical signed bundle manifest") from error
+    if raw_manifest.resolve() != canonical_manifest:
+        raise RuntimeError("raw manifest is not the canonical signed bundle manifest")
+    return raw_directory
+
+
 def _validate_formal_execution_envelope(config: ReviewServiceConfig) -> dict[str, str]:
     reviewer_python = _absolute_executable(config.reviewer_python)
     if _absolute_executable(Path(sys.executable)) != reviewer_python:
@@ -509,7 +632,7 @@ def _validate_formal_execution_envelope(config: ReviewServiceConfig) -> dict[str
     if not config.log_directory.resolve().is_relative_to(DEFAULT_LOG_ROOT.resolve()):
         raise RuntimeError("formal review logs must use the fixed Stage 5.2 log root")
 
-    raw_directory = config.raw_manifest.resolve(strict=True).parent.parent
+    raw_directory = _canonical_raw_directory(config.raw_manifest)
     scope_values = _option_values(config.command, "--scope")
     if len(scope_values) != 1:
         raise RuntimeError("formal review command requires one scope")
@@ -557,6 +680,10 @@ def _validate_formal_execution_envelope(config: ReviewServiceConfig) -> dict[str
     expected_limit = config.max_aggregate_rss_bytes / 1024**3
     if len(limit_values) != 1 or float(limit_values[0]) != expected_limit:
         raise RuntimeError("review command RSS limit does not match service config")
+    receipt_values = _option_values(config.command, _REVIEW_EXECUTION_OPTION)
+    expected_receipt = config.log_directory.resolve() / "review_execution.json"
+    if len(receipt_values) != 1 or Path(receipt_values[0]).resolve() != expected_receipt:
+        raise RuntimeError("review command execution receipt does not match service config")
 
     manifest = json.loads(config.raw_manifest.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict):
@@ -882,12 +1009,27 @@ def finalize_review_execution(config: ReviewServiceConfig) -> None:
         )
     receipt["completed_at"] = completed_at.isoformat()
     receipt["finalized"] = True
+    review_manifest_path = (
+        config.raw_manifest.resolve().parent.parent / "review" / "review_manifest.json"
+    )
+    if (
+        receipt.get("status") == "completed"
+        and service_result == "success"
+        and receipt.get("cgroup_memory_peak_status") == "verified"
+        and receipt.get("raw_manifest_unchanged") is True
+        and review_manifest_path.is_file()
+    ):
+        receipt["review_manifest_sha256"] = _sha256(review_manifest_path)
     _atomic_json(receipt_path, receipt)
+    if receipt.get("review_manifest_sha256") is not None:
+        _atomic_json(review_manifest_path.parent / "review_execution.json", receipt)
 
 
 def launch_review_service(config: ReviewServiceConfig) -> None:
     """Create one transient user service without inheriting the caller's lifetime."""
 
+    if config.max_aggregate_rss_bytes != DEFAULT_MAX_AGGREGATE_RSS_BYTES:
+        raise RuntimeError("formal reviewer internal RSS limit is fixed at 5.5 GiB")
     _prepare_review_execution(config)
     staging_directory = config.log_directory.with_name(f".{config.log_directory.name}.launch")
     staging_directory.mkdir(exist_ok=False)
@@ -1003,6 +1145,8 @@ def main() -> int:
                 str(progress_log),
                 "--max-aggregate-rss-gib",
                 str(arguments.max_aggregate_rss_gib),
+                _REVIEW_EXECUTION_OPTION,
+                str(log_directory / "review_execution.json"),
             )
         )
         config = ReviewServiceConfig(

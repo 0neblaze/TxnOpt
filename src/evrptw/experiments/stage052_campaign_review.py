@@ -90,6 +90,7 @@ PILOT_SEEDS = (2014, 2015, 2016)
 PER_WORKER_RSS_LIMIT_BYTES = 4_357_382_144
 PROCESS_TREE_RSS_LIMIT_BYTES = 12 * 1024**3
 CAMPAIGN_REVIEW_SCHEMA = "stage05.2-campaign-review-v1"
+_REVIEW_EXECUTION_ENV = "STAGE052_REVIEW_EXECUTION_RECEIPT"
 COMPACT_TRACE_SCHEMA = "stage05.2-campaign-trace-v1"
 COMPACT_TRACE_MAX_BYTES = 16 * 1024 * 1024
 MAX_STREAM_AUDIT_KEYS = 65_536
@@ -4134,6 +4135,8 @@ def _publish_review(
         "previous_review_manifest_sha256": previous_sha256,
         "review_history": history,
     }
+    if os.environ.get(_REVIEW_EXECUTION_ENV):
+        manifest_payload["review_execution_required"] = True
     manifest_bytes = (json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     temporary_manifest = review_dir / f".review_manifest.{uuid.uuid4().hex}.tmp"
     try:
@@ -4342,6 +4345,7 @@ def main() -> int:
         default=Path("experiments/registries/stage05.2_retention_registry.csv"),
     )
     parser.add_argument("--progress-log", type=Path, required=True)
+    parser.add_argument("--review-execution-receipt", type=Path, required=True)
     parser.add_argument("--max-aggregate-rss-gib", type=float, default=5.5)
     arguments = parser.parse_args()
     if arguments.max_aggregate_rss_gib <= 0.0:
@@ -4392,7 +4396,9 @@ def main() -> int:
         progress=progress,
     )
     previous_progress = os.environ.get("STAGE052_REVIEW_PROGRESS_LOG")
+    previous_receipt = os.environ.get(_REVIEW_EXECUTION_ENV)
     os.environ["STAGE052_REVIEW_PROGRESS_LOG"] = str(progress_path)
+    os.environ[_REVIEW_EXECUTION_ENV] = str(arguments.review_execution_receipt.resolve())
     progress.emit(
         "campaign_review_start",
         campaign_dir=str(campaign_dir),
@@ -4422,6 +4428,10 @@ def main() -> int:
             os.environ.pop("STAGE052_REVIEW_PROGRESS_LOG", None)
         else:
             os.environ["STAGE052_REVIEW_PROGRESS_LOG"] = previous_progress
+        if previous_receipt is None:
+            os.environ.pop(_REVIEW_EXECUTION_ENV, None)
+        else:
+            os.environ[_REVIEW_EXECUTION_ENV] = previous_receipt
     progress.emit(
         "campaign_review_complete",
         outputs={key: str(path) for key, path in outputs.items()},

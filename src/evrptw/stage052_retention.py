@@ -395,10 +395,10 @@ def _metadata(
     completeness: set[str] = set()
     commits: set[str] = set()
     references: set[str] = set()
-    candidates = (
-        *sorted((run_dir / "control").glob("**/*.json")),
-        *sorted((run_dir / "review").glob("**/*.json")),
-    )
+    candidates = list(sorted((run_dir / "control").glob("**/*.json")))
+    current_review = run_dir / "review" / "review_manifest.json"
+    if current_review.is_file():
+        candidates.append(current_review)
     for path in candidates:
         if path.name.startswith("._") or path.stat().st_size > 8 * 1024 * 1024:
             continue
@@ -821,6 +821,41 @@ def archive_stage052_inventory(
     )
 
 
+def archive_stage052_inventory_to_registry(
+    inventory_path: Path,
+    *,
+    inventory_sha256: str,
+    archive_root: Path,
+    registry_path: Path,
+) -> tuple[RetentionRecord, ...]:
+    """Preflight the registry under lock before moving any source evidence."""
+
+    inventory = load_retention_inventory(
+        inventory_path,
+        expected_sha256=inventory_sha256,
+    )
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    with _registry_lock(registry_path):
+        existing = (
+            {record.run_label: record for record in load_retention_registry(registry_path)}
+            if registry_path.exists()
+            else {}
+        )
+        for record in inventory.records:
+            previous = existing.get(record.run_label)
+            if previous is not None and _registry_identity(previous) != _registry_identity(record):
+                raise RetentionIntegrityError(
+                    f"retention registry identity conflict for {record.run_label}"
+                )
+        archived = archive_stage052_inventory(
+            inventory_path,
+            inventory_sha256=inventory_sha256,
+            archive_root=archive_root,
+        )
+        _write_retention_registry_locked(registry_path, archived)
+        return archived
+
+
 @contextmanager
 def _registry_lock(path: Path) -> Iterator[None]:
     lock_identity = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
@@ -1089,12 +1124,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     locator = StorageRootLocator.from_toml(arguments.storage_root_locator)
     alias = approved.policy.archive_root_alias
     locator.verify_all(probe_volume_identity, (alias,))
-    records = archive_stage052_inventory(
+    records = archive_stage052_inventory_to_registry(
         arguments.inventory,
         inventory_sha256=arguments.inventory_sha256,
         archive_root=locator.resolve(alias).absolute_path,
+        registry_path=arguments.registry,
     )
-    write_retention_registry(arguments.registry, records)
     print(
         json.dumps(
             {

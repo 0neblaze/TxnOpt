@@ -1463,6 +1463,35 @@ def verify_job_parallel_selection(
     )
 
 
+def verify_stage052_review_execution_receipt(
+    raw_dir: Path,
+    review_manifest_path: Path,
+) -> dict[str, object]:
+    """Verify the finalized systemd receipt bound to one current review manifest."""
+
+    execution_path = raw_dir / "review" / "review_execution.json"
+    try:
+        execution = json.loads(execution_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ArtifactIntegrityError(
+            "prerequisite review lacks a finalized service execution receipt"
+        ) from error
+    if (
+        not isinstance(execution, dict)
+        or execution.get("run_label") != raw_dir.name
+        or execution.get("finalized") is not True
+        or execution.get("status") != "completed"
+        or execution.get("systemd_service_result") != "success"
+        or execution.get("cgroup_memory_peak_status") != "verified"
+        or execution.get("raw_manifest_unchanged") is not True
+        or execution.get("review_manifest_sha256") != _sha256(review_manifest_path)
+    ):
+        raise ArtifactIntegrityError(
+            "prerequisite review service execution receipt is invalid"
+        )
+    return execution
+
+
 def verify_stage052_prerequisite(
     raw_dir: Path,
     *,
@@ -1530,6 +1559,12 @@ def verify_stage052_prerequisite(
     ):
         raise ArtifactIntegrityError("prerequisite review contains an invalid gate set")
     verify_stage052_review_files(raw_dir, review)
+
+    if review.get("review_execution_required") is not True:
+        raise ArtifactIntegrityError(
+            "prerequisite review does not require bounded service execution"
+        )
+    verify_stage052_review_execution_receipt(raw_dir, review_manifest_path)
 
     reader = ArtifactReader(raw_dir)
     if reader.manifest.get("evidence_completeness") != "complete":

@@ -14,6 +14,7 @@ from evrptw.stage052_retention import (
     RetentionIntegrityError,
     Stage052RetentionPolicy,
     archive_stage052_inventory,
+    archive_stage052_inventory_to_registry,
     audit_stage052_runs,
     load_retention_inventory,
     resolve_retained_run,
@@ -126,6 +127,32 @@ def test_audit_uses_run_status_not_nested_prerequisite_status(tmp_path: Path) ->
 
     assert record.status == "READY_FOR_STAGE052_HOT_PATH"
     assert record.source_commit == "a" * 40 + "|" + "b" * 40
+
+
+def test_audit_uses_current_review_status_not_failed_retry_history(tmp_path: Path) -> None:
+    source = tmp_path / "results"
+    run_label = "stage05.2_hot_path_attempt03"
+    run = _run(source, run_label, status="complete", completeness="complete")
+    review = run / "review"
+    history = review / "history" / ("b" * 64)
+    history.mkdir(parents=True)
+    (history / "review_manifest.json").write_text(
+        json.dumps({"run_label": run_label, "status": "NOT_READY"}),
+        encoding="utf-8",
+    )
+    (review / "review_manifest.json").write_text(
+        json.dumps(
+            {
+                "run_label": run_label,
+                "status": "READY_FOR_STAGE052_ARTIFACT_STREAMING",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    record = audit_stage052_runs(source, _policy()).records[0]
+
+    assert record.status == "READY_FOR_STAGE052_ARTIFACT_STREAMING"
 
 
 @pytest.mark.parametrize(
@@ -260,6 +287,34 @@ def test_archive_preflights_all_records_before_moving_any_source(tmp_path: Path)
     assert first.is_dir()
     assert stale.is_dir()
     assert not (archive / "stage05.2/history" / first.name).exists()
+
+
+def test_registry_conflict_is_rejected_before_archive_moves_source(tmp_path: Path) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    registry = tmp_path / "retention.csv"
+    run = _run(
+        source,
+        "stage05.2_job_parallel_attempt18",
+        status="complete",
+        completeness="complete",
+    )
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+    conflict = replace(inventory.records[0], tree_sha256="f" * 64)
+    write_retention_registry(registry, (conflict,))
+
+    with pytest.raises(RetentionIntegrityError, match="identity conflict"):
+        archive_stage052_inventory_to_registry(
+            inventory_path,
+            inventory_sha256=inventory_sha256,
+            archive_root=archive,
+            registry_path=registry,
+        )
+
+    assert run.is_dir()
+    assert not (archive / "stage05.2/history" / run.name).exists()
 
 
 def test_interrupted_move_retains_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
