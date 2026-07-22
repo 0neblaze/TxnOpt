@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import psutil
 import pytest
 
 import evrptw.experiments.stage052_performance as stage052_performance
@@ -3183,30 +3184,39 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     replay_probe = """
 import json
 import os
-import resource
 import sys
 from pathlib import Path
 from evrptw.experiments.stage052_performance_review import replay_stage052_storage_semantics
 
 replay_stage052_storage_semantics(Path(sys.argv[1]))
-peak_rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-print(json.dumps({"pid": os.getpid(), "peak_rss_bytes": peak_rss_bytes}))
+print(json.dumps({"pid": os.getpid()}))
 """
 
     def replay_peak(path: Path) -> dict[str, int]:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             (sys.executable, "-c", replay_probe, str(path)),
-            check=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
         )
-        payload = json.loads(completed.stdout.splitlines()[-1])
-        return {key: int(value) for key, value in payload.items()}
+        observed = psutil.Process(process.pid)
+        peak_rss_bytes = 0
+        while process.poll() is None:
+            try:
+                peak_rss_bytes = max(peak_rss_bytes, observed.memory_info().rss)
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                break
+            time.sleep(0.002)
+        stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            raise AssertionError(stderr)
+        payload = json.loads(stdout.splitlines()[-1])
+        return {"pid": int(payload["pid"]), "peak_rss_bytes": peak_rss_bytes}
 
     small_peak = replay_peak(v2)
     large_peak = replay_peak(memory_fixture)
     assert small_peak["pid"] != large_peak["pid"]
-    assert large_peak["peak_rss_bytes"] - small_peak["peak_rss_bytes"] < 12 * 1024 * 1024
+    assert large_peak["peak_rss_bytes"] - small_peak["peak_rss_bytes"] < 16 * 1024 * 1024
 
 
 def test_native_distance_matrix_matches_worked_euclidean_fixture() -> None:

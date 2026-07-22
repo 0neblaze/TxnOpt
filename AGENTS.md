@@ -615,8 +615,9 @@ this repository or one of its subdirectories.
   `MemorySwapMax=2G`, no restart/fallback, an internal 5.5-GiB aggregate-RSS
   stop, external progress logs, and an `ExecStopPost`-sealed execution receipt.
   Formal launch rejects a dirty producer snapshot, arbitrary command, raw
-  run-label mismatch, or reviewer Python not installed from the declared frozen
-  wheel. Reviewer logs
+  run-label mismatch, unsealed reviewer revision, or reviewer Python whose
+  installed files do not match the declared frozen wheel. ExecStopPost must
+  independently re-hash the raw manifest and read cgroup memory peaks. Reviewer logs
   are operational evidence outside immutable raw bundles and do not alter the
   scientific review schema or readiness gates.
 - The registry, trusted manifest, and versioned review products are published

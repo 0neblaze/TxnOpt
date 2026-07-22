@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -24,6 +25,7 @@ from urllib.parse import unquote, urlparse
 import psutil  # type: ignore[import-untyped]
 
 REVIEW_EXECUTION_SCHEMA_VERSION = "stage05.2-review-execution-v1"
+REVIEWER_WHEEL_PROVENANCE_SCHEMA_VERSION = "stage05.2-reviewer-wheel-provenance-v1"
 DEFAULT_LOG_ROOT = Path("/home/oneblaze/stage052-review-logs")
 DEFAULT_MAX_AGGREGATE_RSS_BYTES = int(5.5 * 1024**3)
 SYSTEMD_MEMORY_HIGH = "5G"
@@ -261,6 +263,21 @@ def _sample_process_tree(root_pid: int) -> tuple[int, int]:
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
         return
+    if os.name == "nt":
+        processes = list(reversed(_processes(process.pid)))
+        for member in processes:
+            try:
+                member.terminate()
+            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                continue
+        _, alive = psutil.wait_procs(processes, timeout=5.0)
+        for member in alive:
+            try:
+                member.kill()
+            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                continue
+        process.wait(timeout=5.0)
+        return
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -345,6 +362,74 @@ print(json.dumps({
     return {key: str(payload[key]) for key in payload}
 
 
+def _wheel_provenance_path(wheel_path: Path) -> Path:
+    return wheel_path.with_suffix(f"{wheel_path.suffix}.reviewer-provenance.json")
+
+
+def seal_reviewer_wheel(wheel_path: Path, reviewer_revision: str) -> Path:
+    """Bind a clean reviewer source revision to one immutable wheel digest."""
+
+    if not re.fullmatch(r"[0-9a-f]{40}", reviewer_revision):
+        raise ValueError("reviewer revision must be a full Git SHA-1")
+    observed_revision = _require_clean_repository(Path.cwd())
+    if observed_revision != reviewer_revision:
+        raise RuntimeError("reviewer revision does not match the clean build source")
+    wheel = wheel_path.resolve(strict=True)
+    provenance_path = _wheel_provenance_path(wheel)
+    _atomic_json(
+        provenance_path,
+        {
+            "schema_version": REVIEWER_WHEEL_PROVENANCE_SCHEMA_VERSION,
+            "reviewer_revision": reviewer_revision,
+            "wheel_filename": wheel.name,
+            "wheel_sha256": _sha256(wheel),
+            "sealed_at": _utc_now(),
+        },
+    )
+    return provenance_path
+
+
+def _verify_wheel_provenance(config: ReviewServiceConfig, wheel_path: Path) -> Path:
+    provenance_path = _wheel_provenance_path(wheel_path)
+    payload = json.loads(provenance_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("reviewer wheel provenance must be a JSON object")
+    expected = {
+        "schema_version": REVIEWER_WHEEL_PROVENANCE_SCHEMA_VERSION,
+        "reviewer_revision": config.reviewer_revision,
+        "wheel_filename": wheel_path.name,
+        "wheel_sha256": _sha256(wheel_path),
+    }
+    if any(payload.get(key) != value for key, value in expected.items()):
+        raise RuntimeError("reviewer wheel provenance does not match revision and wheel")
+    return provenance_path
+
+
+def _verify_installed_distribution_matches_wheel(
+    wheel_path: Path,
+    distribution_root: Path,
+) -> str:
+    aggregate = hashlib.sha256()
+    with zipfile.ZipFile(wheel_path) as archive:
+        members = sorted(
+            member
+            for member in archive.namelist()
+            if not member.endswith("/") and not member.endswith(".dist-info/RECORD")
+        )
+        for member in members:
+            installed = distribution_root / member
+            if not installed.is_file():
+                raise RuntimeError(f"installed reviewer wheel member is missing: {member}")
+            wheel_digest = hashlib.sha256(archive.read(member)).hexdigest()
+            if _sha256(installed) != wheel_digest:
+                raise RuntimeError(f"installed reviewer wheel member differs: {member}")
+            aggregate.update(member.encode("utf-8"))
+            aggregate.update(b"\0")
+            aggregate.update(wheel_digest.encode("ascii"))
+            aggregate.update(b"\n")
+    return aggregate.hexdigest()
+
+
 def _validate_formal_execution_envelope(config: ReviewServiceConfig) -> dict[str, str]:
     reviewer_python = config.reviewer_python.resolve(strict=True)
     if Path(sys.executable).resolve() != reviewer_python:
@@ -406,6 +491,7 @@ def _validate_formal_execution_envelope(config: ReviewServiceConfig) -> dict[str
 
     producer_revision = _require_clean_repository(config.working_directory)
     wheel_path = config.wheel_path.resolve(strict=True)
+    provenance_path = _verify_wheel_provenance(config, wheel_path)
     install = _reviewer_install_identity(reviewer_python)
     parsed_url = urlparse(install["direct_url"])
     installed_from = (
@@ -417,11 +503,18 @@ def _validate_formal_execution_envelope(config: ReviewServiceConfig) -> dict[str
     distribution_root = Path(install["distribution_root"])
     if not module_path.is_relative_to(distribution_root):
         raise RuntimeError("reviewer module is not loaded from its installed distribution")
+    installed_distribution_digest = _verify_installed_distribution_matches_wheel(
+        wheel_path,
+        distribution_root,
+    )
     return {
         "producer_repository_revision": producer_revision,
         "reviewer_module_path": str(module_path),
         "reviewer_distribution_root": str(distribution_root),
         "reviewer_install_url": install["direct_url"],
+        "reviewer_installed_distribution_digest": installed_distribution_digest,
+        "wheel_provenance_path": str(provenance_path),
+        "wheel_provenance_sha256": _sha256(provenance_path),
     }
 
 
@@ -442,8 +535,11 @@ def _initial_receipt(config: ReviewServiceConfig) -> dict[str, object]:
         "reviewer_module_path": None,
         "reviewer_distribution_root": None,
         "reviewer_install_url": None,
+        "reviewer_installed_distribution_digest": None,
         "wheel_path": str(config.wheel_path.resolve()),
         "wheel_sha256": None,
+        "wheel_provenance_path": str(_wheel_provenance_path(config.wheel_path.resolve())),
+        "wheel_provenance_sha256": None,
         "raw_manifest_path": str(config.raw_manifest.resolve()),
         "raw_manifest_sha256_before": None,
         "raw_manifest_sha256_after": None,
@@ -478,7 +574,6 @@ def _prepare_review_execution(config: ReviewServiceConfig) -> dict[str, object]:
         receipt.update(identity)
         receipt["wheel_sha256"] = _sha256(config.wheel_path)
         receipt["raw_manifest_sha256_before"] = _sha256(config.raw_manifest)
-        receipt["raw_manifest_sha256_after"] = receipt["raw_manifest_sha256_before"]
         _atomic_json(receipt_path, receipt)
         return receipt
     except BaseException as error:
@@ -588,6 +683,35 @@ def supervise_review(config: ReviewServiceConfig) -> int:
     return int(exit_code)
 
 
+def _systemd_memory_peaks(unit: str) -> tuple[int | None, int | None]:
+    try:
+        result = subprocess.run(
+            (
+                "systemctl",
+                "--user",
+                "show",
+                unit,
+                "--property=MemoryPeak",
+                "--property=MemorySwapPeak",
+            ),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None, None
+    values: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        key, separator, raw_value = line.partition("=")
+        if separator and raw_value.isdigit():
+            values[key] = int(raw_value)
+    return values.get("MemoryPeak"), values.get("MemorySwapPeak")
+
+
+def _receipt_nonnegative_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
 def finalize_review_execution(config: ReviewServiceConfig) -> None:
     """Seal the receipt from ExecStopPost, including hard cgroup/OOM termination."""
 
@@ -610,7 +734,35 @@ def finalize_review_execution(config: ReviewServiceConfig) -> None:
     receipt["systemd_service_result"] = service_result
     receipt["systemd_exit_code"] = os.environ.get("EXIT_CODE")
     receipt["systemd_exit_status"] = os.environ.get("EXIT_STATUS")
-    receipt["completed_at"] = receipt.get("completed_at") or _utc_now()
+    raw_after = _sha256(config.raw_manifest) if config.raw_manifest.is_file() else None
+    receipt["raw_manifest_sha256_after"] = raw_after
+    raw_before = receipt.get("raw_manifest_sha256_before")
+    receipt["raw_manifest_unchanged"] = raw_before is not None and raw_after == raw_before
+    if not receipt["raw_manifest_unchanged"]:
+        receipt["status"] = "failed"
+        receipt["stop_reason"] = "raw_manifest_changed"
+    memory_peak, swap_peak = _systemd_memory_peaks(config.unit)
+    receipt["aggregate_peak_rss_bytes"] = max(
+        _receipt_nonnegative_int(receipt.get("aggregate_peak_rss_bytes")), memory_peak or 0
+    )
+    receipt["aggregate_peak_swap_bytes"] = max(
+        _receipt_nonnegative_int(receipt.get("aggregate_peak_swap_bytes")), swap_peak or 0
+    )
+    service_log = config.log_directory / "service.log"
+    receipt["service_log_sha256"] = _sha256(service_log) if service_log.is_file() else None
+    receipt["progress_log_sha256"] = (
+        _sha256(config.progress_log)
+        if config.progress_log is not None and config.progress_log.is_file()
+        else None
+    )
+    completed_at = datetime.now(UTC)
+    started_at = receipt.get("started_at")
+    if isinstance(started_at, str):
+        receipt["duration_seconds"] = max(
+            0.0,
+            (completed_at - datetime.fromisoformat(started_at)).total_seconds(),
+        )
+    receipt["completed_at"] = completed_at.isoformat()
     receipt["finalized"] = True
     _atomic_json(receipt_path, receipt)
 
@@ -706,6 +858,9 @@ def _build_parser() -> argparse.ArgumentParser:
     supervise.add_argument("--config", type=Path, required=True)
     finalize = subparsers.add_parser("finalize")
     finalize.add_argument("--config", type=Path, required=True)
+    seal_wheel = subparsers.add_parser("seal-wheel")
+    seal_wheel.add_argument("--wheel-path", type=Path, required=True)
+    seal_wheel.add_argument("--reviewer-revision", required=True)
     for action in ("status", "follow", "stop"):
         command_parser = subparsers.add_parser(action)
         command_parser.add_argument("--unit", required=True)
@@ -761,6 +916,13 @@ def main() -> int:
             return 0
         finally:
             shutil.rmtree(arguments.config.parent, ignore_errors=True)
+    if arguments.action == "seal-wheel":
+        provenance_path = seal_reviewer_wheel(
+            arguments.wheel_path,
+            arguments.reviewer_revision,
+        )
+        print(provenance_path)
+        return 0
     if arguments.action == "receipt":
         print((arguments.log_dir / "review_execution.json").read_text(encoding="utf-8"), end="")
         return 0

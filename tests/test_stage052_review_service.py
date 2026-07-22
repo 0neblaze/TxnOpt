@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import zipfile
 from dataclasses import replace
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from evrptw.stage052_review_service import (
 
 
 def _config(tmp_path: Path, *, limit_bytes: int) -> ReviewServiceConfig:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     raw_manifest = tmp_path / "raw_manifest.json"
     raw_manifest.write_text(
         '{"run_label":"stage05.2_hot_path_attempt99",'
@@ -154,6 +156,11 @@ def test_exec_stop_post_finalizes_hard_oom_receipt(
         lambda _: {"producer_repository_revision": "2" * 40},
     )
     review_service._prepare_review_execution(config)
+    monkeypatch.setattr(
+        review_service,
+        "_systemd_memory_peaks",
+        lambda _: (6 * 1024**3, 512 * 1024**2),
+    )
     monkeypatch.setenv("SERVICE_RESULT", "oom-kill")
     monkeypatch.setenv("EXIT_CODE", "killed")
     monkeypatch.setenv("EXIT_STATUS", "9")
@@ -166,6 +173,36 @@ def test_exec_stop_post_finalizes_hard_oom_receipt(
     assert receipt["stop_reason"] == "systemd_memory_max"
     assert receipt["systemd_service_result"] == "oom-kill"
     assert receipt["systemd_exit_status"] == "9"
+    assert receipt["raw_manifest_unchanged"] is True
+    assert receipt["raw_manifest_sha256_after"] == receipt["raw_manifest_sha256_before"]
+    assert receipt["aggregate_peak_rss_bytes"] == 6 * 1024**3
+    assert receipt["aggregate_peak_swap_bytes"] == 512 * 1024**2
+    assert receipt["duration_seconds"] is not None
+
+
+def test_exec_stop_post_rehashes_raw_manifest_after_supervisor_is_killed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, limit_bytes=int(5.5 * 1024**3))
+    monkeypatch.setattr(
+        review_service,
+        "_validate_formal_execution_envelope",
+        lambda _: {"producer_repository_revision": "2" * 40},
+    )
+    monkeypatch.setattr(review_service, "_systemd_memory_peaks", lambda _: (None, None))
+    review_service._prepare_review_execution(config)
+    config.raw_manifest.write_text('{"tampered":true}\n', encoding="utf-8")
+    monkeypatch.setenv("SERVICE_RESULT", "oom-kill")
+
+    finalize_review_execution(config)
+
+    receipt = json.loads((config.log_directory / "review_execution.json").read_text())
+    assert receipt["status"] == "failed"
+    assert receipt["finalized"] is True
+    assert receipt["stop_reason"] == "raw_manifest_changed"
+    assert receipt["raw_manifest_unchanged"] is False
+    assert receipt["raw_manifest_sha256_after"] != receipt["raw_manifest_sha256_before"]
 
 
 def test_formal_launcher_rejects_arbitrary_command_before_systemd(tmp_path: Path) -> None:
@@ -178,3 +215,36 @@ def test_formal_launcher_rejects_arbitrary_command_before_systemd(tmp_path: Path
     assert receipt["status"] == "failed"
     assert receipt["finalized"] is True
     assert receipt["stop_reason"] == "preflight_failed"
+
+
+def test_reviewer_revision_is_bound_to_wheel_and_installed_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel = tmp_path / "reviewer.whl"
+    members = {
+        "evrptw/reviewer.py": b"REVIEWER = True\n",
+        "evrptw_reproduction-0.1.dist-info/METADATA": b"Name: evrptw-reproduction\n",
+        "evrptw_reproduction-0.1.dist-info/RECORD": b"installed record differs\n",
+    }
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+    monkeypatch.setattr(review_service, "_require_clean_repository", lambda _: "1" * 40)
+    provenance = review_service.seal_reviewer_wheel(wheel, "1" * 40)
+    config = replace(_config(tmp_path / "config", limit_bytes=1024), wheel_path=wheel)
+
+    assert review_service._verify_wheel_provenance(config, wheel) == provenance
+    install_root = tmp_path / "installed"
+    for name, content in members.items():
+        if name.endswith(".dist-info/RECORD"):
+            content = b"pip rewrote this file\n"
+        destination = install_root / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+    assert review_service._verify_installed_distribution_matches_wheel(wheel, install_root)
+
+    with wheel.open("ab") as handle:
+        handle.write(b"replacement")
+    with pytest.raises(RuntimeError, match="provenance does not match"):
+        review_service._verify_wheel_provenance(config, wheel)
