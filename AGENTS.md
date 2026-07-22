@@ -613,7 +613,10 @@ this repository or one of its subdirectories.
   transient `systemd --user` services rather than Codex desktop child
   processes. The service uses `MemoryHigh=5G`, `MemoryMax=6G`,
   `MemorySwapMax=2G`, no restart/fallback, an internal 5.5-GiB aggregate-RSS
-  stop, external progress logs, and a sealed execution receipt. Reviewer logs
+  stop, external progress logs, and an `ExecStopPost`-sealed execution receipt.
+  Formal launch rejects a dirty producer snapshot, arbitrary command, raw
+  run-label mismatch, or reviewer Python not installed from the declared frozen
+  wheel. Reviewer logs
   are operational evidence outside immutable raw bundles and do not alter the
   scientific review schema or readiness gates.
 - The registry, trusted manifest, and versioned review products are published

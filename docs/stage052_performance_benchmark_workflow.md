@@ -207,6 +207,9 @@ reviewer 自身在 aggregate RSS 达到 5.5 GiB 时先行失败。每次运行�
 `/home/oneblaze/stage052-review-logs/<run-label>/<UTC timestamp>/` 保留
 `progress.jsonl`、`service.log` 和 `review_execution.json`。这些是 operational
 evidence（运行证据），不写入 immutable raw manifest，也不改变 review gate。
+service 还必须配置 `ExecStopPost` 外部收尾器；即使 `MemoryMax` 直接终止 reviewer
+与 supervisor，收尾器仍从 systemd 的 `SERVICE_RESULT/EXIT_CODE/EXIT_STATUS` 封存
+失败回执。回执只有 `finalized=true` 才是最终状态。
 
 固定操作入口为：
 
@@ -215,9 +218,13 @@ evidence（运行证据），不写入 immutable raw manifest，也不改变 rev
 - `... stage052_review_service stop --unit <unit>`：停止完整 control group；
 - `... stage052_review_service receipt --log-dir <dir>`：读取最终执行回执。
 
-正式启动必须传入 frozen non-editable wheel、clean working directory、raw manifest
-和完整 reviewer command。reviewer command 必须包含 raw/comparison/prerequisite
-identity；launcher 自动追加外部 progress log 和 5.5-GiB 内部上限。Codex 只启动和
+正式启动必须传入 reviewer wheel 对应的完整 `--reviewer-revision`、frozen
+non-editable wheel、clean working directory、raw manifest 和完整 reviewer command。
+reviewer command 必须包含 raw/comparison/prerequisite identity，并固定通过该 wheel
+所在 venv 的 Python 使用 `-I -m evrptw.experiments.stage052_performance_review` 启动；
+launcher 会核对 installed distribution 的 `direct_url.json`、module path、wheel
+path/hash、raw run label 以及 clean producer snapshot，然后自动追加外部 progress log
+和 5.5-GiB 内部上限。Codex 只启动和
 轮询 service，不持有 reviewer 生命周期。超限、worker failure 或 service interruption
 不得自动重试；只有显式的新 review generation 才能再次运行。
 

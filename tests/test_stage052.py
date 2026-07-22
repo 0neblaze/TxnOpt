@@ -4,10 +4,10 @@ import copy
 import hashlib
 import json
 import math
+import os
 import subprocess
 import sys
 import time
-import tracemalloc
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -3119,6 +3119,26 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         replay_stage052_storage_semantics(v1),
     ]
 
+    progress_log = tmp_path / "review-progress.jsonl"
+    previous_progress = os.environ.get("STAGE052_REVIEW_PROGRESS_LOG")
+    os.environ["STAGE052_REVIEW_PROGRESS_LOG"] = str(progress_log)
+    try:
+        replay_stage052_storage_semantics_many((v1, v2))
+    finally:
+        if previous_progress is None:
+            os.environ.pop("STAGE052_REVIEW_PROGRESS_LOG", None)
+        else:
+            os.environ["STAGE052_REVIEW_PROGRESS_LOG"] = previous_progress
+    replay_starts = [
+        json.loads(line)
+        for line in progress_log.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["event"] == "storage_replay_start"
+    ]
+    worker_pids = [int(event["pid"]) for event in replay_starts]
+    assert len(worker_pids) == 2
+    assert len(set(worker_pids)) == 2
+    assert os.getpid() not in worker_pids
+
     changed_route = write(
         "artifact-storage-v2",
         "artifact_streaming",
@@ -3136,17 +3156,57 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     with pytest.raises(ArtifactIntegrityError, match="axis identity mismatch"):
         replay_stage052_storage_semantics(extra_axis)
 
+    fail_fast_progress = tmp_path / "fail-fast-progress.jsonl"
+    previous_progress = os.environ.get("STAGE052_REVIEW_PROGRESS_LOG")
+    os.environ["STAGE052_REVIEW_PROGRESS_LOG"] = str(fail_fast_progress)
+    try:
+        with pytest.raises(ArtifactIntegrityError, match="axis identity mismatch"):
+            replay_stage052_storage_semantics_many((extra_axis, v1))
+    finally:
+        if previous_progress is None:
+            os.environ.pop("STAGE052_REVIEW_PROGRESS_LOG", None)
+        else:
+            os.environ["STAGE052_REVIEW_PROGRESS_LOG"] = previous_progress
+    started_directories = [
+        json.loads(line)["raw_dir"]
+        for line in fail_fast_progress.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["event"] == "bundle_replay_start"
+    ]
+    assert started_directories == [str(extra_axis.resolve())]
+
     memory_fixture = write(
         "artifact-storage-v2",
         "artifact_streaming",
         "stage05.2_artifact_streaming_attempt89",
         repeated_event_count=20_000,
     )
-    tracemalloc.start()
-    replay_stage052_storage_semantics(memory_fixture)
-    _, peak_bytes = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    assert peak_bytes < 8 * 1024 * 1024, peak_bytes
+    replay_probe = """
+import json
+import os
+import resource
+import sys
+from pathlib import Path
+from evrptw.experiments.stage052_performance_review import replay_stage052_storage_semantics
+
+replay_stage052_storage_semantics(Path(sys.argv[1]))
+peak_rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+print(json.dumps({"pid": os.getpid(), "peak_rss_bytes": peak_rss_bytes}))
+"""
+
+    def replay_peak(path: Path) -> dict[str, int]:
+        completed = subprocess.run(
+            (sys.executable, "-c", replay_probe, str(path)),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        payload = json.loads(completed.stdout.splitlines()[-1])
+        return {key: int(value) for key, value in payload.items()}
+
+    small_peak = replay_peak(v2)
+    large_peak = replay_peak(memory_fixture)
+    assert small_peak["pid"] != large_peak["pid"]
+    assert large_peak["peak_rss_bytes"] - small_peak["peak_rss_bytes"] < 12 * 1024 * 1024
 
 
 def test_native_distance_matrix_matches_worked_euclidean_fixture() -> None:
@@ -3157,6 +3217,23 @@ def test_native_distance_matrix_matches_worked_euclidean_fixture() -> None:
         [5.0, 0.0, 5.0],
         [10.0, 5.0, 0.0],
     ]
+
+
+def test_storage_replay_aborts_executor_when_spawn_submit_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = SimpleNamespace()
+    aborted: list[object] = []
+
+    monkeypatch.setattr(stage052_review, "ProcessPoolExecutor", lambda **_: executor)
+    executor.submit = lambda *_: (_ for _ in ()).throw(RuntimeError("spawn failed"))
+    monkeypatch.setattr(stage052_review, "abort_process_executor", aborted.append)
+
+    with pytest.raises(RuntimeError, match="spawn failed"):
+        replay_stage052_storage_semantics_many((tmp_path,))
+
+    assert aborted == [executor]
 
 
 def test_storage_replay_expands_compact_v2_screening_decisions(

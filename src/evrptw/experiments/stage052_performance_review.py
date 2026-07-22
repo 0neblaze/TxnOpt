@@ -16,7 +16,7 @@ import subprocess
 import tempfile
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
 from contextlib import contextmanager
 from multiprocessing import get_context
 from pathlib import Path
@@ -729,13 +729,15 @@ def replay_stage052_storage_semantics_many(
     results: list[dict[StorageReplayIdentity, str]] = []
     for raw_dir in raw_dirs:
         _emit_review_progress("bundle_replay_start", raw_dir=str(raw_dir.resolve()))
-        executor = ProcessPoolExecutor(
-            max_workers=1,
-            mp_context=get_context("spawn"),
-            max_tasks_per_child=1,
-        )
-        future = executor.submit(replay_stage052_storage_semantics, raw_dir)
+        executor: ProcessPoolExecutor | None = None
+        future: Future[dict[StorageReplayIdentity, str]] | None = None
         try:
+            executor = ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=get_context("spawn"),
+                max_tasks_per_child=1,
+            )
+            future = executor.submit(replay_stage052_storage_semantics, raw_dir)
             results.append(future.result())
             _emit_review_progress("bundle_replay_complete", raw_dir=str(raw_dir.resolve()))
         except BaseException as error:
@@ -745,15 +747,21 @@ def replay_stage052_storage_semantics_many(
                 error_type=type(error).__name__,
                 error=str(error),
             )
-            future.cancel()
-            try:
-                abort_process_executor(executor)
-            except BaseException as abort_error:
-                raise RuntimeError(
-                    f"replay failure {type(error).__name__}: {error}; "
-                    f"process-pool abort failure {type(abort_error).__name__}: {abort_error}"
-                ) from error
+            if future is not None:
+                future.cancel()
+            if executor is not None:
+                try:
+                    abort_process_executor(executor)
+                except BaseException as abort_error:
+                    _emit_review_progress(
+                        "bundle_replay_abort_unavailable",
+                        raw_dir=str(raw_dir.resolve()),
+                        error_type=type(abort_error).__name__,
+                        error=str(abort_error),
+                    )
+                    executor.shutdown(wait=True, cancel_futures=True)
             raise
+        assert executor is not None
         executor.shutdown(wait=True)
     return results
 
