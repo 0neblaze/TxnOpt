@@ -335,8 +335,19 @@ def verify_stage052_review_prerequisite(
     except ArtifactIntegrityError as error:
         raise ValueError(str(error)) from error
     raw_manifest_path = ArtifactReader(raw_dir).result.manifest_path
-    if payload.get("raw_manifest_sha256") != _sha256(raw_manifest_path):
+    raw_manifest_sha256 = _sha256(raw_manifest_path)
+    if payload.get("raw_manifest_sha256") != raw_manifest_sha256:
         raise ValueError("prerequisite review is stale for the current raw manifest")
+    try:
+        _validated_review_retry_history(
+            raw_dir,
+            payload,
+            component=Stage052Component(expected_component),
+            scope=expected_scope,
+            raw_manifest_sha256=raw_manifest_sha256,
+        )
+    except (ArtifactIntegrityError, ValueError) as error:
+        raise ValueError(str(error)) from error
 
 
 StorageReplayIdentity = tuple[str, int, str]
@@ -1642,7 +1653,7 @@ def review_stage052(
             f"expected={sorted(expected_roles)} observed={sorted(supplied_prerequisites)}"
         )
     validate_stage052_run_label(raw_dir.name, selected)
-    review_lineage = _prior_review_manifest_hashes(raw_dir)
+    review_lineage, review_retry_history = _prior_review_manifest_history(raw_dir)
     reader = ArtifactReader(raw_dir)
     manifest = reader.manifest
     artifact_types = {
@@ -1877,6 +1888,7 @@ def review_stage052(
         "status": status,
         "raw_manifest_sha256": _sha256(reader.result.manifest_path),
         "review_manifest_lineage_sha256": review_lineage,
+        "review_retry_history_sha256": review_retry_history,
         "gates": gates,
     }
     _bind_persistence_attribution_review(
@@ -2007,7 +2019,7 @@ def _review_accelerator_pilot_v2(
 
     contract = stage052_contract(Stage052Component.ACCELERATOR_PILOT, scope)
     requirement = contract.prerequisites[0]
-    review_lineage = _prior_review_manifest_hashes(raw_dir)
+    review_lineage, review_retry_history = _prior_review_manifest_history(raw_dir)
     gates: dict[str, dict[str, object]] = {}
     artifact_types = {
         str(item.get("artifact_type"))
@@ -2123,6 +2135,7 @@ def _review_accelerator_pilot_v2(
         "status": status,
         "raw_manifest_sha256": _sha256(reader.result.manifest_path),
         "review_manifest_lineage_sha256": review_lineage,
+        "review_retry_history_sha256": review_retry_history,
         "accelerator_decision": audited.get("decision") if passed and audited else "NOT_READY",
         "selected_backend": selected_backend if passed else None,
         "selected_exact_backend": "cpu_batch" if passed else None,
@@ -2153,7 +2166,7 @@ def _review_accelerator_metal_pilot(
     """Replay complete or explicit partial Metal pilot evidence."""
 
     contract = stage052_contract(Stage052Component.ACCELERATOR_PILOT, scope)
-    review_lineage = _prior_review_manifest_hashes(raw_dir)
+    review_lineage, review_retry_history = _prior_review_manifest_history(raw_dir)
     gates: dict[str, dict[str, object]] = {}
     artifacts = [item for item in reader.manifest.get("artifacts", []) if isinstance(item, dict)]
     artifact_types = [str(item.get("artifact_type", "")) for item in artifacts]
@@ -2354,6 +2367,7 @@ def _review_accelerator_metal_pilot(
         "status": status,
         "raw_manifest_sha256": _sha256(reader.result.manifest_path),
         "review_manifest_lineage_sha256": review_lineage,
+        "review_retry_history_sha256": review_retry_history,
         "accelerator_decision": decision,
         "selected_backend": selected_backend,
         "selected_exact_backend": "cpu_batch" if passed else None,
@@ -2452,7 +2466,7 @@ def _review_accelerator_decision_only(
 
     del benchmark_dir
     contract = stage052_contract(Stage052Component.ACCELERATOR_PILOT, scope)
-    review_lineage = _prior_review_manifest_hashes(raw_dir)
+    review_lineage, review_retry_history = _prior_review_manifest_history(raw_dir)
     gates: dict[str, dict[str, object]] = {}
     artifacts = [item for item in reader.manifest.get("artifacts", []) if isinstance(item, dict)]
     artifact_types = [str(item.get("artifact_type", "")) for item in artifacts]
@@ -2647,6 +2661,7 @@ def _review_accelerator_decision_only(
         "status": status,
         "raw_manifest_sha256": _sha256(reader.result.manifest_path),
         "review_manifest_lineage_sha256": review_lineage,
+        "review_retry_history_sha256": review_retry_history,
         "accelerator_decision": "GPU_NOT_JUSTIFIED" if passed else "NOT_READY",
         "selected_backend": "native_cpu" if passed else None,
         "selected_exact_backend": "cpu_batch" if passed else None,
@@ -5137,12 +5152,79 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _prior_review_manifest_hashes(raw_dir: Path) -> list[str]:
-    """Preserve accepted review identity while publishing a stronger re-review."""
+def _validated_review_retry_history(
+    raw_dir: Path,
+    payload: Mapping[str, object],
+    *,
+    component: Stage052Component,
+    scope: str,
+    raw_manifest_sha256: str,
+) -> list[str]:
+    raw_history = payload.get("review_retry_history_sha256", [])
+    if not isinstance(raw_history, list) or any(
+        not isinstance(item, str)
+        or len(item) != 64
+        or any(character not in "0123456789abcdef" for character in item)
+        for item in raw_history
+    ):
+        raise ArtifactIntegrityError("prior Stage 5.2 review retry history is invalid")
+    history = [str(item) for item in raw_history]
+    if len(history) != len(set(history)):
+        raise ArtifactIntegrityError("prior Stage 5.2 review retry history is duplicated")
+    for manifest_sha256 in history:
+        archive_dir = raw_dir / "review" / "history" / manifest_sha256
+        manifest_path = archive_dir / "review_manifest.json"
+        try:
+            manifest_bytes = manifest_path.read_bytes()
+            archived = json.loads(manifest_bytes)
+        except (OSError, json.JSONDecodeError) as error:
+            raise ArtifactIntegrityError(
+                "cannot read prior Stage 5.2 failed-review archive"
+            ) from error
+        if (
+            not isinstance(archived, Mapping)
+            or hashlib.sha256(manifest_bytes).hexdigest() != manifest_sha256
+            or archived.get("schema_version") != STAGE052_REVIEW_SCHEMA_VERSION
+            or archived.get("run_label") != raw_dir.name
+            or archived.get("component") != component.value
+            or archived.get("scope") != scope
+            or archived.get("status") != NOT_READY
+            or archived.get("raw_manifest_sha256") != raw_manifest_sha256
+        ):
+            raise ArtifactIntegrityError("prior Stage 5.2 failed-review archive is invalid")
+        gates = archived.get("gates")
+        files = archived.get("files")
+        if (
+            not isinstance(gates, Mapping)
+            or not gates
+            or all(
+                isinstance(gate, Mapping) and gate.get("passed") is True
+                for gate in gates.values()
+            )
+            or not isinstance(files, Mapping)
+        ):
+            raise ArtifactIntegrityError("prior Stage 5.2 failed-review archive is invalid")
+        expected_files = {"review_manifest.json", *(str(name) for name in files)}
+        observed_files = {
+            path.relative_to(archive_dir).as_posix()
+            for path in archive_dir.rglob("*")
+            if path.is_file() and not path.name.startswith("._")
+        }
+        if observed_files != expected_files or any(
+            not (archive_dir / str(name)).is_file()
+            or _sha256(archive_dir / str(name)) != str(checksum)
+            for name, checksum in files.items()
+        ):
+            raise ArtifactIntegrityError("prior Stage 5.2 failed-review files are invalid")
+    return history
+
+
+def _prior_review_manifest_history(raw_dir: Path) -> tuple[list[str], list[str]]:
+    """Archive an accepted predecessor or explicit failed-review retry history."""
 
     path = raw_dir / "review" / "review_manifest.json"
     if not path.is_file():
-        return []
+        return [], []
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -5166,32 +5248,44 @@ def _prior_review_manifest_hashes(raw_dir: Path) -> list[str]:
         "run_label": raw_dir.name,
         "component": component.value,
         "scope": scope,
-        "status": contract.next_status,
     }
     if any(payload.get(field) != expected for field, expected in expected_identity.items()):
-        raise ArtifactIntegrityError("only an accepted prior Stage 5.2 review may be superseded")
+        raise ArtifactIntegrityError("prior Stage 5.2 review identity is invalid")
     gates = payload.get("gates")
-    if (
-        not isinstance(gates, Mapping)
-        or not gates
-        or any(
-            not isinstance(gate, Mapping) or gate.get("passed") is not True
-            for gate in gates.values()
-        )
+    if not isinstance(gates, Mapping) or not gates or any(
+        not isinstance(gate, Mapping) for gate in gates.values()
     ):
-        raise ArtifactIntegrityError("prior Stage 5.2 review gates are not accepted")
+        raise ArtifactIntegrityError("prior Stage 5.2 review gates are invalid")
+    accepted = payload.get("status") == contract.next_status and all(
+        gate.get("passed") is True for gate in gates.values() if isinstance(gate, Mapping)
+    )
+    failed = payload.get("status") == NOT_READY and any(
+        gate.get("passed") is not True for gate in gates.values() if isinstance(gate, Mapping)
+    )
+    if not accepted and not failed:
+        raise ArtifactIntegrityError(
+            "prior Stage 5.2 review is neither accepted nor an explicit failed review"
+        )
     verify_stage052_review_files(raw_dir, payload)
     current_raw_sha256 = _sha256(ArtifactReader(raw_dir).result.manifest_path)
     prior_raw_sha256 = payload.get("raw_manifest_sha256")
     if prior_raw_sha256 is not None and prior_raw_sha256 != current_raw_sha256:
         raise ArtifactIntegrityError("prior Stage 5.2 review is stale for the current raw manifest")
-    return [
-        _archive_prior_review_generation(
-            raw_dir,
-            manifest_path=path,
-            manifest_payload=payload,
-        )
-    ]
+    retry_history = _validated_review_retry_history(
+        raw_dir,
+        payload,
+        component=component,
+        scope=scope,
+        raw_manifest_sha256=current_raw_sha256,
+    )
+    archived = _archive_prior_review_generation(
+        raw_dir,
+        manifest_path=path,
+        manifest_payload=payload,
+    )
+    if accepted:
+        return [archived], retry_history
+    return [], [*retry_history, archived]
 
 
 def _review_lineage_archive_matches(

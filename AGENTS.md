@@ -646,6 +646,11 @@ this repository or one of its subdirectories.
   field may differ from the historical producer identity, while CPU, GPU,
   Windows, WSL, mount, NVMe, wheel, Python, native, and dependency identities
   remain exact hard gates.
+  A published `NOT_READY` review caused by reviewer/runtime defects must be
+  archived byte-for-byte under `review/history/<manifest-sha256>/` before an
+  explicit retry. Its hash belongs in `review_retry_history_sha256`, not the
+  accepted-review lineage; every retry archive remains a prerequisite-time
+  manifest/raw/file-hash gate and may never be deleted or silently replaced.
 - The registry, trusted manifest, and versioned review products are published
   only after G02 raw replay reports `READY_FOR_STAGE05_3`. Publication is a
   generation transaction whose trusted manifest is replaced last; no producer,

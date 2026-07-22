@@ -52,7 +52,7 @@ from evrptw.experiments.stage052_performance_review import (
     _audit_native_execution,
     _bind_persistence_attribution_review,
     _prerequisite_binding_matches,
-    _prior_review_manifest_hashes,
+    _prior_review_manifest_history,
     _recompute_native_occupancies,
     _validate_native_shard_manifest_scope,
     _validate_stage052_staging_root_identity,
@@ -1893,21 +1893,8 @@ def test_stage052_review_prerequisite_verifies_identity_status_and_files(
         )
 
 
-@pytest.mark.parametrize(
-    ("attempt", "status", "lineage", "message"),
-    (
-        (91, "NOT_READY", None, "accepted prior"),
-        (92, "READY_FOR_STAGE052_ARTIFACT_STREAMING", ["b" * 64], "already has lineage"),
-    ),
-)
-def test_review_lineage_rejects_failed_or_self_declared_prior_hashes(
-    tmp_path: Path,
-    attempt: int,
-    status: str,
-    lineage: list[str] | None,
-    message: str,
-) -> None:
-    run_label = f"stage05.2_hot_path_attempt{attempt:02d}"
+def test_review_lineage_rejects_self_declared_prior_hashes(tmp_path: Path) -> None:
+    run_label = "stage05.2_hot_path_attempt92"
     raw_dir = tmp_path / run_label
     ArtifactBundleWriter(
         raw_dir,
@@ -1925,22 +1912,91 @@ def test_review_lineage_rejects_failed_or_self_declared_prior_hashes(
         "run_label": run_label,
         "component": "hot_path",
         "scope": "performance",
-        "status": status,
+        "status": "READY_FOR_STAGE052_ARTIFACT_STREAMING",
         "gates": {"all": {"passed": True}},
         "files": {
             report.name: hashlib.sha256(report.read_bytes()).hexdigest(),
             findings.name: hashlib.sha256(findings.read_bytes()).hexdigest(),
         },
     }
-    if lineage is not None:
-        payload["review_manifest_lineage_sha256"] = lineage
+    payload["review_manifest_lineage_sha256"] = ["b" * 64]
     (review_dir / "review_manifest.json").write_text(
         json.dumps(payload),
         encoding="utf-8",
     )
 
-    with pytest.raises(ArtifactIntegrityError, match=message):
-        _prior_review_manifest_hashes(raw_dir)
+    with pytest.raises(ArtifactIntegrityError, match="already has lineage"):
+        _prior_review_manifest_history(raw_dir)
+
+
+def test_failed_review_is_archived_as_explicit_retry_history(tmp_path: Path) -> None:
+    run_label = "stage05.2_hot_path_attempt91"
+    raw_dir = tmp_path / run_label
+    bundle = ArtifactBundleWriter(
+        raw_dir,
+        ArtifactRunContext("stage05.2", "hot_path", run_label),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v1"),
+    ).finalize()
+    review_dir = raw_dir / "review"
+    review_dir.mkdir()
+    report = review_dir / "review_report.md"
+    findings = review_dir / "review_findings.csv"
+    report.write_text("not ready\n", encoding="utf-8")
+    findings.write_text("gate,passed\nruntime_identity,False\n", encoding="utf-8")
+    prior_manifest = review_dir / "review_manifest.json"
+    prior_manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": "stage05.2-review-v1",
+                "run_label": run_label,
+                "component": "hot_path",
+                "scope": "performance",
+                "status": "NOT_READY",
+                "raw_manifest_sha256": hashlib.sha256(
+                    bundle.manifest_path.read_bytes()
+                ).hexdigest(),
+                "gates": {"runtime_identity": {"passed": False}},
+                "files": {
+                    report.name: hashlib.sha256(report.read_bytes()).hexdigest(),
+                    findings.name: hashlib.sha256(findings.read_bytes()).hexdigest(),
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    prior_sha256 = hashlib.sha256(prior_manifest.read_bytes()).hexdigest()
+
+    lineage, retry_history = _prior_review_manifest_history(raw_dir)
+
+    assert lineage == []
+    assert retry_history == [prior_sha256]
+    assert (review_dir / "history" / prior_sha256 / "review_manifest.json").is_file()
+
+    second = stage052_review._publish_review_generation(
+        review_dir=review_dir,
+        findings=b"gate,passed\nruntime_identity,False\n",
+        report=b"still not ready\n",
+        manifest={
+            "schema_version": "stage05.2-review-v1",
+            "run_label": run_label,
+            "component": "hot_path",
+            "scope": "performance",
+            "status": "NOT_READY",
+            "raw_manifest_sha256": hashlib.sha256(
+                bundle.manifest_path.read_bytes()
+            ).hexdigest(),
+            "review_manifest_lineage_sha256": [],
+            "review_retry_history_sha256": retry_history,
+            "gates": {"runtime_identity": {"passed": False}},
+        },
+    )
+    second_sha256 = hashlib.sha256(second["review_manifest"].read_bytes()).hexdigest()
+
+    lineage, retry_history = _prior_review_manifest_history(raw_dir)
+
+    assert lineage == []
+    assert retry_history == [prior_sha256, second_sha256]
 
 
 @pytest.mark.parametrize(
@@ -1993,7 +2049,8 @@ def test_review_generation_publish_failure_preserves_and_archives_prior_review(
         report.name: report.read_bytes(),
     }
     prior_sha256 = hashlib.sha256(prior_manifest.read_bytes()).hexdigest()
-    lineage = _prior_review_manifest_hashes(raw_dir)
+    lineage, retry_history = _prior_review_manifest_history(raw_dir)
+    assert retry_history == []
     assert lineage == [prior_sha256]
 
     original_write = stage052_review._write_fsync
@@ -2205,7 +2262,8 @@ def test_stage052_producer_prerequisite_binds_raw_and_review_identity(tmp_path: 
     assert identity.repository_revision == "a" * 40
 
     review_path = review_dir / "review_manifest.json"
-    lineage = _prior_review_manifest_hashes(raw_dir)
+    lineage, retry_history = _prior_review_manifest_history(raw_dir)
+    assert retry_history == []
     assert len(lineage) == 1
     prior_review_sha256 = lineage[0]
     stronger_review = json.loads(review_path.read_text(encoding="utf-8"))
