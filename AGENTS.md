@@ -609,6 +609,12 @@ this repository or one of its subdirectories.
   raw bundles are replayed strictly in input order, one fresh spawned process
   per bundle; the parent retains digest maps only. Field-level mismatch output
   is generated only for unequal axes through a disk-backed temporary spool.
+  The spool stores one compressed canonical record per row and expands fields
+  only while comparing; per-field database rows are forbidden because they
+  amplify disk usage and cgroup page cache. Comparison uses primary-key ordered
+  two-way merge and point-reads payloads only for unequal records; BLOB temp
+  sorts are forbidden. The mismatch CSV is streamed through temporary-file
+  hashing and publication and is never accumulated as one in-memory payload.
 - On the Windows/WSL2 formal host, long-running Stage 5.2 reviewers must run as
   transient `systemd --user` services rather than Codex desktop child
   processes. The service uses `MemoryHigh=5G`, `MemoryMax=6G`,

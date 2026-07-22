@@ -60,6 +60,7 @@ from evrptw.experiments.stage052_performance_review import (
     replay_stage052_storage_semantics_many,
     validate_per_run_scope,
     verify_stage052_review_prerequisite,
+    write_semantic_mismatches,
 )
 from evrptw.experiments.stage052_performance_review import (
     _strict_float as _review_strict_float,
@@ -2059,6 +2060,90 @@ def test_review_generation_publish_failure_preserves_and_archives_prior_review(
     assert report.read_bytes() == prior_bytes[report.name]
 
 
+def test_review_generation_streams_mismatch_file_into_publication(tmp_path: Path) -> None:
+    mismatch_source = tmp_path / "mismatches.csv"
+    mismatch_source.write_bytes(
+        b"instance,seed,axis,ordinal,field,left_digest,right_digest\n"
+        + b"c101_21,2014,fixed_work,1,event.status,left,right\n" * 10_000
+    )
+    review_dir = tmp_path / "review"
+
+    outputs = stage052_review._publish_review_generation(
+        review_dir=review_dir,
+        findings=b"gate,passed,detail\nall,True,passed\n",
+        report=b"accepted\n",
+        semantic_mismatches=mismatch_source,
+        manifest={
+            "schema_version": "stage05.2-review-v1",
+            "run_label": "stage05.2_hot_path_attempt99",
+            "component": "hot_path",
+            "scope": "performance",
+            "status": "READY_FOR_STAGE052_ARTIFACT_STREAMING",
+            "raw_manifest_sha256": "a" * 64,
+            "gates": {"all": {"passed": True}},
+        },
+    )
+
+    assert outputs["semantic_mismatches"].read_bytes() == mismatch_source.read_bytes()
+    manifest = json.loads(outputs["review_manifest"].read_text(encoding="utf-8"))
+    relative = outputs["semantic_mismatches"].relative_to(review_dir).as_posix()
+    assert manifest["files"][relative] == hashlib.sha256(mismatch_source.read_bytes()).hexdigest()
+
+
+def test_prior_review_archive_streams_published_mismatch_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_dir = tmp_path / "stage05.2_hot_path_attempt98"
+    review_dir = raw_dir / "review"
+    mismatch_source = tmp_path / "mismatches.csv"
+    mismatch_source.write_bytes(
+        b"instance,seed,axis,ordinal,field,left_digest,right_digest\n"
+        + b"c101_21,2014,fixed_work,1,event.status,left,right\n" * 20_000
+    )
+    outputs = stage052_review._publish_review_generation(
+        review_dir=review_dir,
+        findings=b"gate,passed,detail\nall,True,passed\n",
+        report=b"accepted\n",
+        semantic_mismatches=mismatch_source,
+        manifest={
+            "schema_version": "stage05.2-review-v1",
+            "run_label": raw_dir.name,
+            "component": "hot_path",
+            "scope": "performance",
+            "status": "READY_FOR_STAGE052_ARTIFACT_STREAMING",
+            "raw_manifest_sha256": "a" * 64,
+            "gates": {"all": {"passed": True}},
+        },
+    )
+    mismatch_path = outputs["semantic_mismatches"]
+    manifest_path = outputs["review_manifest"]
+    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    original_read_bytes = Path.read_bytes
+
+    def reject_mismatch_read_bytes(path: Path) -> bytes:
+        if path == mismatch_path:
+            raise AssertionError("large mismatch archive must not use Path.read_bytes()")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_mismatch_read_bytes)
+    prior_sha256 = stage052_review._archive_prior_review_generation(
+        raw_dir,
+        manifest_path=manifest_path,
+        manifest_payload=manifest_payload,
+    )
+
+    archived_mismatch = (
+        review_dir
+        / "history"
+        / prior_sha256
+        / mismatch_path.relative_to(review_dir)
+    )
+    assert archived_mismatch.read_text(encoding="utf-8") == mismatch_source.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_stage052_producer_prerequisite_binds_raw_and_review_identity(tmp_path: Path) -> None:
     run_label = "stage05.2_artifact_streaming_attempt04"
     raw_dir = tmp_path / run_label
@@ -3114,6 +3199,9 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     assert mismatch_lines[1].startswith(
         "c101_21,2014,fixed_work,2,event.propagation_status,"
     )
+    streamed_mismatches = tmp_path / "streamed-mismatches.csv"
+    write_semantic_mismatches(changed_event, (v1,), streamed_mismatches)
+    assert streamed_mismatches.read_bytes() == ("\n".join(mismatch_lines) + "\n").encode()
     ordered_replays = replay_stage052_storage_semantics_many((changed_event, v1))
     assert ordered_replays == [
         replay_stage052_storage_semantics(changed_event),
@@ -3181,6 +3269,38 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         "stage05.2_artifact_streaming_attempt89",
         repeated_event_count=20_000,
     )
+    spool_root = tmp_path / "spool-root"
+    spool_root.mkdir()
+    spool_progress = tmp_path / "spool-progress.jsonl"
+    previous_tmp = os.environ.get("STAGE052_REVIEW_TMPDIR")
+    previous_progress = os.environ.get("STAGE052_REVIEW_PROGRESS_LOG")
+    os.environ["STAGE052_REVIEW_TMPDIR"] = str(spool_root)
+    os.environ["STAGE052_REVIEW_PROGRESS_LOG"] = str(spool_progress)
+    large_mismatches = tmp_path / "large-mismatches.csv"
+    try:
+        write_semantic_mismatches(memory_fixture, (v1,), large_mismatches)
+    finally:
+        if previous_tmp is None:
+            os.environ.pop("STAGE052_REVIEW_TMPDIR", None)
+        else:
+            os.environ["STAGE052_REVIEW_TMPDIR"] = previous_tmp
+        if previous_progress is None:
+            os.environ.pop("STAGE052_REVIEW_PROGRESS_LOG", None)
+        else:
+            os.environ["STAGE052_REVIEW_PROGRESS_LOG"] = previous_progress
+    with large_mismatches.open("rb") as mismatch_handle:
+        assert sum(1 for _ in mismatch_handle) > 20_000
+    spool_sizes = [
+        int(event["spool_bytes"])
+        for event in map(
+            json.loads,
+            spool_progress.read_text(encoding="utf-8").splitlines(),
+        )
+        if event["event"] == "semantic_spool_bundle_complete"
+    ]
+    assert len(spool_sizes) == 2
+    assert max(spool_sizes) < 16 * 1024 * 1024
+    assert not any(spool_root.iterdir())
     replay_probe = """
 import json
 import os
@@ -3244,6 +3364,35 @@ def test_storage_replay_aborts_executor_when_spawn_submit_fails(
         replay_stage052_storage_semantics_many((tmp_path,))
 
     assert aborted == [executor]
+
+
+def test_semantic_spool_merge_uses_primary_key_without_temp_sort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STAGE052_REVIEW_TMPDIR", str(tmp_path))
+    with stage052_review._semantic_record_spool() as connection:
+        for bundle, digest in ((0, "left"), (1, "right")):
+            connection.execute(
+                "INSERT INTO semantic_records VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (bundle, "c101_21", 2014, "fixed_work", 0, digest, b"payload"),
+            )
+        plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT instance, seed, axis, ordinal, digest
+            FROM semantic_records
+            WHERE bundle = ?
+            ORDER BY instance, seed, axis, ordinal
+            """,
+            (0,),
+        ).fetchall()
+
+        details = " ".join(str(row[-1]) for row in plan)
+        assert "TEMP B-TREE" not in details
+        assert [key for key, _, _ in stage052_review._merge_semantic_spool_keys(connection)] == [
+            ("c101_21", 2014, "fixed_work", 0)
+        ]
 
 
 def test_storage_replay_expands_compact_v2_screening_decisions(

@@ -197,7 +197,12 @@ storage semantic replay（存储语义重放）必须在读取 canonical record�
 直接更新每个 axis 的 SHA-256；禁止构建完整的 per-axis event list（逐轴事件列表）。
 多个 raw bundle 严格按输入顺序处理，每个 bundle 使用一个新的 `spawn` 子进程，父
 进程只接收小型 digest map（摘要映射）。只有 axis digest 不一致时才执行字段级重放，
-并使用 ext4 上的临时 SQLite spool；成功或失败后都删除临时数据。
+并使用 ext4 上的临时 SQLite spool；spool 每条 canonical record 只保存一行压缩
+payload 和 digest，比较时才展开字段，禁止按每个 field 写一行造成磁盘与 cgroup
+page-cache 放大。比较使用 SQLite primary-key ordered scan（主键有序扫描）的两路
+merge，仅对 digest 不同的 record point-read payload；禁止携带 BLOB 的 temp sort。
+`semantic_mismatches.csv` 必须直接流式写临时文件，并通过流式 hash/copy 发布，禁止
+在 `StringIO` 或 `bytes` 中累积完整 mismatch 输出。成功或失败后都删除临时数据。
 
 Windows/WSL2 formal reviewer 固定通过
 `python -m evrptw.stage052_review_service launch` 启动 transient

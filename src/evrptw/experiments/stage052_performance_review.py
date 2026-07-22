@@ -15,6 +15,7 @@ import statistics
 import subprocess
 import tempfile
 import uuid
+import zlib
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ProcessPoolExecutor
 from contextlib import contextmanager
@@ -767,28 +768,27 @@ def replay_stage052_storage_semantics_many(
 
 
 @contextmanager
-def _semantic_field_digest_spool() -> Iterator[sqlite3.Connection]:
-    configured_root = os.environ.get("STAGE052_REVIEW_TMPDIR")
-    root = Path(configured_root).resolve() if configured_root else None
-    if root is not None and (not root.is_dir() or not os.access(root, os.W_OK)):
-        raise RuntimeError(f"Stage 5.2 review temporary root is not writable: {root}")
+def _semantic_record_spool() -> Iterator[sqlite3.Connection]:
+    root = _review_temporary_root()
     with tempfile.TemporaryDirectory(prefix="stage052-review-fields-", dir=root) as directory:
         connection = sqlite3.connect(Path(directory) / "semantic_fields.sqlite3")
         try:
             connection.execute("PRAGMA journal_mode=OFF")
             connection.execute("PRAGMA synchronous=OFF")
             connection.execute("PRAGMA temp_store=FILE")
+            connection.execute("PRAGMA cache_size=-8192")
+            connection.execute("PRAGMA mmap_size=0")
             connection.execute(
                 """
-                CREATE TABLE field_digests (
+                CREATE TABLE semantic_records (
                     bundle INTEGER NOT NULL,
                     instance TEXT NOT NULL,
                     seed INTEGER NOT NULL,
                     axis TEXT NOT NULL,
                     ordinal INTEGER NOT NULL,
-                    field TEXT NOT NULL,
                     digest TEXT NOT NULL,
-                    PRIMARY KEY (bundle, instance, seed, axis, ordinal, field)
+                    payload BLOB NOT NULL,
+                    PRIMARY KEY (bundle, instance, seed, axis, ordinal)
                 ) WITHOUT ROWID
                 """
             )
@@ -797,7 +797,15 @@ def _semantic_field_digest_spool() -> Iterator[sqlite3.Connection]:
             connection.close()
 
 
-def _spool_semantic_field_digests(
+def _review_temporary_root() -> Path | None:
+    configured_root = os.environ.get("STAGE052_REVIEW_TMPDIR")
+    root = Path(configured_root).resolve() if configured_root else None
+    if root is not None and (not root.is_dir() or not os.access(root, os.W_OK)):
+        raise RuntimeError(f"Stage 5.2 review temporary root is not writable: {root}")
+    return root
+
+
+def _spool_semantic_records(
     connection: sqlite3.Connection,
     *,
     bundle: int,
@@ -811,35 +819,118 @@ def _spool_semantic_field_digests(
             return
         ordinal = ordinals.get(identity, 0)
         ordinals[identity] = ordinal + 1
-        flattened: list[tuple[str, object]] = []
-        _flatten_semantic_fields(
-            record,
-            prefix=str(record.get("record", "record")),
-            output=flattened,
-        )
+        payload = _canonical_json_bytes(record)
         try:
-            connection.executemany(
-                "INSERT INTO field_digests VALUES (?, ?, ?, ?, ?, ?, ?)",
+            connection.execute(
+                "INSERT INTO semantic_records VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
-                    (
-                        bundle,
-                        identity[0],
-                        identity[1],
-                        identity[2],
-                        ordinal,
-                        field,
-                        hashlib.sha256(_canonical_json_bytes(value)).hexdigest(),
-                    )
-                    for field, value in flattened
+                    bundle,
+                    identity[0],
+                    identity[1],
+                    identity[2],
+                    ordinal,
+                    hashlib.sha256(payload).hexdigest(),
+                    zlib.compress(payload, level=1),
                 ),
             )
         except sqlite3.IntegrityError as error:
             raise ArtifactIntegrityError(
-                f"duplicate semantic field location: {identity}/{ordinal}"
+                f"duplicate semantic record location: {identity}/{ordinal}"
             ) from error
 
     _visit_stage052_storage_semantic_records(raw_dir, consume)
     connection.commit()
+    page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+    page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+    _emit_review_progress(
+        "semantic_spool_bundle_complete",
+        raw_dir=str(raw_dir.resolve()),
+        bundle=bundle,
+        record_count=sum(ordinals.values()),
+        spool_bytes=page_count * page_size,
+    )
+
+
+def _semantic_field_digests(payload: bytes | None) -> dict[str, str]:
+    if payload is None:
+        return {}
+    value = json.loads(zlib.decompress(payload))
+    if not isinstance(value, Mapping):
+        raise ArtifactIntegrityError("spooled semantic record is not an object")
+    flattened: list[tuple[str, object]] = []
+    _flatten_semantic_fields(
+        value,
+        prefix=str(value.get("record", "record")),
+        output=flattened,
+    )
+    return {
+        field: hashlib.sha256(_canonical_json_bytes(field_value)).hexdigest()
+        for field, field_value in flattened
+    }
+
+
+SemanticSpoolKey = tuple[str, int, str, int]
+
+
+def _semantic_spool_keys(
+    connection: sqlite3.Connection,
+    bundle: int,
+) -> Iterator[tuple[SemanticSpoolKey, str]]:
+    rows = connection.execute(
+        """
+        SELECT instance, seed, axis, ordinal, digest
+        FROM semantic_records
+        WHERE bundle = ?
+        ORDER BY instance, seed, axis, ordinal
+        """,
+        (bundle,),
+    )
+    for instance, seed, axis, ordinal, digest in rows:
+        yield (str(instance), int(seed), str(axis), int(ordinal)), str(digest)
+
+
+def _semantic_spool_payload(
+    connection: sqlite3.Connection,
+    bundle: int,
+    key: SemanticSpoolKey,
+) -> bytes | None:
+    row = connection.execute(
+        """
+        SELECT payload FROM semantic_records
+        WHERE bundle = ? AND instance = ? AND seed = ? AND axis = ? AND ordinal = ?
+        """,
+        (bundle, *key),
+    ).fetchone()
+    return bytes(row[0]) if row is not None else None
+
+
+def _merge_semantic_spool_keys(
+    connection: sqlite3.Connection,
+) -> Iterator[tuple[SemanticSpoolKey, bytes | None, bytes | None]]:
+    previous = iter(_semantic_spool_keys(connection, 0))
+    current = iter(_semantic_spool_keys(connection, 1))
+    left = next(previous, None)
+    right = next(current, None)
+    while left is not None or right is not None:
+        if right is None or (left is not None and left[0] < right[0]):
+            assert left is not None
+            key = left[0]
+            yield key, _semantic_spool_payload(connection, 0, key), None
+            left = next(previous, None)
+        elif left is None or right[0] < left[0]:
+            key = right[0]
+            yield key, None, _semantic_spool_payload(connection, 1, key)
+            right = next(current, None)
+        else:
+            key = left[0]
+            if left[1] != right[1]:
+                yield (
+                    key,
+                    _semantic_spool_payload(connection, 0, key),
+                    _semantic_spool_payload(connection, 1, key),
+                )
+            left = next(previous, None)
+            right = next(current, None)
 
 
 def render_semantic_mismatches(
@@ -863,8 +954,44 @@ def render_semantic_mismatches(
         lineterminator="\n",
     )
     writer.writeheader()
+    _write_semantic_mismatch_rows(writer, raw_dir, comparison_dirs)
+    return output.getvalue().encode("utf-8")
+
+
+def write_semantic_mismatches(
+    raw_dir: Path,
+    comparison_dirs: Sequence[Path],
+    output_path: Path,
+) -> None:
+    """Stream field-addressable differences to a fsynced CSV outside Python memory."""
+
+    with output_path.open("x", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(
+            output,
+            fieldnames=(
+                "instance",
+                "seed",
+                "axis",
+                "ordinal",
+                "field",
+                "left_digest",
+                "right_digest",
+            ),
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        _write_semantic_mismatch_rows(writer, raw_dir, comparison_dirs)
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def _write_semantic_mismatch_rows(
+    writer: csv.DictWriter[str],
+    raw_dir: Path,
+    comparison_dirs: Sequence[Path],
+) -> None:
     if not comparison_dirs:
-        return output.getvalue().encode("utf-8")
+        return
     current = replay_stage052_storage_semantics_many((raw_dir,))[0]
     for comparison_dir in comparison_dirs:
         prior = replay_stage052_storage_semantics_many((comparison_dir,))[0]
@@ -875,75 +1002,38 @@ def render_semantic_mismatches(
         }
         if not mismatched:
             continue
-        with _semantic_field_digest_spool() as connection:
-            _spool_semantic_field_digests(
+        with _semantic_record_spool() as connection:
+            _spool_semantic_records(
                 connection,
                 bundle=0,
                 raw_dir=comparison_dir,
                 identities=mismatched,
             )
-            _spool_semantic_field_digests(
+            _spool_semantic_records(
                 connection,
                 bundle=1,
                 raw_dir=raw_dir,
                 identities=mismatched,
             )
-            rows = connection.execute(
-                """
-                WITH locations AS (
-                    SELECT instance, seed, axis, ordinal, field
-                    FROM field_digests WHERE bundle = 0
-                    UNION
-                    SELECT instance, seed, axis, ordinal, field
-                    FROM field_digests WHERE bundle = 1
-                )
-                SELECT
-                    locations.instance,
-                    locations.seed,
-                    locations.axis,
-                    locations.ordinal,
-                    locations.field,
-                    COALESCE(previous.digest, '<missing>'),
-                    COALESCE(current.digest, '<missing>')
-                FROM locations
-                LEFT JOIN field_digests AS previous
-                  ON previous.bundle = 0
-                 AND previous.instance = locations.instance
-                 AND previous.seed = locations.seed
-                 AND previous.axis = locations.axis
-                 AND previous.ordinal = locations.ordinal
-                 AND previous.field = locations.field
-                LEFT JOIN field_digests AS current
-                  ON current.bundle = 1
-                 AND current.instance = locations.instance
-                 AND current.seed = locations.seed
-                 AND current.axis = locations.axis
-                 AND current.ordinal = locations.ordinal
-                 AND current.field = locations.field
-                WHERE previous.digest IS NULL
-                   OR current.digest IS NULL
-                   OR previous.digest != current.digest
-                ORDER BY
-                    locations.instance,
-                    locations.seed,
-                    locations.axis,
-                    locations.ordinal,
-                    locations.field
-                """
-            )
-            for instance, seed, axis, ordinal, field, left, right in rows:
-                writer.writerow(
-                    {
-                        "instance": instance,
-                        "seed": seed,
-                        "axis": axis,
-                        "ordinal": ordinal,
-                        "field": field,
-                        "left_digest": left,
-                        "right_digest": right,
-                    }
-                )
-    return output.getvalue().encode("utf-8")
+            for key, left_payload, right_payload in _merge_semantic_spool_keys(connection):
+                instance, seed, axis, ordinal = key
+                left_fields = _semantic_field_digests(left_payload)
+                right_fields = _semantic_field_digests(right_payload)
+                for field in sorted(set(left_fields) | set(right_fields)):
+                    left = left_fields.get(field, "<missing>")
+                    right = right_fields.get(field, "<missing>")
+                    if left != right:
+                        writer.writerow(
+                            {
+                                "instance": instance,
+                                "seed": seed,
+                                "axis": axis,
+                                "ordinal": ordinal,
+                                "field": field,
+                                "left_digest": left,
+                                "right_digest": right,
+                            }
+                        )
 
 
 def _flatten_semantic_fields(
@@ -1098,7 +1188,41 @@ def _write_fsync(path: Path, payload: bytes) -> None:
         os.fsync(handle.fileno())
 
 
+def _copy_fsync(path: Path, source: Path) -> None:
+    with source.open("rb") as input_handle, path.open("xb") as output_handle:
+        shutil.copyfileobj(input_handle, output_handle, length=1024 * 1024)
+        output_handle.flush()
+        os.fsync(output_handle.fileno())
+
+
+def _update_digest_from_source(
+    hasher: Any,
+    source: bytes | Path,
+) -> None:
+    if isinstance(source, bytes):
+        hasher.update(source)
+        return
+    with source.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(block)
+
+
+def _source_sha256(source: bytes | Path) -> str:
+    if isinstance(source, bytes):
+        return hashlib.sha256(source).hexdigest()
+    return _sha256(source)
+
+
+def _source_matches(path: Path, source: bytes | Path, expected_sha256: str) -> bool:
+    expected_size = len(source) if isinstance(source, bytes) else source.stat().st_size
+    return path.stat().st_size == expected_size and _sha256(path) == expected_sha256
+
+
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        # Windows does not permit opening a directory with the POSIX flags used
+        # for directory fsync. File handles are still flushed before replace.
+        return
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
@@ -1111,7 +1235,7 @@ def _publish_review_generation(
     review_dir: Path,
     findings: bytes,
     report: bytes,
-    semantic_mismatches: bytes = (
+    semantic_mismatches: bytes | Path = (
         b"instance,seed,axis,ordinal,field,left_digest,right_digest\n"
     ),
     manifest: Mapping[str, object],
@@ -1120,9 +1244,14 @@ def _publish_review_generation(
 
     _emit_review_progress("review_publication_start", review_dir=str(review_dir.resolve()))
     review_dir.mkdir(parents=True, exist_ok=True)
-    generation_id = hashlib.sha256(
-        findings + b"\0" + report + b"\0" + semantic_mismatches
-    ).hexdigest()
+    generation_hasher = hashlib.sha256()
+    generation_hasher.update(findings)
+    generation_hasher.update(b"\0")
+    generation_hasher.update(report)
+    generation_hasher.update(b"\0")
+    _update_digest_from_source(generation_hasher, semantic_mismatches)
+    generation_id = generation_hasher.hexdigest()
+    mismatches_sha256 = _source_sha256(semantic_mismatches)
     generations_dir = review_dir / "generations"
     generations_dir.mkdir(exist_ok=True)
     generation_dir = generations_dir / generation_id
@@ -1138,7 +1267,11 @@ def _publish_review_generation(
             or not report_path.is_file()
             or report_path.read_bytes() != report
             or not mismatches_path.is_file()
-            or mismatches_path.read_bytes() != semantic_mismatches
+            or not _source_matches(
+                mismatches_path,
+                semantic_mismatches,
+                mismatches_sha256,
+            )
             or {path.name for path in generation_dir.iterdir() if not path.name.startswith("._")}
             != {"review_findings.csv", "review_report.md", "semantic_mismatches.csv"}
         ):
@@ -1148,7 +1281,10 @@ def _publish_review_generation(
         try:
             _write_fsync(temporary_generation / findings_path.name, findings)
             _write_fsync(temporary_generation / report_path.name, report)
-            _write_fsync(temporary_generation / mismatches_path.name, semantic_mismatches)
+            if isinstance(semantic_mismatches, bytes):
+                _write_fsync(temporary_generation / mismatches_path.name, semantic_mismatches)
+            else:
+                _copy_fsync(temporary_generation / mismatches_path.name, semantic_mismatches)
             _fsync_directory(temporary_generation)
             os.replace(temporary_generation, generation_dir)
             _fsync_directory(generations_dir)
@@ -1160,9 +1296,7 @@ def _publish_review_generation(
     manifest_payload["files"] = {
         findings_path.relative_to(review_dir).as_posix(): hashlib.sha256(findings).hexdigest(),
         report_path.relative_to(review_dir).as_posix(): hashlib.sha256(report).hexdigest(),
-        mismatches_path.relative_to(review_dir).as_posix(): hashlib.sha256(
-            semantic_mismatches
-        ).hexdigest(),
+        mismatches_path.relative_to(review_dir).as_posix(): mismatches_sha256,
     }
     manifest_bytes = (json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     manifest_path = review_dir / "review_manifest.json"
@@ -1197,9 +1331,9 @@ def _archive_prior_review_generation(
 
     prior_sha256 = _sha256(manifest_path)
     verified_files = verify_stage052_review_files(raw_dir, manifest_payload)
-    archived_payloads = {
+    archive_sources: dict[str, bytes | Path] = {
         "review_manifest.json": manifest_path.read_bytes(),
-        **{relative: path.read_bytes() for relative, path in verified_files.items()},
+        **verified_files,
     }
     history_dir = raw_dir / "review" / "history"
     history_dir.mkdir(exist_ok=True)
@@ -1212,10 +1346,14 @@ def _archive_prior_review_generation(
                 for path in archive_dir.rglob("*")
                 if path.is_file() and not path.name.startswith("._")
             }
-            != set(archived_payloads)
+            != set(archive_sources)
             or any(
-                (archive_dir / name).read_bytes() != payload
-                for name, payload in archived_payloads.items()
+                not _source_matches(
+                    archive_dir / name,
+                    source,
+                    _source_sha256(source),
+                )
+                for name, source in archive_sources.items()
             )
         ):
             raise ArtifactIntegrityError("prior review archive identity collision")
@@ -1223,9 +1361,12 @@ def _archive_prior_review_generation(
     temporary = history_dir / f".{prior_sha256}.{uuid.uuid4().hex}.tmp"
     temporary.mkdir()
     try:
-        for name, payload in archived_payloads.items():
+        for name, source in archive_sources.items():
             (temporary / name).parent.mkdir(parents=True, exist_ok=True)
-            _write_fsync(temporary / name, payload)
+            if isinstance(source, bytes):
+                _write_fsync(temporary / name, source)
+            else:
+                _copy_fsync(temporary / name, source)
         _fsync_directory(temporary)
         os.replace(temporary, archive_dir)
         _fsync_directory(history_dir)
@@ -1571,13 +1712,23 @@ def review_stage052(
     semantic_comparisons = comparison_dirs
     if selected is Stage052Component.ARTIFACT_STREAMING and not semantic_comparisons:
         semantic_comparisons = (supplied_prerequisites["hot_path_predecessor"],)
-    return _publish_review_generation(
-        review_dir=review_dir,
-        findings=_render_review_findings(gates),
-        report=_render_review_report(run_label=raw_dir.name, status=status, gates=gates),
-        semantic_mismatches=render_semantic_mismatches(raw_dir, semantic_comparisons),
-        manifest=review_manifest,
-    )
+    with tempfile.TemporaryDirectory(
+        prefix="stage052-review-output-",
+        dir=_review_temporary_root(),
+    ) as temporary_output:
+        semantic_mismatches_path = Path(temporary_output) / "semantic_mismatches.csv"
+        write_semantic_mismatches(
+            raw_dir,
+            semantic_comparisons,
+            semantic_mismatches_path,
+        )
+        return _publish_review_generation(
+            review_dir=review_dir,
+            findings=_render_review_findings(gates),
+            report=_render_review_report(run_label=raw_dir.name, status=status, gates=gates),
+            semantic_mismatches=semantic_mismatches_path,
+            manifest=review_manifest,
+        )
 
 
 def _audit_cuda_runtime_identity(runtime: Mapping[str, object]) -> tuple[bool, str]:
@@ -4680,7 +4831,11 @@ def _replace_event_route_ids(
 
 
 def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _prior_review_manifest_hashes(raw_dir: Path) -> list[str]:

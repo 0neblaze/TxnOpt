@@ -835,7 +835,15 @@ def verify_stage052_runtime_identity(
 
 
 def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    _update_digest_from_path(digest, path)
+    return digest.hexdigest()
+
+
+def _update_digest_from_path(digest: Any, path: Path) -> None:
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
 
 
 def stage052_storage_root_binding(
@@ -1013,21 +1021,22 @@ def verify_stage052_review_files(
             item = campaign_publication_files[key]
             assert isinstance(item, Mapping)
             relative_path = str(item["relative_path"])
-            digest.update(key.encode("utf-8") + b"\0" + verified[relative_path].read_bytes())
+            digest.update(key.encode("utf-8") + b"\0")
+            _update_digest_from_path(digest, verified[relative_path])
         generation = next(iter(Path(path).parts[1] for path in verified))
         if digest.hexdigest() != generation:
             raise ArtifactIntegrityError("campaign review generation digest does not replay")
     elif parsed:
         by_name = {path.name: verified[path.as_posix()] for path in parsed}
         generation = parsed[0].parts[1]
-        digest_input = (
-            by_name["review_findings.csv"].read_bytes()
-            + b"\0"
-            + by_name["review_report.md"].read_bytes()
-        )
+        digest = hashlib.sha256()
+        _update_digest_from_path(digest, by_name["review_findings.csv"])
+        digest.update(b"\0")
+        _update_digest_from_path(digest, by_name["review_report.md"])
         if "semantic_mismatches.csv" in by_name:
-            digest_input += b"\0" + by_name["semantic_mismatches.csv"].read_bytes()
-        generation_digest = hashlib.sha256(digest_input).hexdigest()
+            digest.update(b"\0")
+            _update_digest_from_path(digest, by_name["semantic_mismatches.csv"])
+        generation_digest = digest.hexdigest()
         if generation_digest != generation:
             raise ArtifactIntegrityError("prerequisite review generation digest does not replay")
     return verified
