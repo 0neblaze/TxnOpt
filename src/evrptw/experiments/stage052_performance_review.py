@@ -781,14 +781,13 @@ def _semantic_record_spool() -> Iterator[sqlite3.Connection]:
             connection.execute(
                 """
                 CREATE TABLE semantic_records (
-                    bundle INTEGER NOT NULL,
                     instance TEXT NOT NULL,
                     seed INTEGER NOT NULL,
                     axis TEXT NOT NULL,
                     ordinal INTEGER NOT NULL,
                     digest TEXT NOT NULL,
                     payload BLOB NOT NULL,
-                    PRIMARY KEY (bundle, instance, seed, axis, ordinal)
+                    PRIMARY KEY (instance, seed, axis, ordinal)
                 ) WITHOUT ROWID
                 """
             )
@@ -808,7 +807,6 @@ def _review_temporary_root() -> Path | None:
 def _spool_semantic_records(
     connection: sqlite3.Connection,
     *,
-    bundle: int,
     raw_dir: Path,
     identities: set[StorageReplayIdentity],
 ) -> None:
@@ -822,9 +820,8 @@ def _spool_semantic_records(
         payload = _canonical_json_bytes(record)
         try:
             connection.execute(
-                "INSERT INTO semantic_records VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO semantic_records VALUES (?, ?, ?, ?, ?, ?)",
                 (
-                    bundle,
                     identity[0],
                     identity[1],
                     identity[2],
@@ -845,7 +842,7 @@ def _spool_semantic_records(
     _emit_review_progress(
         "semantic_spool_bundle_complete",
         raw_dir=str(raw_dir.resolve()),
-        bundle=bundle,
+        bundle="comparison",
         record_count=sum(ordinals.values()),
         spool_bytes=page_count * page_size,
     )
@@ -874,16 +871,13 @@ SemanticSpoolKey = tuple[str, int, str, int]
 
 def _semantic_spool_keys(
     connection: sqlite3.Connection,
-    bundle: int,
 ) -> Iterator[tuple[SemanticSpoolKey, str]]:
     rows = connection.execute(
         """
         SELECT instance, seed, axis, ordinal, digest
         FROM semantic_records
-        WHERE bundle = ?
         ORDER BY instance, seed, axis, ordinal
-        """,
-        (bundle,),
+        """
     )
     for instance, seed, axis, ordinal, digest in rows:
         yield (str(instance), int(seed), str(axis), int(ordinal)), str(digest)
@@ -891,46 +885,148 @@ def _semantic_spool_keys(
 
 def _semantic_spool_payload(
     connection: sqlite3.Connection,
-    bundle: int,
     key: SemanticSpoolKey,
-) -> bytes | None:
+) -> tuple[str, bytes] | None:
     row = connection.execute(
         """
-        SELECT payload FROM semantic_records
-        WHERE bundle = ? AND instance = ? AND seed = ? AND axis = ? AND ordinal = ?
+        SELECT digest, payload FROM semantic_records
+        WHERE instance = ? AND seed = ? AND axis = ? AND ordinal = ?
         """,
-        (bundle, *key),
+        key,
     ).fetchone()
-    return bytes(row[0]) if row is not None else None
+    return (str(row[0]), bytes(row[1])) if row is not None else None
 
 
-def _merge_semantic_spool_keys(
+def _delete_semantic_spool_record(
     connection: sqlite3.Connection,
-) -> Iterator[tuple[SemanticSpoolKey, bytes | None, bytes | None]]:
-    previous = iter(_semantic_spool_keys(connection, 0))
-    current = iter(_semantic_spool_keys(connection, 1))
-    left = next(previous, None)
-    right = next(current, None)
-    while left is not None or right is not None:
-        if right is None or (left is not None and left[0] < right[0]):
-            assert left is not None
-            key = left[0]
-            yield key, _semantic_spool_payload(connection, 0, key), None
-            left = next(previous, None)
-        elif left is None or right[0] < left[0]:
-            key = right[0]
-            yield key, None, _semantic_spool_payload(connection, 1, key)
-            right = next(current, None)
-        else:
-            key = left[0]
-            if left[1] != right[1]:
-                yield (
-                    key,
-                    _semantic_spool_payload(connection, 0, key),
-                    _semantic_spool_payload(connection, 1, key),
+    key: SemanticSpoolKey,
+) -> None:
+    connection.execute(
+        """
+        DELETE FROM semantic_records
+        WHERE instance = ? AND seed = ? AND axis = ? AND ordinal = ?
+        """,
+        key,
+    )
+
+
+_SEMANTIC_MISMATCH_FIELDS = (
+    "instance",
+    "seed",
+    "axis",
+    "ordinal",
+    "field",
+    "left_digest",
+    "right_digest",
+)
+
+
+def _write_record_field_mismatches(
+    writer: csv.DictWriter[str],
+    key: SemanticSpoolKey,
+    left_payload: bytes | None,
+    right_payload: bytes | None,
+) -> None:
+    instance, seed, axis, ordinal = key
+    left_fields = _semantic_field_digests(left_payload)
+    right_fields = _semantic_field_digests(right_payload)
+    for field in sorted(set(left_fields) | set(right_fields)):
+        left = left_fields.get(field, "<missing>")
+        right = right_fields.get(field, "<missing>")
+        if left != right:
+            writer.writerow(
+                {
+                    "instance": instance,
+                    "seed": seed,
+                    "axis": axis,
+                    "ordinal": ordinal,
+                    "field": field,
+                    "left_digest": left,
+                    "right_digest": right,
+                }
+            )
+
+
+@contextmanager
+def _semantic_mismatch_fragments(
+    identities: set[StorageReplayIdentity],
+) -> Iterator[
+    tuple[
+        dict[StorageReplayIdentity, csv.DictWriter[str]],
+        dict[StorageReplayIdentity, Path],
+        dict[StorageReplayIdentity, Any],
+    ]
+]:
+    root = _review_temporary_root()
+    with tempfile.TemporaryDirectory(prefix="stage052-review-mismatches-", dir=root) as directory:
+        handles: dict[StorageReplayIdentity, Any] = {}
+        writers: dict[StorageReplayIdentity, csv.DictWriter[str]] = {}
+        paths: dict[StorageReplayIdentity, Path] = {}
+        try:
+            for index, identity in enumerate(sorted(identities)):
+                path = Path(directory) / f"{index:04d}.csv"
+                handle = path.open("x", encoding="utf-8", newline="")
+                handles[identity] = handle
+                writers[identity] = csv.DictWriter(
+                    handle,
+                    fieldnames=_SEMANTIC_MISMATCH_FIELDS,
+                    lineterminator="\n",
                 )
-            left = next(previous, None)
-            right = next(current, None)
+                paths[identity] = path
+            yield writers, paths, handles
+        finally:
+            for handle in handles.values():
+                handle.close()
+
+
+def _compare_semantic_records_against_spool(
+    connection: sqlite3.Connection,
+    *,
+    raw_dir: Path,
+    identities: set[StorageReplayIdentity],
+    writers: Mapping[StorageReplayIdentity, csv.DictWriter[str]],
+) -> None:
+    ordinals: dict[StorageReplayIdentity, int] = {}
+
+    def consume(identity: StorageReplayIdentity, record: Mapping[str, object]) -> None:
+        if identity not in identities:
+            return
+        ordinal = ordinals.get(identity, 0)
+        ordinals[identity] = ordinal + 1
+        key = (*identity, ordinal)
+        right_payload = _canonical_json_bytes(record)
+        right_digest = hashlib.sha256(right_payload).hexdigest()
+        left = _semantic_spool_payload(connection, key)
+        if left is None:
+            _write_record_field_mismatches(
+                writers[identity], key, None, zlib.compress(right_payload, level=1)
+            )
+            return
+        left_digest, left_payload = left
+        _delete_semantic_spool_record(connection, key)
+        if left_digest != right_digest:
+            _write_record_field_mismatches(
+                writers[identity],
+                key,
+                left_payload,
+                zlib.compress(right_payload, level=1),
+            )
+
+    _visit_stage052_storage_semantic_records(raw_dir, consume)
+    for key, _ in _semantic_spool_keys(connection):
+        left = _semantic_spool_payload(connection, key)
+        assert left is not None
+        _write_record_field_mismatches(writers[key[:3]], key, left[1], None)
+    connection.commit()
+    page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+    page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+    _emit_review_progress(
+        "semantic_stream_bundle_complete",
+        raw_dir=str(raw_dir.resolve()),
+        bundle="candidate",
+        record_count=sum(ordinals.values()),
+        spool_bytes=page_count * page_size,
+    )
 
 
 def render_semantic_mismatches(
@@ -942,19 +1038,11 @@ def render_semantic_mismatches(
     output = io.StringIO()
     writer = csv.DictWriter(
         output,
-        fieldnames=(
-            "instance",
-            "seed",
-            "axis",
-            "ordinal",
-            "field",
-            "left_digest",
-            "right_digest",
-        ),
+        fieldnames=_SEMANTIC_MISMATCH_FIELDS,
         lineterminator="\n",
     )
     writer.writeheader()
-    _write_semantic_mismatch_rows(writer, raw_dir, comparison_dirs)
+    _write_semantic_mismatch_rows(output, raw_dir, comparison_dirs)
     return output.getvalue().encode("utf-8")
 
 
@@ -968,25 +1056,17 @@ def write_semantic_mismatches(
     with output_path.open("x", encoding="utf-8", newline="") as output:
         writer = csv.DictWriter(
             output,
-            fieldnames=(
-                "instance",
-                "seed",
-                "axis",
-                "ordinal",
-                "field",
-                "left_digest",
-                "right_digest",
-            ),
+            fieldnames=_SEMANTIC_MISMATCH_FIELDS,
             lineterminator="\n",
         )
         writer.writeheader()
-        _write_semantic_mismatch_rows(writer, raw_dir, comparison_dirs)
+        _write_semantic_mismatch_rows(output, raw_dir, comparison_dirs)
         output.flush()
         os.fsync(output.fileno())
 
 
 def _write_semantic_mismatch_rows(
-    writer: csv.DictWriter[str],
+    output: Any,
     raw_dir: Path,
     comparison_dirs: Sequence[Path],
 ) -> None:
@@ -1005,35 +1085,21 @@ def _write_semantic_mismatch_rows(
         with _semantic_record_spool() as connection:
             _spool_semantic_records(
                 connection,
-                bundle=0,
                 raw_dir=comparison_dir,
                 identities=mismatched,
             )
-            _spool_semantic_records(
-                connection,
-                bundle=1,
-                raw_dir=raw_dir,
-                identities=mismatched,
-            )
-            for key, left_payload, right_payload in _merge_semantic_spool_keys(connection):
-                instance, seed, axis, ordinal = key
-                left_fields = _semantic_field_digests(left_payload)
-                right_fields = _semantic_field_digests(right_payload)
-                for field in sorted(set(left_fields) | set(right_fields)):
-                    left = left_fields.get(field, "<missing>")
-                    right = right_fields.get(field, "<missing>")
-                    if left != right:
-                        writer.writerow(
-                            {
-                                "instance": instance,
-                                "seed": seed,
-                                "axis": axis,
-                                "ordinal": ordinal,
-                                "field": field,
-                                "left_digest": left,
-                                "right_digest": right,
-                            }
-                        )
+            with _semantic_mismatch_fragments(mismatched) as (writers, paths, handles):
+                _compare_semantic_records_against_spool(
+                    connection,
+                    raw_dir=raw_dir,
+                    identities=mismatched,
+                    writers=writers,
+                )
+                for handle in handles.values():
+                    handle.flush()
+                for identity in sorted(mismatched):
+                    with paths[identity].open("r", encoding="utf-8", newline="") as fragment:
+                        shutil.copyfileobj(fragment, output, length=1024 * 1024)
 
 
 def _flatten_semantic_fields(

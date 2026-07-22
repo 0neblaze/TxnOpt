@@ -3298,7 +3298,16 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         )
         if event["event"] == "semantic_spool_bundle_complete"
     ]
-    assert len(spool_sizes) == 2
+    streamed_sizes = [
+        int(event["spool_bytes"])
+        for event in map(
+            json.loads,
+            spool_progress.read_text(encoding="utf-8").splitlines(),
+        )
+        if event["event"] == "semantic_stream_bundle_complete"
+    ]
+    assert len(spool_sizes) == 1
+    assert streamed_sizes == spool_sizes
     assert max(spool_sizes) < 16 * 1024 * 1024
     assert not any(spool_root.iterdir())
     replay_probe = """
@@ -3366,33 +3375,35 @@ def test_storage_replay_aborts_executor_when_spawn_submit_fails(
     assert aborted == [executor]
 
 
-def test_semantic_spool_merge_uses_primary_key_without_temp_sort(
+def test_semantic_spool_lookup_and_order_use_primary_key_without_temp_sort(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("STAGE052_REVIEW_TMPDIR", str(tmp_path))
     with stage052_review._semantic_record_spool() as connection:
-        for bundle, digest in ((0, "left"), (1, "right")):
-            connection.execute(
-                "INSERT INTO semantic_records VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (bundle, "c101_21", 2014, "fixed_work", 0, digest, b"payload"),
-            )
+        connection.execute(
+            "INSERT INTO semantic_records VALUES (?, ?, ?, ?, ?, ?)",
+            ("c101_21", 2014, "fixed_work", 0, "left", b"payload"),
+        )
         plan = connection.execute(
             """
             EXPLAIN QUERY PLAN
             SELECT instance, seed, axis, ordinal, digest
             FROM semantic_records
-            WHERE bundle = ?
             ORDER BY instance, seed, axis, ordinal
-            """,
-            (0,),
+            """
         ).fetchall()
 
         details = " ".join(str(row[-1]) for row in plan)
         assert "TEMP B-TREE" not in details
-        assert [key for key, _, _ in stage052_review._merge_semantic_spool_keys(connection)] == [
-            ("c101_21", 2014, "fixed_work", 0)
-        ]
+        key = ("c101_21", 2014, "fixed_work", 0)
+        assert list(stage052_review._semantic_spool_keys(connection)) == [(key, "left")]
+        assert stage052_review._semantic_spool_payload(connection, key) == (
+            "left",
+            b"payload",
+        )
+        stage052_review._delete_semantic_spool_record(connection, key)
+        assert list(stage052_review._semantic_spool_keys(connection)) == []
 
 
 def test_storage_replay_expands_compact_v2_screening_decisions(

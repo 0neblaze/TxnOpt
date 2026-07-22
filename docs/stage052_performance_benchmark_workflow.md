@@ -199,8 +199,10 @@ storage semantic replay（存储语义重放）必须在读取 canonical record�
 进程只接收小型 digest map（摘要映射）。只有 axis digest 不一致时才执行字段级重放，
 并使用 ext4 上的临时 SQLite spool；spool 每条 canonical record 只保存一行压缩
 payload 和 digest，比较时才展开字段，禁止按每个 field 写一行造成磁盘与 cgroup
-page-cache 放大。比较使用 SQLite primary-key ordered scan（主键有序扫描）的两路
-merge，仅对 digest 不同的 record point-read payload；禁止携带 BLOB 的 temp sort。
+page-cache 放大。spool 只保存 comparison bundle（对照证据）；candidate bundle（候选
+证据）边读边按主键 point lookup（点查询）、比较并删除已消费的对照记录，不得同时
+保存两套完整 payload。字段差异先流式写入每个 axis 的有序临时 fragment（片段），
+再按 identity 顺序拼接；禁止携带 BLOB 的 temp sort。
 `semantic_mismatches.csv` 必须直接流式写临时文件，并通过流式 hash/copy 发布，禁止
 在 `StringIO` 或 `bytes` 中累积完整 mismatch 输出。成功或失败后都删除临时数据。
 
