@@ -834,6 +834,116 @@ def verify_stage052_runtime_identity(
     return tracked
 
 
+_RUNTIME_LOCAL_ONLY_FIELDS = {
+    "native_extension",
+    "python_executable",
+    "source_repository_root",
+    "wheel_path",
+}
+
+
+def _same_producer_machine_ignoring_review_memory(
+    frozen: Mapping[str, object],
+    current: Mapping[str, object],
+) -> bool:
+    """Compare producer hardware while excluding the review-only WSL memory cap."""
+
+    return {key: value for key, value in frozen.items() if key != "memory_bytes"} == {
+        key: value for key, value in current.items() if key != "memory_bytes"
+    }
+
+
+def verify_frozen_stage052_producer_runtime_identity(
+    root: Path,
+    revision: str,
+) -> dict[str, object]:
+    """Replay a producer identity in its frozen venv, separate from reviewer code."""
+
+    identity_path = root / "configs" / "stage052_runtime_identity.local.json"
+    payload = json.loads(identity_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("Stage 5.2 runtime identity must be an object")
+    if payload.get("repository_revision") != revision:
+        raise RuntimeError("Stage 5.2 producer runtime revision does not match raw evidence")
+    if payload.get("source_repository_root") != str(root.resolve()):
+        raise RuntimeError("Stage 5.2 producer source root does not match review snapshot")
+
+    wheel = Path(str(payload.get("wheel_path", ""))).resolve()
+    native_extension = Path(str(payload.get("native_extension", ""))).resolve()
+    recorded_python = Path(str(payload.get("python_executable", ""))).resolve()
+    if not wheel.is_file() or not native_extension.is_file() or not recorded_python.is_file():
+        raise RuntimeError("Stage 5.2 frozen producer runtime files are unavailable")
+    if _sha256(wheel) != payload.get("wheel_sha256"):
+        raise RuntimeError("Stage 5.2 frozen producer wheel hash mismatch")
+    if _sha256(native_extension) != payload.get("native_extension_sha256"):
+        raise RuntimeError("Stage 5.2 frozen producer native extension hash mismatch")
+    if _sha256(recorded_python) != payload.get("python_executable_sha256"):
+        raise RuntimeError("Stage 5.2 frozen producer Python hash mismatch")
+
+    site_packages = next(
+        (parent for parent in native_extension.parents if parent.name == "site-packages"),
+        None,
+    )
+    if site_packages is None or site_packages.parent.parent.name != "lib":
+        raise RuntimeError("Stage 5.2 frozen producer venv cannot be derived")
+    producer_python = site_packages.parent.parent.parent / "bin" / "python"
+    if not producer_python.is_file() or producer_python.resolve() != recorded_python:
+        raise RuntimeError("Stage 5.2 frozen producer Python does not match its venv")
+
+    script = """
+import json
+import sys
+from pathlib import Path
+from evrptw import _core
+from evrptw.stage052_evidence import (
+    _dependency_versions,
+    _distribution_is_editable,
+    _installed_distribution_digest,
+    _stage052_machine_identity,
+)
+print(json.dumps({
+    "dependency_versions": _dependency_versions(),
+    "installed_distribution_sha256": _installed_distribution_digest(),
+    "installed_editable": _distribution_is_editable(),
+    "machine_identity": _stage052_machine_identity(),
+    "native_extension": str(Path(_core.__file__).resolve()),
+    "python_executable": str(Path(sys.executable).resolve()),
+    "python_version": sys.version.split()[0],
+}, sort_keys=True))
+"""
+    completed = subprocess.run(
+        (str(producer_python), "-I", "-c", script),
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60.0,
+    )
+    live = json.loads(completed.stdout)
+    if not isinstance(live, dict):
+        raise RuntimeError("Stage 5.2 frozen producer runtime replay is invalid")
+    for field in (
+        "dependency_versions",
+        "installed_distribution_sha256",
+        "installed_editable",
+        "native_extension",
+        "python_executable",
+        "python_version",
+    ):
+        if live.get(field) != payload.get(field):
+            raise RuntimeError(f"Stage 5.2 frozen producer {field} mismatch")
+    frozen_machine = payload.get("machine_identity")
+    live_machine = live.get("machine_identity")
+    if not isinstance(frozen_machine, Mapping) or not isinstance(live_machine, Mapping):
+        raise RuntimeError("Stage 5.2 producer machine identity is invalid")
+    if not _same_producer_machine_ignoring_review_memory(frozen_machine, live_machine):
+        raise RuntimeError("Stage 5.2 producer machine identity mismatch")
+
+    return {
+        key: value for key, value in payload.items() if key not in _RUNTIME_LOCAL_ONLY_FIELDS
+    }
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     _update_digest_from_path(digest, path)
@@ -1555,13 +1665,10 @@ def verify_stage052_evidence_input(
     if not isinstance(observed_runtime, Mapping):
         raise ArtifactIntegrityError("current-chain prerequisite has no frozen runtime identity")
     root = repository_root()
-    runtime_path = root / (
-        "configs/stage052_runtime_identity.local.json"
-    )
     try:
-        verified_runtime = verify_stage052_runtime_identity(
-            runtime_path,
-            expected_repository_revision=identity.repository_revision,
+        verified_runtime = verify_frozen_stage052_producer_runtime_identity(
+            root,
+            identity.repository_revision,
         )
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         raise ArtifactIntegrityError(

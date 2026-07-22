@@ -446,6 +446,89 @@ def test_stage052_current_chain_prerequisites_reject_historical_physical_identit
         verify_stage052_evidence_input(tmp_path, requirement)
 
 
+def test_current_chain_prerequisite_replays_frozen_producer_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirement = stage052_contract(
+        Stage052Component.JOB_PARALLEL, "performance"
+    ).prerequisites[0]
+    identity = Stage052PrerequisiteIdentity(
+        run_label="stage05.2_artifact_streaming_attempt04",
+        component="artifact_streaming",
+        status="READY_FOR_STAGE052_JOB_PARALLEL",
+        repository_revision="a" * 40,
+        configuration_sha256="b" * 64,
+        raw_manifest_sha256="c" * 64,
+        review_manifest_sha256="d" * 64,
+        scope="performance",
+    )
+    frozen_runtime = {"wheel_sha256": "e" * 64}
+    monkeypatch.setattr(
+        stage052_evidence,
+        "verify_stage052_prerequisite",
+        lambda *_args, **_kwargs: identity,
+    )
+    review_dir = tmp_path / "review"
+    review_dir.mkdir()
+    (review_dir / "review_manifest.json").write_text("{}\n", encoding="utf-8")
+    generation = f"generations/{'f' * 64}"
+    monkeypatch.setattr(
+        stage052_evidence,
+        "verify_stage052_review_files",
+        lambda *_args, **_kwargs: {
+            f"{generation}/review_report.md": tmp_path / "review_report.md",
+            f"{generation}/review_findings.csv": tmp_path / "review_findings.csv",
+            f"{generation}/semantic_mismatches.csv": tmp_path
+            / "semantic_mismatches.csv",
+        },
+    )
+
+    class CurrentReader:
+        manifest = {
+            "artifacts": [
+                {
+                    "artifact_type": "manifest_metadata",
+                    "relative_path": "control/metadata.json",
+                }
+            ]
+        }
+
+        def __init__(self, _path: Path) -> None:
+            pass
+
+        def read_json(self, _relative_path: str) -> dict[str, object]:
+            return {
+                "backend": "cpu_batch",
+                "storage_policy_version": "artifact-storage-v2",
+                "screening_schema_version": "screening_decisions_v3",
+                "runtime_identity": frozen_runtime,
+                "staging_root": {"alias": "wsl_staging"},
+            }
+
+    monkeypatch.setattr(stage052_evidence, "ArtifactReader", CurrentReader)
+    monkeypatch.setattr(stage052_evidence, "repository_root", lambda: tmp_path)
+    replayed: list[tuple[Path, str]] = []
+
+    def replay_runtime(root: Path, revision: str) -> dict[str, object]:
+        replayed.append((root, revision))
+        return frozen_runtime
+
+    monkeypatch.setattr(
+        stage052_evidence,
+        "verify_frozen_stage052_producer_runtime_identity",
+        replay_runtime,
+    )
+    monkeypatch.setattr(
+        stage052_evidence,
+        "verify_stage052_storage_root_binding",
+        lambda *_args, **_kwargs: None,
+    )
+
+    assert verify_stage052_evidence_input(tmp_path, requirement) == identity
+    assert replayed == [(tmp_path, "a" * 40)]
+
+
 def test_stage052_storage_root_binding_is_path_free_and_matches_local_locator(
     tmp_path: Path,
 ) -> None:
@@ -2846,8 +2929,8 @@ def test_review_runtime_machine_comparison_excludes_only_wsl_memory_limit() -> N
     }
     current = {**frozen, "memory_bytes": 16 * 1024**3}
 
-    assert stage052_review._same_producer_machine_ignoring_review_memory(frozen, current)
-    assert not stage052_review._same_producer_machine_ignoring_review_memory(
+    assert stage052_evidence._same_producer_machine_ignoring_review_memory(frozen, current)
+    assert not stage052_evidence._same_producer_machine_ignoring_review_memory(
         frozen,
         {**current, "logical_cpu_count": 12},
     )
