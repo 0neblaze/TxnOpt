@@ -539,13 +539,16 @@ def test_performance_reviewer_independently_reprobes_staging_volume(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "repo"
-    results = root / "results"
-    results.mkdir(parents=True)
+    staging = tmp_path / "external-staging"
+    staging.mkdir(parents=True)
     locator_path = root / "storage.local.toml"
+    root.mkdir()
+    raw_dir = staging / "stage05.2_artifact_streaming_attempt99"
+    raw_dir.mkdir()
     locator_path.write_text(
         f"""
 [roots.transfer_staging]
-absolute_path = "{results}"
+absolute_path = "{staging}"
 device_uuid = "transfer-uuid"
 filesystem = "ExFAT"
 """.strip()
@@ -561,6 +564,7 @@ filesystem = "ExFAT"
 
     passed, detail = _validate_stage052_staging_root_identity(
         metadata,
+        raw_dir=raw_dir,
         root=root,
         locator_path=locator_path,
         expected_alias="transfer_staging",
@@ -568,6 +572,7 @@ filesystem = "ExFAT"
     )
     changed, changed_detail = _validate_stage052_staging_root_identity(
         metadata,
+        raw_dir=raw_dir,
         root=root,
         locator_path=locator_path,
         expected_alias="transfer_staging",
@@ -578,6 +583,101 @@ filesystem = "ExFAT"
     assert "transfer_staging" in detail
     assert not changed
     assert "mismatch" in changed_detail
+
+
+def test_current_staging_review_rejects_wrong_path_filesystem_and_aliases(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    staging = tmp_path / "stage052-active"
+    archive = tmp_path / "archive"
+    outside = tmp_path / "outside" / "stage05.2_perf_baseline_attempt99"
+    root.mkdir()
+    staging.mkdir()
+    archive.mkdir()
+    outside.mkdir(parents=True)
+    raw_dir = staging / "stage05.2_perf_baseline_attempt99"
+    raw_dir.mkdir()
+    locator_path = root / "storage.local.toml"
+    metadata = {
+        "staging_root": stage052_storage_root_binding(
+            alias="wsl_staging",
+            volume={"device_uuid": "ext4-uuid", "filesystem": "ext4"},
+        )
+    }
+
+    def write_locator(*, filesystem: str = "ext4", extra_alias: bool = False) -> None:
+        extra_root = (
+            '[roots.usb]\nabsolute_path = "/mnt/e"\n'
+            'device_uuid = "usb"\nfilesystem = "ExFAT"'
+            if extra_alias
+            else ""
+        )
+        locator_path.write_text(
+            f"""
+[roots.wsl_staging]
+absolute_path = "{staging}"
+device_uuid = "ext4-uuid"
+filesystem = "{filesystem}"
+
+[roots.d_archive]
+absolute_path = "{archive}"
+device_uuid = "d-nvme"
+filesystem = "9p"
+{extra_root}
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def probe(_path: Path) -> VolumeIdentity:
+        return VolumeIdentity("ext4-uuid", "ext4")
+
+    write_locator()
+    passed, _ = _validate_stage052_staging_root_identity(
+        metadata,
+        raw_dir=raw_dir,
+        root=root,
+        locator_path=locator_path,
+        volume_probe=probe,
+    )
+    wrong_path, wrong_path_detail = _validate_stage052_staging_root_identity(
+        metadata,
+        raw_dir=outside,
+        root=root,
+        locator_path=locator_path,
+        volume_probe=probe,
+    )
+    write_locator(filesystem="ExFAT")
+    exfat_metadata = {
+        "staging_root": stage052_storage_root_binding(
+            alias="wsl_staging",
+            volume={"device_uuid": "ext4-uuid", "filesystem": "ExFAT"},
+        )
+    }
+    wrong_filesystem, wrong_filesystem_detail = _validate_stage052_staging_root_identity(
+        exfat_metadata,
+        raw_dir=raw_dir,
+        root=root,
+        locator_path=locator_path,
+        volume_probe=lambda _path: VolumeIdentity("ext4-uuid", "ExFAT"),
+    )
+    write_locator(extra_alias=True)
+    wrong_aliases, wrong_aliases_detail = _validate_stage052_staging_root_identity(
+        metadata,
+        raw_dir=raw_dir,
+        root=root,
+        locator_path=locator_path,
+        volume_probe=probe,
+    )
+
+    assert passed
+    assert not wrong_path
+    assert "outside" in wrong_path_detail
+    assert not wrong_filesystem
+    assert "not ext4" in wrong_filesystem_detail
+    assert not wrong_aliases
+    assert "aliases" in wrong_aliases_detail
 
 
 def test_stage052_current_chain_rejects_old_not_ready_remediation_input(

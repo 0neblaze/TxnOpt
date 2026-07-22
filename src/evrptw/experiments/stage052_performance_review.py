@@ -1168,7 +1168,9 @@ def review_stage052(
         "passed": runtime_passed,
         "detail": runtime_detail,
     }
-    staging_passed, staging_detail = _validate_stage052_staging_root_identity(metadata)
+    staging_passed, staging_detail = _validate_stage052_staging_root_identity(
+        metadata, raw_dir=raw_dir
+    )
     gates["staging_root_identity"] = {
         "passed": staging_passed,
         "detail": staging_detail,
@@ -1191,7 +1193,9 @@ def review_stage052(
         Stage052Component.NATIVE_KERNELS,
         Stage052Component.ACCELERATOR_PILOT,
     }:
-        staging_passed, staging_detail = _validate_stage052_staging_root_identity(metadata)
+        staging_passed, staging_detail = _validate_stage052_staging_root_identity(
+            metadata, raw_dir=raw_dir
+        )
         gates["staging_root_identity"] = {
             "passed": staging_passed,
             "detail": staging_detail,
@@ -1540,7 +1544,9 @@ def _review_accelerator_pilot_v2(
         "passed": runtime_passed,
         "detail": runtime_detail,
     }
-    staging_passed, staging_detail = _validate_stage052_staging_root_identity(metadata)
+    staging_passed, staging_detail = _validate_stage052_staging_root_identity(
+        metadata, raw_dir=raw_dir
+    )
     gates["staging_root_identity"] = {
         "passed": staging_passed,
         "detail": staging_detail,
@@ -1774,7 +1780,9 @@ def _review_accelerator_metal_pilot(
         "passed": runtime_identity_passed,
         "detail": runtime_identity_detail,
     }
-    staging_passed, staging_detail = _validate_stage052_staging_root_identity(metadata)
+    staging_passed, staging_detail = _validate_stage052_staging_root_identity(
+        metadata, raw_dir=raw_dir
+    )
     gates["staging_root_identity"] = {"passed": staging_passed, "detail": staging_detail}
     completeness_passed = (
         complete and reader.manifest.get("evidence_completeness") == "complete"
@@ -1930,7 +1938,9 @@ def _review_accelerator_decision_only(
         "passed": runtime_passed,
         "detail": runtime_detail,
     }
-    staging_passed, staging_detail = _validate_stage052_staging_root_identity(metadata)
+    staging_passed, staging_detail = _validate_stage052_staging_root_identity(
+        metadata, raw_dir=raw_dir
+    )
     gates["staging_root_identity"] = {
         "passed": staging_passed,
         "detail": staging_detail,
@@ -3400,12 +3410,13 @@ def _validate_stage052_source_snapshot(
 def _validate_stage052_staging_root_identity(
     metadata: Mapping[str, object],
     *,
+    raw_dir: Path,
     root: Path | None = None,
     locator_path: Path | None = None,
     expected_alias: str = "wsl_staging",
     volume_probe: Callable[[Path], VolumeIdentity] | None = None,
 ) -> tuple[bool, str]:
-    """Independently bind C--F raw evidence to the live external results volume."""
+    """Independently bind raw evidence to the configured live staging volume."""
 
     repository_root = find_repository_root() if root is None else root.resolve()
     local_locator_path = (
@@ -3421,8 +3432,16 @@ def _validate_stage052_staging_root_identity(
         )
         locator = StorageRootLocator.from_toml(local_locator_path)
         staging = locator.resolve(expected_alias)
-        if staging.absolute_path.resolve() != (repository_root / "results").resolve():
-            return False, "configured staging root is not this repository's results root"
+        staging_path = staging.absolute_path.resolve()
+        if raw_dir.resolve().parent != staging_path:
+            return False, "raw evidence directory is outside the configured staging root"
+        if expected_alias == "wsl_staging":
+            if locator.aliases != ("d_archive", "wsl_staging"):
+                return False, "current storage locator aliases are not exact"
+            if staging.volume.filesystem.casefold() != "ext4":
+                return False, "current wsl_staging filesystem is not ext4"
+            if staging_path == Path("/mnt") or Path("/mnt") in staging_path.parents:
+                return False, "current wsl_staging path is under /mnt"
         locator.verify_all(
             probe_volume_identity if volume_probe is None else volume_probe,
             (expected_alias,),
@@ -3857,7 +3876,9 @@ def validate_job_parallel_evidence_contract(
     runtime_passed, runtime_detail = _validate_stage052_runtime_identity(metadata)
     if not runtime_passed:
         return False, runtime_detail
-    staging_passed, staging_detail = _validate_stage052_staging_root_identity(metadata)
+    staging_passed, staging_detail = _validate_stage052_staging_root_identity(
+        metadata, raw_dir=raw_dir
+    )
     if not staging_passed:
         return False, staging_detail
     return True, "complete canonical D evidence contract passed"
