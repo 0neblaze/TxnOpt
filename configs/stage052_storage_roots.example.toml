@@ -1,18 +1,13 @@
 # Copy this file to stage052_storage_roots.local.toml and replace every
-# REPLACE_* value with the identity observed on the benchmark Mac.  The local
-# file is ignored because it contains machine-specific absolute paths.
+# REPLACE_* value with the identity observed in WSL2. The local file is ignored
+# because it contains machine-specific absolute paths.
 
-[roots.transfer_staging]
-absolute_path = "/Volumes/TRANSFER/FURP-2026-Yiyang-GUO-EVRP-TW/results"
-device_uuid = "REPLACE_WITH_TRANSFER_DEVICE_UUID"
-filesystem = "REPLACE_WITH_TRANSFER_FILESYSTEM"
+[roots.wsl_staging]
+absolute_path = "/home/REPLACE_USER/stage052-active"
+device_uuid = "REPLACE_WITH_WSL_EXT4_DEVICE_ID"
+filesystem = "ext4"
 
-[roots.transfer_archive]
-absolute_path = "/Volumes/TRANSFER/FURP-2026-Yiyang-GUO-EVRP-TW-results"
-device_uuid = "REPLACE_WITH_TRANSFER_DEVICE_UUID"
-filesystem = "REPLACE_WITH_TRANSFER_FILESYSTEM"
-
-[roots.internal_archive]
-absolute_path = "/Users/guoyiyang/Documents/Codex/FURP-2026-Yiyang-GUO-EVRP-TW-results"
-device_uuid = "REPLACE_WITH_INTERNAL_DEVICE_UUID"
-filesystem = "apfs"
+[roots.d_archive]
+absolute_path = "/mnt/d/FURP-2026-Yiyang-GUO-EVRP-TW-results"
+device_uuid = "REPLACE_WITH_D_NVME_IDENTITY"
+filesystem = "9p"

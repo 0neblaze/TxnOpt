@@ -7,7 +7,6 @@ import json
 import os
 import platform
 import re
-import resource
 import subprocess
 import tomllib
 from dataclasses import asdict, dataclass, replace
@@ -51,6 +50,7 @@ from evrptw.objective import (
 )
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
+from evrptw.stage052_platform import peak_rss_bytes
 from evrptw.validation import validate_routes
 
 SCHEMA_VERSION = "1"
@@ -1432,10 +1432,7 @@ def _git_dirty(root: Path) -> bool:
 
 
 def _peak_rss_bytes() -> int | None:
-    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if usage <= 0:
-        return None
-    return int(usage if platform.system() == "Darwin" else usage * 1024)
+    return peak_rss_bytes()
 
 
 def _write_manifest(directory: Path) -> None:

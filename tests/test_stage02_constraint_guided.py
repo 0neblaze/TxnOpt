@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from evrptw import _core
 from evrptw.experiments.stage02_constraint_guided_review import (
     _accepted_feasible_constraint_candidate,
     _blocking_review_findings,
@@ -123,10 +124,7 @@ large_removal_max_fraction = 0.35
 def test_review_provenance_captures_dependency_and_runtime_hashes() -> None:
     environment = {
         "captured_environment": {
-            "native_extension": str(
-                Path.cwd()
-                / ".venv/lib/python3.13/site-packages/evrptw/_core.cpython-313-darwin.so"
-            ),
+            "native_extension": str(_core.__file__),
             "packages": {"pytest": "9.1.0"},
             "python": {"version": "3.13.13", "executable": "/tmp/python"},
         }

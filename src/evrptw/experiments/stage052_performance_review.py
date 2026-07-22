@@ -11,6 +11,7 @@ import math
 import os
 import shutil
 import statistics
+import subprocess
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -53,6 +54,7 @@ from evrptw.stage052 import (
 )
 from evrptw.stage052_accelerator import (
     MetalPilotStatus,
+    audit_accelerator_pilot,
     audit_metal_pilot_result,
     campaign_execution_adapter_gate,
 )
@@ -69,6 +71,7 @@ from evrptw.stage052_evidence import (
     verify_stage052_evidence_input,
     verify_stage052_review_files,
     verify_stage052_runtime_identity,
+    verify_stage052_source_snapshot,
     verify_stage052_storage_root_binding,
 )
 from evrptw.stage052_remediation import (
@@ -322,10 +325,10 @@ def verify_stage052_review_prerequisite(
         raise ValueError("prerequisite review is stale for the current raw manifest")
 
 
-def replay_stage052_storage_semantics(
+def _replay_stage052_storage_semantic_records(
     raw_dir: Path,
-) -> dict[tuple[str, int, str], str]:
-    """Recompute storage-comparison digests from raw JSON and streamed events."""
+) -> dict[tuple[str, int, str], tuple[dict[str, object], ...]]:
+    """Recompute ordered canonical semantic records from raw storage."""
 
     reader = ArtifactReader(raw_dir)
     artifacts = [item for item in reader.manifest.get("artifacts", []) if isinstance(item, Mapping)]
@@ -336,7 +339,7 @@ def replay_stage052_storage_semantics(
         key = (str(item.get("artifact_type", "")), str(item.get("artifact_subtype", "")))
         by_directory.setdefault(directory, {})[key] = item
 
-    output: dict[tuple[str, int, str], str] = {}
+    output: dict[tuple[str, int, str], tuple[dict[str, object], ...]] = {}
     for directory, items in sorted(by_directory.items()):
         raw_ref = items.get(("raw", ""))
         solution_ref = items.get(("solution", ""))
@@ -387,7 +390,7 @@ def replay_stage052_storage_semantics(
                     f"duplicate route dictionary ID in {directory}: {route_id}"
                 )
             route_dictionary[route_id] = dict(row)
-        hashers: dict[str, Any] = {}
+        records_by_axis: dict[str, list[dict[str, object]]] = {}
         for axis, raw_axis in raw_axes.items():
             solution_axis = solution_axes.get(axis)
             if not isinstance(raw_axis, Mapping) or not isinstance(solution_axis, Mapping):
@@ -400,10 +403,8 @@ def replay_stage052_storage_semantics(
                 trace=trace,
                 axis=str(axis),
             )
-            axis_hasher = hashlib.sha256()
-            axis_hasher.update(_canonical_json_bytes(base) + b"\n")
-            hashers[str(axis)] = axis_hasher
-        event_ordinals = {axis: 0 for axis in hashers}
+            records_by_axis[str(axis)] = [base]
+        event_ordinals = {axis: 0 for axis in records_by_axis}
         event_family_counts = {
             axis: {
                 "events": 0,
@@ -411,7 +412,7 @@ def replay_stage052_storage_semantics(
                 "route_evaluations": 0,
                 "screening_decisions": 0,
             }
-            for axis in hashers
+            for axis in records_by_axis
         }
         previous_event_id = 0
         for logical_event in reader.iter_events(str(events_ref["relative_path"])):
@@ -428,8 +429,8 @@ def replay_stage052_storage_semantics(
                 ):
                     row.pop(volatile_byte_field, None)
             axis = str(row.get("benchmark_axis", ""))
-            event_hasher = hashers.get(axis)
-            if event_hasher is None:
+            axis_records = records_by_axis.get(axis)
+            if axis_records is None:
                 raise ArtifactIntegrityError(
                     f"event has unknown benchmark axis in {directory}: {axis}"
                 )
@@ -468,7 +469,7 @@ def replay_stage052_storage_semantics(
                 event_payload.get("operator"), str
             ):
                 raise ArtifactIntegrityError(f"event dictionary identity is missing in {directory}")
-            event_hasher.update(_canonical_json_bytes(event_payload) + b"\n")
+            axis_records.append(event_payload)
         trace_axes = trace.get("axes")
         if isinstance(trace_axes, Mapping):
             for axis, observed_counts in event_family_counts.items():
@@ -488,23 +489,35 @@ def replay_stage052_storage_semantics(
         ):
             lane = str(row.get("lane", ""))
             axis = lane.split(":", 1)[0]
-            diagnostic_hasher = hashers.get(axis)
-            if diagnostic_hasher is None:
+            axis_records = records_by_axis.get(axis)
+            if axis_records is None:
                 raise ArtifactIntegrityError(
                     f"diagnostic row has unknown benchmark axis in {directory}: {axis}"
                 )
             payload = dict(row)
             payload["run_label"] = "<canonical-run-label>"
-            diagnostic_hasher.update(
-                _canonical_json_bytes({"record": "diagnostic", **payload}) + b"\n"
-            )
-        for axis, axis_hasher in hashers.items():
+            axis_records.append({"record": "diagnostic", **payload})
+        for axis, axis_records in records_by_axis.items():
             identity = (instance, seed, axis)
             if identity in output:
                 raise ArtifactIntegrityError(f"duplicate storage replay identity: {identity}")
-            output[identity] = axis_hasher.hexdigest()
+            output[identity] = tuple(axis_records)
     if not output:
         raise ArtifactIntegrityError("storage replay evidence is empty")
+    return output
+
+
+def replay_stage052_storage_semantics(
+    raw_dir: Path,
+) -> dict[tuple[str, int, str], str]:
+    """Recompute storage-comparison digests from canonical semantic records."""
+
+    output: dict[tuple[str, int, str], str] = {}
+    for identity, records in _replay_stage052_storage_semantic_records(raw_dir).items():
+        hasher = hashlib.sha256()
+        for record in records:
+            hasher.update(_canonical_json_bytes(record) + b"\n")
+        output[identity] = hasher.hexdigest()
     return output
 
 
@@ -708,6 +721,101 @@ def replay_stage052_storage_semantics_many(
     return [result for result in results if result is not None]
 
 
+def render_semantic_mismatches(
+    raw_dir: Path,
+    comparison_dirs: Sequence[Path],
+) -> bytes:
+    """Return field-addressable digest differences from independent raw replay."""
+
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=(
+            "instance",
+            "seed",
+            "axis",
+            "ordinal",
+            "field",
+            "left_digest",
+            "right_digest",
+        ),
+        lineterminator="\n",
+    )
+    writer.writeheader()
+    if not comparison_dirs:
+        return output.getvalue().encode("utf-8")
+    current = _replay_stage052_storage_semantic_records(raw_dir)
+    for comparison_dir in comparison_dirs:
+        prior = _replay_stage052_storage_semantic_records(comparison_dir)
+        for identity in sorted(set(prior) | set(current)):
+            left_fields = _semantic_record_field_digests(prior.get(identity, ()))
+            right_fields = _semantic_record_field_digests(current.get(identity, ()))
+            for location in sorted(set(left_fields) | set(right_fields)):
+                left = left_fields.get(location, "<missing>")
+                right = right_fields.get(location, "<missing>")
+                if left == right:
+                    continue
+                writer.writerow(
+                    {
+                        "instance": identity[0],
+                        "seed": identity[1],
+                        "axis": identity[2],
+                        "ordinal": location[0],
+                        "field": location[1],
+                        "left_digest": left,
+                        "right_digest": right,
+                    }
+                )
+    return output.getvalue().encode("utf-8")
+
+
+def _semantic_record_field_digests(
+    records: Sequence[Mapping[str, object]],
+) -> dict[tuple[int, str], str]:
+    output: dict[tuple[int, str], str] = {}
+    for ordinal, record in enumerate(records):
+        record_type = str(record.get("record", "record"))
+        flattened: list[tuple[str, object]] = []
+        _flatten_semantic_fields(record, prefix=record_type, output=flattened)
+        for field, value in flattened:
+            key = (ordinal, field)
+            if key in output:
+                raise ArtifactIntegrityError(f"duplicate semantic field location: {key}")
+            output[key] = hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+    return output
+
+
+def _flatten_semantic_fields(
+    value: object,
+    *,
+    prefix: str,
+    output: list[tuple[str, object]],
+) -> None:
+    if isinstance(value, Mapping):
+        if not value:
+            output.append((prefix, {}))
+            return
+        for key, item in sorted(value.items(), key=lambda pair: str(pair[0])):
+            _flatten_semantic_fields(
+                item,
+                prefix=f"{prefix}.{key}",
+                output=output,
+            )
+        return
+    if isinstance(value, (list, tuple)):
+        if not value:
+            output.append((prefix, []))
+            return
+        for index, item in enumerate(value):
+            _flatten_semantic_fields(
+                item,
+                prefix=f"{prefix}[{index}]",
+                output=output,
+            )
+        return
+    output.append((prefix, value))
+
+
 def _screening_schema_version(reader: ArtifactReader) -> str | None:
     """Return a schema only when declaration and physical artifacts agree."""
 
@@ -842,17 +950,23 @@ def _publish_review_generation(
     review_dir: Path,
     findings: bytes,
     report: bytes,
+    semantic_mismatches: bytes = (
+        b"instance,seed,axis,ordinal,field,left_digest,right_digest\n"
+    ),
     manifest: Mapping[str, object],
 ) -> dict[str, Path]:
     """Publish immutable review files behind one atomic manifest pointer."""
 
     review_dir.mkdir(parents=True, exist_ok=True)
-    generation_id = hashlib.sha256(findings + b"\0" + report).hexdigest()
+    generation_id = hashlib.sha256(
+        findings + b"\0" + report + b"\0" + semantic_mismatches
+    ).hexdigest()
     generations_dir = review_dir / "generations"
     generations_dir.mkdir(exist_ok=True)
     generation_dir = generations_dir / generation_id
     findings_path = generation_dir / "review_findings.csv"
     report_path = generation_dir / "review_report.md"
+    mismatches_path = generation_dir / "semantic_mismatches.csv"
     temporary_generation = generations_dir / f".{generation_id}.{uuid.uuid4().hex}.tmp"
     if generation_dir.exists():
         if (
@@ -861,8 +975,10 @@ def _publish_review_generation(
             or findings_path.read_bytes() != findings
             or not report_path.is_file()
             or report_path.read_bytes() != report
+            or not mismatches_path.is_file()
+            or mismatches_path.read_bytes() != semantic_mismatches
             or {path.name for path in generation_dir.iterdir() if not path.name.startswith("._")}
-            != {"review_findings.csv", "review_report.md"}
+            != {"review_findings.csv", "review_report.md", "semantic_mismatches.csv"}
         ):
             raise ArtifactIntegrityError("review generation identity collision")
     else:
@@ -870,6 +986,7 @@ def _publish_review_generation(
         try:
             _write_fsync(temporary_generation / findings_path.name, findings)
             _write_fsync(temporary_generation / report_path.name, report)
+            _write_fsync(temporary_generation / mismatches_path.name, semantic_mismatches)
             _fsync_directory(temporary_generation)
             os.replace(temporary_generation, generation_dir)
             _fsync_directory(generations_dir)
@@ -881,6 +998,9 @@ def _publish_review_generation(
     manifest_payload["files"] = {
         findings_path.relative_to(review_dir).as_posix(): hashlib.sha256(findings).hexdigest(),
         report_path.relative_to(review_dir).as_posix(): hashlib.sha256(report).hexdigest(),
+        mismatches_path.relative_to(review_dir).as_posix(): hashlib.sha256(
+            semantic_mismatches
+        ).hexdigest(),
     }
     manifest_bytes = (json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     manifest_path = review_dir / "review_manifest.json"
@@ -894,6 +1014,7 @@ def _publish_review_generation(
     return {
         "review_report": report_path,
         "review_findings": findings_path,
+        "semantic_mismatches": mismatches_path,
         "review_manifest": manifest_path,
     }
 
@@ -982,6 +1103,16 @@ def review_stage052(
     }
     if (
         selected is Stage052Component.ACCELERATOR_PILOT
+        and "accelerator_pilot" in artifact_types
+    ):
+        return _review_accelerator_pilot_v2(
+            raw_dir=raw_dir,
+            reader=reader,
+            scope=scope,
+            prerequisite_dir=supplied_prerequisites[contract.prerequisites[0].role],
+        )
+    if (
+        selected is Stage052Component.ACCELERATOR_PILOT
         and "metal_pilot" in artifact_types
     ):
         return _review_accelerator_metal_pilot(
@@ -1029,6 +1160,18 @@ def review_stage052(
             == "primary_active_writes_v1",
             "detail": str(metadata.get("persistence_attribution")),
         },
+    }
+    source_passed, source_detail = _validate_stage052_source_snapshot(metadata)
+    gates["source_snapshot"] = {"passed": source_passed, "detail": source_detail}
+    runtime_passed, runtime_detail = _validate_stage052_runtime_identity(metadata)
+    gates["runtime_identity"] = {
+        "passed": runtime_passed,
+        "detail": runtime_detail,
+    }
+    staging_passed, staging_detail = _validate_stage052_staging_root_identity(metadata)
+    gates["staging_root_identity"] = {
+        "passed": staging_passed,
+        "detail": staging_detail,
     }
     if selected in {
         Stage052Component.ARTIFACT_STREAMING,
@@ -1213,11 +1356,234 @@ def review_stage052(
         review_manifest["selected_workers"] = job_parallel_selection.selected_workers
         review_manifest["performance_predecessor"] = job_parallel_selection.selected_run_label
         review_manifest["native_configuration"] = NativeKernelConfig().to_dict()
+    semantic_comparisons = comparison_dirs
+    if selected is Stage052Component.ARTIFACT_STREAMING and not semantic_comparisons:
+        semantic_comparisons = (supplied_prerequisites["hot_path_predecessor"],)
     return _publish_review_generation(
         review_dir=review_dir,
         findings=_render_review_findings(gates),
         report=_render_review_report(run_label=raw_dir.name, status=status, gates=gates),
+        semantic_mismatches=render_semantic_mismatches(raw_dir, semantic_comparisons),
         manifest=review_manifest,
+    )
+
+
+def _audit_cuda_runtime_identity(runtime: Mapping[str, object]) -> tuple[bool, str]:
+    """Recompute helper and CUDA Toolkit identity from the live registered files."""
+
+    required = {
+        "runtime": "subprocess-accelerator-helper",
+        "backend": "cuda",
+        "protocol_schema_version": "stage05.2-accelerator-helper-v2",
+        "fallback_allowed": False,
+        "production_evidence_eligible": True,
+    }
+    if any(runtime.get(field) != expected for field, expected in required.items()):
+        return False, "CUDA helper protocol identity is invalid"
+    helper_path = runtime.get("helper_path")
+    helper_sha256 = runtime.get("helper_sha256")
+    nvcc_path = runtime.get("nvcc_path")
+    nvcc_sha256 = runtime.get("nvcc_sha256")
+    version_output = runtime.get("nvcc_version_output")
+    version_sha256 = runtime.get("nvcc_version_sha256")
+    toolkit_root = runtime.get("cuda_toolkit_root")
+    if not all(
+        isinstance(value, str) and value
+        for value in (
+            helper_path,
+            helper_sha256,
+            nvcc_path,
+            nvcc_sha256,
+            version_output,
+            version_sha256,
+            toolkit_root,
+        )
+    ):
+        return False, "CUDA Toolkit/helper identity fields are incomplete"
+    assert isinstance(helper_path, str)
+    assert isinstance(helper_sha256, str)
+    assert isinstance(nvcc_path, str)
+    assert isinstance(nvcc_sha256, str)
+    assert isinstance(version_output, str)
+    assert isinstance(version_sha256, str)
+    assert isinstance(toolkit_root, str)
+    helper = Path(helper_path).resolve()
+    nvcc = Path(nvcc_path).resolve()
+    toolkit = Path(toolkit_root).resolve()
+    if (
+        not helper.is_file()
+        or not os.access(helper, os.X_OK)
+        or _sha256(helper) != helper_sha256
+    ):
+        return False, "CUDA helper path, executable bit, or SHA-256 does not replay"
+    if (
+        not nvcc.is_file()
+        or not os.access(nvcc, os.X_OK)
+        or _sha256(nvcc) != nvcc_sha256
+        or nvcc.parent.parent != toolkit
+    ):
+        return False, "CUDA Toolkit nvcc path/root/hash does not replay"
+    try:
+        completed = subprocess.run(
+            (str(nvcc), "--version"),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, f"CUDA Toolkit nvcc version replay failed: {error}"
+    observed_version = completed.stdout.strip()
+    if (
+        observed_version != version_output
+        or hashlib.sha256(observed_version.encode("utf-8")).hexdigest()
+        != version_sha256
+    ):
+        return False, "CUDA Toolkit nvcc version identity does not replay"
+    return True, "CUDA helper and Toolkit/nvcc identities independently replayed"
+
+
+def _review_accelerator_pilot_v2(
+    *,
+    raw_dir: Path,
+    reader: ArtifactReader,
+    scope: str,
+    prerequisite_dir: Path,
+) -> dict[str, Path]:
+    """Independently replay generic CUDA helper protocol v2 evidence."""
+
+    contract = stage052_contract(Stage052Component.ACCELERATOR_PILOT, scope)
+    requirement = contract.prerequisites[0]
+    review_lineage = _prior_review_manifest_hashes(raw_dir)
+    gates: dict[str, dict[str, object]] = {}
+    artifact_types = {
+        str(item.get("artifact_type"))
+        for item in reader.manifest.get("artifacts", ())
+        if isinstance(item, Mapping)
+    }
+    expected_artifacts = {"manifest_metadata", "config", "accelerator_pilot"}
+    gates["accelerator_pilot_artifact_schema"] = {
+        "passed": artifact_types == expected_artifacts,
+        "detail": f"observed={sorted(artifact_types)}",
+    }
+    artifact = reader.read_json(str(_one_artifact(reader, "accelerator_pilot")["relative_path"]))
+    metadata = reader.read_json(str(_one_artifact(reader, "manifest_metadata")["relative_path"]))
+    try:
+        predecessor = verify_stage052_evidence_input(prerequisite_dir, requirement)
+        expected_occupancies, expected_median = _recompute_native_occupancies(prerequisite_dir)
+        expected_native = _recompute_native_performance_observations(prerequisite_dir)
+        pilot = artifact.get("pilot") if isinstance(artifact, Mapping) else None
+        if (
+            not isinstance(artifact, Mapping)
+            or artifact.get("schema_version")
+            != "stage05.2-accelerator-pilot-artifact-v2"
+            or artifact.get("occupancy_inputs") != expected_occupancies
+            or artifact.get("occupancy_input_count") != len(expected_occupancies)
+            or artifact.get("native_prerequisite") != predecessor.to_dict()
+            or not isinstance(pilot, Mapping)
+            or pilot.get("median_batch_occupancy") != expected_median
+        ):
+            raise ValueError("CUDA pilot wrapper does not match accepted E evidence")
+        audited = audit_accelerator_pilot(
+            pilot,
+            expected_backend="cuda",
+            expected_native=expected_native,
+        )
+    except (ArtifactIntegrityError, KeyError, TypeError, ValueError) as error:
+        audited = None
+        gates["independent_accelerator_replay"] = {"passed": False, "detail": str(error)}
+    else:
+        gates["independent_accelerator_replay"] = {
+            "passed": True,
+            "detail": "CUDA helper v2 decision and accepted E inputs replay exactly",
+        }
+    runtime = audited.get("runtime_identity") if audited is not None else None
+    status_value = audited.get("status") if audited is not None else None
+    complete = status_value == MetalPilotStatus.COMPLETE.value
+    median_occupancy = (
+        audited.get("median_batch_occupancy") if audited is not None else None
+    )
+    cuda_required = (
+        isinstance(median_occupancy, int | float) and median_occupancy >= 32.0
+    )
+    if cuda_required and isinstance(runtime, Mapping):
+        real_runtime, runtime_detail = _audit_cuda_runtime_identity(runtime)
+    elif not cuda_required and runtime is None:
+        real_runtime = True
+        runtime_detail = "occupancy below 32; CUDA Toolkit/helper execution is not required"
+    else:
+        real_runtime = False
+        runtime_detail = "CUDA runtime identity is missing or unexpectedly present"
+    gates["cuda_runtime_identity"] = {
+        "passed": complete and real_runtime,
+        "detail": runtime_detail,
+    }
+    selected_backend = audited.get("selected_backend") if audited is not None else None
+    selected_workers = metadata.get("worker_count") if isinstance(metadata, Mapping) else None
+    metadata_passed = (
+        isinstance(metadata, Mapping)
+        and metadata.get("component") == Stage052Component.ACCELERATOR_PILOT.value
+        and metadata.get("backend") == "cpu_batch"
+        and metadata.get("execution_backend") == selected_backend
+        and metadata.get("accelerator_decision_mode") == "accelerator_pilot"
+        and metadata.get("native_kernel_config") == NativeKernelConfig().to_dict()
+        and metadata.get("staging_root", {}).get("alias") == "wsl_staging"
+    )
+    gates["accelerator_pilot_metadata"] = {
+        "passed": metadata_passed,
+        "detail": "CUDA pilot metadata passed" if metadata_passed else "metadata mismatch",
+    }
+    source_passed, source_detail = _validate_stage052_source_snapshot(metadata)
+    gates["source_snapshot"] = {"passed": source_passed, "detail": source_detail}
+    runtime_passed, runtime_detail = _validate_stage052_runtime_identity(metadata)
+    gates["runtime_identity"] = {
+        "passed": runtime_passed,
+        "detail": runtime_detail,
+    }
+    staging_passed, staging_detail = _validate_stage052_staging_root_identity(metadata)
+    gates["staging_root_identity"] = {
+        "passed": staging_passed,
+        "detail": staging_detail,
+    }
+    gates["evidence_completeness"] = {
+        "passed": complete and reader.manifest.get("evidence_completeness") == "complete",
+        "detail": str(reader.manifest.get("evidence_completeness")),
+    }
+    adapter_passed = selected_backend == "native_cpu"
+    gates["campaign_execution_adapter"] = {
+        "passed": adapter_passed,
+        "detail": (
+            "native CPU campaign adapter is registered"
+            if adapter_passed
+            else "CUDA promotion cannot enter G until an audited campaign adapter exists"
+        ),
+    }
+    passed = all(bool(gate["passed"]) for gate in gates.values())
+    status = contract.next_status if passed else NOT_READY
+    manifest = {
+        "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
+        "run_label": raw_dir.name,
+        "component": Stage052Component.ACCELERATOR_PILOT.value,
+        "scope": scope,
+        "status": status,
+        "raw_manifest_sha256": _sha256(reader.result.manifest_path),
+        "review_manifest_lineage_sha256": review_lineage,
+        "accelerator_decision": audited.get("decision") if passed and audited else "NOT_READY",
+        "selected_backend": selected_backend if passed else None,
+        "selected_exact_backend": "cpu_batch" if passed else None,
+        "selected_workers": selected_workers if passed else None,
+        "selected_optimization_profile": "cuda" if selected_backend == "cuda" else "native",
+        "native_configuration": NativeKernelConfig().to_dict() if passed else None,
+        "accelerator_runtime_identity": (
+            dict(runtime) if passed and isinstance(runtime, Mapping) else None
+        ),
+        "gates": gates,
+    }
+    return _publish_review_generation(
+        review_dir=raw_dir / "review",
+        findings=_render_review_findings(gates),
+        report=_render_review_report(run_label=raw_dir.name, status=status, gates=gates),
+        manifest=manifest,
     )
 
 
@@ -1557,6 +1923,8 @@ def _review_accelerator_decision_only(
         "passed": metadata_passed,
         "detail": "decision-only native metadata passed" if metadata_passed else "invalid metadata",
     }
+    source_passed, source_detail = _validate_stage052_source_snapshot(metadata)
+    gates["source_snapshot"] = {"passed": source_passed, "detail": source_detail}
     runtime_passed, runtime_detail = _validate_stage052_runtime_identity(metadata)
     gates["runtime_identity"] = {
         "passed": runtime_passed,
@@ -2479,30 +2847,24 @@ def _component_gates(
             }
         return gates
     if component is Stage052Component.ARTIFACT_STREAMING:
-        expected_roles = {
-            "hot_path_predecessor",
-            "historical_storage",
-            "remediation_source",
-        }
+        expected_roles = {"performance_baseline", "hot_path_predecessor"}
         if (
-            comparison_dirs
-            or set(prerequisite_dirs) != expected_roles
+            set(prerequisite_dirs) != expected_roles
             or set(prerequisite_identities) != expected_roles
         ):
             return {
                 "storage_prerequisites": {
                     "passed": False,
-                    "detail": "C05 requires exactly the named B03/C04/E03 inputs",
+                    "detail": "C16 requires the exact current-chain A05 and B04 inputs",
                 }
             }
+        baseline_dir = prerequisite_dirs["performance_baseline"]
         predecessor_dir = prerequisite_dirs["hot_path_predecessor"]
-        historical_dir = prerequisite_dirs["historical_storage"]
-        remediation_source = prerequisite_dirs["remediation_source"]
         current_reader = ArtifactReader(raw_dir)
-        historical_reader = ArtifactReader(historical_dir)
         physical_schema_passed = (
             _screening_schema_version(current_reader) == "screening_decisions_v3"
-            and _screening_schema_version(historical_reader) == "screening_decisions_v2"
+            and _screening_schema_version(ArtifactReader(predecessor_dir))
+            == "screening_decisions_v1"
         )
         replay_maps = replay_stage052_storage_semantics_many(
             (predecessor_dir, raw_dir),
@@ -2528,35 +2890,39 @@ def _component_gates(
             rows,
             component=Stage052Component.ARTIFACT_STREAMING,
         )
-        remediation_passed, remediation_detail = _validate_c05_remediation(
-            raw_dir,
-            source_dir=remediation_source,
-            source_identity=prerequisite_identities["remediation_source"],
-        )
+        baseline_resource = _load_resource_summary(baseline_dir)
+        current_resource = _load_resource_summary(raw_dir)
+        baseline_rss = _strict_float(baseline_resource.get("aggregate_peak_rss_bytes"))
+        current_rss = _strict_float(current_resource.get("aggregate_peak_rss_bytes"))
+        rss_passed = baseline_rss > 0.0 and current_rss <= baseline_rss * 0.5
         return {
             "storage_schema_amendment": {
                 "passed": physical_schema_passed,
                 "detail": (
-                    "historical C04 screening_decisions_v2 preserved; C05 uses v3"
+                    "B04 screening_decisions_v1 preserved; C16 uses v3"
                     if physical_schema_passed
-                    else "C04/C05 physical screening schemas are invalid"
+                    else "B04/C16 physical screening schemas are invalid"
                 ),
             },
             "v1_v3_replay_equality": {
                 "passed": replay_equal,
                 "detail": (
-                    "24 B03/C05 fixed-work axes have exact canonical equality"
+                    "24 B04/C16 fixed-work axes have exact canonical equality"
                     if replay_equal
-                    else "24 B03/C05 fixed-work axes do not replay identically"
+                    else "24 B04/C16 fixed-work axes do not replay identically"
                 ),
             },
             "persistence_ratio": {
                 "passed": persistence_passed,
                 "detail": persistence_detail,
             },
-            "e03_full_remediation": {
-                "passed": remediation_passed,
-                "detail": remediation_detail,
+            "peak_rss_reduction": {
+                "passed": rss_passed,
+                "detail": (
+                    f"C16/A05 peak RSS ratio={current_rss / baseline_rss:.6f}"
+                    if baseline_rss > 0.0
+                    else "A05 peak RSS is invalid"
+                ),
             },
         }
     if component is Stage052Component.JOB_PARALLEL:
@@ -3016,12 +3382,27 @@ def _validate_stage052_runtime_identity(
     return True, "wheel, Python, native extension, and dependency hashes passed"
 
 
+def _validate_stage052_source_snapshot(
+    metadata: Mapping[str, object],
+) -> tuple[bool, str]:
+    observed = metadata.get("source_snapshot")
+    if not isinstance(observed, Mapping):
+        return False, "raw evidence is missing its ext4 read-only source snapshot identity"
+    try:
+        current = verify_stage052_source_snapshot(find_repository_root())
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
+        return False, str(error)
+    if dict(observed) != current:
+        return False, "raw source snapshot identity does not match independent live replay"
+    return True, "clean ext4 read-only source snapshot independently replayed"
+
+
 def _validate_stage052_staging_root_identity(
     metadata: Mapping[str, object],
     *,
     root: Path | None = None,
     locator_path: Path | None = None,
-    expected_alias: str = "transfer_staging",
+    expected_alias: str = "wsl_staging",
     volume_probe: Callable[[Path], VolumeIdentity] | None = None,
 ) -> tuple[bool, str]:
     """Independently bind C--F raw evidence to the live external results volume."""

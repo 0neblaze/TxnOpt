@@ -42,6 +42,7 @@ from evrptw.stage052_campaign_runner import (
     BenchmarkExecutionLock,
     MachineSnapshot,
     RollingCampaignCapacityError,
+    WindowsWslMachineSnapshotSource,
     collect_preflight_observation,
     probe_volume_identity,
     validate_batch_measurements,
@@ -53,12 +54,95 @@ from evrptw.stage052_evidence import (
     RunResourceSummary,
     Stage052PersistenceAttribution,
 )
+from evrptw.stage052_platform import WindowsWslPowerStatus
 
 
 def _sha256_json(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def test_windows_wsl_snapshot_uses_windows_power_and_wsl_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native_calls = 0
+
+    def native_power() -> WindowsWslPowerStatus:
+        nonlocal native_calls
+        native_calls += 1
+        return WindowsWslPowerStatus(True, False, 76, 8, "balanced-guid")
+
+    monkeypatch.setattr(
+        campaign_runner,
+        "read_windows_wsl_power_status",
+        native_power,
+    )
+    monkeypatch.setattr(campaign_runner, "read_wsl_ac_power_online", lambda: True)
+    monkeypatch.setattr(campaign_runner.os, "getloadavg", lambda: (1.25, 0.0, 0.0))
+    monkeypatch.setattr(campaign_runner, "_unrelated_user_cpu_seconds", lambda: {})
+
+    source = WindowsWslMachineSnapshotSource()
+    source.refresh_native_status()
+    observed = source()
+    source()
+
+    assert observed.power_source == "AC Power"
+    assert observed.low_power_mode_enabled is False
+    assert observed.load1 == 1.25
+    assert native_calls == 1
+
+
+def test_windows_wsl_snapshot_fails_on_unknown_power_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        campaign_runner,
+        "read_windows_wsl_power_status",
+        lambda: (_ for _ in ()).throw(RuntimeError("AC power state mismatch")),
+    )
+
+    with pytest.raises(RuntimeError, match="AC power state mismatch"):
+        WindowsWslMachineSnapshotSource()()
+
+
+def test_native_power_boundary_allows_charge_progress_but_binds_invariants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations = iter(
+        (
+            WindowsWslPowerStatus(True, False, 50, 8, "balanced-guid"),
+            WindowsWslPowerStatus(True, False, 75, 1, "balanced-guid"),
+        )
+    )
+    monkeypatch.setattr(
+        campaign_runner,
+        "read_windows_wsl_power_status",
+        lambda: next(observations),
+    )
+    source = WindowsWslMachineSnapshotSource()
+    source.refresh_native_status()
+
+    evidence = source.verify_native_status_unchanged()
+
+    assert evidence["invariants_unchanged"] is True
+    assert evidence["before"]["battery_life_percent"] == 50
+    assert evidence["after"]["battery_life_percent"] == 75
+
+
+def test_unrelated_process_sampler_fails_on_unparseable_ps_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        campaign_runner.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            (), 0, stdout="123 malformed-row\n", stderr=""
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="invalid non-empty ps process row"):
+        campaign_runner._unrelated_user_cpu_seconds()
 
 
 def test_volume_probe_resolves_a_directory_to_its_containing_device(
@@ -95,6 +179,7 @@ def test_volume_probe_resolves_a_directory_to_its_containing_device(
         )
 
     monkeypatch.setattr(campaign_runner.subprocess, "run", run)
+    monkeypatch.setattr(campaign_runner.sys, "platform", "darwin")
 
     identity = probe_volume_identity(tmp_path)
 
@@ -126,7 +211,7 @@ def _accepted_f02_payloads() -> tuple[dict[str, object], dict[str, object], str]
         "failure_policy": "fail_fast_no_fallback",
     }
     runtime = {
-        "schema_version": "stage05.2-runtime-identity-v1",
+        "schema_version": "stage05.2-runtime-identity-v2",
         "repository_revision": "a" * 40,
         "python_sha256": "b" * 64,
         "wheel_sha256": "c" * 64,
@@ -198,13 +283,13 @@ def test_execution_lock_binds_every_selected_f02_input() -> None:
     assert lock.archive_root_aliases_exercised == ()
 
 
-def test_execution_lock_binds_promoted_metal_backend() -> None:
+def test_execution_lock_binds_promoted_cuda_backend() -> None:
     metadata, review, raw_manifest_sha = _accepted_f02_payloads()
-    metadata["execution_backend"] = "metal"
-    metadata["optimization_profile"] = "metal"
-    review["selected_backend"] = "metal"
+    metadata["execution_backend"] = "cuda"
+    metadata["optimization_profile"] = "cuda"
+    review["selected_backend"] = "cuda"
     review["accelerator_decision"] = "ACCELERATOR_PROMOTED"
-    review["selected_optimization_profile"] = "metal"
+    review["selected_optimization_profile"] = "cuda"
 
     lock = BenchmarkExecutionLock.from_accepted_evidence(
         metadata=metadata,
@@ -214,7 +299,7 @@ def test_execution_lock_binds_promoted_metal_backend() -> None:
         expected_status="READY_FOR_STAGE052_BENCHMARK",
     )
 
-    assert lock.selected_backend == "metal"
+    assert lock.selected_backend == "cuda"
 
 
 def test_execution_lock_freezes_accepted_g01_storage_root_alias_set() -> None:
@@ -437,32 +522,113 @@ def test_stage052_config_routes_campaign_storage_through_ignored_locator() -> No
     config = load_stage052_config(Path("configs/stage052_performance.toml"))
 
     assert config.storage_root_locator == Path("configs/stage052_storage_roots.local.toml")
-    assert config.staging_root_alias == "transfer_staging"
-    assert config.archive_root_aliases == ("transfer_archive", "internal_archive")
+    assert config.staging_root_alias == "wsl_staging"
+    assert config.archive_root_aliases == ("d_archive",)
 
 
 def test_campaign_root_location_drift_is_rejected_before_writes(tmp_path: Path) -> None:
-    volume = VolumeIdentity("test-volume", "apfs")
+    ext4 = VolumeIdentity("wsl-ext4", "ext4")
+    d_drive = VolumeIdentity("d-nvme", "9p")
     locator = StorageRootLocator(
         {
-            "transfer_staging": StorageRoot(
-                "transfer_staging", tmp_path / "results", volume
+            "wsl_staging": StorageRoot(
+                "wsl_staging", Path("/mnt/d/wrong-staging"), ext4
             ),
-            "transfer_archive": StorageRoot(
-                "transfer_archive",
-                Path("/Volumes/TRANSFER/FURP-2026-Yiyang-GUO-EVRP-TW-results"),
-                volume,
-            ),
-            "internal_archive": StorageRoot(
-                "internal_archive", tmp_path / "wrong-internal-root", volume
+            "d_archive": StorageRoot(
+                "d_archive", Path("/mnt/d/FURP-2026-Yiyang-GUO-EVRP-TW-results"), d_drive
             ),
         }
     )
 
-    with pytest.raises(RuntimeError, match="absolute locations"):
+    with pytest.raises(RuntimeError, match="ext4"):
         verify_campaign_root_locations(repository_root=tmp_path, locator=locator)
-    assert not (tmp_path / "results").exists()
-    assert not (tmp_path / "wrong-internal-root").exists()
+    assert not Path("/mnt/d/wrong-staging").exists()
+
+
+@pytest.mark.parametrize(
+    ("archive_path", "filesystem"),
+    ((Path("/mnt/e/stage052"), "9p"), (Path("/mnt/d/stage052"), "exfat")),
+)
+def test_campaign_root_preflight_rejects_forbidden_storage(
+    tmp_path: Path,
+    archive_path: Path,
+    filesystem: str,
+) -> None:
+    locator = StorageRootLocator(
+        {
+            "wsl_staging": StorageRoot(
+                "wsl_staging", tmp_path / "staging", VolumeIdentity("wsl", "ext4")
+            ),
+            "d_archive": StorageRoot(
+                "d_archive", archive_path, VolumeIdentity("archive", filesystem)
+            ),
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="forbidden|ExFAT"):
+        verify_campaign_root_locations(repository_root=tmp_path, locator=locator)
+
+
+def test_wsl_volume_probe_records_ext4_mount_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(arguments: tuple[str, ...], **_: object) -> SimpleNamespace:
+        assert arguments[:2] == ("findmnt", "--json")
+        return SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    "filesystems": [
+                        {
+                            "source": "/dev/sdd",
+                            "fstype": "ext4",
+                            "uuid": "wsl-ext4-uuid",
+                        }
+                    ]
+                }
+            )
+        )
+
+    monkeypatch.setattr(campaign_runner.subprocess, "run", fake_run)
+
+    assert campaign_runner.probe_volume_identity(Path("/home/user/staging")) == (
+        VolumeIdentity("wsl-ext4-uuid", "ext4")
+    )
+
+
+def test_wsl_volume_probe_records_d_nvme_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def fake_run(arguments: tuple[str, ...], **_: object) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            assert arguments[:2] == ("findmnt", "--json")
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    {
+                        "filesystems": [
+                            {"source": "D:\\", "fstype": "9p", "uuid": None}
+                        ]
+                    }
+                )
+            )
+        return SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    "FriendlyName": "Samsung SSD 990 EVO Plus 1TB",
+                    "SerialNumber": "0025_3854_5141_BD22.",
+                    "BusType": "NVMe",
+                }
+            )
+        )
+
+    monkeypatch.setattr(campaign_runner.subprocess, "run", fake_run)
+
+    assert campaign_runner.probe_volume_identity(Path("/mnt/d/archive")) == (
+        VolumeIdentity("nvme-samsung-ssd-990-evo-plus-1tb-0025-3854-5141-bd22", "9p")
+    )
 
 
 def test_rolling_capacity_failure_carries_complete_observation(tmp_path: Path) -> None:
@@ -868,8 +1034,11 @@ def test_batch_measurements_enforce_persistence_resource_and_runtime_gates() -> 
 def _dispatcher_locator(tmp_path: Path) -> StorageRootLocator:
     external = VolumeIdentity("external-device", "exfat")
     internal = VolumeIdentity("internal-device", "apfs")
+    d_drive = VolumeIdentity("d-nvme-device", "9p")
     return StorageRootLocator(
         {
+            "wsl_staging": StorageRoot("wsl_staging", tmp_path / "wsl-active", internal),
+            "d_archive": StorageRoot("d_archive", tmp_path / "archive-d", d_drive),
             "transfer_staging": StorageRoot("transfer_staging", tmp_path / "results", external),
             "transfer_archive": StorageRoot(
                 "transfer_archive", tmp_path / "archive-external", external
@@ -980,10 +1149,29 @@ def _patch_dispatcher_dependencies(
     monkeypatch.setattr(stage052_performance, "_git", lambda *_args: "a" * 40)
     monkeypatch.setattr(
         stage052_performance,
+        "verify_stage052_source_snapshot",
+        lambda _root: {
+            "repository_revision": "a" * 40,
+            "mount": {"filesystem": "ext4", "uuid": "test-uuid"},
+            "tracked_file_count": 100,
+            "read_only": True,
+        },
+    )
+    monkeypatch.setattr(
+        stage052_performance,
         "verify_stage052_runtime_identity",
         lambda *_args, **_kwargs: {"runtime_identity_sha256": "b" * 64},
     )
     monkeypatch.setattr(stage052_performance, "collect_environment", lambda: {})
+    monkeypatch.setattr(
+        stage052_performance,
+        "WindowsWslMachineSnapshotSource",
+        lambda: SimpleNamespace(
+            refresh_native_status=lambda: None,
+            verify_native_status_unchanged=lambda: None,
+            __call__=lambda: MachineSnapshot("AC Power", False, 0.0, 0.0),
+        ),
+    )
     monkeypatch.setattr(
         stage052_performance,
         "collect_performance_provenance",
@@ -1213,7 +1401,7 @@ def _run_patched_pilot(
             "verify_rolling_campaign_capacity",
             reject_capacity,
         )
-    output_dir = tmp_path / "results" / "stage05.2_benchmark_attempt01"
+    output_dir = tmp_path / "wsl-active" / "stage05.2_benchmark_attempt01"
     if fail_rolling_summary_once:
         real_atomic_write = stage052_performance.atomic_write_signed_json
         injected = False

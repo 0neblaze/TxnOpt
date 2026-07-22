@@ -16,8 +16,9 @@ identity_manifest = "configs/stage052_runtime_identity.local.json"
 
 [campaign]
 storage_root_locator = "configs/stage052_storage_roots.local.toml"
-staging_root_alias = "transfer_staging"
-archive_root_aliases = ["transfer_archive", "internal_archive"]
+lock_manifest = "configs/stage052_campaign_lock.local.json"
+staging_root_alias = "wsl_staging"
+archive_root_aliases = ["d_archive"]
 
 [native_kernels]
 enabled = true
@@ -29,10 +30,12 @@ abi_version = "stage05.2-native-kernels-v1"
 context_policy = "pack_once_per_solve"
 failure_policy = "fail_fast_no_fallback"
 
-# Optional fail-fast Metal pilot adapter.  Set `metal_helper_path` only to an
-# executable implementing stage05.2-metal-helper-v1; absence is explicit
-# PARTIAL/NOT_READY whenever the accepted E occupancy median is at least 32.
+# Optional fail-fast CUDA pilot adapter. Set `helper_path` only to an executable
+# implementing stage05.2-accelerator-helper-v2; fallback is always forbidden.
 [accelerator]
+backend = "cuda"
+helper_schema_version = "stage05.2-accelerator-helper-v2"
+fallback_allowed = false
 
 [artifact_storage_v1]
 enabled = true

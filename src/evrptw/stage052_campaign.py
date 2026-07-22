@@ -1466,7 +1466,7 @@ class CampaignManifest:
             raise ValueError(f"campaign manifest geometry is not {self.scope}-complete")
         if (
             self.selected_workers not in {2, 4}
-            or self.selected_backend not in {"native_cpu", "metal"}
+            or self.selected_backend not in {"native_cpu", "cuda"}
             or self.selected_exact_backend != "cpu_batch"
             or not self.native_profile
             or self.storage_policy_version != "artifact-storage-v2"
@@ -2132,7 +2132,7 @@ class BenchmarkCampaignConfig:
     batch_target_bytes: int = 24 * GIB
     batch_hard_cap_bytes: int = 32 * GIB
     shard_hard_cap_bytes: int = 2 * GIB
-    external_safety_reserve_bytes: int = 20 * GIB
+    external_safety_reserve_bytes: int = 50 * GIB
     external_active_workspace_bytes: int = 32 * GIB
     internal_safety_reserve_bytes: int = 50 * GIB
     required_power_source: str = "AC Power"
@@ -2151,12 +2151,12 @@ class BenchmarkCampaignConfig:
         if len(set(self.archive_root_aliases)) != len(self.archive_root_aliases):
             raise ValueError("archive root aliases must be unique")
         if (
-            self.selected_backend not in {"native_cpu", "metal"}
+            self.selected_backend not in {"native_cpu", "cuda"}
             or self.selected_exact_backend != "cpu_batch"
             or not self.native_profile
         ):
             raise ValueError(
-                "Stage 5.2 campaign requires selected native_cpu/metal execution "
+                "Stage 5.2 campaign requires selected native_cpu/cuda execution "
                 "and cpu_batch exact backend"
             )
         if self.selected_workers not in {2, 4}:
@@ -2180,7 +2180,7 @@ class BenchmarkCampaignConfig:
             self.batch_target_bytes != 24 * GIB
             or self.batch_hard_cap_bytes != 32 * GIB
             or self.shard_hard_cap_bytes != 2 * GIB
-            or self.external_safety_reserve_bytes != 20 * GIB
+            or self.external_safety_reserve_bytes != 50 * GIB
             or self.external_active_workspace_bytes != 32 * GIB
             or self.internal_safety_reserve_bytes != 50 * GIB
         ):
@@ -2266,7 +2266,7 @@ class BenchmarkCampaignConfig:
         batch_target_bytes: int = 24 * GIB,
         batch_hard_cap_bytes: int = 32 * GIB,
         shard_hard_cap_bytes: int = 2 * GIB,
-        external_safety_reserve_bytes: int = 20 * GIB,
+        external_safety_reserve_bytes: int = 50 * GIB,
         external_active_workspace_bytes: int = 32 * GIB,
         internal_safety_reserve_bytes: int = 50 * GIB,
     ) -> BenchmarkCampaignConfig:
@@ -2304,7 +2304,7 @@ class BenchmarkCampaignConfig:
         batch_target_bytes: int = 24 * GIB,
         batch_hard_cap_bytes: int = 32 * GIB,
         shard_hard_cap_bytes: int = 2 * GIB,
-        external_safety_reserve_bytes: int = 20 * GIB,
+        external_safety_reserve_bytes: int = 50 * GIB,
         external_active_workspace_bytes: int = 32 * GIB,
         internal_safety_reserve_bytes: int = 50 * GIB,
     ) -> BenchmarkCampaignConfig:
@@ -2497,7 +2497,7 @@ class BenchmarkCampaignConfig:
         external_floor = self.external_safety_reserve_bytes + self.external_active_workspace_bytes
         if free_values[staging_device] < external_floor:
             raise RuntimeError(
-                "external staging capacity cannot preserve the 20 GiB safety "
+                "ext4 staging capacity cannot preserve the 50 GiB safety "
                 "reserve and 32 GiB active-batch workspace"
             )
 
@@ -2512,8 +2512,12 @@ class BenchmarkCampaignConfig:
             if device == staging_device:
                 reserve = external_floor
             else:
-                if root.volume.filesystem.casefold() != "apfs":
-                    raise RuntimeError(f"internal archive root must use APFS: {alias}")
+                filesystem = root.volume.filesystem.casefold()
+                if alias == "d_archive":
+                    if filesystem not in {"9p", "ntfs"}:
+                        raise RuntimeError("D archive root must resolve to WSL 9p/NTFS")
+                elif filesystem != "apfs":
+                    raise RuntimeError(f"historical internal archive root must use APFS: {alias}")
                 reserve = self.internal_safety_reserve_bytes
             usable[device] = max(0, free_values[device] - reserve)
 

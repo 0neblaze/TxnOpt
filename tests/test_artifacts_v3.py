@@ -680,6 +680,65 @@ def test_v2_writer_ignores_private_precomputed_screening_tail(tmp_path: Path) ->
     assert rows[0]["checks"] == list(visible["checks"])
 
 
+def test_v3_writer_reconstructs_definition_from_visible_event(tmp_path: Path) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt92"
+    writer = ArtifactBundleWriter(
+        tmp_path / run_label,
+        ArtifactRunContext("stage05.2", "artifact_streaming", run_label),
+        ArtifactStorageConfig(
+            storage_policy_version="artifact-storage-v2",
+            screening_schema_version="screening_decisions_v3",
+        ),
+    )
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    visible = _screening_event(decision_id=9, started_at=1.25)
+    visible["_precomputed_screening_definition"] = (
+        artifacts_module._PrecomputedScreeningDefinition(  # noqa: SLF001
+            (
+                "forged",
+                "forged",
+                "forged_axis",
+                999.0,
+                None,
+                999.0,
+                True,
+                "forged",
+                -999.0,
+                True,
+                False,
+                999.0,
+                (),
+            )
+        )
+    )
+    shard.append(
+        route_dictionary={"route:2:C1": ("C1",)},
+        critical_events=(visible,),
+    )
+    shard.finalize(
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+    )
+    bundle = writer.finalize()
+
+    rows = list(
+        ArtifactReader(bundle.run_dir).iter_events(
+            f"toy/2014/{run_label}_events_toy_2014.parquet"
+        )
+    )
+
+    assert rows[0]["status"] == visible["status"]
+    assert rows[0]["demand"] == visible["demand"]
+    assert rows[0]["checks"] == list(visible["checks"])
+
+
 def test_reader_accepts_pre_amendment_v2_manifest_without_physical_schema_field(
     tmp_path: Path,
 ) -> None:

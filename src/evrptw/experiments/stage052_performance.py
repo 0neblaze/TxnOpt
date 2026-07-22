@@ -11,7 +11,6 @@ import json
 import math
 import os
 import re
-import resource
 import shutil
 import statistics
 import subprocess
@@ -36,8 +35,6 @@ from evrptw.artifacts import (
     ArtifactReader,
     ArtifactRunContext,
     ArtifactStorageConfig,
-    _BufferedScreeningDecision,
-    _PrecomputedScreeningDefinition,
     aggregate_diagnostic_events,
     atomic_write_signed_json,
     build_stage03_critical_events,
@@ -70,8 +67,8 @@ from evrptw.stage052 import (
 )
 from evrptw.stage052_accelerator import (
     MetalPilotStatus,
-    SubprocessMetalPilotExecutor,
-    run_conditional_metal_pilot,
+    SubprocessAcceleratorPilotExecutor,
+    run_conditional_accelerator_pilot,
 )
 from evrptw.stage052_campaign import (
     CHECKPOINT_SECONDS,
@@ -92,8 +89,8 @@ from evrptw.stage052_campaign import (
 from evrptw.stage052_campaign_runner import (
     ArchivedBatchStateWriteError,
     BatchRuntimeMonitor,
-    MacMachineSnapshotSource,
     RollingCampaignCapacityError,
+    WindowsWslMachineSnapshotSource,
     archive_verified_batch_with_evidence,
     campaign_control_paths,
     collect_preflight_observation,
@@ -116,14 +113,13 @@ from evrptw.stage052_evidence import (
     collect_performance_provenance,
     stage052_storage_root_binding,
     verify_job_parallel_selection,
+    verify_stage052_campaign_lock,
     verify_stage052_evidence_input,
     verify_stage052_runtime_identity,
+    verify_stage052_source_snapshot,
 )
-from evrptw.stage052_remediation import (
-    Stage052RemediationConfig,
-    Stage052RemediationResult,
-    remediate_stage052_artifacts,
-)
+from evrptw.stage052_platform import peak_rss_bytes
+from evrptw.stage052_remediation import Stage052RemediationResult
 from evrptw.validation import validate_routes
 
 STAGE052_SCHEMA_VERSION = "stage05.2-performance-v1"
@@ -267,10 +263,14 @@ class Stage052Config:
     v1_storage: ArtifactStorageConfig
     v2_storage: ArtifactStorageConfig
     runtime_identity_manifest: Path
+    campaign_lock_manifest: Path
     storage_root_locator: Path
     staging_root_alias: str
     archive_root_aliases: tuple[str, ...]
-    metal_helper_path: Path | None
+    accelerator_backend: str
+    accelerator_helper_schema_version: str
+    accelerator_fallback_allowed: bool
+    accelerator_helper_path: Path | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,12 +310,16 @@ def load_stage052_config(path: Path) -> Stage052Config:
             v1_storage=v1,
             v2_storage=v2,
             runtime_identity_manifest=Path(str(runtime["identity_manifest"])),
+            campaign_lock_manifest=Path(str(campaign["lock_manifest"])),
             storage_root_locator=Path(str(campaign["storage_root_locator"])),
             staging_root_alias=str(campaign["staging_root_alias"]),
             archive_root_aliases=tuple(str(item) for item in campaign["archive_root_aliases"]),
-            metal_helper_path=(
-                Path(str(accelerator["metal_helper_path"]))
-                if isinstance(accelerator, Mapping) and accelerator.get("metal_helper_path")
+            accelerator_backend=str(accelerator["backend"]),
+            accelerator_helper_schema_version=str(accelerator["helper_schema_version"]),
+            accelerator_fallback_allowed=bool(accelerator["fallback_allowed"]),
+            accelerator_helper_path=(
+                Path(str(accelerator["helper_path"]))
+                if isinstance(accelerator, Mapping) and accelerator.get("helper_path")
                 else None
             ),
         )
@@ -329,11 +333,17 @@ def load_stage052_config(path: Path) -> Stage052Config:
         raise ValueError("current Stage 5.2 streaming storage requires screening_decisions_v3")
     if config.max_iterations != 1000 or config.batch_size <= 0:
         raise ValueError("Stage 5.2 requires 1000 iterations and a positive batch size")
-    if config.staging_root_alias != "transfer_staging" or config.archive_root_aliases != (
-        "transfer_archive",
-        "internal_archive",
+    if config.staging_root_alias != "wsl_staging" or config.archive_root_aliases != (
+        "d_archive",
     ):
         raise ValueError("Stage 5.2 campaign storage root aliases are fixed")
+    if (
+        config.accelerator_backend != "cuda"
+        or config.accelerator_helper_schema_version
+        != "stage05.2-accelerator-helper-v2"
+        or config.accelerator_fallback_allowed
+    ):
+        raise ValueError("Stage 5.2 accelerator contract requires CUDA helper v2 without fallback")
     return config
 
 
@@ -355,16 +365,14 @@ def _verify_performance_staging_root(
     output_dir: Path,
     volume_probe: Callable[[Path], VolumeIdentity] | None = None,
 ) -> dict[str, object]:
-    """Bind C--F evidence to the configured external staging volume."""
+    """Bind C--F evidence to the configured WSL2 ext4 staging volume."""
 
     locator = StorageRootLocator.from_toml(locator_path)
     staging = locator.resolve(staging_alias)
-    expected_results = (root / "results").resolve()
-    if staging.absolute_path.resolve() != expected_results:
-        raise ValueError(
-            "Stage 5.2 performance staging root must equal this repository's results root"
-        )
-    if output_dir.resolve().parent != expected_results:
+    del root
+    if staging_alias != "wsl_staging" or locator.aliases != ("d_archive", "wsl_staging"):
+        raise ValueError("Stage 5.2 performance storage aliases are not the WSL2 contract")
+    if output_dir.resolve().parent != staging.absolute_path.resolve():
         raise ValueError("Stage 5.2 performance output is outside the staging root")
     locator.verify_all(
         probe_volume_identity if volume_probe is None else volume_probe,
@@ -446,26 +454,20 @@ def run_stage052(
         raise ValueError("Stage 5.2 worker_count must be 1, 2, or 4")
     root = repository_root()
     resolved_config = _resolve(root, config_path)
+    config = load_stage052_config(resolved_config)
     resolved_output = _resolve(root, output_dir)
-    if resolved_output != root / "results" / run_label:
-        raise ValueError("Stage 5.2 output must be results/<canonical-run-label>")
+    if resolved_output.name != run_label:
+        raise ValueError("Stage 5.2 output directory must end with the canonical run label")
     if resolved_output.exists():
         raise FileExistsError(resolved_output)
     _require_clean_repository(root)
-    config = load_stage052_config(resolved_config)
-    staging_root_binding: dict[str, object] | None = None
-    if selected in {
-        Stage052Component.ARTIFACT_STREAMING,
-        Stage052Component.JOB_PARALLEL,
-        Stage052Component.NATIVE_KERNELS,
-        Stage052Component.ACCELERATOR_PILOT,
-    }:
-        staging_root_binding = _verify_performance_staging_root(
-            root=root,
-            locator_path=_resolve(root, config.storage_root_locator),
-            staging_alias=config.staging_root_alias,
-            output_dir=resolved_output,
-        )
+    source_snapshot = verify_stage052_source_snapshot(root)
+    staging_root_binding = _verify_performance_staging_root(
+        root=root,
+        locator_path=_resolve(root, config.storage_root_locator),
+        staging_alias=config.staging_root_alias,
+        output_dir=resolved_output,
+    )
     prerequisite = verify_stage051_prerequisite(_resolve(root, config.stage051_manifest))
     component_prerequisite = None
     component_prerequisites: dict[str, object] = {}
@@ -494,6 +496,12 @@ def run_stage052(
                 resolved_input,
                 requirement,
             )
+            if requirement.requires_current_chain_identity:
+                verify_stage052_campaign_lock(
+                    _resolve(root, config.campaign_lock_manifest),
+                    raw_dir=resolved_input,
+                    identity=identities[requirement.role],
+                )
         component_prerequisites = {
             role: identity.to_dict() for role, identity in identities.items()
         }
@@ -528,9 +536,10 @@ def run_stage052(
             accelerator_decision_payload = _accelerator_decision_inputs(
                 prerequisite_path,
                 prerequisite=identities["native_selection"],
-                metal_helper_path=(
-                    _resolve(root, config.metal_helper_path)
-                    if config.metal_helper_path is not None
+                accelerator_backend=config.accelerator_backend,
+                accelerator_helper_path=(
+                    _resolve(root, config.accelerator_helper_path)
+                    if config.accelerator_helper_path is not None
                     else None
                 ),
             )
@@ -564,6 +573,7 @@ def run_stage052(
     context = ArtifactRunContext("stage05.2", selected.value, run_label)
     parent_writer = ArtifactBundleWriter(resolved_output, context, storage)
     revision = _git(root, "rev-parse", "HEAD")
+    source_snapshot = verify_stage052_source_snapshot(root)
     runtime_identity = verify_stage052_runtime_identity(
         _resolve(root, config.runtime_identity_manifest),
         expected_repository_revision=revision,
@@ -636,6 +646,7 @@ def run_stage052(
         "repository_revision": revision,
         "repository_dirty": False,
         "runtime_identity": runtime_identity,
+        "source_snapshot": source_snapshot,
         "staging_root": staging_root_binding,
         "configuration_sha256": _sha256(resolved_config),
         "stage051_prerequisite": prerequisite,
@@ -668,10 +679,10 @@ def run_stage052(
     with persistence_recorder.record("parent_write_control"):
         parent_writer.write_control(metadata=metadata, configuration_path=resolved_config)
     if accelerator_decision_payload is not None:
-        metal_mode = accelerator_decision_payload.get("schema_version") == (
-            "stage05.2-accelerator-pilot-artifact-v1"
+        accelerator_mode = accelerator_decision_payload.get("schema_version") == (
+            "stage05.2-accelerator-pilot-artifact-v2"
         )
-        artifact_type = "metal_pilot" if metal_mode else "accelerator_decision"
+        artifact_type = "accelerator_pilot" if accelerator_mode else "accelerator_decision"
         decision_path = resolved_output / "control" / f"{run_label}_{artifact_type}.json"
         decision_path.write_text(
             json.dumps(accelerator_decision_payload, indent=2, sort_keys=True) + "\n",
@@ -685,7 +696,7 @@ def run_stage052(
         )
         pilot = accelerator_decision_payload.get("pilot")
         is_partial = (
-            metal_mode
+            accelerator_mode
             and isinstance(pilot, Mapping)
             and pilot.get("status") == MetalPilotStatus.PARTIAL.value
         )
@@ -721,6 +732,8 @@ def run_stage052(
         )
         if selected
         in {
+            Stage052Component.PERF_BASELINE,
+            Stage052Component.HOT_PATH,
             Stage052Component.ARTIFACT_STREAMING,
             Stage052Component.JOB_PARALLEL,
             Stage052Component.NATIVE_KERNELS,
@@ -755,23 +768,6 @@ def run_stage052(
                 _record_resource_summary(parent_writer, summary)
         parent_writer.finalize(status="partial", evidence_completeness="partial")
         raise
-    remediation_result: Stage052RemediationResult | None = None
-    if selected is Stage052Component.ARTIFACT_STREAMING:
-        try:
-            remediation_source = resolved_prerequisite_dirs["remediation_source"]
-            remediation_result = remediate_stage052_artifacts(
-                source_dir=remediation_source,
-                child_dir=resolved_output / "remediation" / remediation_source.name,
-                config=Stage052RemediationConfig(child_run_label=run_label),
-            )
-            _record_remediation_child(parent_writer, remediation_result)
-        except BaseException:
-            if resource_sampler is not None:
-                with contextlib.suppress(BaseException):
-                    summary = resource_sampler.stop()
-                    _record_resource_summary(parent_writer, summary)
-            parent_writer.finalize(status="partial", evidence_completeness="partial")
-            raise
     rows.sort(
         key=lambda row: (
             str(row["instance"]),
@@ -821,8 +817,6 @@ def run_stage052(
         outputs["resource_summary"] = resource_summary_path
     if timing_evidence_path is not None:
         outputs["timing_evidence"] = timing_evidence_path
-    if remediation_result is not None:
-        outputs["remediation_manifest"] = remediation_result.child_manifest_path
     return outputs
 
 
@@ -988,6 +982,7 @@ def _run_benchmark_campaign_impl(
             f"({selection_lock.selected_workers})"
         )
     revision = _git(root, "rev-parse", "HEAD")
+    source_snapshot = verify_stage052_source_snapshot(root)
     runtime_identity = verify_stage052_runtime_identity(
         _resolve(root, config.runtime_identity_manifest),
         expected_repository_revision=revision,
@@ -1015,9 +1010,9 @@ def _run_benchmark_campaign_impl(
         input_provenance=performance_provenance,
         native_kernel_config=config.native_kernels.to_dict(),
     )
-    if selection_lock.selected_backend == "metal":
+    if selection_lock.selected_backend == "cuda":
         raise RuntimeError(
-            "accepted F02 selected Metal, but no Stage 5.2 campaign Metal execution "
+            "accepted F02 selected CUDA, but no Stage 5.2 campaign CUDA execution "
             "adapter is registered; native CPU fallback is forbidden"
         )
     locator_path = _resolve(root, config.storage_root_locator)
@@ -1030,8 +1025,8 @@ def _run_benchmark_campaign_impl(
         (config.staging_root_alias, *config.archive_root_aliases),
     )
     staging = locator.resolve(config.staging_root_alias)
-    if staging.absolute_path.resolve() != (root / "results").resolve():
-        raise RuntimeError("benchmark active writes must use the configured external results root")
+    if staging.absolute_path.resolve() != output_dir.resolve().parent:
+        raise RuntimeError("benchmark active writes must use the configured ext4 staging root")
     if output_dir != staging.absolute_path / run_label:
         raise RuntimeError("benchmark output is not below the verified staging root")
     campaign_config = (
@@ -1095,7 +1090,8 @@ def _run_benchmark_campaign_impl(
                 dict.fromkeys(assignment.root_alias for assignment in capacity.assignments)
             ),
         )
-    snapshot_source = MacMachineSnapshotSource()
+    snapshot_source = WindowsWslMachineSnapshotSource()
+    snapshot_source.refresh_native_status()
     preflight = collect_preflight_observation(
         campaign_config,
         snapshot=snapshot_source,
@@ -1119,7 +1115,7 @@ def _run_benchmark_campaign_impl(
         "backend": "cpu_batch",
         "execution_backend": selection_lock.selected_backend,
         "optimization_profile": (
-            "metal" if selection_lock.selected_backend == "metal" else "native"
+            "cuda" if selection_lock.selected_backend == "cuda" else "native"
         ),
         "worker_count": worker_count,
         "native_profile": "stage05.2-native-kernels-v1",
@@ -1130,6 +1126,7 @@ def _run_benchmark_campaign_impl(
         "campaign_configuration_sha256": campaign_config_sha256,
         "campaign_prerequisite_review_sha256": prerequisite_review_sha256,
         "runtime_identity": runtime_identity,
+        "source_snapshot": source_snapshot,
         "performance_provenance": performance_provenance,
         "storage_policy_version": storage.storage_policy_version,
         "screening_schema_version": storage.screening_schema_version,
@@ -1273,6 +1270,7 @@ def _run_benchmark_campaign_impl(
                     selection_lock=selection_lock.to_dict(),
                     repository_revision=revision,
                     runtime_identity=runtime_identity,
+                    source_snapshot=source_snapshot,
                     performance_provenance=performance_provenance,
                     locator=locator,
                     storage=storage,
@@ -1700,10 +1698,11 @@ def _run_benchmark_batch(
     selection_lock: Mapping[str, object],
     repository_revision: str,
     runtime_identity: Mapping[str, object],
+    source_snapshot: Mapping[str, object],
     performance_provenance: Mapping[str, object],
     locator: StorageRootLocator,
     storage: ArtifactStorageConfig,
-    snapshot_source: MacMachineSnapshotSource,
+    snapshot_source: WindowsWslMachineSnapshotSource,
 ) -> _VerifiedBatchExecution:
     """Run, verify, and seal one indivisible next-fit campaign batch."""
 
@@ -1737,6 +1736,7 @@ def _run_benchmark_batch(
         "campaign_configuration_sha256": campaign_configuration_sha256,
         "campaign_prerequisite_review_sha256": campaign_prerequisite_review_sha256,
         "runtime_identity": dict(runtime_identity),
+        "source_snapshot": dict(source_snapshot),
         "performance_provenance": dict(performance_provenance),
         "benchmark_execution_lock": dict(selection_lock),
         "storage_policy_version": storage.storage_policy_version,
@@ -1776,6 +1776,7 @@ def _run_benchmark_batch(
     resource_started = False
     runtime_started = False
     try:
+        snapshot_source.refresh_native_status()
         batch_preflight = collect_preflight_observation(
             campaign_config,
             snapshot=snapshot_source,
@@ -1851,6 +1852,7 @@ def _run_benchmark_batch(
             resource_path = _record_resource_summary(writer, resource_summary)
         runtime_evidence = runtime_monitor.stop()
         runtime_started = False
+        native_power_boundary = snapshot_source.verify_native_status_unchanged()
         runtime_path = (
             batch_dir
             / "control"
@@ -1879,6 +1881,7 @@ def _run_benchmark_batch(
                     "run_label": campaign_config.run_label,
                     "batch_id": plan.batch_id,
                     "status": "complete",
+                    "native_power_boundary": native_power_boundary,
                     "preflight": {
                         "power_source": batch_preflight.power_source,
                         "low_power_mode_enabled": (batch_preflight.low_power_mode_enabled),
@@ -2586,6 +2589,8 @@ def _record_remediation_child(
     writer: ArtifactBundleWriter,
     result: Stage052RemediationResult,
 ) -> None:
+    """Retain the historical Mac remediation reader; current producers never call it."""
+
     summary_path = result.summary_path
     if not summary_path.is_file():
         raise RuntimeError("remediation summary is missing after child finalization")
@@ -2701,9 +2706,10 @@ def _accelerator_decision_inputs(
     raw_dir: Path,
     *,
     prerequisite: object,
-    metal_helper_path: Path | None = None,
+    accelerator_backend: str,
+    accelerator_helper_path: Path | None = None,
 ) -> dict[str, object]:
-    """Recompute E occupancy and run the conditional Metal branch when required."""
+    """Recompute E occupancy and run the conditional CUDA branch when required."""
 
     reader = ArtifactReader(raw_dir)
     references = [
@@ -2794,7 +2800,7 @@ def _accelerator_decision_inputs(
             if isinstance(item, Mapping) and item.get("artifact_type") == "per_run_results"
         ]
         if len(per_run_references) != 1:
-            raise ValueError("accepted E must contain one per-run result table for Metal")
+            raise ValueError("accepted E must contain one per-run result table for CUDA")
         per_run_path = raw_dir / str(per_run_references[0].get("relative_path", ""))
         with per_run_path.open(newline="", encoding="utf-8") as handle:
             for row in csv.DictReader(handle):
@@ -2802,7 +2808,7 @@ def _accelerator_decision_inputs(
                 if identity not in expected or row.get("axis") != "fixed_work":
                     continue
                 if identity in native_observations:
-                    raise ValueError(f"duplicate E Metal performance row: {identity}")
+                    raise ValueError(f"duplicate E CUDA performance row: {identity}")
                 native_observations[identity] = PerformanceObservation(
                     instance=identity[0],
                     seed=identity[1],
@@ -2823,11 +2829,15 @@ def _accelerator_decision_inputs(
                 "E fixed-work raw/per-run performance semantics are incomplete or disagree"
             )
         executor = (
-            SubprocessMetalPilotExecutor(metal_helper_path)
-            if metal_helper_path is not None
+            SubprocessAcceleratorPilotExecutor(
+                accelerator_helper_path,
+                backend=accelerator_backend,
+            )
+            if accelerator_helper_path is not None
             else None
         )
-        pilot = run_conditional_metal_pilot(
+        pilot = run_conditional_accelerator_pilot(
+            backend=accelerator_backend,
             median_batch_occupancy=median,
             native_observations=tuple(
                 native_observations[identity] for identity in sorted(native_observations)
@@ -2835,11 +2845,11 @@ def _accelerator_decision_inputs(
             executor=executor,
         )
         return {
-            "schema_version": "stage05.2-accelerator-pilot-artifact-v1",
+            "schema_version": "stage05.2-accelerator-pilot-artifact-v2",
             "occupancy_input_count": len(ordered),
             "occupancy_inputs": ordered,
             "native_prerequisite": prerequisite_dict,
-            "pilot": pilot.to_dict(),
+            "pilot": pilot,
         }
     return {
         "schema_version": "stage05.2-accelerator-decision-v1",
@@ -2860,8 +2870,8 @@ def _accelerator_decision_inputs(
 def _accelerator_mode(payload: Mapping[str, object]) -> str:
     if payload.get("schema_version") == "stage05.2-accelerator-decision-v1":
         return "decision_only"
-    if payload.get("schema_version") == "stage05.2-accelerator-pilot-artifact-v1":
-        return "metal_pilot"
+    if payload.get("schema_version") == "stage05.2-accelerator-pilot-artifact-v2":
+        return "accelerator_pilot"
     raise ValueError("unknown accelerator evidence schema")
 
 
@@ -2877,10 +2887,10 @@ def _execution_backend(
             return "native_cpu"
         pilot = accelerator_decision_payload.get("pilot")
         if not isinstance(pilot, Mapping):
-            raise ValueError("Metal pilot payload is missing")
+            raise ValueError("accelerator pilot payload is missing")
         backend = pilot.get("selected_backend")
-        if backend is not None and backend not in {"native_cpu", "metal"}:
-            raise ValueError("Metal pilot selected backend is invalid")
+        if backend is not None and backend not in {"native_cpu", "cuda"}:
+            raise ValueError("accelerator pilot selected backend is invalid")
         return backend if isinstance(backend, str) else None
     if component is Stage052Component.BENCHMARK:
         raise ValueError("benchmark execution backend must come from the accepted selection lock")
@@ -2901,7 +2911,7 @@ def _accelerator_optimization_profile(
     if component is Stage052Component.ACCELERATOR_PILOT:
         if backend is None:
             return None
-        return "metal" if backend == "metal" else "native"
+        return "cuda" if backend == "cuda" else "native"
     return _optimization_profile(component)
 
 
@@ -3220,7 +3230,7 @@ class _Stage052StreamingShard(Protocol):
         self,
         *,
         route_dictionary: Mapping[str, Sequence[str]],
-        critical_events: Iterable[Mapping[str, object] | _BufferedScreeningDecision],
+        critical_events: Iterable[Mapping[str, object]],
         diagnostic_rows: Iterable[Mapping[str, object]] = (),
         cache_lookups_coalesced: bool = False,
     ) -> int: ...
@@ -3274,7 +3284,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self.axis_name = axis_name
         self._buffer_rows = buffer_rows
         self._neighborhood_buffer_rows = neighborhood_buffer_rows
-        self._event_buffer: list[dict[str, object] | _BufferedScreeningDecision] = []
+        self._event_buffer: list[dict[str, object]] = []
         self.event_count = 0
         self._persisted_family_counts: Counter[str] = Counter()
         self._screening_decision_count = 0
@@ -3285,12 +3295,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._neighborhood_spool_path: Path | None = None
         self._neighborhood_read_offset = 0
         self._semantic_event_digest = hashlib.sha256()
-        self._screening_tail_cache: dict[
-            tuple[object, ...], _PrecomputedScreeningDefinition
-        ] = {}
-        self._negative_screening_tail_cache: dict[
-            str, tuple[tuple[object, ...], _PrecomputedScreeningDefinition]
-        ] = {}
+        self._negative_screening_evidence_cache: dict[str, tuple[object, ...]] = {}
         self._initial_objective_key: ObjectiveKey | None = None
         self._visible_global_bests: dict[int, AcceptedGlobalBest] = {}
         self._last_candidate_timestamp = 0.0
@@ -3327,13 +3332,6 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
 
     def append_screening_decision(self, decision: ScreeningDecision) -> None:
         started_ns = time.perf_counter_ns()
-        if self._screening_schema_version == "screening_decisions_v3":
-            try:
-                self._append_screening_decision(decision)
-            finally:
-                elapsed_ns = time.perf_counter_ns() - started_ns
-                self.persistence_nanoseconds += elapsed_ns
-            return
         previously_recorded_ns = self.persistence_nanoseconds
         try:
             self._append_screening_decision(decision)
@@ -3343,153 +3341,65 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
 
     def _append_screening_decision(self, decision: ScreeningDecision) -> None:
-        if self._screening_schema_version != "screening_decisions_v3":
-            self._queue_owned(
-                {
-                    "decision_id": decision.decision_id,
-                    "route_key": decision.route_key,
-                    "lane": decision.lane,
-                    "iteration": decision.iteration,
-                    "operator": decision.operator,
-                    "status": decision.status,
-                    "first_failed_check": decision.first_failed_check,
-                    "reason": decision.reason,
-                    "demand": decision.demand,
-                    "min_time_window_slack": decision.min_time_window_slack,
-                    "distance_lower_bound": decision.distance_lower_bound,
-                    "distance_increment_lower_bound": (
-                        decision.distance_increment_lower_bound
-                    ),
-                    "single_segment_reachable": decision.single_segment_reachable,
-                    "structural_energy_lower_bound": (
-                        decision.structural_energy_lower_bound
-                    ),
-                    "negative_cache_hit": decision.negative_cache_hit,
-                    "exact_call_blocked": decision.exact_call_blocked,
-                    "started_at": decision.started_at,
-                    "completed_at": decision.completed_at,
-                    "duration_seconds": decision.duration_seconds,
-                    "checks": tuple(
-                        {
-                            "check": check.check,
-                            "status": check.status,
-                            "value": check.value,
-                            "reason": check.reason,
-                        }
-                        for check in decision.checks
-                    ),
-                    "record_type": "screening_decision",
-                    "event_type": "screening_decision",
-                }
-            )
-            return
-        negative_cached = (
-            self._negative_screening_tail_cache.get(decision.route_key)
-            if decision.negative_cache_hit
-            else None
+        evidence_tail = (
+            decision.status,
+            decision.reason,
+            decision.demand,
+            decision.distance_increment_lower_bound,
+            decision.distance_lower_bound,
+            decision.exact_call_blocked,
+            decision.first_failed_check,
+            decision.min_time_window_slack,
+            decision.negative_cache_hit,
+            decision.single_segment_reachable,
+            decision.structural_energy_lower_bound,
+            decision.checks,
         )
-        tail_key: tuple[object, ...] | None = None
-        precomputed: _PrecomputedScreeningDefinition | None
-        if negative_cached is not None:
-            cached_tail = negative_cached[0]
-            if not (
-                cached_tail[0] == decision.status
-                and cached_tail[1] == decision.reason
-                and cached_tail[2] == decision.demand
-                and cached_tail[3] == decision.distance_increment_lower_bound
-                and cached_tail[4] == decision.distance_lower_bound
-                and cached_tail[5] == decision.exact_call_blocked
-                and cached_tail[6] == decision.first_failed_check
-                and cached_tail[7] == decision.min_time_window_slack
-                and cached_tail[8] == decision.negative_cache_hit
-                and cached_tail[9] == decision.single_segment_reachable
-                and cached_tail[10] == decision.structural_energy_lower_bound
-                and cached_tail[11] == decision.checks
-            ):
+        if decision.negative_cache_hit:
+            cached_tail = self._negative_screening_evidence_cache.get(decision.route_key)
+            if cached_tail is not None and cached_tail != evidence_tail:
                 raise RuntimeError(
                     "negative screening cache returned inconsistent evidence for one route"
                 )
-            precomputed = negative_cached[1]
-        else:
-            tail_key = (
-                decision.status,
-                decision.reason,
-                decision.demand,
-                decision.distance_increment_lower_bound,
-                decision.distance_lower_bound,
-                decision.exact_call_blocked,
-                decision.first_failed_check,
-                decision.min_time_window_slack,
-                decision.negative_cache_hit,
-                decision.single_segment_reachable,
-                decision.structural_energy_lower_bound,
-                decision.checks,
-            )
-            precomputed = (
-                None
-                if decision.negative_cache_hit
-                else self._screening_tail_cache.get(tail_key)
-            )
-        if precomputed is None:
-            if tail_key is None:
-                raise AssertionError("uncached screening evidence requires a complete tail key")
-            compact_checks = tuple(
-                (
-                    check.check,
-                    check.status,
-                    check.value if isinstance(check.value, bool) else None,
-                    float(check.value)
-                    if isinstance(check.value, (int, float))
-                    and not isinstance(check.value, bool)
-                    else None,
-                    check.value if isinstance(check.value, str) else None,
-                    check.reason,
+            self._negative_screening_evidence_cache[decision.route_key] = evidence_tail
+            if len(self._negative_screening_evidence_cache) > 262_144:
+                self._negative_screening_evidence_cache.pop(
+                    next(iter(self._negative_screening_evidence_cache))
                 )
-                for check in decision.checks
-            )
-            precomputed = _PrecomputedScreeningDefinition(
-                (
-                    tail_key[0],
-                    tail_key[1],
-                    self.axis_name,
-                    *tail_key[2:-1],
-                    compact_checks,
-                )
-            )
-            if decision.negative_cache_hit:
-                self._negative_screening_tail_cache[decision.route_key] = (
-                    tail_key,
-                    precomputed,
-                )
-                if len(self._negative_screening_tail_cache) > 262_144:
-                    self._negative_screening_tail_cache.pop(
-                        next(iter(self._negative_screening_tail_cache))
-                    )
-            else:
-                self._screening_tail_cache[tail_key] = precomputed
-                if len(self._screening_tail_cache) > 262_144:
-                    self._screening_tail_cache.pop(next(iter(self._screening_tail_cache)))
-        if self._screening_schema_version == "screening_decisions_v3":
-            if self._pending_cache_lookup is not None:
-                self._flush_pending_lookup()
-            self._event_buffer.append(
-                (
-                    decision.decision_id,
-                    decision.route_key,
-                    f"{self.axis_name}:{decision.lane}",
-                    decision.iteration,
-                    decision.operator,
-                    decision.started_at,
-                    decision.completed_at,
-                    precomputed,
-                )
-            )
-            if len(self._event_buffer) >= self._buffer_rows:
-                self._flush_event_buffer()
-            self._screening_decision_count += 1
-            self.event_count += 1
-            return
-        raise AssertionError("v3 screening decisions must use the typed append path")
+        self._queue_owned(
+            {
+                "decision_id": decision.decision_id,
+                "route_key": decision.route_key,
+                "lane": decision.lane,
+                "iteration": decision.iteration,
+                "operator": decision.operator,
+                "status": decision.status,
+                "first_failed_check": decision.first_failed_check,
+                "reason": decision.reason,
+                "demand": decision.demand,
+                "min_time_window_slack": decision.min_time_window_slack,
+                "distance_lower_bound": decision.distance_lower_bound,
+                "distance_increment_lower_bound": decision.distance_increment_lower_bound,
+                "single_segment_reachable": decision.single_segment_reachable,
+                "structural_energy_lower_bound": decision.structural_energy_lower_bound,
+                "negative_cache_hit": decision.negative_cache_hit,
+                "exact_call_blocked": decision.exact_call_blocked,
+                "started_at": decision.started_at,
+                "completed_at": decision.completed_at,
+                "duration_seconds": decision.duration_seconds,
+                "checks": tuple(
+                    {
+                        "check": check.check,
+                        "status": check.status,
+                        "value": check.value,
+                        "reason": check.reason,
+                    }
+                    for check in decision.checks
+                ),
+                "record_type": "screening_decision",
+                "event_type": "screening_decision",
+            }
+        )
 
     def append_incremental_propagation(self, propagation: Mapping[str, object]) -> None:
         started_ns = time.perf_counter_ns()
@@ -4625,8 +4535,7 @@ def _require_clean_repository(root: Path) -> None:
 
 
 def _peak_rss_bytes() -> int:
-    value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    return value if value > 10_000_000 else value * 1024
+    return peak_rss_bytes()
 
 
 def _optimization_profile(component: Stage052Component) -> str:

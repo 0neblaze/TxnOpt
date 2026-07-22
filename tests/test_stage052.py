@@ -51,6 +51,7 @@ from evrptw.experiments.stage052_performance_review import (
     _recompute_native_occupancies,
     _validate_native_shard_manifest_scope,
     _validate_stage052_staging_root_identity,
+    render_semantic_mismatches,
     replay_stage052_storage_semantics,
     replay_stage052_storage_semantics_many,
     validate_per_run_scope,
@@ -85,13 +86,72 @@ from evrptw.stage052_evidence import (
     collect_performance_provenance,
     create_stage052_runtime_identity,
     stage052_storage_root_binding,
+    upsert_stage052_campaign_lock,
     validate_worker_ownership,
     verify_job_parallel_selection,
+    verify_stage052_campaign_lock,
     verify_stage052_evidence_input,
     verify_stage052_prerequisite,
     verify_stage052_runtime_identity,
+    verify_stage052_source_snapshot,
     verify_stage052_storage_root_binding,
 )
+
+
+def test_source_snapshot_requires_clean_ext4_and_read_only_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    tracked = source / "tracked.txt"
+    tracked.write_text("source", encoding="utf-8")
+    subprocess.run(("git", "init", str(source)), check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(source), "add", "tracked.txt"), check=True)
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(source),
+            "-c",
+            "user.name=Stage052 Test",
+            "-c",
+            "user.email=stage052@example.invalid",
+            "commit",
+            "-m",
+            "snapshot",
+        ),
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.setattr(
+        stage052_evidence,
+        "_findmnt_identity",
+        lambda _path: {
+            "source": "/dev/test",
+            "filesystem": "ext4",
+            "uuid": "test-uuid",
+            "target": str(source),
+        },
+    )
+    tracked.chmod(0o444)
+    source.chmod(0o555)
+
+    observed = verify_stage052_source_snapshot(source)
+
+    assert observed["read_only"] is True
+    assert observed["tracked_file_count"] == 1
+    source.chmod(0o755)
+    injected = source / "sitecustomize.py"
+    injected.write_text("raise RuntimeError('injected')\n", encoding="utf-8")
+    injected.chmod(0o444)
+    source.chmod(0o555)
+    with pytest.raises(RuntimeError, match="unregistered untracked file"):
+        verify_stage052_source_snapshot(source)
+    source.chmod(0o755)
+    injected.unlink()
+    with pytest.raises(RuntimeError, match="writable tracked paths"):
+        verify_stage052_source_snapshot(source)
 
 
 def test_persistence_attribution_recomputes_monotonic_control_intervals() -> None:
@@ -183,31 +243,57 @@ def test_stage052_contract_requires_an_accepted_pilot_before_formal() -> None:
     )
 
 
-def test_stage052_storage_amendment_contract_binds_all_named_inputs() -> None:
+def test_stage052_storage_amendment_contract_binds_current_predecessor() -> None:
     contract = stage052_contract(Stage052Component.ARTIFACT_STREAMING, "performance")
     requirements = {requirement.role: requirement for requirement in contract.prerequisites}
 
-    assert tuple(requirements) == (
-        "hot_path_predecessor",
-        "historical_storage",
-        "remediation_source",
-    )
-    assert requirements["hot_path_predecessor"].exact_run_label == ("stage05.2_hot_path_attempt03")
-    assert requirements["hot_path_predecessor"].allowed_statuses == (
+    assert tuple(requirements) == ("performance_baseline", "hot_path_predecessor")
+    predecessor = requirements["hot_path_predecessor"]
+    assert predecessor.exact_run_label is None
+    assert predecessor.allowed_statuses == (
         "READY_FOR_STAGE052_ARTIFACT_STREAMING",
     )
-    assert requirements["historical_storage"].exact_run_label == (
-        "stage05.2_artifact_streaming_attempt04"
+    assert predecessor.requires_current_chain_identity
+
+
+def test_stage052_campaign_lock_binds_exact_raw_review_runtime_identity(
+    tmp_path: Path,
+) -> None:
+    raw_dir = tmp_path / "stage05.2_perf_baseline_attempt05"
+    config = tmp_path / "stage052.toml"
+    config.write_text("[stage05_2]\nschema_version='test'\n", encoding="utf-8")
+    writer = ArtifactBundleWriter(
+        raw_dir,
+        ArtifactRunContext("stage05.2", "perf_baseline", raw_dir.name),
+        ArtifactStorageConfig(),
     )
-    assert requirements["historical_storage"].requires_passed_review
-    assert requirements["remediation_source"].exact_run_label == (
-        "stage05.2_native_kernels_attempt03"
+    writer.write_control(
+        metadata={
+            "run_label": raw_dir.name,
+            "component": "perf_baseline",
+            "scope": "performance",
+            "runtime_identity": {"machine": "windows-wsl2-test"},
+        },
+        configuration_path=config,
     )
-    assert requirements["remediation_source"].allowed_statuses == ("NOT_READY",)
-    assert not requirements["remediation_source"].requires_passed_review
-    assert not any(
-        requirement.requires_current_chain_identity for requirement in requirements.values()
+    writer.finalize()
+    identity = Stage052PrerequisiteIdentity(
+        run_label=raw_dir.name,
+        component="perf_baseline",
+        status="READY_FOR_STAGE052_HOT_PATH",
+        repository_revision="a" * 40,
+        configuration_sha256="b" * 64,
+        raw_manifest_sha256="c" * 64,
+        review_manifest_sha256="d" * 64,
     )
+    lock_path = tmp_path / "campaign-lock.json"
+
+    upsert_stage052_campaign_lock(lock_path, raw_dir=raw_dir, identity=identity)
+    verify_stage052_campaign_lock(lock_path, raw_dir=raw_dir, identity=identity)
+
+    changed = replace(identity, review_manifest_sha256="e" * 64)
+    with pytest.raises(ArtifactIntegrityError, match="does not bind exact prerequisite"):
+        verify_stage052_campaign_lock(lock_path, raw_dir=raw_dir, identity=changed)
 
 
 def test_stage052_current_chain_prerequisites_reject_historical_physical_identity(
@@ -246,7 +332,13 @@ def test_stage052_current_chain_prerequisites_reject_historical_physical_identit
     monkeypatch.setattr(
         stage052_evidence,
         "verify_stage052_review_files",
-        lambda *_args, **_kwargs: {immutable_review: tmp_path / immutable_review},
+        lambda *_args, **_kwargs: {
+            immutable_review: tmp_path / immutable_review,
+            immutable_review.replace("review_report.md", "review_findings.csv"): tmp_path
+            / "review_findings.csv",
+            immutable_review.replace("review_report.md", "semantic_mismatches.csv"): tmp_path
+            / "semantic_mismatches.csv",
+        },
     )
 
     class HistoricalReader:
@@ -360,10 +452,14 @@ def test_performance_producer_verifies_exact_staging_path_and_live_volume(
     locator_path.parent.mkdir()
     locator_path.write_text(
         f"""
-[roots.transfer_staging]
+[roots.wsl_staging]
 absolute_path = "{results}"
-device_uuid = "transfer-uuid"
-filesystem = "ExFAT"
+device_uuid = "ext4-uuid"
+filesystem = "ext4"
+[roots.d_archive]
+absolute_path = "{tmp_path / 'archive'}"
+device_uuid = "d-nvme"
+filesystem = "9p"
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -372,12 +468,12 @@ filesystem = "ExFAT"
     binding = _verify_performance_staging_root(
         root=root,
         locator_path=locator_path,
-        staging_alias="transfer_staging",
+        staging_alias="wsl_staging",
         output_dir=results / "stage05.2_artifact_streaming_attempt05",
-        volume_probe=lambda _path: VolumeIdentity("transfer-uuid", "ExFAT"),
+        volume_probe=lambda _path: VolumeIdentity("ext4-uuid", "ext4"),
     )
 
-    assert binding["alias"] == "transfer_staging"
+    assert binding["alias"] == "wsl_staging"
     assert "absolute_path" not in json.dumps(binding)
 
 
@@ -390,10 +486,14 @@ def test_performance_producer_rejects_wrong_staging_volume(
     locator_path = root / "storage.local.toml"
     locator_path.write_text(
         f"""
-[roots.transfer_staging]
+[roots.wsl_staging]
 absolute_path = "{results}"
-device_uuid = "transfer-uuid"
-filesystem = "ExFAT"
+device_uuid = "ext4-uuid"
+filesystem = "ext4"
+[roots.d_archive]
+absolute_path = "{tmp_path / 'archive'}"
+device_uuid = "d-nvme"
+filesystem = "9p"
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -403,7 +503,7 @@ filesystem = "ExFAT"
         _verify_performance_staging_root(
             root=root,
             locator_path=locator_path,
-            staging_alias="transfer_staging",
+            staging_alias="wsl_staging",
             output_dir=results / "stage05.2_job_parallel_attempt07",
             volume_probe=lambda _path: VolumeIdentity("internal-uuid", "APFS"),
         )
@@ -454,7 +554,7 @@ filesystem = "ExFAT"
     assert "mismatch" in changed_detail
 
 
-def test_stage052_remediation_input_accepts_only_the_signed_not_ready_review(
+def test_stage052_current_chain_rejects_old_not_ready_remediation_input(
     tmp_path: Path,
 ) -> None:
     requirement = stage052_contract(
@@ -509,11 +609,8 @@ def test_stage052_remediation_input_accepts_only_the_signed_not_ready_review(
         encoding="utf-8",
     )
 
-    identity = verify_stage052_evidence_input(raw_dir, requirement)
-
-    assert identity.run_label == raw_dir.name
-    assert identity.status == "NOT_READY"
-    assert identity.scope == "performance"
+    with pytest.raises(ArtifactIntegrityError, match="component mismatch"):
+        verify_stage052_evidence_input(raw_dir, requirement)
 
 
 def test_artifact_persistence_gate_rejects_the_measured_e03_ratio() -> None:
@@ -1260,6 +1357,7 @@ def test_accelerator_decision_recomputes_exactly_nine_e_occupancies(
     payload = _accelerator_decision_inputs(
         raw_dir,
         prerequisite=SimpleNamespace(to_dict=lambda: {"run_label": run_label}),
+        accelerator_backend="cuda",
     )
     assert payload["decision"] == "GPU_NOT_JUSTIFIED"
     assert payload["median_batch_occupancy"] == pytest.approx(5.0)
@@ -2274,6 +2372,22 @@ def test_stage052_runtime_identity_binds_wheel_python_native_and_dependencies(
     wheel.write_bytes(b"wheel-under-test")
     manifest = tmp_path / "stage052_runtime.local.json"
     monkeypatch.setattr(stage052_evidence, "_distribution_is_editable", lambda: False)
+    monkeypatch.setattr(
+        stage052_evidence,
+        "_stage052_machine_identity",
+        lambda: {"execution_environment": "windows11_wsl2_test"},
+    )
+    monkeypatch.setattr(stage052_evidence, "repository_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        stage052_evidence,
+        "_findmnt_identity",
+        lambda _path: {
+            "source": "/dev/test",
+            "filesystem": "ext4",
+            "uuid": "test-uuid",
+            "target": "/",
+        },
+    )
 
     created = create_stage052_runtime_identity(
         output_path=manifest,
@@ -2717,6 +2831,13 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         route_evaluation_status="completed_infeasible",
     )
     assert replay_stage052_storage_semantics(v1) != replay_stage052_storage_semantics(changed_event)
+    mismatch_lines = render_semantic_mismatches(changed_event, (v1,)).decode().splitlines()
+    assert mismatch_lines[0] == (
+        "instance,seed,axis,ordinal,field,left_digest,right_digest"
+    )
+    assert mismatch_lines[1].startswith(
+        "c101_21,2014,fixed_work,2,event.propagation_status,"
+    )
     ordered_replays = replay_stage052_storage_semantics_many((changed_event, v1), max_workers=2)
     assert ordered_replays == [
         replay_stage052_storage_semantics(changed_event),

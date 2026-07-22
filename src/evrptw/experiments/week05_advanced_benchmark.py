@@ -6,7 +6,6 @@ import json
 import math
 import os
 import platform
-import resource
 import statistics
 import subprocess
 import time
@@ -25,6 +24,7 @@ from evrptw.bpc import BPCResult, solve_branch_price_and_cut
 from evrptw.environment import collect_environment
 from evrptw.models import Instance
 from evrptw.parser import parse_schneider
+from evrptw.stage052_platform import peak_rss_bytes
 from evrptw.validation import SolutionReport, validate_routes
 
 DEFAULT_PRIMARY_INSTANCES = (
@@ -297,7 +297,7 @@ def _timed_call(function: Callable[[], Any]) -> _TimedValue:
         datetime.now(UTC).isoformat(),
         time.perf_counter() - wall_start,
         time.process_time() - cpu_start,
-        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 * 1024.0),
+        peak_rss_bytes() / (1024.0 * 1024.0),
     )
 
 

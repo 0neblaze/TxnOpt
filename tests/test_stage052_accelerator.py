@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import evrptw.experiments.stage052_performance_review as stage052_review
+import evrptw.stage052_accelerator as accelerator_module
 from evrptw.artifacts import (
     ArtifactBundleWriter,
     ArtifactRunContext,
@@ -15,8 +17,11 @@ from evrptw.artifacts import (
 from evrptw.experiments.stage052_performance import _accelerator_decision_inputs
 from evrptw.stage052 import AcceleratorDecision, PerformanceObservation
 from evrptw.stage052_accelerator import (
+    ACCELERATOR_HELPER_SCHEMA_VERSION,
+    AcceleratorPilotExecutor,
     InjectedMetalPilotExecutor,
     MetalPilotStatus,
+    SubprocessAcceleratorPilotExecutor,
     SubprocessMetalPilotExecutor,
     audit_metal_pilot_result,
     campaign_execution_adapter_gate,
@@ -39,6 +44,16 @@ def _native_observations() -> tuple[PerformanceObservation, ...]:
                 )
             )
     return tuple(rows)
+
+
+def _register_fake_nvcc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    toolkit = tmp_path / "cuda-toolkit"
+    nvcc = toolkit / "bin" / "nvcc"
+    nvcc.parent.mkdir(parents=True)
+    nvcc.write_text("#!/bin/sh\necho 'Cuda compilation tools, release 13.0'\n", encoding="utf-8")
+    nvcc.chmod(0o755)
+    monkeypatch.setattr(accelerator_module.shutil, "which", lambda _name: str(nvcc))
+    return nvcc
 
 
 def _write_high_occupancy_e_bundle(tmp_path: Path) -> Path:
@@ -139,19 +154,24 @@ def test_runner_input_branch_persists_partial_payload_when_helper_is_missing(
     payload = _accelerator_decision_inputs(
         raw_dir,
         prerequisite=SimpleNamespace(to_dict=lambda: {"run_label": raw_dir.name}),
+        accelerator_backend="cuda",
     )
 
-    assert payload["schema_version"] == "stage05.2-accelerator-pilot-artifact-v1"
+    assert payload["schema_version"] == "stage05.2-accelerator-pilot-artifact-v2"
     pilot = payload["pilot"]
     assert isinstance(pilot, dict)
     assert pilot["status"] == "partial"
-    assert pilot["failure_code"] == "METAL_RUNTIME_UNAVAILABLE"
+    assert pilot["failure_code"] == "CUDA_RUNTIME_UNAVAILABLE"
     assert pilot["fallback_used"] is False
 
 
-def test_runner_input_branch_executes_configured_metal_helper(tmp_path: Path) -> None:
+def test_runner_input_branch_executes_configured_cuda_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _register_fake_nvcc(tmp_path, monkeypatch)
     raw_dir = _write_high_occupancy_e_bundle(tmp_path)
-    helper = tmp_path / "metal-helper"
+    helper = tmp_path / "cuda-helper"
     helper.write_text(
         "#!/usr/bin/env python3\n"
         "import json, sys\n"
@@ -159,8 +179,8 @@ def test_runner_input_branch_executes_configured_metal_helper(tmp_path: Path) ->
         "rows = request['rows']\n"
         "for row in rows:\n"
         "    row['end_to_end_seconds'] *= 0.8\n"
-        "json.dump({'schema_version': 'stage05.2-metal-helper-v1', "
-        "'execution_backend': 'metal', 'fallback_used': False, 'rows': rows}, sys.stdout)\n",
+        "json.dump({'schema_version': 'stage05.2-accelerator-helper-v2', "
+        "'backend': 'cuda', 'fallback_used': False, 'rows': rows}, sys.stdout)\n",
         encoding="utf-8",
     )
     helper.chmod(0o755)
@@ -168,14 +188,15 @@ def test_runner_input_branch_executes_configured_metal_helper(tmp_path: Path) ->
     payload = _accelerator_decision_inputs(
         raw_dir,
         prerequisite=SimpleNamespace(to_dict=lambda: {"run_label": raw_dir.name}),
-        metal_helper_path=helper,
+        accelerator_backend="cuda",
+        accelerator_helper_path=helper,
     )
 
     pilot = payload["pilot"]
     assert isinstance(pilot, dict)
     assert pilot["status"] == "complete"
     assert pilot["decision"] == "ACCELERATOR_PROMOTED"
-    assert pilot["selected_backend"] == "metal"
+    assert pilot["selected_backend"] == "cuda"
 
 
 def test_injected_real_pilot_promotes_only_after_semantic_and_performance_gates() -> None:
@@ -335,6 +356,50 @@ def test_subprocess_executor_runs_strict_real_helper_protocol(tmp_path: Path) ->
     assert result.selected_backend == "metal"
     assert result.runtime_identity is not None
     assert result.runtime_identity["production_evidence_eligible"] is True
+
+
+def test_generic_cuda_executor_uses_helper_protocol_v2_without_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nvcc = _register_fake_nvcc(tmp_path, monkeypatch)
+    helper = tmp_path / "cuda-helper"
+    helper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "request = json.load(sys.stdin)\n"
+        "assert request['schema_version'] == 'stage05.2-accelerator-helper-v2'\n"
+        "assert request['backend'] == 'cuda'\n"
+        "assert request['fallback_allowed'] is False\n"
+        "json.dump({'schema_version': request['schema_version'], "
+        "'backend': 'cuda', 'fallback_used': False, 'rows': request['rows']}, sys.stdout)\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    executor: AcceleratorPilotExecutor = SubprocessAcceleratorPilotExecutor(
+        helper,
+        backend="cuda",
+    )
+
+    rows = executor.execute(_native_observations())
+
+    assert rows == _native_observations()
+    assert executor.runtime_identity["backend"] == "cuda"
+    assert executor.runtime_identity["protocol_schema_version"] == (
+        ACCELERATOR_HELPER_SCHEMA_VERSION
+    )
+    assert executor.runtime_identity["fallback_allowed"] is False
+    assert len(str(executor.runtime_identity["helper_sha256"])) == 64
+    assert executor.runtime_identity["nvcc_path"] == str(nvcc.resolve())
+    assert len(str(executor.runtime_identity["nvcc_sha256"])) == 64
+
+    frozen_identity = dict(executor.runtime_identity)
+    passed, _ = stage052_review._audit_cuda_runtime_identity(frozen_identity)
+    assert passed
+    helper.write_text("tampered", encoding="utf-8")
+    passed, detail = stage052_review._audit_cuda_runtime_identity(frozen_identity)
+    assert not passed
+    assert "SHA-256" in detail
 
 
 def test_pilot_payload_round_trips_without_losing_gate_evidence() -> None:

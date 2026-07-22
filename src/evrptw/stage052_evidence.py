@@ -7,6 +7,7 @@ import importlib.metadata
 import json
 import math
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -19,14 +20,21 @@ from typing import Any
 
 import psutil  # type: ignore[import-untyped]
 
-from evrptw.artifacts import ArtifactIntegrityError, ArtifactReader, signed_sidecar_matches
+from evrptw.artifacts import (
+    ArtifactIntegrityError,
+    ArtifactReader,
+    atomic_write_signed_json,
+    signed_sidecar_matches,
+)
 from evrptw.repository import repository_root
 from evrptw.stage052 import Stage052PrerequisiteRequirement
+from evrptw.stage052_platform import read_windows_wsl_power_status
 
 STAGE052_REVIEW_SCHEMA_VERSION = "stage05.2-review-v1"
 STAGE052_RESOURCE_SCHEMA_VERSION = "stage05.2-run-resource-v3"
 STAGE052_LEGACY_RESOURCE_SCHEMA_VERSION = "stage05.2-run-resource-v2"
-STAGE052_RUNTIME_IDENTITY_SCHEMA_VERSION = "stage05.2-runtime-identity-v1"
+STAGE052_RUNTIME_IDENTITY_SCHEMA_VERSION = "stage05.2-runtime-identity-v2"
+STAGE052_CAMPAIGN_LOCK_SCHEMA_VERSION = "stage05.2-campaign-lock-v1"
 STAGE052_STORAGE_ROOT_BINDING_SCHEMA_VERSION = "stage05.2-storage-root-binding-v1"
 STAGE052_PERSISTENCE_ATTRIBUTION_SCHEMA_VERSION = (
     "stage05.2-persistence-attribution-v1"
@@ -539,6 +547,10 @@ def _runtime_identity_payload(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+    source_root = repository_root().resolve()
+    source_mount = _findmnt_identity(source_root)
+    if source_mount.get("filesystem") != "ext4":
+        raise RuntimeError("Stage 5.2 source repository must be on WSL2 ext4")
     tracked: dict[str, object] = {
         "schema_version": STAGE052_RUNTIME_IDENTITY_SCHEMA_VERSION,
         "repository_revision": repository_revision,
@@ -551,14 +563,215 @@ def _runtime_identity_payload(
         "dependency_manifest_sha256": hashlib.sha256(dependency_bytes).hexdigest(),
         "installed_distribution_sha256": _installed_distribution_digest(),
         "installed_editable": editable,
+        "machine_identity": _stage052_machine_identity(),
+        "source_repository_mount": source_mount,
     }
     local = {
         **tracked,
         "wheel_path": str(resolved_wheel),
         "python_executable": str(python_executable),
         "native_extension": str(native_extension),
+        "source_repository_root": str(source_root),
     }
     return tracked, local
+
+
+def verify_stage052_source_snapshot(root: Path) -> dict[str, object]:
+    """Require a clean ext4 Git snapshot whose entire source tree is read-only."""
+
+    resolved = root.resolve()
+    mount = _findmnt_identity(resolved)
+    if mount.get("filesystem") != "ext4":
+        raise RuntimeError("Stage 5.2 source snapshot must be on WSL2 ext4")
+    status = subprocess.run(
+        ("git", "-C", str(resolved), "status", "--porcelain", "--untracked-files=no"),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+    ).stdout
+    if status.strip():
+        raise RuntimeError("Stage 5.2 source snapshot must be a clean Git checkout")
+    revision = subprocess.run(
+        ("git", "-C", str(resolved), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+    ).stdout.strip()
+    tracked_output = subprocess.run(
+        ("git", "-C", str(resolved), "ls-files", "-z"),
+        check=True,
+        capture_output=True,
+        timeout=10.0,
+    ).stdout
+    tracked_paths = [
+        resolved / os.fsdecode(raw)
+        for raw in tracked_output.split(b"\0")
+        if raw
+    ]
+    if not tracked_paths:
+        raise RuntimeError("Stage 5.2 source snapshot has no tracked files")
+    tracked_relative = {
+        path.relative_to(resolved).as_posix() for path in tracked_paths
+    }
+    allowed_local_files = {
+        "configs/stage052_campaign_lock.local.json",
+        "configs/stage052_runtime_identity.local.json",
+        "configs/stage052_storage_roots.local.toml",
+    }
+    allowed_untracked: dict[str, str] = {}
+    writable: list[str] = []
+    for path in tracked_paths:
+        if not path.is_file():
+            raise RuntimeError(f"tracked Stage 5.2 source file is unavailable: {path}")
+    source_paths = [resolved, *resolved.rglob("*")]
+    for path in source_paths:
+        relative = path.relative_to(resolved)
+        if relative.parts and relative.parts[0] == ".git":
+            continue
+        relative_text = relative.as_posix()
+        if path.is_symlink():
+            raise RuntimeError(f"Stage 5.2 source snapshot contains a symlink: {relative_text}")
+        if path.lstat().st_mode & 0o222:
+            writable.append(relative_text or ".")
+        if not path.is_file() or relative_text in tracked_relative:
+            continue
+        allowed = relative_text in allowed_local_files or (
+            len(relative.parts) == 3
+            and relative.parts[:2] == ("data", "schneider")
+        )
+        if not allowed:
+            raise RuntimeError(
+                "Stage 5.2 source snapshot contains an unregistered untracked file: "
+                f"{relative_text}"
+            )
+        allowed_untracked[relative_text] = _sha256(path)
+    if writable:
+        raise RuntimeError(
+            "Stage 5.2 source snapshot contains writable tracked paths: "
+            + ", ".join(sorted(writable)[:10])
+        )
+    return {
+        "repository_revision": revision,
+        "mount": mount,
+        "tracked_file_count": len(tracked_paths),
+        "allowed_untracked_sha256": dict(sorted(allowed_untracked.items())),
+        "read_only": True,
+    }
+
+
+def _stage052_machine_identity() -> dict[str, object]:
+    """Collect the stable Windows/WSL2 hardware and mount identity."""
+
+    system = platform.system()
+    release = platform.release()
+    base: dict[str, object] = {
+        "host_system": system,
+        "linux_kernel": release,
+        "logical_cpu_count": psutil.cpu_count(logical=True),
+        "physical_cpu_count": psutil.cpu_count(logical=False),
+        "memory_bytes": int(psutil.virtual_memory().total),
+    }
+    if system != "Linux" or "microsoft" not in release.casefold():
+        return {**base, "execution_environment": system.casefold()}
+    windows = json.loads(
+        _run_command(
+            (
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-CimInstance Win32_OperatingSystem | Select-Object "
+                "Caption,Version,BuildNumber,TotalVisibleMemorySize) | "
+                "ConvertTo-Json -Compress",
+            )
+        )
+    )
+    cpu = json.loads(
+        _run_command(
+            (
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-CimInstance Win32_Processor | Select-Object "
+                "Name,NumberOfCores,NumberOfLogicalProcessors) | ConvertTo-Json -Compress",
+            )
+        )
+    )
+    gpu_line = _run_command(
+        (
+            "nvidia-smi",
+            "--query-gpu=name,driver_version,compute_cap",
+            "--format=csv,noheader,nounits",
+        )
+    ).splitlines()
+    if len(gpu_line) != 1 or len(gpu_line[0].split(",")) != 3:
+        raise RuntimeError("Stage 5.2 requires exactly one auditable NVIDIA GPU")
+    gpu_name, driver, capability = (part.strip() for part in gpu_line[0].split(","))
+    wsl_version = _run_command(("wsl.exe", "--version")).replace("\x00", "")
+    ext4 = _findmnt_identity(Path(sys.executable))
+    d_archive = _findmnt_identity(Path("/mnt/d"))
+    if ext4.get("filesystem") != "ext4" or d_archive.get("filesystem") != "9p":
+        raise RuntimeError("Stage 5.2 runtime must use ext4 execution and D-drive 9p archive")
+    d_disk = json.loads(
+        _run_command(
+            (
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$p=Get-Partition -DriveLetter D; $d=$p|Get-Disk; "
+                "[pscustomobject]@{FriendlyName=$d.FriendlyName;SerialNumber=$d.SerialNumber;"
+                "BusType=[string]$d.BusType;Number=$d.Number}|ConvertTo-Json -Compress",
+            )
+        )
+    )
+    if not isinstance(d_disk, Mapping) or str(d_disk.get("BusType")) != "NVMe":
+        raise RuntimeError("Stage 5.2 D archive must be backed by NVMe")
+    return {
+        **base,
+        "execution_environment": "windows11_wsl2",
+        "windows": windows,
+        "wsl_version": wsl_version,
+        "cpu": cpu,
+        "nvidia_gpu": {
+            "name": gpu_name,
+            "driver_version": driver,
+            "cuda_capability": capability,
+        },
+        "ext4_mount": ext4,
+        "d_archive_mount": d_archive,
+        "d_archive_disk": dict(d_disk),
+    }
+
+
+def _findmnt_identity(path: Path) -> dict[str, object]:
+    payload = json.loads(
+        _run_command(
+            (
+                "findmnt",
+                "--json",
+                "--target",
+                str(path),
+                "--output",
+                "SOURCE,FSTYPE,UUID,TARGET",
+            )
+        )
+    )
+    filesystems = payload.get("filesystems") if isinstance(payload, Mapping) else None
+    if not isinstance(filesystems, list) or len(filesystems) != 1:
+        raise RuntimeError(f"findmnt identity is invalid for {path}")
+    item = filesystems[0]
+    if not isinstance(item, Mapping):
+        raise RuntimeError(f"findmnt identity is invalid for {path}")
+    return {
+        "source": str(item.get("source", "")),
+        "filesystem": str(item.get("fstype", "")),
+        "uuid": str(item.get("uuid", "")),
+        "target": str(item.get("target", "")),
+    }
 
 
 def create_stage052_runtime_identity(
@@ -764,13 +977,18 @@ def verify_stage052_review_files(
             raise ArtifactIntegrityError("campaign review files/publication_files differ")
         campaign_publication_files = publication_files
     else:
-        if len(files) != 2:
+        if len(files) not in {2, 3}:
             raise ArtifactIntegrityError("prerequisite review file identity mismatch")
         legacy = set(relative_paths) == {"review_findings.csv", "review_report.md"}
         parsed = [] if legacy else [Path(value) for value in relative_paths]
     if not campaign_review and parsed:
+        observed_names = {path.name for path in parsed}
         if (
-            {path.name for path in parsed} != {"review_findings.csv", "review_report.md"}
+            observed_names
+            not in (
+                {"review_findings.csv", "review_report.md"},
+                {"review_findings.csv", "review_report.md", "semantic_mismatches.csv"},
+            )
             or any(len(path.parts) != 3 or path.parts[0] != "generations" for path in parsed)
             or len({path.parts[1] for path in parsed}) != 1
         ):
@@ -801,11 +1019,14 @@ def verify_stage052_review_files(
     elif parsed:
         by_name = {path.name: verified[path.as_posix()] for path in parsed}
         generation = parsed[0].parts[1]
-        generation_digest = hashlib.sha256(
+        digest_input = (
             by_name["review_findings.csv"].read_bytes()
             + b"\0"
             + by_name["review_report.md"].read_bytes()
-        ).hexdigest()
+        )
+        if "semantic_mismatches.csv" in by_name:
+            digest_input += b"\0" + by_name["semantic_mismatches.csv"].read_bytes()
+        generation_digest = hashlib.sha256(digest_input).hexdigest()
         if generation_digest != generation:
             raise ArtifactIntegrityError("prerequisite review generation digest does not replay")
     return verified
@@ -873,6 +1094,97 @@ class Stage052PrerequisiteIdentity:
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+def stage052_campaign_lock_entry(
+    raw_dir: Path,
+    identity: Stage052PrerequisiteIdentity,
+) -> dict[str, object]:
+    """Build the exact immutable predecessor identity stored in the campaign lock."""
+
+    reader = ArtifactReader(raw_dir.resolve())
+    metadata_items = [
+        item
+        for item in reader.manifest.get("artifacts", ())
+        if isinstance(item, Mapping) and item.get("artifact_type") == "manifest_metadata"
+    ]
+    if len(metadata_items) != 1:
+        raise ArtifactIntegrityError("campaign-lock predecessor metadata is incomplete")
+    metadata = reader.read_json(str(metadata_items[0].get("relative_path", "")))
+    runtime = metadata.get("runtime_identity")
+    if not isinstance(runtime, Mapping):
+        raise ArtifactIntegrityError("campaign-lock predecessor runtime identity is missing")
+    runtime_bytes = json.dumps(
+        dict(runtime), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {
+        **identity.to_dict(),
+        "runtime_identity_sha256": hashlib.sha256(runtime_bytes).hexdigest(),
+    }
+
+
+def verify_stage052_campaign_lock(
+    lock_path: Path,
+    *,
+    raw_dir: Path,
+    identity: Stage052PrerequisiteIdentity,
+) -> None:
+    """Require one prerequisite to match an exact signed campaign-lock entry."""
+
+    sidecar = lock_path.with_suffix(".sha256")
+    if not signed_sidecar_matches(lock_path, sidecar):
+        raise ArtifactIntegrityError("Stage 5.2 campaign lock or sidecar is invalid")
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ArtifactIntegrityError("Stage 5.2 campaign lock is unreadable") from error
+    entries = payload.get("entries") if isinstance(payload, Mapping) else None
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("schema_version") != STAGE052_CAMPAIGN_LOCK_SCHEMA_VERSION
+        or not isinstance(entries, list)
+    ):
+        raise ArtifactIntegrityError("Stage 5.2 campaign lock schema is invalid")
+    expected = stage052_campaign_lock_entry(raw_dir, identity)
+    matches = [entry for entry in entries if isinstance(entry, Mapping) and dict(entry) == expected]
+    if len(matches) != 1:
+        raise ArtifactIntegrityError(
+            f"Stage 5.2 campaign lock does not bind exact prerequisite {identity.run_label}"
+        )
+
+
+def upsert_stage052_campaign_lock(
+    lock_path: Path,
+    *,
+    raw_dir: Path,
+    identity: Stage052PrerequisiteIdentity,
+) -> tuple[Path, Path]:
+    """Publish an accepted reviewed identity for the next current-chain producer."""
+
+    entries: list[dict[str, object]] = []
+    if lock_path.exists():
+        sidecar = lock_path.with_suffix(".sha256")
+        if not signed_sidecar_matches(lock_path, sidecar):
+            raise ArtifactIntegrityError("cannot update an invalid Stage 5.2 campaign lock")
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("schema_version") != STAGE052_CAMPAIGN_LOCK_SCHEMA_VERSION
+            or not isinstance(payload.get("entries"), list)
+        ):
+            raise ArtifactIntegrityError("cannot update a campaign lock with invalid schema")
+        entries = [dict(entry) for entry in payload["entries"] if isinstance(entry, Mapping)]
+    entry = stage052_campaign_lock_entry(raw_dir, identity)
+    entries = [item for item in entries if item.get("run_label") != identity.run_label]
+    entries.append(entry)
+    entries.sort(key=lambda item: str(item.get("run_label", "")))
+    return atomic_write_signed_json(
+        lock_path,
+        {
+            "schema_version": STAGE052_CAMPAIGN_LOCK_SCHEMA_VERSION,
+            "entries": entries,
+        },
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1186,6 +1498,14 @@ def verify_stage052_evidence_input(
         raise ArtifactIntegrityError(
             "current-chain prerequisite requires an immutable review generation"
         )
+    if {path.name for path in current_review_files.values()} != {
+        "review_findings.csv",
+        "review_report.md",
+        "semantic_mismatches.csv",
+    }:
+        raise ArtifactIntegrityError(
+            "current-chain prerequisite requires semantic_mismatches.csv"
+        )
     reader = ArtifactReader(raw_dir.resolve())
     metadata_items = [
         item
@@ -1195,11 +1515,21 @@ def verify_stage052_evidence_input(
     if len(metadata_items) != 1:
         raise ArtifactIntegrityError("current-chain prerequisite metadata is incomplete")
     metadata = reader.read_json(str(metadata_items[0].get("relative_path", "")))
-    expected_fields = {
-        "backend": "cpu_batch",
-        "storage_policy_version": "artifact-storage-v2",
-        "screening_schema_version": "screening_decisions_v3",
-    }
+    expected_fields = {"backend": "cpu_batch"}
+    if requirement.component.value in {"perf_baseline", "hot_path"}:
+        expected_fields.update(
+            {
+                "storage_policy_version": "artifact-storage-v1",
+                "screening_schema_version": "screening_decisions_v1",
+            }
+        )
+    else:
+        expected_fields.update(
+            {
+                "storage_policy_version": "artifact-storage-v2",
+                "screening_schema_version": "screening_decisions_v3",
+            }
+        )
     if any(metadata.get(field) != expected for field, expected in expected_fields.items()):
         raise ArtifactIntegrityError(
             "prerequisite is historical evidence, not the current v3/cpu_batch chain"
@@ -1227,7 +1557,7 @@ def verify_stage052_evidence_input(
     verify_stage052_storage_root_binding(
         metadata,
         locator_path=root / "configs/stage052_storage_roots.local.toml",
-        expected_alias="transfer_staging",
+        expected_alias="wsl_staging",
     )
     return identity
 
@@ -1632,8 +1962,18 @@ def _runtime_signature(environment: Mapping[str, object]) -> dict[str, object]:
 
 
 def _collect_power_mode() -> dict[str, object]:
+    if os.uname().sysname == "Linux" and "microsoft" in os.uname().release.casefold():
+        status = read_windows_wsl_power_status()
+        return {
+            "available": True,
+            "source": "AC Power" if status.ac_online else "Battery Power",
+            "low_power_mode": status.battery_saver,
+            "battery_life_percent": status.battery_life_percent,
+            "battery_flag": status.battery_flag,
+            "active_power_scheme": status.active_power_scheme,
+        }
     if os.uname().sysname != "Darwin":
-        return {"available": False, "source": "not_macos", "low_power_mode": None}
+        raise RuntimeError("Stage 5.2 performance provenance requires WSL2 or macOS replay")
     source_output = _run_command(("pmset", "-g", "batt"))
     profile_output = _run_command(("pmset", "-g", "custom"))
     source = "unknown"

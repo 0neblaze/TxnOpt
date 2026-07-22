@@ -44,6 +44,7 @@ from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES
 from evrptw.models import Instance
 from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
 from evrptw.parser import parse_schneider
+from evrptw.repository import repository_root
 from evrptw.stage052 import Stage052Component, stage052_contract
 from evrptw.stage052_campaign import (
     CHECKPOINT_SECONDS,
@@ -72,6 +73,7 @@ from evrptw.stage052_evidence import (
     verify_stage052_campaign_gate_set,
     verify_stage052_evidence_input,
     verify_stage052_review_files,
+    verify_stage052_source_snapshot,
 )
 from evrptw.validation import validate_routes
 
@@ -201,9 +203,9 @@ def validate_campaign_selection_lock(
     expected_backend = {
         "GPU_NOT_JUSTIFIED": "native_cpu",
         "NATIVE_CPU_RETAINED": "native_cpu",
-        "ACCELERATOR_PROMOTED": "metal",
+        "ACCELERATOR_PROMOTED": "cuda",
     }.get(accelerator_decision)
-    expected_profile = "metal" if expected_backend == "metal" else "native"
+    expected_profile = "cuda" if expected_backend == "cuda" else "native"
     if (
         expected_backend is None
         or campaign_backend != expected_backend
@@ -272,7 +274,7 @@ def validate_campaign_selection_lock(
     ):
         failures.append("F02 revision/config/raw/review digest is invalid")
     runtime_valid = isinstance(runtime, Mapping) and (
-        runtime.get("schema_version") == "stage05.2-runtime-identity-v1"
+        runtime.get("schema_version") == "stage05.2-runtime-identity-v2"
         and runtime.get("repository_revision") == revision
         and runtime.get("installed_editable") is False
         and all(
@@ -1551,6 +1553,11 @@ def _validate_power_load(
     runtime = payload.get("runtime")
     if not isinstance(preflight, Mapping) or not isinstance(runtime, Mapping):
         return False, "batch power/load observations are missing"
+    boundary_passed, boundary_detail = _validate_native_power_boundary(
+        payload.get("native_power_boundary")
+    )
+    if not boundary_passed:
+        return False, boundary_detail
     windows = preflight.get("windows")
     if (
         preflight.get("power_source") != "AC Power"
@@ -1658,6 +1665,41 @@ def _validate_power_load(
     )
 
 
+def _validate_native_power_boundary(payload: object) -> tuple[bool, str]:
+    if not isinstance(payload, Mapping):
+        return False, "native power boundary evidence is missing"
+    before = payload.get("before")
+    after = payload.get("after")
+    if (
+        payload.get("schema_version") != "stage05.2-native-power-boundary-v1"
+        or payload.get("stable_invariants")
+        != ["ac_online", "battery_saver", "active_power_scheme"]
+        or payload.get("invariants_unchanged") is not True
+        or not isinstance(before, Mapping)
+        or not isinstance(after, Mapping)
+    ):
+        return False, "native power boundary schema is invalid"
+    for observation in (before, after):
+        percent = observation.get("battery_life_percent")
+        flag = observation.get("battery_flag")
+        if (
+            observation.get("ac_online") is not True
+            or observation.get("battery_saver") is not False
+            or not isinstance(observation.get("active_power_scheme"), str)
+            or not str(observation.get("active_power_scheme")).strip()
+            or isinstance(percent, bool)
+            or not isinstance(percent, int)
+            or percent not in range(0, 256)
+            or isinstance(flag, bool)
+            or not isinstance(flag, int)
+        ):
+            return False, "native power boundary observation is invalid"
+    invariants = ("ac_online", "battery_saver", "active_power_scheme")
+    if any(before.get(field) != after.get(field) for field in invariants):
+        return False, "native power hard invariant changed across the batch"
+    return True, "native power boundary invariants independently replayed"
+
+
 def _validate_batch_resources(
     *,
     resource: dict[str, object],
@@ -1717,6 +1759,7 @@ def _validate_batch_metadata(
     *,
     campaign: CampaignManifest,
     selection_lock: Mapping[str, object],
+    source_snapshot: Mapping[str, object],
 ) -> tuple[bool, str, tuple[str, str, str]]:
     runtime = metadata.get("runtime_identity")
     provenance = metadata.get("performance_provenance")
@@ -1744,7 +1787,7 @@ def _validate_batch_metadata(
         and metadata.get("component") == Stage052Component.BENCHMARK.value
         and metadata.get("scope") == campaign.scope
         and metadata.get("execution_backend") == campaign.selected_backend
-        and campaign.selected_backend in {"native_cpu", "metal"}
+        and campaign.selected_backend in {"native_cpu", "cuda"}
         and metadata.get("backend") == campaign.selected_exact_backend == "cpu_batch"
         and metadata.get("worker_count") == campaign.selected_workers
         and metadata.get("native_profile") == campaign.native_profile
@@ -1769,7 +1812,8 @@ def _validate_batch_metadata(
         and len(repository_revision) == 40
         and all(character in "0123456789abcdef" for character in repository_revision)
         and metadata.get("repository_dirty") is False
-        and runtime.get("schema_version") == "stage05.2-runtime-identity-v1"
+        and metadata.get("source_snapshot") == source_snapshot
+        and runtime.get("schema_version") == "stage05.2-runtime-identity-v2"
         and runtime.get("installed_editable") is False
         and runtime.get("repository_revision") == repository_revision
         and all(
@@ -2728,7 +2772,7 @@ def _verify_campaign_review_prerequisite(
     expected_backend = {
         "GPU_NOT_JUSTIFIED": "native_cpu",
         "NATIVE_CPU_RETAINED": "native_cpu",
-        "ACCELERATOR_PROMOTED": "metal",
+        "ACCELERATOR_PROMOTED": "cuda",
     }.get(decision)
     if (
         not isinstance(selection, Mapping)
@@ -2922,7 +2966,7 @@ def _independent_capacity_plan(
         measured = free_bytes_by_alias[alias]
         free_by_device[device] = min(free_by_device.get(device, measured), measured)
     staging_device = roots[config.staging_root_alias].volume.device_uuid
-    external_floor = 52 * GIB
+    external_floor = 82 * GIB
     if free_by_device[staging_device] < external_floor:
         raise ArtifactIntegrityError("campaign staging capacity is below the fixed reserve")
     representative_alias: dict[str, str] = {}
@@ -2936,8 +2980,12 @@ def _independent_capacity_plan(
         if device == staging_device:
             reserve = external_floor
         else:
-            if root.volume.filesystem.casefold() != "apfs":
-                raise ArtifactIntegrityError("internal campaign archive must use APFS")
+            filesystem = root.volume.filesystem.casefold()
+            if alias == "d_archive":
+                if filesystem not in {"9p", "ntfs"}:
+                    raise ArtifactIntegrityError("D campaign archive must use WSL 9p/NTFS")
+            elif filesystem != "apfs":
+                raise ArtifactIntegrityError("historical internal archive must use APFS")
             reserve = 50 * GIB
         usable[device] = max(0, free_by_device[device] - reserve)
     if sum(usable.values()) < plan.estimated_bytes:
@@ -3137,7 +3185,7 @@ def _audit_campaign(
         campaign.status == "complete"
         and campaign.scope == scope
         and campaign.run_label == campaign_dir.name
-        and campaign.selected_backend in {"native_cpu", "metal"}
+        and campaign.selected_backend in {"native_cpu", "cuda"}
         and campaign.selected_exact_backend == "cpu_batch"
         and campaign.native_profile == "stage05.2-native-kernels-v1"
     )
@@ -3147,6 +3195,21 @@ def _audit_campaign(
         if campaign_identity
         else "campaign identity/status/backend/native profile mismatch",
     }
+    try:
+        current_source_snapshot = verify_stage052_source_snapshot(repository_root())
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
+        current_source_snapshot = {}
+        gates["source_snapshot"] = {"passed": False, "detail": str(error)}
+    else:
+        source_passed = standard_metadata.get("source_snapshot") == current_source_snapshot
+        gates["source_snapshot"] = {
+            "passed": source_passed,
+            "detail": (
+                "clean ext4 read-only source snapshot independently replayed"
+                if source_passed
+                else "campaign source snapshot does not match independent replay"
+            ),
+        }
 
     prerequisite_payload: dict[str, object] = {}
     selection_lock: dict[str, object] = {}
@@ -3338,6 +3401,7 @@ def _audit_campaign(
                 metadata,
                 campaign=campaign,
                 selection_lock=selection_lock,
+                source_snapshot=current_source_snapshot,
             )
             if not metadata_ok:
                 raise ArtifactIntegrityError(metadata_detail)

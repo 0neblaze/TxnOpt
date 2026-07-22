@@ -128,7 +128,7 @@ _CURRENT_COMPONENT_CONTRACTS: Mapping[
                 Stage052Component.PERF_BASELINE,
                 "performance",
                 ("READY_FOR_STAGE052_HOT_PATH",),
-                "stage05.2_perf_baseline_attempt04",
+                requires_current_chain_identity=True,
             ),
         ),
         "single",
@@ -140,26 +140,18 @@ _CURRENT_COMPONENT_CONTRACTS: Mapping[
     (Stage052Component.ARTIFACT_STREAMING, "performance"): (
         (
             Stage052PrerequisiteRequirement(
+                "performance_baseline",
+                Stage052Component.PERF_BASELINE,
+                "performance",
+                ("READY_FOR_STAGE052_HOT_PATH",),
+                requires_current_chain_identity=True,
+            ),
+            Stage052PrerequisiteRequirement(
                 "hot_path_predecessor",
                 Stage052Component.HOT_PATH,
                 "performance",
                 ("READY_FOR_STAGE052_ARTIFACT_STREAMING",),
-                "stage05.2_hot_path_attempt03",
-            ),
-            Stage052PrerequisiteRequirement(
-                "historical_storage",
-                Stage052Component.ARTIFACT_STREAMING,
-                "performance",
-                ("READY_FOR_STAGE052_JOB_PARALLEL",),
-                "stage05.2_artifact_streaming_attempt04",
-            ),
-            Stage052PrerequisiteRequirement(
-                "remediation_source",
-                Stage052Component.NATIVE_KERNELS,
-                "performance",
-                ("NOT_READY",),
-                "stage05.2_native_kernels_attempt03",
-                requires_passed_review=False,
+                requires_current_chain_identity=True,
             ),
         ),
         "single",

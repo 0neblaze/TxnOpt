@@ -15,6 +15,7 @@ import plistlib
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -52,15 +53,15 @@ from evrptw.stage052_evidence import (
     verify_stage052_campaign_gate_set,
     verify_stage052_review_files,
 )
+from evrptw.stage052_platform import (
+    WindowsWslPowerStatus,
+    read_windows_wsl_power_status,
+    read_wsl_ac_power_online,
+)
 
 PER_WORKER_RSS_LIMIT_BYTES = 4_357_382_144
 AGGREGATE_RSS_LIMIT_BYTES = 12 * 1024**3
-STAGE052_TRANSFER_ARCHIVE_ROOT = Path(
-    "/Volumes/TRANSFER/FURP-2026-Yiyang-GUO-EVRP-TW-results"
-)
-STAGE052_INTERNAL_ARCHIVE_ROOT = Path(
-    "/Users/guoyiyang/Documents/Codex/FURP-2026-Yiyang-GUO-EVRP-TW-results"
-)
+STAGE052_MINIMUM_FREE_BYTES = 50 * 1024**3
 
 
 def _canonical_sha256(value: object) -> str:
@@ -476,7 +477,7 @@ class BenchmarkExecutionLock:
         expected_backend = {
             "GPU_NOT_JUSTIFIED": "native_cpu",
             "NATIVE_CPU_RETAINED": "native_cpu",
-            "ACCELERATOR_PROMOTED": "metal",
+            "ACCELERATOR_PROMOTED": "cuda",
         }.get(accelerator_decision)
         if (
             expected_backend is None
@@ -489,7 +490,7 @@ class BenchmarkExecutionLock:
                 "Stage 5.2 benchmark execution backend does not match the accepted "
                 "accelerator decision/cpu_batch exact backend"
             )
-        expected_profile = "metal" if selected_backend == "metal" else "native"
+        expected_profile = "cuda" if selected_backend == "cuda" else "native"
         if (
             metadata.get("optimization_profile") != expected_profile
             or review_manifest.get("selected_optimization_profile") != expected_profile
@@ -766,6 +767,77 @@ def _file_sha256(path: Path) -> str:
 def probe_volume_identity(path: Path) -> VolumeIdentity:
     """Return the mounted volume UUID/filesystem for one local root."""
 
+    if sys.platform == "darwin":
+        return _probe_macos_volume_identity(path)
+    completed = subprocess.run(
+        (
+            "findmnt",
+            "--json",
+            "--target",
+            str(path),
+            "--output",
+            "SOURCE,FSTYPE,UUID",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        payload = json.loads(completed.stdout)
+        filesystems = payload["filesystems"]
+        mount = filesystems[0]
+        source = str(mount["source"])
+        filesystem = str(mount["fstype"])
+        uuid_value = mount.get("uuid")
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"findmnt returned invalid volume metadata for {path}") from error
+    if isinstance(uuid_value, str) and uuid_value:
+        return VolumeIdentity(device_uuid=uuid_value, filesystem=filesystem)
+    drive_match = re.fullmatch(r"([A-Za-z]):\\", source)
+    if drive_match is None:
+        raise RuntimeError(f"mounted volume identity is incomplete for {path}: {source}")
+    return VolumeIdentity(
+        device_uuid=_windows_nvme_identity(drive_match.group(1)),
+        filesystem=filesystem,
+    )
+
+
+def _windows_nvme_identity(drive_letter: str) -> str:
+    powershell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
+    if powershell is None:
+        raise RuntimeError("Windows drive identity requires PowerShell")
+    script = (
+        f"$disk = Get-Partition -DriveLetter '{drive_letter}' | Get-Disk; "
+        "[pscustomobject]@{FriendlyName=$disk.FriendlyName;"
+        "SerialNumber=$disk.SerialNumber;BusType=[string]$disk.BusType} "
+        "| ConvertTo-Json -Compress"
+    )
+    completed = subprocess.run(
+        (powershell, "-NoLogo", "-NoProfile", "-Command", script),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        payload = json.loads(completed.stdout)
+        friendly_name = str(payload["FriendlyName"])
+        serial_number = str(payload["SerialNumber"])
+        bus_type = str(payload["BusType"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError("PowerShell returned invalid Windows disk identity") from error
+    if bus_type.casefold() != "nvme" or not friendly_name or not serial_number:
+        raise RuntimeError("D archive must resolve to an identified NVMe disk")
+    identity = re.sub(
+        r"[^a-z0-9]+",
+        "-",
+        f"{bus_type}-{friendly_name}-{serial_number}".casefold(),
+    ).strip("-")
+    if not identity:
+        raise RuntimeError("Windows NVMe identity is empty")
+    return identity
+
+
+def _probe_macos_volume_identity(path: Path) -> VolumeIdentity:
     filesystem_result = subprocess.run(
         ("df", "-P", str(path)),
         check=True,
@@ -807,16 +879,23 @@ def verify_campaign_root_locations(
 ) -> None:
     """Reject local locator drift before creating or writing any campaign root."""
 
-    expected = {
-        "transfer_staging": (repository_root / "results").resolve(),
-        "transfer_archive": STAGE052_TRANSFER_ARCHIVE_ROOT.resolve(),
-        "internal_archive": STAGE052_INTERNAL_ARCHIVE_ROOT.resolve(),
-    }
-    if set(locator.aliases) != set(expected) or any(
-        locator.resolve(alias).absolute_path.resolve() != path
-        for alias, path in expected.items()
+    del repository_root
+    if locator.aliases != ("d_archive", "wsl_staging"):
+        raise RuntimeError("Stage 5.2 storage locator must contain only d_archive/wsl_staging")
+    staging = locator.resolve("wsl_staging")
+    archive = locator.resolve("d_archive")
+    staging_path = staging.absolute_path.resolve()
+    archive_path = archive.absolute_path.resolve()
+    if staging.volume.filesystem.casefold() != "ext4" or staging_path.is_relative_to(
+        Path("/mnt")
     ):
-        raise RuntimeError("Stage 5.2 storage root absolute locations differ from PLAN.md")
+        raise RuntimeError("Stage 5.2 wsl_staging must be on WSL2 native ext4")
+    if not archive_path.is_relative_to(Path("/mnt/d")):
+        raise RuntimeError("Stage 5.2 archive path is forbidden outside the D drive")
+    if archive.volume.filesystem.casefold() in {"exfat", "vfat", "fat", "fat32"}:
+        raise RuntimeError("Stage 5.2 D archive cannot use ExFAT or removable FAT storage")
+    if "usb" in archive.volume.device_uuid.casefold():
+        raise RuntimeError("Stage 5.2 D archive cannot use USB storage")
 
 
 def verify_rolling_campaign_capacity(
@@ -1227,41 +1306,61 @@ def archive_verified_batch_with_evidence(
     )
 
 
-class MacMachineSnapshotSource:
-    """Sample macOS power state, load1, and unrelated user CPU usage."""
+class WindowsWslMachineSnapshotSource:
+    """Sample Windows power state plus WSL2 load and unrelated CPU usage."""
+
+    def __init__(self) -> None:
+        self._native_status: WindowsWslPowerStatus | None = None
+
+    def refresh_native_status(self) -> WindowsWslPowerStatus:
+        """Refresh native Windows state outside the measured runtime interval."""
+
+        observed = read_windows_wsl_power_status()
+        self._native_status = observed
+        return observed
+
+    def verify_native_status_unchanged(self) -> dict[str, object]:
+        """Verify stable native invariants and return both boundary observations."""
+
+        expected = self._native_status
+        if expected is None:
+            raise RuntimeError("Windows native power status was not sampled at preflight")
+        observed = read_windows_wsl_power_status()
+        expected_invariants = (
+            expected.ac_online,
+            expected.battery_saver,
+            expected.active_power_scheme,
+        )
+        observed_invariants = (
+            observed.ac_online,
+            observed.battery_saver,
+            observed.active_power_scheme,
+        )
+        if observed_invariants != expected_invariants:
+            raise RuntimeError(
+                "Windows native power state changed during the benchmark batch: "
+                f"expected={expected!r} observed={observed!r}"
+            )
+        return {
+            "schema_version": "stage05.2-native-power-boundary-v1",
+            "before": _windows_power_status_to_dict(expected),
+            "after": _windows_power_status_to_dict(observed),
+            "stable_invariants": [
+                "ac_online",
+                "battery_saver",
+                "active_power_scheme",
+            ],
+            "invariants_unchanged": True,
+        }
 
     def __call__(self) -> MachineSnapshot:
-        power_output = subprocess.run(
-            ("pmset", "-g", "batt"),
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-        profile_output = subprocess.run(
-            ("pmset", "-g", "custom"),
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-        source_match = re.search(r"Now drawing from '([^']+)'", power_output)
-        if source_match is None:
-            raise RuntimeError("cannot determine active macOS power source")
-        source = source_match.group(1)
-        active_section = "AC Power" if source == "AC Power" else "Battery Power"
-        current_section = ""
-        low_power: int | None = None
-        for line in profile_output.splitlines():
-            if line and not line[0].isspace():
-                current_section = line.rstrip(":")
-            match = re.match(r"\s*lowpowermode\s+(\d+)\s*$", line)
-            if match is not None and active_section in current_section:
-                low_power = int(match.group(1))
-                break
-        if low_power not in {0, 1}:
-            raise RuntimeError("cannot determine active macOS low power mode")
+        power = self._native_status
+        if power is None:
+            power = self.refresh_native_status()
+        ac_online = read_wsl_ac_power_online()
         return MachineSnapshot(
-            power_source=source,
-            low_power_mode_enabled=bool(low_power),
+            power_source="AC Power" if ac_online else "Battery Power",
+            low_power_mode_enabled=power.battery_saver,
             load1=float(os.getloadavg()[0]),
             unrelated_process_average_cores=0.0,
             sampled_at_seconds=time.monotonic(),
@@ -1296,6 +1395,16 @@ def _parse_process_cpu_time(value: str) -> float:
     return days * 86_400.0 + hours * 3_600.0 + minutes * 60.0 + seconds
 
 
+def _windows_power_status_to_dict(status: WindowsWslPowerStatus) -> dict[str, object]:
+    return {
+        "ac_online": status.ac_online,
+        "battery_saver": status.battery_saver,
+        "battery_life_percent": status.battery_life_percent,
+        "battery_flag": status.battery_flag,
+        "active_power_scheme": status.active_power_scheme,
+    }
+
+
 def _unrelated_user_cpu_seconds() -> dict[int, float]:
     completed = subprocess.run(
         ("ps", "-axo", "pid=,ppid=,uid=,time="),
@@ -1307,9 +1416,11 @@ def _unrelated_user_cpu_seconds() -> dict[int, float]:
     current_uid = os.getuid()
     records: list[tuple[int, int, int, float]] = []
     for line in completed.stdout.splitlines():
+        if not line.strip():
+            continue
         fields = line.split()
         if len(fields) != 4:
-            continue
+            raise RuntimeError(f"invalid non-empty ps process row: {line!r}")
         try:
             records.append(
                 (
@@ -1319,8 +1430,8 @@ def _unrelated_user_cpu_seconds() -> dict[int, float]:
                     _parse_process_cpu_time(fields[3]),
                 )
             )
-        except (RuntimeError, ValueError):
-            continue
+        except (RuntimeError, ValueError) as error:
+            raise RuntimeError(f"cannot parse ps process row: {line!r}") from error
     related = {current_pid}
     changed = True
     while changed:

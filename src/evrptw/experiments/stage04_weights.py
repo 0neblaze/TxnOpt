@@ -21,7 +21,6 @@ import csv
 import hashlib
 import json
 import re
-import resource
 import statistics
 import subprocess
 import tomllib
@@ -60,6 +59,7 @@ from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
 from evrptw.stage04 import Stage04Config, with_fixed_weights
+from evrptw.stage052_platform import peak_rss_bytes
 
 STAGE04_SCHEMA_VERSION = "stage04-adaptive-weights-v6"
 STAGE04_RUN_LABEL = re.compile(
@@ -832,9 +832,7 @@ def _sha256(path: Path) -> str:
 
 
 def _peak_rss_bytes() -> int:
-    value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    # macOS reports bytes; Linux reports KiB.
-    return value if value > 10_000_000 else value * 1024
+    return peak_rss_bytes()
 
 
 def _source_sha256(root: Path) -> str:

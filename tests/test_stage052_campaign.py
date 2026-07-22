@@ -143,7 +143,7 @@ def test_pilot_campaign_uses_exact_stage0_scope_and_shared_manifest_contract(
         plan,
         locator,
         free_bytes_by_alias={
-            "transfer_staging": 52 * 1024**3,
+            "transfer_staging": 82 * 1024**3,
             "internal_archive": 50 * 1024**3 + plan.estimated_bytes,
         },
     )
@@ -164,19 +164,19 @@ def test_pilot_campaign_uses_exact_stage0_scope_and_shared_manifest_contract(
         replace(config, scope="formal")
 
 
-def test_campaign_contract_can_bind_an_independently_promoted_metal_backend() -> None:
+def test_campaign_contract_can_bind_an_independently_promoted_cuda_backend() -> None:
     config = BenchmarkCampaignConfig.pilot(
         run_label="stage05.2_benchmark_attempt02",
         staging_root_alias="transfer_staging",
         archive_root_aliases=("internal_archive",),
-        selected_backend="metal",
+        selected_backend="cuda",
         selected_exact_backend="cpu_batch",
         selected_workers=2,
         native_profile="stage05.2-native-kernels-v1",
     )
 
-    assert config.selected_backend == "metal"
-    assert config.to_dict()["selected_backend"] == "metal"
+    assert config.selected_backend == "cuda"
+    assert config.to_dict()["selected_backend"] == "cuda"
 
 
 def test_formal_campaign_uses_sequential_next_fit_without_splitting_shards() -> None:
@@ -338,7 +338,7 @@ def test_campaign_capacity_preserves_external_workspace_and_internal_reserve(
         native_profile="stage05.2-native-kernels-v1",
     )
     plan = config.build_plan(_pilot_observations())
-    external_floor = 52 * 1024**3
+    external_floor = 82 * 1024**3
     internal_free = 50 * 1024**3 + plan.estimated_bytes
 
     capacity = config.plan_archive_roots(
@@ -354,7 +354,7 @@ def test_campaign_capacity_preserves_external_workspace_and_internal_reserve(
     assert len(capacity.assignments) == len(plan.batches)
     assert {assignment.root_alias for assignment in capacity.assignments} == {"internal_archive"}
 
-    with pytest.raises(RuntimeError, match="external staging capacity"):
+    with pytest.raises(RuntimeError, match="ext4 staging capacity"):
         config.plan_archive_roots(
             plan,
             locator,
@@ -542,7 +542,7 @@ def test_campaign_and_batch_manifests_are_path_free_and_completion_gated(
         plan,
         locator,
         free_bytes_by_alias={
-            "transfer_staging": 52 * 1024**3,
+            "transfer_staging": 82 * 1024**3,
             "internal_archive": 50 * 1024**3 + plan.estimated_bytes,
         },
     )

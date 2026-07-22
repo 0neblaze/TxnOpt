@@ -36,8 +36,8 @@ from evrptw.artifacts import (
 from evrptw.stage052 import (
     ArtifactPersistenceObservation,
     Stage052Component,
+    Stage052PrerequisiteRequirement,
     evaluate_artifact_persistence,
-    stage052_contract,
 )
 from evrptw.stage052_evidence import (
     Stage052PrerequisiteIdentity,
@@ -326,13 +326,13 @@ def remediate_stage052_artifacts(
     """
 
     selected = config or Stage052RemediationConfig()
-    requirement = next(
-        item
-        for item in stage052_contract(
-            Stage052Component.ARTIFACT_STREAMING,
-            scope="performance",
-        ).prerequisites
-        if item.role == "remediation_source"
+    requirement = Stage052PrerequisiteRequirement(
+        role="historical_remediation_source",
+        component=Stage052Component.NATIVE_KERNELS,
+        scope="performance",
+        allowed_statuses=("NOT_READY",),
+        exact_run_label="stage05.2_native_kernels_attempt03",
+        requires_passed_review=False,
     )
     source_identity = verify_stage052_evidence_input(source_dir, requirement)
     source_reader = ArtifactReader(source_dir, verify=False)

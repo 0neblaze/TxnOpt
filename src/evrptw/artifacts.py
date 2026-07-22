@@ -29,6 +29,8 @@ import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from evrptw.stage052_platform import durable_replace, sync_directory
+
 ARTIFACT_STORAGE_SCHEMA_VERSION = "artifact-storage-v1"
 ARTIFACT_STORAGE_V2 = "artifact-storage-v2"
 SUPPORTED_STORAGE_POLICIES = frozenset({ARTIFACT_STORAGE_SCHEMA_VERSION, ARTIFACT_STORAGE_V2})
@@ -110,7 +112,7 @@ def atomic_write_signed_json(
     path: Path,
     payload: Mapping[str, object],
     *,
-    _replace: Callable[[Path, Path], None] = os.replace,
+    _replace: Callable[[Path, Path], None] | None = None,
 ) -> tuple[Path, Path]:
     """Crash-consistently replace one JSON object and its SHA-256 sidecar."""
 
@@ -148,6 +150,7 @@ def atomic_write_signed_json(
     )
     payload_replaced = False
     sidecar_replaced = False
+    replace = durable_replace if _replace is None else _replace
     try:
         with temporary.open("xb") as handle:
             handle.write(encoded)
@@ -157,30 +160,18 @@ def atomic_write_signed_json(
             handle.write("".join(f"{item}\n" for item in transition_digests))
             handle.flush()
             os.fsync(handle.fileno())
-        _replace(temporary_sidecar, sidecar)
+        replace(temporary_sidecar, sidecar)
         sidecar_replaced = True
-        descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        _replace(temporary, path)
+        sync_directory(path.parent)
+        replace(temporary, path)
         payload_replaced = True
-        descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        sync_directory(path.parent)
         with final_sidecar.open("x", encoding="utf-8") as handle:
             handle.write(digest + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        _replace(final_sidecar, sidecar)
-        descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        replace(final_sidecar, sidecar)
+        sync_directory(path.parent)
     except BaseException:
         if payload_replaced or sidecar_replaced:
             if previous_payload is None or previous_sidecar is None:
@@ -200,13 +191,9 @@ def atomic_write_signed_json(
                         handle.write(previous_sidecar)
                         handle.flush()
                         os.fsync(handle.fileno())
-                    os.replace(rollback_payload, path)
-                    os.replace(rollback_sidecar, sidecar)
-                    descriptor = os.open(path.parent, os.O_RDONLY)
-                    try:
-                        os.fsync(descriptor)
-                    finally:
-                        os.close(descriptor)
+                    durable_replace(rollback_payload, path)
+                    durable_replace(rollback_sidecar, sidecar)
+                    sync_directory(path.parent)
                 finally:
                     rollback_payload.unlink(missing_ok=True)
                     rollback_sidecar.unlink(missing_ok=True)
@@ -1420,9 +1407,6 @@ def _screening_definition_cache_key(
     operator_id: int,
     route_id: int | None,
 ) -> tuple[object, ...]:
-    precomputed = payload.get("_precomputed_screening_definition")
-    if isinstance(precomputed, _PrecomputedScreeningDefinition):
-        return (lane_id, operator_id, route_id, *precomputed.tail)
     raw_checks = payload.get("checks")
     checks = raw_checks if isinstance(raw_checks, (list, tuple)) else ()
     if len(checks) > MAX_SCREENING_CHECKS_PER_DECISION:
@@ -5129,45 +5113,25 @@ class ArtifactV2ShardSession:
         _PendingScreeningDefinition | None,
     ]:
         event_get = event.get
-        precomputed = (
-            event_get("_precomputed_screening_definition")
-            if self._screening_definitions_sink is not None
-            else None
+        definition_key = _screening_definition_cache_key(
+            event,
+            lane_id=lane_id,
+            operator_id=operator_id,
+            route_id=route_id,
         )
-        cache_key: tuple[object, ...]
-        definition_key: tuple[object, ...]
-        if isinstance(precomputed, _PrecomputedScreeningDefinition):
-            definition_key = (lane_id, operator_id, route_id, *precomputed.tail)
-            compact_key = (lane_id, operator_id, route_id, precomputed.cache_hash)
-            cache_key = compact_key
-            cached_entry = self._screening_definition_cache.get(compact_key)
-            if cached_entry is not None and cached_entry[0] != precomputed.tail:
-                cache_key = definition_key
-                cached_entry = self._screening_definition_cache.get(definition_key)
-        else:
-            definition_key = _screening_definition_cache_key(
-                event,
-                lane_id=lane_id,
-                operator_id=operator_id,
-                route_id=route_id,
-            )
-            cache_key = definition_key
-            cached_entry = self._screening_definition_cache.get(definition_key)
+        cache_key = definition_key
+        cached_entry = self._screening_definition_cache.get(definition_key)
         cached = cached_entry[1:] if cached_entry is not None else None
         first_occurrence = False
         definition: dict[str, object] | None = None
         if cached is None:
             if route_id is not None and route_id not in self._route_digests:
                 self._register_route(route_key, _route_sequence_from_key(route_key))
-            definition = (
-                _screening_definition_from_cache_key(definition_key)
-                if isinstance(precomputed, _PrecomputedScreeningDefinition)
-                else _normalise_screening_definition(
-                    event,
-                    lane_id=lane_id,
-                    operator_id=operator_id,
-                    route_id=route_id,
-                )
+            definition = _normalise_screening_definition(
+                event,
+                lane_id=lane_id,
+                operator_id=operator_id,
+                route_id=route_id,
             )
             definition_id, definition_json, definition_digest = _screening_definition_identity(
                 definition
@@ -5178,9 +5142,7 @@ class ArtifactV2ShardSession:
                 definition_digest,
             )
             self._screening_definition_cache[cache_key] = (
-                precomputed.tail
-                if isinstance(precomputed, _PrecomputedScreeningDefinition)
-                else None,
+                None,
                 *cached,
             )
             if (

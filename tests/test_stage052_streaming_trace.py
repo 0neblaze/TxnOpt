@@ -210,24 +210,7 @@ class _RecordingShard:
     ) -> int:
         del route_dictionary, diagnostic_rows, cache_lookups_coalesced
         self.append_calls += 1
-        rows = [
-            {
-                "decision_id": row[0],
-                "route_key": row[1],
-                "lane": row[2],
-                "iteration": row[3],
-                "operator": row[4],
-                "started_at": row[5],
-                "completed_at": row[6],
-                "benchmark_axis": row[7].tail[2],
-                "record_type": "screening_decision",
-                "event_type": "screening_decision",
-                "_precomputed_screening_definition": row[7],
-            }
-            if isinstance(row, tuple)
-            else dict(row)
-            for row in critical_events  # type: ignore[union-attr]
-        ]
+        rows = [dict(row) for row in critical_events]  # type: ignore[union-attr]
         self.events.extend(rows)
         return len(rows)
 
@@ -375,7 +358,7 @@ def test_neighborhood_rejections_and_failures_are_retained_in_order() -> None:
     ]
 
 
-def test_precomputed_screening_definition_matches_mapping_normalization() -> None:
+def test_streamed_screening_definition_matches_mapping_normalization() -> None:
     shard = _RecordingShard()
     sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
         shard=shard,  # type: ignore[arg-type]
@@ -410,46 +393,33 @@ def test_precomputed_screening_definition_matches_mapping_normalization() -> Non
 
     sink.append_screening_decision(decision)
     streamed = shard.events[0]
-    key = artifact_module._screening_definition_cache_key(  # noqa: SLF001
+    normalized = artifact_module._normalise_screening_definition(  # noqa: SLF001
         streamed,
         lane_id=11,
         operator_id=12,
         route_id=13,
     )
-    precomputed = artifact_module._screening_definition_from_cache_key(key)  # noqa: SLF001
-    mapping_payload = {
-        **streamed,
-        "status": decision.status,
-        "reason": decision.reason,
-        "benchmark_axis": "fixed_work",
-        "demand": decision.demand,
-        "distance_increment_lower_bound": decision.distance_increment_lower_bound,
-        "distance_lower_bound": decision.distance_lower_bound,
-        "exact_call_blocked": decision.exact_call_blocked,
-        "first_failed_check": decision.first_failed_check,
-        "min_time_window_slack": decision.min_time_window_slack,
-        "negative_cache_hit": decision.negative_cache_hit,
-        "single_segment_reachable": decision.single_segment_reachable,
-        "structural_energy_lower_bound": decision.structural_energy_lower_bound,
-        "checks": tuple(
-            {
-                "check": check.check,
-                "status": check.status,
-                "value": check.value,
-                "reason": check.reason,
-            }
-            for check in decision.checks
-        ),
-    }
-    mapping_payload.pop("_precomputed_screening_definition")
-    normalized = artifact_module._normalise_screening_definition(  # noqa: SLF001
-        mapping_payload,
-        lane_id=11,
-        operator_id=12,
-        route_id=13,
-    )
 
-    assert precomputed == normalized
+    assert normalized["status"] == decision.status
+    assert normalized["reason"] == decision.reason
+    assert normalized["benchmark_axis"] == "fixed_work"
+    assert normalized["demand"] == decision.demand
+    assert normalized["checks"] == [
+        {
+            "check": check.check,
+            "status": check.status,
+            "value_bool": check.value if isinstance(check.value, bool) else None,
+            "value_float": (
+                float(check.value)
+                if isinstance(check.value, (int, float))
+                and not isinstance(check.value, bool)
+                else None
+            ),
+            "value_text": check.value if isinstance(check.value, str) else None,
+            "reason": check.reason,
+        }
+        for check in decision.checks
+    ]
 
 
 def test_v2_screening_bridge_retains_the_complete_legacy_payload() -> None:
@@ -631,17 +601,13 @@ def test_screening_identity_is_charged_to_persistence_timing(
         axis_name="fixed_work",
         buffer_rows=100,
     )
-    original_definition = stage052_performance._PrecomputedScreeningDefinition  # noqa: SLF001
+    original_queue = sink._queue_owned  # noqa: SLF001
 
-    def delayed_definition(*args: object, **kwargs: object) -> object:
+    def delayed_queue(payload: dict[str, object]) -> None:
         time.sleep(0.01)
-        return original_definition(*args, **kwargs)  # type: ignore[arg-type]
+        original_queue(payload)
 
-    monkeypatch.setattr(
-        stage052_performance,
-        "_PrecomputedScreeningDefinition",
-        delayed_definition,
-    )
+    monkeypatch.setattr(sink, "_queue_owned", delayed_queue)
     decision = ScreeningDecision(
         decision_id=1,
         route_key="route:2:C1",

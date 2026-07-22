@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import evrptw.experiments.stage052_campaign_review as campaign_review_module
 import tools.publish_stage052_artifacts as publisher_module
 from evrptw.artifacts import (
     ANYTIME_CHECKPOINT_SCHEMA,
@@ -70,6 +71,27 @@ from tools.publish_stage052_artifacts import (
     verify_canonical_registry_against_trusted,
     verify_published_stage052_review,
 )
+
+_SOURCE_SNAPSHOT = {
+    "repository_revision": "a" * 40,
+    "mount": {
+        "source": "/dev/test",
+        "filesystem": "ext4",
+        "uuid": "test-uuid",
+        "target": "/test-source",
+    },
+    "tracked_file_count": 100,
+    "read_only": True,
+}
+
+
+@pytest.fixture(autouse=True)
+def _verified_source_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        campaign_review_module,
+        "verify_stage052_source_snapshot",
+        lambda _root: dict(_SOURCE_SNAPSHOT),
+    )
 
 
 def _formal_geometry() -> tuple[CampaignGeometryRecord, ...]:
@@ -138,7 +160,7 @@ def test_campaign_planning_replay_requires_canonical_pilot_next_fit(
         native_profile="stage05.2-native-kernels-v1",
     )
     plan = config.build_plan()
-    free_by_alias = {"staging": 124 * 1024**3, "archive": 124 * 1024**3}
+    free_by_alias = {"staging": 200 * 1024**3, "archive": 200 * 1024**3}
     capacity = config.plan_archive_roots(
         plan,
         locator,
@@ -565,7 +587,7 @@ def _selection_inputs() -> tuple[dict[str, object], dict[str, object], dict[str,
         "failure_policy": "fail_fast_no_fallback",
     }
     runtime = {
-        "schema_version": "stage05.2-runtime-identity-v1",
+        "schema_version": "stage05.2-runtime-identity-v2",
         "repository_revision": "a" * 40,
         "repository_dirty": False,
         "wheel_sha256": "1" * 64,
@@ -745,6 +767,7 @@ def _build_complete_pilot_campaign(
         "campaign_configuration_sha256": campaign_configuration_sha256,
         "campaign_prerequisite_review_sha256": prerequisite_hash,
         "runtime_identity": predecessor_metadata["runtime_identity"],
+        "source_snapshot": dict(_SOURCE_SNAPSHOT),
         "performance_provenance": predecessor_metadata["performance_provenance"],
         "storage_policy_version": "artifact-storage-v2",
         "screening_schema_version": "screening_decisions_v3",
@@ -1006,6 +1029,29 @@ def _build_complete_pilot_campaign(
             "run_label": run_label,
             "batch_id": "batch0001",
             "status": "complete",
+            "native_power_boundary": {
+                "schema_version": "stage05.2-native-power-boundary-v1",
+                "before": {
+                    "ac_online": True,
+                    "battery_saver": False,
+                    "battery_life_percent": 50,
+                    "battery_flag": 8,
+                    "active_power_scheme": "balanced-guid",
+                },
+                "after": {
+                    "ac_online": True,
+                    "battery_saver": False,
+                    "battery_life_percent": 75,
+                    "battery_flag": 1,
+                    "active_power_scheme": "balanced-guid",
+                },
+                "stable_invariants": [
+                    "ac_online",
+                    "battery_saver",
+                    "active_power_scheme",
+                ],
+                "invariants_unchanged": True,
+            },
             "preflight": {
                 "power_source": "AC Power",
                 "low_power_mode_enabled": False,
@@ -1178,6 +1224,7 @@ def _build_complete_pilot_campaign(
             "scope": "pilot",
             "staging_root_alias": "staging",
             "planned_archive_root_aliases": ["archive"],
+            "source_snapshot": dict(_SOURCE_SNAPSHOT),
             "persistence_attribution": "primary_active_writes_v1",
         },
         configuration_path=Path("configs/stage052_performance.toml"),
@@ -1199,9 +1246,9 @@ def _build_complete_pilot_campaign(
             "free_bytes_by_device": {volume.device_uuid: 100 * 1024**3},
             "required_bytes_by_device": {
                 volume.device_uuid: (
-                    52 * 1024**3 + batch.estimated_bytes
+                    82 * 1024**3 + batch.estimated_bytes
                     if phase == "pre_dispatch"
-                    else 52 * 1024**3
+                    else 82 * 1024**3
                 )
             },
             "passed": True,
@@ -1474,16 +1521,16 @@ def test_campaign_selection_lock_binds_f02_backend_worker_native_and_provenance(
     assert audit.selection_lock["accelerator_review_manifest_sha256"] == "b" * 64
 
 
-def test_campaign_selection_lock_binds_promoted_metal_backend() -> None:
+def test_campaign_selection_lock_binds_promoted_cuda_backend() -> None:
     metadata, review, identity = _selection_inputs()
-    metadata["execution_backend"] = "metal"
-    metadata["optimization_profile"] = "metal"
-    review["selected_backend"] = "metal"
-    review["selected_optimization_profile"] = "metal"
+    metadata["execution_backend"] = "cuda"
+    metadata["optimization_profile"] = "cuda"
+    review["selected_backend"] = "cuda"
+    review["selected_optimization_profile"] = "cuda"
     review["accelerator_decision"] = "ACCELERATOR_PROMOTED"
 
     audit = validate_campaign_selection_lock(
-        campaign_backend="metal",
+        campaign_backend="cuda",
         campaign_exact_backend="cpu_batch",
         campaign_workers=2,
         campaign_native_profile="stage05.2-native-kernels-v1",
@@ -1493,7 +1540,7 @@ def test_campaign_selection_lock_binds_promoted_metal_backend() -> None:
     )
 
     assert audit.passed
-    assert audit.selection_lock["selected_backend"] == "metal"
+    assert audit.selection_lock["selected_backend"] == "cuda"
     assert audit.selection_lock["accelerator_decision"] == "ACCELERATOR_PROMOTED"
 
 

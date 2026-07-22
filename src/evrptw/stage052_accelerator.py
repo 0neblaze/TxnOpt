@@ -12,6 +12,8 @@ import hashlib
 import json
 import math
 import os
+import re
+import shutil
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -28,6 +30,8 @@ from evrptw.stage052 import (
 METAL_OCCUPANCY_THRESHOLD = 32.0
 METAL_PILOT_SCHEMA_VERSION = "stage05.2-metal-pilot-v1"
 METAL_HELPER_SCHEMA_VERSION = "stage05.2-metal-helper-v1"
+ACCELERATOR_HELPER_SCHEMA_VERSION = "stage05.2-accelerator-helper-v2"
+ACCELERATOR_PILOT_SCHEMA_VERSION = "stage05.2-accelerator-pilot-v2"
 
 
 class MetalPilotStatus(StrEnum):
@@ -37,6 +41,323 @@ class MetalPilotStatus(StrEnum):
 
 class MetalRuntimeUnavailable(RuntimeError):
     """Raised when no explicit Metal runtime can execute the pilot."""
+
+
+class AcceleratorPilotExecutor(Protocol):
+    """Backend-neutral Stage 5.2 accelerator execution seam."""
+
+    @property
+    def runtime_identity(self) -> Mapping[str, object]: ...
+
+    def execute(
+        self, native_observations: Sequence[PerformanceObservation]
+    ) -> Sequence[PerformanceObservation]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class SubprocessAcceleratorPilotExecutor:
+    """Run a registered accelerator helper through strict protocol v2."""
+
+    helper_path: Path
+    backend: str
+    timeout_seconds: float = 300.0
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[a-z][a-z0-9_]*", self.backend) is None:
+            raise ValueError("accelerator backend is invalid")
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0.0:
+            raise ValueError("accelerator helper timeout must be finite and positive")
+
+    @property
+    def runtime_identity(self) -> Mapping[str, object]:
+        path = self.helper_path.resolve()
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise MetalRuntimeUnavailable(
+                f"accelerator helper is unavailable or not executable: {path}"
+            )
+        identity: dict[str, object] = {
+            "runtime": "subprocess-accelerator-helper",
+            "backend": self.backend,
+            "helper_path": str(path),
+            "helper_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "protocol_schema_version": ACCELERATOR_HELPER_SCHEMA_VERSION,
+            "fallback_allowed": False,
+            "production_evidence_eligible": True,
+        }
+        if self.backend == "cuda":
+            raw_nvcc = shutil.which("nvcc")
+            if raw_nvcc is None:
+                raise MetalRuntimeUnavailable("CUDA Toolkit nvcc is unavailable")
+            nvcc = Path(raw_nvcc).resolve()
+            if not nvcc.is_file() or not os.access(nvcc, os.X_OK):
+                raise MetalRuntimeUnavailable(f"CUDA Toolkit nvcc is not executable: {nvcc}")
+            try:
+                completed = subprocess.run(
+                    (str(nvcc), "--version"),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30.0,
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                raise MetalRuntimeUnavailable(
+                    f"CUDA Toolkit nvcc identity probe failed: {error}"
+                ) from error
+            version_output = completed.stdout.strip()
+            if not version_output:
+                raise MetalRuntimeUnavailable("CUDA Toolkit nvcc version output is empty")
+            identity.update(
+                {
+                    "cuda_toolkit_root": str(nvcc.parent.parent),
+                    "nvcc_path": str(nvcc),
+                    "nvcc_sha256": hashlib.sha256(nvcc.read_bytes()).hexdigest(),
+                    "nvcc_version_output": version_output,
+                    "nvcc_version_sha256": hashlib.sha256(
+                        version_output.encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
+        return identity
+
+    def execute(
+        self, native_observations: Sequence[PerformanceObservation]
+    ) -> Sequence[PerformanceObservation]:
+        identity = self.runtime_identity
+        request = {
+            "schema_version": ACCELERATOR_HELPER_SCHEMA_VERSION,
+            "backend": self.backend,
+            "fallback_allowed": False,
+            "rows": [_observation_to_dict(item) for item in native_observations],
+        }
+        completed = subprocess.run(
+            [str(identity["helper_path"])],
+            input=json.dumps(request, sort_keys=True),
+            text=True,
+            capture_output=True,
+            timeout=self.timeout_seconds,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "accelerator helper failed without fallback: "
+                f"exit={completed.returncode} stderr={completed.stderr.strip()}"
+            )
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise ValueError("accelerator helper returned invalid JSON") from error
+        if not isinstance(payload, dict):
+            raise ValueError("accelerator helper response must be an object")
+        if payload.get("schema_version") != ACCELERATOR_HELPER_SCHEMA_VERSION:
+            raise ValueError("accelerator helper schema version mismatch")
+        if payload.get("backend") != self.backend:
+            raise ValueError("accelerator helper backend mismatch")
+        if payload.get("fallback_used") is not False:
+            raise ValueError("accelerator helper fallback is forbidden")
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            raise ValueError("accelerator helper rows must be a list")
+        return tuple(_observation_from_dict(item) for item in rows)
+
+
+def run_conditional_accelerator_pilot(
+    *,
+    backend: str,
+    median_batch_occupancy: float,
+    native_observations: Sequence[PerformanceObservation],
+    executor: AcceleratorPilotExecutor | None = None,
+) -> dict[str, object]:
+    """Run helper protocol v2 with an explicit backend and no CPU fallback."""
+
+    if backend != "cuda":
+        raise ValueError("the current Stage 5.2 accelerator backend must be cuda")
+    if not math.isfinite(median_batch_occupancy) or median_batch_occupancy < 0.0:
+        raise ValueError("median_batch_occupancy must be finite and non-negative")
+    native = tuple(native_observations)
+    if median_batch_occupancy < METAL_OCCUPANCY_THRESHOLD:
+        if native:
+            raise ValueError("accelerator performance rows are forbidden below occupancy 32")
+        return {
+            "schema_version": ACCELERATOR_PILOT_SCHEMA_VERSION,
+            "status": MetalPilotStatus.COMPLETE.value,
+            "backend": backend,
+            "threshold": METAL_OCCUPANCY_THRESHOLD,
+            "median_batch_occupancy": median_batch_occupancy,
+            "decision": AcceleratorDecision.GPU_NOT_JUSTIFIED.value,
+            "selected_backend": "native_cpu",
+            "selected_exact_backend": "cpu_batch",
+            "native_rows": [],
+            "accelerator_rows": [],
+            "runtime_identity": None,
+            "semantic_equality_passed": True,
+            "aggregate_median_saving": None,
+            "family_median_savings": {},
+            "minimum_aggregate_saving": 0.15,
+            "maximum_family_regression": 0.03,
+            "fallback_used": False,
+            "failure_code": None,
+            "failure_detail": None,
+        }
+    _validate_native_scope(native)
+    if executor is None:
+        return _accelerator_runtime_unavailable_payload(
+            backend=backend,
+            median_batch_occupancy=median_batch_occupancy,
+            native=native,
+            detail="no explicit CUDA helper was configured",
+        )
+    try:
+        runtime_identity = dict(executor.runtime_identity)
+    except MetalRuntimeUnavailable as error:
+        return _accelerator_runtime_unavailable_payload(
+            backend=backend,
+            median_batch_occupancy=median_batch_occupancy,
+            native=native,
+            detail=str(error),
+        )
+    if (
+        runtime_identity.get("backend") != backend
+        or runtime_identity.get("protocol_schema_version")
+        != ACCELERATOR_HELPER_SCHEMA_VERSION
+        or runtime_identity.get("fallback_allowed") is not False
+    ):
+        raise ValueError("accelerator runtime identity does not match helper protocol v2")
+    accelerated = tuple(executor.execute(native))
+    _validate_native_scope(accelerated)
+    decision = decide_accelerator(
+        median_batch_occupancy=median_batch_occupancy,
+        native_cpu=native,
+        accelerator=accelerated,
+    )
+    semantic, aggregate, families = _promotion_details(native, accelerated)
+    selected_backend = (
+        backend if decision is AcceleratorDecision.ACCELERATOR_PROMOTED else "native_cpu"
+    )
+    return {
+        "schema_version": ACCELERATOR_PILOT_SCHEMA_VERSION,
+        "status": MetalPilotStatus.COMPLETE.value,
+        "backend": backend,
+        "threshold": METAL_OCCUPANCY_THRESHOLD,
+        "median_batch_occupancy": median_batch_occupancy,
+        "decision": decision.value,
+        "selected_backend": selected_backend,
+        "selected_exact_backend": "cpu_batch",
+        "native_rows": [_observation_to_dict(item) for item in native],
+        "accelerator_rows": [_observation_to_dict(item) for item in accelerated],
+        "runtime_identity": runtime_identity,
+        "semantic_equality_passed": semantic,
+        "aggregate_median_saving": aggregate,
+        "family_median_savings": dict(families),
+        "minimum_aggregate_saving": 0.15,
+        "maximum_family_regression": 0.03,
+        "fallback_used": False,
+        "failure_code": None,
+        "failure_detail": None,
+    }
+
+
+def audit_accelerator_pilot(
+    payload: Mapping[str, object],
+    *,
+    expected_backend: str,
+    expected_native: Sequence[PerformanceObservation],
+) -> dict[str, object]:
+    """Replay a helper-protocol-v2 pilot without executing the helper."""
+
+    if (
+        payload.get("schema_version") != ACCELERATOR_PILOT_SCHEMA_VERSION
+        or payload.get("backend") != expected_backend
+        or payload.get("threshold") != METAL_OCCUPANCY_THRESHOLD
+        or payload.get("minimum_aggregate_saving") != 0.15
+        or payload.get("maximum_family_regression") != 0.03
+        or payload.get("fallback_used") is not False
+    ):
+        raise ValueError("accelerator pilot constants, backend, or fallback state are invalid")
+    native_rows = payload.get("native_rows")
+    accelerated_rows = payload.get("accelerator_rows")
+    if not isinstance(native_rows, list) or not isinstance(accelerated_rows, list):
+        raise ValueError("accelerator pilot rows must be lists")
+    native = tuple(_observation_from_dict(item) for item in native_rows)
+    accelerated = tuple(_observation_from_dict(item) for item in accelerated_rows)
+    if tuple(_observation_to_dict(item) for item in native) != tuple(
+        _observation_to_dict(item) for item in expected_native
+    ):
+        raise ValueError("accelerator pilot native rows do not match accepted evidence")
+    median = _finite_float(payload.get("median_batch_occupancy"), "median_batch_occupancy")
+    status = MetalPilotStatus(str(payload.get("status")))
+    if status is MetalPilotStatus.PARTIAL:
+        if (
+            median < METAL_OCCUPANCY_THRESHOLD
+            or accelerated
+            or payload.get("decision") is not None
+            or payload.get("selected_backend") is not None
+            or payload.get("selected_exact_backend") is not None
+            or payload.get("failure_code") != "CUDA_RUNTIME_UNAVAILABLE"
+        ):
+            raise ValueError("partial accelerator pilot state is invalid")
+        return dict(payload)
+    if median < METAL_OCCUPANCY_THRESHOLD:
+        if native or accelerated or payload.get("decision") != "GPU_NOT_JUSTIFIED":
+            raise ValueError("below-threshold accelerator decision is invalid")
+        return dict(payload)
+    _validate_native_scope(native)
+    _validate_native_scope(accelerated)
+    decision = decide_accelerator(
+        median_batch_occupancy=median,
+        native_cpu=native,
+        accelerator=accelerated,
+    )
+    semantic, aggregate, families = _promotion_details(native, accelerated)
+    expected_selected = (
+        expected_backend
+        if decision is AcceleratorDecision.ACCELERATOR_PROMOTED
+        else "native_cpu"
+    )
+    runtime = payload.get("runtime_identity")
+    if (
+        payload.get("decision") != decision.value
+        or payload.get("selected_backend") != expected_selected
+        or payload.get("selected_exact_backend") != "cpu_batch"
+        or payload.get("semantic_equality_passed") is not semantic
+        or payload.get("aggregate_median_saving") != aggregate
+        or payload.get("family_median_savings") != dict(families)
+        or not isinstance(runtime, Mapping)
+        or runtime.get("backend") != expected_backend
+        or runtime.get("protocol_schema_version") != ACCELERATOR_HELPER_SCHEMA_VERSION
+        or runtime.get("fallback_allowed") is not False
+    ):
+        raise ValueError("accelerator pilot decision or runtime identity does not replay")
+    return dict(payload)
+
+
+def _accelerator_runtime_unavailable_payload(
+    *,
+    backend: str,
+    median_batch_occupancy: float,
+    native: Sequence[PerformanceObservation],
+    detail: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": ACCELERATOR_PILOT_SCHEMA_VERSION,
+        "status": MetalPilotStatus.PARTIAL.value,
+        "backend": backend,
+        "threshold": METAL_OCCUPANCY_THRESHOLD,
+        "median_batch_occupancy": median_batch_occupancy,
+        "decision": None,
+        "selected_backend": None,
+        "selected_exact_backend": None,
+        "native_rows": [_observation_to_dict(item) for item in native],
+        "accelerator_rows": [],
+        "runtime_identity": None,
+        "semantic_equality_passed": False,
+        "aggregate_median_saving": None,
+        "family_median_savings": {},
+        "minimum_aggregate_saving": 0.15,
+        "maximum_family_regression": 0.03,
+        "fallback_used": False,
+        "failure_code": "CUDA_RUNTIME_UNAVAILABLE",
+        "failure_detail": detail,
+    }
 
 
 class MetalPilotExecutor(Protocol):
