@@ -460,7 +460,7 @@ def run_stage052(
         raise ValueError("Stage 5.2 output directory must end with the canonical run label")
     if resolved_output.exists():
         raise FileExistsError(resolved_output)
-    _require_clean_repository(root)
+    _require_clean_stage052_repository(root)
     source_snapshot = verify_stage052_source_snapshot(root)
     staging_root_binding = _verify_performance_staging_root(
         root=root,
@@ -4531,6 +4531,13 @@ def _git(root: Path, *arguments: str) -> str:
 
 def _require_clean_repository(root: Path) -> None:
     if _git(root, "status", "--porcelain"):
+        raise RuntimeError("Stage 5.2 runner requires a clean repository commit")
+
+
+def _require_clean_stage052_repository(root: Path) -> None:
+    """Reject tracked changes; source-snapshot verification owns local untracked files."""
+
+    if _git(root, "status", "--porcelain", "--untracked-files=no"):
         raise RuntimeError("Stage 5.2 runner requires a clean repository commit")
 
 

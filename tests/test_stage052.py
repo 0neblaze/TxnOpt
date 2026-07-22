@@ -33,6 +33,7 @@ from evrptw.experiments.stage052_performance import (
     _accelerator_decision_inputs,
     _ensure_partial_shard_failure,
     _launch_occupancy_summary,
+    _require_clean_stage052_repository,
     _run_and_persist_v2_shard,
     _run_v2_shard_task,
     _run_v2_tasks,
@@ -166,6 +167,40 @@ def test_source_snapshot_requires_clean_ext4_and_read_only_tree(
     injected.unlink()
     with pytest.raises(RuntimeError, match="writable tracked paths"):
         verify_stage052_source_snapshot(source)
+
+
+def test_stage052_clean_check_defers_untracked_files_to_source_snapshot(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    tracked = repository / "tracked.txt"
+    tracked.write_text("clean\n", encoding="utf-8")
+    subprocess.run(("git", "init", str(repository)), check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(repository), "add", "tracked.txt"), check=True)
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Stage052 Test",
+            "-c",
+            "user.email=stage052@example.invalid",
+            "commit",
+            "-m",
+            "snapshot",
+        ),
+        check=True,
+        capture_output=True,
+    )
+    (repository / "local-only.json").write_text("{}\n", encoding="utf-8")
+
+    _require_clean_stage052_repository(repository)
+
+    tracked.write_text("dirty\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="clean repository"):
+        _require_clean_stage052_repository(repository)
 
 
 def test_windows_command_output_uses_explicit_utf_encodings(
