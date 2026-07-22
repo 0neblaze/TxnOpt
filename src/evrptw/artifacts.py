@@ -586,9 +586,20 @@ ANYTIME_CHECKPOINT_SCHEMA = pa.schema(
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
+        read_since_release = 0
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+            read_since_release += len(chunk)
+            if read_since_release >= 64 * 1024 * 1024:
+                _drop_file_page_cache(handle)
+                read_since_release = 0
+        _drop_file_page_cache(handle)
     return digest.hexdigest()
+
+
+def _drop_file_page_cache(handle: Any) -> None:
+    if hasattr(os, "posix_fadvise"):
+        os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
 
 
 def _payload_sha256(payload: object) -> str:
@@ -5491,10 +5502,14 @@ class ArtifactReader:
                 raise ArtifactIntegrityError(
                     f"Parquet projection contains unknown columns: {sorted(unknown)}"
                 )
-        yield from parquet.iter_batches(
-            batch_size=batch_size,
-            columns=selected_columns,
-        )
+        try:
+            yield from parquet.iter_batches(
+                batch_size=batch_size,
+                columns=selected_columns,
+            )
+        finally:
+            with path.open("rb") as handle:
+                _drop_file_page_cache(handle)
 
     def iter_parquet_rows(
         self,
@@ -5540,15 +5555,20 @@ class ArtifactReader:
         path = _safe_artifact_path(self.run_dir, Path(relative_path).as_posix())
         if path.suffix == ".jsonl":
             with path.open(encoding="utf-8") as handle:
-                for line in handle:
-                    if not line.strip():
-                        continue
-                    item = json.loads(line)
-                    if not isinstance(item, dict):
-                        raise ArtifactIntegrityError(f"legacy event row is not an object: {path}")
-                    payload = item.get("payload")
-                    logical = payload if isinstance(payload, dict) else item
-                    yield dict(logical)
+                try:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        item = json.loads(line)
+                        if not isinstance(item, dict):
+                            raise ArtifactIntegrityError(
+                                f"legacy event row is not an object: {path}"
+                            )
+                        payload = item.get("payload")
+                        logical = payload if isinstance(payload, dict) else item
+                        yield dict(logical)
+                finally:
+                    _drop_file_page_cache(handle)
             return
         if path.suffix != ".parquet":
             raise ArtifactIntegrityError(f"unsupported event artifact: {path}")

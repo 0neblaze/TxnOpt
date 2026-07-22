@@ -811,8 +811,10 @@ def _spool_semantic_records(
     identities: set[StorageReplayIdentity],
 ) -> None:
     ordinals: dict[StorageReplayIdentity, int] = {}
+    processed_records = 0
 
     def consume(identity: StorageReplayIdentity, record: Mapping[str, object]) -> None:
+        nonlocal processed_records
         if identity not in identities:
             return
         ordinal = ordinals.get(identity, 0)
@@ -834,11 +836,23 @@ def _spool_semantic_records(
             raise ArtifactIntegrityError(
                 f"duplicate semantic record location: {identity}/{ordinal}"
             ) from error
+        processed_records += 1
+        if processed_records % _SQLITE_CACHE_RELEASE_INTERVAL_RECORDS == 0:
+            page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+            page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+            _release_sqlite_page_cache(connection)
+            _emit_review_progress(
+                "semantic_spool_cache_release",
+                raw_dir=str(raw_dir.resolve()),
+                record_count=processed_records,
+                spool_bytes=page_count * page_size,
+            )
 
     _visit_stage052_storage_semantic_records(raw_dir, consume)
     connection.commit()
     page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
     page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+    _release_sqlite_page_cache(connection)
     _emit_review_progress(
         "semantic_spool_bundle_complete",
         raw_dir=str(raw_dir.resolve()),
@@ -867,6 +881,59 @@ def _semantic_field_digests(payload: bytes | None) -> dict[str, str]:
 
 
 SemanticSpoolKey = tuple[str, int, str, int]
+_CACHE_RELEASE_INTERVAL_BYTES = 64 * 1024 * 1024
+_SQLITE_CACHE_RELEASE_INTERVAL_RECORDS = 100_000
+
+
+def _file_descriptor(handle: Any) -> int | None:
+    try:
+        return int(handle.fileno())
+    except (AttributeError, io.UnsupportedOperation):
+        return None
+
+
+def _drop_file_page_cache(handle: Any) -> None:
+    descriptor = _file_descriptor(handle)
+    if descriptor is None or not hasattr(os, "posix_fadvise"):
+        return
+    os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
+
+
+def _flush_sync_and_drop_file_cache(handle: Any) -> None:
+    handle.flush()
+    descriptor = _file_descriptor(handle)
+    if descriptor is None:
+        return
+    os.fsync(descriptor)
+    _drop_file_page_cache(handle)
+
+
+def _copy_text_stream_bounded(source: Any, destination: Any) -> None:
+    copied_since_release = 0
+    while True:
+        block = source.read(1024 * 1024)
+        if not block:
+            break
+        destination.write(block)
+        copied_since_release += len(block)
+        if copied_since_release >= _CACHE_RELEASE_INTERVAL_BYTES:
+            _flush_sync_and_drop_file_cache(destination)
+            _drop_file_page_cache(source)
+            copied_since_release = 0
+    _flush_sync_and_drop_file_cache(destination)
+    _drop_file_page_cache(source)
+
+
+def _release_sqlite_page_cache(connection: sqlite3.Connection) -> Path:
+    connection.commit()
+    connection.execute("PRAGMA shrink_memory")
+    row = connection.execute("PRAGMA database_list").fetchone()
+    if row is None or not row[2]:
+        raise RuntimeError("semantic spool database path is unavailable")
+    path = Path(str(row[2]))
+    with path.open("r+b") as handle:
+        _flush_sync_and_drop_file_cache(handle)
+    return path
 
 
 def _semantic_spool_keys(
@@ -897,17 +964,21 @@ def _semantic_spool_payload(
     return (str(row[0]), bytes(row[1])) if row is not None else None
 
 
-def _delete_semantic_spool_record(
+def _semantic_spool_tail_payloads(
     connection: sqlite3.Connection,
-    key: SemanticSpoolKey,
-) -> None:
-    connection.execute(
-        """
-        DELETE FROM semantic_records
-        WHERE instance = ? AND seed = ? AND axis = ? AND ordinal = ?
-        """,
-        key,
-    )
+    ordinals: Mapping[StorageReplayIdentity, int],
+) -> Iterator[tuple[SemanticSpoolKey, bytes]]:
+    for identity in sorted(ordinals):
+        rows = connection.execute(
+            """
+            SELECT ordinal, payload FROM semantic_records
+            WHERE instance = ? AND seed = ? AND axis = ? AND ordinal >= ?
+            ORDER BY ordinal
+            """,
+            (*identity, ordinals[identity]),
+        )
+        for ordinal, payload in rows:
+            yield (*identity, int(ordinal)), bytes(payload)
 
 
 _SEMANTIC_MISMATCH_FIELDS = (
@@ -985,39 +1056,81 @@ def _compare_semantic_records_against_spool(
     raw_dir: Path,
     identities: set[StorageReplayIdentity],
     writers: Mapping[StorageReplayIdentity, csv.DictWriter[str]],
+    handles: Mapping[StorageReplayIdentity, Any],
 ) -> None:
-    ordinals: dict[StorageReplayIdentity, int] = {}
+    ordinals: dict[StorageReplayIdentity, int] = {identity: 0 for identity in identities}
+    processed_records = 0
+    fragment_bytes_since_release = 0
+    spool_path = _release_sqlite_page_cache(connection)
+    spool_handle = spool_path.open("rb")
+
+    def write_bounded(
+        identity: StorageReplayIdentity,
+        key: SemanticSpoolKey,
+        left_payload: bytes | None,
+        right_payload: bytes | None,
+    ) -> None:
+        nonlocal fragment_bytes_since_release
+        handle = handles[identity]
+        before = int(handle.tell())
+        _write_record_field_mismatches(
+            writers[identity], key, left_payload, right_payload
+        )
+        fragment_bytes_since_release += int(handle.tell()) - before
+        if fragment_bytes_since_release >= _CACHE_RELEASE_INTERVAL_BYTES:
+            for fragment_handle in handles.values():
+                _flush_sync_and_drop_file_cache(fragment_handle)
+            fragment_bytes_since_release = 0
 
     def consume(identity: StorageReplayIdentity, record: Mapping[str, object]) -> None:
+        nonlocal processed_records
         if identity not in identities:
             return
-        ordinal = ordinals.get(identity, 0)
+        ordinal = ordinals[identity]
         ordinals[identity] = ordinal + 1
         key = (*identity, ordinal)
         right_payload = _canonical_json_bytes(record)
         right_digest = hashlib.sha256(right_payload).hexdigest()
         left = _semantic_spool_payload(connection, key)
         if left is None:
-            _write_record_field_mismatches(
-                writers[identity], key, None, zlib.compress(right_payload, level=1)
-            )
-            return
-        left_digest, left_payload = left
-        _delete_semantic_spool_record(connection, key)
-        if left_digest != right_digest:
-            _write_record_field_mismatches(
-                writers[identity],
+            write_bounded(
+                identity,
                 key,
-                left_payload,
+                None,
                 zlib.compress(right_payload, level=1),
             )
+        else:
+            left_digest, left_payload = left
+            if left_digest != right_digest:
+                write_bounded(
+                    identity,
+                    key,
+                    left_payload,
+                    zlib.compress(right_payload, level=1),
+                )
+        processed_records += 1
+        if processed_records % _SQLITE_CACHE_RELEASE_INTERVAL_RECORDS == 0:
+            _drop_file_page_cache(spool_handle)
 
-    _visit_stage052_storage_semantic_records(raw_dir, consume)
-    for key, _ in _semantic_spool_keys(connection):
-        left = _semantic_spool_payload(connection, key)
-        assert left is not None
-        _write_record_field_mismatches(writers[key[:3]], key, left[1], None)
-    connection.commit()
+    try:
+        _visit_stage052_storage_semantic_records(raw_dir, consume)
+        for tail_records, (key, left_payload) in enumerate(
+            _semantic_spool_tail_payloads(connection, ordinals),
+            start=1,
+        ):
+            write_bounded(
+                key[:3],
+                key,
+                left_payload,
+                None,
+            )
+            if tail_records % _SQLITE_CACHE_RELEASE_INTERVAL_RECORDS == 0:
+                _drop_file_page_cache(spool_handle)
+        for handle in handles.values():
+            _flush_sync_and_drop_file_cache(handle)
+        _drop_file_page_cache(spool_handle)
+    finally:
+        spool_handle.close()
     page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
     page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
     _emit_review_progress(
@@ -1094,12 +1207,11 @@ def _write_semantic_mismatch_rows(
                     raw_dir=raw_dir,
                     identities=mismatched,
                     writers=writers,
+                    handles=handles,
                 )
-                for handle in handles.values():
-                    handle.flush()
                 for identity in sorted(mismatched):
                     with paths[identity].open("r", encoding="utf-8", newline="") as fragment:
-                        shutil.copyfileobj(fragment, output, length=1024 * 1024)
+                        _copy_text_stream_bounded(fragment, output)
 
 
 def _flatten_semantic_fields(
@@ -1256,9 +1368,16 @@ def _write_fsync(path: Path, payload: bytes) -> None:
 
 def _copy_fsync(path: Path, source: Path) -> None:
     with source.open("rb") as input_handle, path.open("xb") as output_handle:
-        shutil.copyfileobj(input_handle, output_handle, length=1024 * 1024)
-        output_handle.flush()
-        os.fsync(output_handle.fileno())
+        copied_since_release = 0
+        for block in iter(lambda: input_handle.read(1024 * 1024), b""):
+            output_handle.write(block)
+            copied_since_release += len(block)
+            if copied_since_release >= _CACHE_RELEASE_INTERVAL_BYTES:
+                _flush_sync_and_drop_file_cache(output_handle)
+                _drop_file_page_cache(input_handle)
+                copied_since_release = 0
+        _flush_sync_and_drop_file_cache(output_handle)
+        _drop_file_page_cache(input_handle)
 
 
 def _update_digest_from_source(
@@ -1269,8 +1388,14 @@ def _update_digest_from_source(
         hasher.update(source)
         return
     with source.open("rb") as handle:
+        read_since_release = 0
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             hasher.update(block)
+            read_since_release += len(block)
+            if read_since_release >= _CACHE_RELEASE_INTERVAL_BYTES:
+                _drop_file_page_cache(handle)
+                read_since_release = 0
+        _drop_file_page_cache(handle)
 
 
 def _source_sha256(source: bytes | Path) -> str:
@@ -4898,9 +5023,7 @@ def _replace_event_route_ids(
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
+    _update_digest_from_source(digest, path)
     return digest.hexdigest()
 
 

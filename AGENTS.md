@@ -612,9 +612,16 @@ this repository or one of its subdirectories.
   The spool stores one compressed canonical record per row and expands fields
   only while comparing; per-field database rows are forbidden because they
   amplify disk usage and cgroup page cache. Only the comparison bundle may be
-  spooled: candidate records must point-query and delete consumed comparison
-  rows while writing per-axis ordered fragments, so two complete payload sets
-  are never retained together. BLOB temp sorts are forbidden. The mismatch CSV is streamed through temporary-file
+  spooled: candidate records point-query comparison rows while left-only rows
+  are derived from each axis's final ordinal tail; bulk DELETEs that dirty the
+  SQLite file are forbidden. Per-axis fragments, the final mismatch CSV, and
+  publication copies periodically fsync and release clean page cache with
+  `POSIX_FADV_DONTNEED`. SQLite construction commits/releases on a bounded
+  record window; fragment release uses one aggregate byte window shared by
+  all axes and the left-only tail. Raw manifest hashing and Parquet/JSONL
+  iterators release their source page cache at file-lifecycle boundaries.
+  BLOB temp sorts are forbidden. The mismatch CSV is
+  streamed through temporary-file
   hashing and publication and is never accumulated as one in-memory payload.
 - On the Windows/WSL2 formal host, long-running Stage 5.2 reviewers must run as
   transient `systemd --user` services rather than Codex desktop child

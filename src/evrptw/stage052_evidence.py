@@ -842,8 +842,15 @@ def _sha256(path: Path) -> str:
 
 def _update_digest_from_path(digest: Any, path: Path) -> None:
     with path.open("rb") as handle:
+        read_since_release = 0
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
+            read_since_release += len(block)
+            if read_since_release >= 64 * 1024 * 1024 and hasattr(os, "posix_fadvise"):
+                os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                read_since_release = 0
+        if hasattr(os, "posix_fadvise"):
+            os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
 
 
 def stage052_storage_root_binding(

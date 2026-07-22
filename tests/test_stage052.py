@@ -16,6 +16,7 @@ import numpy as np
 import psutil
 import pytest
 
+import evrptw.artifacts as artifacts_module
 import evrptw.experiments.stage052_performance as stage052_performance
 import evrptw.experiments.stage052_performance_review as stage052_review
 import evrptw.stage052_evidence as stage052_evidence
@@ -3042,6 +3043,7 @@ def test_streamed_record_counts_must_match_independent_replay() -> None:
 
 def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def write(
         policy: str,
@@ -3162,7 +3164,20 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         screening_schema_version="screening_decisions_v3",
     )
 
+    released_artifacts: list[str] = []
+    original_artifact_cache_drop = artifacts_module._drop_file_page_cache
+
+    def record_artifact_cache_drop(handle: object) -> None:
+        released_artifacts.append(str(getattr(handle, "name", "")))
+        original_artifact_cache_drop(handle)
+
+    monkeypatch.setattr(
+        artifacts_module,
+        "_drop_file_page_cache",
+        record_artifact_cache_drop,
+    )
     assert replay_stage052_storage_semantics(v1) == replay_stage052_storage_semantics(v2)
+    assert any(path.endswith(".parquet") for path in released_artifacts)
     assert replay_stage052_storage_semantics(v1) == replay_stage052_storage_semantics(v3)
     serial_replays = replay_stage052_storage_semantics_many((v1, v2))
     assert serial_replays[0] == serial_replays[1]
@@ -3276,6 +3291,11 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     previous_progress = os.environ.get("STAGE052_REVIEW_PROGRESS_LOG")
     os.environ["STAGE052_REVIEW_TMPDIR"] = str(spool_root)
     os.environ["STAGE052_REVIEW_PROGRESS_LOG"] = str(spool_progress)
+    monkeypatch.setattr(
+        stage052_review,
+        "_SQLITE_CACHE_RELEASE_INTERVAL_RECORDS",
+        1,
+    )
     large_mismatches = tmp_path / "large-mismatches.csv"
     try:
         write_semantic_mismatches(memory_fixture, (v1,), large_mismatches)
@@ -3309,7 +3329,39 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     assert len(spool_sizes) == 1
     assert streamed_sizes == spool_sizes
     assert max(spool_sizes) < 16 * 1024 * 1024
+    assert any(
+        event["event"] == "semantic_spool_cache_release"
+        for event in map(
+            json.loads,
+            spool_progress.read_text(encoding="utf-8").splitlines(),
+        )
+    )
     assert not any(spool_root.iterdir())
+
+    cache_flushes = 0
+    original_cache_flush = stage052_review._flush_sync_and_drop_file_cache
+
+    def record_cache_flush(handle: object) -> None:
+        nonlocal cache_flushes
+        cache_flushes += 1
+        original_cache_flush(handle)
+
+    monkeypatch.setattr(stage052_review, "_CACHE_RELEASE_INTERVAL_BYTES", 1024 * 1024)
+    monkeypatch.setattr(
+        stage052_review,
+        "_SQLITE_CACHE_RELEASE_INTERVAL_RECORDS",
+        10_000,
+    )
+    monkeypatch.setattr(
+        stage052_review,
+        "_flush_sync_and_drop_file_cache",
+        record_cache_flush,
+    )
+    left_only_mismatches = tmp_path / "left-only-mismatches.csv"
+    write_semantic_mismatches(v1, (memory_fixture,), left_only_mismatches)
+    with left_only_mismatches.open("rb") as mismatch_handle:
+        assert sum(1 for _ in mismatch_handle) > 20_000
+    assert cache_flushes > 1
     replay_probe = """
 import json
 import os
@@ -3402,8 +3454,13 @@ def test_semantic_spool_lookup_and_order_use_primary_key_without_temp_sort(
             "left",
             b"payload",
         )
-        stage052_review._delete_semantic_spool_record(connection, key)
-        assert list(stage052_review._semantic_spool_keys(connection)) == []
+        identity = key[:3]
+        assert list(
+            stage052_review._semantic_spool_tail_payloads(connection, {identity: 0})
+        ) == [(key, b"payload")]
+        assert list(
+            stage052_review._semantic_spool_tail_payloads(connection, {identity: 1})
+        ) == []
 
 
 def test_storage_replay_expands_compact_v2_screening_decisions(
