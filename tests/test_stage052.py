@@ -135,6 +135,15 @@ def test_source_snapshot_requires_clean_ext4_and_read_only_tree(
             "target": str(source),
         },
     )
+    configs = source / "configs"
+    configs.mkdir()
+    lock = configs / "stage052_campaign_lock.local.json"
+    lock_sidecar = configs / "stage052_campaign_lock.local.sha256"
+    lock.write_text('{"schema_version":"test"}\n', encoding="utf-8")
+    lock_sidecar.write_text(hashlib.sha256(lock.read_bytes()).hexdigest() + "\n")
+    lock.chmod(0o444)
+    lock_sidecar.chmod(0o444)
+    configs.chmod(0o555)
     tracked.chmod(0o444)
     source.chmod(0o555)
 
@@ -142,6 +151,10 @@ def test_source_snapshot_requires_clean_ext4_and_read_only_tree(
 
     assert observed["read_only"] is True
     assert observed["tracked_file_count"] == 1
+    assert set(observed["allowed_untracked_sha256"]) == {
+        "configs/stage052_campaign_lock.local.json",
+        "configs/stage052_campaign_lock.local.sha256",
+    }
     source.chmod(0o755)
     injected = source / "sitecustomize.py"
     injected.write_text("raise RuntimeError('injected')\n", encoding="utf-8")

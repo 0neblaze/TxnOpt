@@ -617,6 +617,7 @@ def verify_stage052_source_snapshot(root: Path) -> dict[str, object]:
     }
     allowed_local_files = {
         "configs/stage052_campaign_lock.local.json",
+        "configs/stage052_campaign_lock.local.sha256",
         "configs/stage052_runtime_identity.local.json",
         "configs/stage052_storage_roots.local.toml",
     }
