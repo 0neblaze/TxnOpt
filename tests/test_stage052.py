@@ -154,6 +154,32 @@ def test_source_snapshot_requires_clean_ext4_and_read_only_tree(
         verify_stage052_source_snapshot(source)
 
 
+def test_windows_command_output_uses_explicit_utf_encodings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, ...]] = []
+
+    def run(
+        arguments: tuple[str, ...],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        observed.append(arguments)
+        output = (
+            "Windows 11 专业版".encode()
+            if arguments[0] == "powershell.exe"
+            else "WSL 版本: 2.9.3.0".encode("utf-16-le")
+        )
+        return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr=b"")
+
+    monkeypatch.setattr(stage052_evidence.subprocess, "run", run)
+
+    assert stage052_evidence._run_command(
+        ("powershell.exe", "-Command", "Write-Output test")
+    ) == "Windows 11 专业版"
+    assert stage052_evidence._run_command(("wsl.exe", "--version")) == "WSL 版本: 2.9.3.0"
+    assert "OutputEncoding" in observed[0][-1]
+
+
 def test_persistence_attribution_recomputes_monotonic_control_intervals() -> None:
     attribution = Stage052PersistenceAttribution(
         run_label="stage05.2_artifact_streaming_attempt05",

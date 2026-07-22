@@ -2002,12 +2002,21 @@ def _collect_power_mode() -> dict[str, object]:
 
 
 def _run_command(arguments: tuple[str, ...]) -> str:
+    command = arguments
+    decode_as_utf16 = Path(arguments[0]).name.casefold() == "wsl.exe"
+    if Path(arguments[0]).name.casefold() == "powershell.exe":
+        if len(arguments) < 2:
+            raise RuntimeError("PowerShell command is missing its script argument")
+        prefix = (
+            "$utf8=[System.Text.UTF8Encoding]::new($false);"
+            "[Console]::OutputEncoding=$utf8;$OutputEncoding=$utf8;"
+        )
+        command = (*arguments[:-1], prefix + arguments[-1])
     try:
         completed = subprocess.run(
-            arguments,
+            command,
             capture_output=True,
             check=False,
-            text=True,
             timeout=5.0,
         )
     except (OSError, subprocess.SubprocessError) as error:
@@ -2016,7 +2025,15 @@ def _run_command(arguments: tuple[str, ...]) -> str:
         raise RuntimeError(
             f"performance provenance command returned {completed.returncode}: {arguments}"
         )
-    output = completed.stdout.strip()
+    try:
+        output = completed.stdout.decode(
+            "utf-16-le" if decode_as_utf16 else "utf-8"
+        ).lstrip("\ufeff").strip()
+    except UnicodeDecodeError as error:
+        encoding = "UTF-16LE" if decode_as_utf16 else "UTF-8"
+        raise RuntimeError(
+            f"performance provenance command output is not valid {encoding}: {arguments}"
+        ) from error
     if not output:
         raise RuntimeError(f"performance provenance command returned no output: {arguments}")
     return output
