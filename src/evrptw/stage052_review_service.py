@@ -152,6 +152,15 @@ def _sha256(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def _absolute_executable(path: Path) -> Path:
+    """Return an absolute executable path without dereferencing a venv symlink."""
+
+    absolute = Path(os.path.abspath(path))
+    if not absolute.is_file():
+        raise FileNotFoundError(absolute)
+    return absolute
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -446,10 +455,10 @@ def _verify_installed_distribution_matches_wheel(
 
 
 def _validate_formal_execution_envelope(config: ReviewServiceConfig) -> dict[str, str]:
-    reviewer_python = config.reviewer_python.resolve(strict=True)
-    if Path(sys.executable).resolve() != reviewer_python:
+    reviewer_python = _absolute_executable(config.reviewer_python)
+    if _absolute_executable(Path(sys.executable)) != reviewer_python:
         raise RuntimeError("service supervisor is not running from reviewer_python")
-    command_python = Path(config.command[0]).resolve(strict=True)
+    command_python = _absolute_executable(Path(config.command[0]))
     if command_python != reviewer_python:
         raise RuntimeError("review command does not use the frozen reviewer Python")
     expected_prefix = (
@@ -564,7 +573,7 @@ def _initial_receipt(config: ReviewServiceConfig) -> dict[str, object]:
         "exit_code": None,
         "command": list(config.command),
         "working_directory": str(config.working_directory.resolve()),
-        "python_executable": str(config.reviewer_python.resolve()),
+        "python_executable": str(_absolute_executable(config.reviewer_python)),
         "reviewer_revision": config.reviewer_revision,
         "producer_repository_revision": None,
         "reviewer_module_path": None,
@@ -814,7 +823,7 @@ def launch_review_service(config: ReviewServiceConfig) -> None:
     _atomic_json(config_path, config.to_dict())
     finalizer = shlex.join(
         (
-            str(config.reviewer_python.resolve()),
+            str(_absolute_executable(config.reviewer_python)),
             "-I",
             "-m",
             "evrptw.stage052_review_service",
@@ -838,7 +847,7 @@ def launch_review_service(config: ReviewServiceConfig) -> None:
         f"--property=ExecStopPost={finalizer}",
         f"--property=WorkingDirectory={config.working_directory.resolve()}",
         f"--setenv=STAGE052_REVIEW_TMPDIR={temporary_root.resolve()}",
-        str(config.reviewer_python.resolve()),
+        str(_absolute_executable(config.reviewer_python)),
         "-I",
         "-m",
         "evrptw.stage052_review_service",

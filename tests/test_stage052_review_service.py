@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import zipfile
@@ -288,3 +289,14 @@ def test_formal_source_allows_only_raw_bound_local_files(tmp_path: Path) -> None
             source,
             allowed_untracked_sha256={"local.json": digest},
         )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows venv launchers are not symlinks")
+def test_reviewer_python_identity_preserves_venv_symlink(tmp_path: Path) -> None:
+    executable = tmp_path / "runtime-python"
+    executable.symlink_to(Path(sys.executable))
+
+    observed = review_service._absolute_executable(executable)
+
+    assert observed == executable.absolute()
+    assert observed != executable.resolve()
