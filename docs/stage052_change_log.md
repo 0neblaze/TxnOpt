@@ -8,6 +8,23 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：跨 revision 冻结 producer replay 修复
+
+- 原因：A10 通过新 reviewer receipt 后，B04 的 producer prerequisite binding 仍指向旧
+  A10 review hash，因此 B04 在现行合同下正确降为 `NOT_READY`。随后 B05 preflight 又
+  暴露 current-chain verifier 错用下游 current worktree 重放上游 producer runtime；当
+  两者 revision 不同时必然失败。
+- 修改：current-chain verifier 从已绑定当前 review manifest 的 systemd receipt 读取上游
+  producer `working_directory`，要求 receipt 中的 producer revision 与 raw identity 完全
+  一致，并在该冻结 source root 中重放 wheel、Python、native extension、dependency 与
+  machine identity。下游 current worktree 只继续提供当前 storage-root locator。
+- 证据影响：B04 的 `NOT_READY` 与失败 review 保留；B05 在 output directory 创建前失败，
+  没有 raw shard，后续实际 B 重跑必须使用新 label。A10 raw 未改写，其现行 review receipt
+  可作为跨 revision prerequisite。
+- 验证：新增跨 revision producer root 与 receipt revision mismatch 测试；修复前 2/2 按
+  预期失败，修复后 2/2 通过。Ruff 与 strict mypy 通过；完整套件将在新 ext4 clean
+  worktree 安装后复跑。
+
 ## 2026-07-23：C 前独立审查加固
 
 - 原因：从固定点 `7f0944e` 的双重独立 code review 发现 canonical raw、wheel source、

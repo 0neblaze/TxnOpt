@@ -527,7 +527,19 @@ def test_current_chain_prerequisite_replays_frozen_producer_runtime(
             }
 
     monkeypatch.setattr(stage052_evidence, "ArtifactReader", CurrentReader)
-    monkeypatch.setattr(stage052_evidence, "repository_root", lambda: tmp_path)
+    current_root = tmp_path / "current"
+    current_root.mkdir()
+    producer_root = tmp_path / "producer"
+    producer_root.mkdir()
+    monkeypatch.setattr(stage052_evidence, "repository_root", lambda: current_root)
+    monkeypatch.setattr(
+        stage052_evidence,
+        "verify_stage052_review_execution_receipt",
+        lambda *_args, **_kwargs: {
+            "working_directory": str(producer_root),
+            "producer_repository_revision": "a" * 40,
+        },
+    )
     replayed: list[tuple[Path, str]] = []
 
     def replay_runtime(root: Path, revision: str) -> dict[str, object]:
@@ -546,7 +558,80 @@ def test_current_chain_prerequisite_replays_frozen_producer_runtime(
     )
 
     assert verify_stage052_evidence_input(tmp_path, requirement) == identity
-    assert replayed == [(tmp_path, "a" * 40)]
+    assert replayed == [(producer_root, "a" * 40)]
+
+
+def test_current_chain_prerequisite_rejects_receipt_revision_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirement = stage052_contract(
+        Stage052Component.JOB_PARALLEL, "performance"
+    ).prerequisites[0]
+    identity = Stage052PrerequisiteIdentity(
+        run_label="stage05.2_artifact_streaming_attempt04",
+        component="artifact_streaming",
+        status="READY_FOR_STAGE052_JOB_PARALLEL",
+        repository_revision="a" * 40,
+        configuration_sha256="b" * 64,
+        raw_manifest_sha256="c" * 64,
+        review_manifest_sha256="d" * 64,
+        scope="performance",
+    )
+    monkeypatch.setattr(
+        stage052_evidence,
+        "verify_stage052_prerequisite",
+        lambda *_args, **_kwargs: identity,
+    )
+    review_dir = tmp_path / "review"
+    review_dir.mkdir()
+    (review_dir / "review_manifest.json").write_text("{}\n", encoding="utf-8")
+    generation = f"generations/{'f' * 64}"
+    monkeypatch.setattr(
+        stage052_evidence,
+        "verify_stage052_review_files",
+        lambda *_args, **_kwargs: {
+            f"{generation}/review_report.md": tmp_path / "review_report.md",
+            f"{generation}/review_findings.csv": tmp_path / "review_findings.csv",
+            f"{generation}/semantic_mismatches.csv": tmp_path
+            / "semantic_mismatches.csv",
+        },
+    )
+
+    class CurrentReader:
+        manifest = {
+            "artifacts": [
+                {
+                    "artifact_type": "manifest_metadata",
+                    "relative_path": "control/metadata.json",
+                }
+            ]
+        }
+
+        def __init__(self, _path: Path) -> None:
+            pass
+
+        def read_json(self, _relative_path: str) -> dict[str, object]:
+            return {
+                "backend": "cpu_batch",
+                "storage_policy_version": "artifact-storage-v2",
+                "screening_schema_version": "screening_decisions_v3",
+                "runtime_identity": {"wheel_sha256": "e" * 64},
+                "staging_root": {"alias": "wsl_staging"},
+            }
+
+    monkeypatch.setattr(stage052_evidence, "ArtifactReader", CurrentReader)
+    monkeypatch.setattr(
+        stage052_evidence,
+        "verify_stage052_review_execution_receipt",
+        lambda *_args, **_kwargs: {
+            "working_directory": str(tmp_path),
+            "producer_repository_revision": "0" * 40,
+        },
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="receipt revision"):
+        verify_stage052_evidence_input(tmp_path, requirement)
 
 
 def test_stage052_storage_root_binding_is_path_free_and_matches_local_locator(

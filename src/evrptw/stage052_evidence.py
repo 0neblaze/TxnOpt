@@ -1699,10 +1699,30 @@ def verify_stage052_evidence_input(
     observed_runtime = metadata.get("runtime_identity")
     if not isinstance(observed_runtime, Mapping):
         raise ArtifactIntegrityError("current-chain prerequisite has no frozen runtime identity")
-    root = repository_root()
+    execution = verify_stage052_review_execution_receipt(raw_dir.resolve(), review_path)
+    if execution.get("producer_repository_revision") != identity.repository_revision:
+        raise ArtifactIntegrityError(
+            "current-chain prerequisite review receipt revision does not match producer"
+        )
+    working_directory = execution.get("working_directory")
+    if not isinstance(working_directory, str) or not working_directory:
+        raise ArtifactIntegrityError(
+            "current-chain prerequisite review receipt lacks its producer source root"
+        )
+    producer_root = Path(working_directory)
+    if not producer_root.is_absolute():
+        raise ArtifactIntegrityError(
+            "current-chain prerequisite producer source root must be absolute"
+        )
+    try:
+        producer_root = producer_root.resolve(strict=True)
+    except OSError as error:
+        raise ArtifactIntegrityError(
+            "current-chain prerequisite producer source root is unavailable"
+        ) from error
     try:
         verified_runtime = verify_frozen_stage052_producer_runtime_identity(
-            root,
+            producer_root,
             identity.repository_revision,
         )
     except (OSError, RuntimeError, TypeError, ValueError) as error:
@@ -1713,6 +1733,7 @@ def verify_stage052_evidence_input(
         raise ArtifactIntegrityError(
             "current-chain prerequisite runtime differs from the active frozen wheel"
         )
+    root = repository_root()
     verify_stage052_storage_root_binding(
         metadata,
         locator_path=root / "configs/stage052_storage_roots.local.toml",
