@@ -640,6 +640,12 @@ this repository or one of its subdirectories.
   `powershell.exe`, and `wsl.exe`, record it in the execution receipt, and fail
   before launch if any required interoperability tool is unavailable; it must
   not rely on an interactive shell's inherited `PATH`.
+  Producer runtime identity must be replayed by the raw-bound frozen producer
+  venv, never by the new reviewer wheel. The review-only WSL memory cap is
+  audited separately as operational receipt evidence; only that live memory
+  field may differ from the historical producer identity, while CPU, GPU,
+  Windows, WSL, mount, NVMe, wheel, Python, native, and dependency identities
+  remain exact hard gates.
 - The registry, trusted manifest, and versioned review products are published
   only after G02 raw replay reports `READY_FOR_STAGE05_3`. Publication is a
   generation transaction whose trusted manifest is replaced last; no producer,

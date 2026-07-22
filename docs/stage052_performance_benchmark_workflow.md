@@ -223,6 +223,12 @@ launcher 必须在启动前解析并冻结 `nvidia-smi`、`powershell.exe` 和 `
 所在目录，将完整 service `PATH` 显式传入 systemd 并记录到
 `review_execution.json`；不得依赖 Codex 或交互式 shell 偶然继承的 Windows
 interop `PATH`。缺少任一正式运行工具时必须在 service 启动前 fail fast。
+producer runtime identity 必须由 raw-bound（原始证据绑定）的 producer venv
+独立重放 wheel、Python、native extension（原生扩展）、dependency（依赖）和
+machine identity（机器身份）；不得用新的 reviewer wheel 冒充 producer wheel。
+review-only `.wslconfig` memory cap（仅审查内存上限）作为 execution receipt
+中的 operational evidence 单独审计，不得改写历史 producer identity，也不得掩盖
+CPU、GPU、Windows、WSL、mount 或 NVMe identity 的变化。
 service 还必须配置 `ExecStopPost` 外部收尾器；即使 `MemoryMax` 直接终止 reviewer
 与 supervisor，收尾器仍从 systemd 的 `SERVICE_RESULT/EXIT_CODE/EXIT_STATUS` 封存
 失败回执，并重新计算 raw manifest、service/progress log hash 以及读取 cgroup

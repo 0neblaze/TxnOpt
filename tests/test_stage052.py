@@ -2754,8 +2754,9 @@ def test_stage052_runtime_identity_binds_wheel_python_native_and_dependencies(
     assert verified["installed_editable"] is False
     monkeypatch.setattr(
         stage052_review,
-        "verify_stage052_runtime_identity",
+        "_verify_frozen_producer_runtime_identity",
         lambda *_args, **_kwargs: verified,
+        raising=False,
     )
     passed, detail = stage052_review._validate_stage052_runtime_identity(
         {"repository_revision": "a" * 40, "runtime_identity": verified}
@@ -2776,6 +2777,22 @@ def test_stage052_runtime_identity_binds_wheel_python_native_and_dependencies(
             manifest,
             expected_repository_revision="a" * 40,
         )
+
+
+def test_review_runtime_machine_comparison_excludes_only_wsl_memory_limit() -> None:
+    frozen = {
+        "execution_environment": "windows11_wsl2",
+        "memory_bytes": 15 * 1024**3,
+        "logical_cpu_count": 24,
+        "nvidia_gpu": {"name": "test-gpu"},
+    }
+    current = {**frozen, "memory_bytes": 16 * 1024**3}
+
+    assert stage052_review._same_producer_machine_ignoring_review_memory(frozen, current)
+    assert not stage052_review._same_producer_machine_ignoring_review_memory(
+        frozen,
+        {**current, "logical_cpu_count": 12},
+    )
 
 
 def test_runtime_signature_allows_historical_python_binary_but_binds_native_profile() -> None:
