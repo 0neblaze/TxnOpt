@@ -46,6 +46,7 @@ from evrptw.experiments.stage052_performance import (
 )
 from evrptw.experiments.stage052_performance_review import (
     _audit_native_execution,
+    _bind_persistence_attribution_review,
     _prerequisite_binding_matches,
     _prior_review_manifest_hashes,
     _recompute_native_occupancies,
@@ -678,6 +679,92 @@ filesystem = "9p"
     assert "not ext4" in wrong_filesystem_detail
     assert not wrong_aliases
     assert "aliases" in wrong_aliases_detail
+
+
+def test_every_primary_write_review_binds_the_attribution_envelope(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "stage05.2_perf_baseline_attempt99"
+    config = tmp_path / "stage052.toml"
+    config.write_text("[stage05_2]\nschema_version='test'\n", encoding="utf-8")
+    writer = ArtifactBundleWriter(
+        raw_dir,
+        ArtifactRunContext("stage05.2", "perf_baseline", raw_dir.name),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v1"),
+    )
+    writer.write_control(
+        metadata={
+            "run_label": raw_dir.name,
+            "component": "perf_baseline",
+            "scope": "performance",
+            "persistence_attribution": "primary_active_writes_v1",
+        },
+        configuration_path=config,
+    )
+    bundle = writer.finalize()
+    attribution = raw_dir / "control" / f"{raw_dir.name}_persistence_attribution.json"
+    sidecar = attribution.with_suffix(".sha256")
+    labels = (
+        "parent_write_control",
+        "parent_timing_and_per_run_control",
+        "parent_resource_control",
+        "parent_primary_manifest_finalize",
+    )
+    attribution_record = Stage052PersistenceAttribution(
+        run_label=raw_dir.name,
+        component="perf_baseline",
+        scope="performance",
+        subject_id="run",
+        primary_manifest_relative_path=bundle.manifest_path.relative_to(raw_dir).as_posix(),
+        primary_manifest_sha256=hashlib.sha256(bundle.manifest_path.read_bytes()).hexdigest(),
+        solver_seconds=1.0,
+        shard_persistence_seconds=0.1,
+        control_intervals=tuple(
+            PersistenceInterval(label, index * 2, index * 2 + 1)
+            for index, label in enumerate(labels)
+        ),
+    )
+    attribution.write_text(
+        json.dumps(attribution_record.to_dict()) + "\n",
+        encoding="utf-8",
+    )
+    sidecar.write_text(
+        hashlib.sha256(attribution.read_bytes()).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+    review_manifest: dict[str, object] = {}
+    metadata = {
+        "component": "perf_baseline",
+        "scope": "performance",
+        "persistence_attribution": "primary_active_writes_v1",
+    }
+
+    _bind_persistence_attribution_review(
+        review_manifest,
+        raw_dir=raw_dir,
+        metadata=metadata,
+    )
+
+    assert review_manifest["persistence_attribution_sha256"] == hashlib.sha256(
+        attribution.read_bytes()
+    ).hexdigest()
+    assert review_manifest["persistence_attribution_sidecar_sha256"] == hashlib.sha256(
+        sidecar.read_bytes()
+    ).hexdigest()
+
+    sidecar.write_text("0" * 64 + "\n", encoding="utf-8")
+    with pytest.raises(ArtifactIntegrityError, match="envelope is missing"):
+        _bind_persistence_attribution_review({}, raw_dir=raw_dir, metadata=metadata)
+
+    wrong_identity = replace(attribution_record, component="hot_path")
+    attribution.write_text(
+        json.dumps(wrong_identity.to_dict()) + "\n",
+        encoding="utf-8",
+    )
+    sidecar.write_text(
+        hashlib.sha256(attribution.read_bytes()).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ArtifactIntegrityError, match="identity is invalid"):
+        _bind_persistence_attribution_review({}, raw_dir=raw_dir, metadata=metadata)
 
 
 def test_stage052_current_chain_rejects_old_not_ready_remediation_input(

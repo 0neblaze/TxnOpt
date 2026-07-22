@@ -1067,6 +1067,56 @@ def _archive_prior_review_generation(
     return prior_sha256
 
 
+def _bind_persistence_attribution_review(
+    review_manifest: dict[str, object],
+    *,
+    raw_dir: Path,
+    metadata: Mapping[str, object],
+) -> None:
+    """Bind every primary-write review to its signed attribution envelope."""
+
+    if metadata.get("persistence_attribution") != "primary_active_writes_v1":
+        return
+    attribution_path = raw_dir / "control" / f"{raw_dir.name}_persistence_attribution.json"
+    attribution_sidecar = attribution_path.with_suffix(".sha256")
+    if (
+        not attribution_path.is_file()
+        or not attribution_sidecar.is_file()
+        or not signed_sidecar_matches(attribution_path, attribution_sidecar)
+    ):
+        raise ArtifactIntegrityError("reviewed persistence attribution envelope is missing")
+    try:
+        raw_attribution = json.loads(attribution_path.read_text(encoding="utf-8"))
+        if not isinstance(raw_attribution, Mapping):
+            raise ValueError("persistence attribution must be an object")
+        attribution = Stage052PersistenceAttribution.from_dict(raw_attribution)
+        reader = ArtifactReader(raw_dir)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ArtifactIntegrityError("reviewed persistence attribution is invalid") from error
+    required_control_labels = {
+        "parent_write_control",
+        "parent_timing_and_per_run_control",
+        "parent_resource_control",
+        "parent_primary_manifest_finalize",
+    }
+    manifest_path = raw_dir / attribution.primary_manifest_relative_path
+    if (
+        attribution.run_label != raw_dir.name
+        or attribution.component != metadata.get("component")
+        or attribution.scope != metadata.get("scope")
+        or attribution.subject_id != "run"
+        or {interval.label for interval in attribution.control_intervals}
+        != required_control_labels
+        or manifest_path.resolve() != reader.result.manifest_path.resolve()
+        or _sha256(manifest_path) != attribution.primary_manifest_sha256
+    ):
+        raise ArtifactIntegrityError("reviewed persistence attribution identity is invalid")
+    review_manifest["persistence_attribution_sha256"] = _sha256(attribution_path)
+    review_manifest["persistence_attribution_sidecar_sha256"] = _sha256(
+        attribution_sidecar
+    )
+
+
 def review_stage052(
     *,
     raw_dir: Path,
@@ -1330,21 +1380,11 @@ def review_stage052(
         "review_manifest_lineage_sha256": review_lineage,
         "gates": gates,
     }
-    if selected in {
-        Stage052Component.ARTIFACT_STREAMING,
-        Stage052Component.JOB_PARALLEL,
-        Stage052Component.NATIVE_KERNELS,
-    } and metadata.get("persistence_attribution") == "primary_active_writes_v1":
-        attribution_path = (
-            raw_dir / "control" / f"{raw_dir.name}_persistence_attribution.json"
-        )
-        attribution_sidecar = attribution_path.with_suffix(".sha256")
-        if not attribution_path.is_file() or not attribution_sidecar.is_file():
-            raise ArtifactIntegrityError("reviewed persistence attribution envelope is missing")
-        review_manifest["persistence_attribution_sha256"] = _sha256(attribution_path)
-        review_manifest["persistence_attribution_sidecar_sha256"] = _sha256(
-            attribution_sidecar
-        )
+    _bind_persistence_attribution_review(
+        review_manifest,
+        raw_dir=raw_dir,
+        metadata=metadata,
+    )
     worker_gate = gates.get("worker_selection", {})
     if passed and selected is Stage052Component.JOB_PARALLEL and worker_gate.get("passed") is True:
         review_manifest["selected_workers"] = worker_gate.get("selected_workers")
@@ -1585,6 +1625,7 @@ def _review_accelerator_pilot_v2(
         ),
         "gates": gates,
     }
+    _bind_persistence_attribution_review(manifest, raw_dir=raw_dir, metadata=metadata)
     return _publish_review_generation(
         review_dir=raw_dir / "review",
         findings=_render_review_findings(gates),
@@ -1796,7 +1837,7 @@ def _review_accelerator_metal_pilot(
     decision = audited.decision.value if audited and audited.decision else "NOT_READY"
     selected_backend = audited.selected_backend if passed and audited else None
     review_dir = raw_dir / "review"
-    review_manifest = {
+    review_manifest: dict[str, object] = {
         "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
         "run_label": raw_dir.name,
         "component": Stage052Component.ACCELERATOR_PILOT.value,
@@ -1815,6 +1856,11 @@ def _review_accelerator_metal_pilot(
         ),
         "gates": gates,
     }
+    _bind_persistence_attribution_review(
+        review_manifest,
+        raw_dir=raw_dir,
+        metadata=metadata,
+    )
     return _publish_review_generation(
         review_dir=review_dir,
         findings=_render_review_findings(gates),
@@ -2084,7 +2130,7 @@ def _review_accelerator_decision_only(
             passed = False
             status = NOT_READY
     review_dir = raw_dir / "review"
-    manifest = {
+    manifest: dict[str, object] = {
         "schema_version": STAGE052_REVIEW_SCHEMA_VERSION,
         "run_label": raw_dir.name,
         "component": Stage052Component.ACCELERATOR_PILOT.value,
@@ -2100,6 +2146,7 @@ def _review_accelerator_decision_only(
         "native_configuration": NativeKernelConfig().to_dict() if passed else None,
         "gates": gates,
     }
+    _bind_persistence_attribution_review(manifest, raw_dir=raw_dir, metadata=metadata)
     return _publish_review_generation(
         review_dir=review_dir,
         findings=_render_review_findings(gates),
