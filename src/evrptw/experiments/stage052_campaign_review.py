@@ -45,6 +45,9 @@ from evrptw.artifacts import (
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
 from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES
+from evrptw.experiments.stage052_performance import (
+    STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS,
+)
 from evrptw.models import Instance
 from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
 from evrptw.parser import parse_schneider
@@ -1102,7 +1105,7 @@ def _native_axis_valid(
                 pipeline.get("writer_thread_switch_interval_seconds"),
                 "writer_thread_switch_interval_seconds",
             )
-            != 0.05
+            != STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS
             or submitted_batches <= 0
             or completed_batches != submitted_batches
             or writer_active_ns <= 0

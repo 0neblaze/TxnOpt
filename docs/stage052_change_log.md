@@ -8,6 +8,29 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：G pilot attempt08 保留失败并去除 route-key 重复解析
+
+- clean revision `24c6b3d` 上的 `stage05.2_accelerator_pilot_attempt08` 已由独立
+  service replay 通过，decision 为 `GPU_NOT_JUSTIFIED`，状态为
+  `READY_FOR_STAGE052_BENCHMARK`；raw/review manifest SHA-256 分别为
+  `4f25aa93ae639936fd46d66dba49c39620313b4533ce645942d59bbb390557d8`
+  和 `e8a9a3703745f70d9465b666789e0f5585f5952c236d925441eaa4000530d916`。
+- `stage05.2_benchmark_attempt08` 的 batch0001/0002 分别以
+  `0.3285104105625469` 和 `0.30459863419342853` 通过；batch0003 以
+  `0.3774904401730277` 被 36% hard gate（硬门槛）拒绝。失败 batch 的 solver 为
+  `198.709423171` 秒，shard persistence 为 `120.490075623` 秒，control persistence
+  为 `0.007523868` 秒。G08 保持不可变，未进入独立 campaign review 或 Formal。
+- native screening transaction 与 deferred sparse event packer 现在在首次观察 route
+  时返回已经严格验证的 customer sequence；writer 不再把同一个 canonical route key
+  在 Python 中第二次 split/length-check。普通非 negative-cache occurrence key 改用
+  单一 flat exact tuple，避免为约五十万条 screening record 额外分配嵌套 evidence
+  tuple；negative-cache token、完整 evidence drift 检查、definition SHA-256、事件顺序
+  与 Parquet schema 均不变。
+- campaign reviewer 不再硬编码过期的 0.05 秒 writer switch interval，而是验证
+  producer 公开的同一协议常量；这修复了 producer 记录 0.5 秒但 reviewer 必然拒绝的
+  contract drift（契约漂移）。后续仍须以新 F/G identity 运行完整 producer/reviewer
+  链，诊断 probe 不构成通过证据。
+
 ## 2026-07-23：G pilot attempt07 保留失败并消除 definition 双重物化
 
 - clean revision `01a9f87` 上的 `stage05.2_accelerator_pilot_attempt07` 已由独立

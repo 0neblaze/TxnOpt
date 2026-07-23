@@ -44,7 +44,7 @@ def pack_stage052_screening_transactions(
     ],
     list[tuple[int, bytes, bytes, dict[str, object], tuple[object, ...]]],
     list[int],
-    list[tuple[str, int]],
+    list[tuple[str, int, tuple[str, ...]]],
 ]: ...
 def pack_stage052_neighborhood_events(
     events: Sequence[object],
@@ -71,7 +71,7 @@ def pack_stage052_deferred_sparse_events(
 ) -> tuple[
     tuple[list[object], ...],
     list[tuple[int, int]],
-    list[tuple[str, int]],
+    list[tuple[str, int, tuple[str, ...]]],
 ]: ...
 def distance_matrix(points: npt.ArrayLike) -> npt.NDArray[np.float64]: ...
 def route_distance(points: Sequence[Point], route: Sequence[int]) -> float: ...

@@ -720,6 +720,10 @@ The executable workflow and gate table are maintained in
   publication; the optimization may not drop, aggregate, or reorder occurrences. High-cardinality
   definition, occurrence, and event Parquet streams disable dictionary encoding and statistics while
   retaining the canonical typed schema and Zstandard level 1.
+  Native screening and deferred sparse packers return the strictly decoded route sequence with every
+  newly observed route ID, so the writer must not parse the same canonical route key a second time.
+  Producer and campaign reviewer must validate the same exported writer thread-switch protocol
+  constant; a reviewer-only hard-coded interval is forbidden contract drift.
   V3 route-evaluation and cache-event batches likewise use native schema-ordered sparse columns;
   mixed ordinary events are filled at their original positions and may not be reordered or dropped.
 - Producer screening-definition collision state stores the full SHA-256 digest without retaining a

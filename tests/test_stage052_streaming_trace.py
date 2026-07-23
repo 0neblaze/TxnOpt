@@ -692,7 +692,11 @@ def test_native_v3_screening_transaction_packer_prepares_one_exact_definition() 
     assert columns[5] == [7, 8]
     assert remaining == [1]
     assert observed_routes == [
-        ("route:2:C1", artifact_module._stable_route_id("route:2:C1"))  # noqa: SLF001
+        (
+            "route:2:C1",
+            artifact_module._stable_route_id("route:2:C1"),  # noqa: SLF001
+            ("C1",),
+        )
     ]
     assert len(pending) == 1
     definition_id, encoded, digest, payload, row = pending[0]

@@ -4675,7 +4675,7 @@ class ArtifactV2ShardSession:
             object, tuple[object, ...]
         ] = {}
         self._deferred_screening_occurrence_cache: dict[
-            tuple[str, str, str, str, object], int
+            tuple[object, ...], int
         ] = {}
         self._prepared_screening_definition_cache: OrderedDict[
             int, tuple[PreparedScreeningDefinition, int]
@@ -4837,11 +4837,11 @@ class ArtifactV2ShardSession:
             packed_columns = cast(tuple[list[object], ...], raw_packed_columns)
             definition_ids = packed_columns[1]
             if definition_ids:
-                for route_key, route_id in raw_observed_routes:
+                for route_key, route_id, route_sequence in raw_observed_routes:
                     if route_id not in self._route_digests:
                         self._register_route(
                             route_key,
-                            _route_sequence_from_key(route_key),
+                            route_sequence,
                             route_id=route_id,
                             validate_key=False,
                         )
@@ -4913,11 +4913,11 @@ class ArtifactV2ShardSession:
                     "native deferred sparse packer returned inconsistent columns"
                 )
             sparse_remaining = raw_sparse_remaining
-            for route_key, route_id in raw_observed_routes:
+            for route_key, route_id, route_sequence in raw_observed_routes:
                 if route_id not in self._route_digests:
                     self._register_route(
                         route_key,
-                        _route_sequence_from_key(route_key),
+                        route_sequence,
                         route_id=route_id,
                         validate_key=False,
                     )
@@ -5583,11 +5583,9 @@ class ArtifactV2ShardSession:
                     "negative screening cache returned inconsistent evidence for one route"
                 )
         occurrence_key = (
-            route_key,
-            event.axis_name,
-            raw_lane,
-            operator,
-            negative_evidence_token if negative_cache_hit else evidence_tail,
+            (route_key, event.axis_name, raw_lane, operator, negative_evidence_token)
+            if negative_cache_hit
+            else (route_key, event.axis_name, raw_lane, operator, *evidence_tail)
         )
         cached_definition_id = self._deferred_screening_occurrence_cache.get(occurrence_key)
         if cached_definition_id is not None:

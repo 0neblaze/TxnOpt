@@ -21,6 +21,77 @@ namespace py = pybind11;
 
 using Point = std::pair<double, double>;
 
+py::tuple stage052_route_sequence_from_key(const py::object& route_key) {
+    if (!PyUnicode_Check(route_key.ptr())) {
+        throw std::invalid_argument("Stage 5.2 canonical route key must be text");
+    }
+    const py::ssize_t key_length = PyUnicode_GetLength(route_key.ptr());
+    if (key_length < 0) {
+        throw py::error_already_set();
+    }
+    const py::str prefix("route:");
+    const int has_prefix =
+        PyUnicode_Tailmatch(route_key.ptr(), prefix.ptr(), 0, key_length, -1);
+    if (has_prefix < 0) {
+        throw py::error_already_set();
+    }
+    if (has_prefix == 0) {
+        throw std::invalid_argument(
+            "cannot reconstruct route dictionary entry from canonical key");
+    }
+    const py::object encoded = py::reinterpret_steal<py::object>(
+        PyUnicode_Substring(route_key.ptr(), 6, key_length));
+    if (!encoded) {
+        throw py::error_already_set();
+    }
+    if (PyUnicode_GetLength(encoded.ptr()) == 0) {
+        return py::tuple();
+    }
+    const py::str delimiter("|");
+    const py::object raw_tokens = py::reinterpret_steal<py::object>(
+        PyUnicode_Split(encoded.ptr(), delimiter.ptr(), -1));
+    if (!raw_tokens) {
+        throw py::error_already_set();
+    }
+    const py::list tokens = py::reinterpret_borrow<py::list>(raw_tokens);
+    py::tuple sequence(py::len(tokens));
+    for (py::ssize_t index = 0; index < py::len(tokens); ++index) {
+        const py::object token = tokens[index];
+        const py::ssize_t token_length = PyUnicode_GetLength(token.ptr());
+        const py::ssize_t separator =
+            PyUnicode_FindChar(token.ptr(), ':', 0, token_length, 1);
+        if (separator <= 0) {
+            if (separator < 0 && PyErr_Occurred()) {
+                throw py::error_already_set();
+            }
+            throw std::invalid_argument("invalid canonical route key token");
+        }
+        std::size_t declared_length = 0;
+        for (py::ssize_t digit_index = 0; digit_index < separator; ++digit_index) {
+            const auto digit = PyUnicode_ReadChar(token.ptr(), digit_index);
+            if (digit < '0' || digit > '9') {
+                throw std::invalid_argument("invalid canonical route key length");
+            }
+            declared_length =
+                declared_length * 10 + static_cast<std::size_t>(digit - '0');
+        }
+        const py::object customer = py::reinterpret_steal<py::object>(
+            PyUnicode_Substring(token.ptr(), separator + 1, token_length));
+        if (!customer) {
+            throw py::error_already_set();
+        }
+        const py::ssize_t customer_length = PyUnicode_GetLength(customer.ptr());
+        if (customer_length < 0) {
+            throw py::error_already_set();
+        }
+        if (declared_length != static_cast<std::size_t>(customer_length)) {
+            throw std::invalid_argument("canonical route key length mismatch");
+        }
+        sequence[index] = customer;
+    }
+    return sequence;
+}
+
 template <typename T>
 py::array checked_array(py::handle array, const char* name, int expected_ndim) {
     if (!py::isinstance<py::array>(array)) {
@@ -255,7 +326,6 @@ py::tuple pack_stage052_screening_transactions(
         }
         return py::float_(converted);
     };
-
     const py::ssize_t event_count = py::len(events);
     for (py::ssize_t event_index = 0; event_index < event_count; ++event_index) {
         const py::object event = events[event_index];
@@ -276,12 +346,13 @@ py::tuple pack_stage052_screening_transactions(
                 "Stage 5.2 deferred screening values must contain twenty fields");
         }
         const py::tuple values = py::reinterpret_borrow<py::tuple>(raw_values);
-        py::tuple occurrence_key(5);
-        occurrence_key[0] = values[1];
-        occurrence_key[1] = axis_name;
-        occurrence_key[2] = values[2];
-        occurrence_key[3] = values[4];
+        py::tuple occurrence_key;
         if (values[15].ptr() == Py_True && !values[19].is_none()) {
+            occurrence_key = py::tuple(5);
+            occurrence_key[0] = values[1];
+            occurrence_key[1] = axis_name;
+            occurrence_key[2] = values[2];
+            occurrence_key[3] = values[4];
             PyObject* cached_evidence =
                 PyDict_GetItemWithError(negative_evidence_cache.ptr(), values[1].ptr());
             if (cached_evidence == nullptr) {
@@ -321,11 +392,14 @@ py::tuple pack_stage052_screening_transactions(
             }
             occurrence_key[4] = values[19];
         } else {
-            py::tuple evidence(12);
+            occurrence_key = py::tuple(16);
+            occurrence_key[0] = values[1];
+            occurrence_key[1] = axis_name;
+            occurrence_key[2] = values[2];
+            occurrence_key[3] = values[4];
             for (py::ssize_t index = 0; index < 12; ++index) {
-                evidence[index] = values[7 + index];
+                occurrence_key[4 + index] = values[7 + index];
             }
-            occurrence_key[4] = std::move(evidence);
         }
 
         event_ids.append(first_event_id + event_index);
@@ -412,7 +486,11 @@ py::tuple pack_stage052_screening_transactions(
             route_was_resolved = true;
         }
         if (route_was_resolved) {
-            observed_routes.append(py::make_tuple(values[1], route_id));
+            observed_routes.append(
+                py::make_tuple(
+                    values[1],
+                    route_id,
+                    stage052_route_sequence_from_key(values[1])));
         }
 
         const py::object demand = checked_float(values[9]);
@@ -825,7 +903,11 @@ py::tuple pack_stage052_deferred_sparse_events(
         }
         if (already_observed == 0) {
             observed_route_keys[key] = py::none();
-            observed_routes.append(py::make_tuple(key, identifier));
+            observed_routes.append(
+                py::make_tuple(
+                    key,
+                    identifier,
+                    stage052_route_sequence_from_key(key)));
         }
         return identifier;
     };
