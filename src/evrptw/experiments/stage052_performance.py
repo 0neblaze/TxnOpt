@@ -22,7 +22,7 @@ import tomllib
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from multiprocessing import get_context
 from pathlib import Path
 from queue import Full, Queue
@@ -3363,6 +3363,15 @@ class _QueuedCriticalBatch:
     rows: _AsyncCriticalBatch
 
 
+@dataclass(slots=True)
+class _NegativeScreeningEvidence:
+    tail: tuple[object, ...]
+    definition: PrecomputedScreeningDefinition | None = None
+    prepared_by_context: dict[tuple[str, str], PreparedScreeningDefinition] = field(
+        default_factory=dict
+    )
+
+
 class _BoundedShardAppender:
     """FIFO one-thread writer with one queued batch and fail-fast handoff."""
 
@@ -3645,16 +3654,12 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._neighborhood_spool_path: Path | None = None
         self._neighborhood_read_offset = 0
         self._semantic_event_digest = hashlib.sha256()
-        self._negative_screening_evidence_cache: dict[str, tuple[object, ...]] = {}
-        self._negative_screening_definition_cache: dict[str, PrecomputedScreeningDefinition] = {}
+        self._negative_screening_cache: dict[str, _NegativeScreeningEvidence] = {}
         self._screening_definition_tail_cache: dict[
             tuple[object, ...], PrecomputedScreeningDefinition
         ] = {}
         self._prepared_screening_definition_cache: dict[
             tuple[str, str, str, tuple[object, ...]], PreparedScreeningDefinition
-        ] = {}
-        self._negative_prepared_screening_cache: dict[
-            tuple[str, str, str, int], PreparedScreeningDefinition
         ] = {}
         self._initial_objective_key: ObjectiveKey | None = None
         self._visible_global_bests: dict[int, AcceptedGlobalBest] = {}
@@ -3729,6 +3734,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             and getattr(self._shard, "supports_buffered_screening_decisions", False) is True
         )
         evidence_tail: tuple[object, ...] | None = None
+        negative_entry: _NegativeScreeningEvidence | None = None
         definition: PrecomputedScreeningDefinition | None = None
         if decision.negative_cache_hit:
             evidence_tail = (
@@ -3745,19 +3751,18 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                 decision.structural_energy_lower_bound,
                 decision.checks,
             )
-            cached_tail = self._negative_screening_evidence_cache.get(decision.route_key)
-            if cached_tail is not None and cached_tail != evidence_tail:
+            negative_entry = self._negative_screening_cache.get(decision.route_key)
+            if negative_entry is not None and negative_entry.tail != evidence_tail:
                 raise RuntimeError(
                     "negative screening cache returned inconsistent evidence for one route"
                 )
-            if cached_tail is None:
-                self._negative_screening_evidence_cache[decision.route_key] = evidence_tail
-                if len(self._negative_screening_evidence_cache) > 262_144:
-                    evicted_route = next(iter(self._negative_screening_evidence_cache))
-                    self._negative_screening_evidence_cache.pop(evicted_route)
-                    self._negative_screening_definition_cache.pop(evicted_route, None)
+            if negative_entry is None:
+                negative_entry = _NegativeScreeningEvidence(evidence_tail)
+                self._negative_screening_cache[decision.route_key] = negative_entry
+                if len(self._negative_screening_cache) > 262_144:
+                    self._negative_screening_cache.pop(next(iter(self._negative_screening_cache)))
             elif buffered_v3:
-                definition = self._negative_screening_definition_cache.get(decision.route_key)
+                definition = negative_entry.definition
         if buffered_v3:
             if definition is None:
                 compact_checks = tuple(
@@ -3800,18 +3805,13 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                             next(iter(self._screening_definition_tail_cache))
                         )
                 if decision.negative_cache_hit:
-                    if evidence_tail is None:
+                    if evidence_tail is None or negative_entry is None:
                         raise RuntimeError("negative screening evidence tail is unavailable")
-                    self._negative_screening_definition_cache[decision.route_key] = definition
-            negative_prepared_key = (
-                decision.lane,
-                decision.operator,
-                decision.route_key,
-                id(definition),
-            )
+                    negative_entry.definition = definition
+            negative_prepared_key = (decision.lane, decision.operator)
             prepared = (
-                self._negative_prepared_screening_cache.get(negative_prepared_key)
-                if decision.negative_cache_hit
+                negative_entry.prepared_by_context.get(negative_prepared_key)
+                if negative_entry is not None
                 else None
             )
             if prepared is None:
@@ -3835,11 +3835,9 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                             next(iter(self._prepared_screening_definition_cache))
                         )
                 if decision.negative_cache_hit:
-                    self._negative_prepared_screening_cache[negative_prepared_key] = prepared
-                    if len(self._negative_prepared_screening_cache) > 262_144:
-                        self._negative_prepared_screening_cache.pop(
-                            next(iter(self._negative_prepared_screening_cache))
-                        )
+                    if negative_entry is None:
+                        raise RuntimeError("negative screening cache entry is unavailable")
+                    negative_entry.prepared_by_context[negative_prepared_key] = prepared
             self._flush_pending_lookup()
             self._event_buffer.append(
                 (

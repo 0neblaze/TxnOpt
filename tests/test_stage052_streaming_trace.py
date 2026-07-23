@@ -495,7 +495,25 @@ def test_v3_screening_bridge_reuses_precomputed_typed_definition() -> None:
 
 def test_v3_buffered_screening_bridge_roundtrips_through_real_writer(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    occurrence_column_batch_sizes: list[int] = []
+    original_append_columns = artifact_module._StreamingParquetSink.append_columns  # noqa: SLF001
+
+    def record_append_columns(
+        self: artifact_module._StreamingParquetSink,  # noqa: SLF001
+        columns: object,
+    ) -> None:
+        buffered = tuple(columns)  # type: ignore[arg-type]
+        if "screening_occurrences" in self.path.name:
+            occurrence_column_batch_sizes.append(len(buffered[0]))
+        original_append_columns(self, buffered)
+
+    monkeypatch.setattr(
+        artifact_module._StreamingParquetSink,  # noqa: SLF001
+        "append_columns",
+        record_append_columns,
+    )
     run_label = "stage05.2_artifact_streaming_attempt96"
     writer = ArtifactBundleWriter(
         tmp_path / "results" / run_label,
@@ -515,6 +533,7 @@ def test_v3_buffered_screening_bridge_roundtrips_through_real_writer(
         shard=shard,
         axis_name="fixed_work",
         buffer_rows=2,
+        async_persistence=True,
     )
     decision = ScreeningDecision(
         decision_id=1,
@@ -540,7 +559,8 @@ def test_v3_buffered_screening_bridge_roundtrips_through_real_writer(
     )
     sink.append_screening_decision(decision)
     sink.append_screening_decision(replace(decision, decision_id=2))
-    sink.finish()
+    sink.close()
+    assert occurrence_column_batch_sizes == [2]
     shard.finalize(
         raw_payload={},
         solution_payload={},

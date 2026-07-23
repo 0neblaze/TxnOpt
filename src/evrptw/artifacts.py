@@ -1386,6 +1386,8 @@ class PreparedScreeningDefinition:
     route_key: str
     lane: str
     operator: str
+    route_id: int
+    pending: _PendingScreeningDefinition
 
 
 def prepare_screening_definition(
@@ -1395,13 +1397,36 @@ def prepare_screening_definition(
     lane: str,
     operator: str,
 ) -> PreparedScreeningDefinition:
-    """Bind reusable route/lane/operator context without expanding its payload."""
+    """Bind and hash reusable route/lane/operator context exactly once."""
+
+    route_id = _stable_route_id(route_key)
+    definition_payload = _screening_definition_from_cache_key(
+        (
+            _stable_dictionary_id(f"lane:{lane}"),
+            _stable_dictionary_id(f"operator:{operator}"),
+            route_id,
+            *definition.tail,
+        )
+    )
+    definition_id, encoded, digest = _screening_definition_identity(definition_payload)
+    pending = _PendingScreeningDefinition(
+        definition_id=definition_id,
+        encoded=encoded,
+        digest=digest,
+        payload=definition_payload,
+        row=(
+            definition_id,
+            *(definition_payload[name] for name in V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]),
+        ),
+    )
 
     return PreparedScreeningDefinition(
         tail=definition.tail,
         route_key=route_key,
         lane=lane,
         operator=operator,
+        route_id=route_id,
+        pending=pending,
     )
 
 
@@ -1552,6 +1577,37 @@ def _screening_definition_identity(definition: Mapping[str, object]) -> tuple[in
     digest = hashlib.sha256(definition_json).digest()
     definition_id = int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
     return definition_id, definition_json, digest
+
+
+def _validate_prepared_screening_identity(
+    prepared: PreparedScreeningDefinition,
+) -> None:
+    expected_route_id = _stable_route_id(prepared.route_key)
+    expected_payload = _screening_definition_from_cache_key(
+        (
+            _stable_dictionary_id(f"lane:{prepared.lane}"),
+            _stable_dictionary_id(f"operator:{prepared.operator}"),
+            expected_route_id,
+            *prepared.tail,
+        )
+    )
+    expected_id, expected_encoded, expected_digest = _screening_definition_identity(
+        expected_payload
+    )
+    expected_row = (
+        expected_id,
+        *(expected_payload[name] for name in V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]),
+    )
+    pending = prepared.pending
+    if (
+        prepared.route_id != expected_route_id
+        or pending.definition_id != expected_id
+        or pending.encoded != expected_encoded
+        or pending.digest != expected_digest
+        or pending.payload != expected_payload
+        or pending.row != expected_row
+    ):
+        raise ArtifactIntegrityError("prepared screening pending identity mismatch")
 
 
 class _BoundedScreeningDefinitionStore:
@@ -2209,6 +2265,28 @@ class _StreamingParquetSink:
             appended = len(chunk)
             self._buffered_row_count += appended
             offset += appended
+            if self._buffered_row_count == V2_PARQUET_ROW_GROUP_SIZE:
+                self.flush()
+
+    def append_columns(self, columns: Sequence[Sequence[object]]) -> None:
+        """Append already-columnar values without row materialization or transposition."""
+
+        if len(columns) != len(self._columns):
+            raise ArtifactIntegrityError(
+                f"typed column width does not match sink schema for {self.path}"
+            )
+        row_count = len(columns[0]) if columns else 0
+        if any(len(column) != row_count for column in columns):
+            raise ArtifactIntegrityError(f"typed column lengths do not match for {self.path}")
+        offset = 0
+        while offset < row_count:
+            available = V2_PARQUET_ROW_GROUP_SIZE - self._buffered_row_count
+            appended = min(available, row_count - offset)
+            end = offset + appended
+            for target, source in zip(self._columns, columns, strict=True):
+                target.extend(source[offset:end])
+            self._buffered_row_count += appended
+            offset = end
             if self._buffered_row_count == V2_PARQUET_ROW_GROUP_SIZE:
                 self.flush()
 
@@ -4574,18 +4652,33 @@ class ArtifactV2ShardSession:
         count = 0
         pending_event_rows: list[tuple[object, ...]] = []
         pending_screening_definitions: list[_PendingScreeningDefinition] = []
-        pending_screening_occurrences: list[tuple[object, ...]] = []
+        pending_screening_occurrence_columns: tuple[list[object], ...] = tuple(
+            [] for _ in V3_SCREENING_OCCURRENCES_SCHEMA.names
+        )
+
+        def buffer_screening_occurrence(row: Sequence[object]) -> int:
+            if len(row) != len(pending_screening_occurrence_columns):
+                raise ArtifactIntegrityError("screening occurrence width does not match schema")
+            for column, value in zip(
+                pending_screening_occurrence_columns,
+                row,
+                strict=True,
+            ):
+                column.append(value)
+            return len(pending_screening_occurrence_columns[0])
 
         def flush_screening_transaction() -> None:
-            nonlocal pending_screening_definitions, pending_screening_occurrences
+            nonlocal pending_screening_definitions, pending_screening_occurrence_columns
             if self._screening_definitions_sink is None:
                 return
             if self._screening_occurrences_sink is None:
                 raise RuntimeError("screening occurrence sink is unavailable")
             candidates = pending_screening_definitions
-            occurrences = pending_screening_occurrences
+            occurrence_columns = pending_screening_occurrence_columns
             pending_screening_definitions = []
-            pending_screening_occurrences = []
+            pending_screening_occurrence_columns = tuple(
+                [] for _ in V3_SCREENING_OCCURRENCES_SCHEMA.names
+            )
             if candidates:
                 if self._screening_definition_store is None:
                     raise RuntimeError("screening definition store is unavailable")
@@ -4595,10 +4688,9 @@ class ArtifactV2ShardSession:
                     self._screening_definitions_sink,
                     definitions,
                 )
-            self._append_buffered_value_rows(
+            self._append_buffered_columns(
                 self._screening_occurrences_sink,
-                occurrences,
-                trusted_width=True,
+                occurrence_columns,
             )
 
         def flush_event_transaction() -> None:
@@ -4632,21 +4724,21 @@ class ArtifactV2ShardSession:
                     prepared_cached = self._prepared_screening_definition_cache.get(cache_key)
                     definition: _PendingScreeningDefinition | None = None
                     if prepared_cached is None:
-                        lane_id = self._lane_ids.get(event[2])
-                        if lane_id is None:
-                            lane_id = _stable_dictionary_id(f"lane:{event[2]}")
-                            self._lane_ids[event[2]] = lane_id
-                        operator_id = self._operator_ids.get(event[4])
-                        if operator_id is None:
-                            operator_id = _stable_dictionary_id(f"operator:{event[4]}")
-                            self._operator_ids[event[4]] = operator_id
+                        _validate_prepared_screening_identity(prepared)
+                        self._lane_ids.setdefault(
+                            prepared.lane,
+                            _stable_dictionary_id(f"lane:{prepared.lane}"),
+                        )
+                        self._operator_ids.setdefault(
+                            prepared.operator,
+                            _stable_dictionary_id(f"operator:{prepared.operator}"),
+                        )
                         route_id = self._resolve_route_id(event[1])
-                        definition_payload = _screening_definition_from_cache_key(
-                            (lane_id, operator_id, route_id, *prepared.tail)
-                        )
-                        definition_id, encoded, digest = _screening_definition_identity(
-                            definition_payload
-                        )
+                        if route_id != prepared.route_id:
+                            raise ArtifactIntegrityError(
+                                "prepared screening route identity mismatch"
+                            )
+                        definition_id = prepared.pending.definition_id
                         self._prepared_screening_definition_cache[cache_key] = (
                             prepared,
                             definition_id,
@@ -4663,19 +4755,7 @@ class ArtifactV2ShardSession:
                                 route_id=route_id,
                                 validate_key=False,
                             )
-                        definition = _PendingScreeningDefinition(
-                            definition_id=definition_id,
-                            encoded=encoded,
-                            digest=digest,
-                            payload=definition_payload,
-                            row=(
-                                definition_id,
-                                *(
-                                    definition_payload[name]
-                                    for name in V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]
-                                ),
-                            ),
-                        )
+                        definition = prepared.pending
                         if self._screening_definition_store is None:
                             self._screening_definition_store = _BoundedScreeningDefinitionStore(
                                 cache_entries=1,
@@ -4688,19 +4768,11 @@ class ArtifactV2ShardSession:
                                 "prepared screening definition object identity collision"
                             )
                         definition_id = prepared_cached[1]
-                    pending_screening_occurrences.append(
-                        (
-                            event_id,
-                            definition_id,
-                            event[5],
-                            event[6],
-                            event[3],
-                            event[0],
-                        )
+                    pending_count = buffer_screening_occurrence(
+                        (event_id, definition_id, event[5], event[6], event[3], event[0])
                     )
                     if definition is not None:
                         pending_screening_definitions.append(definition)
-                    pending_count = len(pending_screening_occurrences)
                     self._max_pending_screening_transaction_rows_observed = max(
                         self._max_pending_screening_transaction_rows_observed,
                         pending_count,
@@ -4727,10 +4799,9 @@ class ArtifactV2ShardSession:
                         event[0],
                     )
                     definition = None
-                pending_screening_occurrences.append(occurrence)
+                pending_count = buffer_screening_occurrence(occurrence)
                 if definition is not None:
                     pending_screening_definitions.append(definition)
-                pending_count = len(pending_screening_occurrences)
                 if pending_count > self._max_pending_screening_transaction_rows_observed:
                     self._max_pending_screening_transaction_rows_observed = pending_count
                 if pending_count >= LIVE_SCREENING_TRANSACTION_ROWS:
@@ -4799,10 +4870,10 @@ class ArtifactV2ShardSession:
                 if self._screening_definitions_sink is not None:
                     if not isinstance(normalized_event, tuple):
                         raise RuntimeError("v3 screening occurrence must be a typed row")
-                    pending_screening_occurrences.append(normalized_event)
+                    pending_count = buffer_screening_occurrence(normalized_event)
                     self._max_pending_screening_transaction_rows_observed = max(
                         self._max_pending_screening_transaction_rows_observed,
-                        len(pending_screening_occurrences),
+                        pending_count,
                     )
                 else:
                     if not isinstance(normalized_event, Mapping):
@@ -4810,7 +4881,11 @@ class ArtifactV2ShardSession:
                     self._append_buffered(screening_sink, normalized_event)
                 if screening_definition is not None:
                     pending_screening_definitions.append(screening_definition)
-                if len(pending_screening_occurrences) >= LIVE_SCREENING_TRANSACTION_ROWS:
+                if (
+                    pending_screening_occurrence_columns[0]
+                    and len(pending_screening_occurrence_columns[0])
+                    >= LIVE_SCREENING_TRANSACTION_ROWS
+                ):
                     flush_screening_transaction()
             else:
                 if not isinstance(normalized_event, tuple):
@@ -5255,6 +5330,27 @@ class ArtifactV2ShardSession:
             victim = self._active_sinks.pop(0)
             victim.flush()
         sink.append_value_rows(rows, trusted_width=trusted_width)
+        if sink.buffered_row_count:
+            if sink not in self._active_sinks:
+                self._active_sinks.append(sink)
+        elif sink in self._active_sinks:
+            self._active_sinks.remove(sink)
+        self._max_buffered_groups_observed = max(
+            self._max_buffered_groups_observed,
+            len(self._active_sinks),
+        )
+
+    def _append_buffered_columns(
+        self,
+        sink: _StreamingParquetSink,
+        columns: Sequence[Sequence[object]],
+    ) -> None:
+        if not columns or not columns[0]:
+            return
+        if sink not in self._active_sinks and len(self._active_sinks) >= 2:
+            victim = self._active_sinks.pop(0)
+            victim.flush()
+        sink.append_columns(columns)
         if sink.buffered_row_count:
             if sink not in self._active_sinks:
                 self._active_sinks.append(sink)
