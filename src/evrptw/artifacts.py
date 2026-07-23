@@ -1503,6 +1503,14 @@ class DeferredRouteEvaluation(NamedTuple):
     values: tuple[object, ...]
 
 
+class DeferredCacheEvent(NamedTuple):
+    """Flat cache event whose sparse schema row is materialized by the writer."""
+
+    marker: str
+    axis_name: str
+    values: tuple[object, ...]
+
+
 def _screening_definition_cache_key(
     payload: Mapping[str, object],
     *,
@@ -2368,12 +2376,14 @@ def _iter_coalesced_cache_lookup_events(
         | BufferedScreeningDecision
         | DeferredScreeningDecision
         | DeferredRouteEvaluation
+        | DeferredCacheEvent
     ],
 ) -> Iterable[
     dict[str, object]
     | BufferedScreeningDecision
     | DeferredScreeningDecision
     | DeferredRouteEvaluation
+    | DeferredCacheEvent
 ]: ...
 
 
@@ -2383,12 +2393,14 @@ def _iter_coalesced_cache_lookup_events(
         | BufferedScreeningDecision
         | DeferredScreeningDecision
         | DeferredRouteEvaluation
+        | DeferredCacheEvent
     ],
 ) -> Iterable[
     dict[str, object]
     | BufferedScreeningDecision
     | DeferredScreeningDecision
     | DeferredRouteEvaluation
+    | DeferredCacheEvent
 ]:
     """Streaming equivalent of :func:`_coalesce_cache_lookup_events`."""
 
@@ -4670,6 +4682,7 @@ class ArtifactV2ShardSession:
         self._neighborhood_extras_cache: dict[tuple[object, ...], str] = {}
         self._neighborhood_row_cache: dict[tuple[object, ...], tuple[object, ...]] = {}
         self._route_evaluation_extras_cache: dict[tuple[object, ...], str] = {}
+        self._cache_event_extras_cache: dict[tuple[object, ...], str] = {}
         self._screening_definition_store: _BoundedScreeningDefinitionStore | None = None
         self._pending_route_rows: list[tuple[object, ...]] = []
         self._pending_check_rows: list[tuple[object, ...]] = []
@@ -4697,6 +4710,7 @@ class ArtifactV2ShardSession:
             | BufferedScreeningDecision
             | DeferredScreeningDecision
             | DeferredRouteEvaluation
+            | DeferredCacheEvent
         ],
         diagnostic_rows: Iterable[Mapping[str, object]] = (),
         cache_lookups_coalesced: bool = False,
@@ -4711,6 +4725,9 @@ class ArtifactV2ShardSession:
         pending_event_columns: tuple[list[object], ...] = tuple(
             [] for _ in EVENTS_SCHEMA.names
         )
+        native_sparse_columns: tuple[list[object], ...] | None = None
+        native_patch_position: int | None = None
+        native_sparse_patched = 0
         pending_screening_definitions: list[_PendingScreeningDefinition] = []
         pending_screening_occurrence_columns: tuple[list[object], ...] = tuple(
             [] for _ in V3_SCREENING_OCCURRENCES_SCHEMA.names
@@ -4728,8 +4745,15 @@ class ArtifactV2ShardSession:
             return len(pending_screening_occurrence_columns[0])
 
         def buffer_event(row: Sequence[object]) -> int:
+            nonlocal native_patch_position, native_sparse_patched
             if len(row) != len(pending_event_columns):
                 raise ArtifactIntegrityError("critical event width does not match schema")
+            if native_sparse_columns is not None and native_patch_position is not None:
+                for column, value in zip(native_sparse_columns, row, strict=True):
+                    column[native_patch_position] = value
+                native_patch_position = None
+                native_sparse_patched += 1
+                return 0
             for column, value in zip(pending_event_columns, row, strict=True):
                 column.append(value)
             return len(pending_event_columns[0])
@@ -4775,6 +4799,7 @@ class ArtifactV2ShardSession:
         )
         native_packed_batch = False
         native_remaining_indices: list[int] | None = None
+        native_remaining_positions: list[int] | None = None
         native_batch_length: int | None = None
         if (
             cache_lookups_coalesced
@@ -4852,6 +4877,59 @@ class ArtifactV2ShardSession:
         if cache_lookups_coalesced and isinstance(critical_events, tuple):
             from evrptw import _core as native_core
 
+            try:
+                (
+                    raw_sparse_columns,
+                    raw_sparse_remaining,
+                    raw_observed_routes,
+                ) = native_core.pack_stage052_deferred_sparse_events(
+                    critical_events,
+                    cast(dict[str, int], self._resolved_route_ids),
+                    self._lane_ids,
+                    self._operator_ids,
+                    self._route_evaluation_extras_cache,
+                    self._cache_event_extras_cache,
+                    self._resolve_route_id,
+                    _stable_dictionary_id,
+                    _json_text,
+                    batch_first_event_id,
+                )
+            except ValueError as error:
+                raise ArtifactIntegrityError(str(error)) from error
+            sparse_columns = raw_sparse_columns
+            if len(sparse_columns) != len(EVENTS_SCHEMA.names):
+                raise ArtifactIntegrityError(
+                    "native deferred sparse packer returned an invalid column count"
+                )
+            sparse_count = len(sparse_columns[0])
+            if any(len(column) != sparse_count for column in sparse_columns):
+                raise ArtifactIntegrityError(
+                    "native deferred sparse packer returned inconsistent columns"
+                )
+            sparse_remaining = raw_sparse_remaining
+            for route_key, route_id in raw_observed_routes:
+                if route_id not in self._route_digests:
+                    self._register_route(
+                        route_key,
+                        _route_sequence_from_key(route_key),
+                        route_id=route_id,
+                        validate_key=False,
+                    )
+            deferred_count = sparse_count - len(sparse_remaining)
+            if deferred_count:
+                native_sparse_columns = sparse_columns
+                native_remaining_indices = [item[0] for item in sparse_remaining]
+                native_remaining_positions = [item[1] for item in sparse_remaining]
+                native_packed_batch = True
+                native_batch_length = len(critical_events)
+                count += deferred_count
+        if (
+            native_sparse_columns is None
+            and cache_lookups_coalesced
+            and isinstance(critical_events, tuple)
+        ):
+            from evrptw import _core as native_core
+
             raw_neighborhood_columns, raw_non_neighborhood_indices = (
                 native_core.pack_stage052_neighborhood_events(
                     critical_events,
@@ -4911,6 +4989,8 @@ class ArtifactV2ShardSession:
                     batch_first_event_id
                     + native_remaining_indices[native_event_index]
                 )
+                if native_remaining_positions is not None:
+                    native_patch_position = native_remaining_positions[native_event_index]
                 native_event_index += 1
             if isinstance(event, DeferredScreeningDecision):
                 if self._screening_definitions_sink is None:
@@ -4938,6 +5018,17 @@ class ArtifactV2ShardSession:
                 event_id = next_event_id
                 next_event_id += 1
                 deferred_row = self._deferred_route_evaluation_row(
+                    event,
+                    event_id=event_id,
+                )
+                if buffer_event(deferred_row) >= V2_PARQUET_ROW_GROUP_SIZE:
+                    flush_event_transaction()
+                count += 1
+                continue
+            if isinstance(event, DeferredCacheEvent):
+                event_id = next_event_id
+                next_event_id += 1
+                deferred_row = self._deferred_cache_event_row(
                     event,
                     event_id=event_id,
                 )
@@ -5151,6 +5242,19 @@ class ArtifactV2ShardSession:
                         if len(self._pending_check_rows) >= V2_PARQUET_ROW_GROUP_SIZE:
                             self._flush_pending_check_rows()
             count += 1
+        if native_sparse_columns is not None:
+            if native_remaining_positions is None:
+                raise RuntimeError("native sparse event positions are unavailable")
+            if native_sparse_patched != len(native_remaining_positions):
+                raise ArtifactIntegrityError(
+                    "native deferred sparse packer left unresolved event positions"
+                )
+            for target, values in zip(
+                pending_event_columns,
+                native_sparse_columns,
+                strict=True,
+            ):
+                target.extend(values)
         if native_packed_batch:
             if native_batch_length is None:
                 raise RuntimeError("native batch length is unavailable")
@@ -5281,6 +5385,132 @@ class ArtifactV2ShardSession:
             evaluation_id,
             None,
             route_change_status,
+            status,
+            extras_json,
+        )
+
+    def _deferred_cache_event_row(
+        self,
+        event: DeferredCacheEvent,
+        *,
+        event_id: int,
+    ) -> tuple[object, ...]:
+        if event.marker != "cache_event":
+            raise ArtifactIntegrityError("deferred cache-event marker is invalid")
+        values = event.values
+        if len(values) != 18:
+            raise ArtifactIntegrityError("deferred cache event must contain eighteen fields")
+        (
+            route_key,
+            lane,
+            iteration,
+            operator,
+            timestamp_seconds,
+            started_at,
+            completed_at,
+            duration_seconds,
+            status,
+            operation,
+            cache_key_digest,
+            current_bytes,
+            current_entries,
+            entry_bytes,
+            lookup_current_bytes,
+            lookup_current_entries,
+            lookup_result,
+            extras_presence,
+        ) = values
+        if (
+            not isinstance(route_key, str)
+            or not isinstance(lane, str)
+            or not isinstance(operator, str)
+            or isinstance(extras_presence, bool)
+            or not isinstance(extras_presence, int)
+        ):
+            raise ArtifactIntegrityError("deferred cache-event context is invalid")
+        lane_id = self._lane_ids.setdefault(
+            lane,
+            _stable_dictionary_id(f"lane:{lane}"),
+        )
+        operator_id = self._operator_ids.setdefault(
+            operator,
+            _stable_dictionary_id(f"operator:{operator}"),
+        )
+        route_id: int | None = None
+        if route_key:
+            route_id = self._resolve_route_id(route_key)
+            if route_id not in self._route_digests:
+                self._register_route(
+                    route_key,
+                    _route_sequence_from_key(route_key),
+                    route_id=route_id,
+                    validate_key=False,
+                )
+        optional_extras = (
+            ("current_bytes", current_bytes),
+            ("current_entries", current_entries),
+            ("entry_bytes", entry_bytes),
+            ("lookup_current_bytes", lookup_current_bytes),
+            ("lookup_current_entries", lookup_current_entries),
+            ("lookup_result", lookup_result),
+        )
+        extras_key = (
+            event.axis_name,
+            extras_presence,
+            *(value for _, value in optional_extras),
+        )
+        extras_json = self._cache_event_extras_cache.get(extras_key)
+        if extras_json is None:
+            extras: dict[str, object] = {"benchmark_axis": event.axis_name}
+            extras.update(
+                {
+                    key: value
+                    for index, (key, value) in enumerate(optional_extras)
+                    if extras_presence & (1 << index)
+                }
+            )
+            extras_json = _json_text(extras)
+            with contextlib.suppress(TypeError):
+                self._cache_event_extras_cache[extras_key] = extras_json
+            if len(self._cache_event_extras_cache) > ROUTE_ID_RESOLUTION_CACHE_ENTRIES:
+                self._cache_event_extras_cache.pop(
+                    next(iter(self._cache_event_extras_cache))
+                )
+        return (
+            event_id,
+            "cache_event",
+            "cache_event",
+            timestamp_seconds,
+            started_at,
+            completed_at,
+            duration_seconds,
+            lane_id,
+            iteration,
+            operator_id,
+            route_id,
+            [],
+            [],
+            [],
+            None,
+            None,
+            status,
+            "",
+            operation,
+            "",
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            cache_key_digest,
+            None,
+            None,
+            "",
             status,
             extras_json,
         )

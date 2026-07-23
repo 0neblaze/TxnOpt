@@ -713,6 +713,8 @@ The executable workflow and gate table are maintained in
   identity is the sealed extension SHA-256 plus the captured runtime contract, never path equality.
   The v3 live screening path uses reusable precomputed typed definitions and occurrence rows;
   reintroducing per-decision dict normalization on that hot path is a performance regression.
+  V3 route-evaluation and cache-event batches likewise use native schema-ordered sparse columns;
+  mixed ordinary events are filled at their original positions and may not be reordered or dropped.
 - Producer screening-definition collision state stores the full SHA-256 digest without retaining a
   duplicate JSON payload; review/read stores retain the payload they must resolve. Exact-route
   evaluation identities likewise remain in a bounded in-memory full-digest/payload store and spill

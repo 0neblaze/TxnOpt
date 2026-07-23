@@ -40,6 +40,7 @@ from evrptw.artifacts import (
     ArtifactRunContext,
     ArtifactStorageConfig,
     BufferedScreeningDecision,
+    DeferredCacheEvent,
     DeferredRouteEvaluation,
     DeferredScreeningDecision,
     aggregate_diagnostic_events,
@@ -3239,6 +3240,7 @@ class _Stage052StreamingShard(Protocol):
             | BufferedScreeningDecision
             | DeferredScreeningDecision
             | DeferredRouteEvaluation
+            | DeferredCacheEvent
         ],
         diagnostic_rows: Iterable[Mapping[str, object]] = (),
         cache_lookups_coalesced: bool = False,
@@ -3251,7 +3253,8 @@ type _AsyncCriticalBatch = tuple[
     Mapping[str, object]
     | BufferedScreeningDecision
     | DeferredScreeningDecision
-    | DeferredRouteEvaluation,
+    | DeferredRouteEvaluation
+    | DeferredCacheEvent,
     ...,
 ]
 
@@ -3334,8 +3337,27 @@ def _pipeline_event_token(
     event: Mapping[str, object]
     | BufferedScreeningDecision
     | DeferredScreeningDecision
-    | DeferredRouteEvaluation,
+    | DeferredCacheEvent
+    | DeferredRouteEvaluation
 ) -> tuple[object, ...]:
+    if isinstance(event, DeferredCacheEvent):
+        values = event.values
+        return (
+            "cache_event",
+            event.axis_name,
+            values[1],
+            values[2],
+            values[3],
+            values[0],
+            None,
+            None,
+            values[9] or None,
+            values[8] or None,
+            None,
+            None,
+            None,
+            None,
+        )
     if isinstance(event, DeferredRouteEvaluation):
         values = event.values
         return (
@@ -3709,6 +3731,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             | BufferedScreeningDecision
             | DeferredScreeningDecision
             | DeferredRouteEvaluation
+            | DeferredCacheEvent
         ] = []
         self.event_count = 0
         self._persisted_family_counts: Counter[str] = Counter()
@@ -4500,7 +4523,46 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         try:
             if event.get("event_type") != "screening_decision":
                 self._observe(event)
-            self._event_buffer.append(event)
+            if (
+                self._buffered_screening_v3
+                and event.get("event_type") == "cache_event"
+            ):
+                optional_fields = (
+                    "current_bytes",
+                    "current_entries",
+                    "entry_bytes",
+                    "lookup_current_bytes",
+                    "lookup_current_entries",
+                    "lookup_result",
+                )
+                extras_presence = sum(
+                    1 << index
+                    for index, field in enumerate(optional_fields)
+                    if field in event
+                )
+                self._event_buffer.append(
+                    DeferredCacheEvent(
+                        "cache_event",
+                        self.axis_name,
+                        (
+                            str(event.get("route_key", "")),
+                            str(event.get("lane", "")),
+                            event.get("iteration"),
+                            str(event.get("operator", "")),
+                            event.get("timestamp_seconds", event.get("started_at")),
+                            event.get("started_at"),
+                            event.get("completed_at"),
+                            event.get("duration_seconds"),
+                            str(event.get("status", "")),
+                            str(event.get("operation", "")),
+                            str(event.get("cache_key_digest", "")),
+                            *(event.get(field) for field in optional_fields),
+                            extras_presence,
+                        ),
+                    )
+                )
+            else:
+                self._event_buffer.append(event)
             if len(self._event_buffer) >= self._buffer_rows:
                 self._flush_event_buffer()
         finally:

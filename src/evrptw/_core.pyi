@@ -33,6 +33,22 @@ def pack_stage052_neighborhood_events(
     json_text: object,
     first_event_id: int,
 ) -> tuple[tuple[list[object], ...], list[int]]: ...
+def pack_stage052_deferred_sparse_events(
+    events: Sequence[object],
+    route_ids: dict[str, int],
+    lane_ids: dict[str, int],
+    operator_ids: dict[str, int],
+    route_evaluation_extras_cache: dict[tuple[object, ...], str],
+    cache_event_extras_cache: dict[tuple[object, ...], str],
+    resolve_route_id: object,
+    stable_dictionary_id: object,
+    json_text: object,
+    first_event_id: int,
+) -> tuple[
+    tuple[list[object], ...],
+    list[tuple[int, int]],
+    list[tuple[str, int]],
+]: ...
 def distance_matrix(points: npt.ArrayLike) -> npt.NDArray[np.float64]: ...
 def route_distance(points: Sequence[Point], route: Sequence[int]) -> float: ...
 def two_opt_delta(

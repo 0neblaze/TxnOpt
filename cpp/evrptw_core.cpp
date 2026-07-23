@@ -466,6 +466,333 @@ py::tuple pack_stage052_neighborhood_events(
         std::move(non_neighborhood_indices));
 }
 
+py::tuple pack_stage052_deferred_sparse_events(
+    const py::sequence& events,
+    py::dict route_ids,
+    py::dict lane_ids,
+    py::dict operator_ids,
+    py::dict route_evaluation_extras_cache,
+    py::dict cache_event_extras_cache,
+    const py::object& resolve_route_id,
+    const py::object& stable_dictionary_id,
+    const py::object& json_text,
+    const std::int64_t first_event_id) {
+    py::tuple columns(36);
+    for (py::ssize_t index = 0; index < 36; ++index) {
+        columns[index] = py::list();
+    }
+    py::list remaining;
+    py::list observed_routes;
+    py::dict observed_route_keys;
+    py::list empty_list;
+    py::object none = py::none();
+
+    const auto append = [&columns](const py::ssize_t column, const py::object& value) {
+        py::reinterpret_borrow<py::list>(columns[column]).append(value);
+    };
+    const auto dictionary_id = [&stable_dictionary_id](
+                                   py::dict& dictionary,
+                                   const py::object& value,
+                                   const char* prefix) -> py::object {
+        PyObject* cached = PyDict_GetItemWithError(dictionary.ptr(), value.ptr());
+        if (cached != nullptr) {
+            return py::reinterpret_borrow<py::object>(cached);
+        }
+        if (PyErr_Occurred()) {
+            throw py::error_already_set();
+        }
+        const py::object identifier = stable_dictionary_id(
+            py::str(std::string(prefix) + py::cast<std::string>(value)));
+        dictionary[value] = identifier;
+        return identifier;
+    };
+    const auto route_id = [
+                              &route_ids,
+                              &resolve_route_id,
+                              &observed_routes,
+                              &observed_route_keys
+                          ](const py::object& key) -> py::object {
+        PyObject* cached = PyDict_GetItemWithError(route_ids.ptr(), key.ptr());
+        py::object identifier;
+        if (cached != nullptr) {
+            identifier = py::reinterpret_borrow<py::object>(cached);
+        } else {
+            if (PyErr_Occurred()) {
+                throw py::error_already_set();
+            }
+            identifier = resolve_route_id(key);
+        }
+        if (!PyLong_Check(identifier.ptr()) || PyBool_Check(identifier.ptr())) {
+            throw std::invalid_argument(
+                "Stage 5.2 deferred sparse route ID must be an integer");
+        }
+        const int already_observed =
+            PyDict_Contains(observed_route_keys.ptr(), key.ptr());
+        if (already_observed < 0) {
+            throw py::error_already_set();
+        }
+        if (already_observed == 0) {
+            observed_route_keys[key] = py::none();
+            observed_routes.append(py::make_tuple(key, identifier));
+        }
+        return identifier;
+    };
+    const auto cached_json = [&json_text](
+                                 py::dict& cache,
+                                 const py::tuple& key,
+                                 py::dict extras) -> py::object {
+        PyObject* cached = PyDict_GetItemWithError(cache.ptr(), key.ptr());
+        if (cached != nullptr) {
+            return py::reinterpret_borrow<py::object>(cached);
+        }
+        if (PyErr_Occurred()) {
+            throw py::error_already_set();
+        }
+        const py::object encoded = json_text(extras);
+        cache[key] = encoded;
+        if (py::len(cache) > 65536) {
+            const py::object iterator = py::iter(cache);
+            PyObject* first = PyIter_Next(iterator.ptr());
+            if (first == nullptr) {
+                if (PyErr_Occurred()) {
+                    throw py::error_already_set();
+                }
+                throw std::runtime_error(
+                    "Stage 5.2 deferred sparse extras cache is unexpectedly empty");
+            }
+            const py::object first_key = py::reinterpret_steal<py::object>(first);
+            cache.attr("pop")(first_key);
+        }
+        return encoded;
+    };
+    const auto append_common_tail = [
+                                        &append,
+                                        &empty_list,
+                                        &none
+                                    ](
+                                        const py::object& status,
+                                        const py::object& kind,
+                                        const py::object& operation,
+                                        const py::object& failure_reason,
+                                        const py::object& feasible,
+                                        const py::object& exact_started,
+                                        const py::object& exact_completed,
+                                        const py::object& cache_key_digest,
+                                        const py::object& evaluation_id,
+                                        const py::object& route_change_status,
+                                        const py::object& extras_json) {
+        append(11, empty_list);
+        append(12, empty_list);
+        append(13, empty_list);
+        append(14, none);
+        append(15, none);
+        append(16, status);
+        append(17, kind);
+        append(18, operation);
+        append(19, py::str(""));
+        append(20, failure_reason);
+        append(21, feasible);
+        append(22, exact_started);
+        append(23, exact_completed);
+        append(24, none);
+        append(25, none);
+        append(26, none);
+        append(27, none);
+        append(28, none);
+        append(29, none);
+        append(30, cache_key_digest);
+        append(31, evaluation_id);
+        append(32, none);
+        append(33, route_change_status);
+        append(34, status);
+        append(35, extras_json);
+    };
+
+    const py::ssize_t event_count = py::len(events);
+    for (py::ssize_t event_index = 0; event_index < event_count; ++event_index) {
+        const py::object event = events[event_index];
+        if (!PyTuple_Check(event.ptr())) {
+            if (PyDict_Check(event.ptr())) {
+                PyObject* event_type = PyDict_GetItemString(event.ptr(), "event_type");
+                if (event_type != nullptr && PyUnicode_Check(event_type)
+                    && PyUnicode_CompareWithASCIIString(
+                           event_type, "screening_decision") == 0) {
+                    continue;
+                }
+            }
+            const auto position = py::len(py::reinterpret_borrow<py::list>(columns[0]));
+            for (py::ssize_t column = 0; column < 36; ++column) {
+                append(column, none);
+            }
+            remaining.append(py::make_tuple(event_index, position));
+            continue;
+        }
+        const auto tuple_size = PyTuple_GET_SIZE(event.ptr());
+        if (tuple_size == 2 || tuple_size == 8) {
+            continue;
+        }
+        if (tuple_size != 3) {
+            const auto position = py::len(py::reinterpret_borrow<py::list>(columns[0]));
+            for (py::ssize_t column = 0; column < 36; ++column) {
+                append(column, none);
+            }
+            remaining.append(py::make_tuple(event_index, position));
+            continue;
+        }
+        const py::object marker =
+            py::reinterpret_borrow<py::object>(PyTuple_GET_ITEM(event.ptr(), 0));
+        const py::object axis_name =
+            py::reinterpret_borrow<py::object>(PyTuple_GET_ITEM(event.ptr(), 1));
+        const py::object raw_values =
+            py::reinterpret_borrow<py::object>(PyTuple_GET_ITEM(event.ptr(), 2));
+        if (!PyUnicode_Check(marker.ptr()) || !PyUnicode_Check(axis_name.ptr())) {
+            throw std::invalid_argument(
+                "Stage 5.2 deferred sparse event marker and axis must be text");
+        }
+        if (!PyTuple_Check(raw_values.ptr())) {
+            throw std::invalid_argument(
+                "Stage 5.2 deferred sparse event values must be a tuple");
+        }
+        const py::tuple values = py::reinterpret_borrow<py::tuple>(raw_values);
+        const bool is_route_evaluation =
+            PyUnicode_CompareWithASCIIString(marker.ptr(), "route_evaluation") == 0;
+        const bool is_cache_event =
+            PyUnicode_CompareWithASCIIString(marker.ptr(), "cache_event") == 0;
+        if (!is_route_evaluation && !is_cache_event) {
+            const auto position = py::len(py::reinterpret_borrow<py::list>(columns[0]));
+            for (py::ssize_t column = 0; column < 36; ++column) {
+                append(column, none);
+            }
+            remaining.append(py::make_tuple(event_index, position));
+            continue;
+        }
+        if ((is_route_evaluation && py::len(values) != 20)
+            || (is_cache_event && py::len(values) != 18)) {
+            throw std::invalid_argument(
+                "Stage 5.2 deferred sparse event has an invalid field count");
+        }
+
+        const py::object key = values[is_route_evaluation ? 1 : 0];
+        const py::object raw_lane = values[is_route_evaluation ? 2 : 1];
+        const py::object operator_name = values[is_route_evaluation ? 4 : 3];
+        if (!PyUnicode_Check(key.ptr()) || !PyUnicode_Check(raw_lane.ptr())
+            || !PyUnicode_Check(operator_name.ptr())) {
+            throw std::invalid_argument(
+                "Stage 5.2 deferred sparse route, lane, and operator must be text");
+        }
+        py::object lane = raw_lane;
+        if (is_route_evaluation) {
+            lane = py::str(
+                py::cast<std::string>(axis_name) + ":" + py::cast<std::string>(raw_lane));
+        }
+        py::object identifier = none;
+        if (is_route_evaluation || py::len(py::reinterpret_borrow<py::str>(key)) > 0) {
+            identifier = route_id(key);
+        }
+        const py::object lane_identifier =
+            dictionary_id(lane_ids, lane, "lane:");
+        const py::object operator_identifier =
+            dictionary_id(operator_ids, operator_name, "operator:");
+
+        append(0, py::int_(first_event_id + event_index));
+        append(1, py::str(is_route_evaluation ? "route_evaluation" : "cache_event"));
+        append(2, py::str(is_route_evaluation ? "route_evaluation" : "cache_event"));
+        if (is_route_evaluation) {
+            py::tuple extras_key(5);
+            extras_key[0] = axis_name;
+            extras_key[1] = values[16];
+            extras_key[2] = values[14];
+            extras_key[3] = values[13];
+            extras_key[4] = values[15];
+            py::dict extras;
+            extras["benchmark_axis"] = axis_name;
+            extras["deadline_boundary"] = values[16];
+            extras["labels_expanded"] = values[14];
+            extras["labels_generated"] = values[13];
+            extras["labels_pruned"] = values[15];
+            const py::object extras_json = cached_json(
+                route_evaluation_extras_cache, extras_key, std::move(extras));
+            append(3, values[6]);
+            append(4, values[6]);
+            append(5, values[7]);
+            append(6, values[8]);
+            append(7, lane_identifier);
+            append(8, values[3]);
+            append(9, operator_identifier);
+            append(10, identifier);
+            append_common_tail(
+                values[19],
+                values[5],
+                py::str(""),
+                values[12],
+                values[11],
+                values[9],
+                values[10],
+                values[17],
+                values[0],
+                values[18],
+                extras_json);
+            continue;
+        }
+
+        if (PyBool_Check(values[17].ptr()) || !PyLong_Check(values[17].ptr())) {
+            throw std::invalid_argument(
+                "Stage 5.2 deferred cache extras presence must be an integer");
+        }
+        const auto extras_presence = PyLong_AsLongLong(values[17].ptr());
+        if (extras_presence == -1 && PyErr_Occurred()) {
+            throw py::error_already_set();
+        }
+        py::tuple extras_key(8);
+        extras_key[0] = axis_name;
+        extras_key[1] = values[17];
+        for (py::ssize_t index = 0; index < 6; ++index) {
+            extras_key[2 + index] = values[11 + index];
+        }
+        py::dict extras;
+        extras["benchmark_axis"] = axis_name;
+        const std::array<const char*, 6> extra_names = {
+            "current_bytes",
+            "current_entries",
+            "entry_bytes",
+            "lookup_current_bytes",
+            "lookup_current_entries",
+            "lookup_result",
+        };
+        for (std::size_t index = 0; index < extra_names.size(); ++index) {
+            if ((extras_presence & (std::int64_t{1} << index)) != 0) {
+                extras[py::str(extra_names[index])] = values[11 + index];
+            }
+        }
+        const py::object extras_json = cached_json(
+            cache_event_extras_cache, extras_key, std::move(extras));
+        append(3, values[4]);
+        append(4, values[5]);
+        append(5, values[6]);
+        append(6, values[7]);
+        append(7, lane_identifier);
+        append(8, values[2]);
+        append(9, operator_identifier);
+        append(10, identifier);
+        append_common_tail(
+            values[8],
+            py::str(""),
+            values[9],
+            py::str(""),
+            none,
+            none,
+            none,
+            values[10],
+            none,
+            py::str(""),
+            extras_json);
+    }
+    return py::make_tuple(
+        std::move(columns),
+        std::move(remaining),
+        std::move(observed_routes));
+}
+
 double route_distance(const std::vector<Point>& points, const std::vector<std::size_t>& route) {
     if (route.size() < 2) {
         return 0.0;
@@ -1894,6 +2221,19 @@ PYBIND11_MODULE(_core, module) {
         py::arg("extras_cache"),
         py::arg("allowed_fields"),
         py::arg("missing_extra"),
+        py::arg("stable_dictionary_id"),
+        py::arg("json_text"),
+        py::arg("first_event_id"));
+    module.def(
+        "pack_stage052_deferred_sparse_events",
+        &pack_stage052_deferred_sparse_events,
+        py::arg("events"),
+        py::arg("route_ids"),
+        py::arg("lane_ids"),
+        py::arg("operator_ids"),
+        py::arg("route_evaluation_extras_cache"),
+        py::arg("cache_event_extras_cache"),
+        py::arg("resolve_route_id"),
         py::arg("stable_dictionary_id"),
         py::arg("json_text"),
         py::arg("first_event_id"));

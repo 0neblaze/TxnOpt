@@ -8,6 +8,31 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：G pilot attempt05 保留失败并批量列式封装 sparse events
+
+- clean revision `90c36ff` 上的 `stage05.2_accelerator_pilot_attempt05` 已由独立
+  reviewer 完整复核，decision 为 `GPU_NOT_JUSTIFIED`，状态为
+  `READY_FOR_STAGE052_BENCHMARK`。随后 `stage05.2_benchmark_attempt05` 在首个
+  12-shard batch 被 36% producer gate 正确拒绝：solver 为 `23.187877539` 秒，
+  persistence 为 `14.957757702` 秒，ratio 为 `0.392122391`。失败 evidence 保留，
+  Formal 未启动。
+- attempt05 已消除 route-evaluation 的 producer/writer 重复物化，但 writer 仍逐条
+  建立约九万条 route-evaluation/cache-event sparse rows，并逐列执行 36 次 Python
+  append。当前实现增加 native deferred sparse-event column packer（原生延迟稀疏事件
+  列封装器）：同一 mixed batch 内的 route evaluation 和 cache event 直接生成完整
+  `EVENTS_SCHEMA` 列，普通事件只保留原位置 placeholder 并继续走通用 normalizer。
+  writer 在原位置回填普通事件后一次性提交列，因此 event ID、FIFO 顺序、route/lane/
+  operator identity、extras presence、semantic digest 与 Parquet schema 均不变。
+- native packer 只缓存 canonical extras JSON 和已经解析的稳定 ID；每批观察到的 route
+  identity 仍回到 Python collision store 做完整 SHA-256 注册，未知 tuple、未知 marker
+  和普通 mapping 均不被静默解释。新增 real-writer mixed-order 回归覆盖
+  `route_evaluation -> operator_call -> cache_event` 的 event ID、lane、evaluation 和
+  lookup-result 重放。
+- `c104C10/2014` 三次单 shard 诊断 persistence 为 2.226010、2.246415 和
+  2.265286 秒，对应 ratio 为 29.4264%、29.6320% 和 29.8214%；相较 attempt05 的
+  同类 shard 约 2.68--3.04 秒已有明确余量。该诊断仍不是晋级证据；下一步必须用新
+  F/G label、冻结 runtime 和独立 raw replay 验证完整 pilot。
+
 ## 2026-07-23：G pilot attempt04 保留失败并移除 route-evaluation 重复物化
 
 - 当前 revision 重新生成并独立复核

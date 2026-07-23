@@ -21,6 +21,7 @@ from evrptw.artifacts import (
     ArtifactReader,
     ArtifactRunContext,
     ArtifactStorageConfig,
+    DeferredCacheEvent,
     DeferredRouteEvaluation,
     DeferredScreeningDecision,
 )
@@ -250,6 +251,12 @@ class _RecordingShard:
                 "kind": row.values[5],
             }
             if isinstance(row, DeferredRouteEvaluation)
+            else {
+                "benchmark_axis": row.axis_name,
+                "record_type": row.marker,
+                "operation": row.values[9],
+            }
+            if isinstance(row, DeferredCacheEvent)
             else dict(row)
             for row in critical_events  # type: ignore[union-attr]
         ]
@@ -768,6 +775,116 @@ def test_v3_buffered_screening_bridge_roundtrips_through_real_writer(
     assert screening_rows[0]["checks"] == [
         {"check": "capacity", "status": "fail", "value": 9.0, "reason": "capacity"}
     ]
+
+
+def test_v3_native_sparse_events_preserve_mixed_event_order(tmp_path: Path) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt94"
+    writer = ArtifactBundleWriter(
+        tmp_path / "results" / run_label,
+        ArtifactRunContext("stage05.2", "artifact_streaming", run_label),
+        ArtifactStorageConfig(
+            storage_policy_version="artifact-storage-v2",
+            screening_schema_version="screening_decisions_v3",
+        ),
+    )
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    route_key = "route:2:C1"
+    assert (
+        shard.append(
+            route_dictionary={route_key: ("C1",)},
+            critical_events=(
+                DeferredRouteEvaluation(
+                    "route_evaluation",
+                    "fixed_work",
+                    (
+                        1,
+                        route_key,
+                        "legacy",
+                        1,
+                        "repair",
+                        "exact_call",
+                        0.1,
+                        0.2,
+                        0.1,
+                        True,
+                        True,
+                        True,
+                        "",
+                        10,
+                        8,
+                        2,
+                        "",
+                        "digest",
+                        "changed",
+                        "completed_feasible",
+                    ),
+                ),
+                {
+                    "record_type": "operator_call",
+                    "event_type": "operator_call",
+                    "timestamp_seconds": 0.21,
+                    "lane": "fixed_work:legacy",
+                    "iteration": 1,
+                    "operator": "repair",
+                    "status": "accepted",
+                },
+                DeferredCacheEvent(
+                    "cache_event",
+                    "fixed_work",
+                    (
+                        route_key,
+                        "fixed_work:legacy",
+                        1,
+                        "repair",
+                        0.25,
+                        0.2,
+                        0.3,
+                        0.1,
+                        "miss",
+                        "lookup_result",
+                        "digest",
+                        10,
+                        2,
+                        5,
+                        8,
+                        1,
+                        "miss",
+                        63,
+                    ),
+                ),
+            ),
+            cache_lookups_coalesced=True,
+        )
+        == 3
+    )
+    shard.finalize(
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+    )
+    bundle = writer.finalize()
+
+    rows = list(
+        ArtifactReader(bundle.run_dir).iter_events(
+            f"toy/2014/{run_label}_events_toy_2014.parquet"
+        )
+    )
+    assert [row["event_id"] for row in rows] == [1, 2, 3]
+    assert [row["event_type"] for row in rows] == [
+        "route_evaluation",
+        "operator_call",
+        "cache_event",
+    ]
+    assert rows[0]["lane"] == "fixed_work:legacy"
+    assert rows[0]["evaluation_id"] == 1
+    assert rows[2]["operation"] == "lookup_result"
+    assert rows[2]["lookup_result"] == "miss"
 
 
 def test_v2_screening_bridge_retains_the_complete_legacy_payload() -> None:
