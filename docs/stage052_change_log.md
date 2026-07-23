@@ -8,6 +8,28 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：G pilot attempt04 保留失败并移除 route-evaluation 重复物化
+
+- 当前 revision 重新生成并独立复核
+  `stage05.2_accelerator_pilot_attempt04`；其 decision-only 证据仍为
+  `GPU_NOT_JUSTIFIED`，全部 gate 通过并报告 `READY_FOR_STAGE052_BENCHMARK`。
+  `stage05.2_benchmark_attempt04` 的首个 12-shard batch 随后被 36% producer gate
+  正确拒绝：solver 为 `23.781636617` 秒，persistence 为 `16.071832465` 秒，
+  ratio 为 `0.403273111`。失败 raw evidence 保留，Formal 未启动。
+- attribution 显示 c104C10 的 route-evaluation（路径评估）高基数记录仍在 producer
+  逐条建立 dictionary、writer 再逐条解析为相同的 sparse schema row（稀疏模式行）。
+  streaming sink 现在提交 immutable flat deferred route-evaluation（不可变扁平延迟
+  路径评估）；writer 直接构造 schema-ordered tuple，并有界缓存只含 benchmark axis、
+  deadline 和 label counters 的 canonical extras JSON。事件字段、event ID、route ID、
+  FIFO batch ledger、semantic digest 和 Parquet schema 均不变。
+- exact unique-route identity（精确唯一路径身份）在 producer 持有 shard turn 时先行
+  注册，使尚未到 row-group flush 的最后一批记录也能参与 solver reconciliation；
+  writer 不重复注册。同一个 65,537-record 边界测试继续证明有界内存、精确计数和 ext4
+  scratch 位置。
+- `c104C10/2014` 单 shard 诊断从 attempt04 的 3.358311 秒 persistence 降至
+  2.598002 秒，诊断 ratio 为 31.8991%。该诊断不是晋级证据；后续必须用新 G label
+  重新执行完整 36-bundle pilot，并由独立 reviewer 确认。
+
 ## 2026-07-23：F/G 前置持久化热路径修复
 
 - `stage05.2_benchmark_attempt03` 的 36% producer gate 失败后，继续从最早受影响的

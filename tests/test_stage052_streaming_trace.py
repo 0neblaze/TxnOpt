@@ -21,6 +21,7 @@ from evrptw.artifacts import (
     ArtifactReader,
     ArtifactRunContext,
     ArtifactStorageConfig,
+    DeferredRouteEvaluation,
     DeferredScreeningDecision,
 )
 from evrptw.experiments import stage052_performance
@@ -242,7 +243,16 @@ class _RecordingShard:
     ) -> int:
         del route_dictionary, diagnostic_rows, cache_lookups_coalesced
         self.append_calls += 1
-        rows = [dict(row) for row in critical_events]  # type: ignore[union-attr]
+        rows = [
+            {
+                "benchmark_axis": row.axis_name,
+                "record_type": row.marker,
+                "kind": row.values[5],
+            }
+            if isinstance(row, DeferredRouteEvaluation)
+            else dict(row)
+            for row in critical_events  # type: ignore[union-attr]
+        ]
         self.events.extend(rows)
         return len(rows)
 

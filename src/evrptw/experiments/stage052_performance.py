@@ -22,7 +22,7 @@ import tomllib
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from multiprocessing import get_context
 from pathlib import Path
 from queue import Full, Queue
@@ -40,6 +40,7 @@ from evrptw.artifacts import (
     ArtifactRunContext,
     ArtifactStorageConfig,
     BufferedScreeningDecision,
+    DeferredRouteEvaluation,
     DeferredScreeningDecision,
     aggregate_diagnostic_events,
     atomic_write_signed_json,
@@ -3234,7 +3235,10 @@ class _Stage052StreamingShard(Protocol):
         *,
         route_dictionary: Mapping[str, Sequence[str]],
         critical_events: Iterable[
-            Mapping[str, object] | BufferedScreeningDecision | DeferredScreeningDecision
+            Mapping[str, object]
+            | BufferedScreeningDecision
+            | DeferredScreeningDecision
+            | DeferredRouteEvaluation
         ],
         diagnostic_rows: Iterable[Mapping[str, object]] = (),
         cache_lookups_coalesced: bool = False,
@@ -3244,7 +3248,10 @@ class _Stage052StreamingShard(Protocol):
 
 
 type _AsyncCriticalBatch = tuple[
-    Mapping[str, object] | BufferedScreeningDecision | DeferredScreeningDecision,
+    Mapping[str, object]
+    | BufferedScreeningDecision
+    | DeferredScreeningDecision
+    | DeferredRouteEvaluation,
     ...,
 ]
 
@@ -3324,8 +3331,29 @@ class _PersistenceActivityMeter:
 
 
 def _pipeline_event_token(
-    event: Mapping[str, object] | BufferedScreeningDecision | DeferredScreeningDecision,
+    event: Mapping[str, object]
+    | BufferedScreeningDecision
+    | DeferredScreeningDecision
+    | DeferredRouteEvaluation,
 ) -> tuple[object, ...]:
+    if isinstance(event, DeferredRouteEvaluation):
+        values = event.values
+        return (
+            "route_evaluation",
+            event.axis_name,
+            f"{event.axis_name}:{values[2]}",
+            values[3],
+            values[4],
+            values[1],
+            None,
+            values[5],
+            None,
+            values[19] or None,
+            None,
+            values[9],
+            values[10],
+            values[11],
+        )
     if isinstance(event, DeferredScreeningDecision):
         values = event.values
         return (
@@ -3677,7 +3705,10 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._buffer_rows = buffer_rows
         self._neighborhood_buffer_rows = neighborhood_buffer_rows
         self._event_buffer: list[
-            dict[str, object] | BufferedScreeningDecision | DeferredScreeningDecision
+            dict[str, object]
+            | BufferedScreeningDecision
+            | DeferredScreeningDecision
+            | DeferredRouteEvaluation
         ] = []
         self.event_count = 0
         self._persisted_family_counts: Counter[str] = Counter()
@@ -3718,10 +3749,54 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
-            payload = {field.name: getattr(record, field.name) for field in fields(record)}
-            payload["record_type"] = "route_evaluation"
-            payload["event_type"] = "route_evaluation"
-            self._queue_owned(payload)
+            if self._pending_cache_lookup is not None:
+                self._flush_pending_lookup()
+            register_identity = getattr(
+                self._shard,
+                "register_route_evaluation_identity",
+                None,
+            )
+            if callable(register_identity):
+                register_identity(
+                    axis=self.axis_name,
+                    route_key=record.route_key,
+                    lane=record.lane,
+                    kind=record.kind,
+                    exact_started=record.exact_started,
+                    exact_completed=record.exact_completed,
+                )
+            self._event_buffer.append(
+                DeferredRouteEvaluation(
+                    "route_evaluation",
+                    self.axis_name,
+                    (
+                        record.evaluation_id,
+                        record.route_key,
+                        record.lane,
+                        record.iteration,
+                        record.operator,
+                        record.kind,
+                        record.started_at,
+                        record.completed_at,
+                        record.duration_seconds,
+                        record.exact_started,
+                        record.exact_completed,
+                        record.feasible,
+                        record.failure_reason,
+                        record.labels_generated,
+                        record.labels_expanded,
+                        record.labels_pruned,
+                        record.deadline_boundary,
+                        record.cache_key_digest,
+                        record.route_change_status,
+                        record.status,
+                    ),
+                )
+            )
+            if len(self._event_buffer) >= self._buffer_rows:
+                self._flush_event_buffer()
+            self._persisted_family_counts["route_evaluations"] += 1
+            self.event_count += 1
         finally:
             try:
                 nested_ns = self.persistence_nanoseconds - previously_recorded_ns

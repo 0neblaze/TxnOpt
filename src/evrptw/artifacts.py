@@ -1495,6 +1495,14 @@ class DeferredScreeningDecision(NamedTuple):
     values: tuple[object, ...]
 
 
+class DeferredRouteEvaluation(NamedTuple):
+    """Flat route-evaluation record normalized directly by the shard writer."""
+
+    marker: str
+    axis_name: str
+    values: tuple[object, ...]
+
+
 def _screening_definition_cache_key(
     payload: Mapping[str, object],
     *,
@@ -2356,19 +2364,31 @@ def _iter_coalesced_cache_lookup_events(
 @overload
 def _iter_coalesced_cache_lookup_events(
     events: Iterable[
-        Mapping[str, object] | BufferedScreeningDecision | DeferredScreeningDecision
+        Mapping[str, object]
+        | BufferedScreeningDecision
+        | DeferredScreeningDecision
+        | DeferredRouteEvaluation
     ],
 ) -> Iterable[
-    dict[str, object] | BufferedScreeningDecision | DeferredScreeningDecision
+    dict[str, object]
+    | BufferedScreeningDecision
+    | DeferredScreeningDecision
+    | DeferredRouteEvaluation
 ]: ...
 
 
 def _iter_coalesced_cache_lookup_events(
     events: Iterable[
-        Mapping[str, object] | BufferedScreeningDecision | DeferredScreeningDecision
+        Mapping[str, object]
+        | BufferedScreeningDecision
+        | DeferredScreeningDecision
+        | DeferredRouteEvaluation
     ],
 ) -> Iterable[
-    dict[str, object] | BufferedScreeningDecision | DeferredScreeningDecision
+    dict[str, object]
+    | BufferedScreeningDecision
+    | DeferredScreeningDecision
+    | DeferredRouteEvaluation
 ]:
     """Streaming equivalent of :func:`_coalesce_cache_lookup_events`."""
 
@@ -4649,6 +4669,7 @@ class ArtifactV2ShardSession:
         ] = OrderedDict()
         self._neighborhood_extras_cache: dict[tuple[object, ...], str] = {}
         self._neighborhood_row_cache: dict[tuple[object, ...], tuple[object, ...]] = {}
+        self._route_evaluation_extras_cache: dict[tuple[object, ...], str] = {}
         self._screening_definition_store: _BoundedScreeningDefinitionStore | None = None
         self._pending_route_rows: list[tuple[object, ...]] = []
         self._pending_check_rows: list[tuple[object, ...]] = []
@@ -4672,7 +4693,10 @@ class ArtifactV2ShardSession:
         *,
         route_dictionary: Mapping[str, Sequence[str]],
         critical_events: Iterable[
-            Mapping[str, object] | BufferedScreeningDecision | DeferredScreeningDecision
+            Mapping[str, object]
+            | BufferedScreeningDecision
+            | DeferredScreeningDecision
+            | DeferredRouteEvaluation
         ],
         diagnostic_rows: Iterable[Mapping[str, object]] = (),
         cache_lookups_coalesced: bool = False,
@@ -4910,6 +4934,17 @@ class ArtifactV2ShardSession:
                     flush_screening_transaction()
                 count += 1
                 continue
+            if isinstance(event, DeferredRouteEvaluation):
+                event_id = next_event_id
+                next_event_id += 1
+                deferred_row = self._deferred_route_evaluation_row(
+                    event,
+                    event_id=event_id,
+                )
+                if buffer_event(deferred_row) >= V2_PARQUET_ROW_GROUP_SIZE:
+                    flush_event_transaction()
+                count += 1
+                continue
             if isinstance(event, tuple):
                 if self._screening_definitions_sink is None:
                     raise RuntimeError("buffered screening decisions require v3 storage")
@@ -5129,6 +5164,126 @@ class ArtifactV2ShardSession:
                 self._owner._normalise_diagnostic(row, self.instance, self.seed),
             )
         return count
+
+    def _deferred_route_evaluation_row(
+        self,
+        event: DeferredRouteEvaluation,
+        *,
+        event_id: int,
+    ) -> tuple[object, ...]:
+        if event.marker != "route_evaluation":
+            raise ArtifactIntegrityError("deferred route-evaluation marker is invalid")
+        values = event.values
+        if len(values) != 20:
+            raise ArtifactIntegrityError(
+                "deferred route evaluation must contain twenty fields"
+            )
+        (
+            evaluation_id,
+            route_key,
+            raw_lane,
+            iteration,
+            operator,
+            kind,
+            started_at,
+            completed_at,
+            duration_seconds,
+            exact_started,
+            exact_completed,
+            feasible,
+            failure_reason,
+            labels_generated,
+            labels_expanded,
+            labels_pruned,
+            deadline_boundary,
+            cache_key_digest,
+            route_change_status,
+            status,
+        ) = values
+        if (
+            not isinstance(route_key, str)
+            or not isinstance(raw_lane, str)
+            or not isinstance(operator, str)
+        ):
+            raise ArtifactIntegrityError("deferred route-evaluation context is invalid")
+        lane = f"{event.axis_name}:{raw_lane}"
+        lane_id = self._lane_ids.setdefault(
+            lane,
+            _stable_dictionary_id(f"lane:{lane}"),
+        )
+        operator_id = self._operator_ids.setdefault(
+            operator,
+            _stable_dictionary_id(f"operator:{operator}"),
+        )
+        route_id = self._resolve_route_id(route_key)
+        if route_id not in self._route_digests:
+            self._register_route(
+                route_key,
+                _route_sequence_from_key(route_key),
+                route_id=route_id,
+                validate_key=False,
+            )
+        extras_key = (
+            event.axis_name,
+            deadline_boundary,
+            labels_expanded,
+            labels_generated,
+            labels_pruned,
+        )
+        extras_json = self._route_evaluation_extras_cache.get(extras_key)
+        if extras_json is None:
+            extras_json = _json_text(
+                {
+                    "benchmark_axis": event.axis_name,
+                    "deadline_boundary": deadline_boundary,
+                    "labels_expanded": labels_expanded,
+                    "labels_generated": labels_generated,
+                    "labels_pruned": labels_pruned,
+                }
+            )
+            self._route_evaluation_extras_cache[extras_key] = extras_json
+            if len(self._route_evaluation_extras_cache) > ROUTE_ID_RESOLUTION_CACHE_ENTRIES:
+                self._route_evaluation_extras_cache.pop(
+                    next(iter(self._route_evaluation_extras_cache))
+                )
+        return (
+            event_id,
+            "route_evaluation",
+            "route_evaluation",
+            started_at,
+            started_at,
+            completed_at,
+            duration_seconds,
+            lane_id,
+            iteration,
+            operator_id,
+            route_id,
+            [],
+            [],
+            [],
+            None,
+            None,
+            status,
+            kind,
+            "",
+            "",
+            failure_reason,
+            feasible,
+            exact_started,
+            exact_completed,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            cache_key_digest,
+            evaluation_id,
+            None,
+            route_change_status,
+            status,
+            extras_json,
+        )
 
     def _deferred_screening_decision_row(
         self,
@@ -5716,6 +5871,38 @@ class ArtifactV2ShardSession:
             axis=axis,
             semantics=semantics,
         )
+
+    def register_route_evaluation_identity(
+        self,
+        *,
+        axis: str,
+        route_key: str,
+        lane: str,
+        kind: str,
+        exact_started: bool,
+        exact_completed: bool,
+    ) -> None:
+        """Register exact identity before a buffered event reaches the writer."""
+
+        if kind != "exact_call":
+            return
+        if exact_started:
+            self._route_digests.register_unique_identity(
+                axis=axis,
+                semantics="legacy_started",
+                identity=(lane, route_key),
+            )
+        if exact_completed:
+            self._route_digests.register_unique_identity(
+                axis=axis,
+                semantics="completed_shared",
+                identity=(route_key,),
+            )
+            self._route_digests.register_unique_identity(
+                axis=axis,
+                semantics="completed_lane",
+                identity=("legacy" if lane == "initialization" else lane, route_key),
+            )
 
     def _append_buffered(self, sink: _StreamingParquetSink, row: Mapping[str, object]) -> None:
         if sink not in self._active_sinks and len(self._active_sinks) >= 2:
