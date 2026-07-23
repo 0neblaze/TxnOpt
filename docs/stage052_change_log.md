@@ -8,6 +8,24 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：v1 物理 screening schema 独立识别修复
+
+- 原因：C16 的独立审查正确验证了 24 个 fixed-work axis（固定工作量轴）的 v1/v3
+  canonical equality（规范等价），但 reviewer 只把独立
+  `screening_decisions_v1` subtype（子类型）识别为 v1。实际 artifact-storage-v1 将
+  screening decision（筛选决策）保存在普通 critical event stream（关键事件流）中，
+  另存 `screening_checks`；因此不存在该 subtype，C16 被错误判为物理 schema 无效。
+- 修改：v1 识别现在要求 manifest 明确声明 `screening_decisions_v1`、同时存在
+  `critical` 与 `screening_checks` 事件工件、至少一个 trace index（轨迹索引），且每个
+  trace 均不存在 v2 compact 或 v3 definitions/occurrences 引用。任何混合或缺失布局仍
+  fail fast。
+- 证据影响：B06、C16 raw 与 C16 的首个 `NOT_READY` review generation 保持不可变；
+  这是 reviewer-only 修复，可在新 clean reviewer revision 下复用 C16 raw 产生追加式
+  review generation，无需重跑 solver。
+- 验证：新增 v1 embedded layout（内嵌布局）正例和伪装 v2 reference（引用）反例；修复
+  前正例按预期失败，修复后 3 个 screening-schema 定向测试通过，并在真实 B06/C16
+  manifest 上分别重放为 v1/v3。
+
 ## 2026-07-23：跨 revision 冻结 producer replay 修复
 
 - 原因：A10 通过新 reviewer receipt 后，B04 的 producer prerequisite binding 仍指向旧

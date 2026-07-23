@@ -3159,6 +3159,54 @@ def test_reviewer_infers_historical_v2_screening_schema_from_artifacts() -> None
     assert stage052_review._screening_schema_version(reader) == "screening_decisions_v2"
 
 
+def test_reviewer_recognises_v1_screening_schema_embedded_in_critical_events() -> None:
+    trace_paths = ("c101C5/2014/trace.json", "c101C5/2015/trace.json")
+    traces = {
+        path: {
+            "events_ref": path.replace("trace.json", "events.parquet"),
+            "screening_checks_ref": path.replace("trace.json", "checks.parquet"),
+        }
+        for path in trace_paths
+    }
+    reader = SimpleNamespace(
+        manifest={
+            "storage_policy": {"screening_schema_version": "screening_decisions_v1"},
+            "artifacts": [
+                {"artifact_type": "events", "artifact_subtype": "critical"},
+                {"artifact_type": "events", "artifact_subtype": "screening_checks"},
+                *(
+                    {"artifact_type": "trace", "relative_path": path}
+                    for path in trace_paths
+                ),
+            ],
+        },
+        read_json=lambda path: traces[path],
+    )
+
+    assert stage052_review._screening_schema_version(reader) == "screening_decisions_v1"
+
+
+def test_reviewer_rejects_v1_declaration_with_v2_trace_reference() -> None:
+    reader = SimpleNamespace(
+        manifest={
+            "storage_policy": {"screening_schema_version": "screening_decisions_v1"},
+            "artifacts": [
+                {"artifact_type": "events", "artifact_subtype": "critical"},
+                {"artifact_type": "events", "artifact_subtype": "screening_checks"},
+                {"artifact_type": "trace", "relative_path": "trace.json"},
+            ],
+        },
+        read_json=lambda _path: {
+            "screening_schema_version": "screening_decisions_v1",
+            "events_ref": "events.parquet",
+            "screening_checks_ref": "checks.parquet",
+            "screening_decisions_ref": "screening_decisions.parquet",
+        },
+    )
+
+    assert stage052_review._screening_schema_version(reader) is None
+
+
 def test_reviewer_rejects_declared_and_physical_screening_schema_mismatch() -> None:
     mismatch = SimpleNamespace(
         manifest={

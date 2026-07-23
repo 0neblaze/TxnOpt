@@ -1453,6 +1453,41 @@ def _screening_schema_version(reader: ArtifactReader) -> str | None:
         observed.add("screening_decisions_v3")
     elif v3_parts & subtypes:
         return None
+    if declared == "screening_decisions_v1" and not observed:
+        # v1 stores screening decisions inside the ordinary critical-event
+        # stream.  The separate ``screening_checks`` table contains only the
+        # decision checks, so there is intentionally no
+        # ``screening_decisions_v1`` artifact subtype to infer from.  Bind the
+        # declaration to every physical trace index and reject any compact or
+        # split decision stream before accepting this historical layout.
+        if not {"critical", "screening_checks"}.issubset(subtypes):
+            return None
+        trace_paths = [
+            str(item.get("relative_path", ""))
+            for item in artifacts
+            if isinstance(item, Mapping) and item.get("artifact_type") == "trace"
+        ]
+        if not trace_paths or any(not path for path in trace_paths):
+            return None
+        for path in trace_paths:
+            try:
+                trace = reader.read_json(path)
+            except (ArtifactIntegrityError, OSError, TypeError, ValueError):
+                return None
+            if (
+                trace.get("screening_schema_version")
+                not in {None, "screening_decisions_v1"}
+                or any(
+                    trace.get(field) is not None
+                    for field in (
+                        "screening_decisions_ref",
+                        "screening_definitions_ref",
+                        "screening_occurrences_ref",
+                    )
+                )
+            ):
+                return None
+        return "screening_decisions_v1"
     if len(observed) != 1:
         return None
     physical = next(iter(observed))
