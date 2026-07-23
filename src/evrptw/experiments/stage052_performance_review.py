@@ -359,6 +359,35 @@ def verify_stage052_review_prerequisite(
 
 StorageReplayIdentity = tuple[str, int, str]
 StorageReplayConsumer = Callable[[StorageReplayIdentity, Mapping[str, object]], None]
+_SCREENING_DIAGNOSTIC_DECIMAL_PLACES = 10
+
+
+def _canonicalize_screening_diagnostic_floats(
+    row: Mapping[str, object],
+) -> dict[str, object]:
+    """Remove machine roundoff only from non-decision screening diagnostics."""
+
+    canonical = dict(row)
+    if canonical.get("event_type") != "screening_decision":
+        return canonical
+
+    def quantize(value: object) -> object:
+        if not isinstance(value, float):
+            return value
+        normalized = round(value, _SCREENING_DIAGNOSTIC_DECIMAL_PLACES)
+        return 0.0 if normalized == 0.0 else normalized
+
+    for field in ("min_time_window_slack", "distance_lower_bound"):
+        canonical[field] = quantize(canonical.get(field))
+    checks = canonical.get("checks")
+    if isinstance(checks, list):
+        canonical["checks"] = [
+            {**check, "value": quantize(check.get("value"))}
+            if isinstance(check, Mapping)
+            else check
+            for check in checks
+        ]
+    return canonical
 
 
 def _visit_stage052_storage_semantic_records(
@@ -572,6 +601,7 @@ def _visit_stage052_storage_semantic_records(
                 "axis_event_ordinal": event_ordinals[axis],
                 **row,
             }
+            event_payload = _canonicalize_screening_diagnostic_floats(event_payload)
             if not isinstance(event_payload.get("lane"), str) or not isinstance(
                 event_payload.get("operator"), str
             ):

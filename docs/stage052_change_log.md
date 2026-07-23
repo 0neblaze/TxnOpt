@@ -8,6 +8,18 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：E native screening differential 采用诊断专用精度
+
+- E 的独立 raw replay 显示 Python/native fixed-work 流的 event identity（事件身份）、
+  route、status、reason、cache 行为和逐项 check 结论完全一致。唯一差异是 166 个事件中
+  220 个派生诊断浮点值；最大绝对误差为 `5.684341886080802e-14`，最大相对误差为
+  `9.9785060296947e-16`。
+- storage semantic replay 现在只把 `screening_decision.min_time_window_slack`、
+  `screening_decision.distance_lower_bound` 和数值型
+  `screening_decision.checks[].value` 诊断量规范到小数点后十位。所有离散决策字段和所有
+  非 screening 事件仍要求 exact equality（精确相等）；超出该 machine-roundoff
+  envelope（机器舍入误差包络）的诊断变化仍会使 native differential gate 失败。
+
 ## 2026-07-23：E persistence gate 调整为 36% 并接受 attempt15
 
 - 用户明确将 Stage 5.2 persistence-to-end-to-end ratio（持久化占端到端比例）硬门槛

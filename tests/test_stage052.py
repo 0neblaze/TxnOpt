@@ -3680,6 +3680,44 @@ def test_persistence_pipeline_metadata_is_nonsemantic() -> None:
     assert pipelined == base
 
 
+def test_native_screening_diagnostic_float_canonicalization_is_narrow() -> None:
+    base = {
+        "event_type": "screening_decision",
+        "status": "rejected",
+        "reason": "forward_time_window_prefilter",
+        "min_time_window_slack": -110.24146527838172,
+        "distance_lower_bound": 263.64617382155,
+        "checks": [
+            {
+                "check": "forward_time_window",
+                "status": "fail",
+                "reason": "forward_time_window_prefilter",
+                "value": -110.24146527838172,
+            }
+        ],
+    }
+    native_roundoff = {
+        **base,
+        "min_time_window_slack": -110.24146527838175,
+        "distance_lower_bound": 263.64617382155006,
+        "checks": [{**base["checks"][0], "value": -110.24146527838175}],
+    }
+
+    canonical = stage052_review._canonicalize_screening_diagnostic_floats(base)
+    assert canonical == stage052_review._canonicalize_screening_diagnostic_floats(
+        native_roundoff
+    )
+    assert canonical != stage052_review._canonicalize_screening_diagnostic_floats(
+        {**native_roundoff, "distance_lower_bound": 263.646173823}
+    )
+    assert canonical != stage052_review._canonicalize_screening_diagnostic_floats(
+        {**native_roundoff, "status": "pass"}
+    )
+    assert stage052_review._canonicalize_screening_diagnostic_floats(
+        {"event_type": "route_evaluation", "distance_lower_bound": 263.64617382155006}
+    ) == {"event_type": "route_evaluation", "distance_lower_bound": 263.64617382155006}
+
+
 def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
