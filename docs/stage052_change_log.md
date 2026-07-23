@@ -8,6 +8,35 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：E10 persistence 与 resource identity 根因修复
+
+- 失败证据：`stage05.2_native_kernels_attempt09` 在创建任何 shard 前因冻结 source
+  缺少 benchmark data（基准数据）而 fail fast；空 run directory 保留且该 label 不复用。
+  `stage05.2_native_kernels_attempt10` 完成 36/36 validator replay（验证器重放），独立审查
+  仍发布 `NOT_READY`：aggregate persistence ratio 为 0.381727992，且 resource contract
+  （资源合同）发现 transient exited process（瞬时退出进程）的零 RSS 记录。E09/E10 均
+  保持不可变。
+- persistence 根因：E10 共持久化 9,139,744 个事件，其中 286,085 个 exact route
+  evaluation（精确路径评估）原本对三类唯一身份逐次执行 SQLite SELECT/INSERT；各 shard
+  的实际集合远低于既有有界内存预算。现在 exact-route identity store（精确路径身份存储）
+  在内存中保存完整 SHA-256 digest 与 payload collision proof（载荷碰撞证明），超过明确
+  262,144-entry 上限后才原子迁移到 shard-local SQLite。spill（溢写）后的去重、碰撞和
+  namespace（命名空间）计数语义不变。
+- screening 存储：producer 已把 canonical definition（规范定义）写入 Parquet，因此
+  collision store（碰撞存储）只保留完整 32-byte SHA-256 token，不再保留第二份 JSON；
+  reviewer/read path 仍保留可解析 payload，超过 producer 的 1,200,000-entry 硬上限才
+  spill。八项 screening-check 上限在 typed fast path（类型化快速路径）与兼容路径中均
+  fail fast。
+- resource 根因：`psutil` 可能在子进程退出后、成为 zombie（僵尸进程）前短暂返回零化
+  memory record（内存记录）。sampler 现在只在 RSS 为正且 CPU times 同一次 oneshot
+  采样成功后登记 process identity（进程身份）；半采样和零 RSS 进程均不形成虚假的
+  measured worker（已测工作进程）。
+- 验证：新增内存路径、强制 spill 去重、producer digest-only、零 RSS transient process
+  回归测试。225,000 个 exact-route identities 的 ext4 microbenchmark（微基准）从
+  1.382240497 秒降至 0.478620427 秒（约 2.89x）；Stage 5.2 artifact/core 133 项和
+  governance 184 项测试通过，Ruff 与 strict mypy 通过。正式 E 门槛仍须由新 clean
+  commit 的 E11 producer 与独立 raw replay 决定，微基准不构成通过证据。
+
 ## 2026-07-23：E native runtime 与 v3 screening 热路径修复
 
 - 失败证据：`stage05.2_native_kernels_attempt08` 保留为 `NOT_READY`；其 reviewer 发现

@@ -1864,6 +1864,12 @@ class ProcessTreeResourceSampler:
                     try:
                         with process.oneshot():
                             process_rss = int(process.memory_info().rss)
+                            if process_rss <= 0:
+                                # psutil can expose a just-exited descendant with a
+                                # zeroed memory record before it becomes a zombie.
+                                # It was never fully sampled and therefore cannot
+                                # be claimed as a measured process identity.
+                                continue
                             times = process.cpu_times()
                             process_cpu = float(times.user + times.system)
                             rss += process_rss

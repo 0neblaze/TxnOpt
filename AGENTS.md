@@ -713,6 +713,14 @@ The executable workflow and gate table are maintained in
   identity is the sealed extension SHA-256 plus the captured runtime contract, never path equality.
   The v3 live screening path uses reusable precomputed typed definitions and occurrence rows;
   reintroducing per-decision dict normalization on that hot path is a performance regression.
+- Producer screening-definition collision state stores the full SHA-256 digest without retaining a
+  duplicate JSON payload; review/read stores retain the payload they must resolve. Exact-route
+  evaluation identities likewise remain in a bounded in-memory full-digest/payload store and spill
+  to shard-local SQLite only after the declared hard limit. Removing collision checks, making either
+  store unbounded, or returning to per-event SQLite identity queries is forbidden.
+- Process-tree resource identity includes only a process whose positive RSS and CPU times were both
+  captured in one successful sample. A half-sampled, zero-RSS, or already-exited transient process
+  is not measured worker evidence and must not be emitted with a fabricated zero peak.
 - Critical events are never dropped. Ordinary candidates, repeated timings, and
   operator totals may be aggregated into diagnostic Parquet only when replay
   semantics are unchanged. Route sequences are stored once in the route

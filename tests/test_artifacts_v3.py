@@ -81,10 +81,11 @@ def _screening_event(*, decision_id: int, started_at: float) -> dict[str, object
 
 def _pending_definition(value: int) -> artifacts_module._PendingScreeningDefinition:
     payload: dict[str, object] = {"value": value}
-    definition_id, encoded, _ = artifacts_module._screening_definition_identity(payload)
+    definition_id, encoded, digest = artifacts_module._screening_definition_identity(payload)
     return artifacts_module._PendingScreeningDefinition(
         definition_id=definition_id,
         encoded=encoded,
+        digest=digest,
         payload=payload,
         row=(definition_id, value),
     )
@@ -450,18 +451,219 @@ def test_screening_definition_store_spills_and_detects_disk_collisions(
         cache_entries=1,
         scratch_root=tmp_path,
     ) as store:
-        assert store.register_many(definitions) == frozenset(
-            definition.definition_id for definition in definitions
-        )
+        assert store.register_many(definitions) == definitions
         assert store.resolve(definitions[0].definition_id) == {"value": 0}
         forged = artifacts_module._PendingScreeningDefinition(  # noqa: SLF001
             definition_id=definitions[0].definition_id,
             encoded=b'{"value":999}',
+            digest=(definitions[0].digest[:8] + b"x" * 24),
             payload={"value": 999},
             row=(definitions[0].definition_id, 999),
         )
         with pytest.raises(ArtifactIntegrityError, match="ID collision"):
             store.register_many((forged,))
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_producer_screening_definition_store_retains_only_full_digests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        artifacts_module,
+        "SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES",
+        3,
+    )
+    definitions = tuple(_pending_definition(value) for value in range(3))
+    with artifacts_module._BoundedScreeningDefinitionStore(  # noqa: SLF001
+        cache_entries=1,
+        scratch_root=tmp_path,
+        retain_payload=False,
+    ) as store:
+        assert store.register_many(definitions) == definitions
+        assert store._connection is None  # noqa: SLF001
+        assert store._encoded_memory == {}  # noqa: SLF001
+        assert len(store._digest_memory) == 3  # noqa: SLF001
+        assert all(  # noqa: SLF001
+            isinstance(digest, bytes) and len(digest) == 32
+            for digest in store._digest_memory.values()  # noqa: SLF001
+        )
+        with pytest.raises(ArtifactIntegrityError, match="payload was not retained"):
+            store.resolve(definitions[0].definition_id)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_producer_screening_definition_store_spills_digest_without_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        artifacts_module,
+        "SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES",
+        1,
+    )
+    first, second = (_pending_definition(value) for value in range(2))
+    with artifacts_module._BoundedScreeningDefinitionStore(  # noqa: SLF001
+        cache_entries=1,
+        scratch_root=tmp_path,
+        retain_payload=False,
+    ) as store:
+        assert store.register_many((first, second)) == (first, second)
+        assert store._connection is not None  # noqa: SLF001
+        stored = store._connection.execute(  # noqa: SLF001
+            "SELECT digest, payload FROM definitions WHERE definition_id = ?",
+            (first.definition_id,),
+        ).fetchone()
+        assert stored is not None
+        assert bytes(stored[0]) == first.digest
+        assert stored[1] is None
+        assert store.register_many((first,)) == ()
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_unique_route_evaluation_identities_remain_in_bounded_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(artifacts_module, "UNIQUE_ROUTE_IDENTITY_MEMORY_ENTRIES", 3)
+    store = artifacts_module._DiskBackedRouteIdentityStore(  # noqa: SLF001
+        scratch_root=tmp_path,
+        memory_entries=1,
+    )
+    try:
+        for index in range(3):
+            assert store.register_unique_identity(
+                axis="fixed_work",
+                semantics="completed_shared",
+                identity=(f"route-{index}",),
+            )
+        assert not store._unique_identities_spilled  # noqa: SLF001
+        assert len(store._unique_identity_memory) == 3  # noqa: SLF001
+        assert store.unique_identity_count(
+            axis="fixed_work",
+            semantics="completed_shared",
+        ) == 3
+    finally:
+        store.close()
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_unique_route_evaluation_identities_spill_without_losing_deduplication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(artifacts_module, "UNIQUE_ROUTE_IDENTITY_MEMORY_ENTRIES", 1)
+    store = artifacts_module._DiskBackedRouteIdentityStore(  # noqa: SLF001
+        scratch_root=tmp_path,
+        memory_entries=1,
+    )
+    try:
+        assert store.register_unique_identity(
+            axis="wall_clock",
+            semantics="completed_shared",
+            identity=("route-a",),
+        )
+        assert store.register_unique_identity(
+            axis="wall_clock",
+            semantics="completed_shared",
+            identity=("route-b",),
+        )
+        assert store._unique_identities_spilled  # noqa: SLF001
+        assert not store.register_unique_identity(
+            axis="wall_clock",
+            semantics="completed_shared",
+            identity=("route-a",),
+        )
+        assert store.unique_identity_count(
+            axis="wall_clock",
+            semantics="completed_shared",
+        ) == 2
+    finally:
+        store.close()
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_unique_route_evaluation_identity_collision_fails_before_and_after_spill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        artifacts_module,
+        "hashlib",
+        SimpleNamespace(
+            sha256=lambda _payload: SimpleNamespace(digest=lambda: b"x" * 32)
+        ),
+    )
+    monkeypatch.setattr(artifacts_module, "UNIQUE_ROUTE_IDENTITY_MEMORY_ENTRIES", 1)
+    memory_store = artifacts_module._DiskBackedRouteIdentityStore(  # noqa: SLF001
+        scratch_root=tmp_path,
+        memory_entries=1,
+    )
+    try:
+        assert memory_store.register_unique_identity(
+            axis="fixed_work",
+            semantics="completed_shared",
+            identity=("route-a",),
+        )
+        with pytest.raises(ArtifactIntegrityError, match="SHA-256 collision"):
+            memory_store.register_unique_identity(
+                axis="fixed_work",
+                semantics="completed_shared",
+                identity=("route-b",),
+            )
+    finally:
+        memory_store.close()
+
+    disk_store = artifacts_module._DiskBackedRouteIdentityStore(  # noqa: SLF001
+        scratch_root=tmp_path,
+        memory_entries=1,
+    )
+    try:
+        assert disk_store.register_unique_identity(
+            axis="fixed_work",
+            semantics="completed_shared",
+            identity=("route-a",),
+        )
+        disk_store._spill_unique_identity_memory()  # noqa: SLF001
+        with pytest.raises(ArtifactIntegrityError, match="SHA-256 collision"):
+            disk_store.register_unique_identity(
+                axis="fixed_work",
+                semantics="completed_shared",
+                identity=("route-b",),
+            )
+    finally:
+        disk_store.close()
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_unique_route_evaluation_identity_namespace_bound_fails_fast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(artifacts_module, "ROUTE_IDENTITY_COUNTER_NAMESPACES", 1)
+    store = artifacts_module._DiskBackedRouteIdentityStore(  # noqa: SLF001
+        scratch_root=tmp_path,
+    )
+    try:
+        assert store.register_unique_identity(
+            axis="fixed_work",
+            semantics="completed_shared",
+            identity=("route-a",),
+        )
+        with pytest.raises(ArtifactIntegrityError, match="namespace bound exceeded"):
+            store.register_unique_identity(
+                axis="wall_clock",
+                semantics="completed_shared",
+                identity=("route-b",),
+            )
+    finally:
+        store.close()
 
     assert list(tmp_path.iterdir()) == []
 

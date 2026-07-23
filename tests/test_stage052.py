@@ -2805,6 +2805,49 @@ def test_process_tree_resource_summary_excludes_half_sampled_transient_child(
     assert transient.pid not in dict(summary.process_peak_rss_bytes)
 
 
+def test_process_tree_resource_summary_excludes_zero_rss_exited_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        def __init__(self, pid: int, rss: int) -> None:
+            self.pid = pid
+            self.rss = rss
+
+        def oneshot(self) -> FakeProcess:
+            return self
+
+        def __enter__(self) -> FakeProcess:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def memory_info(self) -> SimpleNamespace:
+            return SimpleNamespace(rss=self.rss)
+
+        def cpu_times(self) -> SimpleNamespace:
+            return SimpleNamespace(user=0.1, system=0.1)
+
+    sampler = ProcessTreeResourceSampler(
+        run_label="stage05.2_native_kernels_attempt99",
+        component="native_kernels",
+        configured_worker_count=4,
+        interval_seconds=0.01,
+    )
+    parent = FakeProcess(sampler.parent_pid, 1024)
+    exited = FakeProcess(999_998, 0)
+    monkeypatch.setattr(sampler, "_processes", lambda: [parent, exited])
+
+    sampler.start()
+    time.sleep(0.03)
+    summary = sampler.stop()
+
+    assert summary.sample_count >= 1
+    assert parent.pid in dict(summary.process_peak_rss_bytes)
+    assert exited.pid not in summary.descendant_pids
+    assert exited.pid not in dict(summary.process_peak_rss_bytes)
+
+
 def test_worker_ownership_requires_actual_sampled_pids() -> None:
     resource = {
         "schema_version": "stage05.2-run-resource-v2",

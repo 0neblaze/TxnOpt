@@ -42,8 +42,17 @@ SUPPORTED_SCREENING_SCHEMAS = frozenset(
 V2_PARQUET_ROW_GROUP_SIZE = 65_536
 ROUTE_IDENTITY_HOT_CACHE_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
 ROUTE_IDENTITY_MEMORY_ENTRIES = 262_144
+# Exact-route evaluation identities are independent of the route dictionary.
+# Formal Stage 5.2 shards contain far fewer identities than this bound, so keep
+# their full SHA-256 collision proof in memory and spill only oversized shards.
+UNIQUE_ROUTE_IDENTITY_MEMORY_ENTRIES = 262_144
 ROUTE_ID_RESOLUTION_CACHE_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
 SCREENING_DEFINITION_HOT_CACHE_ENTRIES = 524_288
+# A producer needs only the full SHA-256 collision token because the canonical
+# definition payload is already written to Parquet.  Keeping the token, rather
+# than a second JSON copy, permits the largest Stage 5.2 shard to remain in
+# bounded memory without entering the SQLite spill path.
+SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES = 1_200_000
 ROUTE_IDENTITY_COUNTER_NAMESPACES = 16
 MAX_SCREENING_CHECKS_PER_DECISION = 8
 # Keep live definition/occurrence transactions below one 65,536-row Parquet
@@ -1396,6 +1405,7 @@ _PrecomputedScreeningDefinition = PrecomputedScreeningDefinition
 class _PendingScreeningDefinition:
     definition_id: int
     encoded: bytes
+    digest: bytes
     payload: dict[str, object]
     row: tuple[object, ...]
 
@@ -1535,17 +1545,23 @@ def _normalise_screening_definition(
     }
 
 
-def _screening_definition_identity(definition: Mapping[str, object]) -> tuple[int, bytes, str]:
+def _screening_definition_identity(definition: Mapping[str, object]) -> tuple[int, bytes, bytes]:
     definition_json = orjson.dumps(definition, option=orjson.OPT_SORT_KEYS)
     digest = hashlib.sha256(definition_json).digest()
     definition_id = int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
-    return definition_id, definition_json, digest.hex()
+    return definition_id, definition_json, digest
 
 
 class _BoundedScreeningDefinitionStore:
     """Exact bounded definition identity store with fail-fast disk spill."""
 
-    def __init__(self, *, cache_entries: int, scratch_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        cache_entries: int,
+        scratch_root: Path | None = None,
+        retain_payload: bool = True,
+    ) -> None:
         if cache_entries <= 0:
             raise ValueError("definition cache_entries must be positive")
         if scratch_root is not None:
@@ -1556,8 +1572,14 @@ class _BoundedScreeningDefinitionStore:
             dir=scratch_root,
         )
         self._connection: sqlite3.Connection | None = None
+        self._retain_payload = retain_payload
+        self._digest_memory: dict[int, bytes] = {}
         self._encoded_memory: dict[int, bytes] = {}
-        self._encoded_memory_entries = SCREENING_DEFINITION_HOT_CACHE_ENTRIES
+        self._memory_entries = (
+            SCREENING_DEFINITION_HOT_CACHE_ENTRIES
+            if retain_payload
+            else SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES
+        )
         self._cache_entries = cache_entries
         self._cache: OrderedDict[int, dict[str, object]] = OrderedDict()
         self._closed = False
@@ -1582,69 +1604,90 @@ class _BoundedScreeningDefinitionStore:
         encoded: bytes | None = None,
     ) -> bool:
         if encoded is None:
-            expected_id, encoded, _ = _screening_definition_identity(definition)
+            expected_id, encoded, digest = _screening_definition_identity(definition)
         else:
             digest = hashlib.sha256(encoded).digest()
             expected_id = int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
         if expected_id != definition_id:
             raise ArtifactIntegrityError("screening definition hash mismatch")
         if self._connection is None:
-            existing_payload = self._encoded_memory.get(definition_id)
-            if existing_payload is not None:
-                if existing_payload != encoded:
+            existing_digest = self._digest_memory.get(definition_id)
+            if existing_digest is not None:
+                if existing_digest != digest:
                     raise ArtifactIntegrityError("screening definition ID collision")
                 if not allow_identical_existing:
                     raise ArtifactIntegrityError("duplicate screening definition ID")
-                self._remember(definition_id, dict(definition))
+                if self._retain_payload:
+                    self._remember(definition_id, dict(definition))
                 return False
-            if len(self._encoded_memory) < self._encoded_memory_entries:
-                self._encoded_memory[definition_id] = encoded
-                self._remember(definition_id, dict(definition))
+            if len(self._digest_memory) < self._memory_entries:
+                self._digest_memory[definition_id] = digest
+                if self._retain_payload:
+                    self._encoded_memory[definition_id] = encoded
+                    self._remember(definition_id, dict(definition))
                 return True
             self._spill_encoded_memory()
         connection = self._require_connection()
         inserted = (
             connection.execute(
-                "INSERT OR IGNORE INTO definitions(definition_id, payload) VALUES (?, ?)",
-                (definition_id, encoded),
+                "INSERT OR IGNORE INTO definitions(definition_id, digest, payload) "
+                "VALUES (?, ?, ?)",
+                (definition_id, digest, encoded if self._retain_payload else None),
             ).rowcount
             == 1
         )
         if not inserted:
             existing = connection.execute(
-                "SELECT payload FROM definitions WHERE definition_id = ?",
+                "SELECT digest FROM definitions WHERE definition_id = ?",
                 (definition_id,),
             ).fetchone()
             if existing is None:
                 raise ArtifactIntegrityError("screening definition insert was not observable")
-            existing_payload = bytes(existing[0])
-            if existing_payload != encoded:
+            if bytes(existing[0]) != digest:
                 raise ArtifactIntegrityError("screening definition ID collision")
             if not allow_identical_existing:
                 raise ArtifactIntegrityError("duplicate screening definition ID")
-        self._remember(definition_id, dict(definition))
+        if self._retain_payload:
+            self._remember(definition_id, dict(definition))
         return inserted
 
     def register_many(
         self,
         definitions: Sequence[_PendingScreeningDefinition],
-    ) -> frozenset[int]:
+    ) -> tuple[_PendingScreeningDefinition, ...]:
         """Register one bounded transaction with batched collision checks."""
+
+        if (
+            self._connection is None
+            and len(self._digest_memory) + len(definitions) <= self._memory_entries
+        ):
+            inserted_fast: list[_PendingScreeningDefinition] = []
+            for definition in definitions:
+                existing_digest = self._digest_memory.get(definition.definition_id)
+                if existing_digest is not None:
+                    if existing_digest != definition.digest:
+                        raise ArtifactIntegrityError("screening definition ID collision")
+                    continue
+                self._digest_memory[definition.definition_id] = definition.digest
+                if self._retain_payload:
+                    self._encoded_memory[definition.definition_id] = definition.encoded
+                inserted_fast.append(definition)
+            return tuple(inserted_fast)
 
         unique: dict[int, _PendingScreeningDefinition] = {}
         for definition in definitions:
             previous = unique.get(definition.definition_id)
-            if previous is not None and previous.encoded != definition.encoded:
+            if previous is not None and previous.digest != definition.digest:
                 raise ArtifactIntegrityError("screening definition ID collision")
             unique[definition.definition_id] = definition
         if self._connection is None:
             existing_memory = {
-                definition_id: self._encoded_memory[definition_id]
+                definition_id: self._digest_memory[definition_id]
                 for definition_id in unique
-                if definition_id in self._encoded_memory
+                if definition_id in self._digest_memory
             }
-            for definition_id, payload in existing_memory.items():
-                if payload != unique[definition_id].encoded:
+            for definition_id, digest in existing_memory.items():
+                if digest != unique[definition_id].digest:
                     raise ArtifactIntegrityError("screening definition ID collision")
             inserted_memory = tuple(
                 definition
@@ -1652,18 +1695,23 @@ class _BoundedScreeningDefinitionStore:
                 if definition_id not in existing_memory
             )
             if (
-                len(self._encoded_memory) + len(inserted_memory)
-                <= self._encoded_memory_entries
+                len(self._digest_memory) + len(inserted_memory)
+                <= self._memory_entries
             ):
-                self._encoded_memory.update(
+                self._digest_memory.update(
                     {
-                        definition.definition_id: definition.encoded
+                        definition.definition_id: definition.digest
                         for definition in inserted_memory
                     }
                 )
-                return frozenset(
-                    definition.definition_id for definition in inserted_memory
-                )
+                if self._retain_payload:
+                    self._encoded_memory.update(
+                        {
+                            definition.definition_id: definition.encoded
+                            for definition in inserted_memory
+                        }
+                    )
+                return inserted_memory
             self._spill_encoded_memory()
         connection = self._require_connection()
         existing: dict[int, bytes] = {}
@@ -1671,14 +1719,14 @@ class _BoundedScreeningDefinitionStore:
         for offset in range(0, len(identifiers), 900):
             chunk = identifiers[offset : offset + 900]
             placeholders = ",".join("?" for _ in chunk)
-            for definition_id, payload in connection.execute(
-                f"SELECT definition_id, payload FROM definitions "  # noqa: S608
+            for definition_id, digest in connection.execute(
+                f"SELECT definition_id, digest FROM definitions "  # noqa: S608
                 f"WHERE definition_id IN ({placeholders})",
                 chunk,
             ):
-                existing[int(definition_id)] = bytes(payload)
-        for definition_id, payload in existing.items():
-            if payload != unique[definition_id].encoded:
+                existing[int(definition_id)] = bytes(digest)
+        for definition_id, digest in existing.items():
+            if digest != unique[definition_id].digest:
                 raise ArtifactIntegrityError("screening definition ID collision")
         inserted = tuple(
             definition
@@ -1687,15 +1735,19 @@ class _BoundedScreeningDefinitionStore:
         )
         try:
             connection.executemany(
-                "INSERT INTO definitions(definition_id, payload) VALUES (?, ?)",
+                "INSERT INTO definitions(definition_id, digest, payload) VALUES (?, ?, ?)",
                 (
-                    (definition.definition_id, definition.encoded)
+                    (
+                        definition.definition_id,
+                        definition.digest,
+                        definition.encoded if self._retain_payload else None,
+                    )
                     for definition in inserted
                 ),
             )
         except sqlite3.IntegrityError as error:
             raise ArtifactIntegrityError("screening definition batch insert failed") from error
-        return frozenset(definition.definition_id for definition in inserted)
+        return inserted
 
     def resolve(self, definition_id: int) -> dict[str, object]:
         cached = self._cache.get(definition_id)
@@ -1705,6 +1757,8 @@ class _BoundedScreeningDefinitionStore:
         encoded = self._encoded_memory.get(definition_id)
         if encoded is not None:
             stored_payload = encoded
+        elif definition_id in self._digest_memory:
+            raise ArtifactIntegrityError("screening definition payload was not retained")
         else:
             connection = self._connection
             if connection is None:
@@ -1719,6 +1773,8 @@ class _BoundedScreeningDefinitionStore:
                 raise ArtifactIntegrityError(
                     "screening row references an unknown definition"
                 )
+            if stored[0] is None:
+                raise ArtifactIntegrityError("screening definition payload was not retained")
             stored_payload = bytes(stored[0])
         try:
             decoded = orjson.loads(stored_payload)
@@ -1736,6 +1792,7 @@ class _BoundedScreeningDefinitionStore:
         if self._connection is not None:
             self._connection.close()
         self._temporary_directory.cleanup()
+        self._digest_memory.clear()
         self._encoded_memory.clear()
         self._cache.clear()
         self._closed = True
@@ -1757,16 +1814,24 @@ class _BoundedScreeningDefinitionStore:
             connection.execute("PRAGMA cache_size=-2048")
             connection.execute(
                 "CREATE TABLE definitions "
-                "(definition_id INTEGER PRIMARY KEY, payload BLOB NOT NULL)"
+                "(definition_id INTEGER PRIMARY KEY, digest BLOB NOT NULL, payload BLOB)"
             )
             connection.executemany(
-                "INSERT INTO definitions(definition_id, payload) VALUES (?, ?)",
-                self._encoded_memory.items(),
+                "INSERT INTO definitions(definition_id, digest, payload) VALUES (?, ?, ?)",
+                (
+                    (
+                        definition_id,
+                        digest,
+                        self._encoded_memory.get(definition_id),
+                    )
+                    for definition_id, digest in self._digest_memory.items()
+                ),
             )
         except BaseException:
             connection.close()
             raise
         self._connection = connection
+        self._digest_memory.clear()
         self._encoded_memory.clear()
 
     def _require_connection(self) -> sqlite3.Connection:
@@ -4244,6 +4309,8 @@ class _DiskBackedRouteIdentityStore(Mapping[int, str]):
         self._routes_spilled = False
         self._route_cache: OrderedDict[int, str] = OrderedDict()
         self._unique_counts: Counter[tuple[str, str]] = Counter()
+        self._unique_identity_memory: dict[tuple[str, str, bytes], bytes] = {}
+        self._unique_identities_spilled = False
         self._route_count = 0
         self._closed = False
 
@@ -4253,13 +4320,19 @@ class _DiskBackedRouteIdentityStore(Mapping[int, str]):
 
     @property
     def hot_entries(self) -> int:
-        return len(self._route_memory) + len(self._route_cache) + len(self._unique_counts)
+        return (
+            len(self._route_memory)
+            + len(self._route_cache)
+            + len(self._unique_identity_memory)
+            + len(self._unique_counts)
+        )
 
     @property
     def hot_entry_limit(self) -> int:
         return (
             self._memory_entries
             + self._cache_entries
+            + UNIQUE_ROUTE_IDENTITY_MEMORY_ENTRIES
             + ROUTE_IDENTITY_COUNTER_NAMESPACES
         )
 
@@ -4306,6 +4379,24 @@ class _DiskBackedRouteIdentityStore(Mapping[int, str]):
             raise ValueError(f"unsupported unique route identity semantics: {semantics}")
         encoded = orjson.dumps(identity)
         digest = hashlib.sha256(encoded).digest()
+        namespace = (axis, semantics)
+        if (
+            namespace not in self._unique_counts
+            and len(self._unique_counts) >= ROUTE_IDENTITY_COUNTER_NAMESPACES
+        ):
+            raise ArtifactIntegrityError("unique route identity counter namespace bound exceeded")
+        if not self._unique_identities_spilled:
+            memory_key = (axis, semantics, digest)
+            existing_payload = self._unique_identity_memory.get(memory_key)
+            if existing_payload is not None:
+                if existing_payload != encoded:
+                    raise ArtifactIntegrityError("unique route identity SHA-256 collision")
+                return False
+            if len(self._unique_identity_memory) < UNIQUE_ROUTE_IDENTITY_MEMORY_ENTRIES:
+                self._unique_identity_memory[memory_key] = encoded
+                self._unique_counts[namespace] += 1
+                return True
+            self._spill_unique_identity_memory()
         existing = self._connection.execute(
             "SELECT payload FROM unique_identities "
             "WHERE axis = ? AND semantics = ? AND identity_digest = ?",
@@ -4315,12 +4406,6 @@ class _DiskBackedRouteIdentityStore(Mapping[int, str]):
             if bytes(existing[0]) != encoded:
                 raise ArtifactIntegrityError("unique route identity SHA-256 collision")
             return False
-        namespace = (axis, semantics)
-        if (
-            namespace not in self._unique_counts
-            and len(self._unique_counts) >= ROUTE_IDENTITY_COUNTER_NAMESPACES
-        ):
-            raise ArtifactIntegrityError("unique route identity counter namespace bound exceeded")
         self._connection.execute(
             "INSERT INTO unique_identities(axis, semantics, identity_digest, payload) "
             "VALUES (?, ?, ?, ?)",
@@ -4339,6 +4424,7 @@ class _DiskBackedRouteIdentityStore(Mapping[int, str]):
         self._temporary_directory.cleanup()
         self._route_memory.clear()
         self._route_cache.clear()
+        self._unique_identity_memory.clear()
         self._closed = True
 
     def __getitem__(self, route_id: int) -> str:
@@ -4390,6 +4476,20 @@ class _DiskBackedRouteIdentityStore(Mapping[int, str]):
         )
         self._route_memory.clear()
         self._routes_spilled = True
+
+    def _spill_unique_identity_memory(self) -> None:
+        if self._unique_identities_spilled:
+            return
+        self._connection.executemany(
+            "INSERT INTO unique_identities(axis, semantics, identity_digest, payload) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                (axis, semantics, digest, payload)
+                for (axis, semantics, digest), payload in self._unique_identity_memory.items()
+            ),
+        )
+        self._unique_identity_memory.clear()
+        self._unique_identities_spilled = True
 
 
 class ArtifactV2ShardSession:
@@ -4465,7 +4565,7 @@ class ArtifactV2ShardSession:
         self._lane_ids: dict[str, int] = {}
         self._operator_ids: dict[str, int] = {}
         self._screening_definition_cache: dict[
-            tuple[object, ...], tuple[object, int, bytes, str]
+            tuple[object, ...], tuple[object, int]
         ] = {}
         self._neighborhood_extras_cache: dict[tuple[object, ...], str] = {}
         self._neighborhood_row_cache: dict[
@@ -4521,11 +4621,9 @@ class ArtifactV2ShardSession:
             if candidates:
                 if self._screening_definition_store is None:
                     raise RuntimeError("screening definition store is unavailable")
-                inserted_ids = self._screening_definition_store.register_many(candidates)
+                inserted = self._screening_definition_store.register_many(candidates)
                 definitions = tuple(
-                    candidate.row
-                    for candidate in candidates
-                    if candidate.definition_id in inserted_ids
+                    candidate.row for candidate in inserted
                 )
                 self._append_buffered_value_rows(
                     self._screening_definitions_sink,
@@ -4731,8 +4829,6 @@ class ArtifactV2ShardSession:
         self._screening_definition_cache[cache_key] = (
             precomputed,
             definition_id,
-            definition_json,
-            definition_digest,
         )
         if len(self._screening_definition_cache) > SCREENING_DEFINITION_HOT_CACHE_ENTRIES:
             self._screening_definition_cache.pop(next(iter(self._screening_definition_cache)))
@@ -4740,10 +4836,12 @@ class ArtifactV2ShardSession:
             self._screening_definition_store = _BoundedScreeningDefinitionStore(
                 cache_entries=1,
                 scratch_root=self._directory,
+                retain_payload=False,
             )
         pending = _PendingScreeningDefinition(
             definition_id=definition_id,
             encoded=definition_json,
+            digest=definition_digest,
             payload=definition,
             row=(
                 definition_id,
@@ -4793,6 +4891,7 @@ class ArtifactV2ShardSession:
             self._screening_definition_store = _BoundedScreeningDefinitionStore(
                 cache_entries=1,
                 scratch_root=self._directory,
+                retain_payload=False,
             )
         occurrence_fields = [field.name for field in V3_SCREENING_OCCURRENCES_SCHEMA]
         for batch in screening_decision_batches:
@@ -5145,10 +5244,11 @@ class ArtifactV2ShardSession:
         )
         cache_key = definition_key
         cached_entry = self._screening_definition_cache.get(definition_key)
-        cached = cached_entry[1:] if cached_entry is not None else None
         first_occurrence = False
         definition: dict[str, object] | None = None
-        if cached is None:
+        definition_json = b""
+        definition_digest = b""
+        if cached_entry is None:
             if route_id is not None and route_id not in self._route_digests:
                 self._register_route(route_key, _route_sequence_from_key(route_key))
             definition = _normalise_screening_definition(
@@ -5160,14 +5260,9 @@ class ArtifactV2ShardSession:
             definition_id, definition_json, definition_digest = _screening_definition_identity(
                 definition
             )
-            cached = (
-                definition_id,
-                definition_json,
-                definition_digest,
-            )
             self._screening_definition_cache[cache_key] = (
                 None,
-                *cached,
+                definition_id,
             )
             if (
                 len(self._screening_definition_cache)
@@ -5178,6 +5273,7 @@ class ArtifactV2ShardSession:
                 self._screening_definition_store = _BoundedScreeningDefinitionStore(
                     cache_entries=1,
                     scratch_root=self._directory,
+                    retain_payload=False,
                 )
             if self._screening_sink is not None:
                 first_occurrence = self._screening_definition_store.register(
@@ -5186,11 +5282,13 @@ class ArtifactV2ShardSession:
                     allow_identical_existing=True,
                     encoded=definition_json,
                 )
-        definition_id, definition_json, _ = cached
+        else:
+            definition_id = cached_entry[1]
         definition_row = (
             _PendingScreeningDefinition(
                 definition_id=definition_id,
                 encoded=definition_json,
+                digest=definition_digest,
                 payload=definition,
                 row=(
                     definition_id,
