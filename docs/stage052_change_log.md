@@ -8,6 +8,37 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-24：F11 通过、G11/G12 保留失败并复用 negative-result identity
+
+- clean revision `9d72dd9` 上的 `stage05.2_accelerator_pilot_attempt11` 已由独立
+  transient service replay 通过，状态为 `READY_FOR_STAGE052_BENCHMARK`。raw/review
+  manifest SHA-256 分别为
+  `c9bf0a675e8bd8213c9d08620eadfc55af110da1ed3620c87078a2b89318da85`
+  和 `be52182cacb8d53b0ccb16df7052171e6c164a5e12a3183f7865240332b06967`；
+  cgroup、冻结 wheel/native identity 与 raw before/after 均通过。
+- `stage05.2_benchmark_attempt11` 的 batch0001 ratio 为
+  `0.32809368818248325`，随后 batch0002 因主机 `load1` 超过 formal guard `4.0`
+  fail fast。该环境失败 identity 保留，不归类为 persistence 失败，也不复用 label。
+- `stage05.2_benchmark_attempt12` 的 batch0001/0002 ratio 分别为
+  `0.31947982337183994` 和 `0.3026241963675267`；batch0003 以
+  `0.383628973309216` 被 36% hard gate 拒绝。失败 batch 的 solver 为
+  `198.560791860` 秒，shard persistence 为 `123.576862186` 秒，control
+  persistence 为 `0.007260724` 秒。G12 保持不可变，不进入独立 campaign review
+  或 Formal。
+- 剖析确认 100-customer screening occurrence 中约 85%--91% 是 negative-cache hit。
+  ALNS 对同一路由返回同一个仍存活的 frozen `ScreeningResult`，但旧路径每次重新构造
+  固定 cache-hit check，并让 writer 对同一 12-field evidence 重做完整 typed
+  signature。当前实现复用唯一 immutable check tuple，并把 `id(result)` 作为仅限
+  producer 进程内的 positive integer token。typed sink 用有界 262,144-entry
+  `route_key -> token` map 验证身份稳定；变化立即 fail fast。manual/legacy rows 仍走
+  完整字段、typed signature 与 collision check。
+- 该 token 不写入 Parquet、definition identity、batch ledger、semantic digest 或
+  review products；首次 occurrence 仍从完整 evidence 生成 canonical definition，
+  reviewer 仍从 raw rows 独立重放全部语义。代表性单 shard probes 在 24 个 batch 下
+  将 `r101_21/2014` ratio 从约 `0.3987` 降至 `0.3052`；`c101_21/2014` 和
+  `rc101_21/2014` 分别为约 `0.2855`、`0.3482`。probe 不是晋级证据；后续必须在新
+  clean revision 上重新执行 F 与完整 G producer/reviewer chain。
+
 ## 2026-07-24：G pilot attempt10 保留失败并修复稀疏 definition buffer rotation
 
 - clean revision `fe35cd9` 上的 `stage05.2_accelerator_pilot_attempt10` 已由独立

@@ -726,6 +726,13 @@ The executable workflow and gate table are maintained in
   Canonical typed signatures distinguish booleans from numerics and preserve IEEE-754 signed zero;
   negative-evidence drift uses the same signature. Probabilistic hash-only identity, unbounded cache
   growth, Python-loose numeric equality, or collision aliasing is forbidden.
+  The typed producer may bind a negative-cache occurrence to the positive integer identity of the
+  still-live frozen `ScreeningResult` returned by ALNS. The sink must maintain a bounded
+  route-key-to-token consistency map and fail fast if one route changes token. This process-local
+  accelerator is never persisted and is excluded from definition identity, event tokens, semantic
+  digests, and replay. Only the trusted typed path may use it; manual and legacy rows continue through
+  the complete field/signature collision check. The fixed negative-cache-hit check tuple is reused
+  as one immutable value rather than reconstructed per occurrence.
   Sparse screening-definition transactions are persisted immediately after collision-store
   registration and do not enter the two-buffer high-volume working set. The two bounded non-empty
   Parquet buffers remain available to occurrence and event streams so a sparse definition sink

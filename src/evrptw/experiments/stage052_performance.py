@@ -3743,6 +3743,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._neighborhood_spool_path: Path | None = None
         self._neighborhood_read_offset = 0
         self._legacy_negative_screening_evidence: dict[str, tuple[object, ...]] = {}
+        self._typed_negative_screening_evidence: dict[str, int] = {}
         self._semantic_event_digest = hashlib.sha256()
         self._initial_objective_key: ObjectiveKey | None = None
         self._visible_global_bests: dict[int, AcceptedGlobalBest] = {}
@@ -3766,6 +3767,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._async_appender = (
             _BoundedShardAppender(shard, self._persistence_meter) if async_persistence else None
         )
+        self._producer_turn_thread_id: int | None = None
 
     def append_route_evaluation(self, record: RouteEvaluationTrace) -> None:
         self._begin_async_producer_turn()
@@ -3882,6 +3884,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         single_segment_reachable: bool,
         structural_energy_lower_bound: float,
         checks: tuple[ScreeningCheckTrace, ...],
+        negative_evidence_token: int | None = None,
     ) -> None:
         """Append normalized screening fields without a transient decision object."""
 
@@ -3892,6 +3895,34 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             if self._buffered_screening_v3:
                 if self._pending_cache_lookup is not None:
                     self._flush_pending_lookup()
+                if negative_cache_hit:
+                    if negative_evidence_token is None:
+                        negative_evidence_marker: object = True
+                    else:
+                        if (
+                            isinstance(negative_evidence_token, bool)
+                            or negative_evidence_token <= 0
+                        ):
+                            raise RuntimeError(
+                                "negative screening evidence token must be a positive integer"
+                            )
+                        cached_token = self._typed_negative_screening_evidence.get(route_key)
+                        if cached_token is None:
+                            self._typed_negative_screening_evidence[route_key] = (
+                                negative_evidence_token
+                            )
+                        elif cached_token != negative_evidence_token:
+                            raise RuntimeError(
+                                "negative screening cache returned inconsistent evidence "
+                                "identity for one route"
+                            )
+                        if len(self._typed_negative_screening_evidence) > 262_144:
+                            self._typed_negative_screening_evidence.pop(
+                                next(iter(self._typed_negative_screening_evidence))
+                            )
+                        negative_evidence_marker = negative_evidence_token
+                else:
+                    negative_evidence_marker = None
                 self._event_buffer.append(
                     DeferredScreeningDecision(
                         self.axis_name,
@@ -3915,7 +3946,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                             single_segment_reachable,
                             structural_energy_lower_bound,
                             checks,
-                            True if negative_cache_hit else None,
+                            negative_evidence_marker,
                         ),
                     )
                 )
@@ -4135,17 +4166,32 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
     def _wait_for_async_writer(self) -> None:
         self._flush_serialized_producer_meter()
         if self._async_appender is not None:
-            self._async_appender.wait_for_writer_turn()
+            try:
+                self._async_appender.wait_for_writer_turn()
+            finally:
+                self._producer_turn_thread_id = None
 
     def _begin_async_producer_turn(self) -> None:
-        if self._async_appender is not None:
-            self._async_appender.begin_producer_turn()
+        if self._async_appender is None:
+            return
+        thread_id = threading.get_ident()
+        if self._producer_turn_thread_id is not None:
+            if self._producer_turn_thread_id != thread_id:
+                raise RuntimeError("Stage 5.2 trace producer thread changed")
+            return
+        self._async_appender.begin_producer_turn()
+        self._producer_turn_thread_id = thread_id
 
     def _end_async_producer_turn(self) -> None:
-        if self._async_appender is not None:
-            if self._async_appender.producer_turn_submitted_batch:
-                self._flush_serialized_producer_meter()
-            self._async_appender.end_producer_turn()
+        if (
+            self._async_appender is not None
+            and self._async_appender.producer_turn_submitted_batch
+        ):
+            self._flush_serialized_producer_meter()
+            try:
+                self._async_appender.end_producer_turn()
+            finally:
+                self._producer_turn_thread_id = None
 
     def _record_serialized_producer(self, elapsed_nanoseconds: int) -> None:
         self._pending_serialized_producer_nanoseconds += elapsed_nanoseconds

@@ -631,12 +631,14 @@ py::tuple pack_stage052_screening_occurrences(
                     throw std::invalid_argument(
                         "Stage 5.2 native negative evidence cache is invalid");
                 }
+                bool all_evidence_fields_identical = true;
                 for (py::ssize_t index = 0; index < 12; ++index) {
                     PyObject* previous = PyTuple_GET_ITEM(cached_evidence, index);
                     PyObject* current = values[7 + index].ptr();
                     if (previous == current) {
                         continue;
                     }
+                    all_evidence_fields_identical = false;
                     const int equal = PyObject_RichCompareBool(previous, current, Py_EQ);
                     if (equal < 0) {
                         throw py::error_already_set();
@@ -646,21 +648,23 @@ py::tuple pack_stage052_screening_occurrences(
                             "negative screening cache returned inconsistent evidence for one route");
                     }
                 }
-                std::array<PyObject*, 16> previous_fields{};
-                std::array<PyObject*, 16> current_fields{};
-                for (py::ssize_t index = 0; index < 12; ++index) {
-                    previous_fields[4 + index] =
-                        PyTuple_GET_ITEM(cached_evidence, index);
-                    current_fields[4 + index] = values[7 + index].ptr();
-                }
-                const Stage052CanonicalSignature previous_signature =
-                    stage052_screening_key_signature(previous_fields, 16);
-                const Stage052CanonicalSignature current_signature =
-                    stage052_screening_key_signature(current_fields, 16);
-                if (!stage052_signature_equal(
-                        previous_signature, current_signature)) {
-                    throw std::invalid_argument(
-                        "negative screening cache returned inconsistent evidence for one route");
+                if (!all_evidence_fields_identical) {
+                    std::array<PyObject*, 16> previous_fields{};
+                    std::array<PyObject*, 16> current_fields{};
+                    for (py::ssize_t index = 0; index < 12; ++index) {
+                        previous_fields[4 + index] =
+                            PyTuple_GET_ITEM(cached_evidence, index);
+                        current_fields[4 + index] = values[7 + index].ptr();
+                    }
+                    const Stage052CanonicalSignature previous_signature =
+                        stage052_screening_key_signature(previous_fields, 16);
+                    const Stage052CanonicalSignature current_signature =
+                        stage052_screening_key_signature(current_fields, 16);
+                    if (!stage052_signature_equal(
+                            previous_signature, current_signature)) {
+                        throw std::invalid_argument(
+                            "negative screening cache returned inconsistent evidence for one route");
+                    }
                 }
             }
             key[4] = values[19];
@@ -799,57 +803,76 @@ py::tuple pack_stage052_screening_transactions(
         occurrence_key_fields[3] = values[4].ptr();
         py::ssize_t occurrence_key_field_count = 16;
         if (values[15].ptr() == Py_True && !values[19].is_none()) {
-            PyObject* cached_evidence =
-                PyDict_GetItemWithError(negative_evidence_cache.ptr(), values[1].ptr());
-            if (cached_evidence == nullptr) {
-                if (PyErr_Occurred()) {
+            bool trusted_producer_token = false;
+            if (PyLong_Check(values[19].ptr()) && !PyBool_Check(values[19].ptr())) {
+                const unsigned long long token =
+                    PyLong_AsUnsignedLongLong(values[19].ptr());
+                if (token == static_cast<unsigned long long>(-1)
+                    && PyErr_Occurred()) {
                     throw py::error_already_set();
                 }
-                if (py::len(negative_evidence_cache) >= 262144) {
+                if (token == 0) {
                     throw std::invalid_argument(
-                        "Stage 5.2 native negative evidence cache exceeds its hard limit");
+                        "Stage 5.2 negative evidence token must be positive");
                 }
-                py::tuple evidence(12);
-                for (py::ssize_t index = 0; index < 12; ++index) {
-                    evidence[index] = values[7 + index];
-                }
-                negative_evidence_cache[values[1]] = std::move(evidence);
-            } else {
-                if (!PyTuple_Check(cached_evidence)
-                    || PyTuple_GET_SIZE(cached_evidence) != 12) {
-                    throw std::invalid_argument(
-                        "Stage 5.2 native negative evidence cache is invalid");
-                }
-                for (py::ssize_t index = 0; index < 12; ++index) {
-                    PyObject* previous = PyTuple_GET_ITEM(cached_evidence, index);
-                    PyObject* current = values[7 + index].ptr();
-                    if (previous == current) {
-                        continue;
-                    }
-                    const int equal = PyObject_RichCompareBool(previous, current, Py_EQ);
-                    if (equal < 0) {
+                trusted_producer_token = true;
+            }
+            if (!trusted_producer_token) {
+                PyObject* cached_evidence =
+                    PyDict_GetItemWithError(negative_evidence_cache.ptr(), values[1].ptr());
+                if (cached_evidence == nullptr) {
+                    if (PyErr_Occurred()) {
                         throw py::error_already_set();
                     }
-                    if (equal == 0) {
+                    if (py::len(negative_evidence_cache) >= 262144) {
                         throw std::invalid_argument(
-                            "negative screening cache returned inconsistent evidence for one route");
+                            "Stage 5.2 native negative evidence cache exceeds its hard limit");
                     }
-                }
-                std::array<PyObject*, 16> previous_fields{};
-                std::array<PyObject*, 16> current_fields{};
-                for (py::ssize_t index = 0; index < 12; ++index) {
-                    previous_fields[4 + index] =
-                        PyTuple_GET_ITEM(cached_evidence, index);
-                    current_fields[4 + index] = values[7 + index].ptr();
-                }
-                const Stage052CanonicalSignature previous_signature =
-                    stage052_screening_key_signature(previous_fields, 16);
-                const Stage052CanonicalSignature current_signature =
-                    stage052_screening_key_signature(current_fields, 16);
-                if (!stage052_signature_equal(
-                        previous_signature, current_signature)) {
-                    throw std::invalid_argument(
-                        "negative screening cache returned inconsistent evidence for one route");
+                    py::tuple evidence(12);
+                    for (py::ssize_t index = 0; index < 12; ++index) {
+                        evidence[index] = values[7 + index];
+                    }
+                    negative_evidence_cache[values[1]] = std::move(evidence);
+                } else {
+                    if (!PyTuple_Check(cached_evidence)
+                        || PyTuple_GET_SIZE(cached_evidence) != 12) {
+                        throw std::invalid_argument(
+                            "Stage 5.2 native negative evidence cache is invalid");
+                    }
+                    for (py::ssize_t index = 0; index < 12; ++index) {
+                        PyObject* previous = PyTuple_GET_ITEM(cached_evidence, index);
+                        PyObject* current = values[7 + index].ptr();
+                        if (previous == current) {
+                            continue;
+                        }
+                        const int equal =
+                            PyObject_RichCompareBool(previous, current, Py_EQ);
+                        if (equal < 0) {
+                            throw py::error_already_set();
+                        }
+                        if (equal == 0) {
+                            throw std::invalid_argument(
+                                "negative screening cache returned inconsistent evidence "
+                                "for one route");
+                        }
+                    }
+                    std::array<PyObject*, 16> previous_fields{};
+                    std::array<PyObject*, 16> current_fields{};
+                    for (py::ssize_t index = 0; index < 12; ++index) {
+                        previous_fields[4 + index] =
+                            PyTuple_GET_ITEM(cached_evidence, index);
+                        current_fields[4 + index] = values[7 + index].ptr();
+                    }
+                    const Stage052CanonicalSignature previous_signature =
+                        stage052_screening_key_signature(previous_fields, 16);
+                    const Stage052CanonicalSignature current_signature =
+                        stage052_screening_key_signature(current_fields, 16);
+                    if (!stage052_signature_equal(
+                            previous_signature, current_signature)) {
+                        throw std::invalid_argument(
+                            "negative screening cache returned inconsistent evidence "
+                            "for one route");
+                    }
                 }
             }
             occurrence_key_fields[4] = values[19].ptr();

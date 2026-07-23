@@ -92,16 +92,19 @@ def test_negative_screening_cache_blocks_exact_and_records_independent_hits() ->
 
     first = evaluator.route(("C2",))
     second = evaluator.route(("C2",))
+    third = evaluator.route(("C2",))
 
-    assert not first.feasible and not second.feasible
+    assert not first.feasible and not second.feasible and not third.feasible
     assert evaluator.calls == 0
     assert evaluator.screening_rejections == 1
-    assert evaluator.screening_cache_hits == 1
-    assert evaluator.screening_exact_call_blocked == 2
+    assert evaluator.screening_cache_hits == 2
+    assert evaluator.screening_exact_call_blocked == 3
     assert [item.status for item in trace.screening_decisions] == [
         "rejected",
         "negative_cache_hit",
+        "negative_cache_hit",
     ]
+    assert trace.screening_decisions[1].checks is trace.screening_decisions[2].checks
     assert not trace.route_evaluations
 
 

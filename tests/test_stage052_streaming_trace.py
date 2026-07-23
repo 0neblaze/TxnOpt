@@ -1546,6 +1546,72 @@ def test_v3_negative_cache_hit_reuses_definition_without_check_iteration(
     assert rows[0]["checks"] == rows[1]["checks"]
 
 
+def test_v3_typed_negative_result_identity_roundtrips(tmp_path: Path) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt96"
+    writer = ArtifactBundleWriter(
+        tmp_path / "results" / run_label,
+        ArtifactRunContext("stage05.2", "artifact_streaming", run_label),
+        ArtifactStorageConfig(
+            storage_policy_version="artifact-storage-v2",
+            screening_schema_version="screening_decisions_v3",
+        ),
+    )
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,
+        axis_name="fixed_work",
+        buffer_rows=2,
+    )
+    trace = Stage03Trace(config=MeasurementConfig(stream_sink=sink))
+    common = {
+        "lane": "legacy",
+        "iteration": 1,
+        "operator": "repair",
+        "status": "negative_cache_hit",
+        "first_failed_check": "capacity",
+        "reason": "capacity",
+        "checks": (
+            ScreeningCheckTrace("negative_sequence_cache", "hit", True, "reused"),
+        ),
+        "demand": 2.5,
+        "min_time_window_slack": 1.0,
+        "distance_lower_bound": 3.0,
+        "distance_increment_lower_bound": None,
+        "single_segment_reachable": True,
+        "structural_energy_lower_bound": 4.0,
+        "negative_cache_hit": True,
+        "exact_call_blocked": True,
+        "negative_evidence_token": 73,
+    }
+    trace.record_screening_decision(("C1",), **common)  # type: ignore[arg-type]
+    trace.record_screening_decision(("C1",), **common)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="inconsistent evidence identity"):
+        trace.record_screening_decision(  # type: ignore[arg-type]
+            ("C1",),
+            **{**common, "negative_evidence_token": 74},
+        )
+    sink.close()
+    shard.finalize(
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+    )
+    bundle = writer.finalize()
+    rows = list(
+        ArtifactReader(bundle.run_dir).iter_events(
+            f"toy/2014/{run_label}_events_toy_2014.parquet"
+        )
+    )
+    assert [row["decision_id"] for row in rows] == [1, 2]
+    assert rows[0]["checks"] == rows[1]["checks"]
+
+
 def test_v3_writer_fails_fast_on_negative_cache_evidence_drift(tmp_path: Path) -> None:
     run_label = "stage05.2_artifact_streaming_attempt92"
     writer = ArtifactBundleWriter(
@@ -1752,6 +1818,103 @@ def test_stage052_trace_sink_async_pipeline_preserves_order_and_drains() -> None
         "completed_batches": 3,
         "peak_queued_batches": 1,
     }
+
+
+def test_async_pipeline_reuses_one_producer_turn_until_batch_submission() -> None:
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="wall_clock_30",
+        buffer_rows=3,
+        async_persistence=True,
+    )
+    appender = sink._async_appender  # noqa: SLF001
+    assert appender is not None
+    original_begin = appender.begin_producer_turn
+    original_end = appender.end_producer_turn
+    calls = {"begin": 0, "end": 0}
+
+    def counted_begin() -> None:
+        calls["begin"] += 1
+        original_begin()
+
+    def counted_end() -> None:
+        calls["end"] += 1
+        original_end()
+
+    appender.begin_producer_turn = counted_begin  # type: ignore[method-assign]
+    appender.end_producer_turn = counted_end  # type: ignore[method-assign]
+    for iteration in range(2):
+        sink.append_event(
+            {
+                "event_type": "operator_call",
+                "lane": "legacy",
+                "iteration": iteration,
+                "operator": "repair",
+            }
+        )
+
+    assert calls == {"begin": 1, "end": 0}
+
+    sink.append_event(
+        {
+            "event_type": "operator_call",
+            "lane": "legacy",
+            "iteration": 2,
+            "operator": "repair",
+        }
+    )
+    assert calls == {"begin": 1, "end": 1}
+    sink.close()
+    assert [event["iteration"] for event in shard.events] == [0, 1, 2]
+
+
+def test_typed_screening_counts_bypass_generic_counter_keys() -> None:
+    shard = _BufferedScreeningRecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="wall_clock_30",
+        buffer_rows=4,
+    )
+    trace = Stage03Trace(config=MeasurementConfig(stream_sink=sink))
+    for status, reason, cache_hit, blocked in (
+        ("pass", "", False, False),
+        ("negative_cache_hit", "capacity", True, True),
+        ("rejected", "capacity", False, True),
+        ("negative_cache_hit", "capacity", True, True),
+    ):
+        trace.record_screening_decision(
+            ("C1",),
+            lane="legacy",
+            iteration=1,
+            operator="repair",
+            status=status,
+            first_failed_check=reason,
+            reason=reason,
+            checks=(),
+            demand=1.0,
+            min_time_window_slack=2.0,
+            distance_lower_bound=3.0,
+            distance_increment_lower_bound=None,
+            single_segment_reachable=True,
+            structural_energy_lower_bound=4.0,
+            negative_cache_hit=cache_hit,
+            exact_call_blocked=blocked,
+            negative_evidence_token=42 if cache_hit else None,
+        )
+
+    assert trace.screening_counts == {
+        "screening_calls": 4,
+        "screening_passes": 1,
+        "screening_rejections": 1,
+        "screening_cache_hits": 2,
+        "screening_exact_call_blocked": 3,
+        "screening_reason_counts": {"capacity": 3},
+    }
+    assert trace.streamed_record_counts["screening_decisions"] == 4
+    sink.close()
+    first_token = shard.rows[1].values[19]  # type: ignore[union-attr]
+    assert first_token is shard.rows[3].values[19]  # type: ignore[union-attr]
 
 
 def test_async_pipeline_waits_for_writer_before_next_callback() -> None:

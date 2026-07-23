@@ -105,6 +105,14 @@ _CONSTRAINT_REMOVAL_ORDER = (
     ConstraintRemovalOperator.SHAW_RELATED.value,
 )
 _CONSTRAINT_REMOVAL_NEIGHBORHOODS = frozenset(_CONSTRAINT_REMOVAL_ORDER)
+_NEGATIVE_SEQUENCE_CACHE_HIT_CHECKS = (
+    ScreeningCheckTrace(
+        "negative_sequence_cache",
+        "hit",
+        True,
+        "reused a previously recorded safe screening rejection",
+    ),
+)
 
 
 @dataclass(slots=True)
@@ -787,14 +795,7 @@ class _Evaluator:
         )
         if self.measurement_trace is not None:
             decision_checks = (
-                (
-                    ScreeningCheckTrace(
-                        "negative_sequence_cache",
-                        "hit",
-                        True,
-                        "reused a previously recorded safe screening rejection",
-                    ),
-                )
+                _NEGATIVE_SEQUENCE_CACHE_HIT_CHECKS
                 if negative_cache_hit
                 else result.checks
             )
@@ -818,6 +819,7 @@ class _Evaluator:
                 started_at=self.measurement_trace._offset(started),
                 completed_at=self.measurement_trace._offset(completed),
                 registered_route_key=key,
+                negative_evidence_token=id(result) if negative_cache_hit else None,
             )
             if incremental_metrics is not None:
                 self.measurement_trace.record_incremental_propagation(

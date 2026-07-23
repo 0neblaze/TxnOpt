@@ -308,6 +308,20 @@ class Stage03Trace:
         init=False,
         repr=False,
     )
+    _typed_screening_append: Any | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _typed_screening_passes: int = field(default=0, init=False, repr=False)
+    _typed_screening_rejections: int = field(default=0, init=False, repr=False)
+    _typed_screening_cache_hits: int = field(default=0, init=False, repr=False)
+    _typed_screening_exact_call_blocked: int = field(default=0, init=False, repr=False)
+    _typed_screening_reason_counts: dict[str, int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._validate_screening_route_dictionary()
@@ -356,6 +370,9 @@ class Stage03Trace:
                 sink=sink,
                 observer=self._observe_streamed_record,
             )
+            typed_screening_append = getattr(sink, "append_screening_fields", None)
+            if callable(typed_screening_append):
+                self._typed_screening_append = typed_screening_append
 
     @property
     def streamed_record_counts(self) -> dict[str, int]:
@@ -768,6 +785,7 @@ class Stage03Trace:
         started_at: float | None = None,
         completed_at: float | None = None,
         registered_route_key: str | None = None,
+        negative_evidence_token: int | None = None,
     ) -> int:
         """Append one auditable Stage 3.1 screening decision.
 
@@ -796,20 +814,22 @@ class Stage03Trace:
         normalized_energy = float(structural_energy_lower_bound)
         normalized_negative_hit = bool(negative_cache_hit)
         normalized_blocked = bool(exact_call_blocked)
-        fast_append = getattr(self.config.stream_sink, "append_screening_fields", None)
-        if callable(fast_append):
+        fast_append = self._typed_screening_append
+        if fast_append is not None:
             summary = self._stream_summary
             if summary is None or not isinstance(
                 self.screening_decisions, _ExternalizedTraceList
             ):
                 raise RuntimeError("typed screening stream is unavailable")
             summary.counts["screening_decisions"] += 1
-            self._observe_streamed_screening_fields(
-                status=status,
-                reason=reason,
-                negative_cache_hit=normalized_negative_hit,
-                exact_call_blocked=normalized_blocked,
-            )
+            self._typed_screening_passes += status == "pass"
+            self._typed_screening_rejections += status == "rejected"
+            self._typed_screening_cache_hits += normalized_negative_hit
+            self._typed_screening_exact_call_blocked += normalized_blocked
+            if reason:
+                self._typed_screening_reason_counts[reason] = (
+                    self._typed_screening_reason_counts.get(reason, 0) + 1
+                )
             fast_append(
                 decision_id,
                 key,
@@ -830,6 +850,7 @@ class Stage03Trace:
                 normalized_reachable,
                 normalized_energy,
                 checks,
+                negative_evidence_token,
             )
             self.screening_decisions.increment_external_count()
             return decision_id
@@ -941,6 +962,19 @@ class Stage03Trace:
     def screening_counts(self) -> dict[str, object]:
         if self._stream_summary is not None:
             summary = self._stream_summary
+            if self._typed_screening_append is not None:
+                return {
+                    "screening_calls": int(summary.counts["screening_decisions"]),
+                    "screening_passes": self._typed_screening_passes,
+                    "screening_rejections": self._typed_screening_rejections,
+                    "screening_cache_hits": self._typed_screening_cache_hits,
+                    "screening_exact_call_blocked": (
+                        self._typed_screening_exact_call_blocked
+                    ),
+                    "screening_reason_counts": dict(
+                        sorted(self._typed_screening_reason_counts.items())
+                    ),
+                }
             return {
                 "screening_calls": int(summary.counts["screening_decisions"]),
                 "screening_passes": int(summary.counts["screening_status:pass"]),
