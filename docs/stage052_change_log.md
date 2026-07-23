@@ -651,3 +651,10 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   路径动态导入 tracked `tools.publish_stage052_artifacts`。reviewer wheel 现在同时
   打包 tracked `tools` package，seal source attestation 与 no-cache rebuild 对这些
   modules 逐文件验证；禁止从 checkout 手工复制或注入未密封工具。
+- sealed-tools 修复后的下一次 review 已运行到 publisher，但 provisional manifest
+  被拒绝为 `campaign review mandatory gate set is incomplete`。实际 gate diff 只有
+  一项：reviewer 已独立验证并发布 `source_snapshot`，而
+  `CAMPAIGN_PILOT_GATES`/`CAMPAIGN_FORMAL_GATES` 的 exact-set contract 漏登记该硬
+  gate。现将 `source_snapshot` 加入 Pilot/Formal common mandatory gate set；这会
+  收紧 publisher/prerequisite 验证，不删除 gate、不降低门槛。该次 `NOT_READY`
+  generation 与成功 finalized receipt 均保留，raw manifest 不变。

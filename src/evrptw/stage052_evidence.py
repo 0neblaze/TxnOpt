@@ -1251,6 +1251,7 @@ _CAMPAIGN_COMMON_GATES = frozenset(
         "power_load",
         "resource_limits",
         "runtime_provenance",
+        "source_snapshot",
         "storage_root_roles",
         "storage_roots",
         "unique_shard_identity",

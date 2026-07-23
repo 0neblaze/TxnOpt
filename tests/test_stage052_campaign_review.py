@@ -86,6 +86,11 @@ _SOURCE_SNAPSHOT = {
 }
 
 
+def test_campaign_gate_contract_requires_source_snapshot() -> None:
+    assert "source_snapshot" in CAMPAIGN_PILOT_GATES
+    assert "source_snapshot" in CAMPAIGN_FORMAL_GATES
+
+
 def test_campaign_volume_probe_uses_shared_cross_platform_implementation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -622,6 +622,9 @@ this repository or one of its subdirectories.
   The sealed reviewer wheel must include and source-bind every tracked
   `tools` Python module used by review or publication dry-run paths; isolated
   `python -I` review services may not depend on an unsealed checkout import.
+  `source_snapshot` is a mandatory common Pilot/Formal campaign review gate,
+  including provisional Pilot publication; it may not exist only as an
+  unregistered extra gate outside the exact gate-set contract.
 - Formal review uses bounded Arrow batches and streaming iterators and rejects
   full-shard `to_pylist()`, `read_events()`, or `reconstruct_trace()`. It
   independently verifies exact campaign geometry, bidirectional descriptors,
