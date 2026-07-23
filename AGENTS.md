@@ -709,6 +709,10 @@ The executable workflow and gate table are maintained in
   be at most 30% of end-to-end time and peak RSS at most 50% of the Stage 5.2
   v1 baseline. Partial shards are sealed with explicit completeness, fail
   immediately, and are then archived; there is no serial persistence fallback.
+- Native producer and reviewer installations may live at different absolute venv paths; native
+  identity is the sealed extension SHA-256 plus the captured runtime contract, never path equality.
+  The v3 live screening path uses reusable precomputed typed definitions and occurrence rows;
+  reintroducing per-decision dict normalization on that hot path is a performance regression.
 - Critical events are never dropped. Ordinary candidates, repeated timings, and
   operator totals may be aggregated into diagnostic Parquet only when replay
   semantics are unchanged. Route sequences are stored once in the route

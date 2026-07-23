@@ -21,7 +21,6 @@ import tempfile
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any, cast, overload
 
@@ -1381,14 +1380,16 @@ def _normalise_compact_screening_checks(
 
 
 @dataclass(frozen=True, slots=True)
-class _PrecomputedScreeningDefinition:
+class PrecomputedScreeningDefinition:
     """Trusted typed cache-key tail produced by the live measurement bridge."""
 
     tail: tuple[object, ...]
-    cache_hash: int = dataclass_field(init=False)
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "cache_hash", hash(self.tail))
+
+# Preserve the prior private spelling for historical malicious-payload tests and
+# any frozen reviewer code that imports it while new producer code uses the
+# explicit public bridge type above.
+_PrecomputedScreeningDefinition = PrecomputedScreeningDefinition
 
 
 @dataclass(frozen=True, slots=True)
@@ -1399,7 +1400,7 @@ class _PendingScreeningDefinition:
     row: tuple[object, ...]
 
 
-type _BufferedScreeningDecision = tuple[
+type BufferedScreeningDecision = tuple[
     int,
     str,
     str,
@@ -1407,7 +1408,7 @@ type _BufferedScreeningDecision = tuple[
     str,
     float,
     float,
-    _PrecomputedScreeningDefinition,
+    PrecomputedScreeningDefinition,
 ]
 
 
@@ -1451,9 +1452,15 @@ def _screening_definition_cache_key(
 def _screening_definition_from_cache_key(
     definition_key: tuple[object, ...],
 ) -> dict[str, object]:
+    if len(definition_key) != 16:
+        raise ArtifactIntegrityError("screening definition cache key is invalid")
     raw_checks = definition_key[15]
     if not isinstance(raw_checks, tuple):
         raise ArtifactIntegrityError("screening definition cache key checks are invalid")
+    if len(raw_checks) > MAX_SCREENING_CHECKS_PER_DECISION:
+        raise ArtifactIntegrityError(
+            "one screening decision exceeds the fixed eight-check domain"
+        )
     checks: list[dict[str, object]] = []
     for raw_check in raw_checks:
         if not isinstance(raw_check, tuple) or len(raw_check) != 6:
@@ -2208,13 +2215,13 @@ def _iter_coalesced_cache_lookup_events(
 
 @overload
 def _iter_coalesced_cache_lookup_events(
-    events: Iterable[Mapping[str, object] | _BufferedScreeningDecision],
-) -> Iterable[dict[str, object] | _BufferedScreeningDecision]: ...
+    events: Iterable[Mapping[str, object] | BufferedScreeningDecision],
+) -> Iterable[dict[str, object] | BufferedScreeningDecision]: ...
 
 
 def _iter_coalesced_cache_lookup_events(
-    events: Iterable[Mapping[str, object] | _BufferedScreeningDecision],
-) -> Iterable[dict[str, object] | _BufferedScreeningDecision]:
+    events: Iterable[Mapping[str, object] | BufferedScreeningDecision],
+) -> Iterable[dict[str, object] | BufferedScreeningDecision]:
     """Streaming equivalent of :func:`_coalesce_cache_lookup_events`."""
 
     pending: Mapping[str, object] | None = None
@@ -4476,11 +4483,17 @@ class ArtifactV2ShardSession:
     def screening_schema_version(self) -> str:
         return self._owner.config.screening_schema_version
 
+    @property
+    def supports_buffered_screening_decisions(self) -> bool:
+        """Whether the live bridge may submit precomputed v3 typed rows."""
+
+        return self._screening_occurrences_sink is not None
+
     def append(
         self,
         *,
         route_dictionary: Mapping[str, Sequence[str]],
-        critical_events: Iterable[Mapping[str, object] | _BufferedScreeningDecision],
+        critical_events: Iterable[Mapping[str, object] | BufferedScreeningDecision],
         diagnostic_rows: Iterable[Mapping[str, object]] = (),
         cache_lookups_coalesced: bool = False,
     ) -> int:
@@ -4688,7 +4701,7 @@ class ArtifactV2ShardSession:
 
     def _buffered_screening_decision_row(
         self,
-        event: _BufferedScreeningDecision,
+        event: BufferedScreeningDecision,
         event_id: int,
         cache_key: tuple[object, ...],
     ) -> tuple[tuple[object, ...], _PendingScreeningDefinition | None]:

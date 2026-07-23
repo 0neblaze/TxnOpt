@@ -35,6 +35,8 @@ from evrptw.artifacts import (
     ArtifactReader,
     ArtifactRunContext,
     ArtifactStorageConfig,
+    BufferedScreeningDecision,
+    PrecomputedScreeningDefinition,
     aggregate_diagnostic_events,
     atomic_write_signed_json,
     build_stage03_critical_events,
@@ -3241,13 +3243,16 @@ class _Stage052StreamingShard(Protocol):
     def screening_schema_version(self) -> str: ...
 
     @property
+    def supports_buffered_screening_decisions(self) -> bool: ...
+
+    @property
     def scratch_directory(self) -> Path: ...
 
     def append(
         self,
         *,
         route_dictionary: Mapping[str, Sequence[str]],
-        critical_events: Iterable[Mapping[str, object]],
+        critical_events: Iterable[Mapping[str, object] | BufferedScreeningDecision],
         diagnostic_rows: Iterable[Mapping[str, object]] = (),
         cache_lookups_coalesced: bool = False,
     ) -> int: ...
@@ -3301,7 +3306,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self.axis_name = axis_name
         self._buffer_rows = buffer_rows
         self._neighborhood_buffer_rows = neighborhood_buffer_rows
-        self._event_buffer: list[dict[str, object]] = []
+        self._event_buffer: list[dict[str, object] | BufferedScreeningDecision] = []
         self.event_count = 0
         self._persisted_family_counts: Counter[str] = Counter()
         self._screening_decision_count = 0
@@ -3313,6 +3318,9 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._neighborhood_read_offset = 0
         self._semantic_event_digest = hashlib.sha256()
         self._negative_screening_evidence_cache: dict[str, tuple[object, ...]] = {}
+        self._screening_definition_tail_cache: dict[
+            tuple[object, ...], PrecomputedScreeningDefinition
+        ] = {}
         self._initial_objective_key: ObjectiveKey | None = None
         self._visible_global_bests: dict[int, AcceptedGlobalBest] = {}
         self._last_candidate_timestamp = 0.0
@@ -3383,6 +3391,67 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                 self._negative_screening_evidence_cache.pop(
                     next(iter(self._negative_screening_evidence_cache))
                 )
+        if (
+            self._screening_schema_version == "screening_decisions_v3"
+            and getattr(self._shard, "supports_buffered_screening_decisions", False) is True
+        ):
+            compact_checks = tuple(
+                (
+                    check.check,
+                    check.status,
+                    check.value if isinstance(check.value, bool) else None,
+                    float(check.value)
+                    if isinstance(check.value, (int, float))
+                    and not isinstance(check.value, bool)
+                    else None,
+                    check.value if isinstance(check.value, str) else None,
+                    check.reason,
+                )
+                for check in decision.checks
+            )
+            tail = (
+                decision.status,
+                decision.reason,
+                self.axis_name,
+                float(decision.demand),
+                float(decision.distance_increment_lower_bound)
+                if decision.distance_increment_lower_bound is not None
+                else None,
+                float(decision.distance_lower_bound),
+                decision.exact_call_blocked,
+                decision.first_failed_check,
+                float(decision.min_time_window_slack),
+                decision.negative_cache_hit,
+                decision.single_segment_reachable,
+                float(decision.structural_energy_lower_bound),
+                compact_checks,
+            )
+            definition = self._screening_definition_tail_cache.get(tail)
+            if definition is None:
+                definition = PrecomputedScreeningDefinition(tail)
+                self._screening_definition_tail_cache[tail] = definition
+                if len(self._screening_definition_tail_cache) > 262_144:
+                    self._screening_definition_tail_cache.pop(
+                        next(iter(self._screening_definition_tail_cache))
+                    )
+            self._flush_pending_lookup()
+            self._event_buffer.append(
+                (
+                    decision.decision_id,
+                    decision.route_key,
+                    f"{self.axis_name}:{decision.lane}",
+                    decision.iteration,
+                    decision.operator,
+                    decision.started_at,
+                    decision.completed_at,
+                    definition,
+                )
+            )
+            if len(self._event_buffer) >= self._buffer_rows:
+                self._flush_event_buffer()
+            self._persisted_family_counts["screening_decisions"] += 1
+            self.event_count += 1
+            return
         self._queue_owned(
             {
                 "decision_id": decision.decision_id,

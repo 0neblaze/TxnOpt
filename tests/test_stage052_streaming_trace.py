@@ -46,6 +46,31 @@ class _RecordingTraceSink:
         self.records.append(("incremental_propagation", propagation))
 
 
+class _BufferedScreeningRecordingShard:
+    screening_schema_version = "screening_decisions_v3"
+    supports_buffered_screening_decisions = True
+
+    def __init__(self) -> None:
+        self.rows: list[object] = []
+
+    @property
+    def scratch_directory(self) -> Path:
+        raise AssertionError("screening-only test must not use scratch storage")
+
+    def append(
+        self,
+        *,
+        route_dictionary: Mapping[str, object],
+        critical_events: object,
+        diagnostic_rows: object = (),
+        cache_lookups_coalesced: bool = False,
+    ) -> int:
+        del route_dictionary, diagnostic_rows, cache_lookups_coalesced
+        rows = list(critical_events)  # type: ignore[arg-type]
+        self.rows.extend(rows)
+        return len(rows)
+
+
 def test_measurement_stream_sink_receives_each_family_without_retaining_rows() -> None:
     sink = _RecordingTraceSink()
     trace = Stage03Trace(MeasurementConfig(stream_sink=sink))
@@ -419,6 +444,116 @@ def test_streamed_screening_definition_matches_mapping_normalization() -> None:
             "reason": check.reason,
         }
         for check in decision.checks
+    ]
+
+
+def test_v3_screening_bridge_reuses_precomputed_typed_definition() -> None:
+    shard = _BufferedScreeningRecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+        buffer_rows=2,
+    )
+    decision = ScreeningDecision(
+        decision_id=1,
+        route_key="route:2:C1",
+        lane="legacy",
+        iteration=1,
+        operator="repair",
+        status="rejected",
+        first_failed_check="capacity",
+        reason="capacity",
+        checks=(ScreeningCheckTrace("capacity", "fail", 2.5, "capacity"),),
+        demand=2.5,
+        min_time_window_slack=1.0,
+        distance_lower_bound=3.0,
+        distance_increment_lower_bound=None,
+        single_segment_reachable=True,
+        structural_energy_lower_bound=4.0,
+        negative_cache_hit=False,
+        exact_call_blocked=True,
+        started_at=0.1,
+        completed_at=0.2,
+        duration_seconds=0.1,
+    )
+
+    sink.append_screening_decision(decision)
+    sink.append_screening_decision(replace(decision, decision_id=2))
+
+    assert len(shard.rows) == 2
+    first, second = shard.rows
+    assert isinstance(first, tuple)
+    assert isinstance(second, tuple)
+    assert first[0] == 1
+    assert first[2] == "fixed_work:legacy"
+    assert first[7] is second[7]
+
+
+def test_v3_buffered_screening_bridge_roundtrips_through_real_writer(
+    tmp_path: Path,
+) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt96"
+    writer = ArtifactBundleWriter(
+        tmp_path / "results" / run_label,
+        ArtifactRunContext("stage05.2", "artifact_streaming", run_label),
+        ArtifactStorageConfig(
+            storage_policy_version="artifact-storage-v2",
+            screening_schema_version="screening_decisions_v3",
+        ),
+    )
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,
+        axis_name="fixed_work",
+        buffer_rows=2,
+    )
+    decision = ScreeningDecision(
+        decision_id=1,
+        route_key="route:2:C1",
+        lane="legacy",
+        iteration=1,
+        operator="repair",
+        status="rejected",
+        first_failed_check="capacity",
+        reason="capacity",
+        checks=(ScreeningCheckTrace("capacity", "fail", 9.0, "capacity"),),
+        demand=9.0,
+        min_time_window_slack=1.0,
+        distance_lower_bound=3.0,
+        distance_increment_lower_bound=None,
+        single_segment_reachable=True,
+        structural_energy_lower_bound=4.0,
+        negative_cache_hit=False,
+        exact_call_blocked=True,
+        started_at=0.1,
+        completed_at=0.2,
+        duration_seconds=0.1,
+    )
+    sink.append_screening_decision(decision)
+    sink.append_screening_decision(replace(decision, decision_id=2))
+    sink.finish()
+    shard.finalize(
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+    )
+    bundle = writer.finalize()
+
+    rows = list(
+        ArtifactReader(bundle.run_dir).iter_events(
+            f"toy/2014/{run_label}_events_toy_2014.parquet"
+        )
+    )
+    assert [row["decision_id"] for row in rows] == [1, 2]
+    assert all(row["demand"] == pytest.approx(9.0) for row in rows)
+    assert rows[0]["checks"] == [
+        {"check": "capacity", "status": "fail", "value": 9.0, "reason": "capacity"}
     ]
 
 

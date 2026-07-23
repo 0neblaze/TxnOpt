@@ -621,6 +621,51 @@ def test_v3_writer_rejects_more_than_eight_screening_checks(tmp_path: Path) -> N
     writer.finalize(status="partial", evidence_completeness="partial")
 
 
+def test_v3_writer_rejects_more_than_eight_precomputed_screening_checks(
+    tmp_path: Path,
+) -> None:
+    writer = _v3_writer(tmp_path, attempt=95)
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    checks = tuple(
+        (f"check-{index}", "pass", True, None, None, "")
+        for index in range(9)
+    )
+    definition = artifacts_module.PrecomputedScreeningDefinition(
+        (
+            "pass",
+            "",
+            "fixed_work",
+            1.0,
+            None,
+            2.0,
+            False,
+            "",
+            3.0,
+            False,
+            True,
+            4.0,
+            checks,
+        )
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="eight-check"):
+        shard.append(
+            route_dictionary={"route:2:C1": ("C1",)},
+            critical_events=(
+                (9, "route:2:C1", "fixed_work:legacy", 1, "repair", 1.25, 1.5, definition),
+            ),
+            cache_lookups_coalesced=True,
+        )
+
+    shard.abort("expected precomputed screening-domain rejection")
+    writer.finalize(status="partial", evidence_completeness="partial")
+
+
 def test_v2_writer_ignores_private_precomputed_screening_tail(tmp_path: Path) -> None:
     run_label = "stage05.2_artifact_streaming_attempt93"
     writer = ArtifactBundleWriter(

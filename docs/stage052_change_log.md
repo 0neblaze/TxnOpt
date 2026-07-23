@@ -8,6 +8,24 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：E native runtime 与 v3 screening 热路径修复
+
+- 失败证据：`stage05.2_native_kernels_attempt08` 保留为 `NOT_READY`；其 reviewer 发现
+  producer/reviewer 的 native extension（原生扩展）虽来自同一 sealed wheel（密封
+  wheel）且 SHA-256 相同，却因 venv 绝对路径不同而被拒绝；同时 5,831,819 条
+  screening decision（筛选决策）仍经过逐事件 dict normalization（字典规范化），使
+  aggregate persistence ratio（聚合持久化占比）达到 0.496440834。
+- 根因修复：native profile 改为比较 reviewer 当前扩展的内容哈希与 producer 签名哈希，
+  不再要求机器本地安装路径相等；v3 live trace bridge（实时轨迹桥）复用预计算 typed
+  screening definition（类型化筛选定义），直接向 artifact deep module（产物深模块）
+  提交 occurrence tuple（出现记录元组），同时保留 v2 compatibility path（兼容路径）、
+  negative-cache evidence drift（负缓存证据漂移）检查和完整 persistence timing（持久化
+  计时）。
+- 验证：新增跨 venv 同哈希 native extension、预计算定义复用和真实 Parquet round-trip
+  （Parquet 往返）回归测试。100,000 条 synthetic screening（合成筛选）探针测得
+  0.390909233 秒 charged persistence（计入持久化时间），用于在新 attempt 正式重跑前
+  验证热路径量级；正式门槛仍只由独立 raw replay（原始重放）决定。
+
 ## 2026-07-23：v1 物理 screening schema 独立识别修复
 
 - 原因：C16 的独立审查正确验证了 24 个 fixed-work axis（固定工作量轴）的 v1/v3

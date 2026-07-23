@@ -4822,8 +4822,7 @@ def _validate_captured_runtime_signature(
     if optimization_profile == "native":
         current_native_path = Path(str(native_core.__file__)).resolve()
         if (
-            Path(native_extension).resolve() != current_native_path
-            or not current_native_path.is_file()
+            not current_native_path.is_file()
             or native_sha256 != _sha256(current_native_path)
         ):
             return False, "native runtime signature does not match the reviewer extension"

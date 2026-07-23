@@ -3093,7 +3093,9 @@ def test_review_runtime_machine_comparison_excludes_only_wsl_memory_limit() -> N
     )
 
 
-def test_runtime_signature_allows_historical_python_binary_but_binds_native_profile() -> None:
+def test_runtime_signature_allows_historical_python_binary_but_binds_native_profile(
+    tmp_path: Path,
+) -> None:
     environment = {
         "python": {"version": "3.13.13", "implementation": "CPython"},
         "system": {"machine": "arm64"},
@@ -3129,6 +3131,16 @@ def test_runtime_signature_allows_historical_python_binary_but_binds_native_prof
     }
     passed, detail = stage052_review._validate_captured_runtime_signature(
         environment=current_environment,
+        runtime_signature=current_signature,
+        optimization_profile="native",
+    )
+    assert passed, detail
+
+    separate_install = tmp_path / current_extension.name
+    separate_install.write_bytes(current_extension.read_bytes())
+    separate_environment = {**environment, "native_extension": str(separate_install)}
+    passed, detail = stage052_review._validate_captured_runtime_signature(
+        environment=separate_environment,
         runtime_signature=current_signature,
         optimization_profile="native",
     )
