@@ -619,6 +619,9 @@ this repository or one of its subdirectories.
   50 GiB safety plus 32 GiB active workspace, final WSL safety is 50 GiB, and
   internal archive safety is 50 GiB. Reviewer-local reserve constants or lower
   thresholds are forbidden contract drift.
+  The sealed reviewer wheel must include and source-bind every tracked
+  `tools` Python module used by review or publication dry-run paths; isolated
+  `python -I` review services may not depend on an unsealed checkout import.
 - Formal review uses bounded Arrow batches and streaming iterators and rejects
   full-shard `to_pylist()`, `read_events()`, or `reconstruct_trace()`. It
   independently verifies exact campaign geometry, bidirectional descriptors,

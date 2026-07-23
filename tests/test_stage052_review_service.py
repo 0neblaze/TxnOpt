@@ -587,6 +587,51 @@ def test_seal_reviewer_wheel_rejects_python_from_another_revision(
         review_service.seal_reviewer_wheel(wheel, revision)
 
 
+def test_seal_reviewer_wheel_requires_tracked_tools_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    package = source / "src" / "evrptw"
+    package.mkdir(parents=True)
+    (package / "reviewer.py").write_text("REVISION = 'current'\n", encoding="utf-8")
+    tools_package = source / "tools"
+    tools_package.mkdir()
+    (tools_package / "__init__.py").write_text("", encoding="utf-8")
+    (tools_package / "publisher.py").write_text("READY = True\n", encoding="utf-8")
+    subprocess.run(("git", "init", "-q"), cwd=source, check=True)
+    subprocess.run(("git", "add", "."), cwd=source, check=True)
+    subprocess.run(
+        (
+            "git",
+            "-c",
+            "user.name=Stage052 Test",
+            "-c",
+            "user.email=stage052@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ),
+        cwd=source,
+        check=True,
+    )
+    revision = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=source,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    wheel = tmp_path / "reviewer.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("evrptw/reviewer.py", b"REVISION = 'current'\n")
+        archive.writestr("tools/__init__.py", b"")
+    monkeypatch.chdir(source)
+
+    with pytest.raises(RuntimeError, match="omits clean source module: tools/publisher.py"):
+        review_service.seal_reviewer_wheel(wheel, revision)
+
+
 def test_formal_source_allows_only_raw_bound_local_files(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()

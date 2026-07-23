@@ -42,7 +42,7 @@ dev = [
 
 [tool.scikit-build]
 cmake.build-type = "Release"
-wheel.packages = ["src/evrptw"]
+wheel.packages = ["src/evrptw", "tools"]
 
 [tool.ruff]
 line-length = 100

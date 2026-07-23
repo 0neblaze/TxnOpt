@@ -292,6 +292,9 @@ path/hash、raw run label 以及 clean producer snapshot，然后自动追加外
 和 5.5-GiB 内部上限。Codex 只启动和
 轮询 service，不持有 reviewer 生命周期。超限、worker failure 或 service interruption
 不得自动重试；只有显式的新 review generation 才能再次运行。
+reviewer 或 pilot publication dry-run 运行时导入的 tracked `tools` modules 必须随
+reviewer wheel 一起安装，并由 source attestation（源证明）和 clean rebuild 逐文件
+绑定；`python -I` service 不得从 working checkout 临时导入未密封工具。
 `--max-aggregate-rss-gib` 在 formal launch 中固定为 5.5，不得放宽。launcher 只接受
 `ArtifactReader` 解析出的 canonical signed raw manifest。科学 reviewer 写出的 READY 在
 `ExecStopPost` 完成前只是 provisional（暂定）；只有成功 receipt 已绑定当前

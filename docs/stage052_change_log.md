@@ -642,3 +642,12 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   reviewer 现在从重建的 `BenchmarkCampaignConfig` 独立计算同一公式并验证
   campaign/config/alias identity，不降低任何容量门槛；第三个 `NOT_READY`
   generation 继续进入 immutable review history，sealed raw 不变。
+- 第四次 service execution 完成全部 raw replay 后首次到达 pilot publication dry-run，
+  但 isolated `python -I` runtime 报告 `No module named 'tools'`；前三个
+  `NOT_READY` generation 因前置 gate 未全过而从未执行该路径。该 execution 以
+  finalized failed receipt 保留，raw manifest 仍为
+  `65c809ecc63b4a28d9f3fffc9548ce74605d07f18b2585403328e4ab8441bacf`，现有 review
+  pointer/history 均未变化。根因是 wheel 只打包 `src/evrptw`，却在 READY pilot
+  路径动态导入 tracked `tools.publish_stage052_artifacts`。reviewer wheel 现在同时
+  打包 tracked `tools` package，seal source attestation 与 no-cache rebuild 对这些
+  modules 逐文件验证；禁止从 checkout 手工复制或注入未密封工具。

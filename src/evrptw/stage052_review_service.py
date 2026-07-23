@@ -443,6 +443,7 @@ def _verify_wheel_source_matches_revision(wheel_path: Path, repository: Path) ->
             "-z",
             "--",
             "src/evrptw",
+            "tools",
             "cpp",
             "CMakeLists.txt",
             "pyproject.toml",
@@ -463,11 +464,13 @@ def _verify_wheel_source_matches_revision(wheel_path: Path, repository: Path) ->
         members = set(archive.namelist())
         for relative in sorted(relative_sources, key=lambda path: path.as_posix()):
             source = (repository / relative).read_bytes()
-            if relative.parts[:2] == ("src", "evrptw") and relative.suffix in {
-                ".py",
-                ".pyi",
-            }:
-                member = Path(*relative.parts[1:]).as_posix()
+            member: str | None = None
+            if relative.suffix in {".py", ".pyi"}:
+                if relative.parts[:2] == ("src", "evrptw"):
+                    member = Path(*relative.parts[1:]).as_posix()
+                elif relative.parts[:1] == ("tools",):
+                    member = relative.as_posix()
+            if member is not None:
                 if member not in members:
                     raise RuntimeError(f"reviewer wheel omits clean source module: {relative}")
                 if archive.read(member) != source:
