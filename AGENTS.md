@@ -717,7 +717,9 @@ The executable workflow and gate table are maintained in
   reintroducing per-decision dict normalization on that hot path is a performance regression.
   Deferred screening batches bind cache misses through the native transaction packer, but every
   canonical definition payload and SHA-256 identity still passes the Python collision store before
-  publication; the optimization may not drop, aggregate, or reorder occurrences.
+  publication; the optimization may not drop, aggregate, or reorder occurrences. High-cardinality
+  definition, occurrence, and event Parquet streams disable dictionary encoding and statistics while
+  retaining the canonical typed schema and Zstandard level 1.
   V3 route-evaluation and cache-event batches likewise use native schema-ordered sparse columns;
   mixed ordinary events are filled at their original positions and may not be reordered or dropped.
 - Producer screening-definition collision state stores the full SHA-256 digest without retaining a

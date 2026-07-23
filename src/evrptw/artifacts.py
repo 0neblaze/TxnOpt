@@ -2232,6 +2232,7 @@ class _StreamingParquetSink:
         high_volume_compact = (
             schema.equals(EVENTS_SCHEMA)
             or schema.equals(V2_SCREENING_DECISIONS_SCHEMA)
+            or schema.equals(V3_SCREENING_DEFINITIONS_SCHEMA)
             or schema.equals(V3_SCREENING_OCCURRENCES_SCHEMA)
         )
         self._writer = pq.ParquetWriter(
@@ -4827,7 +4828,6 @@ class ArtifactV2ShardSession:
                         self._resolved_route_ids,
                         self._resolve_route_id,
                         _stable_dictionary_id,
-                        _screening_definition_from_cache_key,
                         _screening_definition_identity,
                         next_event_id,
                     )

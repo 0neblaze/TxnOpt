@@ -217,7 +217,6 @@ py::tuple pack_stage052_screening_transactions(
     py::dict route_ids,
     const py::object& resolve_route_id,
     const py::object& stable_dictionary_id,
-    const py::object& definition_from_cache_key,
     const py::object& definition_identity,
     const std::int64_t first_event_id) {
     py::tuple columns(6);
@@ -357,7 +356,6 @@ py::tuple pack_stage052_screening_transactions(
             throw std::invalid_argument(
                 "one screening decision exceeds the fixed eight-check domain");
         }
-        py::tuple compact_checks(py::len(checks));
         py::list check_payloads;
         for (py::ssize_t check_index = 0; check_index < py::len(checks); ++check_index) {
             const py::object check = checks[check_index];
@@ -386,14 +384,6 @@ py::tuple pack_stage052_screening_transactions(
             } else if (PyUnicode_Check(value.ptr())) {
                 value_text = value;
             }
-            py::tuple compact(6);
-            compact[0] = name;
-            compact[1] = status;
-            compact[2] = value_bool;
-            compact[3] = value_float;
-            compact[4] = value_text;
-            compact[5] = reason;
-            compact_checks[check_index] = std::move(compact);
             py::dict payload;
             payload["check"] = name;
             payload["status"] = status;
@@ -425,26 +415,29 @@ py::tuple pack_stage052_screening_transactions(
             observed_routes.append(py::make_tuple(values[1], route_id));
         }
 
-        py::tuple definition_key(16);
-        definition_key[0] = lane_id;
-        definition_key[1] = operator_id;
-        definition_key[2] = route_id;
-        definition_key[3] = values[7];
-        definition_key[4] = values[8];
-        definition_key[5] = axis_name;
-        definition_key[6] = checked_float(values[9]);
-        definition_key[7] =
+        const py::object demand = checked_float(values[9]);
+        const py::object distance_increment_lower_bound =
             values[10].is_none() ? py::none() : checked_float(values[10]);
-        definition_key[8] = checked_float(values[11]);
-        definition_key[9] = values[12];
-        definition_key[10] = values[13];
-        definition_key[11] = checked_float(values[14]);
-        definition_key[12] = values[15];
-        definition_key[13] = values[16];
-        definition_key[14] = checked_float(values[17]);
-        definition_key[15] = compact_checks;
-        const py::dict definition =
-            py::cast<py::dict>(definition_from_cache_key(definition_key));
+        const py::object distance_lower_bound = checked_float(values[11]);
+        const py::object min_time_window_slack = checked_float(values[14]);
+        const py::object structural_energy_lower_bound = checked_float(values[17]);
+        py::dict definition;
+        definition["lane_id"] = lane_id;
+        definition["operator_id"] = operator_id;
+        definition["route_id"] = route_id;
+        definition["status"] = values[7];
+        definition["reason"] = values[8];
+        definition["benchmark_axis"] = axis_name;
+        definition["demand"] = demand;
+        definition["distance_increment_lower_bound"] = distance_increment_lower_bound;
+        definition["distance_lower_bound"] = distance_lower_bound;
+        definition["exact_call_blocked"] = values[12];
+        definition["first_failed_check"] = values[13];
+        definition["min_time_window_slack"] = min_time_window_slack;
+        definition["negative_cache_hit"] = values[15];
+        definition["single_segment_reachable"] = values[16];
+        definition["structural_energy_lower_bound"] = structural_energy_lower_bound;
+        definition["checks"] = check_payloads;
         const py::tuple identity =
             py::cast<py::tuple>(definition_identity(definition));
         if (py::len(identity) != 3) {
@@ -482,15 +475,15 @@ py::tuple pack_stage052_screening_transactions(
         row[4] = values[7];
         row[5] = values[8];
         row[6] = axis_name;
-        row[7] = definition_key[6];
-        row[8] = definition_key[7];
-        row[9] = definition_key[8];
+        row[7] = demand;
+        row[8] = distance_increment_lower_bound;
+        row[9] = distance_lower_bound;
         row[10] = values[12];
         row[11] = values[13];
-        row[12] = definition_key[11];
+        row[12] = min_time_window_slack;
         row[13] = values[15];
         row[14] = values[16];
-        row[15] = definition_key[14];
+        row[15] = structural_energy_lower_bound;
         row[16] = std::move(check_payloads);
         pending_definitions.append(
             py::make_tuple(
@@ -2522,7 +2515,6 @@ PYBIND11_MODULE(_core, module) {
         py::arg("route_ids"),
         py::arg("resolve_route_id"),
         py::arg("stable_dictionary_id"),
-        py::arg("definition_from_cache_key"),
         py::arg("definition_identity"),
         py::arg("first_event_id"));
     module.def(

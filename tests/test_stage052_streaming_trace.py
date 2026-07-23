@@ -682,7 +682,6 @@ def test_native_v3_screening_transaction_packer_prepares_one_exact_definition() 
             route_ids,
             resolve_route_id,
             artifact_module._stable_dictionary_id,  # noqa: SLF001
-            artifact_module._screening_definition_from_cache_key,  # noqa: SLF001
             artifact_module._screening_definition_identity,  # noqa: SLF001
             100,
         )

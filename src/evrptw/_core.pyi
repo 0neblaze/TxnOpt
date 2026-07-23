@@ -31,7 +31,6 @@ def pack_stage052_screening_transactions(
     route_ids: dict[str, int],
     resolve_route_id: object,
     stable_dictionary_id: object,
-    definition_from_cache_key: object,
     definition_identity: object,
     first_event_id: int,
 ) -> tuple[

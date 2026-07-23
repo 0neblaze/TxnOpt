@@ -8,6 +8,32 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：G pilot attempt07 保留失败并消除 definition 双重物化
+
+- clean revision `01a9f87` 上的 `stage05.2_accelerator_pilot_attempt07` 已由独立
+  service replay 通过，decision 为 `GPU_NOT_JUSTIFIED`，状态为
+  `READY_FOR_STAGE052_BENCHMARK`；raw/review manifest SHA-256 分别为
+  `297a725628a7f77bf7fc706e3756c7a5e1582de132a9a5e1ff6dd365a92bac4d`
+  和 `e816fd9383ab22f200e099ced60147e380f67ec69f71d00664f57c81039746b7`。
+  receipt 的 raw before/after 相同、cgroup peak 已验证、exit code 为 0。
+- `stage05.2_benchmark_attempt07` 的 batch0001/0002 分别以
+  `0.35311510035046867` 和 `0.3137778929854619` 通过并归档；batch0003 以
+  `0.3915422769640815` 被 36% gate 拒绝。失败 batch 的 solver 为
+  `195.835908036` 秒，shard persistence 为 `126.012511109` 秒，control
+  persistence 为 `0.007809516` 秒。G07 保持不可变，未进入独立 campaign review
+  或 Formal。
+- profile 证明 transaction packer 虽已移除逐 miss Python control flow，但每个新
+  definition 仍先在 C++ 构造 compact-check tuple 和 typed check dict，再调用 Python
+  重新构造第二份 canonical payload/check dict。当前实现直接从已经验证的 typed fields
+  构造唯一 canonical payload，用该对象同时生成 sorted JSON/SHA-256 和 Parquet row；
+  不再创建中间 cache-key payload。`r101_21/2014` profile 中 native transaction
+  packing 从约 `5.42` 秒降至 `3.55` 秒，writer append 从约 `8.19` 秒降至
+  `6.19` 秒。
+- high-cardinality definition Parquet 与 events/occurrences 一样关闭 dictionary 和
+  statistics；Zstandard level 1、65,536-row group、typed nested checks、row order、
+  semantic digest 与完整 replay 均不变。四进程 100-customer 争用探针仍显示机器抖动，
+  因而这些数字不是通过证据；后续必须以新 F/G identity 重跑完整链。
+
 ## 2026-07-23：G pilot attempt06 保留失败并原生封装 screening transaction
 
 - clean revision `4be5425` 上的 `stage05.2_accelerator_pilot_attempt06` 已完成独立
