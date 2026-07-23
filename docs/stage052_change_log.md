@@ -669,3 +669,8 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   不生成该 performance comparison 文件。verifier 现在按 component 区分：
   performance 仍严格要求三文件 generation，Benchmark 要求已验证的完整 campaign
   publication surface；不减少任何 campaign artifact 或 gate。
+- G17 `stage05.2_benchmark_attempt17` 在创建 raw 目录和启动 solver 前被 Formal
+  predecessor loader fail-fast 拒绝：G16 review 的嵌套 `selection_lock` 已记录
+  `selected_optimization_profile=native`，但顶层 review manifest 漏发该冻结字段。
+  attempt17 不复用。根因修复是在 campaign reviewer 的顶层 publication surface
+  同步发布该字段；loader 继续要求顶层与 metadata 精确一致，不从嵌套值兜底。

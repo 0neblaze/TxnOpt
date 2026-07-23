@@ -4408,6 +4408,9 @@ def review_stage052_campaign(
         "selected_backend": evidence.selection_lock.get("selected_backend"),
         "selected_exact_backend": evidence.selection_lock.get("selected_exact_backend"),
         "selected_workers": evidence.selection_lock.get("selected_workers"),
+        "selected_optimization_profile": evidence.selection_lock.get(
+            "selected_optimization_profile"
+        ),
         "native_profile": evidence.selection_lock.get("native_profile"),
         "native_kernel_config": evidence.selection_lock.get("native_kernel_config"),
         "native_configuration": evidence.selection_lock.get("native_kernel_config"),

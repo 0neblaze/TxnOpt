@@ -2732,4 +2732,5 @@ def test_noncanonical_single_batch_pilot_cannot_receive_ready_review(
 
     review = json.loads(outputs["review_manifest"].read_text(encoding="utf-8"))
     assert review["status"] == "NOT_READY"
+    assert review["selected_optimization_profile"] == "native"
     assert review["gates"]["campaign_planning_replay"]["passed"] is False

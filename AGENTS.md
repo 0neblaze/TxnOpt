@@ -629,6 +629,9 @@ this repository or one of its subdirectories.
   `semantic_mismatches.csv`; Benchmark campaign prerequisites instead require
   the complete content-addressed campaign publication surface. The generic
   verifier must not impose the performance-only mismatch filename on campaigns.
+  A Benchmark campaign review must publish `selected_optimization_profile` at
+  the top level as well as inside `selection_lock`; the next campaign loader
+  rejects a review whose frozen top-level execution selection is incomplete.
 - Formal review uses bounded Arrow batches and streaming iterators and rejects
   full-shard `to_pylist()`, `read_events()`, or `reconstruct_trace()`. It
   independently verifies exact campaign geometry, bidirectional descriptors,
