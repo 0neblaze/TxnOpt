@@ -572,8 +572,16 @@ def test_global_best_stream_summary_keeps_only_checkpoint_visible_events() -> No
     report = validate_routes(instance, routes)
     assert report.feasible
     objective = SolutionObjective.from_report(instance, report).key
-    route_keys = [
+    full_route_keys = [
         "route:" + "|".join(f"{len(str(node))}:{node}" for node in route) for route in routes
+    ]
+    customer_names = {customer.name for customer in instance.customers}
+    customer_sequences = [
+        [node for node in route if node in customer_names] for route in routes
+    ]
+    route_keys = [
+        "route:" + "|".join(f"{len(str(node))}:{node}" for node in route)
+        for route in customer_sequences
     ]
     events = (
         {
@@ -584,6 +592,7 @@ def test_global_best_stream_summary_keeps_only_checkpoint_visible_events() -> No
             "timestamp_seconds": 0.25,
             "iteration": 1,
             "candidate_route_keys": route_keys,
+            "candidate_full_route_keys": full_route_keys,
             "candidate_objective_key": list(objective),
         },
     )
@@ -596,10 +605,40 @@ def test_global_best_stream_summary_keeps_only_checkpoint_visible_events() -> No
 
     assert len(summaries["wall_clock_30"]) == 1
 
+    missing_full_routes = (
+        {
+            key: value
+            for key, value in events[0].items()
+            if key != "candidate_full_route_keys"
+        },
+    )
+    with pytest.raises(ValueError, match="lacks complete candidate route identity"):
+        summarize_streamed_global_bests(
+            missing_full_routes,
+            {"wall_clock_30": 30},
+            instance=instance,
+        )
+
     tampered = ({**events[0], "candidate_objective_key": [objective[0], objective[1] + 1, 0, 0]},)
     with pytest.raises(ValueError, match="routes/objective mismatch"):
         summarize_streamed_global_bests(
             tampered,
+            {"wall_clock_30": 30},
+            instance=instance,
+        )
+
+    wrong_projection = (
+        {
+            **events[0],
+            "candidate_route_keys": [
+                "route:" + "|".join(f"{len(node)}:{node}" for node in customer_sequences[0][1:]),
+                *route_keys[1:],
+            ],
+        },
+    )
+    with pytest.raises(ValueError, match="complete routes/customer sequences mismatch"):
+        summarize_streamed_global_bests(
+            wrong_projection,
             {"wall_clock_30": 30},
             instance=instance,
         )

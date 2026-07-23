@@ -717,6 +717,7 @@ class Stage03Trace:
         operator: str,
         current_sequences: tuple[tuple[str, ...], ...],
         candidate_sequences: tuple[tuple[str, ...], ...],
+        candidate_full_routes: tuple[tuple[str, ...], ...] | None = None,
         current_objective_key: tuple[int, float, float, int] | tuple[()],
         candidate_objective_key: tuple[int, float, float, int] | tuple[()],
         candidate_feasible: bool,
@@ -729,29 +730,35 @@ class Stage03Trace:
             return
         current_keys = tuple(self.register_route(route) for route in current_sequences)
         candidate_keys = tuple(self.register_route(route) for route in candidate_sequences)
+        candidate_full_keys = (
+            tuple(self.register_route(route) for route in candidate_full_routes)
+            if candidate_full_routes is not None
+            else ()
+        )
         current_vehicle_count = len(current_sequences)
         candidate_vehicle_count = len(candidate_sequences)
-        self.events.append(
-            {
-                "event_type": "candidate_state",
-                "timestamp_seconds": self._offset(),
-                "lane": lane,
-                "iteration": iteration,
-                "operator": operator,
-                "status": status,
-                "reason": reason,
-                "current_route_keys": current_keys,
-                "candidate_route_keys": candidate_keys,
-                "candidate_feasible": candidate_feasible,
-                "accepted": accepted,
-                "global_best": global_best,
-                "current_objective_key": current_objective_key,
-                "candidate_objective_key": candidate_objective_key,
-                "current_vehicle_count": current_vehicle_count,
-                "candidate_vehicle_count": candidate_vehicle_count,
-                "candidate_vehicle_delta": candidate_vehicle_count - current_vehicle_count,
-            }
-        )
+        event: dict[str, object] = {
+            "event_type": "candidate_state",
+            "timestamp_seconds": self._offset(),
+            "lane": lane,
+            "iteration": iteration,
+            "operator": operator,
+            "status": status,
+            "reason": reason,
+            "current_route_keys": current_keys,
+            "candidate_route_keys": candidate_keys,
+            "candidate_feasible": candidate_feasible,
+            "accepted": accepted,
+            "global_best": global_best,
+            "current_objective_key": current_objective_key,
+            "candidate_objective_key": candidate_objective_key,
+            "current_vehicle_count": current_vehicle_count,
+            "candidate_vehicle_count": candidate_vehicle_count,
+            "candidate_vehicle_delta": candidate_vehicle_count - current_vehicle_count,
+        }
+        if candidate_full_keys:
+            event["candidate_full_route_keys"] = candidate_full_keys
+        self.events.append(event)
 
     def record_execution_error(self, error: BaseException) -> None:
         self.events.append(

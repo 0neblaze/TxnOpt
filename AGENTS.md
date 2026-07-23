@@ -594,6 +594,11 @@ this repository or one of its subdirectories.
   `(instance, seed)` shards, 2,040 runs, 229,200 declared solver seconds, and
   10,400 anytime rows. Only independent review may open Formal or report
   `READY_FOR_STAGE05_3`.
+- Candidate events retain both customer-sequence route identity and the
+  complete exact-charging depot/station route identity. Independent review
+  validates every accepted global-best complete route and objective and
+  requires its customer projection to equal the recorded customer sequence;
+  either identity missing or drifting is a hard failure.
 - Local absolute paths live only in the ignored storage-root locator. Tracked
   evidence records aliases, relative archive paths, volume identities, run
   status, source revision, prerequisite identities, byte count, and checksum.

@@ -8,6 +8,33 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-24：G15 producer 通过 36% 门槛但独立 review 拒绝不完整 route identity
+
+- clean revision `9834400` 上的 `stage05.2_accelerator_pilot_attempt14` 已由独立
+  transient service replay 通过，状态为 `READY_FOR_STAGE052_BENCHMARK`。raw/review
+  manifest SHA-256 分别为
+  `cad31e49851ee5953431045e1fcf601097ae6c1515619d7c875133ae0fc48c4b`
+  和 `94b5a22df0c983903dff487598af02935f9a7da15c5ce30e151f83513cec5d16`。
+  同 revision 的 F13 在 raw 创建前因测试工作副本遗留 `.pytest_cache` 被 source
+  snapshot guard 拒绝；正式 producer 改用从未执行测试的新只读 ext4 clone。
+- `stage05.2_benchmark_attempt15` producer 完成 36/36 pilot shards，三个 batch
+  persistence ratio 为 `0.34517927869972653`、`0.29652732269638515` 和
+  `0.3381115581407812`，campaign aggregate 为 `0.33377378597941765`，全部低于
+  36% hard gate。独立 campaign reviewer 正确返回 `NOT_READY`，未开放 Formal。
+- 最早 review failure 是首个 global-best event 的 route replay。producer 的
+  `candidate_route_keys` 按设计只表示 customer sequence；reviewer 错把该序列当作已经
+  包含 depot/station 的完整路线交给 validator，导致首个客户被报告为 unvisited。
+  其余 geometry/resource/storage 失败是 reviewer 在首 shard 中止后的级联结果，不得
+  单独标为真实 gate failure。
+- 当前实现保留原 `candidate_route_keys` 语义，并新增
+  `candidate_full_route_keys`，从同一个 feasible `_EvaluatedSolution` 的 exact-charging
+  results 记录完整 depot/station routes。该字段作为 typed event 的 bounded
+  `extras_json` list 持久化，不改变现有 Parquet schema；完整 route keys 同样进入
+  route dictionary。reviewer 现在验证完整路线与 objective，并要求其 customer
+  projection 与原 customer sequences 完全相等。缺失、不可行、objective mismatch
+  或 projection mismatch 均 fail fast。G15 保留 `NOT_READY`，后续须从新 clean
+  revision 重跑 F/G。
+
 ## 2026-07-24：F12 通过、G13/G14 环境失败并稳定 Windows edition identity
 
 - clean revision `c17e0dc` 上的 `stage05.2_accelerator_pilot_attempt12` 已由独立

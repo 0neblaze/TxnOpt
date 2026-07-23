@@ -1181,6 +1181,7 @@ def _normalise_general_event_values(
             in {
                 "current_objective_key",
                 "candidate_objective_key",
+                "candidate_full_route_keys",
                 "source_objective_key",
                 "objective_key",
                 "submission_order",

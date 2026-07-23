@@ -222,6 +222,19 @@ class _EvaluatedSolution:
     objective: SolutionObjective | None
 
 
+def _evaluated_full_routes(
+    solution: _EvaluatedSolution,
+) -> tuple[tuple[str, ...], ...] | None:
+    """Return complete depot/station routes only for a feasible evaluated solution."""
+
+    if not solution.feasible:
+        return None
+    routes = tuple(tuple(result.route) for result in solution.charging)
+    if len(routes) != len(solution.sequences) or any(not route for route in routes):
+        raise RuntimeError("feasible evaluated solution lacks complete charging routes")
+    return routes
+
+
 @dataclass(slots=True)
 class _IncumbentRouteLedger:
     by_lane: dict[
@@ -2687,6 +2700,7 @@ def _solve_alns(
                             operator=shadow_neighborhood,
                             current_sequences=shadow_current_before.sequences,
                             candidate_sequences=shadow_candidate.sequences,
+                            candidate_full_routes=_evaluated_full_routes(shadow_candidate),
                             current_objective_key=(
                                 shadow_current_before.objective.key
                                 if shadow_current_before.objective is not None
@@ -2899,6 +2913,7 @@ def _solve_alns(
                         operator=constraint_operator,
                         current_sequences=constraint_current_before.sequences,
                         candidate_sequences=constraint_candidate.sequences,
+                        candidate_full_routes=_evaluated_full_routes(constraint_candidate),
                         current_objective_key=(
                             constraint_current_before.objective.key
                             if constraint_current_before.objective is not None
@@ -3138,6 +3153,7 @@ def _solve_alns(
                     ),
                     current_sequences=previous_current.sequences,
                     candidate_sequences=candidate.sequences,
+                    candidate_full_routes=_evaluated_full_routes(candidate),
                     current_objective_key=(
                         previous_current.objective.key
                         if previous_current.objective is not None
@@ -3309,6 +3325,7 @@ def _solve_alns(
                 ),
                 current_sequences=previous_current.sequences,
                 candidate_sequences=candidate.sequences,
+                candidate_full_routes=_evaluated_full_routes(candidate),
                 current_objective_key=(
                     previous_current.objective.key if previous_current.objective is not None else ()
                 ),

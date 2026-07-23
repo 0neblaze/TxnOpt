@@ -1296,6 +1296,7 @@ def summarize_streamed_global_bests(
         if axis not in last:
             raise ArtifactIntegrityError(f"global-best event has unknown axis: {axis}")
         route_keys = event.get("candidate_route_keys")
+        full_route_keys = event.get("candidate_full_route_keys")
         if (
             not isinstance(route_keys, (list, tuple))
             or not route_keys
@@ -1304,7 +1305,28 @@ def summarize_streamed_global_bests(
             raise ArtifactIntegrityError(
                 f"global-best event lacks candidate route identity on {axis}"
             )
-        candidate_routes = [_route_sequence_from_key(str(key)) for key in route_keys]
+        if (
+            not isinstance(full_route_keys, (list, tuple))
+            or not full_route_keys
+            or any(not isinstance(key, str) or not key for key in full_route_keys)
+        ):
+            raise ArtifactIntegrityError(
+                f"global-best event lacks complete candidate route identity on {axis}"
+            )
+        candidate_sequences = [
+            _route_sequence_from_key(str(key)) for key in route_keys
+        ]
+        candidate_routes = [
+            _route_sequence_from_key(str(key)) for key in full_route_keys
+        ]
+        customer_names = {customer.name for customer in instance.customers}
+        projected_sequences = [
+            [node for node in route if node in customer_names] for route in candidate_routes
+        ]
+        if projected_sequences != candidate_sequences:
+            raise ArtifactIntegrityError(
+                f"global-best complete routes/customer sequences mismatch on {axis}"
+            )
         report = validate_routes(instance, candidate_routes)
         if not report.feasible:
             raise ArtifactIntegrityError(f"global-best candidate routes fail validation on {axis}")

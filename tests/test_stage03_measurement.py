@@ -230,6 +230,7 @@ def test_accepted_stage03_candidate_has_complete_vehicle_first_state() -> None:
     assert accepted
     for event in accepted:
         assert event["candidate_route_keys"]
+        assert event["candidate_full_route_keys"]
         assert event["candidate_objective_key"]
         assert event["candidate_vehicle_count"] <= event["current_vehicle_count"]
 

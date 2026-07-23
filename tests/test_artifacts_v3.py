@@ -2259,8 +2259,14 @@ def test_iter_events_restores_candidate_route_keys_for_global_best(
         worker_identity="worker-0",
     )
     route_keys = ("route:2:C1", "route:2:C2")
+    full_route_keys = ("route:2:D0|2:C1|2:D0", "route:2:D0|2:C2|2:D0")
     shard.append(
-        route_dictionary={route_keys[0]: ("C1",), route_keys[1]: ("C2",)},
+        route_dictionary={
+            route_keys[0]: ("C1",),
+            route_keys[1]: ("C2",),
+            full_route_keys[0]: ("D0", "C1", "D0"),
+            full_route_keys[1]: ("D0", "C2", "D0"),
+        },
         critical_events=(
             {
                 "event_type": "candidate_state",
@@ -2274,6 +2280,7 @@ def test_iter_events_restores_candidate_route_keys_for_global_best(
                 "candidate_vehicle_count": 2,
                 "candidate_vehicle_delta": 0,
                 "candidate_route_keys": route_keys,
+                "candidate_full_route_keys": full_route_keys,
                 "candidate_objective_key": [2, 10.0, 0.0, 0],
             },
         ),
@@ -2293,6 +2300,7 @@ def test_iter_events_restores_candidate_route_keys_for_global_best(
     )
 
     assert rows[0]["candidate_route_keys"] == list(route_keys)
+    assert rows[0]["candidate_full_route_keys"] == list(full_route_keys)
     assert len(rows[0]["candidate_route_ids"]) == 2
 
 
