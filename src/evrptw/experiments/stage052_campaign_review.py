@@ -2498,6 +2498,7 @@ def _audit_campaign_controls(
     campaign_dir: Path,
     reader: ArtifactReader,
     campaign: CampaignManifest,
+    config: BenchmarkCampaignConfig,
     locator: StorageRootLocator,
     staging_root_alias: str,
     archive_root_aliases: tuple[str, ...],
@@ -2541,6 +2542,7 @@ def _audit_campaign_controls(
             phase = ("pre_dispatch", "pre_archive", "post_archive")[observation_index % 3]
             expected_required = _expected_rolling_capacity_required(
                 campaign=campaign,
+                config=config,
                 batch_index=batch_index,
                 phase=phase,
                 staging_root_alias=staging_root_alias,
@@ -2842,6 +2844,7 @@ def _audit_campaign_controls(
 def _expected_rolling_capacity_required(
     *,
     campaign: CampaignManifest,
+    config: BenchmarkCampaignConfig,
     batch_index: int,
     phase: str,
     staging_root_alias: str,
@@ -2851,6 +2854,13 @@ def _expected_rolling_capacity_required(
 
     if phase not in {"pre_dispatch", "pre_archive", "post_archive"}:
         raise ArtifactIntegrityError("rolling capacity phase is invalid")
+    if (
+        config.run_label != campaign.run_label
+        or config.scope != campaign.scope
+        or config.staging_root_alias != staging_root_alias
+        or config.archive_root_aliases != archive_root_aliases
+    ):
+        raise ArtifactIntegrityError("rolling capacity campaign/config identity is invalid")
     try:
         current = campaign.batches[batch_index]
         staging_device = campaign.storage_roots[staging_root_alias].device_uuid
@@ -2859,7 +2869,12 @@ def _expected_rolling_capacity_required(
     required: dict[str, int] = {}
     for alias in archive_root_aliases:
         volume = campaign.storage_roots[alias]
-        reserve = 52 * 1024**3 if volume.device_uuid == staging_device else 50 * 1024**3
+        reserve = (
+            config.external_safety_reserve_bytes
+            + config.external_active_workspace_bytes
+            if volume.device_uuid == staging_device
+            else config.internal_safety_reserve_bytes
+        )
         required[volume.device_uuid] = max(required.get(volume.device_uuid, 0), reserve)
     future = campaign.batches[batch_index + 1 :]
     projected = campaign.batches[batch_index:] if phase == "pre_dispatch" else future
@@ -2872,18 +2887,24 @@ def _expected_rolling_capacity_required(
         target = campaign.storage_roots[current.archive_root_alias].device_uuid
         if target != staging_device:
             required[target] = required.get(target, 0) + current.actual_bytes
-        staging_required = 20 * 1024**3
+        staging_required = config.external_safety_reserve_bytes
         if future:
             staging_required = (
-                52 * 1024**3
+                config.external_safety_reserve_bytes
+                + config.external_active_workspace_bytes
                 if target == staging_device
-                else max(20 * 1024**3, 52 * 1024**3 - current.actual_bytes)
+                else max(
+                    config.external_safety_reserve_bytes,
+                    config.external_safety_reserve_bytes
+                    + config.external_active_workspace_bytes
+                    - current.actual_bytes,
+                )
             )
         required[staging_device] = max(required.get(staging_device, 0), staging_required)
     else:
-        staging_reserve = 20 * 1024**3
+        staging_reserve = config.external_safety_reserve_bytes
         if phase == "pre_dispatch" or future:
-            staging_reserve = 52 * 1024**3
+            staging_reserve += config.external_active_workspace_bytes
         required[staging_device] = max(required.get(staging_device, 0), staging_reserve)
     return dict(sorted(required.items()))
 
@@ -3457,6 +3478,7 @@ def _audit_campaign(
         if not root_failures
         else f"storage root identity failures: {sorted(root_failures)}",
     }
+    planning_config: BenchmarkCampaignConfig | None = None
     try:
         planning_config = (
             BenchmarkCampaignConfig.pilot(
@@ -3869,14 +3891,19 @@ def _audit_campaign(
                 else "Formal planned archive/staging aliases exceed accepted pilot coverage"
             ),
         }
-    controls_passed, controls_detail = _audit_campaign_controls(
-        campaign_dir=campaign_dir,
-        reader=standard_reader,
-        campaign=campaign,
-        locator=locator,
-        staging_root_alias=str(top_staging_alias),
-        archive_root_aliases=tuple(str(alias) for alias in top_archive_aliases),
-    )
+    if planning_config is None:
+        controls_passed = False
+        controls_detail = "canonical campaign configuration could not be reconstructed"
+    else:
+        controls_passed, controls_detail = _audit_campaign_controls(
+            campaign_dir=campaign_dir,
+            reader=standard_reader,
+            campaign=campaign,
+            config=planning_config,
+            locator=locator,
+            staging_root_alias=str(top_staging_alias),
+            archive_root_aliases=tuple(str(alias) for alias in top_archive_aliases),
+        )
     if scope == "pilot":
         if controls_passed:
             evidence.verified_archive_root_aliases.update(map(str, top_archive_aliases))

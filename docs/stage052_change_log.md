@@ -632,3 +632,13 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   cross-platform `probe_volume_identity`；campaign reviewer 现在复用同一实现，WSL
   ext4 UUID 与 D: NVMe/9p identity 均重新核对。旧 reviewer generation 和 finalized
   receipt 继续保留，不改写 raw。
+- cross-platform probe 修复后的第三次 review 已令 `storage_roots` 及此前通过的全部
+  scientific gates 通过，但在 `pilot_campaign_drills` 暴露 reviewer 自身的
+  rolling-capacity arithmetic drift：producer 的 canonical config 固定
+  `external_safety=50 GiB`、`external_active_workspace=32 GiB`、
+  `internal_safety=50 GiB`，而旧 reviewer 错误硬编码为 52/20 GiB。九份已签名
+  observation 与 producer 逻辑一致：active/future 阶段 WSL staging reserve 为
+  82 GiB，final safety reserve 为 50 GiB，D archive internal reserve 为 50 GiB。
+  reviewer 现在从重建的 `BenchmarkCampaignConfig` 独立计算同一公式并验证
+  campaign/config/alias identity，不降低任何容量门槛；第三个 `NOT_READY`
+  generation 继续进入 immutable review history，sealed raw 不变。

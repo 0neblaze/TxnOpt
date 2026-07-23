@@ -614,6 +614,11 @@ this repository or one of its subdirectories.
   shared cross-platform `probe_volume_identity`; WSL uses `findmnt`, DrvFS
   additionally binds the Windows NVMe identity, and macOS uses `diskutil`.
   Reviewer-local platform probes are forbidden contract drift.
+  Campaign rolling-capacity replay must derive its reserves from the rebuilt
+  identity-matched `BenchmarkCampaignConfig`: WSL active/future staging uses
+  50 GiB safety plus 32 GiB active workspace, final WSL safety is 50 GiB, and
+  internal archive safety is 50 GiB. Reviewer-local reserve constants or lower
+  thresholds are forbidden contract drift.
 - Formal review uses bounded Arrow batches and streaming iterators and rejects
   full-shard `to_pylist()`, `read_events()`, or `reconstruct_trace()`. It
   independently verifies exact campaign geometry, bidirectional descriptors,

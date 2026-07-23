@@ -171,6 +171,10 @@ next-fit partitioning 的 target/hard cap 为 24/32 GiB，单 shard hard cap 2 G
 producer、retention、performance reviewer 与 campaign reviewer 必须调用同一个
 cross-platform `probe_volume_identity`：WSL 用 `findmnt`，DrvFS 额外绑定 Windows
 NVMe identity，macOS 才使用 `diskutil`。reviewer 不得复制或硬编码单一平台 probe。
+rolling-capacity replay 必须从重建且与 campaign identity 一致的 canonical
+`BenchmarkCampaignConfig` 读取 reserve：WSL active/future workspace 为
+`50 + 32 = 82 GiB`，final WSL safety 为 `50 GiB`，D archive internal safety 为
+`50 GiB`。reviewer 不得另设 magic constants（魔法常量）或降低 producer 门槛。
 
 ### Formal budget matrix
 

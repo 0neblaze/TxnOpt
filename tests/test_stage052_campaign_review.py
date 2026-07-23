@@ -103,6 +103,66 @@ def test_campaign_volume_probe_uses_shared_cross_platform_implementation(
     assert observed_paths == [path]
 
 
+def test_rolling_capacity_replay_uses_canonical_campaign_reserves() -> None:
+    gib = 1024**3
+    config = BenchmarkCampaignConfig.pilot(
+        run_label="stage05.2_benchmark_attempt16",
+        staging_root_alias="staging",
+        archive_root_aliases=("archive",),
+        selected_backend="native_cpu",
+        selected_exact_backend="cpu_batch",
+        selected_workers=4,
+        native_profile="stage05.2-native-kernels-v1",
+    )
+    staging = VolumeIdentity(device_uuid="staging-ext4", filesystem="ext4")
+    archive = VolumeIdentity(device_uuid="archive-9p", filesystem="9p")
+    current = SimpleNamespace(
+        archive_root_alias="archive",
+        estimated_bytes=2 * gib,
+        actual_bytes=3 * gib,
+    )
+    campaign = SimpleNamespace(
+        run_label=config.run_label,
+        scope=config.scope,
+        storage_roots={"staging": staging, "archive": archive},
+        batches=(current,),
+    )
+
+    assert campaign_review_module._expected_rolling_capacity_required(
+        campaign=campaign,
+        config=config,
+        batch_index=0,
+        phase="pre_dispatch",
+        staging_root_alias="staging",
+        archive_root_aliases=("archive",),
+    ) == {
+        "archive-9p": 52 * gib,
+        "staging-ext4": 82 * gib,
+    }
+    assert campaign_review_module._expected_rolling_capacity_required(
+        campaign=campaign,
+        config=config,
+        batch_index=0,
+        phase="pre_archive",
+        staging_root_alias="staging",
+        archive_root_aliases=("archive",),
+    ) == {
+        "archive-9p": 53 * gib,
+        "staging-ext4": 50 * gib,
+    }
+    assert campaign_review_module._expected_rolling_capacity_required(
+        campaign=campaign,
+        config=config,
+        batch_index=0,
+        phase="post_archive",
+        staging_root_alias="staging",
+        archive_root_aliases=("archive",),
+    ) == {
+        "archive-9p": 50 * gib,
+        "staging-ext4": 50 * gib,
+    }
+
+
 @pytest.fixture(autouse=True)
 def _verified_source_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
