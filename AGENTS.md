@@ -599,6 +599,13 @@ this repository or one of its subdirectories.
   validates every accepted global-best complete route and objective and
   requires its customer projection to equal the recorded customer sequence;
   either identity missing or drifting is a hard failure.
+- Deadline boundaries are lane-local because the constraint-guided profile
+  reserves its final 0.1-second slice after the legacy/quality deadline.
+  Independent replay forbids exact work, cache stores, or candidate acceptance
+  after a boundary in the same lane and independently rejects any exact
+  completion or accepted candidate beyond the axis wall-clock budget. A
+  legacy/quality boundary must not terminate valid constraint-lane work that
+  remains within the overall axis budget.
 - Local absolute paths live only in the ignored storage-root locator. Tracked
   evidence records aliases, relative archive paths, volume identities, run
   status, source revision, prerequisite identities, byte count, and checksum.

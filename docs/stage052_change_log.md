@@ -598,3 +598,29 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   5.5-GiB process-tree guard。
 - 证据影响：producer/solver 语义不变；B04 使用新 reviewer generation 复审后才锁定为
   C prerequisite。旧 review generation 与巨大 mismatch 文件保持不可变并归档。
+
+## 2026-07-23：G pilot attempt16 lane-local deadline replay 修复
+
+- `stage05.2_benchmark_attempt16` producer 完成 36/36 pilot shards，三批 persistence
+  ratio 分别为 `0.32856322689393336`、`0.2994853687778845` 和
+  `0.33177058212924965`，campaign aggregate 为 `0.32904761287664286`，均未超过
+  36% 门槛；raw manifest SHA-256 为
+  `65c809ecc63b4a28d9f3fffc9548ce74605d07f18b2585403328e4ab8441bacf`。
+- 首次 independent campaign review 发布 `NOT_READY`。最早失败为
+  `batch0003/c101_21/2015` 的 “exact work started after deadline”；其余 geometry、
+  persistence、storage、resource 和 publication failures 是该 shard 未进入 aggregate
+  后的级联结果。
+- 原始事件证明首个 boundary 位于 `29.919126434993814` 秒并属于
+  `wall_clock_30:legacy`；其后 56 条 exact-start/cache-store 事件全部属于预留的
+  `wall_clock_30:constraint_lane`，均在 30 秒总预算内。同一 lane 在自身 boundary 后
+  的违规数为零。producer raw 因而没有 deadline violation。
+- 根因是 campaign reviewer 用一个 axis-global `deadline_seen` Boolean 截断所有 lane，
+  与 ALNS 的 `legacy_deadline = overall_deadline - 0.1s` 和 constraint-lane reservation
+  冲突。reviewer 现在分别记录 lane-local boundary；同 lane 后续 exact/cache/accept
+  仍是 hard failure，任何 exact completion 或 accepted candidate 超过 axis 总预算也
+  仍是 hard failure。
+- 回归测试先在旧状态机上稳定失败，再在修复后通过；修复版对原始 1,305,412 条逻辑
+  事件完整重放通过，核对 1,365 次 started/completed exact calls、148 次 accepted
+  candidates、6 次 global best 和 wall-clock deadline identity。producer、solver、
+  objective、36% persistence gate 和 raw bytes 均未修改；首次 NOT_READY review
+  generation 保留在 immutable history 后，以新 reviewer wheel 显式复审同一 sealed raw。

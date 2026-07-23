@@ -24,6 +24,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any, TypeGuard
 
@@ -575,6 +576,7 @@ class _AxisEventState:
     exact_started: int = 0
     exact_completed: int = 0
     deadline_seen: bool = False
+    deadline_lanes: set[str] = dataclass_field(default_factory=set)
     accepted_candidates: int = 0
     global_bests: int = 0
 
@@ -610,6 +612,7 @@ def audit_streamed_events(
         if state is None:
             failures.append(f"event refers to an unknown benchmark axis: {axis}")
             continue
+        lane = str(event.get("lane", "")) or axis
         observed_axes.add(axis)
         event_type = str(event.get("event_type", event.get("record_type", "")))
         fallback_fields = (
@@ -627,6 +630,7 @@ def audit_streamed_events(
 
         if event_type == "deadline_boundary":
             state.deadline_seen = True
+            state.deadline_lanes.add(lane)
             timestamp = _finite_number(event.get("timestamp_seconds"))
             if timestamp is None or not math.isclose(
                 timestamp,
@@ -643,7 +647,7 @@ def audit_streamed_events(
             else:
                 state.last_evaluation_id = evaluation_id
         if event_type == "route_evaluation" and event.get("exact_started") is True:
-            if state.deadline_seen:
+            if lane in state.deadline_lanes:
                 failures.append(f"exact work started after deadline on {axis}")
             state.exact_started += 1
             started_at = _finite_number(event.get("started_at"))
@@ -667,11 +671,12 @@ def audit_streamed_events(
                     completed_exact_keys[axis].add(digest)
             if event.get("deadline_boundary"):
                 state.deadline_seen = True
+                state.deadline_lanes.add(lane)
 
         if event_type == "cache_event":
             operation = str(event.get("operation", ""))
             digest = str(event.get("cache_key_digest", ""))
-            if state.deadline_seen and operation == "store":
+            if lane in state.deadline_lanes and operation == "store":
                 failures.append(f"cache store observed after deadline on {axis}")
             if operation == "store":
                 if not digest:
@@ -698,7 +703,7 @@ def audit_streamed_events(
             global_best = event.get("global_best") is True
             if accepted:
                 state.accepted_candidates += 1
-                if state.deadline_seen:
+                if lane in state.deadline_lanes:
                     failures.append(f"candidate accepted after deadline on {axis}")
                 vehicle_delta = event.get("candidate_vehicle_delta")
                 if not _is_int(vehicle_delta) or vehicle_delta > 0:

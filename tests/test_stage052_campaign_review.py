@@ -273,6 +273,56 @@ def test_streaming_event_audit_rejects_acceptance_after_deadline() -> None:
     assert "deadline" in audit.detail
 
 
+def test_streaming_event_audit_keeps_deadline_boundaries_lane_local() -> None:
+    events = (
+        {
+            "event_id": 1,
+            "benchmark_axis": "wall_clock_30",
+            "lane": "wall_clock_30:legacy",
+            "event_type": "deadline_boundary",
+            "timestamp_seconds": 29.9,
+        },
+        {
+            "event_id": 2,
+            "benchmark_axis": "wall_clock_30",
+            "lane": "wall_clock_30:constraint_lane",
+            "event_type": "cache_event",
+            "operation": "lookup_result",
+            "lookup_result": "miss",
+            "cache_key_digest": "constraint-route",
+            "timestamp_seconds": 29.91,
+        },
+        {
+            "event_id": 3,
+            "benchmark_axis": "wall_clock_30",
+            "lane": "wall_clock_30:constraint_lane",
+            "event_type": "route_evaluation",
+            "kind": "exact_call",
+            "evaluation_id": 1,
+            "exact_started": True,
+            "exact_completed": True,
+            "started_at": 29.92,
+            "completed_at": 29.93,
+            "cache_key_digest": "constraint-route",
+            "status": "completed_feasible",
+        },
+        {
+            "event_id": 4,
+            "benchmark_axis": "wall_clock_30",
+            "lane": "wall_clock_30:constraint_lane",
+            "event_type": "cache_event",
+            "operation": "store",
+            "cache_key_digest": "constraint-route",
+            "timestamp_seconds": 29.94,
+        },
+    )
+
+    audit = audit_streamed_events(events, {"wall_clock_30": 30})
+
+    assert audit.passed is True, audit.detail
+    assert audit.deadline_axes == ("wall_clock_30",)
+
+
 def test_streaming_event_audit_rejects_native_fallback() -> None:
     audit = audit_streamed_events(
         (

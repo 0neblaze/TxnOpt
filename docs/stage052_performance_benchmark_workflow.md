@@ -198,6 +198,11 @@ anytime checkpoints 为预算范围内的 `1/5/10/30/60/120/300 s`。small insta
 
 independent reviewer 必须从 raw shards 重算：exact scope identity、validator/objective、event/cache/exact-call、deadline/budget、worker/shard completeness、resource limits、严格性能 gate、anytime 汇总和模型兼容性。BKS compatibility 仍为 `False`，因此不创建 gap 列。
 
+`deadline_boundary` 按 lane（搜索通道）生效：同一 lane 在 boundary 后不得再启动
+exact work、写 cache 或接受 candidate；同时所有 exact completion 和 accepted
+candidate 仍不得越过 axis 的总 wall-clock budget。Stage 2.3 明确保留的最后 0.1 秒
+constraint-lane slice 不得被 legacy/quality lane 的提前 boundary 错误截断。
+
 已进入 retention registry 的归档目录是 immutable review input（不可变审查输入），可
 作为 comparison/prerequisite 读取，但不能再作为写入 review generation 的 `raw_dir`。
 需要产生新 review generation 时，目标 raw 必须仍位于 active root；封存完成后再归档。
