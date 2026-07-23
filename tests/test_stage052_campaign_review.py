@@ -426,6 +426,24 @@ def test_campaign_reviewer_recomputes_async_batch_ledger() -> None:
         )
 
 
+def test_campaign_reviewer_restores_prepared_screening_empty_reason_token() -> None:
+    token = campaign_review_module._pipeline_event_token_from_logical_row(  # noqa: SLF001
+        {
+            "event_type": "screening_decision",
+            "benchmark_axis": "wall_clock_30",
+            "lane": "wall_clock_30:constraint",
+            "iteration": 1,
+            "operator": "repair",
+            "route_key": "route:2:C1",
+            "decision_id": 2,
+            "status": "pass",
+            "reason": None,
+        }
+    )
+
+    assert token[10] == ""
+
+
 def test_axis_reconciliation_rejects_missing_deadline_and_exact_events() -> None:
     event_audit = audit_streamed_events(
         (

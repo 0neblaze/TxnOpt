@@ -818,12 +818,21 @@ def _validate_persistence_pipeline(recorded: object) -> None:
 
 def _pipeline_event_token_from_logical_row(row: Mapping[str, object]) -> tuple[object, ...]:
     get = row.get
+    event_type = str(get("event_type", get("record_type", "event")))
     kind = get("kind") or None
     operation = get("operation") or None
     status = get("status") or None
-    reason = get("reason") or None
+    raw_reason = get("reason")
+    # Prepared v3 screening tuples hash the original ScreeningDecision.reason
+    # directly.  Its empty string is represented as null by the expanded
+    # physical schema, so restore that one lossless producer token here.
+    reason = (
+        ""
+        if event_type == "screening_decision" and raw_reason is None
+        else raw_reason or None
+    )
     return (
-        str(get("event_type", get("record_type", "event"))),
+        event_type,
         get("benchmark_axis"),
         get("lane"),
         get("iteration"),

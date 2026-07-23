@@ -23,6 +23,13 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   persistence 为 113.799960 秒，ratio 为 0.345195736；因此它低于 36% 新门槛，可进入
   独立 raw replay 并作为 E 候选通过证据。最终 E readiness 仍以重审生成的签名 review
   products（审查产物）为准。
+- 首次重审在 `c101C5/2014/fixed_work_control` 暴露 reviewer-only ledger
+  reconstruction bug（仅审查器的账本重构缺陷）：prepared v3 producer 直接把空
+  `ScreeningDecision.reason` 字符串写入 batch token，而 expanded physical row（展开后的
+  物理行）按 schema 表示为 null；两个 reviewer 错误地继续把 null 哈希为 null。逐字段
+  重算证明把该 screening null 恢复为空字符串后，首批 27,194-row SHA-256 与 raw ledger
+  完全一致。performance 与 campaign reviewer 现仅在 screening token 上恢复这一有损表示，
+  producer/raw 均不修改；空 reason 回归测试覆盖实际 v3 round-trip。
 
 ## 2026-07-23：E13--E14 mixed-batch columnar screening persistence
 
