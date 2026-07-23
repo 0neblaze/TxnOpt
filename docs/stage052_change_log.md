@@ -8,6 +8,30 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：F/G 前置持久化热路径修复
+
+- `stage05.2_benchmark_attempt03` 的 36% producer gate 失败后，继续从最早受影响的
+  screening/neighborhood persistence（筛选/邻域持久化）热路径修复；没有启动 Formal，
+  也没有复用 attempt03 label。
+- v3 screening callback 现在提交 immutable flat deferred rows（不可变扁平延迟行），
+  writer 通过 native typed-column prepass（原生类型列预扫描）批量绑定 occurrence；
+  negative-cache evidence（负缓存证据）按 route identity 有界复用，并在证据漂移时
+  fail fast。definition payload、完整 checks、SHA-256 collision check 和 occurrence
+  顺序均保留。
+- 内存中的 neighborhood block（邻域事件块）使用 native column packer（原生列打包器）
+  直接生成 36 列 schema；包含普通事件的 mixed batch（混合批次）仍回退到原顺序
+  normalizer，避免通过重排换取性能。未知字段也回退到通用路径，不会静默丢失。
+- producer callback 的单调时钟纳秒仍逐次测量，但 cooperative shard turn 下的
+  non-overlapping intervals（非重叠区间）按最多 4,096 次 callback 有界汇总后写入
+  union meter；提交 batch、释放 writer turn、finish 或 close 前强制 flush。该修改只
+  去除每条记录重复获取计量锁的成本，不改变累计纳秒或 36% 公式。
+- writer 使用 0.5 秒 thread switch interval（线程切换间隔），producer callback 与
+  writer 采用 cooperative turns（协作式执行权）；显式 finish/drain 中允许的重叠仍由
+  union meter 只计一次。reviewer 从同一常量验证该物理协议。
+- differential、negative-cache drift、FIFO ledger、real-writer round-trip、mypy 和 ruff
+  回归均通过。代表性单 shard 诊断仍有机器抖动，不能替代正式 batch aggregate gate；
+  后续 F/G 必须使用新 label，由 producer 和 independent reviewer 共同执行 36% 硬门。
+
 ## 2026-07-23：G pilot attempt03 拒绝错误重叠计量并确认剩余编码瓶颈
 
 - `stage05.2_benchmark_attempt03` 在完成首个 12-shard batch 后由 producer gate

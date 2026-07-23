@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -74,6 +75,395 @@ py::array_t<double> distance_matrix(
         }
     }
     return output;
+}
+
+py::tuple pack_stage052_screening_occurrences(
+    const py::sequence& events,
+    const py::dict& definition_cache,
+    py::dict negative_evidence_cache,
+    const std::int64_t first_event_id) {
+    py::list event_ids;
+    py::list definition_ids;
+    py::list started_at;
+    py::list completed_at;
+    py::list iterations;
+    py::list decision_ids;
+    py::list misses;
+    py::list non_screening_indices;
+    py::dict pending_indices;
+
+    const py::ssize_t event_count = py::len(events);
+    for (py::ssize_t event_index = 0; event_index < event_count; ++event_index) {
+        const py::object event = events[event_index];
+        if (!PyTuple_Check(event.ptr()) || PyTuple_GET_SIZE(event.ptr()) != 2) {
+            non_screening_indices.append(event_index);
+            continue;
+        }
+        const py::object axis_name =
+            py::reinterpret_borrow<py::object>(PyTuple_GET_ITEM(event.ptr(), 0));
+        const py::object raw_values =
+            py::reinterpret_borrow<py::object>(PyTuple_GET_ITEM(event.ptr(), 1));
+        if (!PyUnicode_Check(axis_name.ptr())) {
+            non_screening_indices.append(event_index);
+            continue;
+        }
+        if (!PyTuple_Check(raw_values.ptr()) || PyTuple_GET_SIZE(raw_values.ptr()) != 20) {
+            throw std::invalid_argument(
+                "Stage 5.2 deferred screening values must contain twenty fields");
+        }
+        const py::tuple values = py::reinterpret_borrow<py::tuple>(raw_values);
+        py::tuple key(5);
+        key[0] = values[1];
+        key[1] = axis_name;
+        key[2] = values[2];
+        key[3] = values[4];
+        if (values[15].ptr() == Py_True && !values[19].is_none()) {
+            PyObject* cached_evidence =
+                PyDict_GetItemWithError(negative_evidence_cache.ptr(), values[1].ptr());
+            if (cached_evidence == nullptr) {
+                if (PyErr_Occurred()) {
+                    throw py::error_already_set();
+                }
+                if (py::len(negative_evidence_cache) >= 262144) {
+                    throw std::invalid_argument(
+                        "Stage 5.2 native negative evidence cache exceeds its hard limit");
+                }
+                py::tuple evidence(12);
+                for (py::ssize_t index = 0; index < 12; ++index) {
+                    evidence[index] = values[7 + index];
+                }
+                negative_evidence_cache[values[1]] = std::move(evidence);
+            } else {
+                if (!PyTuple_Check(cached_evidence)
+                    || PyTuple_GET_SIZE(cached_evidence) != 12) {
+                    throw std::invalid_argument(
+                        "Stage 5.2 native negative evidence cache is invalid");
+                }
+                for (py::ssize_t index = 0; index < 12; ++index) {
+                    PyObject* previous = PyTuple_GET_ITEM(cached_evidence, index);
+                    PyObject* current = values[7 + index].ptr();
+                    if (previous == current) {
+                        continue;
+                    }
+                    const int equal = PyObject_RichCompareBool(previous, current, Py_EQ);
+                    if (equal < 0) {
+                        throw py::error_already_set();
+                    }
+                    if (equal == 0) {
+                        throw std::invalid_argument(
+                            "negative screening cache returned inconsistent evidence for one route");
+                    }
+                }
+            }
+            key[4] = values[19];
+        } else {
+            py::tuple evidence(12);
+            for (py::ssize_t index = 0; index < 12; ++index) {
+                evidence[index] = values[7 + index];
+            }
+            key[4] = std::move(evidence);
+        }
+
+        const auto occurrence_index = py::len(event_ids);
+        event_ids.append(first_event_id + event_index);
+        started_at.append(values[5]);
+        completed_at.append(values[6]);
+        iterations.append(values[3]);
+        decision_ids.append(values[0]);
+        PyObject* cached = PyDict_GetItemWithError(definition_cache.ptr(), key.ptr());
+        if (cached != nullptr) {
+            if (!PyLong_Check(cached) || PyBool_Check(cached)) {
+                throw std::invalid_argument(
+                    "Stage 5.2 screening definition cache value must be an integer");
+            }
+            definition_ids.append(py::reinterpret_borrow<py::object>(cached));
+            continue;
+        }
+        if (PyErr_Occurred()) {
+            throw py::error_already_set();
+        }
+        definition_ids.append(py::none());
+        PyObject* pending = PyDict_GetItemWithError(pending_indices.ptr(), key.ptr());
+        if (pending == nullptr) {
+            if (PyErr_Occurred()) {
+                throw py::error_already_set();
+            }
+            py::list indices;
+            indices.append(occurrence_index);
+            pending_indices[key] = indices;
+            misses.append(py::make_tuple(key, event_index, indices));
+        } else {
+            py::reinterpret_borrow<py::list>(pending).append(occurrence_index);
+        }
+    }
+    return py::make_tuple(
+        py::make_tuple(
+            std::move(event_ids),
+            std::move(definition_ids),
+            std::move(started_at),
+            std::move(completed_at),
+            std::move(iterations),
+            std::move(decision_ids)),
+        std::move(misses),
+        std::move(non_screening_indices));
+}
+
+py::tuple pack_stage052_neighborhood_events(
+    const py::sequence& events,
+    py::dict lane_ids,
+    py::dict operator_ids,
+    py::dict extras_cache,
+    const py::object& allowed_fields,
+    const py::object& missing_extra,
+    const py::object& stable_dictionary_id,
+    const py::object& json_text,
+    const std::int64_t first_event_id) {
+    py::tuple columns(36);
+    for (py::ssize_t index = 0; index < 36; ++index) {
+        columns[index] = py::list();
+    }
+    py::list non_neighborhood_indices;
+    py::list empty_list;
+    py::object none = py::none();
+    const std::array<const char*, 21> extra_fields = {
+        "aggregate_count",
+        "benchmark_axis",
+        "candidate_objective_key",
+        "candidate_pool_hash",
+        "chain_depth",
+        "constraint_category",
+        "distance_improvement",
+        "exact_route_evaluations",
+        "new_routes_created",
+        "prefilter_passed",
+        "ranking_score",
+        "removal_size_actual",
+        "removal_size_requested",
+        "removal_tier",
+        "removal_trigger",
+        "reset_observed",
+        "segment_length",
+        "selection_rank",
+        "stagnation_iterations",
+        "track",
+        "vehicle_reduction",
+    };
+    const auto append = [&columns](const py::ssize_t column, const py::object& value) {
+        py::reinterpret_borrow<py::list>(columns[column]).append(value);
+    };
+    const auto get = [](PyObject* mapping, const char* key) -> PyObject* {
+        return PyDict_GetItemString(mapping, key);
+    };
+    const auto string_value = [](PyObject* value) -> py::object {
+        if (value == nullptr) {
+            return py::str("");
+        }
+        return py::str(py::reinterpret_borrow<py::object>(value));
+    };
+    const auto optional_float = [&none](PyObject* value) -> py::object {
+        if (value == nullptr || value == Py_None || PyBool_Check(value)) {
+            return none;
+        }
+        if (PyFloat_Check(value) || PyLong_Check(value)) {
+            const double converted = PyFloat_AsDouble(value);
+            if (converted == -1.0 && PyErr_Occurred()) {
+                throw py::error_already_set();
+            }
+            return py::float_(converted);
+        }
+        const py::str text(py::reinterpret_borrow<py::object>(value));
+        PyObject* converted = PyFloat_FromString(text.ptr());
+        if (converted != nullptr) {
+            return py::reinterpret_steal<py::object>(converted);
+        }
+        PyErr_Clear();
+        return none;
+    };
+    const auto optional_int = [&none](PyObject* value) -> py::object {
+        if (value == nullptr || value == Py_None || PyBool_Check(value)) {
+            return none;
+        }
+        if (PyLong_Check(value)) {
+            return py::reinterpret_borrow<py::object>(value);
+        }
+        const py::str text(py::reinterpret_borrow<py::object>(value));
+        PyObject* converted = PyLong_FromUnicodeObject(text.ptr(), 10);
+        if (converted != nullptr) {
+            return py::reinterpret_steal<py::object>(converted);
+        }
+        PyErr_Clear();
+        return none;
+    };
+    const auto optional_bool = [&none](PyObject* value) -> py::object {
+        if (value == Py_True || value == Py_False) {
+            return py::reinterpret_borrow<py::object>(value);
+        }
+        return none;
+    };
+    const auto dictionary_id = [&stable_dictionary_id](
+                                   py::dict& dictionary,
+                                   const py::object& text,
+                                   const char* prefix) -> py::object {
+        PyObject* cached = PyDict_GetItemWithError(dictionary.ptr(), text.ptr());
+        if (cached != nullptr) {
+            return py::reinterpret_borrow<py::object>(cached);
+        }
+        if (PyErr_Occurred()) {
+            throw py::error_already_set();
+        }
+        const py::object value = stable_dictionary_id(
+            py::str(std::string(prefix) + py::cast<std::string>(text)));
+        dictionary[text] = value;
+        return value;
+    };
+
+    const py::ssize_t event_count = py::len(events);
+    for (py::ssize_t event_index = 0; event_index < event_count; ++event_index) {
+        const py::object event = events[event_index];
+        if (!PyDict_Check(event.ptr())) {
+            non_neighborhood_indices.append(event_index);
+            continue;
+        }
+        PyObject* event_type = get(event.ptr(), "event_type");
+        PyObject* record_type = get(event.ptr(), "record_type");
+        const bool is_neighborhood =
+            (event_type != nullptr && PyUnicode_Check(event_type)
+             && PyUnicode_CompareWithASCIIString(event_type, "neighborhood_event") == 0)
+            || (event_type == nullptr && record_type != nullptr
+                && PyUnicode_Check(record_type)
+                && PyUnicode_CompareWithASCIIString(record_type, "neighborhood_event") == 0);
+        if (!is_neighborhood) {
+            non_neighborhood_indices.append(event_index);
+            continue;
+        }
+        PyObject* key = nullptr;
+        PyObject* value = nullptr;
+        Py_ssize_t position = 0;
+        bool supported = true;
+        while (PyDict_Next(event.ptr(), &position, &key, &value)) {
+            const int allowed = PySet_Contains(allowed_fields.ptr(), key);
+            if (allowed < 0) {
+                throw py::error_already_set();
+            }
+            if (allowed == 0) {
+                non_neighborhood_indices.append(event_index);
+                supported = false;
+                break;
+            }
+        }
+        if (!supported) {
+            continue;
+        }
+
+        py::tuple extra_values(extra_fields.size());
+        py::dict extras;
+        for (std::size_t index = 0; index < extra_fields.size(); ++index) {
+            PyObject* raw = get(event.ptr(), extra_fields[index]);
+            if (raw == nullptr) {
+                extra_values[index] = missing_extra;
+            } else {
+                const py::object borrowed = py::reinterpret_borrow<py::object>(raw);
+                extra_values[index] = borrowed;
+                extras[py::str(extra_fields[index])] = borrowed;
+            }
+        }
+        py::object extras_json;
+        PyObject* cached_extras =
+            PyDict_GetItemWithError(extras_cache.ptr(), extra_values.ptr());
+        if (cached_extras != nullptr) {
+            extras_json = py::reinterpret_borrow<py::object>(cached_extras);
+        } else {
+            if (PyErr_Occurred()) {
+                PyErr_Clear();
+            }
+            extras_json = py::len(extras) == 0 ? py::str("") : json_text(extras);
+            if (PyObject_Hash(extra_values.ptr()) != -1) {
+                extras_cache[extra_values] = extras_json;
+                if (py::len(extras_cache) > 65536) {
+                    const py::object iterator = py::iter(extras_cache);
+                    PyObject* first = PyIter_Next(iterator.ptr());
+                    if (first == nullptr) {
+                        if (PyErr_Occurred()) {
+                            throw py::error_already_set();
+                        }
+                        throw std::runtime_error(
+                            "Stage 5.2 neighborhood extras cache is unexpectedly empty");
+                    }
+                    const py::object first_key =
+                        py::reinterpret_steal<py::object>(first);
+                    extras_cache.attr("pop")(first_key);
+                }
+            } else {
+                PyErr_Clear();
+            }
+        }
+
+        const py::object lane = string_value(get(event.ptr(), "lane"));
+        const py::object operator_name = string_value(get(event.ptr(), "operator"));
+        PyObject* timestamp = get(event.ptr(), "timestamp_seconds");
+        if (timestamp == nullptr || (!PyFloat_Check(timestamp) && !PyLong_Check(timestamp))) {
+            timestamp = get(event.ptr(), "started_at");
+        }
+        if (timestamp == nullptr || (!PyFloat_Check(timestamp) && !PyLong_Check(timestamp))) {
+            timestamp = get(event.ptr(), "timestamp");
+        }
+        py::object timestamp_value = none;
+        if (timestamp != nullptr && (PyFloat_Check(timestamp) || PyLong_Check(timestamp))) {
+            const double converted = PyFloat_AsDouble(timestamp);
+            if (converted == -1.0 && PyErr_Occurred()) {
+                throw py::error_already_set();
+            }
+            timestamp_value = py::float_(converted);
+        }
+        PyObject* status = get(event.ptr(), "status");
+        append(0, py::int_(first_event_id + event_index));
+        append(
+            1,
+            record_type == nullptr
+                ? py::str("neighborhood_event")
+                : string_value(record_type));
+        append(2, py::str("neighborhood_event"));
+        append(3, timestamp_value);
+        append(4, optional_float(get(event.ptr(), "started_at")));
+        append(5, optional_float(get(event.ptr(), "completed_at")));
+        append(6, optional_float(get(event.ptr(), "duration_seconds")));
+        append(7, dictionary_id(lane_ids, lane, "lane:"));
+        append(8, optional_int(get(event.ptr(), "iteration")));
+        append(9, dictionary_id(operator_ids, operator_name, "operator:"));
+        append(10, none);
+        append(11, empty_list);
+        append(12, empty_list);
+        append(13, empty_list);
+        append(14, none);
+        append(15, none);
+        append(16, string_value(status));
+        append(17, string_value(get(event.ptr(), "kind")));
+        append(18, string_value(get(event.ptr(), "operation")));
+        append(19, string_value(get(event.ptr(), "reason")));
+        append(20, string_value(get(event.ptr(), "failure_reason")));
+        append(21, optional_bool(get(event.ptr(), "feasible")));
+        append(22, optional_bool(get(event.ptr(), "exact_started")));
+        append(23, optional_bool(get(event.ptr(), "exact_completed")));
+        append(24, optional_bool(get(event.ptr(), "candidate_feasible")));
+        append(25, optional_bool(get(event.ptr(), "accepted")));
+        append(26, optional_bool(get(event.ptr(), "global_best")));
+        append(27, optional_int(get(event.ptr(), "current_vehicle_count")));
+        append(28, optional_int(get(event.ptr(), "candidate_vehicle_count")));
+        append(29, optional_int(get(event.ptr(), "candidate_vehicle_delta")));
+        append(30, string_value(get(event.ptr(), "cache_key_digest")));
+        append(31, optional_int(get(event.ptr(), "evaluation_id")));
+        append(32, optional_int(get(event.ptr(), "decision_id")));
+        append(33, string_value(get(event.ptr(), "route_change_status")));
+        append(
+            34,
+            get(event.ptr(), "propagation_status") == nullptr
+                ? string_value(status)
+                : string_value(get(event.ptr(), "propagation_status")));
+        append(35, extras_json);
+    }
+    return py::make_tuple(
+        std::move(columns),
+        std::move(non_neighborhood_indices));
 }
 
 double route_distance(const std::vector<Point>& points, const std::vector<std::size_t>& route) {
@@ -1488,6 +1878,25 @@ py::tuple propagate_routes_numeric(
 
 PYBIND11_MODULE(_core, module) {
     module.doc() = "Native kernels for EVRP-TW route evaluation";
+    module.def(
+        "pack_stage052_screening_occurrences",
+        &pack_stage052_screening_occurrences,
+        py::arg("events"),
+        py::arg("definition_cache"),
+        py::arg("negative_evidence_cache"),
+        py::arg("first_event_id"));
+    module.def(
+        "pack_stage052_neighborhood_events",
+        &pack_stage052_neighborhood_events,
+        py::arg("events"),
+        py::arg("lane_ids"),
+        py::arg("operator_ids"),
+        py::arg("extras_cache"),
+        py::arg("allowed_fields"),
+        py::arg("missing_extra"),
+        py::arg("stable_dictionary_id"),
+        py::arg("json_text"),
+        py::arg("first_event_id"));
     module.def("route_distance", &route_distance, py::arg("points"), py::arg("route"));
     module.def("distance_matrix", &distance_matrix, py::arg("points"));
     module.def(

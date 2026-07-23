@@ -722,8 +722,10 @@ The executable workflow and gate table are maintained in
   captured in one successful sample. A half-sampled, zero-RSS, or already-exited transient process
   is not measured worker evidence and must not be emitted with a fabricated zero peak.
 - Native and benchmark trace persistence uses one non-daemon FIFO writer thread per open axis with
-  a hard queue bound of one callback batch. It may overlap Parquet encoding/I/O with solver work,
-  but every finish, semantic digest, close, and shard finalization must drain the queue; writer
+  a hard queue bound of one callback batch. Solver callbacks and the writer take cooperative,
+  non-overlapping shard turns so Python/GIL contention cannot inflate writer wall time; bounded
+  producer/writer overlap is permitted only during explicit finish/drain work and remains measured.
+  Every finish, semantic digest, close, and shard finalization must drain the queue; writer
   failure aborts the shard without synchronous fallback. Trace evidence records submitted/completed
   batches, queue bound/peak, producer/writer wall time, writer thread CPU time, their overlapping wall
   union, producer wait time, and an ordered row-count/SHA-256 ledger for every batch. Formal

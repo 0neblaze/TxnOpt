@@ -5,6 +5,34 @@ import numpy.typing as npt
 
 Point = tuple[float, float]
 
+def pack_stage052_screening_occurrences(
+    events: Sequence[object],
+    definition_cache: dict[object, int],
+    negative_evidence_cache: dict[object, tuple[object, ...]],
+    first_event_id: int,
+) -> tuple[
+    tuple[
+        list[int],
+        list[int | None],
+        list[float],
+        list[float],
+        list[int | None],
+        list[int],
+    ],
+    list[tuple[object, int, list[int]]],
+    list[int],
+]: ...
+def pack_stage052_neighborhood_events(
+    events: Sequence[object],
+    lane_ids: dict[str, int],
+    operator_ids: dict[str, int],
+    extras_cache: dict[tuple[object, ...], str],
+    allowed_fields: frozenset[str],
+    missing_extra: object,
+    stable_dictionary_id: object,
+    json_text: object,
+    first_event_id: int,
+) -> tuple[tuple[list[object], ...], list[int]]: ...
 def distance_matrix(points: npt.ArrayLike) -> npt.NDArray[np.float64]: ...
 def route_distance(points: Sequence[Point], route: Sequence[int]) -> float: ...
 def two_opt_delta(

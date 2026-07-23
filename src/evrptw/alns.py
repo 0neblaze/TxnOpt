@@ -817,6 +817,7 @@ class _Evaluator:
                 exact_call_blocked=blocked,
                 started_at=self.measurement_trace._offset(started),
                 completed_at=self.measurement_trace._offset(completed),
+                registered_route_key=key,
             )
             if incremental_metrics is not None:
                 self.measurement_trace.record_incremental_propagation(

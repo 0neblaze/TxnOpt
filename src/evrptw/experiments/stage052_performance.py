@@ -40,13 +40,11 @@ from evrptw.artifacts import (
     ArtifactRunContext,
     ArtifactStorageConfig,
     BufferedScreeningDecision,
-    PrecomputedScreeningDefinition,
-    PreparedScreeningDefinition,
+    DeferredScreeningDecision,
     aggregate_diagnostic_events,
     atomic_write_signed_json,
     build_stage03_critical_events,
     iter_stage03_critical_events,
-    prepare_screening_definition,
     signed_sidecar_matches,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
@@ -61,6 +59,7 @@ from evrptw.measurement import (
     MeasurementConfig,
     MeasurementTraceSink,
     RouteEvaluationTrace,
+    ScreeningCheckTrace,
     ScreeningDecision,
 )
 from evrptw.models import Instance
@@ -132,6 +131,7 @@ from evrptw.stage052_remediation import Stage052RemediationResult
 from evrptw.stage052_retention import resolve_retained_run_from_locator
 from evrptw.validation import validate_routes
 
+STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS = 0.5
 STAGE052_SCHEMA_VERSION = "stage05.2-performance-v1"
 _RETENTION_REGISTRY = Path("experiments/registries/stage05.2_retention_registry.csv")
 PERFORMANCE_INSTANCES = ("c101C5", "c101_21", "r101_21", "rc101_21")
@@ -3233,7 +3233,9 @@ class _Stage052StreamingShard(Protocol):
         self,
         *,
         route_dictionary: Mapping[str, Sequence[str]],
-        critical_events: Iterable[Mapping[str, object] | BufferedScreeningDecision],
+        critical_events: Iterable[
+            Mapping[str, object] | BufferedScreeningDecision | DeferredScreeningDecision
+        ],
         diagnostic_rows: Iterable[Mapping[str, object]] = (),
         cache_lookups_coalesced: bool = False,
     ) -> int: ...
@@ -3241,7 +3243,10 @@ class _Stage052StreamingShard(Protocol):
     def flush(self) -> None: ...
 
 
-type _AsyncCriticalBatch = tuple[Mapping[str, object] | BufferedScreeningDecision, ...]
+type _AsyncCriticalBatch = tuple[
+    Mapping[str, object] | BufferedScreeningDecision | DeferredScreeningDecision,
+    ...,
+]
 
 
 class _PersistenceActivityMeter:
@@ -3293,6 +3298,16 @@ class _PersistenceActivityMeter:
                 self._union_nanoseconds += now - self._union_started_ns
                 self._union_started_ns = None
 
+    def record_serialized(self, role: str, elapsed_nanoseconds: int) -> None:
+        """Record an interval protected from overlap by the shard turn."""
+
+        if elapsed_nanoseconds < 0:
+            raise RuntimeError("persistence activity duration is invalid")
+        if self._active_roles or self._union_started_ns is not None:
+            raise RuntimeError("serialized persistence interval overlaps active work")
+        self._role_nanoseconds[role] += elapsed_nanoseconds
+        self._union_nanoseconds += elapsed_nanoseconds
+
     def role_nanoseconds(self, role: str) -> int:
         with self._lock:
             return int(self._role_nanoseconds[role])
@@ -3309,8 +3324,26 @@ class _PersistenceActivityMeter:
 
 
 def _pipeline_event_token(
-    event: Mapping[str, object] | BufferedScreeningDecision,
+    event: Mapping[str, object] | BufferedScreeningDecision | DeferredScreeningDecision,
 ) -> tuple[object, ...]:
+    if isinstance(event, DeferredScreeningDecision):
+        values = event.values
+        return (
+            "screening_decision",
+            event.axis_name,
+            f"{event.axis_name}:{values[2]}",
+            values[3],
+            values[4],
+            values[1],
+            values[0],
+            None,
+            None,
+            values[7],
+            values[8],
+            None,
+            None,
+            None,
+        )
     if isinstance(event, tuple):
         tail = event[7].tail
         return (
@@ -3356,14 +3389,7 @@ def _pipeline_event_token(
 class _QueuedCriticalBatch:
     ordinal: int
     rows: _AsyncCriticalBatch
-
-
-@dataclass(slots=True)
-class _NegativeScreeningEvidence:
-    tail: tuple[object, ...]
-    definition: PrecomputedScreeningDefinition | None = None
-    prepared_context: tuple[str, str] | None = None
-    prepared: PreparedScreeningDefinition | None = None
+    event_token_sha256: str
 
 
 class _BoundedShardAppender:
@@ -3402,7 +3428,9 @@ class _BoundedShardAppender:
         return {
             "mode": "bounded_async_thread",
             "queue_max_batches": 1,
-            "writer_thread_switch_interval_seconds": 0.05,
+            "writer_thread_switch_interval_seconds": (
+                STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS
+            ),
             "submitted_batches": self._submitted_batches,
             "completed_batches": self._completed_batches,
             "writer_active_nanoseconds": self._meter.role_nanoseconds("writer"),
@@ -3418,28 +3446,43 @@ class _BoundedShardAppender:
     def writer_cpu_nanoseconds(self) -> int:
         return self._writer_cpu_nanoseconds
 
+    @property
+    def producer_turn_submitted_batch(self) -> bool:
+        return self._submitted_batches != self._completed_batches
+
     def begin_producer_turn(self) -> None:
-        """Serialize producer callbacks without waiting for the writer."""
+        """Hold the shard turn until one producer callback is complete."""
 
         thread_id = threading.get_ident()
         if self._producer_turn_thread_id is not None:
             if self._producer_turn_thread_id != thread_id:
                 raise RuntimeError("Stage 5.2 trace producer thread changed")
             return
-        self._raise_if_failed()
-        self._write_turn.acquire()
-        self._raise_if_failed()
-        self._producer_turn_thread_id = thread_id
+        while True:
+            if self._submitted_batches != self._completed_batches:
+                self._queue.join()
+                self._raise_if_failed()
+                continue
+            self._write_turn.acquire()
+            if self._submitted_batches == self._completed_batches:
+                error = self._error
+                if error is not None:
+                    self._write_turn.release()
+                    raise error
+                self._producer_turn_thread_id = thread_id
+                return
+            self._write_turn.release()
 
     def end_producer_turn(self) -> None:
         if self._producer_turn_thread_id != threading.get_ident():
             raise RuntimeError("Stage 5.2 trace producer does not own the shard turn")
-        self._release_producer_turn()
+        if self._submitted_batches != self._completed_batches:
+            self._release_producer_turn()
 
     def wait_for_writer_turn(self) -> None:
         self._release_producer_turn()
-        self._queue.join()
-        self._raise_if_failed()
+        with self._write_turn:
+            self._raise_if_failed()
 
     def _release_producer_turn(self) -> None:
         owner = self._producer_turn_thread_id
@@ -3455,13 +3498,21 @@ class _BoundedShardAppender:
             return
         if self._closed:
             raise RuntimeError("Stage 5.2 async persistence pipeline is closed")
+        digest = hashlib.sha256()
+        for event in batch:
+            digest.update(orjson.dumps(_pipeline_event_token(event)) + b"\n")
+        event_token_sha256 = digest.hexdigest()
         started_ns = time.perf_counter_ns()
         try:
             while True:
                 self._raise_if_failed()
                 try:
                     self._queue.put(
-                        _QueuedCriticalBatch(self._submitted_batches, batch),
+                        _QueuedCriticalBatch(
+                            self._submitted_batches,
+                            batch,
+                            event_token_sha256,
+                        ),
                         timeout=0.05,
                     )
                 except Full:
@@ -3523,33 +3574,33 @@ class _BoundedShardAppender:
                 if not isinstance(queued, _QueuedCriticalBatch):
                     raise RuntimeError("Stage 5.2 async persistence batch is invalid")
                 batch = queued.rows
-                activity = self._meter.enter("writer")
-                previous_switch_interval = sys.getswitchinterval()
-                writer_wall_started_ns = time.perf_counter_ns()
-                writer_cpu_started_ns = time.thread_time_ns()
-                try:
-                    sys.setswitchinterval(0.05)
-                    digest = hashlib.sha256()
-                    for event in batch:
-                        digest.update(orjson.dumps(_pipeline_event_token(event)) + b"\n")
-                    persisted = self._shard.append(
-                        route_dictionary={},
-                        critical_events=batch,
-                        cache_lookups_coalesced=True,
-                    )
-                finally:
-                    writer_cpu_elapsed_ns = time.thread_time_ns() - writer_cpu_started_ns
-                    writer_wall_elapsed_ns = time.perf_counter_ns() - writer_wall_started_ns
-                    # A coarse per-thread CPU clock can jump by one full tick
-                    # across a much shorter batch.  One thread cannot consume
-                    # more CPU than elapsed wall time, so preserve the physical
-                    # invariant instead of publishing a quantization artifact.
-                    self._writer_cpu_nanoseconds += min(
-                        writer_cpu_elapsed_ns,
-                        writer_wall_elapsed_ns,
-                    )
-                    sys.setswitchinterval(previous_switch_interval)
-                    self._meter.exit(activity)
+                with self._write_turn:
+                    activity = self._meter.enter("writer")
+                    previous_switch_interval = sys.getswitchinterval()
+                    writer_wall_started_ns = time.perf_counter_ns()
+                    writer_cpu_started_ns = time.thread_time_ns()
+                    try:
+                        sys.setswitchinterval(
+                            STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS
+                        )
+                        persisted = self._shard.append(
+                            route_dictionary={},
+                            critical_events=batch,
+                            cache_lookups_coalesced=True,
+                        )
+                    finally:
+                        writer_cpu_elapsed_ns = time.thread_time_ns() - writer_cpu_started_ns
+                        writer_wall_elapsed_ns = time.perf_counter_ns() - writer_wall_started_ns
+                        # A coarse per-thread CPU clock can jump by one full tick
+                        # across a much shorter batch.  One thread cannot consume
+                        # more CPU than elapsed wall time, so preserve the physical
+                        # invariant instead of publishing a quantization artifact.
+                        self._writer_cpu_nanoseconds += min(
+                            writer_cpu_elapsed_ns,
+                            writer_wall_elapsed_ns,
+                        )
+                        sys.setswitchinterval(previous_switch_interval)
+                        self._meter.exit(activity)
                 if persisted != len(batch):
                     raise RuntimeError(
                         "Stage 5.2 trace sink did not persist its complete logical event batch"
@@ -3559,7 +3610,7 @@ class _BoundedShardAppender:
                     {
                         "ordinal": queued.ordinal,
                         "row_count": len(batch),
-                        "event_token_sha256": digest.hexdigest(),
+                        "event_token_sha256": queued.event_token_sha256,
                     }
                 )
             except BaseException as error:
@@ -3625,7 +3676,9 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self.axis_name = axis_name
         self._buffer_rows = buffer_rows
         self._neighborhood_buffer_rows = neighborhood_buffer_rows
-        self._event_buffer: list[dict[str, object] | BufferedScreeningDecision] = []
+        self._event_buffer: list[
+            dict[str, object] | BufferedScreeningDecision | DeferredScreeningDecision
+        ] = []
         self.event_count = 0
         self._persisted_family_counts: Counter[str] = Counter()
         self._screening_decision_count = 0
@@ -3635,14 +3688,8 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._neighborhood_spool: Any | None = None
         self._neighborhood_spool_path: Path | None = None
         self._neighborhood_read_offset = 0
+        self._legacy_negative_screening_evidence: dict[str, tuple[object, ...]] = {}
         self._semantic_event_digest = hashlib.sha256()
-        self._negative_screening_cache: dict[str, _NegativeScreeningEvidence] = {}
-        self._screening_definition_tail_cache: dict[
-            tuple[object, ...], PrecomputedScreeningDefinition
-        ] = {}
-        self._prepared_screening_definition_cache: dict[
-            tuple[str, str, str, tuple[object, ...]], PreparedScreeningDefinition
-        ] = {}
         self._initial_objective_key: ObjectiveKey | None = None
         self._visible_global_bests: dict[int, AcceptedGlobalBest] = {}
         self._last_candidate_timestamp = 0.0
@@ -3651,18 +3698,23 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._screening_schema_version = getattr(
             shard, "screening_schema_version", "screening_decisions_v3"
         )
+        self._buffered_screening_v3 = (
+            self._screening_schema_version == "screening_decisions_v3"
+            and getattr(shard, "supports_buffered_screening_decisions", False) is True
+        )
         self._persistence_meter = _PersistenceActivityMeter()
         self._solver_persistence_union_nanoseconds: int | None = None
         self._solver_persistence_critical_path_nanoseconds: int | None = None
         self._solver_producer_active_nanoseconds: int | None = None
         self._solver_writer_cpu_nanoseconds: int | None = None
+        self._pending_serialized_producer_nanoseconds = 0
+        self._pending_serialized_producer_callbacks = 0
         self._async_appender = (
             _BoundedShardAppender(shard, self._persistence_meter) if async_persistence else None
         )
 
     def append_route_evaluation(self, record: RouteEvaluationTrace) -> None:
         self._begin_async_producer_turn()
-        activity = self._persistence_meter.enter("producer")
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
@@ -3672,16 +3724,15 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             self._queue_owned(payload)
         finally:
             try:
-                self._persistence_meter.exit(activity)
                 nested_ns = self.persistence_nanoseconds - previously_recorded_ns
                 elapsed_ns = time.perf_counter_ns() - started_ns
+                self._record_serialized_producer(elapsed_ns)
                 self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
             finally:
                 self._end_async_producer_turn()
 
     def append_event(self, event: Mapping[str, object]) -> None:
         self._begin_async_producer_turn()
-        activity = self._persistence_meter.enter("producer")
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
@@ -3690,159 +3741,187 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             self._queue_owned(payload)
         finally:
             try:
-                self._persistence_meter.exit(activity)
                 nested_ns = self.persistence_nanoseconds - previously_recorded_ns
                 elapsed_ns = time.perf_counter_ns() - started_ns
+                self._record_serialized_producer(elapsed_ns)
                 self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
             finally:
                 self._end_async_producer_turn()
 
     def append_screening_decision(self, decision: ScreeningDecision) -> None:
         self._begin_async_producer_turn()
-        activity = self._persistence_meter.enter("producer")
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
             self._append_screening_decision(decision)
         finally:
             try:
-                self._persistence_meter.exit(activity)
                 nested_ns = self.persistence_nanoseconds - previously_recorded_ns
                 elapsed_ns = time.perf_counter_ns() - started_ns
+                self._record_serialized_producer(elapsed_ns)
+                self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
+            finally:
+                self._end_async_producer_turn()
+
+    def append_screening_fields(
+        self,
+        decision_id: int,
+        route_key: str,
+        lane: str,
+        iteration: int | None,
+        operator: str,
+        started_at: float,
+        completed_at: float,
+        status: str,
+        reason: str,
+        demand: float,
+        distance_increment_lower_bound: float | None,
+        distance_lower_bound: float,
+        exact_call_blocked: bool,
+        first_failed_check: str,
+        min_time_window_slack: float,
+        negative_cache_hit: bool,
+        single_segment_reachable: bool,
+        structural_energy_lower_bound: float,
+        checks: tuple[ScreeningCheckTrace, ...],
+    ) -> None:
+        """Append normalized screening fields without a transient decision object."""
+
+        self._begin_async_producer_turn()
+        started_ns = time.perf_counter_ns()
+        previously_recorded_ns = self.persistence_nanoseconds
+        try:
+            if self._buffered_screening_v3:
+                if self._pending_cache_lookup is not None:
+                    self._flush_pending_lookup()
+                self._event_buffer.append(
+                    DeferredScreeningDecision(
+                        self.axis_name,
+                        (
+                            decision_id,
+                            route_key,
+                            lane,
+                            iteration,
+                            operator,
+                            started_at,
+                            completed_at,
+                            status,
+                            reason,
+                            demand,
+                            distance_increment_lower_bound,
+                            distance_lower_bound,
+                            exact_call_blocked,
+                            first_failed_check,
+                            min_time_window_slack,
+                            negative_cache_hit,
+                            single_segment_reachable,
+                            structural_energy_lower_bound,
+                            checks,
+                            True if negative_cache_hit else None,
+                        ),
+                    )
+                )
+                if len(self._event_buffer) >= self._buffer_rows:
+                    self._flush_event_buffer()
+                self._screening_decision_count += 1
+                self.event_count += 1
+            else:
+                self._append_screening_decision(
+                    ScreeningDecision(
+                        decision_id=decision_id,
+                        route_key=route_key,
+                        lane=lane,
+                        iteration=iteration,
+                        operator=operator,
+                        status=status,
+                        first_failed_check=first_failed_check,
+                        reason=reason,
+                        checks=checks,
+                        demand=demand,
+                        min_time_window_slack=min_time_window_slack,
+                        distance_lower_bound=distance_lower_bound,
+                        distance_increment_lower_bound=distance_increment_lower_bound,
+                        single_segment_reachable=single_segment_reachable,
+                        structural_energy_lower_bound=structural_energy_lower_bound,
+                        negative_cache_hit=negative_cache_hit,
+                        exact_call_blocked=exact_call_blocked,
+                        started_at=started_at,
+                        completed_at=completed_at,
+                        duration_seconds=max(0.0, completed_at - started_at),
+                    )
+                )
+        finally:
+            try:
+                nested_ns = self.persistence_nanoseconds - previously_recorded_ns
+                elapsed_ns = time.perf_counter_ns() - started_ns
+                self._record_serialized_producer(elapsed_ns)
                 self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
             finally:
                 self._end_async_producer_turn()
 
     def _append_screening_decision(self, decision: ScreeningDecision) -> None:
-        buffered_v3 = (
-            self._screening_schema_version == "screening_decisions_v3"
-            and getattr(self._shard, "supports_buffered_screening_decisions", False) is True
-        )
-        evidence_tail: tuple[object, ...] | None = None
-        negative_entry: _NegativeScreeningEvidence | None = None
-        definition: PrecomputedScreeningDefinition | None = None
-        if decision.negative_cache_hit:
-            evidence_tail = (
-                decision.status,
-                decision.reason,
-                decision.demand,
-                decision.distance_increment_lower_bound,
-                decision.distance_lower_bound,
-                decision.exact_call_blocked,
-                decision.first_failed_check,
-                decision.min_time_window_slack,
-                decision.negative_cache_hit,
-                decision.single_segment_reachable,
-                decision.structural_energy_lower_bound,
-                decision.checks,
-            )
-            negative_entry = self._negative_screening_cache.get(decision.route_key)
-            if negative_entry is not None and negative_entry.tail != evidence_tail:
-                raise RuntimeError(
-                    "negative screening cache returned inconsistent evidence for one route"
-                )
-            if negative_entry is None:
-                negative_entry = _NegativeScreeningEvidence(evidence_tail)
-                self._negative_screening_cache[decision.route_key] = negative_entry
-                if len(self._negative_screening_cache) > 262_144:
-                    self._negative_screening_cache.pop(next(iter(self._negative_screening_cache)))
-            elif buffered_v3:
-                definition = negative_entry.definition
+        buffered_v3 = self._buffered_screening_v3
         if buffered_v3:
-            if definition is None:
-                compact_checks = tuple(
-                    (
-                        check.check,
-                        check.status,
-                        check.value if isinstance(check.value, bool) else None,
-                        float(check.value)
-                        if isinstance(check.value, (int, float))
-                        and not isinstance(check.value, bool)
-                        else None,
-                        check.value if isinstance(check.value, str) else None,
-                        check.reason,
-                    )
-                    for check in decision.checks
-                )
-                tail = (
-                    decision.status,
-                    decision.reason,
-                    self.axis_name,
-                    float(decision.demand),
-                    float(decision.distance_increment_lower_bound)
-                    if decision.distance_increment_lower_bound is not None
-                    else None,
-                    float(decision.distance_lower_bound),
-                    decision.exact_call_blocked,
-                    decision.first_failed_check,
-                    float(decision.min_time_window_slack),
-                    decision.negative_cache_hit,
-                    decision.single_segment_reachable,
-                    float(decision.structural_energy_lower_bound),
-                    compact_checks,
-                )
-                definition = self._screening_definition_tail_cache.get(tail)
-                if definition is None:
-                    definition = PrecomputedScreeningDefinition(tail)
-                    self._screening_definition_tail_cache[tail] = definition
-                    if len(self._screening_definition_tail_cache) > 262_144:
-                        self._screening_definition_tail_cache.pop(
-                            next(iter(self._screening_definition_tail_cache))
-                        )
-                if decision.negative_cache_hit:
-                    if evidence_tail is None or negative_entry is None:
-                        raise RuntimeError("negative screening evidence tail is unavailable")
-                    negative_entry.definition = definition
-            negative_prepared_key = (decision.lane, decision.operator)
-            prepared = (
-                negative_entry.prepared
-                if negative_entry is not None
-                and negative_entry.prepared_context == negative_prepared_key
-                else None
-            )
-            if prepared is None:
-                prepared_key = (
-                    decision.lane,
-                    decision.operator,
-                    decision.route_key,
-                    definition.tail,
-                )
-                prepared = self._prepared_screening_definition_cache.get(prepared_key)
-                if prepared is None:
-                    prepared = prepare_screening_definition(
-                        definition,
-                        route_key=decision.route_key,
-                        lane=f"{self.axis_name}:{decision.lane}",
-                        operator=decision.operator,
-                    )
-                    self._prepared_screening_definition_cache[prepared_key] = prepared
-                    if len(self._prepared_screening_definition_cache) > 262_144:
-                        self._prepared_screening_definition_cache.pop(
-                            next(iter(self._prepared_screening_definition_cache))
-                        )
-                if decision.negative_cache_hit:
-                    if negative_entry is None:
-                        raise RuntimeError("negative screening cache entry is unavailable")
-                    negative_entry.prepared_context = negative_prepared_key
-                    negative_entry.prepared = prepared
-            self._flush_pending_lookup()
+            if self._pending_cache_lookup is not None:
+                self._flush_pending_lookup()
             self._event_buffer.append(
-                (
-                    decision.decision_id,
-                    decision.route_key,
-                    f"{self.axis_name}:{decision.lane}",
-                    decision.iteration,
-                    decision.operator,
-                    decision.started_at,
-                    decision.completed_at,
-                    prepared,
+                DeferredScreeningDecision(
+                    self.axis_name,
+                    (
+                        decision.decision_id,
+                        decision.route_key,
+                        decision.lane,
+                        decision.iteration,
+                        decision.operator,
+                        decision.started_at,
+                        decision.completed_at,
+                        decision.status,
+                        decision.reason,
+                        decision.demand,
+                        decision.distance_increment_lower_bound,
+                        decision.distance_lower_bound,
+                        decision.exact_call_blocked,
+                        decision.first_failed_check,
+                        decision.min_time_window_slack,
+                        decision.negative_cache_hit,
+                        decision.single_segment_reachable,
+                        decision.structural_energy_lower_bound,
+                        decision.checks,
+                        True if decision.negative_cache_hit else None,
+                    ),
                 )
             )
             if len(self._event_buffer) >= self._buffer_rows:
                 self._flush_event_buffer()
-            self._persisted_family_counts["screening_decisions"] += 1
+            self._screening_decision_count += 1
             self.event_count += 1
             return
+        if decision.negative_cache_hit:
+            evidence_tail = (
+                    decision.status,
+                    decision.reason,
+                    decision.demand,
+                    decision.distance_increment_lower_bound,
+                    decision.distance_lower_bound,
+                    decision.exact_call_blocked,
+                    decision.first_failed_check,
+                    decision.min_time_window_slack,
+                    decision.negative_cache_hit,
+                    decision.single_segment_reachable,
+                    decision.structural_energy_lower_bound,
+                    decision.checks,
+            )
+            previous = self._legacy_negative_screening_evidence.get(decision.route_key)
+            if previous is not None and previous != evidence_tail:
+                raise RuntimeError(
+                    "negative screening cache returned inconsistent evidence for one route"
+                )
+            if previous is None:
+                self._legacy_negative_screening_evidence[decision.route_key] = evidence_tail
+                if len(self._legacy_negative_screening_evidence) > 262_144:
+                    self._legacy_negative_screening_evidence.pop(
+                        next(iter(self._legacy_negative_screening_evidence))
+                    )
         self._queue_owned(
             {
                 "decision_id": decision.decision_id,
@@ -3880,7 +3959,6 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
 
     def append_incremental_propagation(self, propagation: Mapping[str, object]) -> None:
         self._begin_async_producer_turn()
-        activity = self._persistence_meter.enter("producer")
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
@@ -3890,9 +3968,9 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             self._queue_owned(payload)
         finally:
             try:
-                self._persistence_meter.exit(activity)
                 nested_ns = self.persistence_nanoseconds - previously_recorded_ns
                 elapsed_ns = time.perf_counter_ns() - started_ns
+                self._record_serialized_producer(elapsed_ns)
                 self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
             finally:
                 self._end_async_producer_turn()
@@ -3904,7 +3982,6 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         route_dictionary: dict[str, tuple[str, ...]],
     ) -> None:
         self._begin_async_producer_turn()
-        activity = self._persistence_meter.enter("producer")
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
@@ -3914,16 +3991,15 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                 self._spool_neighborhood_event(payload)
         finally:
             try:
-                self._persistence_meter.exit(activity)
                 nested_ns = self.persistence_nanoseconds - previously_recorded_ns
                 elapsed_ns = time.perf_counter_ns() - started_ns
+                self._record_serialized_producer(elapsed_ns)
                 self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
             finally:
                 self._end_async_producer_turn()
 
     def append_neighborhood_event(self, event: Mapping[str, object]) -> None:
         self._begin_async_producer_turn()
-        activity = self._persistence_meter.enter("producer")
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
@@ -3932,14 +4008,15 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             self._spool_neighborhood_event(payload)
         finally:
             try:
-                self._persistence_meter.exit(activity)
                 nested_ns = self.persistence_nanoseconds - previously_recorded_ns
                 elapsed_ns = time.perf_counter_ns() - started_ns
+                self._record_serialized_producer(elapsed_ns)
                 self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
             finally:
                 self._end_async_producer_turn()
 
     def finish(self) -> None:
+        self._flush_serialized_producer_meter()
         self._wait_for_async_writer()
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
@@ -3958,6 +4035,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
 
     def _wait_for_async_writer(self) -> None:
+        self._flush_serialized_producer_meter()
         if self._async_appender is not None:
             self._async_appender.wait_for_writer_turn()
 
@@ -3967,7 +4045,26 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
 
     def _end_async_producer_turn(self) -> None:
         if self._async_appender is not None:
+            if self._async_appender.producer_turn_submitted_batch:
+                self._flush_serialized_producer_meter()
             self._async_appender.end_producer_turn()
+
+    def _record_serialized_producer(self, elapsed_nanoseconds: int) -> None:
+        self._pending_serialized_producer_nanoseconds += elapsed_nanoseconds
+        self._pending_serialized_producer_callbacks += 1
+        if (
+            self._async_appender is None
+            or self._pending_serialized_producer_callbacks >= 4_096
+        ):
+            self._flush_serialized_producer_meter()
+
+    def _flush_serialized_producer_meter(self) -> None:
+        elapsed_nanoseconds = self._pending_serialized_producer_nanoseconds
+        if elapsed_nanoseconds == 0:
+            return
+        self._pending_serialized_producer_nanoseconds = 0
+        self._pending_serialized_producer_callbacks = 0
+        self._persistence_meter.record_serialized("producer", elapsed_nanoseconds)
 
     def close(self) -> None:
         if self._closed:
@@ -4072,8 +4169,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                 self._neighborhood_buffer.clear()
             finally:
                 self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
-            for payload in pending:
-                self._queue_owned(payload)
+            self._queue_neighborhood_batch(pending)
             return
         started_ns = time.perf_counter_ns()
         spool.flush()
@@ -4092,6 +4188,39 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                 raise RuntimeError("neighborhood scratch record is not a JSON object")
             self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
             self._queue_owned(payload)
+
+    def _queue_neighborhood_batch(
+        self,
+        pending: tuple[dict[str, object], ...],
+    ) -> None:
+        """Queue one in-memory neighborhood block without per-row dispatch."""
+
+        if not pending:
+            return
+        if self._pending_cache_lookup is not None:
+            raise RuntimeError("neighborhood block cannot follow a pending cache lookup")
+        for payload in pending:
+            payload["lane"] = f"{self.axis_name}:{payload.get('lane', '')}"
+            payload["benchmark_axis"] = self.axis_name
+        self.diagnostic_counts.update(
+            (
+                str(payload.get("lane", "")),
+                str(payload.get("operator", "")),
+                str(payload.get("reason", payload.get("status", ""))),
+                str(payload.get("event_type", payload.get("record_type", "event"))),
+            )
+            for payload in pending
+        )
+        offset = 0
+        while offset < len(pending):
+            available = self._buffer_rows - len(self._event_buffer)
+            end = min(len(pending), offset + available)
+            self._event_buffer.extend(pending[offset:end])
+            offset = end
+            if len(self._event_buffer) >= self._buffer_rows:
+                self._flush_event_buffer()
+        self._persisted_family_counts["events"] += len(pending)
+        self.event_count += len(pending)
 
     def _close_neighborhood_spool(self) -> None:
         errors: list[BaseException] = []

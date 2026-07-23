@@ -22,7 +22,7 @@ from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast, overload
+from typing import Any, NamedTuple, cast, overload
 
 import orjson
 import pyarrow as pa
@@ -1387,6 +1387,8 @@ class PreparedScreeningDefinition:
     route_key: str
     lane: str
     operator: str
+    route_id: int
+    pending: _PendingScreeningDefinition
 
 
 def prepare_screening_definition(
@@ -1396,13 +1398,35 @@ def prepare_screening_definition(
     lane: str,
     operator: str,
 ) -> PreparedScreeningDefinition:
-    """Bind reusable route/lane/operator context without expanding its payload."""
+    """Bind and hash reusable route/lane/operator context exactly once."""
 
+    route_id = _stable_route_id(route_key)
+    definition_payload = _screening_definition_from_cache_key(
+        (
+            _stable_dictionary_id(f"lane:{lane}"),
+            _stable_dictionary_id(f"operator:{operator}"),
+            route_id,
+            *definition.tail,
+        )
+    )
+    definition_id, encoded, digest = _screening_definition_identity(definition_payload)
+    pending = _PendingScreeningDefinition(
+        definition_id=definition_id,
+        encoded=encoded,
+        digest=digest,
+        payload=definition_payload,
+        row=(
+            definition_id,
+            *(definition_payload[name] for name in V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]),
+        ),
+    )
     return PreparedScreeningDefinition(
         tail=definition.tail,
         route_key=route_key,
         lane=lane,
         operator=operator,
+        route_id=route_id,
+        pending=pending,
     )
 
 
@@ -1421,6 +1445,37 @@ class _PendingScreeningDefinition:
     row: tuple[object, ...]
 
 
+def _validate_prepared_screening_identity(
+    prepared: PreparedScreeningDefinition,
+) -> None:
+    expected_route_id = _stable_route_id(prepared.route_key)
+    expected_payload = _screening_definition_from_cache_key(
+        (
+            _stable_dictionary_id(f"lane:{prepared.lane}"),
+            _stable_dictionary_id(f"operator:{prepared.operator}"),
+            expected_route_id,
+            *prepared.tail,
+        )
+    )
+    expected_id, expected_encoded, expected_digest = _screening_definition_identity(
+        expected_payload
+    )
+    expected_row = (
+        expected_id,
+        *(expected_payload[name] for name in V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]),
+    )
+    pending = prepared.pending
+    if (
+        prepared.route_id != expected_route_id
+        or pending.definition_id != expected_id
+        or pending.encoded != expected_encoded
+        or pending.digest != expected_digest
+        or pending.payload != expected_payload
+        or pending.row != expected_row
+    ):
+        raise ArtifactIntegrityError("prepared screening pending identity mismatch")
+
+
 type BufferedScreeningDecision = tuple[
     int,
     str,
@@ -1431,6 +1486,13 @@ type BufferedScreeningDecision = tuple[
     float,
     PrecomputedScreeningDefinition | PreparedScreeningDefinition,
 ]
+
+
+class DeferredScreeningDecision(NamedTuple):
+    """Immutable flat v3 decision whose definition is materialized by the writer."""
+
+    axis_name: str
+    values: tuple[object, ...]
 
 
 def _screening_definition_cache_key(
@@ -2293,18 +2355,26 @@ def _iter_coalesced_cache_lookup_events(
 
 @overload
 def _iter_coalesced_cache_lookup_events(
-    events: Iterable[Mapping[str, object] | BufferedScreeningDecision],
-) -> Iterable[dict[str, object] | BufferedScreeningDecision]: ...
+    events: Iterable[
+        Mapping[str, object] | BufferedScreeningDecision | DeferredScreeningDecision
+    ],
+) -> Iterable[
+    dict[str, object] | BufferedScreeningDecision | DeferredScreeningDecision
+]: ...
 
 
 def _iter_coalesced_cache_lookup_events(
-    events: Iterable[Mapping[str, object] | BufferedScreeningDecision],
-) -> Iterable[dict[str, object] | BufferedScreeningDecision]:
+    events: Iterable[
+        Mapping[str, object] | BufferedScreeningDecision | DeferredScreeningDecision
+    ],
+) -> Iterable[
+    dict[str, object] | BufferedScreeningDecision | DeferredScreeningDecision
+]:
     """Streaming equivalent of :func:`_coalesce_cache_lookup_events`."""
 
     pending: Mapping[str, object] | None = None
     for raw_event in events:
-        if isinstance(raw_event, tuple):
+        if isinstance(raw_event, (tuple, DeferredScreeningDecision)):
             if pending is not None:
                 yield dict(pending) if not isinstance(pending, dict) else pending
                 pending = None
@@ -4565,6 +4635,15 @@ class ArtifactV2ShardSession:
         self._lane_ids: dict[str, int] = {}
         self._operator_ids: dict[str, int] = {}
         self._screening_definition_cache: dict[tuple[object, ...], tuple[object, int]] = {}
+        self._deferred_negative_screening_evidence: dict[
+            str, tuple[tuple[object, ...], tuple[object, ...]]
+        ] = {}
+        self._deferred_native_negative_evidence: dict[
+            object, tuple[object, ...]
+        ] = {}
+        self._deferred_screening_occurrence_cache: dict[
+            tuple[str, str, str, str, object], int
+        ] = {}
         self._prepared_screening_definition_cache: OrderedDict[
             int, tuple[PreparedScreeningDefinition, int]
         ] = OrderedDict()
@@ -4592,7 +4671,9 @@ class ArtifactV2ShardSession:
         self,
         *,
         route_dictionary: Mapping[str, Sequence[str]],
-        critical_events: Iterable[Mapping[str, object] | BufferedScreeningDecision],
+        critical_events: Iterable[
+            Mapping[str, object] | BufferedScreeningDecision | DeferredScreeningDecision
+        ],
         diagnostic_rows: Iterable[Mapping[str, object]] = (),
         cache_lookups_coalesced: bool = False,
     ) -> int:
@@ -4662,12 +4743,173 @@ class ArtifactV2ShardSession:
             self._append_buffered_columns(self._event_sink, columns)
 
         next_event_id = self._owner._next_event_id
+        batch_first_event_id = next_event_id
         events = (
             critical_events
             if cache_lookups_coalesced
             else _iter_coalesced_cache_lookup_events(critical_events)
         )
+        native_packed_batch = False
+        native_remaining_indices: list[int] | None = None
+        native_batch_length: int | None = None
+        if (
+            cache_lookups_coalesced
+            and isinstance(critical_events, tuple)
+            and self._screening_definitions_sink is not None
+        ):
+            from evrptw import _core as native_core
+
+            try:
+                raw_packed_columns, raw_misses, raw_non_screening_indices = (
+                    native_core.pack_stage052_screening_occurrences(
+                        critical_events,
+                        cast(
+                            dict[object, int],
+                            self._deferred_screening_occurrence_cache,
+                        ),
+                        self._deferred_native_negative_evidence,
+                        next_event_id,
+                    )
+                )
+            except ValueError as error:
+                raise ArtifactIntegrityError(str(error)) from error
+            packed_columns = cast(tuple[list[object], ...], raw_packed_columns)
+            misses = raw_misses
+            definition_ids = packed_columns[1]
+            if definition_ids:
+                for raw_key, event_index, occurrence_indices in misses:
+                    event = critical_events[event_index]
+                    if not isinstance(event, DeferredScreeningDecision):
+                        raise ArtifactIntegrityError(
+                            "native screening packer returned a non-screening miss"
+                        )
+                    occurrence, deferred_definition = self._deferred_screening_decision_row(
+                        event,
+                        event_id=next_event_id + event_index,
+                    )
+                    definition_id = occurrence[1]
+                    if isinstance(definition_id, bool) or not isinstance(definition_id, int):
+                        raise ArtifactIntegrityError(
+                            "native screening packer definition ID is invalid"
+                        )
+                    occurrence_key = cast(
+                        tuple[str, str, str, str, object],
+                        raw_key,
+                    )
+                    if (
+                        self._deferred_screening_occurrence_cache.get(occurrence_key)
+                        != definition_id
+                    ):
+                        raise ArtifactIntegrityError(
+                            "native screening packer cache binding is inconsistent"
+                        )
+                    for occurrence_index in occurrence_indices:
+                        definition_ids[occurrence_index] = definition_id
+                    if deferred_definition is not None:
+                        pending_screening_definitions.append(deferred_definition)
+                if any(definition_id is None for definition_id in definition_ids):
+                    raise ArtifactIntegrityError(
+                        "native screening packer left an unresolved definition"
+                    )
+                for target, values in zip(
+                    pending_screening_occurrence_columns,
+                    packed_columns,
+                    strict=True,
+                ):
+                    target.extend(values)
+                self._max_pending_screening_transaction_rows_observed = max(
+                    self._max_pending_screening_transaction_rows_observed,
+                    len(definition_ids),
+                )
+                native_packed_batch = True
+                native_remaining_indices = raw_non_screening_indices
+                native_batch_length = len(critical_events)
+                count += len(definition_ids)
+        if cache_lookups_coalesced and isinstance(critical_events, tuple):
+            from evrptw import _core as native_core
+
+            raw_neighborhood_columns, raw_non_neighborhood_indices = (
+                native_core.pack_stage052_neighborhood_events(
+                    critical_events,
+                    self._lane_ids,
+                    self._operator_ids,
+                    self._neighborhood_extras_cache,
+                    _NEIGHBORHOOD_FAST_FIELDS,
+                    _MISSING_NEIGHBORHOOD_EXTRA,
+                    _stable_dictionary_id,
+                    _json_text,
+                    batch_first_event_id,
+                )
+            )
+            neighborhood_columns = raw_neighborhood_columns
+            neighborhood_count = len(neighborhood_columns[0])
+            remaining_neighborhood_indices = set(raw_non_neighborhood_indices)
+            prior_indices = list(
+                native_remaining_indices
+                if native_remaining_indices is not None
+                else range(len(critical_events))
+            )
+            remaining_indices = [
+                index
+                for index in prior_indices
+                if index in remaining_neighborhood_indices
+            ]
+            if neighborhood_count and not remaining_indices:
+                if len(neighborhood_columns) != len(EVENTS_SCHEMA.names) or any(
+                    len(column) != neighborhood_count
+                    for column in neighborhood_columns
+                ):
+                    raise ArtifactIntegrityError(
+                        "native neighborhood packer returned inconsistent columns"
+                    )
+                for target, values in zip(
+                    pending_event_columns,
+                    neighborhood_columns,
+                    strict=True,
+                ):
+                    target.extend(values)
+                native_remaining_indices = remaining_indices
+                native_packed_batch = True
+                native_batch_length = len(critical_events)
+                count += neighborhood_count
+        if native_packed_batch:
+            if not isinstance(critical_events, tuple):
+                raise RuntimeError("native batch source is unavailable")
+            if native_remaining_indices is None:
+                native_remaining_indices = list(range(len(critical_events)))
+            events = (critical_events[index] for index in native_remaining_indices)
+        native_event_index = 0
         for event in events:
+            if native_packed_batch:
+                if native_remaining_indices is None:
+                    raise RuntimeError("native event indexes are unavailable")
+                next_event_id = (
+                    batch_first_event_id
+                    + native_remaining_indices[native_event_index]
+                )
+                native_event_index += 1
+            if isinstance(event, DeferredScreeningDecision):
+                if self._screening_definitions_sink is None:
+                    raise RuntimeError("deferred screening decisions require v3 storage")
+                if self._screening_occurrences_sink is None:
+                    raise RuntimeError("screening occurrence sink is unavailable")
+                event_id = next_event_id
+                next_event_id += 1
+                occurrence, deferred_definition = self._deferred_screening_decision_row(
+                    event,
+                    event_id=event_id,
+                )
+                pending_count = buffer_screening_occurrence(occurrence)
+                if deferred_definition is not None:
+                    pending_screening_definitions.append(deferred_definition)
+                self._max_pending_screening_transaction_rows_observed = max(
+                    self._max_pending_screening_transaction_rows_observed,
+                    pending_count,
+                )
+                if pending_count >= LIVE_PREPARED_SCREENING_TRANSACTION_ROWS:
+                    flush_screening_transaction()
+                count += 1
+                continue
             if isinstance(event, tuple):
                 if self._screening_definitions_sink is None:
                     raise RuntimeError("buffered screening decisions require v3 storage")
@@ -4687,21 +4929,21 @@ class ArtifactV2ShardSession:
                     prepared_cached = self._prepared_screening_definition_cache.get(cache_key)
                     definition: _PendingScreeningDefinition | None = None
                     if prepared_cached is None:
-                        lane_id = self._lane_ids.get(event[2])
-                        if lane_id is None:
-                            lane_id = _stable_dictionary_id(f"lane:{event[2]}")
-                            self._lane_ids[event[2]] = lane_id
-                        operator_id = self._operator_ids.get(event[4])
-                        if operator_id is None:
-                            operator_id = _stable_dictionary_id(f"operator:{event[4]}")
-                            self._operator_ids[event[4]] = operator_id
+                        _validate_prepared_screening_identity(prepared)
+                        self._lane_ids.setdefault(
+                            prepared.lane,
+                            _stable_dictionary_id(f"lane:{prepared.lane}"),
+                        )
+                        self._operator_ids.setdefault(
+                            prepared.operator,
+                            _stable_dictionary_id(f"operator:{prepared.operator}"),
+                        )
                         route_id = self._resolve_route_id(event[1])
-                        definition_payload = _screening_definition_from_cache_key(
-                            (lane_id, operator_id, route_id, *prepared.tail)
-                        )
-                        definition_id, encoded, digest = _screening_definition_identity(
-                            definition_payload
-                        )
+                        if route_id != prepared.route_id:
+                            raise ArtifactIntegrityError(
+                                "prepared screening route identity mismatch"
+                            )
+                        definition_id = prepared.pending.definition_id
                         self._prepared_screening_definition_cache[cache_key] = (
                             prepared,
                             definition_id,
@@ -4718,19 +4960,7 @@ class ArtifactV2ShardSession:
                                 route_id=route_id,
                                 validate_key=False,
                             )
-                        definition = _PendingScreeningDefinition(
-                            definition_id=definition_id,
-                            encoded=encoded,
-                            digest=digest,
-                            payload=definition_payload,
-                            row=(
-                                definition_id,
-                                *(
-                                    definition_payload[name]
-                                    for name in V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]
-                                ),
-                            ),
-                        )
+                        definition = prepared.pending
                         if self._screening_definition_store is None:
                             self._screening_definition_store = _BoundedScreeningDefinitionStore(
                                 cache_entries=1,
@@ -4886,6 +5116,10 @@ class ArtifactV2ShardSession:
                         if len(self._pending_check_rows) >= V2_PARQUET_ROW_GROUP_SIZE:
                             self._flush_pending_check_rows()
             count += 1
+        if native_packed_batch:
+            if native_batch_length is None:
+                raise RuntimeError("native batch length is unavailable")
+            next_event_id = batch_first_event_id + native_batch_length
         self._owner._next_event_id = next_event_id
         flush_screening_transaction()
         flush_event_transaction()
@@ -4895,6 +5129,213 @@ class ArtifactV2ShardSession:
                 self._owner._normalise_diagnostic(row, self.instance, self.seed),
             )
         return count
+
+    def _deferred_screening_decision_row(
+        self,
+        event: DeferredScreeningDecision,
+        *,
+        event_id: int,
+    ) -> tuple[tuple[object, ...], _PendingScreeningDefinition | None]:
+        values = event.values
+        if len(values) != 20:
+            raise ArtifactIntegrityError(
+                "deferred screening decision must contain twenty fields"
+            )
+        (
+            decision_id,
+            route_key,
+            raw_lane,
+            iteration,
+            operator,
+            started_at,
+            completed_at,
+            status,
+            reason,
+            demand,
+            distance_increment_lower_bound,
+            distance_lower_bound,
+            exact_call_blocked,
+            first_failed_check,
+            min_time_window_slack,
+            negative_cache_hit,
+            single_segment_reachable,
+            structural_energy_lower_bound,
+            raw_checks,
+            negative_evidence_token,
+        ) = values
+        if not isinstance(route_key, str) or not isinstance(raw_lane, str) or not isinstance(
+            operator, str
+        ):
+            raise ArtifactIntegrityError("deferred screening context is invalid")
+        if not isinstance(raw_checks, tuple):
+            raise ArtifactIntegrityError("deferred screening checks are invalid")
+        checks = raw_checks
+        evidence_tail = (
+            status,
+            reason,
+            demand,
+            distance_increment_lower_bound,
+            distance_lower_bound,
+            exact_call_blocked,
+            first_failed_check,
+            min_time_window_slack,
+            negative_cache_hit,
+            single_segment_reachable,
+            structural_energy_lower_bound,
+            checks,
+        )
+        previous_negative: tuple[tuple[object, ...], tuple[object, ...]] | None = None
+        if negative_cache_hit:
+            previous_negative = self._deferred_negative_screening_evidence.get(route_key)
+            if previous_negative is not None and previous_negative[0] != evidence_tail:
+                raise ArtifactIntegrityError(
+                    "negative screening cache returned inconsistent evidence for one route"
+                )
+        occurrence_key = (
+            route_key,
+            event.axis_name,
+            raw_lane,
+            operator,
+            negative_evidence_token if negative_cache_hit else evidence_tail,
+        )
+        cached_definition_id = self._deferred_screening_occurrence_cache.get(occurrence_key)
+        if cached_definition_id is not None:
+            return (
+                (
+                    event_id,
+                    cached_definition_id,
+                    started_at,
+                    completed_at,
+                    iteration,
+                    decision_id,
+                ),
+                None,
+            )
+        if previous_negative is not None:
+            tail = previous_negative[1]
+        else:
+            compact_checks = tuple(
+                (
+                    check.check,
+                    check.status,
+                    check.value if isinstance(check.value, bool) else None,
+                    float(check.value)
+                    if isinstance(check.value, (int, float))
+                    and not isinstance(check.value, bool)
+                    else None,
+                    check.value if isinstance(check.value, str) else None,
+                    check.reason,
+                )
+                for check in checks
+            )
+            tail = (
+                status,
+                reason,
+                event.axis_name,
+                float(cast(float, demand)),
+                float(cast(float, distance_increment_lower_bound))
+                if distance_increment_lower_bound is not None
+                else None,
+                float(cast(float, distance_lower_bound)),
+                exact_call_blocked,
+                first_failed_check,
+                float(cast(float, min_time_window_slack)),
+                negative_cache_hit,
+                single_segment_reachable,
+                float(cast(float, structural_energy_lower_bound)),
+                compact_checks,
+            )
+            if negative_cache_hit:
+                self._deferred_negative_screening_evidence[route_key] = (
+                    evidence_tail,
+                    tail,
+                )
+                if len(self._deferred_negative_screening_evidence) > 262_144:
+                    self._deferred_negative_screening_evidence.pop(
+                        next(iter(self._deferred_negative_screening_evidence))
+                    )
+        lane = f"{event.axis_name}:{raw_lane}"
+        cache_key = (lane, operator, route_key, tail)
+        cached = self._screening_definition_cache.get(cache_key)
+        if cached is not None:
+            self._deferred_screening_occurrence_cache[occurrence_key] = cached[1]
+            if len(self._deferred_screening_occurrence_cache) > 262_144:
+                self._deferred_screening_occurrence_cache.pop(
+                    next(iter(self._deferred_screening_occurrence_cache))
+                )
+            return (
+                (
+                    event_id,
+                    cached[1],
+                    started_at,
+                    completed_at,
+                    iteration,
+                    decision_id,
+                ),
+                None,
+            )
+        lane_id = self._lane_ids.get(lane)
+        if lane_id is None:
+            lane_id = _stable_dictionary_id(f"lane:{lane}")
+            self._lane_ids[lane] = lane_id
+        operator_id = self._operator_ids.get(operator)
+        if operator_id is None:
+            operator_id = _stable_dictionary_id(f"operator:{operator}")
+            self._operator_ids[operator] = operator_id
+        route_id = self._resolve_route_id(route_key)
+        if route_id not in self._route_digests:
+            self._register_route(
+                route_key,
+                _route_sequence_from_key(route_key),
+                route_id=route_id,
+                validate_key=False,
+            )
+        definition_payload = _screening_definition_from_cache_key(
+            (lane_id, operator_id, route_id, *tail)
+        )
+        definition_id, definition_json, definition_digest = (
+            _screening_definition_identity(definition_payload)
+        )
+        self._screening_definition_cache[cache_key] = (tail, definition_id)
+        if len(self._screening_definition_cache) > SCREENING_DEFINITION_HOT_CACHE_ENTRIES:
+            self._screening_definition_cache.pop(
+                next(iter(self._screening_definition_cache))
+            )
+        if self._screening_definition_store is None:
+            self._screening_definition_store = _BoundedScreeningDefinitionStore(
+                cache_entries=1,
+                scratch_root=self._directory,
+                retain_payload=False,
+            )
+        definition = _PendingScreeningDefinition(
+            definition_id=definition_id,
+            encoded=definition_json,
+            digest=definition_digest,
+            payload=definition_payload,
+            row=(
+                definition_id,
+                *(
+                    definition_payload[name]
+                    for name in V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]
+                ),
+            ),
+        )
+        self._deferred_screening_occurrence_cache[occurrence_key] = definition_id
+        if len(self._deferred_screening_occurrence_cache) > 262_144:
+            self._deferred_screening_occurrence_cache.pop(
+                next(iter(self._deferred_screening_occurrence_cache))
+            )
+        return (
+            (
+                event_id,
+                definition_id,
+                started_at,
+                completed_at,
+                iteration,
+                decision_id,
+            ),
+            definition,
+        )
 
     def _buffered_screening_decision_row(
         self,

@@ -38,6 +38,7 @@ from evrptw.best_known import BEST_KNOWN_VALUES
 from evrptw.experiments.stage052_performance import (
     PERFORMANCE_INSTANCES,
     PERFORMANCE_SEEDS,
+    STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS,
     axes_for_scope,
     load_stage052_config,
     validate_stage052_run_label,
@@ -800,7 +801,8 @@ def _validate_persistence_pipeline(recorded: object) -> None:
     if (
         recorded.get("mode") != "bounded_async_thread"
         or _strict_int(recorded.get("queue_max_batches"), "queue_max_batches") != 1
-        or _strict_float(recorded.get("writer_thread_switch_interval_seconds")) != 0.05
+        or _strict_float(recorded.get("writer_thread_switch_interval_seconds"))
+        != STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS
         or submitted <= 0
         or completed != submitted
         or writer_active_ns <= 0

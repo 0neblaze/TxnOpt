@@ -223,6 +223,11 @@ class _ExternalizedTraceList[T](list[T]):
         for value in values:
             self.append(value)
 
+    def increment_external_count(self) -> None:
+        """Advance a record emitted through a sink-specific typed fast path."""
+
+        self._count += 1
+
     def __len__(self) -> int:
         return self._count
 
@@ -425,11 +430,12 @@ class Stage03Trace:
             return
         if family == "screening_decisions":
             decision = cast(ScreeningDecision, value)
-            summary.counts[f"screening_status:{decision.status}"] += 1
-            summary.counts["screening_negative_cache_hit"] += int(decision.negative_cache_hit)
-            summary.counts["screening_exact_call_blocked"] += int(decision.exact_call_blocked)
-            if decision.reason:
-                summary.screening_reasons[decision.reason] += 1
+            self._observe_streamed_screening_fields(
+                status=decision.status,
+                reason=decision.reason,
+                negative_cache_hit=decision.negative_cache_hit,
+                exact_call_blocked=decision.exact_call_blocked,
+            )
             return
         if family == "incremental_propagations":
             propagation = cast(Mapping[str, object], value)
@@ -467,6 +473,23 @@ class Stage03Trace:
             and compare_objectives(candidate, current) is ObjectiveComparison.BETTER
         ):
             summary.improving_legacy += 1
+
+    def _observe_streamed_screening_fields(
+        self,
+        *,
+        status: str,
+        reason: str,
+        negative_cache_hit: bool,
+        exact_call_blocked: bool,
+    ) -> None:
+        summary = self._stream_summary
+        if summary is None:
+            raise RuntimeError("stream observer is unavailable")
+        summary.counts[f"screening_status:{status}"] += 1
+        summary.counts["screening_negative_cache_hit"] += int(negative_cache_hit)
+        summary.counts["screening_exact_call_blocked"] += int(exact_call_blocked)
+        if reason:
+            summary.screening_reasons[reason] += 1
 
     def _validate_screening_route_dictionary(self) -> None:
         if (
@@ -744,6 +767,7 @@ class Stage03Trace:
         exact_call_blocked: bool,
         started_at: float | None = None,
         completed_at: float | None = None,
+        registered_route_key: str | None = None,
     ) -> int:
         """Append one auditable Stage 3.1 screening decision.
 
@@ -752,11 +776,65 @@ class Stage03Trace:
         cannot inflate exact-call or route-cache counters.
         """
 
-        key = self.register_route(sequence)
+        key = (
+            self.register_route(sequence)
+            if registered_route_key is None
+            else registered_route_key
+        )
         started = self._offset() if started_at is None else started_at
         completed = self._offset() if completed_at is None else completed_at
+        decision_id = len(self.screening_decisions) + 1
+        normalized_demand = float(demand)
+        normalized_slack = float(min_time_window_slack)
+        normalized_distance = float(distance_lower_bound)
+        normalized_increment = (
+            None
+            if distance_increment_lower_bound is None
+            else float(distance_increment_lower_bound)
+        )
+        normalized_reachable = bool(single_segment_reachable)
+        normalized_energy = float(structural_energy_lower_bound)
+        normalized_negative_hit = bool(negative_cache_hit)
+        normalized_blocked = bool(exact_call_blocked)
+        fast_append = getattr(self.config.stream_sink, "append_screening_fields", None)
+        if callable(fast_append):
+            summary = self._stream_summary
+            if summary is None or not isinstance(
+                self.screening_decisions, _ExternalizedTraceList
+            ):
+                raise RuntimeError("typed screening stream is unavailable")
+            summary.counts["screening_decisions"] += 1
+            self._observe_streamed_screening_fields(
+                status=status,
+                reason=reason,
+                negative_cache_hit=normalized_negative_hit,
+                exact_call_blocked=normalized_blocked,
+            )
+            fast_append(
+                decision_id,
+                key,
+                lane,
+                iteration,
+                operator,
+                started,
+                completed,
+                status,
+                reason,
+                normalized_demand,
+                normalized_increment,
+                normalized_distance,
+                normalized_blocked,
+                first_failed_check,
+                normalized_slack,
+                normalized_negative_hit,
+                normalized_reachable,
+                normalized_energy,
+                checks,
+            )
+            self.screening_decisions.increment_external_count()
+            return decision_id
         decision = ScreeningDecision(
-            decision_id=len(self.screening_decisions) + 1,
+            decision_id=decision_id,
             route_key=key,
             lane=lane,
             iteration=iteration,
@@ -765,18 +843,14 @@ class Stage03Trace:
             first_failed_check=first_failed_check,
             reason=reason,
             checks=checks,
-            demand=float(demand),
-            min_time_window_slack=float(min_time_window_slack),
-            distance_lower_bound=float(distance_lower_bound),
-            distance_increment_lower_bound=(
-                None
-                if distance_increment_lower_bound is None
-                else float(distance_increment_lower_bound)
-            ),
-            single_segment_reachable=bool(single_segment_reachable),
-            structural_energy_lower_bound=float(structural_energy_lower_bound),
-            negative_cache_hit=bool(negative_cache_hit),
-            exact_call_blocked=bool(exact_call_blocked),
+            demand=normalized_demand,
+            min_time_window_slack=normalized_slack,
+            distance_lower_bound=normalized_distance,
+            distance_increment_lower_bound=normalized_increment,
+            single_segment_reachable=normalized_reachable,
+            structural_energy_lower_bound=normalized_energy,
+            negative_cache_hit=normalized_negative_hit,
+            exact_call_blocked=normalized_blocked,
             started_at=started,
             completed_at=completed,
             duration_seconds=max(0.0, completed - started),

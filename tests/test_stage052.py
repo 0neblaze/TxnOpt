@@ -1271,7 +1271,10 @@ def test_native_execution_audit_cross_checks_per_run_raw_and_trace(tmp_path: Pat
                         "persistence_pipeline": {
                             "mode": "bounded_async_thread",
                             "queue_max_batches": 1,
-                            "writer_thread_switch_interval_seconds": 0.05,
+                            "writer_thread_switch_interval_seconds": (
+                                stage052_performance
+                                .STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS
+                            ),
                             "submitted_batches": 2,
                             "completed_batches": 2,
                             "writer_active_nanoseconds": 8_000_000,
@@ -3624,7 +3627,9 @@ def test_native_persistence_pipeline_requires_bounded_complete_fifo_batches() ->
     valid = {
         "mode": "bounded_async_thread",
         "queue_max_batches": 1,
-        "writer_thread_switch_interval_seconds": 0.05,
+        "writer_thread_switch_interval_seconds": (
+            stage052_performance.STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS
+        ),
         "submitted_batches": 10,
         "completed_batches": 10,
         "writer_active_nanoseconds": 100,

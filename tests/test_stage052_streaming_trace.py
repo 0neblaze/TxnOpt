@@ -21,6 +21,7 @@ from evrptw.artifacts import (
     ArtifactReader,
     ArtifactRunContext,
     ArtifactStorageConfig,
+    DeferredScreeningDecision,
 )
 from evrptw.experiments import stage052_performance
 from evrptw.experiments.stage052_performance_review import (
@@ -452,7 +453,7 @@ def test_streamed_screening_definition_matches_mapping_normalization() -> None:
     ]
 
 
-def test_v3_screening_bridge_reuses_precomputed_typed_definition() -> None:
+def test_v3_screening_bridge_flattens_decision_for_native_writer() -> None:
     shard = _BufferedScreeningRecordingShard()
     sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
         shard=shard,  # type: ignore[arg-type]
@@ -487,11 +488,176 @@ def test_v3_screening_bridge_reuses_precomputed_typed_definition() -> None:
 
     assert len(shard.rows) == 2
     first, second = shard.rows
-    assert isinstance(first, tuple)
-    assert isinstance(second, tuple)
-    assert first[0] == 1
-    assert first[2] == "fixed_work:legacy"
-    assert first[7] is second[7]
+    assert isinstance(first, DeferredScreeningDecision)
+    assert isinstance(second, DeferredScreeningDecision)
+    assert first.axis_name == "fixed_work"
+    assert first.values[0] == 1
+    assert first.values[1] == decision.route_key
+    assert second.values[0] == 2
+
+
+def test_native_v3_screening_packer_preserves_positions_and_cache_identity() -> None:
+    from evrptw import _core
+
+    deferred = DeferredScreeningDecision(
+        axis_name="fixed_work",
+        values=(
+            7,
+            "route:2:C1",
+            "legacy",
+            3,
+            "repair",
+            0.1,
+            0.2,
+            "rejected",
+            "capacity",
+            2.5,
+            None,
+            3.0,
+            True,
+            "capacity",
+            1.0,
+            False,
+            True,
+            4.0,
+            (("capacity", "fail", 2.5, "capacity"),),
+            None,
+        ),
+    )
+    definition_cache: dict[object, int] = {}
+
+    columns, misses, non_screening_indices = _core.pack_stage052_screening_occurrences(
+        (
+            deferred,
+            {"event": "not_screening"},
+            deferred._replace(values=(8, *deferred.values[1:])),
+        ),
+        definition_cache,
+        {},
+        100,
+    )
+
+    assert columns[0] == [100, 102]
+    assert columns[1] == [None, None]
+    assert columns[5] == [7, 8]
+    assert len(misses) == 1
+    assert non_screening_indices == [1]
+    definition_key, event_index, occurrence_indices = misses[0]
+    assert event_index == 0
+    assert occurrence_indices == [0, 1]
+
+    definition_cache[definition_key] = 17
+    cached_columns, cached_misses, cached_non_screening_indices = (
+        _core.pack_stage052_screening_occurrences(
+        (deferred,),
+        definition_cache,
+        {},
+        200,
+        )
+    )
+
+    assert cached_columns[0] == [200]
+    assert cached_columns[1] == [17]
+    assert cached_misses == []
+    assert cached_non_screening_indices == []
+
+
+def test_native_v3_screening_packer_rejects_negative_evidence_drift() -> None:
+    from evrptw import _core
+
+    deferred = DeferredScreeningDecision(
+        axis_name="fixed_work",
+        values=(
+            7,
+            "route:2:C1",
+            "legacy",
+            3,
+            "repair",
+            0.1,
+            0.2,
+            "rejected",
+            "negative_cache",
+            2.5,
+            None,
+            3.0,
+            True,
+            "negative_cache",
+            1.0,
+            True,
+            True,
+            4.0,
+            (("capacity", "fail", 2.5, "capacity"),),
+            True,
+        ),
+    )
+    evidence_cache: dict[object, tuple[object, ...]] = {}
+    _core.pack_stage052_screening_occurrences(
+        (deferred,),
+        {},
+        evidence_cache,
+        1,
+    )
+    drifted_values = list(deferred.values)
+    drifted_values[8] = "changed_reason"
+    with pytest.raises(ValueError, match="inconsistent evidence"):
+        _core.pack_stage052_screening_occurrences(
+            (deferred._replace(values=tuple(drifted_values)),),
+            {},
+            evidence_cache,
+            2,
+        )
+
+
+def test_native_neighborhood_packer_matches_python_normalizer() -> None:
+    from evrptw import _core
+
+    event: dict[str, object] = {
+        "event_type": "neighborhood_event",
+        "record_type": None,
+        "timestamp_seconds": True,
+        "started_at": "1.25",
+        "completed_at": 2,
+        "duration_seconds": "invalid",
+        "lane": None,
+        "iteration": "7",
+        "operator": "repair",
+        "status": None,
+        "feasible": True,
+        "candidate_vehicle_count": "3",
+        "candidate_objective_key": [3, 100.0, 2.0, 1],
+        "route_indices": (0, 1),
+    }
+    lane_ids: dict[str, int] = {}
+    operator_ids: dict[str, int] = {}
+    columns, non_neighborhood_indices = _core.pack_stage052_neighborhood_events(
+        (event, {"event_type": "neighborhood_event", "unsupported": 1}),
+        lane_ids,
+        operator_ids,
+        {},
+        artifact_module._NEIGHBORHOOD_FAST_FIELDS,  # noqa: SLF001
+        artifact_module._MISSING_NEIGHBORHOOD_EXTRA,  # noqa: SLF001
+        artifact_module._stable_dictionary_id,  # noqa: SLF001
+        artifact_module._json_text,  # noqa: SLF001
+        41,
+    )
+
+    assert non_neighborhood_indices == [1]
+    assert lane_ids == {
+        "None": artifact_module._stable_dictionary_id("lane:None")  # noqa: SLF001
+    }
+    assert operator_ids == {
+        "repair": artifact_module._stable_dictionary_id(  # noqa: SLF001
+            "operator:repair"
+        )
+    }
+    native_row = tuple(column[0] for column in columns)
+    python_row = artifact_module._normalise_neighborhood_event_values(  # noqa: SLF001
+        event,
+        event_id=41,
+        lane_ids=lane_ids,
+        operator_ids=operator_ids,
+    )
+    assert native_row == python_row
 
 
 def test_v3_buffered_screening_bridge_roundtrips_through_real_writer(
@@ -842,14 +1008,30 @@ def test_negative_screening_tail_cache_fails_on_route_evidence_drift() -> None:
         sink.append_screening_decision(replace(base, decision_id=2, demand=9.0))
 
 
-def test_v3_negative_cache_hit_reuses_precomputed_definition_without_check_iteration() -> None:
+def test_v3_negative_cache_hit_reuses_definition_without_check_iteration(
+    tmp_path: Path,
+) -> None:
     class NoIterationChecks(tuple[ScreeningCheckTrace, ...]):
         def __iter__(self) -> Any:
             raise AssertionError("cached negative screening checks were rebuilt")
 
-    shard = _BufferedScreeningRecordingShard()
+    run_label = "stage05.2_artifact_streaming_attempt94"
+    writer = ArtifactBundleWriter(
+        tmp_path / "results" / run_label,
+        ArtifactRunContext("stage05.2", "artifact_streaming", run_label),
+        ArtifactStorageConfig(
+            storage_policy_version="artifact-storage-v2",
+            screening_schema_version="screening_decisions_v3",
+        ),
+    )
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
     sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
-        shard=shard,  # type: ignore[arg-type]
+        shard=shard,
         axis_name="fixed_work",
         buffer_rows=2,
     )
@@ -883,15 +1065,90 @@ def test_v3_negative_cache_hit_reuses_precomputed_definition_without_check_itera
             checks=NoIterationChecks(base.checks),
         )
     )
+    sink.close()
+    shard.finalize(
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+    )
+    bundle = writer.finalize()
+    rows = list(
+        ArtifactReader(bundle.run_dir).iter_events(
+            f"toy/2014/{run_label}_events_toy_2014.parquet"
+        )
+    )
+    assert [row["decision_id"] for row in rows] == [1, 2]
+    assert rows[0]["checks"] == rows[1]["checks"]
 
-    assert len(shard.rows) == 2
-    assert shard.rows[0][7] is shard.rows[1][7]  # type: ignore[index]
 
-
-def test_v3_negative_cache_retains_only_one_prepared_context_per_route() -> None:
-    shard = _BufferedScreeningRecordingShard()
+def test_v3_writer_fails_fast_on_negative_cache_evidence_drift(tmp_path: Path) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt92"
+    writer = ArtifactBundleWriter(
+        tmp_path / "results" / run_label,
+        ArtifactRunContext("stage05.2", "artifact_streaming", run_label),
+        ArtifactStorageConfig(
+            storage_policy_version="artifact-storage-v2",
+            screening_schema_version="screening_decisions_v3",
+        ),
+    )
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
     sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
-        shard=shard,  # type: ignore[arg-type]
+        shard=shard,
+        axis_name="fixed_work",
+        buffer_rows=2,
+    )
+    base = ScreeningDecision(
+        decision_id=1,
+        route_key="route:2:C1",
+        lane="legacy",
+        iteration=1,
+        operator="repair",
+        status="negative_cache_hit",
+        first_failed_check="capacity",
+        reason="capacity",
+        checks=(ScreeningCheckTrace("negative_sequence_cache", "hit", True, "reused"),),
+        demand=2.5,
+        min_time_window_slack=1.0,
+        distance_lower_bound=3.0,
+        distance_increment_lower_bound=None,
+        single_segment_reachable=True,
+        structural_energy_lower_bound=4.0,
+        negative_cache_hit=True,
+        exact_call_blocked=True,
+        started_at=0.1,
+        completed_at=0.2,
+        duration_seconds=0.1,
+    )
+
+    sink.append_screening_decision(base)
+    with pytest.raises(ArtifactIntegrityError, match="inconsistent evidence"):
+        sink.append_screening_decision(replace(base, decision_id=2, demand=9.0))
+
+
+def test_v3_negative_cache_contexts_roundtrip_through_writer(tmp_path: Path) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt93"
+    writer = ArtifactBundleWriter(
+        tmp_path / "results" / run_label,
+        ArtifactRunContext("stage05.2", "artifact_streaming", run_label),
+        ArtifactStorageConfig(
+            storage_policy_version="artifact-storage-v2",
+            screening_schema_version="screening_decisions_v3",
+        ),
+    )
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,
         axis_name="fixed_work",
         buffer_rows=256,
     )
@@ -927,9 +1184,26 @@ def test_v3_negative_cache_retains_only_one_prepared_context_per_route() -> None
             )
         )
 
-    entry = sink._negative_screening_cache[base.route_key]  # noqa: SLF001
-    assert entry.prepared_context == ("lane-99", "operator-99")
-    assert isinstance(entry.prepared, artifact_module.PreparedScreeningDefinition)
+    sink.close()
+    shard.finalize(
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+    )
+    bundle = writer.finalize()
+    rows = list(
+        ArtifactReader(bundle.run_dir).iter_events(
+            f"toy/2014/{run_label}_events_toy_2014.parquet"
+        )
+    )
+    assert [row["decision_id"] for row in rows] == list(range(1, 101))
+    assert [row["lane"] for row in rows] == [
+        f"fixed_work:lane-{index}" for index in range(100)
+    ]
+    assert [row["operator"] for row in rows] == [
+        f"operator-{index}" for index in range(100)
+    ]
 
 
 def test_stage052_trace_sink_flushes_bounded_event_batches() -> None:
@@ -1007,14 +1281,16 @@ def test_stage052_trace_sink_async_pipeline_preserves_order_and_drains() -> None
     assert pipeline == {
         "mode": "bounded_async_thread",
         "queue_max_batches": 1,
-        "writer_thread_switch_interval_seconds": 0.05,
+        "writer_thread_switch_interval_seconds": (
+            stage052_performance.STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS
+        ),
         "submitted_batches": 3,
         "completed_batches": 3,
         "peak_queued_batches": 1,
     }
 
 
-def test_async_pipeline_prepares_next_batch_while_writer_is_active() -> None:
+def test_async_pipeline_waits_for_writer_before_next_callback() -> None:
     writer_started = threading.Event()
     release_writer = threading.Event()
 
@@ -1047,27 +1323,29 @@ def test_async_pipeline_prepares_next_batch_while_writer_is_active() -> None:
     producer_completed = threading.Event()
 
     def append_while_writer_is_active() -> None:
-        sink.append_event(
-            {
-                "event_type": "operator_call",
-                "lane": "legacy",
-                "iteration": 2,
-                "operator": "repair",
-            }
-        )
+        for iteration in (2, 3):
+            sink.append_event(
+                {
+                    "event_type": "operator_call",
+                    "lane": "legacy",
+                    "iteration": iteration,
+                    "operator": "repair",
+                }
+            )
         producer_completed.set()
 
     producer = threading.Thread(target=append_while_writer_is_active)
     producer.start()
     try:
-        assert producer_completed.wait(timeout=1.0)
+        assert not producer_completed.wait(timeout=0.1)
     finally:
         release_writer.set()
         producer.join(timeout=5.0)
     assert not producer.is_alive()
+    assert producer_completed.is_set()
 
     sink.close()
-    assert [event["iteration"] for event in shard.events] == [0, 1, 2]
+    assert [event["iteration"] for event in shard.events] == [0, 1, 2, 3]
     pipeline = sink.persistence_pipeline
     producer_ns = pipeline["producer_active_nanoseconds"]
     writer_ns = pipeline["writer_active_nanoseconds"]
@@ -1075,7 +1353,7 @@ def test_async_pipeline_prepares_next_batch_while_writer_is_active() -> None:
     assert isinstance(producer_ns, int)
     assert isinstance(writer_ns, int)
     assert isinstance(union_ns, int)
-    assert max(producer_ns, writer_ns) <= union_ns < producer_ns + writer_ns
+    assert max(producer_ns, writer_ns) <= union_ns <= producer_ns + writer_ns
 
 
 def test_stage052_trace_sink_rejects_oversized_async_callback_batch() -> None:
