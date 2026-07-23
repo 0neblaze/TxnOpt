@@ -8,6 +8,29 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-24：F12 通过、G13/G14 环境失败并稳定 Windows edition identity
+
+- clean revision `c17e0dc` 上的 `stage05.2_accelerator_pilot_attempt12` 已由独立
+  transient service replay 通过，状态为 `READY_FOR_STAGE052_BENCHMARK`。raw/review
+  manifest SHA-256 分别为
+  `e6927e66fd544aa3e4f5f21381c61f9b54c47a08f7a8179b12858037f816cebc`
+  和 `53fa45cc8b6f8dc0c44eb93f24c7c2fa07e39ef531bf235ee29d62d421e508fc`；
+  raw before/after 相同，cgroup peak、冻结 wheel/native identity 均通过。
+- `stage05.2_benchmark_attempt13` 在 batch0001 运行时因 unrelated process 平均占用
+  达到一个完整 CPU core 被环境 guard 中止；该 identity 保留为 startup/runtime
+  failure，不归类为 36% persistence 失败。后续运行在 measured interval 内不再启动
+  额外诊断 shell。
+- `stage05.2_benchmark_attempt14` 在创建测量 batch 前 fail fast：同一 Windows edition
+  的 CIM `Caption` 在英文 `Microsoft Windows 11 Pro for Workstations` 与中文
+  `Microsoft Windows 11 专业工作站版` 之间变化，逐字 machine-identity 比较因此
+  拒绝启动。CPU/GPU、Windows Version/BuildNumber、WSL、mount UUID 和 NVMe identity
+  均未变化；G14 不进入性能判定或独立 review。
+- 当前实现不再把本地化 `Caption` 写入新 producer machine identity，改用语言无关的
+  数值 CIM `OperatingSystemSKU`，并继续精确绑定 `Version`、`BuildNumber` 与
+  `TotalVisibleMemorySize`。缺失、布尔值、非整数或非正 SKU 均 fail fast；历史 evidence
+  的中英文 Caption reviewer compatibility 不变。后续必须从新 clean revision 重跑
+  F，并用新 label 执行 G pilot/Formal 完整链路；36% 门槛及归因公式不变。
+
 ## 2026-07-24：F11 通过、G11/G12 保留失败并复用 negative-result identity
 
 - clean revision `9d72dd9` 上的 `stage05.2_accelerator_pilot_attempt11` 已由独立

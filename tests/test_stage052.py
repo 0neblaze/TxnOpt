@@ -3352,6 +3352,33 @@ def test_review_runtime_machine_comparison_normalizes_windows_caption_locale() -
     )
 
 
+def test_windows_operating_system_identity_uses_locale_independent_sku() -> None:
+    chinese = {
+        "Caption": "Microsoft Windows 11 专业工作站版",
+        "Version": "10.0.26200",
+        "BuildNumber": "26200",
+        "TotalVisibleMemorySize": 32629612,
+        "OperatingSystemSKU": 161,
+    }
+    english = {
+        **chinese,
+        "Caption": "Microsoft Windows 11 Pro for Workstations",
+    }
+
+    expected = {
+        "Version": "10.0.26200",
+        "BuildNumber": "26200",
+        "TotalVisibleMemorySize": 32629612,
+        "OperatingSystemSKU": 161,
+    }
+    assert stage052_evidence._canonical_windows_operating_system_identity(chinese) == expected
+    assert stage052_evidence._canonical_windows_operating_system_identity(english) == expected
+    with pytest.raises(RuntimeError, match="OperatingSystemSKU"):
+        stage052_evidence._canonical_windows_operating_system_identity(
+            {**english, "OperatingSystemSKU": True}
+        )
+
+
 def test_runtime_signature_is_self_consistent_without_impersonating_producer() -> None:
     environment = {
         "python": {"version": "3.13.13", "implementation": "CPython"},

@@ -712,11 +712,12 @@ def _stage052_machine_identity() -> dict[str, object]:
                 "-NonInteractive",
                 "-Command",
                 "(Get-CimInstance Win32_OperatingSystem | Select-Object "
-                "Caption,Version,BuildNumber,TotalVisibleMemorySize) | "
+                "Caption,Version,BuildNumber,TotalVisibleMemorySize,OperatingSystemSKU) | "
                 "ConvertTo-Json -Compress",
             )
         )
     )
+    windows = _canonical_windows_operating_system_identity(windows)
     cpu = json.loads(
         _run_command(
             (
@@ -773,6 +774,41 @@ def _stage052_machine_identity() -> dict[str, object]:
         "ext4_mount": ext4,
         "d_archive_mount": d_archive,
         "d_archive_disk": dict(d_disk),
+    }
+
+
+def _canonical_windows_operating_system_identity(
+    payload: object,
+) -> dict[str, object]:
+    """Return locale-independent Windows operating-system identity fields."""
+
+    if not isinstance(payload, Mapping):
+        raise RuntimeError("Stage 5.2 Windows operating-system identity is invalid")
+    version = payload.get("Version")
+    build_number = payload.get("BuildNumber")
+    total_memory = payload.get("TotalVisibleMemorySize")
+    operating_system_sku = payload.get("OperatingSystemSKU")
+    if not isinstance(version, str) or not version:
+        raise RuntimeError("Stage 5.2 Windows Version is invalid")
+    if not isinstance(build_number, str) or not build_number:
+        raise RuntimeError("Stage 5.2 Windows BuildNumber is invalid")
+    if (
+        isinstance(total_memory, bool)
+        or not isinstance(total_memory, int)
+        or total_memory <= 0
+    ):
+        raise RuntimeError("Stage 5.2 Windows TotalVisibleMemorySize is invalid")
+    if (
+        isinstance(operating_system_sku, bool)
+        or not isinstance(operating_system_sku, int)
+        or operating_system_sku <= 0
+    ):
+        raise RuntimeError("Stage 5.2 Windows OperatingSystemSKU is invalid")
+    return {
+        "Version": version,
+        "BuildNumber": build_number,
+        "TotalVisibleMemorySize": total_memory,
+        "OperatingSystemSKU": operating_system_sku,
     }
 
 
