@@ -8,6 +8,33 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-24：G pilot attempt10 保留失败并修复稀疏 definition buffer rotation
+
+- clean revision `fe35cd9` 上的 `stage05.2_accelerator_pilot_attempt10` 已由独立
+  transient service replay 通过，状态为 `READY_FOR_STAGE052_BENCHMARK`。raw/review
+  manifest SHA-256 分别为
+  `7be1a39234804a6dd914113ea31addd240b0da178f550fc0b8261e43e27368ac`
+  和 `69c624a47bc9e087c7448448a36c9b20375af62aae400b13ad9426fdf6911333`；
+  review receipt 的 raw before/after 相同、cgroup peak 已验证且 exit code 为 0。
+- `stage05.2_benchmark_attempt10` 的 batch0001/0002 分别以
+  `0.335693353885035` 和 `0.3025066369792433` 通过并归档；batch0003 以
+  `0.38743692510495514` 被 36% producer hard gate 拒绝。失败 batch 的 solver 为
+  `195.487977799` 秒，shard persistence 为 `123.633580845` 秒，control
+  persistence 为 `0.009622798` 秒。G10 保持不可变，不进入独立 campaign review
+  或 Formal。
+- 根因分析发现 v3 live transaction 每次先把稀疏 screening definition 写入一个
+  partial Parquet row group，再在 occurrence/event 两个高流量 sink 之间执行
+  two-buffer FIFO rotation；第三个 definition sink 会反复提前 flush occurrence 或
+  event，产生大量不足 65,536 行的 row group。当前实现将已经通过 collision store
+  的 definition transaction 立即写入，不让它进入高流量 bounded working set；
+  两个受限非空缓冲稳定留给 occurrence 与 event。完整 definition/occurrence/event
+  行、顺序、typed schema、SHA-256 identity、36% 归因公式及最大两个非空缓冲的资源
+  上限均不改变。
+- 新回归以三个相邻 mixed transactions 验证稀疏 definition 不再轮换两个高流量
+  buffer，并继续验证 occurrence row-group 上限和 simultaneous-buffer 上限。ext4
+  完整测试为 734 passed；Ruff、Mypy 与 `git diff --check` 通过。后续 F/G 必须使用
+  新 clean revision 和新 label；G10 不得重用。
+
 ## 2026-07-23：G pilot attempt09 保留失败并引入 exact-key native cache
 
 - clean revision `7a8c0ed` 上的 `stage05.2_accelerator_pilot_attempt09` 已由独立

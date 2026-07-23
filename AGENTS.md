@@ -726,6 +726,11 @@ The executable workflow and gate table are maintained in
   Canonical typed signatures distinguish booleans from numerics and preserve IEEE-754 signed zero;
   negative-evidence drift uses the same signature. Probabilistic hash-only identity, unbounded cache
   growth, Python-loose numeric equality, or collision aliasing is forbidden.
+  Sparse screening-definition transactions are persisted immediately after collision-store
+  registration and do not enter the two-buffer high-volume working set. The two bounded non-empty
+  Parquet buffers remain available to occurrence and event streams so a sparse definition sink
+  cannot force repeated partial row-group rotation. This physical scheduling rule may not change,
+  omit, aggregate, or reorder any definition, occurrence, or event row.
   Native screening and deferred sparse packers return the strictly decoded route sequence with every
   newly observed route ID, so the writer must not parse the same canonical route key a second time.
   Producer and campaign reviewer must validate the same exported writer thread-switch protocol

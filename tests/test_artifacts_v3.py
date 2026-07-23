@@ -1947,6 +1947,54 @@ def test_v3_row_groups_and_simultaneous_buffers_stay_bounded(tmp_path: Path) -> 
     ] == [65_536, 1]
 
 
+def test_v3_sparse_definitions_do_not_rotate_high_volume_buffers(tmp_path: Path) -> None:
+    writer = _v3_writer(tmp_path, attempt=92)
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+
+    for index in range(3):
+        route_key = f"route:2:C{index + 1}"
+        screening = _screening_event(
+            decision_id=index + 1,
+            started_at=float(index),
+        )
+        screening["route_key"] = route_key
+        shard.append(
+            route_dictionary={route_key: (f"C{index + 1}",)},
+            critical_events=(
+                screening,
+                {
+                    "event_type": "route_evaluation",
+                    "benchmark_axis": "fixed_work",
+                    "route_key": route_key,
+                },
+            ),
+        )
+
+    assert shard.max_buffered_groups_observed <= 2
+    shard.finalize(
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+    )
+    bundle = writer.finalize()
+    prefix = bundle.run_dir / "toy" / "2014" / writer.context.run_label
+    occurrences = pq.ParquetFile(
+        prefix.with_name(f"{prefix.name}_screening_occurrences_toy_2014.parquet")
+    )
+    events = pq.ParquetFile(
+        prefix.with_name(f"{prefix.name}_events_toy_2014.parquet")
+    )
+
+    assert occurrences.metadata.num_row_groups == 1
+    assert events.metadata.num_row_groups == 1
+
+
 def test_v3_occurrences_append_schema_ordered_values_without_row_mappings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

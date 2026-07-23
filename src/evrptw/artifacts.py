@@ -4781,10 +4781,15 @@ class ArtifactV2ShardSession:
                     raise RuntimeError("screening definition store is unavailable")
                 inserted = self._screening_definition_store.register_many(candidates)
                 definitions = tuple(candidate.row for candidate in inserted)
-                self._append_buffered_value_rows(
+                self._append_immediate_value_rows(
                     self._screening_definitions_sink,
                     definitions,
                 )
+                # Definitions are sparse relative to occurrences and events.  Leaving
+                # their partial row group active would rotate one of those two
+                # high-volume sinks out of the bounded two-buffer working set on
+                # every live transaction.  Persist the definition transaction
+                # immediately so occurrences and events can retain full row groups.
             self._append_buffered_columns(
                 self._screening_occurrences_sink,
                 occurrence_columns,
@@ -6196,6 +6201,20 @@ class ArtifactV2ShardSession:
             self._max_buffered_groups_observed,
             len(self._active_sinks),
         )
+
+    def _append_immediate_value_rows(
+        self,
+        sink: _StreamingParquetSink,
+        rows: Sequence[Sequence[object]],
+    ) -> None:
+        """Persist sparse rows without entering the bounded live-buffer rotation."""
+
+        if not rows:
+            return
+        if sink in self._active_sinks:
+            self._flush_sink(sink)
+        sink.append_value_rows(rows)
+        sink.flush()
 
     def _flush_sink(self, sink: _StreamingParquetSink) -> None:
         sink.flush()
