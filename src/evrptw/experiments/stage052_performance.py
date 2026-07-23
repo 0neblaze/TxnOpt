@@ -3293,14 +3293,6 @@ class _PersistenceActivityMeter:
                 self._union_nanoseconds += now - self._union_started_ns
                 self._union_started_ns = None
 
-    def record_serialized(self, role: str, elapsed_nanoseconds: int) -> None:
-        """Record one non-overlapping interval already protected by the shard turn."""
-
-        if elapsed_nanoseconds < 0:
-            raise RuntimeError("persistence activity duration is invalid")
-        self._role_nanoseconds[role] += elapsed_nanoseconds
-        self._union_nanoseconds += elapsed_nanoseconds
-
     def role_nanoseconds(self, role: str) -> int:
         with self._lock:
             return int(self._role_nanoseconds[role])
@@ -3670,6 +3662,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
 
     def append_route_evaluation(self, record: RouteEvaluationTrace) -> None:
         self._begin_async_producer_turn()
+        activity = self._persistence_meter.enter("producer")
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
@@ -3679,15 +3672,16 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             self._queue_owned(payload)
         finally:
             try:
+                self._persistence_meter.exit(activity)
                 nested_ns = self.persistence_nanoseconds - previously_recorded_ns
                 elapsed_ns = time.perf_counter_ns() - started_ns
-                self._persistence_meter.record_serialized("producer", elapsed_ns)
                 self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
             finally:
                 self._end_async_producer_turn()
 
     def append_event(self, event: Mapping[str, object]) -> None:
         self._begin_async_producer_turn()
+        activity = self._persistence_meter.enter("producer")
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
@@ -3696,24 +3690,25 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             self._queue_owned(payload)
         finally:
             try:
+                self._persistence_meter.exit(activity)
                 nested_ns = self.persistence_nanoseconds - previously_recorded_ns
                 elapsed_ns = time.perf_counter_ns() - started_ns
-                self._persistence_meter.record_serialized("producer", elapsed_ns)
                 self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
             finally:
                 self._end_async_producer_turn()
 
     def append_screening_decision(self, decision: ScreeningDecision) -> None:
         self._begin_async_producer_turn()
+        activity = self._persistence_meter.enter("producer")
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
             self._append_screening_decision(decision)
         finally:
             try:
+                self._persistence_meter.exit(activity)
                 nested_ns = self.persistence_nanoseconds - previously_recorded_ns
                 elapsed_ns = time.perf_counter_ns() - started_ns
-                self._persistence_meter.record_serialized("producer", elapsed_ns)
                 self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
             finally:
                 self._end_async_producer_turn()
@@ -3885,6 +3880,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
 
     def append_incremental_propagation(self, propagation: Mapping[str, object]) -> None:
         self._begin_async_producer_turn()
+        activity = self._persistence_meter.enter("producer")
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
@@ -3894,9 +3890,9 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             self._queue_owned(payload)
         finally:
             try:
+                self._persistence_meter.exit(activity)
                 nested_ns = self.persistence_nanoseconds - previously_recorded_ns
                 elapsed_ns = time.perf_counter_ns() - started_ns
-                self._persistence_meter.record_serialized("producer", elapsed_ns)
                 self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
             finally:
                 self._end_async_producer_turn()
@@ -3908,6 +3904,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         route_dictionary: dict[str, tuple[str, ...]],
     ) -> None:
         self._begin_async_producer_turn()
+        activity = self._persistence_meter.enter("producer")
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
@@ -3917,15 +3914,16 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                 self._spool_neighborhood_event(payload)
         finally:
             try:
+                self._persistence_meter.exit(activity)
                 nested_ns = self.persistence_nanoseconds - previously_recorded_ns
                 elapsed_ns = time.perf_counter_ns() - started_ns
-                self._persistence_meter.record_serialized("producer", elapsed_ns)
                 self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
             finally:
                 self._end_async_producer_turn()
 
     def append_neighborhood_event(self, event: Mapping[str, object]) -> None:
         self._begin_async_producer_turn()
+        activity = self._persistence_meter.enter("producer")
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
@@ -3934,9 +3932,9 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             self._spool_neighborhood_event(payload)
         finally:
             try:
+                self._persistence_meter.exit(activity)
                 nested_ns = self.persistence_nanoseconds - previously_recorded_ns
                 elapsed_ns = time.perf_counter_ns() - started_ns
-                self._persistence_meter.record_serialized("producer", elapsed_ns)
                 self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
             finally:
                 self._end_async_producer_turn()

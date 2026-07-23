@@ -8,6 +8,27 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：G pilot attempt03 拒绝错误重叠计量并确认剩余编码瓶颈
+
+- `stage05.2_benchmark_attempt03` 在完成首个 12-shard batch 后由 producer gate
+  拒绝：solver 为 `21.586026866` 秒，persistence 为 `17.875972692` 秒，
+  batch ratio 为 `0.452992066`，超过当前 36% 门槛。该失败证据保留，label 不复用，
+  Formal 未启动。
+- attempt03 暴露 `fdc7227` overlap 改动后的 attribution bug：producer callback
+  仍调用只适用于 non-overlapping interval（非重叠区间）的 `record_serialized()`，
+  同时 writer 已允许并发，因此 producer/writer 同时活跃的墙钟区间会重复计数。
+  producer callback 现在与 writer 一样通过同一个 activity meter 的 `enter/exit`
+  记录；union 只计算一次重叠区间，producer/writer 各自 wall time 仍完整保留。
+- 普通 critical events 不再先积累 row tuples 后二次转置，而是直接进入 typed column
+  buffers；`EVENTS_SCHEMA` 的高基数 event ID、timestamp 和 extras 不再启用 Parquet
+  dictionary/statistics，Zstandard level 1、65,536-row group、完整事件、FIFO 顺序、
+  semantic digest 和 queue bound 均不变。
+- 独立诊断仍证明 G 未达到晋级条件：`c101_21/2014` 的 30-second axis 产生
+  1,063,145 条 screening decisions，正确计量后的 solver 为 `13.213825385` 秒、
+  persistence 为 `17.934538759` 秒。不得据此启动新的 G pilot/Formal；下一次正式
+  attempt 必须先证明 100-customer typed encoding 能把代表性 persistence ratio
+  降到 36% 以下，且不能删除事件、重排 batch 或改写归因公式。
+
 ## 2026-07-23：G pilot attempt01 暴露 async producer/writer 串行化
 
 - `stage05.2_benchmark_attempt01` 完成 12 个 pilot shard 后由 producer gate 拒绝：

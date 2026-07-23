@@ -2151,8 +2151,10 @@ class _StreamingParquetSink:
         self._columns: tuple[list[object], ...] = tuple([] for _ in schema)
         self._buffered_row_count = 0
         self.row_count = 0
-        high_volume_compact = schema.equals(V2_SCREENING_DECISIONS_SCHEMA) or schema.equals(
-            V3_SCREENING_OCCURRENCES_SCHEMA
+        high_volume_compact = (
+            schema.equals(EVENTS_SCHEMA)
+            or schema.equals(V2_SCREENING_DECISIONS_SCHEMA)
+            or schema.equals(V3_SCREENING_OCCURRENCES_SCHEMA)
         )
         self._writer = pq.ParquetWriter(
             path,
@@ -4601,7 +4603,9 @@ class ArtifactV2ShardSession:
             self._register_route(key, tuple(raw_sequence))
 
         count = 0
-        pending_event_rows: list[tuple[object, ...]] = []
+        pending_event_columns: tuple[list[object], ...] = tuple(
+            [] for _ in EVENTS_SCHEMA.names
+        )
         pending_screening_definitions: list[_PendingScreeningDefinition] = []
         pending_screening_occurrence_columns: tuple[list[object], ...] = tuple(
             [] for _ in V3_SCREENING_OCCURRENCES_SCHEMA.names
@@ -4617,6 +4621,13 @@ class ArtifactV2ShardSession:
             ):
                 column.append(value)
             return len(pending_screening_occurrence_columns[0])
+
+        def buffer_event(row: Sequence[object]) -> int:
+            if len(row) != len(pending_event_columns):
+                raise ArtifactIntegrityError("critical event width does not match schema")
+            for column, value in zip(pending_event_columns, row, strict=True):
+                column.append(value)
+            return len(pending_event_columns[0])
 
         def flush_screening_transaction() -> None:
             nonlocal pending_screening_definitions, pending_screening_occurrence_columns
@@ -4645,9 +4656,10 @@ class ArtifactV2ShardSession:
             )
 
         def flush_event_transaction() -> None:
-            rows = tuple(pending_event_rows)
-            pending_event_rows.clear()
-            self._append_buffered_value_rows(self._event_sink, rows)
+            nonlocal pending_event_columns
+            columns = pending_event_columns
+            pending_event_columns = tuple([] for _ in EVENTS_SCHEMA.names)
+            self._append_buffered_columns(self._event_sink, columns)
 
         next_event_id = self._owner._next_event_id
         events = (
@@ -4853,8 +4865,7 @@ class ArtifactV2ShardSession:
             else:
                 if not isinstance(normalized_event, tuple):
                     raise RuntimeError("critical event must be a typed row")
-                pending_event_rows.append(normalized_event)
-                if len(pending_event_rows) >= V2_PARQUET_ROW_GROUP_SIZE:
+                if buffer_event(normalized_event) >= V2_PARQUET_ROW_GROUP_SIZE:
                     flush_event_transaction()
             checks = event_get("checks")
             if not screening_event and isinstance(checks, (list, tuple)):

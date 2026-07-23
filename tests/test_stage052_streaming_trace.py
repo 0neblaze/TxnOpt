@@ -499,6 +499,7 @@ def test_v3_buffered_screening_bridge_roundtrips_through_real_writer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     occurrence_column_batch_sizes: list[int] = []
+    event_column_batch_sizes: list[int] = []
     original_append_columns = artifact_module._StreamingParquetSink.append_columns  # noqa: SLF001
 
     def record_append_columns(
@@ -508,6 +509,8 @@ def test_v3_buffered_screening_bridge_roundtrips_through_real_writer(
         buffered = tuple(columns)  # type: ignore[arg-type]
         if "screening_occurrences" in self.path.name:
             occurrence_column_batch_sizes.append(len(buffered[0]))
+        elif "_events_" in self.path.name:
+            event_column_batch_sizes.append(len(buffered[0]))
         original_append_columns(self, buffered)
 
     monkeypatch.setattr(
@@ -536,6 +539,15 @@ def test_v3_buffered_screening_bridge_roundtrips_through_real_writer(
         buffer_rows=2,
         async_persistence=True,
     )
+    for iteration in range(2):
+        sink.append_event(
+            {
+                "event_type": "operator_call",
+                "lane": "legacy",
+                "iteration": iteration,
+                "operator": "repair",
+            }
+        )
     decision = ScreeningDecision(
         decision_id=1,
         route_key="route:2:C1",
@@ -561,6 +573,7 @@ def test_v3_buffered_screening_bridge_roundtrips_through_real_writer(
     sink.append_screening_decision(decision)
     sink.append_screening_decision(replace(decision, decision_id=2))
     sink.close()
+    assert event_column_batch_sizes == [2]
     assert occurrence_column_batch_sizes == [2]
     shard.finalize(
         raw_payload={},
@@ -573,9 +586,10 @@ def test_v3_buffered_screening_bridge_roundtrips_through_real_writer(
     rows = list(
         ArtifactReader(bundle.run_dir).iter_events(f"toy/2014/{run_label}_events_toy_2014.parquet")
     )
-    assert [row["decision_id"] for row in rows] == [1, 2]
-    assert all(row["demand"] == pytest.approx(9.0) for row in rows)
-    assert rows[0]["checks"] == [
+    screening_rows = [row for row in rows if row["event_type"] == "screening_decision"]
+    assert [row["decision_id"] for row in screening_rows] == [1, 2]
+    assert all(row["demand"] == pytest.approx(9.0) for row in screening_rows)
+    assert screening_rows[0]["checks"] == [
         {"check": "capacity", "status": "fail", "value": 9.0, "reason": "capacity"}
     ]
 
@@ -1054,6 +1068,14 @@ def test_async_pipeline_prepares_next_batch_while_writer_is_active() -> None:
 
     sink.close()
     assert [event["iteration"] for event in shard.events] == [0, 1, 2]
+    pipeline = sink.persistence_pipeline
+    producer_ns = pipeline["producer_active_nanoseconds"]
+    writer_ns = pipeline["writer_active_nanoseconds"]
+    union_ns = pipeline["persistence_union_nanoseconds"]
+    assert isinstance(producer_ns, int)
+    assert isinstance(writer_ns, int)
+    assert isinstance(union_ns, int)
+    assert max(producer_ns, writer_ns) <= union_ns < producer_ns + writer_ns
 
 
 def test_stage052_trace_sink_rejects_oversized_async_callback_batch() -> None:
