@@ -49,7 +49,11 @@ from evrptw.models import Instance
 from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
-from evrptw.stage052 import Stage052Component, stage052_contract
+from evrptw.stage052 import (
+    STAGE052_MAXIMUM_PERSISTENCE_RATIO,
+    Stage052Component,
+    stage052_contract,
+)
 from evrptw.stage052_campaign import (
     CHECKPOINT_SECONDS,
     GIB,
@@ -2033,10 +2037,10 @@ def _persistence_rows(
         "solver_seconds": solver,
         "artifact_persistence_seconds": persistence,
         "persistence_ratio": ratio,
-        "maximum_ratio": 0.30,
+        "maximum_ratio": STAGE052_MAXIMUM_PERSISTENCE_RATIO,
     }
     return (
-        ratio <= 0.30,
+        ratio <= STAGE052_MAXIMUM_PERSISTENCE_RATIO,
         f"batch persistence ratio={ratio:.9f}",
         summary,
     )
@@ -2310,7 +2314,7 @@ def _audit_batch_persistence(
             )
         ):
             raise ArtifactIntegrityError("batch final persistence envelope does not replay")
-        passed = envelope.persistence_ratio <= 0.30
+        passed = envelope.persistence_ratio <= STAGE052_MAXIMUM_PERSISTENCE_RATIO
         return (
             passed,
             f"batch persistence ratio={envelope.persistence_ratio:.9f}",
@@ -2322,7 +2326,7 @@ def _audit_batch_persistence(
                     attribution.control_persistence_seconds + envelope.state_persistence_seconds
                 ),
                 "persistence_ratio": envelope.persistence_ratio,
-                "maximum_ratio": 0.30,
+                "maximum_ratio": STAGE052_MAXIMUM_PERSISTENCE_RATIO,
             },
         )
     except (ArtifactIntegrityError, OSError, TypeError, ValueError) as error:
@@ -2451,10 +2455,10 @@ def _audit_campaign_persistence(
             "artifact_persistence_seconds": attribution.total_persistence_seconds,
             "control_persistence_seconds": attribution.control_persistence_seconds,
             "persistence_ratio": attribution.persistence_ratio,
-            "maximum_ratio": 0.30,
+            "maximum_ratio": STAGE052_MAXIMUM_PERSISTENCE_RATIO,
         }
         return (
-            attribution.persistence_ratio <= 0.30,
+            attribution.persistence_ratio <= STAGE052_MAXIMUM_PERSISTENCE_RATIO,
             f"campaign aggregate persistence ratio={attribution.persistence_ratio:.9f}",
             row,
             _sha256(path),

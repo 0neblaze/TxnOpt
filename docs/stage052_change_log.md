@@ -8,6 +8,22 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：E persistence gate 调整为 36% 并接受 attempt15
+
+- 用户明确将 Stage 5.2 persistence-to-end-to-end ratio（持久化占端到端比例）硬门槛
+  从 30% 调整为 36%。该调整发生在 `stage05.2_native_kernels_attempt15` raw evidence
+  生成之后，必须作为显式 protocol revision（协议修订）保留，不能回写成原始 30% 规则
+  下通过；此前按 30% 判定失败或未送审的 E13/E14 结论保持历史原貌。
+- 唯一执行常量为 `STAGE052_MAXIMUM_PERSISTENCE_RATIO = 0.36`。producer、performance
+  reviewer、campaign producer/reviewer、batch/campaign manifest 校验和 remediation
+  默认值均引用该常量。新 persistence attribution 与 batch envelope 使用 v2 schema
+  并声明 36%；v1 schema 仍按其原始 30% 字段只读校验，promotion（晋级）则使用当前
+  36% 规则。
+- E15 在 clean commit `8f148d9` 上完成 36/36 axis，solver 为 215.867958 秒，
+  persistence 为 113.799960 秒，ratio 为 0.345195736；因此它低于 36% 新门槛，可进入
+  独立 raw replay 并作为 E 候选通过证据。最终 E readiness 仍以重审生成的签名 review
+  products（审查产物）为准。
+
 ## 2026-07-23：E13--E14 mixed-batch columnar screening persistence
 
 - 失败证据：`stage05.2_native_kernels_attempt12` 的冻结 source snapshot（源码快照）漏带

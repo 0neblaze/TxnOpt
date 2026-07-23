@@ -569,7 +569,7 @@ this repository or one of its subdirectories.
   typed bounded Parquet streams, 65,536-row groups, at most two non-empty buffer
   groups, and compatible v1/old-v2/v3/legacy reads. Canonical semantic digests
   are computed over expanded logical events, so physical IDs and compression
-  layout cannot change replay. Persistence is at most 30% of end-to-end time
+  layout cannot change replay. Persistence is at most 36% of end-to-end time
   and peak RSS is at most 50% of the Stage 5.2 v1 baseline.
 - Job-parallel selection compares 1/2/4 workers on the fixed four-instance,
   three-seed scope. Two workers require at least 1.5x speedup and at most 12 GiB
@@ -580,7 +580,7 @@ this repository or one of its subdirectories.
   exact ordering, candidate/cache/event semantics, and zero fallback across all
   fixed-work axes. Aggregate 100-customer paired median end-to-end improvement
   must be at least 15%, no C/R/RC family may regress by more than 3%,
-  persistence must remain at most 30%, each worker RSS at most 4,357,382,144
+  persistence must remain at most 36%, each worker RSS at most 4,357,382,144
   bytes, and process-tree RSS at most 12 GiB.
 - The accelerator gate independently recomputes 100-customer batch occupancy.
   Median below 32 publishes `GPU_NOT_JUSTIFIED`; median at least 32 requires the
@@ -706,7 +706,7 @@ The executable workflow and gate table are maintained in
   not.
 - v2 promotion requires v1/v2 replay equality for validator, objective,
   critical events, exact-call and failure semantics; artifact persistence must
-  be at most 30% of end-to-end time and peak RSS at most 50% of the Stage 5.2
+  be at most 36% of end-to-end time and peak RSS at most 50% of the Stage 5.2
   v1 baseline. Partial shards are sealed with explicit completeness, fail
   immediately, and are then archived; there is no serial persistence fallback.
 - Native producer and reviewer installations may live at different absolute venv paths; native
@@ -729,7 +729,7 @@ The executable workflow and gate table are maintained in
   union, producer wait time, and an ordered row-count/SHA-256 ledger for every batch. Formal
   persistence attribution uses the measured producer/writer wall-time union at the drained solver
   boundary, counting overlap once. The maximum of producer wall and writer CPU is diagnostic only;
-  it must not replace the 30% persistence/end-to-end gate. Background hashing or writing may never
+  it must not replace the 36% persistence/end-to-end gate. Background hashing or writing may never
   be silently omitted or represented as zero. Review independently replays
   the ledger from logical events and rejects missing, incomplete, over-bound, or inconsistent pipeline
   evidence. These physical-pipeline fields are non-semantic for fixed-work algorithm comparison, so

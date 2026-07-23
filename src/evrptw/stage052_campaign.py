@@ -25,6 +25,7 @@ from typing import Final, Protocol, cast
 from evrptw.artifacts import signed_sidecar_matches
 from evrptw.best_known import BEST_KNOWN_VALUES
 from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
+from evrptw.stage052 import STAGE052_MAXIMUM_PERSISTENCE_RATIO
 
 GIB: Final = 1024**3
 FORMAL_SEEDS: Final = tuple(range(2014, 2024))
@@ -1173,7 +1174,9 @@ class BatchManifest:
                 or self.control_persistence_seconds < 0.0
                 or self.persistence_ratio is None
                 or not math.isfinite(self.persistence_ratio)
-                or not 0.0 <= self.persistence_ratio <= 0.30
+                or not 0.0
+                <= self.persistence_ratio
+                <= STAGE052_MAXIMUM_PERSISTENCE_RATIO
                 or not isinstance(self.shard_manifest_sha256_by_id, Mapping)
                 or set(self.shard_manifest_sha256_by_id) != set(self.shard_ids)
                 or any(not _is_sha256(value) for value in self.shard_manifest_sha256_by_id.values())

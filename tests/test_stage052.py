@@ -69,6 +69,7 @@ from evrptw.experiments.stage052_performance_review import (
 from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.native_kernels import NATIVE_KERNEL_ABI_VERSION, NativeKernelConfig
 from evrptw.stage052 import (
+    STAGE052_MAXIMUM_PERSISTENCE_RATIO,
     AcceleratorDecision,
     ArtifactPersistenceObservation,
     ArtifactStorageObservation,
@@ -84,6 +85,7 @@ from evrptw.stage052 import (
 )
 from evrptw.stage052_campaign import VolumeIdentity
 from evrptw.stage052_evidence import (
+    BatchPersistenceEnvelope,
     JobParallelSelectionIdentity,
     PersistenceInterval,
     ProcessTreeResourceSampler,
@@ -273,6 +275,61 @@ def test_persistence_attribution_recomputes_monotonic_control_intervals() -> Non
     assert replayed.control_persistence_seconds == pytest.approx(1.0)
     assert replayed.total_persistence_seconds == pytest.approx(2.0)
     assert replayed.persistence_ratio == pytest.approx(0.2)
+    assert attribution.to_dict()["maximum_persistence_ratio"] == pytest.approx(0.36)
+    assert pytest.approx(0.36) == STAGE052_MAXIMUM_PERSISTENCE_RATIO
+
+
+def test_persistence_attribution_keeps_v1_threshold_metadata_readable() -> None:
+    attribution = Stage052PersistenceAttribution(
+        run_label="stage05.2_native_kernels_attempt15",
+        component="native_kernels",
+        scope="performance",
+        subject_id="run",
+        primary_manifest_relative_path="control/manifest.json",
+        primary_manifest_sha256="a" * 64,
+        solver_seconds=65.0,
+        shard_persistence_seconds=35.0,
+        control_intervals=(),
+    )
+    legacy_payload = attribution.to_dict()
+    legacy_payload["schema_version"] = "stage05.2-persistence-attribution-v1"
+    legacy_payload["maximum_persistence_ratio"] = 0.30
+
+    replayed = Stage052PersistenceAttribution.from_dict(legacy_payload)
+
+    assert replayed.persistence_ratio == pytest.approx(0.35)
+
+
+def test_batch_persistence_envelope_uses_v2_and_reads_v1_threshold_metadata() -> None:
+    envelope = BatchPersistenceEnvelope(
+        run_label="stage05.2_benchmark_attempt01",
+        batch_id="batch0001",
+        base_attribution_sha256="a" * 64,
+        verified_manifest_sha256="b" * 64,
+        archived_manifest_sha256="c" * 64,
+        solver_seconds=65.0,
+        base_persistence_seconds=35.0,
+        state_intervals=(
+            PersistenceInterval("verified_batch_manifest_write", 1, 1),
+            PersistenceInterval("archived_batch_manifest_write", 2, 2),
+        ),
+    )
+
+    current_payload = envelope.to_dict()
+    assert current_payload["schema_version"] == (
+        "stage05.2-batch-persistence-envelope-v2"
+    )
+    assert current_payload["maximum_persistence_ratio"] == pytest.approx(0.36)
+    assert BatchPersistenceEnvelope.from_dict(current_payload).persistence_ratio == (
+        pytest.approx(0.35)
+    )
+
+    legacy_payload = dict(current_payload)
+    legacy_payload["schema_version"] = "stage05.2-batch-persistence-envelope-v1"
+    legacy_payload["maximum_persistence_ratio"] = 0.30
+    assert BatchPersistenceEnvelope.from_dict(legacy_payload).persistence_ratio == (
+        pytest.approx(0.35)
+    )
 
 
 def test_persistence_attribution_rejects_overlapping_control_intervals() -> None:
@@ -1070,7 +1127,7 @@ def test_artifact_persistence_gate_rejects_the_measured_e03_ratio() -> None:
 
     assert decision.ratio == pytest.approx(0.5016461621692021)
     assert not decision.passed
-    assert "exceeds 30%" in decision.detail
+    assert "exceeds 36%" in decision.detail
 
 
 def test_artifact_persistence_gate_uses_verified_solver_plus_new_persistence() -> None:
@@ -1085,6 +1142,20 @@ def test_artifact_persistence_gate_uses_verified_solver_plus_new_persistence() -
 
     assert decision.ratio == pytest.approx(100.0 / (280.766185035 + 100.0))
     assert decision.passed
+
+
+def test_artifact_persistence_gate_uses_the_36_percent_boundary() -> None:
+    passing = evaluate_artifact_persistence(
+        (ArtifactPersistenceObservation(65.0, 35.0),)
+    )
+    failing = evaluate_artifact_persistence(
+        (ArtifactPersistenceObservation(63.0, 37.0),)
+    )
+
+    assert passing.passed
+    assert passing.maximum_ratio == pytest.approx(0.36)
+    assert not failing.passed
+    assert failing.maximum_ratio == pytest.approx(0.36)
 
 
 def test_native_kernel_config_is_explicit_complete_and_serializable() -> None:
@@ -1699,7 +1770,7 @@ def test_artifact_storage_promotion_enforces_persistence_and_half_rss() -> None:
     slow = [
         _storage_observation(
             policy="artifact-storage-v2",
-            persistence_seconds=3.01,
+            persistence_seconds=3.61,
             peak_rss_bytes=50,
         )
     ]

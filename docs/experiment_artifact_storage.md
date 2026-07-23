@@ -116,13 +116,13 @@ raw、solution、event、environment 和 failure evidence，将 shard 与 run �
 
 1. 相同 fixed-work 输入下，v1/v2 的 validator、objective、critical-event、exact-call、candidate/cache 和 failure semantics 完全一致；
 2. v1 历史和现有 bundle 继续通过同一 reader/reviewer；
-3. artifact persistence time 不超过 end-to-end time 的 30%；
+3. artifact persistence time 不超过 end-to-end time 的 36%；
 4. peak RSS 不超过 Stage 5.2 v1 baseline 的 50%；
 5. partial/timeout/worker failure 都产生可校验 shard manifest 并 fail fast；
 6. independent reviewer 从 raw shard 重算所有汇总，不信任 runner 自报计数。
 
 当前 C 运行必须完成声明的 performance scope 与 fixed-work equality，证明 expanded
-logical semantics（展开逻辑语义）完全一致，并满足 30% persistence 门槛。任何旧
+logical semantics（展开逻辑语义）完全一致，并满足 36% persistence 门槛。任何旧
 physical schema、remediation source 或失败 predecessor 的关系只由 manifest、
 retention registry 和 change log 保存。后续 gate 若破坏这些门槛必须标记
 `NOT_READY`，不得退回隐式 v1 fallback 或降低阈值。

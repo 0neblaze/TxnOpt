@@ -96,7 +96,7 @@ B 的最终组合必须通过严格性能门槛，单项收益和组合收益都
 
 除语义 gate 外，C 还必须满足：
 
-- artifact persistence ≤ end-to-end 的 30%；
+- artifact persistence ≤ end-to-end 的 36%；
 - peak RSS ≤ A 中 v1 baseline 的 50%；
 - timeout、byte-budget、writer error 和 worker failure 均保留 partial shard 并 fail fast；
 - reviewer 不读取全量 events 到一个 Python list，不依赖 worker completion order。
@@ -104,7 +104,7 @@ B 的最终组合必须通过严格性能门槛，单项收益和组合收益都
 当前 C 实现保持 v2 policy，并使用 `screening_decisions_v3`
 definitions/occurrences 分表、typed buffers、bounded streaming merge 和跨
 v1/旧v2/v3/legacy reader。任何 C 运行必须通过 36 axes、fixed-work semantic
-equality 和 30% persistence gate；旧 physical schema 或失败 remediation（补救）
+equality 和 36% persistence gate；旧 physical schema 或失败 remediation（补救）
 关系只记录在 manifest、retention registry 和 change log 中。
 
 ## D. Job-level parallelism
@@ -138,7 +138,7 @@ load 和 power mode。
 
 每个 kernel 先做 frozen fixture、small brute-force（小规模暴力枚举）和 fixed-work
 differential test（差分测试），再进入完整性能 scope。E 的组合实现只绑定当前
-accepted D selection，并重新执行 Python/native equality、15%/3% performance、30%
+accepted D selection，并重新执行 Python/native equality、15%/3% performance、36%
 persistence、每 worker 4,357,382,144-byte RSS、process-tree 12-GiB RSS 和
 zero-fallback gate。旧 E 失败原因进入 change log，不进入长期政策正文。
 

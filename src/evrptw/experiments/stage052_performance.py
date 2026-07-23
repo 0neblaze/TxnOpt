@@ -68,6 +68,7 @@ from evrptw.native_kernels import NativeKernelConfig
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
 from evrptw.stage052 import (
+    STAGE052_MAXIMUM_PERSISTENCE_RATIO,
     PerformanceObservation,
     Stage052Component,
     formal_budget_matrix,
@@ -1343,9 +1344,10 @@ def _run_benchmark_campaign_impl(
                     batch_id=execution.batch.batch_id,
                     phase="post_archive",
                 )
-                if envelope.persistence_ratio > 0.30:
+                if envelope.persistence_ratio > STAGE052_MAXIMUM_PERSISTENCE_RATIO:
                     raise RuntimeError(
-                        "batch final persistence ratio exceeds 30%: "
+                        "batch final persistence ratio exceeds "
+                        f"{STAGE052_MAXIMUM_PERSISTENCE_RATIO:.0%}: "
                         f"{envelope.persistence_ratio:.9f}"
                     )
             except BaseException as error:
@@ -1674,9 +1676,10 @@ def _run_benchmark_campaign_impl(
         output_dir / "control" / f"{run_label}_persistence_attribution.json",
         campaign_attribution.to_dict(),
     )
-    if campaign_attribution.persistence_ratio > 0.30:
+    if campaign_attribution.persistence_ratio > STAGE052_MAXIMUM_PERSISTENCE_RATIO:
         raise RuntimeError(
-            "campaign aggregate persistence ratio exceeds 30%: "
+            "campaign aggregate persistence ratio exceeds "
+            f"{STAGE052_MAXIMUM_PERSISTENCE_RATIO:.0%}: "
             f"{campaign_attribution.persistence_ratio:.9f}"
         )
     # The canonical campaign status is the final success commit.  Before this

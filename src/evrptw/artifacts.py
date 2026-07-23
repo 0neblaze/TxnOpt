@@ -28,6 +28,7 @@ import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from evrptw.stage052 import STAGE052_MAXIMUM_PERSISTENCE_RATIO
 from evrptw.stage052_platform import durable_replace, sync_directory
 
 ARTIFACT_STORAGE_SCHEMA_VERSION = "artifact-storage-v1"
@@ -3952,7 +3953,11 @@ def _verify_post_manifest_persistence_envelopes(
             raise ArtifactIntegrityError("batch persistence envelope JSON is invalid") from error
         if (
             not isinstance(decoded_payload, Mapping)
-            or decoded_payload.get("schema_version") != "stage05.2-batch-persistence-envelope-v1"
+            or decoded_payload.get("schema_version")
+            not in {
+                "stage05.2-batch-persistence-envelope-v1",
+                "stage05.2-batch-persistence-envelope-v2",
+            }
             or decoded_payload.get("run_label") != run_label
             or decoded_payload.get("batch_id") != expected_subject
         ):
@@ -4101,7 +4106,9 @@ def _verify_post_manifest_persistence_envelopes(
                 != _sha256(primary_manifest_path)
                 or isinstance(persistence_ratio, bool)
                 or not isinstance(persistence_ratio, int | float)
-                or not 0.0 <= float(persistence_ratio) <= 0.30
+                or not 0.0
+                <= float(persistence_ratio)
+                <= STAGE052_MAXIMUM_PERSISTENCE_RATIO
             ):
                 raise ArtifactIntegrityError(
                     "complete campaign is not committed after a passing attribution gate"

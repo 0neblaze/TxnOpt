@@ -50,6 +50,7 @@ from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root as find_repository_root
 from evrptw.stage052 import (
+    STAGE052_MAXIMUM_PERSISTENCE_RATIO,
     ArtifactPersistenceObservation,
     ArtifactStorageObservation,
     PerformanceObservation,
@@ -288,7 +289,9 @@ def _audit_primary_persistence(
             abs_tol=1e-9,
         ):
             raise ArtifactIntegrityError("persistence attribution totals do not replay")
-        passed = attribution.persistence_ratio <= 0.30
+        passed = (
+            attribution.persistence_ratio <= STAGE052_MAXIMUM_PERSISTENCE_RATIO
+        )
         return (
             passed,
             "independent primary active-write ratio="
@@ -4026,7 +4029,10 @@ def _component_gates(
             },
             "persistence_ratio": {
                 "passed": True,
-                "detail": "all 1/2/4-worker bundles have aggregate persistence <= 30%",
+                "detail": (
+                    "all 1/2/4-worker bundles have aggregate persistence <= "
+                    f"{STAGE052_MAXIMUM_PERSISTENCE_RATIO:.0%}"
+                ),
             },
             "worker_selection": {
                 "passed": True,

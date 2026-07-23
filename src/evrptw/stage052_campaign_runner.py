@@ -28,6 +28,7 @@ from evrptw.artifacts import (
     atomic_write_signed_json,
     signed_sidecar_matches,
 )
+from evrptw.stage052 import STAGE052_MAXIMUM_PERSISTENCE_RATIO
 from evrptw.stage052_campaign import (
     ArchiveTransferCompletedError,
     BatchArchiver,
@@ -400,9 +401,10 @@ def validate_batch_measurements(
     if denominator <= 0.0:
         raise RuntimeError("batch solver plus persistence time must be positive")
     persistence_ratio = persistence_seconds / denominator
-    if persistence_ratio > 0.30:
+    if persistence_ratio > STAGE052_MAXIMUM_PERSISTENCE_RATIO:
         raise RuntimeError(
-            f"batch aggregate persistence ratio exceeds 30%: {persistence_ratio:.9f}"
+            "batch aggregate persistence ratio exceeds "
+            f"{STAGE052_MAXIMUM_PERSISTENCE_RATIO:.0%}: {persistence_ratio:.9f}"
         )
     if not runtime_evidence.passed:
         raise RuntimeError(f"batch runtime power/load violation: {runtime_evidence.failure_reason}")

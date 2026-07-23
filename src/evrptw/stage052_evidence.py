@@ -27,7 +27,10 @@ from evrptw.artifacts import (
     signed_sidecar_matches,
 )
 from evrptw.repository import repository_root
-from evrptw.stage052 import Stage052PrerequisiteRequirement
+from evrptw.stage052 import (
+    STAGE052_MAXIMUM_PERSISTENCE_RATIO,
+    Stage052PrerequisiteRequirement,
+)
 from evrptw.stage052_platform import read_windows_wsl_power_status
 
 STAGE052_REVIEW_SCHEMA_VERSION = "stage05.2-review-v1"
@@ -37,7 +40,16 @@ STAGE052_RUNTIME_IDENTITY_SCHEMA_VERSION = "stage05.2-runtime-identity-v2"
 STAGE052_CAMPAIGN_LOCK_SCHEMA_VERSION = "stage05.2-campaign-lock-v1"
 STAGE052_STORAGE_ROOT_BINDING_SCHEMA_VERSION = "stage05.2-storage-root-binding-v1"
 STAGE052_PERSISTENCE_ATTRIBUTION_SCHEMA_VERSION = (
+    "stage05.2-persistence-attribution-v2"
+)
+STAGE052_LEGACY_PERSISTENCE_ATTRIBUTION_SCHEMA_VERSION = (
     "stage05.2-persistence-attribution-v1"
+)
+STAGE052_BATCH_PERSISTENCE_ENVELOPE_SCHEMA_VERSION = (
+    "stage05.2-batch-persistence-envelope-v2"
+)
+STAGE052_LEGACY_BATCH_PERSISTENCE_ENVELOPE_SCHEMA_VERSION = (
+    "stage05.2-batch-persistence-envelope-v1"
 )
 STAGE052_RESOURCE_MEASUREMENT_SCOPE = "task_scheduling_through_parent_control_preparation"
 STAGE052_PERSISTENCE_EXCLUSIONS = (
@@ -205,7 +217,7 @@ class Stage052PersistenceAttribution:
             "control_persistence_seconds": self.control_persistence_seconds,
             "total_persistence_seconds": self.total_persistence_seconds,
             "persistence_ratio": self.persistence_ratio,
-            "maximum_persistence_ratio": 0.30,
+            "maximum_persistence_ratio": STAGE052_MAXIMUM_PERSISTENCE_RATIO,
             "excluded_operations": list(self.excluded_operations),
         }
 
@@ -230,7 +242,11 @@ class Stage052PersistenceAttribution:
         }
         if set(payload) != expected:
             raise ValueError("persistence attribution schema is invalid")
-        if payload.get("schema_version") != STAGE052_PERSISTENCE_ATTRIBUTION_SCHEMA_VERSION:
+        schema_version = payload.get("schema_version")
+        if schema_version not in {
+            STAGE052_PERSISTENCE_ATTRIBUTION_SCHEMA_VERSION,
+            STAGE052_LEGACY_PERSISTENCE_ATTRIBUTION_SCHEMA_VERSION,
+        }:
             raise ValueError("persistence attribution version is invalid")
         strings = {
             field: payload.get(field)
@@ -288,11 +304,16 @@ class Stage052PersistenceAttribution:
                 "maximum_persistence_ratio",
             ),
         )
+        expected_maximum_ratio = (
+            0.30
+            if schema_version == STAGE052_LEGACY_PERSISTENCE_ATTRIBUTION_SCHEMA_VERSION
+            else STAGE052_MAXIMUM_PERSISTENCE_RATIO
+        )
         expected_values = (
             attribution.control_persistence_seconds,
             attribution.total_persistence_seconds,
             attribution.persistence_ratio,
-            0.30,
+            expected_maximum_ratio,
         )
         if any(
             not math.isclose(left, right, rel_tol=0.0, abs_tol=1e-12)
@@ -366,7 +387,7 @@ class BatchPersistenceEnvelope:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "schema_version": "stage05.2-batch-persistence-envelope-v1",
+            "schema_version": STAGE052_BATCH_PERSISTENCE_ENVELOPE_SCHEMA_VERSION,
             "run_label": self.run_label,
             "batch_id": self.batch_id,
             "base_attribution_sha256": self.base_attribution_sha256,
@@ -378,7 +399,7 @@ class BatchPersistenceEnvelope:
             "state_persistence_seconds": self.state_persistence_seconds,
             "total_persistence_seconds": self.total_persistence_seconds,
             "persistence_ratio": self.persistence_ratio,
-            "maximum_persistence_ratio": 0.30,
+            "maximum_persistence_ratio": STAGE052_MAXIMUM_PERSISTENCE_RATIO,
             "excluded_operations": list(STAGE052_PERSISTENCE_EXCLUSIONS),
         }
 
@@ -400,9 +421,11 @@ class BatchPersistenceEnvelope:
             "maximum_persistence_ratio",
             "excluded_operations",
         }
-        if set(payload) != expected or payload.get("schema_version") != (
-            "stage05.2-batch-persistence-envelope-v1"
-        ):
+        schema_version = payload.get("schema_version")
+        if set(payload) != expected or schema_version not in {
+            STAGE052_BATCH_PERSISTENCE_ENVELOPE_SCHEMA_VERSION,
+            STAGE052_LEGACY_BATCH_PERSISTENCE_ENVELOPE_SCHEMA_VERSION,
+        }:
             raise ValueError("batch persistence envelope schema is invalid")
         raw_intervals = payload.get("state_intervals")
         if not isinstance(raw_intervals, list) or len(raw_intervals) != 2:
@@ -451,11 +474,16 @@ class BatchPersistenceEnvelope:
                 "maximum_persistence_ratio",
             ),
         )
+        expected_maximum_ratio = (
+            0.30
+            if schema_version == STAGE052_LEGACY_BATCH_PERSISTENCE_ENVELOPE_SCHEMA_VERSION
+            else STAGE052_MAXIMUM_PERSISTENCE_RATIO
+        )
         expected_values = (
             envelope.state_persistence_seconds,
             envelope.total_persistence_seconds,
             envelope.persistence_ratio,
-            0.30,
+            expected_maximum_ratio,
         )
         if any(
             not math.isclose(left, right, rel_tol=0.0, abs_tol=1e-12)

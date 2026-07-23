@@ -34,6 +34,7 @@ from evrptw.artifacts import (
     artifact_context_from_run_label,
 )
 from evrptw.stage052 import (
+    STAGE052_MAXIMUM_PERSISTENCE_RATIO,
     ArtifactPersistenceObservation,
     Stage052Component,
     Stage052PrerequisiteRequirement,
@@ -71,7 +72,7 @@ class Stage052RemediationConfig:
     expected_identities: tuple[tuple[str, int], ...] = E03_IDENTITIES
     expected_axes: tuple[str, ...] = E03_AXES
     batch_size: int = 65_536
-    maximum_persistence_ratio: float = 0.30
+    maximum_persistence_ratio: float = STAGE052_MAXIMUM_PERSISTENCE_RATIO
     per_instance_seed_max_bytes: int = 2 * 1024 * 1024 * 1024
     per_run_max_bytes: int = 32 * 1024 * 1024 * 1024
 

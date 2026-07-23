@@ -14,6 +14,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
+STAGE052_MAXIMUM_PERSISTENCE_RATIO = 0.36
+
 
 class Stage052Component(StrEnum):
     PERF_BASELINE = "perf_baseline"
@@ -274,7 +276,7 @@ def stage052_contract(
 def evaluate_artifact_persistence(
     observations: Sequence[ArtifactPersistenceObservation],
     *,
-    maximum_ratio: float = 0.30,
+    maximum_ratio: float = STAGE052_MAXIMUM_PERSISTENCE_RATIO,
 ) -> ArtifactPersistenceDecision:
     """Evaluate persistence against verified solver plus new persistence time."""
 
@@ -483,7 +485,7 @@ def evaluate_artifact_storage_promotion(
     predecessor: Sequence[ArtifactStorageObservation],
     candidate: Sequence[ArtifactStorageObservation],
     *,
-    maximum_persistence_ratio: float = 0.30,
+    maximum_persistence_ratio: float = STAGE052_MAXIMUM_PERSISTENCE_RATIO,
     maximum_baseline_rss_fraction: float = 0.50,
 ) -> ArtifactStoragePromotionDecision:
     """Evaluate artifact-storage-v2 replay, persistence, and memory gates."""
