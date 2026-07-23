@@ -86,6 +86,23 @@ _SOURCE_SNAPSHOT = {
 }
 
 
+def test_campaign_volume_probe_uses_shared_cross_platform_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = VolumeIdentity(device_uuid="test-ext4", filesystem="ext4")
+    observed_paths: list[Path] = []
+
+    def fake_probe(path: Path) -> VolumeIdentity:
+        observed_paths.append(path)
+        return expected
+
+    monkeypatch.setattr(campaign_review_module, "probe_volume_identity", fake_probe)
+
+    path = Path("/home/test/stage052-active")
+    assert campaign_review_module._default_volume_probe(path) == expected
+    assert observed_paths == [path]
+
+
 @pytest.fixture(autouse=True)
 def _verified_source_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(

@@ -610,6 +610,10 @@ this repository or one of its subdirectories.
   evidence records aliases, relative archive paths, volume identities, run
   status, source revision, prerequisite identities, byte count, and checksum.
   Batch target/hard cap remains 24/32 GiB and shard hard cap remains 2 GiB.
+  Producer, retention, performance review, and campaign review must all use the
+  shared cross-platform `probe_volume_identity`; WSL uses `findmnt`, DrvFS
+  additionally binds the Windows NVMe identity, and macOS uses `diskutil`.
+  Reviewer-local platform probes are forbidden contract drift.
 - Formal review uses bounded Arrow batches and streaming iterators and rejects
   full-shard `to_pylist()`, `read_events()`, or `reconstruct_trace()`. It
   independently verifies exact campaign geometry, bidirectional descriptors,

@@ -624,3 +624,11 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   candidates、6 次 global best 和 wall-clock deadline identity。producer、solver、
   objective、36% persistence gate 和 raw bytes 均未修改；首次 NOT_READY review
   generation 保留在 immutable history 后，以新 reviewer wheel 显式复审同一 sealed raw。
+- lane-local 修复后的第二次 review 证明 shard replay、36/36 geometry、36% persistence、
+  resource、runtime 和 power/load gates 全部通过，但暴露独立的 storage-root probe
+  defect：campaign reviewer 无条件调用 macOS `diskutil`，所以 WSL2 上
+  `wsl_staging` 与 `d_archive` 均无法探测，rolling-capacity drill 和 publication
+  dry-run 随之级联失败。producer、retention 和 performance reviewer 已使用共享
+  cross-platform `probe_volume_identity`；campaign reviewer 现在复用同一实现，WSL
+  ext4 UUID 与 D: NVMe/9p identity 均重新核对。旧 reviewer generation 和 finalized
+  receipt 继续保留，不改写 raw。

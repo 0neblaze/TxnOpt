@@ -14,7 +14,6 @@ import io
 import json
 import math
 import os
-import plistlib
 import re
 import shutil
 import statistics
@@ -77,6 +76,7 @@ from evrptw.stage052_campaign import (
     load_campaign_manifest,
     maximum_process_average_cores,
 )
+from evrptw.stage052_campaign_runner import probe_volume_identity
 from evrptw.stage052_evidence import (
     STAGE052_RESOURCE_SCHEMA_VERSION,
     BatchPersistenceEnvelope,
@@ -989,20 +989,7 @@ def _batch_reader(batch_dir: Path, *, run_label: str) -> ArtifactReader:
 
 
 def _default_volume_probe(path: Path) -> VolumeIdentity:
-    try:
-        completed = subprocess.run(
-            ("diskutil", "info", "-plist", str(path)),
-            check=True,
-            capture_output=True,
-        )
-        payload = plistlib.loads(completed.stdout)
-        device_uuid = payload.get("VolumeUUID") or payload.get("DiskUUID")
-        filesystem = payload.get("FilesystemName") or payload.get("FilesystemType")
-    except (OSError, subprocess.CalledProcessError, plistlib.InvalidFileException) as error:
-        raise ArtifactIntegrityError(f"cannot probe storage volume for {path}") from error
-    if not isinstance(device_uuid, str) or not isinstance(filesystem, str):
-        raise ArtifactIntegrityError(f"storage volume identity is incomplete for {path}")
-    return VolumeIdentity(device_uuid=device_uuid, filesystem=filesystem)
+    return probe_volume_identity(path)
 
 
 def _axis_budget(axis: str) -> int:

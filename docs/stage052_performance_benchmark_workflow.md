@@ -168,6 +168,10 @@ Campaign active writes 与归档目标只通过 ignored root locator（忽略的
 next-fit partitioning 的 target/hard cap 为 24/32 GiB，单 shard hard cap 2 GiB，并
 持续满足 locator 声明的容量 reserve。
 
+producer、retention、performance reviewer 与 campaign reviewer 必须调用同一个
+cross-platform `probe_volume_identity`：WSL 用 `findmnt`，DrvFS 额外绑定 Windows
+NVMe identity，macOS 才使用 `diskutil`。reviewer 不得复制或硬编码单一平台 probe。
+
 ### Formal budget matrix
 
 | Scope | Seeds | 30 s | 60 s | 300 s |
