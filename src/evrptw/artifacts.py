@@ -1386,8 +1386,6 @@ class PreparedScreeningDefinition:
     route_key: str
     lane: str
     operator: str
-    route_id: int
-    pending: _PendingScreeningDefinition
 
 
 def prepare_screening_definition(
@@ -1397,36 +1395,13 @@ def prepare_screening_definition(
     lane: str,
     operator: str,
 ) -> PreparedScreeningDefinition:
-    """Bind and hash reusable route/lane/operator context exactly once."""
-
-    route_id = _stable_route_id(route_key)
-    definition_payload = _screening_definition_from_cache_key(
-        (
-            _stable_dictionary_id(f"lane:{lane}"),
-            _stable_dictionary_id(f"operator:{operator}"),
-            route_id,
-            *definition.tail,
-        )
-    )
-    definition_id, encoded, digest = _screening_definition_identity(definition_payload)
-    pending = _PendingScreeningDefinition(
-        definition_id=definition_id,
-        encoded=encoded,
-        digest=digest,
-        payload=definition_payload,
-        row=(
-            definition_id,
-            *(definition_payload[name] for name in V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]),
-        ),
-    )
+    """Bind reusable route/lane/operator context without expanding its payload."""
 
     return PreparedScreeningDefinition(
         tail=definition.tail,
         route_key=route_key,
         lane=lane,
         operator=operator,
-        route_id=route_id,
-        pending=pending,
     )
 
 
@@ -1577,37 +1552,6 @@ def _screening_definition_identity(definition: Mapping[str, object]) -> tuple[in
     digest = hashlib.sha256(definition_json).digest()
     definition_id = int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
     return definition_id, definition_json, digest
-
-
-def _validate_prepared_screening_identity(
-    prepared: PreparedScreeningDefinition,
-) -> None:
-    expected_route_id = _stable_route_id(prepared.route_key)
-    expected_payload = _screening_definition_from_cache_key(
-        (
-            _stable_dictionary_id(f"lane:{prepared.lane}"),
-            _stable_dictionary_id(f"operator:{prepared.operator}"),
-            expected_route_id,
-            *prepared.tail,
-        )
-    )
-    expected_id, expected_encoded, expected_digest = _screening_definition_identity(
-        expected_payload
-    )
-    expected_row = (
-        expected_id,
-        *(expected_payload[name] for name in V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]),
-    )
-    pending = prepared.pending
-    if (
-        prepared.route_id != expected_route_id
-        or pending.definition_id != expected_id
-        or pending.encoded != expected_encoded
-        or pending.digest != expected_digest
-        or pending.payload != expected_payload
-        or pending.row != expected_row
-    ):
-        raise ArtifactIntegrityError("prepared screening pending identity mismatch")
 
 
 class _BoundedScreeningDefinitionStore:
@@ -4724,21 +4668,21 @@ class ArtifactV2ShardSession:
                     prepared_cached = self._prepared_screening_definition_cache.get(cache_key)
                     definition: _PendingScreeningDefinition | None = None
                     if prepared_cached is None:
-                        _validate_prepared_screening_identity(prepared)
-                        self._lane_ids.setdefault(
-                            prepared.lane,
-                            _stable_dictionary_id(f"lane:{prepared.lane}"),
-                        )
-                        self._operator_ids.setdefault(
-                            prepared.operator,
-                            _stable_dictionary_id(f"operator:{prepared.operator}"),
-                        )
+                        lane_id = self._lane_ids.get(event[2])
+                        if lane_id is None:
+                            lane_id = _stable_dictionary_id(f"lane:{event[2]}")
+                            self._lane_ids[event[2]] = lane_id
+                        operator_id = self._operator_ids.get(event[4])
+                        if operator_id is None:
+                            operator_id = _stable_dictionary_id(f"operator:{event[4]}")
+                            self._operator_ids[event[4]] = operator_id
                         route_id = self._resolve_route_id(event[1])
-                        if route_id != prepared.route_id:
-                            raise ArtifactIntegrityError(
-                                "prepared screening route identity mismatch"
-                            )
-                        definition_id = prepared.pending.definition_id
+                        definition_payload = _screening_definition_from_cache_key(
+                            (lane_id, operator_id, route_id, *prepared.tail)
+                        )
+                        definition_id, encoded, digest = _screening_definition_identity(
+                            definition_payload
+                        )
                         self._prepared_screening_definition_cache[cache_key] = (
                             prepared,
                             definition_id,
@@ -4755,7 +4699,19 @@ class ArtifactV2ShardSession:
                                 route_id=route_id,
                                 validate_key=False,
                             )
-                        definition = prepared.pending
+                        definition = _PendingScreeningDefinition(
+                            definition_id=definition_id,
+                            encoded=encoded,
+                            digest=digest,
+                            payload=definition_payload,
+                            row=(
+                                definition_id,
+                                *(
+                                    definition_payload[name]
+                                    for name in V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]
+                                ),
+                            ),
+                        )
                         if self._screening_definition_store is None:
                             self._screening_definition_store = _BoundedScreeningDefinitionStore(
                                 cache_entries=1,

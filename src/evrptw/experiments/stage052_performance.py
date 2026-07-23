@@ -22,7 +22,7 @@ import tomllib
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, fields, replace
 from multiprocessing import get_context
 from pathlib import Path
 from queue import Full, Queue
@@ -3367,9 +3367,8 @@ class _QueuedCriticalBatch:
 class _NegativeScreeningEvidence:
     tail: tuple[object, ...]
     definition: PrecomputedScreeningDefinition | None = None
-    prepared_by_context: dict[tuple[str, str], PreparedScreeningDefinition] = field(
-        default_factory=dict
-    )
+    prepared_context: tuple[str, str] | None = None
+    prepared: PreparedScreeningDefinition | None = None
 
 
 class _BoundedShardAppender:
@@ -3810,8 +3809,9 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                     negative_entry.definition = definition
             negative_prepared_key = (decision.lane, decision.operator)
             prepared = (
-                negative_entry.prepared_by_context.get(negative_prepared_key)
+                negative_entry.prepared
                 if negative_entry is not None
+                and negative_entry.prepared_context == negative_prepared_key
                 else None
             )
             if prepared is None:
@@ -3837,7 +3837,8 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                 if decision.negative_cache_hit:
                     if negative_entry is None:
                         raise RuntimeError("negative screening cache entry is unavailable")
-                    negative_entry.prepared_by_context[negative_prepared_key] = prepared
+                    negative_entry.prepared_context = negative_prepared_key
+                    negative_entry.prepared = prepared
             self._flush_pending_lookup()
             self._event_buffer.append(
                 (

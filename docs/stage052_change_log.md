@@ -8,30 +8,31 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
-## 2026-07-23：E13 mixed-batch columnar screening persistence
+## 2026-07-23：E13--E14 mixed-batch columnar screening persistence
 
 - 失败证据：`stage05.2_native_kernels_attempt12` 的冻结 source snapshot（源码快照）漏带
   ignored benchmark data，在创建 shard 前失败，空目录保留且 label 不复用。
   `stage05.2_native_kernels_attempt13` 在 clean commit `75cf816` 上完成 36/36 axis，但
   producer persistence ratio 为 0.347341265（solver 216.880358280 秒，persistence
   115.422492442 秒），未达到 30% gate，因此不提交独立 readiness review，raw evidence
-  保持不可变。
+  保持不可变。`stage05.2_native_kernels_attempt14` 在 clean commit `ea1733f` 上也完成
+  36/36 axis，但把 canonical definition preparation 移入 producer callback 后削弱了与
+  writer 的有效重叠，ratio 回退到 0.382957313（solver 203.324121904 秒，persistence
+  126.189745317 秒）；该完整失败 evidence 同样保留且不进入独立 readiness review。
 - 根因：大型 wall-clock shards 中 screening occurrences 占绝大多数；producer 已复用
   definition，却仍在 writer 内为每条 occurrence 构造 row tuple，随后再次转置成 Parquet
   columns。把 prepared screening 与其他事件按连续段拆开会破坏 batch 粒度，故未采用。
-- 修改：`PreparedScreeningDefinition` 现在一次预计算 route/lane/operator identity、canonical
-  definition payload、SHA-256 和 typed row；每个 route 的 negative-cache evidence、definition
-  与按 lane/operator 划分的 prepared context 合并到一个有界 entry。writer 保持原始 mixed
-  batch 与 FIFO ledger 不变，在同一遍扫描中把全部 screening occurrence 直接累积为 schema-
-  ordered columns，并继续按原 event ID 顺序写入。row-group、cache、transaction 和 batch 上限
-  均保持 65,536 或既有更严格边界。
-- 完整性修复：首次 prepared cache miss 从顶层 route/lane/operator/tail 独立重建 canonical
-  definition，并逐项绑定 route ID、definition ID、encoded bytes、digest、payload 与 row；交叉
-  拼接其他 route 的合法 pending definition 会 fail fast，不能静默改变 reviewer 读取到的身份。
-- 验证：artifact v3 与 streaming trace 定向测试 97 项通过；完整测试 715 项、Ruff 和
-  `git diff --check` 通过。两个只读独立代码复核均未留下 High/Medium finding。真实
-  `c101_21/2014` 单 shard probe 的 wall-clock persistence union 为约 9.68 秒；正式门槛仍只
-  接受新 clean commit 上完整 36-axis producer evidence 与独立 raw replay。
+- 修改：每个 route 的 negative-cache evidence、definition 与最后一个 lane/operator prepared
+  context 合并到一个有界 entry；其他 context 回退到既有 262,144-entry 全局有界 cache，避免
+  route-local 字典绕过内存硬上限。`PreparedScreeningDefinition` 只绑定 typed tail 与顶层上下文；
+  canonical payload、route/lane/operator identity、SHA-256 和 typed definition row 仍在 writer
+  首次 cache miss 时构造，使 CPU 工作留在可与 solver core overlap 的线程。writer 保持原始
+  mixed batch 与 FIFO ledger 不变，在同一遍扫描中把全部 screening occurrence 直接累积为
+  schema-ordered columns，并继续按原 event ID 顺序写入。row-group、cache、transaction 和 batch
+  上限均保持 65,536 或既有更严格边界；Prepared 不携带可与顶层身份交叉拼接的 pending row。
+- 验证：artifact v3 与 streaming trace 定向测试 97 项通过；Ruff 与 `git diff --check` 通过。
+  `c101_21/2014` 单 shard probe 的 wall-clock persistence union 为约 9.47 秒。正式门槛仍只接受
+  后续新 clean commit 上完整 36-axis producer evidence 与独立 raw replay。
 
 ## 2026-07-23：E11 真实剖析与 bounded async persistence pipeline
 

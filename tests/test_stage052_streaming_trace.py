@@ -873,6 +873,50 @@ def test_v3_negative_cache_hit_reuses_precomputed_definition_without_check_itera
     assert shard.rows[0][7] is shard.rows[1][7]  # type: ignore[index]
 
 
+def test_v3_negative_cache_retains_only_one_prepared_context_per_route() -> None:
+    shard = _BufferedScreeningRecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+        buffer_rows=256,
+    )
+    base = ScreeningDecision(
+        decision_id=1,
+        route_key="route:2:C1",
+        lane="lane-0",
+        iteration=1,
+        operator="operator-0",
+        status="negative_cache_hit",
+        first_failed_check="capacity",
+        reason="capacity",
+        checks=(ScreeningCheckTrace("negative_sequence_cache", "hit", True, "reused"),),
+        demand=2.5,
+        min_time_window_slack=1.0,
+        distance_lower_bound=3.0,
+        distance_increment_lower_bound=None,
+        single_segment_reachable=True,
+        structural_energy_lower_bound=4.0,
+        negative_cache_hit=True,
+        exact_call_blocked=True,
+        started_at=0.1,
+        completed_at=0.2,
+        duration_seconds=0.1,
+    )
+    for index in range(100):
+        sink.append_screening_decision(
+            replace(
+                base,
+                decision_id=index + 1,
+                lane=f"lane-{index}",
+                operator=f"operator-{index}",
+            )
+        )
+
+    entry = sink._negative_screening_cache[base.route_key]  # noqa: SLF001
+    assert entry.prepared_context == ("lane-99", "operator-99")
+    assert isinstance(entry.prepared, artifact_module.PreparedScreeningDefinition)
+
+
 def test_stage052_trace_sink_flushes_bounded_event_batches() -> None:
     shard = _RecordingShard()
     sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001

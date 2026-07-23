@@ -4,7 +4,6 @@ import hashlib
 import json
 import subprocess
 import sys
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -900,46 +899,6 @@ def test_v3_writer_rejects_prepared_screening_context_mismatch(tmp_path: Path) -
         )
 
     shard.abort("expected prepared-context rejection")
-    writer.finalize(status="partial", evidence_completeness="partial")
-
-
-def test_v3_writer_rejects_cross_wired_prepared_screening_pending_identity(
-    tmp_path: Path,
-) -> None:
-    writer = _v3_writer(tmp_path, attempt=96)
-    shard = writer.open_v2_shard(
-        instance="toy",
-        seed=2014,
-        shard_ordinal=0,
-        worker_identity="worker-0",
-    )
-    definition = artifacts_module.PrecomputedScreeningDefinition(
-        ("pass", "", "fixed_work", 1.0, None, 2.0, False, "", 3.0, False, True, 4.0, ())
-    )
-    first = artifacts_module.prepare_screening_definition(
-        definition,
-        route_key="route:2:C1",
-        lane="fixed_work:legacy",
-        operator="repair",
-    )
-    second = artifacts_module.prepare_screening_definition(
-        definition,
-        route_key="route:2:C2",
-        lane="fixed_work:legacy",
-        operator="repair",
-    )
-    cross_wired = replace(first, pending=second.pending)
-
-    with pytest.raises(ArtifactIntegrityError, match="pending identity mismatch"):
-        shard.append(
-            route_dictionary={"route:2:C1": ("C1",)},
-            critical_events=(
-                (9, "route:2:C1", "fixed_work:legacy", 1, "repair", 1.25, 1.5, cross_wired),
-            ),
-            cache_lookups_coalesced=True,
-        )
-
-    shard.abort("expected prepared-pending identity rejection")
     writer.finalize(status="partial", evidence_completeness="partial")
 
 
