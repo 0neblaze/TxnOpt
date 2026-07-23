@@ -4,22 +4,443 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <deque>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <queue>
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <descrobject.h>
 
 namespace py = pybind11;
 
 using Point = std::pair<double, double>;
+
+struct Stage052CanonicalSignature {
+    std::array<std::uint64_t, 32> values{};
+    py::ssize_t count = 0;
+};
+
+struct Stage052ScreeningDefinitionCacheEntry {
+    py::tuple key;
+    Stage052CanonicalSignature signature;
+    py::object definition_id;
+};
+
+struct Stage052ScreeningDefinitionCache {
+    std::unordered_multimap<std::size_t, Stage052ScreeningDefinitionCacheEntry>
+        definitions;
+    std::deque<
+        std::pair<std::size_t, Stage052ScreeningDefinitionCacheEntry*>>
+        insertion_order;
+    PyTypeObject* check_type = nullptr;
+    py::object check_type_owner;
+    std::array<py::object, 4> check_descriptors;
+    std::array<Py_ssize_t, 4> check_offsets{{-1, -1, -1, -1}};
+    std::size_t capacity = 262144;
+};
+
+constexpr const char* STAGE052_SCREENING_CACHE_CAPSULE =
+    "evrptw.stage052_screening_definition_cache";
+
+py::capsule create_stage052_screening_definition_cache(
+    const py::ssize_t capacity = 262144) {
+    if (capacity <= 0 || capacity > 262144) {
+        throw std::invalid_argument(
+            "Stage 5.2 screening definition cache capacity must be in 1..262144");
+    }
+    auto cache = std::make_unique<Stage052ScreeningDefinitionCache>();
+    cache->definitions.max_load_factor(0.8F);
+    cache->definitions.reserve(static_cast<std::size_t>(capacity));
+    cache->capacity = static_cast<std::size_t>(capacity);
+    py::capsule capsule(
+        cache.get(),
+        STAGE052_SCREENING_CACHE_CAPSULE,
+        [](PyObject* capsule) {
+            auto* owned = static_cast<Stage052ScreeningDefinitionCache*>(
+                PyCapsule_GetPointer(capsule, STAGE052_SCREENING_CACHE_CAPSULE));
+            if (owned == nullptr) {
+                PyErr_Clear();
+                return;
+            }
+            delete owned;
+        });
+    cache.release();
+    return capsule;
+}
+
+void append_stage052_signature(
+    Stage052CanonicalSignature& signature,
+    const std::uint64_t value) {
+    if (signature.count >= static_cast<py::ssize_t>(signature.values.size())) {
+        throw std::invalid_argument(
+            "Stage 5.2 screening canonical signature exceeds its fixed domain");
+    }
+    signature.values[static_cast<std::size_t>(signature.count)] = value;
+    ++signature.count;
+}
+
+std::uint64_t stage052_double_bits(PyObject* value) {
+    const double number = PyFloat_AsDouble(value);
+    if (number == -1.0 && PyErr_Occurred()) {
+        throw py::error_already_set();
+    }
+    std::uint64_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(number));
+    std::memcpy(&bits, &number, sizeof(bits));
+    return bits;
+}
+
+void append_stage052_typed_value_signature(
+    Stage052CanonicalSignature& signature,
+    PyObject* value) {
+    if (value == Py_None) {
+        append_stage052_signature(signature, 0);
+    } else if (PyBool_Check(value)) {
+        append_stage052_signature(signature, value == Py_True ? 2 : 1);
+    } else if (PyLong_Check(value) || PyFloat_Check(value)) {
+        append_stage052_signature(signature, 3);
+        append_stage052_signature(signature, stage052_double_bits(value));
+    } else if (PyUnicode_Check(value)) {
+        const Py_hash_t value_hash = PyObject_Hash(value);
+        if (value_hash == -1 && PyErr_Occurred()) {
+            throw py::error_already_set();
+        }
+        append_stage052_signature(signature, 4);
+        append_stage052_signature(
+            signature, static_cast<std::uint64_t>(value_hash));
+    } else {
+        // Unsupported check values canonicalise to three null value columns.
+        append_stage052_signature(signature, 5);
+    }
+}
+
+std::pair<PyObject*, bool> stage052_screening_check_field(
+    PyObject* check,
+    const py::ssize_t field_index,
+    Stage052ScreeningDefinitionCache* cache) {
+    if (PyTuple_Check(check) && PyTuple_GET_SIZE(check) == 4) {
+        return {PyTuple_GET_ITEM(check, field_index), false};
+    }
+    if (cache != nullptr) {
+        if (cache->check_type == nullptr) {
+            constexpr std::array<const char*, 4> names{
+                "check", "status", "value", "reason"};
+            std::array<py::object, 4> descriptors;
+            std::array<Py_ssize_t, 4> offsets{{-1, -1, -1, -1}};
+            bool descriptors_available = true;
+            for (py::ssize_t index = 0; index < 4; ++index) {
+                PyObject* descriptor = PyObject_GetAttrString(
+                    reinterpret_cast<PyObject*>(Py_TYPE(check)),
+                    names[static_cast<std::size_t>(index)]);
+                if (descriptor == nullptr) {
+                    PyErr_Clear();
+                    descriptors_available = false;
+                    break;
+                }
+                descriptors[static_cast<std::size_t>(index)] =
+                    py::reinterpret_steal<py::object>(descriptor);
+                if (Py_IS_TYPE(descriptor, &PyMemberDescr_Type)) {
+                    const auto* member_descriptor =
+                        reinterpret_cast<PyMemberDescrObject*>(descriptor);
+                    if (member_descriptor->d_member != nullptr
+                        && member_descriptor->d_member->type == Py_T_OBJECT_EX) {
+                        offsets[static_cast<std::size_t>(index)] =
+                            member_descriptor->d_member->offset;
+                    }
+                }
+                if (offsets[static_cast<std::size_t>(index)] < 0
+                    && Py_TYPE(descriptor)->tp_descr_get == nullptr) {
+                    descriptors_available = false;
+                    break;
+                }
+            }
+            if (descriptors_available) {
+                cache->check_type_owner =
+                    py::reinterpret_borrow<py::object>(
+                        reinterpret_cast<PyObject*>(Py_TYPE(check)));
+                cache->check_type = Py_TYPE(check);
+                cache->check_descriptors = std::move(descriptors);
+                cache->check_offsets = offsets;
+            }
+        }
+        if (Py_TYPE(check) == cache->check_type) {
+            const Py_ssize_t offset =
+                cache->check_offsets[static_cast<std::size_t>(field_index)];
+            if (offset >= 0) {
+                auto** slot = reinterpret_cast<PyObject**>(
+                    reinterpret_cast<char*>(check) + offset);
+                if (*slot == nullptr) {
+                    throw std::invalid_argument(
+                        "Stage 5.2 screening check slot is empty");
+                }
+                return {*slot, false};
+            }
+            const py::object& descriptor =
+                cache->check_descriptors[static_cast<std::size_t>(field_index)];
+            descrgetfunc get_value =
+                Py_TYPE(descriptor.ptr())->tp_descr_get;
+            if (get_value == nullptr) {
+                throw std::invalid_argument(
+                    "Stage 5.2 screening check descriptor is invalid");
+            }
+            PyObject* value = get_value(
+                descriptor.ptr(),
+                check,
+                reinterpret_cast<PyObject*>(cache->check_type));
+            if (value == nullptr) {
+                throw py::error_already_set();
+            }
+            return {value, true};
+        }
+    }
+    constexpr std::array<const char*, 4> names{
+        "check", "status", "value", "reason"};
+    PyObject* value = PyObject_GetAttrString(
+        check, names[static_cast<std::size_t>(field_index)]);
+    if (value == nullptr) {
+        throw py::error_already_set();
+    }
+    return {value, true};
+}
+
+Stage052CanonicalSignature stage052_screening_key_signature(
+    const std::array<PyObject*, 16>& fields,
+    const py::ssize_t field_count,
+    Stage052ScreeningDefinitionCache* cache = nullptr) {
+    Stage052CanonicalSignature signature;
+    if (field_count == 5) {
+        append_stage052_typed_value_signature(signature, fields[4]);
+        return signature;
+    }
+    if (field_count != 16) {
+        throw std::invalid_argument(
+            "Stage 5.2 screening cache key has an invalid field count");
+    }
+    append_stage052_signature(signature, stage052_double_bits(fields[6]));
+    if (fields[7] == Py_None) {
+        append_stage052_signature(signature, 0);
+    } else {
+        append_stage052_signature(signature, 1);
+        append_stage052_signature(signature, stage052_double_bits(fields[7]));
+    }
+    append_stage052_signature(signature, stage052_double_bits(fields[8]));
+    append_stage052_typed_value_signature(signature, fields[9]);
+    append_stage052_signature(signature, stage052_double_bits(fields[11]));
+    append_stage052_typed_value_signature(signature, fields[12]);
+    append_stage052_typed_value_signature(signature, fields[13]);
+    append_stage052_signature(signature, stage052_double_bits(fields[14]));
+    if (!PyTuple_Check(fields[15])) {
+        throw std::invalid_argument("Stage 5.2 deferred screening checks are invalid");
+    }
+    const py::ssize_t check_count = PyTuple_GET_SIZE(fields[15]);
+    if (check_count > 8) {
+        throw std::invalid_argument(
+            "one screening decision exceeds the fixed eight-check domain");
+    }
+    append_stage052_signature(
+        signature, static_cast<std::uint64_t>(check_count));
+    for (py::ssize_t index = 0; index < check_count; ++index) {
+        PyObject* check = PyTuple_GET_ITEM(fields[15], index);
+        const auto [value, owns_value] =
+            stage052_screening_check_field(check, 2, cache);
+        try {
+            append_stage052_typed_value_signature(signature, value);
+        } catch (...) {
+            if (owns_value) {
+                Py_DECREF(value);
+            }
+            throw;
+        }
+        if (owns_value) {
+            Py_DECREF(value);
+        }
+    }
+    return signature;
+}
+
+bool stage052_signature_equal(
+    const Stage052CanonicalSignature& left,
+    const Stage052CanonicalSignature& right) {
+    if (left.count != right.count) {
+        return false;
+    }
+    for (py::ssize_t index = 0; index < left.count; ++index) {
+        if (left.values[static_cast<std::size_t>(index)]
+            != right.values[static_cast<std::size_t>(index)]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::size_t stage052_screening_key_hash(
+    const std::array<PyObject*, 16>& fields,
+    const py::ssize_t field_count,
+    const Stage052CanonicalSignature& signature,
+    Stage052ScreeningDefinitionCache* cache) {
+    std::size_t hash =
+        static_cast<std::size_t>(field_count) ^ 0x9e3779b97f4a7c15ULL;
+    const auto mix_value = [&hash](const std::size_t value) {
+        hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6U) + (hash >> 2U);
+    };
+    const auto mix_object = [&mix_value](PyObject* value) {
+        const Py_hash_t field_hash = PyObject_Hash(value);
+        if (field_hash == -1 && PyErr_Occurred()) {
+            throw py::error_already_set();
+        }
+        mix_value(static_cast<std::size_t>(field_hash));
+    };
+    for (py::ssize_t index = 0; index < 4; ++index) {
+        mix_object(fields[index]);
+    }
+    if (field_count == 5) {
+        mix_object(fields[4]);
+    } else {
+        mix_object(fields[4]);
+        mix_object(fields[5]);
+        mix_object(fields[10]);
+        const py::ssize_t check_count = PyTuple_GET_SIZE(fields[15]);
+        for (py::ssize_t check_index = 0;
+             check_index < check_count;
+             ++check_index) {
+            PyObject* check = PyTuple_GET_ITEM(fields[15], check_index);
+            for (const py::ssize_t check_field : {0, 1, 3}) {
+                const auto [value, owns_value] =
+                    stage052_screening_check_field(
+                        check, check_field, cache);
+                try {
+                    mix_object(value);
+                } catch (...) {
+                    if (owns_value) {
+                        Py_DECREF(value);
+                    }
+                    throw;
+                }
+                if (owns_value) {
+                    Py_DECREF(value);
+                }
+            }
+        }
+    }
+    for (py::ssize_t index = 0; index < signature.count; ++index) {
+        mix_value(static_cast<std::size_t>(
+            signature.values[static_cast<std::size_t>(index)]));
+    }
+    return hash;
+}
+
+bool stage052_object_equal(PyObject* previous, PyObject* current) {
+    if (previous == current) {
+        return true;
+    }
+    const int equal = PyObject_RichCompareBool(previous, current, Py_EQ);
+    if (equal < 0) {
+        throw py::error_already_set();
+    }
+    return equal == 1;
+}
+
+bool stage052_screening_key_equal(
+    const Stage052ScreeningDefinitionCacheEntry& stored,
+    const std::array<PyObject*, 16>& fields,
+    const py::ssize_t field_count,
+    const Stage052CanonicalSignature& signature,
+    Stage052ScreeningDefinitionCache* cache) {
+    if (!stage052_signature_equal(stored.signature, signature)
+        || PyTuple_GET_SIZE(stored.key.ptr()) != field_count) {
+        return false;
+    }
+    std::array<py::ssize_t, 7> compared_fields{{0, 1, 2, 3, 4, 5, 10}};
+    const py::ssize_t compared_count = field_count == 5 ? 5 : 7;
+    for (py::ssize_t position = 0; position < compared_count; ++position) {
+        const py::ssize_t index =
+            compared_fields[static_cast<std::size_t>(position)];
+        if (!stage052_object_equal(
+                PyTuple_GET_ITEM(stored.key.ptr(), index),
+                fields[index])) {
+            return false;
+        }
+    }
+    if (field_count == 5) {
+        return true;
+    }
+    PyObject* stored_checks = PyTuple_GET_ITEM(stored.key.ptr(), 15);
+    const py::ssize_t check_count = PyTuple_GET_SIZE(fields[15]);
+    if (!PyTuple_Check(stored_checks)
+        || PyTuple_GET_SIZE(stored_checks) != check_count) {
+        return false;
+    }
+    for (py::ssize_t check_index = 0;
+         check_index < check_count;
+         ++check_index) {
+        PyObject* previous_check =
+            PyTuple_GET_ITEM(stored_checks, check_index);
+        PyObject* current_check =
+            PyTuple_GET_ITEM(fields[15], check_index);
+        for (const py::ssize_t check_field : {0, 1, 2, 3}) {
+            const auto [previous, owns_previous] =
+                stage052_screening_check_field(
+                    previous_check, check_field, cache);
+            PyObject* current = nullptr;
+            bool owns_current = false;
+            try {
+                const auto resolved_current =
+                    stage052_screening_check_field(
+                        current_check, check_field, cache);
+                current = resolved_current.first;
+                owns_current = resolved_current.second;
+            } catch (...) {
+                if (owns_previous) {
+                    Py_DECREF(previous);
+                }
+                throw;
+            }
+            bool equal = false;
+            try {
+                equal = stage052_object_equal(previous, current);
+            } catch (...) {
+                if (owns_previous) {
+                    Py_DECREF(previous);
+                }
+                if (owns_current) {
+                    Py_DECREF(current);
+                }
+                throw;
+            }
+            if (owns_previous) {
+                Py_DECREF(previous);
+            }
+            if (owns_current) {
+                Py_DECREF(current);
+            }
+            if (!equal) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+py::tuple stage052_screening_key_tuple(
+    const std::array<PyObject*, 16>& fields,
+    const py::ssize_t field_count) {
+    py::tuple key(field_count);
+    for (py::ssize_t index = 0; index < field_count; ++index) {
+        key[index] = py::reinterpret_borrow<py::object>(fields[index]);
+    }
+    return key;
+}
 
 py::tuple stage052_route_sequence_from_key(const py::object& route_key) {
     if (!PyUnicode_Check(route_key.ptr())) {
@@ -225,6 +646,22 @@ py::tuple pack_stage052_screening_occurrences(
                             "negative screening cache returned inconsistent evidence for one route");
                     }
                 }
+                std::array<PyObject*, 16> previous_fields{};
+                std::array<PyObject*, 16> current_fields{};
+                for (py::ssize_t index = 0; index < 12; ++index) {
+                    previous_fields[4 + index] =
+                        PyTuple_GET_ITEM(cached_evidence, index);
+                    current_fields[4 + index] = values[7 + index].ptr();
+                }
+                const Stage052CanonicalSignature previous_signature =
+                    stage052_screening_key_signature(previous_fields, 16);
+                const Stage052CanonicalSignature current_signature =
+                    stage052_screening_key_signature(current_fields, 16);
+                if (!stage052_signature_equal(
+                        previous_signature, current_signature)) {
+                    throw std::invalid_argument(
+                        "negative screening cache returned inconsistent evidence for one route");
+                }
             }
             key[4] = values[19];
         } else {
@@ -281,7 +718,7 @@ py::tuple pack_stage052_screening_occurrences(
 
 py::tuple pack_stage052_screening_transactions(
     const py::sequence& events,
-    py::dict definition_cache,
+    const py::object& definition_cache,
     py::dict negative_evidence_cache,
     py::dict lane_ids,
     py::dict operator_ids,
@@ -290,6 +727,15 @@ py::tuple pack_stage052_screening_transactions(
     const py::object& stable_dictionary_id,
     const py::object& definition_identity,
     const std::int64_t first_event_id) {
+    auto* native_definition_cache =
+        static_cast<Stage052ScreeningDefinitionCache*>(
+            PyCapsule_GetPointer(
+                definition_cache.ptr(), STAGE052_SCREENING_CACHE_CAPSULE));
+    if (native_definition_cache == nullptr) {
+        PyErr_Clear();
+        throw std::invalid_argument(
+            "Stage 5.2 native screening definition cache is invalid");
+    }
     py::tuple columns(6);
     for (py::ssize_t index = 0; index < 6; ++index) {
         columns[index] = py::list();
@@ -346,13 +792,13 @@ py::tuple pack_stage052_screening_transactions(
                 "Stage 5.2 deferred screening values must contain twenty fields");
         }
         const py::tuple values = py::reinterpret_borrow<py::tuple>(raw_values);
-        py::tuple occurrence_key;
+        std::array<PyObject*, 16> occurrence_key_fields{};
+        occurrence_key_fields[0] = values[1].ptr();
+        occurrence_key_fields[1] = axis_name.ptr();
+        occurrence_key_fields[2] = values[2].ptr();
+        occurrence_key_fields[3] = values[4].ptr();
+        py::ssize_t occurrence_key_field_count = 16;
         if (values[15].ptr() == Py_True && !values[19].is_none()) {
-            occurrence_key = py::tuple(5);
-            occurrence_key[0] = values[1];
-            occurrence_key[1] = axis_name;
-            occurrence_key[2] = values[2];
-            occurrence_key[3] = values[4];
             PyObject* cached_evidence =
                 PyDict_GetItemWithError(negative_evidence_cache.ptr(), values[1].ptr());
             if (cached_evidence == nullptr) {
@@ -389,36 +835,68 @@ py::tuple pack_stage052_screening_transactions(
                             "negative screening cache returned inconsistent evidence for one route");
                     }
                 }
+                std::array<PyObject*, 16> previous_fields{};
+                std::array<PyObject*, 16> current_fields{};
+                for (py::ssize_t index = 0; index < 12; ++index) {
+                    previous_fields[4 + index] =
+                        PyTuple_GET_ITEM(cached_evidence, index);
+                    current_fields[4 + index] = values[7 + index].ptr();
+                }
+                const Stage052CanonicalSignature previous_signature =
+                    stage052_screening_key_signature(previous_fields, 16);
+                const Stage052CanonicalSignature current_signature =
+                    stage052_screening_key_signature(current_fields, 16);
+                if (!stage052_signature_equal(
+                        previous_signature, current_signature)) {
+                    throw std::invalid_argument(
+                        "negative screening cache returned inconsistent evidence for one route");
+                }
             }
-            occurrence_key[4] = values[19];
+            occurrence_key_fields[4] = values[19].ptr();
+            occurrence_key_field_count = 5;
         } else {
-            occurrence_key = py::tuple(16);
-            occurrence_key[0] = values[1];
-            occurrence_key[1] = axis_name;
-            occurrence_key[2] = values[2];
-            occurrence_key[3] = values[4];
             for (py::ssize_t index = 0; index < 12; ++index) {
-                occurrence_key[4 + index] = values[7 + index];
+                occurrence_key_fields[4 + index] = values[7 + index].ptr();
             }
         }
+        const Stage052CanonicalSignature occurrence_key_signature =
+            stage052_screening_key_signature(
+                occurrence_key_fields,
+                occurrence_key_field_count,
+                native_definition_cache);
+        const std::size_t occurrence_key_hash = stage052_screening_key_hash(
+            occurrence_key_fields,
+            occurrence_key_field_count,
+            occurrence_key_signature,
+            native_definition_cache);
 
         event_ids.append(first_event_id + event_index);
         started_at.append(values[5]);
         completed_at.append(values[6]);
         iterations.append(values[3]);
         decision_ids.append(values[0]);
-        PyObject* cached =
-            PyDict_GetItemWithError(definition_cache.ptr(), occurrence_key.ptr());
-        if (cached != nullptr) {
-            if (!PyLong_Check(cached) || PyBool_Check(cached)) {
-                throw std::invalid_argument(
-                    "Stage 5.2 screening definition cache value must be an integer");
+        const auto cached_range =
+            native_definition_cache->definitions.equal_range(occurrence_key_hash);
+        const Stage052ScreeningDefinitionCacheEntry* cached_definition = nullptr;
+        for (auto cached = cached_range.first; cached != cached_range.second; ++cached) {
+            if (stage052_screening_key_equal(
+                    cached->second,
+                    occurrence_key_fields,
+                    occurrence_key_field_count,
+                    occurrence_key_signature,
+                    native_definition_cache)) {
+                cached_definition = &cached->second;
+                break;
             }
-            definition_ids.append(py::reinterpret_borrow<py::object>(cached));
-            continue;
         }
-        if (PyErr_Occurred()) {
-            throw py::error_already_set();
+        if (cached_definition != nullptr) {
+            if (!PyLong_Check(cached_definition->definition_id.ptr())
+                || PyBool_Check(cached_definition->definition_id.ptr())) {
+                throw std::invalid_argument(
+                    "Stage 5.2 native screening cache value is invalid");
+            }
+            definition_ids.append(cached_definition->definition_id);
+            continue;
         }
 
         const py::object raw_checks = values[18];
@@ -523,27 +1001,46 @@ py::tuple pack_stage052_screening_transactions(
                 "Stage 5.2 screening definition identity is invalid");
         }
         const py::object definition_id = identity[0];
-        if (py::len(definition_cache) >= 262144) {
-            PyObject* iterator = PyObject_GetIter(definition_cache.ptr());
-            if (iterator == nullptr) {
-                throw py::error_already_set();
-            }
-            PyObject* oldest = PyIter_Next(iterator);
-            Py_DECREF(iterator);
-            if (oldest == nullptr) {
-                if (PyErr_Occurred()) {
-                    throw py::error_already_set();
-                }
+        if (native_definition_cache->definitions.size()
+            >= native_definition_cache->capacity) {
+            if (native_definition_cache->insertion_order.empty()) {
                 throw std::invalid_argument(
                     "Stage 5.2 screening definition cache is unexpectedly empty");
             }
-            const int removed = PyDict_DelItem(definition_cache.ptr(), oldest);
-            Py_DECREF(oldest);
-            if (removed != 0) {
-                throw py::error_already_set();
+            const auto oldest = native_definition_cache->insertion_order.front();
+            native_definition_cache->insertion_order.pop_front();
+            const auto oldest_range =
+                native_definition_cache->definitions.equal_range(oldest.first);
+            bool removed = false;
+            for (auto candidate = oldest_range.first;
+                 candidate != oldest_range.second;
+                 ++candidate) {
+                if (&candidate->second == oldest.second) {
+                    native_definition_cache->definitions.erase(candidate);
+                    removed = true;
+                    break;
+                }
+            }
+            if (!removed) {
+                throw std::invalid_argument(
+                    "Stage 5.2 screening definition cache eviction is invalid");
             }
         }
-        definition_cache[occurrence_key] = definition_id;
+        const auto inserted = native_definition_cache->definitions.emplace(
+            occurrence_key_hash,
+            Stage052ScreeningDefinitionCacheEntry{
+                stage052_screening_key_tuple(
+                    occurrence_key_fields, occurrence_key_field_count),
+                occurrence_key_signature,
+                definition_id,
+            });
+        try {
+            native_definition_cache->insertion_order.emplace_back(
+                occurrence_key_hash, &inserted->second);
+        } catch (...) {
+            native_definition_cache->definitions.erase(inserted);
+            throw;
+        }
         definition_ids.append(definition_id);
         py::tuple row(17);
         row[0] = definition_id;
@@ -2586,6 +3083,10 @@ PYBIND11_MODULE(_core, module) {
         py::arg("definition_cache"),
         py::arg("negative_evidence_cache"),
         py::arg("first_event_id"));
+    module.def(
+        "create_stage052_screening_definition_cache",
+        &create_stage052_screening_definition_cache,
+        py::arg("capacity") = 262144);
     module.def(
         "pack_stage052_screening_transactions",
         &pack_stage052_screening_transactions,

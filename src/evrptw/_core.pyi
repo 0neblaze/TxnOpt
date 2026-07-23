@@ -22,9 +22,10 @@ def pack_stage052_screening_occurrences(
     list[tuple[object, int, list[int]]],
     list[int],
 ]: ...
+def create_stage052_screening_definition_cache(capacity: int = 262144) -> object: ...
 def pack_stage052_screening_transactions(
     events: Sequence[object],
-    definition_cache: dict[object, int],
+    definition_cache: object,
     negative_evidence_cache: dict[object, tuple[object, ...]],
     lane_ids: dict[str, int],
     operator_ids: dict[str, int],

@@ -4677,6 +4677,11 @@ class ArtifactV2ShardSession:
         self._deferred_screening_occurrence_cache: dict[
             tuple[object, ...], int
         ] = {}
+        from evrptw import _core as native_core
+
+        self._deferred_native_screening_occurrence_cache: object = (
+            native_core.create_stage052_screening_definition_cache()
+        )
         self._prepared_screening_definition_cache: OrderedDict[
             int, tuple[PreparedScreeningDefinition, int]
         ] = OrderedDict()
@@ -4815,22 +4820,17 @@ class ArtifactV2ShardSession:
                     raw_pending_definitions,
                     raw_non_screening_indices,
                     raw_observed_routes,
-                ) = (
-                    native_core.pack_stage052_screening_transactions(
-                        critical_events,
-                        cast(
-                            dict[object, int],
-                            self._deferred_screening_occurrence_cache,
-                        ),
-                        self._deferred_native_negative_evidence,
-                        self._lane_ids,
-                        self._operator_ids,
-                        self._resolved_route_ids,
-                        self._resolve_route_id,
-                        _stable_dictionary_id,
-                        _screening_definition_identity,
-                        next_event_id,
-                    )
+                ) = native_core.pack_stage052_screening_transactions(
+                    critical_events,
+                    self._deferred_native_screening_occurrence_cache,
+                    self._deferred_native_negative_evidence,
+                    self._lane_ids,
+                    self._operator_ids,
+                    self._resolved_route_ids,
+                    self._resolve_route_id,
+                    _stable_dictionary_id,
+                    _screening_definition_identity,
+                    next_event_id,
                 )
             except ValueError as error:
                 raise ArtifactIntegrityError(str(error)) from error

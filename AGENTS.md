@@ -720,6 +720,12 @@ The executable workflow and gate table are maintained in
   publication; the optimization may not drop, aggregate, or reorder occurrences. High-cardinality
   definition, occurrence, and event Parquet streams disable dictionary encoding and statistics while
   retaining the canonical typed schema and Zstandard level 1.
+  Repeated screening definitions use a shard-local native capsule with a hard 262,144-entry FIFO
+  bound. Its composite hash is only a lookup accelerator: every hit must pass exact field equality,
+  and every miss must retain an owning exact key before publishing the canonical definition identity.
+  Canonical typed signatures distinguish booleans from numerics and preserve IEEE-754 signed zero;
+  negative-evidence drift uses the same signature. Probabilistic hash-only identity, unbounded cache
+  growth, Python-loose numeric equality, or collision aliasing is forbidden.
   Native screening and deferred sparse packers return the strictly decoded route sequence with every
   newly observed route ID, so the writer must not parse the same canonical route key a second time.
   Producer and campaign reviewer must validate the same exported writer thread-switch protocol

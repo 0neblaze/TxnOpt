@@ -628,6 +628,10 @@ def test_native_v3_screening_packer_rejects_negative_evidence_drift() -> None:
 def test_native_v3_screening_transaction_packer_prepares_one_exact_definition() -> None:
     from evrptw import _core
 
+    class CollidingText(str):
+        def __hash__(self) -> int:
+            return 17
+
     checks = (
         ScreeningCheckTrace("capacity", "fail", 2.5, "capacity"),
         ScreeningCheckTrace("reachability", "pass", True, ""),
@@ -640,7 +644,7 @@ def test_native_v3_screening_transaction_packer_prepares_one_exact_definition() 
             "route:2:C1",
             "legacy",
             3,
-            "repair",
+            CollidingText("repair"),
             0.1,
             0.2,
             "rejected",
@@ -658,7 +662,7 @@ def test_native_v3_screening_transaction_packer_prepares_one_exact_definition() 
             None,
         ),
     )
-    occurrence_cache: dict[object, int] = {}
+    occurrence_cache = _core.create_stage052_screening_definition_cache()
     lane_ids: dict[str, int] = {}
     operator_ids: dict[str, int] = {}
     route_ids: dict[str, int] = {}
@@ -674,6 +678,14 @@ def test_native_v3_screening_transaction_packer_prepares_one_exact_definition() 
                 deferred,
                 {"event": "not_screening"},
                 deferred._replace(values=(8, *deferred.values[1:])),
+                deferred._replace(
+                    values=(
+                        9,
+                        *deferred.values[1:4],
+                        CollidingText("repair-collision"),
+                        *deferred.values[5:],
+                    )
+                ),
             ),
             occurrence_cache,
             {},
@@ -687,9 +699,9 @@ def test_native_v3_screening_transaction_packer_prepares_one_exact_definition() 
         )
     )
 
-    assert columns[0] == [100, 102]
-    assert columns[1] == [pending[0][0], pending[0][0]]
-    assert columns[5] == [7, 8]
+    assert columns[0] == [100, 102, 103]
+    assert columns[1] == [pending[0][0], pending[0][0], pending[1][0]]
+    assert columns[5] == [7, 8, 9]
     assert remaining == [1]
     assert observed_routes == [
         (
@@ -698,7 +710,8 @@ def test_native_v3_screening_transaction_packer_prepares_one_exact_definition() 
             ("C1",),
         )
     ]
-    assert len(pending) == 1
+    assert len(pending) == 2
+    assert pending[0][0] != pending[1][0]
     definition_id, encoded, digest, payload, row = pending[0]
     expected_payload = artifact_module._screening_definition_from_cache_key(  # noqa: SLF001
         (
@@ -732,6 +745,221 @@ def test_native_v3_screening_transaction_packer_prepares_one_exact_definition() 
         definition_id,
         *(payload[name] for name in artifact_module.V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]),
     )
+
+
+def test_native_screening_transaction_cache_rejects_non_capsule() -> None:
+    from evrptw import _core
+
+    with pytest.raises(
+        ValueError,
+        match="native screening definition cache is invalid",
+    ):
+        _core.pack_stage052_screening_transactions(
+            (),
+            {},
+            {},
+            {},
+            {},
+            {},
+            lambda route_key: route_key,
+            lambda value: value,
+            lambda value: value,
+            0,
+        )
+
+
+def test_native_screening_cache_preserves_canonical_numeric_identity() -> None:
+    from evrptw import _core
+
+    checks_bool = (ScreeningCheckTrace("reachability", "pass", True, ""),)
+    deferred = DeferredScreeningDecision(
+        axis_name="fixed_work",
+        values=(
+            1,
+            "route:2:C1",
+            "legacy",
+            3,
+            "repair",
+            0.1,
+            0.2,
+            "accepted",
+            "",
+            2.5,
+            0.0,
+            3.0,
+            False,
+            "",
+            1.0,
+            False,
+            True,
+            4.0,
+            checks_bool,
+            None,
+        ),
+    )
+    signed_zero_values = list(deferred.values)
+    signed_zero_values[0] = 2
+    signed_zero_values[10] = -0.0
+    numeric_check_values = list(deferred.values)
+    numeric_check_values[0] = 3
+    numeric_check_values[18] = (
+        ScreeningCheckTrace("reachability", "pass", 1.0, ""),
+    )
+    repeated_numeric_values = list(numeric_check_values)
+    repeated_numeric_values[0] = 4
+    evicted_base_values = list(deferred.values)
+    evicted_base_values[0] = 5
+    route_ids: dict[str, int] = {}
+
+    def resolve_route_id(route_key: str) -> int:
+        route_id = artifact_module._stable_route_id(route_key)  # noqa: SLF001
+        route_ids[route_key] = route_id
+        return route_id
+
+    columns, pending, remaining, _ = _core.pack_stage052_screening_transactions(
+        (
+            deferred,
+            deferred._replace(values=tuple(signed_zero_values)),
+            deferred._replace(values=tuple(numeric_check_values)),
+            deferred._replace(values=tuple(repeated_numeric_values)),
+            deferred._replace(values=tuple(evicted_base_values)),
+        ),
+        _core.create_stage052_screening_definition_cache(capacity=2),
+        {},
+        {},
+        {},
+        route_ids,
+        resolve_route_id,
+        artifact_module._stable_dictionary_id,  # noqa: SLF001
+        artifact_module._screening_definition_identity,  # noqa: SLF001
+        1,
+    )
+
+    assert remaining == []
+    assert len(pending) == 4
+    assert len({pending[index][0] for index in range(3)}) == 3
+    assert pending[3][0] == pending[0][0]
+    assert columns[1] == [
+        pending[0][0],
+        pending[1][0],
+        pending[2][0],
+        pending[2][0],
+        pending[3][0],
+    ]
+
+
+def test_native_screening_cache_rejects_typed_negative_evidence_drift() -> None:
+    from evrptw import _core
+
+    deferred = DeferredScreeningDecision(
+        axis_name="fixed_work",
+        values=(
+            1,
+            "route:2:C1",
+            "legacy",
+            3,
+            "repair",
+            0.1,
+            0.2,
+            "negative_cache_hit",
+            "capacity",
+            2.5,
+            0.0,
+            3.0,
+            True,
+            "capacity",
+            1.0,
+            True,
+            True,
+            4.0,
+            (ScreeningCheckTrace("capacity", "fail", True, "capacity"),),
+            True,
+        ),
+    )
+    drifted_values = list(deferred.values)
+    drifted_values[0] = 2
+    drifted_values[10] = -0.0
+
+    with pytest.raises(ValueError, match="inconsistent evidence"):
+        _core.pack_stage052_screening_transactions(
+            (
+                deferred,
+                deferred._replace(values=tuple(drifted_values)),
+            ),
+            _core.create_stage052_screening_definition_cache(),
+            {},
+            {},
+            {},
+            {},
+            artifact_module._stable_route_id,  # noqa: SLF001
+            artifact_module._stable_dictionary_id,  # noqa: SLF001
+            artifact_module._screening_definition_identity,  # noqa: SLF001
+            1,
+        )
+
+
+def test_native_screening_cache_falls_back_for_instance_check_attributes() -> None:
+    from evrptw import _core
+
+    class InstanceCheck:
+        def __init__(self) -> None:
+            self.check = "capacity"
+            self.status = "fail"
+            self.value = 2.5
+            self.reason = "capacity"
+
+    deferred = DeferredScreeningDecision(
+        axis_name="fixed_work",
+        values=(
+            1,
+            "route:2:C1",
+            "legacy",
+            3,
+            "repair",
+            0.1,
+            0.2,
+            "rejected",
+            "capacity",
+            2.5,
+            None,
+            3.0,
+            True,
+            "capacity",
+            1.0,
+            False,
+            True,
+            4.0,
+            (InstanceCheck(),),
+            None,
+        ),
+    )
+    cache = _core.create_stage052_screening_definition_cache(capacity=2)
+    route_ids: dict[str, int] = {}
+
+    def resolve_route_id(route_key: str) -> int:
+        route_id = artifact_module._stable_route_id(route_key)  # noqa: SLF001
+        route_ids[route_key] = route_id
+        return route_id
+
+    columns, pending, remaining, _ = _core.pack_stage052_screening_transactions(
+        (
+            deferred,
+            deferred._replace(values=(2, *deferred.values[1:])),
+        ),
+        cache,
+        {},
+        {},
+        {},
+        route_ids,
+        resolve_route_id,
+        artifact_module._stable_dictionary_id,  # noqa: SLF001
+        artifact_module._screening_definition_identity,  # noqa: SLF001
+        1,
+    )
+
+    assert remaining == []
+    assert len(pending) == 1
+    assert columns[1] == [pending[0][0], pending[0][0]]
 
 
 def test_native_neighborhood_packer_matches_python_normalizer() -> None:

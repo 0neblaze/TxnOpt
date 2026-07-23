@@ -8,6 +8,33 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：G pilot attempt09 保留失败并引入 exact-key native cache
+
+- clean revision `7a8c0ed` 上的 `stage05.2_accelerator_pilot_attempt09` 已由独立
+  service replay 通过，decision 为 `GPU_NOT_JUSTIFIED`，状态为
+  `READY_FOR_STAGE052_BENCHMARK`；raw/review manifest SHA-256 分别为
+  `e8f0184f210dac173bfc4ad1603e17fca964b0d6469d72039bfde468d59168c9`
+  和 `a14e464c2db920e28046ed593b65702a149548c120af211b222e1aa3c09cae0c`。
+- `stage05.2_benchmark_attempt09` 的 batch0001/0002 分别以
+  `0.33753112465519763` 和 `0.3103083675151225` 通过；batch0003 以
+  `0.3927620670953848` 被 36% hard gate 拒绝。失败 batch 的 solver 为
+  `194.144702373` 秒，shard persistence 为 `125.565650103` 秒，control
+  persistence 为 `0.007326300` 秒。G09 保持不可变，未进入独立 campaign review
+  或 Formal。
+- profile 将剩余 screening producer 热点定位为每条记录重复构造并哈希 Python
+  occurrence tuple。当前实现使用 shard-local native capsule 持有有界 262,144-entry
+  exact-key cache。独立代码审查在正式运行前发现 Python equality 会把 `True/1.0`
+  及 `0.0/-0.0` 错误合并；该版本没有生成 F/G identity。修正实现以 canonical typed
+  signature 区分 bool/numeric union 和 IEEE-754 signed zero，并对所有 hash bucket
+  继续执行精确字段比较；negative-evidence drift 使用同一 typed signature。
+- Native cache 默认预留但硬限制为 262,144 entries，FIFO node pointer 在 rehash 后
+  保持有效；测试专用的小容量仍不得超过该硬上限。仅 cache miss 保存一份 owning
+  tuple 并继续生成 canonical sorted JSON、完整 SHA-256 与 typed definition row。
+  新回归覆盖 forced string-hash collision、bool/float、signed zero、FIFO eviction、
+  typed negative-evidence drift 和非法 capsule。四 worker contention probes 仍受主机
+  调度噪声影响，观察到约 `0.367--0.386`；这些 probe 不替代后续不可变 F/G
+  producer/reviewer evidence。
+
 ## 2026-07-23：G pilot attempt08 保留失败并去除 route-key 重复解析
 
 - clean revision `24c6b3d` 上的 `stage05.2_accelerator_pilot_attempt08` 已由独立
