@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import replace
@@ -997,6 +998,62 @@ def test_stage052_trace_sink_async_pipeline_preserves_order_and_drains() -> None
         "completed_batches": 3,
         "peak_queued_batches": 1,
     }
+
+
+def test_async_pipeline_prepares_next_batch_while_writer_is_active() -> None:
+    writer_started = threading.Event()
+    release_writer = threading.Event()
+
+    class BlockingShard(_RecordingShard):
+        def append(self, **kwargs: object) -> int:
+            if not writer_started.is_set():
+                writer_started.set()
+                if not release_writer.wait(timeout=5.0):
+                    raise RuntimeError("test writer release timed out")
+            return super().append(**kwargs)
+
+    shard = BlockingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="wall_clock_30",
+        buffer_rows=2,
+        async_persistence=True,
+    )
+    for iteration in range(2):
+        sink.append_event(
+            {
+                "event_type": "operator_call",
+                "lane": "legacy",
+                "iteration": iteration,
+                "operator": "repair",
+            }
+        )
+    assert writer_started.wait(timeout=1.0)
+
+    producer_completed = threading.Event()
+
+    def append_while_writer_is_active() -> None:
+        sink.append_event(
+            {
+                "event_type": "operator_call",
+                "lane": "legacy",
+                "iteration": 2,
+                "operator": "repair",
+            }
+        )
+        producer_completed.set()
+
+    producer = threading.Thread(target=append_while_writer_is_active)
+    producer.start()
+    try:
+        assert producer_completed.wait(timeout=1.0)
+    finally:
+        release_writer.set()
+        producer.join(timeout=5.0)
+    assert not producer.is_alive()
+
+    sink.close()
+    assert [event["iteration"] for event in shard.events] == [0, 1, 2]
 
 
 def test_stage052_trace_sink_rejects_oversized_async_callback_batch() -> None:

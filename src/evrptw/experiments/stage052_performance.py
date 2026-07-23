@@ -3427,38 +3427,27 @@ class _BoundedShardAppender:
         return self._writer_cpu_nanoseconds
 
     def begin_producer_turn(self) -> None:
-        """Hold the shard turn until one producer callback is complete."""
+        """Serialize producer callbacks without waiting for the writer."""
 
         thread_id = threading.get_ident()
         if self._producer_turn_thread_id is not None:
             if self._producer_turn_thread_id != thread_id:
                 raise RuntimeError("Stage 5.2 trace producer thread changed")
             return
-        while True:
-            if self._submitted_batches != self._completed_batches:
-                self._queue.join()
-                self._raise_if_failed()
-                continue
-            self._write_turn.acquire()
-            if self._submitted_batches == self._completed_batches:
-                error = self._error
-                if error is not None:
-                    self._write_turn.release()
-                    raise error
-                self._producer_turn_thread_id = thread_id
-                return
-            self._write_turn.release()
+        self._raise_if_failed()
+        self._write_turn.acquire()
+        self._raise_if_failed()
+        self._producer_turn_thread_id = thread_id
 
     def end_producer_turn(self) -> None:
         if self._producer_turn_thread_id != threading.get_ident():
             raise RuntimeError("Stage 5.2 trace producer does not own the shard turn")
-        if self._submitted_batches != self._completed_batches:
-            self._release_producer_turn()
+        self._release_producer_turn()
 
     def wait_for_writer_turn(self) -> None:
         self._release_producer_turn()
-        with self._write_turn:
-            self._raise_if_failed()
+        self._queue.join()
+        self._raise_if_failed()
 
     def _release_producer_turn(self) -> None:
         owner = self._producer_turn_thread_id
@@ -3542,34 +3531,33 @@ class _BoundedShardAppender:
                 if not isinstance(queued, _QueuedCriticalBatch):
                     raise RuntimeError("Stage 5.2 async persistence batch is invalid")
                 batch = queued.rows
-                with self._write_turn:
-                    activity = self._meter.enter("writer")
-                    previous_switch_interval = sys.getswitchinterval()
-                    writer_wall_started_ns = time.perf_counter_ns()
-                    writer_cpu_started_ns = time.thread_time_ns()
-                    try:
-                        sys.setswitchinterval(0.05)
-                        digest = hashlib.sha256()
-                        for event in batch:
-                            digest.update(orjson.dumps(_pipeline_event_token(event)) + b"\n")
-                        persisted = self._shard.append(
-                            route_dictionary={},
-                            critical_events=batch,
-                            cache_lookups_coalesced=True,
-                        )
-                    finally:
-                        writer_cpu_elapsed_ns = time.thread_time_ns() - writer_cpu_started_ns
-                        writer_wall_elapsed_ns = time.perf_counter_ns() - writer_wall_started_ns
-                        # A coarse per-thread CPU clock can jump by one full tick
-                        # across a much shorter batch.  One thread cannot consume
-                        # more CPU than elapsed wall time, so preserve the physical
-                        # invariant instead of publishing a quantization artifact.
-                        self._writer_cpu_nanoseconds += min(
-                            writer_cpu_elapsed_ns,
-                            writer_wall_elapsed_ns,
-                        )
-                        sys.setswitchinterval(previous_switch_interval)
-                        self._meter.exit(activity)
+                activity = self._meter.enter("writer")
+                previous_switch_interval = sys.getswitchinterval()
+                writer_wall_started_ns = time.perf_counter_ns()
+                writer_cpu_started_ns = time.thread_time_ns()
+                try:
+                    sys.setswitchinterval(0.05)
+                    digest = hashlib.sha256()
+                    for event in batch:
+                        digest.update(orjson.dumps(_pipeline_event_token(event)) + b"\n")
+                    persisted = self._shard.append(
+                        route_dictionary={},
+                        critical_events=batch,
+                        cache_lookups_coalesced=True,
+                    )
+                finally:
+                    writer_cpu_elapsed_ns = time.thread_time_ns() - writer_cpu_started_ns
+                    writer_wall_elapsed_ns = time.perf_counter_ns() - writer_wall_started_ns
+                    # A coarse per-thread CPU clock can jump by one full tick
+                    # across a much shorter batch.  One thread cannot consume
+                    # more CPU than elapsed wall time, so preserve the physical
+                    # invariant instead of publishing a quantization artifact.
+                    self._writer_cpu_nanoseconds += min(
+                        writer_cpu_elapsed_ns,
+                        writer_wall_elapsed_ns,
+                    )
+                    sys.setswitchinterval(previous_switch_interval)
+                    self._meter.exit(activity)
                 if persisted != len(batch):
                     raise RuntimeError(
                         "Stage 5.2 trace sink did not persist its complete logical event batch"

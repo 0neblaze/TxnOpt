@@ -8,6 +8,22 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：G pilot attempt01 暴露 async producer/writer 串行化
+
+- `stage05.2_benchmark_attempt01` 完成 12 个 pilot shard 后由 producer gate 拒绝：
+  batch persistence ratio 为 `0.421537045`，超过修订后的 36% 门槛。该失败证据保留，
+  label 不复用。
+- attribution 显示 bounded async writer（有界异步写入器）仍在每次 solver callback
+  开始前等待上一批写完，使 producer preparation 与 Parquet writer 无法重叠。以
+  `c104C10/2014` 为例，194,918 个事件产生 3.284804 秒 solver-interleaved
+  persistence，其中 producer active 为 1.914229 秒、writer CPU 为 2.026477 秒；
+  两者原本可在 queue bound（队列上限）内安全重叠。
+- async pipeline 现在只串行化 producer callback 本身；单 writer 仍按 FIFO 写入，
+  queue 仍严格最多保留一个 waiting batch，失败仍 fail fast，finish/close 仍完整 drain。
+  已提交 batch 的 event mapping 和 prepared screening definition 均为 owned/immutable，
+  因此 writer 活跃时 producer 可准备下一批而不会共享可变 shard state。新增阻塞 writer
+  回归测试证明下一批 producer preparation 不等待 active writer，且最终顺序保持不变。
+
 ## 2026-07-23：E native screening differential 采用诊断专用精度
 
 - E 的独立 raw replay 显示 Python/native fixed-work 流的 event identity（事件身份）、
