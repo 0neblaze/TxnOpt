@@ -656,7 +656,9 @@ this repository or one of its subdirectories.
   Producer runtime identity must be replayed by the raw-bound frozen producer
   venv, never by the new reviewer wheel. The review-only WSL memory cap is
   audited separately as operational receipt evidence; only that live memory
-  field may differ from the historical producer identity, while CPU, GPU,
+  field may differ from the historical producer identity. The exact Chinese and
+  English CIM captions for Windows 11 Pro for Workstations are one locale-normalized
+  edition identity; every other Windows caption, CPU, GPU,
   Windows, WSL, mount, NVMe, wheel, Python, native, and dependency identities
   remain exact hard gates.
   A published `NOT_READY` review caused by reviewer/runtime defects must be

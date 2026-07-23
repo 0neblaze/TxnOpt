@@ -876,9 +876,23 @@ def _same_producer_machine_ignoring_review_memory(
 ) -> bool:
     """Compare producer hardware while excluding the review-only WSL memory cap."""
 
-    return {key: value for key, value in frozen.items() if key != "memory_bytes"} == {
-        key: value for key, value in current.items() if key != "memory_bytes"
-    }
+    def canonical(identity: Mapping[str, object]) -> dict[str, object]:
+        comparison = {
+            key: value for key, value in identity.items() if key != "memory_bytes"
+        }
+        windows = comparison.get("windows")
+        if isinstance(windows, Mapping):
+            canonical_windows = dict(windows)
+            caption = canonical_windows.get("Caption")
+            if caption in {
+                "Microsoft Windows 11 Pro for Workstations",
+                "Microsoft Windows 11 专业工作站版",
+            }:
+                canonical_windows["Caption"] = "windows_11_pro_for_workstations"
+            comparison["windows"] = canonical_windows
+        return comparison
+
+    return canonical(frozen) == canonical(current)
 
 
 def verify_frozen_stage052_producer_runtime_identity(

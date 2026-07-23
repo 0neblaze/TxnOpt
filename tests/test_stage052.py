@@ -3321,6 +3321,37 @@ def test_review_runtime_machine_comparison_excludes_only_wsl_memory_limit() -> N
     )
 
 
+def test_review_runtime_machine_comparison_normalizes_windows_caption_locale() -> None:
+    frozen = {
+        "execution_environment": "windows11_wsl2",
+        "windows": {
+            "Caption": "Microsoft Windows 11 专业工作站版",
+            "Version": "10.0.26200",
+            "BuildNumber": "26200",
+            "TotalVisibleMemorySize": 32629612,
+        },
+    }
+    current = {
+        **frozen,
+        "windows": {
+            **frozen["windows"],
+            "Caption": "Microsoft Windows 11 Pro for Workstations",
+        },
+    }
+
+    assert stage052_evidence._same_producer_machine_ignoring_review_memory(frozen, current)
+    assert not stage052_evidence._same_producer_machine_ignoring_review_memory(
+        frozen,
+        {
+            **current,
+            "windows": {
+                **current["windows"],
+                "Caption": "Microsoft Windows 11 Home",
+            },
+        },
+    )
+
+
 def test_runtime_signature_is_self_consistent_without_impersonating_producer() -> None:
     environment = {
         "python": {"version": "3.13.13", "implementation": "CPython"},

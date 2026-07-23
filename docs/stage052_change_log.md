@@ -35,6 +35,13 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   中 writer CPU 由约 `7.53` 秒降至 `6.22` 秒。两者只是修复诊断，不是晋级证据；
   后续必须以新 clean revision 重跑 F，再用全新 G label 完成 producer gate 和独立
   campaign replay。
+- 首次 F07 preflight（预检）在创建 raw 目录前重放 E15 runtime，发现 Windows CIM
+  `Caption` 从中文 `Microsoft Windows 11 专业工作站版` 变为英文
+  `Microsoft Windows 11 Pro for Workstations`；Version、BuildNumber、内存、CPU、
+  GPU、WSL、kernel、mount 和 NVMe identity 全部相同。这是 PowerShell locale
+  presentation drift（区域语言呈现漂移），不是机器变化。runtime comparison 只把这
+  两个精确 edition alias 规范成同一 canonical value；其他 Caption、Version 或硬件
+  变化仍 fail fast。由于预检没有创建 output directory，F07 label 尚未消耗。
 
 ## 2026-07-23：G pilot attempt05 保留失败并批量列式封装 sparse events
 
