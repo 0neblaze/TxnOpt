@@ -29,6 +29,7 @@ from evrptw.artifacts import (
 from evrptw.repository import repository_root
 from evrptw.stage052 import (
     STAGE052_MAXIMUM_PERSISTENCE_RATIO,
+    Stage052Component,
     Stage052PrerequisiteRequirement,
 )
 from evrptw.stage052_platform import read_windows_wsl_power_status
@@ -1706,6 +1707,32 @@ def verify_stage052_prerequisite(
     )
 
 
+def _verify_current_chain_review_file_surface(
+    current_review_files: Mapping[str, Path],
+    requirement: Stage052PrerequisiteRequirement,
+) -> None:
+    """Require the component-specific immutable review publication surface."""
+
+    if any(
+        len(Path(relative).parts) != 3
+        or Path(relative).parts[0] != "generations"
+        for relative in current_review_files
+    ):
+        raise ArtifactIntegrityError(
+            "current-chain prerequisite requires an immutable review generation"
+        )
+    if requirement.component is Stage052Component.BENCHMARK:
+        return
+    if {path.name for path in current_review_files.values()} != {
+        "review_findings.csv",
+        "review_report.md",
+        "semantic_mismatches.csv",
+    }:
+        raise ArtifactIntegrityError(
+            "current-chain prerequisite requires semantic_mismatches.csv"
+        )
+
+
 def verify_stage052_evidence_input(
     raw_dir: Path,
     requirement: Stage052PrerequisiteRequirement,
@@ -1731,22 +1758,7 @@ def verify_stage052_evidence_input(
     if not isinstance(review_payload, Mapping):
         raise ArtifactIntegrityError("current-chain review manifest is invalid")
     current_review_files = verify_stage052_review_files(raw_dir.resolve(), review_payload)
-    if any(
-        len(Path(relative).parts) != 3
-        or Path(relative).parts[0] != "generations"
-        for relative in current_review_files
-    ):
-        raise ArtifactIntegrityError(
-            "current-chain prerequisite requires an immutable review generation"
-        )
-    if {path.name for path in current_review_files.values()} != {
-        "review_findings.csv",
-        "review_report.md",
-        "semantic_mismatches.csv",
-    }:
-        raise ArtifactIntegrityError(
-            "current-chain prerequisite requires semantic_mismatches.csv"
-        )
+    _verify_current_chain_review_file_surface(current_review_files, requirement)
     reader = ArtifactReader(raw_dir.resolve())
     metadata_items = [
         item

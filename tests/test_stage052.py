@@ -518,6 +518,34 @@ def test_stage052_current_chain_prerequisites_reject_historical_physical_identit
         verify_stage052_evidence_input(tmp_path, requirement)
 
 
+def test_current_chain_campaign_uses_complete_campaign_review_generation() -> None:
+    requirement = stage052_contract(
+        Stage052Component.BENCHMARK, "formal"
+    ).prerequisites[0]
+    generation = "a" * 64
+    campaign_files = {
+        f"generations/{generation}/{name}": Path(name)
+        for name in (
+            "anytime_summary.csv",
+            "budget_summary.csv",
+            "failure_analysis.csv",
+            "family_summary.csv",
+            "gpu_decision.json",
+            "per_run_results.csv",
+            "performance_gates.csv",
+            "persistence_summary.csv",
+            "resource_summary.csv",
+            "review_findings.csv",
+            "review_report.md",
+        )
+    }
+
+    stage052_evidence._verify_current_chain_review_file_surface(
+        campaign_files,
+        requirement,
+    )
+
+
 def test_current_chain_prerequisite_replays_frozen_producer_runtime(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

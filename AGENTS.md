@@ -625,6 +625,10 @@ this repository or one of its subdirectories.
   `source_snapshot` is a mandatory common Pilot/Formal campaign review gate,
   including provisional Pilot publication; it may not exist only as an
   unregistered extra gate outside the exact gate-set contract.
+  Current-chain performance reviews require their three-file generation with
+  `semantic_mismatches.csv`; Benchmark campaign prerequisites instead require
+  the complete content-addressed campaign publication surface. The generic
+  verifier must not impose the performance-only mismatch filename on campaigns.
 - Formal review uses bounded Arrow batches and streaming iterators and rejects
   full-shard `to_pylist()`, `read_events()`, or `reconstruct_trace()`. It
   independently verifies exact campaign geometry, bidirectional descriptors,

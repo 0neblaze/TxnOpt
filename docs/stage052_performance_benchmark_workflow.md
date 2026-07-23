@@ -297,6 +297,9 @@ reviewer wheel 一起安装，并由 source attestation（源证明）和 clean 
 绑定；`python -I` service 不得从 working checkout 临时导入未密封工具。
 `source_snapshot` 是 Pilot/Formal 共用的 mandatory review gate（强制审查门槛），
 provisional Pilot publication 也必须在 exact gate set 中保留并通过该项。
+current-chain performance reviews 继续要求含 `semantic_mismatches.csv` 的三文件
+generation；Benchmark campaign prerequisite 使用其完整 content-addressed publication
+surface（内容寻址发布面），不得被通用 verifier 错套 performance-only 文件名。
 `--max-aggregate-rss-gib` 在 formal launch 中固定为 5.5，不得放宽。launcher 只接受
 `ArtifactReader` 解析出的 canonical signed raw manifest。科学 reviewer 写出的 READY 在
 `ExecStopPost` 完成前只是 provisional（暂定）；只有成功 receipt 已绑定当前

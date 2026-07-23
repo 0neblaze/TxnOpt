@@ -658,3 +658,14 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   gate。现将 `source_snapshot` 加入 Pilot/Formal common mandatory gate set；这会
   收紧 publisher/prerequisite 验证，不删除 gate、不降低门槛。该次 `NOT_READY`
   generation 与成功 finalized receipt 均保留，raw manifest 不变。
+- G16 18/18 gates 最终通过并发布
+  `READY_FOR_STAGE052_FORMAL_BENCHMARK`；review SHA-256 为
+  `7d87b8f7df84cadd04e73e5cc36a01c10b0cbf64496be70da175913091bbef73`，
+  raw SHA-256 仍为
+  `65c809ecc63b4a28d9f3fffc9548ce74605d07f18b2585403328e4ab8441bacf`。
+  Formal lock preflight 随后暴露 generic current-chain verifier 错把 performance review
+  专属的 `semantic_mismatches.csv` 强制用于 Benchmark campaign review；campaign
+  已由 `verify_stage052_review_files` 验证完整 11-file content-addressed generation，
+  不生成该 performance comparison 文件。verifier 现在按 component 区分：
+  performance 仍严格要求三文件 generation，Benchmark 要求已验证的完整 campaign
+  publication surface；不减少任何 campaign artifact 或 gate。
