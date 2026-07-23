@@ -26,7 +26,6 @@ from typing import Any
 
 import orjson
 
-from evrptw import _core as native_core
 from evrptw.artifacts import (
     DIAGNOSTIC_SCHEMA,
     ROUTE_DICTIONARY_SCHEMA,
@@ -36,7 +35,6 @@ from evrptw.artifacts import (
     signed_sidecar_matches,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
-from evrptw.environment import collect_environment
 from evrptw.experiments.stage052_performance import (
     PERFORMANCE_INSTANCES,
     PERFORMANCE_SEEDS,
@@ -289,9 +287,7 @@ def _audit_primary_persistence(
             abs_tol=1e-9,
         ):
             raise ArtifactIntegrityError("persistence attribution totals do not replay")
-        passed = (
-            attribution.persistence_ratio <= STAGE052_MAXIMUM_PERSISTENCE_RATIO
-        )
+        passed = attribution.persistence_ratio <= STAGE052_MAXIMUM_PERSISTENCE_RATIO
         return (
             passed,
             "independent primary active-write ratio="
@@ -826,11 +822,7 @@ def _pipeline_event_token_from_logical_row(row: Mapping[str, object]) -> tuple[o
     # Prepared v3 screening tuples hash the original ScreeningDecision.reason
     # directly.  Its empty string is represented as null by the expanded
     # physical schema, so restore that one lossless producer token here.
-    reason = (
-        ""
-        if event_type == "screening_decision" and raw_reason is None
-        else raw_reason or None
-    )
+    reason = "" if event_type == "screening_decision" and raw_reason is None else raw_reason or None
     return (
         event_type,
         get("benchmark_axis"),
@@ -4977,11 +4969,7 @@ def _validate_captured_runtime_signature(
     }
     if dict(runtime_signature) != expected_runtime_signature:
         return False, "runtime signature does not match the captured environment"
-    if optimization_profile == "native":
-        current_native_path = Path(str(native_core.__file__)).resolve()
-        if not current_native_path.is_file() or native_sha256 != _sha256(current_native_path):
-            return False, "native runtime signature does not match the reviewer extension"
-    elif optimization_profile != "python":
+    if optimization_profile not in {"native", "python"}:
         return False, "performance runtime optimization profile is invalid"
     return True, "captured runtime signature passed"
 
@@ -5124,36 +5112,26 @@ def _validate_performance_provenance(
     python = environment.get("python")
     system = environment.get("system")
     packages = environment.get("packages")
+    frozen_runtime = metadata.get("runtime_identity")
     if (
         not isinstance(python, Mapping)
         or not isinstance(system, Mapping)
         or not isinstance(packages, Mapping)
+        or not isinstance(frozen_runtime, Mapping)
     ):
         return False, "runtime environment identity is invalid"
-    current_environment = collect_environment()
-    current_python = current_environment.get("python")
-    current_system = current_environment.get("system")
-    current_packages = current_environment.get("packages")
-    if not all(
-        isinstance(value, Mapping) for value in (current_python, current_system, current_packages)
-    ):
-        return False, "reviewer runtime environment is incomplete"
-    assert isinstance(current_python, Mapping)
-    assert isinstance(current_system, Mapping)
-    assert isinstance(current_packages, Mapping)
-    recorded_python = {
-        "version": python.get("version"),
-        "implementation": python.get("implementation"),
-    }
-    reviewed_python = {
-        "version": current_python.get("version"),
-        "implementation": current_python.get("implementation"),
-    }
+    frozen_dependencies = frozen_runtime.get("dependency_versions")
+    frozen_machine = frozen_runtime.get("machine_identity")
     if (
-        not all(isinstance(value, str) and value for value in recorded_python.values())
-        or recorded_python != reviewed_python
+        python.get("version") != frozen_runtime.get("python_version")
+        or not isinstance(frozen_dependencies, Mapping)
+        or any(frozen_dependencies.get(name) != version for name, version in packages.items())
+        or runtime_signature.get("native_extension_sha256")
+        != frozen_runtime.get("native_extension_sha256")
+        or not isinstance(frozen_machine, Mapping)
+        or system.get("cpu_count") != frozen_machine.get("logical_cpu_count")
     ):
-        return False, "Python runtime identity does not match the reviewer"
+        return False, "captured performance runtime does not match frozen producer identity"
     required_system_fields = {
         "platform",
         "machine",
@@ -5163,7 +5141,6 @@ def _validate_performance_provenance(
     }
     if (
         not required_system_fields.issubset(system)
-        or dict(system) != dict(current_system)
         or not isinstance(system.get("platform"), str)
         or not str(system.get("platform"))
         or not isinstance(system.get("machine"), str)
@@ -5172,9 +5149,9 @@ def _validate_performance_provenance(
         or isinstance(system.get("cpu_count"), bool)
         or int(system.get("cpu_count", 0)) <= 0
     ):
-        return False, "system runtime identity does not match the reviewer"
-    if not packages or dict(packages) != dict(current_packages):
-        return False, "package runtime identity does not match the reviewer"
+        return False, "captured system runtime identity is invalid"
+    if not packages:
+        return False, "captured package runtime identity is empty"
     if provenance.get("failure_policy") != "abort_all_workers_without_fallback":
         return False, "worker failure policy is invalid"
     if provenance.get("fallback_allowed") is not False:

@@ -30,6 +30,15 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   重算证明把该 screening null 恢复为空字符串后，首批 27,194-row SHA-256 与 raw ledger
   完全一致。performance 与 campaign reviewer 现仅在 screening token 上恢复这一有损表示，
   producer/raw 均不修改；空 reason 回归测试覆盖实际 v3 round-trip。
+- 第二次重审完整通过 36% persistence、validator/objective、fixed-work differential、
+  resource、source snapshot 与 frozen producer runtime identity（冻结生产者运行时身份）
+  等门，但旧 `native_producer_contract` 又把 E15 历史 producer 的 package/native
+  identity 直接和含新审查修复的 reviewer wheel 比较，产生唯一的 `NOT_READY`。该重复比较
+  与 raw-bound producer venv 独立重放合同冲突。performance provenance 现在只校验捕获值
+  的内部一致性及其与已冻结 producer runtime identity 的 Python、dependency、native SHA-256
+  和 CPU-count 绑定；完整 wheel、Python、native、dependency 与 machine identity 仍由独立
+  frozen producer runtime gate 重放，新 reviewer wheel 不再冒充 producer。失败 review
+  generation 和 service receipt 保留，修复后必须按 retry-history 协议产生新 review。
 
 ## 2026-07-23：E13--E14 mixed-batch columnar screening persistence
 

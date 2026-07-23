@@ -316,9 +316,7 @@ def test_batch_persistence_envelope_uses_v2_and_reads_v1_threshold_metadata() ->
     )
 
     current_payload = envelope.to_dict()
-    assert current_payload["schema_version"] == (
-        "stage05.2-batch-persistence-envelope-v2"
-    )
+    assert current_payload["schema_version"] == ("stage05.2-batch-persistence-envelope-v2")
     assert current_payload["maximum_persistence_ratio"] == pytest.approx(0.36)
     assert BatchPersistenceEnvelope.from_dict(current_payload).persistence_ratio == (
         pytest.approx(0.35)
@@ -1145,12 +1143,8 @@ def test_artifact_persistence_gate_uses_verified_solver_plus_new_persistence() -
 
 
 def test_artifact_persistence_gate_uses_the_36_percent_boundary() -> None:
-    passing = evaluate_artifact_persistence(
-        (ArtifactPersistenceObservation(65.0, 35.0),)
-    )
-    failing = evaluate_artifact_persistence(
-        (ArtifactPersistenceObservation(63.0, 37.0),)
-    )
+    passing = evaluate_artifact_persistence((ArtifactPersistenceObservation(65.0, 35.0),))
+    failing = evaluate_artifact_persistence((ArtifactPersistenceObservation(63.0, 37.0),))
 
     assert passing.passed
     assert passing.maximum_ratio == pytest.approx(0.36)
@@ -3136,6 +3130,111 @@ def test_performance_provenance_records_inputs_without_secret_environment(
     assert provenance["fallback_allowed"] is False
 
 
+def test_performance_provenance_is_bound_to_captured_producer_not_reviewer(
+    tmp_path: Path,
+) -> None:
+    repository_root = tmp_path / "repository"
+    benchmark_dir = repository_root / "data" / "schneider"
+    config_dir = repository_root / "configs"
+    benchmark_dir.mkdir(parents=True)
+    config_dir.mkdir()
+    instance_hashes: dict[str, str] = {}
+    for instance in stage052_review.PERFORMANCE_INSTANCES:
+        path = benchmark_dir / f"{instance}.txt"
+        path.write_text(instance, encoding="utf-8")
+        instance_hashes[instance] = hashlib.sha256(path.read_bytes()).hexdigest()
+    stage02 = config_dir / "stage02_constraint_guided.toml"
+    stage04 = config_dir / "stage04_weights.toml"
+    stage02.write_text("stage02", encoding="utf-8")
+    stage04.write_text("stage04", encoding="utf-8")
+    producer_native = tmp_path / "producer_core.so"
+    producer_native.write_bytes(b"producer-native")
+    producer_environment = {
+        "python": {"version": "3.13.13", "implementation": "CPython"},
+        "system": {
+            "platform": "Linux-producer",
+            "machine": "x86_64",
+            "processor": "x86_64",
+            "cpu_count": 24,
+            "gpu_used": False,
+        },
+        "packages": {"numpy": "2.4.1", "pyarrow": "23.0.1"},
+        "native_extension": str(producer_native),
+    }
+    provenance = {
+        "schema_version": "stage05.2-performance-provenance-v1",
+        "instance_sha256": instance_hashes,
+        "warm_start": {"enabled": False, "source": None},
+        "operator_surface": {
+            "operator_profile": "stage02_constraint_guided",
+            "stage02_config_sha256": hashlib.sha256(stage02.read_bytes()).hexdigest(),
+            "stage04_config_sha256": hashlib.sha256(stage04.read_bytes()).hexdigest(),
+        },
+        "fixed_work_contract": {
+            "exact_call_budget": 100,
+            "watchdog_seconds": 120.0,
+            "max_iterations": 1000,
+            "batch_size": 128,
+            "backend": "cpu_batch",
+        },
+        "worker_affinity": {"supported": True, "cpu_ids": [0, 1]},
+        "environment_variables": {
+            name: None for name in stage052_review._PERFORMANCE_ENVIRONMENT_VARIABLES
+        },
+        "background_load": {
+            "load_average": [0.1, 0.2, 0.3],
+            "process_status_counts": {"running": 1},
+        },
+        "power_mode": {
+            "available": True,
+            "source": "AC Power",
+            "low_power_mode": 0,
+        },
+        "runtime_signature": {
+            "python": producer_environment["python"],
+            "system": producer_environment["system"],
+            "packages": producer_environment["packages"],
+            "native_extension_sha256": hashlib.sha256(producer_native.read_bytes()).hexdigest(),
+        },
+        "failure_policy": "abort_all_workers_without_fallback",
+        "fallback_allowed": False,
+    }
+    metadata = {
+        "environment": producer_environment,
+        "optimization_profile": "native",
+        "performance_provenance": provenance,
+        "runtime_identity": {
+            "python_version": "3.13.13",
+            "dependency_versions": producer_environment["packages"],
+            "native_extension_sha256": provenance["runtime_signature"]["native_extension_sha256"],
+            "machine_identity": {"logical_cpu_count": 24},
+        },
+    }
+    passed, detail = stage052_review._validate_performance_provenance(
+        metadata,
+        benchmark_dir=benchmark_dir,
+    )
+
+    assert passed, detail
+    assert detail == "performance provenance passed"
+    mismatched = {
+        **metadata,
+        "performance_provenance": {
+            **provenance,
+            "runtime_signature": {
+                **provenance["runtime_signature"],
+                "packages": {"numpy": "tampered"},
+            },
+        },
+    }
+    passed, detail = stage052_review._validate_performance_provenance(
+        mismatched,
+        benchmark_dir=benchmark_dir,
+    )
+    assert not passed
+    assert detail == "runtime signature does not match the captured environment"
+
+
 def test_stage052_runtime_identity_binds_wheel_python_native_and_dependencies(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3219,9 +3318,7 @@ def test_review_runtime_machine_comparison_excludes_only_wsl_memory_limit() -> N
     )
 
 
-def test_runtime_signature_allows_historical_python_binary_but_binds_native_profile(
-    tmp_path: Path,
-) -> None:
+def test_runtime_signature_is_self_consistent_without_impersonating_producer() -> None:
     environment = {
         "python": {"version": "3.13.13", "implementation": "CPython"},
         "system": {"machine": "arm64"},
@@ -3246,31 +3343,15 @@ def test_runtime_signature_allows_historical_python_binary_but_binds_native_prof
         runtime_signature=historical_signature,
         optimization_profile="native",
     )
+    assert passed, detail
+
+    passed, detail = stage052_review._validate_captured_runtime_signature(
+        environment=environment,
+        runtime_signature=historical_signature,
+        optimization_profile="unknown",
+    )
     assert not passed
-    assert "reviewer extension" in detail
-
-    current_extension = Path(stage052_review.native_core.__file__).resolve()
-    current_environment = {**environment, "native_extension": str(current_extension)}
-    current_signature = {
-        **historical_signature,
-        "native_extension_sha256": hashlib.sha256(current_extension.read_bytes()).hexdigest(),
-    }
-    passed, detail = stage052_review._validate_captured_runtime_signature(
-        environment=current_environment,
-        runtime_signature=current_signature,
-        optimization_profile="native",
-    )
-    assert passed, detail
-
-    separate_install = tmp_path / current_extension.name
-    separate_install.write_bytes(current_extension.read_bytes())
-    separate_environment = {**environment, "native_extension": str(separate_install)}
-    passed, detail = stage052_review._validate_captured_runtime_signature(
-        environment=separate_environment,
-        runtime_signature=current_signature,
-        optimization_profile="native",
-    )
-    assert passed, detail
+    assert "optimization profile" in detail
 
     malformed = {**historical_signature, "native_extension_sha256": "not-a-hash"}
     passed, _ = stage052_review._validate_captured_runtime_signature(
