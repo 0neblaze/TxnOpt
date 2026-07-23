@@ -55,9 +55,10 @@ SCREENING_DEFINITION_HOT_CACHE_ENTRIES = 524_288
 SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES = 1_200_000
 ROUTE_IDENTITY_COUNTER_NAMESPACES = 16
 MAX_SCREENING_CHECKS_PER_DECISION = 8
-# Keep live definition/occurrence transactions below one 65,536-row Parquet
+# Keep live definition/occurrence transactions at or below one 65,536-row Parquet
 # group while amortising collision checks and typed-column appends.
 LIVE_SCREENING_TRANSACTION_ROWS = 8_192
+LIVE_PREPARED_SCREENING_TRANSACTION_ROWS = V2_PARQUET_ROW_GROUP_SIZE
 UNIQUE_ROUTE_IDENTITY_SEMANTICS = frozenset(
     {"legacy_started", "completed_shared", "completed_lane"}
 )
@@ -107,8 +108,7 @@ def signed_sidecar_matches(path: Path, sidecar: Path | None = None) -> bool:
         not 1 <= len(digests) <= 2
         or len(set(digests)) != len(digests)
         or any(
-            len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)
+            len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest)
             for digest in digests
         )
     ):
@@ -147,14 +147,10 @@ def atomic_write_signed_json(
         previous_payload = candidate_payload
         previous_sidecar = candidate_sidecar
     previous_digest = (
-        hashlib.sha256(previous_payload).hexdigest()
-        if previous_payload is not None
-        else None
+        hashlib.sha256(previous_payload).hexdigest() if previous_payload is not None else None
     )
     transition_digests = tuple(
-        dict.fromkeys(
-            item for item in (previous_digest, digest) if item is not None
-        )
+        dict.fromkeys(item for item in (previous_digest, digest) if item is not None)
     )
     payload_replaced = False
     sidecar_replaced = False
@@ -187,9 +183,7 @@ def atomic_write_signed_json(
                 sidecar.unlink(missing_ok=True)
             else:
                 rollback_payload = path.with_name(f".{path.name}.{os.getpid()}.rollback")
-                rollback_sidecar = sidecar.with_name(
-                    f".{sidecar.name}.{os.getpid()}.rollback"
-                )
+                rollback_sidecar = sidecar.with_name(f".{sidecar.name}.{os.getpid()}.rollback")
                 try:
                     with rollback_payload.open("xb") as handle:
                         handle.write(previous_payload)
@@ -1107,9 +1101,7 @@ def _normalise_event_values(
     lane_ids: Mapping[str, int],
     operator_ids: Mapping[str, int],
     neighborhood_extras_cache: dict[tuple[object, ...], str] | None = None,
-    neighborhood_row_cache: dict[
-        tuple[object, ...], tuple[object, ...]
-    ] | None = None,
+    neighborhood_row_cache: dict[tuple[object, ...], tuple[object, ...]] | None = None,
 ) -> tuple[object, ...]:
     if (
         event.get("event_type", event.get("record_type")) == "neighborhood_event"
@@ -1123,10 +1115,7 @@ def _normalise_event_values(
             extras_cache=neighborhood_extras_cache,
             row_cache=neighborhood_row_cache,
         )
-    if (
-        event.get("event_type") == "cache_event"
-        and event.keys() <= _CACHE_EVENT_FAST_FIELDS
-    ):
+    if event.get("event_type") == "cache_event" and event.keys() <= _CACHE_EVENT_FAST_FIELDS:
         return _normalise_sparse_route_event_values(
             event,
             event_id=event_id,
@@ -1176,12 +1165,8 @@ def _normalise_general_event_values(
         return tuple(row.get(name) for name in EVENTS_SCHEMA.names)
     route_id = _route_id(get("route_key", get("route_id")), route_ids)
     base_route_id = _route_id(get("base_route_key", get("base_route_id")), route_ids)
-    candidate_route_id = _route_id(
-        get("candidate_route_key", get("candidate_route_id")), route_ids
-    )
-    current_route_ids = _route_ids(
-        get("current_route_keys", get("current_route_ids")), route_ids
-    )
+    candidate_route_id = _route_id(get("candidate_route_key", get("candidate_route_id")), route_ids)
+    current_route_ids = _route_ids(get("current_route_keys", get("current_route_ids")), route_ids)
     candidate_route_ids = _route_ids(
         get("candidate_route_keys", get("candidate_route_ids")), route_ids
     )
@@ -1340,9 +1325,7 @@ def _normalise_screening_event(
 
 def _compact_screening_check_key(check: Mapping[str, object]) -> tuple[object, ...]:
     value = check.get("value")
-    already_compact = any(
-        field in check for field in ("value_bool", "value_float", "value_text")
-    )
+    already_compact = any(field in check for field in ("value_bool", "value_float", "value_text"))
     return (
         str(check.get("check", "")),
         str(check.get("status", "")),
@@ -1372,8 +1355,8 @@ def _normalise_compact_screening_checks(
     for check in checks:
         if not isinstance(check, Mapping):
             continue
-        name, status, value_bool, value_float, value_text, reason = (
-            _compact_screening_check_key(check)
+        name, status, value_bool, value_float, value_text, reason = _compact_screening_check_key(
+            check
         )
         output.append(
             {
@@ -1393,6 +1376,33 @@ class PrecomputedScreeningDefinition:
     """Trusted typed cache-key tail produced by the live measurement bridge."""
 
     tail: tuple[object, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedScreeningDefinition:
+    """Stable v3 definition context prepared once by the live bridge."""
+
+    tail: tuple[object, ...]
+    route_key: str
+    lane: str
+    operator: str
+
+
+def prepare_screening_definition(
+    definition: PrecomputedScreeningDefinition,
+    *,
+    route_key: str,
+    lane: str,
+    operator: str,
+) -> PreparedScreeningDefinition:
+    """Bind reusable route/lane/operator context without expanding its payload."""
+
+    return PreparedScreeningDefinition(
+        tail=definition.tail,
+        route_key=route_key,
+        lane=lane,
+        operator=operator,
+    )
 
 
 # Preserve the prior private spelling for historical malicious-payload tests and
@@ -1418,7 +1428,7 @@ type BufferedScreeningDecision = tuple[
     str,
     float,
     float,
-    PrecomputedScreeningDefinition,
+    PrecomputedScreeningDefinition | PreparedScreeningDefinition,
 ]
 
 
@@ -1432,9 +1442,7 @@ def _screening_definition_cache_key(
     raw_checks = payload.get("checks")
     checks = raw_checks if isinstance(raw_checks, (list, tuple)) else ()
     if len(checks) > MAX_SCREENING_CHECKS_PER_DECISION:
-        raise ArtifactIntegrityError(
-            "one screening decision exceeds the fixed eight-check domain"
-        )
+        raise ArtifactIntegrityError("one screening decision exceeds the fixed eight-check domain")
     return (
         lane_id,
         operator_id,
@@ -1452,9 +1460,7 @@ def _screening_definition_cache_key(
         _as_bool(payload.get("single_segment_reachable")),
         _as_float(payload.get("structural_energy_lower_bound")),
         tuple(
-            _compact_screening_check_key(check)
-            for check in checks
-            if isinstance(check, Mapping)
+            _compact_screening_check_key(check) for check in checks if isinstance(check, Mapping)
         ),
     )
 
@@ -1468,9 +1474,7 @@ def _screening_definition_from_cache_key(
     if not isinstance(raw_checks, tuple):
         raise ArtifactIntegrityError("screening definition cache key checks are invalid")
     if len(raw_checks) > MAX_SCREENING_CHECKS_PER_DECISION:
-        raise ArtifactIntegrityError(
-            "one screening decision exceeds the fixed eight-check domain"
-        )
+        raise ArtifactIntegrityError("one screening decision exceeds the fixed eight-check domain")
     checks: list[dict[str, object]] = []
     for raw_check in raw_checks:
         if not isinstance(raw_check, tuple) or len(raw_check) != 6:
@@ -1516,9 +1520,7 @@ def _normalise_screening_definition(
     raw_checks = payload.get("checks")
     checks = raw_checks if isinstance(raw_checks, (list, tuple)) else ()
     if len(checks) > MAX_SCREENING_CHECKS_PER_DECISION:
-        raise ArtifactIntegrityError(
-            "one screening decision exceeds the fixed eight-check domain"
-        )
+        raise ArtifactIntegrityError("one screening decision exceeds the fixed eight-check domain")
     resolved_lane_id = lane_id if lane_id is not None else _as_int(payload.get("lane_id"))
     resolved_operator_id = (
         operator_id if operator_id is not None else _as_int(payload.get("operator_id"))
@@ -1694,15 +1696,9 @@ class _BoundedScreeningDefinitionStore:
                 for definition_id, definition in unique.items()
                 if definition_id not in existing_memory
             )
-            if (
-                len(self._digest_memory) + len(inserted_memory)
-                <= self._memory_entries
-            ):
+            if len(self._digest_memory) + len(inserted_memory) <= self._memory_entries:
                 self._digest_memory.update(
-                    {
-                        definition.definition_id: definition.digest
-                        for definition in inserted_memory
-                    }
+                    {definition.definition_id: definition.digest for definition in inserted_memory}
                 )
                 if self._retain_payload:
                     self._encoded_memory.update(
@@ -1762,17 +1758,13 @@ class _BoundedScreeningDefinitionStore:
         else:
             connection = self._connection
             if connection is None:
-                raise ArtifactIntegrityError(
-                    "screening row references an unknown definition"
-                )
+                raise ArtifactIntegrityError("screening row references an unknown definition")
             stored = connection.execute(
-            "SELECT payload FROM definitions WHERE definition_id = ?",
-            (definition_id,),
+                "SELECT payload FROM definitions WHERE definition_id = ?",
+                (definition_id,),
             ).fetchone()
             if stored is None:
-                raise ArtifactIntegrityError(
-                    "screening row references an unknown definition"
-                )
+                raise ArtifactIntegrityError("screening row references an unknown definition")
             if stored[0] is None:
                 raise ArtifactIntegrityError("screening definition payload was not retained")
             stored_payload = bytes(stored[0])
@@ -1926,9 +1918,7 @@ def _expand_screening_decision_row(
             raise ArtifactIntegrityError("compact screening checks_json is invalid") from error
     compact_checks = raw_checks if isinstance(raw_checks, (list, tuple)) else ()
     if len(compact_checks) > MAX_SCREENING_CHECKS_PER_DECISION:
-        raise ArtifactIntegrityError(
-            "one screening decision exceeds the fixed eight-check domain"
-        )
+        raise ArtifactIntegrityError("one screening decision exceeds the fixed eight-check domain")
     extras = {
         key: expanded_row.get(key)
         for key in (
@@ -2204,9 +2194,7 @@ class _StreamingParquetSink:
             return
         width = len(self._columns)
         invalid_width = (
-            len(rows[0]) != width
-            if trusted_width
-            else any(len(row) != width for row in rows)
+            len(rows[0]) != width if trusted_width else any(len(row) != width for row in rows)
         )
         if invalid_width:
             raise ArtifactIntegrityError(
@@ -3887,11 +3875,7 @@ def _verify_post_manifest_persistence_envelopes(
         else f"{run_label}_persistence_attribution"
     )
     candidates = (
-        [
-            path
-            for path in control.glob(f"{run_label}*_persistence_attribution.*")
-            if path.is_file()
-        ]
+        [path for path in control.glob(f"{run_label}*_persistence_attribution.*") if path.is_file()]
         if control.is_dir()
         else []
     )
@@ -3937,9 +3921,7 @@ def _verify_post_manifest_persistence_envelopes(
                 "batch persistence envelope is only valid at a canonical batch root"
             )
         if not batch_payload.is_file() or not batch_sidecar.is_file():
-            raise ArtifactIntegrityError(
-                "batch persistence envelope must include JSON and sidecar"
-            )
+            raise ArtifactIntegrityError("batch persistence envelope must include JSON and sidecar")
         if not signed_sidecar_matches(batch_payload, batch_sidecar):
             raise ArtifactIntegrityError("batch persistence envelope sidecar hash mismatch")
         try:
@@ -3948,8 +3930,7 @@ def _verify_post_manifest_persistence_envelopes(
             raise ArtifactIntegrityError("batch persistence envelope JSON is invalid") from error
         if (
             not isinstance(decoded_payload, Mapping)
-            or decoded_payload.get("schema_version")
-            != "stage05.2-batch-persistence-envelope-v1"
+            or decoded_payload.get("schema_version") != "stage05.2-batch-persistence-envelope-v1"
             or decoded_payload.get("run_label") != run_label
             or decoded_payload.get("batch_id") != expected_subject
         ):
@@ -4032,10 +4013,7 @@ def _verify_post_manifest_persistence_envelopes(
             or set(volume) != {"device_uuid", "filesystem"}
             or not all(isinstance(value, str) and value for value in volume.values())
             or batch_state.get("failure_reason") is not None
-            or (
-                status == "verified"
-                and (transfer_mode is not None or archive_seconds is not None)
-            )
+            or (status == "verified" and (transfer_mode is not None or archive_seconds is not None))
             or (
                 status == "archived"
                 and (
@@ -4080,8 +4058,7 @@ def _verify_post_manifest_persistence_envelopes(
             raise ArtifactIntegrityError("campaign manifest JSON is invalid") from error
         if (
             not isinstance(campaign_state, Mapping)
-            or campaign_state.get("schema_version")
-            != "stage05.2-campaign-manifest-v1"
+            or campaign_state.get("schema_version") != "stage05.2-campaign-manifest-v1"
             or campaign_state.get("run_label") != run_label
             or campaign_state.get("status") not in {"planned", "complete", "failed"}
         ):
@@ -4196,11 +4173,7 @@ class _DiskBackedRouteKeyStore(Mapping[int, str]):
         require_canonical_key: bool,
     ) -> None:
         raw_route_id = row.get("route_id")
-        if (
-            isinstance(raw_route_id, bool)
-            or not isinstance(raw_route_id, int)
-            or raw_route_id <= 0
-        ):
+        if isinstance(raw_route_id, bool) or not isinstance(raw_route_id, int) or raw_route_id <= 0:
             raise ArtifactIntegrityError("route dictionary ID must be a positive integer")
         route_key = row.get("canonical_route_key")
         raw_sequence = row.get("customer_sequence")
@@ -4222,9 +4195,7 @@ class _DiskBackedRouteKeyStore(Mapping[int, str]):
                 (raw_route_id, route_key),
             )
         except sqlite3.IntegrityError as error:
-            raise ArtifactIntegrityError(
-                "route dictionary IDs and keys must be unique"
-            ) from error
+            raise ArtifactIntegrityError("route dictionary IDs and keys must be unique") from error
         self._route_count += 1
         self._remember(raw_route_id, route_key)
 
@@ -4356,9 +4327,7 @@ class _DiskBackedRouteIdentityStore(Mapping[int, str]):
             previous = None
         if previous is not None:
             if previous != route_digest:
-                raise ArtifactIntegrityError(
-                    f"stable route ID collision for route ID {route_id}"
-                )
+                raise ArtifactIntegrityError(f"stable route ID collision for route ID {route_id}")
             return False
         self._connection.execute(
             "INSERT INTO routes(route_id, digest) VALUES (?, ?)",
@@ -4564,13 +4533,12 @@ class ArtifactV2ShardSession:
         self._resolved_route_ids: OrderedDict[str, int] = OrderedDict()
         self._lane_ids: dict[str, int] = {}
         self._operator_ids: dict[str, int] = {}
-        self._screening_definition_cache: dict[
-            tuple[object, ...], tuple[object, int]
-        ] = {}
+        self._screening_definition_cache: dict[tuple[object, ...], tuple[object, int]] = {}
+        self._prepared_screening_definition_cache: OrderedDict[
+            int, tuple[PreparedScreeningDefinition, int]
+        ] = OrderedDict()
         self._neighborhood_extras_cache: dict[tuple[object, ...], str] = {}
-        self._neighborhood_row_cache: dict[
-            tuple[object, ...], tuple[object, ...]
-        ] = {}
+        self._neighborhood_row_cache: dict[tuple[object, ...], tuple[object, ...]] = {}
         self._screening_definition_store: _BoundedScreeningDefinitionStore | None = None
         self._pending_route_rows: list[tuple[object, ...]] = []
         self._pending_check_rows: list[tuple[object, ...]] = []
@@ -4622,9 +4590,7 @@ class ArtifactV2ShardSession:
                 if self._screening_definition_store is None:
                     raise RuntimeError("screening definition store is unavailable")
                 inserted = self._screening_definition_store.register_many(candidates)
-                definitions = tuple(
-                    candidate.row for candidate in inserted
-                )
+                definitions = tuple(candidate.row for candidate in inserted)
                 self._append_buffered_value_rows(
                     self._screening_definitions_sink,
                     definitions,
@@ -4652,9 +4618,100 @@ class ArtifactV2ShardSession:
                     raise RuntimeError("buffered screening decisions require v3 storage")
                 event_id = next_event_id
                 next_event_id += 1
+                if isinstance(event[7], PreparedScreeningDefinition):
+                    prepared = event[7]
+                    if (
+                        prepared.route_key != event[1]
+                        or prepared.lane != event[2]
+                        or prepared.operator != event[4]
+                    ):
+                        raise ArtifactIntegrityError(
+                            "prepared screening definition context mismatch"
+                        )
+                    cache_key = id(prepared)
+                    prepared_cached = self._prepared_screening_definition_cache.get(cache_key)
+                    definition: _PendingScreeningDefinition | None = None
+                    if prepared_cached is None:
+                        lane_id = self._lane_ids.get(event[2])
+                        if lane_id is None:
+                            lane_id = _stable_dictionary_id(f"lane:{event[2]}")
+                            self._lane_ids[event[2]] = lane_id
+                        operator_id = self._operator_ids.get(event[4])
+                        if operator_id is None:
+                            operator_id = _stable_dictionary_id(f"operator:{event[4]}")
+                            self._operator_ids[event[4]] = operator_id
+                        route_id = self._resolve_route_id(event[1])
+                        definition_payload = _screening_definition_from_cache_key(
+                            (lane_id, operator_id, route_id, *prepared.tail)
+                        )
+                        definition_id, encoded, digest = _screening_definition_identity(
+                            definition_payload
+                        )
+                        self._prepared_screening_definition_cache[cache_key] = (
+                            prepared,
+                            definition_id,
+                        )
+                        if (
+                            len(self._prepared_screening_definition_cache)
+                            > SCREENING_DEFINITION_HOT_CACHE_ENTRIES
+                        ):
+                            self._prepared_screening_definition_cache.popitem(last=False)
+                        if route_id not in self._route_digests:
+                            self._register_route(
+                                event[1],
+                                _route_sequence_from_key(event[1]),
+                                route_id=route_id,
+                                validate_key=False,
+                            )
+                        definition = _PendingScreeningDefinition(
+                            definition_id=definition_id,
+                            encoded=encoded,
+                            digest=digest,
+                            payload=definition_payload,
+                            row=(
+                                definition_id,
+                                *(
+                                    definition_payload[name]
+                                    for name in V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]
+                                ),
+                            ),
+                        )
+                        if self._screening_definition_store is None:
+                            self._screening_definition_store = _BoundedScreeningDefinitionStore(
+                                cache_entries=1,
+                                scratch_root=self._directory,
+                                retain_payload=False,
+                            )
+                    else:
+                        if prepared_cached[0] is not prepared:
+                            raise ArtifactIntegrityError(
+                                "prepared screening definition object identity collision"
+                            )
+                        definition_id = prepared_cached[1]
+                    pending_screening_occurrences.append(
+                        (
+                            event_id,
+                            definition_id,
+                            event[5],
+                            event[6],
+                            event[3],
+                            event[0],
+                        )
+                    )
+                    if definition is not None:
+                        pending_screening_definitions.append(definition)
+                    pending_count = len(pending_screening_occurrences)
+                    self._max_pending_screening_transaction_rows_observed = max(
+                        self._max_pending_screening_transaction_rows_observed,
+                        pending_count,
+                    )
+                    if pending_count >= LIVE_PREPARED_SCREENING_TRANSACTION_ROWS:
+                        flush_screening_transaction()
+                    count += 1
+                    continue
                 compact_key = (event[2], event[4], event[1], id(event[7]))
-                cached_entry = self._screening_definition_cache.get(compact_key)
-                if cached_entry is None:
+                legacy_cached = self._screening_definition_cache.get(compact_key)
+                if legacy_cached is None:
                     occurrence, definition = self._buffered_screening_decision_row(
                         event,
                         event_id=event_id,
@@ -4663,7 +4720,7 @@ class ArtifactV2ShardSession:
                 else:
                     occurrence = (
                         event_id,
-                        cached_entry[1],
+                        legacy_cached[1],
                         event[5],
                         event[6],
                         event[3],
@@ -4707,10 +4764,7 @@ class ArtifactV2ShardSession:
                 self._operator_ids[operator] = _stable_dictionary_id(f"operator:{operator}")
             if not screening_event:
                 _validate_event_routes(event, event_route_ids)
-            if (
-                event_type == "route_evaluation"
-                and event_get("kind") == "exact_call"
-            ):
+            if event_type == "route_evaluation" and event_get("kind") == "exact_call":
                 self._register_unique_route_evaluation_identity(event)
             event_id = next_event_id
             next_event_id += 1
@@ -4756,10 +4810,7 @@ class ArtifactV2ShardSession:
                     self._append_buffered(screening_sink, normalized_event)
                 if screening_definition is not None:
                     pending_screening_definitions.append(screening_definition)
-                if (
-                    len(pending_screening_occurrences)
-                    >= LIVE_SCREENING_TRANSACTION_ROWS
-                ):
+                if len(pending_screening_occurrences) >= LIVE_SCREENING_TRANSACTION_ROWS:
                     flush_screening_transaction()
             else:
                 if not isinstance(normalized_event, tuple):
@@ -4780,8 +4831,7 @@ class ArtifactV2ShardSession:
                         )
                         self._pending_check_rows.append(
                             tuple(
-                                normalized_check.get(name)
-                                for name in SCREENING_CHECKS_SCHEMA.names
+                                normalized_check.get(name) for name in SCREENING_CHECKS_SCHEMA.names
                             )
                         )
                         if len(self._pending_check_rows) >= V2_PARQUET_ROW_GROUP_SIZE:
@@ -4823,8 +4873,8 @@ class ArtifactV2ShardSession:
                 validate_key=False,
             )
         definition = _screening_definition_from_cache_key(definition_key)
-        definition_id, definition_json, definition_digest = (
-            _screening_definition_identity(definition)
+        definition_id, definition_json, definition_digest = _screening_definition_identity(
+            definition
         )
         self._screening_definition_cache[cache_key] = (
             precomputed,
@@ -4897,9 +4947,7 @@ class ArtifactV2ShardSession:
         for batch in screening_decision_batches:
             if not batch.schema.equals(V2_SCREENING_DECISIONS_SCHEMA, check_metadata=False):
                 raise ArtifactIntegrityError("old-v2 screening decision schema is invalid")
-            definition_ids = batch.column(
-                batch.schema.get_field_index("definition_id")
-            ).to_pylist()
+            definition_ids = batch.column(batch.schema.get_field_index("definition_id")).to_pylist()
             definition_payloads = batch.column(
                 batch.schema.get_field_index("definition_json")
             ).to_pylist()
@@ -5264,10 +5312,7 @@ class ArtifactV2ShardSession:
                 None,
                 definition_id,
             )
-            if (
-                len(self._screening_definition_cache)
-                > SCREENING_DEFINITION_HOT_CACHE_ENTRIES
-            ):
+            if len(self._screening_definition_cache) > SCREENING_DEFINITION_HOT_CACHE_ENTRIES:
                 self._screening_definition_cache.pop(next(iter(self._screening_definition_cache)))
             if self._screening_definition_store is None:
                 self._screening_definition_store = _BoundedScreeningDefinitionStore(
@@ -5295,8 +5340,7 @@ class ArtifactV2ShardSession:
                     *(definition[name] for name in V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]),
                 ),
             )
-            if definition is not None
-            and self._screening_definitions_sink is not None
+            if definition is not None and self._screening_definitions_sink is not None
             else None
         )
         started_at = event_get("started_at")
@@ -5337,10 +5381,7 @@ class ArtifactV2ShardSession:
         self,
         event: Mapping[str, object],
     ) -> None:
-        if (
-            event.get("event_type") != "route_evaluation"
-            or event.get("kind") != "exact_call"
-        ):
+        if event.get("event_type") != "route_evaluation" or event.get("kind") != "exact_call":
             return
         axis = str(event.get("benchmark_axis", ""))
         route_key = str(event.get("route_key", ""))
@@ -5711,20 +5752,15 @@ class ArtifactReader:
                 route_by_id.register(
                     route_row,
                     require_canonical_key=(
-                        trace_index.get("screening_schema_version")
-                        == SCREENING_DECISIONS_V3
+                        trace_index.get("screening_schema_version") == SCREENING_DECISIONS_V3
                     ),
                 )
 
-            checks_path = path.with_name(
-                path.name.replace("_events_", "_screening_checks_", 1)
-            )
+            checks_path = path.with_name(path.name.replace("_events_", "_screening_checks_", 1))
             ordinary_rows = self._iter_events_with_checks(
                 path.relative_to(self.run_dir),
                 checks_path=(
-                    checks_path.relative_to(self.run_dir)
-                    if checks_path.is_file()
-                    else None
+                    checks_path.relative_to(self.run_dir) if checks_path.is_file() else None
                 ),
                 batch_size=batch_size,
             )
@@ -5742,9 +5778,7 @@ class ArtifactReader:
             for physical_row in merged:
                 event_id = _required_event_id(physical_row)
                 if event_id <= previous_event_id:
-                    raise ArtifactIntegrityError(
-                        "event IDs must be unique and strictly increasing"
-                    )
+                    raise ArtifactIntegrityError("event IDs must be unique and strictly increasing")
                 previous_event_id = event_id
                 yield _writer_event_mapping(
                     physical_row,

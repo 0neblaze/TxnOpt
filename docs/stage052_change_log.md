@@ -8,6 +8,48 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：E11 真实剖析与 bounded async persistence pipeline
+
+- 失败证据：`stage05.2_native_kernels_attempt11` 在 clean commit `cffa5a5` 上完成 36 个
+  axis 且资源记录不再包含零 RSS 进程，但 producer persistence ratio 仍为
+  0.381931566（solver 201.266761702 秒，persistence 124.371550767 秒），因此不进入
+  明知必败的耗时独立 review，也不得成为 E prerequisite。该完整 raw 保持不可变。
+- 证伪与剖析：exact-route identity 内存化虽在 225,000-entry microbenchmark 中达到约
+  2.89x，却不是 formal workload（正式负载）的主导成本。E11 的大型 shard 共含
+  7,346,949 个 screening occurrences，其中 6,143,240 个是 negative-cache hit；真实
+  `c101_21/2014` cProfile 显示 screening callback preparation 与同步 shard append 是
+  persistence critical path（持久化关键路径）。
+- 修改：native/benchmark component 使用一个 shard-local bounded async persistence
+  pipeline（分片本地有界异步持久化流水线）。每个 axis 只有一个 non-daemon FIFO writer
+  thread，队列硬上限为一个 65,536-row callback batch；无 fallback。producer 可与后台
+  Parquet 编码/I/O 重叠，但 `finish`、semantic digest（语义摘要）和 finalize 前必须完整
+  drain。后台异常在下一次 submit/drain 立即抛出；abort 先停止并回收线程再封存 partial
+  shard。非 native 历史路径保持同步。
+- 可观测性：每个 trace axis 记录 mode、queue hard bound、submitted/completed batch、
+  peak queued batches、producer/writer wall nanoseconds、writer thread CPU nanoseconds、两者
+  wall activity union、solver-boundary concurrent critical path diagnostic（并发关键路径诊断量）、
+  producer wait，以及逐 batch 的 row count + logical-event SHA-256 ledger。正式 30% gate 仍使用
+  drained solver boundary 上 producer/writer wall interval 的并集，重叠只计一次；producer wall
+  与 writer thread CPU 的最大值只用于解释 GIL scheduling，不参与 readiness。后台
+  hashing/Parquet I/O 不得静默消失或伪造为零。E reviewer 与 G campaign
+  reviewer 都从 logical event stream 独立重算 ledger，并交叉核对 timing evidence；缺失、
+  partial completion、over-bound、digest mismatch 或异步错误均 fail fast。pipeline metadata
+  是物理存储证据，不参与 D/E fixed-work algorithm semantics（算法语义）比较。
+- GIL-aware cooperative turn（感知 GIL 的协作轮次）保证已提交批次在下一 callback 前完成，
+  writer 可与 callback 之间的 solver core work（求解器核心工作）重叠，但不会因 Python
+  线程争用把 descheduled wall time（被调度暂停的墙钟时间）伪装为写入成本。每批 writer
+  thread CPU 只作为诊断，并按同一批 wall interval 上限裁剪粗粒度 CPU clock tick；正式归因
+  始终使用 wall activity union。async callback batch 被 producer 与两个 reviewer 同时硬限制为
+  `1..65,536` rows。
+- negative-cache 快速路径：每个 route 仍逐次比较完整 evidence tail 以检测漂移，但重复
+  cache hit 复用已验证的 `PrecomputedScreeningDefinition`，不重复展开 screening checks。
+- 验证：一百万个重复 negative-cache callback 从 1.601136860 秒降至 0.907102130 秒；
+  初版带真实求解、Parquet writer 和 finalization 的单 shard cProfile 从
+  10.448471206 秒降至 6.593397739 秒，但该初版未把后台 writer 活动并入 gate attribution，
+  因而只用于定位、不能作为 E 通过依据。修正后的计时明确覆盖 producer preparation、batch
+  hashing 和 Parquet append；正式结论仍只接受新 clean commit 的 E12 raw 与 systemd
+  independent review（独立审查）。
+
 ## 2026-07-23：E10 persistence 与 resource identity 根因修复
 
 - 失败证据：`stage05.2_native_kernels_attempt09` 在创建任何 shard 前因冻结 source

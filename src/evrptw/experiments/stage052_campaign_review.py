@@ -15,6 +15,7 @@ import json
 import math
 import os
 import plistlib
+import re
 import shutil
 import statistics
 import subprocess
@@ -24,7 +25,9 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TypeGuard
+from typing import Any, TypeGuard
+
+import orjson
 
 from evrptw.artifacts import (
     ANYTIME_CHECKPOINT_SCHEMA,
@@ -32,6 +35,7 @@ from evrptw.artifacts import (
     EVENTS_SCHEMA,
     ROUTE_DICTIONARY_SCHEMA,
     SCREENING_CHECKS_SCHEMA,
+    V2_PARQUET_ROW_GROUP_SIZE,
     V3_SCREENING_DEFINITIONS_SCHEMA,
     V3_SCREENING_OCCURRENCES_SCHEMA,
     ArtifactIntegrityError,
@@ -98,12 +102,8 @@ COMPACT_TRACE_SCHEMA_FINGERPRINTS = {
     "route_dictionary": artifact_schema_fingerprint(ROUTE_DICTIONARY_SCHEMA),
     "events": artifact_schema_fingerprint(EVENTS_SCHEMA),
     "screening_checks": artifact_schema_fingerprint(SCREENING_CHECKS_SCHEMA),
-    "screening_definitions": artifact_schema_fingerprint(
-        V3_SCREENING_DEFINITIONS_SCHEMA
-    ),
-    "screening_occurrences": artifact_schema_fingerprint(
-        V3_SCREENING_OCCURRENCES_SCHEMA
-    ),
+    "screening_definitions": artifact_schema_fingerprint(V3_SCREENING_DEFINITIONS_SCHEMA),
+    "screening_occurrences": artifact_schema_fingerprint(V3_SCREENING_OCCURRENCES_SCHEMA),
     "diagnostic": artifact_schema_fingerprint(DIAGNOSTIC_SCHEMA),
 }
 
@@ -153,9 +153,7 @@ def _validated_instance_hashes(value: Mapping[str, object]) -> dict[str, str]:
         not isinstance(raw, Mapping)
         or not raw
         or any(
-            not isinstance(instance, str)
-            or not instance
-            or not _is_sha256(digest)
+            not isinstance(instance, str) or not instance or not _is_sha256(digest)
             for instance, digest in raw.items()
         )
     ):
@@ -713,9 +711,7 @@ def audit_streamed_events(
                     or not route_keys
                     or any(not isinstance(key, str) or not key for key in route_keys)
                 ):
-                    failures.append(
-                        f"global best lacks candidate route identity on {axis}"
-                    )
+                    failures.append(f"global best lacks candidate route identity on {axis}")
             cache_misses[axis].clear()
             completed_exact_keys[axis].clear()
 
@@ -1042,6 +1038,87 @@ def _native_axis_valid(
         if not isinstance(occupancies_raw, list):
             raise ArtifactIntegrityError("launch_occupancies must be an array")
         occupancies = tuple(_strict_int(value, "launch_occupancy") for value in occupancies_raw)
+        pipeline = trace_axis.get("persistence_pipeline")
+        if not isinstance(pipeline, Mapping):
+            raise ArtifactIntegrityError("bounded async persistence pipeline is missing")
+        submitted_batches = _strict_int(pipeline.get("submitted_batches"), "submitted_batches")
+        completed_batches = _strict_int(pipeline.get("completed_batches"), "completed_batches")
+        writer_active_ns = _strict_int(
+            pipeline.get("writer_active_nanoseconds"), "writer_active_nanoseconds"
+        )
+        writer_cpu_ns = _strict_int(
+            pipeline.get("writer_cpu_nanoseconds"), "writer_cpu_nanoseconds"
+        )
+        producer_active_ns = _strict_int(
+            pipeline.get("producer_active_nanoseconds"), "producer_active_nanoseconds"
+        )
+        union_ns = _strict_int(
+            pipeline.get("persistence_union_nanoseconds"),
+            "persistence_union_nanoseconds",
+        )
+        solver_union_ns = _strict_int(
+            pipeline.get("solver_persistence_union_nanoseconds"),
+            "solver_persistence_union_nanoseconds",
+        )
+        solver_critical_ns = _strict_int(
+            pipeline.get("solver_persistence_critical_path_nanoseconds"),
+            "solver_persistence_critical_path_nanoseconds",
+        )
+        solver_producer_ns = _strict_int(
+            pipeline.get("solver_producer_active_nanoseconds"),
+            "solver_producer_active_nanoseconds",
+        )
+        solver_writer_cpu_ns = _strict_int(
+            pipeline.get("solver_writer_cpu_nanoseconds"),
+            "solver_writer_cpu_nanoseconds",
+        )
+        producer_wait_ns = _strict_int(
+            pipeline.get("producer_wait_nanoseconds"), "producer_wait_nanoseconds"
+        )
+        ledger = pipeline.get("batch_ledger")
+        if not isinstance(ledger, list):
+            raise ArtifactIntegrityError("bounded async persistence batch ledger is missing")
+        for ordinal, entry in enumerate(ledger):
+            if (
+                not isinstance(entry, Mapping)
+                or set(entry) != {"ordinal", "row_count", "event_token_sha256"}
+                or _strict_int(entry.get("ordinal"), "batch ordinal") != ordinal
+                or not (
+                    0
+                    < _strict_int(entry.get("row_count"), "batch row_count")
+                    <= V2_PARQUET_ROW_GROUP_SIZE
+                )
+                or re.fullmatch(r"[0-9a-f]{64}", str(entry.get("event_token_sha256", ""))) is None
+            ):
+                raise ArtifactIntegrityError("bounded async persistence batch ledger is invalid")
+        if (
+            pipeline.get("mode") != "bounded_async_thread"
+            or _strict_int(pipeline.get("queue_max_batches"), "queue_max_batches") != 1
+            or _strict_float(
+                pipeline.get("writer_thread_switch_interval_seconds"),
+                "writer_thread_switch_interval_seconds",
+            )
+            != 0.05
+            or submitted_batches <= 0
+            or completed_batches != submitted_batches
+            or writer_active_ns <= 0
+            or writer_cpu_ns < 0
+            or producer_active_ns <= 0
+            or producer_wait_ns < 0
+            or solver_union_ns <= 0
+            or solver_critical_ns != max(solver_producer_ns, solver_writer_cpu_ns)
+            or solver_critical_ns > solver_union_ns
+            or solver_producer_ns <= 0
+            or solver_writer_cpu_ns < 0
+            or solver_producer_ns > producer_active_ns
+            or solver_writer_cpu_ns > writer_cpu_ns
+            or max(writer_active_ns, producer_active_ns) > union_ns
+            or union_ns > writer_active_ns + producer_active_ns
+            or solver_union_ns > union_ns
+            or _strict_int(pipeline.get("peak_queued_batches"), "peak_queued_batches") != 1
+            or len(ledger) != submitted_batches
+        ):
+            raise ArtifactIntegrityError("bounded async persistence pipeline is invalid")
     except ArtifactIntegrityError as error:
         return False, str(error)
     screening = result.get("screening_statistics")
@@ -1072,6 +1149,101 @@ def _native_axis_valid(
         if passed
         else "native counters, exact-call ordering, or no-fallback failed",
     )
+
+
+def _pipeline_event_token_from_logical_row(
+    row: Mapping[str, object],
+) -> tuple[object, ...]:
+    get = row.get
+    kind = get("kind") or None
+    operation = get("operation") or None
+    status = get("status") or None
+    reason = get("reason") or None
+    return (
+        str(get("event_type", get("record_type", "event"))),
+        get("benchmark_axis"),
+        get("lane"),
+        get("iteration"),
+        get("operator"),
+        get("route_key"),
+        get("decision_id"),
+        kind,
+        operation,
+        status,
+        reason,
+        get("exact_started"),
+        get("exact_completed"),
+        get("feasible"),
+    )
+
+
+@dataclass(slots=True)
+class _PipelineLedgerReplay:
+    ledger: list[object]
+    index: int = 0
+    seen: int = 0
+    hasher: Any = None
+
+    def __post_init__(self) -> None:
+        if self.hasher is None:
+            self.hasher = hashlib.sha256()
+
+
+def _audit_async_persistence_ledgers(
+    events: Iterable[Mapping[str, object]],
+    trace_axes: Mapping[str, object],
+) -> None:
+    """Recompute every physical async batch digest from the logical event stream."""
+
+    states: dict[str, _PipelineLedgerReplay] = {}
+    for axis, raw_trace_axis in trace_axes.items():
+        if not isinstance(raw_trace_axis, Mapping):
+            raise ArtifactIntegrityError("trace axis is invalid for persistence replay")
+        pipeline = raw_trace_axis.get("persistence_pipeline")
+        if not isinstance(pipeline, Mapping):
+            raise ArtifactIntegrityError("persistence pipeline is missing for ledger replay")
+        ledger = pipeline.get("batch_ledger")
+        if not isinstance(ledger, list):
+            raise ArtifactIntegrityError("persistence batch ledger is missing")
+        states[str(axis)] = _PipelineLedgerReplay(ledger=list(ledger))
+    for row in events:
+        axis = str(row.get("benchmark_axis") or str(row.get("lane", "")).partition(":")[0])
+        state = states.get(axis)
+        if state is None:
+            raise ArtifactIntegrityError(
+                f"persistence event refers to an unknown benchmark axis: {axis}"
+            )
+        ledger = state.ledger
+        index = state.index
+        if index >= len(ledger):
+            raise ArtifactIntegrityError(
+                f"persistence ledger ended before the event stream: {axis}"
+            )
+        entry = ledger[index]
+        hasher = state.hasher
+        if not isinstance(entry, Mapping) or not hasattr(hasher, "update"):
+            raise ArtifactIntegrityError("persistence ledger replay state is invalid")
+        hasher.update(orjson.dumps(_pipeline_event_token_from_logical_row(row)) + b"\n")
+        seen = state.seen + 1
+        expected_rows = _strict_int(entry.get("row_count"), "persistence ledger row_count")
+        if seen == expected_rows:
+            if hasher.hexdigest() != entry.get("event_token_sha256"):
+                raise ArtifactIntegrityError(
+                    f"persistence batch digest does not replay: {axis}/{index}"
+                )
+            state.index = index + 1
+            state.seen = 0
+            state.hasher = hashlib.sha256()
+        elif seen > expected_rows:
+            raise ArtifactIntegrityError(f"persistence batch row count overflow: {axis}/{index}")
+        else:
+            state.seen = seen
+    for axis, state in states.items():
+        ledger = state.ledger
+        if state.index != len(ledger) or state.seen != 0:
+            raise ArtifactIntegrityError(
+                f"persistence ledger does not cover the complete event stream: {axis}"
+            )
 
 
 def _route_sequence_from_key(route_key: str) -> list[str]:
@@ -1120,9 +1292,7 @@ def summarize_streamed_global_bests(
         candidate_routes = [_route_sequence_from_key(str(key)) for key in route_keys]
         report = validate_routes(instance, candidate_routes)
         if not report.feasible:
-            raise ArtifactIntegrityError(
-                f"global-best candidate routes fail validation on {axis}"
-            )
+            raise ArtifactIntegrityError(f"global-best candidate routes fail validation on {axis}")
         replayed_objective = SolutionObjective.from_report(instance, report).key
         recorded_objective = _objective_key(
             event.get("candidate_objective_key"), "candidate objective"
@@ -1213,9 +1383,7 @@ def _checkpoint_evidence(
         initial = verified_initial_objectives.get(axis)
         if initial is None:
             raise ArtifactIntegrityError(f"verified initial objective is missing on {axis}")
-        raw_initial = _objective_key(
-            raw_axis.get("initial_objective_key"), "initial_objective_key"
-        )
+        raw_initial = _objective_key(raw_axis.get("initial_objective_key"), "initial_objective_key")
         if (
             compare_objectives(
                 SolutionObjective(*raw_initial),
@@ -1367,13 +1535,10 @@ def _replay_shard(
         "screening_checks": by_type["events", "screening_checks"],
         "screening_definitions": by_type["events", "screening_definitions_v3"],
         "screening_occurrences": by_type["events", "screening_occurrences_v3"],
-        "diagnostic": next(
-            item for item in artifacts if item.get("artifact_type") == "diagnostic"
-        ),
+        "diagnostic": next(item for item in artifacts if item.get("artifact_type") == "diagnostic"),
     }
     if any(
-        descriptor.get("schema_fingerprint")
-        != COMPACT_TRACE_SCHEMA_FINGERPRINTS[schema_name]
+        descriptor.get("schema_fingerprint") != COMPACT_TRACE_SCHEMA_FINGERPRINTS[schema_name]
         for schema_name, descriptor in schema_descriptors.items()
     ):
         raise ArtifactIntegrityError(
@@ -1497,6 +1662,10 @@ def _replay_shard(
         )
     axis_budgets = {axis: _axis_budget(axis) for axis in expected_axes}
     event_path = str(events_ref["relative_path"])
+    _audit_async_persistence_ledgers(
+        reader.iter_events(event_path, batch_size=1024),
+        trace_axes,
+    )
     event_audit = audit_streamed_events(
         reader.iter_events(event_path, batch_size=1024),
         axis_budgets,
@@ -1678,8 +1847,7 @@ def _validate_native_power_boundary(payload: object) -> tuple[bool, str]:
     after = payload.get("after")
     if (
         payload.get("schema_version") != "stage05.2-native-power-boundary-v1"
-        or payload.get("stable_invariants")
-        != ["ac_online", "battery_saver", "active_power_scheme"]
+        or payload.get("stable_invariants") != ["ac_online", "battery_saver", "active_power_scheme"]
         or payload.get("invariants_unchanged") is not True
         or not isinstance(before, Mapping)
         or not isinstance(after, Mapping)
@@ -1812,8 +1980,7 @@ def _validate_batch_metadata(
         and dict(native) == selection_lock.get("native_kernel_config")
         and campaign.selected_workers == selection_lock.get("selected_workers")
         and campaign.selected_backend == selection_lock.get("selected_backend")
-        and campaign.selected_exact_backend
-        == selection_lock.get("selected_exact_backend")
+        and campaign.selected_exact_backend == selection_lock.get("selected_exact_backend")
         and campaign.native_profile == selection_lock.get("native_profile")
         and len(repository_revision) == 40
         and all(character in "0123456789abcdef" for character in repository_revision)
@@ -1910,6 +2077,30 @@ def _audit_batch_persistence(
         }
         if len(row_by_identity) != len(rows):
             raise ArtifactIntegrityError("batch persistence per-run identity is duplicate")
+        pipeline_by_identity: dict[tuple[str, int, str], Mapping[str, object]] = {}
+        for trace_ref in (
+            item
+            for item in reader.manifest.get("artifacts", ())
+            if isinstance(item, Mapping) and item.get("artifact_type") == "trace"
+        ):
+            trace_payload = _read_bounded_compact_trace(reader, trace_ref)
+            trace_instance = str(trace_payload.get("instance", ""))
+            trace_seed = _strict_int(trace_payload.get("seed"), "trace seed")
+            trace_axes = trace_payload.get("axes")
+            if not isinstance(trace_axes, Mapping):
+                raise ArtifactIntegrityError("batch trace axes are missing")
+            for axis, trace_axis in trace_axes.items():
+                if not isinstance(trace_axis, Mapping):
+                    raise ArtifactIntegrityError("batch trace axis is invalid")
+                pipeline = trace_axis.get("persistence_pipeline")
+                if not isinstance(pipeline, Mapping):
+                    raise ArtifactIntegrityError("batch persistence pipeline is missing")
+                identity = (trace_instance, trace_seed, str(axis))
+                if identity in pipeline_by_identity:
+                    raise ArtifactIntegrityError("batch persistence pipeline identity is duplicate")
+                pipeline_by_identity[identity] = pipeline
+        if set(pipeline_by_identity) != set(row_by_identity):
+            raise ArtifactIntegrityError("batch persistence pipeline scope mismatch")
         observed: set[tuple[str, int, str]] = set()
         solver_seconds = 0.0
         shard_persistence_seconds = 0.0
@@ -1940,27 +2131,39 @@ def _audit_batch_persistence(
                 raw_timing.get("live_stream_persistence_ns"),
                 "live_stream_persistence_ns",
             )
-            event_count = _strict_int(raw_timing.get("axis_event_count"), "axis_event_count")
-            total_events = _strict_int(
-                raw_timing.get("total_event_count"), "total_event_count"
+            solver_interleaved_ns = _strict_int(
+                raw_timing.get("solver_interleaved_persistence_ns"),
+                "solver_interleaved_persistence_ns",
             )
+            pipeline = pipeline_by_identity[identity]
+            solver_union_ns = _strict_int(
+                pipeline.get("solver_persistence_union_nanoseconds"),
+                "solver_persistence_union_nanoseconds",
+            )
+            persistence_union_ns = _strict_int(
+                pipeline.get("persistence_union_nanoseconds"),
+                "persistence_union_nanoseconds",
+            )
+            event_count = _strict_int(raw_timing.get("axis_event_count"), "axis_event_count")
+            total_events = _strict_int(raw_timing.get("total_event_count"), "total_event_count")
             axis_count = _strict_int(raw_timing.get("axis_count"), "axis_count")
             if (
                 solver_completed_ns <= solver_started_ns
                 or finalize_completed_ns < finalize_started_ns
                 or live_ns < 0
                 or live_ns > solver_completed_ns - solver_started_ns
+                or solver_interleaved_ns != solver_union_ns
+                or solver_interleaved_ns > live_ns
+                or persistence_union_ns > live_ns
                 or event_count < 0
                 or total_events < 0
                 or axis_count <= 0
             ):
                 raise ArtifactIntegrityError("batch persistence monotonic interval is invalid")
             audited_solver = (
-                solver_completed_ns - solver_started_ns - live_ns
+                solver_completed_ns - solver_started_ns - solver_interleaved_ns
             ) / 1_000_000_000
-            finalize_seconds = (
-                finalize_completed_ns - finalize_started_ns
-            ) / 1_000_000_000
+            finalize_seconds = (finalize_completed_ns - finalize_started_ns) / 1_000_000_000
             finalize_share = (
                 finalize_seconds * event_count / total_events
                 if total_events
@@ -2000,9 +2203,7 @@ def _audit_batch_persistence(
             or not signed_sidecar_matches(attribution_path, sidecar)
         ):
             raise ArtifactIntegrityError("batch signed persistence attribution is invalid")
-        attribution = Stage052PersistenceAttribution.from_dict(
-            _json_object(attribution_path)
-        )
+        attribution = Stage052PersistenceAttribution.from_dict(_json_object(attribution_path))
         required_labels = {
             "batch_write_control",
             "batch_preflight_control",
@@ -2085,13 +2286,9 @@ def _audit_batch_persistence(
                 "verified batch manifest state cannot be reconstructed"
             ) from error
         verified_manifest_sha = hashlib.sha256(
-            (json.dumps(verified_batch.to_dict(), indent=2, sort_keys=True) + "\n").encode(
-                "utf-8"
-            )
+            (json.dumps(verified_batch.to_dict(), indent=2, sort_keys=True) + "\n").encode("utf-8")
         ).hexdigest()
-        campaign_envelope_sha = campaign.batch_persistence_envelope_sha256_by_id.get(
-            batch_id
-        )
+        campaign_envelope_sha = campaign.batch_persistence_envelope_sha256_by_id.get(batch_id)
         if (
             envelope.run_label != run_label
             or envelope.batch_id != batch_id
@@ -2122,8 +2319,7 @@ def _audit_batch_persistence(
                 "solver_seconds": envelope.solver_seconds,
                 "artifact_persistence_seconds": envelope.total_persistence_seconds,
                 "control_persistence_seconds": (
-                    attribution.control_persistence_seconds
-                    + envelope.state_persistence_seconds
+                    attribution.control_persistence_seconds + envelope.state_persistence_seconds
                 ),
                 "persistence_ratio": envelope.persistence_ratio,
                 "maximum_ratio": 0.30,
@@ -2145,17 +2341,9 @@ def _audit_campaign_persistence(
     """Replay batch totals plus every non-archive campaign active write."""
 
     try:
-        path = (
-            campaign_dir
-            / "control"
-            / f"{campaign.run_label}_persistence_attribution.json"
-        )
+        path = campaign_dir / "control" / f"{campaign.run_label}_persistence_attribution.json"
         sidecar = path.with_suffix(".sha256")
-        if (
-            not path.is_file()
-            or not sidecar.is_file()
-            or not signed_sidecar_matches(path, sidecar)
-        ):
+        if not path.is_file() or not sidecar.is_file() or not signed_sidecar_matches(path, sidecar):
             raise ArtifactIntegrityError("campaign persistence attribution is unsigned")
         attribution = Stage052PersistenceAttribution.from_dict(_json_object(path))
         expected_labels = [
@@ -2297,8 +2485,7 @@ def _audit_campaign_controls(
             for phase in ("pre_dispatch", "pre_archive", "post_archive")
         )
         if (
-            rolling.get("schema_version")
-            != "stage05.2-rolling-capacity-summary-v1"
+            rolling.get("schema_version") != "stage05.2-rolling-capacity-summary-v1"
             or rolling.get("run_label") != campaign.run_label
             or rolling.get("scope") != campaign.scope
             or rolling.get("status") != "complete"
@@ -2322,9 +2509,7 @@ def _audit_campaign_controls(
             free = observation.get("free_bytes_by_device")
             required = observation.get("required_bytes_by_device")
             batch_index = observation_index // 3
-            phase = ("pre_dispatch", "pre_archive", "post_archive")[
-                observation_index % 3
-            ]
+            phase = ("pre_dispatch", "pre_archive", "post_archive")[observation_index % 3]
             expected_required = _expected_rolling_capacity_required(
                 campaign=campaign,
                 batch_index=batch_index,
@@ -2332,9 +2517,7 @@ def _audit_campaign_controls(
                 staging_root_alias=staging_root_alias,
                 archive_root_aliases=archive_root_aliases,
             )
-            expected_devices = {
-                volume.device_uuid for volume in campaign.storage_roots.values()
-            }
+            expected_devices = {volume.device_uuid for volume in campaign.storage_roots.values()}
             normalized_free = (
                 {
                     str(device): _strict_int(value, "rolling free bytes")
@@ -2361,14 +2544,11 @@ def _audit_campaign_controls(
                 or normalized_required != expected_required
                 or any(value < 0 for value in normalized_free.values())
                 or any(
-                    normalized_free[device] < value
-                    for device, value in normalized_required.items()
+                    normalized_free[device] < value for device, value in normalized_required.items()
                 )
             ):
                 raise ArtifactIntegrityError("rolling capacity reserve replay failed")
-            journal = reader.read_json(
-                str(journal_refs[observation_index]["relative_path"])
-            )
+            journal = reader.read_json(str(journal_refs[observation_index]["relative_path"]))
             if journal != dict(observation):
                 raise ArtifactIntegrityError(
                     "rolling capacity summary differs from its signed append-only journal"
@@ -2401,9 +2581,7 @@ def _audit_campaign_controls(
         ):
             raise ArtifactIntegrityError("failure-state partial write drill is invalid")
         failed_batch_ref = _one_artifact(reader, "failure_state_drill_failed_batch")
-        failed_campaign_ref = _one_artifact(
-            reader, "failure_state_drill_failed_campaign"
-        )
+        failed_campaign_ref = _one_artifact(reader, "failure_state_drill_failed_campaign")
         failed_batch_relative = str(failed_batch_ref["relative_path"])
         failed_campaign_relative = str(failed_campaign_ref["relative_path"])
         failed_batch_path = campaign_dir / failed_batch_relative
@@ -2415,14 +2593,12 @@ def _audit_campaign_controls(
         if (
             failure.get("failed_batch_relative_path") != failed_batch_relative
             or failure.get("failed_batch_sha256") != _sha256(failed_batch_path)
-            or failure.get("failed_campaign_relative_path")
-            != failed_campaign_relative
+            or failure.get("failed_campaign_relative_path") != failed_campaign_relative
             or failure.get("failed_campaign_sha256") != _sha256(failed_campaign_path)
             or failure.get("atomic_state_relative_path") != atomic_state_relative
             or failure.get("atomic_state_sha256") != _sha256(atomic_state_path)
             or failure.get("atomic_state_generation") != 1
-            or atomic_state
-            != {"run_label": campaign.run_label, "generation": 1}
+            or atomic_state != {"run_label": campaign.run_label, "generation": 1}
         ):
             raise ArtifactIntegrityError("failure-state signed manifest bindings are invalid")
         worker_failure_ref = _one_artifact(reader, "failure_state_drill_worker_failure")
@@ -2469,8 +2645,7 @@ def _audit_campaign_controls(
             or failure.get("archive_manifest_relative_path") != archive_manifest_relative
             or failure.get("archive_manifest_sha256") != _sha256(archive_manifest_path)
             or failure.get("archive_transfer_mode") != "same_volume_atomic_rename"
-            or failure.get("archive_injected_failure")
-            != "injected archive state write failure"
+            or failure.get("archive_injected_failure") != "injected archive state write failure"
             or archived_drill_batch.status != "archived"
             or archived_drill_batch.transfer_mode != "same_volume_atomic_rename"
             or directory_checksum(archive_manifest_path.parent)
@@ -2511,17 +2686,16 @@ def _audit_campaign_controls(
             batch_persistence_envelope_sha256_by_id={},
         )
         expected_failed_batch = planned_batches[0].mark_failed(injected_reason)
-        expected_failed_campaign = planned_campaign.with_batch(
-            expected_failed_batch
-        ).mark_failed(injected_reason)
+        expected_failed_campaign = planned_campaign.with_batch(expected_failed_batch).mark_failed(
+            injected_reason
+        )
         deterministic_payload = hashlib.sha256(campaign.run_label.encode("utf-8")).digest() * 256
         if (
             failed_batch.to_dict() != expected_failed_batch.to_dict()
             or failed_campaign.to_dict() != expected_failed_campaign.to_dict()
             or failure.get("expected_total_bytes") != len(deterministic_payload)
             or failure.get("injected_after_bytes") != len(deterministic_payload) // 2
-            or partial_path.read_bytes()
-            != deterministic_payload[: len(deterministic_payload) // 2]
+            or partial_path.read_bytes() != deterministic_payload[: len(deterministic_payload) // 2]
         ):
             raise ArtifactIntegrityError("failure-state drill transition does not replay")
 
@@ -2538,9 +2712,7 @@ def _audit_campaign_controls(
         ):
             raise ArtifactIntegrityError("raw replay drill summary is incomplete")
         raw_by_batch = {
-            str(item.get("batch_id")): item
-            for item in raw_results
-            if isinstance(item, Mapping)
+            str(item.get("batch_id")): item for item in raw_results if isinstance(item, Mapping)
         }
         for batch in campaign.batches:
             item = raw_by_batch.get(batch.batch_id)
@@ -2549,12 +2721,10 @@ def _audit_campaign_controls(
             batch_reader = ArtifactReader(batch_dir)
             if (
                 item is None
-                or item.get("raw_manifest_sha256")
-                != _sha256(batch_reader.result.manifest_path)
+                or item.get("raw_manifest_sha256") != _sha256(batch_reader.result.manifest_path)
                 or item.get("directory_checksum_sha256") != batch.checksum_sha256
                 or item.get("actual_bytes") != batch.actual_bytes
-                or item.get("artifact_count")
-                != len(batch_reader.manifest.get("artifacts", ()))
+                or item.get("artifact_count") != len(batch_reader.manifest.get("artifacts", ()))
             ):
                 raise ArtifactIntegrityError("raw replay drill does not match archived batch")
 
@@ -2572,9 +2742,7 @@ def _audit_campaign_controls(
         ):
             raise ArtifactIntegrityError("archive dry-run summary is incomplete")
         observed_archive_aliases = tuple(
-            str(item.get("archive_root_alias", ""))
-            for item in results
-            if isinstance(item, Mapping)
+            str(item.get("archive_root_alias", "")) for item in results if isinstance(item, Mapping)
         )
         if observed_archive_aliases != archive_root_aliases:
             raise ArtifactIntegrityError("archive dry-run alias coverage is not exact")
@@ -2604,8 +2772,7 @@ def _audit_campaign_controls(
                 or archived.volume.to_dict() != item.get("volume_identity")
                 or archived.transfer_mode != expected_mode
                 or item.get("transfer_mode") != expected_mode
-                or archived.archive_transfer_seconds
-                != item.get("archive_transfer_seconds")
+                or archived.archive_transfer_seconds != item.get("archive_transfer_seconds")
                 or archived.checksum_sha256 != item.get("checksum_sha256")
                 or archived.actual_bytes != item.get("actual_bytes")
                 or directory_checksum(archived_dir) != archived.checksum_sha256
@@ -2754,26 +2921,19 @@ def _verify_campaign_review_prerequisite(
     reader = ArtifactReader(raw_dir)
     if payload.get("raw_manifest_sha256") != _sha256(reader.result.manifest_path):
         raise ArtifactIntegrityError("accepted pilot standard raw manifest hash mismatch")
-    attribution_path = (
-        raw_dir / "control" / f"{raw_dir.name}_persistence_attribution.json"
-    )
+    attribution_path = raw_dir / "control" / f"{raw_dir.name}_persistence_attribution.json"
     attribution_sidecar = attribution_path.with_suffix(".sha256")
     if (
         not attribution_path.is_file()
         or not attribution_sidecar.is_file()
         or not signed_sidecar_matches(attribution_path, attribution_sidecar)
         or payload.get("persistence_attribution_sha256") != _sha256(attribution_path)
-        or payload.get("persistence_attribution_sidecar_sha256")
-        != _sha256(attribution_sidecar)
+        or payload.get("persistence_attribution_sidecar_sha256") != _sha256(attribution_sidecar)
     ):
-        raise ArtifactIntegrityError(
-            "accepted pilot campaign persistence attribution is stale"
-        )
+        raise ArtifactIntegrityError("accepted pilot campaign persistence attribution is stale")
     selection = payload.get("selection_lock")
     native = payload.get("native_configuration")
-    raw_decision = (
-        selection.get("accelerator_decision") if isinstance(selection, Mapping) else None
-    )
+    raw_decision = selection.get("accelerator_decision") if isinstance(selection, Mapping) else None
     decision = raw_decision if isinstance(raw_decision, str) else ""
     expected_backend = {
         "GPU_NOT_JUSTIFIED": "native_cpu",
@@ -2790,8 +2950,7 @@ def _verify_campaign_review_prerequisite(
         or not isinstance(native, Mapping)
         or payload.get("native_kernel_config") != native
         or selection.get("selected_backend") != payload.get("selected_backend")
-        or selection.get("selected_exact_backend")
-        != payload.get("selected_exact_backend")
+        or selection.get("selected_exact_backend") != payload.get("selected_exact_backend")
         or selection.get("selected_workers") != payload.get("selected_workers")
         or selection.get("native_profile") != payload.get("native_profile")
         or selection.get("native_kernel_config") != native
@@ -3059,9 +3218,7 @@ def audit_campaign_planning(
         if not isinstance(raw_assignments, list):
             raise ArtifactIntegrityError("campaign capacity assignments are invalid")
         assignments = {
-            str(item["batch_id"]): item
-            for item in raw_assignments
-            if isinstance(item, Mapping)
+            str(item["batch_id"]): item for item in raw_assignments if isinstance(item, Mapping)
         }
         if len(campaign.batches) != len(expected_plan.batches):
             raise ArtifactIntegrityError("campaign manifest batch count differs from the plan")
@@ -3161,9 +3318,7 @@ def _audit_campaign(
     raw_manifest_hash = _sha256(campaign_path)
     standard_reader = ArtifactReader(campaign_dir)
     standard_metadata_ref = _one_artifact(standard_reader, "manifest_metadata")
-    standard_metadata = standard_reader.read_json(
-        str(standard_metadata_ref["relative_path"])
-    )
+    standard_metadata = standard_reader.read_json(str(standard_metadata_ref["relative_path"]))
     if (
         standard_reader.manifest.get("component") != Stage052Component.BENCHMARK.value
         or standard_reader.manifest.get("evidence_completeness") != "complete"
@@ -3182,8 +3337,7 @@ def _audit_campaign(
         or len(set(top_archive_aliases)) != len(top_archive_aliases)
         or top_staging_alias in top_archive_aliases
         or top_staging_alias not in campaign.storage_roots
-        or set(top_archive_aliases)
-        != set(campaign.storage_roots).difference({top_staging_alias})
+        or set(top_archive_aliases) != set(campaign.storage_roots).difference({top_staging_alias})
     ):
         raise ArtifactIntegrityError("campaign top-level root roles are invalid")
     evidence.standard_raw_manifest_sha256 = _sha256(standard_reader.result.manifest_path)
@@ -3237,8 +3391,7 @@ def _audit_campaign(
             )
         selection_matches = (
             selection_lock.get("selected_backend") == campaign.selected_backend
-            and selection_lock.get("selected_exact_backend")
-            == campaign.selected_exact_backend
+            and selection_lock.get("selected_exact_backend") == campaign.selected_exact_backend
             and selection_lock.get("selected_workers") == campaign.selected_workers
             and selection_lock.get("native_profile") == campaign.native_profile
             and selection_lock.get("native_kernel_config") is not None
@@ -3321,9 +3474,7 @@ def _audit_campaign(
             config=planning_config,
             expected_plan=expected_plan,
             plan_payload=standard_reader.read_json(str(plan_ref["relative_path"])),
-            preflight_payload=standard_reader.read_json(
-                str(preflight_ref["relative_path"])
-            ),
+            preflight_payload=standard_reader.read_json(str(preflight_ref["relative_path"])),
             capacity_payload=dict(raw_capacity),
             locator=locator,
         )
@@ -3559,20 +3710,14 @@ def _audit_campaign(
                     raise ArtifactIntegrityError("per-run axis is not in raw replay")
                 recorded_objective = SolutionObjective(
                     vehicle_count=_strict_int(row.get("vehicle_count"), "vehicle_count"),
-                    total_distance=_strict_float(
-                        row.get("total_distance"), "total_distance"
-                    ),
+                    total_distance=_strict_float(row.get("total_distance"), "total_distance"),
                     total_charging_time=_strict_float(
                         row.get("total_charging_time"), "total_charging_time"
                     ),
-                    charging_count=_strict_int(
-                        row.get("charging_count"), "charging_count"
-                    ),
+                    charging_count=_strict_int(row.get("charging_count"), "charging_count"),
                 )
                 replayed_objective = SolutionObjective(
-                    vehicle_count=_strict_int(
-                        replayed["vehicle_count"], "replayed vehicle_count"
-                    ),
+                    vehicle_count=_strict_int(replayed["vehicle_count"], "replayed vehicle_count"),
                     total_distance=_strict_float(
                         replayed["total_distance"], "replayed total_distance"
                     ),
@@ -3936,9 +4081,7 @@ def _review_payloads(
                     "run_label": run_label,
                     "decision": evidence.selection_lock.get("accelerator_decision"),
                     "selected_backend": evidence.selection_lock.get("selected_backend"),
-                    "selected_exact_backend": evidence.selection_lock.get(
-                        "selected_exact_backend"
-                    ),
+                    "selected_exact_backend": evidence.selection_lock.get("selected_exact_backend"),
                     "selected_workers": evidence.selection_lock.get("selected_workers"),
                     "native_profile": evidence.selection_lock.get("native_profile"),
                     "native_config_sha256": evidence.selection_lock.get("native_config_sha256"),
@@ -4017,9 +4160,7 @@ def _verified_prior_campaign_review_history(
     if campaign_manifest.is_file() and payload.get("raw_campaign_manifest_sha256") != _sha256(
         campaign_manifest
     ):
-        raise ArtifactIntegrityError(
-            "prior campaign review is stale for the campaign manifest"
-        )
+        raise ArtifactIntegrityError("prior campaign review is stale for the campaign manifest")
     raw_history = payload.get("review_history")
     if (
         not isinstance(raw_history, list)
@@ -4113,9 +4254,7 @@ def _publish_review(
             previous_payload = json.loads(previous_bytes)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ArtifactIntegrityError("prior campaign review manifest is invalid") from error
-        history.extend(
-            _verified_prior_campaign_review_history(campaign_dir, previous_payload)
-        )
+        history.extend(_verified_prior_campaign_review_history(campaign_dir, previous_payload))
         if previous_sha256 not in history:
             history.append(previous_sha256)
         history_dir = review_dir / "history" / previous_sha256
@@ -4300,9 +4439,7 @@ def review_stage052_campaign(
         "status": status,
         "raw_manifest_sha256": evidence.standard_raw_manifest_sha256,
         "raw_campaign_manifest_sha256": raw_hash,
-        "persistence_attribution_sha256": (
-            evidence.campaign_persistence_attribution_sha256
-        ),
+        "persistence_attribution_sha256": (evidence.campaign_persistence_attribution_sha256),
         "persistence_attribution_sidecar_sha256": (
             evidence.campaign_persistence_attribution_sidecar_sha256
         ),

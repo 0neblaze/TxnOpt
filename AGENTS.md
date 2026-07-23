@@ -721,6 +721,19 @@ The executable workflow and gate table are maintained in
 - Process-tree resource identity includes only a process whose positive RSS and CPU times were both
   captured in one successful sample. A half-sampled, zero-RSS, or already-exited transient process
   is not measured worker evidence and must not be emitted with a fabricated zero peak.
+- Native and benchmark trace persistence uses one non-daemon FIFO writer thread per open axis with
+  a hard queue bound of one callback batch. It may overlap Parquet encoding/I/O with solver work,
+  but every finish, semantic digest, close, and shard finalization must drain the queue; writer
+  failure aborts the shard without synchronous fallback. Trace evidence records submitted/completed
+  batches, queue bound/peak, producer/writer wall time, writer thread CPU time, their overlapping wall
+  union, producer wait time, and an ordered row-count/SHA-256 ledger for every batch. Formal
+  persistence attribution uses the measured producer/writer wall-time union at the drained solver
+  boundary, counting overlap once. The maximum of producer wall and writer CPU is diagnostic only;
+  it must not replace the 30% persistence/end-to-end gate. Background hashing or writing may never
+  be silently omitted or represented as zero. Review independently replays
+  the ledger from logical events and rejects missing, incomplete, over-bound, or inconsistent pipeline
+  evidence. These physical-pipeline fields are non-semantic for fixed-work algorithm comparison, so
+  overlap is observable without fabricating a trajectory change.
 - Critical events are never dropped. Ordinary candidates, repeated timings, and
   operator totals may be aggregated into diagnostic Parquet only when replay
   semantics are unchanged. Route sequences are stored once in the route

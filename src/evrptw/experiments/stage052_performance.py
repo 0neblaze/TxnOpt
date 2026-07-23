@@ -14,7 +14,9 @@ import re
 import shutil
 import statistics
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import tomllib
 from collections import Counter
@@ -23,6 +25,7 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_complete
 from dataclasses import dataclass, fields, replace
 from multiprocessing import get_context
 from pathlib import Path
+from queue import Full, Queue
 from typing import Any, Protocol
 
 import orjson
@@ -30,6 +33,7 @@ import orjson
 from evrptw.alns import ALNSResult, solve_alns
 from evrptw.artifacts import (
     ARTIFACT_STORAGE_V2,
+    V2_PARQUET_ROW_GROUP_SIZE,
     ArtifactBundleWriter,
     ArtifactIntegrityError,
     ArtifactReader,
@@ -37,10 +41,12 @@ from evrptw.artifacts import (
     ArtifactStorageConfig,
     BufferedScreeningDecision,
     PrecomputedScreeningDefinition,
+    PreparedScreeningDefinition,
     aggregate_diagnostic_events,
     atomic_write_signed_json,
     build_stage03_critical_events,
     iter_stage03_critical_events,
+    prepare_screening_definition,
     signed_sidecar_matches,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
@@ -337,14 +343,11 @@ def load_stage052_config(path: Path) -> Stage052Config:
         raise ValueError("current Stage 5.2 streaming storage requires screening_decisions_v3")
     if config.max_iterations != 1000 or config.batch_size <= 0:
         raise ValueError("Stage 5.2 requires 1000 iterations and a positive batch size")
-    if config.staging_root_alias != "wsl_staging" or config.archive_root_aliases != (
-        "d_archive",
-    ):
+    if config.staging_root_alias != "wsl_staging" or config.archive_root_aliases != ("d_archive",):
         raise ValueError("Stage 5.2 campaign storage root aliases are fixed")
     if (
         config.accelerator_backend != "cuda"
-        or config.accelerator_helper_schema_version
-        != "stage05.2-accelerator-helper-v2"
+        or config.accelerator_helper_schema_version != "stage05.2-accelerator-helper-v2"
         or config.accelerator_fallback_allowed
     ):
         raise ValueError("Stage 5.2 accelerator contract requires CUDA helper v2 without fallback")
@@ -1133,9 +1136,7 @@ def _run_benchmark_campaign_impl(
         "seeds": list(seeds),
         "backend": "cpu_batch",
         "execution_backend": selection_lock.selected_backend,
-        "optimization_profile": (
-            "cuda" if selection_lock.selected_backend == "cuda" else "native"
-        ),
+        "optimization_profile": ("cuda" if selection_lock.selected_backend == "cuda" else "native"),
         "worker_count": worker_count,
         "native_profile": "stage05.2-native-kernels-v1",
         "native_kernel_config": config.native_kernels.to_dict(),
@@ -1225,14 +1226,10 @@ def _run_benchmark_campaign_impl(
             output_dir
             / "control"
             / "rolling_capacity_observations"
-            / (
-                f"{ordinal:04d}_{observation['batch_id']}_"
-                f"{observation['phase']}.json"
-            )
+            / (f"{ordinal:04d}_{observation['batch_id']}_{observation['phase']}.json")
         )
         with campaign_persistence_recorder.record(
-            f"{observation['batch_id']}_{observation['phase']}_"
-            "rolling_capacity_journal_write"
+            f"{observation['batch_id']}_{observation['phase']}_rolling_capacity_journal_write"
         ):
             journal_payload, journal_sidecar = atomic_write_signed_json(
                 journal_path,
@@ -1316,15 +1313,11 @@ def _run_benchmark_campaign_impl(
                 envelope = BatchPersistenceEnvelope(
                     run_label=run_label,
                     batch_id=execution.batch.batch_id,
-                    base_attribution_sha256=str(
-                        execution.batch.persistence_attribution_sha256
-                    ),
+                    base_attribution_sha256=str(execution.batch.persistence_attribution_sha256),
                     verified_manifest_sha256=execution.verified_manifest_sha256,
                     archived_manifest_sha256=archived_evidence.manifest_sha256,
                     solver_seconds=execution.base_attribution.solver_seconds,
-                    base_persistence_seconds=(
-                        execution.base_attribution.total_persistence_seconds
-                    ),
+                    base_persistence_seconds=(execution.base_attribution.total_persistence_seconds),
                     state_intervals=(
                         execution.verified_manifest_write_interval,
                         archived_evidence.state_write_interval,
@@ -1334,8 +1327,7 @@ def _run_benchmark_campaign_impl(
                     f"{execution.batch.batch_id}_persistence_envelope_write"
                 ):
                     envelope_path, _ = atomic_write_signed_json(
-                        archived_evidence.manifest_path.parent
-                        / "batch_persistence_envelope.json",
+                        archived_evidence.manifest_path.parent / "batch_persistence_envelope.json",
                         envelope.to_dict(),
                     )
                 campaign = campaign.with_batch_persistence_envelope(
@@ -1809,12 +1801,12 @@ def _run_benchmark_batch(
             batch_preflight_path.write_text(
                 json.dumps(
                     {
-                    "schema_version": "stage05.2-batch-preflight-v1",
-                    "run_label": campaign_config.run_label,
-                    "batch_id": plan.batch_id,
-                    "power_source": batch_preflight.power_source,
-                    "low_power_mode_enabled": batch_preflight.low_power_mode_enabled,
-                    "windows": [window.to_dict() for window in batch_preflight.windows],
+                        "schema_version": "stage05.2-batch-preflight-v1",
+                        "run_label": campaign_config.run_label,
+                        "batch_id": plan.batch_id,
+                        "power_source": batch_preflight.power_source,
+                        "low_power_mode_enabled": batch_preflight.low_power_mode_enabled,
+                        "windows": [window.to_dict() for window in batch_preflight.windows],
                     },
                     indent=2,
                     sort_keys=True,
@@ -1896,37 +1888,36 @@ def _run_benchmark_batch(
             power_load_path.write_text(
                 json.dumps(
                     {
-                    "schema_version": "stage05.2-batch-power-load-v1",
-                    "run_label": campaign_config.run_label,
-                    "batch_id": plan.batch_id,
-                    "status": "complete",
-                    "native_power_boundary": native_power_boundary,
-                    "preflight": {
-                        "power_source": batch_preflight.power_source,
-                        "low_power_mode_enabled": (batch_preflight.low_power_mode_enabled),
-                        "windows": [window.to_dict() for window in batch_preflight.windows],
-                    },
-                    "runtime": {
-                        "sample_count": runtime_evidence.sample_count,
-                        "power_source_violations": (
-                            0
-                            if runtime_evidence.power_sources
-                            == (campaign_config.required_power_source,)
-                            else 1
-                        ),
-                        "low_power_mode_violations": (
-                            1 if runtime_evidence.low_power_mode_observed else 0
-                        ),
-                        "maximum_load1": runtime_evidence.maximum_load1,
-                        "maximum_unrelated_process_average_cores": (
-                            runtime_evidence.maximum_unrelated_process_average_cores
-                        ),
-                        "logical_cpu_count": runtime_evidence.logical_cpu_count,
-                        "process_cpu_samples": [
-                            sample.to_dict()
-                            for sample in runtime_evidence.process_cpu_samples
-                        ],
-                    },
+                        "schema_version": "stage05.2-batch-power-load-v1",
+                        "run_label": campaign_config.run_label,
+                        "batch_id": plan.batch_id,
+                        "status": "complete",
+                        "native_power_boundary": native_power_boundary,
+                        "preflight": {
+                            "power_source": batch_preflight.power_source,
+                            "low_power_mode_enabled": (batch_preflight.low_power_mode_enabled),
+                            "windows": [window.to_dict() for window in batch_preflight.windows],
+                        },
+                        "runtime": {
+                            "sample_count": runtime_evidence.sample_count,
+                            "power_source_violations": (
+                                0
+                                if runtime_evidence.power_sources
+                                == (campaign_config.required_power_source,)
+                                else 1
+                            ),
+                            "low_power_mode_violations": (
+                                1 if runtime_evidence.low_power_mode_observed else 0
+                            ),
+                            "maximum_load1": runtime_evidence.maximum_load1,
+                            "maximum_unrelated_process_average_cores": (
+                                runtime_evidence.maximum_unrelated_process_average_cores
+                            ),
+                            "logical_cpu_count": runtime_evidence.logical_cpu_count,
+                            "process_cpu_samples": [
+                                sample.to_dict() for sample in runtime_evidence.process_cpu_samples
+                            ],
+                        },
                     },
                     indent=2,
                     sort_keys=True,
@@ -2174,9 +2165,10 @@ def _exercise_campaign_failure_state_machine(
     expected_payload = hashlib.sha256(campaign.run_label.encode("utf-8")).digest() * 256
     injected_after_bytes = len(expected_payload) // 2
     try:
-        with recorder.record("failure_state_drill_partial_write"), partial_path.open(
-            "xb"
-        ) as handle:
+        with (
+            recorder.record("failure_state_drill_partial_write"),
+            partial_path.open("xb") as handle,
+        ):
             handle.write(expected_payload[:injected_after_bytes])
             handle.flush()
             os.fsync(handle.fileno())
@@ -2269,14 +2261,12 @@ def _exercise_campaign_failure_state_machine(
         f"{campaign.run_label}_failure_{worker_task.instance_name}_{worker_task.seed}.json"
     )
     worker_manifest_path = worker_shard_dir / (
-        f"{campaign.run_label}_shard_manifest_"
-        f"{worker_task.instance_name}_{worker_task.seed}.json"
+        f"{campaign.run_label}_shard_manifest_{worker_task.instance_name}_{worker_task.seed}.json"
     )
     worker_manifest_sidecar = worker_manifest_path.with_suffix(".sha256")
     worker_manifest = json.loads(worker_manifest_path.read_text(encoding="utf-8"))
     if (
-        worker_manifest_sidecar.read_text(encoding="utf-8").strip()
-        != _sha256(worker_manifest_path)
+        worker_manifest_sidecar.read_text(encoding="utf-8").strip() != _sha256(worker_manifest_path)
         or worker_manifest.get("evidence_completeness") != "partial"
         or worker_manifest.get("worker_identity") != "failure-recorder"
     ):
@@ -2289,12 +2279,8 @@ def _exercise_campaign_failure_state_machine(
     drill_volume = campaign.batches[0].volume
     archive_locator = StorageRootLocator(
         {
-            "drill_staging": StorageRoot(
-                "drill_staging", archive_source_root, drill_volume
-            ),
-            "drill_archive": StorageRoot(
-                "drill_archive", archive_destination_root, drill_volume
-            ),
+            "drill_staging": StorageRoot("drill_staging", archive_source_root, drill_volume),
+            "drill_archive": StorageRoot("drill_archive", archive_destination_root, drill_volume),
         }
     )
     archive_logical_path = "archive_recovery/payload"
@@ -2370,17 +2356,13 @@ def _exercise_campaign_failure_state_machine(
                 "injected_after_bytes": injected_after_bytes,
                 "partial_file_relative_path": partial_path.relative_to(output_dir).as_posix(),
                 "partial_file_sha256": _sha256(partial_path),
-                "failed_batch_relative_path": failed_batch_path.relative_to(
-                    output_dir
-                ).as_posix(),
+                "failed_batch_relative_path": failed_batch_path.relative_to(output_dir).as_posix(),
                 "failed_batch_sha256": _sha256(failed_batch_path),
                 "failed_campaign_relative_path": failed_campaign_path.relative_to(
                     output_dir
                 ).as_posix(),
                 "failed_campaign_sha256": _sha256(failed_campaign_path),
-                "atomic_state_relative_path": atomic_state_path.relative_to(
-                    output_dir
-                ).as_posix(),
+                "atomic_state_relative_path": atomic_state_path.relative_to(output_dir).as_posix(),
                 "atomic_state_sha256": _sha256(atomic_state_path),
                 "atomic_state_generation": 1,
                 "worker_failure_relative_path": worker_failure_path.relative_to(
@@ -2623,16 +2605,13 @@ def _record_remediation_child(
             child_path,
             artifact_type="remediation_child_payload",
             artifact_subtype=(
-                f"{descriptor.get('artifact_type', '')}:"
-                f"{descriptor.get('artifact_subtype', '')}"
+                f"{descriptor.get('artifact_type', '')}:{descriptor.get('artifact_subtype', '')}"
             ),
             retention_class="critical",
             storage_format=str(descriptor.get("storage_format", "")),
             compression=str(descriptor.get("compression", "none")),
             row_count=(
-                int(descriptor["row_count"])
-                if descriptor.get("row_count") is not None
-                else None
+                int(descriptor["row_count"]) if descriptor.get("row_count") is not None else None
             ),
             schema_fingerprint=str(descriptor.get("schema_fingerprint", "")),
         )
@@ -2839,8 +2818,7 @@ def _accelerator_decision_inputs(
             set(native_observations) != expected
             or set(raw_semantic_digests) != expected
             or any(
-                native_observations[identity].semantic_digest
-                != raw_semantic_digests[identity]
+                native_observations[identity].semantic_digest != raw_semantic_digests[identity]
                 for identity in expected
             )
         ):
@@ -3260,6 +3238,353 @@ class _Stage052StreamingShard(Protocol):
     def flush(self) -> None: ...
 
 
+type _AsyncCriticalBatch = tuple[Mapping[str, object] | BufferedScreeningDecision, ...]
+
+
+class _PersistenceActivityMeter:
+    """Thread-safe union and per-role timing for overlapping persistence work."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._depth: dict[tuple[int, str], int] = {}
+        self._role_started_ns: dict[tuple[int, str], int] = {}
+        self._role_nanoseconds: Counter[str] = Counter()
+        self._active_roles = 0
+        self._union_started_ns: int | None = None
+        self._union_nanoseconds = 0
+
+    def enter(self, role: str) -> tuple[int, str, bool]:
+        identity = (threading.get_ident(), role)
+        with self._lock:
+            depth = self._depth.get(identity, 0)
+            self._depth[identity] = depth + 1
+            if depth:
+                return (*identity, False)
+            now = time.perf_counter_ns()
+            self._role_started_ns[identity] = now
+            if self._active_roles == 0:
+                self._union_started_ns = now
+            self._active_roles += 1
+            return (*identity, True)
+
+    def exit(self, token: tuple[int, str, bool]) -> None:
+        thread_id, role, outermost = token
+        identity = (thread_id, role)
+        with self._lock:
+            depth = self._depth.get(identity)
+            if depth is None or depth <= 0:
+                raise RuntimeError("persistence activity depth is invalid")
+            if depth > 1:
+                self._depth[identity] = depth - 1
+                return
+            self._depth.pop(identity)
+            if not outermost:
+                raise RuntimeError("persistence activity nesting is invalid")
+            started_ns = self._role_started_ns.pop(identity)
+            now = time.perf_counter_ns()
+            self._role_nanoseconds[role] += now - started_ns
+            self._active_roles -= 1
+            if self._active_roles == 0:
+                if self._union_started_ns is None:
+                    raise RuntimeError("persistence union interval is invalid")
+                self._union_nanoseconds += now - self._union_started_ns
+                self._union_started_ns = None
+
+    def record_serialized(self, role: str, elapsed_nanoseconds: int) -> None:
+        """Record one non-overlapping interval already protected by the shard turn."""
+
+        if elapsed_nanoseconds < 0:
+            raise RuntimeError("persistence activity duration is invalid")
+        self._role_nanoseconds[role] += elapsed_nanoseconds
+        self._union_nanoseconds += elapsed_nanoseconds
+
+    def role_nanoseconds(self, role: str) -> int:
+        with self._lock:
+            return int(self._role_nanoseconds[role])
+
+    @property
+    def union_nanoseconds(self) -> int:
+        with self._lock:
+            total = self._union_nanoseconds
+            if self._active_roles:
+                if self._union_started_ns is None:
+                    raise RuntimeError("active persistence union has no start")
+                total += time.perf_counter_ns() - self._union_started_ns
+            return total
+
+
+def _pipeline_event_token(
+    event: Mapping[str, object] | BufferedScreeningDecision,
+) -> tuple[object, ...]:
+    if isinstance(event, tuple):
+        tail = event[7].tail
+        return (
+            "screening_decision",
+            tail[2],
+            event[2],
+            event[3],
+            event[4],
+            event[1],
+            event[0],
+            None,
+            None,
+            tail[0],
+            tail[1],
+            None,
+            None,
+            None,
+        )
+    get = event.get
+    kind = get("kind") or None
+    operation = get("operation") or None
+    status = get("status") or None
+    reason = get("reason") or None
+    return (
+        str(get("event_type", get("record_type", "event"))),
+        get("benchmark_axis"),
+        get("lane"),
+        get("iteration"),
+        get("operator"),
+        get("route_key"),
+        get("decision_id"),
+        kind,
+        operation,
+        status,
+        reason,
+        get("exact_started"),
+        get("exact_completed"),
+        get("feasible"),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _QueuedCriticalBatch:
+    ordinal: int
+    rows: _AsyncCriticalBatch
+
+
+class _BoundedShardAppender:
+    """FIFO one-thread writer with one queued batch and fail-fast handoff."""
+
+    def __init__(
+        self,
+        shard: _Stage052StreamingShard,
+        meter: _PersistenceActivityMeter,
+    ) -> None:
+        self._shard = shard
+        self._meter = meter
+        self._sentinel = object()
+        self._queue: Queue[_QueuedCriticalBatch | object] = Queue(maxsize=1)
+        self._error: BaseException | None = None
+        self._error_lock = threading.Lock()
+        self._write_turn = threading.Lock()
+        self._producer_turn_thread_id: int | None = None
+        self._discard = False
+        self._closed = False
+        self._submitted_batches = 0
+        self._completed_batches = 0
+        self._producer_wait_nanoseconds = 0
+        self._writer_cpu_nanoseconds = 0
+        self._peak_queued_batches = 0
+        self._batch_ledger: list[dict[str, object]] = []
+        self._thread = threading.Thread(
+            target=self._run,
+            name="stage052-artifact-writer",
+            daemon=False,
+        )
+        self._thread.start()
+
+    @property
+    def summary(self) -> dict[str, object]:
+        return {
+            "mode": "bounded_async_thread",
+            "queue_max_batches": 1,
+            "writer_thread_switch_interval_seconds": 0.05,
+            "submitted_batches": self._submitted_batches,
+            "completed_batches": self._completed_batches,
+            "writer_active_nanoseconds": self._meter.role_nanoseconds("writer"),
+            "writer_cpu_nanoseconds": self._writer_cpu_nanoseconds,
+            "producer_active_nanoseconds": self._meter.role_nanoseconds("producer"),
+            "persistence_union_nanoseconds": self._meter.union_nanoseconds,
+            "producer_wait_nanoseconds": self._producer_wait_nanoseconds,
+            "peak_queued_batches": self._peak_queued_batches,
+            "batch_ledger": [dict(item) for item in self._batch_ledger],
+        }
+
+    @property
+    def writer_cpu_nanoseconds(self) -> int:
+        return self._writer_cpu_nanoseconds
+
+    def begin_producer_turn(self) -> None:
+        """Hold the shard turn until one producer callback is complete."""
+
+        thread_id = threading.get_ident()
+        if self._producer_turn_thread_id is not None:
+            if self._producer_turn_thread_id != thread_id:
+                raise RuntimeError("Stage 5.2 trace producer thread changed")
+            return
+        while True:
+            if self._submitted_batches != self._completed_batches:
+                self._queue.join()
+                self._raise_if_failed()
+                continue
+            self._write_turn.acquire()
+            if self._submitted_batches == self._completed_batches:
+                error = self._error
+                if error is not None:
+                    self._write_turn.release()
+                    raise error
+                self._producer_turn_thread_id = thread_id
+                return
+            self._write_turn.release()
+
+    def end_producer_turn(self) -> None:
+        if self._producer_turn_thread_id != threading.get_ident():
+            raise RuntimeError("Stage 5.2 trace producer does not own the shard turn")
+        if self._submitted_batches != self._completed_batches:
+            self._release_producer_turn()
+
+    def wait_for_writer_turn(self) -> None:
+        self._release_producer_turn()
+        with self._write_turn:
+            self._raise_if_failed()
+
+    def _release_producer_turn(self) -> None:
+        owner = self._producer_turn_thread_id
+        if owner is None:
+            return
+        if owner != threading.get_ident():
+            raise RuntimeError("Stage 5.2 trace producer turn belongs to another thread")
+        self._producer_turn_thread_id = None
+        self._write_turn.release()
+
+    def submit(self, batch: _AsyncCriticalBatch) -> None:
+        if not batch:
+            return
+        if self._closed:
+            raise RuntimeError("Stage 5.2 async persistence pipeline is closed")
+        started_ns = time.perf_counter_ns()
+        try:
+            while True:
+                self._raise_if_failed()
+                try:
+                    self._queue.put(
+                        _QueuedCriticalBatch(self._submitted_batches, batch),
+                        timeout=0.05,
+                    )
+                except Full:
+                    continue
+                self._submitted_batches += 1
+                # A successful put is the linearization point proving that the
+                # single queue slot was occupied, even if the writer dequeues
+                # before the producer can sample qsize().
+                self._peak_queued_batches = 1
+                return
+        finally:
+            self._producer_wait_nanoseconds += time.perf_counter_ns() - started_ns
+
+    def drain(self) -> None:
+        started_ns = time.perf_counter_ns()
+        try:
+            self._queue.join()
+            self._raise_if_failed()
+        finally:
+            self._producer_wait_nanoseconds += time.perf_counter_ns() - started_ns
+
+    def close(self) -> None:
+        if self._closed:
+            self._raise_if_failed()
+            return
+        self._release_producer_turn()
+        failure: BaseException | None = None
+        try:
+            self.drain()
+        except BaseException as error:
+            failure = error
+        self._queue.put(self._sentinel)
+        self._thread.join()
+        self._closed = True
+        if failure is not None:
+            raise failure
+        self._raise_if_failed()
+
+    def discard(self) -> None:
+        if self._closed:
+            return
+        self._release_producer_turn()
+        self._discard = True
+        self._queue.join()
+        self._queue.put(self._sentinel)
+        self._thread.join()
+        self._closed = True
+        self._raise_if_failed()
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is self._sentinel:
+                    return
+                if self._discard or self._error is not None:
+                    continue
+                queued = item
+                if not isinstance(queued, _QueuedCriticalBatch):
+                    raise RuntimeError("Stage 5.2 async persistence batch is invalid")
+                batch = queued.rows
+                with self._write_turn:
+                    activity = self._meter.enter("writer")
+                    previous_switch_interval = sys.getswitchinterval()
+                    writer_wall_started_ns = time.perf_counter_ns()
+                    writer_cpu_started_ns = time.thread_time_ns()
+                    try:
+                        sys.setswitchinterval(0.05)
+                        digest = hashlib.sha256()
+                        for event in batch:
+                            digest.update(orjson.dumps(_pipeline_event_token(event)) + b"\n")
+                        persisted = self._shard.append(
+                            route_dictionary={},
+                            critical_events=batch,
+                            cache_lookups_coalesced=True,
+                        )
+                    finally:
+                        writer_cpu_elapsed_ns = time.thread_time_ns() - writer_cpu_started_ns
+                        writer_wall_elapsed_ns = time.perf_counter_ns() - writer_wall_started_ns
+                        # A coarse per-thread CPU clock can jump by one full tick
+                        # across a much shorter batch.  One thread cannot consume
+                        # more CPU than elapsed wall time, so preserve the physical
+                        # invariant instead of publishing a quantization artifact.
+                        self._writer_cpu_nanoseconds += min(
+                            writer_cpu_elapsed_ns,
+                            writer_wall_elapsed_ns,
+                        )
+                        sys.setswitchinterval(previous_switch_interval)
+                        self._meter.exit(activity)
+                if persisted != len(batch):
+                    raise RuntimeError(
+                        "Stage 5.2 trace sink did not persist its complete logical event batch"
+                    )
+                self._completed_batches += 1
+                self._batch_ledger.append(
+                    {
+                        "ordinal": queued.ordinal,
+                        "row_count": len(batch),
+                        "event_token_sha256": digest.hexdigest(),
+                    }
+                )
+            except BaseException as error:
+                with self._error_lock:
+                    if self._error is None:
+                        self._error = error
+            finally:
+                self._queue.task_done()
+
+    def _raise_if_failed(self) -> None:
+        with self._error_lock:
+            error = self._error
+        if error is not None:
+            raise error
+
+
 def _abort_v2_shard_after_failure(
     shard: Any,
     *,
@@ -3293,9 +3618,12 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         axis_name: str,
         buffer_rows: int = 65_536,
         neighborhood_buffer_rows: int = 524_288,
+        async_persistence: bool = False,
     ) -> None:
         if isinstance(buffer_rows, bool) or not isinstance(buffer_rows, int) or buffer_rows <= 0:
             raise ValueError("trace stream buffer_rows must be a positive integer")
+        if async_persistence and buffer_rows > V2_PARQUET_ROW_GROUP_SIZE:
+            raise ValueError("async trace stream buffer_rows may not exceed one Parquet row group")
         if (
             isinstance(neighborhood_buffer_rows, bool)
             or not isinstance(neighborhood_buffer_rows, int)
@@ -3318,8 +3646,15 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._neighborhood_read_offset = 0
         self._semantic_event_digest = hashlib.sha256()
         self._negative_screening_evidence_cache: dict[str, tuple[object, ...]] = {}
+        self._negative_screening_definition_cache: dict[str, PrecomputedScreeningDefinition] = {}
         self._screening_definition_tail_cache: dict[
             tuple[object, ...], PrecomputedScreeningDefinition
+        ] = {}
+        self._prepared_screening_definition_cache: dict[
+            tuple[str, str, str, tuple[object, ...]], PreparedScreeningDefinition
+        ] = {}
+        self._negative_prepared_screening_cache: dict[
+            tuple[str, str, str, int], PreparedScreeningDefinition
         ] = {}
         self._initial_objective_key: ObjectiveKey | None = None
         self._visible_global_bests: dict[int, AcceptedGlobalBest] = {}
@@ -3329,8 +3664,17 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._screening_schema_version = getattr(
             shard, "screening_schema_version", "screening_decisions_v3"
         )
+        self._persistence_meter = _PersistenceActivityMeter()
+        self._solver_persistence_union_nanoseconds: int | None = None
+        self._solver_persistence_critical_path_nanoseconds: int | None = None
+        self._solver_producer_active_nanoseconds: int | None = None
+        self._solver_writer_cpu_nanoseconds: int | None = None
+        self._async_appender = (
+            _BoundedShardAppender(shard, self._persistence_meter) if async_persistence else None
+        )
 
     def append_route_evaluation(self, record: RouteEvaluationTrace) -> None:
+        self._begin_async_producer_turn()
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
@@ -3339,11 +3683,16 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             payload["event_type"] = "route_evaluation"
             self._queue_owned(payload)
         finally:
-            nested_ns = self.persistence_nanoseconds - previously_recorded_ns
-            elapsed_ns = time.perf_counter_ns() - started_ns
-            self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
+            try:
+                nested_ns = self.persistence_nanoseconds - previously_recorded_ns
+                elapsed_ns = time.perf_counter_ns() - started_ns
+                self._persistence_meter.record_serialized("producer", elapsed_ns)
+                self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
+            finally:
+                self._end_async_producer_turn()
 
     def append_event(self, event: Mapping[str, object]) -> None:
+        self._begin_async_producer_turn()
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
@@ -3351,89 +3700,146 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             payload["record_type"] = str(event.get("event_type", "event"))
             self._queue_owned(payload)
         finally:
-            nested_ns = self.persistence_nanoseconds - previously_recorded_ns
-            elapsed_ns = time.perf_counter_ns() - started_ns
-            self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
+            try:
+                nested_ns = self.persistence_nanoseconds - previously_recorded_ns
+                elapsed_ns = time.perf_counter_ns() - started_ns
+                self._persistence_meter.record_serialized("producer", elapsed_ns)
+                self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
+            finally:
+                self._end_async_producer_turn()
 
     def append_screening_decision(self, decision: ScreeningDecision) -> None:
+        self._begin_async_producer_turn()
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
             self._append_screening_decision(decision)
         finally:
-            nested_ns = self.persistence_nanoseconds - previously_recorded_ns
-            elapsed_ns = time.perf_counter_ns() - started_ns
-            self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
+            try:
+                nested_ns = self.persistence_nanoseconds - previously_recorded_ns
+                elapsed_ns = time.perf_counter_ns() - started_ns
+                self._persistence_meter.record_serialized("producer", elapsed_ns)
+                self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
+            finally:
+                self._end_async_producer_turn()
 
     def _append_screening_decision(self, decision: ScreeningDecision) -> None:
-        evidence_tail = (
-            decision.status,
-            decision.reason,
-            decision.demand,
-            decision.distance_increment_lower_bound,
-            decision.distance_lower_bound,
-            decision.exact_call_blocked,
-            decision.first_failed_check,
-            decision.min_time_window_slack,
-            decision.negative_cache_hit,
-            decision.single_segment_reachable,
-            decision.structural_energy_lower_bound,
-            decision.checks,
+        buffered_v3 = (
+            self._screening_schema_version == "screening_decisions_v3"
+            and getattr(self._shard, "supports_buffered_screening_decisions", False) is True
         )
+        evidence_tail: tuple[object, ...] | None = None
+        definition: PrecomputedScreeningDefinition | None = None
         if decision.negative_cache_hit:
+            evidence_tail = (
+                decision.status,
+                decision.reason,
+                decision.demand,
+                decision.distance_increment_lower_bound,
+                decision.distance_lower_bound,
+                decision.exact_call_blocked,
+                decision.first_failed_check,
+                decision.min_time_window_slack,
+                decision.negative_cache_hit,
+                decision.single_segment_reachable,
+                decision.structural_energy_lower_bound,
+                decision.checks,
+            )
             cached_tail = self._negative_screening_evidence_cache.get(decision.route_key)
             if cached_tail is not None and cached_tail != evidence_tail:
                 raise RuntimeError(
                     "negative screening cache returned inconsistent evidence for one route"
                 )
-            self._negative_screening_evidence_cache[decision.route_key] = evidence_tail
-            if len(self._negative_screening_evidence_cache) > 262_144:
-                self._negative_screening_evidence_cache.pop(
-                    next(iter(self._negative_screening_evidence_cache))
-                )
-        if (
-            self._screening_schema_version == "screening_decisions_v3"
-            and getattr(self._shard, "supports_buffered_screening_decisions", False) is True
-        ):
-            compact_checks = tuple(
-                (
-                    check.check,
-                    check.status,
-                    check.value if isinstance(check.value, bool) else None,
-                    float(check.value)
-                    if isinstance(check.value, (int, float))
-                    and not isinstance(check.value, bool)
-                    else None,
-                    check.value if isinstance(check.value, str) else None,
-                    check.reason,
-                )
-                for check in decision.checks
-            )
-            tail = (
-                decision.status,
-                decision.reason,
-                self.axis_name,
-                float(decision.demand),
-                float(decision.distance_increment_lower_bound)
-                if decision.distance_increment_lower_bound is not None
-                else None,
-                float(decision.distance_lower_bound),
-                decision.exact_call_blocked,
-                decision.first_failed_check,
-                float(decision.min_time_window_slack),
-                decision.negative_cache_hit,
-                decision.single_segment_reachable,
-                float(decision.structural_energy_lower_bound),
-                compact_checks,
-            )
-            definition = self._screening_definition_tail_cache.get(tail)
+            if cached_tail is None:
+                self._negative_screening_evidence_cache[decision.route_key] = evidence_tail
+                if len(self._negative_screening_evidence_cache) > 262_144:
+                    evicted_route = next(iter(self._negative_screening_evidence_cache))
+                    self._negative_screening_evidence_cache.pop(evicted_route)
+                    self._negative_screening_definition_cache.pop(evicted_route, None)
+            elif buffered_v3:
+                definition = self._negative_screening_definition_cache.get(decision.route_key)
+        if buffered_v3:
             if definition is None:
-                definition = PrecomputedScreeningDefinition(tail)
-                self._screening_definition_tail_cache[tail] = definition
-                if len(self._screening_definition_tail_cache) > 262_144:
-                    self._screening_definition_tail_cache.pop(
-                        next(iter(self._screening_definition_tail_cache))
+                compact_checks = tuple(
+                    (
+                        check.check,
+                        check.status,
+                        check.value if isinstance(check.value, bool) else None,
+                        float(check.value)
+                        if isinstance(check.value, (int, float))
+                        and not isinstance(check.value, bool)
+                        else None,
+                        check.value if isinstance(check.value, str) else None,
+                        check.reason,
                     )
+                    for check in decision.checks
+                )
+                tail = (
+                    decision.status,
+                    decision.reason,
+                    self.axis_name,
+                    float(decision.demand),
+                    float(decision.distance_increment_lower_bound)
+                    if decision.distance_increment_lower_bound is not None
+                    else None,
+                    float(decision.distance_lower_bound),
+                    decision.exact_call_blocked,
+                    decision.first_failed_check,
+                    float(decision.min_time_window_slack),
+                    decision.negative_cache_hit,
+                    decision.single_segment_reachable,
+                    float(decision.structural_energy_lower_bound),
+                    compact_checks,
+                )
+                definition = self._screening_definition_tail_cache.get(tail)
+                if definition is None:
+                    definition = PrecomputedScreeningDefinition(tail)
+                    self._screening_definition_tail_cache[tail] = definition
+                    if len(self._screening_definition_tail_cache) > 262_144:
+                        self._screening_definition_tail_cache.pop(
+                            next(iter(self._screening_definition_tail_cache))
+                        )
+                if decision.negative_cache_hit:
+                    if evidence_tail is None:
+                        raise RuntimeError("negative screening evidence tail is unavailable")
+                    self._negative_screening_definition_cache[decision.route_key] = definition
+            negative_prepared_key = (
+                decision.lane,
+                decision.operator,
+                decision.route_key,
+                id(definition),
+            )
+            prepared = (
+                self._negative_prepared_screening_cache.get(negative_prepared_key)
+                if decision.negative_cache_hit
+                else None
+            )
+            if prepared is None:
+                prepared_key = (
+                    decision.lane,
+                    decision.operator,
+                    decision.route_key,
+                    definition.tail,
+                )
+                prepared = self._prepared_screening_definition_cache.get(prepared_key)
+                if prepared is None:
+                    prepared = prepare_screening_definition(
+                        definition,
+                        route_key=decision.route_key,
+                        lane=f"{self.axis_name}:{decision.lane}",
+                        operator=decision.operator,
+                    )
+                    self._prepared_screening_definition_cache[prepared_key] = prepared
+                    if len(self._prepared_screening_definition_cache) > 262_144:
+                        self._prepared_screening_definition_cache.pop(
+                            next(iter(self._prepared_screening_definition_cache))
+                        )
+                if decision.negative_cache_hit:
+                    self._negative_prepared_screening_cache[negative_prepared_key] = prepared
+                    if len(self._negative_prepared_screening_cache) > 262_144:
+                        self._negative_prepared_screening_cache.pop(
+                            next(iter(self._negative_prepared_screening_cache))
+                        )
             self._flush_pending_lookup()
             self._event_buffer.append(
                 (
@@ -3444,7 +3850,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                     decision.operator,
                     decision.started_at,
                     decision.completed_at,
-                    definition,
+                    prepared,
                 )
             )
             if len(self._event_buffer) >= self._buffer_rows:
@@ -3488,6 +3894,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         )
 
     def append_incremental_propagation(self, propagation: Mapping[str, object]) -> None:
+        self._begin_async_producer_turn()
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
@@ -3496,9 +3903,13 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             payload["event_type"] = "incremental_propagation"
             self._queue_owned(payload)
         finally:
-            nested_ns = self.persistence_nanoseconds - previously_recorded_ns
-            elapsed_ns = time.perf_counter_ns() - started_ns
-            self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
+            try:
+                nested_ns = self.persistence_nanoseconds - previously_recorded_ns
+                elapsed_ns = time.perf_counter_ns() - started_ns
+                self._persistence_meter.record_serialized("producer", elapsed_ns)
+                self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
+            finally:
+                self._end_async_producer_turn()
 
     def append_neighborhood_events(
         self,
@@ -3506,6 +3917,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         *,
         route_dictionary: dict[str, tuple[str, ...]],
     ) -> None:
+        self._begin_async_producer_turn()
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
@@ -3514,11 +3926,16 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                 payload["record_type"] = "neighborhood_event"
                 self._spool_neighborhood_event(payload)
         finally:
-            nested_ns = self.persistence_nanoseconds - previously_recorded_ns
-            elapsed_ns = time.perf_counter_ns() - started_ns
-            self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
+            try:
+                nested_ns = self.persistence_nanoseconds - previously_recorded_ns
+                elapsed_ns = time.perf_counter_ns() - started_ns
+                self._persistence_meter.record_serialized("producer", elapsed_ns)
+                self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
+            finally:
+                self._end_async_producer_turn()
 
     def append_neighborhood_event(self, event: Mapping[str, object]) -> None:
+        self._begin_async_producer_turn()
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
@@ -3526,37 +3943,90 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             payload["record_type"] = "neighborhood_event"
             self._spool_neighborhood_event(payload)
         finally:
-            nested_ns = self.persistence_nanoseconds - previously_recorded_ns
-            elapsed_ns = time.perf_counter_ns() - started_ns
-            self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
+            try:
+                nested_ns = self.persistence_nanoseconds - previously_recorded_ns
+                elapsed_ns = time.perf_counter_ns() - started_ns
+                self._persistence_meter.record_serialized("producer", elapsed_ns)
+                self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
+            finally:
+                self._end_async_producer_turn()
 
     def finish(self) -> None:
+        self._wait_for_async_writer()
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
+        activity = self._persistence_meter.enter("producer")
         try:
             self._flush_pending_lookup()
             self._flush_event_buffer()
             self._drain_neighborhood_spool()
             self._flush_event_buffer()
+            if self._async_appender is not None:
+                self._async_appender.drain()
         finally:
+            self._persistence_meter.exit(activity)
             nested_ns = self.persistence_nanoseconds - previously_recorded_ns
             elapsed_ns = time.perf_counter_ns() - started_ns
             self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
 
+    def _wait_for_async_writer(self) -> None:
+        if self._async_appender is not None:
+            self._async_appender.wait_for_writer_turn()
+
+    def _begin_async_producer_turn(self) -> None:
+        if self._async_appender is not None:
+            self._async_appender.begin_producer_turn()
+
+    def _end_async_producer_turn(self) -> None:
+        if self._async_appender is not None:
+            self._async_appender.end_producer_turn()
+
     def close(self) -> None:
         if self._closed:
             return
-        self.finish()
-        self._close_neighborhood_spool()
+        activity = self._persistence_meter.enter("producer")
+        errors: list[BaseException] = []
+        try:
+            self.finish()
+        except BaseException as error:
+            errors.append(error)
+        if self._async_appender is not None:
+            try:
+                self._async_appender.close()
+            except BaseException as error:
+                errors.append(error)
+        try:
+            self._close_neighborhood_spool()
+        except BaseException as error:
+            errors.append(error)
         self._closed = True
+        try:
+            self._persistence_meter.exit(activity)
+        except BaseException as error:
+            errors.append(error)
+        if errors:
+            raise BaseExceptionGroup("failed to close Stage 5.2 trace stream", errors)
 
     def discard_pending(self) -> None:
         """Discard an uncommitted callback batch after a shard append failure."""
 
         self._pending_cache_lookup = None
         self._event_buffer.clear()
-        self._close_neighborhood_spool()
+        errors: list[BaseException] = []
+        if self._async_appender is not None:
+            try:
+                self._async_appender.discard()
+            except BaseException as error:
+                errors.append(error)
+        try:
+            self._close_neighborhood_spool()
+        except BaseException as error:
+            errors.append(error)
         self._closed = True
+        if errors:
+            if len(errors) == 1:
+                raise errors[0]
+            raise BaseExceptionGroup("failed to discard Stage 5.2 trace stream", errors)
 
     def _spool_neighborhood_event(self, event: Mapping[str, object]) -> None:
         if self._closed:
@@ -3704,6 +4174,66 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         output["screening_decisions"] += self._screening_decision_count
         return output
 
+    @property
+    def persistence_pipeline(self) -> dict[str, object]:
+        if self._async_appender is None:
+            return {
+                "mode": "synchronous",
+                "queue_max_batches": 0,
+                "writer_thread_switch_interval_seconds": 0.0,
+                "submitted_batches": 0,
+                "completed_batches": 0,
+                "writer_active_nanoseconds": 0,
+                "writer_cpu_nanoseconds": 0,
+                "producer_active_nanoseconds": self._persistence_meter.role_nanoseconds("producer"),
+                "persistence_union_nanoseconds": self._persistence_meter.union_nanoseconds,
+                "solver_persistence_union_nanoseconds": (
+                    self._solver_persistence_union_nanoseconds or 0
+                ),
+                "solver_persistence_critical_path_nanoseconds": (
+                    self._solver_persistence_critical_path_nanoseconds or 0
+                ),
+                "solver_producer_active_nanoseconds": (
+                    self._solver_producer_active_nanoseconds or 0
+                ),
+                "solver_writer_cpu_nanoseconds": (self._solver_writer_cpu_nanoseconds or 0),
+                "producer_wait_nanoseconds": 0,
+                "peak_queued_batches": 0,
+                "batch_ledger": [],
+            }
+        summary = self._async_appender.summary
+        summary["solver_persistence_union_nanoseconds"] = (
+            self._solver_persistence_union_nanoseconds or 0
+        )
+        summary["solver_persistence_critical_path_nanoseconds"] = (
+            self._solver_persistence_critical_path_nanoseconds or 0
+        )
+        summary["solver_producer_active_nanoseconds"] = (
+            self._solver_producer_active_nanoseconds or 0
+        )
+        summary["solver_writer_cpu_nanoseconds"] = self._solver_writer_cpu_nanoseconds or 0
+        return summary
+
+    @property
+    def persistence_union_nanoseconds(self) -> int:
+        return self._persistence_meter.union_nanoseconds
+
+    def freeze_solver_persistence_boundary(self) -> int:
+        if self._solver_persistence_union_nanoseconds is not None:
+            raise RuntimeError("solver persistence boundary was already frozen")
+        self._solver_persistence_union_nanoseconds = self._persistence_meter.union_nanoseconds
+        self._solver_writer_cpu_nanoseconds = (
+            self._async_appender.writer_cpu_nanoseconds if self._async_appender is not None else 0
+        )
+        self._solver_producer_active_nanoseconds = self._persistence_meter.role_nanoseconds(
+            "producer"
+        )
+        self._solver_persistence_critical_path_nanoseconds = max(
+            self._solver_producer_active_nanoseconds,
+            self._solver_writer_cpu_nanoseconds,
+        )
+        return self._solver_persistence_union_nanoseconds
+
     def diagnostic_rows(
         self,
         *,
@@ -3801,6 +4331,9 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             return
         pending = tuple(self._event_buffer)
         self._event_buffer.clear()
+        if self._async_appender is not None:
+            self._async_appender.submit(pending)
+            return
         persisted = self._shard.append(
             route_dictionary={},
             critical_events=pending,
@@ -3903,7 +4436,15 @@ def _run_and_persist_v2_shard(
         for axis in axes:
             axis_started_ns = time.perf_counter_ns()
             solver_started_ns = axis_started_ns
-            trace_stream = _Stage052TraceStreamSink(shard=shard, axis_name=axis.name)
+            trace_stream = _Stage052TraceStreamSink(
+                shard=shard,
+                axis_name=axis.name,
+                async_persistence=task.component
+                in {
+                    Stage052Component.NATIVE_KERNELS.value,
+                    Stage052Component.BENCHMARK.value,
+                },
+            )
             active_trace_stream = trace_stream
             result = _solve_stage052_axis(
                 instance,
@@ -3916,7 +4457,7 @@ def _run_and_persist_v2_shard(
             )
             trace_stream.finish()
             solver_completed_ns = time.perf_counter_ns()
-            solver_persistence_ns = trace_stream.persistence_nanoseconds
+            solver_persistence_ns = trace_stream.freeze_solver_persistence_boundary()
             solver_persistence_ns_by_axis[axis.name] = solver_persistence_ns
             solver_elapsed_ns = solver_completed_ns - solver_started_ns
             if solver_persistence_ns > solver_elapsed_ns:
@@ -4014,7 +4555,6 @@ def _run_and_persist_v2_shard(
             }
             trace_axis = trace.to_index_dict()
             trace_axis["streamed_record_counts"] = trace_stream.persisted_family_counts
-            trace_axes[axis.name] = trace_axis
             drafts[axis.name] = _stage052_row_draft(
                 task=task,
                 axis=axis,
@@ -4026,6 +4566,8 @@ def _run_and_persist_v2_shard(
                 storage=storage,
             )
             trace_stream.close()
+            trace_axis["persistence_pipeline"] = trace_stream.persistence_pipeline
+            trace_axes[axis.name] = trace_axis
             active_trace_stream = None
             artifact_preparation_completed_ns = time.perf_counter_ns()
             postsolve_artifact_preparation_ns = (

@@ -24,10 +24,13 @@ from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
+import orjson
+
 from evrptw import _core as native_core
 from evrptw.artifacts import (
     DIAGNOSTIC_SCHEMA,
     ROUTE_DICTIONARY_SCHEMA,
+    V2_PARQUET_ROW_GROUP_SIZE,
     ArtifactIntegrityError,
     ArtifactReader,
     signed_sidecar_matches,
@@ -211,9 +214,7 @@ def _audit_primary_persistence(
             solver_seconds = (
                 solver_completed_ns - solver_started_ns - solver_live_ns
             ) / 1_000_000_000
-            finalization_seconds = (
-                finalize_completed_ns - finalize_started_ns
-            ) / 1_000_000_000
+            finalization_seconds = (finalize_completed_ns - finalize_started_ns) / 1_000_000_000
             finalization_share = (
                 finalization_seconds * event_count / total_event_count
                 if total_event_count
@@ -464,6 +465,28 @@ def _visit_stage052_storage_semantic_records(
             }
             for axis in identities_by_axis
         }
+        pipeline_states: dict[str, dict[str, Any]] = {}
+        trace_axes = trace.get("axes")
+        if isinstance(trace_axes, Mapping):
+            for axis in identities_by_axis:
+                trace_axis = trace_axes.get(axis)
+                pipeline = (
+                    trace_axis.get("persistence_pipeline")
+                    if isinstance(trace_axis, Mapping)
+                    else None
+                )
+                if isinstance(pipeline, Mapping) and pipeline.get("mode") == (
+                    "bounded_async_thread"
+                ):
+                    _validate_persistence_pipeline(pipeline)
+                    ledger = pipeline.get("batch_ledger")
+                    assert isinstance(ledger, list)
+                    pipeline_states[axis] = {
+                        "ledger": ledger,
+                        "index": 0,
+                        "seen": 0,
+                        "hasher": hashlib.sha256(),
+                    }
         previous_event_id = 0
         for logical_event in reader.iter_events(str(events_ref["relative_path"])):
             row = dict(logical_event)
@@ -509,6 +532,41 @@ def _visit_stage052_storage_semantic_records(
                 route_dictionary=route_dictionary,
                 directory=directory,
             )
+            pipeline_state = pipeline_states.get(axis)
+            if pipeline_state is not None:
+                ledger = pipeline_state["ledger"]
+                index = pipeline_state["index"]
+                if (
+                    not isinstance(ledger, list)
+                    or not isinstance(index, int)
+                    or index >= len(ledger)
+                ):
+                    raise ArtifactIntegrityError(
+                        f"async persistence ledger ended before event stream in {directory}/{axis}"
+                    )
+                entry = ledger[index]
+                if not isinstance(entry, Mapping):
+                    raise ArtifactIntegrityError("async persistence ledger entry is invalid")
+                hasher = pipeline_state["hasher"]
+                if not hasattr(hasher, "update"):
+                    raise ArtifactIntegrityError("async persistence ledger hasher is invalid")
+                hasher.update(orjson.dumps(_pipeline_event_token_from_logical_row(row)) + b"\n")
+                seen = _strict_int(pipeline_state["seen"], "pipeline seen") + 1
+                row_count = _strict_int(entry.get("row_count"), "pipeline row_count")
+                if seen == row_count:
+                    if hasher.hexdigest() != entry.get("event_token_sha256"):
+                        raise ArtifactIntegrityError(
+                            f"async persistence batch digest mismatch in {directory}/{axis}"
+                        )
+                    pipeline_state["index"] = index + 1
+                    pipeline_state["seen"] = 0
+                    pipeline_state["hasher"] = hashlib.sha256()
+                elif seen > row_count:
+                    raise ArtifactIntegrityError(
+                        f"async persistence batch row count overflow in {directory}/{axis}"
+                    )
+                else:
+                    pipeline_state["seen"] = seen
             event_ordinals[axis] += 1
             event_payload = {
                 "record": "event",
@@ -521,7 +579,16 @@ def _visit_stage052_storage_semantic_records(
                 raise ArtifactIntegrityError(f"event dictionary identity is missing in {directory}")
             consume(event_identity, event_payload)
             shard_record_count += 1
-        trace_axes = trace.get("axes")
+        for axis, pipeline_state in pipeline_states.items():
+            ledger = pipeline_state["ledger"]
+            if (
+                not isinstance(ledger, list)
+                or pipeline_state["index"] != len(ledger)
+                or pipeline_state["seen"] != 0
+            ):
+                raise ArtifactIntegrityError(
+                    f"async persistence ledger does not cover event stream in {directory}/{axis}"
+                )
         if isinstance(trace_axes, Mapping):
             for axis, observed_counts in event_family_counts.items():
                 trace_axis = trace_axes.get(axis)
@@ -530,8 +597,7 @@ def _visit_stage052_storage_semantic_records(
                         trace_axis.get("streamed_record_counts"),
                         observed_counts,
                         required=(
-                            trace.get("screening_schema_version")
-                            == "screening_decisions_v3"
+                            trace.get("screening_schema_version") == "screening_decisions_v3"
                         ),
                     )
         for row in reader.iter_parquet_rows(
@@ -611,6 +677,7 @@ _NON_SEMANTIC_STORAGE_FIELDS = frozenset(
         "native_propagation_invocations",
         "trace_reconciliation",
         "streamed_record_counts",
+        "persistence_pipeline",
         "trace_storage_version",
         "route_dictionary_ref",
         "events_ref",
@@ -650,6 +717,126 @@ def _validate_streamed_record_counts(
         raise ArtifactIntegrityError("streamed record counts do not match replayed events")
 
 
+def _validate_persistence_pipeline(recorded: object) -> None:
+    if not isinstance(recorded, Mapping):
+        raise ArtifactIntegrityError("bounded async persistence pipeline evidence is missing")
+    submitted = _strict_int(recorded.get("submitted_batches"), "submitted_batches")
+    completed = _strict_int(recorded.get("completed_batches"), "completed_batches")
+    writer_active_ns = _strict_int(
+        recorded.get("writer_active_nanoseconds"), "writer_active_nanoseconds"
+    )
+    writer_cpu_ns = _strict_int(recorded.get("writer_cpu_nanoseconds"), "writer_cpu_nanoseconds")
+    producer_wait_ns = _strict_int(
+        recorded.get("producer_wait_nanoseconds"), "producer_wait_nanoseconds"
+    )
+    producer_active_ns = _strict_int(
+        recorded.get("producer_active_nanoseconds"), "producer_active_nanoseconds"
+    )
+    union_ns = _strict_int(
+        recorded.get("persistence_union_nanoseconds"),
+        "persistence_union_nanoseconds",
+    )
+    solver_union_ns = _strict_int(
+        recorded.get("solver_persistence_union_nanoseconds"),
+        "solver_persistence_union_nanoseconds",
+    )
+    solver_critical_ns = _strict_int(
+        recorded.get("solver_persistence_critical_path_nanoseconds"),
+        "solver_persistence_critical_path_nanoseconds",
+    )
+    solver_producer_ns = _strict_int(
+        recorded.get("solver_producer_active_nanoseconds"),
+        "solver_producer_active_nanoseconds",
+    )
+    solver_writer_cpu_ns = _strict_int(
+        recorded.get("solver_writer_cpu_nanoseconds"),
+        "solver_writer_cpu_nanoseconds",
+    )
+    ledger = recorded.get("batch_ledger")
+    if not isinstance(ledger, list):
+        raise ArtifactIntegrityError("bounded async persistence batch ledger is missing")
+    for ordinal, entry in enumerate(ledger):
+        if (
+            not isinstance(entry, Mapping)
+            or set(entry) != {"ordinal", "row_count", "event_token_sha256"}
+            or _strict_int(entry.get("ordinal"), "batch ordinal") != ordinal
+            or not (
+                0
+                < _strict_int(entry.get("row_count"), "batch row_count")
+                <= V2_PARQUET_ROW_GROUP_SIZE
+            )
+            or re.fullmatch(r"[0-9a-f]{64}", str(entry.get("event_token_sha256", ""))) is None
+        ):
+            raise ArtifactIntegrityError("bounded async persistence batch ledger is invalid")
+    if (
+        recorded.get("mode") != "bounded_async_thread"
+        or _strict_int(recorded.get("queue_max_batches"), "queue_max_batches") != 1
+        or _strict_float(recorded.get("writer_thread_switch_interval_seconds")) != 0.05
+        or submitted <= 0
+        or completed != submitted
+        or writer_active_ns <= 0
+        or writer_cpu_ns < 0
+        or producer_active_ns <= 0
+        or producer_wait_ns < 0
+        or solver_union_ns <= 0
+        or solver_critical_ns != max(solver_producer_ns, solver_writer_cpu_ns)
+        or solver_critical_ns > solver_union_ns
+        or solver_producer_ns <= 0
+        or solver_writer_cpu_ns < 0
+        or solver_producer_ns > producer_active_ns
+        or solver_writer_cpu_ns > writer_cpu_ns
+        or max(writer_active_ns, producer_active_ns) > union_ns
+        or union_ns > writer_active_ns + producer_active_ns
+        or solver_union_ns > union_ns
+        or _strict_int(recorded.get("peak_queued_batches"), "peak_queued_batches") != 1
+        or len(ledger) != submitted
+        or set(recorded)
+        != {
+            "mode",
+            "queue_max_batches",
+            "writer_thread_switch_interval_seconds",
+            "submitted_batches",
+            "completed_batches",
+            "writer_active_nanoseconds",
+            "writer_cpu_nanoseconds",
+            "producer_active_nanoseconds",
+            "persistence_union_nanoseconds",
+            "solver_persistence_union_nanoseconds",
+            "solver_persistence_critical_path_nanoseconds",
+            "solver_producer_active_nanoseconds",
+            "solver_writer_cpu_nanoseconds",
+            "producer_wait_nanoseconds",
+            "peak_queued_batches",
+            "batch_ledger",
+        }
+    ):
+        raise ArtifactIntegrityError("bounded async persistence pipeline evidence is invalid")
+
+
+def _pipeline_event_token_from_logical_row(row: Mapping[str, object]) -> tuple[object, ...]:
+    get = row.get
+    kind = get("kind") or None
+    operation = get("operation") or None
+    status = get("status") or None
+    reason = get("reason") or None
+    return (
+        str(get("event_type", get("record_type", "event"))),
+        get("benchmark_axis"),
+        get("lane"),
+        get("iteration"),
+        get("operator"),
+        get("route_key"),
+        get("decision_id"),
+        kind,
+        operation,
+        status,
+        reason,
+        get("exact_started"),
+        get("exact_completed"),
+        get("feasible"),
+    )
+
+
 def _canonical_semantic_value(value: object) -> object:
     if isinstance(value, Mapping):
         return {
@@ -672,16 +859,16 @@ def _canonical_axis_semantics(
     normalized_raw_axis = dict(raw_axis)
     normalized_raw_axis.setdefault("anytime_checkpoints", [])
     normalized_raw_axis.setdefault("initial_objective_key", [])
-    normalized_raw_axis.setdefault(
-        "unique_route_semantics", "completed_cache_owner_identity_v2"
-    )
+    normalized_raw_axis.setdefault("unique_route_semantics", "completed_cache_owner_identity_v2")
     reconciliation = normalized_raw_axis.get("trace_reconciliation")
     if reconciliation is not None:
         if not isinstance(reconciliation, Mapping) or reconciliation.get("status") != "pass":
             raise ArtifactIntegrityError("trace reconciliation did not pass")
         checks = reconciliation.get("checks")
-        if not isinstance(checks, Mapping) or not checks or not all(
-            value is True for value in checks.values()
+        if (
+            not isinstance(checks, Mapping)
+            or not checks
+            or not all(value is True for value in checks.values())
         ):
             raise ArtifactIntegrityError("trace reconciliation checks are incomplete")
     raw_backend = normalized_raw_axis.get("backend_metrics")
@@ -715,9 +902,7 @@ def _canonical_axis_semantics(
             if isinstance(screening_statistics, Mapping):
                 normalized_screening_statistics = dict(screening_statistics)
                 normalized_screening_statistics.setdefault("native_protocol_fallbacks", 0)
-                normalized_result_summary["screening_statistics"] = (
-                    normalized_screening_statistics
-                )
+                normalized_result_summary["screening_statistics"] = normalized_screening_statistics
             normalized_trace_axis["result_summary"] = normalized_result_summary
         streamed_counts = normalized_trace_axis.get("streamed_record_counts")
         if streamed_counts is not None and (
@@ -1135,9 +1320,7 @@ def _compare_semantic_records_against_spool(
         nonlocal fragment_bytes_since_release
         handle = handles[identity]
         before = int(handle.tell())
-        _write_record_field_mismatches(
-            writers[identity], key, left_payload, right_payload
-        )
+        _write_record_field_mismatches(writers[identity], key, left_payload, right_payload)
         fragment_bytes_since_release += int(handle.tell()) - before
         if fragment_bytes_since_release >= cache_release_interval_bytes:
             for fragment_handle in handles.values():
@@ -1440,8 +1623,7 @@ def _screening_schema_version(reader: ArtifactReader) -> str | None:
     subtypes = {
         str(item.get("artifact_subtype"))
         for item in artifacts
-        if isinstance(item, Mapping)
-        and item.get("artifact_type") == "events"
+        if isinstance(item, Mapping) and item.get("artifact_type") == "events"
     }
     observed: set[str] = {
         subtype
@@ -1474,16 +1656,12 @@ def _screening_schema_version(reader: ArtifactReader) -> str | None:
                 trace = reader.read_json(path)
             except (ArtifactIntegrityError, OSError, TypeError, ValueError):
                 return None
-            if (
-                trace.get("screening_schema_version")
-                not in {None, "screening_decisions_v1"}
-                or any(
-                    trace.get(field) is not None
-                    for field in (
-                        "screening_decisions_ref",
-                        "screening_definitions_ref",
-                        "screening_occurrences_ref",
-                    )
+            if trace.get("screening_schema_version") not in {None, "screening_decisions_v1"} or any(
+                trace.get(field) is not None
+                for field in (
+                    "screening_decisions_ref",
+                    "screening_definitions_ref",
+                    "screening_occurrences_ref",
                 )
             ):
                 return None
@@ -1822,16 +2000,13 @@ def _bind_persistence_attribution_review(
         or attribution.component != metadata.get("component")
         or attribution.scope != metadata.get("scope")
         or attribution.subject_id != "run"
-        or {interval.label for interval in attribution.control_intervals}
-        != required_control_labels
+        or {interval.label for interval in attribution.control_intervals} != required_control_labels
         or manifest_path.resolve() != reader.result.manifest_path.resolve()
         or _sha256(manifest_path) != attribution.primary_manifest_sha256
     ):
         raise ArtifactIntegrityError("reviewed persistence attribution identity is invalid")
     review_manifest["persistence_attribution_sha256"] = _sha256(attribution_path)
-    review_manifest["persistence_attribution_sidecar_sha256"] = _sha256(
-        attribution_sidecar
-    )
+    review_manifest["persistence_attribution_sidecar_sha256"] = _sha256(attribution_sidecar)
 
 
 def review_stage052(
@@ -1868,20 +2043,14 @@ def review_stage052(
         for item in manifest.get("artifacts", [])
         if isinstance(item, Mapping)
     }
-    if (
-        selected is Stage052Component.ACCELERATOR_PILOT
-        and "accelerator_pilot" in artifact_types
-    ):
+    if selected is Stage052Component.ACCELERATOR_PILOT and "accelerator_pilot" in artifact_types:
         return _review_accelerator_pilot_v2(
             raw_dir=raw_dir,
             reader=reader,
             scope=scope,
             prerequisite_dir=supplied_prerequisites[contract.prerequisites[0].role],
         )
-    if (
-        selected is Stage052Component.ACCELERATOR_PILOT
-        and "metal_pilot" in artifact_types
-    ):
+    if selected is Stage052Component.ACCELERATOR_PILOT and "metal_pilot" in artifact_types:
         return _review_accelerator_metal_pilot(
             raw_dir=raw_dir,
             reader=reader,
@@ -1923,8 +2092,7 @@ def review_stage052(
             selected, metadata.get("optimization_profile")
         ),
         "persistence_attribution": {
-            "passed": metadata.get("persistence_attribution")
-            == "primary_active_writes_v1",
+            "passed": metadata.get("persistence_attribution") == "primary_active_writes_v1",
             "detail": str(metadata.get("persistence_attribution")),
         },
     }
@@ -2183,11 +2351,7 @@ def _audit_cuda_runtime_identity(runtime: Mapping[str, object]) -> tuple[bool, s
     helper = Path(helper_path).resolve()
     nvcc = Path(nvcc_path).resolve()
     toolkit = Path(toolkit_root).resolve()
-    if (
-        not helper.is_file()
-        or not os.access(helper, os.X_OK)
-        or _sha256(helper) != helper_sha256
-    ):
+    if not helper.is_file() or not os.access(helper, os.X_OK) or _sha256(helper) != helper_sha256:
         return False, "CUDA helper path, executable bit, or SHA-256 does not replay"
     if (
         not nvcc.is_file()
@@ -2209,8 +2373,7 @@ def _audit_cuda_runtime_identity(runtime: Mapping[str, object]) -> tuple[bool, s
     observed_version = completed.stdout.strip()
     if (
         observed_version != version_output
-        or hashlib.sha256(observed_version.encode("utf-8")).hexdigest()
-        != version_sha256
+        or hashlib.sha256(observed_version.encode("utf-8")).hexdigest() != version_sha256
     ):
         return False, "CUDA Toolkit nvcc version identity does not replay"
     return True, "CUDA helper and Toolkit/nvcc identities independently replayed"
@@ -2248,8 +2411,7 @@ def _review_accelerator_pilot_v2(
         pilot = artifact.get("pilot") if isinstance(artifact, Mapping) else None
         if (
             not isinstance(artifact, Mapping)
-            or artifact.get("schema_version")
-            != "stage05.2-accelerator-pilot-artifact-v2"
+            or artifact.get("schema_version") != "stage05.2-accelerator-pilot-artifact-v2"
             or artifact.get("occupancy_inputs") != expected_occupancies
             or artifact.get("occupancy_input_count") != len(expected_occupancies)
             or artifact.get("native_prerequisite") != predecessor.to_dict()
@@ -2273,12 +2435,8 @@ def _review_accelerator_pilot_v2(
     runtime = audited.get("runtime_identity") if audited is not None else None
     status_value = audited.get("status") if audited is not None else None
     complete = status_value == MetalPilotStatus.COMPLETE.value
-    median_occupancy = (
-        audited.get("median_batch_occupancy") if audited is not None else None
-    )
-    cuda_required = (
-        isinstance(median_occupancy, int | float) and median_occupancy >= 32.0
-    )
+    median_occupancy = audited.get("median_batch_occupancy") if audited is not None else None
+    cuda_required = isinstance(median_occupancy, int | float) and median_occupancy >= 32.0
     if cuda_required and isinstance(runtime, Mapping):
         real_runtime, runtime_detail = _audit_cuda_runtime_identity(runtime)
     elif not cuda_required and runtime is None:
@@ -2379,16 +2537,13 @@ def _review_accelerator_metal_pilot(
     artifacts = [item for item in reader.manifest.get("artifacts", []) if isinstance(item, dict)]
     artifact_types = [str(item.get("artifact_type", "")) for item in artifacts]
     expected_artifacts = {"manifest_metadata", "config", "metal_pilot"}
-    artifact_gate = (
-        set(artifact_types) == expected_artifacts
-        and all(artifact_types.count(item) == 1 for item in expected_artifacts)
+    artifact_gate = set(artifact_types) == expected_artifacts and all(
+        artifact_types.count(item) == 1 for item in expected_artifacts
     )
     gates["metal_pilot_artifact_schema"] = {
         "passed": artifact_gate,
         "detail": (
-            "exclusive Metal pilot artifact set passed"
-            if artifact_gate
-            else str(artifact_types)
+            "exclusive Metal pilot artifact set passed" if artifact_gate else str(artifact_types)
         ),
     }
     metadata = reader.read_json(str(_one_artifact(reader, "manifest_metadata")["relative_path"]))
@@ -2497,10 +2652,7 @@ def _review_accelerator_metal_pilot(
         and runtime.get("production_evidence_eligible") is True
         and isinstance(runtime.get("helper_sha256"), str)
         and len(str(runtime.get("helper_sha256"))) == 64
-        and all(
-            character in "0123456789abcdef"
-            for character in str(runtime.get("helper_sha256"))
-        )
+        and all(character in "0123456789abcdef" for character in str(runtime.get("helper_sha256")))
         and helper_path is not None
         and helper_path.is_absolute()
         and helper_path.is_file()
@@ -2528,9 +2680,7 @@ def _review_accelerator_metal_pilot(
         "passed": campaign_adapter_passed,
         "detail": campaign_adapter_detail,
     }
-    expected_backend = (
-        audited.selected_backend if audited is not None and complete else None
-    )
+    expected_backend = audited.selected_backend if audited is not None and complete else None
     expected_profile = "metal" if expected_backend == "metal" else "native"
     metadata_passed = (
         scope == "performance"
@@ -2555,9 +2705,7 @@ def _review_accelerator_metal_pilot(
         metadata, raw_dir=raw_dir
     )
     gates["staging_root_identity"] = {"passed": staging_passed, "detail": staging_detail}
-    completeness_passed = (
-        complete and reader.manifest.get("evidence_completeness") == "complete"
-    )
+    completeness_passed = complete and reader.manifest.get("evidence_completeness") == "complete"
     gates["evidence_completeness"] = {
         "passed": completeness_passed,
         "detail": str(reader.manifest.get("evidence_completeness")),
@@ -2612,10 +2760,7 @@ def _recompute_native_performance_observations(
     }
     raw_semantics: dict[tuple[str, int], str] = {}
     for raw_reference in reader.manifest.get("artifacts", []):
-        if (
-            not isinstance(raw_reference, Mapping)
-            or raw_reference.get("artifact_type") != "raw"
-        ):
+        if not isinstance(raw_reference, Mapping) or raw_reference.get("artifact_type") != "raw":
             continue
         raw = reader.read_json(str(raw_reference.get("relative_path", "")))
         if not isinstance(raw, Mapping):
@@ -2629,11 +2774,7 @@ def _recompute_native_performance_observations(
         axes = raw.get("axes")
         fixed = axes.get("fixed_work") if isinstance(axes, Mapping) else None
         semantic_digest = fixed.get("semantic_digest") if isinstance(fixed, Mapping) else None
-        if (
-            identity in raw_semantics
-            or not isinstance(semantic_digest, str)
-            or not semantic_digest
-        ):
+        if identity in raw_semantics or not isinstance(semantic_digest, str) or not semantic_digest:
             raise ArtifactIntegrityError(f"invalid E raw semantic identity: {identity}")
         raw_semantics[identity] = semantic_digest
     reference = _one_artifact(reader, "per_run_results")
@@ -2655,8 +2796,7 @@ def _recompute_native_performance_observations(
     if set(observations) != expected:
         raise ArtifactIntegrityError("E Metal-pilot performance scope is incomplete")
     if set(raw_semantics) != expected or any(
-        observations[identity].semantic_digest != raw_semantics[identity]
-        for identity in expected
+        observations[identity].semantic_digest != raw_semantics[identity] for identity in expected
     ):
         raise ArtifactIntegrityError("E raw/per-run semantic evidence disagrees")
     return tuple(observations[identity] for identity in sorted(observations))
@@ -3155,6 +3295,9 @@ def _audit_native_execution(
                         f"native axis evidence is incomplete: {axis_identity}"
                     )
                 reconciliation = raw_axis.get("trace_reconciliation")
+                persistence_pipeline = trace_axis.get("persistence_pipeline")
+                _validate_persistence_pipeline(persistence_pipeline)
+                assert isinstance(persistence_pipeline, Mapping)
                 checks = (
                     reconciliation.get("checks") if isinstance(reconciliation, Mapping) else None
                 )
@@ -3348,31 +3491,35 @@ def _audit_native_execution(
                     or live_stream_persistence_ns < 0
                     or solver_interleaved_persistence_ns < 0
                     or solver_interleaved_persistence_ns > live_stream_persistence_ns
-                    or solver_interleaved_persistence_ns
-                    > solver_completed_ns - solver_started_ns
+                    or solver_interleaved_persistence_ns > solver_completed_ns - solver_started_ns
                     or axis_event_count < 0
                     or total_event_count < 0
                     or axis_count <= 0
+                    or solver_interleaved_persistence_ns
+                    != _strict_int(
+                        persistence_pipeline.get("solver_persistence_union_nanoseconds"),
+                        "solver_persistence_union_nanoseconds",
+                    )
+                    or _strict_int(
+                        persistence_pipeline.get("persistence_union_nanoseconds"),
+                        "persistence_union_nanoseconds",
+                    )
+                    > live_stream_persistence_ns
                 ):
                     raise ArtifactIntegrityError(
                         f"native monotonic timing interval is invalid: {axis_identity}"
                     )
                 solver_seconds = (
-                    solver_completed_ns
-                    - solver_started_ns
-                    - solver_interleaved_persistence_ns
+                    solver_completed_ns - solver_started_ns - solver_interleaved_persistence_ns
                 ) / 1_000_000_000
-                finalization_seconds = (
-                    finalize_completed_ns - finalize_started_ns
-                ) / 1_000_000_000
+                finalization_seconds = (finalize_completed_ns - finalize_started_ns) / 1_000_000_000
                 finalization_share = (
                     finalization_seconds * axis_event_count / total_event_count
                     if total_event_count
                     else finalization_seconds / axis_count
                 )
                 persistence_seconds = (
-                    finalization_share
-                    + live_stream_persistence_ns / 1_000_000_000
+                    finalization_share + live_stream_persistence_ns / 1_000_000_000
                 )
                 float_bindings.update(
                     {
@@ -3968,24 +4115,20 @@ def _validate_c05_remediation(
     if not isinstance(child_descriptors, list) or not isinstance(parent_descriptors, list):
         return False, "remediation parent/child artifact descriptors are invalid"
     expected_nested = {
-        (child_dir / str(item.get("relative_path", "")))
-        .relative_to(raw_dir)
-        .as_posix(): item
+        (child_dir / str(item.get("relative_path", ""))).relative_to(raw_dir).as_posix(): item
         for item in child_descriptors
         if isinstance(item, Mapping)
     }
     observed_nested = {
         str(item.get("relative_path", "")): item
         for item in parent_descriptors
-        if isinstance(item, Mapping)
-        and item.get("artifact_type") == "remediation_child_payload"
+        if isinstance(item, Mapping) and item.get("artifact_type") == "remediation_child_payload"
     }
     if set(observed_nested) != set(expected_nested) or any(
         observed_nested[relative].get("checksum") != nested.get("checksum")
         or observed_nested[relative].get("byte_size") != nested.get("byte_size")
         or observed_nested[relative].get("row_count") != nested.get("row_count")
-        or observed_nested[relative].get("schema_fingerprint")
-        != nested.get("schema_fingerprint")
+        or observed_nested[relative].get("schema_fingerprint") != nested.get("schema_fingerprint")
         for relative, nested in expected_nested.items()
     ):
         return False, "remediation child payload closure is incomplete or stale"
@@ -4821,10 +4964,7 @@ def _validate_captured_runtime_signature(
         return False, "runtime signature does not match the captured environment"
     if optimization_profile == "native":
         current_native_path = Path(str(native_core.__file__)).resolve()
-        if (
-            not current_native_path.is_file()
-            or native_sha256 != _sha256(current_native_path)
-        ):
+        if not current_native_path.is_file() or native_sha256 != _sha256(current_native_path):
             return False, "native runtime signature does not match the reviewer extension"
     elif optimization_profile != "python":
         return False, "performance runtime optimization profile is invalid"
@@ -5299,8 +5439,7 @@ def _validated_review_retry_history(
             not isinstance(gates, Mapping)
             or not gates
             or all(
-                isinstance(gate, Mapping) and gate.get("passed") is True
-                for gate in gates.values()
+                isinstance(gate, Mapping) and gate.get("passed") is True for gate in gates.values()
             )
             or not isinstance(files, Mapping)
         ):
@@ -5348,8 +5487,10 @@ def _prior_review_manifest_history(raw_dir: Path) -> tuple[list[str], list[str]]
     if any(payload.get(field) != expected for field, expected in expected_identity.items()):
         raise ArtifactIntegrityError("prior Stage 5.2 review identity is invalid")
     gates = payload.get("gates")
-    if not isinstance(gates, Mapping) or not gates or any(
-        not isinstance(gate, Mapping) for gate in gates.values()
+    if (
+        not isinstance(gates, Mapping)
+        or not gates
+        or any(not isinstance(gate, Mapping) for gate in gates.values())
     ):
         raise ArtifactIntegrityError("prior Stage 5.2 review gates are invalid")
     accepted = payload.get("status") == contract.next_status and all(
@@ -5376,8 +5517,7 @@ def _prior_review_manifest_history(raw_dir: Path) -> tuple[list[str], list[str]]
     )
     raw_lineage = payload.get("review_manifest_lineage_sha256", [])
     if not isinstance(raw_lineage, list) or any(
-        not isinstance(item, str)
-        or re.fullmatch(r"[0-9a-f]{64}", item) is None
+        not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{64}", item) is None
         for item in raw_lineage
     ):
         raise ArtifactIntegrityError("prior Stage 5.2 accepted-review lineage is invalid")
@@ -5612,16 +5752,12 @@ def main() -> int:
             return resolve_retained_run_from_locator(
                 path.as_posix(),
                 registry_path=(repository / arguments.retention_registry).resolve(),
-                storage_root_locator_path=(
-                    repository / arguments.storage_root_locator
-                ).resolve(),
+                storage_root_locator_path=(repository / arguments.storage_root_locator).resolve(),
             )
         return ordinary.resolve()
 
     ordinary_raw = (
-        arguments.raw_dir
-        if arguments.raw_dir.is_absolute()
-        else repository / arguments.raw_dir
+        arguments.raw_dir if arguments.raw_dir.is_absolute() else repository / arguments.raw_dir
     )
     if not ordinary_raw.is_dir():
         parser.error(

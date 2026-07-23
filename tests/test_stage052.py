@@ -115,9 +115,7 @@ def _bind_successful_review_execution(review_manifest: Path) -> None:
                 "systemd_service_result": "success",
                 "cgroup_memory_peak_status": "verified",
                 "raw_manifest_unchanged": True,
-                "review_manifest_sha256": hashlib.sha256(
-                    review_manifest.read_bytes()
-                ).hexdigest(),
+                "review_manifest_sha256": hashlib.sha256(review_manifest.read_bytes()).hexdigest(),
             }
         ),
         encoding="utf-8",
@@ -246,9 +244,10 @@ def test_windows_command_output_uses_explicit_utf_encodings(
 
     monkeypatch.setattr(stage052_evidence.subprocess, "run", run)
 
-    assert stage052_evidence._run_command(
-        ("powershell.exe", "-Command", "Write-Output test")
-    ) == "Windows 11 专业版"
+    assert (
+        stage052_evidence._run_command(("powershell.exe", "-Command", "Write-Output test"))
+        == "Windows 11 专业版"
+    )
     assert stage052_evidence._run_command(("wsl.exe", "--version")) == "WSL 版本: 2.9.3.0"
     assert "OutputEncoding" in observed[0][-1]
 
@@ -349,9 +348,7 @@ def test_stage052_storage_amendment_contract_binds_current_predecessor() -> None
     assert tuple(requirements) == ("performance_baseline", "hot_path_predecessor")
     predecessor = requirements["hot_path_predecessor"]
     assert predecessor.exact_run_label is None
-    assert predecessor.allowed_statuses == (
-        "READY_FOR_STAGE052_ARTIFACT_STREAMING",
-    )
+    assert predecessor.allowed_statuses == ("READY_FOR_STAGE052_ARTIFACT_STREAMING",)
     assert predecessor.requires_current_chain_identity
 
 
@@ -470,9 +467,7 @@ def test_current_chain_prerequisite_replays_frozen_producer_runtime(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    requirement = stage052_contract(
-        Stage052Component.JOB_PARALLEL, "performance"
-    ).prerequisites[0]
+    requirement = stage052_contract(Stage052Component.JOB_PARALLEL, "performance").prerequisites[0]
     identity = Stage052PrerequisiteIdentity(
         run_label="stage05.2_artifact_streaming_attempt04",
         component="artifact_streaming",
@@ -499,8 +494,7 @@ def test_current_chain_prerequisite_replays_frozen_producer_runtime(
         lambda *_args, **_kwargs: {
             f"{generation}/review_report.md": tmp_path / "review_report.md",
             f"{generation}/review_findings.csv": tmp_path / "review_findings.csv",
-            f"{generation}/semantic_mismatches.csv": tmp_path
-            / "semantic_mismatches.csv",
+            f"{generation}/semantic_mismatches.csv": tmp_path / "semantic_mismatches.csv",
         },
     )
 
@@ -565,9 +559,7 @@ def test_current_chain_prerequisite_rejects_receipt_revision_mismatch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    requirement = stage052_contract(
-        Stage052Component.JOB_PARALLEL, "performance"
-    ).prerequisites[0]
+    requirement = stage052_contract(Stage052Component.JOB_PARALLEL, "performance").prerequisites[0]
     identity = Stage052PrerequisiteIdentity(
         run_label="stage05.2_artifact_streaming_attempt04",
         component="artifact_streaming",
@@ -593,8 +585,7 @@ def test_current_chain_prerequisite_rejects_receipt_revision_mismatch(
         lambda *_args, **_kwargs: {
             f"{generation}/review_report.md": tmp_path / "review_report.md",
             f"{generation}/review_findings.csv": tmp_path / "review_findings.csv",
-            f"{generation}/semantic_mismatches.csv": tmp_path
-            / "semantic_mismatches.csv",
+            f"{generation}/semantic_mismatches.csv": tmp_path / "semantic_mismatches.csv",
         },
     )
 
@@ -724,7 +715,7 @@ absolute_path = "{results}"
 device_uuid = "ext4-uuid"
 filesystem = "ext4"
 [roots.d_archive]
-absolute_path = "{tmp_path / 'archive'}"
+absolute_path = "{tmp_path / "archive"}"
 device_uuid = "d-nvme"
 filesystem = "9p"
 """.strip()
@@ -758,7 +749,7 @@ absolute_path = "{results}"
 device_uuid = "ext4-uuid"
 filesystem = "ext4"
 [roots.d_archive]
-absolute_path = "{tmp_path / 'archive'}"
+absolute_path = "{tmp_path / "archive"}"
 device_uuid = "d-nvme"
 filesystem = "9p"
 """.strip()
@@ -849,8 +840,7 @@ def test_current_staging_review_rejects_wrong_path_filesystem_and_aliases(
 
     def write_locator(*, filesystem: str = "ext4", extra_alias: bool = False) -> None:
         extra_root = (
-            '[roots.usb]\nabsolute_path = "/mnt/e"\n'
-            'device_uuid = "usb"\nfilesystem = "ExFAT"'
+            '[roots.usb]\nabsolute_path = "/mnt/e"\ndevice_uuid = "usb"\nfilesystem = "ExFAT"'
             if extra_alias
             else ""
         )
@@ -983,12 +973,14 @@ def test_every_primary_write_review_binds_the_attribution_envelope(tmp_path: Pat
         metadata=metadata,
     )
 
-    assert review_manifest["persistence_attribution_sha256"] == hashlib.sha256(
-        attribution.read_bytes()
-    ).hexdigest()
-    assert review_manifest["persistence_attribution_sidecar_sha256"] == hashlib.sha256(
-        sidecar.read_bytes()
-    ).hexdigest()
+    assert (
+        review_manifest["persistence_attribution_sha256"]
+        == hashlib.sha256(attribution.read_bytes()).hexdigest()
+    )
+    assert (
+        review_manifest["persistence_attribution_sidecar_sha256"]
+        == hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    )
 
     sidecar.write_text("0" * 64 + "\n", encoding="utf-8")
     with pytest.raises(ArtifactIntegrityError, match="envelope is missing"):
@@ -1211,6 +1203,31 @@ def test_native_execution_audit_cross_checks_per_run_raw_and_trace(tmp_path: Pat
                 "event_identity": {"shard_ordinal": 3, "local_field": "event_id"},
                 "axes": {
                     "fixed_work": {
+                        "persistence_pipeline": {
+                            "mode": "bounded_async_thread",
+                            "queue_max_batches": 1,
+                            "writer_thread_switch_interval_seconds": 0.05,
+                            "submitted_batches": 2,
+                            "completed_batches": 2,
+                            "writer_active_nanoseconds": 8_000_000,
+                            "writer_cpu_nanoseconds": 5_000_000,
+                            "producer_active_nanoseconds": 6_000_000,
+                            "persistence_union_nanoseconds": 10_000_000,
+                            "solver_persistence_union_nanoseconds": 10_000_000,
+                            "solver_persistence_critical_path_nanoseconds": 6_000_000,
+                            "solver_producer_active_nanoseconds": 6_000_000,
+                            "solver_writer_cpu_nanoseconds": 5_000_000,
+                            "producer_wait_nanoseconds": 2_000_000,
+                            "peak_queued_batches": 1,
+                            "batch_ledger": [
+                                {
+                                    "ordinal": ordinal,
+                                    "row_count": 1,
+                                    "event_token_sha256": "0" * 64,
+                                }
+                                for ordinal in range(2)
+                            ],
+                        },
                         "result_summary": {
                             "screening_statistics": screening,
                             "cache_incremental_statistics": incremental,
@@ -1219,7 +1236,7 @@ def test_native_execution_audit_cross_checks_per_run_raw_and_trace(tmp_path: Pat
                             "effective_iterations": 3,
                             "unique_route_semantics": ("completed_cache_owner_identity_v2"),
                             "termination_reason": "exact_call_budget_exhausted",
-                        }
+                        },
                     }
                 },
             }
@@ -1242,6 +1259,7 @@ def test_native_execution_audit_cross_checks_per_run_raw_and_trace(tmp_path: Pat
                         "solver_started_ns": 1_000_000_000,
                         "solver_completed_ns": 1_100_000_000,
                         "live_stream_persistence_ns": 10_000_000,
+                        "solver_interleaved_persistence_ns": 10_000_000,
                         "axis_completed_ns": 1_120_000_000,
                         "finalize_started_ns": 3_000_000_000,
                         "finalize_completed_ns": 3_030_000_000,
@@ -2144,22 +2162,21 @@ def test_prerequisite_receipt_must_bind_finalized_service_and_current_review(
         "systemd_service_result": "success",
         "cgroup_memory_peak_status": "verified",
         "raw_manifest_unchanged": True,
-        "review_manifest_sha256": hashlib.sha256(
-            review_manifest.read_bytes()
-        ).hexdigest(),
+        "review_manifest_sha256": hashlib.sha256(review_manifest.read_bytes()).hexdigest(),
     }
     execution = review_dir / "review_execution.json"
     execution.write_text(json.dumps(receipt), encoding="utf-8")
 
-    assert stage052_evidence.verify_stage052_review_execution_receipt(
-        raw_dir, review_manifest
-    )["status"] == "completed"
+    assert (
+        stage052_evidence.verify_stage052_review_execution_receipt(raw_dir, review_manifest)[
+            "status"
+        ]
+        == "completed"
+    )
     receipt["cgroup_memory_peak_status"] = "unavailable"
     execution.write_text(json.dumps(receipt), encoding="utf-8")
     with pytest.raises(ArtifactIntegrityError, match="execution receipt is invalid"):
-        stage052_evidence.verify_stage052_review_execution_receipt(
-            raw_dir, review_manifest
-        )
+        stage052_evidence.verify_stage052_review_execution_receipt(raw_dir, review_manifest)
 
 
 def test_failed_review_is_archived_as_explicit_retry_history(tmp_path: Path) -> None:
@@ -2216,9 +2233,7 @@ def test_failed_review_is_archived_as_explicit_retry_history(tmp_path: Path) -> 
             "component": "hot_path",
             "scope": "performance",
             "status": "NOT_READY",
-            "raw_manifest_sha256": hashlib.sha256(
-                bundle.manifest_path.read_bytes()
-            ).hexdigest(),
+            "raw_manifest_sha256": hashlib.sha256(bundle.manifest_path.read_bytes()).hexdigest(),
             "review_manifest_lineage_sha256": [],
             "review_retry_history_sha256": retry_history,
             "gates": {"runtime_identity": {"passed": False}},
@@ -2425,10 +2440,7 @@ def test_prior_review_archive_streams_published_mismatch_file(
     )
 
     archived_mismatch = (
-        review_dir
-        / "history"
-        / prior_sha256
-        / mismatch_path.relative_to(review_dir)
+        review_dir / "history" / prior_sha256 / mismatch_path.relative_to(review_dir)
     )
     assert archived_mismatch.read_text(encoding="utf-8") == mismatch_source.read_text(
         encoding="utf-8"
@@ -3229,10 +3241,7 @@ def test_reviewer_recognises_v1_screening_schema_embedded_in_critical_events() -
             "artifacts": [
                 {"artifact_type": "events", "artifact_subtype": "critical"},
                 {"artifact_type": "events", "artifact_subtype": "screening_checks"},
-                *(
-                    {"artifact_type": "trace", "relative_path": path}
-                    for path in trace_paths
-                ),
+                *({"artifact_type": "trace", "relative_path": path} for path in trace_paths),
             ],
         },
         read_json=lambda path: traces[path],
@@ -3459,6 +3468,66 @@ def test_streamed_record_counts_must_match_independent_replay() -> None:
         stage052_review._validate_streamed_record_counts(None, observed, required=True)
 
 
+def test_native_persistence_pipeline_requires_bounded_complete_fifo_batches() -> None:
+    valid = {
+        "mode": "bounded_async_thread",
+        "queue_max_batches": 1,
+        "writer_thread_switch_interval_seconds": 0.05,
+        "submitted_batches": 10,
+        "completed_batches": 10,
+        "writer_active_nanoseconds": 100,
+        "writer_cpu_nanoseconds": 70,
+        "producer_active_nanoseconds": 80,
+        "persistence_union_nanoseconds": 150,
+        "solver_persistence_union_nanoseconds": 120,
+        "solver_persistence_critical_path_nanoseconds": 70,
+        "solver_producer_active_nanoseconds": 60,
+        "solver_writer_cpu_nanoseconds": 70,
+        "producer_wait_nanoseconds": 50,
+        "peak_queued_batches": 1,
+        "batch_ledger": [
+            {
+                "ordinal": ordinal,
+                "row_count": 1,
+                "event_token_sha256": "0" * 64,
+            }
+            for ordinal in range(10)
+        ],
+    }
+    stage052_review._validate_persistence_pipeline(valid)
+
+    with pytest.raises(ArtifactIntegrityError, match="pipeline evidence is invalid"):
+        stage052_review._validate_persistence_pipeline({**valid, "completed_batches": 9})
+    with pytest.raises(ArtifactIntegrityError, match="pipeline evidence is invalid"):
+        stage052_review._validate_persistence_pipeline(
+            {**valid, "solver_persistence_union_nanoseconds": 69}
+        )
+    oversized = dict(valid)
+    oversized["batch_ledger"] = [
+        {**entry, "row_count": 65_537} if index == 0 else entry
+        for index, entry in enumerate(valid["batch_ledger"])
+    ]
+    with pytest.raises(ArtifactIntegrityError, match="batch ledger is invalid"):
+        stage052_review._validate_persistence_pipeline(oversized)
+    with pytest.raises(ArtifactIntegrityError, match="pipeline evidence is missing"):
+        stage052_review._validate_persistence_pipeline(None)
+
+
+def test_persistence_pipeline_metadata_is_nonsemantic() -> None:
+    base = stage052_review._canonical_semantic_value({"objective_key": [2, 10.0, 0.0, 0]})
+    pipelined = stage052_review._canonical_semantic_value(
+        {
+            "objective_key": [2, 10.0, 0.0, 0],
+            "persistence_pipeline": {
+                "mode": "bounded_async_thread",
+                "submitted_batches": 10,
+            },
+        }
+    )
+
+    assert pipelined == base
+
+
 def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3547,7 +3616,7 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
                     "exact_started": True,
                     "exact_completed": True,
                     "evaluation_id": 1,
-                        "route_key": fixed_route_key,
+                    "route_key": fixed_route_key,
                 },
                 {
                     "event_type": "cache_event",
@@ -3627,12 +3696,8 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     )
     assert replay_stage052_storage_semantics(v1) != replay_stage052_storage_semantics(changed_event)
     mismatch_lines = render_semantic_mismatches(changed_event, (v1,)).decode().splitlines()
-    assert mismatch_lines[0] == (
-        "instance,seed,axis,ordinal,field,left_digest,right_digest"
-    )
-    assert mismatch_lines[1].startswith(
-        "c101_21,2014,fixed_work,2,event.propagation_status,"
-    )
+    assert mismatch_lines[0] == ("instance,seed,axis,ordinal,field,left_digest,right_digest")
+    assert mismatch_lines[1].startswith("c101_21,2014,fixed_work,2,event.propagation_status,")
     streamed_mismatches = tmp_path / "streamed-mismatches.csv"
     field_progress = tmp_path / "field-progress.jsonl"
     monkeypatch.setenv("STAGE052_REVIEW_PROGRESS_LOG", str(field_progress))
@@ -3664,15 +3729,17 @@ def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
         axis="wall_clock_30",
         route_evaluation_status="completed_infeasible",
     )
-    summarized_wall_clock = render_semantic_mismatches(
-        wall_clock_candidate,
-        (wall_clock_prior,),
-        detailed_axis_prefixes=("fixed_work",),
-    ).decode().splitlines()
-    assert len(summarized_wall_clock) == 2
-    assert summarized_wall_clock[1].startswith(
-        "c101_21,2014,wall_clock_30,-1,axis_digest_summary,"
+    summarized_wall_clock = (
+        render_semantic_mismatches(
+            wall_clock_candidate,
+            (wall_clock_prior,),
+            detailed_axis_prefixes=("fixed_work",),
+        )
+        .decode()
+        .splitlines()
     )
+    assert len(summarized_wall_clock) == 2
+    assert summarized_wall_clock[1].startswith("c101_21,2014,wall_clock_30,-1,axis_digest_summary,")
     ordered_replays = replay_stage052_storage_semantics_many((changed_event, v1))
     assert ordered_replays == [
         replay_stage052_storage_semantics(changed_event),
@@ -3911,12 +3978,10 @@ def test_semantic_spool_lookup_and_order_use_primary_key_without_temp_sort(
             b"payload",
         )
         identity = key[:3]
-        assert list(
-            stage052_review._semantic_spool_tail_payloads(connection, {identity: 0})
-        ) == [(key, b"payload")]
-        assert list(
-            stage052_review._semantic_spool_tail_payloads(connection, {identity: 1})
-        ) == []
+        assert list(stage052_review._semantic_spool_tail_payloads(connection, {identity: 0})) == [
+            (key, b"payload")
+        ]
+        assert list(stage052_review._semantic_spool_tail_payloads(connection, {identity: 1})) == []
 
 
 def test_storage_replay_expands_compact_v2_screening_decisions(
@@ -4160,6 +4225,7 @@ def test_v2_all_artifact_preparation_is_charged_without_gc_or_double_counting(
         unique_route_semantics="completed_cache_owner_identity_v2",
         termination_reason="fixed_work_budget",
     )
+
     def solve_with_live_event(*_args: object, **kwargs: object) -> object:
         sink = kwargs["trace_sink"]
         assert isinstance(sink, stage052_performance._Stage052TraceStreamSink)
@@ -4243,17 +4309,14 @@ def test_v2_all_artifact_preparation_is_charged_without_gc_or_double_counting(
         + diagnostic_append_delay_seconds
     )
     assert persistence >= expected_charged_delays * 0.9
-    assert persistence < (
-        expected_charged_delays * 2.0
-    )
+    assert persistence < (expected_charged_delays * 2.0)
     assert solver_seconds == pytest.approx(recomputed_solver)
     assert persistence == pytest.approx(
         recomputed_finalize + timing["live_stream_persistence_ns"] / 1_000_000_000
     )
     assert recomputed_post_solver >= postprocess_delay_seconds * 0.9
     postsolve_persistence = (
-        timing["live_stream_persistence_ns"]
-        - timing["solver_interleaved_persistence_ns"]
+        timing["live_stream_persistence_ns"] - timing["solver_interleaved_persistence_ns"]
     ) / 1_000_000_000
     assert postsolve_persistence == pytest.approx(
         timing["postsolve_artifact_preparation_ns"] / 1_000_000_000

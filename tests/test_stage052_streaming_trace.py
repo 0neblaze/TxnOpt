@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import time
 from collections.abc import Mapping
@@ -15,11 +16,15 @@ from evrptw import artifacts as artifact_module
 from evrptw.alns import _NeighborhoodEventStream
 from evrptw.artifacts import (
     ArtifactBundleWriter,
+    ArtifactIntegrityError,
     ArtifactReader,
     ArtifactRunContext,
     ArtifactStorageConfig,
 )
 from evrptw.experiments import stage052_performance
+from evrptw.experiments.stage052_performance_review import (
+    replay_stage052_storage_semantics,
+)
 from evrptw.measurement import (
     MeasurementConfig,
     RouteEvaluationTrace,
@@ -436,8 +441,7 @@ def test_streamed_screening_definition_matches_mapping_normalization() -> None:
             "value_bool": check.value if isinstance(check.value, bool) else None,
             "value_float": (
                 float(check.value)
-                if isinstance(check.value, (int, float))
-                and not isinstance(check.value, bool)
+                if isinstance(check.value, (int, float)) and not isinstance(check.value, bool)
                 else None
             ),
             "value_text": check.value if isinstance(check.value, str) else None,
@@ -546,9 +550,7 @@ def test_v3_buffered_screening_bridge_roundtrips_through_real_writer(
     bundle = writer.finalize()
 
     rows = list(
-        ArtifactReader(bundle.run_dir).iter_events(
-            f"toy/2014/{run_label}_events_toy_2014.parquet"
-        )
+        ArtifactReader(bundle.run_dir).iter_events(f"toy/2014/{run_label}_events_toy_2014.parquet")
     )
     assert [row["decision_id"] for row in rows] == [1, 2]
     assert all(row["demand"] == pytest.approx(9.0) for row in rows)
@@ -653,9 +655,7 @@ def test_v2_screening_bridge_roundtrips_through_the_real_writer(tmp_path: Path) 
     bundle = writer.finalize()
 
     rows = list(
-        ArtifactReader(bundle.run_dir).iter_events(
-            f"toy/2014/{run_label}_events_toy_2014.parquet"
-        )
+        ArtifactReader(bundle.run_dir).iter_events(f"toy/2014/{run_label}_events_toy_2014.parquet")
     )
     assert rows[0]["status"] == "rejected"
     assert rows[0]["demand"] == pytest.approx(9.0)
@@ -807,6 +807,52 @@ def test_negative_screening_tail_cache_fails_on_route_evidence_drift() -> None:
         sink.append_screening_decision(replace(base, decision_id=2, demand=9.0))
 
 
+def test_v3_negative_cache_hit_reuses_precomputed_definition_without_check_iteration() -> None:
+    class NoIterationChecks(tuple[ScreeningCheckTrace, ...]):
+        def __iter__(self) -> Any:
+            raise AssertionError("cached negative screening checks were rebuilt")
+
+    shard = _BufferedScreeningRecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+        buffer_rows=2,
+    )
+    base = ScreeningDecision(
+        decision_id=1,
+        route_key="route:2:C1",
+        lane="legacy",
+        iteration=1,
+        operator="repair",
+        status="negative_cache_hit",
+        first_failed_check="capacity",
+        reason="capacity",
+        checks=(ScreeningCheckTrace("negative_sequence_cache", "hit", True, "reused"),),
+        demand=2.5,
+        min_time_window_slack=1.0,
+        distance_lower_bound=3.0,
+        distance_increment_lower_bound=None,
+        single_segment_reachable=True,
+        structural_energy_lower_bound=4.0,
+        negative_cache_hit=True,
+        exact_call_blocked=True,
+        started_at=0.1,
+        completed_at=0.2,
+        duration_seconds=0.1,
+    )
+    sink.append_screening_decision(base)
+    sink.append_screening_decision(
+        replace(
+            base,
+            decision_id=2,
+            checks=NoIterationChecks(base.checks),
+        )
+    )
+
+    assert len(shard.rows) == 2
+    assert shard.rows[0][7] is shard.rows[1][7]  # type: ignore[index]
+
+
 def test_stage052_trace_sink_flushes_bounded_event_batches() -> None:
     shard = _RecordingShard()
     sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
@@ -835,6 +881,255 @@ def test_stage052_trace_sink_flushes_bounded_event_batches() -> None:
     sink.finish()
     assert shard.append_calls == 2
     assert len(shard.events) == 5
+
+
+def test_stage052_trace_sink_async_pipeline_preserves_order_and_drains() -> None:
+    original_switch_interval = sys.getswitchinterval()
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="wall_clock_30",
+        buffer_rows=2,
+        async_persistence=True,
+    )
+    for iteration in range(5):
+        sink.append_event(
+            {
+                "event_type": "operator_call",
+                "lane": "legacy",
+                "iteration": iteration,
+                "operator": "repair",
+            }
+        )
+
+    sink.finish()
+    sink.freeze_solver_persistence_boundary()
+    sink.close()
+    assert sys.getswitchinterval() == original_switch_interval
+
+    assert [event["iteration"] for event in shard.events] == list(range(5))
+    pipeline = sink.persistence_pipeline
+    assert pipeline.pop("writer_active_nanoseconds") > 0  # type: ignore[operator]
+    writer_cpu_ns = pipeline.pop("writer_cpu_nanoseconds")
+    assert pipeline.pop("producer_wait_nanoseconds") >= 0  # type: ignore[operator]
+    producer_active_ns = pipeline.pop("producer_active_nanoseconds")
+    union_ns = pipeline.pop("persistence_union_nanoseconds")
+    solver_union_ns = pipeline.pop("solver_persistence_union_nanoseconds")
+    solver_critical_ns = pipeline.pop("solver_persistence_critical_path_nanoseconds")
+    solver_producer_ns = pipeline.pop("solver_producer_active_nanoseconds")
+    solver_writer_cpu_ns = pipeline.pop("solver_writer_cpu_nanoseconds")
+    assert 0 < producer_active_ns <= union_ns  # type: ignore[operator]
+    assert 0 < solver_union_ns <= union_ns  # type: ignore[operator]
+    assert 0 <= solver_writer_cpu_ns <= writer_cpu_ns  # type: ignore[operator]
+    assert solver_critical_ns == max(solver_producer_ns, solver_writer_cpu_ns)
+    ledger = pipeline.pop("batch_ledger")
+    assert [entry["ordinal"] for entry in ledger] == [0, 1, 2]  # type: ignore[index, union-attr]
+    assert [entry["row_count"] for entry in ledger] == [2, 2, 1]  # type: ignore[index, union-attr]
+    assert pipeline == {
+        "mode": "bounded_async_thread",
+        "queue_max_batches": 1,
+        "writer_thread_switch_interval_seconds": 0.05,
+        "submitted_batches": 3,
+        "completed_batches": 3,
+        "peak_queued_batches": 1,
+    }
+
+
+def test_stage052_trace_sink_rejects_oversized_async_callback_batch() -> None:
+    with pytest.raises(ValueError, match="may not exceed one Parquet row group"):
+        stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+            shard=_RecordingShard(),
+            axis_name="fixed_work",
+            buffer_rows=65_537,
+            async_persistence=True,
+        )
+
+
+def test_stage052_trace_sink_async_pipeline_surfaces_writer_failure() -> None:
+    original_switch_interval = sys.getswitchinterval()
+
+    class FailingShard(_RecordingShard):
+        def append(self, **_kwargs: object) -> int:
+            raise RuntimeError("writer failed")
+
+    shard = FailingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="wall_clock_30",
+        buffer_rows=1,
+        async_persistence=True,
+    )
+    sink.append_event(
+        {
+            "event_type": "operator_call",
+            "lane": "legacy",
+            "iteration": 1,
+            "operator": "repair",
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="writer failed"):
+        sink.finish()
+    with pytest.raises(RuntimeError, match="writer failed"):
+        sink.discard_pending()
+    assert sys.getswitchinterval() == original_switch_interval
+
+
+def test_async_writer_cpu_tick_is_bounded_by_elapsed_wall_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = iter((0, 1_000_000_000))
+    monkeypatch.setattr(stage052_performance.time, "thread_time_ns", lambda: next(ticks))
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=_RecordingShard(),  # type: ignore[arg-type]
+        axis_name="fixed_work",
+        buffer_rows=1,
+        async_persistence=True,
+    )
+    sink.append_event(
+        {
+            "event_type": "operator_call",
+            "lane": "legacy",
+            "iteration": 1,
+            "operator": "repair",
+        }
+    )
+    sink.finish()
+    sink.freeze_solver_persistence_boundary()
+    sink.close()
+
+    pipeline = sink.persistence_pipeline
+    assert pipeline["writer_cpu_nanoseconds"] <= pipeline["writer_active_nanoseconds"]
+    assert (
+        pipeline["solver_persistence_critical_path_nanoseconds"]
+        <= pipeline["solver_persistence_union_nanoseconds"]
+    )
+
+
+def test_async_pipeline_ledger_is_independently_replayed_from_events(
+    tmp_path: Path,
+) -> None:
+    def write(label: str, *, corrupt_digest: bool) -> Path:
+        run_dir = tmp_path / label
+        writer = ArtifactBundleWriter(
+            run_dir,
+            ArtifactRunContext("stage05.2", "native_kernels", label),
+            ArtifactStorageConfig(
+                storage_policy_version="artifact-storage-v2",
+                screening_schema_version="screening_decisions_v3",
+            ),
+        )
+        shard = writer.open_v2_shard(
+            instance="toy",
+            seed=2014,
+            shard_ordinal=0,
+            worker_identity="worker-0",
+        )
+        sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+            shard=shard,
+            axis_name="fixed_work",
+            buffer_rows=2,
+            async_persistence=True,
+        )
+        for iteration in range(3):
+            sink.append_event(
+                {
+                    "event_type": "operator_call",
+                    "lane": "legacy",
+                    "iteration": iteration,
+                    "operator": "repair",
+                }
+            )
+        sink.append_screening_decision(
+            ScreeningDecision(
+                decision_id=1,
+                route_key="route:2:C1",
+                lane="legacy",
+                iteration=3,
+                operator="repair",
+                status="rejected",
+                first_failed_check="capacity",
+                reason="capacity",
+                checks=(ScreeningCheckTrace("capacity", "fail", 2.5, "capacity"),),
+                demand=2.5,
+                min_time_window_slack=1.0,
+                distance_lower_bound=3.0,
+                distance_increment_lower_bound=None,
+                single_segment_reachable=True,
+                structural_energy_lower_bound=4.0,
+                negative_cache_hit=False,
+                exact_call_blocked=True,
+                started_at=0.1,
+                completed_at=0.2,
+                duration_seconds=0.1,
+            )
+        )
+        sink.append_route_evaluation(
+            RouteEvaluationTrace(
+                evaluation_id=1,
+                route_key="route:2:C1",
+                lane="legacy",
+                iteration=4,
+                operator="repair",
+                kind="cache_hit",
+                started_at=0.2,
+                completed_at=0.3,
+                duration_seconds=0.1,
+                exact_started=False,
+                exact_completed=False,
+                feasible=True,
+                failure_reason="",
+            )
+        )
+        sink.finish()
+        sink.freeze_solver_persistence_boundary()
+        sink.close()
+        pipeline = sink.persistence_pipeline
+        if corrupt_digest:
+            ledger = pipeline["batch_ledger"]
+            assert isinstance(ledger, list)
+            assert isinstance(ledger[0], dict)
+            ledger[0]["event_token_sha256"] = "f" * 64
+        shard.finalize(
+            raw_payload={
+                "instance": "toy",
+                "seed": 2014,
+                "axes": {"fixed_work": {"started_calls": 0, "completed_calls": 0}},
+            },
+            solution_payload={
+                "instance": "toy",
+                "seed": 2014,
+                "axes": {
+                    "fixed_work": {
+                        "routes": [],
+                        "objective_key": [0, 0.0, 0.0, 0],
+                    }
+                },
+            },
+            trace_payload={
+                "axes": {
+                    "fixed_work": {
+                        "streamed_record_counts": {
+                            "events": 3,
+                            "incremental_propagations": 0,
+                            "route_evaluations": 1,
+                            "screening_decisions": 1,
+                        },
+                        "persistence_pipeline": pipeline,
+                    }
+                }
+            },
+            environment_payload={},
+        )
+        writer.finalize()
+        return run_dir
+
+    valid = write("stage05.2_native_kernels_attempt98", corrupt_digest=False)
+    forged = write("stage05.2_native_kernels_attempt97", corrupt_digest=True)
+
+    assert replay_stage052_storage_semantics(valid)
+    with pytest.raises(ArtifactIntegrityError, match="batch digest mismatch"):
+        replay_stage052_storage_semantics(forged)
 
 
 def test_small_neighborhood_stream_stays_in_bounded_memory_until_canonical_merge() -> None:
@@ -948,12 +1243,12 @@ def test_spool_close_and_unlink_are_charged_to_persistence() -> None:
     )
     for iteration in range(2):
         sink.append_neighborhood_event(
-                {
-                    "event_type": "neighborhood_event",
-                    "lane": "legacy",
-                    "iteration": iteration,
-                    "status": "failed",
-                }
+            {
+                "event_type": "neighborhood_event",
+                "lane": "legacy",
+                "iteration": iteration,
+                "status": "failed",
+            }
         )
     scratch_path = sink._neighborhood_spool_path  # noqa: SLF001
     assert scratch_path is not None
@@ -989,14 +1284,10 @@ def test_fdopen_failure_closes_descriptor_and_removes_scratch_file(
         buffer_rows=1,
         neighborhood_buffer_rows=1,
     )
-    sink.append_neighborhood_event(
-        {"event_type": "neighborhood_event", "status": "failed"}
-    )
+    sink.append_neighborhood_event({"event_type": "neighborhood_event", "status": "failed"})
 
     with pytest.raises(OSError, match="fdopen failure"):
-        sink.append_neighborhood_event(
-            {"event_type": "neighborhood_event", "status": "failed"}
-        )
+        sink.append_neighborhood_event({"event_type": "neighborhood_event", "status": "failed"})
 
     assert len(descriptors) == len(paths) == 1
     with pytest.raises(OSError):
@@ -1060,6 +1351,51 @@ def test_spool_cleanup_failure_still_publishes_partial_shard_abort() -> None:
     assert shard.aborted_with is original
     assert caught.value.exceptions[0] is original
     assert isinstance(caught.value.exceptions[1], OSError)
+
+
+def test_concurrent_writer_failure_is_retained_with_solver_failure() -> None:
+    original = RuntimeError("solver failed")
+
+    class FailingShard(_RecordingShard):
+        def __init__(self) -> None:
+            super().__init__()
+            self.aborted_with: BaseException | None = None
+
+        def append(self, **_kwargs: object) -> int:
+            raise OSError("writer failed")
+
+        def abort(self, error: BaseException) -> None:
+            self.aborted_with = error
+
+    shard = FailingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="wall_clock_30",
+        buffer_rows=1,
+        async_persistence=True,
+    )
+    sink.append_event(
+        {
+            "event_type": "operator_call",
+            "lane": "legacy",
+            "iteration": 1,
+            "operator": "repair",
+        }
+    )
+    with pytest.raises(OSError, match="writer failed"):
+        sink.finish()
+
+    with pytest.raises(BaseExceptionGroup, match="cleanup also failed") as caught:
+        stage052_performance._abort_v2_shard_after_failure(  # noqa: SLF001
+            shard,
+            active_trace_stream=sink,
+            original_error=original,
+        )
+
+    assert shard.aborted_with is original
+    assert caught.value.exceptions[0] is original
+    assert isinstance(caught.value.exceptions[1], OSError)
+    assert str(caught.value.exceptions[1]) == "writer failed"
 
 
 def test_neighborhood_event_stream_externalizes_more_than_a_row_group() -> None:

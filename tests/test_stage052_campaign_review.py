@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -383,6 +384,48 @@ def test_streaming_event_audit_tracks_all_route_evaluation_ids_with_cache_hits()
     assert audit.exact_started == 2
 
 
+def test_campaign_reviewer_recomputes_async_batch_ledger() -> None:
+    events = [
+        {
+            "event_type": "operator_call",
+            "benchmark_axis": "wall_clock_30",
+            "lane": "wall_clock_30:legacy",
+            "iteration": iteration,
+            "operator": "repair",
+        }
+        for iteration in range(3)
+    ]
+    digest = hashlib.sha256()
+    for event in events:
+        digest.update(
+            orjson.dumps(
+                campaign_review_module._pipeline_event_token_from_logical_row(  # noqa: SLF001
+                    event
+                )
+            )
+            + b"\n"
+        )
+    pipeline = {
+        "batch_ledger": [
+            {
+                "ordinal": 0,
+                "row_count": len(events),
+                "event_token_sha256": digest.hexdigest(),
+            }
+        ]
+    }
+    trace_axes = {"wall_clock_30": {"persistence_pipeline": pipeline}}
+
+    campaign_review_module._audit_async_persistence_ledgers(  # noqa: SLF001
+        events, trace_axes
+    )
+    pipeline["batch_ledger"][0]["event_token_sha256"] = "f" * 64
+    with pytest.raises(ArtifactIntegrityError, match="digest does not replay"):
+        campaign_review_module._audit_async_persistence_ledgers(  # noqa: SLF001
+            events, trace_axes
+        )
+
+
 def test_axis_reconciliation_rejects_missing_deadline_and_exact_events() -> None:
     event_audit = audit_streamed_events(
         (
@@ -504,8 +547,7 @@ def test_global_best_stream_summary_keeps_only_checkpoint_visible_events() -> No
     instance = parse_schneider(Path("data/schneider/c101C5.txt"))
     baseline = json.loads(
         Path(
-            "experiments/baselines/stage00/solutions/"
-            "c101C5-alns_exact_charging-2014.json"
+            "experiments/baselines/stage00/solutions/c101C5-alns_exact_charging-2014.json"
         ).read_text(encoding="utf-8")
     )
     routes = baseline["routes"]
@@ -513,8 +555,7 @@ def test_global_best_stream_summary_keeps_only_checkpoint_visible_events() -> No
     assert report.feasible
     objective = SolutionObjective.from_report(instance, report).key
     route_keys = [
-        "route:" + "|".join(f"{len(str(node))}:{node}" for node in route)
-        for route in routes
+        "route:" + "|".join(f"{len(str(node))}:{node}" for node in route) for route in routes
     ]
     events = (
         {
@@ -907,9 +948,7 @@ def _build_complete_pilot_campaign(
             "validator_passed": True,
             "runtime_seconds": (0.5 if bks_counts[instance_name] < 100 else 30.0),
             "termination_reason": (
-                "iteration_limit"
-                if bks_counts[instance_name] < 100
-                else "wall_clock_deadline"
+                "iteration_limit" if bks_counts[instance_name] < 100 else "wall_clock_deadline"
             ),
             "iteration_limit_completed_at_seconds": (
                 0.5 if bks_counts[instance_name] < 100 else None
@@ -1148,9 +1187,7 @@ def _build_complete_pilot_campaign(
         row_count=event_row_count,
         physical_schema="screening_decisions_v3",
         resource_summary_sha256=hashlib.sha256(resource_path.read_bytes()).hexdigest(),
-        persistence_attribution_sha256=hashlib.sha256(
-            attribution_path.read_bytes()
-        ).hexdigest(),
+        persistence_attribution_sha256=hashlib.sha256(attribution_path.read_bytes()).hexdigest(),
         control_persistence_seconds=attribution.control_persistence_seconds,
         persistence_ratio=attribution.persistence_ratio,
         shard_manifest_sha256_by_id=shard_hashes,
@@ -1485,9 +1522,7 @@ def _build_complete_pilot_campaign(
         primary_manifest_relative_path=top_bundle.manifest_path.relative_to(
             campaign_dir
         ).as_posix(),
-        primary_manifest_sha256=hashlib.sha256(
-            top_bundle.manifest_path.read_bytes()
-        ).hexdigest(),
+        primary_manifest_sha256=hashlib.sha256(top_bundle.manifest_path.read_bytes()).hexdigest(),
         solver_seconds=envelope.solver_seconds,
         shard_persistence_seconds=envelope.total_persistence_seconds,
         control_intervals=tuple(
@@ -1751,9 +1786,7 @@ def _accepted_review(
     final_generation = generation.with_name(generation_digest.hexdigest())
     generation.rename(final_generation)
     for key, item in publication_files.items():
-        item["relative_path"] = (
-            final_generation / targets[key]
-        ).relative_to(review_dir).as_posix()
+        item["relative_path"] = (final_generation / targets[key]).relative_to(review_dir).as_posix()
     manifest = {
         "schema_version": "stage05.2-campaign-review-v1",
         "run_label": run_label,
@@ -1781,15 +1814,10 @@ def _accepted_review(
             "accelerator_review_manifest_sha256": "d" * 64,
         },
         "publication_files": publication_files,
-        "files": {
-            item["relative_path"]: item["sha256"]
-            for item in publication_files.values()
-        },
+        "files": {item["relative_path"]: item["sha256"] for item in publication_files.values()},
         "gates": {
             gate: {"passed": True, "detail": "passed"}
-            for gate in (
-                CAMPAIGN_PILOT_GATES if scope == "pilot" else CAMPAIGN_FORMAL_GATES
-            )
+            for gate in (CAMPAIGN_PILOT_GATES if scope == "pilot" else CAMPAIGN_FORMAL_GATES)
         },
     }
     manifest_path = review_dir / "review_manifest.json"
@@ -1924,8 +1952,7 @@ def test_publisher_rechecks_source_review_after_final_checkpoint(
         )
 
     trusted = (
-        repository
-        / "experiments/manifests/stage05.2_performance_benchmark_artifact_manifest.json"
+        repository / "experiments/manifests/stage05.2_performance_benchmark_artifact_manifest.json"
     )
     assert not trusted.exists()
 
@@ -1958,8 +1985,7 @@ def test_publisher_rechecks_live_g01_chain_immediately_before_trusted_replace(
 
     assert calls == 2
     assert not (
-        repository
-        / "experiments/manifests/stage05.2_performance_benchmark_artifact_manifest.json"
+        repository / "experiments/manifests/stage05.2_performance_benchmark_artifact_manifest.json"
     ).exists()
 
 
@@ -2093,8 +2119,7 @@ def test_same_run_new_review_generation_preserves_old_publication(
     )
     first_trusted = json.loads(first_outputs["artifact_manifest"].read_text(encoding="utf-8"))
     first_generation_files = {
-        relative: (repository / relative).read_bytes()
-        for relative in first_trusted["files"]
+        relative: (repository / relative).read_bytes() for relative in first_trusted["files"]
     }
     second_review = _accepted_review(tmp_path / "second")
     second_payload = json.loads(second_review.read_text(encoding="utf-8"))
@@ -2106,9 +2131,7 @@ def test_same_run_new_review_generation_preserves_old_publication(
         repository_root=repository,
         prerequisite_dir=tmp_path / "g01",
     )
-    second_trusted = json.loads(
-        second_outputs["artifact_manifest"].read_text(encoding="utf-8")
-    )
+    second_trusted = json.loads(second_outputs["artifact_manifest"].read_text(encoding="utf-8"))
 
     assert second_trusted["generation_id"] != first_trusted["generation_id"]
     assert second_outputs["artifact_registry"] != first_outputs["artifact_registry"]
@@ -2172,9 +2195,7 @@ def test_interrupted_new_publication_preserves_prior_ready_generation(
     )
     with pytest.raises(ValueError, match="differs|does not match"):
         verify_canonical_registry_against_trusted(
-            registry_path=(
-                repository / "experiments/registries/stage05.2_artifact_registry.csv"
-            ),
+            registry_path=(repository / "experiments/registries/stage05.2_artifact_registry.csv"),
             trusted_manifest_path=trusted_path,
         )
 
@@ -2231,21 +2252,15 @@ def test_publisher_live_chain_rejects_raw_tamper_before_publication(
     review = {
         "run_label": raw_dir.name,
         "raw_manifest_sha256": hashlib.sha256(raw_manifest.read_bytes()).hexdigest(),
-        "raw_campaign_manifest_sha256": hashlib.sha256(
-            campaign_path.read_bytes()
-        ).hexdigest(),
-        "persistence_attribution_sha256": hashlib.sha256(
-            attribution.read_bytes()
-        ).hexdigest(),
+        "raw_campaign_manifest_sha256": hashlib.sha256(campaign_path.read_bytes()).hexdigest(),
+        "persistence_attribution_sha256": hashlib.sha256(attribution.read_bytes()).hexdigest(),
         "persistence_attribution_sidecar_sha256": hashlib.sha256(
             attribution.with_suffix(".sha256").read_bytes()
         ).hexdigest(),
         "selected_backend": "native_cpu",
         "selected_exact_backend": "cpu_batch",
         "selected_workers": 2,
-        "campaign_prerequisite_review_sha256": hashlib.sha256(
-            g01_review.read_bytes()
-        ).hexdigest(),
+        "campaign_prerequisite_review_sha256": hashlib.sha256(g01_review.read_bytes()).hexdigest(),
     }
     _write_json(review_pointer, review)
     campaign = SimpleNamespace(
@@ -2479,13 +2494,7 @@ def test_campaign_review_rejects_corrupt_prior_files_and_history(
     )
     second_payload = json.loads(second["review_manifest"].read_text(encoding="utf-8"))
     prior_sha256 = second_payload["review_history"][0]
-    (
-        campaign_dir
-        / "review"
-        / "history"
-        / prior_sha256
-        / "review_manifest.json"
-    ).unlink()
+    (campaign_dir / "review" / "history" / prior_sha256 / "review_manifest.json").unlink()
     with pytest.raises(ArtifactIntegrityError, match="history manifest is missing"):
         _publish_review(campaign_dir=campaign_dir, manifest=manifest, payloads=payloads)
 

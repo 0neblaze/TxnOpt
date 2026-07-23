@@ -435,9 +435,11 @@ def test_sparse_route_event_fast_normalizer_matches_general(
     }
 
     assert artifacts_module._normalise_event_values(  # noqa: SLF001
-        event, **keywords  # type: ignore[arg-type]
+        event,
+        **keywords,  # type: ignore[arg-type]
     ) == artifacts_module._normalise_general_event_values(  # noqa: SLF001
-        event, **keywords  # type: ignore[arg-type]
+        event,
+        **keywords,  # type: ignore[arg-type]
     )
 
 
@@ -542,10 +544,13 @@ def test_unique_route_evaluation_identities_remain_in_bounded_memory(
             )
         assert not store._unique_identities_spilled  # noqa: SLF001
         assert len(store._unique_identity_memory) == 3  # noqa: SLF001
-        assert store.unique_identity_count(
-            axis="fixed_work",
-            semantics="completed_shared",
-        ) == 3
+        assert (
+            store.unique_identity_count(
+                axis="fixed_work",
+                semantics="completed_shared",
+            )
+            == 3
+        )
     finally:
         store.close()
 
@@ -578,10 +583,13 @@ def test_unique_route_evaluation_identities_spill_without_losing_deduplication(
             semantics="completed_shared",
             identity=("route-a",),
         )
-        assert store.unique_identity_count(
-            axis="wall_clock",
-            semantics="completed_shared",
-        ) == 2
+        assert (
+            store.unique_identity_count(
+                axis="wall_clock",
+                semantics="completed_shared",
+            )
+            == 2
+        )
     finally:
         store.close()
 
@@ -595,9 +603,7 @@ def test_unique_route_evaluation_identity_collision_fails_before_and_after_spill
     monkeypatch.setattr(
         artifacts_module,
         "hashlib",
-        SimpleNamespace(
-            sha256=lambda _payload: SimpleNamespace(digest=lambda: b"x" * 32)
-        ),
+        SimpleNamespace(sha256=lambda _payload: SimpleNamespace(digest=lambda: b"x" * 32)),
     )
     monkeypatch.setattr(artifacts_module, "UNIQUE_ROUTE_IDENTITY_MEMORY_ENTRIES", 1)
     memory_store = artifacts_module._DiskBackedRouteIdentityStore(  # noqa: SLF001
@@ -833,10 +839,7 @@ def test_v3_writer_rejects_more_than_eight_precomputed_screening_checks(
         shard_ordinal=0,
         worker_identity="worker-0",
     )
-    checks = tuple(
-        (f"check-{index}", "pass", True, None, None, "")
-        for index in range(9)
-    )
+    checks = tuple((f"check-{index}", "pass", True, None, None, "") for index in range(9))
     definition = artifacts_module.PrecomputedScreeningDefinition(
         (
             "pass",
@@ -868,6 +871,91 @@ def test_v3_writer_rejects_more_than_eight_precomputed_screening_checks(
     writer.finalize(status="partial", evidence_completeness="partial")
 
 
+def test_v3_writer_rejects_prepared_screening_context_mismatch(tmp_path: Path) -> None:
+    writer = _v3_writer(tmp_path, attempt=96)
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    definition = artifacts_module.PrecomputedScreeningDefinition(
+        ("pass", "", "fixed_work", 1.0, None, 2.0, False, "", 3.0, False, True, 4.0, ())
+    )
+    prepared = artifacts_module.prepare_screening_definition(
+        definition,
+        route_key="route:2:C1",
+        lane="fixed_work:legacy",
+        operator="repair",
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="context mismatch"):
+        shard.append(
+            route_dictionary={"route:2:C1": ("C1",)},
+            critical_events=(
+                (9, "route:2:C1", "fixed_work:constraint", 1, "repair", 1.25, 1.5, prepared),
+            ),
+            cache_lookups_coalesced=True,
+        )
+
+    shard.abort("expected prepared-context rejection")
+    writer.finalize(status="partial", evidence_completeness="partial")
+
+
+def test_v3_prepared_screening_cache_eviction_rehydrates_exact_definition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(artifacts_module, "SCREENING_DEFINITION_HOT_CACHE_ENTRIES", 1)
+    writer = _v3_writer(tmp_path, attempt=97)
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    definition = artifacts_module.PrecomputedScreeningDefinition(
+        ("pass", "", "fixed_work", 1.0, None, 2.0, False, "", 3.0, False, True, 4.0, ())
+    )
+    first = artifacts_module.prepare_screening_definition(
+        definition,
+        route_key="route:2:C1",
+        lane="fixed_work:legacy",
+        operator="repair",
+    )
+    second = artifacts_module.prepare_screening_definition(
+        definition,
+        route_key="route:2:C2",
+        lane="fixed_work:legacy",
+        operator="repair",
+    )
+    assert (
+        shard.append(
+            route_dictionary={"route:2:C1": ("C1",), "route:2:C2": ("C2",)},
+            critical_events=(
+                (1, "route:2:C1", "fixed_work:legacy", 1, "repair", 1.0, 1.1, first),
+                (2, "route:2:C2", "fixed_work:legacy", 2, "repair", 2.0, 2.1, second),
+                (3, "route:2:C1", "fixed_work:legacy", 3, "repair", 3.0, 3.1, first),
+            ),
+            cache_lookups_coalesced=True,
+        )
+        == 3
+    )
+    shard.finalize(
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+    )
+    bundle = writer.finalize()
+    events = list(
+        ArtifactReader(bundle.run_dir).iter_events(
+            f"toy/2014/{writer.context.run_label}_events_toy_2014.parquet"
+        )
+    )
+    assert [event["decision_id"] for event in events] == [1, 2, 3]
+
+
 def test_v2_writer_ignores_private_precomputed_screening_tail(tmp_path: Path) -> None:
     run_label = "stage05.2_artifact_streaming_attempt93"
     writer = ArtifactBundleWriter(
@@ -885,23 +973,21 @@ def test_v2_writer_ignores_private_precomputed_screening_tail(tmp_path: Path) ->
         worker_identity="worker-0",
     )
     visible = _screening_event(decision_id=9, started_at=1.25)
-    visible["_precomputed_screening_definition"] = (
-        artifacts_module._PrecomputedScreeningDefinition(  # noqa: SLF001
-            (
-                "forged",
-                "forged",
-                "forged_axis",
-                999.0,
-                None,
-                999.0,
-                True,
-                "forged",
-                -999.0,
-                True,
-                False,
-                999.0,
-                (),
-            )
+    visible["_precomputed_screening_definition"] = artifacts_module._PrecomputedScreeningDefinition(  # noqa: SLF001
+        (
+            "forged",
+            "forged",
+            "forged_axis",
+            999.0,
+            None,
+            999.0,
+            True,
+            "forged",
+            -999.0,
+            True,
+            False,
+            999.0,
+            (),
         )
     )
     shard.append(
@@ -917,9 +1003,7 @@ def test_v2_writer_ignores_private_precomputed_screening_tail(tmp_path: Path) ->
     bundle = writer.finalize()
 
     rows = list(
-        ArtifactReader(bundle.run_dir).iter_events(
-            f"toy/2014/{run_label}_events_toy_2014.parquet"
-        )
+        ArtifactReader(bundle.run_dir).iter_events(f"toy/2014/{run_label}_events_toy_2014.parquet")
     )
 
     assert rows[0]["status"] == visible["status"]
@@ -944,23 +1028,21 @@ def test_v3_writer_reconstructs_definition_from_visible_event(tmp_path: Path) ->
         worker_identity="worker-0",
     )
     visible = _screening_event(decision_id=9, started_at=1.25)
-    visible["_precomputed_screening_definition"] = (
-        artifacts_module._PrecomputedScreeningDefinition(  # noqa: SLF001
-            (
-                "forged",
-                "forged",
-                "forged_axis",
-                999.0,
-                None,
-                999.0,
-                True,
-                "forged",
-                -999.0,
-                True,
-                False,
-                999.0,
-                (),
-            )
+    visible["_precomputed_screening_definition"] = artifacts_module._PrecomputedScreeningDefinition(  # noqa: SLF001
+        (
+            "forged",
+            "forged",
+            "forged_axis",
+            999.0,
+            None,
+            999.0,
+            True,
+            "forged",
+            -999.0,
+            True,
+            False,
+            999.0,
+            (),
         )
     )
     shard.append(
@@ -976,9 +1058,7 @@ def test_v3_writer_reconstructs_definition_from_visible_event(tmp_path: Path) ->
     bundle = writer.finalize()
 
     rows = list(
-        ArtifactReader(bundle.run_dir).iter_events(
-            f"toy/2014/{run_label}_events_toy_2014.parquet"
-        )
+        ArtifactReader(bundle.run_dir).iter_events(f"toy/2014/{run_label}_events_toy_2014.parquet")
     )
 
     assert rows[0]["status"] == visible["status"]
@@ -1021,9 +1101,7 @@ def test_reader_accepts_only_the_signed_post_manifest_persistence_envelope(
     writer = _v3_writer(tmp_path, attempt=98)
     bundle = writer.finalize()
     attribution = (
-        bundle.run_dir
-        / "control"
-        / f"{writer.context.run_label}_persistence_attribution.json"
+        bundle.run_dir / "control" / f"{writer.context.run_label}_persistence_attribution.json"
     )
     atomic_write_signed_json(
         attribution,
@@ -1137,9 +1215,7 @@ def test_reader_accepts_strict_cross_bound_batch_post_manifest_envelopes(
         row_count=0,
         physical_schema="screening_decisions_v3",
         resource_summary_sha256="2" * 64,
-        persistence_attribution_sha256=hashlib.sha256(
-            attribution_path.read_bytes()
-        ).hexdigest(),
+        persistence_attribution_sha256=hashlib.sha256(attribution_path.read_bytes()).hexdigest(),
         control_persistence_seconds=0.0,
         persistence_ratio=0.0,
         shard_manifest_sha256_by_id={"shard0001": "3" * 64},
@@ -1425,12 +1501,8 @@ def test_v3_transcodes_old_v2_arrow_batches_without_logical_drift(tmp_path: Path
         environment_payload={},
     )
     child_reader = ArtifactReader(child_writer.finalize().run_dir)
-    source_events_ref = source_trace_ref.replace("_trace_", "_events_").replace(
-        ".json", ".parquet"
-    )
-    child_events_ref = (
-        f"toy/2014/{child_writer.context.run_label}_events_toy_2014.parquet"
-    )
+    source_events_ref = source_trace_ref.replace("_trace_", "_events_").replace(".json", ".parquet")
+    child_events_ref = f"toy/2014/{child_writer.context.run_label}_events_toy_2014.parquet"
 
     assert list(source.iter_events(source_events_ref)) == list(
         child_reader.iter_events(child_events_ref)
@@ -1852,7 +1924,7 @@ def test_v3_row_groups_and_simultaneous_buffers_stay_bounded(tmp_path: Path) -> 
         ),
     )
     assert shard.max_buffered_groups_observed <= 2
-    assert shard.max_pending_screening_transaction_rows_observed <= 8_192
+    assert shard.max_pending_screening_transaction_rows_observed <= 65_536
     shard.finalize(
         raw_payload={},
         solution_payload={},
@@ -1916,10 +1988,13 @@ def test_v3_occurrences_append_schema_ordered_values_without_row_mappings(
         worker_identity="worker-0",
     )
 
-    assert shard.append(
-        route_dictionary={"route:2:C1": ("C1",)},
-        critical_events=(_screening_event(decision_id=9, started_at=1.25),),
-    ) == 1
+    assert (
+        shard.append(
+            route_dictionary={"route:2:C1": ("C1",)},
+            critical_events=(_screening_event(decision_id=9, started_at=1.25),),
+        )
+        == 1
+    )
     shard.abort("typed occurrence test complete")
 
 
@@ -1938,9 +2013,7 @@ def test_empty_v3_screening_transaction_does_not_flush_other_sinks(tmp_path: Pat
         "operator": "relocate",
         "iteration": 3,
         "exact_started": True,
-        "checks": (
-            {"check": "capacity", "status": "pass", "value": True, "reason": ""},
-        ),
+        "checks": ({"check": "capacity", "status": "pass", "value": True, "reason": ""},),
     }
     for index in range(3):
         shard.append(
@@ -1955,10 +2028,7 @@ def test_empty_v3_screening_transaction_does_not_flush_other_sinks(tmp_path: Pat
     )
     bundle = writer.finalize()
     events_path = (
-        bundle.run_dir
-        / "toy"
-        / "2014"
-        / f"{writer.context.run_label}_events_toy_2014.parquet"
+        bundle.run_dir / "toy" / "2014" / f"{writer.context.run_label}_events_toy_2014.parquet"
     )
     parquet = pq.ParquetFile(events_path)
 
@@ -2246,9 +2316,7 @@ def test_v2_sequential_route_ids_migrate_to_v3_content_ids_by_key(
         environment_payload={},
     )
     target = target_writer.finalize()
-    target_ref = (
-        f"toy/2014/{target_writer.context.run_label}_events_toy_2014.parquet"
-    )
+    target_ref = f"toy/2014/{target_writer.context.run_label}_events_toy_2014.parquet"
     migrated = list(ArtifactReader(target.run_dir).iter_events(target_ref))
 
     assert migrated[0]["route_key"] == route_keys[0]
