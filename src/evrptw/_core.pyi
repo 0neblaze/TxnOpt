@@ -22,6 +22,31 @@ def pack_stage052_screening_occurrences(
     list[tuple[object, int, list[int]]],
     list[int],
 ]: ...
+def pack_stage052_screening_transactions(
+    events: Sequence[object],
+    definition_cache: dict[object, int],
+    negative_evidence_cache: dict[object, tuple[object, ...]],
+    lane_ids: dict[str, int],
+    operator_ids: dict[str, int],
+    route_ids: dict[str, int],
+    resolve_route_id: object,
+    stable_dictionary_id: object,
+    definition_from_cache_key: object,
+    definition_identity: object,
+    first_event_id: int,
+) -> tuple[
+    tuple[
+        list[int],
+        list[int],
+        list[float],
+        list[float],
+        list[int | None],
+        list[int],
+    ],
+    list[tuple[int, bytes, bytes, dict[str, object], tuple[object, ...]]],
+    list[int],
+    list[tuple[str, int]],
+]: ...
 def pack_stage052_neighborhood_events(
     events: Sequence[object],
     lane_ids: dict[str, int],

@@ -208,6 +208,305 @@ py::tuple pack_stage052_screening_occurrences(
         std::move(non_screening_indices));
 }
 
+py::tuple pack_stage052_screening_transactions(
+    const py::sequence& events,
+    py::dict definition_cache,
+    py::dict negative_evidence_cache,
+    py::dict lane_ids,
+    py::dict operator_ids,
+    py::dict route_ids,
+    const py::object& resolve_route_id,
+    const py::object& stable_dictionary_id,
+    const py::object& definition_from_cache_key,
+    const py::object& definition_identity,
+    const std::int64_t first_event_id) {
+    py::tuple columns(6);
+    for (py::ssize_t index = 0; index < 6; ++index) {
+        columns[index] = py::list();
+    }
+    auto event_ids = py::reinterpret_borrow<py::list>(columns[0]);
+    auto definition_ids = py::reinterpret_borrow<py::list>(columns[1]);
+    auto started_at = py::reinterpret_borrow<py::list>(columns[2]);
+    auto completed_at = py::reinterpret_borrow<py::list>(columns[3]);
+    auto iterations = py::reinterpret_borrow<py::list>(columns[4]);
+    auto decision_ids = py::reinterpret_borrow<py::list>(columns[5]);
+    py::list pending_definitions;
+    py::list non_screening_indices;
+    py::list observed_routes;
+
+    const auto cached_dictionary_id = [&stable_dictionary_id](
+                                          py::dict cache,
+                                          const py::object& value,
+                                          const char* prefix) -> py::object {
+        PyObject* cached = PyDict_GetItemWithError(cache.ptr(), value.ptr());
+        if (cached != nullptr) {
+            return py::reinterpret_borrow<py::object>(cached);
+        }
+        if (PyErr_Occurred()) {
+            throw py::error_already_set();
+        }
+        const py::object identifier = stable_dictionary_id(py::str(prefix) + py::str(value));
+        cache[value] = identifier;
+        return identifier;
+    };
+    const auto checked_float = [](const py::object& value) -> py::object {
+        const double converted = PyFloat_AsDouble(value.ptr());
+        if (converted == -1.0 && PyErr_Occurred()) {
+            throw py::error_already_set();
+        }
+        return py::float_(converted);
+    };
+
+    const py::ssize_t event_count = py::len(events);
+    for (py::ssize_t event_index = 0; event_index < event_count; ++event_index) {
+        const py::object event = events[event_index];
+        if (!PyTuple_Check(event.ptr()) || PyTuple_GET_SIZE(event.ptr()) != 2) {
+            non_screening_indices.append(event_index);
+            continue;
+        }
+        const py::object axis_name =
+            py::reinterpret_borrow<py::object>(PyTuple_GET_ITEM(event.ptr(), 0));
+        const py::object raw_values =
+            py::reinterpret_borrow<py::object>(PyTuple_GET_ITEM(event.ptr(), 1));
+        if (!PyUnicode_Check(axis_name.ptr())) {
+            non_screening_indices.append(event_index);
+            continue;
+        }
+        if (!PyTuple_Check(raw_values.ptr()) || PyTuple_GET_SIZE(raw_values.ptr()) != 20) {
+            throw std::invalid_argument(
+                "Stage 5.2 deferred screening values must contain twenty fields");
+        }
+        const py::tuple values = py::reinterpret_borrow<py::tuple>(raw_values);
+        py::tuple occurrence_key(5);
+        occurrence_key[0] = values[1];
+        occurrence_key[1] = axis_name;
+        occurrence_key[2] = values[2];
+        occurrence_key[3] = values[4];
+        if (values[15].ptr() == Py_True && !values[19].is_none()) {
+            PyObject* cached_evidence =
+                PyDict_GetItemWithError(negative_evidence_cache.ptr(), values[1].ptr());
+            if (cached_evidence == nullptr) {
+                if (PyErr_Occurred()) {
+                    throw py::error_already_set();
+                }
+                if (py::len(negative_evidence_cache) >= 262144) {
+                    throw std::invalid_argument(
+                        "Stage 5.2 native negative evidence cache exceeds its hard limit");
+                }
+                py::tuple evidence(12);
+                for (py::ssize_t index = 0; index < 12; ++index) {
+                    evidence[index] = values[7 + index];
+                }
+                negative_evidence_cache[values[1]] = std::move(evidence);
+            } else {
+                if (!PyTuple_Check(cached_evidence)
+                    || PyTuple_GET_SIZE(cached_evidence) != 12) {
+                    throw std::invalid_argument(
+                        "Stage 5.2 native negative evidence cache is invalid");
+                }
+                for (py::ssize_t index = 0; index < 12; ++index) {
+                    PyObject* previous = PyTuple_GET_ITEM(cached_evidence, index);
+                    PyObject* current = values[7 + index].ptr();
+                    if (previous == current) {
+                        continue;
+                    }
+                    const int equal = PyObject_RichCompareBool(previous, current, Py_EQ);
+                    if (equal < 0) {
+                        throw py::error_already_set();
+                    }
+                    if (equal == 0) {
+                        throw std::invalid_argument(
+                            "negative screening cache returned inconsistent evidence for one route");
+                    }
+                }
+            }
+            occurrence_key[4] = values[19];
+        } else {
+            py::tuple evidence(12);
+            for (py::ssize_t index = 0; index < 12; ++index) {
+                evidence[index] = values[7 + index];
+            }
+            occurrence_key[4] = std::move(evidence);
+        }
+
+        event_ids.append(first_event_id + event_index);
+        started_at.append(values[5]);
+        completed_at.append(values[6]);
+        iterations.append(values[3]);
+        decision_ids.append(values[0]);
+        PyObject* cached =
+            PyDict_GetItemWithError(definition_cache.ptr(), occurrence_key.ptr());
+        if (cached != nullptr) {
+            if (!PyLong_Check(cached) || PyBool_Check(cached)) {
+                throw std::invalid_argument(
+                    "Stage 5.2 screening definition cache value must be an integer");
+            }
+            definition_ids.append(py::reinterpret_borrow<py::object>(cached));
+            continue;
+        }
+        if (PyErr_Occurred()) {
+            throw py::error_already_set();
+        }
+
+        const py::object raw_checks = values[18];
+        if (!PyTuple_Check(raw_checks.ptr())) {
+            throw std::invalid_argument("Stage 5.2 deferred screening checks are invalid");
+        }
+        const py::tuple checks = py::reinterpret_borrow<py::tuple>(raw_checks);
+        if (py::len(checks) > 8) {
+            throw std::invalid_argument(
+                "one screening decision exceeds the fixed eight-check domain");
+        }
+        py::tuple compact_checks(py::len(checks));
+        py::list check_payloads;
+        for (py::ssize_t check_index = 0; check_index < py::len(checks); ++check_index) {
+            const py::object check = checks[check_index];
+            py::object name;
+            py::object status;
+            py::object value;
+            py::object reason;
+            if (PyTuple_Check(check.ptr()) && PyTuple_GET_SIZE(check.ptr()) == 4) {
+                name = py::reinterpret_borrow<py::object>(PyTuple_GET_ITEM(check.ptr(), 0));
+                status = py::reinterpret_borrow<py::object>(PyTuple_GET_ITEM(check.ptr(), 1));
+                value = py::reinterpret_borrow<py::object>(PyTuple_GET_ITEM(check.ptr(), 2));
+                reason = py::reinterpret_borrow<py::object>(PyTuple_GET_ITEM(check.ptr(), 3));
+            } else {
+                name = check.attr("check");
+                status = check.attr("status");
+                value = check.attr("value");
+                reason = check.attr("reason");
+            }
+            py::object value_bool = py::none();
+            py::object value_float = py::none();
+            py::object value_text = py::none();
+            if (PyBool_Check(value.ptr())) {
+                value_bool = value;
+            } else if (PyLong_Check(value.ptr()) || PyFloat_Check(value.ptr())) {
+                value_float = checked_float(value);
+            } else if (PyUnicode_Check(value.ptr())) {
+                value_text = value;
+            }
+            py::tuple compact(6);
+            compact[0] = name;
+            compact[1] = status;
+            compact[2] = value_bool;
+            compact[3] = value_float;
+            compact[4] = value_text;
+            compact[5] = reason;
+            compact_checks[check_index] = std::move(compact);
+            py::dict payload;
+            payload["check"] = name;
+            payload["status"] = status;
+            payload["value_bool"] = value_bool;
+            payload["value_float"] = value_float;
+            payload["value_text"] = value_text;
+            payload["reason"] = reason;
+            check_payloads.append(std::move(payload));
+        }
+
+        const py::str lane = py::str(axis_name) + py::str(":") + py::str(values[2]);
+        const py::object lane_id =
+            cached_dictionary_id(lane_ids, lane, "lane:");
+        const py::object operator_id =
+            cached_dictionary_id(operator_ids, values[4], "operator:");
+        PyObject* cached_route = PyDict_GetItemWithError(route_ids.ptr(), values[1].ptr());
+        py::object route_id;
+        bool route_was_resolved = false;
+        if (cached_route != nullptr) {
+            route_id = py::reinterpret_borrow<py::object>(cached_route);
+        } else {
+            if (PyErr_Occurred()) {
+                throw py::error_already_set();
+            }
+            route_id = resolve_route_id(values[1]);
+            route_was_resolved = true;
+        }
+        if (route_was_resolved) {
+            observed_routes.append(py::make_tuple(values[1], route_id));
+        }
+
+        py::tuple definition_key(16);
+        definition_key[0] = lane_id;
+        definition_key[1] = operator_id;
+        definition_key[2] = route_id;
+        definition_key[3] = values[7];
+        definition_key[4] = values[8];
+        definition_key[5] = axis_name;
+        definition_key[6] = checked_float(values[9]);
+        definition_key[7] =
+            values[10].is_none() ? py::none() : checked_float(values[10]);
+        definition_key[8] = checked_float(values[11]);
+        definition_key[9] = values[12];
+        definition_key[10] = values[13];
+        definition_key[11] = checked_float(values[14]);
+        definition_key[12] = values[15];
+        definition_key[13] = values[16];
+        definition_key[14] = checked_float(values[17]);
+        definition_key[15] = compact_checks;
+        const py::dict definition =
+            py::cast<py::dict>(definition_from_cache_key(definition_key));
+        const py::tuple identity =
+            py::cast<py::tuple>(definition_identity(definition));
+        if (py::len(identity) != 3) {
+            throw std::invalid_argument(
+                "Stage 5.2 screening definition identity is invalid");
+        }
+        const py::object definition_id = identity[0];
+        if (py::len(definition_cache) >= 262144) {
+            PyObject* iterator = PyObject_GetIter(definition_cache.ptr());
+            if (iterator == nullptr) {
+                throw py::error_already_set();
+            }
+            PyObject* oldest = PyIter_Next(iterator);
+            Py_DECREF(iterator);
+            if (oldest == nullptr) {
+                if (PyErr_Occurred()) {
+                    throw py::error_already_set();
+                }
+                throw std::invalid_argument(
+                    "Stage 5.2 screening definition cache is unexpectedly empty");
+            }
+            const int removed = PyDict_DelItem(definition_cache.ptr(), oldest);
+            Py_DECREF(oldest);
+            if (removed != 0) {
+                throw py::error_already_set();
+            }
+        }
+        definition_cache[occurrence_key] = definition_id;
+        definition_ids.append(definition_id);
+        py::tuple row(17);
+        row[0] = definition_id;
+        row[1] = lane_id;
+        row[2] = operator_id;
+        row[3] = route_id;
+        row[4] = values[7];
+        row[5] = values[8];
+        row[6] = axis_name;
+        row[7] = definition_key[6];
+        row[8] = definition_key[7];
+        row[9] = definition_key[8];
+        row[10] = values[12];
+        row[11] = values[13];
+        row[12] = definition_key[11];
+        row[13] = values[15];
+        row[14] = values[16];
+        row[15] = definition_key[14];
+        row[16] = std::move(check_payloads);
+        pending_definitions.append(
+            py::make_tuple(
+                definition_id,
+                identity[1],
+                identity[2],
+                std::move(definition),
+                std::move(row)));
+    }
+    return py::make_tuple(
+        std::move(columns),
+        std::move(pending_definitions),
+        std::move(non_screening_indices),
+        std::move(observed_routes));
+}
+
 py::tuple pack_stage052_neighborhood_events(
     const py::sequence& events,
     py::dict lane_ids,
@@ -2211,6 +2510,20 @@ PYBIND11_MODULE(_core, module) {
         py::arg("events"),
         py::arg("definition_cache"),
         py::arg("negative_evidence_cache"),
+        py::arg("first_event_id"));
+    module.def(
+        "pack_stage052_screening_transactions",
+        &pack_stage052_screening_transactions,
+        py::arg("events"),
+        py::arg("definition_cache"),
+        py::arg("negative_evidence_cache"),
+        py::arg("lane_ids"),
+        py::arg("operator_ids"),
+        py::arg("route_ids"),
+        py::arg("resolve_route_id"),
+        py::arg("stable_dictionary_id"),
+        py::arg("definition_from_cache_key"),
+        py::arg("definition_identity"),
         py::arg("first_event_id"));
     module.def(
         "pack_stage052_neighborhood_events",

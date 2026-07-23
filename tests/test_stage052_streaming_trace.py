@@ -625,6 +625,112 @@ def test_native_v3_screening_packer_rejects_negative_evidence_drift() -> None:
         )
 
 
+def test_native_v3_screening_transaction_packer_prepares_one_exact_definition() -> None:
+    from evrptw import _core
+
+    checks = (
+        ScreeningCheckTrace("capacity", "fail", 2.5, "capacity"),
+        ScreeningCheckTrace("reachability", "pass", True, ""),
+        ScreeningCheckTrace("optional", "skip", None, ""),
+    )
+    deferred = DeferredScreeningDecision(
+        axis_name="fixed_work",
+        values=(
+            7,
+            "route:2:C1",
+            "legacy",
+            3,
+            "repair",
+            0.1,
+            0.2,
+            "rejected",
+            "capacity",
+            2.5,
+            None,
+            3.0,
+            True,
+            "capacity",
+            1.0,
+            False,
+            True,
+            4.0,
+            checks,
+            None,
+        ),
+    )
+    occurrence_cache: dict[object, int] = {}
+    lane_ids: dict[str, int] = {}
+    operator_ids: dict[str, int] = {}
+    route_ids: dict[str, int] = {}
+
+    def resolve_route_id(route_key: str) -> int:
+        route_id = artifact_module._stable_route_id(route_key)  # noqa: SLF001
+        route_ids[route_key] = route_id
+        return route_id
+
+    columns, pending, remaining, observed_routes = (
+        _core.pack_stage052_screening_transactions(
+            (
+                deferred,
+                {"event": "not_screening"},
+                deferred._replace(values=(8, *deferred.values[1:])),
+            ),
+            occurrence_cache,
+            {},
+            lane_ids,
+            operator_ids,
+            route_ids,
+            resolve_route_id,
+            artifact_module._stable_dictionary_id,  # noqa: SLF001
+            artifact_module._screening_definition_from_cache_key,  # noqa: SLF001
+            artifact_module._screening_definition_identity,  # noqa: SLF001
+            100,
+        )
+    )
+
+    assert columns[0] == [100, 102]
+    assert columns[1] == [pending[0][0], pending[0][0]]
+    assert columns[5] == [7, 8]
+    assert remaining == [1]
+    assert observed_routes == [
+        ("route:2:C1", artifact_module._stable_route_id("route:2:C1"))  # noqa: SLF001
+    ]
+    assert len(pending) == 1
+    definition_id, encoded, digest, payload, row = pending[0]
+    expected_payload = artifact_module._screening_definition_from_cache_key(  # noqa: SLF001
+        (
+            artifact_module._stable_dictionary_id("lane:fixed_work:legacy"),  # noqa: SLF001
+            artifact_module._stable_dictionary_id("operator:repair"),  # noqa: SLF001
+            artifact_module._stable_route_id("route:2:C1"),  # noqa: SLF001
+            "rejected",
+            "capacity",
+            "fixed_work",
+            2.5,
+            None,
+            3.0,
+            True,
+            "capacity",
+            1.0,
+            False,
+            True,
+            4.0,
+            (
+                ("capacity", "fail", None, 2.5, None, "capacity"),
+                ("reachability", "pass", True, None, None, ""),
+                ("optional", "skip", None, None, None, ""),
+            ),
+        )
+    )
+    assert payload == expected_payload
+    assert (definition_id, encoded, digest) == artifact_module._screening_definition_identity(  # noqa: SLF001
+        payload
+    )
+    assert row == (
+        definition_id,
+        *(payload[name] for name in artifact_module.V3_SCREENING_DEFINITIONS_SCHEMA.names[1:]),
+    )
+
+
 def test_native_neighborhood_packer_matches_python_normalizer() -> None:
     from evrptw import _core
 

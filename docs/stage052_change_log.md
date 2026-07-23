@@ -8,6 +8,34 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-23：G pilot attempt06 保留失败并原生封装 screening transaction
+
+- clean revision `4be5425` 上的 `stage05.2_accelerator_pilot_attempt06` 已完成独立
+  replay，decision 为 `GPU_NOT_JUSTIFIED`，状态为
+  `READY_FOR_STAGE052_BENCHMARK`。`stage05.2_benchmark_attempt06` 的 batch0001
+  与 batch0002 分别以 `0.3468719322` 和 `0.3168614722` 通过 36% gate 并归档；
+  batch0003 以 `0.37722766418417175` 被正确拒绝。该 batch 的 solver 为
+  `199.819570929` 秒，persistence 为 `121.035353796` 秒，其中 shard persistence
+  为 `121.027650956` 秒、control persistence 为 `0.007702840` 秒。attempt06
+  保持不可变，未送独立 campaign review，Formal 未启动。
+- batch0003 的九个 100-customer shard 各有约 60.9 万至 107.4 万条 screening
+  occurrences，以及约 4.7 万至 12.5 万条首次 definition。此前 native prepass
+  只批量发现 occurrence cache miss，随后仍逐 miss 回到 Python 重建 evidence tail、
+  compact checks、lane/operator/route identity、definition payload 和 occurrence
+  binding。新的 native screening transaction packer（原生筛选事务打包器）在同一
+  FIFO batch 内一次完成这些 miss 事务，并返回 schema-ordered occurrence columns、
+  typed definition rows 和需要进入 Python collision store 的 canonical payload。
+- 新路径仍对 negative-cache evidence drift、八项 check 上限、stable ID、canonical
+  sorted JSON、SHA-256 definition identity、route collision registration 和 unknown
+  event fallback 执行 fail fast；没有删除、聚合或重排事件，也没有改变 36% 归因公式。
+  duplicate occurrence 在同一批次只生成一个 definition，回归测试逐字段比较 native
+  row 与 canonical Python payload/identity。
+- 同一 `r101_21/2014` 无 profiler 对照中，旧冻结 `4be5425` runtime 的 persistence
+  为 `16.149927407` 秒，新 transaction packer 为 `14.422620998` 秒；c101 profile
+  中 writer CPU 由约 `7.53` 秒降至 `6.22` 秒。两者只是修复诊断，不是晋级证据；
+  后续必须以新 clean revision 重跑 F，再用全新 G label 完成 producer gate 和独立
+  campaign replay。
+
 ## 2026-07-23：G pilot attempt05 保留失败并批量列式封装 sparse events
 
 - clean revision `90c36ff` 上的 `stage05.2_accelerator_pilot_attempt05` 已由独立

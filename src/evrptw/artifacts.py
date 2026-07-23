@@ -4809,53 +4809,59 @@ class ArtifactV2ShardSession:
             from evrptw import _core as native_core
 
             try:
-                raw_packed_columns, raw_misses, raw_non_screening_indices = (
-                    native_core.pack_stage052_screening_occurrences(
+                (
+                    raw_packed_columns,
+                    raw_pending_definitions,
+                    raw_non_screening_indices,
+                    raw_observed_routes,
+                ) = (
+                    native_core.pack_stage052_screening_transactions(
                         critical_events,
                         cast(
                             dict[object, int],
                             self._deferred_screening_occurrence_cache,
                         ),
                         self._deferred_native_negative_evidence,
+                        self._lane_ids,
+                        self._operator_ids,
+                        self._resolved_route_ids,
+                        self._resolve_route_id,
+                        _stable_dictionary_id,
+                        _screening_definition_from_cache_key,
+                        _screening_definition_identity,
                         next_event_id,
                     )
                 )
             except ValueError as error:
                 raise ArtifactIntegrityError(str(error)) from error
             packed_columns = cast(tuple[list[object], ...], raw_packed_columns)
-            misses = raw_misses
             definition_ids = packed_columns[1]
             if definition_ids:
-                for raw_key, event_index, occurrence_indices in misses:
-                    event = critical_events[event_index]
-                    if not isinstance(event, DeferredScreeningDecision):
-                        raise ArtifactIntegrityError(
-                            "native screening packer returned a non-screening miss"
+                for route_key, route_id in raw_observed_routes:
+                    if route_id not in self._route_digests:
+                        self._register_route(
+                            route_key,
+                            _route_sequence_from_key(route_key),
+                            route_id=route_id,
+                            validate_key=False,
                         )
-                    occurrence, deferred_definition = self._deferred_screening_decision_row(
-                        event,
-                        event_id=next_event_id + event_index,
+                if raw_pending_definitions:
+                    if self._screening_definition_store is None:
+                        self._screening_definition_store = _BoundedScreeningDefinitionStore(
+                            cache_entries=1,
+                            scratch_root=self._directory,
+                            retain_payload=False,
+                        )
+                    pending_screening_definitions.extend(
+                        _PendingScreeningDefinition(
+                            definition_id=raw_definition[0],
+                            encoded=raw_definition[1],
+                            digest=raw_definition[2],
+                            payload=raw_definition[3],
+                            row=raw_definition[4],
+                        )
+                        for raw_definition in raw_pending_definitions
                     )
-                    definition_id = occurrence[1]
-                    if isinstance(definition_id, bool) or not isinstance(definition_id, int):
-                        raise ArtifactIntegrityError(
-                            "native screening packer definition ID is invalid"
-                        )
-                    occurrence_key = cast(
-                        tuple[str, str, str, str, object],
-                        raw_key,
-                    )
-                    if (
-                        self._deferred_screening_occurrence_cache.get(occurrence_key)
-                        != definition_id
-                    ):
-                        raise ArtifactIntegrityError(
-                            "native screening packer cache binding is inconsistent"
-                        )
-                    for occurrence_index in occurrence_indices:
-                        definition_ids[occurrence_index] = definition_id
-                    if deferred_definition is not None:
-                        pending_screening_definitions.append(deferred_definition)
                 if any(definition_id is None for definition_id in definition_ids):
                     raise ArtifactIntegrityError(
                         "native screening packer left an unresolved definition"
