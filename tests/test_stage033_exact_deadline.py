@@ -15,7 +15,13 @@ from evrptw.artifacts import (
     verify_manifest,
 )
 from evrptw.cache_incremental import CacheIncrementalConfig
-from evrptw.cpu_batch import ExactBatchDeadlineExceeded, solve_exact_charging_batch
+from evrptw.charging import ChargingSubproblemResult
+from evrptw.cpu_batch import (
+    BackendMetrics,
+    BatchChargingResult,
+    ExactBatchDeadlineExceeded,
+    solve_exact_charging_batch,
+)
 from evrptw.exact_deadline import ExactDeadlineConfig
 from evrptw.experiments.stage033_exact_deadline import (
     load_stage033_config,
@@ -124,6 +130,132 @@ def test_single_route_batch_deadline_is_a_candidate_stop(
 
     with pytest.raises(alns_module._TimeLimitReached):
         evaluator.route(("C1",))
+
+
+def test_successful_exact_return_after_deadline_is_an_interrupted_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 9.0}
+    monkeypatch.setattr(alns_module.time, "perf_counter", lambda: clock["now"])
+    trace = Stage03Trace(
+        MeasurementConfig(),
+        exact_deadline_config=ExactDeadlineConfig.wall_clock(),
+    )
+    controller = alns_module.ExactCallController(ExactDeadlineConfig.wall_clock())
+    evaluator = alns_module._Evaluator(
+        _instance(),
+        deadline=10.0,
+        measurement_trace=trace,
+        backend="cpu_batch",
+        exact_call_controller=controller,
+    )
+    result = ChargingSubproblemResult(
+        True,
+        ("D0", "C1", "D0"),
+        2.0,
+        2.0,
+        0.0,
+        0.0,
+        1,
+        1,
+        0,
+        0.001,
+        "",
+    )
+    metrics = BackendMetrics(
+        "cpu_batch",
+        8,
+        exact_calls=1,
+        batch_launches=1,
+        started_calls=1,
+        completed_calls=1,
+        launch_occupancies=[1],
+    )
+
+    def return_late(*args: object, **kwargs: object) -> BatchChargingResult:
+        clock["now"] = 10.001
+        return BatchChargingResult((result,), metrics)
+
+    monkeypatch.setattr(alns_module, "solve_exact_charging_batch", return_late)
+
+    with pytest.raises(alns_module._TimeLimitReached):
+        evaluator.route(("C1",))
+
+    records = [record for record in trace.route_evaluations if record.kind == "exact_call"]
+    assert len(records) == 1
+    assert records[0].exact_started is True
+    assert records[0].exact_completed is False
+    assert controller.started_calls == 1
+    assert controller.completed_calls == 0
+    assert controller.interrupted_calls == 1
+    assert evaluator.evaluated_routes == set()
+    assert evaluator.calls == 0
+    assert evaluator.backend_metrics.completed_calls == 0
+    assert evaluator.backend_metrics.interrupted_calls == 1
+
+
+def test_successful_exact_batch_return_after_deadline_is_atomically_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 9.0}
+    monkeypatch.setattr(alns_module.time, "perf_counter", lambda: clock["now"])
+    trace = Stage03Trace(
+        MeasurementConfig(),
+        exact_deadline_config=ExactDeadlineConfig.wall_clock(),
+    )
+    controller = alns_module.ExactCallController(ExactDeadlineConfig.wall_clock())
+    evaluator = alns_module._Evaluator(
+        _instance(),
+        deadline=10.0,
+        measurement_trace=trace,
+        backend="cpu_batch",
+        exact_call_controller=controller,
+    )
+    results = tuple(
+        ChargingSubproblemResult(
+            True,
+            ("D0", customer, "D0"),
+            2.0,
+            2.0,
+            0.0,
+            0.0,
+            1,
+            1,
+            0,
+            0.001,
+            "",
+        )
+        for customer in ("C1", "C2")
+    )
+    metrics = BackendMetrics(
+        "cpu_batch",
+        8,
+        exact_calls=2,
+        batch_launches=1,
+        started_calls=2,
+        completed_calls=2,
+        launch_occupancies=[2],
+    )
+
+    def return_late(*args: object, **kwargs: object) -> BatchChargingResult:
+        clock["now"] = 10.001
+        return BatchChargingResult(results, metrics)
+
+    monkeypatch.setattr(alns_module, "solve_exact_charging_batch", return_late)
+
+    with pytest.raises(alns_module._TimeLimitReached):
+        evaluator._solve_uncached_batch((("C1",), ("C2",)), "changed")
+
+    records = [record for record in trace.route_evaluations if record.kind == "exact_call"]
+    assert len(records) == 2
+    assert all(record.exact_started and not record.exact_completed for record in records)
+    assert controller.started_calls == 2
+    assert controller.completed_calls == 0
+    assert controller.interrupted_calls == 2
+    assert evaluator.evaluated_routes == set()
+    assert evaluator.calls == 0
+    assert evaluator.backend_metrics.completed_calls == 0
+    assert evaluator.backend_metrics.interrupted_calls == 2
 
 
 def test_fixed_exact_call_budget_stops_at_cap_and_keeps_complete_incumbent() -> None:

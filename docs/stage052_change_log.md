@@ -674,3 +674,9 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   `selected_optimization_profile=native`，但顶层 review manifest 漏发该冻结字段。
   attempt17 不复用。根因修复是在 campaign reviewer 的顶层 publication surface
   同步发布该字段；loader 继续要求顶层与 metadata 精确一致，不从嵌套值兜底。
+- `stage05.2_benchmark_attempt20` producer 完成 36 shards，但独立 replay 在
+  `r101_21/2016` 发现一次 wall-clock exact transaction 于 29.999819 秒开始、
+  30.000254 秒返回；producer 已丢弃 candidate/cache，却错误保留
+  `exact_completed=True`。review 正确发布 `NOT_READY`。修复将所有在 lane deadline
+  时或之后返回的单次/批量 exact transaction 原子记为 interrupted，并清除 completed
+  counters、route identity 与 candidate/cache 影响；不增加 deadline 容差。

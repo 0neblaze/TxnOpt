@@ -1133,13 +1133,53 @@ class _Evaluator:
                     exact_route_evaluations=error.completed_exact_calls,
                 ) from error
             raise
+        exact_completed_at = time.perf_counter()
+        transactional_deadline = (
+            self.exact_call_controller is not None and exact_completed_at >= self.deadline
+        )
+        if transactional_deadline:
+            assert self.exact_call_controller is not None
+            if self.backend_metrics.completed_calls < 1:
+                raise RuntimeError("deadline transaction lacks one completed backend call")
+            self.backend_metrics.completed_calls -= 1
+            self.backend_metrics.interrupted_calls += 1
+            self.exact_call_controller.interrupt(1)
+            late_exact_call_id = None
+            if self.measurement_trace is not None:
+                late_exact_call_id = self.measurement_trace.record_route_evaluation(
+                    sequence,
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    kind="exact_call",
+                    started_at=started_offset,
+                    completed_at=self.measurement_trace._offset(exact_completed_at),
+                    exact_started=True,
+                    exact_completed=False,
+                    feasible=None,
+                    failure_reason="exact call transaction completed at or after the lane deadline",
+                    cache_key_digest=(
+                        self.route_cache.make_key(sequence).digest
+                        if self.route_cache is not None
+                        else ""
+                    ),
+                    route_change_status=route_change_status,
+                )
+                self.measurement_trace.record_deadline_boundary(
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    boundary="after_exact_call",
+                    route_sequence=sequence,
+                    exact_call_id=late_exact_call_id,
+                    reason="exact call transaction completed at or after the lane deadline",
+                )
+            self._discard_pending_candidate_cache("deadline_after_exact_call")
+            raise _TimeLimitReached(sequence, exact_route_evaluations=0)
         self.evaluated_routes.add(sequence)
         self.evaluated_route_keys.add((self.lane, sequence))
         if self.exact_call_controller is not None:
             self.exact_call_controller.complete(1)
-        transactional_deadline = (
-            self.exact_call_controller is not None and time.perf_counter() >= self.deadline
-        )
         if self.exact_call_controller is not None and not transactional_deadline:
             self.pending_candidate_cache[sequence] = result
         elif not transactional_deadline and self.route_cache is None and self.local_cache_enabled:
@@ -1203,9 +1243,6 @@ class _Evaluator:
                 route_change_status=route_change_status,
                 **fields,
             )
-        # The exact solver is currently cooperative rather than interruptible.
-        # Preserve the completed call in the counters, then stop before its
-        # result can enter a candidate after the lane deadline.
         if time.perf_counter() >= self.deadline:
             self._discard_pending_candidate_cache("deadline_after_exact_call")
             if self.measurement_trace is not None:
@@ -1582,18 +1619,62 @@ class _Evaluator:
                 ) from error
             raise
         batch_completed = time.perf_counter()
-        if self.exact_call_controller is not None:
+        transactional_deadline = (
+            self.exact_call_controller is not None and batch_completed >= self.deadline
+        )
+        if transactional_deadline:
+            assert self.exact_call_controller is not None
+            if batch.metrics.completed_calls < len(batch.results):
+                raise RuntimeError(
+                    "deadline transaction backend completed-call count is incomplete"
+                )
+            batch.metrics.completed_calls -= len(batch.results)
+            batch.metrics.interrupted_calls += len(batch.results)
+            self.exact_call_controller.interrupt(len(batch.results))
+        elif self.exact_call_controller is not None:
             self.exact_call_controller.complete(len(batch.results))
         self.backend_metrics.add(batch.metrics)
+        if transactional_deadline:
+            if self.measurement_trace is not None:
+                completed_offset = self.measurement_trace._offset(batch_completed)
+                for sequence in active_sequences:
+                    self.measurement_trace.record_route_evaluation(
+                        sequence,
+                        lane=self.lane,
+                        iteration=self.iteration,
+                        operator=self.operator,
+                        kind="exact_call",
+                        started_at=started_offset,
+                        completed_at=completed_offset,
+                        exact_started=True,
+                        exact_completed=False,
+                        feasible=None,
+                        failure_reason=(
+                            "exact batch transaction completed at or after the lane deadline"
+                        ),
+                        cache_key_digest=(
+                            self.route_cache.make_key(sequence).digest
+                            if self.route_cache is not None
+                            else ""
+                        ),
+                        route_change_status=route_change_status,
+                    )
+                self.measurement_trace.record_deadline_boundary(
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    boundary="after_exact_batch",
+                    route_sequence=active_sequences[-1],
+                    reason="CPU exact batch transaction completed at or after the lane deadline",
+                )
+            self._discard_pending_candidate_cache("deadline_after_exact_batch")
+            raise _TimeLimitReached(active_sequences[-1], exact_route_evaluations=0)
         self.calls += len(batch.results)
         self.runtime += batch.metrics.total_seconds
         self.labels_generated += sum(item.labels_generated for item in batch.results)
         self.labels_pruned += sum(item.labels_pruned for item in batch.results)
         self.evaluated_routes.update(active_sequences)
         self.evaluated_route_keys.update((self.lane, sequence) for sequence in active_sequences)
-        transactional_deadline = (
-            self.exact_call_controller is not None and batch_completed >= self.deadline
-        )
         for sequence, result in zip(active_sequences, batch.results, strict=True):
             cache_key_digest = (
                 self.route_cache.make_key(sequence).digest if self.route_cache is not None else ""

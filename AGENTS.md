@@ -295,6 +295,9 @@ this repository or one of its subdirectories.
   prefix is recorded but the incomplete candidate and its cache writes are
   discarded. Deadline interruption likewise returns only the most recent
   complete ALNS incumbent and may not update acceptance or global best state.
+  An exact call or atomic exact batch that returns at or after its lane deadline
+  is recorded as interrupted, not completed; its route identities, completed
+  counters, cache writes, and candidate transaction are discarded.
 - Every call records started, completed, infeasible, interrupted, or budget
   boundary state. Backend evidence includes batch launches, transitions,
   packing/unpacking time, checkpoint count, exact calls, and total batch time.
