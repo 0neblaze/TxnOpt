@@ -168,6 +168,11 @@ Campaign active writes 与归档目标只通过 ignored root locator（忽略的
 next-fit partitioning 的 target/hard cap 为 24/32 GiB，单 shard hard cap 2 GiB，并
 持续满足 locator 声明的容量 reserve。
 
+campaign 启动前的两段 30 秒窗口继续要求 `load1 <= 4.0`。batch 运行中总
+`load1` 上限为 `4.0 + selected_workers`，因为被选中的 worker 本身就是预期负载；
+同时按 PID tree 排除本 campaign 后的 unrelated user process（无关用户进程）仍不得
+在完整窗口平均占用一整核。两项证据分别记录、分别由 reviewer 重放，不得互相替代。
+
 producer、retention、performance reviewer 与 campaign reviewer 必须调用同一个
 cross-platform `probe_volume_identity`：WSL 用 `findmnt`，DrvFS 额外绑定 Windows
 NVMe identity，macOS 才使用 `diskutil`。reviewer 不得复制或硬编码单一平台 probe。

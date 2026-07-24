@@ -597,6 +597,11 @@ this repository or one of its subdirectories.
   `(instance, seed)` shards, 2,040 runs, 229,200 declared solver seconds, and
   10,400 anytime rows. Only independent review may open Formal or report
   `READY_FOR_STAGE05_3`.
+- Campaign preflight keeps the fixed `load1 <= 4.0` idle-host gate. During a
+  batch, the auditable total-load ceiling is `4.0 + selected_workers`, because
+  the selected campaign workers are expected load; unrelated user CPU remains
+  a separate PID-tree-excluding hard gate at one full core. AC power and low
+  power mode remain continuous hard gates.
 - Candidate events retain both customer-sequence route identity and the
   complete exact-charging depot/station route identity. Independent review
   validates every accepted global-best complete route and objective and

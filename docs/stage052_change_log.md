@@ -680,3 +680,23 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   `exact_completed=True`。review 正确发布 `NOT_READY`。修复将所有在 lane deadline
   时或之后返回的单次/批量 exact transaction 原子记为 interrupted，并清除 completed
   counters、route identity 与 candidate/cache 影响；不增加 deadline 容差。
+
+## 2026-07-24：G21 Pilot 通过，G22 Formal 自身负载误判修复
+
+- `stage05.2_benchmark_attempt21` 已完成 36/36 Pilot axes，independent campaign
+  review 的 18/18 gates 全部通过，状态为
+  `READY_FOR_STAGE052_FORMAL_BENCHMARK`。campaign aggregate persistence ratio 为
+  `0.335996595`；review receipt finalized、raw before/after hash 相同、cgroup peak
+  可用且 service exit code 为 0。
+- `stage05.2_benchmark_attempt22` Formal preflight 两个连续窗口的最大 `load1` 分别
+  为 `0.76416015625` 和 `0.5302734375`，unrelated process average cores 均为 0；
+  batch0001 启动四个已选择 worker 后，runtime guard 却以 `load1 exceeded 4.0`
+  中止并封存 partial evidence。该 label 已消耗，不得续跑或导入 shard。
+- 根因是 runtime guard 把 campaign 自己的四个 worker 也计入固定的 idle-host
+  `load1 <= 4.0` 阈值；同一监视器其实已经按 PID tree 排除 campaign descendants，
+  单独测量 unrelated user CPU。修复保留 preflight 的 4.0 hard gate，batch 运行中
+  使用可重放的 `4.0 + selected_workers` 总负载上限；unrelated process 完整窗口一整核、
+  AC power 和 low-power mode 仍分别 fail fast。
+- producer 现在显式记录 `maximum_permitted_load1`，reviewer 要求其恰等于
+  `4.0 + selected_workers` 并独立比较实际 maximum。后续只从新的 G Pilot identity
+  继续，不重跑 C--F。

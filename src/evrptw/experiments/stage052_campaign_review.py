@@ -1745,6 +1745,7 @@ def _validate_power_load(
     *,
     run_label: str,
     batch_id: str,
+    selected_workers: int,
 ) -> tuple[bool, str]:
     if (
         payload.get("schema_version") != "stage05.2-batch-power-load-v1"
@@ -1822,6 +1823,10 @@ def _validate_power_load(
             runtime.get("low_power_mode_violations"), "low power violations"
         )
         maximum_load1 = _strict_float(runtime.get("maximum_load1"), "runtime load1")
+        maximum_permitted_load1 = _strict_float(
+            runtime.get("maximum_permitted_load1"),
+            "runtime permitted load1",
+        )
         maximum_unrelated = _strict_float(
             runtime.get("maximum_unrelated_process_average_cores"),
             "runtime unrelated cores",
@@ -1852,7 +1857,8 @@ def _validate_power_load(
         runtime_samples > 0
         and power_violations == 0
         and low_power_violations == 0
-        and maximum_load1 <= 4.0
+        and maximum_permitted_load1 == 4.0 + selected_workers
+        and maximum_load1 <= maximum_permitted_load1
         and maximum_unrelated < 1.0
         and math.isclose(
             maximum_unrelated,
@@ -3827,6 +3833,7 @@ def _audit_campaign(
                 _json_object(power_path),
                 run_label=campaign.run_label,
                 batch_id=embedded_batch.batch_id,
+                selected_workers=campaign.selected_workers,
             )
             if not power_ok:
                 raise ArtifactIntegrityError(power_detail)

@@ -193,6 +193,7 @@ class BatchRuntimeEvidence:
 
     sample_count: int
     maximum_load1: float
+    maximum_permitted_load1: float
     maximum_unrelated_process_average_cores: float
     power_sources: tuple[str, ...]
     low_power_mode_observed: bool
@@ -228,19 +229,21 @@ class BatchRuntimeEvidence:
             snapshots,
             logical_cpu_count=recorded_logical_cpu_count,
         )
+        maximum_permitted_load1 = config.maximum_load1 + config.selected_workers
         low_power = any(sample.low_power_mode_enabled for sample in snapshots)
         failures: list[str] = []
         if sources != (config.required_power_source,):
             failures.append("power source drift")
         if low_power:
             failures.append("low power mode enabled")
-        if maximum_load1 > config.maximum_load1:
-            failures.append("load1 exceeded 4.0")
+        if maximum_load1 > maximum_permitted_load1:
+            failures.append(f"load1 exceeded {maximum_permitted_load1:.1f}")
         if maximum_unrelated >= config.maximum_unrelated_process_average_cores:
             failures.append("unrelated process averaged one full core")
         return cls(
             sample_count=len(snapshots),
             maximum_load1=maximum_load1,
+            maximum_permitted_load1=maximum_permitted_load1,
             maximum_unrelated_process_average_cores=maximum_unrelated,
             power_sources=sources,
             low_power_mode_observed=low_power,
@@ -255,6 +258,7 @@ class BatchRuntimeEvidence:
             "schema_version": "stage05.2-batch-runtime-evidence-v1",
             "sample_count": self.sample_count,
             "maximum_load1": self.maximum_load1,
+            "maximum_permitted_load1": self.maximum_permitted_load1,
             "maximum_unrelated_process_average_cores": (
                 self.maximum_unrelated_process_average_cores
             ),
