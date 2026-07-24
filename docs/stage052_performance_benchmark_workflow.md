@@ -178,7 +178,8 @@ producer 自报阈值成为审计依据。
 
 若 G 自身的 campaign runner/reviewer 出现缺陷，可以在不重跑 F 的前提下消费已接受
 F evidence，但必须同时满足：当前 revision 是 F revision 的 Git descendant（后继）；
-二者间全部 changed paths 均落在显式 G runner/reviewer/test/documentation allowlist；
+二者间全部 changed paths 均落在显式 G runner/artifact-persistence
+adapter/reviewer/test/documentation allowlist；
 Python、dependency、machine、source mount、native extension、configuration、
 instance、backend 与 worker 的稳定选择 hash 完全一致。producer 与 independent
 reviewer 各自执行该检查。solver、objective、配置、native 或任意其他 source path

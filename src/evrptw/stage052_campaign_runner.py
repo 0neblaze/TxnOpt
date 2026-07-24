@@ -68,11 +68,13 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
         "AGENTS.md",
         "docs/stage052_change_log.md",
         "docs/stage052_performance_benchmark_workflow.md",
+        "src/evrptw/artifacts.py",
         "src/evrptw/experiments/stage052_campaign_review.py",
         "src/evrptw/experiments/stage052_performance.py",
         "src/evrptw/stage052_campaign_runner.py",
         "tests/test_stage052_campaign_review.py",
         "tests/test_stage052_campaign_runner.py",
+        "tests/test_artifacts_v3.py",
     }
 )
 

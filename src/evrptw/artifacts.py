@@ -1879,7 +1879,10 @@ class _BoundedScreeningDefinitionStore:
         if self._connection is not None:
             return
         database_path = Path(self._temporary_directory.name) / "definitions.sqlite3"
-        connection = sqlite3.connect(database_path)
+        # Stage 5.2 serializes producer/writer access through one explicit
+        # shard turn.  The connection may therefore move between those two
+        # threads, but it is never used concurrently.
+        connection = sqlite3.connect(database_path, check_same_thread=False)
         try:
             connection.execute("PRAGMA journal_mode=OFF")
             connection.execute("PRAGMA synchronous=OFF")
@@ -4396,7 +4399,14 @@ class _DiskBackedRouteIdentityStore(Mapping[int, str]):
             dir=scratch_root,
         )
         self._database_path = Path(self._temporary_directory.name) / "identities.sqlite3"
-        self._connection = sqlite3.connect(self._database_path)
+        # The Stage 5.2 async appender creates the shard on the producer
+        # thread and performs bounded writes on its single writer thread.
+        # Its shard-turn lock prevents concurrent access, so permit that
+        # deliberate ownership handoff while retaining SQLite serialization.
+        self._connection = sqlite3.connect(
+            self._database_path,
+            check_same_thread=False,
+        )
         self._connection.execute("PRAGMA journal_mode=OFF")
         self._connection.execute("PRAGMA synchronous=OFF")
         self._connection.execute("PRAGMA temp_store=MEMORY")

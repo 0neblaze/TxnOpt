@@ -604,8 +604,9 @@ this repository or one of its subdirectories.
   power mode remain continuous hard gates.
 - G may consume accepted F evidence from an older revision only when the
   current revision is its Git descendant and the entire intervening diff is
-  confined to the explicit G campaign runner/reviewer/test/documentation
-  allowlist. The independent reviewer repeats this diff audit. Runtime
+  confined to the explicit G campaign runner, artifact-persistence adapter,
+  reviewer, test, and documentation allowlist. The independent reviewer
+  repeats this diff audit. Runtime
   selection identity still freezes Python, dependencies, machine, source
   mount, native extension, configuration, instances, backend, and workers;
   solver, objective, configuration, native, or other source drift is a hard

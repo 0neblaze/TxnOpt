@@ -4,6 +4,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -526,6 +527,60 @@ def test_producer_screening_definition_store_spills_digest_without_payload(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_stage052_disk_spill_supports_serialized_writer_thread_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(artifacts_module, "UNIQUE_ROUTE_IDENTITY_MEMORY_ENTRIES", 1)
+    route_store = artifacts_module._DiskBackedRouteIdentityStore(  # noqa: SLF001
+        scratch_root=tmp_path,
+        memory_entries=1,
+    )
+    definition_store = artifacts_module._BoundedScreeningDefinitionStore(  # noqa: SLF001
+        cache_entries=1,
+        scratch_root=tmp_path,
+        retain_payload=False,
+    )
+    definitions = tuple(_pending_definition(value) for value in range(2))
+    failures: list[BaseException] = []
+
+    def writer_turn() -> None:
+        try:
+            assert route_store.register_route(1, "digest-1")
+            assert route_store.register_route(2, "digest-2")
+            assert route_store.register_unique_identity(
+                axis="wall_clock",
+                semantics="completed_shared",
+                identity=("route-a",),
+            )
+            assert route_store.register_unique_identity(
+                axis="wall_clock",
+                semantics="completed_shared",
+                identity=("route-b",),
+            )
+            assert definition_store.register_many(definitions) == definitions
+        except BaseException as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=writer_turn)
+    thread.start()
+    thread.join()
+    try:
+        assert failures == []
+        assert route_store[1] == "digest-1"
+        assert not route_store.register_unique_identity(
+            axis="wall_clock",
+            semantics="completed_shared",
+            identity=("route-a",),
+        )
+        assert definition_store.register_many((definitions[0],)) == ()
+    finally:
+        definition_store.close()
+        route_store.close()
+
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_unique_route_evaluation_identities_remain_in_bounded_memory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -680,7 +735,7 @@ def test_screening_definition_store_cleans_scratch_after_spill_failure(
 ) -> None:
     monkeypatch.setattr(artifacts_module, "SCREENING_DEFINITION_HOT_CACHE_ENTRIES", 1)
 
-    def fail_connect(_path: object) -> object:
+    def fail_connect(_path: object, **_kwargs: object) -> object:
         raise OSError("simulated scratch failure")
 
     monkeypatch.setattr(artifacts_module.sqlite3, "connect", fail_connect)

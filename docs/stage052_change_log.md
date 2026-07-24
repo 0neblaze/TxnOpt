@@ -706,3 +706,19 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   source mount、native extension、配置、实例、backend 和 worker 仍由稳定 runtime
   selection hash 冻结，solver/objective/native/其他 source drift 直接 fail fast。
   后续只从新的 G Pilot identity 继续，不重跑 C--F。
+
+## 2026-07-24：G25 Formal SQLite 跨线程 spill 根因修复
+
+- `stage05.2_benchmark_attempt25` 在 batch0001 运行约三小时后失败；首个真实错误为
+  `c103_21/2015` 的 SQLite thread-affinity（线程亲和性）拒绝。此时 route identity
+  累计首次超过 262,144-entry 内存上限并进入 disk spill；连接由 producer thread
+  创建，单一 async artifact writer thread 在 shard-turn lock 保护下接管写入，但旧
+  connection 仍启用 SQLite 默认 same-thread 检查。
+- 修复只允许已经由 shard-turn lock 严格串行化的 producer/writer ownership handoff；
+  route identity 与 screening definition 两个 spill connection 使用
+  `check_same_thread=False`，不允许并发 SQL、不改变 row identity、schema、objective、
+  solver、native kernel、backend 或 worker selection。
+- 新回归测试把 route/unique identity 与 screening definition 的内存阈值压到 1，
+  强制 writer thread spill，再由 producer thread 读取、去重和关闭，证明跨线程串行
+  handoff 及 scratch cleanup。G25 及其 6.2-GB partial evidence 保持 failed，不复用；
+  后续从新的 G Pilot 标签重试，不重跑 A--F。
