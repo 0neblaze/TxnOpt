@@ -43,10 +43,12 @@ from evrptw.stage052_campaign_runner import (
     MachineSnapshot,
     RollingCampaignCapacityError,
     WindowsWslMachineSnapshotSource,
+    campaign_runtime_selection_sha256,
     collect_preflight_observation,
     probe_volume_identity,
     validate_batch_measurements,
     verify_campaign_root_locations,
+    verify_campaign_successor_revision,
     verify_rolling_campaign_capacity,
 )
 from evrptw.stage052_evidence import (
@@ -504,6 +506,91 @@ def test_execution_lock_rejects_current_runtime_or_worker_drift() -> None:
             input_provenance=metadata["performance_provenance"],
             native_kernel_config=metadata["native_kernel_config"],
         )
+
+
+def test_campaign_successor_revision_allows_only_g_governance_paths(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(("git", "init", "-q", str(repository)), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.email", "test@example.com"),
+        check=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.name", "Stage 5.2 test"),
+        check=True,
+    )
+    allowed = repository / "src" / "evrptw" / "stage052_campaign_runner.py"
+    allowed.parent.mkdir(parents=True)
+    allowed.write_text("v1\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "commit", "-qm", "base"),
+        check=True,
+    )
+    predecessor = subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    allowed.write_text("v2\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(repository), "commit", "-qam", "G fix"), check=True)
+    successor = subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    assert verify_campaign_successor_revision(
+        repository,
+        predecessor_revision=predecessor,
+        current_revision=successor,
+    ) == ("src/evrptw/stage052_campaign_runner.py",)
+
+    forbidden = repository / "src" / "evrptw" / "objective.py"
+    forbidden.write_text("changed\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "commit", "-qm", "forbidden"),
+        check=True,
+    )
+    forbidden_successor = subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    with pytest.raises(RuntimeError, match="non-G paths"):
+        verify_campaign_successor_revision(
+            repository,
+            predecessor_revision=predecessor,
+            current_revision=forbidden_successor,
+        )
+
+
+def test_campaign_runtime_selection_hash_excludes_only_g_wheel_identity() -> None:
+    metadata, _, _ = _accepted_f02_payloads()
+    runtime = metadata["runtime_identity"]
+    assert isinstance(runtime, dict)
+    successor = {
+        **runtime,
+        "repository_revision": "9" * 40,
+        "wheel_filename": "successor.whl",
+        "wheel_sha256": "8" * 64,
+        "installed_distribution_sha256": "7" * 64,
+    }
+
+    assert campaign_runtime_selection_sha256(successor) == (
+        campaign_runtime_selection_sha256(runtime)
+    )
+    successor["native_extension_sha256"] = "6" * 64
+    assert campaign_runtime_selection_sha256(successor) != (
+        campaign_runtime_selection_sha256(runtime)
+    )
 
 
 def _pilot_config() -> BenchmarkCampaignConfig:

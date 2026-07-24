@@ -63,12 +63,106 @@ from evrptw.stage052_platform import (
 PER_WORKER_RSS_LIMIT_BYTES = 4_357_382_144
 AGGREGATE_RSS_LIMIT_BYTES = 12 * 1024**3
 STAGE052_MINIMUM_FREE_BYTES = 50 * 1024**3
+_CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
+    {
+        "AGENTS.md",
+        "docs/stage052_change_log.md",
+        "docs/stage052_performance_benchmark_workflow.md",
+        "src/evrptw/experiments/stage052_campaign_review.py",
+        "src/evrptw/experiments/stage052_performance.py",
+        "src/evrptw/stage052_campaign_runner.py",
+        "tests/test_stage052_campaign_review.py",
+        "tests/test_stage052_campaign_runner.py",
+    }
+)
 
 
 def _canonical_sha256(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def campaign_runtime_selection_sha256(value: Mapping[str, object]) -> str:
+    """Hash the frozen runtime selection while excluding G-only wheel identity."""
+
+    excluded = {
+        "installed_distribution_sha256",
+        "repository_revision",
+        "wheel_filename",
+        "wheel_sha256",
+    }
+    return _canonical_sha256(
+        {key: item for key, item in value.items() if key not in excluded}
+    )
+
+
+def verify_campaign_successor_revision(
+    repository: Path,
+    *,
+    predecessor_revision: str,
+    current_revision: str,
+) -> tuple[str, ...]:
+    """Allow a newer revision only when every change is confined to G governance."""
+
+    for label, revision in (
+        ("predecessor", predecessor_revision),
+        ("current", current_revision),
+    ):
+        if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+            raise RuntimeError(f"campaign {label} repository revision is invalid")
+    resolved = repository.resolve()
+    ancestor = subprocess.run(
+        (
+            "git",
+            "-C",
+            str(resolved),
+            "merge-base",
+            "--is-ancestor",
+            predecessor_revision,
+            current_revision,
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+    )
+    if ancestor.returncode != 0:
+        raise RuntimeError(
+            "benchmark repository revision is not a descendant of the accepted selection"
+        )
+    result = subprocess.run(
+        (
+            "git",
+            "-C",
+            str(resolved),
+            "diff",
+            "--name-only",
+            "-z",
+            predecessor_revision,
+            current_revision,
+        ),
+        check=True,
+        capture_output=True,
+        timeout=10.0,
+    )
+    changed_paths = tuple(
+        sorted(
+            path.decode("utf-8")
+            for path in result.stdout.split(b"\0")
+            if path
+        )
+    )
+    forbidden = tuple(
+        path for path in changed_paths if path not in _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS
+    )
+    if not changed_paths:
+        raise RuntimeError("campaign successor revision has no recorded changes")
+    if forbidden:
+        raise RuntimeError(
+            "campaign successor revision changes non-G paths: " + ", ".join(forbidden)
+        )
+    return changed_paths
 
 
 def _input_lock_payload(value: Mapping[str, object]) -> dict[str, object]:
@@ -440,6 +534,7 @@ class BenchmarkExecutionLock:
     selected_workers: int
     repository_revision: str
     runtime_identity_sha256: str
+    runtime_selection_sha256: str
     input_provenance_sha256: str
     configuration_sha256: str
     native_config_sha256: str
@@ -562,6 +657,7 @@ class BenchmarkExecutionLock:
             selected_workers=workers,
             repository_revision=revision,
             runtime_identity_sha256=_canonical_sha256(runtime),
+            runtime_selection_sha256=campaign_runtime_selection_sha256(runtime),
             input_provenance_sha256=_canonical_sha256(_input_lock_payload(inputs)),
             configuration_sha256=config_sha,
             native_config_sha256=_canonical_sha256(native),
@@ -580,6 +676,7 @@ class BenchmarkExecutionLock:
             "selected_workers": self.selected_workers,
             "repository_revision": self.repository_revision,
             "runtime_identity_sha256": self.runtime_identity_sha256,
+            "runtime_selection_sha256": self.runtime_selection_sha256,
             "input_provenance_sha256": self.input_provenance_sha256,
             "configuration_sha256": self.configuration_sha256,
             "native_config_sha256": self.native_config_sha256,
@@ -633,6 +730,7 @@ class BenchmarkExecutionLock:
         runtime_identity: object,
         input_provenance: object,
         native_kernel_config: object,
+        repository: Path | None = None,
     ) -> None:
         """Reject any execution drift from the accepted predecessor lock."""
 
@@ -642,15 +740,29 @@ class BenchmarkExecutionLock:
             raise RuntimeError("benchmark exact backend differs from accepted selection")
         if selected_workers != self.selected_workers:
             raise RuntimeError("benchmark worker count differs from accepted selection")
-        if repository_revision != self.repository_revision:
-            raise RuntimeError("benchmark repository revision differs from accepted selection")
         if configuration_sha256 != self.configuration_sha256:
             raise RuntimeError("benchmark configuration differs from accepted selection")
-        if (
-            _canonical_sha256(_mapping(runtime_identity, "runtime identity"))
-            != self.runtime_identity_sha256
-        ):
-            raise RuntimeError("benchmark runtime identity differs from accepted selection")
+        current_runtime = _mapping(runtime_identity, "runtime identity")
+        if repository_revision == self.repository_revision:
+            if _canonical_sha256(current_runtime) != self.runtime_identity_sha256:
+                raise RuntimeError("benchmark runtime identity differs from accepted selection")
+        else:
+            if repository is None:
+                raise RuntimeError(
+                    "benchmark successor revision requires an auditable repository"
+                )
+            verify_campaign_successor_revision(
+                repository,
+                predecessor_revision=self.repository_revision,
+                current_revision=repository_revision,
+            )
+            if (
+                campaign_runtime_selection_sha256(current_runtime)
+                != self.runtime_selection_sha256
+            ):
+                raise RuntimeError(
+                    "benchmark runtime selection differs from accepted selection"
+                )
         current_inputs = _mapping(input_provenance, "input provenance")
         if _canonical_sha256(_input_lock_payload(current_inputs)) != self.input_provenance_sha256:
             raise RuntimeError("benchmark input provenance differs from accepted selection")

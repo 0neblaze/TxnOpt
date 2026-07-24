@@ -1034,6 +1034,7 @@ def _run_benchmark_campaign_impl(
         runtime_identity=runtime_identity,
         input_provenance=performance_provenance,
         native_kernel_config=config.native_kernels.to_dict(),
+        repository=root,
     )
     if selection_lock.selected_backend == "cuda":
         raise RuntimeError(
@@ -1915,9 +1916,6 @@ def _run_benchmark_batch(
                                 1 if runtime_evidence.low_power_mode_observed else 0
                             ),
                             "maximum_load1": runtime_evidence.maximum_load1,
-                            "maximum_permitted_load1": (
-                                runtime_evidence.maximum_permitted_load1
-                            ),
                             "maximum_unrelated_process_average_cores": (
                                 runtime_evidence.maximum_unrelated_process_average_cores
                             ),

@@ -602,6 +602,14 @@ this repository or one of its subdirectories.
   the selected campaign workers are expected load; unrelated user CPU remains
   a separate PID-tree-excluding hard gate at one full core. AC power and low
   power mode remain continuous hard gates.
+- G may consume accepted F evidence from an older revision only when the
+  current revision is its Git descendant and the entire intervening diff is
+  confined to the explicit G campaign runner/reviewer/test/documentation
+  allowlist. The independent reviewer repeats this diff audit. Runtime
+  selection identity still freezes Python, dependencies, machine, source
+  mount, native extension, configuration, instances, backend, and workers;
+  solver, objective, configuration, native, or other source drift is a hard
+  failure and requires a new prerequisite rather than a G-only continuation.
 - Candidate events retain both customer-sequence route identity and the
   complete exact-charging depot/station route identity. Independent review
   validates every accepted global-best complete route and objective and

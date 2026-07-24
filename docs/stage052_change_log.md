@@ -697,6 +697,12 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   单独测量 unrelated user CPU。修复保留 preflight 的 4.0 hard gate，batch 运行中
   使用可重放的 `4.0 + selected_workers` 总负载上限；unrelated process 完整窗口一整核、
   AC power 和 low-power mode 仍分别 fail fast。
-- producer 现在显式记录 `maximum_permitted_load1`，reviewer 要求其恰等于
-  `4.0 + selected_workers` 并独立比较实际 maximum。后续只从新的 G Pilot identity
-  继续，不重跑 C--F。
+- runtime monitor evidence 现在显式记录 `maximum_permitted_load1`；power/load
+  artifact 只记录实际采样，reviewer 从冻结 worker 数独立重建
+  `4.0 + selected_workers` 并比较实际 maximum，避免信任 producer 自报阈值。
+- 为避免 G-only 修复误触发 F 重跑，execution lock 允许 F revision 的 Git
+  descendant，但逐路径 diff 必须完全落在显式 G runner/reviewer/test/documentation
+  allowlist；producer 与 independent reviewer 各自重放该检查。Python、依赖、机器、
+  source mount、native extension、配置、实例、backend 和 worker 仍由稳定 runtime
+  selection hash 冻结，solver/objective/native/其他 source drift 直接 fail fast。
+  后续只从新的 G Pilot identity 继续，不重跑 C--F。

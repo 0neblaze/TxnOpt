@@ -172,6 +172,17 @@ campaign 启动前的两段 30 秒窗口继续要求 `load1 <= 4.0`。batch 运�
 `load1` 上限为 `4.0 + selected_workers`，因为被选中的 worker 本身就是预期负载；
 同时按 PID tree 排除本 campaign 后的 unrelated user process（无关用户进程）仍不得
 在完整窗口平均占用一整核。两项证据分别记录、分别由 reviewer 重放，不得互相替代。
+运行监视器的独立 runtime evidence（运行时证据）显式记录该动态上限；power/load
+artifact 记录实际采样，reviewer 从冻结的 worker 数独立重建上限并比较，避免
+producer 自报阈值成为审计依据。
+
+若 G 自身的 campaign runner/reviewer 出现缺陷，可以在不重跑 F 的前提下消费已接受
+F evidence，但必须同时满足：当前 revision 是 F revision 的 Git descendant（后继）；
+二者间全部 changed paths 均落在显式 G runner/reviewer/test/documentation allowlist；
+Python、dependency、machine、source mount、native extension、configuration、
+instance、backend 与 worker 的稳定选择 hash 完全一致。producer 与 independent
+reviewer 各自执行该检查。solver、objective、配置、native 或任意其他 source path
+变化都 fail fast，并要求新的 prerequisite。
 
 producer、retention、performance reviewer 与 campaign reviewer 必须调用同一个
 cross-platform `probe_volume_identity`：WSL 用 `findmnt`，DrvFS 额外绑定 Windows

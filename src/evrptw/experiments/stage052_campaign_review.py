@@ -76,7 +76,11 @@ from evrptw.stage052_campaign import (
     load_campaign_manifest,
     maximum_process_average_cores,
 )
-from evrptw.stage052_campaign_runner import probe_volume_identity
+from evrptw.stage052_campaign_runner import (
+    campaign_runtime_selection_sha256,
+    probe_volume_identity,
+    verify_campaign_successor_revision,
+)
 from evrptw.stage052_evidence import (
     STAGE052_RESOURCE_SCHEMA_VERSION,
     BatchPersistenceEnvelope,
@@ -326,6 +330,7 @@ def validate_campaign_selection_lock(
         "repository_revision": revision,
         "configuration_sha256": configuration,
         "runtime_identity_sha256": _canonical_sha256(runtime),
+        "runtime_selection_sha256": campaign_runtime_selection_sha256(runtime),
         "input_provenance_sha256": _canonical_sha256(_stable_input_provenance(provenance)),
         "instance_sha256": dict(sorted(_validated_instance_hashes(provenance).items())),
         "native_config_sha256": _canonical_sha256(native),
@@ -1823,10 +1828,7 @@ def _validate_power_load(
             runtime.get("low_power_mode_violations"), "low power violations"
         )
         maximum_load1 = _strict_float(runtime.get("maximum_load1"), "runtime load1")
-        maximum_permitted_load1 = _strict_float(
-            runtime.get("maximum_permitted_load1"),
-            "runtime permitted load1",
-        )
+        maximum_permitted_load1 = 4.0 + selected_workers
         maximum_unrelated = _strict_float(
             runtime.get("maximum_unrelated_process_average_cores"),
             "runtime unrelated cores",
@@ -1982,6 +1984,26 @@ def _validate_batch_metadata(
     repository_revision = str(metadata.get("repository_revision", ""))
     campaign_configuration = str(metadata.get("campaign_configuration_sha256", ""))
     runtime_digest = _canonical_sha256(runtime)
+    locked_revision = selection_lock.get("repository_revision")
+    exact_runtime_match = (
+        repository_revision == locked_revision
+        and runtime_digest == selection_lock.get("runtime_identity_sha256")
+    )
+    successor_runtime_match = False
+    if repository_revision != locked_revision and isinstance(locked_revision, str):
+        try:
+            verify_campaign_successor_revision(
+                repository_root(),
+                predecessor_revision=locked_revision,
+                current_revision=repository_revision,
+            )
+        except (OSError, subprocess.SubprocessError, RuntimeError):
+            successor_runtime_match = False
+        else:
+            successor_runtime_match = (
+                campaign_runtime_selection_sha256(runtime)
+                == selection_lock.get("runtime_selection_sha256")
+            )
     try:
         current_instance_hashes = _validated_instance_hashes(provenance)
     except ArtifactIntegrityError:
@@ -2006,8 +2028,7 @@ def _validate_batch_metadata(
         and metadata.get("campaign_prerequisite_review_sha256")
         == campaign.prerequisite_review_sha256
         and metadata.get("configuration_sha256") == selection_lock.get("configuration_sha256")
-        and repository_revision == selection_lock.get("repository_revision")
-        and runtime_digest == selection_lock.get("runtime_identity_sha256")
+        and (exact_runtime_match or successor_runtime_match)
         and _canonical_sha256(_stable_input_provenance(provenance))
         == selection_lock.get("input_provenance_sha256")
         and locked_instances_match

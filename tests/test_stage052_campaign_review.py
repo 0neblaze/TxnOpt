@@ -1313,7 +1313,6 @@ def _build_complete_pilot_campaign(
                 "power_source_violations": 0,
                 "low_power_mode_violations": 0,
                 "maximum_load1": 5.9,
-                "maximum_permitted_load1": 6.0,
                 "maximum_unrelated_process_average_cores": 0.0,
                 "logical_cpu_count": 12,
                 "process_cpu_samples": [
