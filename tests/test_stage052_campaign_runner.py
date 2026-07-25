@@ -1453,6 +1453,53 @@ def test_batch_measurements_enforce_persistence_resource_and_runtime_gates() -> 
         )
 
 
+def test_benchmark_campaign_uses_relaxed_g_resource_limits() -> None:
+    batch, rows = _pilot_batch_rows()
+    runtime = BatchRuntimeEvidence.from_snapshots(
+        (MachineSnapshot("AC Power", False, 1.0, 0.1),),
+        config=_pilot_config(),
+    )
+    relaxed = replace(
+        _resource_summary(aggregate_rss=19 * 1024**3),
+        process_peak_rss_bytes=(
+            (100, 100_000_000),
+            (101, 7 * 1024**3),
+            (102, 7 * 1024**3),
+        ),
+    )
+    assert validate_batch_measurements(
+        batch=batch,
+        rows=rows,
+        resource_summary=relaxed,
+        runtime_evidence=runtime,
+        expected_workers=2,
+    ) == pytest.approx(1.0 / 11.0)
+
+    with pytest.raises(RuntimeError, match="20 GiB"):
+        validate_batch_measurements(
+            batch=batch,
+            rows=rows,
+            resource_summary=replace(relaxed, aggregate_peak_rss_bytes=21 * 1024**3),
+            runtime_evidence=runtime,
+            expected_workers=2,
+        )
+    with pytest.raises(RuntimeError, match="per-worker"):
+        validate_batch_measurements(
+            batch=batch,
+            rows=rows,
+            resource_summary=replace(
+                relaxed,
+                process_peak_rss_bytes=(
+                    (100, 100_000_000),
+                    (101, 9 * 1024**3),
+                    (102, 7 * 1024**3),
+                ),
+            ),
+            runtime_evidence=runtime,
+            expected_workers=2,
+        )
+
+
 def _dispatcher_locator(tmp_path: Path) -> StorageRootLocator:
     external = VolumeIdentity("external-device", "exfat")
     internal = VolumeIdentity("internal-device", "apfs")

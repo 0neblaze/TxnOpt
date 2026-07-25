@@ -111,6 +111,14 @@ equality 和 36% persistence gate；旧 physical schema 或失败 remediation（
 
 并行独立 `(instance, seed)` shard，依次评估 1、2、4 workers。禁止复用“单候选内部四进程 exact-call”作为正式方案，也禁止 worker error 后转串行。
 
+这里的 worker count 是同时运行的最大并发数，不是整个 batch 生命周期内 PID 的总数。
+每个 shard 必须由新的 `spawn` worker process 执行，executor 固定
+`max_tasks_per_child=1`，不得跨 shard 复用 Python/native allocator state。batch
+metadata 必须记录 `worker_process_lifecycle=one_shard_per_spawned_process`；
+reviewer 要求所有 shard owner 都属于 50-ms process-tree samples，并至少观察到冻结的
+并发 worker 数。worker recycle（工作进程回收）不得改变 shard 顺序、solver、backend、
+objective、validator、event schema 或失败语义。
+
 选择规则：
 
 - 2 workers：相对 1 worker speedup ≥ 1.5×，aggregate RSS ≤ 12 GiB；
@@ -188,6 +196,13 @@ Python、dependency、machine、source mount、native extension、configuration�
 instance、backend 与 worker 的稳定选择 hash 完全一致。producer 与 independent
 reviewer 各自执行该检查。solver、objective、配置、native 或任意其他 source path
 变化都 fail fast，并要求新的 prerequisite。
+
+已接受 D/F evidence 的 worker-selection resource gate 仍为 12 GiB，不追溯重写。
+当前 G Benchmark Pilot/Formal 为扩大运行余量，batch producer 与 campaign reviewer
+统一使用 per-worker 8-GiB、process-tree aggregate 20-GiB gate；producer WSL VM
+分配 24 GB。该放宽不适用于 independent reviewer：review service 仍固定
+5.5-GiB internal guard、`MemoryHigh=5G`、`MemoryMax=6G`。四 worker 是最大并发数，
+仍必须逐 shard 新进程回收，禁止用新增内存替代 lifecycle isolation（生命周期隔离）。
 
 producer、retention、performance reviewer 与 campaign reviewer 必须调用同一个
 cross-platform `probe_volume_identity`：WSL 用 `findmnt`，DrvFS 额外绑定 Windows

@@ -61,8 +61,8 @@ from evrptw.stage052_platform import (
     read_wsl_ac_power_online,
 )
 
-PER_WORKER_RSS_LIMIT_BYTES = 4_357_382_144
-AGGREGATE_RSS_LIMIT_BYTES = 12 * 1024**3
+PER_WORKER_RSS_LIMIT_BYTES = 8 * 1024**3
+AGGREGATE_RSS_LIMIT_BYTES = 20 * 1024**3
 STAGE052_MINIMUM_FREE_BYTES = 50 * 1024**3
 _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
     {
@@ -577,12 +577,14 @@ def validate_batch_measurements(
     ):
         raise RuntimeError("batch resource summary identity is invalid")
     if resource_summary.aggregate_peak_rss_bytes > AGGREGATE_RSS_LIMIT_BYTES:
-        raise RuntimeError("batch process-tree aggregate RSS exceeds 12 GiB")
+        raise RuntimeError("batch process-tree aggregate RSS exceeds 20 GiB")
     descendants = set(resource_summary.descendant_pids)
     process_peaks = dict(resource_summary.process_peak_rss_bytes)
     if not descendants or not descendants.issubset(process_peaks):
         raise RuntimeError("batch worker process RSS evidence is incomplete")
-    if any(process_peaks[pid] > PER_WORKER_RSS_LIMIT_BYTES for pid in descendants):
+    if any(
+        process_peaks[pid] > PER_WORKER_RSS_LIMIT_BYTES for pid in descendants
+    ):
         raise RuntimeError("batch per-worker RSS exceeds the fixed limit")
     return persistence_ratio
 

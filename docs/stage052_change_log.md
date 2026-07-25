@@ -8,6 +8,38 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-26：Formal attempt37 producer 逐 shard worker 回收
+
+- `stage05.2_benchmark_attempt37` 完成并跨卷复验归档 batch0001--batch0006，
+  共 636/920 shards；batch0007 完成 raw shard 计算后由既有 12-GiB
+  process-tree aggregate RSS gate 拒绝。失败 batch 的实测峰值为
+  `15,841,632,256` bytes，四个长期 worker 的各自峰值为
+  `5,079,650,304`、`4,651,958,272`、`4,480,434,176` 和
+  `4,106,354,688` bytes。Attempt37 永久保留为 failed evidence，不续跑、不导入
+  已完成 shard。随后 operator 明确授权放宽当前 G campaign 的 producer 内存门槛；
+  这不追溯改变 Attempt37 的失败判定。
+- 根因是 producer 的 `spawn` `ProcessPoolExecutor` 在整个 batch 内复用四个 worker；
+  每个进程连续处理约十二个高基数 shard，Python/native allocator 高水位跨 shard
+  保留。resource sampler 的 parent 仅约 76 MiB，短命 native child 绝大多数约
+  4 MiB，排除了 parent accumulation、退出进程重复计数和 orphan overlap。
+- parallel shard executor 现在固定 `max_tasks_per_child=1`：并发上限仍是冻结的四
+  workers，但每个 `(instance, seed)` shard 使用新的 `spawn` worker，进程退出后回收
+  Python/native allocator。batch metadata 新增
+  `worker_process_lifecycle=one_shard_per_spawned_process`，independent reviewer
+  必须核对该合同；worker ownership 接受多于 configured concurrency 的真实、已采样
+  owner PID，但少于四个仍 fail fast。
+- 当前 G Benchmark Pilot/Formal 的 producer/reviewer batch resource gate 调整为
+  per-worker `8 GiB`、process-tree aggregate `20 GiB`；WSL producer memory cap 从
+  `16 GB` 调整为 `24 GB`，给 Windows host 保留约 `8 GB`。已接受 D/F selection 的
+  12-GiB scientific gate、36% persistence gate、四 worker 并发、solver/backend 和
+  independent reviewer 的 5.5-GiB internal guard/6-GiB systemd `MemoryMax` 均不变。
+- 定向反馈测试在修复前因缺失 `max_tasks_per_child` 稳定失败；修复后同时证明每个
+  shard 获得唯一 PID、异常 worker 仍无 fallback、旧 ownership evidence 仍兼容。
+  Stage 5.2 定向测试为 360 passed；完整测试为 768 passed，Ruff、strict mypy 和
+  `git diff --check` 全部通过。
+  由于这是 producer 缺陷，后续必须使用新 clean revision 先跑新的 Benchmark Pilot，
+  通过独立 review 后再以新的最低未占用 Formal label 执行完整 920-shard campaign。
+
 ## 2026-07-25：G26 campaign reviewer 单遍重放与逐 shard 内存隔离
 
 - `stage05.2_benchmark_attempt26` producer 已完整生成 36/36 Pilot axes，aggregate

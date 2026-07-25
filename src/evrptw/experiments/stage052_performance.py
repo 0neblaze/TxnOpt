@@ -1837,6 +1837,7 @@ def _run_benchmark_batch(
         "backend": campaign_config.selected_exact_backend,
         "execution_backend": campaign_config.selected_backend,
         "worker_count": campaign_config.selected_workers,
+        "worker_process_lifecycle": "one_shard_per_spawned_process",
         "native_profile": campaign_config.native_profile,
         "native_kernel_config": config.native_kernels.to_dict(),
         "repository_revision": repository_revision,
@@ -3081,22 +3082,25 @@ def _run_v2_tasks(
     *,
     worker_count: int,
     abort_reason: Callable[[], str | None] | None = None,
+    _task_runner: Callable[[_ShardTask], list[dict[str, object]]] | None = None,
 ) -> list[dict[str, object]]:
+    task_runner = _run_v2_shard_task if _task_runner is None else _task_runner
     rows: list[dict[str, object]] = []
     if worker_count == 1:
         for task in tasks:
             reason = abort_reason() if abort_reason is not None else None
             if reason is not None:
                 raise RuntimeError(f"runtime guard aborted Stage 5.2 work: {reason}")
-            rows.extend(_run_v2_shard_task(task))
+            rows.extend(task_runner(task))
         return rows
     executor = ProcessPoolExecutor(
         max_workers=worker_count,
         mp_context=get_context("spawn"),
+        max_tasks_per_child=1,
     )
     futures: dict[Any, _ShardTask] = {}
     try:
-        futures = {executor.submit(_run_v2_shard_task, task): task for task in tasks}
+        futures = {executor.submit(task_runner, task): task for task in tasks}
         if abort_reason is None:
             for future in as_completed(futures):
                 rows.extend(future.result())

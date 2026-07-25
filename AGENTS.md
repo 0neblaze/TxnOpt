@@ -577,8 +577,13 @@ this repository or one of its subdirectories.
 - Job-parallel selection compares 1/2/4 workers on the fixed four-instance,
   three-seed scope. Two workers require at least 1.5x speedup and at most 12 GiB
   aggregate RSS; four workers are selected only at 2.5x and at most 12 GiB.
-  Worker ownership uses real PIDs and cumulative process CPU samples; worker
-  failure aborts without fallback.
+  Worker count is maximum concurrency, not a lifetime PID count. Every parallel
+  `(instance, seed)` shard uses a fresh `spawn` worker with
+  `max_tasks_per_child=1`; cross-shard allocator reuse is forbidden. Batch
+  metadata records `worker_process_lifecycle=one_shard_per_spawned_process`.
+  Worker ownership uses real sampled PIDs and cumulative process CPU samples,
+  permits more owner PIDs than configured concurrency, and still requires at
+  least the configured worker count. Worker failure aborts without fallback.
 - Native-kernel promotion must preserve Python/native objective, validator,
   exact ordering, candidate/cache/event semantics, and zero fallback across all
   fixed-work axes. Aggregate 100-customer paired median end-to-end improvement
@@ -597,6 +602,12 @@ this repository or one of its subdirectories.
   `(instance, seed)` shards, 2,040 runs, 229,200 declared solver seconds, and
   10,400 anytime rows. Only independent review may open Formal or report
   `READY_FOR_STAGE05_3`.
+- The accepted D/F worker-selection evidence keeps its historical 12-GiB
+  scientific gate. Current G Benchmark Pilot/Formal batches use an explicitly
+  relaxed operational resource gate of 8 GiB per worker and 20 GiB for the
+  process tree, with a 24-GB producer WSL allocation. This does not relax the
+  36% persistence gate, four-worker concurrency, solver/backend freeze, or the
+  independent reviewer's 5.5-GiB internal guard and 6-GiB systemd MemoryMax.
 - Campaign preflight keeps the fixed `load1 <= 4.0` idle-host gate. During a
   batch, the auditable total-load ceiling is `4.0 + selected_workers`, because
   the selected campaign workers are expected load; unrelated user CPU remains

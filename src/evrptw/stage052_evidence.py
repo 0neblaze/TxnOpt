@@ -2142,10 +2142,11 @@ def validate_worker_ownership(
         if pid not in allowed_pids:
             return False, f"shard owner PID {pid} was not observed in the process tree", ()
         owners.add(pid)
-    if len(owners) != expected_workers:
+    if len(owners) < expected_workers:
         return (
             False,
-            f"expected {expected_workers} actual shard workers, observed {len(owners)}",
+            f"expected at least {expected_workers} actual shard workers, "
+            f"observed {len(owners)}",
             tuple(sorted(owners)),
         )
     return True, "actual shard worker ownership passed", tuple(sorted(owners))

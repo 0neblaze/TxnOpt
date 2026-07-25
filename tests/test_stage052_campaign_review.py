@@ -1212,6 +1212,7 @@ def _build_complete_pilot_campaign(
         "backend": "cpu_batch",
         "execution_backend": "native_cpu",
         "worker_count": 2,
+        "worker_process_lifecycle": "one_shard_per_spawned_process",
         "native_profile": "stage05.2-native-kernels-v1",
         "native_kernel_config": predecessor_metadata["native_kernel_config"],
         "repository_revision": predecessor_metadata["repository_revision"],
@@ -1268,7 +1269,7 @@ def _build_complete_pilot_campaign(
             instance=instance_name,
             seed=seed,
             shard_ordinal=ordinal,
-            worker_identity=f"pid-{101 + ordinal % 2}",
+            worker_identity=f"pid-{101 + ordinal}",
         )
         critical_events: list[dict[str, object]] = [
             {
@@ -1493,9 +1494,12 @@ def _build_complete_pilot_campaign(
         "run_wall_seconds": 1080.0,
         "sample_interval_seconds": 0.05,
         "parent_pid": 100,
-        "descendant_pids": [101, 102],
+        "descendant_pids": list(range(101, 137)),
         "aggregate_peak_rss_bytes": 3_000_000,
-        "process_peak_rss_bytes": {"100": 1_000_000, "101": 1_000_000, "102": 1_000_000},
+        "process_peak_rss_bytes": {
+            "100": 1_000_000,
+            **{str(pid): 1_000_000 for pid in range(101, 137)},
+        },
         "mean_active_cores": 1.0,
         "peak_active_cores": 2.0,
         "load1_min": 0.5,

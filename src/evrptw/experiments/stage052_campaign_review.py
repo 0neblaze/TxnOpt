@@ -85,6 +85,8 @@ from evrptw.stage052_campaign import (
     maximum_process_average_cores_over_windows,
 )
 from evrptw.stage052_campaign_runner import (
+    AGGREGATE_RSS_LIMIT_BYTES,
+    PER_WORKER_RSS_LIMIT_BYTES,
     campaign_runtime_selection_sha256,
     probe_volume_identity,
     verify_campaign_successor_revision,
@@ -143,8 +145,6 @@ def _verify_review_storage_migration(
     )
 FORMAL_SEEDS = tuple(range(2014, 2024))
 PILOT_SEEDS = (2014, 2015, 2016)
-PER_WORKER_RSS_LIMIT_BYTES = 4_357_382_144
-PROCESS_TREE_RSS_LIMIT_BYTES = 12 * 1024**3
 CAMPAIGN_REVIEW_SCHEMA = "stage05.2-campaign-review-v1"
 _REVIEW_EXECUTION_ENV = "STAGE052_REVIEW_EXECUTION_RECEIPT"
 _REVIEW_PROGRESS_ENV = "STAGE052_REVIEW_PROGRESS_LOG"
@@ -2482,7 +2482,7 @@ def _validate_batch_resources(
     passed = (
         worker_peak > 0
         and worker_peak <= PER_WORKER_RSS_LIMIT_BYTES
-        and aggregate <= PROCESS_TREE_RSS_LIMIT_BYTES
+        and aggregate <= AGGREGATE_RSS_LIMIT_BYTES
     )
     summary = {
         "configured_workers": workers,
@@ -2498,7 +2498,7 @@ def _validate_batch_resources(
         passed,
         "per-worker and process-tree RSS limits passed"
         if passed
-        else "per-worker 4357382144-byte or process-tree 12-GiB RSS limit failed",
+        else "per-worker 8-GiB or process-tree 20-GiB RSS limit failed",
         summary,
     )
 
@@ -2563,6 +2563,8 @@ def _validate_batch_metadata(
         and campaign.selected_backend in {"native_cpu", "cuda"}
         and metadata.get("backend") == campaign.selected_exact_backend == "cpu_batch"
         and metadata.get("worker_count") == campaign.selected_workers
+        and metadata.get("worker_process_lifecycle")
+        == "one_shard_per_spawned_process"
         and metadata.get("native_profile") == campaign.native_profile
         and metadata.get("storage_policy_version") == campaign.storage_policy_version
         and metadata.get("screening_schema_version") == campaign.screening_schema_version
