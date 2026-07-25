@@ -2509,6 +2509,7 @@ def _validate_batch_metadata(
     campaign: CampaignManifest,
     selection_lock: Mapping[str, object],
     source_snapshot: Mapping[str, object],
+    storage_migration: Mapping[str, object] | None = None,
 ) -> tuple[bool, str, tuple[str, str, str]]:
     runtime = metadata.get("runtime_identity")
     provenance = metadata.get("performance_provenance")
@@ -2539,7 +2540,10 @@ def _validate_batch_metadata(
             successor_runtime_match = False
         else:
             successor_runtime_match = (
-                campaign_runtime_selection_sha256(runtime)
+                campaign_runtime_selection_sha256(
+                    runtime,
+                    storage_migration=storage_migration,
+                )
                 == selection_lock.get("runtime_selection_sha256")
             )
     try:
@@ -4236,6 +4240,7 @@ def _audit_campaign(
                 campaign=campaign,
                 selection_lock=selection_lock,
                 source_snapshot=current_source_snapshot,
+                storage_migration=migration_payload,
             )
             if not metadata_ok:
                 raise ArtifactIntegrityError(metadata_detail)

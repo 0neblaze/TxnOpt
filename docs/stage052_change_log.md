@@ -856,3 +856,9 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   `--storage-migration-evidence-dir`，重验历史 G26 campaign 后再把 migration payload
   用于 F prerequisite 与 successor runtime selection replay；不得把旧 attestation
   直接绑定到 Attempt36。Attempt36 sealed raw 不变，只追加新 review generation。
+- 第二代复审证明 prerequisite 已恢复，但 batch provenance replay 仍未把已验证的
+  migration payload 传入 runtime-selection hash，因而把新 D 盘误报为 F17 selection
+  drift，并再次级联为 0 shards。`campaign_runtime_selection_sha256` 现提供同一显式
+  migration normalization 路径；只允许 destination disk 精确替换为 attested source
+  disk，memory 仍按既有规则排除，其余 runtime 字段全部参与 hash。Attempt36 继续只
+  追加 review generation。

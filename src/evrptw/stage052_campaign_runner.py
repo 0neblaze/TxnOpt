@@ -97,9 +97,18 @@ def _canonical_sha256(value: object) -> str:
     ).hexdigest()
 
 
-def campaign_runtime_selection_sha256(value: Mapping[str, object]) -> str:
+def campaign_runtime_selection_sha256(
+    value: Mapping[str, object],
+    *,
+    storage_migration: Mapping[str, object] | None = None,
+) -> str:
     """Hash the frozen runtime selection while excluding G-only wheel identity."""
 
+    if storage_migration is not None:
+        value = _runtime_selection_with_attested_archive_source(
+            value,
+            storage_migration,
+        )
     excluded = {
         "installed_distribution_sha256",
         "repository_revision",

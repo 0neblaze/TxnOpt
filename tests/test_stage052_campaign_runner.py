@@ -721,6 +721,58 @@ def test_campaign_runtime_selection_hash_excludes_only_g_wheel_identity() -> Non
     )
 
 
+def test_campaign_runtime_selection_hash_normalizes_attested_archive_disk() -> None:
+    source_disk = {
+        "BusType": "NVMe",
+        "FriendlyName": "original",
+        "Number": 1,
+        "SerialNumber": "original-serial",
+    }
+    frozen_machine = {
+        "memory_bytes": 16 * 1024**3,
+        "cpu": {"Name": "same"},
+        "d_archive_disk": source_disk,
+    }
+    frozen = {
+        "schema_version": "stage05.2-runtime-identity-v2",
+        "repository_revision": "1" * 40,
+        "wheel_filename": "original.whl",
+        "wheel_sha256": "2" * 64,
+        "installed_distribution_sha256": "3" * 64,
+        "native_extension_sha256": "4" * 64,
+        "machine_identity": frozen_machine,
+    }
+    destination_disk = {
+        "BusType": "NVMe",
+        "FriendlyName": "replacement",
+        "Number": 1,
+        "SerialNumber": "replacement-serial",
+    }
+    live = {
+        **frozen,
+        "repository_revision": "9" * 40,
+        "wheel_filename": "successor.whl",
+        "wheel_sha256": "8" * 64,
+        "installed_distribution_sha256": "7" * 64,
+        "machine_identity": {
+            **frozen_machine,
+            "memory_bytes": int(frozen_machine["memory_bytes"]) - 4096,
+            "d_archive_disk": destination_disk,
+        },
+    }
+    migration = {
+        "source_machine_disk": source_disk,
+        "destination_machine_disk": destination_disk,
+    }
+
+    assert campaign_runtime_selection_sha256(frozen) == (
+        campaign_runtime_selection_sha256(
+            live,
+            storage_migration=migration,
+        )
+    )
+
+
 def _pilot_config() -> BenchmarkCampaignConfig:
     return BenchmarkCampaignConfig.pilot(
         run_label="stage05.2_benchmark_attempt01",
