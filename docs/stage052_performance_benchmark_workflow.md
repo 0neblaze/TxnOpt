@@ -127,6 +127,10 @@ Native counter replay 必须显式对账 deadline interruption：batch 已声明
 `batch_launches - native_invocations` 只能小于等于已重放的 interrupted call
 数量；同时必须满足 `started = completed + interrupted`，且所有 native/protocol
 fallback counter 为零。
+Single-pass replay 同时接受显式 `deadline_boundary` event，以及
+`route_evaluation.status=interrupted_deadline` 作为权威 deadline evidence。
+后者必须绑定当前 lane，并对其后的 exact work、cache store 和 acceptance
+应用相同的 fail-fast 规则。
 reviewer 要求所有 shard owner 都属于 50-ms process-tree samples，并至少观察到冻结的
 并发 worker 数。worker recycle（工作进程回收）不得改变 shard 顺序、solver、backend、
 objective、validator、event schema 或失败语义。

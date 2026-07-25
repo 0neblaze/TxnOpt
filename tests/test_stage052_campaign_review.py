@@ -487,6 +487,40 @@ def test_native_axis_allows_deadline_interrupt_before_native_invocation() -> Non
     assert passed, detail
 
 
+def test_streaming_event_audit_treats_interrupted_exact_as_deadline_boundary() -> None:
+    events = (
+        {
+            "event_id": 1,
+            "benchmark_axis": "wall_clock_30",
+            "lane": "wall_clock_30:legacy",
+            "event_type": "route_evaluation",
+            "evaluation_id": 1,
+            "status": "interrupted_deadline",
+            "exact_started": True,
+            "exact_completed": False,
+            "started_at": 29.8,
+            "completed_at": 30.2,
+        },
+        {
+            "event_id": 2,
+            "benchmark_axis": "wall_clock_30",
+            "lane": "wall_clock_30:legacy",
+            "event_type": "candidate_state",
+            "status": "accepted",
+            "accepted": True,
+            "global_best": False,
+            "candidate_feasible": True,
+            "candidate_vehicle_delta": 0,
+        },
+    )
+
+    audit = audit_streamed_events(events, {"wall_clock_30": 30})
+
+    assert audit.deadline_axes == ("wall_clock_30",)
+    assert audit.passed is False
+    assert "accepted after deadline" in audit.detail
+
+
 def test_streaming_event_audit_keeps_deadline_boundaries_lane_local() -> None:
     events = (
         {

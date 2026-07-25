@@ -40,6 +40,10 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   现在要求 `started = completed + interrupted`，并只允许
   `batch_launches - native_invocations` 落在已证明的 interrupted 数量内；
   fallback 仍必须为零，未证明的 counter 缺口仍 fail fast。
+- Combined single-pass accumulator 还必须把
+  `route_evaluation.status=interrupted_deadline` 识别为该 lane/axis 的 deadline
+  boundary evidence；不能只依赖可为空的附加 `deadline_boundary` 字段。该映射
+  同时阻止同 lane 后续 exact work、cache store 或 candidate acceptance。
   必须核对该合同；worker ownership 接受多于 configured concurrency 的真实、已采样
   owner PID，但少于四个仍 fail fast。
 - 当前 G Benchmark Pilot/Formal 的 producer/reviewer batch resource gate 调整为

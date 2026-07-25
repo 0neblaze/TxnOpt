@@ -733,7 +733,10 @@ class _StreamedEventAuditAccumulator:
                 else:
                     self._cache_misses[axis].discard(digest)
                     self._completed_exact_keys[axis].add(digest)
-            if event.get("deadline_boundary"):
+            if (
+                event.get("deadline_boundary")
+                or event.get("status") == "interrupted_deadline"
+            ):
                 state.deadline_seen = True
                 state.deadline_lanes.add(lane)
 
