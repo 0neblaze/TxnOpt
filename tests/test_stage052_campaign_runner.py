@@ -520,7 +520,11 @@ def test_execution_lock_accepts_only_attested_archive_disk_successor_drift(
         "SerialNumber": "original-serial",
     }
     base_runtime = dict(metadata["runtime_identity"])
-    base_runtime["machine_identity"] = {"d_archive_disk": source_disk}
+    base_runtime["machine_identity"] = {
+        "d_archive_disk": source_disk,
+        "memory_bytes": 16 * 1024**3,
+        "host_system": "Linux",
+    }
     metadata["runtime_identity"] = base_runtime
     lock = BenchmarkExecutionLock.from_accepted_evidence(
         metadata=metadata,
@@ -577,6 +581,7 @@ def test_execution_lock_accepts_only_attested_archive_disk_successor_drift(
         "SerialNumber": "replacement-serial",
     }
     machine["d_archive_disk"] = destination_disk
+    machine["memory_bytes"] = int(machine["memory_bytes"]) - 4096
     runtime["machine_identity"] = machine
     migration = {
         "source_machine_disk": source_disk,
@@ -610,6 +615,24 @@ def test_execution_lock_accepts_only_attested_archive_disk_successor_drift(
             native_kernel_config=metadata["native_kernel_config"],
             repository=repository,
             storage_migration=bad_migration,
+        )
+
+    drifted_runtime = dict(runtime)
+    drifted_machine = dict(machine)
+    drifted_machine["host_system"] = "different"
+    drifted_runtime["machine_identity"] = drifted_machine
+    with pytest.raises(RuntimeError, match="runtime selection"):
+        lock.verify_current_execution(
+            selected_backend="native_cpu",
+            selected_exact_backend="cpu_batch",
+            selected_workers=2,
+            repository_revision=current_revision,
+            configuration_sha256="4" * 64,
+            runtime_identity=drifted_runtime,
+            input_provenance=metadata["performance_provenance"],
+            native_kernel_config=metadata["native_kernel_config"],
+            repository=repository,
+            storage_migration=migration,
         )
 
 

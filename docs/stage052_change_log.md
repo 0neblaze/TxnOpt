@@ -801,3 +801,8 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   仅当当前 D archive disk 精确等于 attestation destination 时，比较前将该单一字段
   规范化为 attestation source，其余 runtime 字段继续冻结；Formal 环境复用 G26 的
   精确 dependency set，仅替换当前 sealed wheel。attempt29 不复用。
+- Formal attempt30 在 raw 创建前再次由同一 lock 拒绝。逐字段比较确认依赖完全一致，
+  唯一剩余差异是 WSL 报告的总内存相差一个 4 KiB page。campaign selection 现与既有
+  producer replay/storage migration 合同一致，仅排除易波动的
+  `machine_identity.memory_bytes`；CPU、GPU、OS、kernel、mount、disk（经签名迁移
+  规范化）、dependency、Python/native identity 仍全部冻结。attempt30 不复用。

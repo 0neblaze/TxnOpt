@@ -104,8 +104,14 @@ def campaign_runtime_selection_sha256(value: Mapping[str, object]) -> str:
         "wheel_filename",
         "wheel_sha256",
     }
+    selection = {key: item for key, item in value.items() if key not in excluded}
+    machine = selection.get("machine_identity")
+    if isinstance(machine, Mapping):
+        selection["machine_identity"] = {
+            key: item for key, item in machine.items() if key != "memory_bytes"
+        }
     return _canonical_sha256(
-        {key: item for key, item in value.items() if key not in excluded}
+        selection
     )
 
 
