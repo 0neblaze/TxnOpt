@@ -30,6 +30,7 @@ from evrptw.experiments.stage052_campaign_review import (
     CampaignGeometryRecord,
     _publish_review,
     _read_bounded_compact_trace,
+    _verify_review_storage_migration,
     audit_campaign_planning,
     audit_streamed_events,
     replay_streamed_shard_events,
@@ -108,6 +109,55 @@ def test_campaign_volume_probe_uses_shared_cross_platform_implementation(
     path = Path("/home/test/stage052-active")
     assert campaign_review_module._default_volume_probe(path) == expected
     assert observed_paths == [path]
+
+
+def test_successor_review_verifies_the_migration_predecessor_campaign(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = tmp_path / "migration.json"
+    current = tmp_path / "stage05.2_benchmark_attempt36"
+    predecessor = tmp_path / "stage05.2_benchmark_attempt26"
+    expected = {"run_label": predecessor.name}
+    calls: list[Path] = []
+
+    def verify_successor(
+        path: Path,
+        *,
+        evidence_dir: Path,
+        locator: object,
+        volume_probe: object,
+    ) -> dict[str, object]:
+        del locator, volume_probe
+        assert path == migration
+        calls.append(evidence_dir)
+        return expected
+
+    monkeypatch.setattr(
+        campaign_review_module,
+        "verify_successor_storage_migration_evidence",
+        verify_successor,
+    )
+    monkeypatch.setattr(
+        campaign_review_module,
+        "verify_campaign_storage_migration",
+        lambda *_args, **_kwargs: pytest.fail(
+            "successor review must not bind the old attestation to the current campaign"
+        ),
+    )
+
+    assert (
+        _verify_review_storage_migration(
+            migration,
+            campaign=SimpleNamespace(),  # type: ignore[arg-type]
+            campaign_dir=current,
+            locator=SimpleNamespace(),  # type: ignore[arg-type]
+            volume_probe=lambda _: VolumeIdentity("unused", "unused"),
+            evidence_dir=predecessor,
+        )
+        == expected
+    )
+    assert calls == [predecessor]
 
 
 def test_rolling_capacity_replay_uses_canonical_campaign_reserves() -> None:

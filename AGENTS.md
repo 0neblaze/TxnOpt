@@ -686,6 +686,12 @@ this repository or one of its subdirectories.
   and finalized successful review receipt. The historical Benchmark review
   never replaces the accelerator prerequisite, and the attestation schema alone
   is insufficient.
+- The independent reviewer for that successor receives the same explicit
+  migration evidence directory. It re-verifies the historical migration
+  campaign before using the payload for prerequisite/runtime replay; it must
+  not compare the old attestation's run label or batch set to the successor
+  campaign, and it must not trust the signed JSON without replaying the
+  historical batches, review, and receipt.
 - Stage 5.2 storage replay hashes canonical records as they are read. It must
   never accumulate a complete axis or bundle of event dictionaries. Multiple
   raw bundles are replayed strictly in input order, one fresh spawned process

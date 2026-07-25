@@ -290,6 +290,10 @@ accelerator pilot 作为科学 prerequisite，并额外显式提供
 验证该 campaign 的全部归档 batch、accepted Pilot review 和 finalized successful
 receipt 后，才可仅规范化冻结 selection lock 中的 D 盘身份；不得用历史 G review
 替代 F prerequisite，也不得只信任 attestation schema。
+successor campaign 的 independent reviewer 必须接收并执行同一
+`--storage-migration-evidence-dir` 合同；它先重验历史 migration campaign，再审计
+当前 successor raw。禁止把旧 attestation 的 run label 或 batch set 与当前 campaign
+强行比较，也禁止仅加载签名 JSON 后跳过历史 batch/review/receipt 复验。
 
 Windows/WSL2 formal reviewer 固定通过
 `python -m evrptw.stage052_review_service launch` 启动 transient

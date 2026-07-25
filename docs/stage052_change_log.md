@@ -850,3 +850,9 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 - 该例外仅适用于 `benchmark/pilot` 接受 `accelerator_pilot` prerequisite 的场景。
   Formal 仍要求其 Benchmark Pilot prerequisite 自身在 review manifest 中绑定同一
   migration SHA-256；缺失、替换、失败或未最终化的历史 review 均 fail fast。
+- `stage05.2_benchmark_attempt36` producer 完成 36/36 shards 后，首代 reviewer 因仍把
+  G26 migration attestation 与当前 successor campaign 强行做 run-label/batch-set
+  绑定而给出级联 `NOT_READY`。reviewer 现在接受同一显式
+  `--storage-migration-evidence-dir`，重验历史 G26 campaign 后再把 migration payload
+  用于 F prerequisite 与 successor runtime selection replay；不得把旧 attestation
+  直接绑定到 Attempt36。Attempt36 sealed raw 不变，只追加新 review generation。

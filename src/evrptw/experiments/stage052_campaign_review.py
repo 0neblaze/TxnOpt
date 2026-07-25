@@ -107,12 +107,40 @@ from evrptw.stage052_retention import (
 from evrptw.stage052_review_service import ReviewProcessMemoryGuard, ReviewProgressLog
 from evrptw.stage052_storage_migration import (
     verify_campaign_storage_migration,
+    verify_successor_storage_migration_evidence,
 )
 from evrptw.validation import validate_routes
 
 NOT_READY = "NOT_READY"
 PILOT_READY = "READY_FOR_STAGE052_FORMAL_BENCHMARK"
 FORMAL_READY = "READY_FOR_STAGE05_3"
+
+
+def _verify_review_storage_migration(
+    path: Path,
+    *,
+    campaign: CampaignManifest,
+    campaign_dir: Path,
+    locator: StorageRootLocator,
+    volume_probe: Callable[[Path], VolumeIdentity],
+    evidence_dir: Path | None,
+) -> dict[str, object]:
+    """Verify either a retrospective migration or its reviewed predecessor."""
+
+    if evidence_dir is None:
+        return verify_campaign_storage_migration(
+            path,
+            campaign=campaign,
+            campaign_dir=campaign_dir,
+            locator=locator,
+            volume_probe=volume_probe,
+        )
+    return verify_successor_storage_migration_evidence(
+        path,
+        evidence_dir=evidence_dir,
+        locator=locator,
+        volume_probe=volume_probe,
+    )
 FORMAL_SEEDS = tuple(range(2014, 2024))
 PILOT_SEEDS = (2014, 2015, 2016)
 PER_WORKER_RSS_LIMIT_BYTES = 4_357_382_144
@@ -3903,6 +3931,7 @@ def _audit_campaign(
     volume_probe: Callable[[Path], VolumeIdentity],
     producer_source_dir: Path | None = None,
     storage_migration_path: Path | None = None,
+    storage_migration_evidence_dir: Path | None = None,
 ) -> tuple[
     dict[str, dict[str, object]],
     _ReviewEvidence,
@@ -3957,12 +3986,13 @@ def _audit_campaign(
     migration_error = ""
     if storage_migration_path is not None:
         try:
-            migration_payload = verify_campaign_storage_migration(
+            migration_payload = _verify_review_storage_migration(
                 storage_migration_path,
                 campaign=campaign,
                 campaign_dir=campaign_dir,
                 locator=locator,
                 volume_probe=volume_probe,
+                evidence_dir=storage_migration_evidence_dir,
             )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             migration_error = str(error)
@@ -4985,11 +5015,16 @@ def review_stage052_campaign(
     volume_probe: Callable[[Path], VolumeIdentity] = _default_volume_probe,
     producer_source_dir: Path | None = None,
     storage_migration_path: Path | None = None,
+    storage_migration_evidence_dir: Path | None = None,
 ) -> dict[str, Path]:
     """Independently replay one G01 pilot or G02 Formal campaign."""
 
     if scope not in {"pilot", "formal"}:
         raise ValueError("campaign review scope must be pilot or formal")
+    if storage_migration_evidence_dir is not None and storage_migration_path is None:
+        raise ValueError(
+            "storage_migration_evidence_dir requires storage_migration_path"
+        )
     run_label = campaign_dir.name
     try:
         gates, evidence, raw_hash, prerequisite = _audit_campaign(
@@ -5002,6 +5037,7 @@ def review_stage052_campaign(
             volume_probe=volume_probe,
             producer_source_dir=producer_source_dir,
             storage_migration_path=storage_migration_path,
+            storage_migration_evidence_dir=storage_migration_evidence_dir,
         )
         campaign = load_campaign_manifest(campaign_dir / "campaign_manifest.json")
         storage_aliases = sorted(campaign.storage_roots)
@@ -5197,6 +5233,11 @@ def main() -> int:
         help="signed archive-disk migration attestation for retrospective review",
     )
     parser.add_argument(
+        "--storage-migration-evidence-dir",
+        type=Path,
+        help="reviewed predecessor campaign that authorizes successor storage",
+    )
+    parser.add_argument(
         "--retention-registry",
         type=Path,
         default=Path("experiments/registries/stage05.2_retention_registry.csv"),
@@ -5232,6 +5273,18 @@ def main() -> int:
     )
     if storage_migration_path is not None and not storage_migration_path.is_file():
         parser.error("--storage-migration must be an existing signed attestation")
+    storage_migration_evidence_dir = (
+        arguments.storage_migration_evidence_dir.resolve()
+        if arguments.storage_migration_evidence_dir is not None
+        else None
+    )
+    if storage_migration_evidence_dir is not None and storage_migration_path is None:
+        parser.error("--storage-migration-evidence-dir requires --storage-migration")
+    if (
+        storage_migration_evidence_dir is not None
+        and not storage_migration_evidence_dir.is_dir()
+    ):
+        parser.error("--storage-migration-evidence-dir must be an existing directory")
     for record in load_retention_registry(registry_path):
         if record.run_label != campaign_dir.name:
             continue
@@ -5286,6 +5339,7 @@ def main() -> int:
                 locator=locator,
                 producer_source_dir=producer_source_dir,
                 storage_migration_path=storage_migration_path,
+                storage_migration_evidence_dir=storage_migration_evidence_dir,
             )
     except BaseException as error:
         progress.emit(
