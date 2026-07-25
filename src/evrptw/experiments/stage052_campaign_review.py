@@ -25,6 +25,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future, ProcessPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from multiprocessing import get_context
@@ -4812,11 +4813,35 @@ def _verified_prior_campaign_review_history(
         raise ArtifactIntegrityError("prior campaign review identity is invalid")
     verify_stage052_review_files(campaign_dir, payload)
     raw_manifest_sha256 = _sha256(ArtifactReader(campaign_dir).result.manifest_path)
-    if payload.get("raw_manifest_sha256") != raw_manifest_sha256:
-        raise ArtifactIntegrityError("prior campaign review is stale for the raw manifest")
     campaign_manifest = campaign_dir / "campaign_manifest.json"
-    if campaign_manifest.is_file() and payload.get("raw_campaign_manifest_sha256") != _sha256(
-        campaign_manifest
+    campaign_manifest_sha256 = (
+        _sha256(campaign_manifest) if campaign_manifest.is_file() else ""
+    )
+
+    def raw_binding_valid(review: Mapping[str, object]) -> bool:
+        if review.get("raw_manifest_sha256") == raw_manifest_sha256:
+            return True
+        gates = review.get("gates")
+        replay_gate = (
+            gates.get("campaign_replay")
+            if isinstance(gates, Mapping)
+            else None
+        )
+        return (
+            review.get("status") == NOT_READY
+            and review.get("raw_manifest_sha256") == ""
+            and review.get("raw_campaign_manifest_sha256")
+            == campaign_manifest_sha256
+            and isinstance(replay_gate, Mapping)
+            and replay_gate.get("passed") is False
+        )
+
+    if not raw_binding_valid(payload):
+        raise ArtifactIntegrityError("prior campaign review is stale for the raw manifest")
+    if (
+        campaign_manifest.is_file()
+        and payload.get("raw_campaign_manifest_sha256")
+        != campaign_manifest_sha256
     ):
         raise ArtifactIntegrityError("prior campaign review is stale for the campaign manifest")
     raw_history = payload.get("review_history")
@@ -4847,7 +4872,7 @@ def _verified_prior_campaign_review_history(
             or historical.get("review_history") != expected_prefix
             or historical.get("previous_review_manifest_sha256")
             != (expected_prefix[-1] if expected_prefix else None)
-            or historical.get("raw_manifest_sha256") != raw_manifest_sha256
+            or not raw_binding_valid(historical)
         ):
             raise ArtifactIntegrityError("prior campaign review history lineage is invalid")
         verify_stage052_review_files(campaign_dir, historical)
@@ -5004,6 +5029,10 @@ def review_stage052_campaign(
             }
         }
         evidence = _ReviewEvidence.empty()
+        with suppress(ArtifactIntegrityError, OSError, TypeError, ValueError):
+            evidence.standard_raw_manifest_sha256 = _sha256(
+                ArtifactReader(campaign_dir).result.manifest_path
+            )
         campaign_path = campaign_dir / "campaign_manifest.json"
         raw_hash = _sha256(campaign_path) if campaign_path.is_file() else ""
         prerequisite = {"error": "prerequisite was not verified"}

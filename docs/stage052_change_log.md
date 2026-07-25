@@ -784,3 +784,9 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   SHA-256。Formal producer 必须显式提供同一 `--storage-migration`，并在 current-chain
   prerequisite replay 前核对该 SHA-256；未绑定、替换或用于非-Benchmark prerequisite
   的证明均 fail fast。
+- 一次 WSL lifecycle interruption 在 315.5 MiB cgroup peak 时终止 reviewer；失败
+  receipt 正确记录 `service_interrupted`，但旧 exception path 把 review manifest 的
+  standard raw SHA-256 留空，使下一代无法归档该 `NOT_READY` pointer。失败路径现在
+  独立重读标准 raw manifest；历史兼容只接受 `NOT_READY`、同一 campaign SHA、完整
+  generation 文件、明确 failed `campaign_replay` 且空 raw hash 的已知形态，归档后
+  继续 append，不改写失败代次，也不允许其成为 prerequisite。
