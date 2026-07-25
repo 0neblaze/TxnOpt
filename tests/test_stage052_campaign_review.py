@@ -407,6 +407,34 @@ def test_streaming_event_audit_rejects_acceptance_after_deadline() -> None:
     assert "deadline" in audit.detail
 
 
+def test_streaming_event_audit_uses_lane_boundary_for_pause_aware_budget() -> None:
+    events = (
+        {
+            "event_id": 1,
+            "benchmark_axis": "wall_clock_30",
+            "lane": "wall_clock_30:legacy",
+            "event_type": "candidate_state",
+            "status": "accepted",
+            "accepted": True,
+            "global_best": False,
+            "candidate_feasible": True,
+            "candidate_vehicle_delta": 0,
+            "timestamp_seconds": 30.35,
+        },
+        {
+            "event_id": 2,
+            "benchmark_axis": "wall_clock_30",
+            "lane": "wall_clock_30:legacy",
+            "event_type": "deadline_boundary",
+            "timestamp_seconds": 30.0,
+        },
+    )
+
+    audit = audit_streamed_events(events, {"wall_clock_30": 30})
+
+    assert audit.passed
+
+
 def test_streaming_event_audit_keeps_deadline_boundaries_lane_local() -> None:
     events = (
         {

@@ -30,6 +30,11 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   `worker_runtime_warmup=in_memory_arrow_zstd1`，消除 fresh-spawn 引入的
   PyArrow/Zstandard 一次性初始化成本；warmup 仅写入内存 buffer，不生成、
   删除或聚合任何审计事件。
+- Pilot Attempt42 首次 independent replay 暴露 reviewer 将包含 interleaved
+  persistence 的 `candidate_state.timestamp_seconds` 直接与 declared solver
+  seconds 比较，重复并错误地拒绝了 deadline boundary 前的合法事务。修复后
+  lane-local deadline boundary 仍是权威边界；exact completion、cache store
+  和 boundary 后 acceptance 的原有拒绝规则保持不变。
   必须核对该合同；worker ownership 接受多于 configured concurrency 的真实、已采样
   owner PID，但少于四个仍 fail fast。
 - 当前 G Benchmark Pilot/Formal 的 producer/reviewer batch resource gate 调整为

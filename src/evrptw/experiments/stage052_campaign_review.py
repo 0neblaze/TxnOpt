@@ -774,11 +774,12 @@ class _StreamedEventAuditAccumulator:
                     self._failures.append(
                         f"accepted candidate increased vehicle count on {axis}"
                     )
-                timestamp = _finite_number(event.get("timestamp_seconds"))
-                if timestamp is None or timestamp > state.budget_seconds:
-                    self._failures.append(
-                        f"candidate accepted beyond wall-clock budget on {axis}"
-                    )
+                # Candidate timestamps include separately audited interleaved
+                # persistence. The solver budget pauses for those intervals, so
+                # the replayed lane-local deadline boundary is authoritative.
+                # Comparing this wall timestamp directly with the declared
+                # solver-seconds budget would reject a valid pre-boundary
+                # transaction after a sufficiently large persistence interval.
                 if event.get("status") != "accepted" or event.get("candidate_feasible") is not True:
                     self._failures.append(
                         f"accepted candidate transaction is inconsistent on {axis}"

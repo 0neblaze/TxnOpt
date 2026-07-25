@@ -118,6 +118,10 @@ metadata 必须记录 `worker_process_lifecycle=one_shard_per_spawned_process`�
 每个 worker 在 shard 计时开始前还必须执行仅内存的 Arrow/Zstandard warmup，
 并记录 `worker_runtime_warmup=in_memory_arrow_zstd1`。warmup 不得写 raw
 artifact，也不得替代、删除、聚合或跳过任何审计事件。
+`candidate_state.timestamp_seconds` 包含已单独归因的 interleaved persistence；
+deadline replay 必须以 lane-local deadline boundary 为权威，不得再把该 wall
+timestamp 直接与 declared solver seconds 比较。boundary 后 acceptance、
+exact completion crossing 和 boundary 后 cache store 仍必须 fail fast。
 reviewer 要求所有 shard owner 都属于 50-ms process-tree samples，并至少观察到冻结的
 并发 worker 数。worker recycle（工作进程回收）不得改变 shard 顺序、solver、backend、
 objective、validator、event schema 或失败语义。
