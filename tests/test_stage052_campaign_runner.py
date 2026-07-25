@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import plistlib
 import subprocess
 from dataclasses import replace
@@ -17,6 +18,7 @@ from evrptw.experiments import stage052_performance
 from evrptw.experiments.stage052_performance import (
     _build_campaign_batch_tasks,
     _logical_event_row_count,
+    _run_v2_tasks,
     load_stage052_config,
 )
 from evrptw.stage052_campaign import (
@@ -56,6 +58,7 @@ from evrptw.stage052_evidence import (
     PersistenceInterval,
     RunResourceSummary,
     Stage052PersistenceAttribution,
+    validate_worker_ownership,
 )
 from evrptw.stage052_platform import WindowsWslPowerStatus
 
@@ -64,6 +67,98 @@ def _sha256_json(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _record_stage052_worker_pid(_: object) -> list[dict[str, object]]:
+    return [{"worker_pid": os.getpid()}]
+
+
+def test_recycled_worker_ownership_allows_more_pids_than_concurrency() -> None:
+    resource = {
+        "schema_version": "stage05.2-run-resource-v2",
+        "run_label": "stage05.2_benchmark_attempt99",
+        "component": "benchmark",
+        "configured_worker_count": 2,
+        "measurement_scope": "task_scheduling_through_parent_control_preparation",
+        "status": "complete",
+        "run_wall_seconds": 10.0,
+        "sample_interval_seconds": 0.05,
+        "aggregate_peak_rss_bytes": 1024,
+        "mean_active_cores": 1.5,
+        "peak_active_cores": 2.0,
+        "sample_count": 200,
+        "parent_pid": 100,
+        "descendant_pids": [201, 202, 301],
+    }
+    manifests = [
+        {
+            "run_label": "stage05.2_benchmark_attempt99",
+            "evidence_completeness": "complete",
+            "shard_ordinal": ordinal,
+            "worker_identity": f"pid-{pid}",
+        }
+        for ordinal, pid in enumerate((201, 202, 301))
+    ]
+
+    passed, _, owners = validate_worker_ownership(
+        resource,
+        manifests,
+        expected_workers=2,
+        expected_run_label="stage05.2_benchmark_attempt99",
+        expected_component="benchmark",
+    )
+
+    assert passed
+    assert owners == (201, 202, 301)
+
+
+def test_parallel_shards_recycle_worker_after_each_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor_options: dict[str, object] = {}
+
+    class FakeFuture:
+        def result(self) -> list[dict[str, object]]:
+            return []
+
+    class RecordingExecutor:
+        def __init__(self, **options: object) -> None:
+            executor_options.update(options)
+
+        def submit(self, *_: object) -> FakeFuture:
+            return FakeFuture()
+
+        def shutdown(self, *, wait: bool) -> None:
+            assert wait
+
+    tasks = [
+        SimpleNamespace(instance_name="c101C5", seed=2014),
+        SimpleNamespace(instance_name="c101C5", seed=2015),
+    ]
+    monkeypatch.setattr(stage052_performance, "ProcessPoolExecutor", RecordingExecutor)
+    monkeypatch.setattr(stage052_performance, "get_context", lambda _: object())
+    monkeypatch.setattr(stage052_performance, "as_completed", lambda futures: iter(futures))
+
+    assert _run_v2_tasks(tasks, worker_count=2) == []  # type: ignore[arg-type]
+    assert executor_options["max_workers"] == 2
+    assert executor_options["max_tasks_per_child"] == 1
+
+
+def test_parallel_shards_use_a_fresh_spawned_pid_per_task() -> None:
+    tasks = [
+        SimpleNamespace(instance_name="c101C5", seed=seed)
+        for seed in range(2014, 2020)
+    ]
+
+    rows = _run_v2_tasks(
+        tasks,  # type: ignore[arg-type]
+        worker_count=2,
+        _task_runner=_record_stage052_worker_pid,  # type: ignore[arg-type]
+    )
+
+    worker_pids = [row["worker_pid"] for row in rows]
+    assert len(worker_pids) == len(tasks)
+    assert len(set(worker_pids)) == len(tasks)
 
 
 def test_windows_wsl_snapshot_uses_windows_power_and_wsl_load(
