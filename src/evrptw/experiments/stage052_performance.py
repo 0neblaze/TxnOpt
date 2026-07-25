@@ -29,6 +29,8 @@ from queue import Full, Queue
 from typing import Any, Protocol
 
 import orjson
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from evrptw.alns import ALNSResult, solve_alns
 from evrptw.artifacts import (
@@ -1838,6 +1840,7 @@ def _run_benchmark_batch(
         "execution_backend": campaign_config.selected_backend,
         "worker_count": campaign_config.selected_workers,
         "worker_process_lifecycle": "one_shard_per_spawned_process",
+        "worker_runtime_warmup": "in_memory_arrow_zstd1",
         "native_profile": campaign_config.native_profile,
         "native_kernel_config": config.native_kernels.to_dict(),
         "repository_revision": repository_revision,
@@ -3097,6 +3100,7 @@ def _run_v2_tasks(
         max_workers=worker_count,
         mp_context=get_context("spawn"),
         max_tasks_per_child=1,
+        initializer=_warm_v2_worker_artifact_runtime,
     )
     futures: dict[Any, _ShardTask] = {}
     try:
@@ -3138,6 +3142,31 @@ def _run_v2_tasks(
         raise
     executor.shutdown(wait=True)
     return rows
+
+
+def _warm_v2_worker_artifact_runtime() -> None:
+    """Initialize Arrow/Zstandard kernels before measured shard persistence."""
+
+    row_count = 1_024
+    table = pa.table(
+        {
+            "event_id": pa.array(range(row_count), type=pa.int64()),
+            "kind": pa.array(["warmup"] * row_count, type=pa.string()),
+            "value": pa.array([0.0] * row_count, type=pa.float64()),
+            "accepted": pa.array([False] * row_count, type=pa.bool_()),
+        }
+    )
+    sink = pa.BufferOutputStream()
+    pq.write_table(
+        table,
+        sink,
+        compression="zstd",
+        compression_level=1,
+        use_dictionary=False,
+        write_statistics=False,
+        row_group_size=row_count,
+    )
+    sink.close()
 
 
 def _run_v2_shard_task(

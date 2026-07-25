@@ -142,6 +142,10 @@ def test_parallel_shards_recycle_worker_after_each_task(
     assert _run_v2_tasks(tasks, worker_count=2) == []  # type: ignore[arg-type]
     assert executor_options["max_workers"] == 2
     assert executor_options["max_tasks_per_child"] == 1
+    assert (
+        executor_options["initializer"]
+        is stage052_performance._warm_v2_worker_artifact_runtime
+    )
 
 
 def test_parallel_shards_use_a_fresh_spawned_pid_per_task() -> None:

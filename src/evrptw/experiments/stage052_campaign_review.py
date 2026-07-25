@@ -2565,6 +2565,7 @@ def _validate_batch_metadata(
         and metadata.get("worker_count") == campaign.selected_workers
         and metadata.get("worker_process_lifecycle")
         == "one_shard_per_spawned_process"
+        and metadata.get("worker_runtime_warmup") == "in_memory_arrow_zstd1"
         and metadata.get("native_profile") == campaign.native_profile
         and metadata.get("storage_policy_version") == campaign.storage_policy_version
         and metadata.get("screening_schema_version") == campaign.screening_schema_version

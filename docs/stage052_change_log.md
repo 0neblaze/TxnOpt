@@ -26,6 +26,10 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   workers，但每个 `(instance, seed)` shard 使用新的 `spawn` worker，进程退出后回收
   Python/native allocator。batch metadata 新增
   `worker_process_lifecycle=one_shard_per_spawned_process`，independent reviewer
+  并在每个新 worker 的计时区间开始前执行
+  `worker_runtime_warmup=in_memory_arrow_zstd1`，消除 fresh-spawn 引入的
+  PyArrow/Zstandard 一次性初始化成本；warmup 仅写入内存 buffer，不生成、
+  删除或聚合任何审计事件。
   必须核对该合同；worker ownership 接受多于 configured concurrency 的真实、已采样
   owner PID，但少于四个仍 fail fast。
 - 当前 G Benchmark Pilot/Formal 的 producer/reviewer batch resource gate 调整为

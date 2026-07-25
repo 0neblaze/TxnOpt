@@ -581,6 +581,10 @@ this repository or one of its subdirectories.
   `(instance, seed)` shard uses a fresh `spawn` worker with
   `max_tasks_per_child=1`; cross-shard allocator reuse is forbidden. Batch
   metadata records `worker_process_lifecycle=one_shard_per_spawned_process`.
+  Each fresh worker performs an in-memory Arrow/Zstandard initialization before
+  measured shard persistence and records
+  `worker_runtime_warmup=in_memory_arrow_zstd1`; this warmup never replaces,
+  drops, aggregates, or skips audit events.
   Worker ownership uses real sampled PIDs and cumulative process CPU samples,
   permits more owner PIDs than configured concurrency, and still requires at
   least the configured worker count. Worker failure aborts without fallback.

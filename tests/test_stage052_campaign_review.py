@@ -1213,6 +1213,7 @@ def _build_complete_pilot_campaign(
         "execution_backend": "native_cpu",
         "worker_count": 2,
         "worker_process_lifecycle": "one_shard_per_spawned_process",
+        "worker_runtime_warmup": "in_memory_arrow_zstd1",
         "native_profile": "stage05.2-native-kernels-v1",
         "native_kernel_config": predecessor_metadata["native_kernel_config"],
         "repository_revision": predecessor_metadata["repository_revision"],
