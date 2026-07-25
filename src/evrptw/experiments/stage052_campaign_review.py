@@ -5114,6 +5114,20 @@ def review_stage052_campaign(
         "campaign_prerequisite_review_sha256": prerequisite.get(
             "campaign_prerequisite_review_sha256"
         ),
+        "storage_migration_sha256": (
+            _sha256(storage_migration_path)
+            if storage_migration_path is not None
+            else None
+        ),
+        "storage_migration_sidecar_sha256": (
+            _sha256(
+                storage_migration_path.with_suffix(
+                    f"{storage_migration_path.suffix}.sha256"
+                )
+            )
+            if storage_migration_path is not None
+            else None
+        ),
         **selection_fields,
         "gates": gates,
     }

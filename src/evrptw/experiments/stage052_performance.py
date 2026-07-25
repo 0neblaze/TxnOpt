@@ -455,6 +455,7 @@ def run_stage052(
     prerequisite_dir: Path | None = None,
     prerequisite_dirs: Mapping[str, Path] | None = None,
     retention_registry_path: Path = _RETENTION_REGISTRY,
+    storage_migration_path: Path | None = None,
 ) -> dict[str, Path]:
     """Execute one canonical Stage 5.2 component attempt."""
 
@@ -483,6 +484,14 @@ def run_stage052(
     component_prerequisite = None
     component_prerequisites: dict[str, object] = {}
     resolved_prerequisite_dirs: dict[str, Path] = {}
+    storage_migration: dict[str, object] | None = None
+    storage_migration_sha256 = ""
+    if storage_migration_path is not None:
+        from evrptw.stage052_storage_migration import load_signed_storage_migration
+
+        resolved_migration = _resolve(root, storage_migration_path)
+        storage_migration = load_signed_storage_migration(resolved_migration)
+        storage_migration_sha256 = _sha256(resolved_migration)
     job_parallel_selection = None
     accelerator_decision_payload: dict[str, object] | None = None
     if contract.prerequisites:
@@ -517,10 +526,31 @@ def run_stage052(
             else:
                 resolved_input = ordinary_input
             resolved_prerequisite_dirs[requirement.role] = resolved_input
-            identities[requirement.role] = verify_stage052_evidence_input(
-                resolved_input,
-                requirement,
-            )
+            if storage_migration is not None:
+                review_manifest = json.loads(
+                    (resolved_input / "review" / "review_manifest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                if (
+                    not isinstance(review_manifest, dict)
+                    or requirement.component is not Stage052Component.BENCHMARK
+                    or review_manifest.get("storage_migration_sha256")
+                    != storage_migration_sha256
+                ):
+                    raise ArtifactIntegrityError(
+                        "prerequisite review does not bind the supplied storage migration"
+                    )
+                identities[requirement.role] = verify_stage052_evidence_input(
+                    resolved_input,
+                    requirement,
+                    storage_migration=storage_migration,
+                )
+            else:
+                identities[requirement.role] = verify_stage052_evidence_input(
+                    resolved_input,
+                    requirement,
+                )
             if requirement.requires_current_chain_identity:
                 verify_stage052_campaign_lock(
                     _resolve(root, config.campaign_lock_manifest),
@@ -5554,6 +5584,7 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--prerequisite-dir", type=Path)
     parser.add_argument("--prerequisite", action="append", default=[])
+    parser.add_argument("--storage-migration", type=Path)
     arguments = parser.parse_args()
     named_prerequisites = _parse_prerequisite_bindings(arguments.prerequisite)
     outputs = run_stage052(
@@ -5565,6 +5596,7 @@ def main() -> int:
         worker_count=arguments.workers,
         prerequisite_dir=arguments.prerequisite_dir,
         prerequisite_dirs=named_prerequisites,
+        storage_migration_path=arguments.storage_migration,
     )
     for name, path in outputs.items():
         print(f"{name}: {path}")

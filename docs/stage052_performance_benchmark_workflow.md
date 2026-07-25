@@ -277,6 +277,9 @@ campaign 与标准 raw manifest SHA-256，以及每个归档 batch 的目录 che
 source snapshot、solver、backend 和科学语义仍须完全一致。reviewer source 与
 producer source snapshot 必须作为两个独立输入验证，不得用新 reviewer checkout
 冒充历史 producer snapshot。
+通过迁移证明完成的 campaign review 必须在 review manifest 顶层发布 attestation
+及 sidecar SHA-256；后续 Formal producer 只有在显式提供相同证明且 SHA-256 与
+accepted Pilot review 完全一致时，才可将该 Pilot 作为 current-chain prerequisite。
 
 Windows/WSL2 formal reviewer 固定通过
 `python -m evrptw.stage052_review_service launch` 启动 transient

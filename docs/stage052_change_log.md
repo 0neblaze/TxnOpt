@@ -780,3 +780,7 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   snapshot，新增 `reviewer_working_directory` 绑定当前 reviewer snapshot。两者分别验证
   clean/read-only source 和 wheel provenance，禁止把 reviewer revision 重复填入
   producer 字段。
+- successful campaign review 在顶层 manifest 发布 migration attestation 及 sidecar
+  SHA-256。Formal producer 必须显式提供同一 `--storage-migration`，并在 current-chain
+  prerequisite replay 前核对该 SHA-256；未绑定、替换或用于非-Benchmark prerequisite
+  的证明均 fail fast。
