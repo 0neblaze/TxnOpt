@@ -115,7 +115,8 @@ def test_recycled_worker_ownership_allows_more_pids_than_concurrency() -> None:
 def test_parallel_shards_recycle_worker_after_each_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executor_options: dict[str, object] = {}
+    events: list[str] = []
+    executor_options: list[dict[str, object]] = []
 
     class FakeFuture:
         def result(self) -> list[dict[str, object]]:
@@ -123,29 +124,45 @@ def test_parallel_shards_recycle_worker_after_each_task(
 
     class RecordingExecutor:
         def __init__(self, **options: object) -> None:
-            executor_options.update(options)
+            self.ordinal = len(executor_options) + 1
+            executor_options.append(options)
+            events.append(f"create:{self.ordinal}")
 
         def submit(self, *_: object) -> FakeFuture:
+            events.append(f"submit:{self.ordinal}")
             return FakeFuture()
 
         def shutdown(self, *, wait: bool) -> None:
             assert wait
+            events.append(f"shutdown:{self.ordinal}")
 
     tasks = [
         SimpleNamespace(instance_name="c101C5", seed=2014),
         SimpleNamespace(instance_name="c101C5", seed=2015),
+        SimpleNamespace(instance_name="c101C5", seed=2016),
     ]
     monkeypatch.setattr(stage052_performance, "ProcessPoolExecutor", RecordingExecutor)
     monkeypatch.setattr(stage052_performance, "get_context", lambda _: object())
     monkeypatch.setattr(stage052_performance, "as_completed", lambda futures: iter(futures))
 
     assert _run_v2_tasks(tasks, worker_count=2) == []  # type: ignore[arg-type]
-    assert executor_options["max_workers"] == 2
-    assert executor_options["max_tasks_per_child"] == 1
-    assert (
-        executor_options["initializer"]
-        is stage052_performance._warm_v2_worker_artifact_runtime
-    )
+    assert events == [
+        "create:1",
+        "submit:1",
+        "submit:1",
+        "shutdown:1",
+        "create:2",
+        "submit:2",
+        "shutdown:2",
+    ]
+    assert len(executor_options) == 2
+    for options in executor_options:
+        assert options["max_workers"] == 2
+        assert options["max_tasks_per_child"] == 1
+        assert (
+            options["initializer"]
+            is stage052_performance._warm_v2_worker_artifact_runtime
+        )
 
 
 def test_parallel_shards_use_a_fresh_spawned_pid_per_task() -> None:

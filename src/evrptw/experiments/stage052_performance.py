@@ -3096,39 +3096,51 @@ def _run_v2_tasks(
                 raise RuntimeError(f"runtime guard aborted Stage 5.2 work: {reason}")
             rows.extend(task_runner(task))
         return rows
-    executor = ProcessPoolExecutor(
-        max_workers=worker_count,
-        mp_context=get_context("spawn"),
-        max_tasks_per_child=1,
-        initializer=_warm_v2_worker_artifact_runtime,
-    )
+    executor: ProcessPoolExecutor | None = None
     futures: dict[Any, _ShardTask] = {}
     try:
-        futures = {executor.submit(task_runner, task): task for task in tasks}
-        if abort_reason is None:
-            for future in as_completed(futures):
-                rows.extend(future.result())
-        else:
-            pending = set(futures)
-            while pending:
-                reason = abort_reason()
-                if reason is not None:
-                    raise RuntimeError(f"runtime guard aborted Stage 5.2 work: {reason}")
-                completed, pending = wait(
-                    pending,
-                    timeout=0.5,
-                    return_when=FIRST_COMPLETED,
-                )
-                for future in completed:
+        for offset in range(0, len(tasks), worker_count):
+            reason = abort_reason() if abort_reason is not None else None
+            if reason is not None:
+                raise RuntimeError(f"runtime guard aborted Stage 5.2 work: {reason}")
+            wave = tasks[offset : offset + worker_count]
+            executor = ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=get_context("spawn"),
+                max_tasks_per_child=1,
+                initializer=_warm_v2_worker_artifact_runtime,
+            )
+            futures = {executor.submit(task_runner, task): task for task in wave}
+            if abort_reason is None:
+                for future in as_completed(futures):
                     rows.extend(future.result())
+            else:
+                pending = set(futures)
+                while pending:
+                    reason = abort_reason()
+                    if reason is not None:
+                        raise RuntimeError(
+                            f"runtime guard aborted Stage 5.2 work: {reason}"
+                        )
+                    completed, pending = wait(
+                        pending,
+                        timeout=0.5,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    for future in completed:
+                        rows.extend(future.result())
+            executor.shutdown(wait=True)
+            executor = None
+            futures = {}
     except BaseException as error:
         for future in futures:
             future.cancel()
         abort_error: BaseException | None = None
-        try:
-            abort_process_executor(executor)
-        except BaseException as observed_abort_error:
-            abort_error = observed_abort_error
+        if executor is not None:
+            try:
+                abort_process_executor(executor)
+            except BaseException as observed_abort_error:
+                abort_error = observed_abort_error
         failure_error: BaseException = error
         if abort_error is not None:
             failure_error = RuntimeError(
@@ -3140,7 +3152,6 @@ def _run_v2_tasks(
         if abort_error is not None:
             raise failure_error from error
         raise
-    executor.shutdown(wait=True)
     return rows
 
 

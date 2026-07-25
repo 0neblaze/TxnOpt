@@ -621,6 +621,11 @@ this repository or one of its subdirectories.
   first complete window, while AC power, low power mode, and total load remain
   immediate continuous hard gates. Runtime samples are retained for failed
   batches as partial replay evidence.
+- G campaign producer dispatches contiguous waves of at most the frozen worker
+  count. Every spawned worker processes exactly one shard, and the whole wave
+  pool must shut down before the next wave is created. This preserves four-way
+  concurrency and unique per-shard PIDs while preventing retiring and warming
+  workers from overlapping in the audited total `load1`.
 - G may consume accepted F evidence from an older revision only when the
   current revision is its Git descendant and the entire intervening diff is
   confined to the explicit G campaign runner, artifact-persistence adapter,

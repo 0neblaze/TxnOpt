@@ -8,6 +8,24 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-26：G46 fresh-worker wave overlap 的 load1 根因修复
+
+- Formal `stage05.2_benchmark_attempt46` 通过完整 preflight，并在 batch0001
+  完成 396/396 shards 后以 `load1 exceeded 8.0` fail fast。失败 runtime evidence
+  完整记录 146 次采样：`maximum_load1=8.1640625`，排除 campaign descendants 后的
+  `maximum_unrelated_process_average_cores=0.8031696417825888`，AC power 稳定且
+  low-power mode 始终关闭。Attempt46 不续跑、不导入任何 shard。
+- 根因是 `max_tasks_per_child=1` 虽保证每 shard 唯一 PID，但一个长寿命
+  `ProcessPoolExecutor` 会在旧 worker 退出期间初始化 replacement worker；快速小
+  shards 连续完成时，retiring/warmup 生命周期短暂重叠，使 campaign 自身总
+  `load1` 超过固定的 `4.0 + selected_workers = 8.0`，并非外部主机负载。
+- Producer 现在把有序 shards 分成最多四个一组的连续 waves。每一 wave 保持冻结的
+  四 worker 并发、`spawn`、`max_tasks_per_child=1` 和 in-memory Arrow/Zstd warmup，
+  但必须完整 shutdown 后才创建下一 wave。total-load、unrelated-process、AC power
+  和 low-power gates 均不放宽；solver、objective、validator、backend、事件和
+  persistence 合同不变。由于这是 producer 调度修复，必须先用新标签重跑 Pilot 并
+  通过独立 review，才能启动新的 Formal。
+
 ## 2026-07-26：Formal attempt37 producer 逐 shard worker 回收
 
 - `stage05.2_benchmark_attempt37` 完成并跨卷复验归档 batch0001--batch0006，

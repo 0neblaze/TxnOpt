@@ -134,6 +134,10 @@ Single-pass replay 同时接受显式 `deadline_boundary` event，以及
 reviewer 要求所有 shard owner 都属于 50-ms process-tree samples，并至少观察到冻结的
 并发 worker 数。worker recycle（工作进程回收）不得改变 shard 顺序、solver、backend、
 objective、validator、event schema 或失败语义。
+Producer 按冻结的 worker 数把 shards 切成连续 waves（波次）；每一 wave 的
+spawn pool 必须在下一 wave 创建前完整 shutdown。每个 worker 仍只处理一个 shard，
+因此每个 shard 保持唯一 PID，同时避免旧 worker 退出与新 worker 初始化重叠而把
+campaign 自身负载重复计入 `load1`。
 
 选择规则：
 
