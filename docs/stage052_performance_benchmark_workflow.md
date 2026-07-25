@@ -246,13 +246,28 @@ page-cache 放大。spool 只保存 comparison bundle（对照证据）；candid
 证据）边读边按主键 point lookup（点查询）和比较，不得同时保存两套完整 payload。
 left-only 记录由每个 axis 的最终 ordinal tail（序号尾部）确定，禁止用大规模 DELETE
 制造 SQLite 脏页。字段差异先流式写入每个 axis 的有序临时 fragment（片段），再按
-identity 顺序拼接；SQLite、fragment、最终 CSV 和发布副本必须周期性 `fsync` 并使用
-`POSIX_FADV_DONTNEED` 释放已落盘 page cache。SQLite 建库必须按记录窗口提交并释放
-脏页；fragment 使用跨全部 axis 的全局字节窗口，left-only tail 复用相同窗口。raw
-manifest hashing 和 Parquet/JSONL iterator（迭代器）在文件生命周期结束时也必须释放
-source page cache（源页缓存）；禁止携带 BLOB 的 temp sort。
+identity 顺序拼接；SQLite、fragment、最终 CSV 和发布副本必须周期性 `fsync`。SQLite
+建库必须按记录窗口提交并释放脏页；fragment 使用跨全部 axis 的全局字节窗口，
+left-only tail 复用相同窗口。raw manifest hashing 和 Parquet/JSONL iterator
+（迭代器）在文件生命周期结束时也必须处理 source page cache（源页缓存）；禁止携带
+BLOB 的 temp sort。原生 Linux 使用 `POSIX_FADV_DONTNEED` 执行 advisory release；
+Windows/WSL2
+不得调用它，因为当前正式主机已复现该调用后的错误 page-cache read。WSL reviewer
+依靠逐 bundle/逐 shard 新进程退出释放进程 RSS，并继续执行 `fsync`、SQLite
+`shrink_memory` 与 scratch cleanup；禁止为了模拟 page-cache release 而降低审计范围。
 `semantic_mismatches.csv` 必须直接流式写临时文件，并通过流式 hash/copy 发布，禁止
 在 `StringIO` 或 `bytes` 中累积完整 mismatch 输出。成功或失败后都删除临时数据。
+Benchmark campaign reviewer 对 campaign 内每个 shard 同样使用一个全新的、严格串行的
+`spawn` 子进程；不得用长寿命 pool 复用 allocator state。每个 child 必须重读 signed
+batch/shard manifest，并在一次 logical event pass 中同时完成 persistence ledger、
+cache/exact/deadline transaction 和 global-best/checkpoint replay。父进程只接收有界
+per-axis summary、checkpoint、计数与 resource telemetry，不得接收 raw event、Arrow
+table、route dictionary 或 screening definition。child failure 不得回退到 parent
+重放；scratch 必须在 child 退出前验证清理，parent/child RSS、PID、event count、
+single-pass count 和 cleanup state 必须写入外部 progress log。child summary 必须是
+JSON-safe（可安全 JSON 序列化）的有界对象并携带 run/batch/shard/instance/seed 身份；
+parent 必须逐字段核对。失败路径同样必须写 child PID/peak RSS、parent RSS、耗时和
+cleanup state，残留 scratch 在 fail fast 前清除并记录，不得静默重试。
 
 Windows/WSL2 formal reviewer 固定通过
 `python -m evrptw.stage052_review_service launch` 启动 transient

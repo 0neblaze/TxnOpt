@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ from evrptw.experiments.stage052_campaign_review import (
     _read_bounded_compact_trace,
     audit_campaign_planning,
     audit_streamed_events,
+    replay_streamed_shard_events,
     review_stage052_campaign,
     review_status_for_scope,
     summarize_streamed_global_bests,
@@ -556,6 +558,177 @@ def test_campaign_reviewer_recomputes_async_batch_ledger() -> None:
         campaign_review_module._audit_async_persistence_ledgers(  # noqa: SLF001
             events, trace_axes
         )
+
+
+def test_campaign_reviewer_replays_each_logical_event_stream_once() -> None:
+    instance = parse_schneider(Path("data/schneider/c101C5.txt"))
+    baseline = json.loads(
+        Path(
+            "experiments/baselines/stage00/solutions/"
+            "c101C5-alns_exact_charging-2014.json"
+        ).read_text(encoding="utf-8")
+    )
+    routes = baseline["routes"]
+    report = validate_routes(instance, routes)
+    assert report.feasible
+    objective = SolutionObjective.from_report(instance, report).key
+    customer_names = {customer.name for customer in instance.customers}
+    full_route_keys = [
+        "route:" + "|".join(f"{len(str(node))}:{node}" for node in route)
+        for route in routes
+    ]
+    route_keys = [
+        "route:"
+        + "|".join(
+            f"{len(str(node))}:{node}"
+            for node in route
+            if str(node) in customer_names
+        )
+        for route in routes
+    ]
+    events = [
+        {
+            "event_id": 1,
+            "event_type": "candidate_state",
+            "benchmark_axis": "wall_clock_30",
+            "lane": "wall_clock_30:legacy",
+            "iteration": 1,
+            "status": "accepted",
+            "candidate_feasible": True,
+            "accepted": True,
+            "global_best": True,
+            "candidate_vehicle_delta": -1,
+            "candidate_route_keys": route_keys,
+            "candidate_full_route_keys": full_route_keys,
+            "candidate_objective_key": list(objective),
+            "timestamp_seconds": 0.25,
+        }
+    ]
+    digest = hashlib.sha256()
+    digest.update(
+        orjson.dumps(
+            campaign_review_module._pipeline_event_token_from_logical_row(  # noqa: SLF001
+                events[0]
+            )
+        )
+        + b"\n"
+    )
+    trace_axes = {
+        "wall_clock_30": {
+            "persistence_pipeline": {
+                "batch_ledger": [
+                    {
+                        "ordinal": 0,
+                        "row_count": 1,
+                        "event_token_sha256": digest.hexdigest(),
+                    }
+                ]
+            }
+        }
+    }
+    legacy_audit = audit_streamed_events(events, {"wall_clock_30": 30})
+    campaign_review_module._audit_async_persistence_ledgers(  # noqa: SLF001
+        events, trace_axes
+    )
+    legacy_histories = summarize_streamed_global_bests(
+        events,
+        {"wall_clock_30": 30},
+        instance=instance,
+    )
+
+    class SingleUseEvents:
+        def __init__(self) -> None:
+            self.iterations = 0
+
+        def __iter__(self) -> Iterator[dict[str, object]]:
+            self.iterations += 1
+            if self.iterations != 1:
+                raise AssertionError("logical event stream was replayed more than once")
+            yield from events
+
+    source = SingleUseEvents()
+    replay = replay_streamed_shard_events(
+        source,
+        trace_axes,
+        {"wall_clock_30": 30},
+        instance=instance,
+    )
+
+    assert source.iterations == 1
+    assert replay.audit.passed is True
+    assert replay.audit.event_count == 1
+    assert replay.audit == legacy_audit
+    assert replay.global_best_histories == legacy_histories
+    assert replay.global_best_histories["wall_clock_30"][0].objective_key == objective
+    assert replay.logical_pass_count == 1
+
+
+def test_spawned_shard_summary_rejects_raw_payload_fields() -> None:
+    summary = campaign_review_module._ShardReplayProcessResult(  # noqa: SLF001
+        run_label="stage05.2_benchmark_attempt99",
+        batch_id="batch0001",
+        shard_id="shard0001",
+        instance="c101C5",
+        seed=2014,
+        replay_rows=[],
+        checkpoints=[],
+        logical_events=1,
+        child_pid=123,
+        child_peak_rss_bytes=456,
+        pyarrow_allocated_bytes_after=0,
+        scratch_cleaned=True,
+        elapsed_seconds=0.5,
+    )
+    payload = json.loads(summary.to_json())
+    payload["raw_events"] = [{"event_id": 1}]
+
+    with pytest.raises(ArtifactIntegrityError, match="summary fields"):
+        campaign_review_module._ShardReplayProcessResult.from_json(  # noqa: SLF001
+            json.dumps(payload)
+        )
+
+
+def test_failed_spawned_shard_is_not_retried_and_cleans_scratch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    batch_dir = tmp_path / "batch0001"
+    batch_dir.mkdir()
+    progress_path = tmp_path / "review-progress.jsonl"
+    monkeypatch.setenv("STAGE052_REVIEW_TMPDIR", str(scratch_root))
+    monkeypatch.setenv("STAGE052_REVIEW_PROGRESS_LOG", str(progress_path))
+
+    with pytest.raises(ArtifactIntegrityError, match="sidecar"):
+        campaign_review_module._replay_shard_in_fresh_process(  # noqa: SLF001
+            batch_dir=batch_dir,
+            shard_relative_path="c101C5/2014/missing_shard_manifest.json",
+            benchmark_dir=Path("data/schneider"),
+            scope="pilot",
+            run_label="stage05.2_benchmark_attempt99",
+            batch_id="batch0001",
+            shard_id="shard0001",
+            expected_instance="c101C5",
+            expected_seed=2014,
+        )
+
+    progress = [
+        json.loads(line)
+        for line in progress_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert sum(row["event"] == "campaign_shard_replay_start" for row in progress) == 1
+    child_failure = next(
+        row for row in progress if row["event"] == "campaign_shard_replay_child_failed"
+    )
+    parent_failure = next(
+        row for row in progress if row["event"] == "campaign_shard_replay_failed"
+    )
+    assert child_failure["child_pid"] != parent_failure["parent_pid"]
+    assert child_failure["scratch_cleaned"] is True
+    assert parent_failure["scratch_cleaned"] is True
+    assert parent_failure["scratch_cleanup_recovered"] is True
+    assert list(scratch_root.iterdir()) == []
 
 
 def test_campaign_reviewer_restores_prepared_screening_empty_reason_token() -> None:
@@ -1156,7 +1329,43 @@ def _build_complete_pilot_campaign(
                 "exact_started_calls": 0,
                 "exact_completed_calls": 0,
                 "screening_statistics": {"native_protocol_fallbacks": 0},
-            }
+            },
+            "persistence_pipeline": {
+                "mode": "bounded_async_thread",
+                "queue_max_batches": 1,
+                "writer_thread_switch_interval_seconds": (
+                    campaign_review_module
+                    .STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS
+                ),
+                "submitted_batches": 1,
+                "completed_batches": 1,
+                "writer_active_nanoseconds": 1,
+                "writer_cpu_nanoseconds": 1,
+                "producer_active_nanoseconds": 1,
+                "persistence_union_nanoseconds": 1,
+                "solver_persistence_union_nanoseconds": 1,
+                "solver_persistence_critical_path_nanoseconds": 1,
+                "solver_producer_active_nanoseconds": 1,
+                "solver_writer_cpu_nanoseconds": 1,
+                "producer_wait_nanoseconds": 0,
+                "peak_queued_batches": 1,
+                "batch_ledger": [
+                    {
+                        "ordinal": 0,
+                        "row_count": len(critical_events),
+                        "event_token_sha256": hashlib.sha256(
+                            b"".join(
+                                orjson.dumps(
+                                    campaign_review_module
+                                    ._pipeline_event_token_from_logical_row(event)  # noqa: SLF001
+                                )
+                                + b"\n"
+                                for event in critical_events
+                            )
+                        ).hexdigest(),
+                    }
+                ],
+            },
         }
         shard.finalize(
             raw_payload={"axes": {"wall_clock_30": raw_axis}},
@@ -2719,6 +2928,8 @@ def test_noncanonical_single_batch_pilot_cannot_receive_ready_review(
         "evrptw.experiments.stage052_campaign_review.verify_stage052_evidence_input",
         lambda _raw_dir, _requirement: synthetic_identity,
     )
+    progress_path = tmp_path / "review-progress.jsonl"
+    monkeypatch.setenv("STAGE052_REVIEW_PROGRESS_LOG", str(progress_path))
 
     outputs = review_stage052_campaign(
         campaign_dir=campaign,
@@ -2734,3 +2945,17 @@ def test_noncanonical_single_batch_pilot_cannot_receive_ready_review(
     assert review["status"] == "NOT_READY"
     assert review["selected_optimization_profile"] == "native"
     assert review["gates"]["campaign_planning_replay"]["passed"] is False
+    progress = [
+        json.loads(line)
+        for line in progress_path.read_text(encoding="utf-8").splitlines()
+    ]
+    completed = [
+        row for row in progress if row["event"] == "campaign_shard_replay_complete"
+    ]
+    assert len(completed) == 36
+    assert len({row["child_pid"] for row in completed}) == 36
+    assert all(row["logical_pass_count"] == 1 for row in completed)
+    assert all(row["scratch_cleaned"] is True for row in completed)
+    assert all(row["child_peak_rss_bytes"] > 0 for row in completed)
+    parent_rss = [int(row["parent_rss_bytes"]) for row in completed]
+    assert max(parent_rss) - min(parent_rss) < 256 * 1024 * 1024

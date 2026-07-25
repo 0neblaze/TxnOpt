@@ -655,6 +655,16 @@ this repository or one of its subdirectories.
   objective/validator and exact/cache/candidate/deadline semantics, resource
   and persistence gates, power/load/root/runtime provenance, BKS incompatibility,
   and the absence of gap columns.
+- Benchmark campaign review replays each shard in a fresh, strictly serial
+  `spawn` child and never reuses a process pool across shards. One logical event
+  pass must jointly replay the async persistence ledger, exact/cache/deadline
+  transactions, and global-best/checkpoint history. The parent receives only
+  bounded JSON-safe summaries and telemetry carrying exact
+  run/batch/shard/instance/seed identity; raw events, Arrow tables, route
+  dictionaries, and screening definitions remain child-local. Child failure has
+  no parent fallback or retry, and both success and failure write
+  PID/RSS/event-count/single-pass/scratch-cleanup evidence to the external
+  progress log. Residual scratch is removed and reported before failure returns.
 - Stage 5.2 storage replay hashes canonical records as they are read. It must
   never accumulate a complete axis or bundle of event dictionaries. Multiple
   raw bundles are replayed strictly in input order, one fresh spawned process
@@ -668,8 +678,11 @@ this repository or one of its subdirectories.
   spooled: candidate records point-query comparison rows while left-only rows
   are derived from each axis's final ordinal tail; bulk DELETEs that dirty the
   SQLite file are forbidden. Per-axis fragments, the final mismatch CSV, and
-  publication copies periodically fsync and release clean page cache with
-  `POSIX_FADV_DONTNEED`. SQLite construction commits/releases on a bounded
+  publication copies periodically fsync. Native Linux releases clean page cache
+  with `POSIX_FADV_DONTNEED`; Windows/WSL2 must not call that advisory because
+  the formal host reproduced incorrect page-cache reads after it. WSL relies on
+  fresh process exit, SQLite `shrink_memory`, and scratch cleanup without
+  weakening replay. SQLite construction commits/releases on a bounded
   record window; fragment release uses one aggregate byte window shared by
   all axes and the left-only tail. Raw manifest hashing and Parquet/JSONL
   iterators release their source page cache at file-lifecycle boundaries.

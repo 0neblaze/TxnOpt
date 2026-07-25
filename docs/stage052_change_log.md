@@ -8,6 +8,37 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-25：G26 campaign reviewer 单遍重放与逐 shard 内存隔离
+
+- `stage05.2_benchmark_attempt26` producer 已完整生成 36/36 Pilot axes，aggregate
+  persistence ratio 为 `0.33339944391668525`，但首次 independent review 在
+  batch0003 只完成 26 个 shard 后达到固定 5.5-GiB aggregate RSS guard，发布
+  `NOT_READY`。其余 geometry、persistence、resource、runtime 和 publication failure
+  是 replay 未完成后的级联结果，raw producer evidence 未被判定为科学失败。
+- 根因是 campaign reviewer 在同一长寿命进程内对每个 shard 的 logical event stream
+  分别执行 persistence ledger、transaction/deadline 和 global-best 三次完整重建。
+  `ArtifactReader.iter_events` 每次都重建 route dictionary 与 screening definition
+  disk-backed stores；PyArrow、SQLite 与 Python allocator 高水位跨 shard 保留，违反
+  reviewer 文档已经要求的 fresh spawned bundle isolation。
+- reviewer 现在用一个 incremental accumulator 在一次 logical pass 内同时完成三类
+  审计。每个 shard 严格由新的 `spawn` child process 重读 signed batch/shard manifest、
+  在独立 ext4 scratch 中重放，并只向 parent 返回 per-axis rows、checkpoints、计数和
+  resource telemetry。child 异常直接 fail fast，无 parent replay 或进程复用 fallback。
+- progress log 对每个 shard 记录 parent/child PID、RSS、PyArrow allocation、事件数、
+  单遍计数、耗时与 scratch cleanup；5.5-GiB internal guard、systemd MemoryHigh/Max、
+  raw schema、objective、validator、event surface 和 publication schema 均未改变。
+- 真实 G26 只读回归完整重放 36/36 shards 与 16,295,563 条 logical events，使用 36 个
+  唯一 child PID，耗时 376.728890604 秒；parent peak RSS 为 89,194,496 bytes，每个
+  child 结束时 PyArrow allocation 为 0，scratch 全部清理。旧失败点之后的
+  100-customer shards 也完整通过，未修改 G26 raw 或首次 `NOT_READY` generation。
+- 完整测试暴露出 WSL 上 `POSIX_FADV_DONTNEED` 对刚完成原子替换的小型 signed JSON
+  产生错误 page-cache replay；同一读取路径曾返回全零页或 systemd journal block，
+  而落盘后的最终 SHA-256 仍正确。离线 `e2fsck -f` 验证 ext4 元数据完整且 0 bad
+  blocks。平台合同现在在 WSL 明确禁用该 advisory cache-drop 优化，原生 Linux 行为
+  保持不变；该优化不计入进程 RSS，也不改变 raw/review 语义。修复后两个原故障测试
+  连续五轮通过，完整测试为 755 passed，Ruff、strict mypy 与 `git diff --check`
+  全部通过。
+
 ## 2026-07-24：G15 producer 通过 36% 门槛但独立 review 拒绝不完整 route identity
 
 - clean revision `9834400` 上的 `stage05.2_accelerator_pilot_attempt14` 已由独立

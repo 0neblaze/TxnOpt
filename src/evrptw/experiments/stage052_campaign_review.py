@@ -18,16 +18,21 @@ import re
 import shutil
 import statistics
 import subprocess
+import sys
 import tempfile
+import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any, TypeGuard
 
 import orjson
+import psutil  # type: ignore[import-untyped]
 
 from evrptw.artifacts import (
     ANYTIME_CHECKPOINT_SCHEMA,
@@ -85,6 +90,7 @@ from evrptw.stage052_evidence import (
     STAGE052_RESOURCE_SCHEMA_VERSION,
     BatchPersistenceEnvelope,
     Stage052PersistenceAttribution,
+    abort_process_executor,
     validate_worker_ownership,
     verify_stage052_campaign_gate_set,
     verify_stage052_evidence_input,
@@ -107,6 +113,7 @@ PER_WORKER_RSS_LIMIT_BYTES = 4_357_382_144
 PROCESS_TREE_RSS_LIMIT_BYTES = 12 * 1024**3
 CAMPAIGN_REVIEW_SCHEMA = "stage05.2-campaign-review-v1"
 _REVIEW_EXECUTION_ENV = "STAGE052_REVIEW_EXECUTION_RECEIPT"
+_REVIEW_PROGRESS_ENV = "STAGE052_REVIEW_PROGRESS_LOG"
 COMPACT_TRACE_SCHEMA = "stage05.2-campaign-trace-v1"
 COMPACT_TRACE_MAX_BYTES = 16 * 1024 * 1024
 MAX_STREAM_AUDIT_KEYS = 65_536
@@ -118,6 +125,12 @@ COMPACT_TRACE_SCHEMA_FINGERPRINTS = {
     "screening_occurrences": artifact_schema_fingerprint(V3_SCREENING_OCCURRENCES_SCHEMA),
     "diagnostic": artifact_schema_fingerprint(DIAGNOSTIC_SCHEMA),
 }
+
+
+def _emit_review_progress(event: str, **details: object) -> None:
+    path = os.environ.get(_REVIEW_PROGRESS_ENV)
+    if path:
+        ReviewProgressLog(Path(path)).emit(event, **details)
 
 
 def _is_int(value: object) -> TypeGuard[int]:
@@ -586,39 +599,49 @@ class _AxisEventState:
     global_bests: int = 0
 
 
-def audit_streamed_events(
-    events: Iterable[Mapping[str, object]],
-    axis_budgets: Mapping[str, int],
-) -> StreamedEventAudit:
-    """Audit ordering and transaction boundaries in one bounded event stream."""
+class _StreamedEventAuditAccumulator:
+    """Incrementally audit one bounded logical event stream."""
 
-    if not axis_budgets or any(
-        not axis or not _is_int(budget) or budget <= 0 for axis, budget in axis_budgets.items()
-    ):
-        raise ValueError("axis_budgets must contain positive integer budgets")
-    states = {axis: _AxisEventState(budget_seconds=budget) for axis, budget in axis_budgets.items()}
-    previous_event_id = 0
-    count = 0
-    failures: list[str] = []
-    observed_axes: set[str] = set()
-    cache_keys: dict[str, set[str]] = {axis: set() for axis in axis_budgets}
-    cache_misses: dict[str, set[str]] = {axis: set() for axis in axis_budgets}
-    completed_exact_keys: dict[str, set[str]] = {axis: set() for axis in axis_budgets}
-    for event in events:
-        count += 1
+    def __init__(self, axis_budgets: Mapping[str, int]) -> None:
+        if not axis_budgets or any(
+            not axis or not _is_int(budget) or budget <= 0
+            for axis, budget in axis_budgets.items()
+        ):
+            raise ValueError("axis_budgets must contain positive integer budgets")
+        self._axis_budgets = dict(axis_budgets)
+        self._states = {
+            axis: _AxisEventState(budget_seconds=budget)
+            for axis, budget in axis_budgets.items()
+        }
+        self._previous_event_id = 0
+        self._count = 0
+        self._failures: list[str] = []
+        self._observed_axes: set[str] = set()
+        self._cache_keys: dict[str, set[str]] = {axis: set() for axis in axis_budgets}
+        self._cache_misses: dict[str, set[str]] = {axis: set() for axis in axis_budgets}
+        self._completed_exact_keys: dict[str, set[str]] = {
+            axis: set() for axis in axis_budgets
+        }
+        self._stopped = False
+
+    def consume(self, event: Mapping[str, object]) -> None:
+        if self._stopped:
+            return
+        self._count += 1
         event_id = event.get("event_id")
-        if not _is_int(event_id) or event_id <= previous_event_id:
-            failures.append("event IDs are not strictly increasing")
-            break
-        previous_event_id = event_id
+        if not _is_int(event_id) or event_id <= self._previous_event_id:
+            self._failures.append("event IDs are not strictly increasing")
+            self._stopped = True
+            return
+        self._previous_event_id = event_id
         raw_axis = event.get("benchmark_axis")
         axis = str(raw_axis) if raw_axis else str(event.get("lane", "")).partition(":")[0]
-        state = states.get(axis)
+        state = self._states.get(axis)
         if state is None:
-            failures.append(f"event refers to an unknown benchmark axis: {axis}")
-            continue
+            self._failures.append(f"event refers to an unknown benchmark axis: {axis}")
+            return
         lane = str(event.get("lane", "")) or axis
-        observed_axes.add(axis)
+        self._observed_axes.add(axis)
         event_type = str(event.get("event_type", event.get("record_type", "")))
         fallback_fields = (
             event.get("native_fallback"),
@@ -631,7 +654,7 @@ def audit_streamed_events(
         )
         failure_text = str(event.get("failure_reason", "")).casefold()
         if explicit_fallback or (event_type == "execution_error" and "fallback" in failure_text):
-            failures.append(f"native/protocol fallback observed on {axis}")
+            self._failures.append(f"native/protocol fallback observed on {axis}")
 
         if event_type == "deadline_boundary":
             state.deadline_seen = True
@@ -643,22 +666,22 @@ def audit_streamed_events(
                 rel_tol=0.0,
                 abs_tol=1.0,
             ):
-                failures.append(f"deadline boundary timestamp mismatch on {axis}")
+                self._failures.append(f"deadline boundary timestamp mismatch on {axis}")
 
         if event_type == "route_evaluation":
             evaluation_id = event.get("evaluation_id")
             if not _is_int(evaluation_id) or evaluation_id != state.last_evaluation_id + 1:
-                failures.append(f"route evaluation ordering mismatch on {axis}")
+                self._failures.append(f"route evaluation ordering mismatch on {axis}")
             else:
                 state.last_evaluation_id = evaluation_id
         if event_type == "route_evaluation" and event.get("exact_started") is True:
             if lane in state.deadline_lanes:
-                failures.append(f"exact work started after deadline on {axis}")
+                self._failures.append(f"exact work started after deadline on {axis}")
             state.exact_started += 1
             started_at = _finite_number(event.get("started_at"))
             completed_at = _finite_number(event.get("completed_at"))
             if started_at is None or started_at < 0.0:
-                failures.append(f"invalid exact start time on {axis}")
+                self._failures.append(f"invalid exact start time on {axis}")
             if event.get("exact_completed") is True:
                 state.exact_completed += 1
                 if (
@@ -667,13 +690,15 @@ def audit_streamed_events(
                     or completed_at < started_at
                     or completed_at > state.budget_seconds
                 ):
-                    failures.append(f"exact completion crosses deadline on {axis}")
+                    self._failures.append(f"exact completion crosses deadline on {axis}")
                 digest = str(event.get("cache_key_digest", ""))
-                if not digest or digest not in cache_misses[axis]:
-                    failures.append(f"exact completion lacks a preceding cache miss on {axis}")
+                if not digest or digest not in self._cache_misses[axis]:
+                    self._failures.append(
+                        f"exact completion lacks a preceding cache miss on {axis}"
+                    )
                 else:
-                    cache_misses[axis].discard(digest)
-                    completed_exact_keys[axis].add(digest)
+                    self._cache_misses[axis].discard(digest)
+                    self._completed_exact_keys[axis].add(digest)
             if event.get("deadline_boundary"):
                 state.deadline_seen = True
                 state.deadline_lanes.add(lane)
@@ -682,26 +707,26 @@ def audit_streamed_events(
             operation = str(event.get("operation", ""))
             digest = str(event.get("cache_key_digest", ""))
             if lane in state.deadline_lanes and operation == "store":
-                failures.append(f"cache store observed after deadline on {axis}")
+                self._failures.append(f"cache store observed after deadline on {axis}")
             if operation == "store":
                 if not digest:
-                    failures.append(f"cache store lacks key on {axis}")
-                elif digest not in completed_exact_keys[axis]:
-                    failures.append(f"cache store precedes exact completion on {axis}")
-                completed_exact_keys[axis].discard(digest)
-                cache_keys[axis].add(digest)
+                    self._failures.append(f"cache store lacks key on {axis}")
+                elif digest not in self._completed_exact_keys[axis]:
+                    self._failures.append(f"cache store precedes exact completion on {axis}")
+                self._completed_exact_keys[axis].discard(digest)
+                self._cache_keys[axis].add(digest)
             elif operation == "evict":
-                if digest not in cache_keys[axis]:
-                    failures.append(f"cache eviction refers to an absent key on {axis}")
-                cache_keys[axis].discard(digest)
+                if digest not in self._cache_keys[axis]:
+                    self._failures.append(f"cache eviction refers to an absent key on {axis}")
+                self._cache_keys[axis].discard(digest)
             elif operation == "lookup_result":
                 if event.get("lookup_result") == "hit":
-                    if digest and digest not in cache_keys[axis]:
-                        failures.append(f"cache hit precedes store on {axis}")
+                    if digest and digest not in self._cache_keys[axis]:
+                        self._failures.append(f"cache hit precedes store on {axis}")
                 elif event.get("lookup_result") == "miss":
                     if not digest:
-                        failures.append(f"cache miss lacks key on {axis}")
-                    cache_misses[axis].add(digest)
+                        self._failures.append(f"cache miss lacks key on {axis}")
+                    self._cache_misses[axis].add(digest)
 
         if event_type == "candidate_state":
             accepted = event.get("accepted") is True
@@ -709,65 +734,101 @@ def audit_streamed_events(
             if accepted:
                 state.accepted_candidates += 1
                 if lane in state.deadline_lanes:
-                    failures.append(f"candidate accepted after deadline on {axis}")
+                    self._failures.append(f"candidate accepted after deadline on {axis}")
                 vehicle_delta = event.get("candidate_vehicle_delta")
                 if not _is_int(vehicle_delta) or vehicle_delta > 0:
-                    failures.append(f"accepted candidate increased vehicle count on {axis}")
+                    self._failures.append(
+                        f"accepted candidate increased vehicle count on {axis}"
+                    )
                 timestamp = _finite_number(event.get("timestamp_seconds"))
                 if timestamp is None or timestamp > state.budget_seconds:
-                    failures.append(f"candidate accepted beyond wall-clock budget on {axis}")
+                    self._failures.append(
+                        f"candidate accepted beyond wall-clock budget on {axis}"
+                    )
                 if event.get("status") != "accepted" or event.get("candidate_feasible") is not True:
-                    failures.append(f"accepted candidate transaction is inconsistent on {axis}")
+                    self._failures.append(
+                        f"accepted candidate transaction is inconsistent on {axis}"
+                    )
             if global_best:
                 state.global_bests += 1
                 if not accepted:
-                    failures.append(f"global best is not an accepted candidate on {axis}")
+                    self._failures.append(
+                        f"global best is not an accepted candidate on {axis}"
+                    )
                 route_keys = event.get("candidate_route_keys")
                 if (
                     not isinstance(route_keys, (list, tuple))
                     or not route_keys
                     or any(not isinstance(key, str) or not key for key in route_keys)
                 ):
-                    failures.append(f"global best lacks candidate route identity on {axis}")
-            cache_misses[axis].clear()
-            completed_exact_keys[axis].clear()
+                    self._failures.append(
+                        f"global best lacks candidate route identity on {axis}"
+                    )
+            self._cache_misses[axis].clear()
+            self._completed_exact_keys[axis].clear()
 
         if any(
             len(items) > MAX_STREAM_AUDIT_KEYS
             for items in (
-                cache_keys[axis],
-                cache_misses[axis],
-                completed_exact_keys[axis],
+                self._cache_keys[axis],
+                self._cache_misses[axis],
+                self._completed_exact_keys[axis],
             )
         ):
-            failures.append(f"bounded cache audit key limit exceeded on {axis}")
-            break
+            self._failures.append(f"bounded cache audit key limit exceeded on {axis}")
+            self._stopped = True
 
-    if observed_axes != set(axis_budgets):
-        failures.append(
+    def finish(self) -> StreamedEventAudit:
+        if self._observed_axes != set(self._axis_budgets):
+            self._failures.append(
             "event stream axis coverage mismatch: "
-            f"expected={sorted(axis_budgets)} observed={sorted(observed_axes)}"
+                f"expected={sorted(self._axis_budgets)} "
+                f"observed={sorted(self._observed_axes)}"
+            )
+        started = sum(state.exact_started for state in self._states.values())
+        completed = sum(state.exact_completed for state in self._states.values())
+        if completed > started:
+            self._failures.append("completed exact calls exceed started exact calls")
+        accepted_count = sum(
+            state.accepted_candidates for state in self._states.values()
         )
-    started = sum(state.exact_started for state in states.values())
-    completed = sum(state.exact_completed for state in states.values())
-    if completed > started:
-        failures.append("completed exact calls exceed started exact calls")
-    accepted_count = sum(state.accepted_candidates for state in states.values())
-    global_bests = sum(state.global_bests for state in states.values())
-    return StreamedEventAudit(
-        not failures,
-        "; ".join(dict.fromkeys(failures)) if failures else "streamed event audit passed",
-        count,
-        started,
-        completed,
-        accepted_count,
-        global_bests,
-        tuple(sorted(axis for axis, state in states.items() if state.deadline_seen)),
-        tuple(
-            (axis, state.exact_started, state.exact_completed)
-            for axis, state in sorted(states.items())
-        ),
-    )
+        global_bests = sum(state.global_bests for state in self._states.values())
+        return StreamedEventAudit(
+            not self._failures,
+            (
+                "; ".join(dict.fromkeys(self._failures))
+                if self._failures
+                else "streamed event audit passed"
+            ),
+            self._count,
+            started,
+            completed,
+            accepted_count,
+            global_bests,
+            tuple(
+                sorted(
+                    axis
+                    for axis, state in self._states.items()
+                    if state.deadline_seen
+                )
+            ),
+            tuple(
+                (axis, state.exact_started, state.exact_completed)
+                for axis, state in sorted(self._states.items())
+            ),
+        )
+
+
+def audit_streamed_events(
+    events: Iterable[Mapping[str, object]],
+    axis_budgets: Mapping[str, int],
+) -> StreamedEventAudit:
+    """Audit ordering and transaction boundaries in one bounded event stream."""
+
+    accumulator = _StreamedEventAuditAccumulator(axis_budgets)
+    for event in events:
+        accumulator.consume(event)
+    return accumulator.finish()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1201,26 +1262,25 @@ class _PipelineLedgerReplay:
             self.hasher = hashlib.sha256()
 
 
-def _audit_async_persistence_ledgers(
-    events: Iterable[Mapping[str, object]],
-    trace_axes: Mapping[str, object],
-) -> None:
-    """Recompute every physical async batch digest from the logical event stream."""
+class _PipelineLedgerAccumulator:
+    """Incrementally replay physical async batch digests."""
 
-    states: dict[str, _PipelineLedgerReplay] = {}
-    for axis, raw_trace_axis in trace_axes.items():
-        if not isinstance(raw_trace_axis, Mapping):
-            raise ArtifactIntegrityError("trace axis is invalid for persistence replay")
-        pipeline = raw_trace_axis.get("persistence_pipeline")
-        if not isinstance(pipeline, Mapping):
-            raise ArtifactIntegrityError("persistence pipeline is missing for ledger replay")
-        ledger = pipeline.get("batch_ledger")
-        if not isinstance(ledger, list):
-            raise ArtifactIntegrityError("persistence batch ledger is missing")
-        states[str(axis)] = _PipelineLedgerReplay(ledger=list(ledger))
-    for row in events:
+    def __init__(self, trace_axes: Mapping[str, object]) -> None:
+        self._states: dict[str, _PipelineLedgerReplay] = {}
+        for axis, raw_trace_axis in trace_axes.items():
+            if not isinstance(raw_trace_axis, Mapping):
+                raise ArtifactIntegrityError("trace axis is invalid for persistence replay")
+            pipeline = raw_trace_axis.get("persistence_pipeline")
+            if not isinstance(pipeline, Mapping):
+                raise ArtifactIntegrityError("persistence pipeline is missing for ledger replay")
+            ledger = pipeline.get("batch_ledger")
+            if not isinstance(ledger, list):
+                raise ArtifactIntegrityError("persistence batch ledger is missing")
+            self._states[str(axis)] = _PipelineLedgerReplay(ledger=list(ledger))
+
+    def consume(self, row: Mapping[str, object]) -> None:
         axis = str(row.get("benchmark_axis") or str(row.get("lane", "")).partition(":")[0])
-        state = states.get(axis)
+        state = self._states.get(axis)
         if state is None:
             raise ArtifactIntegrityError(
                 f"persistence event refers to an unknown benchmark axis: {axis}"
@@ -1247,15 +1307,30 @@ def _audit_async_persistence_ledgers(
             state.seen = 0
             state.hasher = hashlib.sha256()
         elif seen > expected_rows:
-            raise ArtifactIntegrityError(f"persistence batch row count overflow: {axis}/{index}")
+            raise ArtifactIntegrityError(
+                f"persistence batch row count overflow: {axis}/{index}"
+            )
         else:
             state.seen = seen
-    for axis, state in states.items():
-        ledger = state.ledger
-        if state.index != len(ledger) or state.seen != 0:
-            raise ArtifactIntegrityError(
-                f"persistence ledger does not cover the complete event stream: {axis}"
-            )
+
+    def finish(self) -> None:
+        for axis, state in self._states.items():
+            if state.index != len(state.ledger) or state.seen != 0:
+                raise ArtifactIntegrityError(
+                    f"persistence ledger does not cover the complete event stream: {axis}"
+                )
+
+
+def _audit_async_persistence_ledgers(
+    events: Iterable[Mapping[str, object]],
+    trace_axes: Mapping[str, object],
+) -> None:
+    """Recompute every physical async batch digest from the logical event stream."""
+
+    accumulator = _PipelineLedgerAccumulator(trace_axes)
+    for row in events:
+        accumulator.consume(row)
+    accumulator.finish()
 
 
 def _route_sequence_from_key(route_key: str) -> list[str]:
@@ -1274,23 +1349,28 @@ def _route_sequence_from_key(route_key: str) -> list[str]:
     return sequence
 
 
-def summarize_streamed_global_bests(
-    events: Iterable[Mapping[str, object]],
-    axis_budgets: Mapping[str, int],
-    *,
-    instance: Instance,
-) -> dict[str, tuple[AcceptedGlobalBest, ...]]:
-    last: dict[str, AcceptedGlobalBest | None] = {axis: None for axis in axis_budgets}
-    visible: dict[str, dict[int, AcceptedGlobalBest]] = {axis: {} for axis in axis_budgets}
-    for event in events:
+class _GlobalBestAccumulator:
+    """Validate global-best routes and retain only checkpoint-visible history."""
+
+    def __init__(self, axis_budgets: Mapping[str, int], *, instance: Instance) -> None:
+        self._axis_budgets = dict(axis_budgets)
+        self._instance = instance
+        self._last: dict[str, AcceptedGlobalBest | None] = {
+            axis: None for axis in axis_budgets
+        }
+        self._visible: dict[str, dict[int, AcceptedGlobalBest]] = {
+            axis: {} for axis in axis_budgets
+        }
+
+    def consume(self, event: Mapping[str, object]) -> None:
         if (
             str(event.get("event_type", event.get("record_type", ""))) != "candidate_state"
             or event.get("accepted") is not True
             or event.get("global_best") is not True
         ):
-            continue
+            return
         axis = str(event.get("benchmark_axis", ""))
-        if axis not in last:
+        if axis not in self._last:
             raise ArtifactIntegrityError(f"global-best event has unknown axis: {axis}")
         route_keys = event.get("candidate_route_keys")
         full_route_keys = event.get("candidate_full_route_keys")
@@ -1316,7 +1396,7 @@ def summarize_streamed_global_bests(
         candidate_routes = [
             _route_sequence_from_key(str(key)) for key in full_route_keys
         ]
-        customer_names = {customer.name for customer in instance.customers}
+        customer_names = {customer.name for customer in self._instance.customers}
         projected_sequences = [
             [node for node in route if node in customer_names] for route in candidate_routes
         ]
@@ -1324,10 +1404,10 @@ def summarize_streamed_global_bests(
             raise ArtifactIntegrityError(
                 f"global-best complete routes/customer sequences mismatch on {axis}"
             )
-        report = validate_routes(instance, candidate_routes)
+        report = validate_routes(self._instance, candidate_routes)
         if not report.feasible:
             raise ArtifactIntegrityError(f"global-best candidate routes fail validation on {axis}")
-        replayed_objective = SolutionObjective.from_report(instance, report).key
+        replayed_objective = SolutionObjective.from_report(self._instance, report).key
         recorded_objective = _objective_key(
             event.get("candidate_objective_key"), "candidate objective"
         )
@@ -1348,7 +1428,7 @@ def summarize_streamed_global_bests(
             iteration=_strict_int(event.get("iteration"), "global-best iteration"),
             objective_key=recorded_objective,
         )
-        previous = last[axis]
+        previous = self._last[axis]
         objective_not_better = previous is not None and (
             compare_objectives(
                 SolutionObjective(*current.objective_key),
@@ -1362,21 +1442,70 @@ def summarize_streamed_global_bests(
             or objective_not_better
         ):
             raise ArtifactIntegrityError(f"global-best history is not strictly improving on {axis}")
-        if current.completed_at_seconds > axis_budgets[axis]:
+        if current.completed_at_seconds > self._axis_budgets[axis]:
             raise ArtifactIntegrityError(f"global-best exceeds axis budget on {axis}")
-        last[axis] = current
+        self._last[axis] = current
         for checkpoint in CHECKPOINT_SECONDS:
-            if checkpoint <= axis_budgets[axis] and current.completed_at_seconds <= checkpoint:
-                visible[axis][checkpoint] = current
-    histories: dict[str, tuple[AcceptedGlobalBest, ...]] = {}
-    for axis in axis_budgets:
-        bounded: list[AcceptedGlobalBest] = []
-        for checkpoint in sorted(visible[axis]):
-            accepted_best = visible[axis][checkpoint]
-            if not bounded or accepted_best != bounded[-1]:
-                bounded.append(accepted_best)
-        histories[axis] = tuple(bounded)
-    return histories
+            if (
+                checkpoint <= self._axis_budgets[axis]
+                and current.completed_at_seconds <= checkpoint
+            ):
+                self._visible[axis][checkpoint] = current
+
+    def finish(self) -> dict[str, tuple[AcceptedGlobalBest, ...]]:
+        histories: dict[str, tuple[AcceptedGlobalBest, ...]] = {}
+        for axis in self._axis_budgets:
+            bounded: list[AcceptedGlobalBest] = []
+            for checkpoint in sorted(self._visible[axis]):
+                accepted_best = self._visible[axis][checkpoint]
+                if not bounded or accepted_best != bounded[-1]:
+                    bounded.append(accepted_best)
+            histories[axis] = tuple(bounded)
+        return histories
+
+
+def summarize_streamed_global_bests(
+    events: Iterable[Mapping[str, object]],
+    axis_budgets: Mapping[str, int],
+    *,
+    instance: Instance,
+) -> dict[str, tuple[AcceptedGlobalBest, ...]]:
+    accumulator = _GlobalBestAccumulator(axis_budgets, instance=instance)
+    for event in events:
+        accumulator.consume(event)
+    return accumulator.finish()
+
+
+@dataclass(frozen=True, slots=True)
+class StreamedShardReplay:
+    """Compact result of one physical pass over a shard's logical events."""
+
+    audit: StreamedEventAudit
+    global_best_histories: dict[str, tuple[AcceptedGlobalBest, ...]]
+    logical_pass_count: int = 1
+
+
+def replay_streamed_shard_events(
+    events: Iterable[Mapping[str, object]],
+    trace_axes: Mapping[str, object],
+    axis_budgets: Mapping[str, int],
+    *,
+    instance: Instance,
+) -> StreamedShardReplay:
+    """Replay ledger, transaction, and global-best semantics in one pass."""
+
+    ledger = _PipelineLedgerAccumulator(trace_axes)
+    audit = _StreamedEventAuditAccumulator(axis_budgets)
+    global_bests = _GlobalBestAccumulator(axis_budgets, instance=instance)
+    for event in events:
+        ledger.consume(event)
+        audit.consume(event)
+        global_bests.consume(event)
+    ledger.finish()
+    return StreamedShardReplay(
+        audit=audit.finish(),
+        global_best_histories=global_bests.finish(),
+    )
 
 
 def _checkpoint_evidence(
@@ -1479,6 +1608,7 @@ def _replay_shard(
     shard_manifest: Mapping[str, object],
     benchmark_dir: Path,
     scope: str,
+    scratch_root: Path | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], int]:
     instance_name = str(shard_manifest.get("instance", ""))
     seed = _strict_int(shard_manifest.get("seed"), "seed")
@@ -1696,14 +1826,17 @@ def _replay_shard(
         )
     axis_budgets = {axis: _axis_budget(axis) for axis in expected_axes}
     event_path = str(events_ref["relative_path"])
-    _audit_async_persistence_ledgers(
-        reader.iter_events(event_path, batch_size=1024),
+    streamed_replay = replay_streamed_shard_events(
+        reader.iter_events(
+            event_path,
+            batch_size=1024,
+            scratch_root=scratch_root,
+        ),
         trace_axes,
-    )
-    event_audit = audit_streamed_events(
-        reader.iter_events(event_path, batch_size=1024),
         axis_budgets,
+        instance=instance,
     )
+    event_audit = streamed_replay.audit
     if not event_audit.passed:
         raise ArtifactIntegrityError(
             f"event replay failed: {instance_name}/{seed}: {event_audit.detail}"
@@ -1718,11 +1851,6 @@ def _replay_shard(
             "event/raw exact-call or deadline reconciliation failed: "
             f"{instance_name}/{seed}: {reconciliation.detail}"
         )
-    histories = summarize_streamed_global_bests(
-        reader.iter_events(event_path, batch_size=1024),
-        axis_budgets,
-        instance=instance,
-    )
     checkpoints = _checkpoint_evidence(
         reader=reader,
         checkpoint_ref=checkpoint_ref,
@@ -1731,10 +1859,385 @@ def _replay_shard(
         customer_count=customer_count,
         raw_axes=raw_axes,
         solution_axes=solution_axes,
-        histories=histories,
+        histories=streamed_replay.global_best_histories,
         verified_initial_objectives=verified_initial_objectives,
     )
     return replay_rows, checkpoints, event_audit.event_count
+
+
+@dataclass(frozen=True, slots=True)
+class _ShardReplayProcessResult:
+    run_label: str
+    batch_id: str
+    shard_id: str
+    instance: str
+    seed: int
+    replay_rows: list[dict[str, object]]
+    checkpoints: list[dict[str, object]]
+    logical_events: int
+    child_pid: int
+    child_peak_rss_bytes: int
+    pyarrow_allocated_bytes_after: int
+    scratch_cleaned: bool
+    elapsed_seconds: float
+    logical_pass_count: int = 1
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "run_label": self.run_label,
+                "batch_id": self.batch_id,
+                "shard_id": self.shard_id,
+                "instance": self.instance,
+                "seed": self.seed,
+                "replay_rows": self.replay_rows,
+                "checkpoints": self.checkpoints,
+                "logical_events": self.logical_events,
+                "child_pid": self.child_pid,
+                "child_peak_rss_bytes": self.child_peak_rss_bytes,
+                "pyarrow_allocated_bytes_after": self.pyarrow_allocated_bytes_after,
+                "scratch_cleaned": self.scratch_cleaned,
+                "elapsed_seconds": self.elapsed_seconds,
+                "logical_pass_count": self.logical_pass_count,
+            },
+            allow_nan=False,
+            sort_keys=True,
+        )
+
+    @classmethod
+    def from_json(cls, payload: str) -> _ShardReplayProcessResult:
+        try:
+            decoded = json.loads(payload)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ArtifactIntegrityError("spawned shard summary is not valid JSON") from error
+        if not isinstance(decoded, Mapping):
+            raise ArtifactIntegrityError("spawned shard summary is not an object")
+        expected_fields = {
+            "run_label",
+            "batch_id",
+            "shard_id",
+            "instance",
+            "seed",
+            "replay_rows",
+            "checkpoints",
+            "logical_events",
+            "child_pid",
+            "child_peak_rss_bytes",
+            "pyarrow_allocated_bytes_after",
+            "scratch_cleaned",
+            "elapsed_seconds",
+            "logical_pass_count",
+        }
+        if set(decoded) != expected_fields:
+            raise ArtifactIntegrityError("spawned shard summary fields are invalid")
+        replay_rows = decoded.get("replay_rows")
+        checkpoints = decoded.get("checkpoints")
+        if (
+            not isinstance(replay_rows, list)
+            or not all(isinstance(row, Mapping) for row in replay_rows)
+            or not isinstance(checkpoints, list)
+            or not all(isinstance(row, Mapping) for row in checkpoints)
+        ):
+            raise ArtifactIntegrityError("spawned shard summary rows are invalid")
+        return cls(
+            run_label=str(decoded.get("run_label", "")),
+            batch_id=str(decoded.get("batch_id", "")),
+            shard_id=str(decoded.get("shard_id", "")),
+            instance=str(decoded.get("instance", "")),
+            seed=_strict_int(decoded.get("seed"), "spawned shard seed"),
+            replay_rows=[dict(row) for row in replay_rows],
+            checkpoints=[dict(row) for row in checkpoints],
+            logical_events=_strict_int(
+                decoded.get("logical_events"), "spawned shard logical_events"
+            ),
+            child_pid=_strict_int(decoded.get("child_pid"), "spawned shard child_pid"),
+            child_peak_rss_bytes=_strict_int(
+                decoded.get("child_peak_rss_bytes"),
+                "spawned shard child_peak_rss_bytes",
+            ),
+            pyarrow_allocated_bytes_after=_strict_int(
+                decoded.get("pyarrow_allocated_bytes_after"),
+                "spawned shard pyarrow_allocated_bytes_after",
+            ),
+            scratch_cleaned=decoded.get("scratch_cleaned") is True,
+            elapsed_seconds=_strict_float(
+                decoded.get("elapsed_seconds"), "spawned shard elapsed_seconds"
+            ),
+            logical_pass_count=_strict_int(
+                decoded.get("logical_pass_count"), "spawned shard logical_pass_count"
+            ),
+        )
+
+
+def _child_peak_rss_bytes() -> int:
+    try:
+        import resource
+    except ImportError:
+        return int(psutil.Process(os.getpid()).memory_info().rss)
+    raw_peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return raw_peak if sys.platform == "darwin" else raw_peak * 1024
+
+
+def _replay_shard_worker(
+    batch_dir: Path,
+    shard_relative_path: str,
+    benchmark_dir: Path,
+    scope: str,
+    run_label: str,
+    batch_id: str,
+    shard_id: str,
+    scratch_path: Path,
+) -> str:
+    """Re-read and replay one signed shard in a disposable spawned process."""
+
+    started = time.monotonic()
+    relative = Path(shard_relative_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ArtifactIntegrityError("spawned shard replay path is not relative")
+    batch_root = batch_dir.resolve()
+    shard_path = (batch_root / relative).resolve()
+    if batch_root not in shard_path.parents:
+        raise ArtifactIntegrityError("spawned shard replay escapes the batch directory")
+    scratch_parent_raw = os.environ.get("STAGE052_REVIEW_TMPDIR")
+    scratch_parent = (
+        Path(scratch_parent_raw).resolve()
+        if scratch_parent_raw
+        else Path(tempfile.gettempdir()).resolve()
+    )
+    if (
+        not scratch_parent.is_dir() or not os.access(scratch_parent, os.W_OK)
+    ):
+        raise RuntimeError(
+            f"Stage 5.2 review temporary root is not writable: {scratch_parent}"
+        )
+    resolved_scratch = scratch_path.resolve()
+    if resolved_scratch.parent != scratch_parent or resolved_scratch.exists():
+        raise ArtifactIntegrityError("spawned shard scratch identity is invalid")
+    resolved_scratch.mkdir(mode=0o700)
+    instance_name = ""
+    seed = -1
+    try:
+        _verify_manifest_sidecar(shard_path)
+        batch_manifest_path = batch_root / "batch_manifest.json"
+        _verify_manifest_sidecar(batch_manifest_path)
+        batch = BatchManifest.from_dict(_json_object(batch_manifest_path))
+        shard_sha = _sha256(shard_path)
+        if (
+            batch.run_label != run_label
+            or batch.batch_id != batch_id
+            or shard_id not in batch.shard_ids
+            or (batch.shard_manifest_sha256_by_id or {}).get(shard_id) != shard_sha
+        ):
+            raise ArtifactIntegrityError("spawned batch-to-shard manifest binding is invalid")
+        # The parent verifies every batch artifact once before dispatch.  Each
+        # disposable child independently re-reads the signed batch and shard
+        # manifests plus their direct binding without re-hashing sibling shards.
+        reader = ArtifactReader(batch_root, verify=False)
+        _verify_manifest_sidecar(reader.result.manifest_path)
+        shard = _json_object(shard_path)
+        instance_name = str(shard.get("instance", ""))
+        seed = _strict_int(shard.get("seed"), "spawned shard seed")
+        if shard.get("run_label") != run_label:
+            raise ArtifactIntegrityError("spawned shard manifest identity is invalid")
+        replay_rows, checkpoints, logical_events = _replay_shard(
+            reader=reader,
+            shard_manifest=shard,
+            benchmark_dir=benchmark_dir,
+            scope=scope,
+            scratch_root=resolved_scratch,
+        )
+        try:
+            import pyarrow as pa
+
+            arrow_allocated = int(pa.total_allocated_bytes())
+        except ImportError:
+            arrow_allocated = 0
+        peak_rss = _child_peak_rss_bytes()
+        child_pid = os.getpid()
+    except BaseException as error:
+        shutil.rmtree(resolved_scratch, ignore_errors=True)
+        _emit_review_progress(
+            "campaign_shard_replay_child_failed",
+            run_label=run_label,
+            batch_id=batch_id,
+            shard_id=shard_id,
+            child_pid=os.getpid(),
+            child_peak_rss_bytes=_child_peak_rss_bytes(),
+            elapsed_seconds=time.monotonic() - started,
+            scratch_cleaned=not resolved_scratch.exists(),
+            error_type=type(error).__name__,
+            error=str(error),
+        )
+        raise
+    try:
+        shutil.rmtree(resolved_scratch)
+        return _ShardReplayProcessResult(
+            run_label=run_label,
+            batch_id=batch_id,
+            shard_id=shard_id,
+            instance=instance_name,
+            seed=seed,
+            replay_rows=replay_rows,
+            checkpoints=checkpoints,
+            logical_events=logical_events,
+            child_pid=child_pid,
+            child_peak_rss_bytes=peak_rss,
+            pyarrow_allocated_bytes_after=arrow_allocated,
+            scratch_cleaned=not resolved_scratch.exists(),
+            elapsed_seconds=time.monotonic() - started,
+        ).to_json()
+    except BaseException as error:
+        shutil.rmtree(resolved_scratch, ignore_errors=True)
+        _emit_review_progress(
+            "campaign_shard_replay_child_failed",
+            run_label=run_label,
+            batch_id=batch_id,
+            shard_id=shard_id,
+            child_pid=os.getpid(),
+            child_peak_rss_bytes=_child_peak_rss_bytes(),
+            elapsed_seconds=time.monotonic() - started,
+            scratch_cleaned=not resolved_scratch.exists(),
+            error_type=type(error).__name__,
+            error=str(error),
+        )
+        raise
+
+
+def _replay_shard_in_fresh_process(
+    *,
+    batch_dir: Path,
+    shard_relative_path: str,
+    benchmark_dir: Path,
+    scope: str,
+    run_label: str,
+    batch_id: str,
+    shard_id: str,
+    expected_instance: str,
+    expected_seed: int,
+) -> _ShardReplayProcessResult:
+    """Replay one shard with process-lifetime allocator isolation."""
+
+    parent = psutil.Process(os.getpid())
+    scratch_parent_raw = os.environ.get("STAGE052_REVIEW_TMPDIR")
+    scratch_parent = (
+        Path(scratch_parent_raw).resolve()
+        if scratch_parent_raw
+        else Path(tempfile.gettempdir()).resolve()
+    )
+    if not scratch_parent.is_dir() or not os.access(scratch_parent, os.W_OK):
+        raise RuntimeError(
+            f"Stage 5.2 review temporary root is not writable: {scratch_parent}"
+        )
+    scratch_path = scratch_parent / (
+        f"stage052-campaign-shard-{batch_id}-{shard_id}-{uuid.uuid4().hex}"
+    )
+    started = time.monotonic()
+    _emit_review_progress(
+        "campaign_shard_replay_start",
+        run_label=run_label,
+        batch_id=batch_id,
+        shard_id=shard_id,
+        parent_pid=os.getpid(),
+        parent_rss_bytes=parent.memory_info().rss,
+    )
+    executor: ProcessPoolExecutor | None = None
+    future: Future[str] | None = None
+    try:
+        executor = ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=get_context("spawn"),
+            max_tasks_per_child=1,
+        )
+        future = executor.submit(
+            _replay_shard_worker,
+            batch_dir,
+            shard_relative_path,
+            benchmark_dir,
+            scope,
+            run_label,
+            batch_id,
+            shard_id,
+            scratch_path,
+        )
+        result = _ShardReplayProcessResult.from_json(future.result())
+    except BaseException as error:
+        scratch_cleaned = not scratch_path.exists()
+        if not scratch_cleaned:
+            shutil.rmtree(scratch_path, ignore_errors=True)
+        _emit_review_progress(
+            "campaign_shard_replay_failed",
+            run_label=run_label,
+            batch_id=batch_id,
+            shard_id=shard_id,
+            parent_pid=os.getpid(),
+            parent_rss_bytes=parent.memory_info().rss,
+            elapsed_seconds=time.monotonic() - started,
+            scratch_cleaned=scratch_cleaned,
+            scratch_cleanup_recovered=not scratch_path.exists(),
+            error_type=type(error).__name__,
+            error=str(error),
+        )
+        if future is not None:
+            future.cancel()
+        if executor is not None:
+            try:
+                abort_process_executor(executor)
+            except BaseException as abort_error:
+                _emit_review_progress(
+                    "campaign_shard_replay_abort_failed",
+                    run_label=run_label,
+                    batch_id=batch_id,
+                    shard_id=shard_id,
+                    error_type=type(abort_error).__name__,
+                    error=str(abort_error),
+                )
+                executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    assert executor is not None
+    executor.shutdown(wait=True)
+    if (
+        result.run_label != run_label
+        or result.batch_id != batch_id
+        or result.shard_id != shard_id
+        or result.instance != expected_instance
+        or result.seed != expected_seed
+        or result.logical_pass_count != 1
+        or not result.scratch_cleaned
+        or scratch_path.exists()
+    ):
+        _emit_review_progress(
+            "campaign_shard_replay_failed",
+            run_label=run_label,
+            batch_id=batch_id,
+            shard_id=shard_id,
+            parent_pid=os.getpid(),
+            parent_rss_bytes=parent.memory_info().rss,
+            child_pid=result.child_pid,
+            child_peak_rss_bytes=result.child_peak_rss_bytes,
+            elapsed_seconds=time.monotonic() - started,
+            scratch_cleaned=not scratch_path.exists(),
+            error_type="ArtifactIntegrityError",
+            error="spawned shard replay identity or lifecycle mismatch",
+        )
+        raise ArtifactIntegrityError(
+            f"spawned shard replay lifecycle is invalid: {batch_id}/{shard_id}"
+        )
+    _emit_review_progress(
+        "campaign_shard_replay_complete",
+        run_label=run_label,
+        batch_id=batch_id,
+        shard_id=shard_id,
+        child_pid=result.child_pid,
+        child_peak_rss_bytes=result.child_peak_rss_bytes,
+        pyarrow_allocated_bytes_after=result.pyarrow_allocated_bytes_after,
+        parent_pid=os.getpid(),
+        parent_rss_bytes=parent.memory_info().rss,
+        logical_events=result.logical_events,
+        logical_pass_count=result.logical_pass_count,
+        scratch_cleaned=result.scratch_cleaned,
+        elapsed_seconds=result.elapsed_seconds,
+    )
+    return result
 
 
 def _batch_control_artifact(
@@ -3728,12 +4231,20 @@ def _audit_campaign(
                 declared_shard_bytes = (embedded_batch.shard_actual_bytes_by_id or {}).get(shard_id)
                 if actual_shard_bytes != declared_shard_bytes:
                     raise ArtifactIntegrityError("shard byte count mismatch")
-                replay, checkpoints, logical_events = _replay_shard(
-                    reader=reader,
-                    shard_manifest=shard,
+                spawned_replay = _replay_shard_in_fresh_process(
+                    batch_dir=batch_dir,
+                    shard_relative_path=shard_path.relative_to(batch_dir).as_posix(),
                     benchmark_dir=benchmark_dir,
                     scope=scope,
+                    run_label=campaign.run_label,
+                    batch_id=embedded_batch.batch_id,
+                    shard_id=shard_id,
+                    expected_instance=str(shard["instance"]),
+                    expected_seed=_strict_int(shard["seed"], "seed"),
                 )
+                replay = spawned_replay.replay_rows
+                checkpoints = spawned_replay.checkpoints
+                logical_events = spawned_replay.logical_events
                 event_rows += logical_events
                 evidence.checkpoint_rows.extend(checkpoints)
                 for row in replay:
