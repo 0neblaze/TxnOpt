@@ -790,3 +790,8 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   独立重读标准 raw manifest；历史兼容只接受 `NOT_READY`、同一 campaign SHA、完整
   generation 文件、明确 failed `campaign_replay` 且空 raw hash 的已知形态，归档后
   继续 append，不改写失败代次，也不允许其成为 prerequisite。
+- Formal attempt27 在 raw 创建前因 transient service 漏传 Windows/WSL executable
+  PATH 而失败；attempt28 补齐 PATH 后又在 raw 创建前被 successor allowlist 拒绝。
+  allowlist 现仅新增本轮实际变更的 reviewer、review service、migration attestation、
+  platform guard 及对应测试/文档路径；solver、objective、validator、native producer
+  algorithm 与配置仍不在允许范围。attempt27/28 的 service logs 保留，均不复用。
