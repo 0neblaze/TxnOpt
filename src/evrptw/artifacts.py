@@ -29,7 +29,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from evrptw.stage052 import STAGE052_MAXIMUM_PERSISTENCE_RATIO
-from evrptw.stage052_platform import durable_replace, sync_directory
+from evrptw.stage052_platform import (
+    durable_replace,
+    posix_file_cache_drop_is_safe,
+    sync_directory,
+)
 
 ARTIFACT_STORAGE_SCHEMA_VERSION = "artifact-storage-v1"
 ARTIFACT_STORAGE_V2 = "artifact-storage-v2"
@@ -601,7 +605,7 @@ def _sha256(path: Path) -> str:
 
 
 def _drop_file_page_cache(handle: Any) -> None:
-    if hasattr(os, "posix_fadvise"):
+    if posix_file_cache_drop_is_safe() and hasattr(os, "posix_fadvise"):
         os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
 
 

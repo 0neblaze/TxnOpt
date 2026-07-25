@@ -19,6 +19,7 @@ MOVEFILE_REPLACE_EXISTING = _PLATFORM.MOVEFILE_REPLACE_EXISTING
 MOVEFILE_WRITE_THROUGH = _PLATFORM.MOVEFILE_WRITE_THROUGH
 durable_replace = _PLATFORM.durable_replace
 peak_rss_bytes = _PLATFORM.peak_rss_bytes
+posix_file_cache_drop_is_safe = _PLATFORM.posix_file_cache_drop_is_safe
 read_windows_wsl_power_status = _PLATFORM.read_windows_wsl_power_status
 
 
@@ -27,6 +28,30 @@ def test_linux_peak_rss_uses_getrusage_kib_units() -> None:
         platform_name="linux",
         getrusage=lambda: 2048,
     ) == 2 * 1024 * 1024
+
+
+def test_posix_file_cache_drop_is_disabled_on_wsl() -> None:
+    assert (
+        posix_file_cache_drop_is_safe(
+            platform_name="linux",
+            kernel_release="6.18.35.2-microsoft-standard-WSL2",
+        )
+        is False
+    )
+    assert (
+        posix_file_cache_drop_is_safe(
+            platform_name="linux",
+            kernel_release="6.8.0-71-generic",
+        )
+        is True
+    )
+    assert (
+        posix_file_cache_drop_is_safe(
+            platform_name="win32",
+            kernel_release="10",
+        )
+        is False
+    )
 
 
 def test_windows_peak_rss_requires_peak_wset() -> None:

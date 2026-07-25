@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import platform
 import subprocess
 import sys
 from collections.abc import Callable
@@ -50,6 +51,21 @@ $scheme = Get-ItemPropertyValue `
     active_power_scheme = [string]$scheme
 } | ConvertTo-Json -Compress
 """.strip()
+
+
+def posix_file_cache_drop_is_safe(
+    *,
+    platform_name: str | None = None,
+    kernel_release: str | None = None,
+) -> bool:
+    """Return whether POSIX_FADV_DONTNEED is safe for evidence files."""
+
+    current_platform = sys.platform if platform_name is None else platform_name
+    current_release = platform.release() if kernel_release is None else kernel_release
+    return (
+        current_platform != "win32"
+        and "microsoft-standard-wsl" not in current_release.casefold()
+    )
 
 
 @dataclass(frozen=True, slots=True)

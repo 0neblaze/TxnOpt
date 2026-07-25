@@ -82,6 +82,7 @@ from evrptw.stage052_evidence import (
     verify_stage052_source_snapshot,
     verify_stage052_storage_root_binding,
 )
+from evrptw.stage052_platform import posix_file_cache_drop_is_safe
 from evrptw.stage052_remediation import (
     E03_EVENT_COUNT,
     E03_SHARD_COUNT,
@@ -1175,7 +1176,11 @@ def _file_descriptor(handle: Any) -> int | None:
 
 def _drop_file_page_cache(handle: Any) -> None:
     descriptor = _file_descriptor(handle)
-    if descriptor is None or not hasattr(os, "posix_fadvise"):
+    if (
+        descriptor is None
+        or not posix_file_cache_drop_is_safe()
+        or not hasattr(os, "posix_fadvise")
+    ):
         return
     os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
 
