@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,7 @@ from evrptw.stage052_storage_migration import (
     StorageMigrationIntegrityError,
     load_signed_storage_migration,
     machine_identity_matches_storage_migration,
+    verify_successor_storage_migration_evidence,
 )
 
 
@@ -85,3 +87,81 @@ def test_machine_identity_migration_allows_only_attested_archive_disk() -> None:
     assert machine_identity_matches_storage_migration(frozen, live, migration)
     live["cpu"] = {"Name": "different"}
     assert not machine_identity_matches_storage_migration(frozen, live, migration)
+
+
+def test_successor_migration_requires_finalized_independent_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "migration.json"
+    payload = _payload()
+    _write_signed(path, payload)
+    evidence_dir = tmp_path / str(payload["run_label"])
+    review_dir = evidence_dir / "review"
+    review_dir.mkdir(parents=True)
+    campaign_payload = {
+        "run_label": payload["run_label"],
+    }
+    (evidence_dir / "campaign_manifest.json").write_text(
+        json.dumps(campaign_payload),
+        encoding="utf-8",
+    )
+    review = {
+        "run_label": payload["run_label"],
+        "component": "benchmark",
+        "scope": "pilot",
+        "status": "READY_FOR_STAGE052_FORMAL_BENCHMARK",
+        "raw_manifest_sha256": payload["standard_raw_manifest_sha256"],
+        "storage_migration_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+    review_path = review_dir / "review_manifest.json"
+    review_path.write_text(json.dumps(review), encoding="utf-8")
+    execution = {
+        "run_label": payload["run_label"],
+        "finalized": True,
+        "status": "completed",
+        "exit_code": 0,
+        "systemd_service_result": "success",
+        "raw_manifest_unchanged": True,
+        "raw_manifest_sha256_before": payload["standard_raw_manifest_sha256"],
+        "raw_manifest_sha256_after": payload["standard_raw_manifest_sha256"],
+        "review_manifest_sha256": hashlib.sha256(review_path.read_bytes()).hexdigest(),
+    }
+    execution_path = review_dir / "review_execution.json"
+    execution_path.write_text(json.dumps(execution), encoding="utf-8")
+    campaign = SimpleNamespace(
+        run_label=payload["run_label"],
+        scope="pilot",
+        status="complete",
+    )
+    monkeypatch.setattr(
+        "evrptw.stage052_storage_migration.load_campaign_manifest",
+        lambda _: campaign,
+    )
+    monkeypatch.setattr(
+        "evrptw.stage052_storage_migration.verify_campaign_storage_migration",
+        lambda *_args, **_kwargs: payload,
+    )
+
+    assert (
+        verify_successor_storage_migration_evidence(
+            path,
+            evidence_dir=evidence_dir,
+            locator=object(),  # type: ignore[arg-type]
+            volume_probe=lambda _: object(),  # type: ignore[return-value]
+        )
+        == payload
+    )
+
+    execution["finalized"] = False
+    execution_path.write_text(json.dumps(execution), encoding="utf-8")
+    with pytest.raises(
+        StorageMigrationIntegrityError,
+        match="receipt is not finalized and successful",
+    ):
+        verify_successor_storage_migration_evidence(
+            path,
+            evidence_dir=evidence_dir,
+            locator=object(),  # type: ignore[arg-type]
+            volume_probe=lambda _: object(),  # type: ignore[return-value]
+        )

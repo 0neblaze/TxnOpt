@@ -782,8 +782,9 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   producer 字段。
 - successful campaign review 在顶层 manifest 发布 migration attestation 及 sidecar
   SHA-256。Formal producer 必须显式提供同一 `--storage-migration`，并在 current-chain
-  prerequisite replay 前核对该 SHA-256；未绑定、替换或用于非-Benchmark prerequisite
-  的证明均 fail fast。
+  prerequisite replay 前核对该 SHA-256；未绑定或替换的证明均 fail fast。用于
+  非-Benchmark prerequisite 的证明默认拒绝，唯一例外是下文经过历史 G campaign
+  完整复验的 successor Benchmark Pilot。
 - 一次 WSL lifecycle interruption 在 315.5 MiB cgroup peak 时终止 reviewer；失败
   receipt 正确记录 `service_interrupted`，但旧 exception path 把 review manifest 的
   standard raw SHA-256 留空，使下一代无法归档该 `NOT_READY` pointer。失败路径现在
@@ -833,3 +834,19 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 - independent reviewer 对同一 runtime samples 使用相同的窗口切分并独立重算最大值；
   raw schema 与 power/load publication surface 不变。失败 batch 现在也持久化已取得的
   runtime evidence，避免只留下摘要错误而无法重放触发窗口。
+
+## 2026-07-25：迁移后 successor Pilot 双重证据绑定
+
+- G33 暴露 producer defect（生产器缺陷）后，协议要求先以新标签重跑 Pilot，再启动
+  Formal。该 Pilot 的科学 prerequisite（前置条件）仍是 accepted F17 accelerator
+  pilot，不能把 G26 benchmark review 冒充成 F prerequisite；但 F17 的 selection
+  lock 又冻结了更换前的 D 盘身份。
+- benchmark Pilot 现在可同时显式提供 `--storage-migration` 和
+  `--storage-migration-evidence-dir`。后者必须精确指向 attestation 声明的历史 G
+  campaign，系统会重验 signed campaign manifest、campaign/raw manifest SHA-256、
+  每个归档 batch 的 checksum/byte count、accepted Pilot review，以及 finalized
+  successful review receipt。只有整条链成立，迁移证明才可用于 F prerequisite 的
+  machine identity normalization（机器身份规范化）。
+- 该例外仅适用于 `benchmark/pilot` 接受 `accelerator_pilot` prerequisite 的场景。
+  Formal 仍要求其 Benchmark Pilot prerequisite 自身在 review manifest 中绑定同一
+  migration SHA-256；缺失、替换、失败或未最终化的历史 review 均 fail fast。

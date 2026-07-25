@@ -15,6 +15,7 @@ from evrptw.stage052_campaign import (
     VolumeIdentity,
     directory_byte_count,
     directory_checksum,
+    load_campaign_manifest,
 )
 
 STORAGE_MIGRATION_SCHEMA_VERSION: Final = "stage05.2-storage-migration-v1"
@@ -202,6 +203,83 @@ def verify_campaign_storage_migration(
                 f"storage migration batch identity mismatch: {batch.batch_id}"
             )
     return payload
+
+
+def verify_successor_storage_migration_evidence(
+    path: Path,
+    *,
+    evidence_dir: Path,
+    locator: StorageRootLocator,
+    volume_probe: Callable[[Path], VolumeIdentity],
+) -> dict[str, object]:
+    """Verify the reviewed campaign that authorizes a successor on new storage."""
+
+    payload = load_signed_storage_migration(path)
+    run_label = str(payload["run_label"])
+    if evidence_dir.name != run_label:
+        raise StorageMigrationIntegrityError(
+            "storage migration evidence directory does not match its run label"
+        )
+    try:
+        campaign = load_campaign_manifest(evidence_dir / "campaign_manifest.json")
+    except (OSError, TypeError, ValueError) as error:
+        raise StorageMigrationIntegrityError(
+            "storage migration campaign manifest is unavailable or invalid"
+        ) from error
+    if (
+        campaign.run_label != run_label
+        or campaign.scope != "pilot"
+        or campaign.status != "complete"
+    ):
+        raise StorageMigrationIntegrityError(
+            "storage migration campaign is not a complete Pilot"
+        )
+    verified = verify_campaign_storage_migration(
+        path,
+        campaign=campaign,
+        campaign_dir=evidence_dir,
+        locator=locator,
+        volume_probe=volume_probe,
+    )
+    try:
+        review_path = evidence_dir / "review" / "review_manifest.json"
+        execution_path = evidence_dir / "review" / "review_execution.json"
+        review = json.loads(review_path.read_text(encoding="utf-8"))
+        execution = json.loads(execution_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise StorageMigrationIntegrityError(
+            "storage migration independent review evidence is unavailable or invalid"
+        ) from error
+    raw_sha256 = str(payload["standard_raw_manifest_sha256"])
+    migration_sha256 = _sha256(path)
+    if (
+        not isinstance(review, dict)
+        or review.get("run_label") != run_label
+        or review.get("component") != "benchmark"
+        or review.get("scope") != "pilot"
+        or review.get("status") != "READY_FOR_STAGE052_FORMAL_BENCHMARK"
+        or review.get("raw_manifest_sha256") != raw_sha256
+        or review.get("storage_migration_sha256") != migration_sha256
+    ):
+        raise StorageMigrationIntegrityError(
+            "storage migration campaign review does not authorize a successor"
+        )
+    if (
+        not isinstance(execution, dict)
+        or execution.get("run_label") != run_label
+        or execution.get("finalized") is not True
+        or execution.get("status") != "completed"
+        or execution.get("exit_code") != 0
+        or execution.get("systemd_service_result") != "success"
+        or execution.get("raw_manifest_unchanged") is not True
+        or execution.get("raw_manifest_sha256_before") != raw_sha256
+        or execution.get("raw_manifest_sha256_after") != raw_sha256
+        or execution.get("review_manifest_sha256") != _sha256(review_path)
+    ):
+        raise StorageMigrationIntegrityError(
+            "storage migration campaign review receipt is not finalized and successful"
+        )
+    return verified
 
 
 def machine_identity_matches_storage_migration(

@@ -457,6 +457,7 @@ def run_stage052(
     prerequisite_dirs: Mapping[str, Path] | None = None,
     retention_registry_path: Path = _RETENTION_REGISTRY,
     storage_migration_path: Path | None = None,
+    storage_migration_evidence_dir: Path | None = None,
 ) -> dict[str, Path]:
     """Execute one canonical Stage 5.2 component attempt."""
 
@@ -487,12 +488,31 @@ def run_stage052(
     resolved_prerequisite_dirs: dict[str, Path] = {}
     storage_migration: dict[str, object] | None = None
     storage_migration_sha256 = ""
+    successor_storage_migration_verified = False
+    if storage_migration_evidence_dir is not None and storage_migration_path is None:
+        raise ValueError(
+            "storage_migration_evidence_dir requires storage_migration_path"
+        )
     if storage_migration_path is not None:
-        from evrptw.stage052_storage_migration import load_signed_storage_migration
+        from evrptw.stage052_storage_migration import (
+            load_signed_storage_migration,
+            verify_successor_storage_migration_evidence,
+        )
 
         resolved_migration = _resolve(root, storage_migration_path)
         storage_migration = load_signed_storage_migration(resolved_migration)
         storage_migration_sha256 = _sha256(resolved_migration)
+        if storage_migration_evidence_dir is not None:
+            resolved_migration_evidence = _resolve(root, storage_migration_evidence_dir)
+            storage_migration = verify_successor_storage_migration_evidence(
+                resolved_migration,
+                evidence_dir=resolved_migration_evidence,
+                locator=StorageRootLocator.from_toml(
+                    _resolve(root, config.storage_root_locator)
+                ),
+                volume_probe=probe_volume_identity,
+            )
+            successor_storage_migration_verified = True
     job_parallel_selection = None
     accelerator_decision_payload: dict[str, object] | None = None
     if contract.prerequisites:
@@ -533,14 +553,25 @@ def run_stage052(
                         encoding="utf-8"
                     )
                 )
-                if (
-                    not isinstance(review_manifest, dict)
-                    or requirement.component is not Stage052Component.BENCHMARK
-                    or review_manifest.get("storage_migration_sha256")
-                    != storage_migration_sha256
+                prerequisite_binds_migration = (
+                    isinstance(review_manifest, dict)
+                    and requirement.component is Stage052Component.BENCHMARK
+                    and review_manifest.get("storage_migration_sha256")
+                    == storage_migration_sha256
+                )
+                successor_campaign_binds_migration = (
+                    selected is Stage052Component.BENCHMARK
+                    and scope == "pilot"
+                    and requirement.component is Stage052Component.ACCELERATOR_PILOT
+                    and successor_storage_migration_verified
+                )
+                if not (
+                    prerequisite_binds_migration
+                    or successor_campaign_binds_migration
                 ):
                     raise ArtifactIntegrityError(
-                        "prerequisite review does not bind the supplied storage migration"
+                        "neither the prerequisite nor an independently reviewed predecessor "
+                        "campaign binds the supplied storage migration"
                     )
                 identities[requirement.role] = verify_stage052_evidence_input(
                     resolved_input,
@@ -5635,6 +5666,7 @@ def main() -> int:
     parser.add_argument("--prerequisite-dir", type=Path)
     parser.add_argument("--prerequisite", action="append", default=[])
     parser.add_argument("--storage-migration", type=Path)
+    parser.add_argument("--storage-migration-evidence-dir", type=Path)
     arguments = parser.parse_args()
     named_prerequisites = _parse_prerequisite_bindings(arguments.prerequisite)
     outputs = run_stage052(
@@ -5647,6 +5679,7 @@ def main() -> int:
         prerequisite_dir=arguments.prerequisite_dir,
         prerequisite_dirs=named_prerequisites,
         storage_migration_path=arguments.storage_migration,
+        storage_migration_evidence_dir=arguments.storage_migration_evidence_dir,
     )
     for name, path in outputs.items():
         print(f"{name}: {path}")

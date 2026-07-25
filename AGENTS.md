@@ -677,6 +677,15 @@ this repository or one of its subdirectories.
   solver, backend, and scientific identities remain exact. Reviewer source and
   the immutable producer source snapshot are separate explicit inputs and must
   remain separate in the finalized review execution receipt.
+- A successor Benchmark Pilot required after a producer defect keeps the
+  accepted accelerator Pilot as its scientific prerequisite. If that
+  prerequisite froze the pre-migration archive disk, the successor must also
+  supply the migration campaign directory explicitly. Before normalizing only
+  the attested archive-disk field, the runner re-verifies that campaign's signed
+  manifest, every archived batch checksum/byte count, accepted Pilot review,
+  and finalized successful review receipt. The historical Benchmark review
+  never replaces the accelerator prerequisite, and the attestation schema alone
+  is insufficient.
 - Stage 5.2 storage replay hashes canonical records as they are read. It must
   never accumulate a complete axis or bundle of event dictionaries. Multiple
   raw bundles are replayed strictly in input order, one fresh spawned process

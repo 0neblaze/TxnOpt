@@ -284,6 +284,12 @@ producer source snapshot 必须作为两个独立输入验证，不得用新 rev
 通过迁移证明完成的 campaign review 必须在 review manifest 顶层发布 attestation
 及 sidecar SHA-256；后续 Formal producer 只有在显式提供相同证明且 SHA-256 与
 accepted Pilot review 完全一致时，才可将该 Pilot 作为 current-chain prerequisite。
+若 producer defect 要求在物理迁移后重跑 successor Pilot，该 Pilot 仍以 accepted F
+accelerator pilot 作为科学 prerequisite，并额外显式提供
+`--storage-migration-evidence-dir` 指向迁移证明声明的历史 G campaign。系统必须重新
+验证该 campaign 的全部归档 batch、accepted Pilot review 和 finalized successful
+receipt 后，才可仅规范化冻结 selection lock 中的 D 盘身份；不得用历史 G review
+替代 F prerequisite，也不得只信任 attestation schema。
 
 Windows/WSL2 formal reviewer 固定通过
 `python -m evrptw.stage052_review_service launch` 启动 transient
