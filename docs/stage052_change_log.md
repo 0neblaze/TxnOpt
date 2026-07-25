@@ -775,3 +775,8 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 - retrospective review 新增显式 `--producer-source-dir` 与
   `--storage-migration`。前者验证 G26 的只读 producer source snapshot，当前 reviewer
   source 继续由密封 wheel 独立证明，避免用 reviewer revision 冒充 producer revision。
+- bounded review service 同步增加独立 `--producer-source-directory` execution-envelope
+  输入；receipt 的 `producer_repository_revision`/`working_directory` 绑定历史 producer
+  snapshot，新增 `reviewer_working_directory` 绑定当前 reviewer snapshot。两者分别验证
+  clean/read-only source 和 wheel provenance，禁止把 reviewer revision 重复填入
+  producer 字段。

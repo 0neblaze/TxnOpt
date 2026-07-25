@@ -225,6 +225,7 @@ class ReviewServiceConfig:
     raw_manifest: Path
     wheel_path: Path
     service_execution_path: str
+    producer_source_directory: Path | None = None
     progress_log: Path | None = None
     max_aggregate_rss_bytes: int = DEFAULT_MAX_AGGREGATE_RSS_BYTES
     sample_interval_seconds: float = 0.1
@@ -256,6 +257,11 @@ class ReviewServiceConfig:
             "wheel_path",
         ):
             payload[key] = str(payload[key])
+        payload["producer_source_directory"] = (
+            str(self.producer_source_directory)
+            if self.producer_source_directory is not None
+            else None
+        )
         payload["progress_log"] = (
             str(self.progress_log) if self.progress_log is not None else None
         )
@@ -277,6 +283,11 @@ class ReviewServiceConfig:
             raw_manifest=Path(str(payload["raw_manifest"])),
             wheel_path=Path(str(payload["wheel_path"])),
             service_execution_path=str(payload["service_execution_path"]),
+            producer_source_directory=(
+                Path(str(payload["producer_source_directory"]))
+                if payload.get("producer_source_directory") is not None
+                else None
+            ),
             progress_log=(
                 Path(str(payload["progress_log"]))
                 if payload.get("progress_log") is not None
@@ -715,10 +726,33 @@ def _validate_formal_execution_envelope(config: ReviewServiceConfig) -> dict[str
         if isinstance(allowed_payload, dict)
         else {}
     )
-    producer_revision = _require_clean_repository(
+    reviewer_revision = _require_clean_repository(
         config.working_directory,
+    )
+    if (
+        config.producer_source_directory is not None
+        and reviewer_revision != config.reviewer_revision
+    ):
+        raise RuntimeError("reviewer working directory revision mismatch")
+    producer_source = (
+        config.working_directory
+        if config.producer_source_directory is None
+        else config.producer_source_directory.resolve()
+    )
+    producer_revision = _require_clean_repository(
+        producer_source,
         allowed_untracked_sha256=allowed_untracked,
     )
+    if config.producer_source_directory is not None:
+        from evrptw.stage052_evidence import verify_stage052_source_snapshot
+
+        if (
+            not isinstance(source_snapshot, dict)
+            or verify_stage052_source_snapshot(producer_source) != source_snapshot
+        ):
+            raise RuntimeError(
+                "producer source directory does not match the sealed raw source snapshot"
+            )
     wheel_path = config.wheel_path.resolve(strict=True)
     provenance_path = _verify_wheel_provenance(config, wheel_path)
     install = _reviewer_install_identity(reviewer_python, module_name)
@@ -758,7 +792,14 @@ def _initial_receipt(config: ReviewServiceConfig) -> dict[str, object]:
         "stop_reason": "service_did_not_finalize",
         "exit_code": None,
         "command": list(config.command),
-        "working_directory": str(config.working_directory.resolve()),
+        "working_directory": str(
+            (
+                config.working_directory
+                if config.producer_source_directory is None
+                else config.producer_source_directory
+            ).resolve()
+        ),
+        "reviewer_working_directory": str(config.working_directory.resolve()),
         "python_executable": str(_absolute_executable(config.reviewer_python)),
         "service_execution_path": config.service_execution_path,
         "reviewer_revision": config.reviewer_revision,
@@ -1116,6 +1157,7 @@ def _build_parser() -> argparse.ArgumentParser:
     launch.add_argument("--raw-manifest", type=Path, required=True)
     launch.add_argument("--wheel-path", type=Path, required=True)
     launch.add_argument("--reviewer-revision", required=True)
+    launch.add_argument("--producer-source-directory", type=Path)
     launch.add_argument("--max-aggregate-rss-gib", type=float, default=5.5)
     launch.add_argument("command", nargs=argparse.REMAINDER)
     supervise = subparsers.add_parser("supervise")
@@ -1163,6 +1205,7 @@ def main() -> int:
             raw_manifest=arguments.raw_manifest,
             wheel_path=arguments.wheel_path,
             service_execution_path=_service_execution_path(),
+            producer_source_directory=arguments.producer_source_directory,
             progress_log=progress_log,
             max_aggregate_rss_bytes=int(arguments.max_aggregate_rss_gib * 1024**3),
         )

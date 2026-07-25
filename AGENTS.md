@@ -671,7 +671,8 @@ this repository or one of its subdirectories.
   every archived batch checksum and byte count. Only the attested
   `d_archive_disk` field may differ; producer runtime, source snapshot, ext4,
   solver, backend, and scientific identities remain exact. Reviewer source and
-  the immutable producer source snapshot are separate explicit inputs.
+  the immutable producer source snapshot are separate explicit inputs and must
+  remain separate in the finalized review execution receipt.
 - Stage 5.2 storage replay hashes canonical records as they are read. It must
   never accumulate a complete axis or bundle of event dictionaries. Multiple
   raw bundles are replayed strictly in input order, one fresh spawned process

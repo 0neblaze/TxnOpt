@@ -65,6 +65,19 @@ def _config(tmp_path: Path, *, limit_bytes: int) -> ReviewServiceConfig:
     )
 
 
+def test_review_service_config_preserves_separate_producer_source(
+    tmp_path: Path,
+) -> None:
+    producer_source = tmp_path / "producer-source"
+    config = replace(
+        _config(tmp_path / "config", limit_bytes=256 * 1024 * 1024),
+        producer_source_directory=producer_source,
+    )
+    replayed = ReviewServiceConfig.from_dict(config.to_dict())
+    assert replayed.producer_source_directory == producer_source
+    assert replayed.working_directory == config.working_directory
+
+
 def test_review_supervisor_writes_receipt_and_preserves_raw_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
