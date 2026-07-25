@@ -98,6 +98,7 @@ from evrptw.stage052_campaign import (
 )
 from evrptw.stage052_campaign_runner import (
     ArchivedBatchStateWriteError,
+    BatchRuntimeEvidence,
     BatchRuntimeMonitor,
     RollingCampaignCapacityError,
     WindowsWslMachineSnapshotSource,
@@ -1737,6 +1738,31 @@ def _run_benchmark_campaign_impl(
     }
 
 
+def _record_batch_runtime_evidence(
+    *,
+    writer: ArtifactBundleWriter,
+    batch_dir: Path,
+    run_label: str,
+    batch_id: str,
+    runtime_evidence: BatchRuntimeEvidence,
+) -> Path:
+    runtime_path = (
+        batch_dir / "control" / f"{run_label}_{batch_id}_runtime_evidence.json"
+    )
+    runtime_path.write_text(
+        json.dumps(runtime_evidence.to_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    writer.record_existing_file(
+        runtime_path,
+        artifact_type="batch_runtime_evidence",
+        artifact_subtype=batch_id,
+        retention_class="control",
+        storage_format="json_control",
+    )
+    return runtime_path
+
+
 def _run_benchmark_batch(
     *,
     root: Path,
@@ -1905,22 +1931,13 @@ def _run_benchmark_batch(
         runtime_evidence = runtime_monitor.stop()
         runtime_started = False
         native_power_boundary = snapshot_source.verify_native_status_unchanged()
-        runtime_path = (
-            batch_dir
-            / "control"
-            / (f"{campaign_config.run_label}_{plan.batch_id}_runtime_evidence.json")
-        )
         with persistence_recorder.record("batch_runtime_control"):
-            runtime_path.write_text(
-                json.dumps(runtime_evidence.to_dict(), indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            writer.record_existing_file(
-                runtime_path,
-                artifact_type="batch_runtime_evidence",
-                artifact_subtype=plan.batch_id,
-                retention_class="control",
-                storage_format="json_control",
+            _record_batch_runtime_evidence(
+                writer=writer,
+                batch_dir=batch_dir,
+                run_label=campaign_config.run_label,
+                batch_id=plan.batch_id,
+                runtime_evidence=runtime_evidence,
             )
         power_load_path = (
             batch_dir / "control" / (f"{campaign_config.run_label}_{plan.batch_id}_power_load.json")
@@ -2009,14 +2026,38 @@ def _run_benchmark_batch(
             run_label=campaign_config.run_label,
         )
     except BaseException as error:
+        cleanup_errors: list[str] = []
         if resource_started:
-            with contextlib.suppress(BaseException):
+            try:
                 _record_resource_summary(writer, resource_sampler.stop())
+            except BaseException as cleanup_error:
+                cleanup_errors.append(
+                    "resource evidence cleanup failed "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
         if runtime_started:
-            with contextlib.suppress(BaseException):
-                runtime_monitor.stop()
+            try:
+                failed_runtime_evidence = runtime_monitor.stop()
+                runtime_started = False
+                _record_batch_runtime_evidence(
+                    writer=writer,
+                    batch_dir=batch_dir,
+                    run_label=campaign_config.run_label,
+                    batch_id=plan.batch_id,
+                    runtime_evidence=failed_runtime_evidence,
+                )
+            except BaseException as cleanup_error:
+                cleanup_errors.append(
+                    "runtime evidence cleanup failed "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+        failure_error: BaseException = error
+        if cleanup_errors:
+            failure_error = RuntimeError(
+                f"{type(error).__name__}: {error}; " + "; ".join(cleanup_errors)
+            )
         for task in tasks:
-            _ensure_partial_shard_failure(task, error)
+            _ensure_partial_shard_failure(task, failure_error)
         with contextlib.suppress(BaseException):
             writer.adopt_v2_shards(
                 expected_identities=tuple((task.instance_name, task.seed) for task in tasks),
@@ -2024,9 +2065,13 @@ def _run_benchmark_batch(
             )
         with contextlib.suppress(BaseException):
             writer.finalize(status="partial", evidence_completeness="partial")
-        failed = planned_manifest.mark_failed(f"{type(error).__name__}: {error}")
+        failed = planned_manifest.mark_failed(
+            f"{type(failure_error).__name__}: {failure_error}"
+        )
         with contextlib.suppress(BaseException):
             atomic_write_signed_json(batch_dir / "batch_manifest.json", failed.to_dict())
+        if failure_error is not error:
+            raise failure_error from error
         raise
 
 

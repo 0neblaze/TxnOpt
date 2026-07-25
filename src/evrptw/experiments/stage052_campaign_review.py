@@ -82,6 +82,7 @@ from evrptw.stage052_campaign import (
     load_batch_manifest,
     load_campaign_manifest,
     maximum_process_average_cores,
+    maximum_process_average_cores_over_windows,
 )
 from evrptw.stage052_campaign_runner import (
     campaign_runtime_selection_sha256,
@@ -2355,9 +2356,10 @@ def _validate_power_load(
         )
         if len(runtime_counter_samples) != len(raw_runtime_samples):
             raise ArtifactIntegrityError("runtime process CPU sample is invalid")
-        replayed_runtime_unrelated = maximum_process_average_cores(
+        replayed_runtime_unrelated = maximum_process_average_cores_over_windows(
             runtime_counter_samples,
             logical_cpu_count=runtime_logical_cpu_count,
+            window_seconds=30.0,
         )
     except ArtifactIntegrityError as error:
         return False, str(error)

@@ -46,6 +46,7 @@ from evrptw.stage052_campaign import (
     directory_checksum,
     load_campaign_manifest,
     maximum_process_average_cores,
+    maximum_process_average_cores_over_windows,
 )
 from evrptw.stage052_evidence import (
     STAGE052_RESOURCE_SCHEMA_VERSION,
@@ -74,6 +75,7 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
         "src/evrptw/experiments/stage052_campaign_review.py",
         "src/evrptw/experiments/stage052_performance.py",
         "src/evrptw/experiments/stage052_performance_review.py",
+        "src/evrptw/stage052_campaign.py",
         "src/evrptw/stage052_campaign_runner.py",
         "src/evrptw/stage052_evidence.py",
         "src/evrptw/stage052_platform.py",
@@ -367,9 +369,14 @@ class BatchRuntimeEvidence:
         recorded_logical_cpu_count = (
             logical_cpu_count or (os.cpu_count() or 1) if len(counter_samples) >= 2 else None
         )
-        maximum_unrelated = _maximum_window_process_average_cores(
-            snapshots,
-            logical_cpu_count=recorded_logical_cpu_count,
+        maximum_unrelated = (
+            maximum_process_average_cores_over_windows(
+                counter_samples,
+                logical_cpu_count=cast(int, recorded_logical_cpu_count),
+                window_seconds=config.preflight_window_seconds,
+            )
+            if len(counter_samples) >= 2
+            else _maximum_window_process_average_cores(snapshots)
         )
         maximum_permitted_load1 = config.maximum_load1 + config.selected_workers
         low_power = any(sample.low_power_mode_enabled for sample in snapshots)

@@ -1217,6 +1217,120 @@ def test_runtime_evidence_rejects_full_window_unrelated_core_average() -> None:
     assert "unrelated" in evidence.failure_reason
 
 
+def test_runtime_monitor_waits_for_a_full_cpu_window_before_rejecting_exit() -> None:
+    monitor = campaign_runner.BatchRuntimeMonitor(
+        _pilot_config(),
+        snapshot=lambda: MachineSnapshot("AC Power", False, 1.0, 0.0),
+    )
+    monitor._samples = [
+        MachineSnapshot(
+            "AC Power",
+            False,
+            1.0,
+            0.0,
+            sampled_at_seconds=0.0,
+            unrelated_process_cpu_seconds={287: 0.0},
+        ),
+        MachineSnapshot(
+            "AC Power",
+            False,
+            1.0,
+            0.0,
+            sampled_at_seconds=1.0,
+            unrelated_process_cpu_seconds={287: 0.0},
+        ),
+        MachineSnapshot(
+            "AC Power",
+            False,
+            1.0,
+            0.0,
+            sampled_at_seconds=2.1,
+            unrelated_process_cpu_seconds={},
+        ),
+    ]
+
+    assert monitor.abort_reason() is None
+
+
+def test_runtime_monitor_rejects_a_full_core_after_one_complete_cpu_window() -> None:
+    monitor = campaign_runner.BatchRuntimeMonitor(
+        _pilot_config(),
+        snapshot=lambda: MachineSnapshot("AC Power", False, 1.0, 0.0),
+    )
+    monitor._samples = [
+        MachineSnapshot(
+            "AC Power",
+            False,
+            1.0,
+            0.0,
+            sampled_at_seconds=0.0,
+            unrelated_process_cpu_seconds={999: 0.0},
+        ),
+        MachineSnapshot(
+            "AC Power",
+            False,
+            1.0,
+            0.0,
+            sampled_at_seconds=30.0,
+            unrelated_process_cpu_seconds={999: 30.0},
+        ),
+    ]
+
+    assert monitor.abort_reason() == "unrelated process averaged one full core"
+
+
+def test_failed_batch_runtime_evidence_can_be_persisted(
+    tmp_path: Path,
+) -> None:
+    records: list[tuple[Path, dict[str, object]]] = []
+    writer = SimpleNamespace(
+        record_existing_file=lambda path, **details: records.append((path, details))
+    )
+    (tmp_path / "control").mkdir()
+    evidence = BatchRuntimeEvidence.from_snapshots(
+        (
+            MachineSnapshot(
+                "AC Power",
+                False,
+                1.0,
+                0.0,
+                sampled_at_seconds=0.0,
+                unrelated_process_cpu_seconds={999: 0.0},
+            ),
+            MachineSnapshot(
+                "AC Power",
+                False,
+                1.0,
+                0.0,
+                sampled_at_seconds=30.0,
+                unrelated_process_cpu_seconds={999: 30.0},
+            ),
+        ),
+        config=_pilot_config(),
+    )
+
+    path = stage052_performance._record_batch_runtime_evidence(
+        writer=writer,
+        batch_dir=tmp_path,
+        run_label="stage05.2_benchmark_attempt34",
+        batch_id="batch0001",
+        runtime_evidence=evidence,
+    )
+
+    assert json.loads(path.read_text(encoding="utf-8"))["passed"] is False
+    assert records == [
+        (
+            path,
+            {
+                "artifact_type": "batch_runtime_evidence",
+                "artifact_subtype": "batch0001",
+                "retention_class": "control",
+                "storage_format": "json_control",
+            },
+        )
+    ]
+
+
 def _resource_summary(*, aggregate_rss: int = 2_000_000_000) -> RunResourceSummary:
     return RunResourceSummary(
         schema_version="stage05.2-run-resource-v3",

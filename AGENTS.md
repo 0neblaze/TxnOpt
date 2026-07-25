@@ -600,8 +600,12 @@ this repository or one of its subdirectories.
 - Campaign preflight keeps the fixed `load1 <= 4.0` idle-host gate. During a
   batch, the auditable total-load ceiling is `4.0 + selected_workers`, because
   the selected campaign workers are expected load; unrelated user CPU remains
-  a separate PID-tree-excluding hard gate at one full core. AC power and low
-  power mode remain continuous hard gates.
+  a separate PID-tree-excluding hard gate at one full core averaged over every
+  complete rolling 30-second window. A partial batch-start window cannot apply
+  the disappearing-PID upper bound as measured CPU; the CPU gate starts at the
+  first complete window, while AC power, low power mode, and total load remain
+  immediate continuous hard gates. Runtime samples are retained for failed
+  batches as partial replay evidence.
 - G may consume accepted F evidence from an older revision only when the
   current revision is its Git descendant and the entire intervening diff is
   confined to the explicit G campaign runner, artifact-persistence adapter,

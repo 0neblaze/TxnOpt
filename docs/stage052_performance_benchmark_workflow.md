@@ -171,10 +171,14 @@ next-fit partitioning 的 target/hard cap 为 24/32 GiB，单 shard hard cap 2 G
 campaign 启动前的两段 30 秒窗口继续要求 `load1 <= 4.0`。batch 运行中总
 `load1` 上限为 `4.0 + selected_workers`，因为被选中的 worker 本身就是预期负载；
 同时按 PID tree 排除本 campaign 后的 unrelated user process（无关用户进程）仍不得
-在完整窗口平均占用一整核。两项证据分别记录、分别由 reviewer 重放，不得互相替代。
+在任何完整 30 秒 rolling window（滚动窗口）平均占用一整核。未满 30 秒的 batch
+startup window（批次启动窗口）不执行该平均值 gate，因为消失 PID 的保守采样上界
+不是已测 CPU 消耗；一旦首个完整窗口形成即开始连续判定。两项证据分别记录、分别由
+reviewer 重放，不得互相替代。
 运行监视器的独立 runtime evidence（运行时证据）显式记录该动态上限；power/load
 artifact 记录实际采样，reviewer 从冻结的 worker 数独立重建上限并比较，避免
-producer 自报阈值成为审计依据。
+producer 自报阈值成为审计依据。batch 异常退出时也必须把已取得的 runtime samples
+写入 partial raw evidence（部分原始证据），不得只在成功路径保留。
 
 若 G 自身的 campaign runner/reviewer 出现缺陷，可以在不重跑 F 的前提下消费已接受
 F evidence，但必须同时满足：当前 revision 是 F revision 的 Git descendant（后继）；

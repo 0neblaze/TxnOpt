@@ -813,3 +813,23 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   被 runtime guard 拒绝：Codex 同时执行的递归 WSL `find/sort` 进度检查成为 unrelated
   full-core process。守卫未降低，partial evidence 已密封；后续 producer 运行期间禁止
   启动 WSL 监控进程，只允许 Windows UNC 轻量只读 manifest 检查。attempt32 不续跑。
+
+## 2026-07-25：G33 跨 batch 短窗口 PID 消失假阳性修复
+
+- Formal `stage05.2_benchmark_attempt33` 的 batch0001 完成 405/405 shards，并以
+  `cross_volume_verified_copy` 将 12,351,248,493 bytes 原子归档到新 D 盘；归档目录
+  checksum 为 `98e6a2ea5ee985a4864a8cfccd552f59f944e2c6479cb0aa2e3f1b7f588dc492`。
+  batch0002 启动约 2.1 秒后，runtime guard 报告 unrelated process 平均占满一核并
+  fail fast；attempt33 保持 failed，不续跑、不导入已完成 shard。
+- 失败与 lifecycle keeper 的固定 30 秒边界重合。keeper 的 `sleep` 子进程几乎不消耗
+  CPU，但旧实现对刚消失 PID 的未知尾段按“全部逻辑 CPU × 一个采样间隔”计入上界。
+  在尚不足一个完整观察窗的 2.1 秒新 batch 中，该上界必然超过 1 core，因而把空闲
+  短生命周期进程误判为干扰。abort 报告中的 PID 14797 由 resource summary 证明是
+  campaign 自身 worker，只是 kill 后未在旧 4 秒等待内完成回收，并非 offending PID。
+- runtime unrelated-process gate 现使用连续完整 30 秒 rolling windows；不足 30 秒时
+  AC power、low-power mode 与 `load1 <= 4.0 + selected_workers` 仍即时 fail fast，
+  只有需要“平均一整核”语义的 CPU gate 等待首个完整窗口。之后每个新采样都重放最近
+  的完整窗口，持续一整核的外部负载仍在 30 秒时被拒绝，门槛未提高。
+- independent reviewer 对同一 runtime samples 使用相同的窗口切分并独立重算最大值；
+  raw schema 与 power/load publication surface 不变。失败 batch 现在也持久化已取得的
+  runtime evidence，避免只留下摘要错误而无法重放触发窗口。

@@ -1011,6 +1011,50 @@ def maximum_process_average_cores(
     return maximum
 
 
+def maximum_process_average_cores_over_windows(
+    samples: Sequence[ProcessCpuCounterSample],
+    *,
+    logical_cpu_count: int,
+    window_seconds: float,
+) -> float:
+    """Return the maximum conservative average over complete rolling windows.
+
+    Runtime monitoring must not interpret the disappearance upper bound from a
+    partial startup window as measured CPU consumption. Every eligible window
+    spans at least ``window_seconds`` and is chosen as tightly as the sampled
+    timestamps permit.
+    """
+
+    if len(samples) < 2:
+        raise ValueError("process CPU replay requires at least two samples")
+    if not math.isfinite(window_seconds) or window_seconds <= 0.0:
+        raise ValueError("process CPU window_seconds must be positive")
+    timestamps = tuple(sample.sampled_at_seconds for sample in samples)
+    if any(
+        right <= left
+        for left, right in zip(timestamps, timestamps[1:], strict=False)
+    ):
+        raise ValueError("process CPU samples must be strictly ordered")
+    maximum = 0.0
+    start_index = 0
+    for end_index in range(1, len(samples)):
+        while (
+            start_index + 1 < end_index
+            and timestamps[end_index] - timestamps[start_index + 1] >= window_seconds
+        ):
+            start_index += 1
+        if timestamps[end_index] - timestamps[start_index] < window_seconds:
+            continue
+        maximum = max(
+            maximum,
+            maximum_process_average_cores(
+                samples[start_index : end_index + 1],
+                logical_cpu_count=logical_cpu_count,
+            ),
+        )
+    return maximum
+
+
 @dataclass(frozen=True, slots=True)
 class SystemLoadWindow:
     """One measured preflight/runtime load window."""
