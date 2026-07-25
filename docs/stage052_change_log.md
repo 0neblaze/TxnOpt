@@ -35,6 +35,11 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   seconds 比较，重复并错误地拒绝了 deadline boundary 前的合法事务。修复后
   lane-local deadline boundary 仍是权威边界；exact completion、cache store
   和 boundary 后 acceptance 的原有拒绝规则保持不变。
+- 同一 Pilot 的下一代 review 又暴露 deadline interrupt 可在 batch 已声明
+  launch、但 native kernel invocation 尚未发生时终止。counter reconciliation
+  现在要求 `started = completed + interrupted`，并只允许
+  `batch_launches - native_invocations` 落在已证明的 interrupted 数量内；
+  fallback 仍必须为零，未证明的 counter 缺口仍 fail fast。
   必须核对该合同；worker ownership 接受多于 configured concurrency 的真实、已采样
   owner PID，但少于四个仍 fail fast。
 - 当前 G Benchmark Pilot/Formal 的 producer/reviewer batch resource gate 调整为

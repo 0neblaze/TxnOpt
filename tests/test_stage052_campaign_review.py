@@ -435,6 +435,58 @@ def test_streaming_event_audit_uses_lane_boundary_for_pause_aware_budget() -> No
     assert audit.passed
 
 
+def test_native_axis_allows_deadline_interrupt_before_native_invocation() -> None:
+    raw_axis = {
+        "backend": "cpu_batch",
+        "started_calls": 2,
+        "completed_calls": 1,
+        "backend_metrics": {
+            "exact_calls": 2,
+            "batch_launches": 2,
+            "work_batches": 2,
+            "native_invocations": 1,
+            "native_fallbacks": 0,
+            "launch_occupancies": [1, 1],
+        },
+    }
+    trace_axis = {
+        "result_summary": {
+            "exact_started_calls": 2,
+            "exact_completed_calls": 1,
+            "exact_interrupted_calls": 1,
+            "screening_statistics": {"native_protocol_fallbacks": 0},
+        },
+        "persistence_pipeline": {
+            "mode": "bounded_async_thread",
+            "queue_max_batches": 1,
+            "writer_thread_switch_interval_seconds": 0.5,
+            "submitted_batches": 1,
+            "completed_batches": 1,
+            "writer_active_nanoseconds": 10,
+            "writer_cpu_nanoseconds": 5,
+            "producer_active_nanoseconds": 10,
+            "persistence_union_nanoseconds": 15,
+            "solver_persistence_union_nanoseconds": 10,
+            "solver_persistence_critical_path_nanoseconds": 8,
+            "solver_producer_active_nanoseconds": 8,
+            "solver_writer_cpu_nanoseconds": 5,
+            "producer_wait_nanoseconds": 0,
+            "peak_queued_batches": 1,
+            "batch_ledger": [
+                {
+                    "ordinal": 0,
+                    "row_count": 1,
+                    "event_token_sha256": "a" * 64,
+                }
+            ],
+        },
+    }
+
+    passed, detail = campaign_review_module._native_axis_valid(raw_axis, trace_axis)
+
+    assert passed, detail
+
+
 def test_streaming_event_audit_keeps_deadline_boundaries_lane_local() -> None:
     events = (
         {
@@ -1408,6 +1460,7 @@ def _build_complete_pilot_campaign(
             "result_summary": {
                 "exact_started_calls": 0,
                 "exact_completed_calls": 0,
+                "exact_interrupted_calls": 0,
                 "screening_statistics": {"native_protocol_fallbacks": 0},
             },
             "persistence_pipeline": {

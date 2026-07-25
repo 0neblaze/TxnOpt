@@ -1231,13 +1231,19 @@ def _native_axis_valid(
         )
         trace_started = _strict_int(result.get("exact_started_calls"), "trace started calls")
         trace_completed = _strict_int(result.get("exact_completed_calls"), "trace completed calls")
+        trace_interrupted = _strict_int(
+            result.get("exact_interrupted_calls"),
+            "trace interrupted calls",
+        )
     except ArtifactIntegrityError as error:
         return False, str(error)
     passed = (
         started == exact_calls == sum(occupancies)
         and completed == trace_completed
         and started == trace_started
-        and batch_launches == work_batches == invocations == len(occupancies)
+        and started == completed + trace_interrupted
+        and batch_launches == work_batches == len(occupancies)
+        and 0 <= batch_launches - invocations <= trace_interrupted
         and all(value > 0 for value in occupancies)
         and fallbacks == 0
         and protocol_fallbacks == 0
@@ -1245,7 +1251,7 @@ def _native_axis_valid(
     )
     return (
         passed,
-        "native counters and no-fallback passed"
+        "native counters, deadline interruption, and no-fallback passed"
         if passed
         else "native counters, exact-call ordering, or no-fallback failed",
     )

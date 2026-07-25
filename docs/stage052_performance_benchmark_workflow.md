@@ -122,6 +122,11 @@ artifact，也不得替代、删除、聚合或跳过任何审计事件。
 deadline replay 必须以 lane-local deadline boundary 为权威，不得再把该 wall
 timestamp 直接与 declared solver seconds 比较。boundary 后 acceptance、
 exact completion crossing 和 boundary 后 cache store 仍必须 fail fast。
+Native counter replay 必须显式对账 deadline interruption：batch 已声明 launch
+后，deadline checkpoint 可在 native invocation 前终止，因此
+`batch_launches - native_invocations` 只能小于等于已重放的 interrupted call
+数量；同时必须满足 `started = completed + interrupted`，且所有 native/protocol
+fallback counter 为零。
 reviewer 要求所有 shard owner 都属于 50-ms process-tree samples，并至少观察到冻结的
 并发 worker 数。worker recycle（工作进程回收）不得改变 shard 顺序、solver、backend、
 objective、validator、event schema 或失败语义。
