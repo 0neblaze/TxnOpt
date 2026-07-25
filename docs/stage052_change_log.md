@@ -806,3 +806,10 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   producer replay/storage migration 合同一致，仅排除易波动的
   `machine_identity.memory_bytes`；CPU、GPU、OS、kernel、mount、disk（经签名迁移
   规范化）、dependency、Python/native identity 仍全部冻结。attempt30 不复用。
+- Formal attempt31 已通过 selection lock，但 Windows-side keepalive 参数引用失效，
+  WSL lifecycle 在 raw 创建前结束；unit 随 system shutdown 正常收束且未创建 campaign
+  目录。随后以独立 stop sentinel 的持久 keeper 验证连续心跳，attempt31 不复用。
+- Formal attempt32 通过完整 preflight 并进入 batch0001，但在 worker 启动后 4.69 秒
+  被 runtime guard 拒绝：Codex 同时执行的递归 WSL `find/sort` 进度检查成为 unrelated
+  full-core process。守卫未降低，partial evidence 已密封；后续 producer 运行期间禁止
+  启动 WSL 监控进程，只允许 Windows UNC 轻量只读 manifest 检查。attempt32 不续跑。
