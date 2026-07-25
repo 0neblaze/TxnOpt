@@ -622,6 +622,7 @@ def run_stage052(
             component_prerequisites=component_prerequisites,
             resolved_prerequisite_dirs=resolved_prerequisite_dirs,
             storage=storage,
+            storage_migration=storage_migration,
         )
 
     resolved_output.mkdir(parents=True)
@@ -975,6 +976,7 @@ def _run_benchmark_campaign(
     component_prerequisites: Mapping[str, object],
     resolved_prerequisite_dirs: Mapping[str, Path],
     storage: ArtifactStorageConfig,
+    storage_migration: Mapping[str, object] | None = None,
 ) -> dict[str, Path]:
     try:
         return _run_benchmark_campaign_impl(
@@ -989,6 +991,7 @@ def _run_benchmark_campaign(
             component_prerequisites=component_prerequisites,
             resolved_prerequisite_dirs=resolved_prerequisite_dirs,
             storage=storage,
+            storage_migration=storage_migration,
         )
     except BaseException as error:
         if output_dir.is_dir():
@@ -1015,6 +1018,7 @@ def _run_benchmark_campaign_impl(
     component_prerequisites: Mapping[str, object],
     resolved_prerequisite_dirs: Mapping[str, Path],
     storage: ArtifactStorageConfig,
+    storage_migration: Mapping[str, object] | None = None,
 ) -> dict[str, Path]:
     """Execute G01/G02 as immutable, archived batches rather than one task fan-out."""
 
@@ -1065,6 +1069,7 @@ def _run_benchmark_campaign_impl(
         input_provenance=performance_provenance,
         native_kernel_config=config.native_kernels.to_dict(),
         repository=root,
+        storage_migration=storage_migration,
     )
     if selection_lock.selected_backend == "cuda":
         raise RuntimeError(

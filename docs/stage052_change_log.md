@@ -795,3 +795,9 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   allowlist 现仅新增本轮实际变更的 reviewer、review service、migration attestation、
   platform guard 及对应测试/文档路径；solver、objective、validator、native producer
   algorithm 与配置仍不在允许范围。attempt27/28 的 service logs 保留，均不复用。
+- Formal attempt29 在 raw 创建前由 runtime selection lock 拒绝。根因是 prerequisite
+  verification 已验证 signed D archive migration，但 successor runtime selection
+  comparison 未接收同一 migration；同时新建环境解析了不同的间接依赖版本。修复后
+  仅当当前 D archive disk 精确等于 attestation destination 时，比较前将该单一字段
+  规范化为 attestation source，其余 runtime 字段继续冻结；Formal 环境复用 G26 的
+  精确 dependency set，仅替换当前 sealed wheel。attempt29 不复用。

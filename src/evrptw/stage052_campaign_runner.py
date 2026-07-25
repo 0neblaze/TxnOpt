@@ -109,6 +109,36 @@ def campaign_runtime_selection_sha256(value: Mapping[str, object]) -> str:
     )
 
 
+def _runtime_selection_with_attested_archive_source(
+    runtime: Mapping[str, object],
+    storage_migration: Mapping[str, object],
+) -> dict[str, object]:
+    """Normalize only an attested archive-disk replacement to its source identity."""
+
+    machine = _mapping(runtime.get("machine_identity"), "runtime machine identity")
+    observed_disk = _mapping(
+        machine.get("d_archive_disk"),
+        "runtime D archive disk identity",
+    )
+    source_disk = _mapping(
+        storage_migration.get("source_machine_disk"),
+        "storage migration source disk identity",
+    )
+    destination_disk = _mapping(
+        storage_migration.get("destination_machine_disk"),
+        "storage migration destination disk identity",
+    )
+    if observed_disk != destination_disk:
+        raise RuntimeError(
+            "benchmark runtime archive disk differs from the attested migration destination"
+        )
+    normalized_machine = dict(machine)
+    normalized_machine["d_archive_disk"] = dict(source_disk)
+    normalized_runtime = dict(runtime)
+    normalized_runtime["machine_identity"] = normalized_machine
+    return normalized_runtime
+
+
 def verify_campaign_successor_revision(
     repository: Path,
     *,
@@ -743,6 +773,7 @@ class BenchmarkExecutionLock:
         input_provenance: object,
         native_kernel_config: object,
         repository: Path | None = None,
+        storage_migration: Mapping[str, object] | None = None,
     ) -> None:
         """Reject any execution drift from the accepted predecessor lock."""
 
@@ -768,10 +799,20 @@ class BenchmarkExecutionLock:
                 predecessor_revision=self.repository_revision,
                 current_revision=repository_revision,
             )
+            current_selection_sha256 = campaign_runtime_selection_sha256(
+                current_runtime
+            )
             if (
-                campaign_runtime_selection_sha256(current_runtime)
-                != self.runtime_selection_sha256
+                current_selection_sha256 != self.runtime_selection_sha256
+                and storage_migration is not None
             ):
+                current_selection_sha256 = campaign_runtime_selection_sha256(
+                    _runtime_selection_with_attested_archive_source(
+                        current_runtime,
+                        storage_migration,
+                    )
+                )
+            if current_selection_sha256 != self.runtime_selection_sha256:
                 raise RuntimeError(
                     "benchmark runtime selection differs from accepted selection"
                 )

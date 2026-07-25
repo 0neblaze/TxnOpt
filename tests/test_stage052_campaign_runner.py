@@ -4,6 +4,7 @@ import hashlib
 import json
 import plistlib
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -505,6 +506,110 @@ def test_execution_lock_rejects_current_runtime_or_worker_drift() -> None:
             runtime_identity=drifted_runtime,
             input_provenance=metadata["performance_provenance"],
             native_kernel_config=metadata["native_kernel_config"],
+        )
+
+
+def test_execution_lock_accepts_only_attested_archive_disk_successor_drift(
+    tmp_path: Path,
+) -> None:
+    metadata, review, raw_manifest_sha = _accepted_f02_payloads()
+    source_disk = {
+        "BusType": "NVMe",
+        "FriendlyName": "original",
+        "Number": 1,
+        "SerialNumber": "original-serial",
+    }
+    base_runtime = dict(metadata["runtime_identity"])
+    base_runtime["machine_identity"] = {"d_archive_disk": source_disk}
+    metadata["runtime_identity"] = base_runtime
+    lock = BenchmarkExecutionLock.from_accepted_evidence(
+        metadata=metadata,
+        review_manifest=review,
+        raw_manifest_sha256=raw_manifest_sha,
+        expected_scope="performance",
+        expected_status="READY_FOR_STAGE052_BENCHMARK",
+    )
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(("git", "init", "-q", str(repository)), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.email", "test@example.com"),
+        check=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.name", "Stage 5.2 test"),
+        check=True,
+    )
+    allowed = repository / "src" / "evrptw" / "stage052_campaign_runner.py"
+    allowed.parent.mkdir(parents=True)
+    allowed.write_text("v1\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "commit", "-qm", "predecessor"),
+        check=True,
+    )
+    predecessor_revision = subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    allowed.write_text("v2\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "commit", "-qm", "successor"),
+        check=True,
+    )
+    current_revision = subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    lock = replace(lock, repository_revision=predecessor_revision)
+
+    runtime = dict(metadata["runtime_identity"])
+    machine = dict(runtime["machine_identity"])
+    destination_disk = {
+        "BusType": "NVMe",
+        "FriendlyName": "replacement",
+        "Number": 1,
+        "SerialNumber": "replacement-serial",
+    }
+    machine["d_archive_disk"] = destination_disk
+    runtime["machine_identity"] = machine
+    migration = {
+        "source_machine_disk": source_disk,
+        "destination_machine_disk": destination_disk,
+    }
+
+    lock.verify_current_execution(
+        selected_backend="native_cpu",
+        selected_exact_backend="cpu_batch",
+        selected_workers=2,
+        repository_revision=current_revision,
+        configuration_sha256="4" * 64,
+        runtime_identity=runtime,
+        input_provenance=metadata["performance_provenance"],
+        native_kernel_config=metadata["native_kernel_config"],
+        repository=repository,
+        storage_migration=migration,
+    )
+
+    bad_migration = dict(migration)
+    bad_migration["destination_machine_disk"] = source_disk
+    with pytest.raises(RuntimeError, match="migration destination"):
+        lock.verify_current_execution(
+            selected_backend="native_cpu",
+            selected_exact_backend="cpu_batch",
+            selected_workers=2,
+            repository_revision=current_revision,
+            configuration_sha256="4" * 64,
+            runtime_identity=runtime,
+            input_provenance=metadata["performance_provenance"],
+            native_kernel_config=metadata["native_kernel_config"],
+            repository=repository,
+            storage_migration=bad_migration,
         )
 
 
