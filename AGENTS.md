@@ -665,6 +665,13 @@ this repository or one of its subdirectories.
   no parent fallback or retry, and both success and failure write
   PID/RSS/event-count/single-pass/scratch-cleanup evidence to the external
   progress log. Residual scratch is removed and reported before failure returns.
+- Retrospective review after a physical archive-disk replacement requires a
+  signed storage-migration attestation binding the old/new volume identities,
+  old/new physical-disk identities, campaign/raw manifest SHA-256 values, and
+  every archived batch checksum and byte count. Only the attested
+  `d_archive_disk` field may differ; producer runtime, source snapshot, ext4,
+  solver, backend, and scientific identities remain exact. Reviewer source and
+  the immutable producer source snapshot are separate explicit inputs.
 - Stage 5.2 storage replay hashes canonical records as they are read. It must
   never accumulate a complete axis or bundle of event dictionaries. Multiple
   raw bundles are replayed strictly in input order, one fresh spawned process

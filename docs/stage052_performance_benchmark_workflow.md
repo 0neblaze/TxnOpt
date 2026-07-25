@@ -269,6 +269,15 @@ JSON-safe（可安全 JSON 序列化）的有界对象并携带 run/batch/shard/
 parent 必须逐字段核对。失败路径同样必须写 child PID/peak RSS、parent RSS、耗时和
 cleanup state，残留 scratch 在 fail fast 前清除并记录，不得静默重试。
 
+若 sealed raw（已密封原始证据）归档后发生物理 D 盘更换，retrospective review
+（追溯复审）只能通过 signed storage migration attestation（签名存储迁移证明）
+接受该变化。证明必须同时绑定旧/新 volume identity（卷身份）、旧/新物理磁盘身份、
+campaign 与标准 raw manifest SHA-256，以及每个归档 batch 的目录 checksum 和字节数。
+仅允许证明中精确声明的 `d_archive_disk` 发生变化；producer runtime、ext4 UUID、
+source snapshot、solver、backend 和科学语义仍须完全一致。reviewer source 与
+producer source snapshot 必须作为两个独立输入验证，不得用新 reviewer checkout
+冒充历史 producer snapshot。
+
 Windows/WSL2 formal reviewer 固定通过
 `python -m evrptw.stage052_review_service launch` 启动 transient
 `systemd --user` service。service 固定使用 `MemoryHigh=5G`、`MemoryMax=6G`、

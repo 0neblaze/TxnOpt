@@ -73,6 +73,7 @@ from evrptw.stage052_campaign import (
     CampaignPlan,
     PilotStorageObservation,
     ProcessCpuCounterSample,
+    StorageRoot,
     StorageRootLocator,
     VolumeIdentity,
     directory_byte_count,
@@ -102,6 +103,9 @@ from evrptw.stage052_retention import (
     resolve_retained_run_from_locator,
 )
 from evrptw.stage052_review_service import ReviewProcessMemoryGuard, ReviewProgressLog
+from evrptw.stage052_storage_migration import (
+    verify_campaign_storage_migration,
+)
 from evrptw.validation import validate_routes
 
 NOT_READY = "NOT_READY"
@@ -3443,9 +3447,18 @@ def _verify_accelerator_prerequisite(
     raw_dir: Path,
     *,
     campaign: CampaignManifest,
+    storage_migration: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, object], str, dict[str, object]]:
     requirement = stage052_contract(Stage052Component.BENCHMARK, "pilot").prerequisites[0]
-    identity = verify_stage052_evidence_input(raw_dir, requirement)
+    identity = (
+        verify_stage052_evidence_input(raw_dir, requirement)
+        if storage_migration is None
+        else verify_stage052_evidence_input(
+            raw_dir,
+            requirement,
+            storage_migration=storage_migration,
+        )
+    )
     reader = ArtifactReader(raw_dir)
     metadata_ref = _one_artifact(reader, "manifest_metadata")
     metadata = reader.read_json(str(metadata_ref["relative_path"]))
@@ -3885,6 +3898,8 @@ def _audit_campaign(
     prerequisite_dir: Path,
     locator: StorageRootLocator,
     volume_probe: Callable[[Path], VolumeIdentity],
+    producer_source_dir: Path | None = None,
+    storage_migration_path: Path | None = None,
 ) -> tuple[
     dict[str, dict[str, object]],
     _ReviewEvidence,
@@ -3935,8 +3950,26 @@ def _audit_campaign(
         if campaign_identity
         else "campaign identity/status/backend/native profile mismatch",
     }
+    migration_payload: dict[str, object] | None = None
+    migration_error = ""
+    if storage_migration_path is not None:
+        try:
+            migration_payload = verify_campaign_storage_migration(
+                storage_migration_path,
+                campaign=campaign,
+                campaign_dir=campaign_dir,
+                locator=locator,
+                volume_probe=volume_probe,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            migration_error = str(error)
+    source_root = (
+        repository_root()
+        if producer_source_dir is None
+        else producer_source_dir.resolve()
+    )
     try:
-        current_source_snapshot = verify_stage052_source_snapshot(repository_root())
+        current_source_snapshot = verify_stage052_source_snapshot(source_root)
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
         current_source_snapshot = {}
         gates["source_snapshot"] = {"passed": False, "detail": str(error)}
@@ -3967,6 +4000,7 @@ def _audit_campaign(
                 _verify_accelerator_prerequisite(
                     prerequisite_dir,
                     campaign=campaign,
+                    storage_migration=migration_payload,
                 )
             )
         selection_matches = (
@@ -3998,16 +4032,45 @@ def _audit_campaign(
         try:
             configured = locator.resolve(alias)
             observed = volume_probe(configured.absolute_path)
-            if configured.volume != expected or observed != expected:
+            migrated_alias = (
+                migration_payload is not None
+                and migration_payload.get("archive_root_alias") == alias
+                and migration_payload.get("source_volume") == expected.to_dict()
+                and migration_payload.get("destination_volume")
+                == configured.volume.to_dict()
+                and observed == configured.volume
+            )
+            if not migrated_alias and (
+                configured.volume != expected or observed != expected
+            ):
                 root_failures.append(alias)
         except (ArtifactIntegrityError, KeyError, OSError, RuntimeError):
             root_failures.append(alias)
     gates["storage_roots"] = {
         "passed": not root_failures,
-        "detail": "all archive root aliases and live volume identities passed"
+        "detail": (
+            "all archive root aliases and live volume identities passed"
+            if migration_payload is None
+            else "all roots passed; replaced archive disk matched signed migration evidence"
+        )
         if not root_failures
-        else f"storage root identity failures: {sorted(root_failures)}",
+        else (
+            f"storage root identity failures: {sorted(root_failures)}"
+            + (f"; migration={migration_error}" if migration_error else "")
+        ),
     }
+    planning_locator = locator
+    if migration_payload is not None:
+        planning_locator = StorageRootLocator(
+            {
+                alias: StorageRoot(
+                    alias,
+                    locator.resolve(alias).absolute_path,
+                    volume,
+                )
+                for alias, volume in campaign.storage_roots.items()
+            }
+        )
     planning_config: BenchmarkCampaignConfig | None = None
     try:
         planning_config = (
@@ -4057,7 +4120,7 @@ def _audit_campaign(
             plan_payload=standard_reader.read_json(str(plan_ref["relative_path"])),
             preflight_payload=standard_reader.read_json(str(preflight_ref["relative_path"])),
             capacity_payload=dict(raw_capacity),
-            locator=locator,
+            locator=planning_locator,
         )
     except (
         ArtifactIntegrityError,
@@ -4893,6 +4956,8 @@ def review_stage052_campaign(
     prerequisite_dir: Path,
     locator: StorageRootLocator,
     volume_probe: Callable[[Path], VolumeIdentity] = _default_volume_probe,
+    producer_source_dir: Path | None = None,
+    storage_migration_path: Path | None = None,
 ) -> dict[str, Path]:
     """Independently replay one G01 pilot or G02 Formal campaign."""
 
@@ -4908,6 +4973,8 @@ def review_stage052_campaign(
             prerequisite_dir=prerequisite_dir,
             locator=locator,
             volume_probe=volume_probe,
+            producer_source_dir=producer_source_dir,
+            storage_migration_path=storage_migration_path,
         )
         campaign = load_campaign_manifest(campaign_dir / "campaign_manifest.json")
         storage_aliases = sorted(campaign.storage_roots)
@@ -5075,6 +5142,16 @@ def main() -> int:
     parser.add_argument("--prerequisite-dir", type=Path, required=True)
     parser.add_argument("--storage-roots", type=Path, required=True)
     parser.add_argument(
+        "--producer-source-dir",
+        type=Path,
+        help="read-only producer source snapshot used by retrospective review",
+    )
+    parser.add_argument(
+        "--storage-migration",
+        type=Path,
+        help="signed archive-disk migration attestation for retrospective review",
+    )
+    parser.add_argument(
         "--retention-registry",
         type=Path,
         default=Path("experiments/registries/stage05.2_retention_registry.csv"),
@@ -5096,6 +5173,20 @@ def main() -> int:
     if not registry_path.is_file() or not locator_path.is_file():
         parser.error("retention registry and storage-root locator are required")
     locator = StorageRootLocator.from_toml(locator_path)
+    producer_source_dir = (
+        arguments.producer_source_dir.resolve()
+        if arguments.producer_source_dir is not None
+        else None
+    )
+    if producer_source_dir is not None and not producer_source_dir.is_dir():
+        parser.error("--producer-source-dir must be an existing directory")
+    storage_migration_path = (
+        arguments.storage_migration.resolve()
+        if arguments.storage_migration is not None
+        else None
+    )
+    if storage_migration_path is not None and not storage_migration_path.is_file():
+        parser.error("--storage-migration must be an existing signed attestation")
     for record in load_retention_registry(registry_path):
         if record.run_label != campaign_dir.name:
             continue
@@ -5148,6 +5239,8 @@ def main() -> int:
                 scope=arguments.scope,
                 prerequisite_dir=prerequisite_dir,
                 locator=locator,
+                producer_source_dir=producer_source_dir,
+                storage_migration_path=storage_migration_path,
             )
     except BaseException as error:
         progress.emit(

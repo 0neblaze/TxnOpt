@@ -935,6 +935,8 @@ def _same_producer_machine_ignoring_review_memory(
 def verify_frozen_stage052_producer_runtime_identity(
     root: Path,
     revision: str,
+    *,
+    storage_migration: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Replay a producer identity in its frozen venv, separate from reviewer code."""
 
@@ -1015,7 +1017,20 @@ print(json.dumps({
     live_machine = live.get("machine_identity")
     if not isinstance(frozen_machine, Mapping) or not isinstance(live_machine, Mapping):
         raise RuntimeError("Stage 5.2 producer machine identity is invalid")
-    if not _same_producer_machine_ignoring_review_memory(frozen_machine, live_machine):
+    machine_matches = _same_producer_machine_ignoring_review_memory(
+        frozen_machine, live_machine
+    )
+    if not machine_matches and storage_migration is not None:
+        from evrptw.stage052_storage_migration import (
+            machine_identity_matches_storage_migration,
+        )
+
+        machine_matches = machine_identity_matches_storage_migration(
+            frozen_machine,
+            live_machine,
+            storage_migration,
+        )
+    if not machine_matches:
         raise RuntimeError("Stage 5.2 producer machine identity mismatch")
 
     return {
@@ -1736,6 +1751,8 @@ def _verify_current_chain_review_file_surface(
 def verify_stage052_evidence_input(
     raw_dir: Path,
     requirement: Stage052PrerequisiteRequirement,
+    *,
+    storage_migration: Mapping[str, object] | None = None,
 ) -> Stage052PrerequisiteIdentity:
     """Verify one named contract input, including signed NOT_READY remediation input."""
 
@@ -1812,9 +1829,17 @@ def verify_stage052_evidence_input(
             "current-chain prerequisite producer source root is unavailable"
         ) from error
     try:
-        verified_runtime = verify_frozen_stage052_producer_runtime_identity(
-            producer_root,
-            identity.repository_revision,
+        verified_runtime = (
+            verify_frozen_stage052_producer_runtime_identity(
+                producer_root,
+                identity.repository_revision,
+            )
+            if storage_migration is None
+            else verify_frozen_stage052_producer_runtime_identity(
+                producer_root,
+                identity.repository_revision,
+                storage_migration=storage_migration,
+            )
         )
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         raise ArtifactIntegrityError(

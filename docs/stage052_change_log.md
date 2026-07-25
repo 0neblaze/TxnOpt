@@ -753,3 +753,25 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   强制 writer thread spill，再由 producer thread 读取、去重和关闭，证明跨线程串行
   handoff 及 scratch cleanup。G25 及其 6.2-GB partial evidence 保持 failed，不复用；
   后续从新的 G Pilot 标签重试，不重跑 A--F。
+
+## 2026-07-25：G26 reviewer 内存隔离与归档盘迁移证明
+
+- G26 首次 campaign review 在 batch0003 累积到 5.5 GiB reviewer RSS 后失败。根因是
+  同一长寿命 reviewer process 对每个 shard 三次重放 critical events，并跨 shard
+  保留 Python、PyArrow 与 SQLite allocator 高水位。campaign reviewer 现改为每 shard
+  一个全新、严格串行的 `spawn` child，并以一次 logical event pass 同时完成
+  persistence、transaction/deadline 与 global-best/checkpoint 审计。
+- child 重新验证 signed batch/shard manifest，只返回有界 JSON-safe summary；parent
+  验证完整 run/batch/shard/instance/seed 身份、single-pass count、PID、RSS 和 scratch
+  cleanup。异常 child 不重试、不回退到 parent replay。真实 G26 只读 harness 已完成
+  36/36 shards、16,295,563 events、36 个不同 child PID，parent peak RSS 为
+  89,194,496 bytes。
+- G26 sealed raw 随 D: 从 Samsung SSD 990 EVO Plus 1TB 迁移到 ZHITAI TiPlus7100s
+  2TB；raw 中旧物理卷身份不可改写。新增 signed storage migration attestation，
+  绑定旧/新物理磁盘和 volume identity、campaign/standard raw manifest SHA-256，
+  以及 batch0001--0003 的目录 checksum 与 byte count。reviewer 仅在全部内容重验
+  一致时允许 `d_archive_disk` 这一项变化；其他 machine/runtime/source identity
+  仍严格匹配。
+- retrospective review 新增显式 `--producer-source-dir` 与
+  `--storage-migration`。前者验证 G26 的只读 producer source snapshot，当前 reviewer
+  source 继续由密封 wheel 独立证明，避免用 reviewer revision 冒充 producer revision。
