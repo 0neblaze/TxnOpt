@@ -1213,6 +1213,49 @@ def test_preflight_collects_two_consecutive_exact_windows() -> None:
     _pilot_config().validate_preflight(observation)
 
 
+def test_batch_handoff_preflight_ignores_prior_campaign_load_history() -> None:
+    now = 0.0
+
+    def clock() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    observation = collect_preflight_observation(
+        _pilot_config(),
+        snapshot=lambda: MachineSnapshot("AC Power", False, 8.56982421875, 0.0),
+        monotonic=clock,
+        sleep=sleep,
+        sample_interval_seconds=10.0,
+        require_idle_load=False,
+    )
+
+    assert max(window.maximum_load1 for window in observation.windows) == 8.56982421875
+    assert now == 60.0
+
+
+def test_campaign_start_preflight_still_rejects_non_idle_load() -> None:
+    now = 0.0
+
+    def clock() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    with pytest.raises(RuntimeError, match="preflight load1 exceeds 4.0"):
+        collect_preflight_observation(
+            _pilot_config(),
+            snapshot=lambda: MachineSnapshot("AC Power", False, 4.1, 0.0),
+            monotonic=clock,
+            sleep=sleep,
+            sample_interval_seconds=10.0,
+        )
+
+
 def test_preflight_windows_remain_consecutive_with_clock_call_overhead() -> None:
     now = 0.0
 

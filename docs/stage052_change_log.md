@@ -31,6 +31,17 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   current contract 重建 `32.0`，禁止 producer 自报更高阈值。合同变更后必须以新
   label 重跑 Pilot 并通过 independent review，再以新的最低未占用 Formal label
   从零运行。
+- 新合同下的 Pilot `stage05.2_benchmark_attempt57` 正常完成并归档 batch0001 与
+  batch0002；两批 runtime peaks 分别为 `0.6875` 与 `8.56982421875`，外部无关进程
+  均为 `0.0` 核。batch0003 启动前却因 `Stage 5.2 preflight load1 exceeds 4.0`
+  失败。worker 已全部退出，数分钟后 load1 自然降至 `1.30`，证明被拒绝的是
+  batch0002 留在 Linux 1-minute load average 中的历史，而非并发外部负载。
+- campaign-start 两段 `load1 <= 4.0` 门槛保持不变。per-batch handoff preflight
+  仍保留两段 30 秒原始采样并校验 AC、low-power mode、24 logical CPUs 与排除
+  campaign PID tree 后的一整核 unrelated-process gate，但不再用上一批的衰减
+  system load average 拒绝下一批；新批次启动后立即受 `32.0` runtime guard 约束。
+  回归测试要求 Attempt57 的 `8.56982421875` handoff 通过，同时 campaign 首次启动
+  的 `4.1` 仍失败。Attempt57 永久保留，不续跑、不导入 shard。
 
 ## 2026-07-26：G48 24-thread runtime load ceiling 修复
 

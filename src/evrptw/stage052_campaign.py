@@ -2501,8 +2501,13 @@ class BenchmarkCampaignConfig:
             raise ValueError(f"{self.scope} campaign geometry does not match the contract")
         return plan
 
-    def validate_preflight(self, observation: BenchmarkPreflightObservation) -> None:
-        """Enforce the fixed power and two-consecutive-window load gate."""
+    def validate_preflight(
+        self,
+        observation: BenchmarkPreflightObservation,
+        *,
+        require_idle_load: bool = True,
+    ) -> None:
+        """Enforce power/process gates and, at campaign start, the idle-load gate."""
 
         if observation.power_source != self.required_power_source:
             raise RuntimeError("Stage 5.2 campaign requires AC Power")
@@ -2521,7 +2526,7 @@ class BenchmarkCampaignConfig:
                 abs_tol=1e-9,
             ):
                 raise RuntimeError("Stage 5.2 load windows must be consecutive")
-            if window.maximum_load1 > self.maximum_load1:
+            if require_idle_load and window.maximum_load1 > self.maximum_load1:
                 raise RuntimeError("Stage 5.2 preflight load1 exceeds 4.0")
             if (
                 window.maximum_unrelated_process_average_cores

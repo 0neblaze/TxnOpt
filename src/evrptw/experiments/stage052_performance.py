@@ -1893,6 +1893,7 @@ def _run_benchmark_batch(
         batch_preflight = collect_preflight_observation(
             campaign_config,
             snapshot=snapshot_source,
+            require_idle_load=False,
         )
         batch_preflight_path = (
             batch_dir

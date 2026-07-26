@@ -2360,13 +2360,13 @@ def _validate_power_load(
             return False, f"window process CPU replay failed: {error}"
         if (
             duration != 30.0
-            or load1 > RUNTIME_LOAD_POLICY.preflight_maximum_load1
+            or load1 < 0.0
             or logical_cpu_count != RUNTIME_LOAD_POLICY.logical_cpu_count
             or unrelated >= 1.0
             or not math.isclose(unrelated, replayed_unrelated, rel_tol=0.0, abs_tol=1e-12)
             or (previous_end is not None and not math.isclose(started, previous_end))
         ):
-            return False, "batch preflight load windows violate the fixed thresholds"
+            return False, "batch handoff preflight windows violate the fixed thresholds"
         previous_end = started + duration
     try:
         runtime_samples = _strict_int(runtime.get("sample_count"), "runtime sample_count")

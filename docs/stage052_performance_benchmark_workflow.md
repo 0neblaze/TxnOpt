@@ -210,6 +210,12 @@ artifact 只记录实际采样，reviewer 从 current contract 独立重建 `32.
 避免 producer 自报阈值成为审计依据。batch 异常退出时也必须把已取得的 runtime
 samples 写入 partial raw evidence（部分原始证据），不得只在成功路径保留。
 
+`load1 <= 4.0` 只用于整个 campaign 的首次启动门槛。同一 campaign 的 per-batch
+handoff preflight（批次交接预检）仍记录两段完整 30 秒窗口，并继续验证 AC power、
+low-power mode、24 logical CPUs 与排除 campaign PID tree 后的 unrelated-process
+一整核 gate；但它不得用上一批留在 Linux 1-minute load average 中的衰减历史拒绝
+下一批。下一批开始后立即重新受 `load1 <= 32.0` runtime guard 约束。
+
 若 G 自身的 campaign runner/reviewer 出现缺陷，可以在不重跑 F 的前提下消费已接受
 F evidence，但必须同时满足：当前 revision 是 F revision 的 Git descendant（后继）；
 二者间全部 changed paths 均落在显式 G runner/artifact-persistence

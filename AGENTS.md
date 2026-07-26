@@ -627,6 +627,13 @@ this repository or one of its subdirectories.
   samples are retained for failed batches as partial replay evidence, and the
   independent reviewer reconstructs the fixed `32.0` ceiling rather than
   trusting a producer-reported threshold.
+- The campaign-start preflight alone applies the two-window `load1 <= 4.0`
+  idle-host gate. Per-batch handoff preflights still record two complete
+  30-second load windows and enforce AC power, low-power mode, 24 logical CPUs,
+  and the PID-tree-excluding unrelated-process one-core gate, but do not reject
+  the decaying system load average left by the immediately preceding campaign
+  batch. The next batch is immediately subject to the fixed `32.0` runtime
+  fail-fast ceiling.
 - G campaign producer dispatches contiguous waves of at most the frozen worker
   count. Every spawned worker processes exactly one shard, and the whole wave
   pool must shut down before the next wave is created. This preserves four-way

@@ -477,6 +477,7 @@ def collect_preflight_observation(
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     sample_interval_seconds: float = 1.0,
+    require_idle_load: bool = True,
 ) -> BenchmarkPreflightObservation:
     """Measure exactly two consecutive preflight windows."""
 
@@ -531,7 +532,7 @@ def collect_preflight_observation(
         low_power_mode_enabled=observed_low_power,
         windows=tuple(windows),
     )
-    config.validate_preflight(observation)
+    config.validate_preflight(observation, require_idle_load=require_idle_load)
     return observation
 
 

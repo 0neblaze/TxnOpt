@@ -156,7 +156,29 @@ def test_reviewer_accepts_runtime_load_within_audited_machine_headroom() -> None
         selected_workers=4,
     )
 
-    assert passed
+    assert passed, detail
+    assert detail == "continuous batch power/load sampling passed"
+
+
+def test_reviewer_accepts_batch_handoff_load_from_prior_campaign_work() -> None:
+    payload = _power_load_payload(8.56982421875)
+    payload["batch_id"] = "batch0002"
+    preflight = payload["preflight"]
+    assert isinstance(preflight, dict)
+    windows = preflight["windows"]
+    assert isinstance(windows, list)
+    for window in windows:
+        assert isinstance(window, dict)
+        window["maximum_load1"] = 8.56982421875
+
+    passed, detail = campaign_review_module._validate_power_load(
+        payload,
+        run_label="stage05.2_benchmark_attempt49",
+        batch_id="batch0002",
+        selected_workers=4,
+    )
+
+    assert passed, detail
     assert detail == "continuous batch power/load sampling passed"
 
 
