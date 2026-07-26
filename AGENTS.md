@@ -682,6 +682,13 @@ this repository or one of its subdirectories.
   objective/validator and exact/cache/candidate/deadline semantics, resource
   and persistence gates, power/load/root/runtime provenance, BKS incompatibility,
   and the absence of gap columns.
+- A wall-clock candidate transaction may commit only while its owning lane
+  deadline and the solve-wide deadline are still open. This final check occurs
+  after proposal, exact/cache work, optional shadow/constraint work, and the
+  acceptance decision but before incumbent, global-best, statistics, or
+  candidate-state mutation. Reaching the deadline at that boundary records a
+  `before_candidate_commit` deadline event and rejects the transaction; neither
+  timestamp clamping nor reviewer-side filtering is permitted.
 - Benchmark campaign review replays each shard in a fresh, strictly serial
   `spawn` child and never reuses a process pool across shards. One logical event
   pass must jointly replay the async persistence ledger, exact/cache/deadline

@@ -2686,6 +2686,22 @@ def _solve_alns(
                             and exact_call_controller.budget_reached
                         )
                     )
+                    if (
+                        quality_probe_accept
+                        and time.perf_counter() >= quality_evaluator.deadline
+                    ):
+                        quality_probe_accept = False
+                        if measurement_trace is not None:
+                            measurement_trace.record_deadline_boundary(
+                                lane="quality_shadow",
+                                iteration=iteration,
+                                operator=shadow_neighborhood,
+                                boundary="before_candidate_commit",
+                                reason=(
+                                    "quality-shadow candidate transaction reached "
+                                    "the lane deadline before commit"
+                                ),
+                            )
                     quality_probe_vehicle_reduction = bool(
                         shadow_candidate.objective is not None
                         and quality_probe_current.objective is not None
@@ -2910,6 +2926,19 @@ def _solve_alns(
                         exact_call_controller is not None and exact_call_controller.budget_reached
                     )
                 )
+                if lane_accept and time.perf_counter() >= constraint_evaluator.deadline:
+                    lane_accept = False
+                    if measurement_trace is not None:
+                        measurement_trace.record_deadline_boundary(
+                            lane="constraint_lane",
+                            iteration=iteration,
+                            operator=constraint_operator,
+                            boundary="before_candidate_commit",
+                            reason=(
+                                "constraint-lane candidate transaction reached "
+                                "the lane deadline before commit"
+                            ),
+                        )
                 lane_vehicle_reduction = bool(
                     constraint_candidate.objective is not None
                     and constraint_lane_current.objective is not None
@@ -3084,6 +3113,24 @@ def _solve_alns(
                 )
             )
         )
+        if accept and time.perf_counter() >= overall_deadline:
+            accept = False
+            main_lane_timed_out = True
+            if measurement_trace is not None:
+                measurement_trace.record_deadline_boundary(
+                    lane="legacy",
+                    iteration=iteration,
+                    operator=(
+                        selected_neighborhood
+                        if selected_neighborhood
+                        else f"{destroy_name}+{repair_name}"
+                    ),
+                    boundary="before_candidate_commit",
+                    reason=(
+                        "main candidate transaction reached the overall deadline "
+                        "before commit"
+                    ),
+                )
         if profile is not OperatorProfile.BASELINE:
             vehicle_reduction = bool(
                 candidate.objective is not None

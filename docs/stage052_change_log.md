@@ -955,3 +955,24 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   migration normalization 路径；只允许 destination disk 精确替换为 attested source
   disk，memory 仍按既有规则排除，其余 runtime 字段全部参与 hash。Attempt36 继续只
   追加 review generation。
+
+## 2026-07-26：Attempt51 候选事务截止边界修复
+
+- `stage05.2_benchmark_attempt51` 在完成并归档 batch0001--0005 后，于 batch0006
+  fail fast。campaign manifest 保持 `failed`，已完成的 557/920 shards 与全部 partial
+  evidence 不续跑、不导入后续 run。失败不是内存或负载：systemd process-tree peak
+  为 14.6 GiB，准确异常为 `accepted global-best event exceeds the axis budget`。
+- 真实事件重放定位到 `r106_21/2016` 的 `wall_clock_60`：legacy candidate 在
+  59.082 秒完成 route/cache 工作，随后 constraint lane 在 60.010 秒记录
+  `deadline_boundary`，旧控制流仍于 60.010851 秒提交该 legacy candidate 为
+  accepted global-best。该 10.85 ms 越界证明根因是 candidate transaction
+  commit（候选事务提交）缺少最后截止检查，不是浮点误差、日志延迟或 reviewer
+  阈值过严。
+- legacy、quality-shadow 与 constraint-lane 现在都在 acceptance decision 之后、
+  incumbent/global-best/statistics mutation 之前执行严格的 commit deadline 检查。
+  到达或超过 deadline 时记录 `before_candidate_commit`，将事务作为 time-limit
+  rejection 保留，禁止更新 current/global-best；reviewer 的严格预算检查保持不变。
+- 新的确定性回归测试让 acceptance decision 恰好跨过 deadline：修复前观察到
+  `accepted_moves == 1` 并失败，修复后要求 0 次接受、1 次拒绝和
+  `wall_clock_deadline`。按 producer-defect 治理，Attempt51 永久保留；修复完成后
+  必须先以最低未占用标签跑新 Pilot 并独立复审，再以另一新标签从头执行 Formal。

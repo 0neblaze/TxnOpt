@@ -4,6 +4,7 @@ import time
 
 import pytest
 
+import evrptw.alns as alns_module
 from evrptw.alns import ExactDeadlineConfig, solve_alns
 from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.stage04 import Stage04Config
@@ -104,6 +105,36 @@ def test_none_iteration_limit_cools_annealing_by_elapsed_time(
     assert result.termination_reason == "wall_clock_deadline"
     assert result.stage04_temperature_history[-1][0] >= 10
     assert final_recorded_temperature <= initial_temperature * 0.1
+
+
+def test_candidate_acceptance_cannot_commit_after_wall_clock_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 0.0}
+    monkeypatch.setattr(alns_module.time, "perf_counter", lambda: clock["now"])
+
+    def cross_deadline_before_acceptance(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        clock["now"] = 2.0
+        return True
+
+    monkeypatch.setattr(
+        alns_module,
+        "accept_annealing_move",
+        cross_deadline_before_acceptance,
+    )
+
+    result = solve_alns(
+        _single_customer_instance(),
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=1.0,
+        operator_profile="baseline",
+    )
+
+    assert result.accepted_moves == 0
+    assert result.rejected_moves == 1
+    assert result.termination_reason == "wall_clock_deadline"
 
 
 def test_integer_iteration_limit_preserves_iteration_bounded_behavior() -> None:
