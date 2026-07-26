@@ -60,6 +60,22 @@ _CAMPAIGN_GEOMETRY: Final = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeLoadPolicy:
+    """Frozen host-capacity policy for Stage 5.2 campaign execution."""
+
+    logical_cpu_count: int
+    preflight_maximum_load1: float
+    runtime_maximum_load1: float
+
+
+RUNTIME_LOAD_POLICY: Final = RuntimeLoadPolicy(
+    logical_cpu_count=24,
+    preflight_maximum_load1=4.0,
+    runtime_maximum_load1=20.0,
+)
+
+
 def _is_plain_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -2185,7 +2201,7 @@ class BenchmarkCampaignConfig:
     required_power_source: str = "AC Power"
     preflight_window_count: int = 2
     preflight_window_seconds: float = 30.0
-    maximum_load1: float = 4.0
+    maximum_load1: float = RUNTIME_LOAD_POLICY.preflight_maximum_load1
     maximum_unrelated_process_average_cores: float = 1.0
 
     def __post_init__(self) -> None:
@@ -2249,7 +2265,7 @@ class BenchmarkCampaignConfig:
             self.required_power_source != "AC Power"
             or self.preflight_window_count != 2
             or self.preflight_window_seconds != 30.0
-            or self.maximum_load1 != 4.0
+            or self.maximum_load1 != RUNTIME_LOAD_POLICY.preflight_maximum_load1
             or self.maximum_unrelated_process_average_cores != 1.0
         ):
             raise ValueError("Stage 5.2 power/load preflight thresholds are fixed")

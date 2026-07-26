@@ -66,6 +66,7 @@ from evrptw.stage052 import (
 from evrptw.stage052_campaign import (
     CHECKPOINT_SECONDS,
     GIB,
+    RUNTIME_LOAD_POLICY,
     AcceptedGlobalBest,
     AnytimeCheckpoint,
     BatchManifest,
@@ -2359,7 +2360,8 @@ def _validate_power_load(
             return False, f"window process CPU replay failed: {error}"
         if (
             duration != 30.0
-            or load1 > 4.0
+            or load1 > RUNTIME_LOAD_POLICY.preflight_maximum_load1
+            or logical_cpu_count != RUNTIME_LOAD_POLICY.logical_cpu_count
             or unrelated >= 1.0
             or not math.isclose(unrelated, replayed_unrelated, rel_tol=0.0, abs_tol=1e-12)
             or (previous_end is not None and not math.isclose(started, previous_end))
@@ -2375,7 +2377,10 @@ def _validate_power_load(
             runtime.get("low_power_mode_violations"), "low power violations"
         )
         maximum_load1 = _strict_float(runtime.get("maximum_load1"), "runtime load1")
-        maximum_permitted_load1 = 4.0 + selected_workers
+        recorded_maximum_permitted_load1 = _strict_float(
+            runtime.get("maximum_permitted_load1"),
+            "runtime maximum permitted load1",
+        )
         maximum_unrelated = _strict_float(
             runtime.get("maximum_unrelated_process_average_cores"),
             "runtime unrelated cores",
@@ -2407,8 +2412,10 @@ def _validate_power_load(
         runtime_samples > 0
         and power_violations == 0
         and low_power_violations == 0
-        and maximum_permitted_load1 == 4.0 + selected_workers
-        and maximum_load1 <= maximum_permitted_load1
+        and recorded_maximum_permitted_load1
+        == RUNTIME_LOAD_POLICY.runtime_maximum_load1
+        and maximum_load1 <= RUNTIME_LOAD_POLICY.runtime_maximum_load1
+        and runtime_logical_cpu_count == RUNTIME_LOAD_POLICY.logical_cpu_count
         and maximum_unrelated < 1.0
         and math.isclose(
             maximum_unrelated,

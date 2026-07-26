@@ -30,6 +30,7 @@ from evrptw.artifacts import (
 )
 from evrptw.stage052 import STAGE052_MAXIMUM_PERSISTENCE_RATIO
 from evrptw.stage052_campaign import (
+    RUNTIME_LOAD_POLICY,
     ArchiveTransferCompletedError,
     BatchArchiver,
     BatchManifest,
@@ -375,19 +376,22 @@ class BatchRuntimeEvidence:
             for sample in snapshots
             if sample.sampled_at_seconds is not None
         )
-        recorded_logical_cpu_count = (
-            logical_cpu_count or (os.cpu_count() or 1) if len(counter_samples) >= 2 else None
-        )
+        recorded_logical_cpu_count = logical_cpu_count or (os.cpu_count() or 1)
+        if (
+            isinstance(recorded_logical_cpu_count, bool)
+            or recorded_logical_cpu_count <= 0
+        ):
+            raise ValueError("batch runtime logical CPU count is invalid")
         maximum_unrelated = (
             maximum_process_average_cores_over_windows(
                 counter_samples,
-                logical_cpu_count=cast(int, recorded_logical_cpu_count),
+                logical_cpu_count=recorded_logical_cpu_count,
                 window_seconds=config.preflight_window_seconds,
             )
             if len(counter_samples) >= 2
             else _maximum_window_process_average_cores(snapshots)
         )
-        maximum_permitted_load1 = config.maximum_load1 + config.selected_workers
+        maximum_permitted_load1 = RUNTIME_LOAD_POLICY.runtime_maximum_load1
         low_power = any(sample.low_power_mode_enabled for sample in snapshots)
         failures: list[str] = []
         if sources != (config.required_power_source,):
@@ -396,6 +400,14 @@ class BatchRuntimeEvidence:
             failures.append("low power mode enabled")
         if maximum_load1 > maximum_permitted_load1:
             failures.append(f"load1 exceeded {maximum_permitted_load1:.1f}")
+        if (
+            recorded_logical_cpu_count is not None
+            and recorded_logical_cpu_count != RUNTIME_LOAD_POLICY.logical_cpu_count
+        ):
+            failures.append(
+                "logical CPU count differs from the frozen "
+                f"{RUNTIME_LOAD_POLICY.logical_cpu_count}-thread machine"
+            )
         if maximum_unrelated >= config.maximum_unrelated_process_average_cores:
             failures.append("unrelated process averaged one full core")
         return cls(

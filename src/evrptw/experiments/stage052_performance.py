@@ -2003,6 +2003,9 @@ def _run_benchmark_batch(
                                 1 if runtime_evidence.low_power_mode_observed else 0
                             ),
                             "maximum_load1": runtime_evidence.maximum_load1,
+                            "maximum_permitted_load1": (
+                                runtime_evidence.maximum_permitted_load1
+                            ),
                             "maximum_unrelated_process_average_cores": (
                                 runtime_evidence.maximum_unrelated_process_average_cores
                             ),

@@ -89,6 +89,121 @@ _SOURCE_SNAPSHOT = {
 }
 
 
+def _power_load_payload(maximum_runtime_load1: float) -> dict[str, object]:
+    power_observation = {
+        "ac_online": True,
+        "battery_saver": False,
+        "battery_life_percent": 75,
+        "battery_flag": 8,
+        "active_power_scheme": "balanced-guid",
+    }
+    windows = [
+        {
+            "started_at_seconds": started,
+            "duration_seconds": 30.0,
+            "maximum_load1": 1.0,
+            "maximum_unrelated_process_average_cores": 0.0,
+            "logical_cpu_count": 24,
+            "process_cpu_samples": [
+                {"sampled_at_seconds": started, "cpu_seconds_by_pid": {}},
+                {"sampled_at_seconds": started + 30.0, "cpu_seconds_by_pid": {}},
+            ],
+        }
+        for started in (0.0, 30.0)
+    ]
+    return {
+        "schema_version": "stage05.2-batch-power-load-v1",
+        "run_label": "stage05.2_benchmark_attempt49",
+        "batch_id": "batch0001",
+        "status": "complete",
+        "native_power_boundary": {
+            "schema_version": "stage05.2-native-power-boundary-v1",
+            "before": power_observation,
+            "after": power_observation,
+            "stable_invariants": [
+                "ac_online",
+                "battery_saver",
+                "active_power_scheme",
+            ],
+            "invariants_unchanged": True,
+        },
+        "preflight": {
+            "power_source": "AC Power",
+            "low_power_mode_enabled": False,
+            "windows": windows,
+        },
+        "runtime": {
+            "sample_count": 2,
+            "power_source_violations": 0,
+            "low_power_mode_violations": 0,
+            "maximum_load1": maximum_runtime_load1,
+            "maximum_permitted_load1": 20.0,
+            "maximum_unrelated_process_average_cores": 0.0,
+            "logical_cpu_count": 24,
+            "process_cpu_samples": [
+                {"sampled_at_seconds": 0.0, "cpu_seconds_by_pid": {}},
+                {"sampled_at_seconds": 30.0, "cpu_seconds_by_pid": {}},
+            ],
+        },
+    }
+
+
+def test_reviewer_accepts_runtime_load_within_audited_machine_headroom() -> None:
+    passed, detail = campaign_review_module._validate_power_load(
+        _power_load_payload(19.9),
+        run_label="stage05.2_benchmark_attempt49",
+        batch_id="batch0001",
+        selected_workers=4,
+    )
+
+    assert passed
+    assert detail == "continuous batch power/load sampling passed"
+
+
+def test_reviewer_rejects_runtime_load_beyond_audited_machine_headroom() -> None:
+    passed, detail = campaign_review_module._validate_power_load(
+        _power_load_payload(20.1),
+        run_label="stage05.2_benchmark_attempt49",
+        batch_id="batch0001",
+        selected_workers=4,
+    )
+
+    assert passed is False
+    assert detail == "continuous batch power/load sampling violated a threshold"
+
+
+def test_reviewer_rejects_missing_producer_runtime_load_ceiling() -> None:
+    payload = _power_load_payload(19.9)
+    runtime = payload["runtime"]
+    assert isinstance(runtime, dict)
+    del runtime["maximum_permitted_load1"]
+
+    passed, _ = campaign_review_module._validate_power_load(
+        payload,
+        run_label="stage05.2_benchmark_attempt49",
+        batch_id="batch0001",
+        selected_workers=4,
+    )
+
+    assert passed is False
+
+
+def test_reviewer_rejects_non_frozen_logical_cpu_count() -> None:
+    payload = _power_load_payload(19.9)
+    runtime = payload["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["logical_cpu_count"] = 16
+
+    passed, _ = campaign_review_module._validate_power_load(
+        payload,
+        run_label="stage05.2_benchmark_attempt49",
+        batch_id="batch0001",
+        selected_workers=4,
+    )
+
+    assert passed is False
+
+
 def test_campaign_gate_contract_requires_source_snapshot() -> None:
     assert "source_snapshot" in CAMPAIGN_PILOT_GATES
     assert "source_snapshot" in CAMPAIGN_FORMAL_GATES
@@ -1668,7 +1783,7 @@ def _build_complete_pilot_campaign(
                         "duration_seconds": 30.0,
                         "maximum_load1": 1.0,
                         "maximum_unrelated_process_average_cores": 0.0,
-                        "logical_cpu_count": 12,
+                        "logical_cpu_count": 24,
                         "process_cpu_samples": [
                             {"sampled_at_seconds": 0.0, "cpu_seconds_by_pid": {}},
                             {"sampled_at_seconds": 30.0, "cpu_seconds_by_pid": {}},
@@ -1679,7 +1794,7 @@ def _build_complete_pilot_campaign(
                         "duration_seconds": 30.0,
                         "maximum_load1": 1.0,
                         "maximum_unrelated_process_average_cores": 0.0,
-                        "logical_cpu_count": 12,
+                        "logical_cpu_count": 24,
                         "process_cpu_samples": [
                             {"sampled_at_seconds": 30.0, "cpu_seconds_by_pid": {}},
                             {"sampled_at_seconds": 60.0, "cpu_seconds_by_pid": {}},
@@ -1692,8 +1807,9 @@ def _build_complete_pilot_campaign(
                 "power_source_violations": 0,
                 "low_power_mode_violations": 0,
                 "maximum_load1": 5.9,
+                "maximum_permitted_load1": 20.0,
                 "maximum_unrelated_process_average_cores": 0.0,
-                "logical_cpu_count": 12,
+                "logical_cpu_count": 24,
                 "process_cpu_samples": [
                     {"sampled_at_seconds": 0.0, "cpu_seconds_by_pid": {}},
                     {"sampled_at_seconds": 30.0, "cpu_seconds_by_pid": {}},

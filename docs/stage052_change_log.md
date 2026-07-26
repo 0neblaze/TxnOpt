@@ -8,6 +8,31 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
 `experiments/registries/stage05.2_retention_registry.csv` 记录。
 
+## 2026-07-26：G48 24-thread runtime load ceiling 修复
+
+- Formal `stage05.2_benchmark_attempt48` 使用 fresh-worker waves 与已放宽的
+  20-GiB producer process-tree memory gate；batch0001 的 395/395 shards 完成并
+  通过 `persistence_ratio=0.2552491582829223`，约 9.64 GB raw 经
+  copy→verify→atomic publish 归档到 D 盘。batch0002 运行到 runtime guard 触发后
+  以 partial evidence finalized，不续跑、不导入任何已完成 shard。
+- batch0002 runtime evidence 记录 `maximum_load1=11.791015625`、
+  `maximum_unrelated_process_average_cores=0.0`、AC power 稳定且 low-power mode
+  关闭；resource evidence 的 `mean_active_cores=4.107891249524004`、
+  `peak_active_cores=26.76909314835371`、aggregate peak RSS
+  `8,490,471,424` bytes。失败不是内存不足或外部进程竞争，而是旧的 runtime
+  `load1 <= 8.0` ceiling 未匹配冻结机器的 24 logical CPUs 与高基数 Parquet
+  persistence 工作负载。
+- Operator 明确授权提高负载上限以匹配本机性能。campaign preflight 继续要求两个
+  连续 30 秒窗口 `load1 <= 4.0`；batch runtime total-load ceiling 固定为 `20.0`，
+  允许使用约 83% 的 24 logical CPUs，并为 host/archive I/O 保留四个逻辑处理器。
+  unrelated user CPU 的完整 30 秒窗口一整核 gate、AC power、low-power mode、
+  20-GiB producer RSS、36% persistence、四 worker、solver/backend/objective/
+  validator 与 5.5-GiB reviewer memory contract 均不放宽。
+- Producer runtime evidence 显式记录 `20.0`，independent reviewer 从 shared
+  current contract 独立重建该值并比较实际 maximum；边界回归要求 19.9 通过、
+  20.1 fail fast。修复后必须使用新 label 重跑 Pilot 并通过 independent review，
+  再以新的最低未占用 Formal label 从零执行 920 shards。
+
 ## 2026-07-26：G46 fresh-worker wave overlap 的 load1 根因修复
 
 - Formal `stage05.2_benchmark_attempt46` 通过完整 preflight，并在 batch0001

@@ -613,14 +613,17 @@ this repository or one of its subdirectories.
   36% persistence gate, four-worker concurrency, solver/backend freeze, or the
   independent reviewer's 5.5-GiB internal guard and 6-GiB systemd MemoryMax.
 - Campaign preflight keeps the fixed `load1 <= 4.0` idle-host gate. During a
-  batch, the auditable total-load ceiling is `4.0 + selected_workers`, because
-  the selected campaign workers are expected load; unrelated user CPU remains
-  a separate PID-tree-excluding hard gate at one full core averaged over every
-  complete rolling 30-second window. A partial batch-start window cannot apply
-  the disappearing-PID upper bound as measured CPU; the CPU gate starts at the
-  first complete window, while AC power, low power mode, and total load remain
-  immediate continuous hard gates. Runtime samples are retained for failed
-  batches as partial replay evidence.
+  batch on the frozen 24-logical-CPU benchmark machine, the auditable
+  total-load ceiling is `20.0`, reserving four logical CPUs for host and archive
+  I/O while permitting the selected four-worker campaign to use the machine.
+  Unrelated user CPU remains a separate PID-tree-excluding hard gate at one full
+  core averaged over every complete rolling 30-second window. A partial
+  batch-start window cannot apply the disappearing-PID upper bound as measured
+  CPU; the CPU gate starts at the first complete window, while AC power, low
+  power mode, and total load remain immediate continuous hard gates. Runtime
+  samples are retained for failed batches as partial replay evidence, and the
+  independent reviewer reconstructs the fixed `20.0` ceiling rather than
+  trusting a producer-reported threshold.
 - G campaign producer dispatches contiguous waves of at most the frozen worker
   count. Every spawned worker processes exactly one shard, and the whole wave
   pool must shut down before the next wave is created. This preserves four-way
