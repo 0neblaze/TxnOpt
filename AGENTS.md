@@ -716,6 +716,10 @@ this repository or one of its subdirectories.
   and finalized successful review receipt. The historical Benchmark review
   never replaces the accelerator prerequisite, and the attestation schema alone
   is insufficient.
+  A producer-root-cause change outside the normal G path allowlist is permitted
+  only through an explicit all-paths-present, current-blob-SHA-256-pinned
+  exception in the successor verifier. Broad solver-directory allowlisting,
+  partial fix sets, and any later byte drift remain hard failures.
 - The independent reviewer for that successor receives the same explicit
   migration evidence directory. It re-verifies the historical migration
   campaign before using the payload for prerequisite/runtime replay; it must

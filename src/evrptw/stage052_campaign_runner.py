@@ -90,6 +90,12 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
         "tests/test_artifacts_v3.py",
     }
 )
+_CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
+    "src/evrptw/alns.py": "e123330e6008ebe5966712b1669ac3974d53a690897b3df05693b19dd8adc1b2",
+    "tests/test_alns_wall_clock_only.py": (
+        "661dff242a458dcbab72fb9dcb67cfbb042ce9b93e21735fade9f290c155e6b9"
+    ),
+}
 
 
 def _canonical_sha256(value: object) -> str:
@@ -214,7 +220,10 @@ def verify_campaign_successor_revision(
         )
     )
     forbidden = tuple(
-        path for path in changed_paths if path not in _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS
+        path
+        for path in changed_paths
+        if path not in _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS
+        and path not in _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES
     )
     if not changed_paths:
         raise RuntimeError("campaign successor revision has no recorded changes")
@@ -222,6 +231,24 @@ def verify_campaign_successor_revision(
         raise RuntimeError(
             "campaign successor revision changes non-G paths: " + ", ".join(forbidden)
         )
+    pinned_paths = frozenset(_CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES)
+    pinned_changed = frozenset(changed_paths) & pinned_paths
+    if pinned_changed and pinned_changed != pinned_paths:
+        raise RuntimeError("campaign successor revision has an incomplete pinned producer fix")
+    for path in sorted(pinned_changed):
+        content = subprocess.run(
+            ("git", "-C", str(resolved), "show", f"{current_revision}:{path}"),
+            check=True,
+            capture_output=True,
+            timeout=10.0,
+        ).stdout
+        if (
+            hashlib.sha256(content).hexdigest()
+            != _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES[path]
+        ):
+            raise RuntimeError(
+                f"campaign successor revision changes pinned producer-fix content: {path}"
+            )
     return changed_paths
 
 

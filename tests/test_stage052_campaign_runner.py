@@ -816,6 +816,74 @@ def test_campaign_successor_revision_allows_only_g_governance_paths(
         )
 
 
+def test_campaign_successor_revision_accepts_only_exact_pinned_producer_fix(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(("git", "-C", str(repository), "init", "-q"), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.email", "test@example.com"),
+        check=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.name", "Stage 5.2 test"),
+        check=True,
+    )
+    source_repository = Path(__file__).resolve().parents[1]
+    pinned_paths = (
+        "src/evrptw/alns.py",
+        "tests/test_alns_wall_clock_only.py",
+    )
+    for relative in pinned_paths:
+        destination = repository / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"pre-fix\n")
+    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "commit", "-qm", "base"),
+        check=True,
+    )
+    predecessor = subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    for relative in pinned_paths:
+        (repository / relative).write_bytes((source_repository / relative).read_bytes())
+    subprocess.run(("git", "-C", str(repository), "commit", "-qam", "producer fix"), check=True)
+    successor = subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    assert verify_campaign_successor_revision(
+        repository,
+        predecessor_revision=predecessor,
+        current_revision=successor,
+    ) == pinned_paths
+
+    with (repository / pinned_paths[0]).open("ab") as stream:
+        stream.write(b"# unapproved change\n")
+    subprocess.run(("git", "-C", str(repository), "commit", "-qam", "drift"), check=True)
+    drifted = subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    with pytest.raises(RuntimeError, match="pinned producer-fix content"):
+        verify_campaign_successor_revision(
+            repository,
+            predecessor_revision=predecessor,
+            current_revision=drifted,
+        )
+
+
 def test_campaign_runtime_selection_hash_excludes_only_g_wheel_identity() -> None:
     metadata, _, _ = _accepted_f02_payloads()
     runtime = metadata["runtime_identity"]

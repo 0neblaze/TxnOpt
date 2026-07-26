@@ -976,3 +976,9 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   `accepted_moves == 1` 并失败，修复后要求 0 次接受、1 次拒绝和
   `wall_clock_deadline`。按 producer-defect 治理，Attempt51 永久保留；修复完成后
   必须先以最低未占用标签跑新 Pilot 并独立复审，再以另一新标签从头执行 Formal。
+- Attempt52 因启动命令误用 prerequisite role `accelerator_pilot` 而在 raw 创建前
+  失败；Attempt53 使用正确的 `accelerator_decision` 后，又由 successor revision
+  gate 在 raw 创建前拒绝这两个非 G 路径。两者均不复用。治理锁现不把 `alns.py`
+  泛化加入 G allowlist，而是同时要求 solver 与回归测试两个路径完整出现，并将
+  current Git blob 的 SHA-256 固定为本次已审计内容；缺失任一路径或未来任何字节漂移
+  都 fail fast。该窄例外只用于执行协议本身要求的“producer defect 修复后新 Pilot”。
