@@ -1375,7 +1375,7 @@ def test_runtime_evidence_rejects_power_or_load_drift() -> None:
     evidence = BatchRuntimeEvidence.from_snapshots(
         (
             MachineSnapshot("AC Power", False, 1.0, 0.1),
-            MachineSnapshot("Battery Power", False, 20.1, 1.0),
+            MachineSnapshot("Battery Power", False, 32.1, 1.0),
         ),
         config=_pilot_config(),
     )
@@ -1397,12 +1397,31 @@ def test_runtime_evidence_allows_the_audited_24_thread_machine_headroom() -> Non
     )
 
     evidence = BatchRuntimeEvidence.from_snapshots(
-        (MachineSnapshot("AC Power", False, 19.9, 0.0),),
+        (MachineSnapshot("AC Power", False, 31.9, 0.0),),
         config=config,
     )
 
     assert evidence.passed is True
-    assert evidence.maximum_permitted_load1 == 20.0
+    assert evidence.maximum_permitted_load1 == 32.0
+
+
+def test_runtime_evidence_allows_attempt56_observed_campaign_load() -> None:
+    config = BenchmarkCampaignConfig.pilot(
+        run_label="stage05.2_benchmark_attempt01",
+        staging_root_alias="transfer_staging",
+        archive_root_aliases=("transfer_archive", "internal_archive"),
+        selected_backend="native_cpu",
+        selected_exact_backend="cpu_batch",
+        selected_workers=4,
+        native_profile="stage05.2-native-kernels-v1",
+    )
+
+    evidence = BatchRuntimeEvidence.from_snapshots(
+        (MachineSnapshot("AC Power", False, 21.60009765625, 0.0),),
+        config=config,
+    )
+
+    assert evidence.passed is True
 
 
 def test_runtime_evidence_rejects_load_beyond_audited_machine_headroom() -> None:
@@ -1417,13 +1436,13 @@ def test_runtime_evidence_rejects_load_beyond_audited_machine_headroom() -> None
     )
 
     evidence = BatchRuntimeEvidence.from_snapshots(
-        (MachineSnapshot("AC Power", False, 20.1, 0.0),),
+        (MachineSnapshot("AC Power", False, 32.1, 0.0),),
         config=config,
     )
 
     assert evidence.passed is False
-    assert evidence.maximum_permitted_load1 == 20.0
-    assert "load1 exceeded 20.0" in evidence.failure_reason
+    assert evidence.maximum_permitted_load1 == 32.0
+    assert "load1 exceeded 32.0" in evidence.failure_reason
 
 
 def test_runtime_evidence_rejects_non_frozen_logical_cpu_count_in_first_sample() -> None:

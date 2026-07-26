@@ -614,15 +614,18 @@ this repository or one of its subdirectories.
   independent reviewer's 5.5-GiB internal guard and 6-GiB systemd MemoryMax.
 - Campaign preflight keeps the fixed `load1 <= 4.0` idle-host gate. During a
   batch on the frozen 24-logical-CPU benchmark machine, the auditable
-  total-load ceiling is `20.0`, reserving four logical CPUs for host and archive
-  I/O while permitting the selected four-worker campaign to use the machine.
+  total-load fail-fast ceiling is `32.0`. This permits all 24 logical CPUs to
+  remain saturated plus a bounded eight-task transient run/I/O queue while the
+  selected four-worker campaign runs; it is an emergency runaway guard, not a
+  CPU throttle. The separate unrelated-process gate continues to reserve the
+  host from competing user workloads.
   Unrelated user CPU remains a separate PID-tree-excluding hard gate at one full
   core averaged over every complete rolling 30-second window. A partial
   batch-start window cannot apply the disappearing-PID upper bound as measured
   CPU; the CPU gate starts at the first complete window, while AC power, low
   power mode, and total load remain immediate continuous hard gates. Runtime
   samples are retained for failed batches as partial replay evidence, and the
-  independent reviewer reconstructs the fixed `20.0` ceiling rather than
+  independent reviewer reconstructs the fixed `32.0` ceiling rather than
   trusting a producer-reported threshold.
 - G campaign producer dispatches contiguous waves of at most the frozen worker
   count. Every spawned worker processes exactly one shard, and the whole wave

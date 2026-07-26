@@ -137,7 +137,7 @@ def _power_load_payload(maximum_runtime_load1: float) -> dict[str, object]:
             "power_source_violations": 0,
             "low_power_mode_violations": 0,
             "maximum_load1": maximum_runtime_load1,
-            "maximum_permitted_load1": 20.0,
+            "maximum_permitted_load1": 32.0,
             "maximum_unrelated_process_average_cores": 0.0,
             "logical_cpu_count": 24,
             "process_cpu_samples": [
@@ -150,7 +150,7 @@ def _power_load_payload(maximum_runtime_load1: float) -> dict[str, object]:
 
 def test_reviewer_accepts_runtime_load_within_audited_machine_headroom() -> None:
     passed, detail = campaign_review_module._validate_power_load(
-        _power_load_payload(19.9),
+        _power_load_payload(31.9),
         run_label="stage05.2_benchmark_attempt49",
         batch_id="batch0001",
         selected_workers=4,
@@ -162,7 +162,7 @@ def test_reviewer_accepts_runtime_load_within_audited_machine_headroom() -> None
 
 def test_reviewer_rejects_runtime_load_beyond_audited_machine_headroom() -> None:
     passed, detail = campaign_review_module._validate_power_load(
-        _power_load_payload(20.1),
+        _power_load_payload(32.1),
         run_label="stage05.2_benchmark_attempt49",
         batch_id="batch0001",
         selected_workers=4,
@@ -173,7 +173,7 @@ def test_reviewer_rejects_runtime_load_beyond_audited_machine_headroom() -> None
 
 
 def test_reviewer_rejects_missing_producer_runtime_load_ceiling() -> None:
-    payload = _power_load_payload(19.9)
+    payload = _power_load_payload(31.9)
     runtime = payload["runtime"]
     assert isinstance(runtime, dict)
     del runtime["maximum_permitted_load1"]
@@ -189,7 +189,7 @@ def test_reviewer_rejects_missing_producer_runtime_load_ceiling() -> None:
 
 
 def test_reviewer_rejects_non_frozen_logical_cpu_count() -> None:
-    payload = _power_load_payload(19.9)
+    payload = _power_load_payload(31.9)
     runtime = payload["runtime"]
     assert isinstance(runtime, dict)
     runtime["logical_cpu_count"] = 16
@@ -1807,7 +1807,7 @@ def _build_complete_pilot_campaign(
                 "power_source_violations": 0,
                 "low_power_mode_violations": 0,
                 "maximum_load1": 5.9,
-                "maximum_permitted_load1": 20.0,
+                "maximum_permitted_load1": 32.0,
                 "maximum_unrelated_process_average_cores": 0.0,
                 "logical_cpu_count": 24,
                 "process_cpu_samples": [

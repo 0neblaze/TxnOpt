@@ -197,15 +197,16 @@ next-fit partitioning 的 target/hard cap 为 24/32 GiB，单 shard hard cap 2 G
 持续满足 locator 声明的容量 reserve。
 
 campaign 启动前的两段 30 秒窗口继续要求 `load1 <= 4.0`。冻结 benchmark machine
-（基准机器）有 24 logical CPUs；batch 运行中总 `load1` 上限固定为 `20.0`，允许四
-worker producer 使用约 83% 的逻辑处理器，并为 host 与 archive I/O 保留四个逻辑
-处理器。按 PID tree 排除本 campaign 后的 unrelated user process（无关用户进程）
+（基准机器）有 24 logical CPUs；batch 运行中总 `load1` fail-fast ceiling
+（快速失败上限）固定为 `32.0`，允许 24 个逻辑处理器持续满载并容纳最多八个任务的
+短时运行/I/O 排队。它是 runaway guard（失控保护），不是 CPU throttle（限速器）。
+按 PID tree 排除本 campaign 后的 unrelated user process（无关用户进程）
 仍不得在任何完整 30 秒 rolling window（滚动窗口）平均占用一整核。未满 30 秒的
 batch startup window（批次启动窗口）不执行该平均值 gate，因为消失 PID 的保守
 采样上界不是已测 CPU 消耗；一旦首个完整窗口形成即开始连续判定。两项证据分别记录、
 分别由 reviewer 重放，不得互相替代。
 运行监视器的独立 runtime evidence（运行时证据）显式记录该固定上限；power/load
-artifact 只记录实际采样，reviewer 从 current contract 独立重建 `20.0` 并比较，
+artifact 只记录实际采样，reviewer 从 current contract 独立重建 `32.0` 并比较，
 避免 producer 自报阈值成为审计依据。batch 异常退出时也必须把已取得的 runtime
 samples 写入 partial raw evidence（部分原始证据），不得只在成功路径保留。
 

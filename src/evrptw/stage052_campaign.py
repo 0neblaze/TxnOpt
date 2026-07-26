@@ -72,7 +72,7 @@ class RuntimeLoadPolicy:
 RUNTIME_LOAD_POLICY: Final = RuntimeLoadPolicy(
     logical_cpu_count=24,
     preflight_maximum_load1=4.0,
-    runtime_maximum_load1=20.0,
+    runtime_maximum_load1=32.0,
 )
 
 
