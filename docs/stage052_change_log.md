@@ -1017,3 +1017,63 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   泛化加入 G allowlist，而是同时要求 solver 与回归测试两个路径完整出现，并将
   current Git blob 的 SHA-256 固定为本次已审计内容；缺失任一路径或未来任何字节漂移
   都 fail fast。该窄例外只用于执行协议本身要求的“producer defect 修复后新 Pilot”。
+
+## 2026-07-26 至 2026-07-27：Attempt58、Formal 主机合同与 SQLite 事务修复
+
+- `stage05.2_benchmark_attempt54` 在候选事务截止修复 revision 上完成 36/36 Pilot
+  shards 并通过 independent review，但随后真实 Formal 暴露主机负载合同缺陷，因此
+  该 Pilot 作为完整、不可变的中间 evidence 保留，不再作为 current Formal
+  prerequisite。Attempt55 因 producer source-root identity 不匹配在 raw 创建前
+  fail fast，不复用。
+- `stage05.2_benchmark_attempt56` Formal 在 batch0001 运行时被
+  `load1 exceeded 20.0` 拒绝。失败 evidence 显示
+  `maximum_load1=21.60009765625`、unrelated process average cores 为 0、AC power、
+  low-power mode 关闭、24 个 logical CPUs，systemd peak 仅 97.4 MiB。根因是
+  runtime ceiling 低于这台 24-thread 主机的正常饱和 load，而非外部干扰或内存不足。
+  campaign-start idle gate 保持 4.0；四 worker 启动后的 runtime guard 提高为 32.0，
+  继续即时检查 AC、low-power、24 logical CPUs 与 unrelated-process 完整窗口，
+  不改变 frozen `native_cpu + cpu_batch + 4 workers`。
+- `stage05.2_benchmark_attempt57` 使用新的 runtime ceiling 完成并归档 batch0001--0002，
+  但 batch0003 handoff preflight 把前一批自身造成、仍在指数衰减的 Linux 1-minute
+  `load1=8.56982421875` 再次当作 campaign-start idle load 而拒绝。batch0001 runtime
+  maximum 为 0.6875，batch0002 runtime maximum 为 8.56982421875，两个 batch 的
+  unrelated process average cores 均为 0。修复后只有 campaign-start preflight
+  执行两个窗口的 `load1 <= 4.0` idle gate；batch handoff 仍执行两个完整窗口并严格
+  检查 AC、low-power、24 logical CPUs 与 unrelated-process one-core gate，但不再用
+  campaign 自己上一批的全局 load history 拒绝下一批。batch 启动后继续执行 32.0
+  runtime guard。
+- 当前 Pilot `stage05.2_benchmark_attempt58` 在 revision
+  `1012288283cba69c127c28b509eb4ecb34221baa` 完成 36/36 shards、36 axes、
+  1,080 declared solver seconds 与 144 checkpoints。producer raw manifest
+  SHA-256 为
+  `de4e224735c07cdfdc262db63f34816cd934de0dcb1fefa22604e425b2a9f9dc`；
+  independent review 逐 shard spawn 完成 36/36 replay，18/18 mandatory gates
+  全部通过，aggregate peak RSS 为 529,690,624 bytes，raw before/after hash
+  相同，finalized receipt 成功，状态为
+  `READY_FOR_STAGE052_FORMAL_BENCHMARK`。review manifest SHA-256 为
+  `f15e043b66780b39214d91be99cf7a175b6a78d02b8429661138fd531f54ace6`。
+- Attempt59 的 Formal service 命令手工转录 prerequisite config SHA-256 时漏掉两个
+  hex characters，campaign lock verifier 在 raw 创建前正确 fail fast；该 label
+  不复用。后续 Formal lock 由
+  `verify_stage052_evidence_input`、`upsert_stage052_campaign_lock` 与
+  `verify_stage052_campaign_lock` 直接从 accepted Attempt58 evidence 程序化生成，
+  禁止再手工转录 hash。
+- `stage05.2_benchmark_attempt60` 完成并原子归档 batch0001--0007，在 batch0008
+  完成 16/50 shards 后因 screening-definition SQLite scratch 报
+  `database disk image is malformed` fail fast。该运行没有续跑或导入已完成 shard，
+  全部 partial/failed evidence 原位保留。外部 cgroup 记录
+  `MemoryPeak=21,495,746,560 bytes`、`MemoryHigh=20 GiB`、`MemoryMax=22 GiB`，
+  `memory.events` 的 `max=0`、`oom=0`、`oom_kill=0`；内核日志没有本次运行期间的
+  ext4/NVMe/I/O error，active ext4 仍有 745 GiB 与 94% inode 空余。因此失败不是
+  hard memory kill、OOM、磁盘满或已观测的文件系统 I/O 故障。
+- 根因审计发现 `_BoundedScreeningDefinitionStore` 使用 `journal_mode=OFF`、
+  `synchronous=OFF`，首次 spill 后没有显式 commit，`register_many` 也没有事务
+  rollback。故障注入红灯测试证明旧实现的第二条 INSERT 失败后，第一条已残留在
+  definition store；另一条测试证明旧合同实际返回 `journal_mode=off`。修复后 scratch
+  固定使用 `journal_mode=MEMORY`、`synchronous=NORMAL`，首次 spill 和每个
+  `register_many` 都由 SQLite transaction context 执行，成功 commit、异常 rollback。
+  两条红灯均转绿；`test_artifacts_v3` 66/66、Stage 5.2 定向测试 374/374、完整 pytest
+  785/785、全仓 Ruff、strict mypy（70 source files）与 `git diff --check` 全部通过。
+  250,000-row 高基数 spill 回归完成 `integrity_check=ok`，吞吐约 186,000 rows/s，
+  peak RSS 91.7 MiB，退出后 scratch 清理。该 producer 修复必须先以新 Pilot 通过
+  36% persistence 与 independent review，再以新 Formal label 重跑完整 scope。

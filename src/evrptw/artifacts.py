@@ -1814,17 +1814,18 @@ class _BoundedScreeningDefinitionStore:
             if definition_id not in existing
         )
         try:
-            connection.executemany(
-                "INSERT INTO definitions(definition_id, digest, payload) VALUES (?, ?, ?)",
-                (
+            with connection:
+                connection.executemany(
+                    "INSERT INTO definitions(definition_id, digest, payload) VALUES (?, ?, ?)",
                     (
-                        definition.definition_id,
-                        definition.digest,
-                        definition.encoded if self._retain_payload else None,
-                    )
-                    for definition in inserted
-                ),
-            )
+                        (
+                            definition.definition_id,
+                            definition.digest,
+                            definition.encoded if self._retain_payload else None,
+                        )
+                        for definition in inserted
+                    ),
+                )
         except sqlite3.IntegrityError as error:
             raise ArtifactIntegrityError("screening definition batch insert failed") from error
         return inserted
@@ -1888,24 +1889,27 @@ class _BoundedScreeningDefinitionStore:
         # threads, but it is never used concurrently.
         connection = sqlite3.connect(database_path, check_same_thread=False)
         try:
-            connection.execute("PRAGMA journal_mode=OFF")
-            connection.execute("PRAGMA synchronous=OFF")
+            journal_mode = connection.execute("PRAGMA journal_mode=MEMORY").fetchone()
+            if journal_mode != ("memory",):
+                raise RuntimeError("screening definition scratch journal mode is unavailable")
+            connection.execute("PRAGMA synchronous=NORMAL")
             connection.execute("PRAGMA cache_size=-2048")
-            connection.execute(
-                "CREATE TABLE definitions "
-                "(definition_id INTEGER PRIMARY KEY, digest BLOB NOT NULL, payload BLOB)"
-            )
-            connection.executemany(
-                "INSERT INTO definitions(definition_id, digest, payload) VALUES (?, ?, ?)",
-                (
+            with connection:
+                connection.execute(
+                    "CREATE TABLE definitions "
+                    "(definition_id INTEGER PRIMARY KEY, digest BLOB NOT NULL, payload BLOB)"
+                )
+                connection.executemany(
+                    "INSERT INTO definitions(definition_id, digest, payload) VALUES (?, ?, ?)",
                     (
-                        definition_id,
-                        digest,
-                        self._encoded_memory.get(definition_id),
-                    )
-                    for definition_id, digest in self._digest_memory.items()
-                ),
-            )
+                        (
+                            definition_id,
+                            digest,
+                            self._encoded_memory.get(definition_id),
+                        )
+                        for definition_id, digest in self._digest_memory.items()
+                    ),
+                )
         except BaseException:
             connection.close()
             raise

@@ -527,6 +527,73 @@ def test_producer_screening_definition_store_spills_digest_without_payload(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_screening_definition_store_uses_recoverable_sqlite_transactions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        artifacts_module,
+        "SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES",
+        1,
+    )
+    first, second = (_pending_definition(value) for value in range(2))
+    with artifacts_module._BoundedScreeningDefinitionStore(  # noqa: SLF001
+        cache_entries=1,
+        scratch_root=tmp_path,
+        retain_payload=False,
+    ) as store:
+        assert store.register_many((first, second)) == (first, second)
+        connection = store._connection  # noqa: SLF001
+        assert connection is not None
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("memory",)
+        assert connection.execute("PRAGMA synchronous").fetchone() == (1,)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_screening_definition_store_rolls_back_a_partial_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        artifacts_module,
+        "SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES",
+        1,
+    )
+    first, second, third, fourth = (_pending_definition(value) for value in range(4))
+    with artifacts_module._BoundedScreeningDefinitionStore(  # noqa: SLF001
+        cache_entries=1,
+        scratch_root=tmp_path,
+        retain_payload=False,
+    ) as store:
+        assert store.register_many((first, second)) == (first, second)
+        connection = store._connection  # noqa: SLF001
+        assert connection is not None
+        connection.execute(
+            "CREATE TRIGGER inject_definition_failure "
+            "BEFORE INSERT ON definitions "
+            f"WHEN NEW.definition_id = {fourth.definition_id} "
+            "BEGIN SELECT RAISE(ABORT, 'injected definition failure'); END"
+        )
+        connection.commit()
+
+        with pytest.raises(ArtifactIntegrityError, match="batch insert failed"):
+            store.register_many((third, fourth))
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM definitions WHERE definition_id IN (?, ?)",
+                (third.definition_id, fourth.definition_id),
+            ).fetchone()
+            == (0,)
+        )
+
+        connection.execute("DROP TRIGGER inject_definition_failure")
+        connection.commit()
+        assert store.register_many((third, fourth)) == (third, fourth)
+
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_stage052_disk_spill_supports_serialized_writer_thread_handoff(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

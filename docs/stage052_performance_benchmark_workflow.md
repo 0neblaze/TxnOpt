@@ -232,6 +232,14 @@ reviewer 各自执行该检查。solver、objective、配置、native 或任意�
 5.5-GiB internal guard、`MemoryHigh=5G`、`MemoryMax=6G`。四 worker 是最大并发数，
 仍必须逐 shard 新进程回收，禁止用新增内存替代 lifecycle isolation（生命周期隔离）。
 
+producer 的 screening-definition SQLite scratch 必须使用 rollback-capable
+`journal_mode=MEMORY` 与 `synchronous=NORMAL`。每个 `register_many` transaction
+（批量注册事务）成功后 commit，任何异常都 rollback 整批；禁止使用
+`journal_mode=OFF` 或让失败批次的前缀行留在 identity store。scratch 仍是 shard-local
+临时状态，不进入 raw schema；成功和失败路径都必须关闭 connection 并清理临时目录。
+Pilot 必须实际触发 disk spill，并同时通过 SQLite `integrity_check`、36% persistence
+gate 与 shard cleanup gate，才允许新的 Formal。
+
 producer、retention、performance reviewer 与 campaign reviewer 必须调用同一个
 cross-platform `probe_volume_identity`：WSL 用 `findmnt`，DrvFS 额外绑定 Windows
 NVMe identity，macOS 才使用 `diskutil`。reviewer 不得复制或硬编码单一平台 probe。
