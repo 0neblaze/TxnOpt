@@ -1154,3 +1154,22 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   campaign runner/reviewer 定向测试 126 项通过。合同变化后必须使用下一最低未占用
   label 从零跑新 Pilot 并通过独立 review，再以新的最低未占用 Formal label 重跑；
   producer 运行期间不再执行递归 WSL 文件扫描。
+
+## 2026-07-27：G65--G68 sealed launch envelope 与 successor allowlist 修复
+
+- `stage05.2_benchmark_attempt65`、`attempt66` 与 `attempt67` 均在 raw directory
+  创建前由 fail-fast launch checks 拒绝：Attempt65 的 transient service PATH
+  缺少 Windows PowerShell；Attempt66 把 benchmark Pilot prerequisite role 误写为
+  `accelerator_pilot` 而非规范的 `accelerator_decision`；Attempt67 的 service PATH
+  缺少 WSL GPU bridge `/usr/lib/wsl/lib`，使 F17 frozen runtime replay 找不到
+  `nvidia-smi`。三者没有 producer raw，但 label 均不复用。
+- 启动环境现先在相同 PATH 下完整执行 F17 frozen runtime identity script，而不是
+  分别探测单个命令。该 probe 已同时验证 Python 3.13.13、24 logical CPUs、RTX 4070
+  identity、driver 610.62、CUDA capability 8.9、PowerShell 与 ZHITAI D archive
+  disk identity。Attempt68 随后在 raw 创建前暴露独立的 successor allowlist 缺口。
+- G64 负载合同的边界回归直接位于 `tests/test_stage052_campaign.py`，但旧 G-only
+  successor allowlist 只列出 campaign runner/reviewer 测试文件，因而把合法的
+  configuration-contract test 误报为 non-G change。allowlist 仅新增这一条精确测试
+  路径；`src/evrptw/objective.py` 等非G路径仍由现有负向回归拒绝。修复前的最小
+  successor fixture 稳定失败，修复后必须返回 runner 与 config-test 两条精确路径。
+  Attempt68 不复用；新 sealed revision 必须从下一最低未占用 Pilot label 启动。
