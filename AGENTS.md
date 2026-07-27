@@ -619,8 +619,11 @@ this repository or one of its subdirectories.
   selected four-worker campaign runs; it is an emergency runaway guard, not a
   CPU throttle. The separate unrelated-process gate continues to reserve the
   host from competing user workloads.
-  Unrelated user CPU remains a separate PID-tree-excluding hard gate at one full
-  core averaged over every complete rolling 30-second window. A partial
+  Unrelated user CPU remains a separate PID-tree-excluding hard gate at four
+  full cores averaged by any one process over every complete rolling 30-second
+  window. This prevents one competing process from consuming one sixth or more
+  of the frozen machine while tolerating bounded host maintenance and
+  monitoring work. A partial
   batch-start window cannot apply the disappearing-PID upper bound as measured
   CPU; the CPU gate starts at the first complete window, while AC power, low
   power mode, and total load remain immediate continuous hard gates. Runtime
@@ -630,7 +633,7 @@ this repository or one of its subdirectories.
 - The campaign-start preflight alone applies the two-window `load1 <= 4.0`
   idle-host gate. Per-batch handoff preflights still record two complete
   30-second load windows and enforce AC power, low-power mode, 24 logical CPUs,
-  and the PID-tree-excluding unrelated-process one-core gate, but do not reject
+  and the PID-tree-excluding unrelated-process four-core gate, but do not reject
   the decaying system load average left by the immediately preceding campaign
   batch. The next batch is immediately subject to the fixed `32.0` runtime
   fail-fast ceiling.

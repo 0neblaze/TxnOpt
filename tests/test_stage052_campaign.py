@@ -416,7 +416,7 @@ def test_campaign_preflight_requires_ac_power_and_two_clean_consecutive_windows(
             BenchmarkPreflightObservation(
                 "AC Power",
                 False,
-                (valid.windows[0], SystemLoadWindow(130.0, 30.0, 3.0, 1.0)),
+                (valid.windows[0], SystemLoadWindow(130.0, 30.0, 3.0, 4.0)),
             )
         )
 

@@ -201,7 +201,9 @@ campaign 启动前的两段 30 秒窗口继续要求 `load1 <= 4.0`。冻结 ben
 （快速失败上限）固定为 `32.0`，允许 24 个逻辑处理器持续满载并容纳最多八个任务的
 短时运行/I/O 排队。它是 runaway guard（失控保护），不是 CPU throttle（限速器）。
 按 PID tree 排除本 campaign 后的 unrelated user process（无关用户进程）
-仍不得在任何完整 30 秒 rolling window（滚动窗口）平均占用一整核。未满 30 秒的
+中，任一进程仍不得在任何完整 30 秒 rolling window（滚动窗口）平均占用四个完整
+逻辑核。该上限禁止单个竞争进程持续占用冻结主机六分之一或更多的逻辑处理器，同时
+允许有限的 host maintenance/monitoring（主机维护/监控）负载。未满 30 秒的
 batch startup window（批次启动窗口）不执行该平均值 gate，因为消失 PID 的保守
 采样上界不是已测 CPU 消耗；一旦首个完整窗口形成即开始连续判定。两项证据分别记录、
 分别由 reviewer 重放，不得互相替代。
@@ -213,7 +215,7 @@ samples 写入 partial raw evidence（部分原始证据），不得只在成功
 `load1 <= 4.0` 只用于整个 campaign 的首次启动门槛。同一 campaign 的 per-batch
 handoff preflight（批次交接预检）仍记录两段完整 30 秒窗口，并继续验证 AC power、
 low-power mode、24 logical CPUs 与排除 campaign PID tree 后的 unrelated-process
-一整核 gate；但它不得用上一批留在 Linux 1-minute load average 中的衰减历史拒绝
+四核 gate；但它不得用上一批留在 Linux 1-minute load average 中的衰减历史拒绝
 下一批。下一批开始后立即重新受 `load1 <= 32.0` runtime guard 约束。
 
 若 G 自身的 campaign runner/reviewer 出现缺陷，可以在不重跑 F 的前提下消费已接受

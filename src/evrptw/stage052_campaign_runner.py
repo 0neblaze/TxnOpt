@@ -439,7 +439,10 @@ class BatchRuntimeEvidence:
                 f"{RUNTIME_LOAD_POLICY.logical_cpu_count}-thread machine"
             )
         if maximum_unrelated >= config.maximum_unrelated_process_average_cores:
-            failures.append("unrelated process averaged one full core")
+            failures.append(
+                "unrelated process reached the frozen "
+                f"{config.maximum_unrelated_process_average_cores:.1f}-core allowance"
+            )
         return cls(
             sample_count=len(snapshots),
             maximum_load1=maximum_load1,

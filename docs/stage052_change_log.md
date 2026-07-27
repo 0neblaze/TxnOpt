@@ -1124,3 +1124,33 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   并要求 raw termination 与读回的 terminal boundary 一致。solver 决策、objective、
   validator、预算和 acceptance 语义均不改变。Attempt62 raw 与失败 review
   generation 永久保留；该 producer 修复必须使用下一最低未占用 Pilot label 重新验证。
+
+## 2026-07-27：G64 unrelated-process 负载合同适配 24-thread 主机
+
+- 修复后的 Pilot `stage05.2_benchmark_attempt63` 完成 36/36 shards，独立 campaign
+  review 通过全部 18 个 mandatory gates，并报告
+  `READY_FOR_STAGE052_FORMAL_BENCHMARK`。随后 Formal
+  `stage05.2_benchmark_attempt64` 按完整 920-shard / 2,040-axis scope 从零启动。
+  batch0001 的 402/402 shards 完成，`persistence_ratio=0.26139573609082606`，
+  9,542,031,075 bytes raw 经 copy→verify→atomic publish 归档到 `d_archive`。
+- batch0002 运行时，Codex 错误执行了递归 `/home/oneblaze/.local` 文件查找。失败
+  runtime evidence 的 908 个可重放样本记录 PID 727009 连续消耗约 28 CPU seconds，
+  `maximum_unrelated_process_average_cores=1.5603668609234687`；其时间范围与该
+  24.2-second 查找严格重合。旧合同只要任一 campaign 外进程在完整 30 秒窗口达到
+  1.0 core 即终止，因此 guard 以
+  `unrelated process averaged one full core` fail fast。Attempt64 batch0002
+  保留 8 个 complete 与 37 个 partial shard envelopes 及失败 scratch，不续跑、
+  不导入或复用其中 shard；batch0001 归档也保持不可变。
+- Operator 已明确要求提高负载上限并最大化匹配这台 24-logical-CPU 主机。current
+  `RuntimeLoadPolicy` 现在把 unrelated-process ceiling 固定为 4.0 cores：低于
+  4.0 的单进程后台维护/监控负载允许，达到 4.0 立即 fail fast。该值仍按每个进程的
+  完整 rolling 30-second average 计算，并继续排除 campaign PID tree；24-thread
+  identity、campaign-start `load1 <= 4.0`、runtime `load1 <= 32.0`、AC power、
+  low-power mode、四 workers、solver/backend/objective/validator、36% persistence、
+  producer memory 和 reviewer 5.5-GiB memory contracts 均不改变。raw/review schema
+  与 publication surface 保持兼容。
+- 最小反馈回路直接重放30秒单核样本：旧实现稳定返回 abort，修复后稳定通过；
+  新的30秒四核边界样本仍被 runtime evidence 与 live monitor 拒绝。Stage 5.2
+  campaign runner/reviewer 定向测试 126 项通过。合同变化后必须使用下一最低未占用
+  label 从零跑新 Pilot 并通过独立 review，再以新的最低未占用 Formal label 重跑；
+  producer 运行期间不再执行递归 WSL 文件扫描。

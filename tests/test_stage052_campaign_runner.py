@@ -1316,7 +1316,7 @@ def test_preflight_uses_full_window_cpu_time_delta_not_instantaneous_peak() -> N
     assert observation.windows[1].maximum_unrelated_process_average_cores == 0.0
 
 
-def test_preflight_rejects_one_process_averaging_a_full_core_for_window() -> None:
+def test_preflight_allows_one_process_averaging_a_full_core_for_window() -> None:
     now = 0.0
 
     def clock() -> float:
@@ -1336,17 +1336,18 @@ def test_preflight_rejects_one_process_averaging_a_full_core_for_window() -> Non
             unrelated_process_cpu_seconds={999: now},
         )
 
-    with pytest.raises(RuntimeError, match="full CPU core"):
-        collect_preflight_observation(
-            _pilot_config(),
-            snapshot=snapshot,
-            monotonic=clock,
-            sleep=sleep,
-            sample_interval_seconds=1.0,
-        )
+    observation = collect_preflight_observation(
+        _pilot_config(),
+        snapshot=snapshot,
+        monotonic=clock,
+        sleep=sleep,
+        sample_interval_seconds=1.0,
+    )
+
+    assert observation.windows[0].maximum_unrelated_process_average_cores == 1.0
 
 
-def test_preflight_counts_a_process_created_after_the_window_baseline() -> None:
+def test_preflight_allows_one_core_process_created_after_the_window_baseline() -> None:
     now = 0.0
 
     def clock() -> float:
@@ -1367,14 +1368,17 @@ def test_preflight_counts_a_process_created_after_the_window_baseline() -> None:
             unrelated_process_cpu_seconds=counters,
         )
 
-    with pytest.raises(RuntimeError, match="full CPU core"):
-        collect_preflight_observation(
-            _pilot_config(),
-            snapshot=snapshot,
-            monotonic=clock,
-            sleep=sleep,
-            sample_interval_seconds=1.0,
-        )
+    observation = collect_preflight_observation(
+        _pilot_config(),
+        snapshot=snapshot,
+        monotonic=clock,
+        sleep=sleep,
+        sample_interval_seconds=1.0,
+    )
+
+    assert observation.windows[0].maximum_unrelated_process_average_cores == pytest.approx(
+        30.1 / 30.0
+    )
 
 
 def test_preflight_conservatively_accounts_for_a_process_that_exits() -> None:
@@ -1408,11 +1412,11 @@ def test_preflight_conservatively_accounts_for_a_process_that_exits() -> None:
     evidence = BatchRuntimeEvidence.from_snapshots(
         snapshots,
         config=_pilot_config(),
-        logical_cpu_count=12,
+        logical_cpu_count=24,
     )
 
-    assert evidence.passed is False
-    assert evidence.maximum_unrelated_process_average_cores == pytest.approx(40.0 / 30.0)
+    assert evidence.passed is True
+    assert evidence.maximum_unrelated_process_average_cores == pytest.approx(52.0 / 30.0)
 
 
 def test_runtime_evidence_rejects_power_or_load_drift() -> None:
@@ -1501,7 +1505,7 @@ def test_runtime_evidence_rejects_non_frozen_logical_cpu_count_in_first_sample()
     assert "24-thread machine" in evidence.failure_reason
 
 
-def test_runtime_evidence_rejects_full_window_unrelated_core_average() -> None:
+def test_runtime_evidence_allows_full_window_unrelated_core_average() -> None:
     evidence = BatchRuntimeEvidence.from_snapshots(
         (
             MachineSnapshot(
@@ -1524,8 +1528,35 @@ def test_runtime_evidence_rejects_full_window_unrelated_core_average() -> None:
         config=_pilot_config(),
     )
 
+    assert evidence.passed is True
+    assert evidence.failure_reason == ""
+
+
+def test_runtime_evidence_rejects_four_unrelated_cores() -> None:
+    evidence = BatchRuntimeEvidence.from_snapshots(
+        (
+            MachineSnapshot(
+                "AC Power",
+                False,
+                1.0,
+                0.0,
+                sampled_at_seconds=0.0,
+                unrelated_process_cpu_seconds={999: 0.0},
+            ),
+            MachineSnapshot(
+                "AC Power",
+                False,
+                1.0,
+                0.0,
+                sampled_at_seconds=30.0,
+                unrelated_process_cpu_seconds={999: 120.0},
+            ),
+        ),
+        config=_pilot_config(),
+    )
+
     assert evidence.passed is False
-    assert "unrelated" in evidence.failure_reason
+    assert "4.0-core allowance" in evidence.failure_reason
 
 
 def test_runtime_monitor_waits_for_a_full_cpu_window_before_rejecting_exit() -> None:
@@ -1563,7 +1594,7 @@ def test_runtime_monitor_waits_for_a_full_cpu_window_before_rejecting_exit() -> 
     assert monitor.abort_reason() is None
 
 
-def test_runtime_monitor_rejects_a_full_core_after_one_complete_cpu_window() -> None:
+def test_runtime_monitor_allows_one_full_core_on_audited_24_thread_machine() -> None:
     monitor = campaign_runner.BatchRuntimeMonitor(
         _pilot_config(),
         snapshot=lambda: MachineSnapshot("AC Power", False, 1.0, 0.0),
@@ -1587,7 +1618,36 @@ def test_runtime_monitor_rejects_a_full_core_after_one_complete_cpu_window() -> 
         ),
     ]
 
-    assert monitor.abort_reason() == "unrelated process averaged one full core"
+    assert monitor.abort_reason() is None
+
+
+def test_runtime_monitor_rejects_four_cores_after_one_complete_cpu_window() -> None:
+    monitor = campaign_runner.BatchRuntimeMonitor(
+        _pilot_config(),
+        snapshot=lambda: MachineSnapshot("AC Power", False, 1.0, 0.0),
+    )
+    monitor._samples = [
+        MachineSnapshot(
+            "AC Power",
+            False,
+            1.0,
+            0.0,
+            sampled_at_seconds=0.0,
+            unrelated_process_cpu_seconds={999: 0.0},
+        ),
+        MachineSnapshot(
+            "AC Power",
+            False,
+            1.0,
+            0.0,
+            sampled_at_seconds=30.0,
+            unrelated_process_cpu_seconds={999: 120.0},
+        ),
+    ]
+
+    assert monitor.abort_reason() == (
+        "unrelated process reached the frozen 4.0-core allowance"
+    )
 
 
 def test_failed_batch_runtime_evidence_can_be_persisted(
@@ -1614,7 +1674,7 @@ def test_failed_batch_runtime_evidence_can_be_persisted(
                 1.0,
                 0.0,
                 sampled_at_seconds=30.0,
-                unrelated_process_cpu_seconds={999: 30.0},
+                unrelated_process_cpu_seconds={999: 120.0},
             ),
         ),
         config=_pilot_config(),

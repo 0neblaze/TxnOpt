@@ -67,12 +67,14 @@ class RuntimeLoadPolicy:
     logical_cpu_count: int
     preflight_maximum_load1: float
     runtime_maximum_load1: float
+    maximum_unrelated_process_average_cores: float
 
 
 RUNTIME_LOAD_POLICY: Final = RuntimeLoadPolicy(
     logical_cpu_count=24,
     preflight_maximum_load1=4.0,
     runtime_maximum_load1=32.0,
+    maximum_unrelated_process_average_cores=4.0,
 )
 
 
@@ -2202,7 +2204,9 @@ class BenchmarkCampaignConfig:
     preflight_window_count: int = 2
     preflight_window_seconds: float = 30.0
     maximum_load1: float = RUNTIME_LOAD_POLICY.preflight_maximum_load1
-    maximum_unrelated_process_average_cores: float = 1.0
+    maximum_unrelated_process_average_cores: float = (
+        RUNTIME_LOAD_POLICY.maximum_unrelated_process_average_cores
+    )
 
     def __post_init__(self) -> None:
         if re.fullmatch(r"stage05\.2_benchmark_(?:attempt|rerun)[0-9]{2}", self.run_label) is None:
@@ -2266,7 +2270,8 @@ class BenchmarkCampaignConfig:
             or self.preflight_window_count != 2
             or self.preflight_window_seconds != 30.0
             or self.maximum_load1 != RUNTIME_LOAD_POLICY.preflight_maximum_load1
-            or self.maximum_unrelated_process_average_cores != 1.0
+            or self.maximum_unrelated_process_average_cores
+            != RUNTIME_LOAD_POLICY.maximum_unrelated_process_average_cores
         ):
             raise ValueError("Stage 5.2 power/load preflight thresholds are fixed")
 
@@ -2532,7 +2537,10 @@ class BenchmarkCampaignConfig:
                 window.maximum_unrelated_process_average_cores
                 >= self.maximum_unrelated_process_average_cores
             ):
-                raise RuntimeError("an unrelated user process averaged one full CPU core")
+                raise RuntimeError(
+                    "an unrelated user process reached the frozen "
+                    f"{self.maximum_unrelated_process_average_cores:.1f}-core allowance"
+                )
             previous_end = window.started_at_seconds + window.duration_seconds
 
     def plan_archive_roots(
