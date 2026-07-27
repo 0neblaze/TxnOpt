@@ -14,10 +14,12 @@
       "axis_count": 36,
       "declared_solver_seconds": 1080,
       "archived_bytes": 322564493,
+      "source_revision": "a5cf00f7580fc2632179495a739a110786ace87d",
       "raw_manifest_sha256": "5aa8b773c39ea3e0a8cd31434756f4219c3ec51f430bdcae1e61107fdd3f38e4",
       "review_manifest_sha256": "24de9cc93ad99f7d607617e11e8c9bee7fda224a421da1f97dd3af1bd6277727",
       "storage_root_alias": "d_archive",
       "logical_path": "stage05.2_benchmark_attempt72",
+      "availability": "local_external_archive_not_public",
       "release_url": null
     },
     {
@@ -34,11 +36,13 @@
       "archived_complete_batches": 2,
       "archived_bytes": 18022104542,
       "staging_partial_batch": "batch0003",
+      "source_revision": "a5cf00f7580fc2632179495a739a110786ace87d",
       "storage_root_aliases": [
         "d_archive",
         "wsl_staging"
       ],
       "logical_path": "stage05.2_benchmark_attempt73",
+      "availability": "local_external_partial_not_for_release",
       "release_url": null,
       "note": "Stopped before completion; the immutable source campaign manifest still records planned."
     }

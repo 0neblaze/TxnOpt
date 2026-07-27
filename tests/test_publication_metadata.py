@@ -30,9 +30,11 @@ def test_artifact_index_does_not_promote_partial_formal_evidence() -> None:
     formal = entries["stage05.2_benchmark_attempt73"]
     assert pilot["status"] == "accepted_pilot"
     assert pilot["review_status"] == "READY_FOR_STAGE052_FORMAL_BENCHMARK"
+    assert pilot["source_revision"] == "a5cf00f7580fc2632179495a739a110786ace87d"
     assert formal["status"] == "partial_unreviewed"
     assert formal["review_status"] is None
     assert formal["source_manifest_status"] == "planned"
+    assert formal["source_revision"] == "a5cf00f7580fc2632179495a739a110786ace87d"
 
 
 def test_commercial_solvers_are_optional_dependencies() -> None:
