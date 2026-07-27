@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 
 import pytest
 
 import evrptw.alns as alns_module
 from evrptw.alns import ExactDeadlineConfig, solve_alns
+from evrptw.measurement import (
+    MeasurementConfig,
+    RouteEvaluationTrace,
+    ScreeningDecision,
+)
 from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.stage04 import Stage04Config
+from evrptw.validation import SolutionReport, validate_routes
 
 
 class _SteppedClock:
@@ -18,6 +25,26 @@ class _SteppedClock:
     def perf_counter(self) -> float:
         self._now += self._step
         return self._now
+
+
+class _CollectingTraceSink:
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    def append_route_evaluation(self, record: RouteEvaluationTrace) -> None:
+        del record
+
+    def append_event(self, event: Mapping[str, object]) -> None:
+        self.events.append(dict(event))
+
+    def append_screening_decision(self, decision: ScreeningDecision) -> None:
+        del decision
+
+    def append_incremental_propagation(
+        self,
+        propagation: Mapping[str, object],
+    ) -> None:
+        del propagation
 
 
 def _single_customer_instance() -> Instance:
@@ -111,7 +138,7 @@ def test_candidate_acceptance_cannot_commit_after_wall_clock_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = {"now": 0.0}
-    monkeypatch.setattr(alns_module.time, "perf_counter", lambda: clock["now"])
+    monkeypatch.setattr(time, "perf_counter", lambda: clock["now"])
 
     def cross_deadline_before_acceptance(*args: object, **kwargs: object) -> bool:
         del args, kwargs
@@ -130,11 +157,78 @@ def test_candidate_acceptance_cannot_commit_after_wall_clock_deadline(
         max_iterations=1,
         time_limit_seconds=1.0,
         operator_profile="baseline",
+        measurement_config=MeasurementConfig(),
     )
 
     assert result.accepted_moves == 0
     assert result.rejected_moves == 1
     assert result.termination_reason == "wall_clock_deadline"
+    assert result.measurement_trace is not None
+    assert result.measurement_trace.deadline_events == 2
+    assert {
+        str(event["lane"])
+        for event in result.measurement_trace.events
+        if event.get("event_type") == "deadline_boundary"
+    } == {"legacy", "solver_finalization"}
+
+
+def test_final_validation_deadline_emits_a_trace_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": time.perf_counter()}
+    started_at = clock["now"]
+    sink = _CollectingTraceSink()
+    monkeypatch.setattr(time, "perf_counter", lambda: clock["now"])
+
+    def cross_deadline_during_final_validation(
+        instance: Instance,
+        routes: list[list[str]],
+        *,
+        claimed_objective: float | None = None,
+    ) -> SolutionReport:
+        clock["now"] = started_at + 2.0
+        return validate_routes(
+            instance,
+            routes,
+            claimed_objective=claimed_objective,
+        )
+
+    monkeypatch.setattr(
+        "evrptw.alns.validate_routes",
+        cross_deadline_during_final_validation,
+    )
+
+    result = solve_alns(
+        _single_customer_instance(),
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=1.0,
+        operator_profile="baseline",
+        measurement_config=MeasurementConfig(stream_sink=sink),
+    )
+
+    assert result.termination_reason == "wall_clock_deadline"
+    assert result.measurement_trace is not None
+    assert result.measurement_trace.deadline_events == 1
+    deadline_events = [
+        event for event in sink.events if event.get("event_type") == "deadline_boundary"
+    ]
+    assert len(deadline_events) == 1
+    assert deadline_events[0]["timestamp_seconds"] == pytest.approx(2.0, abs=0.1)
+    assert deadline_events[0] | {"timestamp_seconds": 2.0} == {
+        "event_type": "deadline_boundary",
+        "timestamp_seconds": 2.0,
+        "lane": "solver_finalization",
+        "iteration": 1,
+        "operator": "termination",
+        "boundary": "solver_termination",
+        "reason": (
+            "overall wall-clock deadline was confirmed after final solution "
+            "validation"
+        ),
+        "route_keys": (),
+        "exact_call_id": None,
+    }
 
 
 def test_integer_iteration_limit_preserves_iteration_bounded_behavior() -> None:

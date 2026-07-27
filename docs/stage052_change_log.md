@@ -1098,3 +1098,29 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   预检，再一次性更新内存索引，确保后项失败不会留下前项。
   该变更不改变 solver、objective、validator、event/raw schema、四 worker 或 36%
   persistence gate；必须用下一最低未占用标签重新跑 Pilot。
+- `stage05.2_benchmark_attempt62` 在 revision
+  `9e168218d2e0a821bfb31beadc8bf594ba89910d` 完成 36/36 Pilot shards，
+  三批 persistence ratio 分别为 35.36%、31.06% 与 31.79%，producer cgroup
+  peak 为 3,671,543,808 bytes 且零 swap。36 个 screening-definition artifacts
+  共含 1,184,415 rows，其中三个 shard 分别为 143,326、140,183 与 135,892 rows，
+  真实越过 signed 131,072-entry bound；producer scratch 成功清理。因此 SQLite
+  spill 与完整性合同已被真实 Pilot 执行。
+- Attempt62 的第一代 independent review 保持 immutable `NOT_READY`：review service
+  正常 finalized、raw before/after SHA-256 均为
+  `aa717c59507267c40a097b4d287958da32f7639536ce795ca013be823232476a`，
+  aggregate peak RSS 为 565,665,792 bytes；但在 batch0003 的
+  `r101_21/2014` 发现 raw 声明 `wall_clock_deadline`、event stream 却没有
+  `deadline_boundary`。同一缺口在 Attempt61 可重复，Attempt58 则有 12 条边界事件，
+  故这是 producer 终止证据缺口，不是 reviewer 内存或 single-pass 解码错误。
+- 根因是 `_solve_alns` 在最终 unified validation 后才按 `solve_completed_at`
+  判定 `wall_clock_deadline`，而旧实现只在 exact/candidate 内部跨线时记录 boundary。
+  当最后一次完整 transaction 在 deadline 前结束、收尾 validation 跨线时，raw
+  termination 与 trace 失配。新增确定性 streaming regression 让时钟仅在最终
+  validation 跨线：修复前稳定得到 `wall_clock_deadline` 加零 boundary；修复后每个
+  deadline termination 都追加一条独立 `solver_finalization` lane 的
+  `solver_termination` boundary。它不冒充提前 0.1 秒结束的 legacy/quality lane，
+  也不替代已有 lane-local boundary。真实 Stage 5.2 shard writer 的集成回归完成
+  stream append、flush/finalize、Parquet seal 与 `ArtifactReader.iter_events()` 回读，
+  并要求 raw termination 与读回的 terminal boundary 一致。solver 决策、objective、
+  validator、预算和 acceptance 语义均不改变。Attempt62 raw 与失败 review
+  generation 永久保留；该 producer 修复必须使用下一最低未占用 Pilot label 重新验证。

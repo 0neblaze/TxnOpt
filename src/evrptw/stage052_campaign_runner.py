@@ -91,9 +91,12 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
     }
 )
 _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
-    "src/evrptw/alns.py": "e123330e6008ebe5966712b1669ac3974d53a690897b3df05693b19dd8adc1b2",
+    "src/evrptw/alns.py": "392164b1fd53541c2a13924dcc95ceb82a71d591c025910070594c297582163a",
     "tests/test_alns_wall_clock_only.py": (
-        "661dff242a458dcbab72fb9dcb67cfbb042ce9b93e21735fade9f290c155e6b9"
+        "0bf741d1e4929564882dd8ff48775f0c589e957328aa00c7309176656fd16481"
+    ),
+    "tests/test_artifacts_v3.py": (
+        "4da79f2adaf7c0f14394c3a3698009f4d290d99df40797f5197b157ccadbbd66"
     ),
 }
 

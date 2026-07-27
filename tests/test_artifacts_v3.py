@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,8 @@ import pyarrow.parquet as pq
 import pytest
 
 import evrptw.artifacts as artifacts_module
+import evrptw.experiments.stage052_performance as stage052_performance
+from evrptw.alns import solve_alns
 from evrptw.artifacts import (
     EVENTS_SCHEMA,
     V2_SCREENING_DECISIONS_SCHEMA_V1,
@@ -27,12 +30,15 @@ from evrptw.artifacts import (
     atomic_write_signed_json,
     signed_sidecar_matches,
 )
+from evrptw.measurement import MeasurementConfig
+from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.stage052_campaign import AnytimeCheckpoint, BatchManifest, VolumeIdentity
 from evrptw.stage052_evidence import (
     BatchPersistenceEnvelope,
     PersistenceInterval,
     Stage052PersistenceAttribution,
 )
+from evrptw.validation import SolutionReport, validate_routes
 
 
 def _v3_writer(tmp_path: Path, *, attempt: int = 5) -> ArtifactBundleWriter:
@@ -45,6 +51,91 @@ def _v3_writer(tmp_path: Path, *, attempt: int = 5) -> ArtifactBundleWriter:
             screening_schema_version="screening_decisions_v3",
         ),
     )
+
+
+def test_terminal_deadline_survives_stage052_parquet_round_trip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = _v3_writer(tmp_path, attempt=98)
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,
+        axis_name="wall_clock_1",
+        buffer_rows=8,
+    )
+    instance = Instance(
+        "stage052_terminal_deadline",
+        (
+            Node("D0", NodeType.DEPOT, 0.0, 0.0, 0.0, 0.0, 200.0, 0.0),
+            Node("F1", NodeType.STATION, 5.0, 0.0, 0.0, 0.0, 200.0, 0.0),
+            Node("C1", NodeType.CUSTOMER, 1.0, 0.0, 1.0, 0.0, 100.0, 1.0),
+        ),
+        Vehicle(11.0, 3.0, 1.0, 0.1, 1.0),
+    )
+    clock = {"now": time.perf_counter()}
+    started_at = clock["now"]
+    monkeypatch.setattr(time, "perf_counter", lambda: clock["now"])
+
+    def cross_deadline_during_final_validation(
+        current_instance: Instance,
+        routes: list[list[str]],
+        *,
+        claimed_objective: float | None = None,
+    ) -> SolutionReport:
+        clock["now"] = started_at + 2.0
+        return validate_routes(
+            current_instance,
+            routes,
+            claimed_objective=claimed_objective,
+        )
+
+    monkeypatch.setattr(
+        "evrptw.alns.validate_routes",
+        cross_deadline_during_final_validation,
+    )
+
+    result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=1.0,
+        operator_profile="stage02_constraint_guided",
+        measurement_config=MeasurementConfig(stream_sink=sink),
+    )
+    sink.close()
+    shard.flush()
+    shard.finalize(
+        raw_payload={
+            "axes": {
+                "wall_clock_1": {
+                    "termination_reason": result.termination_reason,
+                }
+            }
+        },
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+    )
+    bundle = writer.finalize()
+
+    reader = ArtifactReader(bundle.run_dir)
+    raw = reader.read_json(shard.paths["raw"])
+    events = list(reader.iter_events(shard.paths["events"]))
+    deadline_events = [
+        event for event in events if event.get("event_type") == "deadline_boundary"
+    ]
+
+    assert raw["axes"]["wall_clock_1"]["termination_reason"] == "wall_clock_deadline"
+    assert len(deadline_events) == 1
+    assert deadline_events[0]["benchmark_axis"] == "wall_clock_1"
+    assert deadline_events[0]["lane"] == "wall_clock_1:solver_finalization"
+    assert deadline_events[0]["boundary"] == "solver_termination"
 
 
 def _screening_event(*, decision_id: int, started_at: float) -> dict[str, object]:

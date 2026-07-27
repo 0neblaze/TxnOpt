@@ -3617,6 +3617,20 @@ def _solve_alns(
         if solve_completed_at >= overall_deadline
         else "iteration_limit"
     )
+    if (
+        termination_reason == "wall_clock_deadline"
+        and measurement_trace is not None
+    ):
+        measurement_trace.record_deadline_boundary(
+            lane="solver_finalization",
+            iteration=completed_iterations,
+            operator="termination",
+            boundary="solver_termination",
+            reason=(
+                "overall wall-clock deadline was confirmed after final solution "
+                "validation"
+            ),
+        )
     return ALNSResult(
         feasible=True,
         routes=routes,

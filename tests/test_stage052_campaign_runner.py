@@ -834,6 +834,7 @@ def test_campaign_successor_revision_accepts_only_exact_pinned_producer_fix(
     pinned_paths = (
         "src/evrptw/alns.py",
         "tests/test_alns_wall_clock_only.py",
+        "tests/test_artifacts_v3.py",
     )
     for relative in pinned_paths:
         destination = repository / relative
