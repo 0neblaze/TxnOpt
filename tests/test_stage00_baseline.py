@@ -11,6 +11,7 @@ from evrptw.benchmark import write_schneider_instance
 from evrptw.experiments.stage00_baseline import (
     COMPARISON_FIELDS,
     Stage00Config,
+    _write_manifest,
     compare_results,
     load_config,
     run_stage00,
@@ -18,6 +19,19 @@ from evrptw.experiments.stage00_baseline import (
     verify_results,
 )
 from evrptw.models import Instance, Node, NodeType, Vehicle
+
+
+def test_stage00_manifest_uses_platform_independent_relative_paths(
+    tmp_path: Path,
+) -> None:
+    nested = tmp_path / "solutions"
+    nested.mkdir()
+    (nested / "solution.json").write_text("{}\n", encoding="utf-8")
+
+    _write_manifest(tmp_path)
+
+    payload = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert set(payload["files"]) == {"solutions/solution.json"}
 
 
 def _instance() -> Instance:
@@ -47,7 +61,7 @@ def _config_file(tmp_path: Path) -> Path:
                 'algorithm = "ALNS_EXACT_CHARGING"',
                 '',
                 '[benchmark]',
-                f'directory = "{benchmark_dir}"',
+                f'directory = "{benchmark_dir.as_posix()}"',
                 'instances = ["tinyC5"]',
                 '',
                 '[run]',

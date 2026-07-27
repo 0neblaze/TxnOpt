@@ -5,8 +5,6 @@ import csv
 import hashlib
 import json
 import math
-import os
-import platform
 import shutil
 import statistics
 import subprocess
@@ -15,6 +13,8 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+import psutil  # type: ignore[import-untyped]
 
 from evrptw.alns import solve_alns
 from evrptw.artifacts import (
@@ -1079,7 +1079,7 @@ def _summary_index(rows: list[dict[str, str]]) -> dict[tuple[str, str], dict[str
 
 def _write_manifest(directory: Path) -> None:
     files = {
-        str(path.relative_to(directory)): _sha256(path)
+        path.relative_to(directory).as_posix(): _sha256(path)
         for path in sorted(directory.rglob("*"))
         if path.is_file() and path.name != "manifest.json"
     }
@@ -1104,7 +1104,7 @@ def _verify_manifest(directory: Path) -> None:
         raise ValueError("manifest hash_algorithm is invalid")
     expected = payload.get("files", {})
     actual = {
-        str(path.relative_to(directory)): _sha256(path)
+        path.relative_to(directory).as_posix(): _sha256(path)
         for path in sorted(directory.rglob("*"))
         if path.is_file() and path.name != "manifest.json"
     }
@@ -1191,17 +1191,7 @@ def _reference_revision(root: Path) -> str | None:
 
 
 def _physical_memory_bytes() -> int:
-    if platform.system() == "Darwin":
-        result = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return int(result.stdout.strip())
-    page_size = os.sysconf("SC_PAGE_SIZE")
-    page_count = os.sysconf("SC_PHYS_PAGES")
-    return int(page_size * page_count)
+    return int(psutil.virtual_memory().total)
 
 
 def _combined_hash(values: dict[str, str]) -> str:

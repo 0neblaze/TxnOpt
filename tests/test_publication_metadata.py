@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -22,6 +23,28 @@ def test_stage_commit_map_contains_exactly_208_unique_mappings() -> None:
     assert all(len(row["public_sha"]) == 40 for row in rows)
 
 
+def test_source_disposition_accounts_for_every_target_byte() -> None:
+    with (ROOT / "docs/provenance/source-file-disposition.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 878
+    assert {row["disposition"] for row in rows} == {
+        "declarative_rename",
+        "migrated_modified_publication",
+        "migrated_unchanged",
+        "school_specific_exclusion",
+    }
+    for row in rows:
+        if not row["target_path"]:
+            assert row["disposition"] == "school_specific_exclusion"
+            continue
+        target = ROOT / row["target_path"]
+        assert target.is_file()
+        assert hashlib.sha256(target.read_bytes()).hexdigest() == row["target_sha256"]
+
+
 def test_artifact_index_does_not_promote_partial_formal_evidence() -> None:
     payload = json.loads((ROOT / "artifacts/index.json").read_text(encoding="utf-8"))
     entries = {entry["run_label"]: entry for entry in payload["entries"]}
@@ -35,6 +58,13 @@ def test_artifact_index_does_not_promote_partial_formal_evidence() -> None:
     assert formal["review_status"] is None
     assert formal["source_manifest_status"] == "planned"
     assert formal["source_revision"] == "a5cf00f7580fc2632179495a739a110786ace87d"
+    assert formal["campaign_manifest_sha256"] == (
+        "1b442b6c7f3b4f4982f308db2e00562614f9cd2097d59d8e5fadba459c91b01e"
+    )
+    assert set(formal["archived_batch_manifest_sha256_by_batch"]) == {
+        "batch0001",
+        "batch0002",
+    }
 
 
 def test_commercial_solvers_are_optional_dependencies() -> None:
@@ -69,3 +99,24 @@ def test_migration_receipt_hashes_match_published_bytes() -> None:
         assert hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest() == (
             expected_sha256
         )
+
+
+def test_local_runtime_and_large_artifact_paths_are_ignored() -> None:
+    paths = (
+        "FURP_Showcase.pdf",
+        "configs/stage052_campaign_lock.local.json",
+        "configs/stage052_campaign_lock.local.sha256",
+        "scratch/reviewer.sqlite",
+        "scratch/reviewer.sqlite3",
+    )
+    result = subprocess.run(
+        ("git", "check-ignore", "-z", "--stdin"),
+        cwd=ROOT,
+        input="\0".join(paths) + "\0",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert set(result.stdout.rstrip("\0").split("\0")) == set(paths)

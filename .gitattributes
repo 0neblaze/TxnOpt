@@ -1,5 +1,9 @@
 * text=auto eol=lf
 
+# Published experiment evidence is byte-addressed by historical manifests.
+# Never apply line-ending conversion to these immutable artifacts.
+experiments/** -text whitespace=cr-at-eol
+
 *.png binary
 *.jpg binary
 *.jpeg binary

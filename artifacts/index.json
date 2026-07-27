@@ -37,6 +37,11 @@
       "archived_bytes": 18022104542,
       "staging_partial_batch": "batch0003",
       "source_revision": "a5cf00f7580fc2632179495a739a110786ace87d",
+      "campaign_manifest_sha256": "1b442b6c7f3b4f4982f308db2e00562614f9cd2097d59d8e5fadba459c91b01e",
+      "archived_batch_manifest_sha256_by_batch": {
+        "batch0001": "8411620afc58625965113e5c484f7b226fe49e42163091b0737cc92b4438c0ad",
+        "batch0002": "164d8e4d193777067328d12be6211cc566f04bd5d4c7711c0bbbddecb2ab9ca6"
+      },
       "storage_root_aliases": [
         "d_archive",
         "wsl_staging"
