@@ -23,6 +23,7 @@ from evrptw.artifacts import (
     ArtifactRunContext,
     ArtifactStorageConfig,
     _schema_fingerprint,
+    screening_definition_store_contract,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
 from evrptw.experiments.stage052_campaign_review import (
@@ -974,6 +975,7 @@ def test_spawned_shard_summary_rejects_raw_payload_fields() -> None:
         replay_rows=[],
         checkpoints=[],
         logical_events=1,
+        screening_definition_rows=131_073,
         child_pid=123,
         child_peak_rss_bytes=456,
         pyarrow_allocated_bytes_after=0,
@@ -986,6 +988,50 @@ def test_spawned_shard_summary_rejects_raw_payload_fields() -> None:
     with pytest.raises(ArtifactIntegrityError, match="summary fields"):
         campaign_review_module._ShardReplayProcessResult.from_json(  # noqa: SLF001
             json.dumps(payload)
+        )
+
+
+def test_screening_definition_spill_gate_requires_a_real_spilled_shard() -> None:
+    failed, failed_detail = (
+        campaign_review_module._screening_definition_spill_gate(  # noqa: SLF001
+            [131_072, 1],
+            producer_memory_entries=131_072,
+        )
+    )
+    passed, passed_detail = (
+        campaign_review_module._screening_definition_spill_gate(  # noqa: SLF001
+            [131_073, 1],
+            producer_memory_entries=131_072,
+        )
+    )
+
+    assert failed is False
+    assert "0 shard" in failed_detail
+    assert passed is True
+    assert "1 shard" in passed_detail
+
+
+def test_batch_replay_mandatory_gate_fails_without_a_real_spill() -> None:
+    gate = campaign_review_module._batch_shard_artifact_replay_gate(  # noqa: SLF001
+        batch_failures=[],
+        screening_definition_row_counts=[131_072, 1],
+        screening_definition_memory_entries={131_072},
+    )
+
+    assert gate["passed"] is False
+    assert "0 shard" in str(gate["detail"])
+
+
+def test_campaign_reviewer_rejects_empty_producer_scratch_directory(
+    tmp_path: Path,
+) -> None:
+    shard_directory = tmp_path / "c101C5" / "2014"
+    shard_directory.mkdir(parents=True)
+    (shard_directory / "evrptw-screening-definitions-leftover").mkdir()
+
+    with pytest.raises(ArtifactIntegrityError, match="scratch cleanup"):
+        campaign_review_module._verify_producer_shard_scratch_cleanup(  # noqa: SLF001
+            shard_directory
         )
 
 
@@ -1465,6 +1511,7 @@ def _build_complete_pilot_campaign(
         "worker_count": 2,
         "worker_process_lifecycle": "one_shard_per_spawned_process",
         "worker_runtime_warmup": "in_memory_arrow_zstd1",
+        "screening_definition_store": screening_definition_store_contract(),
         "native_profile": "stage05.2-native-kernels-v1",
         "native_kernel_config": predecessor_metadata["native_kernel_config"],
         "repository_revision": predecessor_metadata["repository_revision"],
@@ -3253,6 +3300,7 @@ def test_noncanonical_single_batch_pilot_cannot_receive_ready_review(
     assert review["status"] == "NOT_READY"
     assert review["selected_optimization_profile"] == "native"
     assert review["gates"]["campaign_planning_replay"]["passed"] is False
+    assert review["gates"]["batch_shard_artifact_replay"]["passed"] is False
     progress = [
         json.loads(line)
         for line in progress_path.read_text(encoding="utf-8").splitlines()

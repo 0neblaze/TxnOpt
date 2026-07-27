@@ -54,10 +54,10 @@ UNIQUE_ROUTE_IDENTITY_MEMORY_ENTRIES = 262_144
 ROUTE_ID_RESOLUTION_CACHE_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
 SCREENING_DEFINITION_HOT_CACHE_ENTRIES = 524_288
 # A producer needs only the full SHA-256 collision token because the canonical
-# definition payload is already written to Parquet.  Keeping the token, rather
-# than a second JSON copy, permits the largest Stage 5.2 shard to remain in
-# bounded memory without entering the SQLite spill path.
-SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES = 1_200_000
+# definition payload is already written to Parquet.  Keeping only the token,
+# rather than a second JSON copy, bounds the pre-spill working set; larger
+# shards deliberately exercise the recoverable SQLite identity store.
+SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES = 131_072
 ROUTE_IDENTITY_COUNTER_NAMESPACES = 16
 MAX_SCREENING_CHECKS_PER_DECISION = 8
 # Keep live definition/occurrence transactions at or below one 65,536-row Parquet
@@ -73,6 +73,21 @@ DEFAULT_COMPRESSION = "zstd"
 DEFAULT_COMPRESSION_LEVEL = 3
 DEFAULT_PER_INSTANCE_SEED_MAX_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_PER_RUN_MAX_BYTES = 32 * 1024 * 1024 * 1024
+
+
+def screening_definition_store_contract() -> dict[str, object]:
+    """Return the signed producer contract used to prove real SQLite spill."""
+
+    return {
+        "schema_version": "stage05.2-screening-definition-store-v1",
+        "producer_memory_entries": SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES,
+        "spill_backend": "sqlite",
+        "journal_mode": "memory",
+        "synchronous": "normal",
+        "integrity_check": "required_before_close",
+        "scratch_cleanup": "required_on_success_and_failure",
+    }
+
 
 _RUN_LABEL_RE = re.compile(
     r"^stage(?:[0-9]{2}|[0-9]{2}\.[0-9])_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}$"
@@ -1743,23 +1758,6 @@ class _BoundedScreeningDefinitionStore:
     ) -> tuple[_PendingScreeningDefinition, ...]:
         """Register one bounded transaction with batched collision checks."""
 
-        if (
-            self._connection is None
-            and len(self._digest_memory) + len(definitions) <= self._memory_entries
-        ):
-            inserted_fast: list[_PendingScreeningDefinition] = []
-            for definition in definitions:
-                existing_digest = self._digest_memory.get(definition.definition_id)
-                if existing_digest is not None:
-                    if existing_digest != definition.digest:
-                        raise ArtifactIntegrityError("screening definition ID collision")
-                    continue
-                self._digest_memory[definition.definition_id] = definition.digest
-                if self._retain_payload:
-                    self._encoded_memory[definition.definition_id] = definition.encoded
-                inserted_fast.append(definition)
-            return tuple(inserted_fast)
-
         unique: dict[int, _PendingScreeningDefinition] = {}
         for definition in definitions:
             previous = unique.get(definition.definition_id)
@@ -1866,13 +1864,32 @@ class _BoundedScreeningDefinitionStore:
     def close(self) -> None:
         if self._closed:
             return
-        if self._connection is not None:
-            self._connection.close()
-        self._temporary_directory.cleanup()
-        self._digest_memory.clear()
-        self._encoded_memory.clear()
-        self._cache.clear()
-        self._closed = True
+        connection = self._connection
+        try:
+            if connection is not None:
+                try:
+                    integrity = connection.execute("PRAGMA integrity_check").fetchone()
+                except sqlite3.DatabaseError as error:
+                    raise ArtifactIntegrityError(
+                        "screening definition scratch failed SQLite integrity_check"
+                    ) from error
+                if integrity != ("ok",):
+                    raise ArtifactIntegrityError(
+                        "screening definition scratch failed SQLite integrity_check"
+                    )
+        finally:
+            try:
+                if connection is not None:
+                    connection.close()
+            finally:
+                self._connection = None
+                try:
+                    self._temporary_directory.cleanup()
+                finally:
+                    self._digest_memory.clear()
+                    self._encoded_memory.clear()
+                    self._cache.clear()
+                    self._closed = True
 
     def _remember(self, definition_id: int, definition: dict[str, object]) -> None:
         self._cache[definition_id] = definition

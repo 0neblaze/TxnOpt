@@ -236,9 +236,14 @@ producer 的 screening-definition SQLite scratch 必须使用 rollback-capable
 `journal_mode=MEMORY` 与 `synchronous=NORMAL`。每个 `register_many` transaction
 （批量注册事务）成功后 commit，任何异常都 rollback 整批；禁止使用
 `journal_mode=OFF` 或让失败批次的前缀行留在 identity store。scratch 仍是 shard-local
-临时状态，不进入 raw schema；成功和失败路径都必须关闭 connection 并清理临时目录。
-Pilot 必须实际触发 disk spill，并同时通过 SQLite `integrity_check`、36% persistence
-gate 与 shard cleanup gate，才允许新的 Formal。
+临时状态，不进入 raw schema。producer 的内存上限固定为 131,072 个 unique
+definitions；超过该值必须转入事务型 SQLite。成功关闭前必须执行
+`PRAGMA integrity_check`，检查失败必须 fail fast；成功和失败路径都必须关闭
+connection 并清理临时目录。Pilot 必须由 signed shard descriptor 的 row count
+与 signed batch metadata 中的 producer bound 共同独立证明至少一个 shard 实际超过
+该上限；reviewer 当前常量不得替代 producer 当时签入 raw 的 bound。reviewer 还必须
+拒绝 shard 目录中的任何残留 scratch directory（包括空目录）。只有同时通过 SQLite
+`integrity_check`、36% persistence gate 与 shard cleanup gate，才允许新的 Formal。
 
 producer、retention、performance reviewer 与 campaign reviewer 必须调用同一个
 cross-platform `probe_volume_identity`：WSL 用 `findmnt`，DrvFS 额外绑定 Windows

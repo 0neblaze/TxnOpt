@@ -1077,3 +1077,24 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   250,000-row 高基数 spill 回归完成 `integrity_check=ok`，吞吐约 186,000 rows/s，
   peak RSS 91.7 MiB，退出后 scratch 清理。该 producer 修复必须先以新 Pilot 通过
   36% persistence 与 independent review，再以新 Formal label 重跑完整 scope。
+- `stage05.2_benchmark_attempt61` 在 revision
+  `823d7c860eb6473db46de6f6dff255e6b4ed5698` 完成 36/36 Pilot shards；三批
+  persistence ratio 分别为 35.22%、31.23% 与 31.56%；signed batch resource
+  evidence 的最大 process-tree aggregate peak 为 3,666,194,432 bytes（3.41 GiB），
+  没有 warning/error。但 signed screening-definition descriptor 显示
+  单 shard 最大仅 143,326 rows，低于当时 1,200,000-entry producer memory bound，
+  因此该 Pilot 没有真实执行刚修复的 SQLite spill path，不能作为 Formal
+  prerequisite，完整 raw 继续保留且不追加成功 review。
+- 为关闭该验证盲区，producer bound 固定为 131,072 unique definitions；Attempt61
+  的原始 row counts 证明相同 Pilot scope 会有三个 shard 越过该界限。spilled store
+  关闭前现在强制执行 `PRAGMA integrity_check`，并以嵌套 `finally` 保证 connection、
+  temporary directory 与内存索引在成功和异常路径都清理。campaign reviewer 从每个
+  signed shard descriptor 读取 definition row count，并从 signed batch metadata
+  读取 producer 当时的完整 store contract，要求所有 batch 精确绑定 131,072-entry
+  bound 且至少一个 shard 超过该值；不得用未来 reviewer 自身常量倒推历史 producer。
+  reviewer 同时拒绝 shard 目录中的任何 producer scratch 残留，包括空目录；否则现有
+  `batch_shard_artifact_replay` mandatory gate 为 `NOT_READY`。
+  `register_many` 的未 spill 内存路径也不再边验证边写入；它先完成整批去重与 collision
+  预检，再一次性更新内存索引，确保后项失败不会留下前项。
+  该变更不改变 solver、objective、validator、event/raw schema、四 worker 或 36%
+  persistence gate；必须用下一最低未占用标签重新跑 Pilot。

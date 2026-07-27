@@ -47,6 +47,7 @@ from evrptw.artifacts import (
     ArtifactIntegrityError,
     ArtifactReader,
     artifact_schema_fingerprint,
+    screening_definition_store_contract,
     signed_sidecar_matches,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
@@ -160,6 +161,58 @@ COMPACT_TRACE_SCHEMA_FINGERPRINTS = {
     "screening_occurrences": artifact_schema_fingerprint(V3_SCREENING_OCCURRENCES_SCHEMA),
     "diagnostic": artifact_schema_fingerprint(DIAGNOSTIC_SCHEMA),
 }
+
+
+def _screening_definition_spill_gate(
+    row_counts: Sequence[int],
+    *,
+    producer_memory_entries: int,
+) -> tuple[bool, str]:
+    spilled_shards = sum(
+        row_count > producer_memory_entries
+        for row_count in row_counts
+    )
+    return (
+        spilled_shards > 0,
+        (
+            f"{spilled_shards} shard(s) exceeded the "
+            f"{producer_memory_entries}-definition signed producer in-memory bound "
+            "and therefore exercised transactional SQLite spill"
+        ),
+    )
+
+
+def _batch_shard_artifact_replay_gate(
+    *,
+    batch_failures: Sequence[str],
+    screening_definition_row_counts: Sequence[int],
+    screening_definition_memory_entries: set[int],
+) -> dict[str, object]:
+    if len(screening_definition_memory_entries) == 1:
+        spill_passed, spill_detail = _screening_definition_spill_gate(
+            screening_definition_row_counts,
+            producer_memory_entries=next(iter(screening_definition_memory_entries)),
+        )
+    else:
+        spill_passed = False
+        spill_detail = (
+            "campaign does not bind exactly one signed producer screening-definition "
+            "memory bound"
+        )
+    passed = not batch_failures and spill_passed
+    return {
+        "passed": passed,
+        "detail": (
+            "campaign->batch->shard->raw/solution/trace/event replay passed; "
+            + spill_detail
+            if passed
+            else (
+                "; ".join(batch_failures[:5])
+                if batch_failures
+                else spill_detail
+            )
+        ),
+    }
 
 
 def _emit_review_progress(event: str, **details: object) -> None:
@@ -1003,6 +1056,17 @@ def _artifacts_for_directory(
     return tuple(item for item in payload if isinstance(item, Mapping))
 
 
+def _verify_producer_shard_scratch_cleanup(shard_directory: Path) -> None:
+    unexpected = sorted(
+        path.name for path in shard_directory.iterdir() if path.is_dir()
+    )
+    if unexpected:
+        raise ArtifactIntegrityError(
+            "producer shard scratch cleanup left directories: "
+            + ", ".join(unexpected[:10])
+        )
+
+
 def _verified_primary_descriptor(
     reader: ArtifactReader,
     nested: Mapping[str, object],
@@ -1654,7 +1718,7 @@ def _replay_shard(
     benchmark_dir: Path,
     scope: str,
     scratch_root: Path | None = None,
-) -> tuple[list[dict[str, object]], list[dict[str, object]], int]:
+) -> tuple[list[dict[str, object]], list[dict[str, object]], int, int]:
     instance_name = str(shard_manifest.get("instance", ""))
     seed = _strict_int(shard_manifest.get("seed"), "seed")
     customer_count = next(
@@ -1753,6 +1817,12 @@ def _replay_shard(
         raise ArtifactIntegrityError(
             "compact trace physical descriptors do not match the fixed schemas"
         )
+    screening_definition_rows = _strict_int(
+        schema_descriptors["screening_definitions"].get("row_count"),
+        "screening definition row_count",
+    )
+    if screening_definition_rows < 0:
+        raise ArtifactIntegrityError("screening definition row_count is negative")
     raw_axes = raw.get("axes")
     solution_axes = solution.get("axes")
     trace_axes = trace.get("axes")
@@ -1907,7 +1977,12 @@ def _replay_shard(
         histories=streamed_replay.global_best_histories,
         verified_initial_objectives=verified_initial_objectives,
     )
-    return replay_rows, checkpoints, event_audit.event_count
+    return (
+        replay_rows,
+        checkpoints,
+        event_audit.event_count,
+        screening_definition_rows,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1920,6 +1995,7 @@ class _ShardReplayProcessResult:
     replay_rows: list[dict[str, object]]
     checkpoints: list[dict[str, object]]
     logical_events: int
+    screening_definition_rows: int
     child_pid: int
     child_peak_rss_bytes: int
     pyarrow_allocated_bytes_after: int
@@ -1938,6 +2014,7 @@ class _ShardReplayProcessResult:
                 "replay_rows": self.replay_rows,
                 "checkpoints": self.checkpoints,
                 "logical_events": self.logical_events,
+                "screening_definition_rows": self.screening_definition_rows,
                 "child_pid": self.child_pid,
                 "child_peak_rss_bytes": self.child_peak_rss_bytes,
                 "pyarrow_allocated_bytes_after": self.pyarrow_allocated_bytes_after,
@@ -1966,6 +2043,7 @@ class _ShardReplayProcessResult:
             "replay_rows",
             "checkpoints",
             "logical_events",
+            "screening_definition_rows",
             "child_pid",
             "child_peak_rss_bytes",
             "pyarrow_allocated_bytes_after",
@@ -1994,6 +2072,10 @@ class _ShardReplayProcessResult:
             checkpoints=[dict(row) for row in checkpoints],
             logical_events=_strict_int(
                 decoded.get("logical_events"), "spawned shard logical_events"
+            ),
+            screening_definition_rows=_strict_int(
+                decoded.get("screening_definition_rows"),
+                "spawned shard screening_definition_rows",
             ),
             child_pid=_strict_int(decoded.get("child_pid"), "spawned shard child_pid"),
             child_peak_rss_bytes=_strict_int(
@@ -2084,7 +2166,12 @@ def _replay_shard_worker(
         seed = _strict_int(shard.get("seed"), "spawned shard seed")
         if shard.get("run_label") != run_label:
             raise ArtifactIntegrityError("spawned shard manifest identity is invalid")
-        replay_rows, checkpoints, logical_events = _replay_shard(
+        (
+            replay_rows,
+            checkpoints,
+            logical_events,
+            screening_definition_rows,
+        ) = _replay_shard(
             reader=reader,
             shard_manifest=shard,
             benchmark_dir=benchmark_dir,
@@ -2125,6 +2212,7 @@ def _replay_shard_worker(
             replay_rows=replay_rows,
             checkpoints=checkpoints,
             logical_events=logical_events,
+            screening_definition_rows=screening_definition_rows,
             child_pid=child_pid,
             child_peak_rss_bytes=peak_rss,
             pyarrow_allocated_bytes_after=arrow_allocated,
@@ -2278,6 +2366,7 @@ def _replay_shard_in_fresh_process(
         parent_pid=os.getpid(),
         parent_rss_bytes=parent.memory_info().rss,
         logical_events=result.logical_events,
+        screening_definition_rows=result.screening_definition_rows,
         logical_pass_count=result.logical_pass_count,
         scratch_cleaned=result.scratch_cleaned,
         elapsed_seconds=result.elapsed_seconds,
@@ -2531,12 +2620,18 @@ def _validate_batch_metadata(
     runtime = metadata.get("runtime_identity")
     provenance = metadata.get("performance_provenance")
     native = metadata.get("native_kernel_config")
+    definition_store = metadata.get("screening_definition_store")
     if (
         not isinstance(runtime, Mapping)
         or not isinstance(provenance, Mapping)
         or not isinstance(native, Mapping)
+        or not isinstance(definition_store, Mapping)
     ):
-        return False, "batch runtime/input/native identity is missing", ("", "", "")
+        return (
+            False,
+            "batch runtime/input/native/screening-store identity is missing",
+            ("", "", ""),
+        )
     repository_revision = str(metadata.get("repository_revision", ""))
     campaign_configuration = str(metadata.get("campaign_configuration_sha256", ""))
     runtime_digest = _canonical_sha256(runtime)
@@ -2586,6 +2681,7 @@ def _validate_batch_metadata(
         and metadata.get("native_profile") == campaign.native_profile
         and metadata.get("storage_policy_version") == campaign.storage_policy_version
         and metadata.get("screening_schema_version") == campaign.screening_schema_version
+        and dict(definition_store) == screening_definition_store_contract()
         and campaign_configuration == campaign.configuration_sha256
         and metadata.get("campaign_prerequisite_review_sha256")
         == campaign.prerequisite_review_sha256
@@ -4223,6 +4319,8 @@ def _audit_campaign(
     metadata_identities: set[tuple[str, str, str]] = set()
     observed_shard_ids: set[str] = set()
     aggregate_event_rows = 0
+    screening_definition_row_counts: list[int] = []
+    screening_definition_memory_entries: set[int] = set()
     for embedded_batch in campaign.batches:
         try:
             root = locator.resolve(embedded_batch.root_alias)
@@ -4264,6 +4362,17 @@ def _audit_campaign(
             )
             if not metadata_ok:
                 raise ArtifactIntegrityError(metadata_detail)
+            definition_store = metadata.get("screening_definition_store")
+            if not isinstance(definition_store, Mapping):
+                raise ArtifactIntegrityError(
+                    "batch screening-definition store contract is missing"
+                )
+            screening_definition_memory_entries.add(
+                _strict_int(
+                    definition_store.get("producer_memory_entries"),
+                    "producer screening definition memory entries",
+                )
+            )
             provenance = metadata.get("performance_provenance")
             if (
                 not isinstance(provenance, Mapping)
@@ -4328,6 +4437,7 @@ def _audit_campaign(
                 ):
                     raise ArtifactIntegrityError("shard identity/completeness mismatch")
                 shard_directory = shard_path.parent
+                _verify_producer_shard_scratch_cleanup(shard_directory)
                 declared_shard_paths = {
                     str(item.get("relative_path", "")) for item in _artifacts_for_directory(shard)
                 }
@@ -4366,6 +4476,9 @@ def _audit_campaign(
                 replay = spawned_replay.replay_rows
                 checkpoints = spawned_replay.checkpoints
                 logical_events = spawned_replay.logical_events
+                screening_definition_row_counts.append(
+                    spawned_replay.screening_definition_rows
+                )
                 event_rows += logical_events
                 evidence.checkpoint_rows.extend(checkpoints)
                 for row in replay:
@@ -4507,12 +4620,11 @@ def _audit_campaign(
             batch_failures.append(f"{embedded_batch.batch_id}: {error}")
             break
 
-    gates["batch_shard_artifact_replay"] = {
-        "passed": not batch_failures,
-        "detail": "campaign->batch->shard->raw/solution/trace/event replay passed"
-        if not batch_failures
-        else "; ".join(batch_failures[:5]),
-    }
+    gates["batch_shard_artifact_replay"] = _batch_shard_artifact_replay_gate(
+        batch_failures=batch_failures,
+        screening_definition_row_counts=screening_definition_row_counts,
+        screening_definition_memory_entries=screening_definition_memory_entries,
+    )
     gates["runtime_provenance"] = {
         "passed": not batch_failures and len(metadata_identities) == 1,
         "detail": "all batches share one commit/config/non-editable runtime"

@@ -49,6 +49,7 @@ from evrptw.artifacts import (
     atomic_write_signed_json,
     build_stage03_critical_events,
     iter_stage03_critical_events,
+    screening_definition_store_contract,
     signed_sidecar_matches,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
@@ -1854,6 +1855,7 @@ def _run_benchmark_batch(
         "benchmark_execution_lock": dict(selection_lock),
         "storage_policy_version": storage.storage_policy_version,
         "screening_schema_version": storage.screening_schema_version,
+        "screening_definition_store": screening_definition_store_contract(),
         "staging_root_alias": campaign_config.staging_root_alias,
         "planned_archive_root_aliases": list(campaign_config.archive_root_aliases),
         "archive_root_aliases_exercised": [planned_manifest.archive_root_alias],

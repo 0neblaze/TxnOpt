@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -527,6 +528,78 @@ def test_producer_screening_definition_store_spills_digest_without_payload(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_producer_screening_definition_store_bound_exercises_pilot_spill() -> None:
+    assert artifacts_module.SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES == 131_072
+
+
+def test_screening_definition_store_checks_integrity_before_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        artifacts_module,
+        "SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES",
+        1,
+    )
+    first, second = (_pending_definition(value) for value in range(2))
+    store = artifacts_module._BoundedScreeningDefinitionStore(  # noqa: SLF001
+        cache_entries=1,
+        scratch_root=tmp_path,
+        retain_payload=False,
+    )
+    assert store.register_many((first, second)) == (first, second)
+    connection = store._connection  # noqa: SLF001
+    assert connection is not None
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+
+    store.close()
+
+    assert any(
+        statement.casefold().startswith("pragma integrity_check")
+        for statement in statements
+    )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_screening_definition_store_cleans_up_after_integrity_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        artifacts_module,
+        "SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES",
+        1,
+    )
+    first, second = (_pending_definition(value) for value in range(2))
+    store = artifacts_module._BoundedScreeningDefinitionStore(  # noqa: SLF001
+        cache_entries=1,
+        scratch_root=tmp_path,
+        retain_payload=False,
+    )
+    assert store.register_many((first, second)) == (first, second)
+    connection = store._connection  # noqa: SLF001
+    assert connection is not None
+    connection.execute("PRAGMA writable_schema=ON")
+    connection.execute(
+        "UPDATE sqlite_schema SET rootpage = 999999 WHERE name = 'definitions'"
+    )
+    connection.execute("PRAGMA writable_schema=OFF")
+    connection.commit()
+    database_path = Path(
+        str(connection.execute("PRAGMA database_list").fetchone()[2])
+    )
+    connection.close()
+    store._connection = sqlite3.connect(database_path)  # noqa: SLF001
+
+    with pytest.raises(ArtifactIntegrityError, match="integrity_check"):
+        store.close()
+
+    assert store._closed is True  # noqa: SLF001
+    assert store._connection is None  # noqa: SLF001
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_screening_definition_store_uses_recoverable_sqlite_transactions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -591,6 +664,39 @@ def test_screening_definition_store_rolls_back_a_partial_batch(
         connection.commit()
         assert store.register_many((third, fourth)) == (third, fourth)
 
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_screening_definition_store_rejects_memory_batch_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        artifacts_module,
+        "SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES",
+        10,
+    )
+    existing, new = (_pending_definition(value) for value in range(2))
+    store = artifacts_module._BoundedScreeningDefinitionStore(  # noqa: SLF001
+        cache_entries=1,
+        scratch_root=tmp_path,
+        retain_payload=False,
+    )
+    assert store.register_many((existing,)) == (existing,)
+    forged = artifacts_module._PendingScreeningDefinition(  # noqa: SLF001
+        definition_id=existing.definition_id,
+        encoded=b'{"value":999}',
+        digest=b"x" * 32,
+        payload={"value": 999},
+        row=(existing.definition_id, 999),
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="ID collision"):
+        store.register_many((new, forged))
+
+    assert new.definition_id not in store._digest_memory  # noqa: SLF001
+    assert set(store._digest_memory) == {existing.definition_id}  # noqa: SLF001
+    store.close()
     assert list(tmp_path.iterdir()) == []
 
 
