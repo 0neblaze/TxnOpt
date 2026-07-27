@@ -9,13 +9,13 @@ from pathlib import Path
 import pytest
 
 from evrptw.alns import solve_alns
+from evrptw.benchmark import write_schneider_instance
 from evrptw.experiments.stage00_baseline import load_config, run_stage00
 from evrptw.experiments.stage01_objective import (
     STAGE01_PER_RUN_FIELDS,
     build_objective_ranking_report,
     run_stage01_objective,
 )
-from evrptw.experiments.week02_baseline_comparison import write_schneider_instance
 from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.objective import SolutionObjective
 

@@ -513,9 +513,9 @@ def _dependency_versions() -> dict[str, str]:
 
 def _distribution_is_editable() -> bool:
     try:
-        distribution = importlib.metadata.distribution("evrptw-reproduction")
+        distribution = importlib.metadata.distribution("reproducible-evrptw")
     except importlib.metadata.PackageNotFoundError as error:
-        raise RuntimeError("evrptw-reproduction is not installed") from error
+        raise RuntimeError("reproducible-evrptw is not installed") from error
     direct_url = distribution.read_text("direct_url.json")
     if direct_url is None:
         return False
@@ -529,9 +529,9 @@ def _distribution_is_editable() -> bool:
 
 def _installed_distribution_digest() -> str:
     try:
-        distribution = importlib.metadata.distribution("evrptw-reproduction")
+        distribution = importlib.metadata.distribution("reproducible-evrptw")
     except importlib.metadata.PackageNotFoundError as error:
-        raise RuntimeError("evrptw-reproduction is not installed") from error
+        raise RuntimeError("reproducible-evrptw is not installed") from error
     files = distribution.files
     if files is None:
         raise RuntimeError("installed distribution has no file inventory")

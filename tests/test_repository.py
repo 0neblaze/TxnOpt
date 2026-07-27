@@ -14,7 +14,7 @@ def test_repository_root_uses_active_checkout_when_package_is_installed(
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
-    (checkout / "pyproject.toml").write_text("[project]\nname='evrptw-reproduction'\n")
+    (checkout / "pyproject.toml").write_text("[project]\nname='reproducible-evrptw'\n")
     configs = checkout / "configs"
     configs.mkdir()
     (configs / "stage052_performance.toml").write_text("schema_version='test'\n")
@@ -31,7 +31,7 @@ def test_repository_root_honours_explicit_checkout_binding(
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
-    (checkout / "pyproject.toml").write_text("[project]\nname='evrptw-reproduction'\n")
+    (checkout / "pyproject.toml").write_text("[project]\nname='reproducible-evrptw'\n")
     configs = checkout / "configs"
     configs.mkdir()
     (configs / "stage052_performance.toml").write_text("schema_version='test'\n")

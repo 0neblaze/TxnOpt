@@ -590,6 +590,7 @@ def c101c5_instance() -> object:
     return parse_schneider("data/schneider/c101C5.txt")
 
 
+@pytest.mark.external_data
 class TestStage04EndToEnd:
     def test_stage04_disabled_preserves_legacy_behavior(
         self, c101c5_instance: object

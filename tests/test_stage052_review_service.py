@@ -524,7 +524,7 @@ def test_reviewer_revision_is_bound_to_wheel_and_installed_files(
     wheel = tmp_path / "reviewer.whl"
     members = {
         "evrptw/reviewer.py": b"REVIEWER = True\n",
-        "evrptw_reproduction-0.1.dist-info/METADATA": b"Name: evrptw-reproduction\n",
+        "reproducible_evrptw-0.1.dist-info/METADATA": b"Name: reproducible-evrptw\n",
         "evrptw_reproduction-0.1.dist-info/RECORD": b"installed record differs\n",
     }
     with zipfile.ZipFile(wheel, "w") as archive:

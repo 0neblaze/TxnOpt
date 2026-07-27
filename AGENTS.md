@@ -1,5 +1,23 @@
 # Repository Instructions
 
+## Repository identity and publication boundary
+
+- This is the independent `Reproducible-EVRPTW` research repository. The school
+  FURP repository ends at Week 5 and is not a publication branch of this repo.
+- The rewritten public history begins with Stage 0. Legacy source revisions in
+  immutable evidence resolve through
+  `docs/provenance/legacy-stage-commit-map.csv`; do not replace those historical
+  hashes with public-history hashes.
+- Large raw evidence remains external. Public Git tracks only code,
+  configuration, tests, curated summaries, registries, manifests, review
+  products, and the lightweight `artifacts/index.json`.
+- Stage 5.2 Pilot `stage05.2_benchmark_attempt72` is accepted. Formal
+  `stage05.2_benchmark_attempt73` is incomplete and unreviewed; Stages 6--8 are
+  roadmap items only.
+- Apache-2.0 applies only to original code and documentation. Benchmark data,
+  papers, commercial solvers, and third-party repositories remain under their
+  own terms.
+
 ## Agent skills
 
 ### Issue tracker

@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software or its evidence protocols, please cite this repository."
+title: "Reproducible-EVRPTW"
+type: software
+version: 0.1.0
+authors:
+  - family-names: Guo
+    given-names: Yiyang
+    affiliation: University of Nottingham Ningbo China
+repository-code: "https://github.com/0neblaze/Reproducible-EVRPTW"
+license: Apache-2.0
+keywords:
+  - EVRP-TW
+  - ALNS
+  - vehicle routing
+  - exact charging
+  - reproducible optimization

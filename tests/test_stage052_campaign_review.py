@@ -862,6 +862,7 @@ def test_campaign_reviewer_recomputes_async_batch_ledger() -> None:
         )
 
 
+@pytest.mark.external_data
 def test_campaign_reviewer_replays_each_logical_event_stream_once() -> None:
     instance = parse_schneider(Path("data/schneider/c101C5.txt"))
     baseline = json.loads(
@@ -1213,6 +1214,7 @@ def test_streaming_audit_has_a_hard_pending_key_bound(
     assert "bounded" in audit.detail
 
 
+@pytest.mark.external_data
 def test_global_best_stream_summary_keeps_only_checkpoint_visible_events() -> None:
     instance = parse_schneider(Path("data/schneider/c101C5.txt"))
     baseline = json.loads(
@@ -3252,6 +3254,7 @@ def test_campaign_review_rejects_corrupt_prior_files_and_history(
         _publish_review(campaign_dir=campaign_dir, manifest=manifest, payloads=payloads)
 
 
+@pytest.mark.external_data
 def test_noncanonical_single_batch_pilot_cannot_receive_ready_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

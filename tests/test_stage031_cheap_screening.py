@@ -185,6 +185,7 @@ def test_stage031_config_and_scope_are_exact() -> None:
     assert len(set(_scope_instances("smoke"))) == 6
 
 
+@pytest.mark.external_data
 def test_real_c5_feasible_route_is_not_rejected_by_full_screen() -> None:
     instance = parse_schneider(Path("data/schneider/c101C5.txt"))
     result = screen_route_candidate(

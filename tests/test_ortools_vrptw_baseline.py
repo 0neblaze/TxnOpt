@@ -7,13 +7,13 @@ from evrptw.baselines.ortools_vrptw import render_summary, solve_vrptw
 from evrptw.parser import parse_schneider
 from evrptw.validation import validate_routes
 
-INSTANCE = Path("src/evrptw/instances/week01_vrptw_toy.txt")
+INSTANCE = Path("src/evrptw/instances/toy_vrptw.txt")
 
 
-def test_week01_toy_instance_parses() -> None:
+def test_toy_instance_parses() -> None:
     instance = parse_schneider(INSTANCE)
 
-    assert instance.name == "week01_vrptw_toy"
+    assert instance.name == "toy_vrptw"
     assert len(instance.customers) == 8
     assert not instance.stations
 
@@ -67,4 +67,3 @@ def test_summary_and_json_payload_include_required_fields(tmp_path: Path) -> Non
         "violations",
     ):
         assert field in payload
-

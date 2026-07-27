@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from evrptw.baselines.ga_vrptw import decode_chromosome, solve_ga_vrptw
-from evrptw.experiments.week02_baseline_comparison import generate_week02_instance
+from evrptw.benchmark import generate_synthetic_instance
 
 
 def test_ga_baseline_is_reproducible_with_same_seed() -> None:
-    instance = generate_week02_instance(12, seed=2014)
+    instance = generate_synthetic_instance(12, seed=2014)
 
     first = solve_ga_vrptw(instance, seed=7, population_size=12, generations=4)
     second = solve_ga_vrptw(instance, seed=7, population_size=12, generations=4)
@@ -16,7 +16,7 @@ def test_ga_baseline_is_reproducible_with_same_seed() -> None:
 
 
 def test_decode_visits_each_customer_once() -> None:
-    instance = generate_week02_instance(10, seed=2014)
+    instance = generate_synthetic_instance(10, seed=2014)
     chromosome = tuple(customer.name for customer in instance.customers)
 
     routes = decode_chromosome(instance, chromosome)
@@ -27,7 +27,7 @@ def test_decode_visits_each_customer_once() -> None:
 
 
 def test_ga_convergence_log_contains_required_fields() -> None:
-    instance = generate_week02_instance(10, seed=2014)
+    instance = generate_synthetic_instance(10, seed=2014)
     result = solve_ga_vrptw(instance, seed=2014, population_size=10, generations=3)
     payload = result.to_dict()
     objective_value = payload["objective_value"]
@@ -45,7 +45,7 @@ def test_ga_convergence_log_contains_required_fields() -> None:
 
 
 def test_ga_rejects_invalid_wall_clock_limit() -> None:
-    instance = generate_week02_instance(10, seed=2014)
+    instance = generate_synthetic_instance(10, seed=2014)
 
     try:
         solve_ga_vrptw(instance, time_limit_seconds=0.0)

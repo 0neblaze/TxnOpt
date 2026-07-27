@@ -1,7 +1,14 @@
 from __future__ import annotations
 
-from evrptw.benchmark import audit_instance, calculate_battery_bounds
+from pathlib import Path
+
+from evrptw.benchmark import (
+    audit_instance,
+    calculate_battery_bounds,
+    write_schneider_instance,
+)
 from evrptw.models import Instance, Node, NodeType, Vehicle
+from evrptw.parser import parse_schneider
 
 
 def _instance(*, battery: float = 12.0, demand: float = 1.0) -> Instance:
@@ -39,3 +46,16 @@ def test_audit_accepts_structurally_sound_toy_instance() -> None:
     assert audit.structurally_feasible is True
     assert audit.failures == ()
     assert audit.distance_metric.startswith("EUC_2D")
+
+
+def test_schneider_instance_writer_round_trips_through_public_benchmark_api(
+    tmp_path: Path,
+) -> None:
+    source = _instance()
+    path = tmp_path / "audit_toy.txt"
+
+    write_schneider_instance(source, path)
+    restored = parse_schneider(path)
+
+    assert restored.nodes == source.nodes
+    assert restored.vehicle == source.vehicle

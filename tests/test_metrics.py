@@ -7,7 +7,7 @@ from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.validation import validate_routes
 
 
-def test_week03_metrics_classify_energy_and_charging_fields() -> None:
+def test_route_metrics_classify_energy_and_charging_fields() -> None:
     instance = Instance(
         "metrics_toy",
         (

@@ -1,4 +1,4 @@
-# Week 5 ALNS、精确充电子问题与 Branch-Price-and-Cut 方法说明
+# ALNS、精确充电子问题与 Branch-Price-and-Cut 方法说明
 
 ## 1. 问题边界
 
@@ -132,19 +132,16 @@ random（随机）和 random-clustered（随机聚类）三类。BPC 只对 5-cu
 
 ## 7. 可复现命令
 
+原 Week 5 runner 属于学校项目边界，已从 publication branch（发表分支）移除。
+其科学方法进入 Stage 0 frozen baseline（冻结基线），公开复现入口为：
+
 ```bash
 uv sync --all-groups
-uv run python -m evrptw.experiments.week05_advanced_benchmark \
-  --benchmark-dir data/schneider \
-  --output-dir results/week05_advanced \
-  --instances c101C5,r105C5,rc105C5,c104C10,r103C10,rc102C10,c106C15,r105C15,rc103C15,c101_21,r101_21,rc101_21 \
-  --stress-instances c101C5,r105C5,rc105C5 \
-  --seeds 2014,2015,2016 \
-  --alns-iterations 1000 \
-  --time-limit-seconds 30 \
-  --ga-population-size 60 \
-  --ga-generations 80
+uv run python -m evrptw.experiments.stage00_baseline run \
+  --config configs/stage00_baseline.toml \
+  --output-dir results/stage00 \
+  --baseline-dir experiments/baselines/stage00
 ```
 
-原始日志、solution 和环境记录位于 `results/week05_advanced/`；审阅用 CSV 位于
-`experiments/summaries/week05_advanced_*.csv`。
+Stage 0 的冻结结果位于 `experiments/baselines/stage00/`；新运行的 raw、solution
+和环境记录写入 ignored（被 Git 忽略）的 `results/stage00/`。

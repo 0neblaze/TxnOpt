@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from evrptw.benchmark import write_schneider_instance
 from evrptw.experiments.stage00_baseline import (
     COMPARISON_FIELDS,
     Stage00Config,
@@ -16,7 +17,6 @@ from evrptw.experiments.stage00_baseline import (
     summarize_metric_values,
     verify_results,
 )
-from evrptw.experiments.week02_baseline_comparison import write_schneider_instance
 from evrptw.models import Instance, Node, NodeType, Vehicle
 
 

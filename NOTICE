@@ -1,0 +1,9 @@
+Reproducible-EVRPTW
+Copyright 2026 Yiyang Guo
+
+This distribution contains original research code and documentation licensed
+under Apache-2.0. It does not license or redistribute third-party benchmark
+data, published papers, commercial solver software, or external reference
+repositories. Their names are used only for attribution and reproducibility.
+
+See THIRD_PARTY_DATA.md and the locked Python dependency metadata for details.

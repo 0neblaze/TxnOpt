@@ -1,0 +1,48 @@
+{
+  "schema_version": "reproducible-evrptw-migration-v1",
+  "created_at": "2026-07-27",
+  "school_repository": {
+    "url": "https://github.com/0neblaze/FURP-2026-Yiyang-GUO-EVRP-TW",
+    "head": "7f4c72d7c391eb05317bc56209389fa889dbe902",
+    "tracked_files": 85,
+    "commit_count": 8
+  },
+  "source": {
+    "head": "a5cf00f7580fc2632179495a739a110786ace87d",
+    "tree": "e93a60f3c652f497626afd786ff23aa93e3005fb",
+    "first_stage_commit": "ed23b8344a1ac9c750a7febeb9ff87a2c604215a",
+    "stage_commit_count": 208,
+    "tracked_files": 878,
+    "tracked_content_bytes": 28146799,
+    "source_directory_bytes": 57135104,
+    "source_file_inventory_sha256": "e51494b1af0a5eeda902328efb7fed16ff226665b18d995cfb7384deadd35c98",
+    "source_file_disposition_sha256": "40ba51a621ded1446ca7a77651379455050b92a1a512c74fc7bb7088aba4840a",
+    "source_file_disposition_summary_sha256": "123c77321379c74522544ed141ac37d2cd9c23325bd87a6a4daacff5b0010f1e",
+    "unclassified_file_count": 0
+  },
+  "public_history": {
+    "root": "0c3d4652d1557d90d3fff3f92bbba843112b4e34",
+    "pre_publication_cleanup_tip": "8b1494e0aa6864a88e37ed700cf686d1165a5320",
+    "commit_count": 208,
+    "replayed_patch_count": 207,
+    "stable_patch_mismatch_count": 0,
+    "stable_patch_verification_sha256": "405ebd9339e388bf4bede063d9cbcbb7e8a52c89e77e455d9b551f4a715805df"
+  },
+  "additional_inputs": [
+    {
+      "destination": "docs/research/evrptw-publication-landscape-2026.md",
+      "bytes": 25545,
+      "sha256": "d74142f2f0e11ebb2c0125368097ed984377bb3fc2428b3d53dce67b728a30c4"
+    }
+  ],
+  "external_storage": {
+    "wsl_staging_bytes": 48919388160,
+    "wsl_staging_alias": "wsl_staging",
+    "d_archive_alias": "d_archive",
+    "d_archive_device_identity": "nvme-zhitai-tiplus7100s-2tb-a428-b706-b430-0003",
+    "raw_bytes_copied_into_git": 0
+  },
+  "source_mutated": false,
+  "school_remote_mutated": false,
+  "raw_evidence_mutated": false
+}

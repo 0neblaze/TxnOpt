@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from evrptw import _core
 from evrptw.experiments.stage02_constraint_guided_review import (
     _accepted_feasible_constraint_candidate,
@@ -141,6 +143,7 @@ def test_review_provenance_captures_dependency_and_runtime_hashes() -> None:
     }
 
 
+@pytest.mark.external_data
 def test_stage02_2_readiness_metric_supplement_is_complete() -> None:
     comparison_rows = _load_comparison_rows(Path("results/stage02-quality_attempt02"))
     rows = _load_comparison_metric_rows(
@@ -166,6 +169,7 @@ def test_stage02_2_readiness_metric_supplement_is_complete() -> None:
     )
 
 
+@pytest.mark.external_data
 def test_stage02_2_metric_supplement_rejects_protocol_drift() -> None:
     comparison_rows = _load_comparison_rows(Path("results/stage02-quality_attempt02"))
     rows = _load_comparison_metric_rows(

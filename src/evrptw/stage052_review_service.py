@@ -29,7 +29,11 @@ from evrptw.artifacts import ArtifactIntegrityError, ArtifactReader
 
 REVIEW_EXECUTION_SCHEMA_VERSION = "stage05.2-review-execution-v1"
 REVIEWER_WHEEL_PROVENANCE_SCHEMA_VERSION = "stage05.2-reviewer-wheel-provenance-v1"
-DEFAULT_LOG_ROOT = Path("/home/oneblaze/stage052-review-logs")
+DEFAULT_LOG_ROOT = (
+    Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    / "reproducible-evrptw"
+    / "stage052-review-logs"
+)
 DEFAULT_MAX_AGGREGATE_RSS_BYTES = int(5.5 * 1024**3)
 SYSTEMD_MEMORY_HIGH = "5G"
 SYSTEMD_MEMORY_MAX = "6G"
@@ -417,7 +421,7 @@ from urllib.parse import unquote, urlparse
 
 reviewer = importlib.import_module(sys.argv[1])
 
-distribution = metadata.distribution("evrptw-reproduction")
+distribution = metadata.distribution("reproducible-evrptw")
 direct_url = json.loads(distribution.read_text("direct_url.json") or "{}")
 print(json.dumps({
     "module_path": str(Path(reviewer.__file__).resolve()),

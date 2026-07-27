@@ -1,13 +1,98 @@
 from __future__ import annotations
 
+import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from evrptw.models import Instance, Node
+from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.parser import parse_schneider
 
 _EPSILON = 1e-9
+
+
+def generate_synthetic_instance(customer_count: int, *, seed: int = 2014) -> Instance:
+    """Create a deterministic EVRP-TW instance for tests and smoke benchmarks."""
+
+    if customer_count <= 0:
+        raise ValueError("customer_count must be positive")
+
+    rng = random.Random(seed + customer_count)
+    horizon = float(10_000 + customer_count * 100)
+    nodes: list[Node] = [
+        Node("D0", NodeType.DEPOT, 50.0, 50.0, 0.0, 0.0, horizon, 0.0),
+    ]
+    station_coordinates = (
+        (20.0, 20.0),
+        (20.0, 80.0),
+        (80.0, 20.0),
+        (80.0, 80.0),
+        (50.0, 50.0),
+    )
+    for index, (x_coordinate, y_coordinate) in enumerate(station_coordinates, start=1):
+        nodes.append(
+            Node(
+                f"S{index}",
+                NodeType.STATION,
+                x_coordinate,
+                y_coordinate,
+                0.0,
+                0.0,
+                horizon,
+                0.0,
+            )
+        )
+
+    for index in range(1, customer_count + 1):
+        nodes.append(
+            Node(
+                f"C{index}",
+                NodeType.CUSTOMER,
+                rng.uniform(0.0, 100.0),
+                rng.uniform(0.0, 100.0),
+                float(rng.randint(1, 5)),
+                0.0,
+                horizon,
+                5.0,
+            )
+        )
+
+    return Instance(
+        f"synthetic_{customer_count}",
+        tuple(nodes),
+        Vehicle(
+            battery_capacity=1_000_000.0,
+            load_capacity=50.0,
+            consumption_rate=1.0,
+            inverse_refueling_rate=0.1,
+            average_velocity=1.0,
+        ),
+    )
+
+
+def write_schneider_instance(instance: Instance, path: Path) -> None:
+    """Write an instance in the Schneider text format used by the experiment CLIs."""
+
+    lines = ["StringID Type x y demand ReadyTime DueDate ServiceTime"]
+    for node in instance.nodes:
+        lines.append(
+            f"{node.name} {node.kind.value} {node.x:.6f} {node.y:.6f} "
+            f"{node.demand:.6f} {node.ready_time:.6f} {node.due_date:.6f} "
+            f"{node.service_time:.6f}"
+        )
+    vehicle = instance.vehicle
+    lines.extend(
+        [
+            "",
+            f"Q / {vehicle.battery_capacity:.6f} /",
+            f"C / {vehicle.load_capacity:.6f} /",
+            f"r / {vehicle.consumption_rate:.6f} /",
+            f"g / {vehicle.inverse_refueling_rate:.6f} /",
+            f"v / {vehicle.average_velocity:.6f} /",
+        ]
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 @dataclass(frozen=True, slots=True)

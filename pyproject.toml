@@ -3,15 +3,13 @@ requires = ["scikit-build-core>=0.11,<0.12", "pybind11>=3.0,<4"]
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "evrptw-reproduction"
+name = "reproducible-evrptw"
 version = "0.1.0"
-description = "Reproducible EVRP-TW research environment"
+description = "Reproducible ALNS and exact-charging research for EVRP-TW"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
+license = "Apache-2.0"
 dependencies = [
-  "cplex==22.2.0.0",
-  "docplex==2.32.264",
-  "gurobipy==13.0.2",
   "highspy>=1.12,<2",
   "jupyterlab>=4.5,<5",
   "matplotlib>=3.10,<4",
@@ -25,6 +23,13 @@ dependencies = [
   "pyarrow>=18,<24",
   "scipy>=1.16,<2",
   "seaborn>=0.13,<1",
+]
+
+[project.optional-dependencies]
+commercial-solvers = [
+  "cplex==22.2.0.0",
+  "docplex==2.32.264",
+  "gurobipy==13.0.2",
 ]
 
 [project.scripts]
@@ -51,6 +56,11 @@ extend-exclude = ["._*", "**/._*"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+markers = [
+  "external_data: requires Schneider benchmark files or ignored raw result bundles",
+]
 
 [tool.mypy]
 python_version = "3.13"

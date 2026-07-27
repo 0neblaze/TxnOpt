@@ -1,0 +1,46 @@
+{
+  "schema_version": "reproducible-evrptw-artifact-index-v1",
+  "generated_at": "2026-07-27",
+  "storage_model": "code_repository_plus_external_artifacts",
+  "entries": [
+    {
+      "run_label": "stage05.2_benchmark_attempt72",
+      "component": "benchmark",
+      "scope": "pilot",
+      "status": "accepted_pilot",
+      "source_manifest_status": "complete",
+      "review_status": "READY_FOR_STAGE052_FORMAL_BENCHMARK",
+      "shard_count": 36,
+      "axis_count": 36,
+      "declared_solver_seconds": 1080,
+      "archived_bytes": 322564493,
+      "raw_manifest_sha256": "5aa8b773c39ea3e0a8cd31434756f4219c3ec51f430bdcae1e61107fdd3f38e4",
+      "review_manifest_sha256": "24de9cc93ad99f7d607617e11e8c9bee7fda224a421da1f97dd3af1bd6277727",
+      "storage_root_alias": "d_archive",
+      "logical_path": "stage05.2_benchmark_attempt72",
+      "release_url": null
+    },
+    {
+      "run_label": "stage05.2_benchmark_attempt73",
+      "component": "benchmark",
+      "scope": "formal",
+      "status": "partial_unreviewed",
+      "source_manifest_status": "planned",
+      "review_status": null,
+      "declared_shard_count": 920,
+      "declared_axis_count": 2040,
+      "declared_solver_seconds": 229200,
+      "archived_complete_shards": 445,
+      "archived_complete_batches": 2,
+      "archived_bytes": 18022104542,
+      "staging_partial_batch": "batch0003",
+      "storage_root_aliases": [
+        "d_archive",
+        "wsl_staging"
+      ],
+      "logical_path": "stage05.2_benchmark_attempt73",
+      "release_url": null,
+      "note": "Stopped before completion; the immutable source campaign manifest still records planned."
+    }
+  ]
+}

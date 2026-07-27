@@ -293,7 +293,7 @@ def render_summary(result: dict[str, Any]) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run the Week 1 OR-Tools VRPTW baseline")
+    parser = argparse.ArgumentParser(description="Run the OR-Tools VRPTW baseline")
     parser.add_argument("--instance", required=True, type=Path, help="Schneider-style instance")
     parser.add_argument("--output", type=Path, help="write machine-readable JSON result")
     parser.add_argument("--vehicle-count", type=int, default=2)

@@ -358,7 +358,8 @@ Windows/WSL2 formal reviewer 固定通过
 `systemd --user` service。service 固定使用 `MemoryHigh=5G`、`MemoryMax=6G`、
 `MemorySwapMax=2G`、`KillMode=control-group`、`Restart=no` 和 `OOMPolicy=stop`；
 reviewer 自身在 aggregate RSS 达到 5.5 GiB 时先行失败。每次运行在
-`/home/oneblaze/stage052-review-logs/<run-label>/<UTC timestamp>/` 保留
+`$XDG_STATE_HOME/reproducible-evrptw/stage052-review-logs/<run-label>/<UTC timestamp>/`
+（未设置 `XDG_STATE_HOME` 时使用 `~/.local/state`）保留
 `progress.jsonl`、`service.log` 和 `review_execution.json`。这些是 operational
 evidence（运行证据），不写入 immutable raw manifest，也不改变 review gate。
 launcher 必须在启动前解析并冻结 `nvidia-smi`、`powershell.exe` 和 `wsl.exe`
