@@ -1054,6 +1054,7 @@ def test_wsl_volume_probe_records_ext4_mount_identity(
     )
 
 
+@pytest.mark.formal_environment
 def test_wsl_volume_probe_records_d_nvme_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1440,6 +1441,7 @@ def test_runtime_evidence_rejects_power_or_load_drift() -> None:
     assert "load1" in evidence.failure_reason
 
 
+@pytest.mark.formal_environment
 def test_runtime_evidence_allows_the_audited_24_thread_machine_headroom() -> None:
     config = BenchmarkCampaignConfig.pilot(
         run_label="stage05.2_benchmark_attempt01",
@@ -1460,6 +1462,7 @@ def test_runtime_evidence_allows_the_audited_24_thread_machine_headroom() -> Non
     assert evidence.maximum_permitted_load1 == 32.0
 
 
+@pytest.mark.formal_environment
 def test_runtime_evidence_allows_attempt56_observed_campaign_load() -> None:
     config = BenchmarkCampaignConfig.pilot(
         run_label="stage05.2_benchmark_attempt01",
@@ -1512,6 +1515,7 @@ def test_runtime_evidence_rejects_non_frozen_logical_cpu_count_in_first_sample()
     assert "24-thread machine" in evidence.failure_reason
 
 
+@pytest.mark.formal_environment
 def test_runtime_evidence_allows_full_window_unrelated_core_average() -> None:
     evidence = BatchRuntimeEvidence.from_snapshots(
         (
@@ -1566,6 +1570,7 @@ def test_runtime_evidence_rejects_four_unrelated_cores() -> None:
     assert "4.0-core allowance" in evidence.failure_reason
 
 
+@pytest.mark.formal_environment
 def test_runtime_monitor_waits_for_a_full_cpu_window_before_rejecting_exit() -> None:
     monitor = campaign_runner.BatchRuntimeMonitor(
         _pilot_config(),
@@ -1601,6 +1606,7 @@ def test_runtime_monitor_waits_for_a_full_cpu_window_before_rejecting_exit() -> 
     assert monitor.abort_reason() is None
 
 
+@pytest.mark.formal_environment
 def test_runtime_monitor_allows_one_full_core_on_audited_24_thread_machine() -> None:
     monitor = campaign_runner.BatchRuntimeMonitor(
         _pilot_config(),
@@ -1628,6 +1634,7 @@ def test_runtime_monitor_allows_one_full_core_on_audited_24_thread_machine() -> 
     assert monitor.abort_reason() is None
 
 
+@pytest.mark.formal_environment
 def test_runtime_monitor_rejects_four_cores_after_one_complete_cpu_window() -> None:
     monitor = campaign_runner.BatchRuntimeMonitor(
         _pilot_config(),
@@ -1752,6 +1759,7 @@ def _pilot_batch_rows() -> tuple[BatchPlan, list[dict[str, object]]]:
     return batch, rows
 
 
+@pytest.mark.formal_environment
 def test_batch_measurements_enforce_persistence_resource_and_runtime_gates() -> None:
     batch, rows = _pilot_batch_rows()
     runtime = BatchRuntimeEvidence.from_snapshots(
@@ -1779,6 +1787,7 @@ def test_batch_measurements_enforce_persistence_resource_and_runtime_gates() -> 
         )
 
 
+@pytest.mark.formal_environment
 def test_benchmark_campaign_uses_relaxed_g_resource_limits() -> None:
     batch, rows = _pilot_batch_rows()
     runtime = BatchRuntimeEvidence.from_snapshots(

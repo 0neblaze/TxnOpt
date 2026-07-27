@@ -22,7 +22,7 @@ jobs:
       - run: uv sync --frozen --all-groups
       - run: uv run ruff check .
       - run: uv run mypy
-      - run: uv run pytest -m "not external_data" -q
+      - run: uv run pytest -m "not external_data and not formal_environment" -q
 
   windows-smoke:
     runs-on: windows-latest

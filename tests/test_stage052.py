@@ -3123,6 +3123,7 @@ def test_serial_replay_aborts_current_bundle_on_first_failure(
     assert events == ["cancel", "abort"]
 
 
+@pytest.mark.formal_environment
 def test_performance_provenance_records_inputs_without_secret_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3809,6 +3810,7 @@ def test_native_screening_diagnostic_float_canonicalization_is_narrow() -> None:
     ) == {"event_type": "route_evaluation", "distance_lower_bound": 263.64617382155006}
 
 
+@pytest.mark.formal_environment
 def test_storage_semantic_replay_is_independent_and_equal_for_v1_v2(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

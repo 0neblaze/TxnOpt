@@ -60,6 +60,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.pytest.ini_options]
 markers = [
   "external_data: requires Schneider benchmark files or ignored raw result bundles",
+  "formal_environment: requires the audited WSL/macOS host, CPU geometry, or memory envelope",
 ]
 
 [tool.mypy]

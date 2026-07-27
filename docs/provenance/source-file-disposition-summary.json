@@ -5,10 +5,10 @@
   "source_file_count": 878,
   "unclassified_count": 0,
   "counts": {
-    "migrated_modified_publication": 24,
-    "migrated_unchanged": 808,
     "school_specific_exclusion": 42,
-    "declarative_rename": 4
+    "declarative_rename": 4,
+    "migrated_modified_publication": 26,
+    "migrated_unchanged": 806
   },
   "receipt": "docs/provenance/source-file-disposition.csv"
 }
