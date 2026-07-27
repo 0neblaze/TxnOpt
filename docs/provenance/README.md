@@ -23,7 +23,7 @@ legacy-to-public relationship. Stable patch IDs match for all 207 replayed
 non-root commits.
 
 `source-file-disposition.csv` accounts for every one of the 878 tracked source
-files. Its machine-readable summary records 809 byte-identical migrations, 23
+files. Its machine-readable summary records 808 byte-identical migrations, 24
 publication-packaging modifications, four declared renames, 42
 school-specific exclusions, and zero unclassified paths.
 
