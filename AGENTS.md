@@ -791,6 +791,19 @@ this repository or one of its subdirectories.
   BLOB temp sorts are forbidden. The mismatch CSV is
   streamed through temporary-file
   hashing and publication and is never accumulated as one in-memory payload.
+- On the Windows/WSL2 formal host, every long-running calibration, producer,
+  and review launch must first detach from the ChatGPT/Codex desktop through
+  the registered Windows Scheduled Task host. The Windows wrapper owns
+  `wsl.exe`; its Linux controller owns the campaign command or transient
+  service, so closing or force-ending the desktop client cannot terminate an
+  accepted launch. Every launch uses a fresh nonce, launcher mutex, Linux
+  `flock`, durable progress log, and terminal receipt. A duplicate or stale
+  launch fails before scientific work. Client-side monitoring is read-only:
+  failures retain their immutable evidence and require root-cause review plus
+  a new label; the detached host never edits code, retries, or falls back on
+  its own. Host shutdown, reboot, explicit sleep/hibernate, `wsl --shutdown`,
+  or manual task termination remain explicit external interruptions rather
+  than lifecycle guarantees.
 - On the Windows/WSL2 formal host, long-running Stage 5.2 reviewers must run as
   transient `systemd --user` services rather than Codex desktop child
   processes. Review workers, `MemoryHigh`, `MemoryMax`, `MemorySwapMax=0`, and

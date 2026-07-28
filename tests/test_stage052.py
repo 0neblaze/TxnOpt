@@ -2955,6 +2955,74 @@ def test_process_tree_resource_summary_includes_live_child() -> None:
     assert summary.status == "complete"
 
 
+def test_process_tree_resource_sampler_exposes_hard_rss_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        def __init__(self, pid: int, rss: int) -> None:
+            self.pid = pid
+            self.rss = rss
+
+        def oneshot(self) -> FakeProcess:
+            return self
+
+        def __enter__(self) -> FakeProcess:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def memory_info(self) -> SimpleNamespace:
+            return SimpleNamespace(rss=self.rss)
+
+        def cpu_times(self) -> SimpleNamespace:
+            return SimpleNamespace(user=0.1, system=0.1)
+
+    sampler = ProcessTreeResourceSampler(
+        run_label="stage05.2_benchmark_attempt99",
+        component="benchmark",
+        configured_worker_count=6,
+        interval_seconds=0.001,
+        aggregate_rss_limit_bytes=1_000,
+        per_process_rss_limit_bytes=900,
+    )
+    parent = FakeProcess(sampler.parent_pid, 200)
+    oversized_worker = FakeProcess(999_997, 950)
+    monkeypatch.setattr(sampler, "_processes", lambda: [parent, oversized_worker])
+
+    sampler.start()
+    deadline = time.monotonic() + 0.5
+    while sampler.abort_reason() is None and time.monotonic() < deadline:
+        time.sleep(0.001)
+    reason = sampler.abort_reason()
+    summary = sampler.stop()
+
+    assert reason == (
+        "aggregate RSS hard limit exceeded: observed=1150 limit=1000; "
+        "process RSS hard limit exceeded: pid=999997 observed=950 limit=900"
+    )
+    assert summary.aggregate_peak_rss_bytes == 1_150
+    assert dict(summary.process_peak_rss_bytes)[oversized_worker.pid] == 950
+    task_started = False
+
+    def task_runner(_task: object) -> list[dict[str, object]]:
+        nonlocal task_started
+        task_started = True
+        return []
+
+    with pytest.raises(
+        RuntimeError,
+        match="runtime guard aborted Stage 5.2 work: aggregate RSS hard limit exceeded",
+    ):
+        _run_v2_tasks(
+            [SimpleNamespace(instance_name="c201_21", seed=2018)],  # type: ignore[arg-type]
+            worker_count=1,
+            abort_reason=sampler.abort_reason,
+            _task_runner=task_runner,  # type: ignore[arg-type]
+        )
+    assert task_started is False
+
+
 def test_process_tree_resource_summary_excludes_half_sampled_transient_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

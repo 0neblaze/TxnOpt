@@ -1389,3 +1389,40 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   memory/mount/path/temperature 等 telemetry 变化不改变 verdict。`source_snapshot`
   同样只锁定 revision、tracked/untracked hashes、read-only 和 ext4 capability；
   mount source/UUID/absolute path 仅记录，不再进入 readiness identity。
+
+## 2026-07-29：G76 Attempt90 内存根因、独立后台宿主与 Formal 高水位合同
+
+- `stage05.2_benchmark_attempt90` 完成并归档 batch0001/0002 后，在 batch0003
+  完成 45/45 shards 但因 6-worker process-tree aggregate RSS 超过旧合同而
+  fail fast。campaign/batch 状态保持 `failed`，batch0003 保留为 `partial`
+  artifact bundle，不续跑、不复用。签名 artifact manifest 绑定的 resource
+  summary SHA-256 为
+  `a813c5cd8cbe82bed7570fe86fc95ae6b2c5885291d75dd3c9b3e473e917cac5`；
+  实测 aggregate peak 为 18,449,874,944 bytes，单 child 最高为
+  3,326,586,880 bytes，无 OOM、swap 或 fallback。
+- producer 的资源采样器现在在运行波次内暴露 aggregate/per-process RSS hard
+  violation；调度器每 0.5 秒轮询，首次违规即取消未完成 futures、终止整个
+  process pool、为全部相关 shards 保留 partial failure evidence，且无 retry/
+  fallback。旧做法直到批次结束才比较峰值，可能让越界任务继续数十分钟。
+- 完整 30/60/300-second Formal memory probes 使用 `c203_21` 高内存波次且
+  `campaign_geometry_contribution=0`。6-worker attempt02 的 aggregate peak 为
+  16,939,073,536 bytes；按用户要求执行的 8-worker attempt03 峰值为
+  21,343,768,576 bytes，占 WSL 容量约 84.7%，swap/fallback/limit violation
+  均为 0。8-worker 仅是 exploratory evidence；replacement Pilot/Formal
+  仍固定 6 workers。calibration report 以 `user_locked` 明确记录这一覆盖决定；
+  6-worker 只要未通过原有 semantic/speed/resource gates 就直接失败，不会降级到
+  4/5。probe 无论成功或被 guard 中止，都会先写 signed v2 attempt report；失败
+  报告记录原异常与零 campaign geometry 后再以非零状态退出。
+- 新 loader 只接受 `failed Formal campaign manifest → failed batch manifest →
+  partial artifact-storage-v2 manifest → complete resource summary` 的完整签名与
+  SHA-256 绑定链，并同时验证 run/batch、worker、row-group 和 queue-depth
+  identity。Attempt90 只提供资源 high-water floor，不贡献新 campaign geometry。
+  新 6-worker contract 取 fresh c203 probe 与 Attempt90 sealed peaks 的逐项最大值；
+  20% operating headroom 对应 aggregate limit 22,139,849,933 bytes、per-worker
+  limit 3,991,904,256 bytes，仍低于当前 WSL 25,196,941,312-byte capability。
+- Windows Scheduled Task `Reproducible-EVRPTW-Stage052-WSL-Host` 通过原子
+  launch nonce、launcher mutex、Linux `flock`、独立 controller 与落盘 receipt
+  托管所有长任务。ChatGPT/Codex desktop 不在计算进程父链中；客户端退出或被
+  清除后台不会终止已启动的 WSL 计算。客户端在线时只读监控日志、资源、manifest
+  与 receipt；失败后保留证据并由人工审查根因，再以新 label 启动，不自动修改代码
+  或静默重试。

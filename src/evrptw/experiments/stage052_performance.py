@@ -100,6 +100,8 @@ from evrptw.stage052_campaign import (
     load_campaign_manifest,
 )
 from evrptw.stage052_campaign_runner import (
+    AGGREGATE_RSS_LIMIT_BYTES,
+    PER_WORKER_RSS_LIMIT_BYTES,
     ArchivedBatchStateWriteError,
     BatchRuntimeEvidence,
     BatchRuntimeMonitor,
@@ -1926,6 +1928,16 @@ def _run_benchmark_batch(
         component=Stage052Component.BENCHMARK.value,
         configured_worker_count=campaign_config.selected_workers,
         interval_seconds=0.05,
+        aggregate_rss_limit_bytes=(
+            campaign_config.producer_resource_contract.aggregate_memory_limit_bytes
+            if campaign_config.producer_resource_contract is not None
+            else AGGREGATE_RSS_LIMIT_BYTES
+        ),
+        per_process_rss_limit_bytes=(
+            campaign_config.producer_resource_contract.per_worker_memory_limit_bytes
+            if campaign_config.producer_resource_contract is not None
+            else PER_WORKER_RSS_LIMIT_BYTES
+        ),
     )
     runtime_monitor = BatchRuntimeMonitor(
         campaign_config,
@@ -1974,10 +1986,14 @@ def _run_benchmark_batch(
         resource_started = True
         runtime_monitor.start()
         runtime_started = True
+
+        def abort_reason() -> str | None:
+            return resource_sampler.abort_reason() or runtime_monitor.abort_reason()
+
         rows = _run_v2_tasks(
             tasks,
             worker_count=campaign_config.selected_workers,
-            abort_reason=runtime_monitor.abort_reason,
+            abort_reason=abort_reason,
         )
         writer.adopt_v2_shards(
             expected_identities=tuple((task.instance_name, task.seed) for task in tasks)

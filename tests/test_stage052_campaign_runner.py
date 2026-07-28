@@ -168,6 +168,73 @@ def test_parallel_shards_recycle_worker_after_each_task(
         )
 
 
+def test_parallel_shards_abort_active_wave_on_resource_violation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeFuture:
+        def cancel(self) -> bool:
+            events.append("cancel")
+            return True
+
+    class RecordingExecutor:
+        def __init__(self, **_options: object) -> None:
+            events.append("create")
+
+        def submit(self, *_args: object) -> FakeFuture:
+            events.append("submit")
+            return FakeFuture()
+
+    tasks = [
+        SimpleNamespace(instance_name="c201_21", seed=2018),
+        SimpleNamespace(instance_name="c201_21", seed=2019),
+    ]
+    abort_checks = 0
+
+    def abort_reason() -> str | None:
+        nonlocal abort_checks
+        abort_checks += 1
+        if abort_checks == 1:
+            return None
+        return "aggregate RSS hard limit exceeded: observed=1001 limit=1000"
+
+    monkeypatch.setattr(stage052_performance, "ProcessPoolExecutor", RecordingExecutor)
+    monkeypatch.setattr(stage052_performance, "get_context", lambda _: object())
+    monkeypatch.setattr(
+        stage052_performance,
+        "abort_process_executor",
+        lambda _executor: events.append("abort"),
+    )
+    monkeypatch.setattr(
+        stage052_performance,
+        "_ensure_partial_shard_failure",
+        lambda task, _error: events.append(f"partial:{task.seed}"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="runtime guard aborted Stage 5.2 work: aggregate RSS hard limit exceeded",
+    ):
+        _run_v2_tasks(  # type: ignore[arg-type]
+            tasks,
+            worker_count=2,
+            abort_reason=abort_reason,
+        )
+
+    assert events == [
+        "create",
+        "submit",
+        "submit",
+        "cancel",
+        "cancel",
+        "abort",
+        "partial:2018",
+        "partial:2019",
+    ]
+    assert abort_checks == 2
+
+
 def test_parallel_shards_use_a_fresh_spawned_pid_per_task() -> None:
     tasks = [
         SimpleNamespace(instance_name="c101C5", seed=seed)

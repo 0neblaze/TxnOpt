@@ -1969,16 +1969,27 @@ class ProcessTreeResourceSampler:
         configured_worker_count: int,
         interval_seconds: float = 0.05,
         parent_pid: int | None = None,
+        aggregate_rss_limit_bytes: int | None = None,
+        per_process_rss_limit_bytes: int | None = None,
     ) -> None:
         if interval_seconds <= 0.0:
             raise ValueError("resource sample interval must be positive")
         if configured_worker_count not in {1, 2, 4, 5, 6, 8}:
             raise ValueError("configured worker count must be 1, 2, 4, 5, 6, or 8")
+        if (
+            aggregate_rss_limit_bytes is not None
+            and aggregate_rss_limit_bytes <= 0
+        ):
+            raise ValueError("aggregate RSS limit must be positive")
+        if per_process_rss_limit_bytes is not None and per_process_rss_limit_bytes <= 0:
+            raise ValueError("per-process RSS limit must be positive")
         self.run_label = run_label
         self.component = component
         self.configured_worker_count = configured_worker_count
         self.interval_seconds = interval_seconds
         self.parent_pid = parent_pid or os.getpid()
+        self.aggregate_rss_limit_bytes = aggregate_rss_limit_bytes
+        self.per_process_rss_limit_bytes = per_process_rss_limit_bytes
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._started = 0.0
@@ -1989,6 +2000,7 @@ class ProcessTreeResourceSampler:
         self._descendant_pids: set[int] = set()
         self._sample_count = 0
         self._error: BaseException | None = None
+        self._abort_reason: str | None = None
 
     def start(self) -> None:
         if self._thread is not None:
@@ -2036,6 +2048,13 @@ class ProcessTreeResourceSampler:
             status="complete",
         )
 
+    def abort_reason(self) -> str | None:
+        """Return the first sampled hard-limit violation without hiding sampler errors."""
+
+        if self._error is not None:
+            return f"resource sampling failed: {type(self._error).__name__}: {self._error}"
+        return self._abort_reason
+
     def _run(self) -> None:
         previous_wall: float | None = None
         previous_cpu: float | None = None
@@ -2045,6 +2064,7 @@ class ProcessTreeResourceSampler:
                 now = time.perf_counter()
                 rss = 0
                 cpu = 0.0
+                largest_process_violation: tuple[int, int] | None = None
                 for process in processes:
                     try:
                         with process.oneshot():
@@ -2065,11 +2085,42 @@ class ProcessTreeResourceSampler:
                             )
                             if process.pid != self.parent_pid:
                                 self._descendant_pids.add(process.pid)
+                                if (
+                                    self.per_process_rss_limit_bytes is not None
+                                    and process_rss > self.per_process_rss_limit_bytes
+                                    and (
+                                        largest_process_violation is None
+                                        or process_rss > largest_process_violation[1]
+                                        or (
+                                            process_rss == largest_process_violation[1]
+                                            and process.pid < largest_process_violation[0]
+                                        )
+                                    )
+                                ):
+                                    largest_process_violation = (process.pid, process_rss)
                     except (psutil.NoSuchProcess, psutil.ZombieProcess):
                         continue
                 self._peak_rss = max(self._peak_rss, rss)
                 self._sample_count += 1
                 self._load1_samples.append(float(os.getloadavg()[0]))
+                violations: list[str] = []
+                if (
+                    self.aggregate_rss_limit_bytes is not None
+                    and rss > self.aggregate_rss_limit_bytes
+                ):
+                    violations.append(
+                        "aggregate RSS hard limit exceeded: "
+                        f"observed={rss} limit={self.aggregate_rss_limit_bytes}"
+                    )
+                if largest_process_violation is not None:
+                    process_pid, process_rss = largest_process_violation
+                    violations.append(
+                        "process RSS hard limit exceeded: "
+                        f"pid={process_pid} observed={process_rss} "
+                        f"limit={self.per_process_rss_limit_bytes}"
+                    )
+                if violations and self._abort_reason is None:
+                    self._abort_reason = "; ".join(violations)
                 if previous_wall is not None and previous_cpu is not None and now > previous_wall:
                     self._active_core_samples.append(
                         max(0.0, (cpu - previous_cpu) / (now - previous_wall))
