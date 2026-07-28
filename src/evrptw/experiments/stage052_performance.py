@@ -106,6 +106,7 @@ from evrptw.stage052_campaign_runner import (
     RollingCampaignCapacityError,
     WindowsWslMachineSnapshotSource,
     archive_verified_batch_with_evidence,
+    campaign_configuration_selection_sha256,
     campaign_control_paths,
     collect_preflight_observation,
     free_bytes,
@@ -1071,11 +1072,11 @@ def _run_benchmark_campaign_impl(
 ) -> dict[str, Path]:
     """Execute G01/G02 as immutable, archived batches rather than one task fan-out."""
 
-    prerequisite_role = "accelerator_decision" if scope == "pilot" else "campaign_pilot"
+    prerequisite_role = "accepted_pilot" if scope == "pilot" else "campaign_pilot"
     prerequisite_dir = resolved_prerequisite_dirs[prerequisite_role]
-    expected_scope = "performance" if scope == "pilot" else "pilot"
+    expected_scope = "pilot"
     expected_status = (
-        "READY_FOR_STAGE052_BENCHMARK"
+        "READY_FOR_STAGE052_FORMAL_BENCHMARK"
         if scope == "pilot"
         else "READY_FOR_STAGE052_FORMAL_BENCHMARK"
     )
@@ -1129,6 +1130,9 @@ def _run_benchmark_campaign_impl(
         selected_workers=worker_count,
         repository_revision=revision,
         configuration_sha256=_sha256(config_path),
+        configuration_selection_sha256=campaign_configuration_selection_sha256(
+            config_path.read_bytes()
+        ),
         runtime_identity=runtime_identity,
         input_provenance=performance_provenance,
         native_kernel_config=config.native_kernels.to_dict(),

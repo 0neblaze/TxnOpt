@@ -1217,3 +1217,22 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   Python ABI、native extension、source/wheel/config/input/schema hashes 以及 fsync/
   atomic-transfer capability。长期 storage publication identity 只包含 alias、
   relative path、file count、byte count 与 tree SHA-256。
+
+## 2026-07-28：G70 Attempt72 continuity contract
+
+- 新 Pilot 的唯一 prerequisite（前置证据）改为已接受且完整独立审查的
+  `stage05.2_benchmark_attempt72`，不再回跳到更早的 accelerator decision
+  `stage05.2_accelerator_pilot_attempt17`。Attempt72 继续冻结 backend、exact backend、
+  native kernel、科学配置、instance hashes 与输入 provenance；新的 signed producer
+  resource contract 只替换 worker/RSS/Parquet tuning（资源与持久化调优）。
+- successor gate 现在从不可变 public-history bridge
+  `968b9dd421dd4ae2b8542d43b284b3ade94e760c` 读取 legacy-to-public provenance map，
+  将 Attempt72 的 legacy revision
+  `a5cf00f7580fc2632179495a739a110786ace87d` 解析为公开历史
+  `8b1494e0aa6864a88e37ed700cf686d1165a5320`，再只审计 bridge 之后的显式 G/replay/
+  resource/test/documentation allowlist。未映射 legacy revision、无法到达 bridge
+  或 allowlist 外变化均 fail fast。
+- configuration selection digest（配置选择摘要）排除由 signed resource contract
+  单独冻结的 `resource_calibration_contract`、Parquet row group 与 queue depth；
+  compression、scientific axes、solver/config inputs 等任意变化仍会拒绝。旧 raw
+  configuration SHA-256 与新 raw configuration SHA-256 均原样保留，不改写证据。

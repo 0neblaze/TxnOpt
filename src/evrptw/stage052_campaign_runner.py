@@ -7,7 +7,9 @@ evidence and to the local machine boundaries used by the experiment runner.
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -18,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,30 +69,53 @@ from evrptw.stage052_resources import ProducerResourceContract
 PER_WORKER_RSS_LIMIT_BYTES = 8 * 1024**3
 AGGREGATE_RSS_LIMIT_BYTES = 20 * 1024**3
 STAGE052_MINIMUM_FREE_BYTES = 50 * 1024**3
+_CAMPAIGN_PUBLICATION_BRIDGE_REVISION = (
+    "968b9dd421dd4ae2b8542d43b284b3ade94e760c"
+)
 _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
     {
+        ".gitignore",
         "AGENTS.md",
+        "configs/stage052_performance.toml",
+        "cpp/evrptw_core.cpp",
+        "docs/provenance/README.md",
+        "docs/provenance/migration-manifest.json",
+        "docs/provenance/source-file-disposition-summary.json",
+        "docs/provenance/source-file-disposition.csv",
         "docs/stage052_change_log.md",
         "docs/stage052_performance_benchmark_workflow.md",
         "experiments/migrations/stage052_d_archive_ssd_20260725.json",
         "experiments/migrations/stage052_d_archive_ssd_20260725.json.sha256",
+        "src/evrptw/_core.pyi",
         "src/evrptw/artifacts.py",
+        "src/evrptw/experiments/stage052_calibration.py",
         "src/evrptw/experiments/stage052_campaign_review.py",
         "src/evrptw/experiments/stage052_performance.py",
         "src/evrptw/experiments/stage052_performance_review.py",
+        "src/evrptw/experiments/stage052_replay_benchmark.py",
+        "src/evrptw/experiments/stage052_review_benchmark.py",
         "src/evrptw/stage052_campaign.py",
         "src/evrptw/stage052_campaign_runner.py",
         "src/evrptw/stage052_evidence.py",
         "src/evrptw/stage052_platform.py",
+        "src/evrptw/stage052_replay.py",
+        "src/evrptw/stage052_resources.py",
+        "src/evrptw/stage052_retention.py",
         "src/evrptw/stage052_review_service.py",
         "src/evrptw/stage052_storage_migration.py",
+        "tests/test_artifacts.py",
+        "tests/test_stage052.py",
+        "tests/test_stage052_calibration.py",
         "tests/test_stage052_campaign_review.py",
         "tests/test_stage052_campaign_runner.py",
         "tests/test_stage052_campaign.py",
         "tests/test_stage052_platform.py",
+        "tests/test_stage052_replay.py",
+        "tests/test_stage052_resources.py",
         "tests/test_stage052_review_service.py",
         "tests/test_stage052_storage_migration.py",
         "tests/test_artifacts_v3.py",
+        "tools/publish_stage052_artifacts.py",
     }
 )
 _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
@@ -128,6 +154,113 @@ def campaign_runtime_selection_sha256(
     return _canonical_sha256(
         selection
     )
+
+
+def campaign_configuration_selection_sha256(content: bytes) -> str:
+    """Hash scientific inputs while resource tuning remains separately signed."""
+
+    try:
+        payload = tomllib.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError("benchmark configuration is not valid UTF-8 TOML") from error
+    campaign = payload.get("campaign")
+    if isinstance(campaign, dict):
+        campaign.pop("resource_calibration_contract", None)
+    artifacts = payload.get("artifact_storage_v2")
+    if isinstance(artifacts, dict):
+        artifacts.pop("parquet_row_group_size", None)
+        artifacts.pop("parquet_queue_depth", None)
+    return _canonical_sha256(payload)
+
+
+def _resolve_campaign_predecessor_revision(
+    repository: Path,
+    *,
+    predecessor_revision: str,
+    current_revision: str,
+) -> str:
+    """Resolve an immutable legacy revision through the public-history bridge."""
+
+    direct = subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "merge-base",
+            "--is-ancestor",
+            predecessor_revision,
+            current_revision,
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+    )
+    if direct.returncode == 0:
+        return predecessor_revision
+    bridge_ancestor = subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "merge-base",
+            "--is-ancestor",
+            _CAMPAIGN_PUBLICATION_BRIDGE_REVISION,
+            current_revision,
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+    )
+    if bridge_ancestor.returncode != 0:
+        raise RuntimeError(
+            "benchmark repository revision is not a descendant of the publication bridge"
+        )
+    mapping_bytes = subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "show",
+            (
+                f"{_CAMPAIGN_PUBLICATION_BRIDGE_REVISION}:"
+                "docs/provenance/legacy-stage-commit-map.csv"
+            ),
+        ),
+        check=True,
+        capture_output=True,
+        timeout=10.0,
+    ).stdout
+    rows = csv.DictReader(io.StringIO(mapping_bytes.decode("utf-8-sig")))
+    mapped = {
+        str(row.get("legacy_sha", "")): str(row.get("public_sha", ""))
+        for row in rows
+    }.get(predecessor_revision)
+    if mapped is None or re.fullmatch(r"[0-9a-f]{40}", mapped) is None:
+        raise RuntimeError(
+            "benchmark predecessor revision has no immutable public-history mapping"
+        )
+    mapped_ancestor = subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "merge-base",
+            "--is-ancestor",
+            mapped,
+            _CAMPAIGN_PUBLICATION_BRIDGE_REVISION,
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+    )
+    if mapped_ancestor.returncode != 0:
+        raise RuntimeError(
+            "benchmark predecessor public mapping does not reach the publication bridge"
+        )
+    return _CAMPAIGN_PUBLICATION_BRIDGE_REVISION
 
 
 def _runtime_selection_with_attested_archive_source(
@@ -175,25 +308,11 @@ def verify_campaign_successor_revision(
         if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
             raise RuntimeError(f"campaign {label} repository revision is invalid")
     resolved = repository.resolve()
-    ancestor = subprocess.run(
-        (
-            "git",
-            "-C",
-            str(resolved),
-            "merge-base",
-            "--is-ancestor",
-            predecessor_revision,
-            current_revision,
-        ),
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10.0,
+    comparison_revision = _resolve_campaign_predecessor_revision(
+        resolved,
+        predecessor_revision=predecessor_revision,
+        current_revision=current_revision,
     )
-    if ancestor.returncode != 0:
-        raise RuntimeError(
-            "benchmark repository revision is not a descendant of the accepted selection"
-        )
     result = subprocess.run(
         (
             "git",
@@ -202,7 +321,7 @@ def verify_campaign_successor_revision(
             "diff",
             "--name-only",
             "-z",
-            predecessor_revision,
+            comparison_revision,
             current_revision,
         ),
         check=True,
@@ -637,6 +756,7 @@ class BenchmarkExecutionLock:
     runtime_selection_sha256: str
     input_provenance_sha256: str
     configuration_sha256: str
+    configuration_selection_sha256: str
     native_config_sha256: str
     native_kernel_config: Mapping[str, object]
     instance_sha256: Mapping[str, str]
@@ -653,6 +773,7 @@ class BenchmarkExecutionLock:
         raw_manifest_sha256: str,
         expected_scope: str,
         expected_status: str,
+        configuration_selection_sha256: str | None = None,
     ) -> BenchmarkExecutionLock:
         """Bind every performance-affecting field from one accepted review."""
 
@@ -780,6 +901,14 @@ class BenchmarkExecutionLock:
             runtime_selection_sha256=campaign_runtime_selection_sha256(runtime),
             input_provenance_sha256=_canonical_sha256(_input_lock_payload(inputs)),
             configuration_sha256=config_sha,
+            configuration_selection_sha256=(
+                config_sha
+                if configuration_selection_sha256 is None
+                else _sha256(
+                    configuration_selection_sha256,
+                    "configuration selection digest",
+                )
+            ),
             native_config_sha256=_canonical_sha256(native),
             native_kernel_config=dict(native),
             instance_sha256=_instance_hashes(inputs),
@@ -800,6 +929,7 @@ class BenchmarkExecutionLock:
             "runtime_selection_sha256": self.runtime_selection_sha256,
             "input_provenance_sha256": self.input_provenance_sha256,
             "configuration_sha256": self.configuration_sha256,
+            "configuration_selection_sha256": self.configuration_selection_sha256,
             "native_config_sha256": self.native_config_sha256,
             "native_kernel_config": dict(self.native_kernel_config),
             "instance_sha256": dict(sorted(self.instance_sha256.items())),
@@ -871,6 +1001,7 @@ class BenchmarkExecutionLock:
         selected_workers: int,
         repository_revision: str,
         configuration_sha256: str,
+        configuration_selection_sha256: str | None = None,
         runtime_identity: object,
         input_provenance: object,
         native_kernel_config: object,
@@ -899,7 +1030,12 @@ class BenchmarkExecutionLock:
             raise RuntimeError(
                 "benchmark producer resource contract differs from accepted Pilot"
             )
-        if configuration_sha256 != self.configuration_sha256:
+        observed_configuration_selection = (
+            configuration_sha256
+            if configuration_selection_sha256 is None
+            else configuration_selection_sha256
+        )
+        if observed_configuration_selection != self.configuration_selection_sha256:
             raise RuntimeError("benchmark configuration differs from accepted selection")
         current_runtime = _mapping(runtime_identity, "runtime identity")
         if repository_revision == self.repository_revision:
@@ -968,6 +1104,17 @@ def load_benchmark_execution_lock(
     if not isinstance(relative_path, str):
         raise RuntimeError("accepted benchmark metadata path is invalid")
     metadata = reader.read_json(relative_path)
+    config_references = [
+        item
+        for item in reader.manifest.get("artifacts", [])
+        if isinstance(item, Mapping) and item.get("artifact_type") == "config"
+    ]
+    if len(config_references) != 1:
+        raise RuntimeError("accepted benchmark predecessor lacks one configuration artifact")
+    config_relative_path = config_references[0].get("relative_path")
+    if not isinstance(config_relative_path, str):
+        raise RuntimeError("accepted benchmark configuration path is invalid")
+    config_content = (prerequisite_dir / config_relative_path).read_bytes()
     review_path = prerequisite_dir / "review" / "review_manifest.json"
     try:
         review = json.loads(review_path.read_text(encoding="utf-8"))
@@ -1046,6 +1193,9 @@ def load_benchmark_execution_lock(
         raw_manifest_sha256=_file_sha256(manifest_path),
         expected_scope=expected_scope,
         expected_status=expected_status,
+        configuration_selection_sha256=campaign_configuration_selection_sha256(
+            config_content
+        ),
     )
 
 

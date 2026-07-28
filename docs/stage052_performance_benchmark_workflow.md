@@ -204,14 +204,16 @@ campaign 启动前与 per-batch handoff preflight（批次交接预检）都保�
 native extension 与 source/wheel/config/input/schema hashes 一致，以及文件系统支持
 所需 fsync 和 atomic transfer（原子传输）。
 
-若 G 自身的 campaign runner/reviewer 出现缺陷，可以在不重跑 F 的前提下消费已接受
-F evidence，但必须同时满足：当前 revision 是 F revision 的 Git descendant（后继）；
-二者间全部 changed paths 均落在显式 G runner/artifact-persistence
+若 G 自身的 campaign runner/reviewer 出现缺陷，可以消费已接受的完整 Attempt72
+Pilot evidence（其科学选择继续追溯到已接受 F evidence），但必须同时满足：legacy
+revision 通过不可变 provenance map 解析到公开历史，当前 revision 是固定 publication
+bridge 的 Git descendant（后继）；bridge 后全部 changed paths 均落在显式 G runner/artifact-persistence
 adapter/reviewer/test/documentation allowlist；
-Python、dependency、machine、source mount、native extension、configuration、
-instance、backend 与 worker 的稳定选择 hash 完全一致。producer 与 independent
-reviewer 各自执行该检查。solver、objective、配置、native 或任意其他 source path
-变化都 fail fast，并要求新的 prerequisite。
+Python、dependency、source、native extension、scientific configuration、instance、
+backend 与 exact backend 的稳定选择 hash 完全一致。worker/RSS/Parquet tuning 由
+新的 signed resource contract 单独冻结，machine/device 仅为 telemetry。producer 与
+independent reviewer 各自执行该检查。solver、objective、科学配置或 allowlist 外
+source path 变化都 fail fast，并要求新的 prerequisite。
 
 已接受 D/F evidence 的历史 resource gate 不追溯重写。新 G Benchmark Pilot 在
 Attempt73 的只读大型 shard 与固定高内存 scope 上校准 4/5/6 workers；高并发必须

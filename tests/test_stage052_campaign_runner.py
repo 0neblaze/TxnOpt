@@ -46,6 +46,7 @@ from evrptw.stage052_campaign_runner import (
     MachineSnapshot,
     RollingCampaignCapacityError,
     WindowsWslMachineSnapshotSource,
+    campaign_configuration_selection_sha256,
     campaign_runtime_selection_sha256,
     collect_preflight_observation,
     probe_volume_identity,
@@ -909,6 +910,36 @@ def test_campaign_runtime_selection_hash_excludes_only_g_wheel_identity() -> Non
     successor["native_extension_sha256"] = "6" * 64
     assert campaign_runtime_selection_sha256(successor) != (
         campaign_runtime_selection_sha256(runtime)
+    )
+
+
+def test_campaign_configuration_selection_excludes_only_resource_tuning() -> None:
+    accepted = b"""
+[campaign]
+storage_root_locator = "roots.toml"
+staging_root_alias = "wsl_staging"
+
+[artifact_storage_v2]
+compression = "zstd"
+"""
+    calibrated = b"""
+[campaign]
+storage_root_locator = "roots.toml"
+resource_calibration_contract = "resource.json"
+staging_root_alias = "wsl_staging"
+
+[artifact_storage_v2]
+compression = "zstd"
+parquet_row_group_size = 262144
+parquet_queue_depth = 2
+"""
+    changed_science = calibrated.replace(b'compression = "zstd"', b'compression = "snappy"')
+
+    assert campaign_configuration_selection_sha256(accepted) == (
+        campaign_configuration_selection_sha256(calibrated)
+    )
+    assert campaign_configuration_selection_sha256(changed_science) != (
+        campaign_configuration_selection_sha256(calibrated)
     )
 
 
@@ -2347,8 +2378,8 @@ def _run_patched_pilot(
             worker_count=4,
             config=config,
             stage051_prerequisite={"status": "READY_FOR_STAGE05_2"},
-            component_prerequisites={"accelerator_decision": {"status": "accepted"}},
-            resolved_prerequisite_dirs={"accelerator_decision": prerequisite_dir},
+            component_prerequisites={"accepted_pilot": {"status": "accepted"}},
+            resolved_prerequisite_dirs={"accepted_pilot": prerequisite_dir},
             storage=config.v2_storage,
         )
 

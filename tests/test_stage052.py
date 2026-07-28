@@ -392,8 +392,10 @@ def test_stage052_contract_requires_an_accepted_pilot_before_formal() -> None:
     pilot = stage052_contract(Stage052Component.BENCHMARK, "pilot")
     formal = stage052_contract(Stage052Component.BENCHMARK, "formal")
 
-    assert pilot.prerequisite_component is Stage052Component.ACCELERATOR_PILOT
-    assert pilot.prerequisite_status == "READY_FOR_STAGE052_BENCHMARK"
+    assert pilot.prerequisite_component is Stage052Component.BENCHMARK
+    assert pilot.prerequisite_status == "READY_FOR_STAGE052_FORMAL_BENCHMARK"
+    assert pilot.prerequisites[0].role == "accepted_pilot"
+    assert pilot.prerequisites[0].exact_run_label == "stage05.2_benchmark_attempt72"
     assert pilot.next_status == "READY_FOR_STAGE052_FORMAL_BENCHMARK"
     assert formal.prerequisite_component is Stage052Component.BENCHMARK
     assert formal.prerequisite_status == "READY_FOR_STAGE052_FORMAL_BENCHMARK"
