@@ -94,6 +94,7 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
         "src/evrptw/experiments/stage052_performance_review.py",
         "src/evrptw/experiments/stage052_replay_benchmark.py",
         "src/evrptw/experiments/stage052_review_benchmark.py",
+        "src/evrptw/stage052.py",
         "src/evrptw/stage052_campaign.py",
         "src/evrptw/stage052_campaign_runner.py",
         "src/evrptw/stage052_evidence.py",
