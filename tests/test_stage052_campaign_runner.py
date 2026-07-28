@@ -61,6 +61,7 @@ from evrptw.stage052_evidence import (
     validate_worker_ownership,
 )
 from evrptw.stage052_platform import WindowsWslPowerStatus
+from evrptw.stage052_resources import ProducerResourceContract
 
 
 def _sha256_json(value: object) -> str:
@@ -1245,7 +1246,7 @@ def test_batch_handoff_preflight_ignores_prior_campaign_load_history() -> None:
     assert now == 60.0
 
 
-def test_campaign_start_preflight_still_rejects_non_idle_load() -> None:
+def test_campaign_start_preflight_records_non_idle_load_as_telemetry() -> None:
     now = 0.0
 
     def clock() -> float:
@@ -1255,14 +1256,45 @@ def test_campaign_start_preflight_still_rejects_non_idle_load() -> None:
         nonlocal now
         now += seconds
 
-    with pytest.raises(RuntimeError, match="preflight load1 exceeds 4.0"):
-        collect_preflight_observation(
-            _pilot_config(),
-            snapshot=lambda: MachineSnapshot("AC Power", False, 4.1, 0.0),
-            monotonic=clock,
-            sleep=sleep,
-            sample_interval_seconds=10.0,
-        )
+    observation = collect_preflight_observation(
+        _pilot_config(),
+        snapshot=lambda: MachineSnapshot("Battery Power", True, 40.1, 6.0),
+        monotonic=clock,
+        sleep=sleep,
+        sample_interval_seconds=10.0,
+    )
+
+    assert observation.power_source == "Battery Power"
+    assert observation.low_power_mode_enabled is True
+    assert max(window.maximum_load1 for window in observation.windows) == 40.1
+
+
+def test_preflight_power_source_transition_is_nonblocking_telemetry() -> None:
+    now = 0.0
+
+    def clock() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    observation = collect_preflight_observation(
+        _pilot_config(),
+        snapshot=lambda: MachineSnapshot(
+            "AC Power" if now < 30.0 else "Battery Power",
+            now >= 30.0,
+            40.0,
+            8.0,
+        ),
+        monotonic=clock,
+        sleep=sleep,
+        sample_interval_seconds=10.0,
+    )
+
+    assert observation.power_source == "AC Power"
+    assert observation.low_power_mode_enabled is True
+    assert max(window.maximum_load1 for window in observation.windows) == 40.0
 
 
 def test_preflight_windows_remain_consecutive_with_clock_call_overhead() -> None:
@@ -1427,7 +1459,7 @@ def test_preflight_conservatively_accounts_for_a_process_that_exits() -> None:
     assert evidence.maximum_unrelated_process_average_cores == pytest.approx(52.0 / 30.0)
 
 
-def test_runtime_evidence_rejects_power_or_load_drift() -> None:
+def test_runtime_evidence_records_power_or_load_drift_as_telemetry() -> None:
     evidence = BatchRuntimeEvidence.from_snapshots(
         (
             MachineSnapshot("AC Power", False, 1.0, 0.1),
@@ -1436,9 +1468,9 @@ def test_runtime_evidence_rejects_power_or_load_drift() -> None:
         config=_pilot_config(),
     )
 
-    assert evidence.passed is False
-    assert "power" in evidence.failure_reason
-    assert "load1" in evidence.failure_reason
+    assert evidence.passed is True
+    assert evidence.power_sources == ("AC Power", "Battery Power")
+    assert evidence.maximum_load1 == 32.1
 
 
 @pytest.mark.formal_environment
@@ -1482,7 +1514,7 @@ def test_runtime_evidence_allows_attempt56_observed_campaign_load() -> None:
     assert evidence.passed is True
 
 
-def test_runtime_evidence_rejects_load_beyond_audited_machine_headroom() -> None:
+def test_runtime_evidence_records_load_beyond_old_machine_headroom() -> None:
     config = BenchmarkCampaignConfig.pilot(
         run_label="stage05.2_benchmark_attempt01",
         staging_root_alias="transfer_staging",
@@ -1498,21 +1530,32 @@ def test_runtime_evidence_rejects_load_beyond_audited_machine_headroom() -> None
         config=config,
     )
 
-    assert evidence.passed is False
+    assert evidence.passed is True
     assert evidence.maximum_permitted_load1 == 32.0
-    assert "load1 exceeded 32.0" in evidence.failure_reason
+    assert evidence.failure_reason == ""
 
 
-def test_runtime_evidence_rejects_non_frozen_logical_cpu_count_in_first_sample() -> None:
+def test_runtime_evidence_accepts_any_logical_cpu_count_sufficient_for_workers() -> None:
     evidence = BatchRuntimeEvidence.from_snapshots(
         (MachineSnapshot("AC Power", False, 1.0, 0.0),),
         config=_pilot_config(),
         logical_cpu_count=16,
     )
 
-    assert evidence.passed is False
+    assert evidence.passed is True
     assert evidence.logical_cpu_count == 16
-    assert "24-thread machine" in evidence.failure_reason
+    assert evidence.failure_reason == ""
+
+
+def test_runtime_evidence_rejects_logical_cpu_count_below_workers() -> None:
+    evidence = BatchRuntimeEvidence.from_snapshots(
+        (MachineSnapshot("AC Power", False, 1.0, 0.0),),
+        config=_pilot_config(),
+        logical_cpu_count=1,
+    )
+
+    assert evidence.passed is False
+    assert "locked worker count" in evidence.failure_reason
 
 
 @pytest.mark.formal_environment
@@ -1543,7 +1586,7 @@ def test_runtime_evidence_allows_full_window_unrelated_core_average() -> None:
     assert evidence.failure_reason == ""
 
 
-def test_runtime_evidence_rejects_four_unrelated_cores() -> None:
+def test_runtime_evidence_records_four_unrelated_cores_as_telemetry() -> None:
     evidence = BatchRuntimeEvidence.from_snapshots(
         (
             MachineSnapshot(
@@ -1566,8 +1609,8 @@ def test_runtime_evidence_rejects_four_unrelated_cores() -> None:
         config=_pilot_config(),
     )
 
-    assert evidence.passed is False
-    assert "4.0-core allowance" in evidence.failure_reason
+    assert evidence.passed is True
+    assert evidence.maximum_unrelated_process_average_cores == 4.0
 
 
 @pytest.mark.formal_environment
@@ -1635,7 +1678,7 @@ def test_runtime_monitor_allows_one_full_core_on_audited_24_thread_machine() -> 
 
 
 @pytest.mark.formal_environment
-def test_runtime_monitor_rejects_four_cores_after_one_complete_cpu_window() -> None:
+def test_runtime_monitor_does_not_abort_for_unrelated_cpu_telemetry() -> None:
     monitor = campaign_runner.BatchRuntimeMonitor(
         _pilot_config(),
         snapshot=lambda: MachineSnapshot("AC Power", False, 1.0, 0.0),
@@ -1659,9 +1702,7 @@ def test_runtime_monitor_rejects_four_cores_after_one_complete_cpu_window() -> N
         ),
     ]
 
-    assert monitor.abort_reason() == (
-        "unrelated process reached the frozen 4.0-core allowance"
-    )
+    assert monitor.abort_reason() is None
 
 
 def test_failed_batch_runtime_evidence_can_be_persisted(
@@ -1692,6 +1733,7 @@ def test_failed_batch_runtime_evidence_can_be_persisted(
             ),
         ),
         config=_pilot_config(),
+        logical_cpu_count=1,
     )
 
     path = stage052_performance._record_batch_runtime_evidence(
@@ -1810,7 +1852,7 @@ def test_benchmark_campaign_uses_relaxed_g_resource_limits() -> None:
         expected_workers=2,
     ) == pytest.approx(1.0 / 11.0)
 
-    with pytest.raises(RuntimeError, match="20 GiB"):
+    with pytest.raises(RuntimeError, match="campaign lock"):
         validate_batch_measurements(
             batch=batch,
             rows=rows,
@@ -1934,21 +1976,44 @@ def _patch_dispatcher_dependencies(
     *,
     locator: StorageRootLocator,
 ) -> list[str]:
+    producer_contract = ProducerResourceContract(
+        selected_workers=4,
+        available_memory_bytes=32 * 1024**3,
+        selected_aggregate_peak_rss_bytes=8 * 1024**3,
+        selected_per_worker_peak_rss_bytes=3 * 1024**3,
+        aggregate_memory_limit_bytes=10 * 1024**3,
+        per_worker_memory_limit_bytes=4 * 1024**3,
+        semantic_digest="9" * 64,
+        calibration_digest="8" * 64,
+        row_group_size=262_144,
+        queue_depth=2,
+    )
     lock = SimpleNamespace(
-        selected_workers=2,
+        selected_workers=4,
         selected_backend="native_cpu",
         selected_exact_backend="cpu_batch",
         verify_current_execution=lambda **_kwargs: None,
         to_dict=lambda: {
             "selected_backend": "native_cpu",
             "selected_exact_backend": "cpu_batch",
-            "selected_workers": 2,
+            "selected_workers": 4,
+        },
+        with_producer_resource_contract=lambda contract: {
+            "selected_backend": "native_cpu",
+            "selected_exact_backend": "cpu_batch",
+            "selected_workers": contract.selected_workers,
+            "producer_resource_contract": contract.to_dict(),
         },
     )
     monkeypatch.setattr(
         stage052_performance,
         "load_benchmark_execution_lock",
         lambda *_args, **_kwargs: lock,
+    )
+    monkeypatch.setattr(
+        stage052_performance,
+        "load_producer_resource_contract",
+        lambda _path: producer_contract,
     )
     monkeypatch.setattr(stage052_performance, "_git", lambda *_args: "a" * 40)
     monkeypatch.setattr(
@@ -2281,7 +2346,7 @@ def _run_patched_pilot(
             output_dir=output_dir,
             run_label="stage05.2_benchmark_attempt01",
             scope="pilot",
-            worker_count=2,
+            worker_count=4,
             config=config,
             stage051_prerequisite={"status": "READY_FOR_STAGE05_2"},
             component_prerequisites={"accelerator_decision": {"status": "accepted"}},

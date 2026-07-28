@@ -17,6 +17,7 @@ identity_manifest = "configs/stage052_runtime_identity.local.json"
 [campaign]
 storage_root_locator = "configs/stage052_storage_roots.local.toml"
 lock_manifest = "configs/stage052_campaign_lock.local.json"
+resource_calibration_contract = "configs/stage052_resource_calibration.local.json"
 staging_root_alias = "wsl_staging"
 archive_root_aliases = ["d_archive"]
 
@@ -63,6 +64,8 @@ screening_schema_version = "screening_decisions_v3"
 event_format = "parquet"
 compression = "zstd"
 compression_level = 1
+parquet_row_group_size = 262144
+parquet_queue_depth = 2
 critical_evidence = "full"
 diagnostic_evidence = "aggregate"
 per_instance_seed_max_bytes = 2147483648

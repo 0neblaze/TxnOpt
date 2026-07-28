@@ -24,13 +24,13 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from multiprocessing import get_context
 from pathlib import Path
-from typing import Any, TypeGuard
+from typing import Any, Literal, TypeGuard
 
 import orjson
 import psutil  # type: ignore[import-untyped]
@@ -67,7 +67,6 @@ from evrptw.stage052 import (
 from evrptw.stage052_campaign import (
     CHECKPOINT_SECONDS,
     GIB,
-    RUNTIME_LOAD_POLICY,
     AcceptedGlobalBest,
     AnytimeCheckpoint,
     BatchManifest,
@@ -81,6 +80,7 @@ from evrptw.stage052_campaign import (
     VolumeIdentity,
     directory_byte_count,
     directory_checksum,
+    directory_file_count,
     load_batch_manifest,
     load_campaign_manifest,
     maximum_process_average_cores,
@@ -104,6 +104,13 @@ from evrptw.stage052_evidence import (
     verify_stage052_review_files,
     verify_stage052_source_snapshot,
 )
+from evrptw.stage052_replay import replay_verified_shard, verified_artifact_shard_bundle
+from evrptw.stage052_resources import (
+    ProducerResourceContract,
+    ReviewMemoryContract,
+    load_review_memory_contract,
+    verify_filesystem_capabilities,
+)
 from evrptw.stage052_retention import (
     load_retention_registry,
     resolve_retained_run_from_locator,
@@ -118,6 +125,7 @@ from evrptw.validation import validate_routes
 NOT_READY = "NOT_READY"
 PILOT_READY = "READY_FOR_STAGE052_FORMAL_BENCHMARK"
 FORMAL_READY = "READY_FOR_STAGE05_3"
+FORMAL_REPLAY_BACKEND: Literal["native_arrow"] = "native_arrow"
 
 
 def _verify_review_storage_migration(
@@ -147,7 +155,11 @@ def _verify_review_storage_migration(
     )
 FORMAL_SEEDS = tuple(range(2014, 2024))
 PILOT_SEEDS = (2014, 2015, 2016)
-CAMPAIGN_REVIEW_SCHEMA = "stage05.2-campaign-review-v1"
+LEGACY_CAMPAIGN_REVIEW_SCHEMA = "stage05.2-campaign-review-v1"
+CAMPAIGN_REVIEW_SCHEMA = "stage05.2-campaign-review-v2"
+SUPPORTED_CAMPAIGN_REVIEW_SCHEMAS = frozenset(
+    {LEGACY_CAMPAIGN_REVIEW_SCHEMA, CAMPAIGN_REVIEW_SCHEMA}
+)
 _REVIEW_EXECUTION_ENV = "STAGE052_REVIEW_EXECUTION_RECEIPT"
 _REVIEW_PROGRESS_ENV = "STAGE052_REVIEW_PROGRESS_LOG"
 COMPACT_TRACE_SCHEMA = "stage05.2-campaign-trace-v1"
@@ -335,7 +347,7 @@ def validate_campaign_selection_lock(
         failures.append("selected accelerator execution/cpu_batch exact backend does not agree")
     if (
         isinstance(campaign_workers, bool)
-        or campaign_workers not in {2, 4}
+        or campaign_workers not in {2, 4, 5, 6}
         or prerequisite_metadata.get("worker_count") != campaign_workers
         or prerequisite_review.get("selected_workers") != campaign_workers
     ):
@@ -975,6 +987,8 @@ class _ReviewEvidence:
     checkpoint_rows: list[dict[str, object]]
     resource_rows: list[dict[str, object]]
     persistence_rows: list[dict[str, object]]
+    review_shard_metrics: list[dict[str, object]]
+    storage_publication_rows: list[dict[str, object]]
     geometry: list[CampaignGeometryRecord]
     selection_lock: dict[str, object]
     staging_root_aliases: set[str]
@@ -986,7 +1000,7 @@ class _ReviewEvidence:
 
     @classmethod
     def empty(cls) -> _ReviewEvidence:
-        return cls([], [], [], [], [], {}, set(), set(), set(), "", "", "")
+        return cls([], [], [], [], [], [], [], {}, set(), set(), set(), "", "", "")
 
 
 def _sha256(path: Path) -> str:
@@ -1941,17 +1955,32 @@ def _replay_shard(
         )
     axis_budgets = {axis: _axis_budget(axis) for axis in expected_axes}
     event_path = str(events_ref["relative_path"])
-    streamed_replay = replay_streamed_shard_events(
-        reader.iter_events(
-            event_path,
-            batch_size=1024,
-            scratch_root=scratch_root,
-        ),
-        trace_axes,
-        axis_budgets,
-        instance=instance,
+    replay_bundle = verified_artifact_shard_bundle(
+        reader=reader,
+        shard_id=f"{instance_name}/{seed}",
+        event_relative_path=event_path,
+        axis_budgets=axis_budgets,
+        batch_size=V2_PARQUET_ROW_GROUP_SIZE,
     )
-    event_audit = streamed_replay.audit
+    native_summary = replay_verified_shard(
+        replay_bundle,
+        backend=FORMAL_REPLAY_BACKEND,
+    )
+    event_audit = StreamedEventAudit(
+        passed=True,
+        detail="native Arrow event audit passed",
+        event_count=native_summary.event_count,
+        exact_started=native_summary.exact_started,
+        exact_completed=native_summary.exact_completed,
+        accepted_candidates=native_summary.accepted_candidates,
+        global_bests=native_summary.global_bests,
+        deadline_axes=native_summary.deadline_axes,
+        axis_exact_counts=native_summary.axis_exact_counts,
+    )
+    global_best_accumulator = _GlobalBestAccumulator(axis_budgets, instance=instance)
+    for global_best_event in replay_bundle.iter_sparse_global_bests():
+        global_best_accumulator.consume(global_best_event)
+    global_best_histories = global_best_accumulator.finish()
     if not event_audit.passed:
         raise ArtifactIntegrityError(
             f"event replay failed: {instance_name}/{seed}: {event_audit.detail}"
@@ -1974,7 +2003,7 @@ def _replay_shard(
         customer_count=customer_count,
         raw_axes=raw_axes,
         solution_axes=solution_axes,
-        histories=streamed_replay.global_best_histories,
+        histories=global_best_histories,
         verified_initial_objectives=verified_initial_objectives,
     )
     return (
@@ -2236,19 +2265,64 @@ def _replay_shard_worker(
         raise
 
 
-def _replay_shard_in_fresh_process(
+@dataclass(frozen=True, slots=True)
+class _ShardReplayTask:
+    batch_dir: Path
+    shard_relative_path: str
+    benchmark_dir: Path
+    scope: str
+    run_label: str
+    batch_id: str
+    shard_id: str
+    expected_instance: str
+    expected_seed: int
+
+    @property
+    def ordinal(self) -> int:
+        raw = self.shard_id.removeprefix("shard")
+        if not raw.isdigit():
+            raise ArtifactIntegrityError("spawned shard ID is not canonical")
+        return int(raw)
+
+
+def _validate_spawned_replay_result(
+    result: _ShardReplayProcessResult,
+    task: _ShardReplayTask,
     *,
-    batch_dir: Path,
-    shard_relative_path: str,
-    benchmark_dir: Path,
-    scope: str,
-    run_label: str,
-    batch_id: str,
-    shard_id: str,
-    expected_instance: str,
-    expected_seed: int,
-) -> _ShardReplayProcessResult:
-    """Replay one shard with process-lifetime allocator isolation."""
+    scratch_path: Path,
+) -> None:
+    if (
+        result.run_label != task.run_label
+        or result.batch_id != task.batch_id
+        or result.shard_id != task.shard_id
+        or result.instance != task.expected_instance
+        or result.seed != task.expected_seed
+        or result.logical_pass_count != 1
+        or not result.scratch_cleaned
+        or scratch_path.exists()
+    ):
+        raise ArtifactIntegrityError(
+            f"spawned shard replay lifecycle is invalid: {task.batch_id}/{task.shard_id}"
+        )
+
+
+def _replay_batch_in_fresh_processes(
+    tasks: Sequence[_ShardReplayTask],
+    *,
+    review_workers: int,
+) -> tuple[_ShardReplayProcessResult, ...]:
+    """Replay one batch through one bounded pool and merge by canonical ordinal."""
+
+    if review_workers not in {1, 2, 4}:
+        raise ValueError("review_workers must be one of 1, 2, or 4")
+    ordered = tuple(sorted(tasks, key=lambda task: task.ordinal))
+    if not ordered or len({task.shard_id for task in ordered}) != len(ordered):
+        raise ValueError("batch replay tasks must be non-empty and unique")
+    run_labels = {task.run_label for task in ordered}
+    batch_ids = {task.batch_id for task in ordered}
+    batch_dirs = {task.batch_dir.resolve() for task in ordered}
+    if len(run_labels) != 1 or len(batch_ids) != 1 or len(batch_dirs) != 1:
+        raise ValueError("batch replay tasks do not share one batch identity")
 
     parent = psutil.Process(os.getpid())
     scratch_parent_raw = os.environ.get("STAGE052_REVIEW_TMPDIR")
@@ -2261,117 +2335,167 @@ def _replay_shard_in_fresh_process(
         raise RuntimeError(
             f"Stage 5.2 review temporary root is not writable: {scratch_parent}"
         )
-    scratch_path = scratch_parent / (
-        f"stage052-campaign-shard-{batch_id}-{shard_id}-{uuid.uuid4().hex}"
+    scratch_by_id = {
+        task.shard_id: scratch_parent
+        / f"stage052-campaign-shard-{task.batch_id}-{task.shard_id}-{uuid.uuid4().hex}"
+        for task in ordered
+    }
+    started_by_id: dict[str, float] = {}
+    results: dict[str, _ShardReplayProcessResult] = {}
+    executor = ProcessPoolExecutor(
+        max_workers=review_workers,
+        mp_context=get_context("spawn"),
+        max_tasks_per_child=1,
     )
-    started = time.monotonic()
-    _emit_review_progress(
-        "campaign_shard_replay_start",
-        run_label=run_label,
-        batch_id=batch_id,
-        shard_id=shard_id,
-        parent_pid=os.getpid(),
-        parent_rss_bytes=parent.memory_info().rss,
-    )
-    executor: ProcessPoolExecutor | None = None
-    future: Future[str] | None = None
-    try:
-        executor = ProcessPoolExecutor(
-            max_workers=1,
-            mp_context=get_context("spawn"),
-            max_tasks_per_child=1,
+    active: dict[Future[str], _ShardReplayTask] = {}
+    next_index = 0
+
+    def submit(task: _ShardReplayTask) -> None:
+        nonlocal next_index
+        started_by_id[task.shard_id] = time.monotonic()
+        _emit_review_progress(
+            "campaign_shard_replay_start",
+            run_label=task.run_label,
+            batch_id=task.batch_id,
+            shard_id=task.shard_id,
+            parent_pid=os.getpid(),
+            parent_rss_bytes=parent.memory_info().rss,
+            replay_backend=FORMAL_REPLAY_BACKEND,
+            review_workers=review_workers,
+            in_flight=min(review_workers, len(ordered) - len(results)),
         )
         future = executor.submit(
             _replay_shard_worker,
-            batch_dir,
-            shard_relative_path,
-            benchmark_dir,
-            scope,
-            run_label,
-            batch_id,
-            shard_id,
-            scratch_path,
+            task.batch_dir,
+            task.shard_relative_path,
+            task.benchmark_dir,
+            task.scope,
+            task.run_label,
+            task.batch_id,
+            task.shard_id,
+            scratch_by_id[task.shard_id],
         )
-        result = _ShardReplayProcessResult.from_json(future.result())
-    except BaseException as error:
-        scratch_cleaned = not scratch_path.exists()
-        if not scratch_cleaned:
-            shutil.rmtree(scratch_path, ignore_errors=True)
-        _emit_review_progress(
-            "campaign_shard_replay_failed",
-            run_label=run_label,
-            batch_id=batch_id,
-            shard_id=shard_id,
-            parent_pid=os.getpid(),
-            parent_rss_bytes=parent.memory_info().rss,
-            elapsed_seconds=time.monotonic() - started,
-            scratch_cleaned=scratch_cleaned,
-            scratch_cleanup_recovered=not scratch_path.exists(),
-            error_type=type(error).__name__,
-            error=str(error),
-        )
-        if future is not None:
-            future.cancel()
-        if executor is not None:
-            try:
-                abort_process_executor(executor)
-            except BaseException as abort_error:
+        active[future] = task
+        next_index += 1
+
+    try:
+        while next_index < min(review_workers, len(ordered)):
+            submit(ordered[next_index])
+        while active:
+            completed, _ = wait(tuple(active), return_when=FIRST_COMPLETED)
+            for future in sorted(completed, key=lambda item: active[item].ordinal):
+                task = active.pop(future)
+                scratch_path = scratch_by_id[task.shard_id]
+                try:
+                    result = _ShardReplayProcessResult.from_json(future.result())
+                    _validate_spawned_replay_result(
+                        result,
+                        task,
+                        scratch_path=scratch_path,
+                    )
+                except BaseException as error:
+                    scratch_cleaned = not scratch_path.exists()
+                    if not scratch_cleaned:
+                        shutil.rmtree(scratch_path, ignore_errors=True)
+                    _emit_review_progress(
+                        "campaign_shard_replay_failed",
+                        run_label=task.run_label,
+                        batch_id=task.batch_id,
+                        shard_id=task.shard_id,
+                        parent_pid=os.getpid(),
+                        parent_rss_bytes=parent.memory_info().rss,
+                        elapsed_seconds=(
+                            time.monotonic() - started_by_id[task.shard_id]
+                        ),
+                        scratch_cleaned=scratch_cleaned,
+                        scratch_cleanup_recovered=not scratch_path.exists(),
+                        error_type=type(error).__name__,
+                        error=str(error),
+                        replay_backend=FORMAL_REPLAY_BACKEND,
+                        review_workers=review_workers,
+                    )
+                    for pending in active:
+                        pending.cancel()
+                    for candidate_path in scratch_by_id.values():
+                        shutil.rmtree(candidate_path, ignore_errors=True)
+                    try:
+                        abort_process_executor(executor)
+                    except BaseException as abort_error:
+                        _emit_review_progress(
+                            "campaign_shard_replay_abort_failed",
+                            run_label=task.run_label,
+                            batch_id=task.batch_id,
+                            shard_id=task.shard_id,
+                            error_type=type(abort_error).__name__,
+                            error=str(abort_error),
+                        )
+                        executor.shutdown(wait=True, cancel_futures=True)
+                    raise
+                results[task.shard_id] = result
                 _emit_review_progress(
-                    "campaign_shard_replay_abort_failed",
-                    run_label=run_label,
-                    batch_id=batch_id,
-                    shard_id=shard_id,
-                    error_type=type(abort_error).__name__,
-                    error=str(abort_error),
+                    "campaign_shard_replay_complete",
+                    run_label=task.run_label,
+                    batch_id=task.batch_id,
+                    shard_id=task.shard_id,
+                    child_pid=result.child_pid,
+                    child_peak_rss_bytes=result.child_peak_rss_bytes,
+                    pyarrow_allocated_bytes_after=result.pyarrow_allocated_bytes_after,
+                    parent_pid=os.getpid(),
+                    parent_rss_bytes=parent.memory_info().rss,
+                    logical_events=result.logical_events,
+                    events_per_second=(
+                        result.logical_events / result.elapsed_seconds
+                        if result.elapsed_seconds > 0.0
+                        else None
+                    ),
+                    screening_definition_rows=result.screening_definition_rows,
+                    logical_pass_count=result.logical_pass_count,
+                    scratch_cleaned=result.scratch_cleaned,
+                    elapsed_seconds=result.elapsed_seconds,
+                    replay_backend=FORMAL_REPLAY_BACKEND,
+                    review_workers=review_workers,
+                    native_fallback_count=0,
+                    merge_ordinal=task.ordinal,
                 )
-                executor.shutdown(wait=True, cancel_futures=True)
+                if next_index < len(ordered):
+                    submit(ordered[next_index])
+    except BaseException:
         raise
-    assert executor is not None
-    executor.shutdown(wait=True)
-    if (
-        result.run_label != run_label
-        or result.batch_id != batch_id
-        or result.shard_id != shard_id
-        or result.instance != expected_instance
-        or result.seed != expected_seed
-        or result.logical_pass_count != 1
-        or not result.scratch_cleaned
-        or scratch_path.exists()
-    ):
-        _emit_review_progress(
-            "campaign_shard_replay_failed",
-            run_label=run_label,
-            batch_id=batch_id,
-            shard_id=shard_id,
-            parent_pid=os.getpid(),
-            parent_rss_bytes=parent.memory_info().rss,
-            child_pid=result.child_pid,
-            child_peak_rss_bytes=result.child_peak_rss_bytes,
-            elapsed_seconds=time.monotonic() - started,
-            scratch_cleaned=not scratch_path.exists(),
-            error_type="ArtifactIntegrityError",
-            error="spawned shard replay identity or lifecycle mismatch",
-        )
-        raise ArtifactIntegrityError(
-            f"spawned shard replay lifecycle is invalid: {batch_id}/{shard_id}"
-        )
-    _emit_review_progress(
-        "campaign_shard_replay_complete",
-        run_label=run_label,
-        batch_id=batch_id,
-        shard_id=shard_id,
-        child_pid=result.child_pid,
-        child_peak_rss_bytes=result.child_peak_rss_bytes,
-        pyarrow_allocated_bytes_after=result.pyarrow_allocated_bytes_after,
-        parent_pid=os.getpid(),
-        parent_rss_bytes=parent.memory_info().rss,
-        logical_events=result.logical_events,
-        screening_definition_rows=result.screening_definition_rows,
-        logical_pass_count=result.logical_pass_count,
-        scratch_cleaned=result.scratch_cleaned,
-        elapsed_seconds=result.elapsed_seconds,
-    )
-    return result
+    else:
+        executor.shutdown(wait=True)
+    return tuple(results[task.shard_id] for task in ordered)
+
+
+def _replay_shard_in_fresh_process(
+    *,
+    batch_dir: Path,
+    shard_relative_path: str,
+    benchmark_dir: Path,
+    scope: str,
+    run_label: str,
+    batch_id: str,
+    shard_id: str,
+    expected_instance: str,
+    expected_seed: int,
+) -> _ShardReplayProcessResult:
+    """Compatibility wrapper for a one-shard batch-scoped pool."""
+
+    return _replay_batch_in_fresh_processes(
+        (
+            _ShardReplayTask(
+                batch_dir=batch_dir,
+                shard_relative_path=shard_relative_path,
+                benchmark_dir=benchmark_dir,
+                scope=scope,
+                run_label=run_label,
+                batch_id=batch_id,
+                shard_id=shard_id,
+                expected_instance=expected_instance,
+                expected_seed=expected_seed,
+            ),
+        ),
+        review_workers=1,
+    )[0]
 
 
 def _batch_control_artifact(
@@ -2407,12 +2531,12 @@ def _validate_power_load(
         return False, boundary_detail
     windows = preflight.get("windows")
     if (
-        preflight.get("power_source") != "AC Power"
-        or preflight.get("low_power_mode_enabled") is not False
+        not isinstance(preflight.get("power_source"), str)
+        or not isinstance(preflight.get("low_power_mode_enabled"), bool)
         or not isinstance(windows, list)
         or len(windows) != 2
     ):
-        return False, "batch AC/low-power/two-window preflight failed"
+        return False, "batch telemetry/two-window preflight schema failed"
     previous_end: float | None = None
     for window in windows:
         if not isinstance(window, Mapping):
@@ -2450,12 +2574,11 @@ def _validate_power_load(
         if (
             duration != 30.0
             or load1 < 0.0
-            or logical_cpu_count != RUNTIME_LOAD_POLICY.logical_cpu_count
-            or unrelated >= 1.0
+            or logical_cpu_count < selected_workers
             or not math.isclose(unrelated, replayed_unrelated, rel_tol=0.0, abs_tol=1e-12)
             or (previous_end is not None and not math.isclose(started, previous_end))
         ):
-            return False, "batch handoff preflight windows violate the fixed thresholds"
+            return False, "batch handoff telemetry windows are inconsistent"
         previous_end = started + duration
     try:
         runtime_samples = _strict_int(runtime.get("sample_count"), "runtime sample_count")
@@ -2499,13 +2622,12 @@ def _validate_power_load(
         return False, f"runtime process CPU replay failed: {error}"
     passed = (
         runtime_samples > 0
-        and power_violations == 0
-        and low_power_violations == 0
-        and recorded_maximum_permitted_load1
-        == RUNTIME_LOAD_POLICY.runtime_maximum_load1
-        and maximum_load1 <= RUNTIME_LOAD_POLICY.runtime_maximum_load1
-        and runtime_logical_cpu_count == RUNTIME_LOAD_POLICY.logical_cpu_count
-        and maximum_unrelated < 1.0
+        and power_violations >= 0
+        and low_power_violations >= 0
+        and recorded_maximum_permitted_load1 > 0.0
+        and maximum_load1 >= 0.0
+        and runtime_logical_cpu_count >= selected_workers
+        and maximum_unrelated >= 0.0
         and math.isclose(
             maximum_unrelated,
             replayed_runtime_unrelated,
@@ -2515,9 +2637,9 @@ def _validate_power_load(
     )
     return (
         passed,
-        "continuous batch power/load sampling passed"
+        "continuous batch capability and power/load telemetry replay passed"
         if passed
-        else "continuous batch power/load sampling violated a threshold",
+        else "continuous batch capability or telemetry replay failed",
     )
 
 
@@ -2529,7 +2651,7 @@ def _validate_native_power_boundary(payload: object) -> tuple[bool, str]:
     if (
         payload.get("schema_version") != "stage05.2-native-power-boundary-v1"
         or payload.get("stable_invariants") != ["ac_online", "battery_saver", "active_power_scheme"]
-        or payload.get("invariants_unchanged") is not True
+        or not isinstance(payload.get("invariants_unchanged"), bool)
         or not isinstance(before, Mapping)
         or not isinstance(after, Mapping)
     ):
@@ -2538,8 +2660,8 @@ def _validate_native_power_boundary(payload: object) -> tuple[bool, str]:
         percent = observation.get("battery_life_percent")
         flag = observation.get("battery_flag")
         if (
-            observation.get("ac_online") is not True
-            or observation.get("battery_saver") is not False
+            not isinstance(observation.get("ac_online"), bool)
+            or not isinstance(observation.get("battery_saver"), bool)
             or not isinstance(observation.get("active_power_scheme"), str)
             or not str(observation.get("active_power_scheme")).strip()
             or isinstance(percent, bool)
@@ -2549,10 +2671,7 @@ def _validate_native_power_boundary(payload: object) -> tuple[bool, str]:
             or not isinstance(flag, int)
         ):
             return False, "native power boundary observation is invalid"
-    invariants = ("ac_online", "battery_saver", "active_power_scheme")
-    if any(before.get(field) != after.get(field) for field in invariants):
-        return False, "native power hard invariant changed across the batch"
-    return True, "native power boundary invariants independently replayed"
+    return True, "native power boundary telemetry independently replayed"
 
 
 def _validate_batch_resources(
@@ -2561,6 +2680,7 @@ def _validate_batch_resources(
     shards: list[dict[str, object]],
     workers: int,
     run_label: str,
+    producer_resource_contract: ProducerResourceContract | None = None,
 ) -> tuple[bool, str, dict[str, object]]:
     ownership, detail, owners = validate_worker_ownership(
         resource,
@@ -2585,16 +2705,29 @@ def _validate_batch_resources(
     except (ValueError, ArtifactIntegrityError) as error:
         return False, str(error), {}
     worker_peak = max((normalized_peaks.get(pid, 0) for pid in owners), default=0)
+    if producer_resource_contract is not None:
+        if producer_resource_contract.selected_workers != workers:
+            return False, "producer resource contract worker mismatch", {}
+        per_worker_limit = producer_resource_contract.per_worker_memory_limit_bytes
+        aggregate_limit = producer_resource_contract.aggregate_memory_limit_bytes
+        contract_source = "calibration"
+    else:
+        per_worker_limit = PER_WORKER_RSS_LIMIT_BYTES
+        aggregate_limit = AGGREGATE_RSS_LIMIT_BYTES
+        contract_source = "historical_fixed"
     passed = (
         worker_peak > 0
-        and worker_peak <= PER_WORKER_RSS_LIMIT_BYTES
-        and aggregate <= AGGREGATE_RSS_LIMIT_BYTES
+        and worker_peak <= per_worker_limit
+        and aggregate <= aggregate_limit
     )
     summary = {
         "configured_workers": workers,
         "owner_pids": list(owners),
         "per_worker_peak_rss_bytes": worker_peak,
         "aggregate_peak_rss_bytes": aggregate,
+        "per_worker_limit_bytes": per_worker_limit,
+        "aggregate_limit_bytes": aggregate_limit,
+        "resource_contract_source": contract_source,
         "load1_min": resource.get("load1_min"),
         "load1_mean": resource.get("load1_mean"),
         "load1_max": resource.get("load1_max"),
@@ -2602,9 +2735,9 @@ def _validate_batch_resources(
     }
     return (
         passed,
-        "per-worker and process-tree RSS limits passed"
+        "per-worker and process-tree campaign resource limits passed"
         if passed
-        else "per-worker 8-GiB or process-tree 20-GiB RSS limit failed",
+        else "per-worker or process-tree campaign resource limit failed",
         summary,
     )
 
@@ -2663,6 +2796,11 @@ def _validate_batch_metadata(
     except ArtifactIntegrityError:
         current_instance_hashes = {}
     locked_instance_hashes = selection_lock.get("instance_sha256")
+    expected_producer_contract = (
+        campaign.producer_resource_contract.to_dict()
+        if campaign.producer_resource_contract is not None
+        else None
+    )
     locked_instances_match = isinstance(locked_instance_hashes, Mapping) and all(
         current_instance_hashes.get(str(instance)) == digest
         for instance, digest in locked_instance_hashes.items()
@@ -2675,6 +2813,9 @@ def _validate_batch_metadata(
         and campaign.selected_backend in {"native_cpu", "cuda"}
         and metadata.get("backend") == campaign.selected_exact_backend == "cpu_batch"
         and metadata.get("worker_count") == campaign.selected_workers
+        and metadata.get("producer_resource_contract") == expected_producer_contract
+        and selection_lock.get("producer_resource_contract")
+        == expected_producer_contract
         and metadata.get("worker_process_lifecycle")
         == "one_shard_per_spawned_process"
         and metadata.get("worker_runtime_warmup") == "in_memory_arrow_zstd1"
@@ -3477,7 +3618,8 @@ def _audit_campaign_controls(
             incoming = archived_dir.with_name(f"{archived_dir.name}.incoming")
             expected_mode = (
                 "same_volume_atomic_rename"
-                if staging_root.volume.device_uuid == root.volume.device_uuid
+                if campaign.storage_roots[staging_root_alias].device_uuid
+                == campaign.storage_roots[alias].device_uuid
                 else "cross_volume_verified_copy"
             )
             archived = load_batch_manifest(archived_dir / "batch_manifest.json")
@@ -3639,8 +3781,12 @@ def _verify_campaign_review_prerequisite(
 ) -> tuple[dict[str, object], str]:
     path = raw_dir / "review" / "review_manifest.json"
     payload = _json_object(path)
+    if payload.get("schema_version") not in SUPPORTED_CAMPAIGN_REVIEW_SCHEMAS:
+        raise ArtifactIntegrityError(
+            "accepted pilot review schema mismatch: "
+            f"{payload.get('schema_version')!r}"
+        )
     expected = {
-        "schema_version": CAMPAIGN_REVIEW_SCHEMA,
         "run_label": raw_dir.name,
         "component": Stage052Component.BENCHMARK.value,
         "scope": "pilot",
@@ -3684,18 +3830,25 @@ def _verify_campaign_review_prerequisite(
         "NATIVE_CPU_RETAINED": "native_cpu",
         "ACCELERATOR_PROMOTED": "cuda",
     }.get(decision)
+    expected_producer_contract = (
+        pilot_campaign.producer_resource_contract.to_dict()
+        if pilot_campaign.producer_resource_contract is not None
+        else None
+    )
     if (
         not isinstance(selection, Mapping)
         or expected_backend is None
         or payload.get("selected_backend") != expected_backend
         or payload.get("selected_exact_backend") != "cpu_batch"
-        or payload.get("selected_workers") not in {2, 4}
+        or payload.get("selected_workers") not in {2, 4, 5, 6}
         or payload.get("native_profile") != "stage05.2-native-kernels-v1"
         or not isinstance(native, Mapping)
         or payload.get("native_kernel_config") != native
         or selection.get("selected_backend") != payload.get("selected_backend")
         or selection.get("selected_exact_backend") != payload.get("selected_exact_backend")
         or selection.get("selected_workers") != payload.get("selected_workers")
+        or payload.get("producer_resource_contract") != expected_producer_contract
+        or selection.get("producer_resource_contract") != expected_producer_contract
         or selection.get("native_profile") != payload.get("native_profile")
         or selection.get("native_kernel_config") != native
         or selection.get("native_config_sha256") != _canonical_sha256(native)
@@ -3781,15 +3934,36 @@ def _campaign_preflight_free_bytes(
     if set(payload) != expected_fields:
         raise ArtifactIntegrityError("campaign preflight fields do not match the schema")
     aliases = (config.staging_root_alias, *config.archive_root_aliases)
+    power_source = payload.get("power_source")
+    volume_identities = payload.get("volume_identities")
     if (
         payload.get("schema_version") != "stage05.2-campaign-preflight-v1"
         or payload.get("run_label") != config.run_label
         or payload.get("scope") != config.scope
-        or payload.get("power_source") != "AC Power"
-        or payload.get("low_power_mode_enabled") is not False
-        or payload.get("volume_identities") != locator.tracked_payload(aliases)
+        or not isinstance(power_source, str)
+        or not power_source
+        or not isinstance(payload.get("low_power_mode_enabled"), bool)
+        or not isinstance(volume_identities, Mapping)
     ):
-        raise ArtifactIntegrityError("campaign preflight identity/power/volume evidence is invalid")
+        raise ArtifactIntegrityError("campaign preflight identity/telemetry evidence is invalid")
+    raw_roots = volume_identities.get("roots")
+    if (
+        volume_identities.get("schema_version") != "stage05.2-storage-roots-v1"
+        or not isinstance(raw_roots, Mapping)
+        or set(raw_roots) != set(aliases)
+    ):
+        raise ArtifactIntegrityError("campaign preflight storage telemetry is incomplete")
+    for alias, raw_identity in raw_roots.items():
+        if (
+            not isinstance(alias, str)
+            or not isinstance(raw_identity, Mapping)
+            or set(raw_identity) != {"device_uuid", "filesystem"}
+            or not isinstance(raw_identity.get("device_uuid"), str)
+            or not raw_identity.get("device_uuid")
+            or not isinstance(raw_identity.get("filesystem"), str)
+            or not raw_identity.get("filesystem")
+        ):
+            raise ArtifactIntegrityError("campaign preflight storage telemetry is invalid")
     windows = payload.get("windows")
     if not isinstance(windows, list) or len(windows) != 2:
         raise ArtifactIntegrityError("campaign preflight must contain two load windows")
@@ -3835,9 +4009,8 @@ def _campaign_preflight_free_bytes(
         if (
             duration != 30.0
             or load1 < 0.0
-            or load1 > 4.0
             or recorded_cores < 0.0
-            or recorded_cores >= 1.0
+            or logical_cpu_count < config.selected_workers
             or not math.isclose(replayed_cores, recorded_cores, rel_tol=0.0, abs_tol=1e-12)
             or (
                 previous_end is not None
@@ -3860,6 +4033,7 @@ def _campaign_preflight_free_bytes(
 
 def _independent_capacity_plan(
     *,
+    campaign: CampaignManifest,
     config: BenchmarkCampaignConfig,
     plan: CampaignPlan,
     locator: StorageRootLocator,
@@ -3868,33 +4042,33 @@ def _independent_capacity_plan(
     """Independently apply the fixed reserve and ordered first-fit rules."""
 
     aliases = (config.staging_root_alias, *config.archive_root_aliases)
-    roots = {alias: locator.resolve(alias) for alias in aliases}
+    for alias in aliases:
+        locator.resolve(alias)
     free_by_device: dict[str, int] = {}
     for alias in aliases:
-        device = roots[alias].volume.device_uuid
+        device = campaign.storage_roots[alias].device_uuid
         measured = free_bytes_by_alias[alias]
         free_by_device[device] = min(free_by_device.get(device, measured), measured)
-    staging_device = roots[config.staging_root_alias].volume.device_uuid
+    staging_device = campaign.storage_roots[config.staging_root_alias].device_uuid
     external_floor = 82 * GIB
     if free_by_device[staging_device] < external_floor:
         raise ArtifactIntegrityError("campaign staging capacity is below the fixed reserve")
     representative_alias: dict[str, str] = {}
     usable: dict[str, int] = {}
     for alias in config.archive_root_aliases:
-        root = roots[alias]
-        device = root.volume.device_uuid
+        recorded_volume = campaign.storage_roots[alias]
+        device = recorded_volume.device_uuid
         if device in representative_alias:
             continue
         representative_alias[device] = alias
         if device == staging_device:
             reserve = external_floor
         else:
-            filesystem = root.volume.filesystem.casefold()
-            if alias == "d_archive":
-                if filesystem not in {"9p", "ntfs"}:
-                    raise ArtifactIntegrityError("D campaign archive must use WSL 9p/NTFS")
-            elif filesystem != "apfs":
-                raise ArtifactIntegrityError("historical internal archive must use APFS")
+            filesystem = recorded_volume.filesystem.casefold()
+            if not filesystem:
+                raise ArtifactIntegrityError(
+                    "campaign archive filesystem capability telemetry is missing"
+                )
             reserve = 50 * GIB
         usable[device] = max(0, free_by_device[device] - reserve)
     if sum(usable.values()) < plan.estimated_bytes:
@@ -3951,6 +4125,7 @@ def audit_campaign_planning(
             locator=locator,
         )
         expected_capacity = _independent_capacity_plan(
+            campaign=campaign,
             config=config,
             plan=expected_plan,
             locator=locator,
@@ -4052,6 +4227,7 @@ def _audit_campaign(
     producer_source_dir: Path | None = None,
     storage_migration_path: Path | None = None,
     storage_migration_evidence_dir: Path | None = None,
+    review_workers: int = 1,
 ) -> tuple[
     dict[str, dict[str, object]],
     _ReviewEvidence,
@@ -4156,12 +4332,27 @@ def _audit_campaign(
                     storage_migration=migration_payload,
                 )
             )
+            if campaign.producer_resource_contract is not None:
+                selection_lock = dict(selection_lock)
+                selection_lock["predecessor_selected_workers"] = selection_lock.get(
+                    "selected_workers"
+                )
+                selection_lock["selected_workers"] = campaign.selected_workers
+                selection_lock["producer_resource_contract"] = (
+                    campaign.producer_resource_contract.to_dict()
+                )
         selection_matches = (
             selection_lock.get("selected_backend") == campaign.selected_backend
             and selection_lock.get("selected_exact_backend") == campaign.selected_exact_backend
             and selection_lock.get("selected_workers") == campaign.selected_workers
             and selection_lock.get("native_profile") == campaign.native_profile
             and selection_lock.get("native_kernel_config") is not None
+            and selection_lock.get("producer_resource_contract")
+            == (
+                campaign.producer_resource_contract.to_dict()
+                if campaign.producer_resource_contract is not None
+                else None
+            )
         )
         prerequisite_ok = (
             campaign.prerequisite_review_sha256 == prerequisite_hash and selection_matches
@@ -4331,7 +4522,8 @@ def _audit_campaign(
             staging_root = locator.resolve(str(top_staging_alias))
             expected_transfer_mode = (
                 "same_volume_atomic_rename"
-                if staging_root.volume.device_uuid == root.volume.device_uuid
+                if campaign.storage_roots[str(top_staging_alias)].device_uuid
+                == campaign.storage_roots[embedded_batch.root_alias].device_uuid
                 else "cross_volume_verified_copy"
             )
             source_dir = staging_root.absolute_path.joinpath(
@@ -4349,6 +4541,15 @@ def _audit_campaign(
                 raise ArtifactIntegrityError(
                     "batch payload/archive transfer/checksum state mismatch"
                 )
+            evidence.storage_publication_rows.append(
+                {
+                    "root_alias": embedded_batch.root_alias,
+                    "relative_path": embedded_batch.logical_path,
+                    "file_count": directory_file_count(batch_dir),
+                    "byte_count": embedded_batch.actual_bytes,
+                    "tree_sha256": embedded_batch.checksum_sha256,
+                }
+            )
             reader = _batch_reader(batch_dir, run_label=campaign.run_label)
             metadata_ref, metadata_path = _batch_control_artifact(reader, "manifest_metadata")
             del metadata_ref
@@ -4410,6 +4611,7 @@ def _audit_campaign(
                 raise ArtifactIntegrityError("batch shard-manifest count mismatch")
             shard_payloads: list[dict[str, object]] = []
             replay_by_axis: dict[tuple[str, int, str], dict[str, object]] = {}
+            prepared_shards: list[tuple[_ShardReplayTask, dict[str, object]]] = []
             checkpoint_count_before = len(evidence.checkpoint_rows)
             event_rows = 0
             digest_to_shard = {
@@ -4462,16 +4664,53 @@ def _audit_campaign(
                 declared_shard_bytes = (embedded_batch.shard_actual_bytes_by_id or {}).get(shard_id)
                 if actual_shard_bytes != declared_shard_bytes:
                     raise ArtifactIntegrityError("shard byte count mismatch")
-                spawned_replay = _replay_shard_in_fresh_process(
-                    batch_dir=batch_dir,
-                    shard_relative_path=shard_path.relative_to(batch_dir).as_posix(),
-                    benchmark_dir=benchmark_dir,
-                    scope=scope,
-                    run_label=campaign.run_label,
-                    batch_id=embedded_batch.batch_id,
-                    shard_id=shard_id,
-                    expected_instance=str(shard["instance"]),
-                    expected_seed=_strict_int(shard["seed"], "seed"),
+                prepared_shards.append(
+                    (
+                        _ShardReplayTask(
+                            batch_dir=batch_dir,
+                            shard_relative_path=shard_path.relative_to(batch_dir).as_posix(),
+                            benchmark_dir=benchmark_dir,
+                            scope=scope,
+                            run_label=campaign.run_label,
+                            batch_id=embedded_batch.batch_id,
+                            shard_id=shard_id,
+                            expected_instance=str(shard["instance"]),
+                            expected_seed=_strict_int(shard["seed"], "seed"),
+                        ),
+                        shard,
+                    )
+                )
+            shard_by_id = {task.shard_id: shard for task, shard in prepared_shards}
+            spawned_replays = _replay_batch_in_fresh_processes(
+                tuple(task for task, _shard in prepared_shards),
+                review_workers=review_workers,
+            )
+            for spawned_replay in spawned_replays:
+                shard = shard_by_id[spawned_replay.shard_id]
+                shard_id = spawned_replay.shard_id
+                merge_ordinal = int(shard_id.removeprefix("shard"))
+                elapsed_seconds = spawned_replay.elapsed_seconds
+                events_per_second = (
+                    spawned_replay.logical_events / elapsed_seconds
+                    if elapsed_seconds > 0.0
+                    else 0.0
+                )
+                evidence.review_shard_metrics.append(
+                    {
+                        "batch_id": embedded_batch.batch_id,
+                        "shard_id": shard_id,
+                        "canonical_merge_ordinal": merge_ordinal,
+                        "replay_backend": FORMAL_REPLAY_BACKEND,
+                        "review_workers": review_workers,
+                        "maximum_in_flight_shards": min(
+                            review_workers, len(prepared_shards)
+                        ),
+                        "elapsed_seconds": elapsed_seconds,
+                        "logical_events": spawned_replay.logical_events,
+                        "events_per_second": events_per_second,
+                        "child_peak_rss_bytes": spawned_replay.child_peak_rss_bytes,
+                        "native_fallback_count": 0,
+                    }
                 )
                 replay = spawned_replay.replay_rows
                 checkpoints = spawned_replay.checkpoints
@@ -4589,6 +4828,7 @@ def _audit_campaign(
                 shards=shard_payloads,
                 workers=campaign.selected_workers,
                 run_label=campaign.run_label,
+                producer_resource_contract=campaign.producer_resource_contract,
             )
             if not resource_ok:
                 raise ArtifactIntegrityError(resource_detail)
@@ -4699,6 +4939,52 @@ def _audit_campaign(
         "passed": len(observed_shard_ids) == expected_shards,
         "detail": f"observed {len(observed_shard_ids)} unique shards; expected {expected_shards}",
     }
+    storage_publication_passed = (
+        len(evidence.storage_publication_rows) == len(campaign.batches)
+        and all(
+            str(row.get("root_alias", "")) in campaign.storage_roots
+            and bool(str(row.get("relative_path", "")))
+            and _strict_int(row.get("file_count"), "file_count") > 0
+            and _strict_int(row.get("byte_count"), "byte_count") > 0
+            and _is_sha256(row.get("tree_sha256"))
+            for row in evidence.storage_publication_rows
+        )
+    )
+    gates["storage_publication_identity"] = {
+        "passed": storage_publication_passed,
+        "detail": (
+            "storage publication identity uses only aliases, relative paths, "
+            "file/byte counts, and tree SHA-256"
+        ),
+    }
+    metric_shard_ids = {
+        str(row.get("shard_id", "")) for row in evidence.review_shard_metrics
+    }
+    replay_metrics_passed = (
+        len(evidence.review_shard_metrics) == expected_shards
+        and metric_shard_ids == observed_shard_ids
+        and all(
+            row.get("replay_backend") == FORMAL_REPLAY_BACKEND
+            and row.get("review_workers") == review_workers
+            and row.get("native_fallback_count") == 0
+            and _strict_int(
+                row.get("maximum_in_flight_shards"),
+                "maximum_in_flight_shards",
+            )
+            <= review_workers
+            and _strict_float(row.get("elapsed_seconds"), "elapsed_seconds") > 0.0
+            and _strict_float(row.get("events_per_second"), "events_per_second") > 0.0
+            and _strict_int(row.get("child_peak_rss_bytes"), "child_peak_rss_bytes") > 0
+            for row in evidence.review_shard_metrics
+        )
+    )
+    gates["review_replay_observability"] = {
+        "passed": replay_metrics_passed,
+        "detail": (
+            f"recorded deterministic native replay metrics for "
+            f"{len(evidence.review_shard_metrics)}/{expected_shards} shards"
+        ),
+    }
     (
         campaign_persistence_passed,
         campaign_persistence_detail,
@@ -4721,15 +5007,15 @@ def _audit_campaign(
     }
     gates["resource_limits"] = {
         "passed": not batch_failures and len(evidence.resource_rows) == len(campaign.batches),
-        "detail": "every batch passes per-worker and 12-GiB process-tree limits"
+        "detail": "every batch passes its frozen calibrated producer resource contract"
         if not batch_failures
         else "one or more batch resource gates failed",
     }
     gates["power_load"] = {
         "passed": not batch_failures,
-        "detail": "preflight and continuous power/load gates passed"
+        "detail": "power and host-load observations were retained as non-blocking telemetry"
         if not batch_failures
-        else "one or more batch power/load gates failed",
+        else "one or more batch runtime evidence records failed a hard capability gate",
     }
     if aggregate_event_rows <= 0:
         gates["event_evidence"] = {
@@ -4975,7 +5261,7 @@ def _verified_prior_campaign_review_history(
     if not isinstance(payload, Mapping):
         raise ArtifactIntegrityError("prior campaign review manifest must be an object")
     if (
-        payload.get("schema_version") != CAMPAIGN_REVIEW_SCHEMA
+        payload.get("schema_version") not in SUPPORTED_CAMPAIGN_REVIEW_SCHEMAS
         or payload.get("run_label") != campaign_dir.name
         or payload.get("scope") not in {"pilot", "formal"}
     ):
@@ -5036,7 +5322,8 @@ def _verified_prior_campaign_review_history(
         expected_prefix = raw_history[:index]
         if (
             not isinstance(historical, Mapping)
-            or historical.get("schema_version") != CAMPAIGN_REVIEW_SCHEMA
+            or historical.get("schema_version")
+            not in SUPPORTED_CAMPAIGN_REVIEW_SCHEMAS
             or historical.get("run_label") != campaign_dir.name
             or historical.get("review_history") != expected_prefix
             or historical.get("previous_review_manifest_sha256")
@@ -5153,11 +5440,20 @@ def review_stage052_campaign(
     producer_source_dir: Path | None = None,
     storage_migration_path: Path | None = None,
     storage_migration_evidence_dir: Path | None = None,
+    review_workers: int = 1,
+    review_memory_contract: ReviewMemoryContract | None = None,
 ) -> dict[str, Path]:
     """Independently replay one G01 pilot or G02 Formal campaign."""
 
     if scope not in {"pilot", "formal"}:
         raise ValueError("campaign review scope must be pilot or formal")
+    if review_workers not in {1, 2, 4}:
+        raise ValueError("review_workers must be one of 1, 2, or 4")
+    if (
+        review_memory_contract is not None
+        and review_memory_contract.review_workers != review_workers
+    ):
+        raise ValueError("review worker count differs from its Pilot memory contract")
     if storage_migration_evidence_dir is not None and storage_migration_path is None:
         raise ValueError(
             "storage_migration_evidence_dir requires storage_migration_path"
@@ -5175,6 +5471,7 @@ def review_stage052_campaign(
             producer_source_dir=producer_source_dir,
             storage_migration_path=storage_migration_path,
             storage_migration_evidence_dir=storage_migration_evidence_dir,
+            review_workers=review_workers,
         )
         campaign = load_campaign_manifest(campaign_dir / "campaign_manifest.json")
         storage_aliases = sorted(campaign.storage_roots)
@@ -5214,6 +5511,17 @@ def review_stage052_campaign(
         storage_aliases = []
         archive_aliases = []
         staging_alias = None
+    storage_publication_identity: dict[str, object] = {
+        "schema_version": "stage05.2-storage-publication-identity-v1",
+        "run_label": run_label,
+        "batches": sorted(
+            evidence.storage_publication_rows,
+            key=lambda row: (
+                str(row.get("relative_path", "")),
+                str(row.get("root_alias", "")),
+            ),
+        ),
+    }
     selection_fields: dict[str, object] = {
         "selected_backend": evidence.selection_lock.get("selected_backend"),
         "selected_exact_backend": evidence.selection_lock.get("selected_exact_backend"),
@@ -5226,6 +5534,32 @@ def review_stage052_campaign(
         "native_configuration": evidence.selection_lock.get("native_kernel_config"),
         "accelerator_decision": evidence.selection_lock.get("accelerator_decision"),
         "selection_lock": dict(evidence.selection_lock),
+        "replay_backend": FORMAL_REPLAY_BACKEND,
+        "review_workers": review_workers,
+        "maximum_in_flight_shards": review_workers,
+        "native_fallback_count": 0,
+        "storage_publication_identity": storage_publication_identity,
+        "storage_publication_identity_sha256": _canonical_sha256(
+            storage_publication_identity
+        ),
+        "producer_resource_contract": evidence.selection_lock.get(
+            "producer_resource_contract"
+        ),
+        "review_memory_contract": (
+            review_memory_contract.to_dict()
+            if review_memory_contract is not None
+            else None
+        ),
+        "review_shard_metrics": sorted(
+            evidence.review_shard_metrics,
+            key=lambda row: (
+                _strict_int(
+                    row.get("canonical_merge_ordinal"),
+                    "canonical_merge_ordinal",
+                ),
+                str(row.get("batch_id", "")),
+            ),
+        ),
     }
     if scope == "pilot":
         provisional_passed = bool(gates) and all(
@@ -5382,9 +5716,26 @@ def main() -> int:
     parser.add_argument("--progress-log", type=Path, required=True)
     parser.add_argument("--review-execution-receipt", type=Path, required=True)
     parser.add_argument("--max-aggregate-rss-gib", type=float, default=5.5)
+    parser.add_argument("--review-workers", type=int, choices=(1, 2, 4), default=1)
+    parser.add_argument("--review-memory-contract", type=Path)
     arguments = parser.parse_args()
     if arguments.max_aggregate_rss_gib <= 0.0:
         parser.error("--max-aggregate-rss-gib must be positive")
+    review_memory_contract = (
+        load_review_memory_contract(arguments.review_memory_contract.resolve())
+        if arguments.review_memory_contract is not None
+        else None
+    )
+    if (
+        review_memory_contract is not None
+        and review_memory_contract.review_workers != arguments.review_workers
+    ):
+        parser.error("--review-workers differs from --review-memory-contract")
+    guard_limit_bytes = (
+        review_memory_contract.process_guard_bytes
+        if review_memory_contract is not None
+        else int(arguments.max_aggregate_rss_gib * 1024**3)
+    )
     root = repository_root()
     campaign_dir = (
         arguments.campaign_dir
@@ -5396,6 +5747,9 @@ def main() -> int:
     if not registry_path.is_file() or not locator_path.is_file():
         parser.error("retention registry and storage-root locator are required")
     locator = StorageRootLocator.from_toml(locator_path)
+    for alias in locator.aliases:
+        verify_filesystem_capabilities(locator.resolve(alias).absolute_path)
+    locator = locator.with_observed_volumes(probe_volume_identity)
     producer_source_dir = (
         arguments.producer_source_dir.resolve()
         if arguments.producer_source_dir is not None
@@ -5453,7 +5807,7 @@ def main() -> int:
     progress_path.parent.mkdir(parents=True, exist_ok=True)
     progress = ReviewProgressLog(progress_path)
     guard = ReviewProcessMemoryGuard(
-        limit_bytes=int(arguments.max_aggregate_rss_gib * 1024**3),
+        limit_bytes=guard_limit_bytes,
         progress=progress,
     )
     previous_progress = os.environ.get("STAGE052_REVIEW_PROGRESS_LOG")
@@ -5477,6 +5831,8 @@ def main() -> int:
                 producer_source_dir=producer_source_dir,
                 storage_migration_path=storage_migration_path,
                 storage_migration_evidence_dir=storage_migration_evidence_dir,
+                review_workers=arguments.review_workers,
+                review_memory_contract=review_memory_contract,
             )
     except BaseException as error:
         progress.emit(

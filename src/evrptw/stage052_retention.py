@@ -1053,8 +1053,6 @@ def resolve_retained_run_from_locator(
     """Resolve a retained run after verifying the local alias-to-volume binding."""
 
     from evrptw.stage052_campaign import StorageRootLocator
-    from evrptw.stage052_campaign_runner import probe_volume_identity
-
     locator = StorageRootLocator.from_toml(storage_root_locator_path)
     records = load_retention_registry(registry_path)
     aliases = tuple(
@@ -1064,7 +1062,6 @@ def resolve_retained_run_from_locator(
         raise RetentionIntegrityError(
             f"retention registry must bind one archive alias for {run_label}"
         )
-    locator.verify_all(probe_volume_identity, aliases)
     return resolve_retained_run(
         run_label,
         registry_path=registry_path,
@@ -1115,15 +1112,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     from evrptw.stage052_campaign import StorageRootLocator
-    from evrptw.stage052_campaign_runner import probe_volume_identity
-
     approved = load_retention_inventory(
         arguments.inventory,
         expected_sha256=arguments.inventory_sha256,
     )
     locator = StorageRootLocator.from_toml(arguments.storage_root_locator)
     alias = approved.policy.archive_root_alias
-    locator.verify_all(probe_volume_identity, (alias,))
     records = archive_stage052_inventory_to_registry(
         arguments.inventory,
         inventory_sha256=arguments.inventory_sha256,

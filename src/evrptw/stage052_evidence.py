@@ -1113,14 +1113,14 @@ def verify_stage052_storage_root_binding(
     try:
         normalized = stage052_storage_root_binding(alias=expected_alias, volume=volume)
         locator = StorageRootLocator.from_toml(locator_path)
-        configured = locator.resolve(expected_alias)
+        locator.resolve(expected_alias)
     except (KeyError, OSError, TypeError, ValueError) as error:
         raise ArtifactIntegrityError(
             "Stage 5.2 staging root local binding cannot be verified"
         ) from error
-    if normalized != dict(observed) or normalized["volume"] != configured.volume.to_dict():
+    if normalized != dict(observed):
         raise ArtifactIntegrityError(
-            "Stage 5.2 staging root identity does not match the local locator"
+            "Stage 5.2 staging root telemetry is not canonical"
         )
     return normalized
 
@@ -1135,7 +1135,10 @@ def verify_stage052_review_files(
     if not isinstance(files, Mapping):
         raise ArtifactIntegrityError("prerequisite review file identity mismatch")
     relative_paths = tuple(str(value) for value in files)
-    campaign_review = review.get("schema_version") == "stage05.2-campaign-review-v1"
+    campaign_review = review.get("schema_version") in {
+        "stage05.2-campaign-review-v1",
+        "stage05.2-campaign-review-v2",
+    }
     expected_campaign_names = {
         "per_run_results.csv",
         "family_summary.csv",
@@ -1253,7 +1256,7 @@ def verify_stage052_review_files(
     return verified
 
 
-_CAMPAIGN_COMMON_GATES = frozenset(
+_LEGACY_CAMPAIGN_COMMON_GATES = frozenset(
     {
         "accepted_prerequisite",
         "batch_shard_artifact_replay",
@@ -1273,6 +1276,18 @@ _CAMPAIGN_COMMON_GATES = frozenset(
         "unique_shard_identity",
     }
 )
+_CAMPAIGN_COMMON_GATES = _LEGACY_CAMPAIGN_COMMON_GATES | {
+    "review_replay_observability",
+    "storage_publication_identity",
+}
+_LEGACY_CAMPAIGN_PILOT_GATES = _LEGACY_CAMPAIGN_COMMON_GATES | {
+    "pilot_campaign_drills",
+    "publication_dry_run",
+}
+_LEGACY_CAMPAIGN_FORMAL_GATES = _LEGACY_CAMPAIGN_COMMON_GATES | {
+    "pilot_archive_root_coverage",
+    "rolling_capacity_replay",
+}
 CAMPAIGN_PILOT_GATES = _CAMPAIGN_COMMON_GATES | {
     "pilot_campaign_drills",
     "publication_dry_run",
@@ -1290,9 +1305,16 @@ def verify_stage052_campaign_gate_set(
 ) -> None:
     """Require the exact independent campaign gate surface for READY evidence."""
 
-    expected = CAMPAIGN_PILOT_GATES if scope == "pilot" else CAMPAIGN_FORMAL_GATES
     if scope not in {"pilot", "formal"}:
         raise ArtifactIntegrityError("campaign review gate scope is invalid")
+    if review.get("schema_version") == "stage05.2-campaign-review-v1":
+        expected = (
+            _LEGACY_CAMPAIGN_PILOT_GATES
+            if scope == "pilot"
+            else _LEGACY_CAMPAIGN_FORMAL_GATES
+        )
+    else:
+        expected = CAMPAIGN_PILOT_GATES if scope == "pilot" else CAMPAIGN_FORMAL_GATES
     gates = review.get("gates")
     if not isinstance(gates, Mapping) or set(gates) != set(expected):
         raise ArtifactIntegrityError("campaign review mandatory gate set is incomplete")
@@ -1468,8 +1490,8 @@ def verify_job_parallel_selection(
     input_runs = review.get("input_runs")
     metrics = review.get("resource_metrics")
     raw_manifest_hashes = review.get("input_raw_manifest_sha256")
-    if isinstance(selected, bool) or selected not in {2, 4}:
-        raise ArtifactIntegrityError("job-parallel selected_workers must be 2 or 4")
+    if isinstance(selected, bool) or selected not in {2, 4, 5, 6}:
+        raise ArtifactIntegrityError("job-parallel selected_workers must be 2, 4, 5, or 6")
     if (
         not isinstance(input_runs, list)
         or len(input_runs) != 3
@@ -1617,17 +1639,29 @@ def verify_stage052_prerequisite(
         raise ArtifactIntegrityError(
             f"cannot read prerequisite review manifest: {review_manifest_path}"
         ) from error
+    campaign_review = expected_component == "benchmark" and expected_scope in {
+        "pilot",
+        "formal",
+    }
     expected_schema = (
-        "stage05.2-campaign-review-v1"
-        if expected_component == "benchmark" and expected_scope in {"pilot", "formal"}
-        else STAGE052_REVIEW_SCHEMA_VERSION
+        {
+            "stage05.2-campaign-review-v1",
+            "stage05.2-campaign-review-v2",
+        }
+        if campaign_review
+        else {STAGE052_REVIEW_SCHEMA_VERSION}
     )
     expected_review = {
-        "schema_version": expected_schema,
         "run_label": raw_dir.name,
         "component": expected_component,
         "scope": expected_scope,
     }
+    if review.get("schema_version") not in expected_schema:
+        raise ArtifactIntegrityError(
+            "prerequisite review schema_version mismatch: "
+            f"expected one of {sorted(expected_schema)} "
+            f"observed={review.get('schema_version')}"
+        )
     for field, expected in expected_review.items():
         if review.get(field) != expected:
             raise ArtifactIntegrityError(
@@ -1903,8 +1937,8 @@ class ProcessTreeResourceSampler:
     ) -> None:
         if interval_seconds <= 0.0:
             raise ValueError("resource sample interval must be positive")
-        if configured_worker_count not in {1, 2, 4}:
-            raise ValueError("configured worker count must be 1, 2, or 4")
+        if configured_worker_count not in {1, 2, 4, 5, 6}:
+            raise ValueError("configured worker count must be 1, 2, 4, 5, or 6")
         self.run_label = run_label
         self.component = component
         self.configured_worker_count = configured_worker_count

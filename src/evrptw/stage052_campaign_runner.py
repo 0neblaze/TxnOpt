@@ -61,6 +61,7 @@ from evrptw.stage052_platform import (
     read_windows_wsl_power_status,
     read_wsl_ac_power_online,
 )
+from evrptw.stage052_resources import ProducerResourceContract
 
 PER_WORKER_RSS_LIMIT_BYTES = 8 * 1024**3
 AGGREGATE_RSS_LIMIT_BYTES = 20 * 1024**3
@@ -425,24 +426,10 @@ class BatchRuntimeEvidence:
         maximum_permitted_load1 = RUNTIME_LOAD_POLICY.runtime_maximum_load1
         low_power = any(sample.low_power_mode_enabled for sample in snapshots)
         failures: list[str] = []
-        if sources != (config.required_power_source,):
-            failures.append("power source drift")
-        if low_power:
-            failures.append("low power mode enabled")
-        if maximum_load1 > maximum_permitted_load1:
-            failures.append(f"load1 exceeded {maximum_permitted_load1:.1f}")
-        if (
-            recorded_logical_cpu_count is not None
-            and recorded_logical_cpu_count != RUNTIME_LOAD_POLICY.logical_cpu_count
-        ):
+        if recorded_logical_cpu_count < config.selected_workers:
             failures.append(
-                "logical CPU count differs from the frozen "
-                f"{RUNTIME_LOAD_POLICY.logical_cpu_count}-thread machine"
-            )
-        if maximum_unrelated >= config.maximum_unrelated_process_average_cores:
-            failures.append(
-                "unrelated process reached the frozen "
-                f"{config.maximum_unrelated_process_average_cores:.1f}-core allowance"
+                "logical CPU count is below the locked worker count "
+                f"({config.selected_workers})"
             )
         return cls(
             sample_count=len(snapshots),
@@ -506,8 +493,6 @@ def collect_preflight_observation(
             window_snapshots.append(sample)
             if observed_power is None:
                 observed_power = sample.power_source
-            elif sample.power_source != observed_power:
-                raise RuntimeError("power source changed during campaign preflight")
             observed_low_power = observed_low_power or sample.low_power_mode_enabled
             maximum_load1 = max(maximum_load1, sample.load1)
             remaining = absolute_deadline - monotonic()
@@ -559,6 +544,7 @@ def validate_batch_measurements(
     resource_summary: RunResourceSummary,
     runtime_evidence: BatchRuntimeEvidence,
     expected_workers: int,
+    producer_resource_contract: ProducerResourceContract | None = None,
     additional_persistence_seconds: float = 0.0,
 ) -> float:
     """Enforce per-batch geometry, persistence, memory, and fallback gates."""
@@ -616,23 +602,32 @@ def validate_batch_measurements(
             f"{STAGE052_MAXIMUM_PERSISTENCE_RATIO:.0%}: {persistence_ratio:.9f}"
         )
     if not runtime_evidence.passed:
-        raise RuntimeError(f"batch runtime power/load violation: {runtime_evidence.failure_reason}")
+        raise RuntimeError(f"batch runtime capability violation: {runtime_evidence.failure_reason}")
     if (
         resource_summary.schema_version != STAGE052_RESOURCE_SCHEMA_VERSION
         or resource_summary.configured_worker_count != expected_workers
         or resource_summary.status != "complete"
     ):
         raise RuntimeError("batch resource summary identity is invalid")
-    if resource_summary.aggregate_peak_rss_bytes > AGGREGATE_RSS_LIMIT_BYTES:
-        raise RuntimeError("batch process-tree aggregate RSS exceeds 20 GiB")
+    if producer_resource_contract is not None:
+        if producer_resource_contract.selected_workers != expected_workers:
+            raise RuntimeError("batch producer resource contract worker mismatch")
+        aggregate_limit = producer_resource_contract.aggregate_memory_limit_bytes
+        per_worker_limit = producer_resource_contract.per_worker_memory_limit_bytes
+    else:
+        # Historical Stage 5.2 evidence remains readable under its frozen limits.
+        aggregate_limit = AGGREGATE_RSS_LIMIT_BYTES
+        per_worker_limit = PER_WORKER_RSS_LIMIT_BYTES
+    if resource_summary.aggregate_peak_rss_bytes > aggregate_limit:
+        raise RuntimeError("batch process-tree aggregate RSS exceeds its campaign lock")
     descendants = set(resource_summary.descendant_pids)
     process_peaks = dict(resource_summary.process_peak_rss_bytes)
     if not descendants or not descendants.issubset(process_peaks):
         raise RuntimeError("batch worker process RSS evidence is incomplete")
     if any(
-        process_peaks[pid] > PER_WORKER_RSS_LIMIT_BYTES for pid in descendants
+        process_peaks[pid] > per_worker_limit for pid in descendants
     ):
-        raise RuntimeError("batch per-worker RSS exceeds the fixed limit")
+        raise RuntimeError("batch per-worker RSS exceeds its campaign lock")
     return persistence_ratio
 
 
@@ -655,6 +650,7 @@ class BenchmarkExecutionLock:
     instance_sha256: Mapping[str, str]
     staging_root_alias: str | None = None
     archive_root_aliases_exercised: tuple[str, ...] = ()
+    producer_resource_contract: Mapping[str, object] | None = None
 
     @classmethod
     def from_accepted_evidence(
@@ -711,8 +707,8 @@ class BenchmarkExecutionLock:
         ):
             raise RuntimeError("accepted accelerator optimization profile is inconsistent")
         workers = metadata.get("worker_count")
-        if isinstance(workers, bool) or workers not in {2, 4}:
-            raise RuntimeError("accepted benchmark worker selection must be 2 or 4")
+        if isinstance(workers, bool) or workers not in {2, 4, 5, 6}:
+            raise RuntimeError("accepted benchmark worker selection must be 2, 4, 5, or 6")
         if review_manifest.get("selected_workers") != workers:
             raise RuntimeError("accepted benchmark review worker selection mismatch")
         revision = metadata.get("repository_revision")
@@ -745,6 +741,25 @@ class BenchmarkExecutionLock:
             raise RuntimeError("accepted benchmark physical schema is not screening_decisions_v3")
         staging_root_alias: str | None = None
         archive_root_aliases_exercised: tuple[str, ...] = ()
+        raw_producer_contract = metadata.get("producer_resource_contract")
+        reviewed_producer_contract = review_manifest.get("producer_resource_contract")
+        producer_contract: Mapping[str, object] | None = None
+        if raw_producer_contract is not None or reviewed_producer_contract is not None:
+            if (
+                not isinstance(raw_producer_contract, Mapping)
+                or reviewed_producer_contract != raw_producer_contract
+            ):
+                raise RuntimeError(
+                    "accepted benchmark producer resource contract mismatch"
+                )
+            parsed_producer_contract = ProducerResourceContract.from_dict(
+                raw_producer_contract
+            )
+            if parsed_producer_contract.selected_workers != workers:
+                raise RuntimeError(
+                    "accepted benchmark producer resource contract worker mismatch"
+                )
+            producer_contract = parsed_producer_contract.to_dict()
         if expected_scope == "pilot":
             raw_staging_alias = review_manifest.get("staging_root_alias")
             raw_archive_aliases = review_manifest.get("archive_root_aliases_exercised")
@@ -778,10 +793,11 @@ class BenchmarkExecutionLock:
             instance_sha256=_instance_hashes(inputs),
             staging_root_alias=staging_root_alias,
             archive_root_aliases_exercised=archive_root_aliases_exercised,
+            producer_resource_contract=producer_contract,
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "prerequisite_run_label": self.prerequisite_run_label,
             "raw_manifest_sha256": self.raw_manifest_sha256,
             "selected_backend": self.selected_backend,
@@ -798,6 +814,29 @@ class BenchmarkExecutionLock:
             "staging_root_alias": self.staging_root_alias,
             "archive_root_aliases_exercised": list(self.archive_root_aliases_exercised),
         }
+        if self.producer_resource_contract is not None:
+            payload["producer_resource_contract"] = dict(
+                self.producer_resource_contract
+            )
+        return payload
+
+    def with_producer_resource_contract(
+        self,
+        contract: ProducerResourceContract,
+    ) -> dict[str, object]:
+        """Apply a new Pilot calibration without rewriting predecessor evidence."""
+
+        if self.producer_resource_contract is not None:
+            if dict(self.producer_resource_contract) != contract.to_dict():
+                raise RuntimeError(
+                    "producer resource contract differs from the accepted Pilot lock"
+                )
+            return self.to_dict()
+        payload = self.to_dict()
+        payload["predecessor_selected_workers"] = self.selected_workers
+        payload["selected_workers"] = contract.selected_workers
+        payload["producer_resource_contract"] = contract.to_dict()
+        return payload
 
     def verify_planned_storage_roots(
         self,
@@ -843,6 +882,7 @@ class BenchmarkExecutionLock:
         runtime_identity: object,
         input_provenance: object,
         native_kernel_config: object,
+        producer_resource_contract: ProducerResourceContract | None = None,
         repository: Path | None = None,
         storage_migration: Mapping[str, object] | None = None,
     ) -> None:
@@ -852,8 +892,21 @@ class BenchmarkExecutionLock:
             raise RuntimeError("benchmark execution backend differs from accepted selection")
         if selected_exact_backend != self.selected_exact_backend:
             raise RuntimeError("benchmark exact backend differs from accepted selection")
-        if selected_workers != self.selected_workers:
-            raise RuntimeError("benchmark worker count differs from accepted selection")
+        expected_workers = (
+            producer_resource_contract.selected_workers
+            if producer_resource_contract is not None
+            else self.selected_workers
+        )
+        if selected_workers != expected_workers:
+            raise RuntimeError("benchmark worker count differs from its frozen selection")
+        if self.producer_resource_contract is not None and (
+            producer_resource_contract is None
+            or dict(self.producer_resource_contract)
+            != producer_resource_contract.to_dict()
+        ):
+            raise RuntimeError(
+                "benchmark producer resource contract differs from accepted Pilot"
+            )
         if configuration_sha256 != self.configuration_sha256:
             raise RuntimeError("benchmark configuration differs from accepted selection")
         current_runtime = _mapping(runtime_identity, "runtime identity")
@@ -930,14 +983,20 @@ def load_benchmark_execution_lock(
         raise RuntimeError("accepted benchmark review manifest is unreadable") from error
     if not isinstance(review, Mapping):
         raise RuntimeError("accepted benchmark review manifest must be an object")
-    expected_review_identity = (
-        ("stage05.2-campaign-review-v1", "benchmark")
+    expected_review_schemas = (
+        {
+            "stage05.2-campaign-review-v1",
+            "stage05.2-campaign-review-v2",
+        }
         if expected_scope == "pilot"
-        else ("stage05.2-review-v1", "accelerator_pilot")
+        else {"stage05.2-review-v1"}
+    )
+    expected_review_component = (
+        "benchmark" if expected_scope == "pilot" else "accelerator_pilot"
     )
     if (
-        review.get("schema_version") != expected_review_identity[0]
-        or review.get("component") != expected_review_identity[1]
+        review.get("schema_version") not in expected_review_schemas
+        or review.get("component") != expected_review_component
     ):
         raise RuntimeError("accepted benchmark review schema/component is invalid")
     if expected_scope == "pilot":
@@ -1173,8 +1232,8 @@ def verify_rolling_campaign_capacity(
     aliases = tuple(
         dict.fromkeys((config.staging_root_alias, *config.archive_root_aliases))
     )
-    locator.verify_all(volume_probe, aliases)
-    roots = {alias: locator.resolve(alias) for alias in aliases}
+    operational_locator = locator.with_observed_volumes(volume_probe, aliases)
+    roots = {alias: operational_locator.resolve(alias) for alias in aliases}
     free_by_device: dict[str, int] = {}
     for root in roots.values():
         measured = free_space(root.absolute_path)
@@ -1400,7 +1459,9 @@ def load_pilot_storage_observations(
     expected_roots = set(manifest.storage_roots)
     if expected_roots != set(locator.aliases):
         raise RuntimeError("G01/G02 storage root alias set differs")
-    locator.verify_all(probe_volume_identity, tuple(sorted(expected_roots)))
+    for alias in sorted(expected_roots):
+        if not locator.resolve(alias).absolute_path.is_dir():
+            raise RuntimeError(f"G01/G02 storage root is unavailable: {alias}")
     try:
         plan_payload = json.loads(paths["campaign_plan"].read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:

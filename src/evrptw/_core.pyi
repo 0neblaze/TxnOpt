@@ -5,6 +5,15 @@ import numpy.typing as npt
 
 Point = tuple[float, float]
 
+class Stage052ReplayState:
+    def __init__(
+        self,
+        axis_budgets: dict[str, int],
+        persistence_ledgers: dict[str, tuple[tuple[int, str], ...]] = {},
+    ) -> None: ...
+    def consume(self, encoded_columns: dict[str, object]) -> None: ...
+    def finish(self) -> dict[str, object]: ...
+
 def pack_stage052_screening_occurrences(
     events: Sequence[object],
     definition_cache: dict[object, int],

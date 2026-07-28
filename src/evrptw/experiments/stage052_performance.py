@@ -134,6 +134,10 @@ from evrptw.stage052_evidence import (
 )
 from evrptw.stage052_platform import peak_rss_bytes
 from evrptw.stage052_remediation import Stage052RemediationResult
+from evrptw.stage052_resources import (
+    load_producer_resource_contract,
+    verify_filesystem_capabilities,
+)
 from evrptw.stage052_retention import resolve_retained_run_from_locator
 from evrptw.validation import validate_routes
 
@@ -281,6 +285,7 @@ class Stage052Config:
     v2_storage: ArtifactStorageConfig
     runtime_identity_manifest: Path
     campaign_lock_manifest: Path
+    resource_calibration_contract: Path
     storage_root_locator: Path
     staging_root_alias: str
     archive_root_aliases: tuple[str, ...]
@@ -328,6 +333,9 @@ def load_stage052_config(path: Path) -> Stage052Config:
             v2_storage=v2,
             runtime_identity_manifest=Path(str(runtime["identity_manifest"])),
             campaign_lock_manifest=Path(str(campaign["lock_manifest"])),
+            resource_calibration_contract=Path(
+                str(campaign["resource_calibration_contract"])
+            ),
             storage_root_locator=Path(str(campaign["storage_root_locator"])),
             staging_root_alias=str(campaign["staging_root_alias"]),
             archive_root_aliases=tuple(str(item) for item in campaign["archive_root_aliases"]),
@@ -388,13 +396,15 @@ def _verify_performance_staging_root(
         raise ValueError("Stage 5.2 performance storage aliases are not the WSL2 contract")
     if output_dir.resolve().parent != staging.absolute_path.resolve():
         raise ValueError("Stage 5.2 performance output is outside the staging root")
-    locator.verify_all(
-        probe_volume_identity if volume_probe is None else volume_probe,
-        (staging_alias,),
+    verify_filesystem_capabilities(staging.absolute_path)
+    observed_volume = (
+        probe_volume_identity(staging.absolute_path)
+        if volume_probe is None
+        else volume_probe(staging.absolute_path)
     )
     return stage052_storage_root_binding(
         alias=staging_alias,
-        volume=staging.volume.to_dict(),
+        volume=observed_volume.to_dict(),
     )
 
 
@@ -467,8 +477,12 @@ def run_stage052(
     selected = Stage052Component(component)
     validate_stage052_run_label(run_label, selected)
     contract = stage052_contract(selected, scope)
-    if worker_count not in {1, 2, 4}:
-        raise ValueError("Stage 5.2 worker_count must be 1, 2, or 4")
+    allowed_workers = {1, 2, 4, 5, 6} if selected is Stage052Component.BENCHMARK else {1, 2, 4}
+    if worker_count not in allowed_workers:
+        raise ValueError(
+            "Stage 5.2 benchmark worker_count must be 1/2/4/5/6; "
+            "historical components remain 1/2/4"
+        )
     root = repository_root()
     resolved_config = _resolve(root, config_path)
     config = load_stage052_config(resolved_config)
@@ -1070,10 +1084,29 @@ def _run_benchmark_campaign_impl(
         expected_scope=expected_scope,
         expected_status=expected_status,
     )
-    if worker_count != selection_lock.selected_workers:
+    producer_resource_contract = load_producer_resource_contract(
+        _resolve(root, config.resource_calibration_contract)
+    )
+    if (
+        storage.parquet_row_group_size
+        != producer_resource_contract.row_group_size
+        or storage.parquet_queue_depth != producer_resource_contract.queue_depth
+    ):
         raise ValueError(
-            "benchmark worker_count must equal the accepted predecessor selection "
-            f"({selection_lock.selected_workers})"
+            "artifact storage parameters differ from the signed producer "
+            "resource calibration contract"
+        )
+    effective_selection_lock = selection_lock.with_producer_resource_contract(
+        producer_resource_contract
+    )
+    if worker_count != producer_resource_contract.selected_workers:
+        raise ValueError(
+            "benchmark worker_count must equal the resource calibration selection "
+            f"({producer_resource_contract.selected_workers})"
+        )
+    if scope == "formal" and worker_count != selection_lock.selected_workers:
+        raise ValueError(
+            "Formal benchmark worker_count differs from the accepted Pilot selection"
         )
     revision = _git(root, "rev-parse", "HEAD")
     source_snapshot = verify_stage052_source_snapshot(root)
@@ -1103,6 +1136,7 @@ def _run_benchmark_campaign_impl(
         runtime_identity=runtime_identity,
         input_provenance=performance_provenance,
         native_kernel_config=config.native_kernels.to_dict(),
+        producer_resource_contract=producer_resource_contract,
         repository=root,
         storage_migration=storage_migration,
     )
@@ -1115,8 +1149,10 @@ def _run_benchmark_campaign_impl(
     locator = StorageRootLocator.from_toml(locator_path)
     verify_campaign_root_locations(repository_root=root, locator=locator)
     for alias in (config.staging_root_alias, *config.archive_root_aliases):
-        locator.resolve(alias).absolute_path.mkdir(parents=True, exist_ok=True)
-    locator.verify_all(
+        storage_path = locator.resolve(alias).absolute_path
+        storage_path.mkdir(parents=True, exist_ok=True)
+        verify_filesystem_capabilities(storage_path)
+    locator = locator.with_observed_volumes(
         probe_volume_identity,
         (config.staging_root_alias, *config.archive_root_aliases),
     )
@@ -1134,6 +1170,7 @@ def _run_benchmark_campaign_impl(
             selected_exact_backend="cpu_batch",
             selected_workers=worker_count,
             native_profile="stage05.2-native-kernels-v1",
+            producer_resource_contract=producer_resource_contract,
         )
         if scope == "pilot"
         else BenchmarkCampaignConfig.formal(
@@ -1144,6 +1181,7 @@ def _run_benchmark_campaign_impl(
             selected_exact_backend="cpu_batch",
             selected_workers=worker_count,
             native_profile="stage05.2-native-kernels-v1",
+            producer_resource_contract=producer_resource_contract,
         )
     )
     observations = (
@@ -1235,8 +1273,9 @@ def _run_benchmark_campaign_impl(
             (config.staging_root_alias, *config.archive_root_aliases)
         ),
         "campaign_capacity_plan": capacity.to_dict(),
+        "producer_resource_contract": producer_resource_contract.to_dict(),
         "persistence_attribution": "primary_active_writes_v1",
-        "benchmark_execution_lock": selection_lock.to_dict(),
+        "benchmark_execution_lock": effective_selection_lock,
         "stage051_prerequisite": dict(stage051_prerequisite),
         "component_prerequisites": dict(component_prerequisites),
         "environment": environment,
@@ -1357,7 +1396,7 @@ def _run_benchmark_campaign_impl(
                     config=config,
                     plan=batch_plan,
                     planned_manifest=planned_batch,
-                    selection_lock=selection_lock.to_dict(),
+                    selection_lock=effective_selection_lock,
                     repository_revision=revision,
                     runtime_identity=runtime_identity,
                     source_snapshot=source_snapshot,
@@ -1853,6 +1892,11 @@ def _run_benchmark_batch(
         "source_snapshot": dict(source_snapshot),
         "performance_provenance": dict(performance_provenance),
         "benchmark_execution_lock": dict(selection_lock),
+        "producer_resource_contract": (
+            campaign_config.producer_resource_contract.to_dict()
+            if campaign_config.producer_resource_contract is not None
+            else None
+        ),
         "storage_policy_version": storage.storage_policy_version,
         "screening_schema_version": storage.screening_schema_version,
         "screening_definition_store": screening_definition_store_contract(),
@@ -2052,6 +2096,7 @@ def _run_benchmark_batch(
             resource_summary=resource_summary,
             runtime_evidence=runtime_evidence,
             expected_workers=campaign_config.selected_workers,
+            producer_resource_contract=campaign_config.producer_resource_contract,
             additional_persistence_seconds=attribution.control_persistence_seconds,
         )
         return _seal_verified_benchmark_batch(

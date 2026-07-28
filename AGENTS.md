@@ -587,8 +587,11 @@ this repository or one of its subdirectories.
   generation inside it. A run that still needs review publication remains in
   the active root until that generation is sealed, then it is archived.
 - `artifact-storage-v2` with physical schema `screening_decisions_v3` uses
-  typed bounded Parquet streams, 65,536-row groups, at most two non-empty buffer
-  groups, and compatible v1/old-v2/v3/legacy reads. Canonical semantic digests
+  typed bounded Parquet streams and compatible v1/old-v2/v3/legacy reads.
+  New campaigns freeze a calibrated 65,536/262,144 row-group choice and queue
+  depth 1/2 in their signed producer resource contract; the non-baseline choice
+  is allowed only after at least 10% persistence-critical-path improvement,
+  semantic equality, and the 75% memory gate. Canonical semantic digests
   are computed over expanded logical events, so physical IDs and compression
   layout cannot change replay. Persistence is at most 36% of end-to-end time
   and peak RSS is at most 50% of the Stage 5.2 v1 baseline.
@@ -624,40 +627,35 @@ this repository or one of its subdirectories.
   `(instance, seed)` shards, 2,040 runs, 229,200 declared solver seconds, and
   10,400 anytime rows. Only independent review may open Formal or report
   `READY_FOR_STAGE05_3`.
+- New campaign review must use `evrptw.stage052_replay` with
+  `replay_backend=native_arrow`; Python reference replay is differential and
+  legacy-compatibility code only, and native failure may not fall back.
+  Review calibrates 1/2/4 batch-scoped workers, gives each child exactly one
+  shard with `max_tasks_per_child=1`, merges by canonical shard ordinal, and
+  cancels all unfinished work on the first child failure. The Pilot-derived
+  parent baseline and per-child p99 RSS determine `MemoryHigh`, the internal
+  process-tree guard, and `MemoryMax`, all within 75% of available memory with
+  swap disabled. Review v2 records per-shard elapsed time, events/second, child
+  peak RSS, merge ordinal, in-flight bound, and zero native fallbacks.
 - The accepted D/F worker-selection evidence keeps its historical 12-GiB
-  scientific gate. Current G Benchmark Pilot/Formal batches use an explicitly
-  relaxed operational resource gate of 8 GiB per worker and 20 GiB for the
-  process tree, with a 24-GB producer WSL allocation. This does not relax the
-  36% persistence gate, four-worker concurrency, solver/backend freeze, or the
-  independent reviewer's 5.5-GiB internal guard and 6-GiB systemd MemoryMax.
-- Campaign preflight keeps the fixed `load1 <= 4.0` idle-host gate. During a
-  batch on the frozen 24-logical-CPU benchmark machine, the auditable
-  total-load fail-fast ceiling is `32.0`. This permits all 24 logical CPUs to
-  remain saturated plus a bounded eight-task transient run/I/O queue while the
-  selected four-worker campaign runs; it is an emergency runaway guard, not a
-  CPU throttle. The separate unrelated-process gate continues to reserve the
-  host from competing user workloads.
-  Unrelated user CPU remains a separate PID-tree-excluding hard gate at four
-  full cores averaged by any one process over every complete rolling 30-second
-  window. This prevents one competing process from consuming one sixth or more
-  of the frozen machine while tolerating bounded host maintenance and
-  monitoring work. A partial
-  batch-start window cannot apply the disappearing-PID upper bound as measured
-  CPU; the CPU gate starts at the first complete window, while AC power, low
-  power mode, and total load remain immediate continuous hard gates. Runtime
-  samples are retained for failed batches as partial replay evidence, and the
-  independent reviewer reconstructs the fixed `32.0` ceiling rather than
-  trusting a producer-reported threshold.
-- The campaign-start preflight alone applies the two-window `load1 <= 4.0`
-  idle-host gate. Per-batch handoff preflights still record two complete
-  30-second load windows and enforce AC power, low-power mode, 24 logical CPUs,
-  and the PID-tree-excluding unrelated-process four-core gate, but do not reject
-  the decaying system load average left by the immediately preceding campaign
-  batch. The next batch is immediately subject to the fixed `32.0` runtime
-  fail-fast ceiling.
-- G campaign producer dispatches contiguous waves of at most the frozen worker
+  scientific gate. New G Benchmark Pilot/Formal batches calibrate 4/5/6
+  producer workers on fixed real high-memory shards. A higher worker count is
+  rejected unless it improves throughput by at least 15% over four workers,
+  stays within 75% of available memory, uses no swap or fallback, and produces
+  the same semantic digest; choices within 5% prefer fewer workers. The chosen
+  worker count and measured per-worker/process-tree limits are frozen into the
+  Pilot and inherited unchanged by Formal.
+- Campaign preflight and per-batch handoff retain two consecutive 30-second
+  telemetry windows. AC/battery state, low-power mode, system load, CPU model,
+  operating-system version, temperature, disk model/serial, device UUID, and
+  unrelated-process load are observable telemetry, not readiness identity or
+  hard publication gates. Hard capability checks require only enough logical
+  CPUs for the selected workers, calibrated memory and free space, the frozen
+  backend/Python/native-extension contract, and filesystem fsync plus atomic
+  transfer support. Failed batches retain all collected telemetry.
+- G campaign producer dispatches contiguous waves of at most the calibrated worker
   count. Every spawned worker processes exactly one shard, and the whole wave
-  pool must shut down before the next wave is created. This preserves four-way
+  pool must shut down before the next wave is created. This preserves frozen
   concurrency and unique per-shard PIDs while preventing retiring and warming
   workers from overlapping in the audited total `load1`.
 - G may consume accepted F evidence from an older revision only when the
@@ -665,8 +663,9 @@ this repository or one of its subdirectories.
   confined to the explicit G campaign runner, artifact-persistence adapter,
   reviewer, test, and documentation allowlist. The independent reviewer
   repeats this diff audit. Runtime
-  selection identity still freezes Python, dependencies, machine, source
-  mount, native extension, configuration, instances, backend, and workers;
+  selection identity still freezes Python ABI, dependencies, source/wheel,
+  native extension, configuration, instances, backend, workers, and audit
+  protocol;
   solver, objective, configuration, native, or other source drift is a hard
   failure and requires a new prerequisite rather than a G-only continuation.
 - Candidate events retain both customer-sequence route identity and the
@@ -681,9 +680,11 @@ this repository or one of its subdirectories.
   completion or accepted candidate beyond the axis wall-clock budget. A
   legacy/quality boundary must not terminate valid constraint-lane work that
   remains within the overall axis budget.
-- Local absolute paths live only in the ignored storage-root locator. Tracked
-  evidence records aliases, relative archive paths, volume identities, run
-  status, source revision, prerequisite identities, byte count, and checksum.
+- Local absolute paths live only in the ignored storage-root locator. Long-term
+  publication identity records aliases, relative archive paths, file count,
+  byte count, and tree SHA-256. Volume/filesystem/device observations may remain
+  in raw operational telemetry for transfer planning, but device UUID, model,
+  serial, and absolute path are excluded from publication identity.
   Batch target/hard cap remains 24/32 GiB and shard hard cap remains 2 GiB.
   Producer, retention, performance review, and campaign review must all use the
   shared cross-platform `probe_volume_identity`; WSL uses `findmnt`, DrvFS

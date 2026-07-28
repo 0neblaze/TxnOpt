@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -99,6 +100,30 @@ def test_v2_streams_shards_with_local_event_identity_and_manifest(tmp_path: Path
         run_dir / "toy/2014/stage05.2_artifact_streaming_attempt01_events_toy_2014.parquet"
     )
     assert parquet.metadata.row_group(0).num_rows <= 65_536
+
+
+def test_v2_parquet_sink_applies_calibrated_row_group_and_async_queue(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "calibrated.parquet"
+    schema = pa.schema((pa.field("value", pa.int64(), nullable=False),))
+    config = ArtifactStorageConfig(
+        storage_policy_version="artifact-storage-v2",
+        parquet_row_group_size=262_144,
+        parquet_queue_depth=2,
+    )
+    sink = artifacts_module._StreamingParquetSink(path, schema, config)
+    values = pa.array(range(150_000), type=pa.int64())
+
+    sink.append_batch(pa.RecordBatch.from_arrays([values], schema=schema))
+    row_count, schema_fingerprint = sink.close()
+
+    parquet = pq.ParquetFile(path)
+    assert row_count == 150_000
+    assert schema_fingerprint
+    assert parquet.metadata.num_row_groups == 1
+    assert parquet.metadata.row_group(0).num_rows == 150_000
+    assert pq.read_table(path).column("value").to_pylist() == list(range(150_000))
 
 
 def test_v2_shard_session_appends_axes_before_finalization(tmp_path: Path) -> None:

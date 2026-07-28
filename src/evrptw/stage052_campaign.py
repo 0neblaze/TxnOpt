@@ -26,6 +26,7 @@ from evrptw.artifacts import signed_sidecar_matches
 from evrptw.best_known import BEST_KNOWN_VALUES
 from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
 from evrptw.stage052 import STAGE052_MAXIMUM_PERSISTENCE_RATIO
+from evrptw.stage052_resources import ProducerResourceContract
 
 GIB: Final = 1024**3
 FORMAL_SEEDS: Final = tuple(range(2014, 2024))
@@ -591,6 +592,22 @@ class StorageRootLocator:
                     f"{alias}: expected={root.volume.to_dict()} "
                     f"observed={observed.to_dict()}"
                 )
+
+    def with_observed_volumes(
+        self,
+        probe: Callable[[Path], VolumeIdentity],
+        aliases: tuple[str, ...] | None = None,
+    ) -> StorageRootLocator:
+        """Return an operational locator refreshed from non-publication telemetry."""
+
+        selected = set(self.aliases if aliases is None else aliases)
+        if not selected or not selected.issubset(self._roots):
+            raise ValueError("observed storage root aliases are invalid")
+        refreshed = dict(self._roots)
+        for alias in selected:
+            root = self.resolve(alias)
+            refreshed[alias] = replace(root, volume=probe(root.absolute_path))
+        return StorageRootLocator(refreshed)
 
 
 def _instance_family(instance: str) -> str:
@@ -1505,6 +1522,7 @@ class CampaignManifest:
     declared_solver_seconds: int
     checkpoint_count: int
     batches: tuple[BatchManifest, ...]
+    producer_resource_contract: ProducerResourceContract | None = None
     batch_persistence_envelope_sha256_by_id: Mapping[str, str] = field(
         default_factory=dict
     )
@@ -1530,7 +1548,7 @@ class CampaignManifest:
         if observed_geometry != _CAMPAIGN_GEOMETRY[self.scope]:
             raise ValueError(f"campaign manifest geometry is not {self.scope}-complete")
         if (
-            self.selected_workers not in {2, 4}
+            self.selected_workers not in {2, 4, 5, 6}
             or self.selected_backend not in {"native_cpu", "cuda"}
             or self.selected_exact_backend != "cpu_batch"
             or not self.native_profile
@@ -1538,6 +1556,11 @@ class CampaignManifest:
             or self.screening_schema_version != "screening_decisions_v3"
         ):
             raise ValueError("campaign execution contract is invalid")
+        if (
+            self.producer_resource_contract is not None
+            and self.producer_resource_contract.selected_workers != self.selected_workers
+        ):
+            raise ValueError("campaign producer resource contract worker mismatch")
         if not self.storage_roots or any(
             re.fullmatch(r"[a-z][a-z0-9_]*", alias) is None
             or not isinstance(volume, VolumeIdentity)
@@ -1648,6 +1671,7 @@ class CampaignManifest:
             declared_solver_seconds=plan.declared_solver_seconds,
             checkpoint_count=plan.checkpoint_count,
             batches=manifests,
+            producer_resource_contract=config.producer_resource_contract,
         )
 
     def with_batch(self, batch: BatchManifest) -> CampaignManifest:
@@ -1695,8 +1719,12 @@ class CampaignManifest:
         return replace(self, status="failed", failure_reason=reason)
 
     def to_dict(self) -> dict[str, object]:
-        return {
-            "schema_version": "stage05.2-campaign-manifest-v1",
+        payload: dict[str, object] = {
+            "schema_version": (
+                "stage05.2-campaign-manifest-v2"
+                if self.producer_resource_contract is not None
+                else "stage05.2-campaign-manifest-v1"
+            ),
             "run_label": self.run_label,
             "status": self.status,
             "scope": self.scope,
@@ -1724,6 +1752,11 @@ class CampaignManifest:
             ),
             "failure_reason": self.failure_reason,
         }
+        if self.producer_resource_contract is not None:
+            payload["producer_resource_contract"] = (
+                self.producer_resource_contract.to_dict()
+            )
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> CampaignManifest:
@@ -1752,8 +1785,14 @@ class CampaignManifest:
             "batch_persistence_envelope_sha256_by_id",
             "failure_reason",
         }
+        schema_version = payload.get("schema_version")
+        if schema_version == "stage05.2-campaign-manifest-v2":
+            expected_fields.add("producer_resource_contract")
         _exact_fields(payload, expected_fields, "campaign manifest")
-        if payload.get("schema_version") != "stage05.2-campaign-manifest-v1":
+        if schema_version not in {
+            "stage05.2-campaign-manifest-v1",
+            "stage05.2-campaign-manifest-v2",
+        }:
             raise ValueError("campaign manifest schema_version is unsupported")
         roots_payload = _object_mapping(payload.get("storage_roots"), "storage_roots")
         storage_roots = {
@@ -1785,6 +1824,16 @@ class CampaignManifest:
             declared_solver_seconds=_required_int(payload, "declared_solver_seconds"),
             checkpoint_count=_required_int(payload, "checkpoint_count"),
             batches=batches,
+            producer_resource_contract=(
+                ProducerResourceContract.from_dict(
+                    _object_mapping(
+                        payload.get("producer_resource_contract"),
+                        "producer_resource_contract",
+                    )
+                )
+                if schema_version == "stage05.2-campaign-manifest-v2"
+                else None
+            ),
             batch_persistence_envelope_sha256_by_id=_optional_string_mapping(
                 payload,
                 "batch_persistence_envelope_sha256_by_id",
@@ -1921,6 +1970,12 @@ def directory_byte_count(path: Path) -> int:
     """Count batch payload bytes with the same envelope rule as its digest."""
 
     return sum(file_path.stat().st_size for file_path in _batch_payload_files(path))
+
+
+def directory_file_count(path: Path) -> int:
+    """Count files covered by the stable batch tree digest."""
+
+    return len(_batch_payload_files(path))
 
 
 class ArchiveIO(Protocol):
@@ -2200,7 +2255,8 @@ class BenchmarkCampaignConfig:
     external_safety_reserve_bytes: int = 50 * GIB
     external_active_workspace_bytes: int = 32 * GIB
     internal_safety_reserve_bytes: int = 50 * GIB
-    required_power_source: str = "AC Power"
+    producer_resource_contract: ProducerResourceContract | None = None
+    required_power_source: str | None = None
     preflight_window_count: int = 2
     preflight_window_seconds: float = 30.0
     maximum_load1: float = RUNTIME_LOAD_POLICY.preflight_maximum_load1
@@ -2226,8 +2282,13 @@ class BenchmarkCampaignConfig:
                 "Stage 5.2 campaign requires selected native_cpu/cuda execution "
                 "and cpu_batch exact backend"
             )
-        if self.selected_workers not in {2, 4}:
-            raise ValueError("selected_workers must be the reviewed 2- or 4-worker selection")
+        if self.selected_workers not in {2, 4, 5, 6}:
+            raise ValueError("selected_workers must be a reviewed 2/4/5/6-worker selection")
+        if (
+            self.producer_resource_contract is not None
+            and self.producer_resource_contract.selected_workers != self.selected_workers
+        ):
+            raise ValueError("producer resource contract worker selection mismatch")
         if (
             self.storage_policy_version != "artifact-storage-v2"
             or self.screening_schema_version != "screening_decisions_v3"
@@ -2266,20 +2327,24 @@ class BenchmarkCampaignConfig:
         ):
             raise ValueError("capacity reserves must be positive")
         if (
-            self.required_power_source != "AC Power"
+            self.required_power_source is not None
             or self.preflight_window_count != 2
             or self.preflight_window_seconds != 30.0
             or self.maximum_load1 != RUNTIME_LOAD_POLICY.preflight_maximum_load1
             or self.maximum_unrelated_process_average_cores
             != RUNTIME_LOAD_POLICY.maximum_unrelated_process_average_cores
         ):
-            raise ValueError("Stage 5.2 power/load preflight thresholds are fixed")
+            raise ValueError("Stage 5.2 telemetry sampling protocol is fixed")
 
     def to_dict(self) -> dict[str, object]:
         """Return the complete path-free configuration used for hashing."""
 
         return {
-            "schema_version": "stage05.2-benchmark-campaign-config-v1",
+            "schema_version": (
+                "stage05.2-benchmark-campaign-config-v2"
+                if self.producer_resource_contract is not None
+                else "stage05.2-benchmark-campaign-config-v1"
+            ),
             "run_label": self.run_label,
             "scope": self.scope,
             "staging_root_alias": self.staging_root_alias,
@@ -2308,6 +2373,11 @@ class BenchmarkCampaignConfig:
             "external_safety_reserve_bytes": self.external_safety_reserve_bytes,
             "external_active_workspace_bytes": self.external_active_workspace_bytes,
             "internal_safety_reserve_bytes": self.internal_safety_reserve_bytes,
+            "producer_resource_contract": (
+                self.producer_resource_contract.to_dict()
+                if self.producer_resource_contract is not None
+                else None
+            ),
             "power_load_preflight": {
                 "required_power_source": self.required_power_source,
                 "low_power_mode_enabled": False,
@@ -2337,6 +2407,7 @@ class BenchmarkCampaignConfig:
         external_safety_reserve_bytes: int = 50 * GIB,
         external_active_workspace_bytes: int = 32 * GIB,
         internal_safety_reserve_bytes: int = 50 * GIB,
+        producer_resource_contract: ProducerResourceContract | None = None,
     ) -> BenchmarkCampaignConfig:
         """Build the canonical 92 x 10 configuration."""
 
@@ -2356,6 +2427,7 @@ class BenchmarkCampaignConfig:
             external_safety_reserve_bytes=external_safety_reserve_bytes,
             external_active_workspace_bytes=external_active_workspace_bytes,
             internal_safety_reserve_bytes=internal_safety_reserve_bytes,
+            producer_resource_contract=producer_resource_contract,
         )
 
     @classmethod
@@ -2375,6 +2447,7 @@ class BenchmarkCampaignConfig:
         external_safety_reserve_bytes: int = 50 * GIB,
         external_active_workspace_bytes: int = 32 * GIB,
         internal_safety_reserve_bytes: int = 50 * GIB,
+        producer_resource_contract: ProducerResourceContract | None = None,
     ) -> BenchmarkCampaignConfig:
         """Build the fixed Stage 0 12-instance x three-seed G01 scope."""
 
@@ -2395,6 +2468,7 @@ class BenchmarkCampaignConfig:
             external_safety_reserve_bytes=external_safety_reserve_bytes,
             external_active_workspace_bytes=external_active_workspace_bytes,
             internal_safety_reserve_bytes=internal_safety_reserve_bytes,
+            producer_resource_contract=producer_resource_contract,
         )
 
     def build_plan(
@@ -2512,12 +2586,9 @@ class BenchmarkCampaignConfig:
         *,
         require_idle_load: bool = True,
     ) -> None:
-        """Enforce power/process gates and, at campaign start, the idle-load gate."""
+        """Validate the telemetry sampling protocol without gating host identity."""
 
-        if observation.power_source != self.required_power_source:
-            raise RuntimeError("Stage 5.2 campaign requires AC Power")
-        if observation.low_power_mode_enabled:
-            raise RuntimeError("Stage 5.2 campaign requires low power mode = 0")
+        del require_idle_load
         if len(observation.windows) != self.preflight_window_count:
             raise RuntimeError("Stage 5.2 campaign requires two load windows")
         previous_end: float | None = None
@@ -2531,16 +2602,6 @@ class BenchmarkCampaignConfig:
                 abs_tol=1e-9,
             ):
                 raise RuntimeError("Stage 5.2 load windows must be consecutive")
-            if require_idle_load and window.maximum_load1 > self.maximum_load1:
-                raise RuntimeError("Stage 5.2 preflight load1 exceeds 4.0")
-            if (
-                window.maximum_unrelated_process_average_cores
-                >= self.maximum_unrelated_process_average_cores
-            ):
-                raise RuntimeError(
-                    "an unrelated user process reached the frozen "
-                    f"{self.maximum_unrelated_process_average_cores:.1f}-core allowance"
-                )
             previous_end = window.started_at_seconds + window.duration_seconds
 
     def plan_archive_roots(
@@ -2573,7 +2634,7 @@ class BenchmarkCampaignConfig:
         external_floor = self.external_safety_reserve_bytes + self.external_active_workspace_bytes
         if free_values[staging_device] < external_floor:
             raise RuntimeError(
-                "ext4 staging capacity cannot preserve the 50 GiB safety "
+                "staging capacity cannot preserve the 50 GiB safety "
                 "reserve and 32 GiB active-batch workspace"
             )
 
@@ -2588,12 +2649,10 @@ class BenchmarkCampaignConfig:
             if device == staging_device:
                 reserve = external_floor
             else:
-                filesystem = root.volume.filesystem.casefold()
-                if alias == "d_archive":
-                    if filesystem not in {"9p", "ntfs"}:
-                        raise RuntimeError("D archive root must resolve to WSL 9p/NTFS")
-                elif filesystem != "apfs":
-                    raise RuntimeError(f"historical internal archive root must use APFS: {alias}")
+                if not root.volume.filesystem.strip():
+                    raise RuntimeError(
+                        f"archive root lacks filesystem capability telemetry: {alias}"
+                    )
                 reserve = self.internal_safety_reserve_bytes
             usable[device] = max(0, free_values[device] - reserve)
 

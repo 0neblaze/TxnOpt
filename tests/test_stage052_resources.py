@@ -1,0 +1,349 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+from collections.abc import Callable
+from pathlib import Path
+
+import pytest
+
+import evrptw.stage052_resources as resources_module
+from evrptw.stage052_resources import (
+    CapabilityRequirement,
+    HostCapabilities,
+    ParquetBenchmark,
+    ProducerBenchmark,
+    ProducerResourceContract,
+    ReviewMemoryContract,
+    RuntimeIdentity,
+    derive_producer_resource_contract,
+    derive_review_memory_contract,
+    load_producer_resource_contract,
+    load_review_memory_contract,
+    select_parquet_configuration,
+    select_producer_configuration,
+    validate_capabilities,
+    verify_filesystem_capabilities,
+)
+
+
+def _producer_result(
+    workers: int,
+    throughput: float,
+    *,
+    rss_gib: float,
+    digest: str = "a" * 64,
+    swap_bytes: int = 0,
+    fallback_count: int = 0,
+) -> ProducerBenchmark:
+    return ProducerBenchmark(
+        workers=workers,
+        throughput=throughput,
+        aggregate_peak_rss_bytes=int(rss_gib * 1024**3),
+        semantic_digest=digest,
+        swap_peak_bytes=swap_bytes,
+        fallback_count=fallback_count,
+        resource_limit_exceeded=False,
+    )
+
+
+def test_capability_contract_accepts_six_workers_without_hardware_identity_gates() -> None:
+    requirement = CapabilityRequirement(
+        workers=6,
+        minimum_memory_bytes=12 * 1024**3,
+        minimum_free_space_bytes=100 * 1024**3,
+        backend="native_cpu",
+        python_abi="cp313",
+        native_extension_sha256="a" * 64,
+    )
+    capabilities = HostCapabilities(
+        logical_cpu_count=24,
+        available_memory_bytes=24 * 1024**3,
+        free_space_bytes=700 * 1024**3,
+        available_backends=frozenset({"native_cpu"}),
+        python_abi="cp313",
+        native_extension_sha256="a" * 64,
+        filesystem_fsync=True,
+        filesystem_atomic_replace=True,
+    )
+
+    validate_capabilities(capabilities, requirement)
+
+
+def test_runtime_publication_identity_excludes_nonblocking_telemetry() -> None:
+    hard = {
+        "source_sha256": "a" * 64,
+        "wheel_sha256": "b" * 64,
+        "selected_workers": 6,
+        "replay_backend": "native_arrow",
+    }
+    first = RuntimeIdentity(hard_contract=hard, telemetry={"power_source": "AC Power"})
+    second = RuntimeIdentity(
+        hard_contract=hard,
+        telemetry={
+            "power_source": "Battery",
+            "cpu_model": "different telemetry",
+            "disk_serial": "not publication identity",
+        },
+    )
+
+    assert first.publication_sha256 == second.publication_sha256
+    assert first.to_dict()["telemetry"] != second.to_dict()["telemetry"]
+
+
+def test_producer_selection_applies_memory_speedup_digest_and_tie_rules() -> None:
+    results = (
+        _producer_result(4, 100.0, rss_gib=8.0),
+        _producer_result(5, 118.0, rss_gib=9.0),
+        _producer_result(6, 122.0, rss_gib=10.0),
+    )
+
+    selected = select_producer_configuration(results, available_memory_bytes=16 * 1024**3)
+
+    # Five and six workers are within five percent, so the smaller candidate wins.
+    assert selected.selected_workers == 5
+    assert selected.semantic_digest == "a" * 64
+    assert selected.candidate_workers == (4, 5, 6)
+    assert selected.rejected_reasons == {}
+
+
+def test_producer_selection_rejects_swap_fallback_digest_drift_and_memory_pressure() -> None:
+    results = (
+        _producer_result(4, 100.0, rss_gib=8.0),
+        _producer_result(5, 140.0, rss_gib=9.0, swap_bytes=1),
+        _producer_result(6, 160.0, rss_gib=13.0, digest="b" * 64),
+    )
+
+    selected = select_producer_configuration(results, available_memory_bytes=16 * 1024**3)
+
+    assert selected.selected_workers == 4
+    assert "swap pressure" in selected.rejected_reasons[5]
+    assert "memory budget" in selected.rejected_reasons[6]
+    assert "semantic digest" in selected.rejected_reasons[6]
+
+
+def test_producer_selection_rejects_higher_concurrency_below_fifteen_percent() -> None:
+    results = (
+        _producer_result(4, 100.0, rss_gib=8.0),
+        _producer_result(5, 114.9, rss_gib=9.0),
+        _producer_result(6, 114.0, rss_gib=10.0),
+    )
+
+    selected = select_producer_configuration(results, available_memory_bytes=16 * 1024**3)
+
+    assert selected.selected_workers == 4
+    assert all(
+        "15% throughput" in selected.rejected_reasons[workers] for workers in (5, 6)
+    )
+
+
+def test_producer_resource_contract_is_calibration_derived_and_round_trips() -> None:
+    results = (
+        _producer_result(4, 100.0, rss_gib=8.0),
+        _producer_result(5, 118.0, rss_gib=9.0),
+        _producer_result(6, 122.0, rss_gib=10.0),
+    )
+    selection = select_producer_configuration(
+        results,
+        available_memory_bytes=16 * 1024**3,
+    )
+
+    contract = derive_producer_resource_contract(
+        results=results,
+        selection=selection,
+        selected_per_worker_peak_rss_bytes=3 * 1024**3,
+        available_memory_bytes=16 * 1024**3,
+        row_group_size=65_536,
+        queue_depth=1,
+    )
+
+    assert contract.selected_workers == 5
+    assert contract.aggregate_memory_limit_bytes == math.ceil(9 * 1024**3 * 1.2)
+    assert contract.per_worker_memory_limit_bytes == math.ceil(3 * 1024**3 * 1.2)
+    assert contract.aggregate_memory_limit_bytes <= int(16 * 1024**3 * 0.75)
+    assert ProducerResourceContract.from_dict(contract.to_dict()) == contract
+
+
+def test_producer_resource_contract_rejects_headroom_beyond_capability_envelope() -> None:
+    results = (
+        _producer_result(4, 100.0, rss_gib=8.0),
+        _producer_result(5, 118.0, rss_gib=10.5),
+        _producer_result(6, 122.0, rss_gib=11.0),
+    )
+    selection = select_producer_configuration(
+        results,
+        available_memory_bytes=16 * 1024**3,
+    )
+
+    with pytest.raises(RuntimeError, match="75%"):
+        derive_producer_resource_contract(
+            results=results,
+            selection=selection,
+            selected_per_worker_peak_rss_bytes=3 * 1024**3,
+            available_memory_bytes=16 * 1024**3,
+            row_group_size=65_536,
+            queue_depth=1,
+        )
+
+
+def test_parquet_tuning_requires_ten_percent_critical_path_improvement() -> None:
+    baseline = ParquetBenchmark(
+        row_group_size=65_536,
+        queue_depth=1,
+        persistence_seconds=100.0,
+        aggregate_peak_rss_bytes=4 * 1024**3,
+        semantic_digest="a" * 64,
+    )
+    insufficient = ParquetBenchmark(
+        row_group_size=262_144,
+        queue_depth=2,
+        persistence_seconds=91.0,
+        aggregate_peak_rss_bytes=5 * 1024**3,
+        semantic_digest="a" * 64,
+    )
+    accepted = ParquetBenchmark(
+        row_group_size=262_144,
+        queue_depth=1,
+        persistence_seconds=89.0,
+        aggregate_peak_rss_bytes=5 * 1024**3,
+        semantic_digest="a" * 64,
+    )
+
+    assert (
+        select_parquet_configuration(
+            (baseline, insufficient),
+            available_memory_bytes=16 * 1024**3,
+        )
+        == baseline
+    )
+    assert (
+        select_parquet_configuration(
+            (baseline, insufficient, accepted),
+            available_memory_bytes=16 * 1024**3,
+        )
+        == accepted
+    )
+
+
+def test_capability_contract_fails_fast_on_missing_atomic_filesystem_support() -> None:
+    requirement = CapabilityRequirement(
+        workers=4,
+        minimum_memory_bytes=1,
+        minimum_free_space_bytes=1,
+        backend="native_cpu",
+        python_abi="cp313",
+        native_extension_sha256="a" * 64,
+    )
+    capabilities = HostCapabilities(
+        logical_cpu_count=24,
+        available_memory_bytes=24 * 1024**3,
+        free_space_bytes=700 * 1024**3,
+        available_backends=frozenset({"native_cpu"}),
+        python_abi="cp313",
+        native_extension_sha256="a" * 64,
+        filesystem_fsync=True,
+        filesystem_atomic_replace=False,
+    )
+
+    with pytest.raises(RuntimeError, match="atomic replace"):
+        validate_capabilities(capabilities, requirement)
+
+
+def test_review_memory_contract_is_pilot_derived_and_bounded_to_seventy_five_percent() -> None:
+    contract = derive_review_memory_contract(
+        parent_baseline_rss_bytes=512 * 1024**2,
+        per_child_p99_rss_bytes=2 * 1024**3,
+        review_workers=4,
+        available_memory_bytes=16 * 1024**3,
+    )
+
+    assert contract.memory_swap_max_bytes == 0
+    assert contract.review_workers == 4
+    assert contract.memory_high_bytes < contract.process_guard_bytes
+    assert contract.process_guard_bytes < contract.memory_max_bytes
+    assert contract.memory_max_bytes <= int(16 * 1024**3 * 0.75)
+
+
+def test_review_memory_contract_rejects_unsafe_concurrency() -> None:
+    with pytest.raises(RuntimeError, match="75%"):
+        derive_review_memory_contract(
+            parent_baseline_rss_bytes=1 * 1024**3,
+            per_child_p99_rss_bytes=4 * 1024**3,
+            review_workers=4,
+            available_memory_bytes=16 * 1024**3,
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "contract", "loader"),
+    (
+        (
+            "producer.json",
+            ProducerResourceContract(
+                selected_workers=5,
+                available_memory_bytes=16 * 1024**3,
+                selected_aggregate_peak_rss_bytes=8 * 1024**3,
+                selected_per_worker_peak_rss_bytes=1536 * 1024**2,
+                aggregate_memory_limit_bytes=10 * 1024**3,
+                per_worker_memory_limit_bytes=2 * 1024**3,
+                semantic_digest="a" * 64,
+                calibration_digest="b" * 64,
+                row_group_size=65_536,
+                queue_depth=1,
+            ),
+            load_producer_resource_contract,
+        ),
+        (
+            "review.json",
+            ReviewMemoryContract(
+                parent_baseline_rss_bytes=512 * 1024**2,
+                per_child_p99_rss_bytes=1024**3,
+                review_workers=4,
+                available_memory_bytes=16 * 1024**3,
+                memory_high_bytes=5 * 1024**3,
+                process_guard_bytes=6 * 1024**3,
+                memory_max_bytes=7 * 1024**3,
+                memory_swap_max_bytes=0,
+            ),
+            load_review_memory_contract,
+        ),
+    ),
+)
+def test_signed_resource_contract_loaders_fail_closed_on_tamper(
+    tmp_path: Path,
+    name: str,
+    contract: ProducerResourceContract | ReviewMemoryContract,
+    loader: Callable[[Path], ProducerResourceContract | ReviewMemoryContract],
+) -> None:
+    path = tmp_path / name
+    raw = (json.dumps(contract.to_dict(), sort_keys=True) + "\n").encode()
+    path.write_bytes(raw)
+    path.with_suffix(".sha256").write_text(
+        hashlib.sha256(raw).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+
+    assert loader(path) == contract
+    path.write_bytes(raw + b" ")
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
+        loader(path)
+
+
+def test_filesystem_capability_probe_verifies_fsync_and_atomic_replace(
+    tmp_path: Path,
+) -> None:
+    verify_filesystem_capabilities(tmp_path)
+    assert not tuple(tmp_path.iterdir())
+
+
+def test_filesystem_capability_probe_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_replace(_source: Path, _destination: Path) -> None:
+        raise OSError("atomic replace unavailable")
+
+    monkeypatch.setattr(resources_module, "durable_replace", fail_replace)
+    with pytest.raises(RuntimeError, match="fsync/atomic-replace"):
+        verify_filesystem_capabilities(tmp_path)

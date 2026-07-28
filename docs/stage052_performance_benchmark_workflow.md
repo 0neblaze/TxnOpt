@@ -196,27 +196,13 @@ Campaign active writes 与归档目标只通过 ignored root locator（忽略的
 next-fit partitioning 的 target/hard cap 为 24/32 GiB，单 shard hard cap 2 GiB，并
 持续满足 locator 声明的容量 reserve。
 
-campaign 启动前的两段 30 秒窗口继续要求 `load1 <= 4.0`。冻结 benchmark machine
-（基准机器）有 24 logical CPUs；batch 运行中总 `load1` fail-fast ceiling
-（快速失败上限）固定为 `32.0`，允许 24 个逻辑处理器持续满载并容纳最多八个任务的
-短时运行/I/O 排队。它是 runaway guard（失控保护），不是 CPU throttle（限速器）。
-按 PID tree 排除本 campaign 后的 unrelated user process（无关用户进程）
-中，任一进程仍不得在任何完整 30 秒 rolling window（滚动窗口）平均占用四个完整
-逻辑核。该上限禁止单个竞争进程持续占用冻结主机六分之一或更多的逻辑处理器，同时
-允许有限的 host maintenance/monitoring（主机维护/监控）负载。未满 30 秒的
-batch startup window（批次启动窗口）不执行该平均值 gate，因为消失 PID 的保守
-采样上界不是已测 CPU 消耗；一旦首个完整窗口形成即开始连续判定。两项证据分别记录、
-分别由 reviewer 重放，不得互相替代。
-运行监视器的独立 runtime evidence（运行时证据）显式记录该固定上限；power/load
-artifact 只记录实际采样，reviewer 从 current contract 独立重建 `32.0` 并比较，
-避免 producer 自报阈值成为审计依据。batch 异常退出时也必须把已取得的 runtime
-samples 写入 partial raw evidence（部分原始证据），不得只在成功路径保留。
-
-`load1 <= 4.0` 只用于整个 campaign 的首次启动门槛。同一 campaign 的 per-batch
-handoff preflight（批次交接预检）仍记录两段完整 30 秒窗口，并继续验证 AC power、
-low-power mode、24 logical CPUs 与排除 campaign PID tree 后的 unrelated-process
-四核 gate；但它不得用上一批留在 Linux 1-minute load average 中的衰减历史拒绝
-下一批。下一批开始后立即重新受 `load1 <= 32.0` runtime guard 约束。
+campaign 启动前与 per-batch handoff preflight（批次交接预检）都保留两段连续
+30 秒窗口。AC/battery、low-power mode、`load1`、unrelated process、CPU/GPU
+型号、系统版本、温度以及磁盘/设备信息全部作为 non-blocking telemetry（非阻断遥测）
+保留，异常退出也必须写入 partial raw evidence（部分原始证据）。硬 gate 只验证：
+逻辑 CPU 数不少于已校准 workers、可用内存与空间满足冻结合同、backend/Python ABI/
+native extension 与 source/wheel/config/input/schema hashes 一致，以及文件系统支持
+所需 fsync 和 atomic transfer（原子传输）。
 
 若 G 自身的 campaign runner/reviewer 出现缺陷，可以在不重跑 F 的前提下消费已接受
 F evidence，但必须同时满足：当前 revision 是 F revision 的 Git descendant（后继）；
@@ -227,12 +213,15 @@ instance、backend 与 worker 的稳定选择 hash 完全一致。producer 与 i
 reviewer 各自执行该检查。solver、objective、配置、native 或任意其他 source path
 变化都 fail fast，并要求新的 prerequisite。
 
-已接受 D/F evidence 的 worker-selection resource gate 仍为 12 GiB，不追溯重写。
-当前 G Benchmark Pilot/Formal 为扩大运行余量，batch producer 与 campaign reviewer
-统一使用 per-worker 8-GiB、process-tree aggregate 20-GiB gate；producer WSL VM
-分配 24 GB。该放宽不适用于 independent reviewer：review service 仍固定
-5.5-GiB internal guard、`MemoryHigh=5G`、`MemoryMax=6G`。四 worker 是最大并发数，
-仍必须逐 shard 新进程回收，禁止用新增内存替代 lifecycle isolation（生命周期隔离）。
+已接受 D/F evidence 的历史 resource gate 不追溯重写。新 G Benchmark Pilot 在
+Attempt73 的只读大型 shard 与固定高内存 scope 上校准 4/5/6 workers；高并发必须
+相对四 workers 提升至少 15%，不使用 swap/fallback，语义摘要一致，并保持 aggregate
+RSS 不超过可用内存 75%。吞吐差距不超过 5% 时选择更少 workers。最终 worker 数、
+per-worker/process-tree limits、Parquet row group 65,536/262,144 与 queue depth 1/2
+写入 signed resource contract（签名资源合同），Formal 原样继承。Independent
+reviewer 单独校准 1/2/4 workers，并由 parent baseline 与 per-child p99 RSS 推导
+`MemoryHigh`、内部 guard 和 `MemoryMax`；swap 固定为 0，所有上限仍不得超过可用内存
+75%。
 
 producer 的 screening-definition SQLite scratch 必须使用 rollback-capable
 `journal_mode=MEMORY` 与 `synchronous=NORMAL`。每个 `register_many` transaction

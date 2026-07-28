@@ -30,6 +30,7 @@ from evrptw.stage052_campaign import (
     VolumeIdentity,
     directory_byte_count,
     directory_checksum,
+    directory_file_count,
     load_campaign_manifest,
 )
 
@@ -313,6 +314,24 @@ def test_storage_root_locator_keeps_absolute_paths_out_of_tracked_payload(
         "filesystem": "apfs",
     }
 
+
+def test_storage_root_locator_refreshes_operational_volume_telemetry(
+    tmp_path: Path,
+) -> None:
+    locator = _root_locator(tmp_path)
+
+    refreshed = locator.with_observed_volumes(
+        lambda _path: VolumeIdentity("observed-device", "xfs"),
+        ("internal_archive",),
+    )
+
+    assert refreshed.resolve("internal_archive").volume == VolumeIdentity(
+        "observed-device", "xfs"
+    )
+    assert refreshed.resolve("transfer_staging") == locator.resolve(
+        "transfer_staging"
+    )
+
     observed = {
         "/Volumes/TRANSFER/project/results": VolumeIdentity("transfer-device", "exfat"),
         "/Volumes/TRANSFER/project/archive": VolumeIdentity("transfer-device", "exfat"),
@@ -354,7 +373,7 @@ def test_campaign_capacity_preserves_external_workspace_and_internal_reserve(
     assert len(capacity.assignments) == len(plan.batches)
     assert {assignment.root_alias for assignment in capacity.assignments} == {"internal_archive"}
 
-    with pytest.raises(RuntimeError, match="ext4 staging capacity"):
+    with pytest.raises(RuntimeError, match="staging capacity"):
         config.plan_archive_roots(
             plan,
             locator,
@@ -376,7 +395,7 @@ def test_campaign_capacity_preserves_external_workspace_and_internal_reserve(
         )
 
 
-def test_campaign_preflight_requires_ac_power_and_two_clean_consecutive_windows() -> None:
+def test_campaign_preflight_treats_power_and_load_as_telemetry() -> None:
     config = BenchmarkCampaignConfig.formal(
         run_label="stage05.2_benchmark_attempt02",
         staging_root_alias="transfer_staging",
@@ -396,27 +415,20 @@ def test_campaign_preflight_requires_ac_power_and_two_clean_consecutive_windows(
     )
 
     config.validate_preflight(valid)
+    config.validate_preflight(
+        BenchmarkPreflightObservation(
+            "Battery Power",
+            True,
+            (valid.windows[0], SystemLoadWindow(130.0, 30.0, 40.0, 8.0)),
+        )
+    )
 
-    with pytest.raises(RuntimeError, match="AC Power"):
-        config.validate_preflight(
-            BenchmarkPreflightObservation("Battery Power", False, valid.windows)
-        )
-    with pytest.raises(RuntimeError, match="low power mode"):
-        config.validate_preflight(BenchmarkPreflightObservation("AC Power", True, valid.windows))
-    with pytest.raises(RuntimeError, match="load1"):
+    with pytest.raises(RuntimeError, match="consecutive"):
         config.validate_preflight(
             BenchmarkPreflightObservation(
                 "AC Power",
                 False,
-                (valid.windows[0], SystemLoadWindow(130.0, 30.0, 4.01, 0.5)),
-            )
-        )
-    with pytest.raises(RuntimeError, match="unrelated user process"):
-        config.validate_preflight(
-            BenchmarkPreflightObservation(
-                "AC Power",
-                False,
-                (valid.windows[0], SystemLoadWindow(130.0, 30.0, 3.0, 4.0)),
+                (valid.windows[0], SystemLoadWindow(131.0, 30.0, 3.0, 0.5)),
             )
         )
 
@@ -805,11 +817,13 @@ def test_batch_payload_checksum_excludes_only_the_top_level_manifest_envelope(
 
     checksum_before = directory_checksum(batch_dir)
     bytes_before = directory_byte_count(batch_dir)
+    files_before = directory_file_count(batch_dir)
     (batch_dir / "batch_manifest.json").write_bytes(b"self-referencing envelope")
     (batch_dir / "batch_manifest.sha256").write_text("0" * 64 + "\n", encoding="utf-8")
 
     assert directory_checksum(batch_dir) == checksum_before
     assert directory_byte_count(batch_dir) == bytes_before
+    assert directory_file_count(batch_dir) == files_before == 2
     (nested_control / "shard_manifest.json").write_bytes(b"tampered nested manifest")
     assert directory_checksum(batch_dir) != checksum_before
 

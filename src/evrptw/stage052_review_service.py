@@ -16,7 +16,7 @@ import tempfile
 import threading
 import time
 import zipfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,8 +26,12 @@ from urllib.parse import unquote, urlparse
 import psutil  # type: ignore[import-untyped]
 
 from evrptw.artifacts import ArtifactIntegrityError, ArtifactReader
+from evrptw.stage052_resources import (
+    ReviewMemoryContract,
+    load_review_memory_contract,
+)
 
-REVIEW_EXECUTION_SCHEMA_VERSION = "stage05.2-review-execution-v1"
+REVIEW_EXECUTION_SCHEMA_VERSION = "stage05.2-review-execution-v2"
 REVIEWER_WHEEL_PROVENANCE_SCHEMA_VERSION = "stage05.2-reviewer-wheel-provenance-v1"
 DEFAULT_LOG_ROOT = (
     Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
@@ -35,9 +39,9 @@ DEFAULT_LOG_ROOT = (
     / "stage052-review-logs"
 )
 DEFAULT_MAX_AGGREGATE_RSS_BYTES = int(5.5 * 1024**3)
-SYSTEMD_MEMORY_HIGH = "5G"
-SYSTEMD_MEMORY_MAX = "6G"
-SYSTEMD_MEMORY_SWAP_MAX = "2G"
+DEFAULT_SYSTEMD_MEMORY_HIGH_BYTES = 5 * 1024**3
+DEFAULT_SYSTEMD_MEMORY_MAX_BYTES = 6 * 1024**3
+DEFAULT_SYSTEMD_MEMORY_SWAP_MAX_BYTES = 0
 _UNIT_PATTERN = re.compile(r"^[A-Za-z0-9_.@-]+$")
 _SERVICE_BASE_PATHS = (
     "/usr/local/sbin",
@@ -74,7 +78,7 @@ class ReviewProgressLog:
 
     def emit(self, event: str, **details: object) -> None:
         payload = {
-            "schema_version": "stage05.2-review-progress-v1",
+            "schema_version": "stage05.2-review-progress-v2",
             "timestamp": _utc_now(),
             "pid": os.getpid(),
             "event": event,
@@ -231,7 +235,11 @@ class ReviewServiceConfig:
     service_execution_path: str
     producer_source_directory: Path | None = None
     progress_log: Path | None = None
+    review_memory_contract: Mapping[str, object] | None = None
     max_aggregate_rss_bytes: int = DEFAULT_MAX_AGGREGATE_RSS_BYTES
+    systemd_memory_high_bytes: int = DEFAULT_SYSTEMD_MEMORY_HIGH_BYTES
+    systemd_memory_max_bytes: int = DEFAULT_SYSTEMD_MEMORY_MAX_BYTES
+    systemd_memory_swap_max_bytes: int = DEFAULT_SYSTEMD_MEMORY_SWAP_MAX_BYTES
     sample_interval_seconds: float = 0.1
 
     def __post_init__(self) -> None:
@@ -247,6 +255,29 @@ class ReviewServiceConfig:
             raise ValueError("review service execution PATH must be non-empty")
         if self.max_aggregate_rss_bytes <= 0:
             raise ValueError("review service RSS limit must be positive")
+        if not (
+            0
+            < self.systemd_memory_high_bytes
+            < self.max_aggregate_rss_bytes
+            < self.systemd_memory_max_bytes
+        ):
+            raise ValueError(
+                "review service memory limits must satisfy High < guard < Max"
+            )
+        if self.systemd_memory_swap_max_bytes != 0:
+            raise ValueError("review service swap must be disabled")
+        if self.review_memory_contract is not None:
+            contract = ReviewMemoryContract.from_dict(self.review_memory_contract)
+            if (
+                contract.memory_high_bytes != self.systemd_memory_high_bytes
+                or contract.process_guard_bytes != self.max_aggregate_rss_bytes
+                or contract.memory_max_bytes != self.systemd_memory_max_bytes
+                or contract.memory_swap_max_bytes
+                != self.systemd_memory_swap_max_bytes
+            ):
+                raise ValueError(
+                    "review service limits differ from the Pilot memory contract"
+                )
         if self.sample_interval_seconds <= 0.0:
             raise ValueError("review service sample interval must be positive")
 
@@ -297,7 +328,30 @@ class ReviewServiceConfig:
                 if payload.get("progress_log") is not None
                 else None
             ),
+            review_memory_contract=(
+                dict(payload["review_memory_contract"])
+                if isinstance(payload.get("review_memory_contract"), Mapping)
+                else None
+            ),
             max_aggregate_rss_bytes=int(payload["max_aggregate_rss_bytes"]),
+            systemd_memory_high_bytes=int(
+                payload.get(
+                    "systemd_memory_high_bytes",
+                    DEFAULT_SYSTEMD_MEMORY_HIGH_BYTES,
+                )
+            ),
+            systemd_memory_max_bytes=int(
+                payload.get(
+                    "systemd_memory_max_bytes",
+                    DEFAULT_SYSTEMD_MEMORY_MAX_BYTES,
+                )
+            ),
+            systemd_memory_swap_max_bytes=int(
+                payload.get(
+                    "systemd_memory_swap_max_bytes",
+                    DEFAULT_SYSTEMD_MEMORY_SWAP_MAX_BYTES,
+                )
+            ),
             sample_interval_seconds=float(payload["sample_interval_seconds"]),
         )
 
@@ -828,9 +882,9 @@ def _initial_receipt(config: ReviewServiceConfig) -> dict[str, object]:
         "cgroup_memory_peak_status": "pending",
         "cgroup_memory_peak_error": None,
         "max_aggregate_rss_bytes": config.max_aggregate_rss_bytes,
-        "systemd_memory_high": SYSTEMD_MEMORY_HIGH,
-        "systemd_memory_max": SYSTEMD_MEMORY_MAX,
-        "systemd_memory_swap_max": SYSTEMD_MEMORY_SWAP_MAX,
+        "systemd_memory_high_bytes": config.systemd_memory_high_bytes,
+        "systemd_memory_max_bytes": config.systemd_memory_max_bytes,
+        "systemd_memory_swap_max_bytes": config.systemd_memory_swap_max_bytes,
         "systemd_service_result": None,
         "systemd_exit_code": None,
         "systemd_exit_status": None,
@@ -1076,8 +1130,6 @@ def finalize_review_execution(config: ReviewServiceConfig) -> None:
 def launch_review_service(config: ReviewServiceConfig) -> None:
     """Create one transient user service without inheriting the caller's lifetime."""
 
-    if config.max_aggregate_rss_bytes != DEFAULT_MAX_AGGREGATE_RSS_BYTES:
-        raise RuntimeError("formal reviewer internal RSS limit is fixed at 5.5 GiB")
     _prepare_review_execution(config)
     staging_directory = config.log_directory.with_name(f".{config.log_directory.name}.launch")
     staging_directory.mkdir(exist_ok=False)
@@ -1102,9 +1154,9 @@ def launch_review_service(config: ReviewServiceConfig) -> None:
         "--collect",
         f"--unit={config.unit}",
         "--property=MemoryAccounting=yes",
-        f"--property=MemoryHigh={SYSTEMD_MEMORY_HIGH}",
-        f"--property=MemoryMax={SYSTEMD_MEMORY_MAX}",
-        f"--property=MemorySwapMax={SYSTEMD_MEMORY_SWAP_MAX}",
+        f"--property=MemoryHigh={config.systemd_memory_high_bytes}",
+        f"--property=MemoryMax={config.systemd_memory_max_bytes}",
+        f"--property=MemorySwapMax={config.systemd_memory_swap_max_bytes}",
         "--property=KillMode=control-group",
         "--property=Restart=no",
         "--property=OOMPolicy=stop",
@@ -1162,6 +1214,7 @@ def _build_parser() -> argparse.ArgumentParser:
     launch.add_argument("--wheel-path", type=Path, required=True)
     launch.add_argument("--reviewer-revision", required=True)
     launch.add_argument("--producer-source-directory", type=Path)
+    launch.add_argument("--review-memory-contract", type=Path)
     launch.add_argument("--max-aggregate-rss-gib", type=float, default=5.5)
     launch.add_argument("command", nargs=argparse.REMAINDER)
     supervise = subparsers.add_parser("supervise")
@@ -1188,16 +1241,35 @@ def main() -> int:
         log_directory = DEFAULT_LOG_ROOT / arguments.run_label / timestamp
         command = list(_parse_command(arguments.command))
         progress_log = log_directory / "progress.jsonl"
+        memory_contract = (
+            load_review_memory_contract(arguments.review_memory_contract.resolve())
+            if arguments.review_memory_contract is not None
+            else None
+        )
+        maximum_rss_bytes = (
+            memory_contract.process_guard_bytes
+            if memory_contract is not None
+            else int(arguments.max_aggregate_rss_gib * 1024**3)
+        )
         command.extend(
             (
                 "--progress-log",
                 str(progress_log),
                 "--max-aggregate-rss-gib",
-                str(arguments.max_aggregate_rss_gib),
+                str(maximum_rss_bytes / 1024**3),
                 _REVIEW_EXECUTION_OPTION,
                 str(log_directory / "review_execution.json"),
             )
         )
+        if memory_contract is not None:
+            command.extend(
+                (
+                    "--review-workers",
+                    str(memory_contract.review_workers),
+                    "--review-memory-contract",
+                    str(arguments.review_memory_contract.resolve()),
+                )
+            )
         config = ReviewServiceConfig(
             unit=unit,
             run_label=arguments.run_label,
@@ -1211,7 +1283,25 @@ def main() -> int:
             service_execution_path=_service_execution_path(),
             producer_source_directory=arguments.producer_source_directory,
             progress_log=progress_log,
-            max_aggregate_rss_bytes=int(arguments.max_aggregate_rss_gib * 1024**3),
+            review_memory_contract=(
+                memory_contract.to_dict() if memory_contract is not None else None
+            ),
+            max_aggregate_rss_bytes=maximum_rss_bytes,
+            systemd_memory_high_bytes=(
+                memory_contract.memory_high_bytes
+                if memory_contract is not None
+                else DEFAULT_SYSTEMD_MEMORY_HIGH_BYTES
+            ),
+            systemd_memory_max_bytes=(
+                memory_contract.memory_max_bytes
+                if memory_contract is not None
+                else DEFAULT_SYSTEMD_MEMORY_MAX_BYTES
+            ),
+            systemd_memory_swap_max_bytes=(
+                memory_contract.memory_swap_max_bytes
+                if memory_contract is not None
+                else DEFAULT_SYSTEMD_MEMORY_SWAP_MAX_BYTES
+            ),
         )
         launch_review_service(config)
         print(json.dumps({"unit": unit, "log_directory": str(log_directory)}))

@@ -158,7 +158,7 @@ def test_reviewer_accepts_runtime_load_within_audited_machine_headroom() -> None
     )
 
     assert passed, detail
-    assert detail == "continuous batch power/load sampling passed"
+    assert detail == "continuous batch capability and power/load telemetry replay passed"
 
 
 def test_reviewer_accepts_batch_handoff_load_from_prior_campaign_work() -> None:
@@ -180,10 +180,10 @@ def test_reviewer_accepts_batch_handoff_load_from_prior_campaign_work() -> None:
     )
 
     assert passed, detail
-    assert detail == "continuous batch power/load sampling passed"
+    assert detail == "continuous batch capability and power/load telemetry replay passed"
 
 
-def test_reviewer_rejects_runtime_load_beyond_audited_machine_headroom() -> None:
+def test_reviewer_records_runtime_load_beyond_old_machine_headroom() -> None:
     passed, detail = campaign_review_module._validate_power_load(
         _power_load_payload(32.1),
         run_label="stage05.2_benchmark_attempt49",
@@ -191,8 +191,8 @@ def test_reviewer_rejects_runtime_load_beyond_audited_machine_headroom() -> None
         selected_workers=4,
     )
 
-    assert passed is False
-    assert detail == "continuous batch power/load sampling violated a threshold"
+    assert passed is True
+    assert detail == "continuous batch capability and power/load telemetry replay passed"
 
 
 def test_reviewer_rejects_missing_producer_runtime_load_ceiling() -> None:
@@ -211,7 +211,7 @@ def test_reviewer_rejects_missing_producer_runtime_load_ceiling() -> None:
     assert passed is False
 
 
-def test_reviewer_rejects_non_frozen_logical_cpu_count() -> None:
+def test_reviewer_accepts_non_frozen_sufficient_logical_cpu_count() -> None:
     payload = _power_load_payload(31.9)
     runtime = payload["runtime"]
     assert isinstance(runtime, dict)
@@ -224,7 +224,24 @@ def test_reviewer_rejects_non_frozen_logical_cpu_count() -> None:
         selected_workers=4,
     )
 
+    assert passed is True
+
+
+def test_reviewer_rejects_logical_cpu_count_below_selected_workers() -> None:
+    payload = _power_load_payload(31.9)
+    runtime = payload["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["logical_cpu_count"] = 3
+
+    passed, detail = campaign_review_module._validate_power_load(
+        payload,
+        run_label="stage05.2_benchmark_attempt49",
+        batch_id="batch0001",
+        selected_workers=4,
+    )
+
     assert passed is False
+    assert "capability" in detail
 
 
 def test_campaign_gate_contract_requires_source_snapshot() -> None:
@@ -2517,7 +2534,7 @@ def _accepted_review(
                         "decision": "GPU_NOT_JUSTIFIED",
                         "selected_backend": "native_cpu",
                         "selected_exact_backend": "cpu_batch",
-                        "selected_workers": 2,
+                        "selected_workers": 4,
                         "native_profile": "stage05.2-native-kernels-v1",
                         "native_config_sha256": native_sha256,
                         "accelerator_review_manifest_sha256": "d" * 64,
@@ -2542,8 +2559,21 @@ def _accepted_review(
     generation.rename(final_generation)
     for key, item in publication_files.items():
         item["relative_path"] = (final_generation / targets[key]).relative_to(review_dir).as_posix()
+    storage_publication_identity = {
+        "schema_version": "stage05.2-storage-publication-identity-v1",
+        "run_label": run_label,
+        "batches": [
+            {
+                "root_alias": "d_archive",
+                "relative_path": f"{run_label}/batch0001",
+                "file_count": 12,
+                "byte_count": 4096,
+                "tree_sha256": "f" * 64,
+            }
+        ],
+    }
     manifest = {
-        "schema_version": "stage05.2-campaign-review-v1",
+        "schema_version": "stage05.2-campaign-review-v2",
         "run_label": run_label,
         "component": "benchmark",
         "scope": scope,
@@ -2552,7 +2582,7 @@ def _accepted_review(
         "raw_campaign_manifest_sha256": "b" * 64,
         "selected_backend": "native_cpu",
         "selected_exact_backend": "cpu_batch",
-        "selected_workers": 2,
+        "selected_workers": 4,
         "native_profile": "stage05.2-native-kernels-v1",
         "accelerator_decision": "GPU_NOT_JUSTIFIED",
         "campaign_prerequisite_review_sha256": "e" * 64,
@@ -2561,13 +2591,36 @@ def _accepted_review(
         "selection_lock": {
             "selected_backend": "native_cpu",
             "selected_exact_backend": "cpu_batch",
-            "selected_workers": 2,
+            "selected_workers": 4,
             "native_profile": "stage05.2-native-kernels-v1",
             "native_config_sha256": native_sha256,
             "native_kernel_config": native,
             "accelerator_decision": "GPU_NOT_JUSTIFIED",
             "accelerator_review_manifest_sha256": "d" * 64,
         },
+        "storage_publication_identity": storage_publication_identity,
+        "storage_publication_identity_sha256": hashlib.sha256(
+            json.dumps(
+                storage_publication_identity,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "review_shard_metrics": [
+            {
+                "batch_id": "batch0001",
+                "shard_id": "shard0001",
+                "canonical_merge_ordinal": 1,
+                "replay_backend": "native_arrow",
+                "review_workers": 4,
+                "maximum_in_flight_shards": 4,
+                "elapsed_seconds": 1.0,
+                "logical_events": 1024,
+                "events_per_second": 1024.0,
+                "child_peak_rss_bytes": 1024,
+                "native_fallback_count": 0,
+            }
+        ],
         "publication_files": publication_files,
         "files": {item["relative_path"]: item["sha256"] for item in publication_files.values()},
         "gates": {

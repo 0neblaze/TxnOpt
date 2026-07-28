@@ -4411,9 +4411,10 @@ def _validate_stage052_staging_root_identity(
                 return False, "current wsl_staging filesystem is not ext4"
             if staging_path == Path("/mnt") or Path("/mnt") in staging_path.parents:
                 return False, "current wsl_staging path is under /mnt"
-        locator.verify_all(
-            probe_volume_identity if volume_probe is None else volume_probe,
-            (expected_alias,),
+        observed_volume = (
+            probe_volume_identity(staging.absolute_path)
+            if volume_probe is None
+            else volume_probe(staging.absolute_path)
         )
     except (
         ArtifactIntegrityError,
@@ -4428,8 +4429,9 @@ def _validate_stage052_staging_root_identity(
     assert isinstance(volume, Mapping)
     return (
         True,
-        f"{expected_alias} live volume identity passed: "
-        f"{volume.get('device_uuid')}/{volume.get('filesystem')}",
+        f"{expected_alias} filesystem capability passed; "
+        f"producer telemetry={volume.get('device_uuid')}/{volume.get('filesystem')}; "
+        f"current telemetry={observed_volume.device_uuid}/{observed_volume.filesystem}",
     )
 
 

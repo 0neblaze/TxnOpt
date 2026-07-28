@@ -18,6 +18,7 @@ from evrptw.artifacts import (
     ArtifactRunContext,
     ArtifactStorageConfig,
 )
+from evrptw.stage052_resources import ReviewMemoryContract
 from evrptw.stage052_review_service import (
     ReviewServiceConfig,
     finalize_review_execution,
@@ -61,6 +62,9 @@ def _config(tmp_path: Path, *, limit_bytes: int) -> ReviewServiceConfig:
         ),
         progress_log=progress_log,
         max_aggregate_rss_bytes=limit_bytes,
+        systemd_memory_high_bytes=int(limit_bytes * 0.8),
+        systemd_memory_max_bytes=int(limit_bytes * 1.2),
+        systemd_memory_swap_max_bytes=0,
         sample_interval_seconds=0.01,
     )
 
@@ -76,6 +80,28 @@ def test_review_service_config_preserves_separate_producer_source(
     replayed = ReviewServiceConfig.from_dict(config.to_dict())
     assert replayed.producer_source_directory == producer_source
     assert replayed.working_directory == config.working_directory
+
+
+def test_review_service_config_binds_exact_pilot_memory_contract(
+    tmp_path: Path,
+) -> None:
+    limit = 512 * 1024**2
+    base = _config(tmp_path / "config", limit_bytes=limit)
+    contract = ReviewMemoryContract(
+        parent_baseline_rss_bytes=64 * 1024**2,
+        per_child_p99_rss_bytes=64 * 1024**2,
+        review_workers=4,
+        available_memory_bytes=4 * 1024**3,
+        memory_high_bytes=base.systemd_memory_high_bytes,
+        process_guard_bytes=base.max_aggregate_rss_bytes,
+        memory_max_bytes=base.systemd_memory_max_bytes,
+        memory_swap_max_bytes=0,
+    )
+    config = replace(base, review_memory_contract=contract.to_dict())
+
+    assert ReviewServiceConfig.from_dict(config.to_dict()) == config
+    with pytest.raises(ValueError, match="differ from the Pilot memory contract"):
+        replace(config, max_aggregate_rss_bytes=limit + 1)
 
 
 def test_review_supervisor_writes_receipt_and_preserves_raw_manifest(
@@ -96,7 +122,7 @@ def test_review_supervisor_writes_receipt_and_preserves_raw_manifest(
 
     assert exit_code == 0
     receipt = json.loads((config.log_directory / "review_execution.json").read_text())
-    assert receipt["schema_version"] == "stage05.2-review-execution-v1"
+    assert receipt["schema_version"] == "stage05.2-review-execution-v2"
     assert receipt["status"] == "completed"
     assert receipt["finalized"] is True
     assert receipt["exit_code"] == 0
@@ -224,7 +250,7 @@ def test_review_supervisor_terminates_process_tree_at_memory_limit(
     assert receipt["raw_manifest_sha256_before"] == receipt["raw_manifest_sha256_after"]
 
 
-def test_review_launcher_applies_fixed_systemd_process_tree_limits(
+def test_review_launcher_applies_pilot_derived_systemd_process_tree_limits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -248,9 +274,9 @@ def test_review_launcher_applies_fixed_systemd_process_tree_limits(
     assert len(observed) == 1
     command = observed[0]
     assert command[:3] == ("systemd-run", "--user", "--collect")
-    assert "--property=MemoryHigh=5G" in command
-    assert "--property=MemoryMax=6G" in command
-    assert "--property=MemorySwapMax=2G" in command
+    assert f"--property=MemoryHigh={config.systemd_memory_high_bytes}" in command
+    assert f"--property=MemoryMax={config.systemd_memory_max_bytes}" in command
+    assert "--property=MemorySwapMax=0" in command
     assert "--property=KillMode=control-group" in command
     assert "--property=Restart=no" in command
     assert "--property=OOMPolicy=stop" in command
@@ -260,7 +286,7 @@ def test_review_launcher_applies_fixed_systemd_process_tree_limits(
     assert any(item.startswith("--property=ExecStopPost=") for item in command)
 
 
-def test_formal_launcher_rejects_noncanonical_internal_rss_limit(
+def test_formal_launcher_accepts_a_consistent_pilot_derived_rss_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -272,10 +298,15 @@ def test_formal_launcher_rejects_noncanonical_internal_rss_limit(
         lambda command, **_kwargs: observed.append(tuple(command)),
     )
 
-    with pytest.raises(RuntimeError, match="fixed at 5.5 GiB"):
-        launch_review_service(config)
+    monkeypatch.setattr(
+        review_service,
+        "_validate_formal_execution_envelope",
+        lambda _: {"producer_repository_revision": "2" * 40},
+    )
 
-    assert observed == []
+    launch_review_service(config)
+
+    assert len(observed) == 1
 
 
 def test_exec_stop_post_finalizes_hard_oom_receipt(

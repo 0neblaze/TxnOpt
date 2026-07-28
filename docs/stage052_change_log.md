@@ -1173,3 +1173,36 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   路径；`src/evrptw/objective.py` 等非G路径仍由现有负向回归拒绝。修复前的最小
   successor fixture 稳定失败，修复后必须返回 runner 与 config-test 两条精确路径。
   Attempt68 不复用；新 sealed revision 必须从下一最低未占用 Pilot label 启动。
+
+## 2026-07-28：G69 native Arrow replay 与自校准资源合同
+
+- Attempt73 保持 immutable interrupted evidence（不可变中断证据）：batch0001/0002
+  只作为只读 benchmark/differential corpus（基准/差分语料），对新 campaign
+  geometry、readiness count 与 shard inheritance 的贡献均为 0。新 Pilot/Formal
+  必须使用新 label 从零执行。
+- 新增深模块 `evrptw.stage052_replay`。`python_reference` 仅用于差分与旧格式兼容；
+  Formal 强制 `native_arrow`，直接消费 Arrow 列缓冲并在 C++ 状态机审计 event/order、
+  cache/exact/deadline/candidate transaction、vehicle-first acceptance 与 persistence
+  ledger，任何 native 失败均禁止回退。Attempt72 全部 36 shards、16,974,466 events
+  逐字段相等；native 单 child 为 742,995 events/s，相对本机 Python reference
+  7.0966x，相对旧 41,966 events/s 基线 17.7x。
+- reviewer scheduler 在 Attempt72 全 36 shards 上实测选择四 workers：
+  699,474 events/s，约为旧串行基线 16.67x；1/2/4-worker semantic digest 完全一致。
+  Pilot-derived memory contract 为 `MemoryHigh=2,292,604,354`、
+  process guard `2,562,322,514`、`MemoryMax=2,697,181,594` bytes，swap 为 0。
+  Review/campaign schema 升至 v2，逐 shard 记录 elapsed、events/s、child peak RSS、
+  canonical merge ordinal、in-flight bound 和 native fallback count。
+- producer 改为 4/5/6-worker real-shard calibration；选择规则固定为 75% available
+  memory、相对四 workers至少 15% 提升、5% tie 选择更少 workers、zero swap/fallback
+  与 identical semantic digest。Attempt73 batch0001/0002 的 sealed long-shard
+  process-tree/per-worker RSS 作为保守内存下限，并按 worker 数线性投影，避免短时
+  fixed-work calibration 低估 Formal 峰值。Parquet 仍为 Zstandard level 1 和既有科学 schema；
+  新 writer 支持校准的 65,536/262,144 row group 与 queue depth 1/2。Attempt73 两个
+  sealed c101_21 event files 的实际 writer-path benchmark 中，262,144/2 从
+  1.605 秒降至 1.085 秒（约 32.4%），峰值约 593 MB，满足 10% adoption gate。
+- runtime identity 分离 hard contract 与 non-blocking telemetry。AC/battery、固定
+  24 logical CPUs、load/temperature、磁盘型号/序列与 device UUID 不再决定 readiness
+  或 publication identity；硬 gate 只要求所选 workers 所需 CPU、内存/空间、backend、
+  Python ABI、native extension、source/wheel/config/input/schema hashes 以及 fsync/
+  atomic-transfer capability。长期 storage publication identity 只包含 alias、
+  relative path、file count、byte count 与 tree SHA-256。

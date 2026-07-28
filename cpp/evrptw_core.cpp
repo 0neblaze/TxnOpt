@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -10,10 +11,13 @@
 #include <memory>
 #include <optional>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -25,6 +29,695 @@
 namespace py = pybind11;
 
 using Point = std::pair<double, double>;
+
+template <typename T>
+struct Stage052ReplayNumericColumn {
+    py::array_t<T, py::array::c_style | py::array::forcecast> values;
+    py::array_t<std::uint8_t, py::array::c_style | py::array::forcecast> valid;
+
+    explicit Stage052ReplayNumericColumn(const py::handle encoded) {
+        const auto tuple = py::cast<py::tuple>(encoded);
+        if (tuple.size() != 3) {
+            throw std::invalid_argument("native replay column encoding is invalid");
+        }
+        values = py::cast<decltype(values)>(tuple[0]);
+        valid = py::cast<decltype(valid)>(tuple[1]);
+        if (values.ndim() != 1 || valid.ndim() != 1 ||
+            values.size() != valid.size()) {
+            throw std::invalid_argument("native replay column width is invalid");
+        }
+    }
+
+    [[nodiscard]] bool has(const py::ssize_t index) const {
+        return *valid.data(index) != 0;
+    }
+
+    [[nodiscard]] T get(const py::ssize_t index) const {
+        return *values.data(index);
+    }
+};
+
+struct Stage052ReplayStringColumn {
+    py::array_t<std::int32_t, py::array::c_style | py::array::forcecast>
+        indices;
+    py::array_t<std::uint8_t, py::array::c_style | py::array::forcecast> valid;
+    std::vector<std::string> dictionary;
+
+    explicit Stage052ReplayStringColumn(const py::handle encoded) {
+        const auto tuple = py::cast<py::tuple>(encoded);
+        if (tuple.size() != 3) {
+            throw std::invalid_argument("native replay string encoding is invalid");
+        }
+        indices = py::cast<decltype(indices)>(tuple[0]);
+        valid = py::cast<decltype(valid)>(tuple[1]);
+        dictionary = py::cast<std::vector<std::string>>(tuple[2]);
+        if (indices.ndim() != 1 || valid.ndim() != 1 ||
+            indices.size() != valid.size()) {
+            throw std::invalid_argument("native replay string width is invalid");
+        }
+    }
+
+    [[nodiscard]] bool has(const py::ssize_t index) const {
+        return *valid.data(index) != 0;
+    }
+
+    [[nodiscard]] const std::string& get(const py::ssize_t index) const {
+        const auto dictionary_index = *indices.data(index);
+        if (dictionary_index < 0 ||
+            static_cast<std::size_t>(dictionary_index) >= dictionary.size()) {
+            throw std::invalid_argument(
+                "native replay dictionary index is invalid");
+        }
+        return dictionary[static_cast<std::size_t>(dictionary_index)];
+    }
+};
+
+struct Stage052ReplayBatch {
+    Stage052ReplayNumericColumn<std::int64_t> event_id;
+    Stage052ReplayStringColumn benchmark_axis;
+    Stage052ReplayStringColumn lane;
+    Stage052ReplayStringColumn event_type;
+    Stage052ReplayNumericColumn<double> timestamp_seconds;
+    Stage052ReplayNumericColumn<double> started_at;
+    Stage052ReplayNumericColumn<double> completed_at;
+    Stage052ReplayNumericColumn<std::int64_t> iteration;
+    Stage052ReplayNumericColumn<std::int64_t> evaluation_id;
+    Stage052ReplayStringColumn cache_key_digest;
+    Stage052ReplayStringColumn operation;
+    Stage052ReplayStringColumn lookup_result;
+    Stage052ReplayStringColumn status;
+    Stage052ReplayStringColumn reason;
+    Stage052ReplayStringColumn route_key;
+    Stage052ReplayNumericColumn<std::int64_t> decision_id;
+    Stage052ReplayStringColumn kind;
+    Stage052ReplayStringColumn operator_name;
+    Stage052ReplayNumericColumn<std::uint8_t> exact_started;
+    Stage052ReplayNumericColumn<std::uint8_t> exact_completed;
+    Stage052ReplayNumericColumn<std::uint8_t> feasible;
+    Stage052ReplayNumericColumn<std::uint8_t> accepted;
+    Stage052ReplayNumericColumn<std::uint8_t> global_best;
+    Stage052ReplayNumericColumn<std::int64_t> candidate_vehicle_delta;
+    Stage052ReplayNumericColumn<std::uint8_t> native_fallback;
+    Stage052ReplayStringColumn failure_reason;
+
+    explicit Stage052ReplayBatch(const py::dict& columns)
+        : event_id(columns["event_id"]),
+          benchmark_axis(columns["benchmark_axis"]),
+          lane(columns["lane"]),
+          event_type(columns["event_type"]),
+          timestamp_seconds(columns["timestamp_seconds"]),
+          started_at(columns["started_at"]),
+          completed_at(columns["completed_at"]),
+          iteration(columns["iteration"]),
+          evaluation_id(columns["evaluation_id"]),
+          cache_key_digest(columns["cache_key_digest"]),
+          operation(columns["operation"]),
+          lookup_result(columns["lookup_result"]),
+          status(columns["status"]),
+          reason(columns["reason"]),
+          route_key(columns["route_key"]),
+          decision_id(columns["decision_id"]),
+          kind(columns["kind"]),
+          operator_name(columns["operator"]),
+          exact_started(columns["exact_started"]),
+          exact_completed(columns["exact_completed"]),
+          feasible(columns["feasible"]),
+          accepted(columns["accepted"]),
+          global_best(columns["global_best"]),
+          candidate_vehicle_delta(columns["candidate_vehicle_delta"]),
+          native_fallback(columns["native_fallback"]),
+          failure_reason(columns["failure_reason"]) {
+        const auto row_count = event_id.values.size();
+        const std::array<py::ssize_t, 25> widths{{
+            benchmark_axis.indices.size(),
+            lane.indices.size(),
+            event_type.indices.size(),
+            timestamp_seconds.values.size(),
+            started_at.values.size(),
+            completed_at.values.size(),
+            iteration.values.size(),
+            evaluation_id.values.size(),
+            cache_key_digest.indices.size(),
+            operation.indices.size(),
+            lookup_result.indices.size(),
+            status.indices.size(),
+            reason.indices.size(),
+            route_key.indices.size(),
+            decision_id.values.size(),
+            kind.indices.size(),
+            operator_name.indices.size(),
+            exact_started.values.size(),
+            exact_completed.values.size(),
+            feasible.values.size(),
+            accepted.values.size(),
+            global_best.values.size(),
+            candidate_vehicle_delta.values.size(),
+            native_fallback.values.size(),
+            failure_reason.indices.size(),
+        }};
+        if (std::any_of(
+                widths.begin(), widths.end(),
+                [row_count](const py::ssize_t width) {
+                    return width != row_count;
+                })) {
+            throw std::invalid_argument(
+                "native replay columns do not share one row count");
+        }
+    }
+};
+
+void stage052_append_json_string(
+    std::string& destination, const std::string_view value) {
+    constexpr char hexadecimal[] = "0123456789abcdef";
+    destination.push_back('"');
+    for (const unsigned char character : value) {
+        switch (character) {
+            case '"':
+                destination += "\\\"";
+                break;
+            case '\\':
+                destination += "\\\\";
+                break;
+            case '\b':
+                destination += "\\b";
+                break;
+            case '\f':
+                destination += "\\f";
+                break;
+            case '\n':
+                destination += "\\n";
+                break;
+            case '\r':
+                destination += "\\r";
+                break;
+            case '\t':
+                destination += "\\t";
+                break;
+            default:
+                if (character < 0x20U) {
+                    destination += "\\u00";
+                    destination.push_back(hexadecimal[character >> 4U]);
+                    destination.push_back(hexadecimal[character & 0x0fU]);
+                } else {
+                    destination.push_back(static_cast<char>(character));
+                }
+        }
+    }
+    destination.push_back('"');
+}
+
+void stage052_append_nullable_string(
+    std::string& destination,
+    const Stage052ReplayStringColumn& column,
+    const py::ssize_t index,
+    const bool empty_is_null = false) {
+    if (!column.has(index) || (empty_is_null && column.get(index).empty())) {
+        destination += "null";
+        return;
+    }
+    stage052_append_json_string(destination, column.get(index));
+}
+
+template <typename T>
+void stage052_append_nullable_integer(
+    std::string& destination,
+    const Stage052ReplayNumericColumn<T>& column,
+    const py::ssize_t index) {
+    if (!column.has(index)) {
+        destination += "null";
+        return;
+    }
+    destination += std::to_string(column.get(index));
+}
+
+void stage052_append_nullable_boolean(
+    std::string& destination,
+    const Stage052ReplayNumericColumn<std::uint8_t>& column,
+    const py::ssize_t index) {
+    if (!column.has(index)) {
+        destination += "null";
+        return;
+    }
+    destination += column.get(index) != 0 ? "true" : "false";
+}
+
+struct Stage052ReplayAxisState {
+    std::int64_t budget_seconds = 0;
+    std::int64_t last_evaluation_id = 0;
+    std::int64_t exact_started = 0;
+    std::int64_t exact_completed = 0;
+    std::int64_t accepted_candidates = 0;
+    std::int64_t global_bests = 0;
+    std::unordered_set<std::string> deadline_lanes;
+    std::unordered_set<std::string> cache_keys;
+    std::unordered_set<std::string> cache_misses;
+    std::unordered_set<std::string> completed_exact_keys;
+    std::vector<std::pair<std::int64_t, std::string>> ledger_entries;
+    std::size_t ledger_index = 0;
+    std::int64_t ledger_seen = 0;
+    std::string ledger_token_bytes;
+    py::object ledger_hasher;
+};
+
+class Stage052ReplayState {
+   public:
+    explicit Stage052ReplayState(
+        const py::dict& axis_budgets,
+        const py::dict& persistence_ledgers)
+        : hasher_(
+              py::module_::import("hashlib").attr("sha256")()) {
+        if (axis_budgets.empty()) {
+            throw std::invalid_argument(
+                "axis budgets must not be empty");
+        }
+        for (const auto& item : axis_budgets) {
+            const auto axis = py::cast<std::string>(item.first);
+            const auto budget = py::cast<std::int64_t>(item.second);
+            if (axis.empty() || budget <= 0) {
+                throw std::invalid_argument(
+                    "axis budgets must be positive integers");
+            }
+            Stage052ReplayAxisState state;
+            state.budget_seconds = budget;
+            states_.emplace(axis, std::move(state));
+        }
+        if (!persistence_ledgers.empty()) {
+            if (persistence_ledgers.size() != states_.size()) {
+                throw std::invalid_argument(
+                    "persistence ledger axes do not match the shard axes");
+            }
+            for (const auto& item : persistence_ledgers) {
+                const auto axis = py::cast<std::string>(item.first);
+                const auto state_iterator = states_.find(axis);
+                if (state_iterator == states_.end()) {
+                    throw std::invalid_argument(
+                        "persistence ledger axes do not match the shard axes");
+                }
+                const auto entries = py::cast<py::sequence>(item.second);
+                if (entries.empty()) {
+                    throw std::invalid_argument(
+                        "persistence ledger must not be empty");
+                }
+                auto& state = state_iterator->second;
+                state.ledger_entries.reserve(
+                    static_cast<std::size_t>(entries.size()));
+                for (const auto& raw_entry : entries) {
+                    const auto entry = py::cast<py::tuple>(raw_entry);
+                    if (entry.size() != 2) {
+                        throw std::invalid_argument(
+                            "persistence ledger entry is invalid");
+                    }
+                    const auto row_count =
+                        py::cast<std::int64_t>(entry[0]);
+                    const auto digest = py::cast<std::string>(entry[1]);
+                    if (row_count <= 0 || digest.size() != 64U) {
+                        throw std::invalid_argument(
+                            "persistence ledger entry is invalid");
+                    }
+                    state.ledger_entries.emplace_back(row_count, digest);
+                }
+                state.ledger_hasher =
+                    py::module_::import("hashlib").attr("sha256")();
+            }
+        }
+    }
+
+    void consume(const py::dict& encoded_columns) {
+        const Stage052ReplayBatch batch(encoded_columns);
+        std::string token_bytes;
+        token_bytes.reserve(
+            static_cast<std::size_t>(batch.event_id.values.size()) * 160U);
+        for (py::ssize_t index = 0; index < batch.event_id.values.size();
+             ++index) {
+            consume_row(batch, index, token_bytes);
+        }
+        if (!token_bytes.empty()) {
+            hasher_.attr("update")(py::bytes(token_bytes));
+        }
+    }
+
+    [[nodiscard]] py::dict finish() const {
+        if (event_count_ <= 0) {
+            throw std::invalid_argument(
+                "native replay event stream is empty");
+        }
+        std::vector<std::string> axes;
+        axes.reserve(states_.size());
+        for (const auto& [axis, unused] : states_) {
+            static_cast<void>(unused);
+            axes.push_back(axis);
+        }
+        std::sort(axes.begin(), axes.end());
+        py::list axis_counts;
+        py::list deadline_axes;
+        std::int64_t exact_started = 0;
+        std::int64_t exact_completed = 0;
+        std::int64_t accepted_candidates = 0;
+        std::int64_t global_bests = 0;
+        for (const auto& axis : axes) {
+            const auto& state = states_.at(axis);
+            if (!state.ledger_entries.empty() &&
+                (state.ledger_index != state.ledger_entries.size() ||
+                 state.ledger_seen != 0)) {
+                throw std::invalid_argument(
+                    "persistence ledger does not cover the complete event stream: " +
+                    axis);
+            }
+            exact_started += state.exact_started;
+            exact_completed += state.exact_completed;
+            accepted_candidates += state.accepted_candidates;
+            global_bests += state.global_bests;
+            if (!state.deadline_lanes.empty()) {
+                deadline_axes.append(axis);
+            }
+            axis_counts.append(py::make_tuple(
+                axis, state.exact_started, state.exact_completed));
+        }
+        py::dict result;
+        result["event_count"] = event_count_;
+        result["first_event_id"] = first_event_id_;
+        result["last_event_id"] = previous_event_id_;
+        result["exact_started"] = exact_started;
+        result["exact_completed"] = exact_completed;
+        result["accepted_candidates"] = accepted_candidates;
+        result["global_bests"] = global_bests;
+        result["native_fallback_count"] = native_fallback_count_;
+        result["deadline_axes"] = deadline_axes;
+        result["axis_exact_counts"] = axis_counts;
+        result["event_type_counts"] = sorted_counts(event_type_counts_);
+        result["failure_reason_counts"] = sorted_counts(failure_reason_counts_);
+        result["event_token_sha256"] = hasher_.attr("hexdigest")();
+        return result;
+    }
+
+   private:
+    std::unordered_map<std::string, Stage052ReplayAxisState> states_;
+    std::unordered_map<std::string, std::int64_t> event_type_counts_;
+    std::unordered_map<std::string, std::int64_t> failure_reason_counts_;
+    std::int64_t previous_event_id_ = 0;
+    std::int64_t first_event_id_ = 0;
+    std::int64_t event_count_ = 0;
+    std::int64_t native_fallback_count_ = 0;
+    py::object hasher_;
+
+    [[nodiscard]] static py::list sorted_counts(
+        const std::unordered_map<std::string, std::int64_t>& counts) {
+        std::vector<std::pair<std::string, std::int64_t>> ordered(
+            counts.begin(), counts.end());
+        std::sort(ordered.begin(), ordered.end());
+        py::list result;
+        for (const auto& [key, value] : ordered) {
+            result.append(py::make_tuple(key, value));
+        }
+        return result;
+    }
+
+    static bool truth(
+        const Stage052ReplayNumericColumn<std::uint8_t>& column,
+        const py::ssize_t index) {
+        return column.has(index) && column.get(index) != 0;
+    }
+
+    static std::string value_or_empty(
+        const Stage052ReplayStringColumn& column,
+        const py::ssize_t index) {
+        return column.has(index) ? column.get(index) : std::string{};
+    }
+
+    static bool contains_casefold_fallback(const std::string& text) {
+        std::string lowered(text);
+        std::transform(
+            lowered.begin(), lowered.end(), lowered.begin(),
+            [](const unsigned char character) {
+                return static_cast<char>(std::tolower(character));
+            });
+        return lowered.find("fallback") != std::string::npos;
+    }
+
+    static void append_event_token(
+        std::string& destination,
+        const Stage052ReplayBatch& batch,
+        const py::ssize_t index) {
+        const auto& event_type = batch.event_type.get(index);
+        destination.push_back('[');
+        stage052_append_json_string(destination, event_type);
+        destination.push_back(',');
+        stage052_append_nullable_string(
+            destination, batch.benchmark_axis, index);
+        destination.push_back(',');
+        stage052_append_nullable_string(destination, batch.lane, index);
+        destination.push_back(',');
+        stage052_append_nullable_integer(destination, batch.iteration, index);
+        destination.push_back(',');
+        stage052_append_nullable_string(
+            destination, batch.operator_name, index);
+        destination.push_back(',');
+        stage052_append_nullable_string(destination, batch.route_key, index);
+        destination.push_back(',');
+        stage052_append_nullable_integer(destination, batch.decision_id, index);
+        destination.push_back(',');
+        stage052_append_nullable_string(
+            destination, batch.kind, index, true);
+        destination.push_back(',');
+        stage052_append_nullable_string(
+            destination, batch.operation, index, true);
+        destination.push_back(',');
+        stage052_append_nullable_string(
+            destination, batch.status, index, true);
+        destination.push_back(',');
+        if (event_type == "screening_decision" &&
+            (!batch.reason.has(index) || batch.reason.get(index).empty())) {
+            stage052_append_json_string(destination, "");
+        } else {
+            stage052_append_nullable_string(
+                destination, batch.reason, index, true);
+        }
+        destination.push_back(',');
+        stage052_append_nullable_boolean(
+            destination, batch.exact_started, index);
+        destination.push_back(',');
+        stage052_append_nullable_boolean(
+            destination, batch.exact_completed, index);
+        destination.push_back(',');
+        stage052_append_nullable_boolean(destination, batch.feasible, index);
+        destination += "]\n";
+    }
+
+    static void consume_ledger_token(
+        Stage052ReplayAxisState& state,
+        const std::string_view token,
+        const std::string& axis) {
+        if (state.ledger_entries.empty()) {
+            return;
+        }
+        if (state.ledger_index >= state.ledger_entries.size()) {
+            throw std::invalid_argument(
+                "persistence ledger ended before the event stream: " + axis);
+        }
+        state.ledger_token_bytes.append(token);
+        ++state.ledger_seen;
+        const auto& [expected_rows, expected_digest] =
+            state.ledger_entries[state.ledger_index];
+        if (state.ledger_seen == expected_rows) {
+            state.ledger_hasher.attr("update")(
+                py::bytes(state.ledger_token_bytes));
+            const auto observed =
+                py::cast<std::string>(
+                    state.ledger_hasher.attr("hexdigest")());
+            if (observed != expected_digest) {
+                throw std::invalid_argument(
+                    "persistence batch digest does not replay: " + axis + "/" +
+                    std::to_string(state.ledger_index));
+            }
+            ++state.ledger_index;
+            state.ledger_seen = 0;
+            state.ledger_token_bytes.clear();
+            state.ledger_hasher =
+                py::module_::import("hashlib").attr("sha256")();
+        } else if (state.ledger_seen > expected_rows) {
+            throw std::invalid_argument(
+                "persistence batch row count overflow: " + axis + "/" +
+                std::to_string(state.ledger_index));
+        }
+    }
+
+    void consume_row(
+        const Stage052ReplayBatch& batch,
+        const py::ssize_t index,
+        std::string& token_bytes) {
+        if (!batch.event_id.has(index)) {
+            throw std::invalid_argument(
+                "event IDs are not strictly increasing");
+        }
+        const auto event_id = batch.event_id.get(index);
+        if (event_id <= previous_event_id_) {
+            throw std::invalid_argument(
+                "event IDs are not strictly increasing");
+        }
+        if (first_event_id_ == 0) {
+            first_event_id_ = event_id;
+        }
+        previous_event_id_ = event_id;
+        ++event_count_;
+
+        auto axis = value_or_empty(batch.benchmark_axis, index);
+        const auto lane = value_or_empty(batch.lane, index);
+        if (axis.empty()) {
+            axis = lane.substr(0, lane.find(':'));
+        }
+        auto state_iterator = states_.find(axis);
+        if (state_iterator == states_.end()) {
+            throw std::invalid_argument(
+                "event refers to an unknown benchmark axis: " + axis);
+        }
+        auto& state = state_iterator->second;
+        const auto& event_type = batch.event_type.get(index);
+        ++event_type_counts_[event_type];
+        const auto token_start = token_bytes.size();
+        append_event_token(token_bytes, batch, index);
+        consume_ledger_token(
+            state,
+            std::string_view(token_bytes).substr(token_start),
+            axis);
+
+        const auto failure_reason =
+            value_or_empty(batch.failure_reason, index);
+        const bool fallback =
+            truth(batch.native_fallback, index) ||
+            (event_type == "execution_error" &&
+             contains_casefold_fallback(failure_reason));
+        if (fallback) {
+            ++native_fallback_count_;
+            throw std::invalid_argument(
+                "native/protocol fallback observed on " + axis);
+        }
+        if (!failure_reason.empty()) {
+            ++failure_reason_counts_[failure_reason];
+        }
+
+        if (event_type == "deadline_boundary") {
+            if (!batch.timestamp_seconds.has(index) ||
+                !std::isfinite(batch.timestamp_seconds.get(index)) ||
+                std::abs(
+                    batch.timestamp_seconds.get(index) -
+                    static_cast<double>(state.budget_seconds)) > 1.0) {
+                throw std::invalid_argument(
+                    "deadline boundary timestamp mismatch on " + axis);
+            }
+            state.deadline_lanes.insert(lane);
+        }
+
+        if (event_type == "route_evaluation") {
+            if (!batch.evaluation_id.has(index) ||
+                batch.evaluation_id.get(index) !=
+                    state.last_evaluation_id + 1) {
+                throw std::invalid_argument(
+                    "route evaluation ordering mismatch on " + axis);
+            }
+            state.last_evaluation_id = batch.evaluation_id.get(index);
+            if (truth(batch.exact_started, index)) {
+                if (state.deadline_lanes.contains(lane)) {
+                    throw std::invalid_argument(
+                        "exact work started after deadline on " + axis);
+                }
+                ++state.exact_started;
+                if (!batch.started_at.has(index) ||
+                    !std::isfinite(batch.started_at.get(index)) ||
+                    batch.started_at.get(index) < 0.0) {
+                    throw std::invalid_argument(
+                        "invalid exact start time on " + axis);
+                }
+                if (truth(batch.exact_completed, index)) {
+                    ++state.exact_completed;
+                    if (!batch.completed_at.has(index) ||
+                        !std::isfinite(batch.completed_at.get(index)) ||
+                        batch.completed_at.get(index) <
+                            batch.started_at.get(index) ||
+                        batch.completed_at.get(index) >
+                            static_cast<double>(state.budget_seconds)) {
+                        throw std::invalid_argument(
+                            "exact completion crosses deadline on " + axis);
+                    }
+                    const auto digest =
+                        value_or_empty(batch.cache_key_digest, index);
+                    if (digest.empty() ||
+                        !state.cache_misses.contains(digest)) {
+                        throw std::invalid_argument(
+                            "exact completion lacks a preceding cache miss on " +
+                            axis);
+                    }
+                    state.cache_misses.erase(digest);
+                    state.completed_exact_keys.insert(digest);
+                }
+                if (value_or_empty(batch.status, index) ==
+                    "interrupted_deadline") {
+                    state.deadline_lanes.insert(lane);
+                }
+            }
+        }
+
+        if (event_type == "cache_event") {
+            const auto operation = value_or_empty(batch.operation, index);
+            const auto digest =
+                value_or_empty(batch.cache_key_digest, index);
+            if (operation == "store") {
+                if (state.deadline_lanes.contains(lane)) {
+                    throw std::invalid_argument(
+                        "cache store observed after deadline on " + axis);
+                }
+                if (digest.empty()) {
+                    throw std::invalid_argument(
+                        "cache store lacks key on " + axis);
+                }
+                if (!state.completed_exact_keys.contains(digest)) {
+                    throw std::invalid_argument(
+                        "cache store precedes exact completion on " + axis);
+                }
+                state.completed_exact_keys.erase(digest);
+                state.cache_keys.insert(digest);
+            } else if (operation == "evict") {
+                if (!state.cache_keys.contains(digest)) {
+                    throw std::invalid_argument(
+                        "cache eviction refers to an absent key on " + axis);
+                }
+                state.cache_keys.erase(digest);
+            } else if (operation == "lookup_result") {
+                const auto result =
+                    value_or_empty(batch.lookup_result, index);
+                if (result == "hit" &&
+                    !state.cache_keys.contains(digest)) {
+                    throw std::invalid_argument(
+                        "cache hit precedes store on " + axis);
+                }
+                if (result == "miss") {
+                    if (digest.empty()) {
+                        throw std::invalid_argument(
+                            "cache miss lacks key on " + axis);
+                    }
+                    state.cache_misses.insert(digest);
+                }
+            }
+        }
+
+        if (event_type == "candidate_state" &&
+            truth(batch.accepted, index)) {
+            if (state.deadline_lanes.contains(lane)) {
+                throw std::invalid_argument(
+                    "candidate accepted after deadline on " + axis);
+            }
+            if (!batch.candidate_vehicle_delta.has(index) ||
+                batch.candidate_vehicle_delta.get(index) > 0) {
+                throw std::invalid_argument(
+                    "accepted candidate violates vehicle-first policy on " +
+                    axis);
+            }
+            ++state.accepted_candidates;
+            if (truth(batch.global_best, index)) {
+                ++state.global_bests;
+            }
+        }
+    }
+};
 
 struct Stage052CanonicalSignature {
     std::array<std::uint64_t, 32> values{};
@@ -3099,6 +3792,13 @@ py::tuple propagate_routes_numeric(
 
 PYBIND11_MODULE(_core, module) {
     module.doc() = "Native kernels for EVRP-TW route evaluation";
+    py::class_<Stage052ReplayState>(module, "Stage052ReplayState")
+        .def(
+            py::init<const py::dict&, const py::dict&>(),
+            py::arg("axis_budgets"),
+            py::arg("persistence_ledgers") = py::dict())
+        .def("consume", &Stage052ReplayState::consume, py::arg("encoded_columns"))
+        .def("finish", &Stage052ReplayState::finish);
     module.def(
         "pack_stage052_screening_occurrences",
         &pack_stage052_screening_occurrences,

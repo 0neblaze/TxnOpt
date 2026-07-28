@@ -20,6 +20,7 @@ import sqlite3
 import tempfile
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple, cast, overload
@@ -242,6 +243,8 @@ class ArtifactStorageConfig:
     critical_evidence: str = "full"
     diagnostic_evidence: str = "aggregate"
     screening_schema_version: str = ""
+    parquet_row_group_size: int = V2_PARQUET_ROW_GROUP_SIZE
+    parquet_queue_depth: int = 1
     per_instance_seed_max_bytes: int = DEFAULT_PER_INSTANCE_SEED_MAX_BYTES
     per_run_max_bytes: int = DEFAULT_PER_RUN_MAX_BYTES
 
@@ -287,6 +290,10 @@ class ArtifactStorageConfig:
             raise ValueError(
                 f"{self.storage_policy_version} does not support {self.screening_schema_version}"
             )
+        if self.parquet_row_group_size not in {65_536, 262_144}:
+            raise ValueError("Parquet row group size must be 65,536 or 262,144")
+        if self.parquet_queue_depth not in {1, 2}:
+            raise ValueError("Parquet queue depth must be 1 or 2")
         if self.per_instance_seed_max_bytes <= 0 or self.per_run_max_bytes <= 0:
             raise ValueError("artifact byte budgets must be positive")
         if self.per_instance_seed_max_bytes > self.per_run_max_bytes:
@@ -302,6 +309,8 @@ class ArtifactStorageConfig:
             "critical_evidence": self.critical_evidence,
             "diagnostic_evidence": self.diagnostic_evidence,
             "screening_schema_version": self.screening_schema_version,
+            "parquet_row_group_size": self.parquet_row_group_size,
+            "parquet_queue_depth": self.parquet_queue_depth,
             "per_instance_seed_max_bytes": self.per_instance_seed_max_bytes,
             "per_run_max_bytes": self.per_run_max_bytes,
         }
@@ -2211,7 +2220,7 @@ def _write_parquet(
         use_dictionary=True,
         write_statistics=True,
         row_group_size=(
-            V2_PARQUET_ROW_GROUP_SIZE
+            config.parquet_row_group_size
             if config.storage_policy_version == ARTIFACT_STORAGE_V2
             else None
         ),
@@ -2258,6 +2267,17 @@ class _StreamingParquetSink:
         self._columns: tuple[list[object], ...] = tuple([] for _ in schema)
         self._buffered_row_count = 0
         self.row_count = 0
+        self._row_group_size = config.parquet_row_group_size
+        self._queue_depth = config.parquet_queue_depth
+        self._executor = (
+            ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="stage052-parquet",
+            )
+            if self._queue_depth == 2
+            else None
+        )
+        self._pending_writes: list[Future[None]] = []
         high_volume_compact = (
             schema.equals(EVENTS_SCHEMA)
             or schema.equals(V2_SCREENING_DECISIONS_SCHEMA)
@@ -2277,7 +2297,7 @@ class _StreamingParquetSink:
         for field, column in zip(self.schema, self._columns, strict=True):
             column.append(row.get(field.name))
         self._buffered_row_count += 1
-        if self._buffered_row_count >= V2_PARQUET_ROW_GROUP_SIZE:
+        if self._buffered_row_count >= self._row_group_size:
             self.flush()
 
     def append_values(self, values: Sequence[object]) -> None:
@@ -2290,7 +2310,7 @@ class _StreamingParquetSink:
         for column, value in zip(self._columns, values, strict=True):
             column.append(value)
         self._buffered_row_count += 1
-        if self._buffered_row_count >= V2_PARQUET_ROW_GROUP_SIZE:
+        if self._buffered_row_count >= self._row_group_size:
             self.flush()
 
     def append_value_rows(
@@ -2313,14 +2333,14 @@ class _StreamingParquetSink:
             )
         offset = 0
         while offset < len(rows):
-            available = V2_PARQUET_ROW_GROUP_SIZE - self._buffered_row_count
+            available = self._row_group_size - self._buffered_row_count
             chunk = rows[offset : offset + available]
             for column, values in zip(self._columns, zip(*chunk, strict=True), strict=True):
                 column.extend(values)
             appended = len(chunk)
             self._buffered_row_count += appended
             offset += appended
-            if self._buffered_row_count == V2_PARQUET_ROW_GROUP_SIZE:
+            if self._buffered_row_count == self._row_group_size:
                 self.flush()
 
     def append_columns(self, columns: Sequence[Sequence[object]]) -> None:
@@ -2335,14 +2355,14 @@ class _StreamingParquetSink:
             raise ArtifactIntegrityError(f"typed column lengths do not match for {self.path}")
         offset = 0
         while offset < row_count:
-            available = V2_PARQUET_ROW_GROUP_SIZE - self._buffered_row_count
+            available = self._row_group_size - self._buffered_row_count
             appended = min(available, row_count - offset)
             end = offset + appended
             for target, source in zip(self._columns, columns, strict=True):
                 target.extend(source[offset:end])
             self._buffered_row_count += appended
             offset = end
-            if self._buffered_row_count == V2_PARQUET_ROW_GROUP_SIZE:
+            if self._buffered_row_count == self._row_group_size:
                 self.flush()
 
     def append_batch(self, batch: pa.RecordBatch) -> None:
@@ -2355,14 +2375,38 @@ class _StreamingParquetSink:
         self.flush()
         offset = 0
         while offset < batch.num_rows:
-            current = batch.slice(offset, V2_PARQUET_ROW_GROUP_SIZE)
-            self._writer.write_batch(current, row_group_size=V2_PARQUET_ROW_GROUP_SIZE)
+            current = batch.slice(offset, self._row_group_size)
+            self._submit_write_batch(current)
             self.row_count += current.num_rows
             offset += current.num_rows
 
     @property
     def buffered_row_count(self) -> int:
         return self._buffered_row_count
+
+    def _submit(self, write: Callable[[], None]) -> None:
+        if self._executor is None:
+            write()
+            return
+        if len(self._pending_writes) >= self._queue_depth:
+            self._pending_writes.pop(0).result()
+        self._pending_writes.append(self._executor.submit(write))
+
+    def _submit_write_batch(self, batch: pa.RecordBatch) -> None:
+        def write() -> None:
+            self._writer.write_batch(batch, row_group_size=self._row_group_size)
+
+        self._submit(write)
+
+    def _submit_write_table(self, table: pa.Table) -> None:
+        def write() -> None:
+            self._writer.write_table(table, row_group_size=self._row_group_size)
+
+        self._submit(write)
+
+    def _drain_pending_writes(self) -> None:
+        while self._pending_writes:
+            self._pending_writes.pop(0).result()
 
     def flush(self) -> None:
         if self._buffered_row_count == 0:
@@ -2372,7 +2416,7 @@ class _StreamingParquetSink:
             for field, column in zip(self.schema, self._columns, strict=True)
         ]
         table = pa.Table.from_arrays(arrays, schema=self.schema)
-        self._writer.write_table(table, row_group_size=V2_PARQUET_ROW_GROUP_SIZE)
+        self._submit_write_table(table)
         self.row_count += table.num_rows
         for column in self._columns:
             column.clear()
@@ -2384,6 +2428,16 @@ class _StreamingParquetSink:
             self.flush()
         except BaseException as error:
             errors.append(error)
+        while self._pending_writes:
+            try:
+                self._pending_writes.pop(0).result()
+            except BaseException as error:
+                errors.append(error)
+        if self._executor is not None:
+            try:
+                self._executor.shutdown(wait=True, cancel_futures=False)
+            except BaseException as error:
+                errors.append(error)
         try:
             self._writer.close()
         except BaseException as error:
@@ -3941,7 +3995,17 @@ def verify_manifest(run_dir: Path) -> dict[str, Any]:
     canonical_policy = policy.to_dict()
     legacy_policy = dict(canonical_policy)
     legacy_policy.pop("screening_schema_version")
-    if dict(policy_payload) not in (canonical_policy, legacy_policy):
+    pre_calibration_policy = dict(canonical_policy)
+    pre_calibration_policy.pop("parquet_row_group_size")
+    pre_calibration_policy.pop("parquet_queue_depth")
+    earliest_policy = dict(pre_calibration_policy)
+    earliest_policy.pop("screening_schema_version")
+    if dict(policy_payload) not in (
+        canonical_policy,
+        pre_calibration_policy,
+        legacy_policy,
+        earliest_policy,
+    ):
         raise ArtifactIntegrityError("current artifact manifest storage policy is not canonical")
     artifact_status = manifest.get("artifact_status")
     if not isinstance(artifact_status, Mapping):
@@ -4219,7 +4283,11 @@ def _verify_post_manifest_persistence_envelopes(
             raise ArtifactIntegrityError("campaign manifest JSON is invalid") from error
         if (
             not isinstance(campaign_state, Mapping)
-            or campaign_state.get("schema_version") != "stage05.2-campaign-manifest-v1"
+            or campaign_state.get("schema_version")
+            not in {
+                "stage05.2-campaign-manifest-v1",
+                "stage05.2-campaign-manifest-v2",
+            }
             or campaign_state.get("run_label") != run_label
             or campaign_state.get("status") not in {"planned", "complete", "failed"}
         ):

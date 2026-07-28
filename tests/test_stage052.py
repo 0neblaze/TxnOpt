@@ -708,7 +708,7 @@ def test_current_chain_prerequisite_rejects_receipt_revision_mismatch(
         verify_stage052_evidence_input(tmp_path, requirement)
 
 
-def test_stage052_storage_root_binding_is_path_free_and_matches_local_locator(
+def test_stage052_storage_root_binding_is_path_free_and_alias_scoped(
     tmp_path: Path,
 ) -> None:
     locator_path = tmp_path / "stage052_storage_roots.local.toml"
@@ -746,11 +746,6 @@ filesystem = "ExFAT"
         {
             "schema_version": "stage05.2-storage-root-binding-v1",
             "alias": "transfer_staging",
-            "volume": {"device_uuid": "wrong", "filesystem": "ExFAT"},
-        },
-        {
-            "schema_version": "stage05.2-storage-root-binding-v1",
-            "alias": "transfer_staging",
             "volume": {
                 "device_uuid": "transfer-uuid",
                 "filesystem": "ExFAT",
@@ -759,7 +754,7 @@ filesystem = "ExFAT"
         },
     ),
 )
-def test_stage052_storage_root_binding_rejects_missing_mismatched_or_pathful_identity(
+def test_stage052_storage_root_binding_rejects_missing_or_pathful_identity(
     staging_root: object,
     tmp_path: Path,
 ) -> None:
@@ -781,6 +776,35 @@ filesystem = "ExFAT"
             locator_path=locator_path,
             expected_alias="transfer_staging",
         )
+
+
+def test_stage052_storage_root_binding_treats_device_change_as_telemetry(
+    tmp_path: Path,
+) -> None:
+    locator_path = tmp_path / "stage052_storage_roots.local.toml"
+    locator_path.write_text(
+        """
+[roots.transfer_staging]
+absolute_path = "/Volumes/TRANSFER/project/results"
+device_uuid = "configured-device"
+filesystem = "ExFAT"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    observed = stage052_storage_root_binding(
+        alias="transfer_staging",
+        volume={"device_uuid": "observed-device", "filesystem": "APFS"},
+    )
+
+    assert (
+        verify_stage052_storage_root_binding(
+            {"staging_root": observed},
+            locator_path=locator_path,
+            expected_alias="transfer_staging",
+        )
+        == observed
+    )
 
 
 def test_performance_producer_verifies_exact_staging_path_and_live_volume(
@@ -818,7 +842,7 @@ filesystem = "9p"
     assert "absolute_path" not in json.dumps(binding)
 
 
-def test_performance_producer_rejects_wrong_staging_volume(
+def test_performance_producer_records_observed_staging_volume_as_telemetry(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "repo"
@@ -840,14 +864,18 @@ filesystem = "9p"
         encoding="utf-8",
     )
 
-    with pytest.raises(RuntimeError, match="volume identity mismatch"):
-        _verify_performance_staging_root(
-            root=root,
-            locator_path=locator_path,
-            staging_alias="wsl_staging",
-            output_dir=results / "stage05.2_job_parallel_attempt07",
-            volume_probe=lambda _path: VolumeIdentity("internal-uuid", "APFS"),
-        )
+    binding = _verify_performance_staging_root(
+        root=root,
+        locator_path=locator_path,
+        staging_alias="wsl_staging",
+        output_dir=results / "stage05.2_job_parallel_attempt07",
+        volume_probe=lambda _path: VolumeIdentity("internal-uuid", "APFS"),
+    )
+
+    assert binding["volume"] == {
+        "device_uuid": "internal-uuid",
+        "filesystem": "APFS",
+    }
 
 
 def test_performance_reviewer_independently_reprobes_staging_volume(
@@ -896,8 +924,8 @@ filesystem = "ExFAT"
 
     assert passed
     assert "transfer_staging" in detail
-    assert not changed
-    assert "mismatch" in changed_detail
+    assert changed
+    assert "current telemetry=other-uuid/APFS" in changed_detail
 
 
 def test_current_staging_review_rejects_wrong_path_filesystem_and_aliases(

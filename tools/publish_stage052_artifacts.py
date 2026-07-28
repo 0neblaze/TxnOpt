@@ -18,7 +18,10 @@ from typing import Any, Final
 from evrptw.artifacts import signed_sidecar_matches
 
 PUBLICATION_SCHEMA: Final = "stage05.2-performance-benchmark-publication-v1"
-REVIEW_SCHEMA: Final = "stage05.2-campaign-review-v1"
+REVIEW_SCHEMA: Final = "stage05.2-campaign-review-v2"
+SUPPORTED_REVIEW_SCHEMAS: Final = frozenset(
+    {"stage05.2-campaign-review-v1", REVIEW_SCHEMA}
+)
 FORMAL_READY: Final = "READY_FOR_STAGE05_3"
 _TARGET_NAMES: Final[dict[str, str]] = {
     "per_run_results": "per_run_results.csv",
@@ -83,8 +86,9 @@ def _load_review_manifest(
         raise ValueError(f"cannot read campaign review manifest: {path}") from error
     if not isinstance(payload, dict):
         raise ValueError("campaign review manifest must be an object")
+    if payload.get("schema_version") not in SUPPORTED_REVIEW_SCHEMAS:
+        raise ValueError("campaign review schema_version is not publishable")
     expected = {
-        "schema_version": REVIEW_SCHEMA,
         "component": "benchmark",
         "scope": expected_scope,
         "status": expected_status,
@@ -105,6 +109,8 @@ def _load_review_manifest(
     selection = payload.get("selection_lock")
     native = payload.get("native_configuration")
     accelerator_decision = payload.get("accelerator_decision")
+    is_current_schema = payload.get("schema_version") == REVIEW_SCHEMA
+    allowed_producer_workers = {4, 5, 6} if is_current_schema else {2, 4}
     expected_backend = {
         "GPU_NOT_JUSTIFIED": "native_cpu",
         "NATIVE_CPU_RETAINED": "native_cpu",
@@ -117,7 +123,7 @@ def _load_review_manifest(
         or expected_backend is None
         or payload.get("selected_backend") != expected_backend
         or payload.get("selected_exact_backend") != "cpu_batch"
-        or payload.get("selected_workers") not in {2, 4}
+        or payload.get("selected_workers") not in allowed_producer_workers
         or payload.get("native_profile") != "stage05.2-native-kernels-v1"
         or selection.get("selected_backend") != payload.get("selected_backend")
         or selection.get("selected_exact_backend")
@@ -133,6 +139,68 @@ def _load_review_manifest(
         or not _is_sha256(selection.get("accelerator_review_manifest_sha256"))
     ):
         raise ValueError("campaign review execution selection lock is invalid")
+    if is_current_schema:
+        storage_identity = payload.get("storage_publication_identity")
+        storage_batches = (
+            storage_identity.get("batches")
+            if isinstance(storage_identity, Mapping)
+            else None
+        )
+        storage_digest = (
+            hashlib.sha256(
+                json.dumps(
+                    storage_identity,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if isinstance(storage_identity, Mapping)
+            else None
+        )
+        replay_metrics = payload.get("review_shard_metrics")
+        if (
+            not isinstance(storage_identity, Mapping)
+            or storage_identity.get("schema_version")
+            != "stage05.2-storage-publication-identity-v1"
+            or storage_identity.get("run_label") != run_label
+            or not isinstance(storage_batches, list)
+            or not storage_batches
+            or any(
+                not isinstance(batch, Mapping)
+                or set(batch)
+                != {
+                    "root_alias",
+                    "relative_path",
+                    "file_count",
+                    "byte_count",
+                    "tree_sha256",
+                }
+                or not isinstance(batch.get("root_alias"), str)
+                or not isinstance(batch.get("relative_path"), str)
+                or not isinstance(batch.get("file_count"), int)
+                or batch.get("file_count", 0) <= 0
+                or not isinstance(batch.get("byte_count"), int)
+                or batch.get("byte_count", 0) <= 0
+                or not _is_sha256(batch.get("tree_sha256"))
+                for batch in storage_batches
+            )
+            or payload.get("storage_publication_identity_sha256") != storage_digest
+            or not isinstance(replay_metrics, list)
+            or not replay_metrics
+            or any(
+                not isinstance(metric, Mapping)
+                or metric.get("replay_backend") != "native_arrow"
+                or metric.get("native_fallback_count") != 0
+                or metric.get("review_workers") not in {1, 2, 4}
+                or not isinstance(metric.get("canonical_merge_ordinal"), int)
+                or not isinstance(metric.get("logical_events"), int)
+                or metric.get("logical_events", 0) <= 0
+                for metric in replay_metrics
+            )
+        ):
+            raise ValueError(
+                "campaign review storage/replay observability contract is invalid"
+            )
     from evrptw.stage052_evidence import (
         CAMPAIGN_PILOT_GATES,
         verify_stage052_campaign_gate_set,
