@@ -1278,3 +1278,11 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   `screening_definition_rows=131043`，比不可降低的 131,072 spill boundary 少 29。
   plan replay 已补齐 resource contract；Attempt75 不被提升，新 Pilot 使用下一 label
   从零运行，只有真实 shard 越过 131,072 才可通过 spill gate。
+- `stage05.2_benchmark_attempt76` 随后从零完成 36/36 shards；真实
+  `rc101_21/2015` shard 写入 131,106 个 unique screening definitions，超过固定
+  131,072 boundary 34 条并触发 transactional SQLite spill。独立 native review
+  generation `62ff2886851c214aaffef66fd3aa370fe054f97052b385d0a31b51a646a973c0`
+  重放 14,978,339 events 后通过 19/20 gates，仅 publication dry run 因新 selection
+  lock 漏带 Attempt72 内部冻结的原 accelerator-review SHA 而失败。该 hash 与
+  Attempt72 review SHA 是两条不同的谱系边：修复后同时保留两者，再以新 sealed
+  reviewer generation 重放同一 immutable Attempt76 raw。

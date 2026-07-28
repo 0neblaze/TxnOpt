@@ -3794,6 +3794,16 @@ def _verify_accelerator_prerequisite(
         expected_scope="pilot",
         expected_status=PILOT_READY,
     )
+    accepted_selection = review.get("selection_lock")
+    accelerator_review_sha256 = (
+        accepted_selection.get("accelerator_review_manifest_sha256")
+        if isinstance(accepted_selection, Mapping)
+        else None
+    )
+    if not _is_sha256(accelerator_review_sha256):
+        raise ArtifactIntegrityError(
+            "accepted Pilot does not preserve its accelerator review identity"
+        )
     if campaign.producer_resource_contract is None:
         raise ArtifactIntegrityError("successor Pilot lacks its producer resource contract")
     selection_lock = accepted.with_producer_resource_contract(
@@ -3802,6 +3812,7 @@ def _verify_accelerator_prerequisite(
     selection_lock.update(
         {
             "accepted_pilot_review_manifest_sha256": identity.review_manifest_sha256,
+            "accelerator_review_manifest_sha256": accelerator_review_sha256,
             "accelerator_decision": review.get("accelerator_decision"),
             "native_profile": campaign.native_profile,
             "selected_optimization_profile": review.get(
