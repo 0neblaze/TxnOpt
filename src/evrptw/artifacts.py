@@ -55,10 +55,9 @@ UNIQUE_ROUTE_IDENTITY_MEMORY_ENTRIES = 262_144
 ROUTE_ID_RESOLUTION_CACHE_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
 SCREENING_DEFINITION_HOT_CACHE_ENTRIES = 524_288
 # A producer needs only the full SHA-256 collision token because the canonical
-# definition payload is already written to Parquet.  Keeping only the token,
-# rather than a second JSON copy, bounds the pre-spill working set; larger
-# shards deliberately exercise the recoverable SQLite identity store.
-SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES = 131_072
+# definition payload is already written to Parquet.  The native bounded store
+# retains those tokens without a disposable SQLite hot-path dependency.
+SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES = 2_097_152
 ROUTE_IDENTITY_COUNTER_NAMESPACES = 16
 MAX_SCREENING_CHECKS_PER_DECISION = 8
 # Keep live definition/occurrence transactions at or below one 65,536-row Parquet
@@ -77,16 +76,15 @@ DEFAULT_PER_RUN_MAX_BYTES = 32 * 1024 * 1024 * 1024
 
 
 def screening_definition_store_contract() -> dict[str, object]:
-    """Return the signed producer contract used to prove real SQLite spill."""
+    """Return the signed bounded producer identity-store contract."""
 
     return {
-        "schema_version": "stage05.2-screening-definition-store-v1",
+        "schema_version": "stage05.2-screening-definition-store-v2",
+        "producer_backend": "native_bounded_digest",
         "producer_memory_entries": SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES,
-        "spill_backend": "sqlite",
-        "journal_mode": "memory",
-        "synchronous": "normal",
-        "integrity_check": "required_before_close",
-        "scratch_cleanup": "required_on_success_and_failure",
+        "overflow_policy": "fail_fast",
+        "spill_backend": "none",
+        "scratch_cleanup": "not_applicable",
     }
 
 
@@ -1663,7 +1661,7 @@ def _screening_definition_identity(definition: Mapping[str, object]) -> tuple[in
 
 
 class _BoundedScreeningDefinitionStore:
-    """Exact bounded definition identity store with fail-fast disk spill."""
+    """Bounded producer identities or payload-retaining compatibility storage."""
 
     def __init__(
         self,
@@ -1677,12 +1675,26 @@ class _BoundedScreeningDefinitionStore:
         if scratch_root is not None:
             scratch_root.mkdir(parents=True, exist_ok=True)
         self._scratch_root = scratch_root
-        self._temporary_directory = tempfile.TemporaryDirectory(
-            prefix="evrptw-screening-definitions-",
-            dir=scratch_root,
+        self._temporary_directory = (
+            tempfile.TemporaryDirectory(
+                prefix="evrptw-screening-definitions-",
+                dir=scratch_root,
+            )
+            if retain_payload
+            else None
         )
         self._connection: sqlite3.Connection | None = None
         self._retain_payload = retain_payload
+        if retain_payload:
+            self._producer_identity_store: object | None = None
+        else:
+            from evrptw import _core as native_core
+
+            self._producer_identity_store = (
+                native_core.create_stage052_definition_identity_store(
+                    SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES
+                )
+            )
         self._digest_memory: dict[int, bytes] = {}
         self._encoded_memory: dict[int, bytes] = {}
         self._memory_entries = (
@@ -1720,6 +1732,15 @@ class _BoundedScreeningDefinitionStore:
             expected_id = int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
         if expected_id != definition_id:
             raise ArtifactIntegrityError("screening definition hash mismatch")
+        if not self._retain_payload:
+            pending = _PendingScreeningDefinition(
+                definition_id=definition_id,
+                encoded=encoded,
+                digest=digest,
+                payload=dict(definition),
+                row=(),
+            )
+            return bool(self.register_many((pending,)))
         if self._connection is None:
             existing_digest = self._digest_memory.get(definition_id)
             if existing_digest is not None:
@@ -1766,6 +1787,21 @@ class _BoundedScreeningDefinitionStore:
         definitions: Sequence[_PendingScreeningDefinition],
     ) -> tuple[_PendingScreeningDefinition, ...]:
         """Register one bounded transaction with batched collision checks."""
+
+        if not self._retain_payload:
+            identity_store = self._producer_identity_store
+            if identity_store is None:
+                raise RuntimeError("screening definition identity store is closed")
+            from evrptw import _core as native_core
+
+            try:
+                native_inserted = native_core.register_stage052_definition_identities(
+                    identity_store,
+                    definitions,
+                )
+            except ValueError as error:
+                raise ArtifactIntegrityError(str(error)) from error
+            return cast(tuple[_PendingScreeningDefinition, ...], native_inserted)
 
         unique: dict[int, _PendingScreeningDefinition] = {}
         for definition in definitions:
@@ -1838,6 +1874,8 @@ class _BoundedScreeningDefinitionStore:
         return inserted
 
     def resolve(self, definition_id: int) -> dict[str, object]:
+        if not self._retain_payload:
+            raise ArtifactIntegrityError("screening definition payload was not retained")
         cached = self._cache.get(definition_id)
         if cached is not None:
             self._cache.move_to_end(definition_id)
@@ -1893,12 +1931,44 @@ class _BoundedScreeningDefinitionStore:
             finally:
                 self._connection = None
                 try:
-                    self._temporary_directory.cleanup()
+                    if self._temporary_directory is not None:
+                        self._temporary_directory.cleanup()
                 finally:
+                    self._producer_identity_store = None
                     self._digest_memory.clear()
                     self._encoded_memory.clear()
                     self._cache.clear()
                     self._closed = True
+
+    @property
+    def producer_backend(self) -> str:
+        return (
+            "python_sqlite_payload"
+            if self._retain_payload
+            else "native_bounded_digest"
+        )
+
+    @property
+    def entry_count(self) -> int:
+        identity_store = self._producer_identity_store
+        if identity_store is not None:
+            from evrptw import _core as native_core
+
+            return int(
+                native_core.stage052_definition_identity_store_size(
+                    identity_store
+                )
+            )
+        if self._connection is not None:
+            stored = self._connection.execute(
+                "SELECT COUNT(*) FROM definitions"
+            ).fetchone()
+            if stored is None:
+                raise ArtifactIntegrityError(
+                    "screening definition count is unavailable"
+                )
+            return int(stored[0])
+        return len(self._digest_memory)
 
     def _remember(self, definition_id: int, definition: dict[str, object]) -> None:
         self._cache[definition_id] = definition
@@ -1909,6 +1979,8 @@ class _BoundedScreeningDefinitionStore:
     def _spill_encoded_memory(self) -> None:
         if self._connection is not None:
             return
+        if self._temporary_directory is None:
+            raise RuntimeError("producer screening definition spill is forbidden")
         database_path = Path(self._temporary_directory.name) / "definitions.sqlite3"
         # Stage 5.2 serializes producer/writer access through one explicit
         # shard turn.  The connection may therefore move between those two

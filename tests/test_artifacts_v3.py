@@ -579,18 +579,15 @@ def test_producer_screening_definition_store_retains_only_full_digests(
         assert store.register_many(definitions) == definitions
         assert store._connection is None  # noqa: SLF001
         assert store._encoded_memory == {}  # noqa: SLF001
-        assert len(store._digest_memory) == 3  # noqa: SLF001
-        assert all(  # noqa: SLF001
-            isinstance(digest, bytes) and len(digest) == 32
-            for digest in store._digest_memory.values()  # noqa: SLF001
-        )
+        assert store._digest_memory == {}  # noqa: SLF001
+        assert store.entry_count == 3
         with pytest.raises(ArtifactIntegrityError, match="payload was not retained"):
             store.resolve(definitions[0].definition_id)
 
     assert list(tmp_path.iterdir()) == []
 
 
-def test_producer_screening_definition_store_spills_digest_without_payload(
+def test_producer_screening_definition_store_fails_fast_without_scratch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -605,22 +602,65 @@ def test_producer_screening_definition_store_spills_digest_without_payload(
         scratch_root=tmp_path,
         retain_payload=False,
     ) as store:
-        assert store.register_many((first, second)) == (first, second)
-        assert store._connection is not None  # noqa: SLF001
-        stored = store._connection.execute(  # noqa: SLF001
-            "SELECT digest, payload FROM definitions WHERE definition_id = ?",
-            (first.definition_id,),
-        ).fetchone()
-        assert stored is not None
-        assert bytes(stored[0]) == first.digest
-        assert stored[1] is None
+        assert store.register(first.definition_id, first.payload, allow_identical_existing=True)
+        assert not store.register(
+            first.definition_id,
+            first.payload,
+            allow_identical_existing=True,
+        )
+        with pytest.raises(ArtifactIntegrityError, match="bound exceeded"):
+            store.register_many((second,))
+        assert store._connection is None  # noqa: SLF001
         assert store.register_many((first,)) == ()
 
     assert list(tmp_path.iterdir()) == []
 
 
-def test_producer_screening_definition_store_bound_exercises_pilot_spill() -> None:
-    assert artifacts_module.SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES == 131_072
+def test_producer_screening_definition_store_uses_native_bounded_identity_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        artifacts_module,
+        "SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES",
+        3,
+    )
+    first, second, third, fourth = (
+        _pending_definition(value) for value in range(4)
+    )
+    store = artifacts_module._BoundedScreeningDefinitionStore(  # noqa: SLF001
+        cache_entries=1,
+        scratch_root=tmp_path,
+        retain_payload=False,
+    )
+    try:
+        assert store.register_many((first, second, third)) == (
+            first,
+            second,
+            third,
+        )
+        assert store.producer_backend == "native_bounded_digest"
+        assert store._connection is None  # noqa: SLF001
+        with pytest.raises(ArtifactIntegrityError, match="bound exceeded"):
+            store.register_many((fourth,))
+        assert store.entry_count == 3
+    finally:
+        store.close()
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_screening_definition_store_contract_binds_native_producer_limit() -> None:
+    contract = artifacts_module.screening_definition_store_contract()
+
+    assert contract == {
+        "schema_version": "stage05.2-screening-definition-store-v2",
+        "producer_backend": "native_bounded_digest",
+        "producer_memory_entries": 2_097_152,
+        "overflow_policy": "fail_fast",
+        "spill_backend": "none",
+        "scratch_cleanup": "not_applicable",
+    }
 
 
 def test_screening_definition_store_checks_integrity_before_cleanup(
@@ -629,14 +669,14 @@ def test_screening_definition_store_checks_integrity_before_cleanup(
 ) -> None:
     monkeypatch.setattr(
         artifacts_module,
-        "SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES",
+        "SCREENING_DEFINITION_HOT_CACHE_ENTRIES",
         1,
     )
     first, second = (_pending_definition(value) for value in range(2))
     store = artifacts_module._BoundedScreeningDefinitionStore(  # noqa: SLF001
         cache_entries=1,
         scratch_root=tmp_path,
-        retain_payload=False,
+        retain_payload=True,
     )
     assert store.register_many((first, second)) == (first, second)
     connection = store._connection  # noqa: SLF001
@@ -659,14 +699,14 @@ def test_screening_definition_store_cleans_up_after_integrity_failure(
 ) -> None:
     monkeypatch.setattr(
         artifacts_module,
-        "SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES",
+        "SCREENING_DEFINITION_HOT_CACHE_ENTRIES",
         1,
     )
     first, second = (_pending_definition(value) for value in range(2))
     store = artifacts_module._BoundedScreeningDefinitionStore(  # noqa: SLF001
         cache_entries=1,
         scratch_root=tmp_path,
-        retain_payload=False,
+        retain_payload=True,
     )
     assert store.register_many((first, second)) == (first, second)
     connection = store._connection  # noqa: SLF001
@@ -697,14 +737,14 @@ def test_screening_definition_store_uses_recoverable_sqlite_transactions(
 ) -> None:
     monkeypatch.setattr(
         artifacts_module,
-        "SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES",
+        "SCREENING_DEFINITION_HOT_CACHE_ENTRIES",
         1,
     )
     first, second = (_pending_definition(value) for value in range(2))
     with artifacts_module._BoundedScreeningDefinitionStore(  # noqa: SLF001
         cache_entries=1,
         scratch_root=tmp_path,
-        retain_payload=False,
+        retain_payload=True,
     ) as store:
         assert store.register_many((first, second)) == (first, second)
         connection = store._connection  # noqa: SLF001
@@ -721,14 +761,14 @@ def test_screening_definition_store_rolls_back_a_partial_batch(
 ) -> None:
     monkeypatch.setattr(
         artifacts_module,
-        "SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES",
+        "SCREENING_DEFINITION_HOT_CACHE_ENTRIES",
         1,
     )
     first, second, third, fourth = (_pending_definition(value) for value in range(4))
     with artifacts_module._BoundedScreeningDefinitionStore(  # noqa: SLF001
         cache_entries=1,
         scratch_root=tmp_path,
-        retain_payload=False,
+        retain_payload=True,
     ) as store:
         assert store.register_many((first, second)) == (first, second)
         connection = store._connection  # noqa: SLF001
@@ -785,8 +825,9 @@ def test_screening_definition_store_rejects_memory_batch_atomically(
     with pytest.raises(ArtifactIntegrityError, match="ID collision"):
         store.register_many((new, forged))
 
-    assert new.definition_id not in store._digest_memory  # noqa: SLF001
-    assert set(store._digest_memory) == {existing.definition_id}  # noqa: SLF001
+    assert store.entry_count == 1
+    assert store.register_many((new,)) == (new,)
+    assert store.entry_count == 2
     store.close()
     assert list(tmp_path.iterdir()) == []
 
@@ -2162,7 +2203,7 @@ def _write_single_v3_screening_bundle(
     )
 
 
-def test_v3_producer_screening_scratch_stays_on_shard_volume(
+def test_v3_producer_native_screening_identity_creates_no_scratch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2184,16 +2225,17 @@ def test_v3_producer_screening_scratch_stays_on_shard_volume(
 
     store = shard._screening_definition_store
     assert store is not None
-    scratch = Path(store._temporary_directory.name)
-    assert scratch.is_relative_to(writer.run_dir / "toy" / "2014")
-    assert not scratch.is_relative_to(foreign_tmp)
+    assert store._temporary_directory is None  # noqa: SLF001
+    shard_directory = writer.run_dir / "toy" / "2014"
+    assert not tuple(shard_directory.glob("evrptw-screening-definitions-*"))
+    assert not tuple(foreign_tmp.glob("evrptw-screening-definitions-*"))
     shard.finalize(
         raw_payload={},
         solution_payload={},
         trace_payload={},
         environment_payload={},
     )
-    assert not scratch.exists()
+    assert not tuple(shard_directory.glob("evrptw-screening-definitions-*"))
 
 
 def test_v3_reader_rejects_a_tampered_definition(tmp_path: Path) -> None:

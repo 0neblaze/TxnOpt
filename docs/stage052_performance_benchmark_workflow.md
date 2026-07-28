@@ -215,28 +215,31 @@ backend 与 exact backend 的稳定选择 hash 完全一致。worker/RSS/Parquet
 independent reviewer 各自执行该检查。solver、objective、科学配置或 allowlist 外
 source path 变化都 fail fast，并要求新的 prerequisite。
 
-已接受 D/F evidence 的历史 resource gate 不追溯重写。新 G Benchmark Pilot 在
-Attempt73 的只读大型 shard 与固定高内存 scope 上校准 4/5/6 workers；高并发必须
-相对四 workers 提升至少 15%，不使用 swap/fallback，语义摘要一致，并保持 aggregate
-RSS 不超过可用内存 75%。吞吐差距不超过 5% 时选择更少 workers。最终 worker 数、
+已接受 D/F evidence 的历史 resource gate 不追溯重写。当前 G Benchmark 校准在
+Attempt73 的只读大型 shard 与固定高内存 scope 上比较 4/5/6 workers，并按用户要求
+增加 8-worker stress probe（压力探针）。6 workers 相对 4 workers 达到既定吞吐门槛，
+不使用 swap/fallback 且语义摘要一致；8 workers 仅为排除性测试，吞吐显著低于 6，
+因此 replacement Pilot/Formal 固定 6 workers。resource gate 使用实际 per-worker/
+process-tree peak、机器可用能力和明确的 operating headroom（运行余量），不再把
+可用内存的任意固定百分比作为 publication gate（发布门槛）。最终 worker 数、
 per-worker/process-tree limits、Parquet row group 65,536/262,144 与 queue depth 1/2
 写入 signed resource contract（签名资源合同），Formal 原样继承。Independent
 reviewer 单独校准 1/2/4 workers，并由 parent baseline 与 per-child p99 RSS 推导
-`MemoryHigh`、内部 guard 和 `MemoryMax`；swap 固定为 0，所有上限仍不得超过可用内存
-75%。
+`MemoryHigh`、内部 guard 和 `MemoryMax`；swap 固定为 0，资源上限必须容纳已选并发
+且不得触发持续 throttling（限流）。
 
-producer 的 screening-definition SQLite scratch 必须使用 rollback-capable
-`journal_mode=MEMORY` 与 `synchronous=NORMAL`。每个 `register_many` transaction
-（批量注册事务）成功后 commit，任何异常都 rollback 整批；禁止使用
-`journal_mode=OFF` 或让失败批次的前缀行留在 identity store。scratch 仍是 shard-local
-临时状态，不进入 raw schema。producer 的内存上限固定为 131,072 个 unique
-definitions；超过该值必须转入事务型 SQLite。成功关闭前必须执行
-`PRAGMA integrity_check`，检查失败必须 fail fast；成功和失败路径都必须关闭
-connection 并清理临时目录。Pilot 必须由 signed shard descriptor 的 row count
-与 signed batch metadata 中的 producer bound 共同独立证明至少一个 shard 实际超过
-该上限；reviewer 当前常量不得替代 producer 当时签入 raw 的 bound。reviewer 还必须
-拒绝 shard 目录中的任何残留 scratch directory（包括空目录）。只有同时通过 SQLite
-`integrity_check`、36% persistence gate 与 shard cleanup gate，才允许新的 Formal。
+producer 的 screening-definition identity state（筛选定义身份状态）固定使用
+`native_bounded_digest`（原生有界摘要）backend，保存完整 SHA-256 collision token
+（碰撞令牌）而不复制 JSON payload。hard limit 固定为 2,097,152 unique definitions；
+`register_many` 必须在任何写入前完成批内去重、已有身份碰撞检查和容量检查，使碰撞或
+overflow（越界）整批 fail fast 且不留下前缀写入。producer 禁止 SQLite spill、
+scratch directory 和 Python fallback。signed batch metadata 必须记录 v2 store
+contract；independent reviewer 必须确认整条 campaign 只有一个相同合同，并证明每个
+signed shard descriptor 的 definition row count 均不超过当次 raw 中签入的 hard
+limit。review/read 的 payload-retaining compatibility store（载荷保留兼容存储）与
+exact-route identity store 保持各自独立的 bounded SQLite 路径，不得被误报成 producer
+fallback。只有同时通过 native bound、零 fallback、36% persistence gate 与 shard
+cleanup gate，才允许新的 Formal。
 
 producer、retention、performance reviewer 与 campaign reviewer 必须调用同一个
 cross-platform `probe_volume_identity`：WSL 用 `findmnt`，DrvFS 额外绑定 Windows

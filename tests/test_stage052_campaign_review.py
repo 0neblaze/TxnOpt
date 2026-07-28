@@ -1009,35 +1009,48 @@ def test_spawned_shard_summary_rejects_raw_payload_fields() -> None:
         )
 
 
-def test_screening_definition_spill_gate_requires_a_real_spilled_shard() -> None:
-    failed, failed_detail = (
-        campaign_review_module._screening_definition_spill_gate(  # noqa: SLF001
-            [131_072, 1],
-            producer_memory_entries=131_072,
-        )
-    )
+def test_screening_definition_bound_gate_requires_native_state_below_limit() -> None:
     passed, passed_detail = (
-        campaign_review_module._screening_definition_spill_gate(  # noqa: SLF001
-            [131_073, 1],
-            producer_memory_entries=131_072,
+        campaign_review_module._screening_definition_bound_gate(  # noqa: SLF001
+            [2_097_152, 1],
+            producer_memory_entries=2_097_152,
+            producer_backend="native_bounded_digest",
+            overflow_policy="fail_fast",
+            spill_backend="none",
+        )
+    )
+    overflowed, overflowed_detail = (
+        campaign_review_module._screening_definition_bound_gate(  # noqa: SLF001
+            [2_097_153, 1],
+            producer_memory_entries=2_097_152,
+            producer_backend="native_bounded_digest",
+            overflow_policy="fail_fast",
+            spill_backend="none",
         )
     )
 
-    assert failed is False
-    assert "0 shard" in failed_detail
     assert passed is True
-    assert "1 shard" in passed_detail
+    assert "maximum observed 2097152" in passed_detail
+    assert overflowed is False
+    assert "exceeded" in overflowed_detail
 
 
-def test_batch_replay_mandatory_gate_fails_without_a_real_spill() -> None:
+def test_batch_replay_mandatory_gate_fails_on_definition_bound_overflow() -> None:
     gate = campaign_review_module._batch_shard_artifact_replay_gate(  # noqa: SLF001
         batch_failures=[],
-        screening_definition_row_counts=[131_072, 1],
-        screening_definition_memory_entries={131_072},
+        screening_definition_row_counts=[2_097_153, 1],
+        screening_definition_store_contracts={
+            (
+                2_097_152,
+                "native_bounded_digest",
+                "fail_fast",
+                "none",
+            )
+        },
     )
 
     assert gate["passed"] is False
-    assert "0 shard" in str(gate["detail"])
+    assert "exceeded" in str(gate["detail"])
 
 
 def test_campaign_reviewer_rejects_empty_producer_scratch_directory(

@@ -1311,3 +1311,40 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   `MemoryHigh=13,833,388,032`、`MemoryMax=16,600,065,639`、
   `MemorySwapMax=0` bytes。运行中状态不构成 readiness，只有 sealed raw 的后续
   independent native review 全部通过后才能发布 `READY_FOR_STAGE05_3`。
+
+## 2026-07-28：G74 Attempt78 失败保留与 native bounded producer store
+
+- Attempt78 完成 batch0001/0002 后在 batch0003 的 `c203_21/2016` shard fail fast。
+  `PRAGMA integrity_check` 返回非 `ok`，触发
+  `ArtifactIntegrityError: screening definition scratch failed SQLite integrity_check`。
+  该服务未发生 OOM、swap、ext4/NVMe I/O error 或 fallback；systemd process-tree
+  peak 为 14,444,707,840 bytes。Attempt78 作为 immutable failed evidence 保留，
+  不续跑、不导入其已完成 batches，也不进入下一 Formal geometry。
+- 对失败 shard 的 sealed raw 重建得到 505,237 个 definitions、3,255,454 个
+  screening occurrences、64 个定义 transaction；全部 definition ID/full SHA-256
+  与 transaction 插入计数一致。单进程、producer/writer 跨线程、6-process 重放和
+  60-store 压力重放均未复现 corruption（损坏）。低层 SQLite page detail 因失败路径
+  已按旧合同清理 scratch 而不可恢复，因此不把未证实的存储设备或线程假设写成根因。
+- 根因修复针对 producer 的系统性 failure surface（失败面）：producer 本来只需要
+  full SHA-256 collision token，却把超过 131,072 的状态转入 disposable SQLite。
+  新 `native_bounded_digest` C++ store 使用 2,097,152-entry hard limit，批量注册在
+  写入前原子完成去重、碰撞和容量验证；overflow/collision 直接失败，无 SQLite、
+  scratch 或 Python fallback。review/read payload store 与 exact-route store 的
+  既有 bounded compatibility path 保持独立。
+- 失败 c203 occurrence stream 以新 backend 重放
+  `transactions=64, occurrences=3,255,454, definitions=505,237`，插入计数完全一致，
+  `sqlite_connection=0`、`scratch_directory=0`。历史最大同协议 shard
+  `c201_21/2014` 的 1,131,700 identities 用时 26.460 s、RSS delta 310,140,928
+  bytes；旧 SQLite 路径为 54.119 s、208,474,112 bytes，即新路径快 51.1%，增量
+  内存约 101.7 MB。6-worker 同规模并发重放 6,790,200 identities 全部通过，
+  aggregate peak RSS 2,233,892,864 bytes，swap 为 0。
+- 4/5/6 calibration 后按用户要求补测 8 workers：8-worker throughput 为
+  51.658 exact calls/s，比 6 workers 的 95.230 低 45.8%，也比 4 workers 低
+  15.2%；semantic digest 相同且无 swap/fallback。因此下一 Pilot/Formal 仍固定
+  6 producer workers，但资源合同改用实测峰值与明确 operating headroom，不再用
+  任意 75% 百分比丢弃可用内存。
+- 当前 source/protocol 已不同于 Attempt76 的 accepted SQLite-store revision，
+  所以不能直接重启 Formal。必须密封新 revision/wheel/snapshots，以新未占用 label
+  从零运行 replacement Pilot，通过 native independent review 后，再用另一个新
+  label 从零运行 Formal。只有 Formal finalized receipt、raw before/after hash
+  一致和全部 mandatory gates 通过后才能发布 `READY_FOR_STAGE05_3`。

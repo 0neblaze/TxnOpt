@@ -30,7 +30,7 @@ from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from multiprocessing import get_context
 from pathlib import Path
-from typing import Any, Literal, TypeGuard
+from typing import Any, Literal, TypeGuard, cast
 
 import orjson
 import psutil  # type: ignore[import-untyped]
@@ -177,21 +177,34 @@ COMPACT_TRACE_SCHEMA_FINGERPRINTS = {
 }
 
 
-def _screening_definition_spill_gate(
+def _screening_definition_bound_gate(
     row_counts: Sequence[int],
     *,
     producer_memory_entries: int,
+    producer_backend: str,
+    overflow_policy: str,
+    spill_backend: str,
 ) -> tuple[bool, str]:
-    spilled_shards = sum(
-        row_count > producer_memory_entries
-        for row_count in row_counts
+    maximum_observed = max(row_counts, default=0)
+    contract_valid = (
+        producer_backend == "native_bounded_digest"
+        and overflow_policy == "fail_fast"
+        and spill_backend == "none"
     )
+    within_bound = maximum_observed <= producer_memory_entries
+    passed = contract_valid and within_bound
     return (
-        spilled_shards > 0,
+        passed,
         (
-            f"{spilled_shards} shard(s) exceeded the "
-            f"{producer_memory_entries}-definition signed producer in-memory bound "
-            "and therefore exercised transactional SQLite spill"
+            f"native bounded producer maximum observed {maximum_observed} "
+            f"within signed {producer_memory_entries}-definition limit"
+            if passed
+            else (
+                f"maximum observed {maximum_observed} exceeded signed "
+                f"{producer_memory_entries}-definition limit"
+                if not within_bound
+                else "producer definition-store contract is not native/no-spill/fail-fast"
+            )
         ),
     )
 
@@ -200,30 +213,39 @@ def _batch_shard_artifact_replay_gate(
     *,
     batch_failures: Sequence[str],
     screening_definition_row_counts: Sequence[int],
-    screening_definition_memory_entries: set[int],
+    screening_definition_store_contracts: set[tuple[int, str, str, str]],
 ) -> dict[str, object]:
-    if len(screening_definition_memory_entries) == 1:
-        spill_passed, spill_detail = _screening_definition_spill_gate(
+    if len(screening_definition_store_contracts) == 1:
+        (
+            producer_memory_entries,
+            producer_backend,
+            overflow_policy,
+            spill_backend,
+        ) = next(iter(screening_definition_store_contracts))
+        bound_passed, bound_detail = _screening_definition_bound_gate(
             screening_definition_row_counts,
-            producer_memory_entries=next(iter(screening_definition_memory_entries)),
+            producer_memory_entries=producer_memory_entries,
+            producer_backend=producer_backend,
+            overflow_policy=overflow_policy,
+            spill_backend=spill_backend,
         )
     else:
-        spill_passed = False
-        spill_detail = (
-            "campaign does not bind exactly one signed producer screening-definition "
-            "memory bound"
+        bound_passed = False
+        bound_detail = (
+            "campaign does not bind exactly one signed producer "
+            "screening-definition store contract"
         )
-    passed = not batch_failures and spill_passed
+    passed = not batch_failures and bound_passed
     return {
         "passed": passed,
         "detail": (
             "campaign->batch->shard->raw/solution/trace/event replay passed; "
-            + spill_detail
+            + bound_detail
             if passed
             else (
                 "; ".join(batch_failures[:5])
                 if batch_failures
-                else spill_detail
+                else bound_detail
             )
         ),
     }
@@ -4571,7 +4593,7 @@ def _audit_campaign(
     observed_shard_ids: set[str] = set()
     aggregate_event_rows = 0
     screening_definition_row_counts: list[int] = []
-    screening_definition_memory_entries: set[int] = set()
+    screening_definition_store_contracts: set[tuple[int, str, str, str]] = set()
     for embedded_batch in campaign.batches:
         try:
             root = locator.resolve(embedded_batch.root_alias)
@@ -4643,10 +4665,25 @@ def _audit_campaign(
                 raise ArtifactIntegrityError(
                     "batch screening-definition store contract is missing"
                 )
-            screening_definition_memory_entries.add(
-                _strict_int(
-                    definition_store.get("producer_memory_entries"),
-                    "producer screening definition memory entries",
+            producer_backend = definition_store.get("producer_backend")
+            overflow_policy = definition_store.get("overflow_policy")
+            spill_backend = definition_store.get("spill_backend")
+            if not all(
+                isinstance(value, str)
+                for value in (producer_backend, overflow_policy, spill_backend)
+            ):
+                raise ArtifactIntegrityError(
+                    "batch screening-definition store policy is invalid"
+                )
+            screening_definition_store_contracts.add(
+                (
+                    _strict_int(
+                        definition_store.get("producer_memory_entries"),
+                        "producer screening definition memory entries",
+                    ),
+                    cast(str, producer_backend),
+                    cast(str, overflow_policy),
+                    cast(str, spill_backend),
                 )
             )
             provenance = metadata.get("performance_provenance")
@@ -4938,7 +4975,7 @@ def _audit_campaign(
     gates["batch_shard_artifact_replay"] = _batch_shard_artifact_replay_gate(
         batch_failures=batch_failures,
         screening_definition_row_counts=screening_definition_row_counts,
-        screening_definition_memory_entries=screening_definition_memory_entries,
+        screening_definition_store_contracts=screening_definition_store_contracts,
     )
     gates["runtime_provenance"] = {
         "passed": not batch_failures and len(metadata_identities) == 1,

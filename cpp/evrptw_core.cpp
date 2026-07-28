@@ -746,6 +746,144 @@ struct Stage052ScreeningDefinitionCache {
 constexpr const char* STAGE052_SCREENING_CACHE_CAPSULE =
     "evrptw.stage052_screening_definition_cache";
 
+struct Stage052DefinitionIdentityStore {
+    std::unordered_map<std::int64_t, std::array<std::uint8_t, 32>> identities;
+    std::size_t capacity = 0;
+};
+
+constexpr const char* STAGE052_DEFINITION_IDENTITY_STORE_CAPSULE =
+    "evrptw.stage052_definition_identity_store";
+
+py::capsule create_stage052_definition_identity_store(
+    const py::ssize_t capacity) {
+    if (capacity <= 0 || capacity > 4194304) {
+        throw std::invalid_argument(
+            "Stage 5.2 definition identity capacity must be in 1..4194304");
+    }
+    auto store = std::make_unique<Stage052DefinitionIdentityStore>();
+    store->identities.max_load_factor(0.8F);
+    store->identities.reserve(
+        std::min<std::size_t>(
+            static_cast<std::size_t>(capacity),
+            262144));
+    store->capacity = static_cast<std::size_t>(capacity);
+    py::capsule capsule(
+        store.get(),
+        STAGE052_DEFINITION_IDENTITY_STORE_CAPSULE,
+        [](PyObject* capsule) {
+            auto* owned = static_cast<Stage052DefinitionIdentityStore*>(
+                PyCapsule_GetPointer(
+                    capsule,
+                    STAGE052_DEFINITION_IDENTITY_STORE_CAPSULE));
+            if (owned == nullptr) {
+                PyErr_Clear();
+                return;
+            }
+            delete owned;
+        });
+    store.release();
+    return capsule;
+}
+
+std::array<std::uint8_t, 32> stage052_definition_digest(
+    const py::handle definition) {
+    const auto encoded = py::cast<py::bytes>(definition.attr("digest"));
+    const auto value = py::cast<std::string>(encoded);
+    if (value.size() != 32) {
+        throw std::invalid_argument(
+            "Stage 5.2 screening definition digest must contain 32 bytes");
+    }
+    std::array<std::uint8_t, 32> digest{};
+    std::memcpy(digest.data(), value.data(), digest.size());
+    return digest;
+}
+
+py::tuple register_stage052_definition_identities(
+    const py::object& identity_store,
+    const py::sequence& definitions) {
+    auto* store = static_cast<Stage052DefinitionIdentityStore*>(
+        PyCapsule_GetPointer(
+            identity_store.ptr(),
+            STAGE052_DEFINITION_IDENTITY_STORE_CAPSULE));
+    if (store == nullptr) {
+        PyErr_Clear();
+        throw std::invalid_argument(
+            "Stage 5.2 native definition identity store is invalid");
+    }
+
+    struct PendingIdentity {
+        std::array<std::uint8_t, 32> digest;
+        py::object definition;
+    };
+    std::unordered_map<std::int64_t, PendingIdentity> unique;
+    unique.reserve(static_cast<std::size_t>(definitions.size()));
+    std::vector<std::int64_t> order;
+    order.reserve(static_cast<std::size_t>(definitions.size()));
+    for (const py::handle raw_definition : definitions) {
+        const auto definition =
+            py::reinterpret_borrow<py::object>(raw_definition);
+        const auto definition_id =
+            py::cast<std::int64_t>(definition.attr("definition_id"));
+        const auto digest = stage052_definition_digest(definition);
+        const auto existing = unique.find(definition_id);
+        if (existing == unique.end()) {
+            order.push_back(definition_id);
+            unique.emplace(
+                definition_id,
+                PendingIdentity{digest, definition});
+        } else {
+            if (existing->second.digest != digest) {
+                throw std::invalid_argument(
+                    "screening definition ID collision");
+            }
+            existing->second.definition = definition;
+        }
+    }
+
+    std::size_t missing = 0;
+    for (const auto definition_id : order) {
+        const auto& pending = unique.at(definition_id);
+        const auto stored = store->identities.find(definition_id);
+        if (stored == store->identities.end()) {
+            ++missing;
+        } else if (stored->second != pending.digest) {
+            throw std::invalid_argument(
+                "screening definition ID collision");
+        }
+    }
+    if (missing > store->capacity - store->identities.size()) {
+        throw std::invalid_argument(
+            "screening definition identity bound exceeded");
+    }
+
+    py::tuple inserted(static_cast<py::ssize_t>(missing));
+    py::ssize_t inserted_index = 0;
+    for (const auto definition_id : order) {
+        auto& pending = unique.at(definition_id);
+        const auto [_, was_inserted] =
+            store->identities.emplace(definition_id, pending.digest);
+        if (was_inserted) {
+            inserted[inserted_index] = std::move(pending.definition);
+            ++inserted_index;
+        }
+    }
+    return inserted;
+}
+
+py::ssize_t stage052_definition_identity_store_size(
+    const py::object& identity_store) {
+    auto* store = static_cast<Stage052DefinitionIdentityStore*>(
+        PyCapsule_GetPointer(
+            identity_store.ptr(),
+            STAGE052_DEFINITION_IDENTITY_STORE_CAPSULE));
+    if (store == nullptr) {
+        PyErr_Clear();
+        throw std::invalid_argument(
+            "Stage 5.2 native definition identity store is invalid");
+    }
+    return static_cast<py::ssize_t>(store->identities.size());
+}
+
 py::capsule create_stage052_screening_definition_cache(
     const py::ssize_t capacity = 262144) {
     if (capacity <= 0 || capacity > 262144) {
@@ -3810,6 +3948,19 @@ PYBIND11_MODULE(_core, module) {
         "create_stage052_screening_definition_cache",
         &create_stage052_screening_definition_cache,
         py::arg("capacity") = 262144);
+    module.def(
+        "create_stage052_definition_identity_store",
+        &create_stage052_definition_identity_store,
+        py::arg("capacity"));
+    module.def(
+        "register_stage052_definition_identities",
+        &register_stage052_definition_identities,
+        py::arg("identity_store"),
+        py::arg("definitions"));
+    module.def(
+        "stage052_definition_identity_store_size",
+        &stage052_definition_identity_store_size,
+        py::arg("identity_store"));
     module.def(
         "pack_stage052_screening_transactions",
         &pack_stage052_screening_transactions,

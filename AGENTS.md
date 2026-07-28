@@ -11,9 +11,11 @@
 - Large raw evidence remains external. Public Git tracks only code,
   configuration, tests, curated summaries, registries, manifests, review
   products, and the lightweight `artifacts/index.json`.
-- Stage 5.2 Pilot `stage05.2_benchmark_attempt72` is accepted. Formal
-  `stage05.2_benchmark_attempt73` is incomplete and unreviewed; Stages 6--8 are
-  roadmap items only.
+- Stage 5.2 Pilot `stage05.2_benchmark_attempt76` is accepted for the preserved
+  SQLite producer-store revision. Formal `stage05.2_benchmark_attempt78` failed
+  during batch 0003 and is immutable failed evidence. The current native
+  bounded-digest producer revision requires a new Pilot and a new Formal label;
+  Stages 6--8 are roadmap items only.
 - Apache-2.0 applies only to original code and documentation. Benchmark data,
   papers, commercial solvers, and third-party repositories remain under their
   own terms.
@@ -591,7 +593,7 @@ this repository or one of its subdirectories.
   New campaigns freeze a calibrated 65,536/262,144 row-group choice and queue
   depth 1/2 in their signed producer resource contract; the non-baseline choice
   is allowed only after at least 10% persistence-critical-path improvement,
-  semantic equality, and the 75% memory gate. Canonical semantic digests
+  semantic equality, and the signed measured-capacity gate. Canonical semantic digests
   are computed over expanded logical events, so physical IDs and compression
   layout cannot change replay. Persistence is at most 36% of end-to-end time
   and peak RSS is at most 50% of the Stage 5.2 v1 baseline.
@@ -634,17 +636,20 @@ this repository or one of its subdirectories.
   shard with `max_tasks_per_child=1`, merges by canonical shard ordinal, and
   cancels all unfinished work on the first child failure. The Pilot-derived
   parent baseline and per-child p99 RSS determine `MemoryHigh`, the internal
-  process-tree guard, and `MemoryMax`, all within 75% of available memory with
-  swap disabled. Review v2 records per-shard elapsed time, events/second, child
+  process-tree guard, and `MemoryMax`; the limits must fit the measured
+  available capability without swap or throttling the selected concurrency.
+  Review v2 records per-shard elapsed time, events/second, child
   peak RSS, merge ordinal, in-flight bound, and zero native fallbacks.
 - The accepted D/F worker-selection evidence keeps its historical 12-GiB
-  scientific gate. New G Benchmark Pilot/Formal batches calibrate 4/5/6
-  producer workers on fixed real high-memory shards. A higher worker count is
-  rejected unless it improves throughput by at least 15% over four workers,
-  stays within 75% of available memory, uses no swap or fallback, and produces
-  the same semantic digest; choices within 5% prefer fewer workers. The chosen
-  worker count and measured per-worker/process-tree limits are frozen into the
-  Pilot and inherited unchanged by Formal.
+  scientific gate. The current G Benchmark calibration compared 4/5/6 workers
+  and an explicit 8-worker stress probe on fixed real high-memory shards.
+  Six producer workers are frozen for the replacement Pilot/Formal: they exceed
+  the four-worker throughput gate, preserve the semantic digest with no swap or
+  fallback, and the 8-worker probe was materially slower. The signed resource
+  contract uses measured per-worker and process-tree peaks plus explicit
+  operating headroom; an arbitrary percentage of otherwise usable memory is
+  not a publication gate. The selected worker count and measured limits are
+  frozen into the Pilot and inherited unchanged by Formal.
 - Campaign preflight and per-batch handoff retain two consecutive 30-second
   telemetry windows. AC/battery state, low-power mode, system load, CPU model,
   operating-system version, temperature, disk model/serial, device UUID, and
@@ -904,11 +909,17 @@ The executable workflow and gate table are maintained in
   constant; a reviewer-only hard-coded interval is forbidden contract drift.
   V3 route-evaluation and cache-event batches likewise use native schema-ordered sparse columns;
   mixed ordinary events are filled at their original positions and may not be reordered or dropped.
-- Producer screening-definition collision state stores the full SHA-256 digest without retaining a
-  duplicate JSON payload; review/read stores retain the payload they must resolve. Exact-route
-  evaluation identities likewise remain in a bounded in-memory full-digest/payload store and spill
-  to shard-local SQLite only after the declared hard limit. Removing collision checks, making either
-  store unbounded, or returning to per-event SQLite identity queries is forbidden.
+- Producer screening-definition collision state uses the native
+  `native_bounded_digest` store: it retains the full SHA-256 digest without a
+  duplicate JSON payload, has a hard 2,097,152-entry limit, validates each batch
+  atomically, and fails fast on collision or overflow. Producer SQLite spill,
+  producer scratch state, and fallback are forbidden. Review/read stores retain
+  the payload they must resolve and may use their separate bounded
+  payload-retaining SQLite path. Exact-route evaluation identities likewise
+  remain in a bounded in-memory full-digest/payload store and spill to
+  shard-local SQLite only after their declared hard limit. Removing collision
+  checks, making any store unbounded, or returning to per-event SQLite identity
+  queries is forbidden.
 - Process-tree resource identity includes only a process whose positive RSS and CPU times were both
   captured in one successful sample. A half-sampled, zero-RSS, or already-exited transient process
   is not measured worker evidence and must not be emitted with a fabricated zero peak.
