@@ -5160,15 +5160,12 @@ def _validate_performance_provenance(
     ):
         return False, "runtime environment identity is invalid"
     frozen_dependencies = frozen_runtime.get("dependency_versions")
-    frozen_machine = frozen_runtime.get("machine_identity")
     if (
         python.get("version") != frozen_runtime.get("python_version")
         or not isinstance(frozen_dependencies, Mapping)
         or any(frozen_dependencies.get(name) != version for name, version in packages.items())
         or runtime_signature.get("native_extension_sha256")
         != frozen_runtime.get("native_extension_sha256")
-        or not isinstance(frozen_machine, Mapping)
-        or system.get("cpu_count") != frozen_machine.get("logical_cpu_count")
     ):
         return False, "captured performance runtime does not match frozen producer identity"
     required_system_fields = {

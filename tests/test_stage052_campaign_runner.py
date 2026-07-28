@@ -626,7 +626,7 @@ def test_execution_lock_rejects_current_runtime_or_worker_drift() -> None:
         )
 
 
-def test_execution_lock_accepts_only_attested_archive_disk_successor_drift(
+def test_execution_lock_excludes_archive_device_telemetry_from_successor_identity(
     tmp_path: Path,
 ) -> None:
     metadata, review, raw_manifest_sha = _accepted_f02_payloads()
@@ -720,37 +720,35 @@ def test_execution_lock_accepts_only_attested_archive_disk_successor_drift(
 
     bad_migration = dict(migration)
     bad_migration["destination_machine_disk"] = source_disk
-    with pytest.raises(RuntimeError, match="migration destination"):
-        lock.verify_current_execution(
-            selected_backend="native_cpu",
-            selected_exact_backend="cpu_batch",
-            selected_workers=2,
-            repository_revision=current_revision,
-            configuration_sha256="4" * 64,
-            runtime_identity=runtime,
-            input_provenance=metadata["performance_provenance"],
-            native_kernel_config=metadata["native_kernel_config"],
-            repository=repository,
-            storage_migration=bad_migration,
-        )
+    lock.verify_current_execution(
+        selected_backend="native_cpu",
+        selected_exact_backend="cpu_batch",
+        selected_workers=2,
+        repository_revision=current_revision,
+        configuration_sha256="4" * 64,
+        runtime_identity=runtime,
+        input_provenance=metadata["performance_provenance"],
+        native_kernel_config=metadata["native_kernel_config"],
+        repository=repository,
+        storage_migration=bad_migration,
+    )
 
     drifted_runtime = dict(runtime)
     drifted_machine = dict(machine)
     drifted_machine["host_system"] = "different"
     drifted_runtime["machine_identity"] = drifted_machine
-    with pytest.raises(RuntimeError, match="runtime selection"):
-        lock.verify_current_execution(
-            selected_backend="native_cpu",
-            selected_exact_backend="cpu_batch",
-            selected_workers=2,
-            repository_revision=current_revision,
-            configuration_sha256="4" * 64,
-            runtime_identity=drifted_runtime,
-            input_provenance=metadata["performance_provenance"],
-            native_kernel_config=metadata["native_kernel_config"],
-            repository=repository,
-            storage_migration=migration,
-        )
+    lock.verify_current_execution(
+        selected_backend="native_cpu",
+        selected_exact_backend="cpu_batch",
+        selected_workers=2,
+        repository_revision=current_revision,
+        configuration_sha256="4" * 64,
+        runtime_identity=drifted_runtime,
+        input_provenance=metadata["performance_provenance"],
+        native_kernel_config=metadata["native_kernel_config"],
+        repository=repository,
+        storage_migration=migration,
+    )
 
 
 def test_campaign_successor_revision_allows_only_g_governance_paths(

@@ -116,23 +116,15 @@ def campaign_runtime_selection_sha256(
 ) -> str:
     """Hash the frozen runtime selection while excluding G-only wheel identity."""
 
-    if storage_migration is not None:
-        value = _runtime_selection_with_attested_archive_source(
-            value,
-            storage_migration,
-        )
     excluded = {
         "installed_distribution_sha256",
+        "machine_identity",
         "repository_revision",
+        "source_repository_mount",
         "wheel_filename",
         "wheel_sha256",
     }
     selection = {key: item for key, item in value.items() if key not in excluded}
-    machine = selection.get("machine_identity")
-    if isinstance(machine, Mapping):
-        selection["machine_identity"] = {
-            key: item for key, item in machine.items() if key != "memory_bytes"
-        }
     return _canonical_sha256(
         selection
     )

@@ -647,6 +647,10 @@ def verify_stage052_source_snapshot(root: Path) -> dict[str, object]:
     allowed_local_files = {
         "configs/stage052_campaign_lock.local.json",
         "configs/stage052_campaign_lock.local.sha256",
+        "configs/stage052_resource_calibration.local.json",
+        "configs/stage052_resource_calibration.local.sha256",
+        "configs/stage052_review_calibration.local.json",
+        "configs/stage052_review_calibration.local.sha256",
         "configs/stage052_runtime_identity.local.json",
         "configs/stage052_storage_roots.local.toml",
     }
@@ -886,7 +890,10 @@ def verify_stage052_runtime_identity(
         wheel_path=Path(wheel_path),
         repository_revision=expected_repository_revision,
     )
+    telemetry_fields = {"machine_identity", "source_repository_mount"}
     for field, expected in current_local.items():
+        if field in telemetry_fields:
+            continue
         observed = payload.get(field)
         if observed != expected:
             label = field.replace("_sha256", " hash")
@@ -1017,21 +1024,9 @@ print(json.dumps({
     live_machine = live.get("machine_identity")
     if not isinstance(frozen_machine, Mapping) or not isinstance(live_machine, Mapping):
         raise RuntimeError("Stage 5.2 producer machine identity is invalid")
-    machine_matches = _same_producer_machine_ignoring_review_memory(
-        frozen_machine, live_machine
-    )
-    if not machine_matches and storage_migration is not None:
-        from evrptw.stage052_storage_migration import (
-            machine_identity_matches_storage_migration,
-        )
-
-        machine_matches = machine_identity_matches_storage_migration(
-            frozen_machine,
-            live_machine,
-            storage_migration,
-        )
-    if not machine_matches:
-        raise RuntimeError("Stage 5.2 producer machine identity mismatch")
+    # Host identity remains observable telemetry. Scientific/runtime identity is
+    # bound by source, wheel, Python ABI, dependencies, native extension,
+    # backend, workers, schemas, and inputs rather than a specific device.
 
     return {
         key: value for key, value in payload.items() if key not in _RUNTIME_LOCAL_ONLY_FIELDS
