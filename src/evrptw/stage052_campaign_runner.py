@@ -361,15 +361,18 @@ def verify_campaign_successor_revision(
         )
     pinned_paths = frozenset(_CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES)
     pinned_changed = frozenset(changed_paths) & pinned_paths
-    if pinned_changed and pinned_changed != pinned_paths:
-        raise RuntimeError("campaign successor revision has an incomplete pinned producer fix")
-    for path in sorted(pinned_changed):
-        content = subprocess.run(
-            ("git", "-C", str(resolved), "show", f"{current_revision}:{path}"),
-            check=True,
-            capture_output=True,
-            timeout=10.0,
-        ).stdout
+    for path in sorted(pinned_paths if pinned_changed else ()):
+        try:
+            content = subprocess.run(
+                ("git", "-C", str(resolved), "show", f"{current_revision}:{path}"),
+                check=True,
+                capture_output=True,
+                timeout=10.0,
+            ).stdout
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(
+                f"campaign successor revision lacks pinned producer-fix content: {path}"
+            ) from error
         if (
             hashlib.sha256(content).hexdigest()
             != _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES[path]

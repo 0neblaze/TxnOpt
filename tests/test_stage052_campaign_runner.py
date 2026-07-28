@@ -843,10 +843,14 @@ def test_campaign_successor_revision_accepts_only_exact_pinned_producer_fix(
         "tests/test_alns_wall_clock_only.py",
         "tests/test_artifacts_v3.py",
     )
-    for relative in pinned_paths:
+    for index, relative in enumerate(pinned_paths):
         destination = repository / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(b"pre-fix\n")
+        destination.write_bytes(
+            (source_repository / relative).read_bytes()
+            if index < 2
+            else b"pre-fix\n"
+        )
     subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
     subprocess.run(
         ("git", "-C", str(repository), "commit", "-qm", "base"),
@@ -873,7 +877,7 @@ def test_campaign_successor_revision_accepts_only_exact_pinned_producer_fix(
         repository,
         predecessor_revision=predecessor,
         current_revision=successor,
-    ) == pinned_paths
+    ) == (pinned_paths[2],)
 
     with (repository / pinned_paths[0]).open("ab") as stream:
         stream.write(b"# unapproved change\n")
