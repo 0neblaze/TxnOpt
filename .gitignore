@@ -128,8 +128,8 @@ secrets.*
 *.sqlite
 *.sqlite3
 
-# Local staged-improvement roadmap (kept in the repository directory, not tracked)
-/EVRP-TW主Baseline分阶段改进路线图.md
+# Local evolving research roadmap (kept in the repository directory, not tracked)
+/docs/roadmap/evrptw-research-roadmap.local.md
 # macOS AppleDouble metadata on non-APFS/external volumes
 ._*
 **/._*

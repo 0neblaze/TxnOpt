@@ -1,9 +1,10 @@
 # Research roadmap
 
-The authoritative staged roadmap is
-[`staged-research-roadmap.zh-CN.md`](staged-research-roadmap.zh-CN.md). It was
-moved from the repository root during the publication split; its scientific
-content was preserved.
+The detailed evolving roadmap is maintained locally as
+`docs/roadmap/evrptw-research-roadmap.local.md`. It is intentionally ignored:
+the document mixes active planning, superseded decisions, and unpublished
+research directions. The public repository records only the status summary
+below and the independently reviewed evidence under `experiments/`.
 
 ## Publication-facing status
 

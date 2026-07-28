@@ -32,13 +32,17 @@ def test_source_disposition_accounts_for_every_target_byte() -> None:
     assert len(rows) == 878
     assert {row["disposition"] for row in rows} == {
         "declarative_rename",
+        "local_external_artifact",
         "migrated_modified_publication",
         "migrated_unchanged",
         "school_specific_exclusion",
     }
     for row in rows:
         if not row["target_path"]:
-            assert row["disposition"] == "school_specific_exclusion"
+            assert row["disposition"] in {
+                "local_external_artifact",
+                "school_specific_exclusion",
+            }
             continue
         target = ROOT / row["target_path"]
         assert target.is_file()
@@ -106,6 +110,9 @@ def test_local_runtime_and_large_artifact_paths_are_ignored() -> None:
         "FURP_Showcase.pdf",
         "configs/stage052_campaign_lock.local.json",
         "configs/stage052_campaign_lock.local.sha256",
+        "docs/roadmap/evrptw-research-roadmap.local.md",
+        "document/literature/README.md",
+        "document/literature/example-paper.pdf",
         "scratch/reviewer.sqlite",
         "scratch/reviewer.sqlite3",
     )

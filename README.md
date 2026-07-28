@@ -81,6 +81,7 @@ The high-level sequence is:
 Start with:
 
 - [Research roadmap](docs/roadmap/README.md)
+- [Literature and citation index](docs/literature.md)
 - [Experiment evidence index](experiments/INDEX.md)
 - [Artifact index](artifacts/README.md)
 - [Migration and provenance](docs/provenance/README.md)

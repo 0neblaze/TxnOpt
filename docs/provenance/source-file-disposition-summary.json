@@ -6,9 +6,10 @@
   "unclassified_count": 0,
   "counts": {
     "school_specific_exclusion": 42,
-    "declarative_rename": 4,
-    "migrated_modified_publication": 26,
-    "migrated_unchanged": 806
+    "declarative_rename": 3,
+    "local_external_artifact": 1,
+    "migrated_modified_publication": 27,
+    "migrated_unchanged": 805
   },
   "receipt": "docs/provenance/source-file-disposition.csv"
 }

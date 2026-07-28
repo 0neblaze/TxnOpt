@@ -24,4 +24,11 @@ repository's Apache-2.0 license.
 
 PDFs and local reference checkouts are ignored. Citations and repository
 revisions may be recorded for provenance, but the third-party bytes are not
-part of this distribution.
+part of this distribution. The local Version of Record collection is stored
+under ignored `document/literature/`; it is for private research use and must
+not be committed, released, or redistributed through this project.
+
+The public bibliographic records are maintained in
+[`docs/references.bib`](docs/references.bib), with a reader-facing index in
+[`docs/literature.md`](docs/literature.md). Bibliographic metadata and DOI
+links are attribution records, not permission to redistribute publisher PDFs.

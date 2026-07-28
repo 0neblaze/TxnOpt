@@ -23,9 +23,9 @@ legacy-to-public relationship. Stable patch IDs match for all 207 replayed
 non-root commits.
 
 `source-file-disposition.csv` accounts for every one of the 878 tracked source
-files. Its machine-readable summary records 806 byte-identical migrations, 26
-publication-packaging modifications, four declared renames, 42
-school-specific exclusions, and zero unclassified paths.
+files. Its machine-readable summary records 805 byte-identical migrations, 27
+publication-packaging modifications, three declared renames, one ignored local
+artifact, 42 school-specific exclusions, and zero unclassified paths.
 
 The rewritten root excludes school programme administration and Week 3--5
 school reporting files. Scientific foundation code required by Stage 0 was
