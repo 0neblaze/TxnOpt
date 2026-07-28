@@ -159,7 +159,7 @@ def test_calibration_contract_includes_selected_formal_memory_measurement(
             (65_536, 1): 100.0,
             (65_536, 2): 80.0,
             (262_144, 1): 90.0,
-            (262_144, 2): 85.0,
+            (262_144, 2): 70.0,
         }[(row_group_size, queue_depth)]
         return ParquetBenchmark(
             row_group_size=row_group_size,
@@ -225,7 +225,7 @@ def test_calibration_contract_includes_selected_formal_memory_measurement(
         ),
     )
 
-    assert formal_calls == [(6, 65_536, 2)]
+    assert formal_calls == [(6, 262_144, 2)]
     assert contract.selected_workers == 6
     assert contract.selected_aggregate_peak_rss_bytes == 15 * 1024**3
     assert contract.selected_per_worker_peak_rss_bytes == 3_300_000_000
@@ -240,6 +240,38 @@ def test_calibration_contract_includes_selected_formal_memory_measurement(
     assert report["formal_campaign_memory_floor"]["run_label"] == (
         "stage05.2_benchmark_attempt90"
     )
+    assert report["formal_campaign_memory_floor"]["row_group_size"] == 65_536
+    assert report["selection"]["row_group_size"] == 262_144
+
+    with pytest.raises(RuntimeError, match="floor worker count"):
+        run_stage052_resource_calibration(
+            corpus_dir=tmp_path / "corpus",
+            output_root=tmp_path / "worker-mismatch-calibration",
+            contract_path=tmp_path / "worker-mismatch-contract.json",
+            root=tmp_path,
+            config_path=tmp_path / "config.toml",
+            producer_runner=producer_runner,
+            parquet_runner=parquet_runner,
+            formal_memory_runner=formal_memory_runner,
+            formal_campaign_memory_floor=FormalCampaignMemoryFloor(
+                workers=5,
+                aggregate_peak_rss_bytes=15 * 1024**3,
+                per_worker_peak_rss_bytes=3_300_000_000,
+                row_group_size=65_536,
+                queue_depth=2,
+                run_label="stage05.2_benchmark_attempt90",
+                batch_id="batch0003",
+                resource_summary_sha256="e" * 64,
+            ),
+            memory_floor=ProducerMemoryFloor(
+                four_worker_aggregate_peak_rss_bytes=1024,
+                per_worker_peak_rss_bytes=1024,
+                source_sha256_by_batch={
+                    "batch0001": "c" * 64,
+                    "batch0002": "d" * 64,
+                },
+            ),
+        )
 
 
 def test_formal_memory_probe_seals_non_campaign_measurement(

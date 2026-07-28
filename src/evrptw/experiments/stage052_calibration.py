@@ -1107,15 +1107,14 @@ def run_stage052_resource_calibration(
         raise RuntimeError(
             "Formal memory measurement observed swap, fallback, or a resource limit"
         )
-    if formal_campaign_memory_floor is not None and (
-        formal_campaign_memory_floor.workers
+    if (
+        formal_campaign_memory_floor is not None
+        and formal_campaign_memory_floor.workers
         != preliminary_selection.selected_workers
-        or formal_campaign_memory_floor.row_group_size
-        != selected_parquet.row_group_size
-        or formal_campaign_memory_floor.queue_depth != selected_parquet.queue_depth
     ):
         raise RuntimeError(
-            "failed Formal memory floor does not match the selected producer contract"
+            "failed Formal memory floor worker count does not match "
+            "the selected producer contract"
         )
     selected_aggregate_peak = max(
         formal_benchmark.aggregate_peak_rss_bytes,
