@@ -25,5 +25,5 @@ copies:
   has the same DOI as the indexed Montoya PDF but different PDF pagination and
   packaging. It is retained locally as an alternate copy, not cited twice.
 
-Every local byte is recorded in `document/literature/SHA256SUMS`. The local
+Every local PDF is recorded in `document/literature/SHA256SUMS`. The local
 README identifies the publisher Version of Record status and copyright holder.
