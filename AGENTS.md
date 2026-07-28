@@ -11,11 +11,11 @@
 - Large raw evidence remains external. Public Git tracks only code,
   configuration, tests, curated summaries, registries, manifests, review
   products, and the lightweight `artifacts/index.json`.
-- Stage 5.2 Pilot `stage05.2_benchmark_attempt76` is accepted for the preserved
-  SQLite producer-store revision. Formal `stage05.2_benchmark_attempt78` failed
-  during batch 0003 and is immutable failed evidence. The current native
-  bounded-digest producer revision requires a new Pilot and a new Formal label;
-  Stages 6--8 are roadmap items only.
+- Stage 5.2 Pilot `stage05.2_benchmark_attempt82` is accepted for the current
+  native bounded-digest producer revision. Formal Attempt83 is immutable
+  interrupted evidence; Attempts 84--86 failed before creating raw evidence and
+  their labels are not reusable. The corrected runtime capability contract
+  requires a new Formal label; Stages 6--8 are roadmap items only.
 - Apache-2.0 applies only to original code and documentation. Benchmark data,
   papers, commercial solvers, and third-party repositories remain under their
   own terms.
@@ -726,11 +726,13 @@ this repository or one of its subdirectories.
   candidate-state mutation. Reaching the deadline at that boundary records a
   `before_candidate_commit` deadline event and rejects the transaction; neither
   timestamp clamping nor reviewer-side filtering is permitted.
-- Benchmark campaign review replays each shard in a fresh, strictly serial
-  `spawn` child and never reuses a process pool across shards. One logical event
-  pass must jointly replay the async persistence ledger, exact/cache/deadline
-  transactions, and global-best/checkpoint history. The parent receives only
-  bounded JSON-safe summaries and telemetry carrying exact
+- Benchmark campaign review uses one batch-scoped `spawn` process pool with the
+  Pilot-selected 1/2/4 concurrency. Each child still executes exactly one shard
+  with `max_tasks_per_child=1`; results merge by canonical shard ordinal, and
+  the first child failure cancels every unfinished task with no fallback or
+  retry. One logical event pass must jointly replay the async persistence
+  ledger, exact/cache/deadline transactions, and global-best/checkpoint history.
+  The parent receives only bounded JSON-safe summaries and telemetry carrying exact
   run/batch/shard/instance/seed identity; raw events, Arrow tables, route
   dictionaries, and screening definitions remain child-local. Child failure has
   no parent fallback or retry, and both success and failure write
@@ -740,9 +742,11 @@ this repository or one of its subdirectories.
   signed storage-migration attestation binding the old/new volume identities,
   old/new physical-disk identities, campaign/raw manifest SHA-256 values, and
   every archived batch checksum and byte count. Only the attested
-  `d_archive_disk` field may differ; producer runtime, source snapshot, ext4,
-  solver, backend, and scientific identities remain exact. Reviewer source and
-  the immutable producer source snapshot are separate explicit inputs and must
+  historical archive mapping may differ; producer hard runtime, source revision
+  and file hashes, ext4 capability, solver, backend, and scientific identities
+  remain exact. Mount source, UUID, absolute path, and physical-disk fields stay
+  as recorded telemetry. Reviewer source and the immutable producer source
+  snapshot are separate explicit inputs and must
   remain separate in the finalized review execution receipt.
 - A successor Benchmark Pilot required after a producer defect keeps the
   accepted accelerator Pilot as its scientific prerequisite. If that
@@ -789,9 +793,12 @@ this repository or one of its subdirectories.
   hashing and publication and is never accumulated as one in-memory payload.
 - On the Windows/WSL2 formal host, long-running Stage 5.2 reviewers must run as
   transient `systemd --user` services rather than Codex desktop child
-  processes. The service uses `MemoryHigh=5G`, `MemoryMax=6G`,
-  `MemorySwapMax=2G`, no restart/fallback, an internal 5.5-GiB aggregate-RSS
-  stop, external progress logs, and an `ExecStopPost`-sealed execution receipt.
+  processes. Review workers, `MemoryHigh`, `MemoryMax`, `MemorySwapMax=0`, and
+  the internal aggregate-RSS stop come from the signed Pilot
+  review-calibration contract derived from parent baseline and per-child p99
+  RSS. Formal never changes that worker count dynamically and has no
+  restart/fallback. The service retains external progress logs and an
+  `ExecStopPost`-sealed execution receipt.
   Formal launch rejects a dirty producer snapshot, arbitrary command, raw
   run-label mismatch, unsealed reviewer revision, or reviewer Python whose
   installed files do not match the declared frozen wheel. ExecStopPost must
@@ -803,7 +810,7 @@ this repository or one of its subdirectories.
   entry points are `evrptw.experiments.stage052_performance_review` and
   `evrptw.experiments.stage052_campaign_review`; their raw/prerequisite command
   envelopes are validated separately and both use the external progress log
-  plus the 5.5-GiB internal process-tree guard.
+  plus the signed internal process-tree guard.
   The internal limit is not operator-configurable for formal review. Launch
   also requires the exact canonical signed raw manifest, a reviewer wheel whose
   tracked Python/native/build inputs match the declared clean revision and whose
@@ -817,15 +824,16 @@ this repository or one of its subdirectories.
   not rely on an interactive shell's inherited `PATH`.
   Producer runtime identity must be replayed by the raw-bound frozen producer
   venv, never by the new reviewer wheel. The review-only WSL memory cap is
-  audited separately as operational receipt evidence; only that live memory
-  field may differ from the historical producer identity. New producer
+  audited separately as operational receipt evidence. Same-revision campaign
+  comparison excludes machine/mount telemetry and local absolute paths, but
+  still hard-locks source revision, wheel, Python, native extension,
+  dependencies, ABI, and all corresponding hashes. New producer
   identities use the locale-independent numeric CIM `OperatingSystemSKU`
   together with exact Version, BuildNumber, and TotalVisibleMemorySize; the
   localized CIM Caption is not an identity field. Historical Chinese and
   English captions for Windows 11 Pro for Workstations remain one
-  locale-normalized reviewer identity. Every other Windows, CPU, GPU, WSL,
-  mount, NVMe, wheel, Python, native, and dependency identity remains an exact
-  hard gate.
+  locale-normalized reviewer identity. CPU/GPU/Windows/WSL/mount/NVMe and live
+  memory details remain recorded telemetry rather than publication identity.
   A published `NOT_READY` review caused by reviewer/runtime defects must be
   archived byte-for-byte under `review/history/<manifest-sha256>/` before an
   explicit retry. Its hash belongs in `review_retry_history_sha256`, not the

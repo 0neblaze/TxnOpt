@@ -329,10 +329,13 @@ cleanup state，残留 scratch 在 fail fast 前清除并记录，不得静默�
 （追溯复审）只能通过 signed storage migration attestation（签名存储迁移证明）
 接受该变化。证明必须同时绑定旧/新 volume identity（卷身份）、旧/新物理磁盘身份、
 campaign 与标准 raw manifest SHA-256，以及每个归档 batch 的目录 checksum 和字节数。
-仅允许证明中精确声明的 `d_archive_disk` 发生变化；producer runtime、ext4 UUID、
-source snapshot、solver、backend 和科学语义仍须完全一致。reviewer source 与
-producer source snapshot 必须作为两个独立输入验证，不得用新 reviewer checkout
-冒充历史 producer snapshot。
+仅允许证明中精确声明的归档存储映射发生变化。producer runtime 的 hard contract
+（硬合同）、source revision、tracked/allowed-untracked file hashes（文件哈希）、
+read-only state（只读状态）、ext4 capability（ext4 能力）、solver、backend 和科学语义
+仍须完全一致；mount source、ext4 UUID、source target path 与物理磁盘身份仅作为
+telemetry（遥测）及 attested storage mapping（经证明的存储映射），不得进入
+publication identity（发布身份）。reviewer source 与 producer source snapshot
+必须作为两个独立输入验证，不得用新 reviewer checkout 冒充历史 producer snapshot。
 通过迁移证明完成的 campaign review 必须在 review manifest 顶层发布 attestation
 及 sidecar SHA-256；后续 Formal producer 只有在显式提供相同证明且 SHA-256 与
 accepted Pilot review 完全一致时，才可将该 Pilot 作为 current-chain prerequisite。
@@ -349,9 +352,13 @@ successor campaign 的 independent reviewer 必须接收并执行同一
 
 Windows/WSL2 formal reviewer 固定通过
 `python -m evrptw.stage052_review_service launch` 启动 transient
-`systemd --user` service。service 固定使用 `MemoryHigh=5G`、`MemoryMax=6G`、
-`MemorySwapMax=2G`、`KillMode=control-group`、`Restart=no` 和 `OOMPolicy=stop`；
-reviewer 自身在 aggregate RSS 达到 5.5 GiB 时先行失败。每次运行在
+`systemd --user` service。review concurrency（审查并发）、`MemoryHigh`、
+`MemoryMax`、`MemorySwapMax=0` 与内部 aggregate RSS guard（聚合常驻内存防线）
+由 Pilot 的 signed review calibration contract（签名审查校准合同）冻结；合同必须
+记录 parent baseline、per-child p99 RSS、候选 1/2/4 workers 的等价性与吞吐，并受
+当前可用内存约束。Formal 不得动态改 workers，也不得在 native child 失败时回退到
+Python。service 仍固定使用 `KillMode=control-group`、`Restart=no` 和
+`OOMPolicy=stop`。每次运行在
 `$XDG_STATE_HOME/reproducible-evrptw/stage052-review-logs/<run-label>/<UTC timestamp>/`
 （未设置 `XDG_STATE_HOME` 时使用 `~/.local/state`）保留
 `progress.jsonl`、`service.log` 和 `review_execution.json`。这些是 operational
@@ -363,9 +370,15 @@ interop `PATH`。缺少任一正式运行工具时必须在 service 启动前 fa
 producer runtime identity 必须由 raw-bound（原始证据绑定）的 producer venv
 独立重放 wheel、Python、native extension（原生扩展）、dependency（依赖）和
 machine identity（机器身份）；不得用新的 reviewer wheel 冒充 producer wheel。
+同 revision 的 campaign runtime contract（实验运行时合同）只排除
+`machine_identity`、mount telemetry（挂载遥测）和本地 absolute paths（绝对路径）；
+wheel、Python、native extension、dependency、ABI 与 source revision 的 hash 仍是
+hard gate。WSL `memory_bytes`、设备枚举和 snapshot 根目录变化只能进入 telemetry，
+不得改变 selection verdict（选择结论）。
 review-only `.wslconfig` memory cap（仅审查内存上限）作为 execution receipt
-中的 operational evidence 单独审计，不得改写历史 producer identity，也不得掩盖
-CPU、GPU、Windows、WSL、mount 或 NVMe identity 的变化。
+中的 operational evidence 单独审计，不得改写历史 producer identity。CPU、GPU、
+Windows、WSL、mount、NVMe 与实时内存变化必须完整记录，但不改变 selection
+verdict（选择结论）。
 若已发布的 review 因 reviewer/runtime 缺陷为 `NOT_READY`，后续显式 service
 运行必须先把旧 manifest 和全部 review files 原样归档到
 `review/history/<manifest-sha256>/`，再把 hash 追加到新 manifest 的
@@ -400,20 +413,24 @@ launcher 会核对 installed distribution 的 `direct_url.json`、module path、
 以及 no-cache clean rebuild（无缓存干净重建）的逐 member 一致性；由
 clean build source 生成的 `.whl.reviewer-provenance.json`、wheel
 path/hash、raw run label 以及 clean producer snapshot，然后自动追加外部 progress log
-和 5.5-GiB 内部上限。Codex 只启动和
+和 signed review contract 的内部 process-tree guard。Codex 只启动和
 轮询 service，不持有 reviewer 生命周期。超限、worker failure 或 service interruption
 不得自动重试；只有显式的新 review generation 才能再次运行。
 reviewer 或 pilot publication dry-run 运行时导入的 tracked `tools` modules 必须随
 reviewer wheel 一起安装，并由 source attestation（源证明）和 clean rebuild 逐文件
 绑定；`python -I` service 不得从 working checkout 临时导入未密封工具。
 `source_snapshot` 是 Pilot/Formal 共用的 mandatory review gate（强制审查门槛），
-provisional Pilot publication 也必须在 exact gate set 中保留并通过该项。
+provisional Pilot publication 也必须在 exact gate set 中保留并通过该项。该 hard
+contract 锁定 revision、tracked file count、允许的 untracked file hashes、read-only
+状态与 ext4 filesystem；mount source、UUID 和 snapshot absolute path 作为 telemetry
+保留，不参与 readiness identity。
 current-chain performance reviews 继续要求含 `semantic_mismatches.csv` 的三文件
 generation；Benchmark campaign prerequisite 使用其完整 content-addressed publication
 surface（内容寻址发布面），不得被通用 verifier 错套 performance-only 文件名。
 Benchmark review manifest 还必须在顶层发布 `selected_optimization_profile`，并与
 `selection_lock` 中的冻结值一致；下一次 campaign loader 不从嵌套字段静默补值。
-`--max-aggregate-rss-gib` 在 formal launch 中固定为 5.5，不得放宽。launcher 只接受
+`--max-aggregate-rss-gib` 在 formal launch 中必须由 signed review contract 的
+`process_guard_bytes` 精确推导，不得人工放宽。launcher 只接受
 `ArtifactReader` 解析出的 canonical signed raw manifest。科学 reviewer 写出的 READY 在
 `ExecStopPost` 完成前只是 provisional（暂定）；只有成功 receipt 已绑定当前
 review-manifest SHA-256、raw manifest 未变化且 cgroup peaks 可用时，后续 prerequisite

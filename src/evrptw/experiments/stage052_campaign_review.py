@@ -90,6 +90,7 @@ from evrptw.stage052_campaign_runner import (
     AGGREGATE_RSS_LIMIT_BYTES,
     PER_WORKER_RSS_LIMIT_BYTES,
     campaign_configuration_selection_sha256,
+    campaign_runtime_contract_sha256,
     campaign_runtime_selection_sha256,
     load_benchmark_execution_lock,
     probe_volume_identity,
@@ -100,6 +101,7 @@ from evrptw.stage052_evidence import (
     BatchPersistenceEnvelope,
     Stage052PersistenceAttribution,
     abort_process_executor,
+    stage052_source_snapshot_contract,
     validate_worker_ownership,
     verify_stage052_campaign_gate_set,
     verify_stage052_evidence_input,
@@ -467,6 +469,7 @@ def validate_campaign_selection_lock(
         "repository_revision": revision,
         "configuration_sha256": configuration,
         "runtime_identity_sha256": _canonical_sha256(runtime),
+        "runtime_contract_sha256": campaign_runtime_contract_sha256(runtime),
         "runtime_selection_sha256": campaign_runtime_selection_sha256(runtime),
         "input_provenance_sha256": _canonical_sha256(_stable_input_provenance(provenance)),
         "instance_sha256": dict(sorted(_validated_instance_hashes(provenance).items())),
@@ -2792,11 +2795,12 @@ def _validate_batch_metadata(
         )
     repository_revision = str(metadata.get("repository_revision", ""))
     campaign_configuration = str(metadata.get("campaign_configuration_sha256", ""))
-    runtime_digest = _canonical_sha256(runtime)
+    runtime_contract_digest = campaign_runtime_contract_sha256(runtime)
     locked_revision = selection_lock.get("repository_revision")
     exact_runtime_match = (
         repository_revision == locked_revision
-        and runtime_digest == selection_lock.get("runtime_identity_sha256")
+        and campaign_runtime_contract_sha256(runtime)
+        == selection_lock.get("runtime_contract_sha256")
     )
     successor_runtime_match = False
     if repository_revision != locked_revision and isinstance(locked_revision, str):
@@ -2874,7 +2878,11 @@ def _validate_batch_metadata(
         and len(repository_revision) == 40
         and all(character in "0123456789abcdef" for character in repository_revision)
         and metadata.get("repository_dirty") is False
-        and metadata.get("source_snapshot") == source_snapshot
+        and isinstance(metadata.get("source_snapshot"), Mapping)
+        and stage052_source_snapshot_contract(
+            cast(Mapping[str, object], metadata["source_snapshot"])
+        )
+        == stage052_source_snapshot_contract(source_snapshot)
         and runtime.get("schema_version") == "stage05.2-runtime-identity-v2"
         and runtime.get("installed_editable") is False
         and runtime.get("repository_revision") == repository_revision
@@ -2896,7 +2904,7 @@ def _validate_batch_metadata(
         "batch input/runtime/backend provenance passed"
         if passed
         else "batch input/runtime/backend provenance mismatch",
-        (repository_revision, campaign_configuration, runtime_digest),
+        (repository_revision, campaign_configuration, runtime_contract_digest),
     )
 
 
@@ -4392,7 +4400,15 @@ def _audit_campaign(
         current_source_snapshot = {}
         gates["source_snapshot"] = {"passed": False, "detail": str(error)}
     else:
-        source_passed = standard_metadata.get("source_snapshot") == current_source_snapshot
+        observed_source_snapshot = standard_metadata.get("source_snapshot")
+        try:
+            source_passed = (
+                isinstance(observed_source_snapshot, Mapping)
+                and stage052_source_snapshot_contract(observed_source_snapshot)
+                == stage052_source_snapshot_contract(current_source_snapshot)
+            )
+        except RuntimeError:
+            source_passed = False
         gates["source_snapshot"] = {
             "passed": source_passed,
             "detail": (
@@ -4979,9 +4995,9 @@ def _audit_campaign(
     )
     gates["runtime_provenance"] = {
         "passed": not batch_failures and len(metadata_identities) == 1,
-        "detail": "all batches share one commit/config/non-editable runtime"
+        "detail": "all batches share one commit/config/non-editable hard runtime contract"
         if not batch_failures and len(metadata_identities) == 1
-        else f"mixed or invalid runtime identities: {metadata_identities}",
+        else f"mixed or invalid hard runtime contracts: {metadata_identities}",
     }
     planned_archive_aliases = {batch.archive_root_alias for batch in campaign.batches}
     root_roles_passed = (

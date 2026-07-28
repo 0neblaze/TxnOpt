@@ -1348,3 +1348,44 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   从零运行 replacement Pilot，通过 native independent review 后，再用另一个新
   label 从零运行 Formal。只有 Formal finalized receipt、raw before/after hash
   一致和全部 mandatory gates 通过后才能发布 `READY_FOR_STAGE05_3`。
+
+## 2026-07-28：G75 replacement Pilot、8-worker 复测与 Formal runtime contract
+
+- 新 revision `615acfc7aa0b63a1d04f56882ceb71053cf4871e` 的 producer calibration
+  在相同 sealed corpus 上选择 6 workers：相对 4 workers 吞吐提高 83.5%，
+  semantic digest、swap=0 与 fallback=0 保持一致。按用户要求补做的 8-worker
+  exploratory probe 为 110.33 units/s，低于 6 workers 的 122.77 units/s 约
+  10.1%，因此 Pilot/Formal 固定 6，不硬编码 8。
+- `stage05.2_benchmark_attempt79` 因错误注入 `PYTHONHASHSEED=0` 在 raw 创建前失败；
+  Attempt80 完成 batch0001 后因没有 Windows-side WSL keepalive 被 WSL 自动关闭；
+  Attempt81 因 transient service 的 `StandardError` 路径错误在 exec 前失败。三者
+  均不复用、不导入 shards。`stage05.2_benchmark_attempt82` 随后从零完成 36/36
+  shards、14,313,033 events 和 3/3 archived batches，aggregate persistence ratio
+  为 30.0718%。independent `native_arrow` review 以 4 workers、0 fallback 重放
+  36/36 shards，20/20 mandatory gates 通过并发布
+  `READY_FOR_STAGE052_FORMAL_BENCHMARK`；raw before/after SHA-256 均为
+  `14642ef490d66432fe4727710e00f8d32e8c37732318e03fc728a9b8b50214e7`，
+  accepted review SHA-256 为
+  `304ee9968461dd5ba62cb5d519e03cc49d8167c6450a9c35ef70e670e025ad5e`。
+- reviewer calibration 的 1/2/4-worker throughput 分别为
+  253,025 / 423,428 / 580,346 events/s；4-worker `native_arrow` 达到历史
+  41,966 events/s 基线的 13.83 倍并冻结进 signed review contract。合同使用
+  `MemoryHigh=2,145,696,153`、`MemoryMax=2,524,348,416`、
+  `MemorySwapMax=0` 和内部 process guard 2,398,130,995 bytes，不允许 Python
+  fallback。
+- `stage05.2_benchmark_attempt83` 使用 16,600,065,639-byte producer RSS 合同值
+  作为外层 cgroup `MemoryMax`；6 个 workers 的 RSS 尚在预算内时，page cache 已使
+  `memory.events.max=986`，造成非科学性的回收/节流。该运行在 batch0001 提交前
+  主动停止并保留 5,706,485,367 bytes partial evidence；不续跑、不导入。
+  后续 Formal 的外层 cgroup 使用完整实测 WSL memory 25,196,933,120 bytes，
+  内部 6-worker aggregate/per-worker RSS 合同保持不变。
+- Attempt84 的 CLI 多传了不合法的 `--prerequisite` 值，Attempt85 的 service PATH
+  漏掉 Windows interop，Attempt86 则暴露同 revision runtime 比较仍错误地把 WSL
+  `memory_bytes` 的 4--12 KiB 波动视为 selection drift。三次均在 raw directory
+  创建前 fail fast，标签不复用。新增显式 hard-field allowlist 的
+  `runtime_contract_sha256`：revision、wheel、Python、native extension、dependency、
+  ABI 及其 hashes 继续锁定，其他字段均为 telemetry；producer、每 batch reviewer
+  与跨 batch runtime-provenance gate 使用同一合同算法，hard hash drift 继续失败，
+  memory/mount/path/temperature 等 telemetry 变化不改变 verdict。`source_snapshot`
+  同样只锁定 revision、tracked/untracked hashes、read-only 和 ext4 capability；
+  mount source/UUID/absolute path 仅记录，不再进入 readiness identity。

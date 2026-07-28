@@ -74,6 +74,7 @@ from evrptw.stage052_evidence import (
     Stage052PersistenceAttribution,
     Stage052PrerequisiteIdentity,
     abort_process_executor,
+    stage052_source_snapshot_contract,
     validate_worker_ownership,
     verify_frozen_stage052_producer_runtime_identity,
     verify_job_parallel_selection,
@@ -4371,7 +4372,13 @@ def _validate_stage052_source_snapshot(
         current = verify_stage052_source_snapshot(find_repository_root())
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
         return False, str(error)
-    if dict(observed) != current:
+    try:
+        matches = stage052_source_snapshot_contract(
+            observed
+        ) == stage052_source_snapshot_contract(current)
+    except RuntimeError as error:
+        return False, str(error)
+    if not matches:
         return False, "raw source snapshot identity does not match independent live replay"
     return True, "clean ext4 read-only source snapshot independently replayed"
 

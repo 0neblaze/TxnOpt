@@ -93,6 +93,7 @@ from evrptw.stage052_evidence import (
     Stage052PrerequisiteIdentity,
     collect_performance_provenance,
     create_stage052_runtime_identity,
+    stage052_source_snapshot_contract,
     stage052_storage_root_binding,
     upsert_stage052_campaign_lock,
     validate_worker_ownership,
@@ -202,6 +203,49 @@ def test_source_snapshot_requires_clean_ext4_and_read_only_tree(
     injected.unlink()
     with pytest.raises(RuntimeError, match="writable tracked paths"):
         verify_stage052_source_snapshot(source)
+
+
+def test_source_snapshot_contract_ignores_device_and_path_telemetry() -> None:
+    frozen = {
+        "repository_revision": "a" * 40,
+        "mount": {
+            "source": "/dev/sdd",
+            "filesystem": "ext4",
+            "uuid": "old-uuid",
+            "target": "/sealed/old",
+        },
+        "tracked_file_count": 866,
+        "allowed_untracked_sha256": {"data/schneider/c101.txt": "b" * 64},
+        "read_only": True,
+    }
+    live = {
+        **frozen,
+        "mount": {
+            "source": "/dev/sde",
+            "filesystem": "ext4",
+            "uuid": "new-uuid",
+            "target": "/sealed/new",
+        },
+    }
+
+    assert stage052_source_snapshot_contract(frozen) == (
+        stage052_source_snapshot_contract(live)
+    )
+    for field, value in (
+        ("repository_revision", "c" * 40),
+        ("tracked_file_count", 865),
+        ("allowed_untracked_sha256", {"data/schneider/c101.txt": "d" * 64}),
+    ):
+        drifted = {**live, field: value}
+        assert stage052_source_snapshot_contract(drifted) != (
+            stage052_source_snapshot_contract(frozen)
+        )
+    invalid_filesystem = {
+        **live,
+        "mount": {**live["mount"], "filesystem": "9p"},
+    }
+    with pytest.raises(RuntimeError, match="hard contract is invalid"):
+        stage052_source_snapshot_contract(invalid_filesystem)
 
 
 def test_stage052_clean_check_defers_untracked_files_to_source_snapshot(

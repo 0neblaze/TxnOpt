@@ -136,6 +136,30 @@ def _canonical_sha256(value: object) -> str:
     ).hexdigest()
 
 
+def campaign_runtime_contract_sha256(value: Mapping[str, object]) -> str:
+    """Hash the explicit hard runtime contract; every other field is telemetry."""
+
+    hard_fields = (
+        "schema_version",
+        "repository_revision",
+        "wheel_filename",
+        "wheel_sha256",
+        "python_version",
+        "python_executable_sha256",
+        "native_extension_sha256",
+        "dependency_versions",
+        "dependency_manifest_sha256",
+        "installed_distribution_sha256",
+        "installed_editable",
+    )
+    missing = [field for field in hard_fields if field not in value]
+    if missing:
+        raise RuntimeError(
+            "runtime identity hard contract is incomplete: " + ", ".join(missing)
+        )
+    return _canonical_sha256({field: value[field] for field in hard_fields})
+
+
 def campaign_runtime_selection_sha256(
     value: Mapping[str, object],
     *,
@@ -768,6 +792,7 @@ class BenchmarkExecutionLock:
     selected_workers: int
     repository_revision: str
     runtime_identity_sha256: str
+    runtime_contract_sha256: str
     runtime_selection_sha256: str
     input_provenance_sha256: str
     configuration_sha256: str
@@ -913,6 +938,7 @@ class BenchmarkExecutionLock:
             selected_workers=workers,
             repository_revision=revision,
             runtime_identity_sha256=_canonical_sha256(runtime),
+            runtime_contract_sha256=campaign_runtime_contract_sha256(runtime),
             runtime_selection_sha256=campaign_runtime_selection_sha256(runtime),
             input_provenance_sha256=_canonical_sha256(_input_lock_payload(inputs)),
             configuration_sha256=config_sha,
@@ -941,6 +967,7 @@ class BenchmarkExecutionLock:
             "selected_workers": self.selected_workers,
             "repository_revision": self.repository_revision,
             "runtime_identity_sha256": self.runtime_identity_sha256,
+            "runtime_contract_sha256": self.runtime_contract_sha256,
             "runtime_selection_sha256": self.runtime_selection_sha256,
             "input_provenance_sha256": self.input_provenance_sha256,
             "configuration_sha256": self.configuration_sha256,
@@ -1054,8 +1081,13 @@ class BenchmarkExecutionLock:
             raise RuntimeError("benchmark configuration differs from accepted selection")
         current_runtime = _mapping(runtime_identity, "runtime identity")
         if repository_revision == self.repository_revision:
-            if _canonical_sha256(current_runtime) != self.runtime_identity_sha256:
-                raise RuntimeError("benchmark runtime identity differs from accepted selection")
+            if (
+                campaign_runtime_contract_sha256(current_runtime)
+                != self.runtime_contract_sha256
+            ):
+                raise RuntimeError(
+                    "benchmark runtime contract differs from accepted selection"
+                )
         else:
             if repository is None:
                 raise RuntimeError(

@@ -31,6 +31,7 @@ from evrptw.experiments.stage052_campaign_review import (
     CampaignGeometryRecord,
     _publish_review,
     _read_bounded_compact_trace,
+    _validate_batch_metadata,
     _verify_review_storage_migration,
     audit_campaign_planning,
     audit_streamed_events,
@@ -86,6 +87,7 @@ _SOURCE_SNAPSHOT = {
         "target": "/test-source",
     },
     "tracked_file_count": 100,
+    "allowed_untracked_sha256": {},
     "read_only": True,
 }
 
@@ -1372,9 +1374,12 @@ def _selection_inputs() -> tuple[dict[str, object], dict[str, object], dict[str,
         "schema_version": "stage05.2-runtime-identity-v2",
         "repository_revision": "a" * 40,
         "repository_dirty": False,
+        "wheel_filename": "runtime.whl",
         "wheel_sha256": "1" * 64,
+        "python_version": "3.13.13",
         "python_executable_sha256": "2" * 64,
         "native_extension_sha256": "3" * 64,
+        "dependency_versions": {"numpy": "2.4.6"},
         "dependency_manifest_sha256": "4" * 64,
         "installed_distribution_sha256": "5" * 64,
         "installed_editable": False,
@@ -2339,6 +2344,94 @@ def test_campaign_selection_lock_binds_f02_backend_worker_native_and_provenance(
     assert audit.selection_lock["selected_workers"] == 2
     assert audit.selection_lock["native_kernel_config"] == metadata["native_kernel_config"]
     assert audit.selection_lock["accelerator_review_manifest_sha256"] == "b" * 64
+
+
+def test_batch_runtime_provenance_ignores_telemetry_across_batches() -> None:
+    prerequisite_metadata, review, identity = _selection_inputs()
+    audit = validate_campaign_selection_lock(
+        campaign_backend="native_cpu",
+        campaign_exact_backend="cpu_batch",
+        campaign_workers=2,
+        campaign_native_profile="stage05.2-native-kernels-v1",
+        prerequisite_metadata=prerequisite_metadata,
+        prerequisite_review=review,
+        prerequisite_identity=identity,
+    )
+    assert audit.passed is True
+    campaign = SimpleNamespace(
+        run_label="stage05.2_benchmark_attempt01",
+        scope="pilot",
+        configuration_sha256="c" * 64,
+        prerequisite_review_sha256="b" * 64,
+        selected_backend="native_cpu",
+        selected_exact_backend="cpu_batch",
+        selected_workers=2,
+        native_profile="stage05.2-native-kernels-v1",
+        storage_policy_version="artifact-storage-v2",
+        screening_schema_version="screening_decisions_v3",
+        producer_resource_contract=None,
+    )
+    runtime = prerequisite_metadata["runtime_identity"]
+    native = prerequisite_metadata["native_kernel_config"]
+    provenance = prerequisite_metadata["performance_provenance"]
+    assert isinstance(runtime, dict)
+    metadata: dict[str, object] = {
+        "run_label": campaign.run_label,
+        "component": "benchmark",
+        "scope": campaign.scope,
+        "execution_backend": campaign.selected_backend,
+        "backend": campaign.selected_exact_backend,
+        "worker_count": campaign.selected_workers,
+        "producer_resource_contract": None,
+        "worker_process_lifecycle": "one_shard_per_spawned_process",
+        "worker_runtime_warmup": "in_memory_arrow_zstd1",
+        "native_profile": campaign.native_profile,
+        "storage_policy_version": campaign.storage_policy_version,
+        "screening_schema_version": campaign.screening_schema_version,
+        "screening_definition_store": screening_definition_store_contract(),
+        "campaign_configuration_sha256": campaign.configuration_sha256,
+        "campaign_prerequisite_review_sha256": campaign.prerequisite_review_sha256,
+        "configuration_sha256": prerequisite_metadata["configuration_sha256"],
+        "repository_revision": prerequisite_metadata["repository_revision"],
+        "repository_dirty": False,
+        "source_snapshot": dict(_SOURCE_SNAPSHOT),
+        "runtime_identity": {
+            **runtime,
+            "machine_identity": {"memory_bytes": 16 * 1024**3},
+        },
+        "performance_provenance": provenance,
+        "native_kernel_config": native,
+    }
+    first = _validate_batch_metadata(
+        metadata,
+        campaign=campaign,
+        selection_lock=audit.selection_lock,
+        configuration_selection_sha256=str(
+            prerequisite_metadata["configuration_sha256"]
+        ),
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+    second_metadata = {
+        **metadata,
+        "runtime_identity": {
+            **runtime,
+            "machine_identity": {"memory_bytes": 16 * 1024**3 - 4096},
+            "temperature_telemetry": {"celsius": 91.0},
+        },
+    }
+    second = _validate_batch_metadata(
+        second_metadata,
+        campaign=campaign,
+        selection_lock=audit.selection_lock,
+        configuration_selection_sha256=str(
+            prerequisite_metadata["configuration_sha256"]
+        ),
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+
+    assert first[0] is True
+    assert second[0] is True
+    assert first[2] == second[2]
 
 
 def test_campaign_selection_lock_binds_promoted_cuda_backend() -> None:

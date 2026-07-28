@@ -802,11 +802,17 @@ def _validate_formal_execution_envelope(config: ReviewServiceConfig) -> dict[str
         allowed_untracked_sha256=allowed_untracked,
     )
     if config.producer_source_directory is not None:
-        from evrptw.stage052_evidence import verify_stage052_source_snapshot
+        from evrptw.stage052_evidence import (
+            stage052_source_snapshot_contract,
+            verify_stage052_source_snapshot,
+        )
 
         if (
             not isinstance(source_snapshot, dict)
-            or verify_stage052_source_snapshot(producer_source) != source_snapshot
+            or stage052_source_snapshot_contract(
+                verify_stage052_source_snapshot(producer_source)
+            )
+            != stage052_source_snapshot_contract(source_snapshot)
         ):
             raise RuntimeError(
                 "producer source directory does not match the sealed raw source snapshot"

@@ -695,6 +695,46 @@ def verify_stage052_source_snapshot(root: Path) -> dict[str, object]:
     }
 
 
+def stage052_source_snapshot_contract(
+    snapshot: Mapping[str, object],
+) -> dict[str, object]:
+    """Return the path/device-independent hard contract for a sealed source tree."""
+
+    revision = snapshot.get("repository_revision")
+    tracked_file_count = snapshot.get("tracked_file_count")
+    allowed_untracked = snapshot.get("allowed_untracked_sha256")
+    read_only = snapshot.get("read_only")
+    mount = snapshot.get("mount")
+    if (
+        not isinstance(revision, str)
+        or len(revision) != 40
+        or any(character not in "0123456789abcdef" for character in revision)
+        or isinstance(tracked_file_count, bool)
+        or not isinstance(tracked_file_count, int)
+        or tracked_file_count <= 0
+        or not isinstance(allowed_untracked, Mapping)
+        or any(
+            not isinstance(path, str)
+            or not path
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            for path, digest in allowed_untracked.items()
+        )
+        or read_only is not True
+        or not isinstance(mount, Mapping)
+        or mount.get("filesystem") != "ext4"
+    ):
+        raise RuntimeError("Stage 5.2 source snapshot hard contract is invalid")
+    return {
+        "repository_revision": revision,
+        "tracked_file_count": tracked_file_count,
+        "allowed_untracked_sha256": dict(sorted(allowed_untracked.items())),
+        "read_only": True,
+        "filesystem": "ext4",
+    }
+
+
 def _stage052_machine_identity() -> dict[str, object]:
     """Collect the stable Windows/WSL2 hardware and mount identity."""
 

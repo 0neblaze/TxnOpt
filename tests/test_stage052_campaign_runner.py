@@ -47,6 +47,7 @@ from evrptw.stage052_campaign_runner import (
     RollingCampaignCapacityError,
     WindowsWslMachineSnapshotSource,
     campaign_configuration_selection_sha256,
+    campaign_runtime_contract_sha256,
     campaign_runtime_selection_sha256,
     collect_preflight_observation,
     probe_volume_identity,
@@ -334,10 +335,15 @@ def _accepted_f02_payloads() -> tuple[dict[str, object], dict[str, object], str]
     runtime = {
         "schema_version": "stage05.2-runtime-identity-v2",
         "repository_revision": "a" * 40,
-        "python_sha256": "b" * 64,
-        "wheel_sha256": "c" * 64,
+        "wheel_filename": "runtime.whl",
+        "wheel_sha256": "b" * 64,
+        "python_version": "3.13.13",
+        "python_executable_sha256": "c" * 64,
         "native_extension_sha256": "d" * 64,
-        "dependency_lock_sha256": "e" * 64,
+        "dependency_versions": {"numpy": "2.4.6"},
+        "dependency_manifest_sha256": "e" * 64,
+        "installed_distribution_sha256": "6" * 64,
+        "installed_editable": False,
     }
     inputs = {
         "instance_sha256": {"c101_21": "f" * 64},
@@ -625,6 +631,92 @@ def test_execution_lock_rejects_current_runtime_or_worker_drift() -> None:
             input_provenance=metadata["performance_provenance"],
             native_kernel_config=metadata["native_kernel_config"],
         )
+
+
+def test_execution_lock_ignores_only_same_revision_runtime_telemetry_and_paths() -> None:
+    metadata, review, raw_manifest_sha = _accepted_f02_payloads()
+    runtime = metadata["runtime_identity"]
+    assert isinstance(runtime, dict)
+    runtime.update(
+        {
+            "machine_identity": {
+                "memory_bytes": 16 * 1024**3,
+                "host_system": "Linux",
+            },
+            "source_repository_mount": {
+                "filesystem": "ext4",
+                "source": "/dev/sdd",
+                "target": "/",
+                "uuid": "old",
+            },
+            "native_extension": "/sealed/old/evrptw/_core.so",
+            "python_executable": "/sealed/old/bin/python",
+            "source_repository_root": "/sealed/old/producer-source",
+            "wheel_path": "/sealed/old/wheels/runtime.whl",
+            "machine_load_telemetry": {"temperature_c": 65.0},
+        }
+    )
+    lock = BenchmarkExecutionLock.from_accepted_evidence(
+        metadata=metadata,
+        review_manifest=review,
+        raw_manifest_sha256=raw_manifest_sha,
+        expected_scope="performance",
+        expected_status="READY_FOR_STAGE052_BENCHMARK",
+    )
+    current = {
+        **runtime,
+        "machine_identity": {
+            "memory_bytes": 16 * 1024**3 - 4096,
+            "host_system": "Linux",
+        },
+        "source_repository_mount": {
+            "filesystem": "ext4",
+            "source": "/dev/sde",
+            "target": "/",
+            "uuid": "new",
+        },
+        "native_extension": "/sealed/new/evrptw/_core.so",
+        "python_executable": "/sealed/new/bin/python",
+        "source_repository_root": "/sealed/new/producer-source",
+        "wheel_path": "/sealed/new/wheels/runtime.whl",
+        "machine_load_telemetry": {"temperature_c": 91.0},
+    }
+
+    assert campaign_runtime_contract_sha256(current) == (
+        campaign_runtime_contract_sha256(runtime)
+    )
+    lock.verify_current_execution(
+        selected_backend="native_cpu",
+        selected_exact_backend="cpu_batch",
+        selected_workers=2,
+        repository_revision="a" * 40,
+        configuration_sha256="4" * 64,
+        runtime_identity=current,
+        input_provenance=metadata["performance_provenance"],
+        native_kernel_config=metadata["native_kernel_config"],
+    )
+
+    for field in (
+        "native_extension_sha256",
+        "python_executable_sha256",
+        "wheel_sha256",
+    ):
+        drifted = {**current, field: "9" * 64}
+        with pytest.raises(RuntimeError, match="runtime contract"):
+            lock.verify_current_execution(
+                selected_backend="native_cpu",
+                selected_exact_backend="cpu_batch",
+                selected_workers=2,
+                repository_revision="a" * 40,
+                configuration_sha256="4" * 64,
+                runtime_identity=drifted,
+                input_provenance=metadata["performance_provenance"],
+                native_kernel_config=metadata["native_kernel_config"],
+            )
+    incomplete = dict(current)
+    del incomplete["python_version"]
+    with pytest.raises(RuntimeError, match="hard contract is incomplete"):
+        campaign_runtime_contract_sha256(incomplete)
 
 
 def test_execution_lock_excludes_archive_device_telemetry_from_successor_identity(
