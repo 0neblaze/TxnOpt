@@ -4473,6 +4473,7 @@ def _audit_campaign(
                 selected_exact_backend=campaign.selected_exact_backend,
                 selected_workers=campaign.selected_workers,
                 native_profile=campaign.native_profile,
+                producer_resource_contract=campaign.producer_resource_contract,
             )
             if scope == "pilot"
             else BenchmarkCampaignConfig.formal(
@@ -4483,6 +4484,7 @@ def _audit_campaign(
                 selected_exact_backend=campaign.selected_exact_backend,
                 selected_workers=campaign.selected_workers,
                 native_profile=campaign.native_profile,
+                producer_resource_contract=campaign.producer_resource_contract,
             )
         )
         planning_observations = (

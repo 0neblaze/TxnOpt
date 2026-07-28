@@ -1270,3 +1270,11 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   artifact。旧 accelerator evidence 仍走显式 historical adapter；新 Pilot 不允许
   implicit fallback。失败 generation 与 finalized receipt 保留，修复后的 reviewer
   必须以新 sealed revision 写入 immutable retry history 后重放同一 Attempt75 raw。
+- 第二代 generation
+  `0711a7fde9603c5c6a577fd3f8559a8af64f1155090b2b7af9233e63d0eb71f2`
+  成功以 `native_arrow`/4 workers 重放 36/36 shards、15,099,532 events，0 fallback，
+  19 个非 publication gates 中 17 个通过。它仍为 `NOT_READY`：reviewer 重建 plan
+  时漏传 signed producer resource contract；同时最大真实 shard 的
+  `screening_definition_rows=131043`，比不可降低的 131,072 spill boundary 少 29。
+  plan replay 已补齐 resource contract；Attempt75 不被提升，新 Pilot 使用下一 label
+  从零运行，只有真实 shard 越过 131,072 才可通过 spill gate。
