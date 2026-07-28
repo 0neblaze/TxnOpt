@@ -147,10 +147,14 @@ def campaign_runtime_selection_sha256(
         "dependency_manifest_sha256",
         "installed_distribution_sha256",
         "machine_identity",
+        "native_extension",
         "native_extension_sha256",
+        "python_executable",
         "repository_revision",
         "source_repository_mount",
+        "source_repository_root",
         "wheel_filename",
+        "wheel_path",
         "wheel_sha256",
     }
     selection = {key: item for key, item in value.items() if key not in excluded}

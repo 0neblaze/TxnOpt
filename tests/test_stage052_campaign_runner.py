@@ -907,6 +907,10 @@ def test_campaign_runtime_selection_hash_excludes_only_g_wheel_identity() -> Non
         "wheel_filename": "successor.whl",
         "wheel_sha256": "8" * 64,
         "installed_distribution_sha256": "7" * 64,
+        "python_executable": "/sealed/runtime/bin/python3.13",
+        "native_extension": "/sealed/runtime/site-packages/evrptw/_core.so",
+        "source_repository_root": "/sealed/runtime/producer-source",
+        "wheel_path": "/sealed/runtime/wheels/successor.whl",
     }
 
     assert campaign_runtime_selection_sha256(successor) == (
