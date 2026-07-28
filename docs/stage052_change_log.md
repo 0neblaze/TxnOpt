@@ -1286,3 +1286,28 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   lock 漏带 Attempt72 内部冻结的原 accelerator-review SHA 而失败。该 hash 与
   Attempt72 review SHA 是两条不同的谱系边：修复后同时保留两者，再以新 sealed
   reviewer generation 重放同一 immutable Attempt76 raw。
+
+## 2026-07-28：G73 accepted Pilot 与 Formal launch
+
+- Attempt76 的最终 independent review generation
+  `4bc54ffae0ddfb97ddaf9a47e0a9d64b6de62e306c1a172631bf253c17d86b64`
+  使用 `native_arrow`、4 reviewer workers 重放全部 36 shards、14,978,339 events，
+  `native_fallback_count=0`，20/20 mandatory gates 全部通过并发布
+  `READY_FOR_STAGE052_FORMAL_BENCHMARK`。finalized review receipt 的 raw manifest
+  before/after SHA-256 均为
+  `e347a435039427ed4b70c0abedc399cdbfbdb4778cd65a0e13629b187d604668`；
+  accepted review manifest SHA-256 为
+  `68af4272706e6e7913ec0680cb7120534a92bdb34fdd3c5bfd032b9c21e96e58`。
+- Formal 使用与 Pilot 相同的 producer revision、wheel、第三方依赖、6-worker
+  resource contract 和科学配置，但通过新的 read-only source snapshot 把 Attempt76
+  写入 signed campaign lock；Attempt76 使用过的 producer snapshot 保持不变。
+- `stage05.2_benchmark_attempt77` 在 raw directory 创建前 fail fast：transient
+  systemd service 的 `PATH` 漏带 Windows interop 目录，冻结 runtime replay
+  子进程无法调用 `powershell.exe`/`wsl.exe`。该标签不复用；没有 shard、axis 或
+  campaign geometry。
+- `stage05.2_benchmark_attempt78` 随后以修正后的完整 service execution `PATH` 启动。
+  Formal geometry 已在落盘前确认为 920 shards、2,040 axes、229,200 declared solver
+  seconds 和 10,400 checkpoints；producer 固定 6 workers，
+  `MemoryHigh=13,833,388,032`、`MemoryMax=16,600,065,639`、
+  `MemorySwapMax=0` bytes。运行中状态不构成 readiness，只有 sealed raw 的后续
+  independent native review 全部通过后才能发布 `READY_FOR_STAGE05_3`。
