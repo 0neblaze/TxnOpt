@@ -126,7 +126,7 @@ def test_producer_selection_rejects_swap_fallback_digest_drift_and_memory_pressu
     results = (
         _producer_result(4, 100.0, rss_gib=8.0),
         _producer_result(5, 140.0, rss_gib=9.0, swap_bytes=1),
-        _producer_result(6, 160.0, rss_gib=13.0, digest="b" * 64),
+        _producer_result(6, 160.0, rss_gib=17.0, digest="b" * 64),
     )
 
     selected = select_producer_configuration(results, available_memory_bytes=16 * 1024**3)
@@ -152,6 +152,22 @@ def test_producer_selection_rejects_higher_concurrency_below_fifteen_percent() -
     )
 
 
+def test_producer_selection_uses_full_measured_memory_capability() -> None:
+    results = (
+        _producer_result(4, 100.0, rss_gib=13.0),
+        _producer_result(5, 116.0, rss_gib=14.0),
+        _producer_result(6, 130.0, rss_gib=15.0),
+    )
+
+    selected = select_producer_configuration(
+        results,
+        available_memory_bytes=16 * 1024**3,
+    )
+
+    assert selected.selected_workers == 6
+    assert selected.rejected_reasons == {}
+
+
 def test_producer_resource_contract_is_calibration_derived_and_round_trips() -> None:
     results = (
         _producer_result(4, 100.0, rss_gib=8.0),
@@ -175,11 +191,11 @@ def test_producer_resource_contract_is_calibration_derived_and_round_trips() -> 
     assert contract.selected_workers == 5
     assert contract.aggregate_memory_limit_bytes == math.ceil(9 * 1024**3 * 1.2)
     assert contract.per_worker_memory_limit_bytes == math.ceil(3 * 1024**3 * 1.2)
-    assert contract.aggregate_memory_limit_bytes <= int(16 * 1024**3 * 0.75)
+    assert contract.aggregate_memory_limit_bytes <= 16 * 1024**3
     assert ProducerResourceContract.from_dict(contract.to_dict()) == contract
 
 
-def test_producer_resource_contract_caps_headroom_at_capability_envelope() -> None:
+def test_producer_resource_contract_keeps_full_headroom_above_seventy_five_percent() -> None:
     results = (
         _producer_result(4, 100.0, rss_gib=8.0),
         _producer_result(5, 118.0, rss_gib=10.5),
@@ -200,7 +216,8 @@ def test_producer_resource_contract_caps_headroom_at_capability_envelope() -> No
     )
 
     assert contract.selected_aggregate_peak_rss_bytes == int(10.5 * 1024**3)
-    assert contract.aggregate_memory_limit_bytes == 12 * 1024**3
+    assert contract.aggregate_memory_limit_bytes == math.ceil(10.5 * 1024**3 * 1.2)
+    assert contract.aggregate_memory_limit_bytes > int(16 * 1024**3 * 0.75)
 
 
 def test_parquet_tuning_requires_ten_percent_critical_path_improvement() -> None:
@@ -242,6 +259,31 @@ def test_parquet_tuning_requires_ten_percent_critical_path_improvement() -> None
     )
 
 
+def test_parquet_tuning_uses_full_measured_memory_capability() -> None:
+    baseline = ParquetBenchmark(
+        row_group_size=65_536,
+        queue_depth=1,
+        persistence_seconds=100.0,
+        aggregate_peak_rss_bytes=8 * 1024**3,
+        semantic_digest="a" * 64,
+    )
+    faster = ParquetBenchmark(
+        row_group_size=262_144,
+        queue_depth=2,
+        persistence_seconds=80.0,
+        aggregate_peak_rss_bytes=13 * 1024**3,
+        semantic_digest="a" * 64,
+    )
+
+    assert (
+        select_parquet_configuration(
+            (baseline, faster),
+            available_memory_bytes=16 * 1024**3,
+        )
+        == faster
+    )
+
+
 def test_capability_contract_fails_fast_on_missing_atomic_filesystem_support() -> None:
     requirement = CapabilityRequirement(
         workers=4,
@@ -266,7 +308,7 @@ def test_capability_contract_fails_fast_on_missing_atomic_filesystem_support() -
         validate_capabilities(capabilities, requirement)
 
 
-def test_review_memory_contract_is_pilot_derived_and_bounded_to_seventy_five_percent() -> None:
+def test_review_memory_contract_is_pilot_derived_with_operating_headroom() -> None:
     contract = derive_review_memory_contract(
         parent_baseline_rss_bytes=512 * 1024**2,
         per_child_p99_rss_bytes=2 * 1024**3,
@@ -278,11 +320,23 @@ def test_review_memory_contract_is_pilot_derived_and_bounded_to_seventy_five_per
     assert contract.review_workers == 4
     assert contract.memory_high_bytes < contract.process_guard_bytes
     assert contract.process_guard_bytes < contract.memory_max_bytes
-    assert contract.memory_max_bytes <= int(16 * 1024**3 * 0.75)
+    assert contract.memory_max_bytes <= 16 * 1024**3
 
 
-def test_review_memory_contract_rejects_unsafe_concurrency() -> None:
-    with pytest.raises(RuntimeError, match="75%"):
+def test_review_memory_contract_uses_full_measured_memory_capability() -> None:
+    contract = derive_review_memory_contract(
+        parent_baseline_rss_bytes=1 * 1024**3,
+        per_child_p99_rss_bytes=3 * 1024**3,
+        review_workers=4,
+        available_memory_bytes=16 * 1024**3,
+    )
+
+    assert contract.memory_max_bytes == math.ceil(13 * 1024**3 * 1.2)
+    assert contract.memory_max_bytes > int(16 * 1024**3 * 0.75)
+
+
+def test_review_memory_contract_rejects_headroom_beyond_available_memory() -> None:
+    with pytest.raises(RuntimeError, match="available memory"):
         derive_review_memory_contract(
             parent_baseline_rss_bytes=1 * 1024**3,
             per_child_p99_rss_bytes=4 * 1024**3,

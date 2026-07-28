@@ -21,7 +21,6 @@ from typing import Final
 from evrptw.stage052_platform import durable_replace, sync_directory
 
 _SHA256_LENGTH: Final = 64
-_MEMORY_FRACTION: Final = 0.75
 _MINIMUM_PRODUCER_SPEEDUP: Final = 0.15
 _THROUGHPUT_TIE_FRACTION: Final = 0.05
 _MINIMUM_PERSISTENCE_IMPROVEMENT: Final = 0.10
@@ -270,10 +269,8 @@ class ProducerResourceContract:
             raise ValueError("aggregate memory limit is below the calibrated peak")
         if self.per_worker_memory_limit_bytes < self.selected_per_worker_peak_rss_bytes:
             raise ValueError("per-worker memory limit is below the calibrated peak")
-        if self.aggregate_memory_limit_bytes > math.floor(
-            self.available_memory_bytes * _MEMORY_FRACTION
-        ):
-            raise ValueError("producer aggregate limit exceeds the 75% capability envelope")
+        if self.aggregate_memory_limit_bytes > self.available_memory_bytes:
+            raise ValueError("producer aggregate limit exceeds available memory")
 
     def to_dict(self) -> dict[str, int | str]:
         return {
@@ -348,7 +345,7 @@ def derive_producer_resource_contract(
     row_group_size: int,
     queue_depth: int,
 ) -> ProducerResourceContract:
-    """Freeze selected producer peaks with 20% headroom under the 75% ceiling."""
+    """Freeze selected producer peaks with 20% headroom within host capability."""
 
     _positive_int(selected_per_worker_peak_rss_bytes, "selected_per_worker_peak_rss_bytes")
     _positive_int(available_memory_bytes, "available_memory_bytes")
@@ -366,15 +363,11 @@ def derive_producer_resource_contract(
     selected = by_workers.get(selection.selected_workers)
     if selected is None or selected.semantic_digest != selection.semantic_digest:
         raise ValueError("producer selection does not match the calibration observations")
-    memory_budget = math.floor(available_memory_bytes * _MEMORY_FRACTION)
-    aggregate_limit = min(
-        math.ceil(selected.aggregate_peak_rss_bytes * 1.20),
-        memory_budget,
-    )
+    aggregate_limit = math.ceil(selected.aggregate_peak_rss_bytes * 1.20)
     per_worker_limit = math.ceil(selected_per_worker_peak_rss_bytes * 1.20)
-    if aggregate_limit < selected.aggregate_peak_rss_bytes:
+    if aggregate_limit > available_memory_bytes:
         raise RuntimeError(
-            "selected producer peak RSS exceeds 75% of available memory"
+            "selected producer peak plus operating headroom exceeds available memory"
         )
     calibration_payload = {
         "available_memory_bytes": available_memory_bytes,
@@ -460,7 +453,7 @@ def select_producer_configuration(
     baseline = by_workers[4]
     rejected: dict[int, str] = {}
     eligible: list[ProducerBenchmark] = []
-    memory_budget = available_memory_bytes * _MEMORY_FRACTION
+    memory_budget = available_memory_bytes
     for workers in sorted(by_workers):
         result = by_workers[workers]
         reasons: list[str] = []
@@ -542,7 +535,7 @@ def select_parquet_configuration(
     )
     if baseline is None:
         raise ValueError("persistence calibration requires the 65,536/1 baseline")
-    memory_budget = available_memory_bytes * _MEMORY_FRACTION
+    memory_budget = available_memory_bytes
     eligible = [
         result
         for result in results
@@ -595,9 +588,9 @@ class ReviewMemoryContract:
             self.memory_high_bytes
             < self.process_guard_bytes
             < self.memory_max_bytes
-            <= int(self.available_memory_bytes * _MEMORY_FRACTION)
+            <= self.available_memory_bytes
         ):
-            raise ValueError("review memory limits exceed the 75% capability envelope")
+            raise ValueError("review memory limits exceed available memory")
 
     def to_dict(self) -> dict[str, int | str]:
         return {
@@ -663,7 +656,7 @@ def derive_review_memory_contract(
     review_workers: int,
     available_memory_bytes: int,
 ) -> ReviewMemoryContract:
-    """Derive frozen limits with 20% headroom and a hard 75% host ceiling."""
+    """Derive frozen limits with 20% headroom within measured host capability."""
 
     for field_name, value in (
         ("parent_baseline_rss_bytes", parent_baseline_rss_bytes),
@@ -675,10 +668,9 @@ def derive_review_memory_contract(
         raise ValueError("review_workers must be one of 1, 2, or 4")
     measured = parent_baseline_rss_bytes + per_child_p99_rss_bytes * review_workers
     memory_max = math.ceil(measured * 1.20)
-    capability_ceiling = math.floor(available_memory_bytes * _MEMORY_FRACTION)
-    if memory_max > capability_ceiling:
+    if memory_max > available_memory_bytes:
         raise RuntimeError(
-            "Pilot-derived reviewer memory requirement exceeds 75% of available memory"
+            "Pilot-derived reviewer memory requirement exceeds available memory"
         )
     return ReviewMemoryContract(
         parent_baseline_rss_bytes=parent_baseline_rss_bytes,
