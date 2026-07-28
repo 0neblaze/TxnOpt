@@ -1252,3 +1252,21 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   installed distribution SHA 继续写入新 runtime identity，并由新 raw/reviewer
   独立验证；Attempt72 全 shard differential equality 与 signed resource semantic
   digest 负责证明新增 replay surface 未改变 solver/event 语义。
+
+## 2026-07-28：G72 accepted-Pilot reviewer continuity
+
+- `stage05.2_benchmark_attempt75` producer 完成全部 36 shards 与 3 batches；
+  15,099,532 raw event rows（最终值仍由 accepted review 独立重算）全部归档，三批
+  persistence ratio 为 `0.3011348793`、`0.2923761033`、`0.3223115685`，
+  systemd producer peak 为 5.3 GiB、swap 为 0。该 raw campaign 保持 immutable。
+- 第一代独立 native review generation
+  `d53db7125c853cde37da96243273cedc0bcf950805b3e9a5b77ace13a18e30f7`
+  返回 `NOT_READY`，因为 campaign reviewer 的 Pilot prerequisite adapter 仍按旧
+  F02 accelerator component 与四 workers 验证，未消费 producer 已正确使用的
+  Attempt72 accepted-Pilot lock + 6-worker resource contract。它在 prerequisite
+  gate 后 fail closed，因此显示 0/36 replay；不是 raw shard 语义失败。
+- reviewer 现在独立加载 Attempt72 的 accepted campaign lock，重新应用 signed
+  producer resource contract，并以 configuration selection digest 校验新 config
+  artifact。旧 accelerator evidence 仍走显式 historical adapter；新 Pilot 不允许
+  implicit fallback。失败 generation 与 finalized receipt 保留，修复后的 reviewer
+  必须以新 sealed revision 写入 immutable retry history 后重放同一 Attempt75 raw。

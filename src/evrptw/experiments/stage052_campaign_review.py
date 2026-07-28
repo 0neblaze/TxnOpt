@@ -89,7 +89,9 @@ from evrptw.stage052_campaign import (
 from evrptw.stage052_campaign_runner import (
     AGGREGATE_RSS_LIMIT_BYTES,
     PER_WORKER_RSS_LIMIT_BYTES,
+    campaign_configuration_selection_sha256,
     campaign_runtime_selection_sha256,
+    load_benchmark_execution_lock,
     probe_volume_identity,
     verify_campaign_successor_revision,
 )
@@ -2747,6 +2749,7 @@ def _validate_batch_metadata(
     *,
     campaign: CampaignManifest,
     selection_lock: Mapping[str, object],
+    configuration_selection_sha256: str,
     source_snapshot: Mapping[str, object],
     storage_migration: Mapping[str, object] | None = None,
 ) -> tuple[bool, str, tuple[str, str, str]]:
@@ -2805,6 +2808,15 @@ def _validate_batch_metadata(
         current_instance_hashes.get(str(instance)) == digest
         for instance, digest in locked_instance_hashes.items()
     )
+    locked_configuration_selection = selection_lock.get(
+        "configuration_selection_sha256"
+    )
+    configuration_matches = (
+        configuration_selection_sha256 == locked_configuration_selection
+        if locked_configuration_selection is not None
+        else metadata.get("configuration_sha256")
+        == selection_lock.get("configuration_sha256")
+    )
     passed = (
         metadata.get("run_label") == campaign.run_label
         and metadata.get("component") == Stage052Component.BENCHMARK.value
@@ -2826,7 +2838,7 @@ def _validate_batch_metadata(
         and campaign_configuration == campaign.configuration_sha256
         and metadata.get("campaign_prerequisite_review_sha256")
         == campaign.prerequisite_review_sha256
-        and metadata.get("configuration_sha256") == selection_lock.get("configuration_sha256")
+        and configuration_matches
         and (exact_runtime_match or successor_runtime_match)
         and _canonical_sha256(_stable_input_provenance(provenance))
         == selection_lock.get("input_provenance_sha256")
@@ -3742,6 +3754,8 @@ def _verify_accelerator_prerequisite(
     campaign: CampaignManifest,
     storage_migration: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, object], str, dict[str, object]]:
+    """Verify the accepted Attempt72 Pilot and apply the signed resource contract."""
+
     requirement = stage052_contract(Stage052Component.BENCHMARK, "pilot").prerequisites[0]
     identity = (
         verify_stage052_evidence_input(raw_dir, requirement)
@@ -3752,28 +3766,70 @@ def _verify_accelerator_prerequisite(
             storage_migration=storage_migration,
         )
     )
-    reader = ArtifactReader(raw_dir)
-    metadata_ref = _one_artifact(reader, "manifest_metadata")
-    metadata = reader.read_json(str(metadata_ref["relative_path"]))
     review_path = raw_dir / "review" / "review_manifest.json"
     review = _json_object(review_path)
-    audit = validate_campaign_selection_lock(
-        campaign_backend=campaign.selected_backend,
-        campaign_exact_backend=campaign.selected_exact_backend,
-        campaign_workers=campaign.selected_workers,
-        campaign_native_profile=campaign.native_profile,
-        prerequisite_metadata=metadata,
-        prerequisite_review=review,
-        prerequisite_identity=identity.to_dict(),
+    if identity.component == Stage052Component.ACCELERATOR_PILOT.value:
+        reader = ArtifactReader(raw_dir)
+        metadata_ref = _one_artifact(reader, "manifest_metadata")
+        metadata = reader.read_json(str(metadata_ref["relative_path"]))
+        audit = validate_campaign_selection_lock(
+            campaign_backend=campaign.selected_backend,
+            campaign_exact_backend=campaign.selected_exact_backend,
+            campaign_workers=campaign.selected_workers,
+            campaign_native_profile=campaign.native_profile,
+            prerequisite_metadata=metadata,
+            prerequisite_review=review,
+            prerequisite_identity=identity.to_dict(),
+        )
+        if not audit.passed:
+            raise ArtifactIntegrityError(audit.detail)
+        payload = {
+            **identity.to_dict(),
+            "accelerator_decision": review.get("accelerator_decision"),
+            "selection_lock": audit.selection_lock,
+        }
+        return payload, identity.review_manifest_sha256, audit.selection_lock
+    accepted = load_benchmark_execution_lock(
+        raw_dir,
+        expected_scope="pilot",
+        expected_status=PILOT_READY,
     )
-    if not audit.passed:
-        raise ArtifactIntegrityError(audit.detail)
+    if campaign.producer_resource_contract is None:
+        raise ArtifactIntegrityError("successor Pilot lacks its producer resource contract")
+    selection_lock = accepted.with_producer_resource_contract(
+        campaign.producer_resource_contract
+    )
+    selection_lock.update(
+        {
+            "accepted_pilot_review_manifest_sha256": identity.review_manifest_sha256,
+            "accelerator_decision": review.get("accelerator_decision"),
+            "native_profile": campaign.native_profile,
+            "selected_optimization_profile": review.get(
+                "selected_optimization_profile"
+            ),
+        }
+    )
+    if (
+        accepted.prerequisite_run_label != identity.run_label
+        or accepted.raw_manifest_sha256 != identity.raw_manifest_sha256
+        or accepted.repository_revision != identity.repository_revision
+        or accepted.selected_backend != campaign.selected_backend
+        or accepted.selected_exact_backend != campaign.selected_exact_backend
+        or campaign.selected_workers
+        != campaign.producer_resource_contract.selected_workers
+        or selection_lock.get("selected_workers") != campaign.selected_workers
+        or selection_lock.get("native_kernel_config") is None
+        or campaign.native_profile != "stage05.2-native-kernels-v1"
+    ):
+        raise ArtifactIntegrityError(
+            "accepted Pilot scientific lock or successor resource contract does not agree"
+        )
     payload = {
         **identity.to_dict(),
         "accelerator_decision": review.get("accelerator_decision"),
-        "selection_lock": audit.selection_lock,
+        "selection_lock": selection_lock,
     }
-    return payload, identity.review_manifest_sha256, audit.selection_lock
+    return payload, identity.review_manifest_sha256, selection_lock
 
 
 def _verify_campaign_review_prerequisite(
@@ -4332,15 +4388,6 @@ def _audit_campaign(
                     storage_migration=migration_payload,
                 )
             )
-            if campaign.producer_resource_contract is not None:
-                selection_lock = dict(selection_lock)
-                selection_lock["predecessor_selected_workers"] = selection_lock.get(
-                    "selected_workers"
-                )
-                selection_lock["selected_workers"] = campaign.selected_workers
-                selection_lock["producer_resource_contract"] = (
-                    campaign.producer_resource_contract.to_dict()
-                )
         selection_matches = (
             selection_lock.get("selected_backend") == campaign.selected_backend
             and selection_lock.get("selected_exact_backend") == campaign.selected_exact_backend
@@ -4554,10 +4601,25 @@ def _audit_campaign(
             metadata_ref, metadata_path = _batch_control_artifact(reader, "manifest_metadata")
             del metadata_ref
             metadata = _json_object(metadata_path)
+            if selection_lock.get("configuration_selection_sha256") is not None:
+                config_ref, config_path = _batch_control_artifact(reader, "config")
+                del config_ref
+                if metadata.get("configuration_sha256") != _sha256(config_path):
+                    raise ArtifactIntegrityError(
+                        "batch configuration artifact does not match metadata"
+                    )
+                configuration_selection_sha256 = (
+                    campaign_configuration_selection_sha256(config_path.read_bytes())
+                )
+            else:
+                configuration_selection_sha256 = str(
+                    selection_lock.get("configuration_sha256", "")
+                )
             metadata_ok, metadata_detail, metadata_identity = _validate_batch_metadata(
                 metadata,
                 campaign=campaign,
                 selection_lock=selection_lock,
+                configuration_selection_sha256=configuration_selection_sha256,
                 source_snapshot=current_source_snapshot,
                 storage_migration=migration_payload,
             )
