@@ -25,7 +25,8 @@ _MEMORY_FRACTION: Final = 0.75
 _MINIMUM_PRODUCER_SPEEDUP: Final = 0.15
 _THROUGHPUT_TIE_FRACTION: Final = 0.05
 _MINIMUM_PERSISTENCE_IMPROVEMENT: Final = 0.10
-_PRODUCER_WORKERS: Final = frozenset({4, 5, 6})
+_PRODUCER_WORKERS: Final = frozenset({4, 5, 6, 8})
+_REQUIRED_PRODUCER_CALIBRATION_WORKERS: Final = frozenset({4, 5, 6})
 _ROW_GROUP_SIZES: Final = frozenset({65_536, 262_144})
 _QUEUE_DEPTHS: Final = frozenset({1, 2})
 
@@ -202,7 +203,7 @@ class ProducerBenchmark:
 
     def __post_init__(self) -> None:
         if self.workers not in _PRODUCER_WORKERS:
-            raise ValueError("producer workers must be one of 4, 5, or 6")
+            raise ValueError("producer workers must be one of 4, 5, 6, or 8")
         if not math.isfinite(self.throughput) or self.throughput <= 0.0:
             raise ValueError("producer throughput must be finite and positive")
         _positive_int(self.aggregate_peak_rss_bytes, "aggregate_peak_rss_bytes")
@@ -248,7 +249,7 @@ class ProducerResourceContract:
 
     def __post_init__(self) -> None:
         if self.selected_workers not in _PRODUCER_WORKERS:
-            raise ValueError("selected_workers must be one of 4, 5, or 6")
+            raise ValueError("selected_workers must be one of 4, 5, 6, or 8")
         for field_name in (
             "available_memory_bytes",
             "selected_aggregate_peak_rss_bytes",
@@ -352,8 +353,16 @@ def derive_producer_resource_contract(
     _positive_int(selected_per_worker_peak_rss_bytes, "selected_per_worker_peak_rss_bytes")
     _positive_int(available_memory_bytes, "available_memory_bytes")
     by_workers = {item.workers: item for item in results}
-    if set(by_workers) != _PRODUCER_WORKERS or len(results) != len(_PRODUCER_WORKERS):
-        raise ValueError("producer resource derivation requires exactly 4/5/6 results")
+    observed_workers = set(by_workers)
+    if (
+        not _REQUIRED_PRODUCER_CALIBRATION_WORKERS.issubset(observed_workers)
+        or not observed_workers.issubset(_PRODUCER_WORKERS)
+        or len(results) != len(observed_workers)
+    ):
+        raise ValueError(
+            "producer resource derivation requires unique 4/5/6-worker results "
+            "and may additionally include 8 workers"
+        )
     selected = by_workers.get(selection.selected_workers)
     if selected is None or selected.semantic_digest != selection.semantic_digest:
         raise ValueError("producer selection does not match the calibration observations")
@@ -438,8 +447,16 @@ def select_producer_configuration(
 
     _positive_int(available_memory_bytes, "available_memory_bytes")
     by_workers = {result.workers: result for result in results}
-    if set(by_workers) != _PRODUCER_WORKERS or len(results) != len(_PRODUCER_WORKERS):
-        raise ValueError("producer calibration requires exactly one 4/5/6-worker result")
+    observed_workers = set(by_workers)
+    if (
+        not _REQUIRED_PRODUCER_CALIBRATION_WORKERS.issubset(observed_workers)
+        or not observed_workers.issubset(_PRODUCER_WORKERS)
+        or len(results) != len(observed_workers)
+    ):
+        raise ValueError(
+            "producer calibration requires unique 4/5/6-worker results "
+            "and may additionally include 8 workers"
+        )
     baseline = by_workers[4]
     rejected: dict[int, str] = {}
     eligible: list[ProducerBenchmark] = []

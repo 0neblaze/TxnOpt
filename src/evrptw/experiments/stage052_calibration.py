@@ -61,6 +61,7 @@ from evrptw.stage052_resources import (
 _CALIBRATION_INSTANCES = ("c101_21", "r101_21", "rc101_21")
 _CALIBRATION_SEEDS = (2014, 2015)
 _PRODUCER_WORKERS = (4, 5, 6)
+_PRODUCER_PROBE_WORKERS = (4, 5, 6, 8)
 _PARQUET_CONFIGURATIONS = (
     (65_536, 1),
     (65_536, 2),
@@ -100,8 +101,8 @@ class ProducerMemoryFloor:
             raise ValueError("producer memory floor is incomplete")
 
     def projected_aggregate_peak_rss_bytes(self, workers: int) -> int:
-        if workers not in _PRODUCER_WORKERS:
-            raise ValueError("producer memory floor workers must be 4, 5, or 6")
+        if workers not in _PRODUCER_PROBE_WORKERS:
+            raise ValueError("producer memory floor workers must be 4, 5, 6, or 8")
         return ceil(self.four_worker_aggregate_peak_rss_bytes * workers / 4)
 
 
@@ -327,8 +328,8 @@ def benchmark_producer_candidate(
 ) -> MeasuredProducerCandidate:
     """Execute the fixed six-shard high-memory scope with one worker candidate."""
 
-    if workers not in _PRODUCER_WORKERS:
-        raise ValueError("producer calibration workers must be 4, 5, or 6")
+    if workers not in _PRODUCER_PROBE_WORKERS:
+        raise ValueError("producer calibration workers must be 4, 5, 6, or 8")
     config = load_stage052_config(config_path)
     candidate_dir = output_root / f"workers{workers}"
     candidate_dir.mkdir(parents=True, exist_ok=False)
@@ -640,19 +641,82 @@ def run_stage052_resource_calibration(
     return contract
 
 
+def run_stage052_producer_probe(
+    *,
+    workers: int,
+    corpus_dir: Path,
+    output_root: Path,
+    root: Path | None = None,
+    config_path: Path | None = None,
+    run_label: str,
+) -> dict[str, object]:
+    """Run one explicitly non-campaign producer concurrency probe."""
+
+    repository = repository_root() if root is None else root.resolve()
+    resolved_config = (
+        repository / "configs/stage052_performance.toml"
+        if config_path is None
+        else config_path.resolve()
+    )
+    measured = benchmark_producer_candidate(
+        workers=workers,
+        root=repository,
+        config_path=resolved_config,
+        output_root=output_root,
+        run_label=run_label,
+    )
+    floor = load_attempt73_memory_floor(corpus_dir)
+    payload: dict[str, object] = {
+        "schema_version": "stage05.2-producer-probe-v1",
+        "corpus_role": "exploratory_only_zero_campaign_geometry",
+        "campaign_geometry_contribution": 0,
+        "workers": workers,
+        "fresh_measurement": asdict(measured),
+        "projected_long_shard_aggregate_peak_rss_bytes": (
+            floor.projected_aggregate_peak_rss_bytes(workers)
+        ),
+        "long_shard_per_worker_peak_rss_bytes": floor.per_worker_peak_rss_bytes,
+        "attempt73_resource_sha256_by_batch": floor.source_sha256_by_batch,
+        "provenance": _calibration_provenance(
+            repository=repository,
+            config_path=resolved_config,
+            corpus_dir=corpus_dir,
+        ),
+    }
+    atomic_write_signed_json(output_root / "probe_report.json", payload)
+    return payload
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Calibrate Stage 5.2 producer resources")
     parser.add_argument("--corpus-dir", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--contract-path", type=Path, required=True)
+    parser.add_argument("--contract-path", type=Path)
     parser.add_argument("--run-label", default="stage05.2_resource_calibration_attempt01")
     parser.add_argument("--allow-dirty-source", action="store_true")
+    parser.add_argument(
+        "--probe-workers",
+        type=int,
+        choices=_PRODUCER_PROBE_WORKERS,
+    )
     parser.add_argument(
         "--config",
         type=Path,
         default=Path("configs/stage052_performance.toml"),
     )
     arguments = parser.parse_args()
+    if arguments.probe_workers is not None:
+        payload = run_stage052_producer_probe(
+            workers=arguments.probe_workers,
+            corpus_dir=arguments.corpus_dir.resolve(),
+            output_root=arguments.output_root.resolve(),
+            config_path=arguments.config.resolve(),
+            run_label=arguments.run_label,
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    if arguments.contract_path is None:
+        parser.error("--contract-path is required unless --probe-workers is used")
     contract = run_stage052_resource_calibration(
         corpus_dir=arguments.corpus_dir.resolve(),
         output_root=arguments.output_root.resolve(),

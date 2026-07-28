@@ -1200,6 +1200,13 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   新 writer 支持校准的 65,536/262,144 row group 与 queue depth 1/2。Attempt73 两个
   sealed c101_21 event files 的实际 writer-path benchmark 中，262,144/2 从
   1.605 秒降至 1.085 秒（约 32.4%），峰值约 593 MB，满足 10% adoption gate。
+- 用户要求的 8-worker exploratory probe 使用同一六-shard fixed-work scope：
+  `51.658 exact calls/s`，低于同轮 6 workers 的 `95.230`（慢约 45.8%），也低于
+  4 workers 的 `60.939`；semantic digest 相同且 swap/fallback 为 0，但 sealed
+  long-shard 线性投影 aggregate RSS 为 `18,444,517,376` bytes。因此 8 workers
+  只保留为零 campaign-geometry 的只读 probe evidence，Pilot 仍选择 6 workers。
+  Parquet 的 row-group/queue-depth 最终值由 signed producer resource contract
+  覆盖静态 TOML 默认值并进入 campaign lock，避免计时噪声要求修改 source revision。
 - runtime identity 分离 hard contract 与 non-blocking telemetry。AC/battery、固定
   24 logical CPUs、load/temperature、磁盘型号/序列与 device UUID 不再决定 readiness
   或 publication identity；硬 gate 只要求所选 workers 所需 CPU、内存/空间、backend、

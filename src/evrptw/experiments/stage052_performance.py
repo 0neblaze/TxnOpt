@@ -1087,15 +1087,11 @@ def _run_benchmark_campaign_impl(
     producer_resource_contract = load_producer_resource_contract(
         _resolve(root, config.resource_calibration_contract)
     )
-    if (
-        storage.parquet_row_group_size
-        != producer_resource_contract.row_group_size
-        or storage.parquet_queue_depth != producer_resource_contract.queue_depth
-    ):
-        raise ValueError(
-            "artifact storage parameters differ from the signed producer "
-            "resource calibration contract"
-        )
+    storage = replace(
+        storage,
+        parquet_row_group_size=producer_resource_contract.row_group_size,
+        parquet_queue_depth=producer_resource_contract.queue_depth,
+    )
     effective_selection_lock = selection_lock.with_producer_resource_contract(
         producer_resource_contract
     )

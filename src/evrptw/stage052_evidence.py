@@ -1937,8 +1937,8 @@ class ProcessTreeResourceSampler:
     ) -> None:
         if interval_seconds <= 0.0:
             raise ValueError("resource sample interval must be positive")
-        if configured_worker_count not in {1, 2, 4, 5, 6}:
-            raise ValueError("configured worker count must be 1, 2, 4, 5, or 6")
+        if configured_worker_count not in {1, 2, 4, 5, 6, 8}:
+            raise ValueError("configured worker count must be 1, 2, 4, 5, 6, or 8")
         self.run_label = run_label
         self.component = component
         self.configured_worker_count = configured_worker_count

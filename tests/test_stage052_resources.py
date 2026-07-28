@@ -108,6 +108,20 @@ def test_producer_selection_applies_memory_speedup_digest_and_tie_rules() -> Non
     assert selected.rejected_reasons == {}
 
 
+def test_producer_selection_can_compare_an_optional_eight_worker_probe() -> None:
+    results = (
+        _producer_result(4, 100.0, rss_gib=8.0),
+        _producer_result(5, 118.0, rss_gib=9.0),
+        _producer_result(6, 122.0, rss_gib=10.0),
+        _producer_result(8, 150.0, rss_gib=11.0),
+    )
+
+    selected = select_producer_configuration(results, available_memory_bytes=16 * 1024**3)
+
+    assert selected.selected_workers == 8
+    assert selected.candidate_workers == (4, 5, 6, 8)
+
+
 def test_producer_selection_rejects_swap_fallback_digest_drift_and_memory_pressure() -> None:
     results = (
         _producer_result(4, 100.0, rss_gib=8.0),
