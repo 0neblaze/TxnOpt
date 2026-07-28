@@ -357,11 +357,15 @@ def derive_producer_resource_contract(
     selected = by_workers.get(selection.selected_workers)
     if selected is None or selected.semantic_digest != selection.semantic_digest:
         raise ValueError("producer selection does not match the calibration observations")
-    aggregate_limit = math.ceil(selected.aggregate_peak_rss_bytes * 1.20)
+    memory_budget = math.floor(available_memory_bytes * _MEMORY_FRACTION)
+    aggregate_limit = min(
+        math.ceil(selected.aggregate_peak_rss_bytes * 1.20),
+        memory_budget,
+    )
     per_worker_limit = math.ceil(selected_per_worker_peak_rss_bytes * 1.20)
-    if aggregate_limit > math.floor(available_memory_bytes * _MEMORY_FRACTION):
+    if aggregate_limit < selected.aggregate_peak_rss_bytes:
         raise RuntimeError(
-            "calibration-derived producer memory requirement exceeds 75% of available memory"
+            "selected producer peak RSS exceeds 75% of available memory"
         )
     calibration_payload = {
         "available_memory_bytes": available_memory_bytes,

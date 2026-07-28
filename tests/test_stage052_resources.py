@@ -165,7 +165,7 @@ def test_producer_resource_contract_is_calibration_derived_and_round_trips() -> 
     assert ProducerResourceContract.from_dict(contract.to_dict()) == contract
 
 
-def test_producer_resource_contract_rejects_headroom_beyond_capability_envelope() -> None:
+def test_producer_resource_contract_caps_headroom_at_capability_envelope() -> None:
     results = (
         _producer_result(4, 100.0, rss_gib=8.0),
         _producer_result(5, 118.0, rss_gib=10.5),
@@ -176,15 +176,17 @@ def test_producer_resource_contract_rejects_headroom_beyond_capability_envelope(
         available_memory_bytes=16 * 1024**3,
     )
 
-    with pytest.raises(RuntimeError, match="75%"):
-        derive_producer_resource_contract(
-            results=results,
-            selection=selection,
-            selected_per_worker_peak_rss_bytes=3 * 1024**3,
-            available_memory_bytes=16 * 1024**3,
-            row_group_size=65_536,
-            queue_depth=1,
-        )
+    contract = derive_producer_resource_contract(
+        results=results,
+        selection=selection,
+        selected_per_worker_peak_rss_bytes=3 * 1024**3,
+        available_memory_bytes=16 * 1024**3,
+        row_group_size=65_536,
+        queue_depth=1,
+    )
+
+    assert contract.selected_aggregate_peak_rss_bytes == int(10.5 * 1024**3)
+    assert contract.aggregate_memory_limit_bytes == 12 * 1024**3
 
 
 def test_parquet_tuning_requires_ten_percent_critical_path_improvement() -> None:
