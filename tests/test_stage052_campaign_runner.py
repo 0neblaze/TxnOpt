@@ -896,6 +896,11 @@ def test_campaign_runtime_selection_hash_excludes_only_g_wheel_identity() -> Non
     metadata, _, _ = _accepted_f02_payloads()
     runtime = metadata["runtime_identity"]
     assert isinstance(runtime, dict)
+    runtime["dependency_versions"] = {
+        "evrptw-reproduction": "0.1.0",
+        "numpy": "2.4.6",
+    }
+    runtime["dependency_manifest_sha256"] = "4" * 64
     successor = {
         **runtime,
         "repository_revision": "9" * 40,
@@ -908,6 +913,22 @@ def test_campaign_runtime_selection_hash_excludes_only_g_wheel_identity() -> Non
         campaign_runtime_selection_sha256(runtime)
     )
     successor["native_extension_sha256"] = "6" * 64
+    successor["dependency_manifest_sha256"] = "5" * 64
+    dependencies = successor["dependency_versions"]
+    assert isinstance(dependencies, dict)
+    successor["dependency_versions"] = {
+        **dependencies,
+        "reproducible-evrptw": "0.1.0",
+    }
+    assert campaign_runtime_selection_sha256(successor) == (
+        campaign_runtime_selection_sha256(runtime)
+    )
+    successor_dependencies = successor["dependency_versions"]
+    assert isinstance(successor_dependencies, dict)
+    successor["dependency_versions"] = {
+        **successor_dependencies,
+        "numpy": "999.0",
+    }
     assert campaign_runtime_selection_sha256(successor) != (
         campaign_runtime_selection_sha256(runtime)
     )

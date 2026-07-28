@@ -141,20 +141,27 @@ def campaign_runtime_selection_sha256(
     *,
     storage_migration: Mapping[str, object] | None = None,
 ) -> str:
-    """Hash the frozen runtime selection while excluding G-only wheel identity."""
+    """Hash stable third-party runtime inputs across an attested G successor."""
 
     excluded = {
+        "dependency_manifest_sha256",
         "installed_distribution_sha256",
         "machine_identity",
+        "native_extension_sha256",
         "repository_revision",
         "source_repository_mount",
         "wheel_filename",
         "wheel_sha256",
     }
     selection = {key: item for key, item in value.items() if key not in excluded}
-    return _canonical_sha256(
-        selection
-    )
+    dependencies = selection.get("dependency_versions")
+    if isinstance(dependencies, Mapping):
+        selection["dependency_versions"] = {
+            key: item
+            for key, item in dependencies.items()
+            if key not in {"evrptw-reproduction", "reproducible-evrptw"}
+        }
+    return _canonical_sha256(selection)
 
 
 def campaign_configuration_selection_sha256(content: bytes) -> str:

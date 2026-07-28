@@ -1236,3 +1236,19 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   单独冻结的 `resource_calibration_contract`、Parquet row group 与 queue depth；
   compression、scientific axes、solver/config inputs 等任意变化仍会拒绝。旧 raw
   configuration SHA-256 与新 raw configuration SHA-256 均原样保留，不改写证据。
+
+## 2026-07-28：G71 successor runtime dependency lock
+
+- `stage05.2_benchmark_attempt74` 在 raw directory 创建前 fail fast，退出原因为旧
+  runtime selection hash 要求整个 native extension 与 Attempt72 字节相同。新增
+  `Stage052ReplayState` 后 extension SHA 必然变化，因此该旧比较无法表达“同一 solver
+  ABI + 新 native replay adapter”。Attempt74 无 shard、无 campaign geometry，
+  label 不复用。
+- 新 successor runtime selection 保持 Attempt72 的完整 third-party dependency
+  versions（第三方依赖版本）与 Python 3.13 identity；仅排除由当前 sealed wheel
+  单独冻结的 native-extension/install-distribution bytes，以及公开仓库改名造成的
+  self distribution name `evrptw-reproduction` → `reproducible-evrptw`。任一第三方
+  依赖版本变化仍 fail fast。当前 extension SHA、wheel SHA、native ABI/config 与
+  installed distribution SHA 继续写入新 runtime identity，并由新 raw/reviewer
+  独立验证；Attempt72 全 shard differential equality 与 signed resource semantic
+  digest 负责证明新增 replay surface 未改变 solver/event 语义。
