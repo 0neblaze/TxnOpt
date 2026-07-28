@@ -1207,6 +1207,10 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   只保留为零 campaign-geometry 的只读 probe evidence，Pilot 仍选择 6 workers。
   Parquet 的 row-group/queue-depth 最终值由 signed producer resource contract
   覆盖静态 TOML 默认值并进入 campaign lock，避免计时噪声要求修改 source revision。
+- producer selection 的 75% 包络以稳定 WSL/cgroup memory capacity（内存容量）
+  计算，不再使用受 IDE、page cache 与刚结束测试影响的瞬时 `available` 值；校准报告
+  同时保留当时的 observed available memory。Pilot/Formal 启动前仍以实际可用内存
+  对冻结的 aggregate limit 执行 hard preflight，因此容量合同不会掩盖运行时竞争。
 - runtime identity 分离 hard contract 与 non-blocking telemetry。AC/battery、固定
   24 logical CPUs、load/temperature、磁盘型号/序列与 device UUID 不再决定 readiness
   或 publication identity；硬 gate 只要求所选 workers 所需 CPU、内存/空间、backend、

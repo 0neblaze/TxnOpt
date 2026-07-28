@@ -563,7 +563,9 @@ def run_stage052_resource_calibration(
     if output_root.exists():
         raise FileExistsError(output_root)
     output_root.mkdir(parents=True)
-    available_memory = int(psutil.virtual_memory().available)
+    memory = psutil.virtual_memory()
+    memory_capacity = int(memory.total)
+    observed_available_memory = int(memory.available)
     fresh_producer_measurements = tuple(
         producer_runner(
             workers=workers,
@@ -594,7 +596,7 @@ def run_stage052_resource_calibration(
     contract, selection, selected_parquet = create_resource_contract(
         producer_measurements=producer_measurements,
         parquet_measurements=parquet_measurements,
-        available_memory_bytes=available_memory,
+        available_memory_bytes=memory_capacity,
     )
     atomic_write_signed_json(contract_path, contract.to_dict())
     if not signed_sidecar_matches(contract_path, contract_path.with_suffix(".sha256")):
@@ -612,7 +614,8 @@ def run_stage052_resource_calibration(
                 config_path=resolved_config,
                 corpus_dir=corpus_dir,
             ),
-            "available_memory_bytes": available_memory,
+            "memory_capacity_bytes": memory_capacity,
+            "observed_available_memory_bytes": observed_available_memory,
             "producer_measurements": [
                 {
                     **asdict(item.benchmark),

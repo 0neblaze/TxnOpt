@@ -65,7 +65,10 @@ def test_calibration_runs_every_candidate_and_seals_selected_contract(
     monkeypatch.setattr(
         stage052_calibration.psutil,
         "virtual_memory",
-        lambda: SimpleNamespace(available=16 * 1024**3),
+        lambda: SimpleNamespace(
+            available=14 * 1024**3,
+            total=16 * 1024**3,
+        ),
     )
     contract_path = tmp_path / "stage052_resource_calibration.local.json"
     contract = run_stage052_resource_calibration(
