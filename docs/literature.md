@@ -18,10 +18,10 @@ not covered by Apache-2.0 and must not be committed or redistributed.
 The local collection contains six unique cited articles and two alternate PDF
 copies:
 
-- `Partial recharge strategies for the electric vehicle routing problem with time windows.pdf`
+- `03_Keskin_Catay_2016_Transportation_Research_Part_C_alternate.pdf`
   has the same DOI and identical normalized extracted text as the indexed
-  Keskin-Catay PDF.
-- `The electric vehicle routing problem with nonlinear charging function.pdf`
+  Keskin-Çatay PDF.
+- `04_Montoya_Gueret_Mendoza_Villegas_2017_Transportation_Research_Part_B_alternate.pdf`
   has the same DOI as the indexed Montoya PDF but different PDF pagination and
   packaging. It is retained locally as an alternate copy, not cited twice.
 
