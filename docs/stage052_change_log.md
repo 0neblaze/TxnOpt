@@ -2069,3 +2069,26 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   rollback、cache rollback 与 deadline boundary 保持不变，不增加容差、不放宽 gate。
 - Pilot96 raw 与失败 review 不回写、不晋级；修复使用新 commit、wheels、sealed
   snapshot 与新 Pilot label。
+
+## 2026-07-30：G Pilot97 accepted
+
+- `stage05.2_benchmark_attempt97` 在 clean commit
+  `71f09a67898159dd8411c0c6e641d1e83196b379` 上完成 36/36 shards、36/36
+  axes、1,080 declared solver seconds 与 144 checkpoints；三个 batch 均已
+  checksum-verified 后归档至签名的 D archive root，Windows Scheduled Task、
+  WSL controller 与 completion receipt 均 exit 0。raw manifest SHA-256 为
+  `c826b22d55447431ef7734fa907a699cda39f0b33e2137bd69d145c46f1e68c7`。
+- 独立 reviewer 由受限 transient `systemd --user` service 执行，并由
+  Windows-side WSL keeper 保持宿主存活至 exact unit 终态。service exit 0、
+  receipt finalized、raw manifest 前后 SHA-256 相同；cgroup aggregate peak
+  RSS 为 1,662,361,600 bytes、swap 0，低于 2,562,322,514-byte guard。
+- reviewer 使用 4 workers 和 native Arrow replay 重放 36/36 shards、
+  15,096,880 logical events；maximum in-flight shards 为 4，
+  `native_fallback_count=0`。candidate transaction、objective、validator、
+  exact/cache/deadline、source snapshot、producer resource、persistence、
+  archive identity 与 publication dry-run 等 20/20 gates 全部通过。
+- review manifest SHA-256 为
+  `29c0756c53bee52c29ef193bcfee952238ec04d9a243a3228fbfa764c0fc232f`，
+  status 为 `READY_FOR_STAGE052_FORMAL_BENCHMARK`。该 Pilot 是后续新 Formal
+  campaign 的唯一 campaign prerequisite；它本身不构成
+  `READY_FOR_STAGE05_3`。
