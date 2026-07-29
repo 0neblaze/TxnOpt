@@ -1854,3 +1854,29 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   working directory（当前工作目录）生成。下一 snapshot 必须保持可写直到
   runtime identity 在该 snapshot root 内生成并复核
   `source_repository_root`，随后才可冻结为只读；attempt29 label 不复用。
+
+## 2026-07-29：E30 pre-dispatch deadline counter 复核修复
+
+- `stage05.2_native_kernels_attempt30` 在 clean commit
+  `061dc121dcc38a9eda61512ee37d71b2a3c620aa` 上完成 12/12 shards 与
+  36/36 axes；raw manifest SHA-256 为
+  `04f1a439c9599306759b27ff8e87f702cb2453af5be1fbd8c6c70ff1d9380f17`。
+  独立 reviewer service exit 0、raw manifest unchanged、swap 0，review manifest
+  SHA-256 为
+  `ed4e452357a861295a67a1db11197c724bfec3325012fbe87ec7458302298091`，
+  但状态为 `NOT_READY`，唯一失败 gate 为 `native_execution`。
+- 失败轴 `c101_21/2015/wall_clock_30` 的 raw counters 为
+  `batch_launches=1445`、`native_invocations=1444`、`started=1450`、
+  `completed=1449`、`interrupted=1`。raw route event 证明最后一次 exact call
+  在 native kernel invocation 前的 deadline checkpoint 中断：
+  `exact_started=true`、`exact_completed=false`、`labels_generated=0`，随后有
+  `before_candidate_commit` deadline boundary；不存在 fallback。
+- 根因是 reviewer 实现仍错误要求
+  `native_invocations == batch_launches == work_batches`，没有落实工作流已声明的
+  pre-dispatch deadline 语义。修复后的 gate 要求
+  `work_batches == batch_launches`、
+  `0 <= batch_launches - native_invocations <= interrupted_calls`、
+  `completed + interrupted == exact_calls`、occupancy sum 等于 exact calls，
+  并继续要求 native/protocol fallback 为零。新增回归测试同时拒绝没有
+  interrupted evidence 的 invocation gap；修复后的审计函数已对 E30 全部
+  36 axes 重算通过。E30 review 不回写，修复使用新 commit/wheel/attempt label。

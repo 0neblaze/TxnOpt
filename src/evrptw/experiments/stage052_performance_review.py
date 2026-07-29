@@ -3233,6 +3233,36 @@ def _validate_native_shard_timing_order(
         raise ArtifactIntegrityError(f"native shard finalization precedes axis completion: {shard}")
 
 
+def _native_exact_counters_reconcile(backend: Mapping[str, object]) -> bool:
+    """Accept only deadline-explained gaps before a native kernel invocation."""
+
+    native_invocations = _strict_int(backend.get("native_invocations"), "native_invocations")
+    work_batches = _strict_int(backend.get("work_batches"), "work_batches")
+    batch_launches = _strict_int(backend.get("batch_launches"), "batch_launches")
+    exact_calls = _strict_int(backend.get("exact_calls"), "exact_calls")
+    completed_calls = _strict_int(backend.get("completed_calls"), "completed_calls")
+    interrupted_calls = _strict_int(backend.get("interrupted_calls"), "interrupted_calls")
+    native_fallbacks = _strict_int(backend.get("native_fallbacks"), "native_fallbacks")
+    native_seconds = _strict_float(backend.get("native_kernel_seconds"))
+    raw_occupancies = backend.get("launch_occupancies")
+    if not isinstance(raw_occupancies, list):
+        return False
+    occupancies = [_strict_int(value, "launch_occupancy") for value in raw_occupancies]
+    predispatch_interrupts = batch_launches - native_invocations
+    return (
+        native_invocations > 0
+        and exact_calls > 0
+        and work_batches == batch_launches
+        and 0 <= predispatch_interrupts <= interrupted_calls
+        and completed_calls + interrupted_calls == exact_calls
+        and len(occupancies) == batch_launches
+        and all(value > 0 for value in occupancies)
+        and sum(occupancies) == exact_calls
+        and native_fallbacks == 0
+        and native_seconds > 0.0
+    )
+
+
 def _audit_native_execution(
     raw_dir: Path,
     rows: Sequence[Mapping[str, object]],
@@ -3481,7 +3511,6 @@ def _audit_native_execution(
                 )
                 exact_calls = _strict_int(backend.get("exact_calls"), "exact_calls")
                 work_batches = _strict_int(backend.get("work_batches"), "work_batches")
-                batch_launches = _strict_int(backend.get("batch_launches"), "batch_launches")
                 raw_occupancies = backend.get("launch_occupancies")
                 if not isinstance(raw_occupancies, list):
                     raise ArtifactIntegrityError(
@@ -3492,17 +3521,7 @@ def _audit_native_execution(
                 ]
                 exact_fallbacks = _strict_int(backend.get("native_fallbacks"), "native_fallbacks")
                 exact_seconds = _strict_float(backend.get("native_kernel_seconds"))
-                if (
-                    exact_invocations <= 0
-                    or exact_calls <= 0
-                    or exact_invocations != work_batches
-                    or exact_invocations != batch_launches
-                    or len(launch_occupancies) != batch_launches
-                    or any(value <= 0 for value in launch_occupancies)
-                    or sum(launch_occupancies) != exact_calls
-                    or exact_fallbacks != 0
-                    or exact_seconds <= 0.0
-                ):
+                if not _native_exact_counters_reconcile(backend):
                     raise ArtifactIntegrityError(
                         f"native exact counters do not reconcile: {axis_identity}"
                     )

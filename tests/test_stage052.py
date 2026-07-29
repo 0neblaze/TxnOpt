@@ -57,6 +57,7 @@ from evrptw.experiments.stage052_performance_review import (
     _audit_native_execution,
     _bind_persistence_attribution_review,
     _expected_native_screening_invocations,
+    _native_exact_counters_reconcile,
     _prerequisite_binding_matches,
     _prior_review_manifest_history,
     _recompute_native_occupancies,
@@ -1300,6 +1301,40 @@ def test_stage052_config_declares_the_complete_native_kernel_profile() -> None:
     assert config.runtime_identity_manifest == Path("configs/stage052_runtime_identity.local.json")
 
 
+def test_native_exact_counters_allow_only_audited_predispatch_interrupts() -> None:
+    completed = {
+        "native_invocations": 2,
+        "work_batches": 2,
+        "batch_launches": 2,
+        "exact_calls": 5,
+        "completed_calls": 5,
+        "interrupted_calls": 0,
+        "launch_occupancies": [1, 4],
+        "native_fallbacks": 0,
+        "native_kernel_seconds": 0.1,
+    }
+    assert _native_exact_counters_reconcile(completed)
+
+    predispatch_interrupted = {
+        **completed,
+        "native_invocations": 1,
+        "completed_calls": 4,
+        "interrupted_calls": 1,
+    }
+    assert _native_exact_counters_reconcile(predispatch_interrupted)
+    assert not _native_exact_counters_reconcile(
+        {**predispatch_interrupted, "interrupted_calls": 0, "completed_calls": 5}
+    )
+    assert not _native_exact_counters_reconcile(
+        {
+            **predispatch_interrupted,
+            "native_invocations": 0,
+            "completed_calls": 3,
+            "interrupted_calls": 2,
+        }
+    )
+
+
 def test_native_execution_audit_cross_checks_per_run_raw_and_trace(tmp_path: Path) -> None:
     run_label = "stage05.2_native_kernels_attempt99"
     raw_dir = tmp_path / run_label
@@ -1317,6 +1352,7 @@ def test_native_execution_audit_cross_checks_per_run_raw_and_trace(tmp_path: Pat
         "batch_launches": 2,
         "exact_calls": 5,
         "completed_calls": 5,
+        "interrupted_calls": 0,
         "launch_occupancies": [1, 4],
         "native_fallbacks": 0,
         "native_kernel_seconds": 0.1,
