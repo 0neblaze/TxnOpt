@@ -2046,3 +2046,26 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 - Pilot95 raw、partial progress 与未最终化的 interrupted service receipt 原样保留，
   不晋级、不重试同一 label。后续 reviewer launch 必须同时启动 wave-owned Windows
   `wsl.exe` keeper，并由 keeper 轮询该 exact unit 至终态；修复从新 Pilot label 建链。
+
+## 2026-07-30：G Pilot96 exact-completion timestamp 修复
+
+- `stage05.2_benchmark_attempt96` 在 clean commit
+  `f4991e1fce8a061ea99630d273a6549d6542f898` 上完成 36/36 shards、36/36
+  axes、1,080 declared solver seconds 与 144 checkpoints；三个 batch 均归档，
+  Windows Scheduled Task、WSL controller 与 completion receipt 均 exit 0。
+- 独立 reviewer 的 Windows-side WSL keeper 保持到 exact transient unit 终态，证明
+  Pilot95 host-liveness 根因已修复。service exit 0、receipt finalized、raw unchanged、
+  cgroup peak RSS 1,634,975,744 bytes、swap 0；review status 为 `NOT_READY`，
+  review manifest SHA-256 为
+  `05c45a3727b832380938ff64ddc719c07ab5b0f3479f05c95bb61e053fba178d`。
+- reviewer 在 batch0003 shard0031（`r101_21/2014`）发现唯一根失败：
+  `exact completion crosses deadline on wall_clock_30`。该 exact call 于
+  `29.999507759` 秒启动，raw 错记 `completed_at=30.000085435` 秒；其余 gate
+  失败均由 replay 在 24/36 后 fail fast 引起。
+- 根因是 single-route exact path 已在 backend 返回后捕获 `exact_completed_at` 并据此
+  正确判断事务是否在 deadline 前完成，但成功 trace 随后再次读取时钟，把 cache/
+  controller bookkeeping 后的时间错误写成 exact completion time。修复后的 trace
+  使用已捕获的 backend-return timestamp；后续 pre-commit deadline check、candidate
+  rollback、cache rollback 与 deadline boundary 保持不变，不增加容差、不放宽 gate。
+- Pilot96 raw 与失败 review 不回写、不晋级；修复使用新 commit、wheels、sealed
+  snapshot 与新 Pilot label。

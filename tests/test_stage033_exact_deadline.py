@@ -194,6 +194,75 @@ def test_successful_exact_return_after_deadline_is_an_interrupted_transaction(
     assert evaluator.backend_metrics.interrupted_calls == 1
 
 
+def test_exact_completion_timestamp_uses_backend_return_before_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 9.0}
+    monkeypatch.setattr(alns_module.time, "perf_counter", lambda: clock["now"])
+    trace = Stage03Trace(
+        MeasurementConfig(),
+        started_at_perf=0.0,
+        exact_deadline_config=ExactDeadlineConfig.wall_clock(),
+    )
+
+    class CrossingController(alns_module.ExactCallController):
+        def complete(self, count: int) -> None:
+            super().complete(count)
+            clock["now"] = 10.001
+
+    controller = CrossingController(ExactDeadlineConfig.wall_clock())
+    evaluator = alns_module._Evaluator(
+        _instance(),
+        deadline=10.0,
+        measurement_trace=trace,
+        backend="cpu_batch",
+        exact_call_controller=controller,
+    )
+    result = ChargingSubproblemResult(
+        True,
+        ("D0", "C1", "D0"),
+        2.0,
+        2.0,
+        0.0,
+        0.0,
+        1,
+        1,
+        0,
+        0.001,
+        "",
+    )
+    metrics = BackendMetrics(
+        "cpu_batch",
+        8,
+        exact_calls=1,
+        batch_launches=1,
+        started_calls=1,
+        completed_calls=1,
+        launch_occupancies=[1],
+    )
+
+    def return_before_deadline(*args: object, **kwargs: object) -> BatchChargingResult:
+        clock["now"] = 9.999
+        return BatchChargingResult((result,), metrics)
+
+    monkeypatch.setattr(
+        alns_module,
+        "solve_exact_charging_batch",
+        return_before_deadline,
+    )
+
+    with pytest.raises(alns_module._TimeLimitReached):
+        evaluator.route(("C1",))
+
+    records = [record for record in trace.route_evaluations if record.kind == "exact_call"]
+    assert len(records) == 1
+    assert records[0].exact_completed is True
+    assert records[0].completed_at == pytest.approx(9.999)
+    assert records[0].completed_at < 10.0
+    assert controller.completed_calls == 1
+    assert controller.interrupted_calls == 0
+
+
 def test_successful_exact_batch_return_after_deadline_is_atomically_interrupted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1660,7 +1660,7 @@ class _Evaluator:
                 operator=self.operator,
                 kind="exact_call",
                 started_at=started_offset,
-                completed_at=self.measurement_trace._offset(),
+                completed_at=self.measurement_trace._offset(exact_completed_at),
                 exact_started=True,
                 exact_completed=True,
                 cache_key_digest=cache_key_digest,
