@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import zipfile
@@ -20,7 +21,12 @@ from evrptw.artifacts import (
 )
 from evrptw.stage052_resources import ReviewMemoryContract
 from evrptw.stage052_review_service import (
+    ReviewMemoryGuardFailed,
+    ReviewMemoryLimitExceeded,
+    ReviewProcessMemoryGuard,
+    ReviewProgressLog,
     ReviewServiceConfig,
+    ReviewServiceInterrupted,
     finalize_review_execution,
     launch_review_service,
     supervise_review,
@@ -102,6 +108,111 @@ def test_review_service_config_binds_exact_pilot_memory_contract(
     assert ReviewServiceConfig.from_dict(config.to_dict()) == config
     with pytest.raises(ValueError, match="differ from the Pilot memory contract"):
         replace(config, max_aggregate_rss_bytes=limit + 1)
+
+
+def test_review_memory_guard_uses_distinct_external_and_rss_limit_signals(
+    tmp_path: Path,
+) -> None:
+    guard = ReviewProcessMemoryGuard(
+        limit_bytes=256 * 1024 * 1024,
+        progress=ReviewProgressLog(tmp_path / "progress.jsonl"),
+    )
+
+    with pytest.raises(ReviewServiceInterrupted, match="external signal"):
+        guard._handle_sigterm(signal.SIGTERM, None)
+
+    guard.exceeded = True
+    with pytest.raises(ReviewServiceInterrupted, match="external signal"):
+        guard._handle_sigterm(signal.SIGTERM, None)
+
+    with pytest.raises(ReviewMemoryLimitExceeded, match="aggregate RSS exceeded"):
+        guard._handle_memory_limit(signal.SIGUSR1, None)
+
+
+def test_review_memory_guard_sends_rss_signal_when_progress_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = ReviewProcessMemoryGuard(
+        limit_bytes=256 * 1024 * 1024,
+        progress=ReviewProgressLog(tmp_path / "progress.jsonl"),
+    )
+    guard._last_progress_at = review_service.time.monotonic()
+    observed_signals: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(
+        review_service,
+        "_sample_process_tree",
+        lambda _pid: (guard.limit_bytes, 0),
+    )
+    monkeypatch.setattr(
+        ReviewProgressLog,
+        "emit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(
+        review_service.os,
+        "kill",
+        lambda pid, signum: observed_signals.append((pid, signum)),
+    )
+
+    guard._sample()
+
+    assert guard.exceeded is True
+    assert observed_signals == [(os.getpid(), signal.SIGUSR1)]
+
+
+def test_review_memory_guard_fails_fast_when_periodic_progress_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = ReviewProcessMemoryGuard(
+        limit_bytes=256 * 1024 * 1024,
+        progress=ReviewProgressLog(tmp_path / "progress.jsonl"),
+    )
+    observed_signals: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(
+        review_service,
+        "_sample_process_tree",
+        lambda _pid: (guard.limit_bytes - 1, 0),
+    )
+    monkeypatch.setattr(
+        ReviewProgressLog,
+        "emit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(
+        review_service.os,
+        "kill",
+        lambda pid, signum: observed_signals.append((pid, signum)),
+    )
+
+    guard._sample()
+
+    assert isinstance(guard._sampling_error, OSError)
+    assert observed_signals == [(os.getpid(), signal.SIGUSR2)]
+    with pytest.raises(ReviewMemoryGuardFailed, match="OSError: disk full"):
+        guard._handle_guard_failure(signal.SIGUSR2, None)
+
+
+def test_review_memory_guard_restores_all_signal_handlers(tmp_path: Path) -> None:
+    previous = {
+        caught: signal.getsignal(caught)
+        for caught in (signal.SIGTERM, signal.SIGUSR1, signal.SIGUSR2)
+    }
+    guard = ReviewProcessMemoryGuard(
+        limit_bytes=8 * 1024**3,
+        progress=ReviewProgressLog(tmp_path / "progress.jsonl"),
+    )
+
+    with guard:
+        assert signal.getsignal(signal.SIGTERM) == guard._handle_sigterm
+        assert signal.getsignal(signal.SIGUSR1) == guard._handle_memory_limit
+        assert signal.getsignal(signal.SIGUSR2) == guard._handle_guard_failure
+
+    assert {
+        caught: signal.getsignal(caught)
+        for caught in (signal.SIGTERM, signal.SIGUSR1, signal.SIGUSR2)
+    } == previous
 
 
 def test_review_supervisor_writes_receipt_and_preserves_raw_manifest(

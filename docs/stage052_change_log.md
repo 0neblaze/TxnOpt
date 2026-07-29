@@ -1585,3 +1585,29 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   为 887 passed；Ruff、70 个 source files 的 strict mypy 与 `git diff --check`
   通过。E18 仍为不可变失败证据；下一次性能运行必须使用新 commit、wheel、snapshot
   和 attempt label。
+
+## 2026-07-29：E19 reviewer WSL 生命周期中断与信号来源修复
+
+- `stage05.2_native_kernels_attempt19` 使用 clean commit `59ba963`、non-editable
+  producer wheel `d6ba433d4d56375feb0e7e6c19674e01e3d0aa5d8c62e8c7e9af4fd3e399587c`
+  和 869 个 tracked files 的 read-only ext4 source snapshot 完成 12/12
+  performance shards。producer manifest 为 `complete`，36 个主结果轴均无 failure，
+  manifest sidecar hash 通过；该 raw attempt 不进入 promotion。
+- 独立 reviewer wheel
+  `be74d460657aba585a26db160e11cebd86107f95afd932caeac6f0ad29c4b027`
+  通过 transient `systemd --user` service 启动。服务在完成三个 C5 shard、进入首个
+  100-customer shard 时因无存活 Windows WSL client 而在约 30 秒的 VM idle boundary
+  收到外部 `SIGTERM`。finalized receipt 记录 reviewer exit 1、raw manifest 前后
+  SHA-256 相等、systemd cgroup memory peak 1,239,379,968 bytes、swap 0；因此不是
+  5.5 GiB process guard 或 6 GiB cgroup 上限触发。
+- 根因同时暴露了信号可观测性错误：`ReviewProcessMemoryGuard` 原先把任何
+  `SIGTERM` 都报告为 `ReviewMemoryLimitExceeded`。现在外部终止固定使用
+  `SIGTERM` 并报告 `ReviewServiceInterrupted` 及 signal number；memory sampler
+  使用独立 `SIGUSR1` 报告 `ReviewMemoryLimitExceeded`。即使 progress evidence
+  写入失败，内部越界信号也在 `finally` 发出。sampler 自身的非阈值异常使用独立
+  `SIGUSR2` 传回主线程并报告 `ReviewMemoryGuardFailed`，不允许 daemon thread
+  静默退出。回归测试覆盖三条信号、周期／越界写入失败和 handler restoration。
+- 后续 reviewer 必须由隐藏 Windows keepalive WSL client 持续绑定到 transient unit
+  生命周期；仅在 unit 终止后退出。E19 review execution 保留为 immutable failed
+  receipt，下一次 producer/reviewer 使用新 commit、wheel、read-only snapshot 和
+  attempt20 label，不重用 E19。

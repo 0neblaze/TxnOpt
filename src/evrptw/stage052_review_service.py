@@ -62,6 +62,10 @@ class ReviewMemoryLimitExceeded(RuntimeError):
     """Raised in the reviewer main thread when its process tree crosses the limit."""
 
 
+class ReviewMemoryGuardFailed(RuntimeError):
+    """Raised in the reviewer main thread when the RSS sampler itself fails."""
+
+
 class ReviewServiceInterrupted(RuntimeError):
     """Raised when systemd or an operator interrupts the receipt supervisor."""
 
@@ -115,18 +119,18 @@ class ReviewProcessMemoryGuard:
         self.exceeded = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._previous_handler: Any = None
+        self._previous_handlers: dict[signal.Signals, Any] = {}
         self._last_progress_at = 0.0
+        self._sampling_error: BaseException | None = None
 
     def __enter__(self) -> ReviewProcessMemoryGuard:
-        self._previous_handler = signal.getsignal(signal.SIGTERM)
-
-        def raise_limit(_: int, __: object) -> None:
-            raise ReviewMemoryLimitExceeded(
-                f"reviewer aggregate RSS exceeded {self.limit_bytes} bytes"
-            )
-
-        signal.signal(signal.SIGTERM, raise_limit)
+        self._previous_handlers = {
+            caught: signal.getsignal(caught)
+            for caught in (signal.SIGTERM, signal.SIGUSR1, signal.SIGUSR2)
+        }
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+        signal.signal(signal.SIGUSR1, self._handle_memory_limit)
+        signal.signal(signal.SIGUSR2, self._handle_guard_failure)
         self._thread = threading.Thread(
             target=self._sample,
             name="stage052-review-memory-guard",
@@ -141,35 +145,63 @@ class ReviewProcessMemoryGuard:
             self._thread.join(timeout=max(1.0, self.interval_seconds * 4.0))
             if self._thread.is_alive():
                 raise RuntimeError("review process memory guard did not stop")
-        signal.signal(signal.SIGTERM, self._previous_handler)
+        for caught, previous in self._previous_handlers.items():
+            signal.signal(caught, previous)
+
+    def _handle_sigterm(self, signum: int, _: object) -> None:
+        raise ReviewServiceInterrupted(
+            f"reviewer process interrupted by external signal {signum}"
+        )
+
+    def _handle_memory_limit(self, _: int, __: object) -> None:
+        raise ReviewMemoryLimitExceeded(
+            f"reviewer aggregate RSS exceeded {self.limit_bytes} bytes"
+        )
+
+    def _handle_guard_failure(self, _: int, __: object) -> None:
+        error = self._sampling_error
+        detail = (
+            f"{type(error).__name__}: {error}"
+            if error is not None
+            else "unknown sampler failure"
+        )
+        raise ReviewMemoryGuardFailed(f"review process memory guard failed: {detail}")
 
     def _sample(self) -> None:
-        while not self._stop.is_set():
-            rss, swap = _sample_process_tree(os.getpid())
-            self.peak_rss_bytes = max(self.peak_rss_bytes, rss)
-            self.peak_swap_bytes = max(self.peak_swap_bytes, swap)
-            now = time.monotonic()
-            if now - self._last_progress_at >= 5.0:
-                self.progress.emit(
-                    "memory_sample",
-                    aggregate_rss_bytes=rss,
-                    aggregate_swap_bytes=swap,
-                    aggregate_peak_rss_bytes=self.peak_rss_bytes,
-                    aggregate_peak_swap_bytes=self.peak_swap_bytes,
-                    limit_bytes=self.limit_bytes,
-                )
-                self._last_progress_at = now
-            if rss >= self.limit_bytes:
-                self.exceeded = True
-                self.progress.emit(
-                    "memory_limit_exceeded",
-                    aggregate_rss_bytes=rss,
-                    aggregate_swap_bytes=swap,
-                    limit_bytes=self.limit_bytes,
-                )
-                os.kill(os.getpid(), signal.SIGTERM)
+        try:
+            while not self._stop.is_set():
+                rss, swap = _sample_process_tree(os.getpid())
+                self.peak_rss_bytes = max(self.peak_rss_bytes, rss)
+                self.peak_swap_bytes = max(self.peak_swap_bytes, swap)
+                now = time.monotonic()
+                if now - self._last_progress_at >= 5.0:
+                    self.progress.emit(
+                        "memory_sample",
+                        aggregate_rss_bytes=rss,
+                        aggregate_swap_bytes=swap,
+                        aggregate_peak_rss_bytes=self.peak_rss_bytes,
+                        aggregate_peak_swap_bytes=self.peak_swap_bytes,
+                        limit_bytes=self.limit_bytes,
+                    )
+                    self._last_progress_at = now
+                if rss >= self.limit_bytes:
+                    self.exceeded = True
+                    try:
+                        self.progress.emit(
+                            "memory_limit_exceeded",
+                            aggregate_rss_bytes=rss,
+                            aggregate_swap_bytes=swap,
+                            limit_bytes=self.limit_bytes,
+                        )
+                    finally:
+                        os.kill(os.getpid(), signal.SIGUSR1)
+                    return
+                self._stop.wait(self.interval_seconds)
+        except BaseException as error:
+            if self.exceeded:
                 return
-            self._stop.wait(self.interval_seconds)
+            self._sampling_error = error
+            os.kill(os.getpid(), signal.SIGUSR2)
 
 
 def _sha256(path: Path) -> str:
