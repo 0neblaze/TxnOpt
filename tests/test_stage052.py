@@ -2708,6 +2708,14 @@ def test_accelerator_worker_transition_inherits_evidence_but_uses_six_worker_ada
         native_worker_count=4,
         accelerator_worker_count=6,
     )
+    assert stage052_review._accelerator_worker_transition_matches(
+        native_worker_count=4,
+        accelerator_worker_count=6,
+    )
+    assert not stage052_review._accelerator_worker_transition_matches(
+        native_worker_count=4,
+        accelerator_worker_count=4,
+    )
 
     with pytest.raises(ValueError, match="invalid E worker count"):
         _validate_accelerator_worker_transition(
@@ -4351,6 +4359,38 @@ def test_stage052_runtime_identity_binds_wheel_python_native_and_dependencies(
             manifest,
             expected_repository_revision="a" * 40,
         )
+
+
+def test_stage052_reviewer_accepts_only_dynamic_wsl_memory_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frozen = {
+        "wheel_sha256": "a" * 64,
+        "machine_identity": {
+            "execution_environment": "windows11_wsl2",
+            "memory_bytes": 25_196_941_312,
+            "logical_cpu_count": 24,
+        },
+    }
+    current = copy.deepcopy(frozen)
+    current["machine_identity"]["memory_bytes"] = 25_196_937_216  # type: ignore[index]
+    monkeypatch.setattr(
+        stage052_review,
+        "_verify_frozen_producer_runtime_identity",
+        lambda *_args, **_kwargs: current,
+    )
+
+    passed, detail = stage052_review._validate_stage052_runtime_identity(
+        {"repository_revision": "a" * 40, "runtime_identity": frozen}
+    )
+    assert passed, detail
+
+    current["machine_identity"]["logical_cpu_count"] = 12  # type: ignore[index]
+    passed, detail = stage052_review._validate_stage052_runtime_identity(
+        {"repository_revision": "a" * 40, "runtime_identity": frozen}
+    )
+    assert not passed
+    assert "does not match" in detail
 
 
 def test_stage052_reviewer_replays_the_receipt_bound_producer_source(

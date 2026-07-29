@@ -1961,3 +1961,26 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   与 G adapter 均明确要求 F 为 6。修复保留 E 的 accepted D width（4），同时固定
   F/G adapter width 为 6，并只验证 E predecessor width 属于合法的 1/2/4 selection。
   F18 日志与 stale host receipt 保留，修复使用新 commit 与 attempt label。
+
+## 2026-07-29：F19 reviewer identity transition 修复
+
+- `stage05.2_accelerator_pilot_attempt19` 在 clean commit
+  `85dc49acd65c707ac11a196e5fad5a506fb82211` 上按固定 6-worker adapter 完成
+  decision-only evidence；producer 判定为 `GPU_NOT_JUSTIFIED`，独立重算的 9 个
+  occupancy 输入中位数为 `25.5 < 32`，无 GPU rows、无 CUDA service、无
+  fallback。raw manifest SHA-256 为
+  `2bed3fed687b2c225107611c9b05913ba9c7f1724efd435635d4a7dfa176dd2b`。
+- 首次独立 review 完整退出但返回 `NOT_READY`，review manifest SHA-256 为
+  `fc7546775800c6fd592dd11da67f63bf52d530af0e7e503c61aac95432562710`。
+  decision schema、occupancy、source snapshot、staging root 与 worker selection
+  均通过；失败仅为 E-to-F worker identity transition 与 runtime machine telemetry。
+- 根因一是 reviewer 仍要求 F worker count 等于 accepted E 的 4，与已经明确的
+  E=4、F/G=6 adapter contract 冲突。reviewer 现复用 producer 的
+  `_validate_accelerator_worker_transition`，要求合法的 E width 和固定 F=6，而不把
+  两者错误视为相等。
+- 根因二是 reviewer 对完整 runtime identity 做 byte-for-byte comparison，而 WSL2
+  dynamic memory（动态内存）的 `memory_bytes` 在相邻调用之间可变化 4096 bytes。
+  wheel、Python、native extension、dependency、source mount 与其余 machine
+  identity 仍严格相等；仅使用既有的 WSL review-memory normalization 排除该动态
+  telemetry，CPU/GPU/OS 等硬件漂移仍会 fail fast。F19 evidence 不回写，修复使用
+  新 commit、wheel 和 attempt label。

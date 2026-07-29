@@ -47,6 +47,7 @@ from evrptw.experiments.stage052_performance import (
     PERFORMANCE_INSTANCES,
     PERFORMANCE_SEEDS,
     STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS,
+    _validate_accelerator_worker_transition,
     axes_for_scope,
     load_stage052_config,
     validate_stage052_run_label,
@@ -81,6 +82,7 @@ from evrptw.stage052_evidence import (
     JobParallelSelectionIdentity,
     Stage052PersistenceAttribution,
     Stage052PrerequisiteIdentity,
+    _same_producer_machine_ignoring_review_memory,
     abort_process_executor,
     stage052_source_snapshot_contract,
     validate_worker_ownership,
@@ -3156,7 +3158,10 @@ def _review_accelerator_decision_only(
                     prerequisite_identity,
                     prerequisite_dir,
                 )
-                and expected_workers == observed_workers
+                and _accelerator_worker_transition_matches(
+                    native_worker_count=expected_workers,
+                    accelerator_worker_count=observed_workers,
+                )
             )
             gates["component_prerequisite"] = {
                 "passed": binding_passed,
@@ -5581,7 +5586,20 @@ def _validate_stage052_runtime_identity(
         ValueError,
     ) as error:
         return False, str(error)
-    if dict(observed) != current:
+    observed_identity = dict(observed)
+    observed_machine = observed_identity.pop("machine_identity", None)
+    current_identity = dict(current)
+    current_machine = current_identity.pop("machine_identity", None)
+    if observed_identity != current_identity or not (
+        observed_machine is None
+        and current_machine is None
+        or isinstance(observed_machine, Mapping)
+        and isinstance(current_machine, Mapping)
+        and _same_producer_machine_ignoring_review_memory(
+            observed_machine,
+            current_machine,
+        )
+    ):
         return False, "raw runtime identity does not match the verified local wheel runtime"
     return (
         True,
@@ -5597,6 +5615,23 @@ def _verify_frozen_producer_runtime_identity(
     """Compatibility seam for tests and callers; implementation is shared."""
 
     return verify_frozen_stage052_producer_runtime_identity(root, revision)
+
+
+def _accelerator_worker_transition_matches(
+    *,
+    native_worker_count: int,
+    accelerator_worker_count: int,
+) -> bool:
+    """Validate the reviewed E-to-F worker-width transition."""
+
+    try:
+        _validate_accelerator_worker_transition(
+            native_worker_count=native_worker_count,
+            accelerator_worker_count=accelerator_worker_count,
+        )
+    except ValueError:
+        return False
+    return True
 
 
 def _validate_stage052_source_snapshot(
