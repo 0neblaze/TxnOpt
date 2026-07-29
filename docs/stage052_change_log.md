@@ -1834,3 +1834,23 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   resource calibration 及 sidecar、review calibration 及 sidecar、storage roots。
   下一 snapshot 必须在冻结为只读前逐项复制并验证这些七项，再单独生成当前
   runtime identity；attempt28 label 不复用。
+
+## 2026-07-29：E29 runtime identity source root 不一致
+
+- `stage05.2_native_kernels_attempt29` 由 audited Windows Scheduled Task host run
+  `20260729T114757Z-4908` 启动，launch nonce 为
+  `0fab48569c0b4de0b1da1bc2ec4c4daf`，current controller SHA-256 为
+  `c75f2e804a38e79d40aa00d46e99a1cb75c14d3ccac8a7d893a64e8b64ee11d2`。
+  它使用 clean commit
+  `f095e92fd34a8c9e2c55597e697215cf0457e8a6`、producer wheel SHA-256
+  `c7f239d81546533c4c7fd4ac52acb36724da4770413cdf323f82987d8ccf44d2`
+  与已验证包含八项本地控制文件的只读 ext4 source snapshot。
+- producer 在创建 shard 前 fail fast，Windows Scheduled Task 与 Linux host
+  controller 均记录 exit code 1。runner 创建了空 output directory，但没有 raw
+  shard、manifest 或 review。直接原因为 runtime identity 的
+  `source_repository_root` 记录活动 checkout，而 runner 要求它等于 sealed
+  snapshot root。
+- 根因是 runtime identity 虽写入 snapshot，却在活动 checkout 作为 current
+  working directory（当前工作目录）生成。下一 snapshot 必须保持可写直到
+  runtime identity 在该 snapshot root 内生成并复核
+  `source_repository_root`，随后才可冻结为只读；attempt29 label 不复用。
