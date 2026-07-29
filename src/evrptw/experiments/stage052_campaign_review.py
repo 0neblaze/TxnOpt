@@ -3767,12 +3767,24 @@ def _verify_accelerator_prerequisite(
         )
         if not audit.passed:
             raise ArtifactIntegrityError(audit.detail)
+        selection_lock = dict(audit.selection_lock)
+        if campaign.producer_resource_contract is not None:
+            if (
+                campaign.producer_resource_contract.selected_workers
+                != campaign.selected_workers
+            ):
+                raise ArtifactIntegrityError(
+                    "campaign producer resource contract worker count mismatch"
+                )
+            selection_lock["producer_resource_contract"] = (
+                campaign.producer_resource_contract.to_dict()
+            )
         payload = {
             **identity.to_dict(),
             "accelerator_decision": review.get("accelerator_decision"),
-            "selection_lock": audit.selection_lock,
+            "selection_lock": selection_lock,
         }
-        return payload, identity.review_manifest_sha256, audit.selection_lock
+        return payload, identity.review_manifest_sha256, selection_lock
     accepted = load_benchmark_execution_lock(
         raw_dir,
         expected_scope="pilot",

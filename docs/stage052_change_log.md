@@ -2005,3 +2005,25 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   `accelerator_selection` / performance / `READY_FOR_STAGE052_BENCHMARK`，Formal
   使用 `campaign_pilot` / pilot / `READY_FOR_STAGE052_FORMAL_BENCHMARK`。
   新 Pilot 使用新 commit、wheel、snapshot 和 label。
+
+## 2026-07-29：G Pilot94 reviewer resource-lock 修复
+
+- `stage05.2_benchmark_attempt94` 在 clean commit
+  `12d027fd222738acde923ec07ae695682b8ffd9b` 上完成 36/36 shards、36/36
+  axes、1,080 declared solver seconds 与 144 checkpoints；三个 batch 均已
+  checksum-verified 后归档至签名的 D archive root，Windows Scheduled Task 与
+  WSL controller 均 exit 0。
+- 首次独立 review 完整退出但返回 `NOT_READY`，review manifest SHA-256 为
+  `dfc2ed01b3d5d0291da6c62c29cd2a42ad11dee466a98a184694021c41b65c7a`。
+  reviewer 在 batch0001 的第一个 provenance check 处中止，因此其余 35 个
+  shards 与 batch0002/0003 未进入 replay；三个不可变 archive batch 均仍物理存在，
+  每个 519 files。
+- 根因是 accelerator prerequisite adapter 已验证 F20 的 scientific/runtime
+  selection lock，但构造 Pilot selection lock 时漏加 campaign 已签入的
+  `producer_resource_contract`。同一遗漏同时使 `accepted_prerequisite` 失败，并
+  使 batch metadata 与 campaign resource contract 比较失败。reviewer 现只从
+  campaign 的已验证 typed contract 补入该字段，并要求 contract worker count 与
+  campaign selected workers 精确相等；backend、native、runtime、input 与 source
+  identity 检查保持不变。
+- Pilot94 raw 与失败 review 不回写、不晋级；修复使用新 commit、producer/reviewer
+  wheels、sealed source snapshot 与新 Pilot label。

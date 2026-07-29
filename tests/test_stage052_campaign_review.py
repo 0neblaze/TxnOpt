@@ -70,6 +70,7 @@ from evrptw.stage052_evidence import (
     Stage052PrerequisiteIdentity,
     verify_stage052_review_files,
 )
+from evrptw.stage052_resources import ProducerResourceContract
 from evrptw.stage052_retention import RetentionRecord, write_retention_registry
 from evrptw.validation import validate_routes
 from tools.publish_stage052_artifacts import (
@@ -2327,6 +2328,58 @@ def test_campaign_selection_lock_binds_f02_backend_worker_native_and_provenance(
     assert audit.selection_lock["selected_workers"] == 6
     assert audit.selection_lock["native_kernel_config"] == metadata["native_kernel_config"]
     assert audit.selection_lock["accelerator_review_manifest_sha256"] == "b" * 64
+
+
+def test_accelerator_prerequisite_adds_campaign_producer_resource_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prerequisite_dir, metadata = _build_accepted_f02(tmp_path)
+    prerequisite_reader = ArtifactReader(prerequisite_dir)
+    prerequisite_review = prerequisite_dir / "review/review_manifest.json"
+    identity = Stage052PrerequisiteIdentity(
+        run_label=prerequisite_dir.name,
+        component="accelerator_pilot",
+        status="READY_FOR_STAGE052_BENCHMARK",
+        repository_revision=str(metadata["repository_revision"]),
+        configuration_sha256=str(metadata["configuration_sha256"]),
+        raw_manifest_sha256=hashlib.sha256(
+            prerequisite_reader.result.manifest_path.read_bytes()
+        ).hexdigest(),
+        review_manifest_sha256=hashlib.sha256(prerequisite_review.read_bytes()).hexdigest(),
+        scope="performance",
+    )
+    monkeypatch.setattr(
+        campaign_review_module,
+        "verify_stage052_evidence_input",
+        lambda _raw_dir, _requirement: identity,
+    )
+    producer_contract = ProducerResourceContract(
+        selected_workers=6,
+        available_memory_bytes=32 * 1024**3,
+        selected_aggregate_peak_rss_bytes=18 * 1024**3,
+        selected_per_worker_peak_rss_bytes=3 * 1024**3,
+        aggregate_memory_limit_bytes=22 * 1024**3,
+        per_worker_memory_limit_bytes=4 * 1024**3,
+        semantic_digest="a" * 64,
+        calibration_digest="b" * 64,
+        row_group_size=262_144,
+        queue_depth=2,
+    )
+    campaign = SimpleNamespace(
+        selected_backend="native_cpu",
+        selected_exact_backend="cpu_batch",
+        selected_workers=6,
+        native_profile="stage05.2-native-kernels-v2",
+        producer_resource_contract=producer_contract,
+    )
+
+    _, _, selection_lock = campaign_review_module._verify_accelerator_prerequisite(
+        prerequisite_dir,
+        campaign=campaign,
+    )
+
+    assert selection_lock["producer_resource_contract"] == producer_contract.to_dict()
 
 
 def test_batch_runtime_provenance_ignores_telemetry_across_batches() -> None:
