@@ -187,6 +187,11 @@ zero-fallback gate。旧 E 失败原因进入 change log，不进入长期政策
 fixed-work axis 的 asynchronous streaming timing 只用于 campaign/resource/
 persistence evidence，不得只替换其中一个 ablation mode 的计时。每个 v4 ablation
 axis 必须显式记录该 envelope，reviewer 对缺失或不同值 fail fast。
+E 相对 D 的 performance promotion（性能晋级）必须在 24-axis core semantic
+replay 已通过后，把 paired fixed-work timing（配对固定工作量计时）绑定到该
+replayed core digest；不得继续使用包含 transaction/screening/cache diagnostics
+（事务／筛选／缓存诊断）的 full-storage digest 作为跨实现语义身份。full-storage
+digest 仍用于同一实现的存储回放与 aggregate diagnostic mismatch（聚合诊断差异）。
 
 ## F. Conditional accelerator pilot
 

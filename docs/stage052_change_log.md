@@ -1909,3 +1909,31 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   24/24 fixed-work axes 实测完全相等。native full-storage mismatch publication
   仅保留 aggregate rows，不再展开字段级差异。E31 review 不回写，修复使用新
   commit/wheel/attempt label。
+
+## 2026-07-29：E32 promotion semantic identity 修复
+
+- `stage05.2_native_kernels_attempt32` 在 clean commit
+  `82e06dbde45f20c97abd8123e6f940456a6f19ef` 上完成 12/12 shards 与
+  36/36 axes；raw manifest SHA-256 为
+  `210cef9f947243c374613202efbad269e45d4791dc515d03df905720ffa3be69`。
+  第一个 reviewer generation 因 Windows 侧等待期间没有活跃 WSL client，在约
+  32 秒收到 WSL lifecycle 的 `SIGTERM 15`；其 finalized receipt 证明 raw
+  manifest unchanged、peak RSS 1,431,629,824 bytes、swap 0。该失败 generation
+  保留，不改写 raw。
+- 第二个独立 reviewer generation 通过持续 WSL client keeper 完整退出 0；
+  aggregate peak RSS 2,394,062,848 bytes、swap 0，review manifest SHA-256 为
+  `fcb6fe3daebf5889693ebfb90ecebaacb3d1a090079b39211ccf7676e92cf2c5`。
+  native ablation 通过，aggregate paired median saving 为 `0.181622`，
+  C/R/RC 分别为 `0.181622`、`0.211868`、`0.162964`；24-axis solution、
+  candidate-state、ordered exact-route 与 deadline core semantics 全部相等。
+- 唯一失败 gate 为 `performance_promotion`。其旧调用仍直接读取 per-run
+  full-storage `semantic_digest`，因此把 9 个 100-customer pair 的预期
+  transaction/screening/cache diagnostic 差异误报成 search semantic mismatch；
+  同一 reviewer 内更严格的 native core differential 与四步 ablation 已独立证明
+  search semantics 相等。这不是性能或解语义回退。
+- performance observations 现可显式绑定 streaming core replay digest，并要求
+  per-run fixed-work identity 与 replay map 精确一致；Hot Path 历史路径继续使用
+  原 full-storage digest。对 E32 timing rows 使用已通过的 core identity 重算，
+  performance promotion aggregate 为 `0.713761`，C/R/RC 分别为
+  `0.783280`、`0.692386`、`0.713761`。E32 review 不回写，修复使用新
+  commit/wheel/attempt label。

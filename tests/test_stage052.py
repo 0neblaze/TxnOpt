@@ -59,6 +59,7 @@ from evrptw.experiments.stage052_performance_review import (
     _expected_native_screening_invocations,
     _native_exact_counters_reconcile,
     _native_fixed_work_core_record,
+    _observations,
     _prerequisite_binding_matches,
     _prior_review_manifest_history,
     _recompute_native_occupancies,
@@ -1388,6 +1389,44 @@ def test_native_fixed_work_core_record_excludes_acceleration_diagnostics() -> No
         )
         is None
     )
+
+
+def test_performance_observations_bind_replayed_native_core_semantics() -> None:
+    rows = [
+        {
+            "instance": "c101_21",
+            "seed": "2014",
+            "axis": "fixed_work",
+            "customer_count": "100",
+            "end_to_end_seconds": "8.0",
+            "semantic_digest": "full-storage-digest",
+        }
+    ]
+    core_digests = {
+        ("c101_21", 2014, "fixed_work"): "core-semantic-digest",
+        ("c101_21", 2014, "fixed_work_control"): "control-core-digest",
+    }
+
+    observations = _observations(
+        rows,
+        axis="fixed_work",
+        semantic_digests=core_digests,
+    )
+
+    assert len(observations) == 1
+    assert observations[0].semantic_digest == "core-semantic-digest"
+    with pytest.raises(
+        ArtifactIntegrityError,
+        match="performance core replay identity",
+    ):
+        _observations(
+            rows,
+            axis="fixed_work",
+            semantic_digests={
+                **core_digests,
+                ("r101_21", 2014, "fixed_work"): "unexpected-core-digest",
+            },
+        )
 
 
 def test_native_execution_audit_cross_checks_per_run_raw_and_trace(tmp_path: Path) -> None:

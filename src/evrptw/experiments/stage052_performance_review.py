@@ -4852,6 +4852,10 @@ def _component_gates(
                     "detail": "one predecessor required",
                 }
             }
+        native_replay_maps: tuple[
+            dict[StorageReplayIdentity, str],
+            dict[StorageReplayIdentity, str],
+        ] | None = None
         if component is Stage052Component.NATIVE_KERNELS:
             if job_parallel_selection is None:
                 return {
@@ -4967,8 +4971,20 @@ def _component_gates(
                         "detail": "24 fixed-work axes do not replay identically",
                     }
                 }
-        previous = _observations(_load_per_run(comparison_dirs[0]), axis="fixed_work")
-        candidate = _observations(rows, axis="fixed_work")
+        previous = _observations(
+            _load_per_run(comparison_dirs[0]),
+            axis="fixed_work",
+            semantic_digests=(
+                native_replay_maps[0] if native_replay_maps is not None else None
+            ),
+        )
+        candidate = _observations(
+            rows,
+            axis="fixed_work",
+            semantic_digests=(
+                native_replay_maps[1] if native_replay_maps is not None else None
+            ),
+        )
         decision = evaluate_promotion(previous, candidate)
         gates = {
             "performance_promotion": {
@@ -6486,19 +6502,44 @@ def _axis_semantics_equal(rows: Sequence[Mapping[str, object]], left: str, right
 
 
 def _observations(
-    rows: Sequence[Mapping[str, object]], *, axis: str
+    rows: Sequence[Mapping[str, object]],
+    *,
+    axis: str,
+    semantic_digests: Mapping[StorageReplayIdentity, str] | None = None,
 ) -> list[PerformanceObservation]:
-    return [
-        PerformanceObservation(
-            instance=str(row["instance"]),
-            seed=_strict_int(row["seed"], "seed"),
-            customer_count=_strict_int(row["customer_count"], "customer_count"),
-            end_to_end_seconds=_strict_float(row["end_to_end_seconds"]),
-            semantic_digest=str(row["semantic_digest"]),
+    output: list[PerformanceObservation] = []
+    observed_identities: set[StorageReplayIdentity] = set()
+    for row in rows:
+        if row.get("axis") != axis:
+            continue
+        identity = (
+            str(row["instance"]),
+            _strict_int(row["seed"], "seed"),
+            axis,
         )
-        for row in rows
-        if row.get("axis") == axis
-    ]
+        observed_identities.add(identity)
+        output.append(
+            PerformanceObservation(
+                instance=identity[0],
+                seed=identity[1],
+                customer_count=_strict_int(row["customer_count"], "customer_count"),
+                end_to_end_seconds=_strict_float(row["end_to_end_seconds"]),
+                semantic_digest=(
+                    semantic_digests[identity]
+                    if semantic_digests is not None
+                    else str(row["semantic_digest"])
+                ),
+            )
+        )
+    if semantic_digests is not None:
+        expected_identities = {
+            identity for identity in semantic_digests if identity[2] == axis
+        }
+        if observed_identities != expected_identities:
+            raise ArtifactIntegrityError(
+                "performance core replay identity does not match per-run rows"
+            )
+    return output
 
 
 def _storage_observations(
