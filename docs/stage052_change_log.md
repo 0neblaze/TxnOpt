@@ -1717,3 +1717,22 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   根因属于 launcher 参数面，不改变 producer/reviewer 科学代码。下一次 review
   service 只使用 performance reviewer 已验证的 5.5-GiB process guard 参数面；
   新证据必须从新 commit、wheel、read-only snapshot 和 attempt25 label 生成。
+
+## 2026-07-29：E25 producer 完成、Windows keepalive quoting 失败
+
+- `stage05.2_native_kernels_attempt25` 使用 clean commit `a3cf2ea`、producer wheel
+  SHA-256
+  `b51bced9692b86e133b1ff6c343011cca3c71fdd5bc9828a00825095f829053a`
+  和新只读 ext4 source snapshot 完成 12/12 shards、36/36 axes。Windows
+  Scheduled Task host run 为 `20260729T093220Z-527`，launch nonce 为
+  `95b9a4e0043045348d99fe36517b5903`；producer manifest SHA-256 为
+  `f07df74128a982040b4ede3183e20fe5b97bb0c761a4344e3a0372099056f0a6`。
+- reviewer 使用已验证的 performance 参数面启动，但 Windows keepalive 又通过
+  `Start-Process -ArgumentList` 传递含空格的 `bash -lc` command string，Windows
+  将其拆分，keepalive 未持续绑定 WSL。reviewer 在约 27 秒后收到外部 `SIGTERM`；
+  finalized receipt 记录 `ReviewServiceInterrupted`、exit 1、raw manifest unchanged、
+  aggregate peak RSS 1,414,012,928 bytes、swap 0，且没有 review manifest。
+- E25 按失败即消费 label 保留，不在同一 label 重试。下一次 keepalive 必须通过
+  `.NET ProcessStartInfo.ArgumentList.Add()` 逐参数传递，并在 review 启动后独立
+  验证 Windows keepalive PID 存活及 WSL command line 完整。新证据使用新 commit、
+  wheel、read-only snapshot 和 attempt26 label。
