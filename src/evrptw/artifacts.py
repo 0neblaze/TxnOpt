@@ -1215,6 +1215,10 @@ def _normalise_general_event_values(
                 "merge_order",
                 "chunk_sizes",
                 "completed_indices",
+                "candidates",
+                "screening_integrity_evidence",
+                "counters",
+                "screening_reason_counts",
             }
         )
     }

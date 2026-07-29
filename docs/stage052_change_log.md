@@ -1611,3 +1611,48 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   生命周期；仅在 unit 终止后退出。E19 review execution 保留为 immutable failed
   receipt，下一次 producer/reviewer 使用新 commit、wheel、read-only snapshot 和
   attempt20 label，不重用 E19。
+
+## 2026-07-29：E20 独立复核完成、producer root 绑定与批内负缓存计数修复
+
+- `stage05.2_native_kernels_attempt20` 使用 clean commit `497f50c`、non-editable
+  producer wheel
+  `6eda8244dde86d8bf80b91664c8dbcc58653381674ed66f5cd64027729957797`
+  与 869 个 tracked files 的 read-only ext4 source snapshot 完成 12/12 shards、
+  36/36 axes，producer failure count 为零。Windows keepalive client 持续绑定
+  WSL 生命周期后，独立 transient `systemd --user` reviewer 完整退出，finalized
+  receipt 记录 exit 0、raw manifest 前后 SHA-256 相等、cgroup memory peak
+  5,369,495,552 bytes、swap 0 和原子 review publication。
+- 独立复核状态为 `NOT_READY`。scope、job-parallel selection、optimization
+  profile、persistence attribution/ratio、prerequisite、replay consistency、
+  resources 与 staging identity gates 通过；source snapshot、runtime identity
+  与 native execution gates 失败。E20 为不可变 rejected evidence，不进入
+  promotion，不重写 review。
+- 前两个失败共用同一 reviewer root-selection 根因：service receipt 已区分
+  producer `working_directory` 与 `reviewer_working_directory`，但 source/runtime
+  gates 仍调用 reviewer checkout 的 `find_repository_root()`，因而把活动目录的
+  `.ruff_cache/.gitignore` 当成 sealed producer snapshot 污染，并从错误根目录
+  校验 producer runtime。receipt 现在新增显式 `producer_source_directory`；
+  reviewer 只从该绝对、存在且为目录的 receipt binding 复核 source snapshot 与
+  frozen runtime，旧 receipt 仅为兼容读取 `working_directory`。
+- native execution 失败来自旧计数公式
+  `screening_calls - screening_cache_hits`：它把一个 native batch 当成多个
+  scalar invocations，并遗漏 batch 内 negative-cache hit。修复后 reviewer 从每个
+  committed transaction 的 ABI-v2 statuses/codes/counters bytes、candidate order
+  与两个 SHA-256 独立重算 batch candidates、cache hits、invocations 和
+  occupancies，再用
+  `scalar_non_cache_candidates + native_batch_invocations` 对账。E20 的失败轴
+  `c101_21/2014/fixed_work` 因此独立重算为 2,346 次，和 raw native counter
+  一致。
+- 为使上述复核不信任 producer summary，candidate list、screening integrity
+  bytes、native counters 与 reason counts 现在随 critical Parquet event 的
+  `extras_json` 持久化；既有 event schema 不变。缺字段、hash mismatch、aggregate
+  mismatch、负数 scalar count 或 undeclared batch evidence 均 fail fast，无
+  Python/serial/CUDA fallback。
+- ABI-v2 raw counters 还必须逐行等于 statuses 中的 unique、duplicate、
+  negative-cache-hit 与 screened 数量；duplicate candidate 必须指向更早且完全相同
+  的首次 route/codes/metrics row；reviewer 也反向维护 first-by-route identity，
+  后续相同 canonical route 不得伪装成新的 screened row。非 duplicate 的
+  `duplicate_of` 必须为 -1，negative cache hit 必须携带安全拒绝 reason。producer
+  deep module 和 reviewer 共用这组 fail-fast 语义，防止内部代数恒等但逐行
+  自相矛盾的 native evidence 被接受。下一次运行必须使用新 commit、wheel、
+  read-only snapshot 和 attempt21 label。

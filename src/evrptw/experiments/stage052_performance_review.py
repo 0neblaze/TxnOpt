@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 import uuid
 import zlib
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ProcessPoolExecutor
 from contextlib import contextmanager
 from multiprocessing import get_context
@@ -3291,6 +3291,24 @@ def _audit_native_execution(
                     )
                 by_shard[shard_identity] = payload
         expected_shards = {(identity[0], identity[1]) for identity in row_by_axis}
+        event_paths: dict[tuple[str, int], str] = {}
+        for reference in reader.manifest.get("artifacts", []):
+            if (
+                not isinstance(reference, Mapping)
+                or reference.get("artifact_type") != "events"
+                or reference.get("artifact_subtype") != "critical"
+            ):
+                continue
+            relative = str(reference.get("relative_path", ""))
+            parts = Path(relative).parts
+            shard_identity = (parts[0], _strict_int(parts[1], "seed"))
+            if shard_identity in event_paths:
+                raise ArtifactIntegrityError(
+                    f"duplicate native event stream: {shard_identity}"
+                )
+            event_paths[shard_identity] = relative
+        if event_paths and set(event_paths) != expected_shards:
+            raise ArtifactIntegrityError("native event-stream shard scope mismatch")
         canonical_ordinals = {
             identity: ordinal
             for ordinal, identity in enumerate(
@@ -3383,6 +3401,17 @@ def _audit_native_execution(
             assert isinstance(trace_axes, Mapping)
             if set(raw_axes) != set(solution_axes) or set(raw_axes) != set(trace_axes):
                 raise ArtifactIntegrityError(f"native raw/solution/trace axis mismatch: {shard}")
+            replayed_batches = (
+                _recompute_native_screening_batch_counters(
+                    reader.iter_events(event_paths[shard])
+                )
+                if event_paths
+                else {}
+            )
+            if not set(replayed_batches).issubset(map(str, raw_axes)):
+                raise ArtifactIntegrityError(
+                    f"native transaction batch axis mismatch: {shard}"
+                )
             for axis, raw_axis in raw_axes.items():
                 axis_identity = (shard[0], shard[1], str(axis))
                 current_row = row_by_axis.get(axis_identity)
@@ -3476,16 +3505,15 @@ def _audit_native_execution(
                         f"native exact counters do not reconcile: {axis_identity}"
                     )
 
-                screening_calls = _strict_int(screening.get("screening_calls"), "screening_calls")
-                screening_cache_hits = _strict_int(
-                    screening.get("screening_cache_hits"), "screening_cache_hits"
-                )
                 screen_invocations = _strict_int(
                     screening.get("native_screening_invocations"),
                     "native_screening_invocations",
                 )
                 screen_seconds = _strict_float(screening.get("native_screening_seconds"))
-                expected_screen_invocations = screening_calls - screening_cache_hits
+                expected_screen_invocations = _expected_native_screening_invocations(
+                    screening,
+                    replayed_batches.get(str(axis)),
+                )
                 if (
                     screen_invocations <= 0
                     or screen_invocations != expected_screen_invocations
@@ -4207,12 +4235,71 @@ def _recompute_transaction_hashes(
         raise ArtifactIntegrityError("transaction candidate IDs lost order")
     if any(int(value) not in {0, 1, 2} for value in statuses):
         raise ArtifactIntegrityError("transaction candidate status is invalid")
+    duplicate_candidates = sum(int(status) == 1 for status in statuses)
+    negative_cache_hits = sum(int(status) == 2 for status in statuses)
+    screened_candidates = sum(int(status) == 0 for status in statuses)
     if (
         int(counters[0]) != candidate_count
-        or int(counters[1]) + int(counters[2]) != candidate_count
-        or int(counters[3]) + int(counters[4]) != int(counters[1])
+        or int(counters[1]) != candidate_count - duplicate_candidates
+        or int(counters[2]) != duplicate_candidates
+        or int(counters[3]) != negative_cache_hits
+        or int(counters[4]) != screened_candidates
     ):
-        raise ArtifactIntegrityError("transaction screening counters are inconsistent")
+        raise ArtifactIntegrityError(
+            "transaction screening counters do not match candidate status counts"
+        )
+    first_by_route: dict[tuple[int | float, ...], int] = {}
+    for index, status_value in enumerate(statuses):
+        status = int(status_value)
+        source = int(duplicate_of[index])
+        begin = int(offsets[index])
+        end = int(offsets[index + 1])
+        route_identity = tuple(route_indices[begin:end])
+        expected_source = first_by_route.get(route_identity)
+        if expected_source is None:
+            first_by_route[route_identity] = index
+            if status == 1:
+                raise ArtifactIntegrityError(
+                    "transaction first candidate is marked as a duplicate"
+                )
+        elif status != 1 or source != expected_source:
+            raise ArtifactIntegrityError(
+                "transaction repeated candidate lacks its first duplicate identity"
+            )
+        if status != 1:
+            if source != -1:
+                raise ArtifactIntegrityError(
+                    "transaction non-duplicate candidate has a duplicate identity"
+                )
+            if status == 2 and (
+                bool(int(codes[index * 16]))
+                or int(codes[index * 16 + 1]) == 0
+            ):
+                raise ArtifactIntegrityError(
+                    "transaction negative-cache hit lacks its safe rejection reason"
+                )
+            continue
+        if source < 0 or source >= index:
+            raise ArtifactIntegrityError("transaction duplicate identity is not earlier")
+        source_begin = int(offsets[source])
+        source_end = int(offsets[source + 1])
+        if (
+            tuple(route_indices[begin:end])
+            != tuple(route_indices[source_begin:source_end])
+            or tuple(codes[index * 16 : (index + 1) * 16])
+            != tuple(codes[source * 16 : (source + 1) * 16])
+            or struct.pack(
+                "<15d",
+                *(float(value) for value in metrics[index * 15 : (index + 1) * 15]),
+            )
+            != struct.pack(
+                "<15d",
+                *(float(value) for value in metrics[source * 15 : (source + 1) * 15]),
+            )
+        ):
+            raise ArtifactIntegrityError(
+                "transaction duplicate candidate does not match its source"
+            )
     screening_passes = sum(bool(int(codes[index * 16])) for index in range(candidate_count))
     screening_cache_hits = sum(int(status) == 2 for status in statuses)
     screening_exact_call_blocked = candidate_count - screening_passes
@@ -4313,6 +4400,140 @@ def _recompute_screening_hash(
         proxy,
         name_to_index=name_to_index,
     )[0]
+
+
+def _recompute_native_screening_batch_counters(
+    events: Iterable[Mapping[str, object]],
+) -> dict[str, dict[str, object]]:
+    """Replay committed transaction batches from their structured ABI v2 bytes."""
+
+    replayed: dict[str, dict[str, object]] = {}
+    for event in events:
+        if (
+            event.get("event_type") != "native_candidate_transaction"
+            or event.get("status") != "committed"
+        ):
+            continue
+        axis = event.get("benchmark_axis")
+        if not isinstance(axis, str) or not axis:
+            raise ArtifactIntegrityError("native candidate transaction lacks its benchmark axis")
+        screening_hash, transaction_hash = _recompute_transaction_hashes(event)
+        if (
+            event.get("screening_pool_hash") != screening_hash
+            or event.get("transaction_sha256") != transaction_hash
+        ):
+            raise ArtifactIntegrityError("native candidate transaction hash does not replay")
+        candidate_count = _strict_int(event.get("input_candidates"), "input_candidates")
+        if candidate_count <= 0:
+            raise ArtifactIntegrityError("native candidate transaction batch is empty")
+        evidence = event.get("screening_integrity_evidence")
+        if not isinstance(evidence, Mapping):
+            raise ArtifactIntegrityError("transaction screening integrity evidence is missing")
+        statuses = _decode_hex_rows(evidence, "statuses_le_hex", candidate_count)
+        cache_hits = sum(int(status) == 2 for status in statuses)
+        aggregate = replayed.setdefault(
+            axis,
+            {
+                "batch_candidates": 0,
+                "batch_cache_hits": 0,
+                "batch_invocations": 0,
+                "occupancies": [],
+            },
+        )
+        aggregate["batch_candidates"] = (
+            _strict_int(aggregate["batch_candidates"], "batch_candidates") + candidate_count
+        )
+        aggregate["batch_cache_hits"] = (
+            _strict_int(aggregate["batch_cache_hits"], "batch_cache_hits") + cache_hits
+        )
+        aggregate["batch_invocations"] = (
+            _strict_int(aggregate["batch_invocations"], "batch_invocations") + 1
+        )
+        occupancies = aggregate["occupancies"]
+        if not isinstance(occupancies, list):
+            raise ArtifactIntegrityError("native batch occupancy replay is invalid")
+        occupancies.append(candidate_count)
+    return replayed
+
+
+def _expected_native_screening_invocations(
+    screening: Mapping[str, object],
+    replayed_batch: Mapping[str, object] | None,
+) -> int:
+    """Reconcile scalar calls with ABI v2 batches and their negative-cache hits."""
+
+    screening_calls = _strict_int(screening.get("screening_calls"), "screening_calls")
+    screening_cache_hits = _strict_int(
+        screening.get("screening_cache_hits"),
+        "screening_cache_hits",
+    )
+    if (
+        screening_calls < 0
+        or screening_cache_hits < 0
+        or screening_cache_hits > screening_calls
+    ):
+        raise ArtifactIntegrityError("native screening scalar counters are invalid")
+    raw_batch_fields = (
+        screening.get("native_screening_batch_candidates"),
+        screening.get("native_screening_batch_invocations"),
+        screening.get("native_screening_batch_occupancies"),
+    )
+    if not any(value is not None for value in raw_batch_fields):
+        if replayed_batch is not None:
+            raise ArtifactIntegrityError("undeclared native screening batch evidence exists")
+        return screening_calls - screening_cache_hits
+    if any(value is None for value in raw_batch_fields):
+        raise ArtifactIntegrityError("native screening batch counters are incomplete")
+    if replayed_batch is None:
+        raise ArtifactIntegrityError("native screening batch evidence is missing")
+    recorded_batch_candidates = _strict_int(
+        raw_batch_fields[0],
+        "native_screening_batch_candidates",
+    )
+    recorded_batch_invocations = _strict_int(
+        raw_batch_fields[1],
+        "native_screening_batch_invocations",
+    )
+    raw_batch_occupancies = raw_batch_fields[2]
+    if not isinstance(raw_batch_occupancies, list):
+        raise ArtifactIntegrityError("native screening batch occupancies are invalid")
+    recorded_batch_occupancies = [
+        _strict_int(value, "native_screening_batch_occupancy")
+        for value in raw_batch_occupancies
+    ]
+    batch_candidates = _strict_int(
+        replayed_batch.get("batch_candidates"),
+        "batch_candidates",
+    )
+    batch_cache_hits = _strict_int(
+        replayed_batch.get("batch_cache_hits"),
+        "batch_cache_hits",
+    )
+    batch_invocations = _strict_int(
+        replayed_batch.get("batch_invocations"),
+        "batch_invocations",
+    )
+    batch_occupancies = replayed_batch.get("occupancies")
+    if (
+        not isinstance(batch_occupancies, list)
+        or recorded_batch_candidates != batch_candidates
+        or recorded_batch_invocations != batch_invocations
+        or recorded_batch_occupancies != batch_occupancies
+        or sum(recorded_batch_occupancies) != recorded_batch_candidates
+        or len(recorded_batch_occupancies) != recorded_batch_invocations
+        or any(value <= 0 for value in recorded_batch_occupancies)
+        or batch_cache_hits < 0
+        or batch_cache_hits > batch_candidates
+    ):
+        raise ArtifactIntegrityError("native screening batch counters do not replay")
+    scalar_screening_candidates = (
+        screening_calls
+        - screening_cache_hits
+        - (batch_candidates - batch_cache_hits)
+    )
+    if scalar_screening_candidates < 0:
+        raise ArtifactIntegrityError("native scalar screening count is negative")
+    return scalar_screening_candidates + batch_invocations
 
 
 def _component_gates(
@@ -5015,6 +5236,30 @@ def _load_metadata(raw_dir: Path) -> dict[str, object]:
     return reader.read_json(str(reference["relative_path"]))
 
 
+def _producer_repository_root() -> Path:
+    """Resolve the sealed producer source bound by the review service receipt."""
+
+    receipt_value = os.environ.get(_REVIEW_EXECUTION_ENV)
+    if receipt_value is None:
+        return find_repository_root()
+    receipt_path = Path(receipt_value)
+    if not receipt_path.is_absolute():
+        raise RuntimeError("Stage 5.2 review execution receipt path must be absolute")
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise RuntimeError("Stage 5.2 review execution receipt must contain an object")
+    source_value = payload.get("producer_source_directory", payload.get("working_directory"))
+    if not isinstance(source_value, str) or not source_value:
+        raise RuntimeError("Stage 5.2 review receipt lacks its producer source directory")
+    source = Path(source_value)
+    if not source.is_absolute():
+        raise RuntimeError("Stage 5.2 producer source directory must be absolute")
+    resolved = source.resolve(strict=True)
+    if not resolved.is_dir():
+        raise RuntimeError("Stage 5.2 producer source directory is not a directory")
+    return resolved
+
+
 def _validate_stage052_runtime_identity(
     metadata: Mapping[str, object],
 ) -> tuple[bool, str]:
@@ -5022,10 +5267,17 @@ def _validate_stage052_runtime_identity(
     revision = metadata.get("repository_revision")
     if not isinstance(observed, Mapping) or not isinstance(revision, str):
         return False, "current Stage 5.2 evidence is missing its frozen runtime identity"
-    root = find_repository_root()
     try:
+        root = _producer_repository_root()
         current = _verify_frozen_producer_runtime_identity(root, revision)
-    except (OSError, RuntimeError, subprocess.SubprocessError, TypeError, ValueError) as error:
+    except (
+        json.JSONDecodeError,
+        OSError,
+        RuntimeError,
+        subprocess.SubprocessError,
+        TypeError,
+        ValueError,
+    ) as error:
         return False, str(error)
     if dict(observed) != current:
         return False, "raw runtime identity does not match the verified local wheel runtime"
@@ -5052,8 +5304,14 @@ def _validate_stage052_source_snapshot(
     if not isinstance(observed, Mapping):
         return False, "raw evidence is missing its ext4 read-only source snapshot identity"
     try:
-        current = verify_stage052_source_snapshot(find_repository_root())
-    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
+        current = verify_stage052_source_snapshot(_producer_repository_root())
+    except (
+        json.JSONDecodeError,
+        OSError,
+        RuntimeError,
+        subprocess.SubprocessError,
+        ValueError,
+    ) as error:
         return False, str(error)
     try:
         matches = stage052_source_snapshot_contract(observed) == stage052_source_snapshot_contract(

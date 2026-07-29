@@ -514,13 +514,40 @@ def native_screen_candidate_batch(
         "negative_cache_hits": int(raw_counters[3]),
         "screened_candidates": int(raw_counters[4]),
     }
+    duplicate_candidates = sum(status == 1 for status in status_codes)
+    negative_cache_hits = sum(status == 2 for status in status_codes)
+    screened_candidates = sum(status == 0 for status in status_codes)
     if (
         counters["input_candidates"] != len(candidates)
-        or counters["unique_candidates"] + counters["duplicate_candidates"] != len(candidates)
-        or counters["negative_cache_hits"] + counters["screened_candidates"]
-        != counters["unique_candidates"]
+        or counters["unique_candidates"] != len(candidates) - duplicate_candidates
+        or counters["duplicate_candidates"] != duplicate_candidates
+        or counters["negative_cache_hits"] != negative_cache_hits
+        or counters["screened_candidates"] != screened_candidates
     ):
         raise RuntimeError("native candidate screening counters are inconsistent")
+    first_by_sequence: dict[CustomerSequence, int] = {}
+    for index, status in enumerate(status_codes):
+        source = int(duplicate_of[index])
+        expected_source = first_by_sequence.get(candidates[index])
+        if expected_source is None:
+            first_by_sequence[candidates[index]] = index
+            if status == 1:
+                raise RuntimeError("native first candidate is marked as a duplicate")
+        elif status != 1 or source != expected_source:
+            raise RuntimeError("native repeated candidate lacks its first duplicate identity")
+        if status != 1:
+            if source != -1:
+                raise RuntimeError("native non-duplicate candidate has a duplicate identity")
+            if status == 2 and (bool(codes[index, 0]) or int(codes[index, 1]) == 0):
+                raise RuntimeError("native negative-cache hit lacks its safe rejection reason")
+            continue
+        if (
+            source < 0
+            or source >= index
+            or not np.array_equal(codes[source], codes[index])
+            or not np.array_equal(metrics[source], metrics[index], equal_nan=True)
+        ):
+            raise RuntimeError("native duplicate candidate identity is inconsistent")
     return CandidateScreeningBatch(
         candidates,
         returned_ids,

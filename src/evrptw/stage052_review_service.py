@@ -895,6 +895,13 @@ def _initial_receipt(config: ReviewServiceConfig) -> dict[str, object]:
                 else config.producer_source_directory
             ).resolve()
         ),
+        "producer_source_directory": str(
+            (
+                config.working_directory
+                if config.producer_source_directory is None
+                else config.producer_source_directory
+            ).resolve()
+        ),
         "reviewer_working_directory": str(config.working_directory.resolve()),
         "python_executable": str(_absolute_executable(config.reviewer_python)),
         "service_execution_path": config.service_execution_path,

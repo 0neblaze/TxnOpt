@@ -781,3 +781,52 @@ def test_event_storage_keeps_explicit_ordering_audit_lists(tmp_path: Path) -> No
     assert extras["merge_order"] == [0, 1]
     assert extras["chunk_sizes"] == [2, 1]
     assert extras["completed_indices"] == [0, 1, 2]
+
+
+def test_event_storage_keeps_native_screening_integrity_bytes(tmp_path: Path) -> None:
+    writer = ArtifactBundleWriter(
+        tmp_path / "results" / "stage05.2_native_kernels_attempt99",
+        ArtifactRunContext(
+            "stage05.2",
+            "native_kernels",
+            "stage05.2_native_kernels_attempt99",
+        ),
+    )
+    writer.write_control(metadata={})
+    integrity = {
+        "candidate_ids_le_hex": "00" * 16,
+        "statuses_le_hex": "01" * 16,
+    }
+    writer.write_instance_seed(
+        instance="toy",
+        seed=2014,
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+        route_dictionary={},
+        critical_events=[
+            {
+                "event_type": "native_candidate_transaction",
+                "status": "committed",
+                "lane": "legacy",
+                "iteration": 1,
+                "operator": "route_merge",
+                "candidates": [["C1"], ["C2"]],
+                "screening_integrity_evidence": integrity,
+                "counters": {"input_candidates": 2},
+            }
+        ],
+        diagnostic_rows=[],
+    )
+    result = writer.finalize()
+    event_path = (
+        result.run_dir
+        / "toy"
+        / "2014"
+        / "stage05.2_native_kernels_attempt99_events_toy_2014.parquet"
+    )
+    extras = json.loads(pq.read_table(event_path).to_pylist()[0]["extras_json"])
+    assert extras["candidates"] == [["C1"], ["C2"]]
+    assert extras["screening_integrity_evidence"] == integrity
+    assert extras["counters"] == {"input_candidates": 2}

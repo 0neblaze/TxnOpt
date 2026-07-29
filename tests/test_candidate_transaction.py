@@ -6,6 +6,7 @@ from collections.abc import Callable
 import numpy as np
 import pytest
 
+import evrptw.candidate_transaction as candidate_transaction_module
 from evrptw.alns import _Evaluator, solve_alns
 from evrptw.cache_incremental import CacheIncrementalConfig, RouteEvaluationCache
 from evrptw.candidate_transaction import (
@@ -215,6 +216,73 @@ def test_native_candidate_screening_digest_binds_all_returned_fields(
         native_screen_candidate_batch(
             instance,
             (("C1",),),
+            native_runtime=native_runtime,
+            transaction_runtime=transaction_runtime,
+            negative_cache={},
+            deadline=time.perf_counter() + 10.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "tampered_semantics",
+    ("counter_status", "duplicate_identity", "missing_duplicate_marker"),
+)
+def test_native_candidate_screening_rejects_hashed_semantic_inconsistency(
+    monkeypatch: pytest.MonkeyPatch,
+    tampered_semantics: str,
+) -> None:
+    from evrptw import _core
+
+    instance = _fixture_instance("candidate_transaction_semantic_fixture")
+    native_runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+    transaction_runtime = NativeCandidateTransactionRuntime(NativeCandidateTransactionConfig())
+    original = _core.screen_route_batch_transaction_v2
+
+    def tampered(*args: object) -> tuple[object, ...]:
+        payload = list(original(*args))
+        if tampered_semantics == "counter_status":
+            payload[5] = np.array([2, 1, 1, 0, 1], dtype=np.int64)
+        elif tampered_semantics == "duplicate_identity":
+            duplicate_of = payload[2].copy()
+            duplicate_of[1] = -1
+            payload[2] = duplicate_of
+        else:
+            statuses = payload[1].copy()
+            duplicate_of = payload[2].copy()
+            counters = payload[5].copy()
+            statuses[1] = 0
+            duplicate_of[1] = -1
+            counters[:] = (2, 2, 0, 0, 2)
+            payload[1] = statuses
+            payload[2] = duplicate_of
+            payload[5] = counters
+        payload[6] = candidate_transaction_module._native_screening_digest(
+            payload[0],
+            payload[1],
+            payload[2],
+            payload[3],
+            payload[4],
+            payload[5],
+            args[8],
+            args[9],
+        )
+        return tuple(payload)
+
+    monkeypatch.setattr(_core, "screen_route_batch_transaction_v2", tampered)
+    expected = (
+        "counters are inconsistent"
+        if tampered_semantics == "counter_status"
+        else "repeated candidate lacks its first duplicate identity"
+    )
+    candidates = (
+        (("C1",), ("C2",))
+        if tampered_semantics == "counter_status"
+        else (("C1",), ("C1",))
+    )
+    with pytest.raises(RuntimeError, match=expected):
+        native_screen_candidate_batch(
+            instance,
+            candidates,
             native_runtime=native_runtime,
             transaction_runtime=transaction_runtime,
             negative_cache={},

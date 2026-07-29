@@ -56,9 +56,11 @@ from evrptw.experiments.stage052_performance_review import (
     _audit_native_ablation_records,
     _audit_native_execution,
     _bind_persistence_attribution_review,
+    _expected_native_screening_invocations,
     _prerequisite_binding_matches,
     _prior_review_manifest_history,
     _recompute_native_occupancies,
+    _recompute_native_screening_batch_counters,
     _recompute_screening_hash,
     _recompute_transaction_hashes,
     _validate_native_shard_manifest_scope,
@@ -2146,6 +2148,138 @@ def test_native_ablation_semantics_replay_exact_cache_and_transaction_events() -
     assert "candidate transaction hash recomputation failed" in failures
 
 
+def test_native_screening_batch_counter_replay_includes_in_batch_cache_hits() -> None:
+    screening_codes = np.zeros((2, 16), dtype="<i8")
+    screening_codes[:, 0] = 1
+
+    def transaction_event(*, statuses: tuple[int, int]) -> dict[str, object]:
+        cache_hits = sum(status == 2 for status in statuses)
+        event_codes = screening_codes.copy()
+        for index, status in enumerate(statuses):
+            if status == 2:
+                event_codes[index, 0] = 0
+                event_codes[index, 1] = 2
+        event: dict[str, object] = {
+            "event_type": "native_candidate_transaction",
+            "status": "committed",
+            "benchmark_axis": "fixed_work",
+            "input_candidates": 2,
+            "candidates": [["C1"], ["C2"]],
+            "exact_budget": 2,
+            "budget_skips": 0,
+            "cache_hits": 0,
+            "exact_misses": 2 - cache_hits,
+            "iteration": 1,
+            "lane": "legacy",
+            "operator": "route_merge",
+            "screening_passes": 2 - cache_hits,
+            "screening_rejections": 0,
+            "screening_cache_hits": cache_hits,
+            "screening_exact_call_blocked": cache_hits,
+            "screening_reason_counts": (
+                {"capacity_prefilter": cache_hits} if cache_hits else {}
+            ),
+            "screening_integrity_evidence": {
+                "candidate_ids_le_hex": np.array([0, 1], dtype="<i8").tobytes().hex(),
+                "statuses_le_hex": np.array(statuses, dtype="<i8").tobytes().hex(),
+                "duplicate_of_le_hex": np.array([-1, -1], dtype="<i8").tobytes().hex(),
+                "codes_le_hex": event_codes.tobytes().hex(),
+                "metrics_le_hex": np.zeros((2, 15), dtype="<f8").tobytes().hex(),
+                "route_offsets_le_hex": np.array([0, 1, 2], dtype="<i8").tobytes().hex(),
+                "route_indices_le_hex": np.array([1, 2], dtype="<i8").tobytes().hex(),
+                "counters_le_hex": np.array(
+                    [2, 2, 0, cache_hits, 2 - cache_hits],
+                    dtype="<i8",
+                )
+                .tobytes()
+                .hex(),
+            },
+        }
+        screening_hash, transaction_hash = _recompute_transaction_hashes(event)
+        event["screening_pool_hash"] = screening_hash
+        event["transaction_sha256"] = transaction_hash
+        return event
+
+    replayed = _recompute_native_screening_batch_counters(
+        [
+            transaction_event(statuses=(0, 0)),
+            transaction_event(statuses=(0, 2)),
+        ]
+    )
+
+    assert replayed == {
+        "fixed_work": {
+            "batch_candidates": 4,
+            "batch_cache_hits": 1,
+            "batch_invocations": 2,
+            "occupancies": [2, 2],
+        }
+    }
+    assert (
+        _expected_native_screening_invocations(
+            {
+                "screening_calls": 3448,
+                "screening_cache_hits": 1101,
+                "native_screening_batch_candidates": 4,
+                "native_screening_batch_invocations": 2,
+                "native_screening_batch_occupancies": [2, 2],
+            },
+            replayed["fixed_work"],
+        )
+        == 2346
+    )
+
+    tampered = transaction_event(statuses=(0, 2))
+    tampered["screening_cache_hits"] = 0
+    with pytest.raises(ArtifactIntegrityError, match="aggregate does not replay"):
+        _recompute_native_screening_batch_counters([tampered])
+    inconsistent_counters = transaction_event(statuses=(0, 2))
+    inconsistent_counters["screening_integrity_evidence"]["counters_le_hex"] = np.array(
+        [2, 1, 1, 0, 1],
+        dtype="<i8",
+    ).tobytes().hex()
+    with pytest.raises(ArtifactIntegrityError, match="status counts"):
+        _recompute_native_screening_batch_counters([inconsistent_counters])
+    duplicate_event = transaction_event(statuses=(0, 0))
+    duplicate_event["candidates"] = [["C1"], ["C1"]]
+    duplicate_event["exact_misses"] = 1
+    duplicate_evidence = duplicate_event["screening_integrity_evidence"]
+    duplicate_evidence["statuses_le_hex"] = np.array([0, 1], dtype="<i8").tobytes().hex()
+    duplicate_evidence["duplicate_of_le_hex"] = np.array([-1, 0], dtype="<i8").tobytes().hex()
+    duplicate_evidence["route_indices_le_hex"] = np.array([1, 1], dtype="<i8").tobytes().hex()
+    duplicate_evidence["counters_le_hex"] = np.array(
+        [2, 1, 1, 0, 1],
+        dtype="<i8",
+    ).tobytes().hex()
+    screening_hash, transaction_hash = _recompute_transaction_hashes(duplicate_event)
+    duplicate_event["screening_pool_hash"] = screening_hash
+    duplicate_event["transaction_sha256"] = transaction_hash
+    assert _recompute_native_screening_batch_counters([duplicate_event])["fixed_work"][
+        "batch_candidates"
+    ] == 2
+    duplicate_evidence["duplicate_of_le_hex"] = np.array(
+        [-1, -1],
+        dtype="<i8",
+    ).tobytes().hex()
+    with pytest.raises(ArtifactIntegrityError, match="duplicate identity"):
+        _recompute_native_screening_batch_counters([duplicate_event])
+    missing_duplicate_marker = transaction_event(statuses=(0, 0))
+    missing_duplicate_marker["candidates"] = [["C1"], ["C1"]]
+    missing_duplicate_marker["screening_integrity_evidence"][
+        "route_indices_le_hex"
+    ] = np.array([1, 1], dtype="<i8").tobytes().hex()
+    with pytest.raises(ArtifactIntegrityError, match="repeated candidate"):
+        _recompute_native_screening_batch_counters([missing_duplicate_marker])
+    with pytest.raises(ArtifactIntegrityError, match="scalar counters are invalid"):
+        _expected_native_screening_invocations(
+            {
+                "screening_calls": 1,
+                "screening_cache_hits": 2,
+            },
+            None,
+        )
+
+
 def test_native_ablation_replays_batched_screening_bytes_and_lane_deadlines() -> None:
     screening_codes = np.zeros((2, 16), dtype="<i8")
     screening_codes[:, 0] = 1
@@ -2244,7 +2378,10 @@ def test_native_ablation_replays_batched_screening_bytes_and_lane_deadlines() ->
         require_transaction=False,
         require_batched_screening=True,
     )
-    assert "batched screening hash recomputation failed" in failures
+    assert failures == [
+        "batched screening evidence is invalid: "
+        "transaction screening counters do not match candidate status counts"
+    ]
 
     same_lane = copy.deepcopy(records)
     same_lane["trace_events"][1]["lane"] = "legacy"
@@ -3907,6 +4044,79 @@ def test_stage052_runtime_identity_binds_wheel_python_native_and_dependencies(
             manifest,
             expected_repository_revision="a" * 40,
         )
+
+
+def test_stage052_reviewer_replays_the_receipt_bound_producer_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    producer_source = tmp_path / "sealed-producer"
+    reviewer_source = tmp_path / "reviewer-worktree"
+    producer_source.mkdir()
+    reviewer_source.mkdir()
+    (reviewer_source / ".ruff_cache").mkdir()
+    receipt = tmp_path / "review_execution.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "producer_source_directory": str(producer_source),
+                "working_directory": str(reviewer_source),
+                "reviewer_working_directory": str(reviewer_source),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("STAGE052_REVIEW_EXECUTION_RECEIPT", str(receipt))
+    monkeypatch.setattr(stage052_review, "find_repository_root", lambda: reviewer_source)
+
+    source_identity = {
+        "repository_revision": "a" * 40,
+        "mount": {"filesystem": "ext4"},
+        "tracked_file_count": 1,
+        "allowed_untracked_sha256": {},
+        "read_only": True,
+    }
+
+    def verify_source(root: Path) -> dict[str, object]:
+        assert root == producer_source
+        return source_identity
+
+    def verify_runtime(root: Path, revision: str) -> dict[str, object]:
+        assert root == producer_source
+        assert revision == "a" * 40
+        return {"wheel_sha256": "b" * 64}
+
+    monkeypatch.setattr(stage052_review, "verify_stage052_source_snapshot", verify_source)
+    monkeypatch.setattr(
+        stage052_review,
+        "_verify_frozen_producer_runtime_identity",
+        verify_runtime,
+    )
+
+    passed, detail = stage052_review._validate_stage052_source_snapshot(
+        {"source_snapshot": source_identity}
+    )
+    assert passed, detail
+    passed, detail = stage052_review._validate_stage052_runtime_identity(
+        {
+            "repository_revision": "a" * 40,
+            "runtime_identity": {"wheel_sha256": "b" * 64},
+        }
+    )
+    assert passed, detail
+    receipt.write_text(
+        json.dumps(
+            {
+                "working_directory": str(producer_source),
+                "reviewer_working_directory": str(reviewer_source),
+            }
+        ),
+        encoding="utf-8",
+    )
+    passed, detail = stage052_review._validate_stage052_source_snapshot(
+        {"source_snapshot": source_identity}
+    )
+    assert passed, detail
 
 
 def test_review_runtime_machine_comparison_excludes_only_wsl_memory_limit() -> None:

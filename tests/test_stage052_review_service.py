@@ -86,6 +86,10 @@ def test_review_service_config_preserves_separate_producer_source(
     replayed = ReviewServiceConfig.from_dict(config.to_dict())
     assert replayed.producer_source_directory == producer_source
     assert replayed.working_directory == config.working_directory
+    receipt = review_service._initial_receipt(config)
+    assert receipt["producer_source_directory"] == str(producer_source.resolve())
+    assert receipt["working_directory"] == str(producer_source.resolve())
+    assert receipt["reviewer_working_directory"] == str(config.working_directory.resolve())
 
 
 def test_review_service_config_binds_exact_pilot_memory_contract(
