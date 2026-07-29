@@ -1984,3 +1984,24 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   identity 仍严格相等；仅使用既有的 WSL review-memory normalization 排除该动态
   telemetry，CPU/GPU/OS 等硬件漂移仍会 fail fast。F19 evidence 不回写，修复使用
   新 commit、wheel 和 attempt label。
+
+## 2026-07-29：F20 accepted 与 G Pilot93 prerequisite role 修复
+
+- `stage05.2_accelerator_pilot_attempt20` 在 clean commit
+  `c0ded60b1a5dfc6e18852e8ca8c93a0bb14be745` 上完成 decision-only evidence；
+  raw manifest SHA-256 为
+  `7a2c06966eafa1fe711a534faa5c4c5fd2bd61328c81d2f01db143f9c89bd09e`。
+  独立 reviewer 完整退出并通过全部 gate，review manifest SHA-256 为
+  `5633f04744cbfda5e0472441d008fec5de9a1b6f94652a13865864843cdcc24e`，
+  status 为 `READY_FOR_STAGE052_BENCHMARK`。最终 accelerator decision 为
+  `GPU_NOT_JUSTIFIED`，occupancy median `25.5 < 32`，Stage 5.2 保留 native CPU。
+- `stage05.2_benchmark_attempt93` 在任何 shard 启动前 fail fast，错误为
+  `KeyError: 'accepted_pilot'`；host exit 1、producer/controller log 与可能生成的
+  partial startup evidence 保留，label 不复用。
+- 根因是 benchmark campaign implementation 将 Pilot 错误映射到未定义的
+  `accepted_pilot` role，并要求 Pilot predecessor 已经是
+  `READY_FOR_STAGE052_FORMAL_BENCHMARK`；这把 Formal 的 predecessor contract
+  错套到了 Pilot。修复后的唯一映射为：Pilot 使用
+  `accelerator_selection` / performance / `READY_FOR_STAGE052_BENCHMARK`，Formal
+  使用 `campaign_pilot` / pilot / `READY_FOR_STAGE052_FORMAL_BENCHMARK`。
+  新 Pilot 使用新 commit、wheel、snapshot 和 label。

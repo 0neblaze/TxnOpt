@@ -1087,6 +1087,24 @@ def _run_benchmark_campaign(
         raise
 
 
+def _benchmark_prerequisite_binding(scope: str) -> tuple[str, str, str]:
+    """Map each benchmark scope to its contract role and accepted review identity."""
+
+    if scope == "pilot":
+        return (
+            "accelerator_selection",
+            "performance",
+            "READY_FOR_STAGE052_BENCHMARK",
+        )
+    if scope == "formal":
+        return (
+            "campaign_pilot",
+            "pilot",
+            "READY_FOR_STAGE052_FORMAL_BENCHMARK",
+        )
+    raise ValueError(f"unsupported benchmark scope: {scope}")
+
+
 def _run_benchmark_campaign_impl(
     *,
     root: Path,
@@ -1104,14 +1122,8 @@ def _run_benchmark_campaign_impl(
 ) -> dict[str, Path]:
     """Execute G01/G02 as immutable, archived batches rather than one task fan-out."""
 
-    prerequisite_role = "accepted_pilot" if scope == "pilot" else "campaign_pilot"
+    prerequisite_role, expected_scope, expected_status = _benchmark_prerequisite_binding(scope)
     prerequisite_dir = resolved_prerequisite_dirs[prerequisite_role]
-    expected_scope = "pilot"
-    expected_status = (
-        "READY_FOR_STAGE052_FORMAL_BENCHMARK"
-        if scope == "pilot"
-        else "READY_FOR_STAGE052_FORMAL_BENCHMARK"
-    )
     selection_lock = load_benchmark_execution_lock(
         prerequisite_dir,
         expected_scope=expected_scope,

@@ -463,6 +463,16 @@ def test_stage052_contract_requires_accelerator_selection_then_new_pilot() -> No
         == formal.screening_schema_version
         == ("screening_decisions_v3")
     )
+    assert stage052_performance._benchmark_prerequisite_binding("pilot") == (
+        "accelerator_selection",
+        "performance",
+        "READY_FOR_STAGE052_BENCHMARK",
+    )
+    assert stage052_performance._benchmark_prerequisite_binding("formal") == (
+        "campaign_pilot",
+        "pilot",
+        "READY_FOR_STAGE052_FORMAL_BENCHMARK",
+    )
 
 
 def test_stage052_storage_amendment_contract_binds_current_predecessor() -> None:

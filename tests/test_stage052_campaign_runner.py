@@ -2576,8 +2576,8 @@ def _run_patched_pilot(
             worker_count=4,
             config=config,
             stage051_prerequisite={"status": "READY_FOR_STAGE05_2"},
-            component_prerequisites={"accepted_pilot": {"status": "accepted"}},
-            resolved_prerequisite_dirs={"accepted_pilot": prerequisite_dir},
+            component_prerequisites={"accelerator_selection": {"status": "accepted"}},
+            resolved_prerequisite_dirs={"accelerator_selection": prerequisite_dir},
             storage=config.v2_storage,
         )
 
