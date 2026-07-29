@@ -1656,3 +1656,43 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   deep module 和 reviewer 共用这组 fail-fast 语义，防止内部代数恒等但逐行
   自相矛盾的 native evidence 被接受。下一次运行必须使用新 commit、wheel、
   read-only snapshot 和 attempt21 label。
+
+## 2026-07-29：E21/E22 启动前拒绝、E23 batch replay 复核修复
+
+- `stage05.2_native_kernels_attempt21` 在创建 shard 前由 canonical output-path
+  preflight 拒绝：launcher 把 staging root 而非完整 run-label directory 传给
+  `--output-dir`。`stage05.2_native_kernels_attempt22` 同样在创建 shard 前拒绝：
+  launcher 未传显式 `stage05.2_job_parallel_attempt21` worker-selection
+  prerequisite。两个 label 均已消费，分别保留 `control/launch_failure.json`；
+  E22 另保留 producer log。没有 shard、raw artifact 或签名 manifest 被复用。
+- `stage05.2_native_kernels_attempt23` 使用 clean commit `e2841d6`、producer wheel
+  SHA-256
+  `919151faa8a6caffd33463a697ebe476596cb8f4cd0f8a4330313aa1fe5cefbb`
+  和只读 ext4 producer source snapshot 完成 12/12 shards、36/36 axes，failure
+  count 为零。独立 reviewer wheel SHA-256 为
+  `41dbf4361873c9fc8e029eec94bf6b1743578af2bb19ce3e1a0ce66ed202d2a2`；
+  transient `systemd --user` review 完整结束，finalized receipt 记录 exit 0、
+  raw manifest 未变化、cgroup memory peak 5,369,589,760 bytes、swap 0。
+- E23 独立复核为 `NOT_READY`。scope、job-parallel selection、optimization
+  profile、persistence attribution/ratio、prerequisite、replay consistency、
+  resource、runtime/source snapshot 和 staging gates 全部通过；唯一失败 gate
+  为 `native_execution`，detail 为 `native screening batch evidence is missing`。
+  该结果保持不可变，不重写、不作为 promotion evidence。
+- 根因是 reviewer 的两项 replay 语义错误，而非 E23 raw evidence 缺失。第一，
+  C5 控制轴合法声明零 batch 为 `0/0/[]`，reviewer 却把非 `None` 的零值误判成
+  必须存在 transaction event。第二，Stage 5.2 持久化流水线按协议把 lane 改写为
+  `benchmark_axis:original_lane`，transaction SHA-256 则绑定改写前的 original
+  lane；reviewer 未先验证并移除 axis prefix，因而会误拒绝真实 batch hash。
+- 修复后，零 batch 仅在 recorded counters 精确为 `0/0/[]` 且不存在 transaction
+  event 时接受；存在任意 event 仍作为 undeclared evidence 失败。对 transaction，
+  reviewer 要求持久化 lane 具有精确 axis prefix，移除一次 prefix 后再重算原始
+  transaction SHA-256；original lane 只允许 producer 可生成的 `legacy`、
+  `quality_shadow`、`constraint_lane` 或 `initialization`，空 lane、重复 axis prefix
+  与其他 lane 均 fail fast。使用修复后的 checkout 对 E23 已签名 Parquet 做只读
+  诊断，12 个 shard 的 36 个轴全部通过 ABI-v2 bytes、hash、occupancy 与 native
+  invocation counter 对账；此诊断不改变 E23 的 immutable `NOT_READY` status。
+- 新回归测试覆盖零 batch 与 persisted lane normalization。editable native wheel
+  重建成功；focused replay/publication suites 通过；完整 pytest 为 897 passed；
+  Ruff、70 个 source files 的 strict mypy 与 `git diff --check` 全部通过。修复经
+  两路独立只读代码复核后形成新 commit；后续性能证据必须使用新 wheel、只读
+  source snapshot 和 attempt24 label。

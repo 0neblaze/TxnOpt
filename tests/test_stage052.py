@@ -2200,11 +2200,12 @@ def test_native_screening_batch_counter_replay_includes_in_batch_cache_hits() ->
         event["transaction_sha256"] = transaction_hash
         return event
 
+    first_persisted = transaction_event(statuses=(0, 0))
+    second_persisted = transaction_event(statuses=(0, 2))
+    first_persisted["lane"] = "fixed_work:legacy"
+    second_persisted["lane"] = "fixed_work:legacy"
     replayed = _recompute_native_screening_batch_counters(
-        [
-            transaction_event(statuses=(0, 0)),
-            transaction_event(statuses=(0, 2)),
-        ]
+        [first_persisted, second_persisted]
     )
 
     assert replayed == {
@@ -2228,12 +2229,41 @@ def test_native_screening_batch_counter_replay_includes_in_batch_cache_hits() ->
         )
         == 2346
     )
+    assert (
+        _expected_native_screening_invocations(
+            {
+                "screening_calls": 12,
+                "screening_cache_hits": 5,
+                "native_screening_batch_candidates": 0,
+                "native_screening_batch_invocations": 0,
+                "native_screening_batch_occupancies": [],
+            },
+            None,
+        )
+        == 7
+    )
+    rolled_back = transaction_event(statuses=(0, 0))
+    rolled_back["status"] = "rolled_back"
+    rolled_back["lane"] = "malformed"
+    with pytest.raises(ArtifactIntegrityError, match="not committed"):
+        _recompute_native_screening_batch_counters([rolled_back])
+    for malformed_lane in (
+        "fixed_work:",
+        "fixed_work:fixed_work:legacy",
+        "wall_clock_30:legacy",
+    ):
+        malformed = transaction_event(statuses=(0, 0))
+        malformed["lane"] = malformed_lane
+        with pytest.raises(ArtifactIntegrityError, match="lane"):
+            _recompute_native_screening_batch_counters([malformed])
 
     tampered = transaction_event(statuses=(0, 2))
+    tampered["lane"] = "fixed_work:legacy"
     tampered["screening_cache_hits"] = 0
     with pytest.raises(ArtifactIntegrityError, match="aggregate does not replay"):
         _recompute_native_screening_batch_counters([tampered])
     inconsistent_counters = transaction_event(statuses=(0, 2))
+    inconsistent_counters["lane"] = "fixed_work:legacy"
     inconsistent_counters["screening_integrity_evidence"]["counters_le_hex"] = np.array(
         [2, 1, 1, 0, 1],
         dtype="<i8",
@@ -2254,6 +2284,7 @@ def test_native_screening_batch_counter_replay_includes_in_batch_cache_hits() ->
     screening_hash, transaction_hash = _recompute_transaction_hashes(duplicate_event)
     duplicate_event["screening_pool_hash"] = screening_hash
     duplicate_event["transaction_sha256"] = transaction_hash
+    duplicate_event["lane"] = "fixed_work:legacy"
     assert _recompute_native_screening_batch_counters([duplicate_event])["fixed_work"][
         "batch_candidates"
     ] == 2
@@ -2264,6 +2295,7 @@ def test_native_screening_batch_counter_replay_includes_in_batch_cache_hits() ->
     with pytest.raises(ArtifactIntegrityError, match="duplicate identity"):
         _recompute_native_screening_batch_counters([duplicate_event])
     missing_duplicate_marker = transaction_event(statuses=(0, 0))
+    missing_duplicate_marker["lane"] = "fixed_work:legacy"
     missing_duplicate_marker["candidates"] = [["C1"], ["C1"]]
     missing_duplicate_marker["screening_integrity_evidence"][
         "route_indices_le_hex"

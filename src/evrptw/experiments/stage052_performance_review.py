@@ -4409,15 +4409,34 @@ def _recompute_native_screening_batch_counters(
 
     replayed: dict[str, dict[str, object]] = {}
     for event in events:
-        if (
-            event.get("event_type") != "native_candidate_transaction"
-            or event.get("status") != "committed"
-        ):
+        if event.get("event_type") != "native_candidate_transaction":
             continue
+        if event.get("status") != "committed":
+            raise ArtifactIntegrityError(
+                "native candidate transaction is not committed"
+            )
         axis = event.get("benchmark_axis")
         if not isinstance(axis, str) or not axis:
             raise ArtifactIntegrityError("native candidate transaction lacks its benchmark axis")
-        screening_hash, transaction_hash = _recompute_transaction_hashes(event)
+        persisted_lane = event.get("lane")
+        lane_prefix = f"{axis}:"
+        if not isinstance(persisted_lane, str) or not persisted_lane.startswith(lane_prefix):
+            raise ArtifactIntegrityError(
+                "native candidate transaction lacks its persisted axis lane prefix"
+            )
+        original_lane = persisted_lane.removeprefix(lane_prefix)
+        if original_lane not in {
+            "legacy",
+            "quality_shadow",
+            "constraint_lane",
+            "initialization",
+        }:
+            raise ArtifactIntegrityError(
+                "native candidate transaction has an invalid original lane"
+            )
+        transaction_event = dict(event)
+        transaction_event["lane"] = original_lane
+        screening_hash, transaction_hash = _recompute_transaction_hashes(transaction_event)
         if (
             event.get("screening_pool_hash") != screening_hash
             or event.get("transaction_sha256") != transaction_hash
@@ -4484,8 +4503,6 @@ def _expected_native_screening_invocations(
         return screening_calls - screening_cache_hits
     if any(value is None for value in raw_batch_fields):
         raise ArtifactIntegrityError("native screening batch counters are incomplete")
-    if replayed_batch is None:
-        raise ArtifactIntegrityError("native screening batch evidence is missing")
     recorded_batch_candidates = _strict_int(
         raw_batch_fields[0],
         "native_screening_batch_candidates",
@@ -4501,6 +4518,16 @@ def _expected_native_screening_invocations(
         _strict_int(value, "native_screening_batch_occupancy")
         for value in raw_batch_occupancies
     ]
+    if (
+        recorded_batch_candidates == 0
+        and recorded_batch_invocations == 0
+        and not recorded_batch_occupancies
+    ):
+        if replayed_batch is not None:
+            raise ArtifactIntegrityError("undeclared native screening batch evidence exists")
+        return screening_calls - screening_cache_hits
+    if replayed_batch is None:
+        raise ArtifactIntegrityError("native screening batch evidence is missing")
     batch_candidates = _strict_int(
         replayed_batch.get("batch_candidates"),
         "batch_candidates",
