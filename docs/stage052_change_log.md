@@ -1696,3 +1696,24 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   Ruff、70 个 source files 的 strict mypy 与 `git diff --check` 全部通过。修复经
   两路独立只读代码复核后形成新 commit；后续性能证据必须使用新 wheel、只读
   source snapshot 和 attempt24 label。
+
+## 2026-07-29：E24 producer 完成、review launch 参数面拒绝
+
+- `stage05.2_native_kernels_attempt24` 使用 clean commit `d925645`、producer wheel
+  SHA-256
+  `01d294e2e816e81663f96c3ea1972482e37c5ed48bec75305216ce1a573128b1`
+  和只读 ext4 source snapshot 完成 12/12 shards、36/36 axes；36 个 validator
+  全部通过，failure status 为零。Windows Scheduled Task host run 为
+  `20260729T092055Z-420`，launch nonce 为
+  `356e168f2f54474c80b39b66d8523d4b`；producer manifest SHA-256 为
+  `72d91eb6e294b4160ec6b2cf41feb41612ffcd4a4cc4c4803b77dd20197b29a6`。
+- 独立 review service 在进入 raw replay 前 fail fast。launcher 错误地向 performance
+  reviewer 传入 review-calibration contract，service 因而追加该 CLI 不支持的
+  `--review-workers 4` 与 `--review-memory-contract`，argparse exit code 为 2。
+  finalized execution receipt 记录 status `failed`、raw manifest 前后 SHA-256
+  相同、cgroup peak 78,864,384 bytes、swap 0；没有 review generation 或
+  review manifest 被写入。
+- E24 按失败即消费 label 的规则保留，不在同一 label 重试，也不进入 promotion。
+  根因属于 launcher 参数面，不改变 producer/reviewer 科学代码。下一次 review
+  service 只使用 performance reviewer 已验证的 5.5-GiB process guard 参数面；
+  新证据必须从新 commit、wheel、read-only snapshot 和 attempt25 label 生成。
