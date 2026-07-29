@@ -159,6 +159,8 @@ def _verify_review_storage_migration(
         locator=locator,
         volume_probe=volume_probe,
     )
+
+
 FORMAL_SEEDS = tuple(range(2014, 2024))
 PILOT_SEEDS = (2014, 2015, 2016)
 LEGACY_CAMPAIGN_REVIEW_SCHEMA = "stage05.2-campaign-review-v1"
@@ -236,21 +238,15 @@ def _batch_shard_artifact_replay_gate(
     else:
         bound_passed = False
         bound_detail = (
-            "campaign does not bind exactly one signed producer "
-            "screening-definition store contract"
+            "campaign does not bind exactly one signed producer screening-definition store contract"
         )
     passed = not batch_failures and bound_passed
     return {
         "passed": passed,
         "detail": (
-            "campaign->batch->shard->raw/solution/trace/event replay passed; "
-            + bound_detail
+            "campaign->batch->shard->raw/solution/trace/event replay passed; " + bound_detail
             if passed
-            else (
-                "; ".join(batch_failures[:5])
-                if batch_failures
-                else bound_detail
-            )
+            else ("; ".join(batch_failures[:5]) if batch_failures else bound_detail)
         ),
     }
 
@@ -339,9 +335,7 @@ def validate_campaign_selection_lock(
     runtime = prerequisite_metadata.get("runtime_identity")
     provenance = prerequisite_metadata.get("performance_provenance")
     candidate_transaction = prerequisite_metadata.get("candidate_transaction_config")
-    review_candidate_transaction = prerequisite_review.get(
-        "candidate_transaction_configuration"
-    )
+    review_candidate_transaction = prerequisite_review.get("candidate_transaction_configuration")
     review_native = prerequisite_review.get("native_configuration")
     alternate_review_native = prerequisite_review.get("native_kernel_config")
     if review_native is None:
@@ -384,6 +378,8 @@ def validate_campaign_selection_lock(
         or prerequisite_review.get("selected_workers") != campaign_workers
     ):
         failures.append("selected worker count does not agree")
+    if campaign_workers != 6:
+        failures.append("current Stage 5.2 Benchmark campaign requires exactly 6 workers")
     if (
         campaign_native_profile != NATIVE_KERNEL_ABI_VERSION
         or not isinstance(native, Mapping)
@@ -479,9 +475,7 @@ def validate_campaign_selection_lock(
         "selected_workers": campaign_workers,
         "native_profile": campaign_native_profile,
         "candidate_transaction_config": dict(candidate_transaction),
-        "candidate_transaction_config_sha256": _canonical_sha256(
-            candidate_transaction
-        ),
+        "candidate_transaction_config_sha256": _canonical_sha256(candidate_transaction),
         "selected_optimization_profile": expected_profile,
         "accelerator_decision": accelerator_decision,
         "repository_revision": revision,
@@ -749,14 +743,12 @@ class _StreamedEventAuditAccumulator:
 
     def __init__(self, axis_budgets: Mapping[str, int]) -> None:
         if not axis_budgets or any(
-            not axis or not _is_int(budget) or budget <= 0
-            for axis, budget in axis_budgets.items()
+            not axis or not _is_int(budget) or budget <= 0 for axis, budget in axis_budgets.items()
         ):
             raise ValueError("axis_budgets must contain positive integer budgets")
         self._axis_budgets = dict(axis_budgets)
         self._states = {
-            axis: _AxisEventState(budget_seconds=budget)
-            for axis, budget in axis_budgets.items()
+            axis: _AxisEventState(budget_seconds=budget) for axis, budget in axis_budgets.items()
         }
         self._previous_event_id = 0
         self._count = 0
@@ -764,9 +756,7 @@ class _StreamedEventAuditAccumulator:
         self._observed_axes: set[str] = set()
         self._cache_keys: dict[str, set[str]] = {axis: set() for axis in axis_budgets}
         self._cache_misses: dict[str, set[str]] = {axis: set() for axis in axis_budgets}
-        self._completed_exact_keys: dict[str, set[str]] = {
-            axis: set() for axis in axis_budgets
-        }
+        self._completed_exact_keys: dict[str, set[str]] = {axis: set() for axis in axis_budgets}
         self._stopped = False
 
     def consume(self, event: Mapping[str, object]) -> None:
@@ -844,10 +834,7 @@ class _StreamedEventAuditAccumulator:
                 else:
                     self._cache_misses[axis].discard(digest)
                     self._completed_exact_keys[axis].add(digest)
-            if (
-                event.get("deadline_boundary")
-                or event.get("status") == "interrupted_deadline"
-            ):
+            if event.get("deadline_boundary") or event.get("status") == "interrupted_deadline":
                 state.deadline_seen = True
                 state.deadline_lanes.add(lane)
 
@@ -885,9 +872,7 @@ class _StreamedEventAuditAccumulator:
                     self._failures.append(f"candidate accepted after deadline on {axis}")
                 vehicle_delta = event.get("candidate_vehicle_delta")
                 if not _is_int(vehicle_delta) or vehicle_delta > 0:
-                    self._failures.append(
-                        f"accepted candidate increased vehicle count on {axis}"
-                    )
+                    self._failures.append(f"accepted candidate increased vehicle count on {axis}")
                 # Candidate timestamps include separately audited interleaved
                 # persistence. The solver budget pauses for those intervals, so
                 # the replayed lane-local deadline boundary is authoritative.
@@ -901,18 +886,14 @@ class _StreamedEventAuditAccumulator:
             if global_best:
                 state.global_bests += 1
                 if not accepted:
-                    self._failures.append(
-                        f"global best is not an accepted candidate on {axis}"
-                    )
+                    self._failures.append(f"global best is not an accepted candidate on {axis}")
                 route_keys = event.get("candidate_route_keys")
                 if (
                     not isinstance(route_keys, (list, tuple))
                     or not route_keys
                     or any(not isinstance(key, str) or not key for key in route_keys)
                 ):
-                    self._failures.append(
-                        f"global best lacks candidate route identity on {axis}"
-                    )
+                    self._failures.append(f"global best lacks candidate route identity on {axis}")
             self._cache_misses[axis].clear()
             self._completed_exact_keys[axis].clear()
 
@@ -930,7 +911,7 @@ class _StreamedEventAuditAccumulator:
     def finish(self) -> StreamedEventAudit:
         if self._observed_axes != set(self._axis_budgets):
             self._failures.append(
-            "event stream axis coverage mismatch: "
+                "event stream axis coverage mismatch: "
                 f"expected={sorted(self._axis_budgets)} "
                 f"observed={sorted(self._observed_axes)}"
             )
@@ -938,9 +919,7 @@ class _StreamedEventAuditAccumulator:
         completed = sum(state.exact_completed for state in self._states.values())
         if completed > started:
             self._failures.append("completed exact calls exceed started exact calls")
-        accepted_count = sum(
-            state.accepted_candidates for state in self._states.values()
-        )
+        accepted_count = sum(state.accepted_candidates for state in self._states.values())
         global_bests = sum(state.global_bests for state in self._states.values())
         return StreamedEventAudit(
             not self._failures,
@@ -954,13 +933,7 @@ class _StreamedEventAuditAccumulator:
             completed,
             accepted_count,
             global_bests,
-            tuple(
-                sorted(
-                    axis
-                    for axis, state in self._states.items()
-                    if state.deadline_seen
-                )
-            ),
+            tuple(sorted(axis for axis, state in self._states.items() if state.deadline_seen)),
             tuple(
                 (axis, state.exact_started, state.exact_completed)
                 for axis, state in sorted(self._states.items())
@@ -1116,13 +1089,10 @@ def _artifacts_for_directory(
 
 
 def _verify_producer_shard_scratch_cleanup(shard_directory: Path) -> None:
-    unexpected = sorted(
-        path.name for path in shard_directory.iterdir() if path.is_dir()
-    )
+    unexpected = sorted(path.name for path in shard_directory.iterdir() if path.is_dir())
     if unexpected:
         raise ArtifactIntegrityError(
-            "producer shard scratch cleanup left directories: "
-            + ", ".join(unexpected[:10])
+            "producer shard scratch cleanup left directories: " + ", ".join(unexpected[:10])
         )
 
 
@@ -1395,11 +1365,7 @@ def _pipeline_event_token_from_logical_row(
     raw_reason = get("reason")
     # Prepared v3 screening tuples hash the original empty reason string, while
     # expanded physical rows represent it as null.
-    reason = (
-        ""
-        if event_type == "screening_decision" and raw_reason is None
-        else raw_reason or None
-    )
+    reason = "" if event_type == "screening_decision" and raw_reason is None else raw_reason or None
     return (
         event_type,
         get("benchmark_axis"),
@@ -1475,9 +1441,7 @@ class _PipelineLedgerAccumulator:
             state.seen = 0
             state.hasher = hashlib.sha256()
         elif seen > expected_rows:
-            raise ArtifactIntegrityError(
-                f"persistence batch row count overflow: {axis}/{index}"
-            )
+            raise ArtifactIntegrityError(f"persistence batch row count overflow: {axis}/{index}")
         else:
             state.seen = seen
 
@@ -1523,9 +1487,7 @@ class _GlobalBestAccumulator:
     def __init__(self, axis_budgets: Mapping[str, int], *, instance: Instance) -> None:
         self._axis_budgets = dict(axis_budgets)
         self._instance = instance
-        self._last: dict[str, AcceptedGlobalBest | None] = {
-            axis: None for axis in axis_budgets
-        }
+        self._last: dict[str, AcceptedGlobalBest | None] = {axis: None for axis in axis_budgets}
         self._visible: dict[str, dict[int, AcceptedGlobalBest]] = {
             axis: {} for axis in axis_budgets
         }
@@ -1558,12 +1520,8 @@ class _GlobalBestAccumulator:
             raise ArtifactIntegrityError(
                 f"global-best event lacks complete candidate route identity on {axis}"
             )
-        candidate_sequences = [
-            _route_sequence_from_key(str(key)) for key in route_keys
-        ]
-        candidate_routes = [
-            _route_sequence_from_key(str(key)) for key in full_route_keys
-        ]
+        candidate_sequences = [_route_sequence_from_key(str(key)) for key in route_keys]
+        candidate_routes = [_route_sequence_from_key(str(key)) for key in full_route_keys]
         customer_names = {customer.name for customer in self._instance.customers}
         projected_sequences = [
             [node for node in route if node in customer_names] for route in candidate_routes
@@ -2205,12 +2163,8 @@ def _replay_shard_worker(
         if scratch_parent_raw
         else Path(tempfile.gettempdir()).resolve()
     )
-    if (
-        not scratch_parent.is_dir() or not os.access(scratch_parent, os.W_OK)
-    ):
-        raise RuntimeError(
-            f"Stage 5.2 review temporary root is not writable: {scratch_parent}"
-        )
+    if not scratch_parent.is_dir() or not os.access(scratch_parent, os.W_OK):
+        raise RuntimeError(f"Stage 5.2 review temporary root is not writable: {scratch_parent}")
     resolved_scratch = scratch_path.resolve()
     if resolved_scratch.parent != scratch_parent or resolved_scratch.exists():
         raise ArtifactIntegrityError("spawned shard scratch identity is invalid")
@@ -2377,9 +2331,7 @@ def _replay_batch_in_fresh_processes(
         else Path(tempfile.gettempdir()).resolve()
     )
     if not scratch_parent.is_dir() or not os.access(scratch_parent, os.W_OK):
-        raise RuntimeError(
-            f"Stage 5.2 review temporary root is not writable: {scratch_parent}"
-        )
+        raise RuntimeError(f"Stage 5.2 review temporary root is not writable: {scratch_parent}")
     scratch_by_id = {
         task.shard_id: scratch_parent
         / f"stage052-campaign-shard-{task.batch_id}-{task.shard_id}-{uuid.uuid4().hex}"
@@ -2449,9 +2401,7 @@ def _replay_batch_in_fresh_processes(
                         shard_id=task.shard_id,
                         parent_pid=os.getpid(),
                         parent_rss_bytes=parent.memory_info().rss,
-                        elapsed_seconds=(
-                            time.monotonic() - started_by_id[task.shard_id]
-                        ),
+                        elapsed_seconds=(time.monotonic() - started_by_id[task.shard_id]),
                         scratch_cleaned=scratch_cleaned,
                         scratch_cleanup_recovered=not scratch_path.exists(),
                         error_type=type(error).__name__,
@@ -2760,11 +2710,7 @@ def _validate_batch_resources(
         per_worker_limit = PER_WORKER_RSS_LIMIT_BYTES
         aggregate_limit = AGGREGATE_RSS_LIMIT_BYTES
         contract_source = "historical_fixed"
-    passed = (
-        worker_peak > 0
-        and worker_peak <= per_worker_limit
-        and aggregate <= aggregate_limit
-    )
+    passed = worker_peak > 0 and worker_peak <= per_worker_limit and aggregate <= aggregate_limit
     summary = {
         "configured_workers": workers,
         "owner_pids": list(owners),
@@ -2831,13 +2777,10 @@ def _validate_batch_metadata(
         except (OSError, subprocess.SubprocessError, RuntimeError):
             successor_runtime_match = False
         else:
-            successor_runtime_match = (
-                campaign_runtime_selection_sha256(
-                    runtime,
-                    storage_migration=storage_migration,
-                )
-                == selection_lock.get("runtime_selection_sha256")
-            )
+            successor_runtime_match = campaign_runtime_selection_sha256(
+                runtime,
+                storage_migration=storage_migration,
+            ) == selection_lock.get("runtime_selection_sha256")
     try:
         current_instance_hashes = _validated_instance_hashes(provenance)
     except ArtifactIntegrityError:
@@ -2852,14 +2795,11 @@ def _validate_batch_metadata(
         current_instance_hashes.get(str(instance)) == digest
         for instance, digest in locked_instance_hashes.items()
     )
-    locked_configuration_selection = selection_lock.get(
-        "configuration_selection_sha256"
-    )
+    locked_configuration_selection = selection_lock.get("configuration_selection_sha256")
     configuration_matches = (
         configuration_selection_sha256 == locked_configuration_selection
         if locked_configuration_selection is not None
-        else metadata.get("configuration_sha256")
-        == selection_lock.get("configuration_sha256")
+        else metadata.get("configuration_sha256") == selection_lock.get("configuration_sha256")
     )
     passed = (
         metadata.get("run_label") == campaign.run_label
@@ -2870,10 +2810,8 @@ def _validate_batch_metadata(
         and metadata.get("backend") == campaign.selected_exact_backend == "cpu_batch"
         and metadata.get("worker_count") == campaign.selected_workers
         and metadata.get("producer_resource_contract") == expected_producer_contract
-        and selection_lock.get("producer_resource_contract")
-        == expected_producer_contract
-        and metadata.get("worker_process_lifecycle")
-        == "one_shard_per_spawned_process"
+        and selection_lock.get("producer_resource_contract") == expected_producer_contract
+        and metadata.get("worker_process_lifecycle") == "one_shard_per_spawned_process"
         and metadata.get("worker_runtime_warmup") == "in_memory_arrow_zstd1"
         and metadata.get("native_profile") == campaign.native_profile
         and metadata.get("storage_policy_version") == campaign.storage_policy_version
@@ -3757,8 +3695,7 @@ def _expected_rolling_capacity_required(
     for alias in archive_root_aliases:
         volume = campaign.storage_roots[alias]
         reserve = (
-            config.external_safety_reserve_bytes
-            + config.external_active_workspace_bytes
+            config.external_safety_reserve_bytes + config.external_active_workspace_bytes
             if volume.device_uuid == staging_device
             else config.internal_safety_reserve_bytes
         )
@@ -3777,8 +3714,7 @@ def _expected_rolling_capacity_required(
         staging_required = config.external_safety_reserve_bytes
         if future:
             staging_required = (
-                config.external_safety_reserve_bytes
-                + config.external_active_workspace_bytes
+                config.external_safety_reserve_bytes + config.external_active_workspace_bytes
                 if target == staging_device
                 else max(
                     config.external_safety_reserve_bytes,
@@ -3854,18 +3790,14 @@ def _verify_accelerator_prerequisite(
         )
     if campaign.producer_resource_contract is None:
         raise ArtifactIntegrityError("successor Pilot lacks its producer resource contract")
-    selection_lock = accepted.with_producer_resource_contract(
-        campaign.producer_resource_contract
-    )
+    selection_lock = accepted.with_producer_resource_contract(campaign.producer_resource_contract)
     selection_lock.update(
         {
             "accepted_pilot_review_manifest_sha256": identity.review_manifest_sha256,
             "accelerator_review_manifest_sha256": accelerator_review_sha256,
             "accelerator_decision": review.get("accelerator_decision"),
             "native_profile": campaign.native_profile,
-            "selected_optimization_profile": review.get(
-                "selected_optimization_profile"
-            ),
+            "selected_optimization_profile": review.get("selected_optimization_profile"),
         }
     )
     if (
@@ -3874,8 +3806,7 @@ def _verify_accelerator_prerequisite(
         or accepted.repository_revision != identity.repository_revision
         or accepted.selected_backend != campaign.selected_backend
         or accepted.selected_exact_backend != campaign.selected_exact_backend
-        or campaign.selected_workers
-        != campaign.producer_resource_contract.selected_workers
+        or campaign.selected_workers != campaign.producer_resource_contract.selected_workers
         or selection_lock.get("selected_workers") != campaign.selected_workers
         or selection_lock.get("native_kernel_config") is None
         or campaign.native_profile != NATIVE_KERNEL_ABI_VERSION
@@ -3898,8 +3829,7 @@ def _verify_campaign_review_prerequisite(
     payload = _json_object(path)
     if payload.get("schema_version") not in SUPPORTED_CAMPAIGN_REVIEW_SCHEMAS:
         raise ArtifactIntegrityError(
-            "accepted pilot review schema mismatch: "
-            f"{payload.get('schema_version')!r}"
+            f"accepted pilot review schema mismatch: {payload.get('schema_version')!r}"
         )
     expected = {
         "run_label": raw_dir.name,
@@ -3950,12 +3880,15 @@ def _verify_campaign_review_prerequisite(
         if pilot_campaign.producer_resource_contract is not None
         else None
     )
+    allowed_workers = (
+        {6} if payload.get("schema_version") == CAMPAIGN_REVIEW_SCHEMA else {2, 4, 5, 6}
+    )
     if (
         not isinstance(selection, Mapping)
         or expected_backend is None
         or payload.get("selected_backend") != expected_backend
         or payload.get("selected_exact_backend") != "cpu_batch"
-        or payload.get("selected_workers") not in {2, 4, 5, 6}
+        or payload.get("selected_workers") not in allowed_workers
         or payload.get("native_profile") != NATIVE_KERNEL_ABI_VERSION
         or not isinstance(native, Mapping)
         or payload.get("native_kernel_config") != native
@@ -4408,9 +4341,7 @@ def _audit_campaign(
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             migration_error = str(error)
     source_root = (
-        repository_root()
-        if producer_source_dir is None
-        else producer_source_dir.resolve()
+        repository_root() if producer_source_dir is None else producer_source_dir.resolve()
     )
     try:
         current_source_snapshot = verify_stage052_source_snapshot(source_root)
@@ -4420,11 +4351,11 @@ def _audit_campaign(
     else:
         observed_source_snapshot = standard_metadata.get("source_snapshot")
         try:
-            source_passed = (
-                isinstance(observed_source_snapshot, Mapping)
-                and stage052_source_snapshot_contract(observed_source_snapshot)
-                == stage052_source_snapshot_contract(current_source_snapshot)
-            )
+            source_passed = isinstance(
+                observed_source_snapshot, Mapping
+            ) and stage052_source_snapshot_contract(
+                observed_source_snapshot
+            ) == stage052_source_snapshot_contract(current_source_snapshot)
         except RuntimeError:
             source_passed = False
         gates["source_snapshot"] = {
@@ -4496,13 +4427,10 @@ def _audit_campaign(
                 migration_payload is not None
                 and migration_payload.get("archive_root_alias") == alias
                 and migration_payload.get("source_volume") == expected.to_dict()
-                and migration_payload.get("destination_volume")
-                == configured.volume.to_dict()
+                and migration_payload.get("destination_volume") == configured.volume.to_dict()
                 and observed == configured.volume
             )
-            if not migrated_alias and (
-                configured.volume != expected or observed != expected
-            ):
+            if not migrated_alias and (configured.volume != expected or observed != expected):
                 root_failures.append(alias)
         except (ArtifactIntegrityError, KeyError, OSError, RuntimeError):
             root_failures.append(alias)
@@ -4679,13 +4607,11 @@ def _audit_campaign(
                     raise ArtifactIntegrityError(
                         "batch configuration artifact does not match metadata"
                     )
-                configuration_selection_sha256 = (
-                    campaign_configuration_selection_sha256(config_path.read_bytes())
+                configuration_selection_sha256 = campaign_configuration_selection_sha256(
+                    config_path.read_bytes()
                 )
             else:
-                configuration_selection_sha256 = str(
-                    selection_lock.get("configuration_sha256", "")
-                )
+                configuration_selection_sha256 = str(selection_lock.get("configuration_sha256", ""))
             metadata_ok, metadata_detail, metadata_identity = _validate_batch_metadata(
                 metadata,
                 campaign=campaign,
@@ -4698,9 +4624,7 @@ def _audit_campaign(
                 raise ArtifactIntegrityError(metadata_detail)
             definition_store = metadata.get("screening_definition_store")
             if not isinstance(definition_store, Mapping):
-                raise ArtifactIntegrityError(
-                    "batch screening-definition store contract is missing"
-                )
+                raise ArtifactIntegrityError("batch screening-definition store contract is missing")
             producer_backend = definition_store.get("producer_backend")
             overflow_policy = definition_store.get("overflow_policy")
             spill_backend = definition_store.get("spill_backend")
@@ -4708,9 +4632,7 @@ def _audit_campaign(
                 isinstance(value, str)
                 for value in (producer_backend, overflow_policy, spill_backend)
             ):
-                raise ArtifactIntegrityError(
-                    "batch screening-definition store policy is invalid"
-                )
+                raise ArtifactIntegrityError("batch screening-definition store policy is invalid")
             screening_definition_store_contracts.add(
                 (
                     _strict_int(
@@ -4850,9 +4772,7 @@ def _audit_campaign(
                         "canonical_merge_ordinal": merge_ordinal,
                         "replay_backend": FORMAL_REPLAY_BACKEND,
                         "review_workers": review_workers,
-                        "maximum_in_flight_shards": min(
-                            review_workers, len(prepared_shards)
-                        ),
+                        "maximum_in_flight_shards": min(review_workers, len(prepared_shards)),
                         "elapsed_seconds": elapsed_seconds,
                         "logical_events": spawned_replay.logical_events,
                         "events_per_second": events_per_second,
@@ -4863,9 +4783,7 @@ def _audit_campaign(
                 replay = spawned_replay.replay_rows
                 checkpoints = spawned_replay.checkpoints
                 logical_events = spawned_replay.logical_events
-                screening_definition_row_counts.append(
-                    spawned_replay.screening_definition_rows
-                )
+                screening_definition_row_counts.append(spawned_replay.screening_definition_rows)
                 event_rows += logical_events
                 evidence.checkpoint_rows.extend(checkpoints)
                 for row in replay:
@@ -5087,16 +5005,15 @@ def _audit_campaign(
         "passed": len(observed_shard_ids) == expected_shards,
         "detail": f"observed {len(observed_shard_ids)} unique shards; expected {expected_shards}",
     }
-    storage_publication_passed = (
-        len(evidence.storage_publication_rows) == len(campaign.batches)
-        and all(
-            str(row.get("root_alias", "")) in campaign.storage_roots
-            and bool(str(row.get("relative_path", "")))
-            and _strict_int(row.get("file_count"), "file_count") > 0
-            and _strict_int(row.get("byte_count"), "byte_count") > 0
-            and _is_sha256(row.get("tree_sha256"))
-            for row in evidence.storage_publication_rows
-        )
+    storage_publication_passed = len(evidence.storage_publication_rows) == len(
+        campaign.batches
+    ) and all(
+        str(row.get("root_alias", "")) in campaign.storage_roots
+        and bool(str(row.get("relative_path", "")))
+        and _strict_int(row.get("file_count"), "file_count") > 0
+        and _strict_int(row.get("byte_count"), "byte_count") > 0
+        and _is_sha256(row.get("tree_sha256"))
+        for row in evidence.storage_publication_rows
     )
     gates["storage_publication_identity"] = {
         "passed": storage_publication_passed,
@@ -5105,9 +5022,7 @@ def _audit_campaign(
             "file/byte counts, and tree SHA-256"
         ),
     }
-    metric_shard_ids = {
-        str(row.get("shard_id", "")) for row in evidence.review_shard_metrics
-    }
+    metric_shard_ids = {str(row.get("shard_id", "")) for row in evidence.review_shard_metrics}
     replay_metrics_passed = (
         len(evidence.review_shard_metrics) == expected_shards
         and metric_shard_ids == observed_shard_ids
@@ -5417,24 +5332,17 @@ def _verified_prior_campaign_review_history(
     verify_stage052_review_files(campaign_dir, payload)
     raw_manifest_sha256 = _sha256(ArtifactReader(campaign_dir).result.manifest_path)
     campaign_manifest = campaign_dir / "campaign_manifest.json"
-    campaign_manifest_sha256 = (
-        _sha256(campaign_manifest) if campaign_manifest.is_file() else ""
-    )
+    campaign_manifest_sha256 = _sha256(campaign_manifest) if campaign_manifest.is_file() else ""
 
     def raw_binding_valid(review: Mapping[str, object]) -> bool:
         if review.get("raw_manifest_sha256") == raw_manifest_sha256:
             return True
         gates = review.get("gates")
-        replay_gate = (
-            gates.get("campaign_replay")
-            if isinstance(gates, Mapping)
-            else None
-        )
+        replay_gate = gates.get("campaign_replay") if isinstance(gates, Mapping) else None
         return (
             review.get("status") == NOT_READY
             and review.get("raw_manifest_sha256") == ""
-            and review.get("raw_campaign_manifest_sha256")
-            == campaign_manifest_sha256
+            and review.get("raw_campaign_manifest_sha256") == campaign_manifest_sha256
             and isinstance(replay_gate, Mapping)
             and replay_gate.get("passed") is False
         )
@@ -5443,8 +5351,7 @@ def _verified_prior_campaign_review_history(
         raise ArtifactIntegrityError("prior campaign review is stale for the raw manifest")
     if (
         campaign_manifest.is_file()
-        and payload.get("raw_campaign_manifest_sha256")
-        != campaign_manifest_sha256
+        and payload.get("raw_campaign_manifest_sha256") != campaign_manifest_sha256
     ):
         raise ArtifactIntegrityError("prior campaign review is stale for the campaign manifest")
     raw_history = payload.get("review_history")
@@ -5470,8 +5377,7 @@ def _verified_prior_campaign_review_history(
         expected_prefix = raw_history[:index]
         if (
             not isinstance(historical, Mapping)
-            or historical.get("schema_version")
-            not in SUPPORTED_CAMPAIGN_REVIEW_SCHEMAS
+            or historical.get("schema_version") not in SUPPORTED_CAMPAIGN_REVIEW_SCHEMAS
             or historical.get("run_label") != campaign_dir.name
             or historical.get("review_history") != expected_prefix
             or historical.get("previous_review_manifest_sha256")
@@ -5603,9 +5509,7 @@ def review_stage052_campaign(
     ):
         raise ValueError("review worker count differs from its Pilot memory contract")
     if storage_migration_evidence_dir is not None and storage_migration_path is None:
-        raise ValueError(
-            "storage_migration_evidence_dir requires storage_migration_path"
-        )
+        raise ValueError("storage_migration_evidence_dir requires storage_migration_path")
     run_label = campaign_dir.name
     try:
         gates, evidence, raw_hash, prerequisite = _audit_campaign(
@@ -5680,9 +5584,7 @@ def review_stage052_campaign(
         "native_profile": evidence.selection_lock.get("native_profile"),
         "native_kernel_config": evidence.selection_lock.get("native_kernel_config"),
         "native_configuration": evidence.selection_lock.get("native_kernel_config"),
-        "candidate_transaction_config": evidence.selection_lock.get(
-            "candidate_transaction_config"
-        ),
+        "candidate_transaction_config": evidence.selection_lock.get("candidate_transaction_config"),
         "candidate_transaction_configuration": evidence.selection_lock.get(
             "candidate_transaction_config"
         ),
@@ -5693,16 +5595,10 @@ def review_stage052_campaign(
         "maximum_in_flight_shards": review_workers,
         "native_fallback_count": 0,
         "storage_publication_identity": storage_publication_identity,
-        "storage_publication_identity_sha256": _canonical_sha256(
-            storage_publication_identity
-        ),
-        "producer_resource_contract": evidence.selection_lock.get(
-            "producer_resource_contract"
-        ),
+        "storage_publication_identity_sha256": _canonical_sha256(storage_publication_identity),
+        "producer_resource_contract": evidence.selection_lock.get("producer_resource_contract"),
         "review_memory_contract": (
-            review_memory_contract.to_dict()
-            if review_memory_contract is not None
-            else None
+            review_memory_contract.to_dict() if review_memory_contract is not None else None
         ),
         "review_shard_metrics": sorted(
             evidence.review_shard_metrics,
@@ -5807,16 +5703,10 @@ def review_stage052_campaign(
             "campaign_prerequisite_review_sha256"
         ),
         "storage_migration_sha256": (
-            _sha256(storage_migration_path)
-            if storage_migration_path is not None
-            else None
+            _sha256(storage_migration_path) if storage_migration_path is not None else None
         ),
         "storage_migration_sidecar_sha256": (
-            _sha256(
-                storage_migration_path.with_suffix(
-                    f"{storage_migration_path.suffix}.sha256"
-                )
-            )
+            _sha256(storage_migration_path.with_suffix(f"{storage_migration_path.suffix}.sha256"))
             if storage_migration_path is not None
             else None
         ),
@@ -5912,9 +5802,7 @@ def main() -> int:
     if producer_source_dir is not None and not producer_source_dir.is_dir():
         parser.error("--producer-source-dir must be an existing directory")
     storage_migration_path = (
-        arguments.storage_migration.resolve()
-        if arguments.storage_migration is not None
-        else None
+        arguments.storage_migration.resolve() if arguments.storage_migration is not None else None
     )
     if storage_migration_path is not None and not storage_migration_path.is_file():
         parser.error("--storage-migration must be an existing signed attestation")
@@ -5925,10 +5813,7 @@ def main() -> int:
     )
     if storage_migration_evidence_dir is not None and storage_migration_path is None:
         parser.error("--storage-migration-evidence-dir requires --storage-migration")
-    if (
-        storage_migration_evidence_dir is not None
-        and not storage_migration_evidence_dir.is_dir()
-    ):
+    if storage_migration_evidence_dir is not None and not storage_migration_evidence_dir.is_dir():
         parser.error("--storage-migration-evidence-dir must be an existing directory")
     for record in load_retention_registry(registry_path):
         if record.run_label != campaign_dir.name:

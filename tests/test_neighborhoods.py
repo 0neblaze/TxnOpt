@@ -212,6 +212,7 @@ def test_route_merge_capacity_prefilter_avoids_exact_merged_route_evaluation() -
     assert aggregate.route_indices == (0, 1)
     assert aggregate.aggregate_count == 4
     assert len(aggregate.candidate_pool_hash) == 64
+    assert aggregate.candidate_route_sequences == sequences
 
 
 def test_route_merge_pair_capacity_hash_is_stable_and_boundary_is_inclusive() -> None:

@@ -22,7 +22,7 @@ import tomllib
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from multiprocessing import get_context
 from pathlib import Path
 from queue import Full, Queue
@@ -346,9 +346,7 @@ def load_stage052_config(path: Path) -> Stage052Config:
             v2_storage=v2,
             runtime_identity_manifest=Path(str(runtime["identity_manifest"])),
             campaign_lock_manifest=Path(str(campaign["lock_manifest"])),
-            resource_calibration_contract=Path(
-                str(campaign["resource_calibration_contract"])
-            ),
+            resource_calibration_contract=Path(str(campaign["resource_calibration_contract"])),
             storage_root_locator=Path(str(campaign["storage_root_locator"])),
             staging_root_alias=str(campaign["staging_root_alias"]),
             archive_root_aliases=tuple(str(item) for item in campaign["archive_root_aliases"]),
@@ -490,12 +488,15 @@ def run_stage052(
     selected = Stage052Component(component)
     validate_stage052_run_label(run_label, selected)
     contract = stage052_contract(selected, scope)
-    allowed_workers = {1, 2, 4, 5, 6} if selected is Stage052Component.BENCHMARK else {1, 2, 4}
+    allowed_workers = (
+        {6}
+        if selected is Stage052Component.BENCHMARK
+        else {6}
+        if selected is Stage052Component.ACCELERATOR_PILOT
+        else {1, 2, 4}
+    )
     if worker_count not in allowed_workers:
-        raise ValueError(
-            "Stage 5.2 benchmark worker_count must be 1/2/4/5/6; "
-            "historical components remain 1/2/4"
-        )
+        raise ValueError("Stage 5.2 worker_count is invalid for the selected component")
     root = repository_root()
     resolved_config = _resolve(root, config_path)
     config = load_stage052_config(resolved_config)
@@ -520,9 +521,7 @@ def run_stage052(
     storage_migration_sha256 = ""
     successor_storage_migration_verified = False
     if storage_migration_evidence_dir is not None and storage_migration_path is None:
-        raise ValueError(
-            "storage_migration_evidence_dir requires storage_migration_path"
-        )
+        raise ValueError("storage_migration_evidence_dir requires storage_migration_path")
     if storage_migration_path is not None:
         from evrptw.stage052_storage_migration import (
             load_signed_storage_migration,
@@ -537,9 +536,7 @@ def run_stage052(
             storage_migration = verify_successor_storage_migration_evidence(
                 resolved_migration,
                 evidence_dir=resolved_migration_evidence,
-                locator=StorageRootLocator.from_toml(
-                    _resolve(root, config.storage_root_locator)
-                ),
+                locator=StorageRootLocator.from_toml(_resolve(root, config.storage_root_locator)),
                 volume_probe=probe_volume_identity,
             )
             successor_storage_migration_verified = True
@@ -579,15 +576,12 @@ def run_stage052(
             resolved_prerequisite_dirs[requirement.role] = resolved_input
             if storage_migration is not None:
                 review_manifest = json.loads(
-                    (resolved_input / "review" / "review_manifest.json").read_text(
-                        encoding="utf-8"
-                    )
+                    (resolved_input / "review" / "review_manifest.json").read_text(encoding="utf-8")
                 )
                 prerequisite_binds_migration = (
                     isinstance(review_manifest, dict)
                     and requirement.component is Stage052Component.BENCHMARK
-                    and review_manifest.get("storage_migration_sha256")
-                    == storage_migration_sha256
+                    and review_manifest.get("storage_migration_sha256") == storage_migration_sha256
                 )
                 successor_campaign_binds_migration = (
                     selected is Stage052Component.BENCHMARK
@@ -595,10 +589,7 @@ def run_stage052(
                     and requirement.component is Stage052Component.ACCELERATOR_PILOT
                     and successor_storage_migration_verified
                 )
-                if not (
-                    prerequisite_binds_migration
-                    or successor_campaign_binds_migration
-                ):
+                if not (prerequisite_binds_migration or successor_campaign_binds_migration):
                     raise ArtifactIntegrityError(
                         "neither the prerequisite nor an independently reviewed predecessor "
                         "campaign binds the supplied storage migration"
@@ -814,9 +805,7 @@ def run_stage052(
     with persistence_recorder.record("parent_write_control"):
         parent_writer.write_control(metadata=metadata, configuration_path=resolved_config)
     if accelerator_decision_payload is not None:
-        accelerator_mode = _accelerator_mode(accelerator_decision_payload) == (
-            "accelerator_pilot"
-        )
+        accelerator_mode = _accelerator_mode(accelerator_decision_payload) == ("accelerator_pilot")
         artifact_type = "accelerator_pilot" if accelerator_mode else "accelerator_decision"
         decision_path = resolved_output / "control" / f"{run_label}_{artifact_type}.json"
         decision_path.write_text(
@@ -1131,9 +1120,7 @@ def _run_benchmark_campaign_impl(
             f"({producer_resource_contract.selected_workers})"
         )
     if scope == "formal" and worker_count != selection_lock.selected_workers:
-        raise ValueError(
-            "Formal benchmark worker_count differs from the accepted Pilot selection"
-        )
+        raise ValueError("Formal benchmark worker_count differs from the accepted Pilot selection")
     revision = _git(root, "rev-parse", "HEAD")
     source_snapshot = verify_stage052_source_snapshot(root)
     runtime_identity = verify_stage052_runtime_identity(
@@ -1849,9 +1836,7 @@ def _record_batch_runtime_evidence(
     batch_id: str,
     runtime_evidence: BatchRuntimeEvidence,
 ) -> Path:
-    runtime_path = (
-        batch_dir / "control" / f"{run_label}_{batch_id}_runtime_evidence.json"
-    )
+    runtime_path = batch_dir / "control" / f"{run_label}_{batch_id}_runtime_evidence.json"
     runtime_path.write_text(
         json.dumps(runtime_evidence.to_dict(), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -2095,9 +2080,7 @@ def _run_benchmark_batch(
                                 1 if runtime_evidence.low_power_mode_observed else 0
                             ),
                             "maximum_load1": runtime_evidence.maximum_load1,
-                            "maximum_permitted_load1": (
-                                runtime_evidence.maximum_permitted_load1
-                            ),
+                            "maximum_permitted_load1": (runtime_evidence.maximum_permitted_load1),
                             "maximum_unrelated_process_average_cores": (
                                 runtime_evidence.maximum_unrelated_process_average_cores
                             ),
@@ -2196,9 +2179,7 @@ def _run_benchmark_batch(
             )
         with contextlib.suppress(BaseException):
             writer.finalize(status="partial", evidence_completeness="partial")
-        failed = planned_manifest.mark_failed(
-            f"{type(failure_error).__name__}: {failure_error}"
-        )
+        failed = planned_manifest.mark_failed(f"{type(failure_error).__name__}: {failure_error}")
         with contextlib.suppress(BaseException):
             atomic_write_signed_json(batch_dir / "batch_manifest.json", failed.to_dict())
         if failure_error is not error:
@@ -2940,13 +2921,19 @@ def _screening_occupancy_from_axis(
     raw_occupancies = transaction.get("native_screening_occupancies")
     if not isinstance(raw_occupancies, (list, tuple)):
         raise ValueError(f"missing E native screening occupancies: {identity}")
-    occupancies = [
-        _strict_int(value, "native_screening_occupancy") for value in raw_occupancies
+    occupancies = [_strict_int(value, "native_screening_occupancy") for value in raw_occupancies]
+    raw_events = axis.get("candidate_transaction_events")
+    if not isinstance(raw_events, list):
+        raise ValueError(f"missing E raw candidate transaction events: {identity}")
+    event_occupancies = [
+        _strict_int(event.get("input_candidates"), "event input_candidates")
+        for event in raw_events
+        if isinstance(event, Mapping)
+        and event.get("event_type") == "native_candidate_transaction"
+        and event.get("status") == "committed"
     ]
     recomputed_median = statistics.median(occupancies) if occupancies else 0.0
-    recorded_median = _strict_float(
-        transaction.get("native_screening_median_occupancy")
-    )
+    recorded_median = _strict_float(transaction.get("native_screening_median_occupancy"))
     if (
         transactions <= 0
         or input_count <= 0
@@ -2955,6 +2942,7 @@ def _screening_occupancy_from_axis(
         or any(value <= 0 for value in occupancies)
         or sum(occupancies) != input_count
         or recorded_median != recomputed_median
+        or event_occupancies != occupancies
     ):
         raise ValueError(f"invalid E candidate transaction counters: {identity}")
     return float(recomputed_median)
@@ -3253,9 +3241,7 @@ def _run_v2_tasks(
                 while pending:
                     reason = abort_reason()
                     if reason is not None:
-                        raise RuntimeError(
-                            f"runtime guard aborted Stage 5.2 work: {reason}"
-                        )
+                        raise RuntimeError(f"runtime guard aborted Stage 5.2 work: {reason}")
                     completed, pending = wait(
                         pending,
                         timeout=0.5,
@@ -3425,9 +3411,7 @@ def _run_and_persist_shard(
                 config.native_kernels if instance.distance_backend == "native" else None
             ),
             candidate_transaction_config=(
-                config.candidate_transaction
-                if instance.distance_backend == "native"
-                else None
+                config.candidate_transaction if instance.distance_backend == "native" else None
             ),
         )
         solver_times[axis.name] = time.perf_counter() - started
@@ -3657,7 +3641,7 @@ def _pipeline_event_token(
     | BufferedScreeningDecision
     | DeferredScreeningDecision
     | DeferredCacheEvent
-    | DeferredRouteEvaluation
+    | DeferredRouteEvaluation,
 ) -> tuple[object, ...]:
     if isinstance(event, DeferredCacheEvent):
         values = event.values
@@ -3949,9 +3933,7 @@ class _BoundedShardAppender:
                     writer_wall_started_ns = time.perf_counter_ns()
                     writer_cpu_started_ns = time.thread_time_ns()
                     try:
-                        sys.setswitchinterval(
-                            STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS
-                        )
+                        sys.setswitchinterval(STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS)
                         persisted = self._shard.append(
                             route_dictionary={},
                             critical_events=batch,
@@ -4346,18 +4328,18 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             return
         if decision.negative_cache_hit:
             evidence_tail = (
-                    decision.status,
-                    decision.reason,
-                    decision.demand,
-                    decision.distance_increment_lower_bound,
-                    decision.distance_lower_bound,
-                    decision.exact_call_blocked,
-                    decision.first_failed_check,
-                    decision.min_time_window_slack,
-                    decision.negative_cache_hit,
-                    decision.single_segment_reachable,
-                    decision.structural_energy_lower_bound,
-                    decision.checks,
+                decision.status,
+                decision.reason,
+                decision.demand,
+                decision.distance_increment_lower_bound,
+                decision.distance_lower_bound,
+                decision.exact_call_blocked,
+                decision.first_failed_check,
+                decision.min_time_window_slack,
+                decision.negative_cache_hit,
+                decision.single_segment_reachable,
+                decision.structural_energy_lower_bound,
+                decision.checks,
             )
             previous = self._legacy_negative_screening_evidence.get(decision.route_key)
             if previous is not None and previous != evidence_tail:
@@ -4502,10 +4484,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._producer_turn_thread_id = thread_id
 
     def _end_async_producer_turn(self) -> None:
-        if (
-            self._async_appender is not None
-            and self._async_appender.producer_turn_submitted_batch
-        ):
+        if self._async_appender is not None and self._async_appender.producer_turn_submitted_batch:
             self._flush_serialized_producer_meter()
             try:
                 self._async_appender.end_producer_turn()
@@ -4515,10 +4494,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
     def _record_serialized_producer(self, elapsed_nanoseconds: int) -> None:
         self._pending_serialized_producer_nanoseconds += elapsed_nanoseconds
         self._pending_serialized_producer_callbacks += 1
-        if (
-            self._async_appender is None
-            or self._pending_serialized_producer_callbacks >= 4_096
-        ):
+        if self._async_appender is None or self._pending_serialized_producer_callbacks >= 4_096:
             self._flush_serialized_producer_meter()
 
     def _flush_serialized_producer_meter(self) -> None:
@@ -4888,10 +4864,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         try:
             if event.get("event_type") != "screening_decision":
                 self._observe(event)
-            if (
-                self._buffered_screening_v3
-                and event.get("event_type") == "cache_event"
-            ):
+            if self._buffered_screening_v3 and event.get("event_type") == "cache_event":
                 optional_fields = (
                     "current_bytes",
                     "current_entries",
@@ -4901,9 +4874,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                     "lookup_result",
                 )
                 extras_presence = sum(
-                    1 << index
-                    for index, field in enumerate(optional_fields)
-                    if field in event
+                    1 << index for index, field in enumerate(optional_fields) if field in event
                 )
                 self._event_buffer.append(
                     DeferredCacheEvent(
@@ -5141,6 +5112,9 @@ def _run_and_persist_v2_shard(
                 "candidate_transaction_statistics": (
                     getattr(result, "candidate_transaction_statistics", {})
                 ),
+                "candidate_transaction_events": [
+                    dict(event) for event in getattr(result, "candidate_transaction_events", ())
+                ],
                 "objective_key": objective_key,
                 "initial_objective_key": initial_objective_key,
                 "runtime_seconds": result.runtime_seconds,
@@ -5459,37 +5433,57 @@ def _native_ablation_record(
         raise RuntimeError("native ablation requires a complete trace and objective")
     validation = validate_routes(instance, [list(route) for route in result.routes])
     reconciliation = trace.reconcile(result)
-    records = [
+    trace_event_types = {
+        "candidate_state",
+        "cache_event",
+        "candidate_cache_commit",
+        "candidate_cache_rollback",
+        "exact_budget_boundary",
+        "deadline_boundary",
+        "native_candidate_screening_batch",
+        "native_candidate_transaction",
+    }
+    trace_events = [
         {
-            key: event.get(key)
-            for key in (
-                "event_type",
-                "lane",
-                "iteration",
-                "operator",
-                "kind",
-                "status",
-                "route_key",
-                "accepted",
-                "global_best",
-                "exact_started",
-                "exact_completed",
-                "boundary",
-            )
-            if key in event
+            key: value
+            for key, value in event.items()
+            if key not in {"timestamp_seconds", "runtime_seconds"}
         }
         for event in trace.events
-        if event.get("event_type")
-        in {
-            "candidate_state",
-            "route_evaluation",
-            "cache_event",
-            "exact_budget_boundary",
-            "deadline_boundary",
-            "native_candidate_screening_batch",
-            "native_candidate_transaction",
-        }
+        if event.get("event_type") in trace_event_types
     ]
+    route_evaluations = [
+        {
+            "event_type": "route_evaluation",
+            **{
+                key: value
+                for key, value in asdict(event).items()
+                if key
+                not in {
+                    "started_at",
+                    "completed_at",
+                    "duration_seconds",
+                }
+            },
+        }
+        for event in trace.route_evaluations
+    ]
+    transaction_events = [dict(event) for event in result.candidate_transaction_events]
+    neighborhood_events = [
+        {
+            key: value
+            for key, value in event.items()
+            if key not in {"timestamp_seconds", "runtime_seconds"}
+        }
+        for event in result.neighborhood_events
+        if event.get("status") == "pair_prefilter_rejected_aggregate"
+    ]
+    records = {
+        "trace_events": trace_events,
+        "route_evaluations": route_evaluations,
+        "candidate_transaction_events": transaction_events,
+        "neighborhood_events": neighborhood_events,
+    }
     candidate_order_sha256 = hashlib.sha256(
         json.dumps(
             records,
@@ -5498,7 +5492,7 @@ def _native_ablation_record(
         ).encode("utf-8")
     ).hexdigest()
     return {
-        "schema_version": "stage05.2-native-ablation-axis-v1",
+        "schema_version": "stage05.2-native-ablation-axis-v2",
         "implementation_mode": implementation_mode,
         "objective_key": list(result.objective.key),
         "routes": [list(route) for route in result.routes],
@@ -5821,9 +5815,10 @@ def _persist_shard(
         raw_axes[axis] = {
             "backend": result.charging_backend,
             "backend_metrics": result.backend_metrics,
-            "candidate_transaction_statistics": (
-                result.candidate_transaction_statistics
-            ),
+            "candidate_transaction_statistics": (result.candidate_transaction_statistics),
+            "candidate_transaction_events": [
+                dict(event) for event in result.candidate_transaction_events
+            ],
             "objective_key": objective_key,
             "runtime_seconds": result.runtime_seconds,
             "effective_iterations": result.effective_iterations,

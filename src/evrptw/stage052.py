@@ -215,11 +215,10 @@ _CURRENT_COMPONENT_CONTRACTS: Mapping[
     (Stage052Component.BENCHMARK, "pilot"): (
         (
             Stage052PrerequisiteRequirement(
-                "accepted_pilot",
-                Stage052Component.BENCHMARK,
-                "pilot",
-                ("READY_FOR_STAGE052_FORMAL_BENCHMARK",),
-                exact_run_label="stage05.2_benchmark_attempt72",
+                "accelerator_selection",
+                Stage052Component.ACCELERATOR_PILOT,
+                "performance",
+                ("READY_FOR_STAGE052_BENCHMARK",),
                 requires_current_chain_identity=True,
             ),
         ),

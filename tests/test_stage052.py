@@ -30,6 +30,7 @@ from evrptw.artifacts import (
     ArtifactStorageConfig,
     expand_v2_screening_decision,
 )
+from evrptw.candidate_transaction import NativeCandidateTransactionConfig
 from evrptw.experiments.stage052_performance import (
     PERFORMANCE_INSTANCES,
     PERFORMANCE_SEEDS,
@@ -50,11 +51,15 @@ from evrptw.experiments.stage052_performance import (
     verify_stage051_prerequisite,
 )
 from evrptw.experiments.stage052_performance_review import (
+    _accelerator_pilot_metadata_matches,
+    _audit_native_ablation_records,
     _audit_native_execution,
     _bind_persistence_attribution_review,
     _prerequisite_binding_matches,
     _prior_review_manifest_history,
     _recompute_native_occupancies,
+    _recompute_screening_hash,
+    _recompute_transaction_hashes,
     _validate_native_shard_manifest_scope,
     _validate_stage052_staging_root_identity,
     render_semantic_mismatches,
@@ -229,9 +234,7 @@ def test_source_snapshot_contract_ignores_device_and_path_telemetry() -> None:
         },
     }
 
-    assert stage052_source_snapshot_contract(frozen) == (
-        stage052_source_snapshot_contract(live)
-    )
+    assert stage052_source_snapshot_contract(frozen) == (stage052_source_snapshot_contract(live))
     for field, value in (
         ("repository_revision", "c" * 40),
         ("tracked_file_count", 865),
@@ -433,14 +436,14 @@ def test_stage052_components_have_one_strict_order() -> None:
     )
 
 
-def test_stage052_contract_requires_an_accepted_pilot_before_formal() -> None:
+def test_stage052_contract_requires_accelerator_selection_then_new_pilot() -> None:
     pilot = stage052_contract(Stage052Component.BENCHMARK, "pilot")
     formal = stage052_contract(Stage052Component.BENCHMARK, "formal")
 
-    assert pilot.prerequisite_component is Stage052Component.BENCHMARK
-    assert pilot.prerequisite_status == "READY_FOR_STAGE052_FORMAL_BENCHMARK"
-    assert pilot.prerequisites[0].role == "accepted_pilot"
-    assert pilot.prerequisites[0].exact_run_label == "stage05.2_benchmark_attempt72"
+    assert pilot.prerequisite_component is Stage052Component.ACCELERATOR_PILOT
+    assert pilot.prerequisite_status == "READY_FOR_STAGE052_BENCHMARK"
+    assert pilot.prerequisites[0].role == "accelerator_selection"
+    assert pilot.prerequisites[0].exact_run_label is None
     assert pilot.next_status == "READY_FOR_STAGE052_FORMAL_BENCHMARK"
     assert formal.prerequisite_component is Stage052Component.BENCHMARK
     assert formal.prerequisite_status == "READY_FOR_STAGE052_FORMAL_BENCHMARK"
@@ -577,9 +580,7 @@ def test_stage052_current_chain_prerequisites_reject_historical_physical_identit
 
 
 def test_current_chain_campaign_uses_complete_campaign_review_generation() -> None:
-    requirement = stage052_contract(
-        Stage052Component.BENCHMARK, "formal"
-    ).prerequisites[0]
+    requirement = stage052_contract(Stage052Component.BENCHMARK, "formal").prerequisites[0]
     generation = "a" * 64
     campaign_files = {
         f"generations/{generation}/{name}": Path(name)
@@ -1386,8 +1387,7 @@ def test_native_execution_audit_cross_checks_per_run_raw_and_trace(tmp_path: Pat
                             "mode": "bounded_async_thread",
                             "queue_max_batches": 1,
                             "writer_thread_switch_interval_seconds": (
-                                stage052_performance
-                                .STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS
+                                stage052_performance.STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS
                             ),
                             "submitted_batches": 2,
                             "completed_batches": 2,
@@ -1976,9 +1976,7 @@ def test_accelerator_decision_recomputes_exactly_nine_e_occupancies(
     for instance in PERFORMANCE_INSTANCES:
         for seed in PERFORMANCE_SEEDS:
             occupancy = 1 if instance == "c101C5" else next(values)
-            screening_occupancies = (
-                [occupancy, occupancy, 100] if occupancy == 9 else [occupancy]
-            )
+            screening_occupancies = [occupancy, occupancy, 100] if occupancy == 9 else [occupancy]
             if instance != "c101C5":
                 expected_values.append(float(occupancy))
             shard = raw_dir / instance / str(seed)
@@ -1996,20 +1994,22 @@ def test_accelerator_decision_recomputes_exactly_nine_e_occupancies(
                                 "validator_passed": True,
                                 "valid": True,
                                 "candidate_transaction_statistics": {
-                                    "native_candidate_transactions": len(
-                                        screening_occupancies
-                                    ),
-                                    "native_candidate_input_count": sum(
-                                        screening_occupancies
-                                    ),
-                                    "native_screening_occupancies": (
-                                        screening_occupancies
-                                    ),
+                                    "native_candidate_transactions": len(screening_occupancies),
+                                    "native_candidate_input_count": sum(screening_occupancies),
+                                    "native_screening_occupancies": (screening_occupancies),
                                     "native_screening_median_occupancy": (
                                         statistics.median(screening_occupancies)
                                     ),
                                     "native_candidate_transaction_fallbacks": 0,
                                 },
+                                "candidate_transaction_events": [
+                                    {
+                                        "event_type": ("native_candidate_transaction"),
+                                        "status": "committed",
+                                        "input_candidates": value,
+                                    }
+                                    for value in screening_occupancies
+                                ],
                                 "backend_metrics": {
                                     "exact_calls": 1,
                                     "batch_launches": 1,
@@ -2036,9 +2036,284 @@ def test_accelerator_decision_recomputes_exactly_nine_e_occupancies(
     independently_recomputed, independent_median = _recompute_native_occupancies(raw_dir)
     assert independently_recomputed == payload["inputs"]
     assert independent_median == pytest.approx(5.0)
-    assert [
-        item["median_screening_occupancy"] for item in payload["inputs"]
-    ] == expected_values
+    assert [item["median_screening_occupancy"] for item in payload["inputs"]] == expected_values
+
+
+def test_native_ablation_semantics_replay_exact_cache_and_transaction_events() -> None:
+    row = {
+        "exact_started_calls": 1,
+        "exact_completed_calls": 1,
+        "cache_statistics": {
+            "cache_lookups": 1,
+            "cache_hits": 0,
+            "cache_misses": 1,
+            "cache_stores": 1,
+            "cache_evictions": 0,
+            "cache_oversize_not_cached": 0,
+        },
+        "candidate_transaction_statistics": {
+            "native_candidate_transactions": 1,
+            "native_screening_occupancies": [2],
+            "native_candidate_transaction_fallbacks": 0,
+        },
+    }
+    screening_codes = np.zeros((2, 16), dtype="<i8")
+    screening_codes[:, 0] = 1
+    transaction_event: dict[str, object] = {
+        "event_type": "native_candidate_transaction",
+        "status": "committed",
+        "input_candidates": 2,
+        "candidates": [["C1"], ["C2"]],
+        "exact_budget": 1,
+        "budget_skips": 1,
+        "cache_hits": 0,
+        "exact_misses": 1,
+        "iteration": 1,
+        "lane": "legacy",
+        "operator": "route_merge",
+        "screening_integrity_evidence": {
+            "candidate_ids_le_hex": np.array([0, 1], dtype="<i8").tobytes().hex(),
+            "statuses_le_hex": np.zeros(2, dtype="<i8").tobytes().hex(),
+            "duplicate_of_le_hex": np.array([-1, -1], dtype="<i8").tobytes().hex(),
+            "codes_le_hex": screening_codes.tobytes().hex(),
+            "metrics_le_hex": np.zeros((2, 15), dtype="<f8").tobytes().hex(),
+            "route_offsets_le_hex": np.array([0, 1, 2], dtype="<i8").tobytes().hex(),
+            "route_indices_le_hex": np.array([1, 2], dtype="<i8").tobytes().hex(),
+            "counters_le_hex": np.array([2, 2, 0, 0, 2], dtype="<i8").tobytes().hex(),
+        },
+    }
+    screening_hash, transaction_hash = _recompute_transaction_hashes(transaction_event)
+    transaction_event["screening_pool_hash"] = screening_hash
+    transaction_event["transaction_sha256"] = transaction_hash
+    records = {
+        "trace_events": [
+            {"event_type": "cache_event", "operation": "lookup"},
+            {"event_type": "cache_event", "operation": "miss"},
+            {"event_type": "cache_event", "operation": "store"},
+        ],
+        "route_evaluations": [
+            {
+                "event_type": "route_evaluation",
+                "exact_started": True,
+                "exact_completed": True,
+            }
+        ],
+        "candidate_transaction_events": [transaction_event],
+        "neighborhood_events": [],
+    }
+
+    assert (
+        _audit_native_ablation_records(
+            row,
+            records,
+            require_transaction=True,
+        )
+        == []
+    )
+
+    tampered = copy.deepcopy(records)
+    tampered["trace_events"].extend(
+        [
+            {"event_type": "exact_budget_boundary"},
+            {
+                "event_type": "candidate_state",
+                "accepted": True,
+                "global_best": False,
+            },
+        ]
+    )
+    failures = _audit_native_ablation_records(
+        row,
+        tampered,
+        require_transaction=True,
+    )
+    assert "accepted/global-best event follows a terminal boundary" in failures
+
+    tampered_hash = copy.deepcopy(records)
+    tampered_hash["candidate_transaction_events"][0]["transaction_sha256"] = "0" * 64
+    failures = _audit_native_ablation_records(
+        row,
+        tampered_hash,
+        require_transaction=True,
+    )
+    assert "candidate transaction hash recomputation failed" in failures
+
+
+def test_native_ablation_replays_batched_screening_bytes_and_lane_deadlines() -> None:
+    screening_codes = np.zeros((2, 16), dtype="<i8")
+    screening_codes[:, 0] = 1
+    transaction_event: dict[str, object] = {
+        "input_candidates": 2,
+        "candidates": [["C1"], ["C2"]],
+        "exact_budget": 1,
+        "budget_skips": 1,
+        "cache_hits": 0,
+        "exact_misses": 1,
+        "iteration": 2,
+        "lane": "constraint",
+        "operator": "route_merge",
+        "screening_integrity_evidence": {
+            "candidate_ids_le_hex": np.array([0, 1], dtype="<i8").tobytes().hex(),
+            "statuses_le_hex": np.zeros(2, dtype="<i8").tobytes().hex(),
+            "duplicate_of_le_hex": np.array([-1, -1], dtype="<i8").tobytes().hex(),
+            "codes_le_hex": screening_codes.tobytes().hex(),
+            "metrics_le_hex": np.zeros((2, 15), dtype="<f8").tobytes().hex(),
+            "route_offsets_le_hex": np.array([0, 1, 2], dtype="<i8").tobytes().hex(),
+            "route_indices_le_hex": np.array([1, 2], dtype="<i8").tobytes().hex(),
+            "counters_le_hex": np.array([2, 2, 0, 0, 2], dtype="<i8").tobytes().hex(),
+        },
+    }
+    screening_hash, _transaction_hash = _recompute_transaction_hashes(transaction_event)
+    screening_event = {
+        key: value
+        for key, value in transaction_event.items()
+        if key
+        in {
+            "candidates",
+            "input_candidates",
+            "screening_integrity_evidence",
+        }
+    }
+    screening_event.update(
+        {
+            "event_type": "native_candidate_screening_batch",
+            "status": "committed",
+            "lane": "constraint",
+            "iteration": 2,
+            "operator": "route_merge",
+            "screening_pool_hash": screening_hash,
+        }
+    )
+    row = {
+        "exact_started_calls": 0,
+        "exact_completed_calls": 0,
+        "cache_statistics": {},
+        "candidate_transaction_statistics": {},
+    }
+    records = {
+        "trace_events": [
+            {"event_type": "deadline_boundary", "lane": "legacy"},
+            {
+                "event_type": "candidate_state",
+                "lane": "constraint",
+                "accepted": True,
+                "global_best": False,
+            },
+            screening_event,
+        ],
+        "route_evaluations": [],
+        "candidate_transaction_events": [],
+        "neighborhood_events": [],
+    }
+
+    assert (
+        _audit_native_ablation_records(
+            row,
+            records,
+            require_transaction=False,
+            require_batched_screening=True,
+        )
+        == []
+    )
+    assert _recompute_screening_hash(screening_event) == screening_hash
+
+    tampered = copy.deepcopy(records)
+    tampered["trace_events"][-1]["screening_integrity_evidence"][
+        "statuses_le_hex"
+    ] = np.array([1, 0], dtype="<i8").tobytes().hex()
+    failures = _audit_native_ablation_records(
+        row,
+        tampered,
+        require_transaction=False,
+        require_batched_screening=True,
+    )
+    assert "batched screening hash recomputation failed" in failures
+
+    same_lane = copy.deepcopy(records)
+    same_lane["trace_events"][1]["lane"] = "legacy"
+    failures = _audit_native_ablation_records(
+        row,
+        same_lane,
+        require_transaction=False,
+        require_batched_screening=True,
+    )
+    assert "accepted/global-best event follows a terminal boundary" in failures
+
+
+def test_accelerator_pilot_metadata_requires_six_workers_and_transaction_config() -> None:
+    metadata = {
+        "component": "accelerator_pilot",
+        "backend": "cpu_batch",
+        "execution_backend": "native_cpu",
+        "accelerator_decision_mode": "accelerator_pilot",
+        "native_kernel_config": NativeKernelConfig().to_dict(),
+        "candidate_transaction_config": NativeCandidateTransactionConfig().to_dict(),
+        "worker_count": 6,
+        "staging_root": {"alias": "wsl_staging"},
+    }
+
+    assert _accelerator_pilot_metadata_matches(metadata, "native_cpu")
+    assert not _accelerator_pilot_metadata_matches({**metadata, "worker_count": 4}, "native_cpu")
+    assert not _accelerator_pilot_metadata_matches(
+        {key: value for key, value in metadata.items() if key != "candidate_transaction_config"},
+        "native_cpu",
+    )
+
+
+def test_pair_pruning_aggregate_is_independently_recomputed() -> None:
+    pair_identity = {
+        "left": {"index": 0, "sequence": ["C1"]},
+        "reason": "capacity_prefilter",
+        "right": {"index": 1, "sequence": ["C2"]},
+        "schema_version": "route-merge-pair-pruning-v1",
+        "skipped_candidate_count": 4,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            pair_identity,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    row = {
+        "exact_started_calls": 0,
+        "exact_completed_calls": 0,
+        "cache_statistics": {},
+        "candidate_transaction_statistics": {},
+    }
+    records = {
+        "trace_events": [],
+        "route_evaluations": [],
+        "candidate_transaction_events": [],
+        "neighborhood_events": [
+            {
+                "operator": "route_merge",
+                "status": "pair_prefilter_rejected_aggregate",
+                "reason": "capacity_prefilter",
+                "route_indices": [0, 1],
+                "candidate_route_sequences": [["C1"], ["C2"]],
+                "aggregate_count": 4,
+                "candidate_pool_hash": digest,
+            }
+        ],
+    }
+
+    assert (
+        _audit_native_ablation_records(
+            row,
+            records,
+            require_transaction=False,
+        )
+        == []
+    )
+    records["neighborhood_events"][0]["aggregate_count"] = 5
+    failures = _audit_native_ablation_records(
+        row,
+        records,
+        require_transaction=False,
+    )
+    assert "pair-pruning aggregate recomputation failed" in failures
 
 
 def test_instance_lookup_and_distance_matrix_are_stable() -> None:
@@ -3983,9 +4258,7 @@ def test_native_screening_diagnostic_float_canonicalization_is_narrow() -> None:
     }
 
     canonical = stage052_review._canonicalize_screening_diagnostic_floats(base)
-    assert canonical == stage052_review._canonicalize_screening_diagnostic_floats(
-        native_roundoff
-    )
+    assert canonical == stage052_review._canonicalize_screening_diagnostic_floats(native_roundoff)
     assert canonical != stage052_review._canonicalize_screening_diagnostic_floats(
         {**native_roundoff, "distance_lower_bound": 263.646173823}
     )

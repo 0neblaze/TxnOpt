@@ -4,7 +4,7 @@ import hashlib
 import json
 import time
 from collections import OrderedDict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal
 
 import numpy as np
@@ -133,6 +133,28 @@ class RouteCacheStatistics:
         return asdict(self)
 
 
+@dataclass(frozen=True, slots=True)
+class RouteCacheTransactionState:
+    """Complete mutable cache state used to roll back an atomic write batch."""
+
+    entries: OrderedDict[RouteCacheKey, tuple[ChargingSubproblemResult, int]]
+    seen_keys: set[RouteCacheKey]
+    statistics: RouteCacheStatistics
+
+
+@dataclass(slots=True)
+class RouteCacheWriteBatch:
+    """O(changes) journal for a cache batch awaiting transaction commit."""
+
+    stores: tuple[CacheStore, ...]
+    inserted_keys: tuple[RouteCacheKey, ...]
+    evicted_entries: tuple[
+        tuple[RouteCacheKey, tuple[ChargingSubproblemResult, int]], ...
+    ]
+    statistics_before: RouteCacheStatistics
+    active: bool = True
+
+
 def estimate_cache_entry_bytes(result: ChargingSubproblemResult) -> int:
     """Estimate memory using a stable serialized payload plus object overhead."""
 
@@ -195,6 +217,107 @@ class RouteEvaluationCache:
 
     def contains(self, sequence: tuple[str, ...] | list[str]) -> bool:
         return self.make_key(sequence) in self._entries
+
+    def snapshot_state(self) -> RouteCacheTransactionState:
+        """Return an isolated snapshot of every mutable cache component."""
+
+        return RouteCacheTransactionState(
+            entries=self._entries.copy(),
+            seen_keys=set(self._seen_keys),
+            statistics=replace(self.statistics),
+        )
+
+    def restore_state(self, state: RouteCacheTransactionState) -> None:
+        """Restore a previously captured transaction state."""
+
+        self._entries = state.entries.copy()
+        self._seen_keys = set(state.seen_keys)
+        self.statistics = replace(state.statistics)
+
+    def begin_store_many_atomic(
+        self,
+        entries: tuple[tuple[tuple[str, ...], ChargingSubproblemResult], ...],
+    ) -> RouteCacheWriteBatch:
+        """Store an ordered miss batch and retain its O(changes) rollback journal."""
+
+        statistics_before = replace(self.statistics)
+        possible_insertions: list[RouteCacheKey] = []
+        evicted_entries: list[tuple[RouteCacheKey, tuple[ChargingSubproblemResult, int]]] = []
+        try:
+            stores: list[CacheStore] = []
+            for sequence, result in entries:
+                key = self.make_key(sequence)
+                if key in self._entries:
+                    raise RuntimeError("atomic candidate cache batch contains a non-miss key")
+                entry_bytes = estimate_cache_entry_bytes(result)
+                predicted_evictions: list[
+                    tuple[RouteCacheKey, tuple[ChargingSubproblemResult, int]]
+                ] = []
+                if entry_bytes <= self.config.max_memory_bytes:
+                    projected_entries = self.statistics.entries_current
+                    projected_bytes = self.statistics.bytes_current
+                    for old_key, old_item in self._entries.items():
+                        if (
+                            projected_entries < self.config.max_entries
+                            and projected_bytes + entry_bytes <= self.config.max_memory_bytes
+                        ):
+                            break
+                        predicted_evictions.append((old_key, old_item))
+                        projected_entries -= 1
+                        projected_bytes -= old_item[1]
+                    possible_insertions.append(key)
+                    inserted = set(possible_insertions)
+                    evicted_entries.extend(
+                        item for item in predicted_evictions if item[0] not in inserted
+                    )
+                store = self.store(sequence, result)
+                if tuple(key for key, _item in predicted_evictions) != store.evicted:
+                    raise RuntimeError("atomic candidate cache eviction prediction diverged")
+                stores.append(store)
+            return RouteCacheWriteBatch(
+                stores=tuple(stores),
+                inserted_keys=tuple(possible_insertions),
+                evicted_entries=tuple(evicted_entries),
+                statistics_before=statistics_before,
+            )
+        except BaseException:
+            for key in possible_insertions:
+                self._entries.pop(key, None)
+            for key, item in reversed(evicted_entries):
+                self._entries[key] = item
+                self._entries.move_to_end(key, last=False)
+            self.statistics = statistics_before
+            raise
+
+    def commit_store_batch(self, batch: RouteCacheWriteBatch) -> tuple[CacheStore, ...]:
+        """Finalize a pending cache batch after sibling stores have committed."""
+
+        if not batch.active:
+            raise RuntimeError("route cache write batch is no longer active")
+        batch.active = False
+        return batch.stores
+
+    def rollback_store_batch(self, batch: RouteCacheWriteBatch) -> None:
+        """Undo a pending cache batch without copying the complete LRU."""
+
+        if not batch.active:
+            raise RuntimeError("route cache write batch is no longer active")
+        for key in batch.inserted_keys:
+            self._entries.pop(key, None)
+        for key, item in reversed(batch.evicted_entries):
+            self._entries[key] = item
+            self._entries.move_to_end(key, last=False)
+        self.statistics = replace(batch.statistics_before)
+        batch.active = False
+
+    def store_many_atomic(
+        self,
+        entries: tuple[tuple[tuple[str, ...], ChargingSubproblemResult], ...],
+    ) -> tuple[CacheStore, ...]:
+        """Store and immediately finalize an ordered atomic cache batch."""
+
+        batch = self.begin_store_many_atomic(entries)
+        return self.commit_store_batch(batch)
 
     def store(
         self,

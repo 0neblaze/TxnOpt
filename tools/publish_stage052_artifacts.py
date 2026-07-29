@@ -21,9 +21,7 @@ from evrptw.native_kernels import NATIVE_KERNEL_ABI_VERSION
 
 PUBLICATION_SCHEMA: Final = "stage05.2-performance-benchmark-publication-v1"
 REVIEW_SCHEMA: Final = "stage05.2-campaign-review-v2"
-SUPPORTED_REVIEW_SCHEMAS: Final = frozenset(
-    {"stage05.2-campaign-review-v1", REVIEW_SCHEMA}
-)
+SUPPORTED_REVIEW_SCHEMAS: Final = frozenset({"stage05.2-campaign-review-v1", REVIEW_SCHEMA})
 FORMAL_READY: Final = "READY_FOR_STAGE05_3"
 _TARGET_NAMES: Final[dict[str, str]] = {
     "per_run_results": "per_run_results.csv",
@@ -113,7 +111,7 @@ def _load_review_manifest(
     candidate_transaction = payload.get("candidate_transaction_configuration")
     accelerator_decision = payload.get("accelerator_decision")
     is_current_schema = payload.get("schema_version") == REVIEW_SCHEMA
-    allowed_producer_workers = {4, 5, 6} if is_current_schema else {2, 4}
+    allowed_producer_workers = {6} if is_current_schema else {2, 4}
     expected_backend = {
         "GPU_NOT_JUSTIFIED": "native_cpu",
         "NATIVE_CPU_RETAINED": "native_cpu",
@@ -125,16 +123,14 @@ def _load_review_manifest(
         or not isinstance(candidate_transaction, Mapping)
         or payload.get("native_kernel_config") != native
         or payload.get("candidate_transaction_config") != candidate_transaction
-        or dict(candidate_transaction)
-        != NativeCandidateTransactionConfig().to_dict()
+        or dict(candidate_transaction) != NativeCandidateTransactionConfig().to_dict()
         or expected_backend is None
         or payload.get("selected_backend") != expected_backend
         or payload.get("selected_exact_backend") != "cpu_batch"
         or payload.get("selected_workers") not in allowed_producer_workers
         or payload.get("native_profile") != NATIVE_KERNEL_ABI_VERSION
         or selection.get("selected_backend") != payload.get("selected_backend")
-        or selection.get("selected_exact_backend")
-        != payload.get("selected_exact_backend")
+        or selection.get("selected_exact_backend") != payload.get("selected_exact_backend")
         or selection.get("selected_workers") != payload.get("selected_workers")
         or selection.get("native_profile") != payload.get("native_profile")
         or selection.get("accelerator_decision") != payload.get("accelerator_decision")
@@ -158,9 +154,7 @@ def _load_review_manifest(
     if is_current_schema:
         storage_identity = payload.get("storage_publication_identity")
         storage_batches = (
-            storage_identity.get("batches")
-            if isinstance(storage_identity, Mapping)
-            else None
+            storage_identity.get("batches") if isinstance(storage_identity, Mapping) else None
         )
         storage_digest = (
             hashlib.sha256(
@@ -176,8 +170,7 @@ def _load_review_manifest(
         replay_metrics = payload.get("review_shard_metrics")
         if (
             not isinstance(storage_identity, Mapping)
-            or storage_identity.get("schema_version")
-            != "stage05.2-storage-publication-identity-v1"
+            or storage_identity.get("schema_version") != "stage05.2-storage-publication-identity-v1"
             or storage_identity.get("run_label") != run_label
             or not isinstance(storage_batches, list)
             or not storage_batches
@@ -214,9 +207,7 @@ def _load_review_manifest(
                 for metric in replay_metrics
             )
         ):
-            raise ValueError(
-                "campaign review storage/replay observability contract is invalid"
-            )
+            raise ValueError("campaign review storage/replay observability contract is invalid")
     from evrptw.stage052_evidence import (
         CAMPAIGN_PILOT_GATES,
         verify_stage052_campaign_gate_set,
@@ -228,8 +219,7 @@ def _load_review_manifest(
         provisional = set(gates) == set(CAMPAIGN_PILOT_GATES).difference(
             {"publication_dry_run"}
         ) and all(
-            isinstance(gate, Mapping) and gate.get("passed") is True
-            for gate in gates.values()
+            isinstance(gate, Mapping) and gate.get("passed") is True for gate in gates.values()
         )
     else:
         provisional = False
@@ -326,9 +316,7 @@ def _verify_live_formal_chain(
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             raise ValueError("publisher retention registry is invalid") from error
         if raw_dir.name in retained_labels or prerequisite_dir.name in retained_labels:
-            raise ValueError(
-                "publisher cannot use a run recorded in the retention registry"
-            )
+            raise ValueError("publisher cannot use a run recorded in the retention registry")
     expected_pointer = raw_dir / "review" / "review_manifest.json"
     if review_manifest.resolve() != expected_pointer:
         raise ValueError("publisher requires the current raw review manifest pointer")
@@ -351,25 +339,17 @@ def _verify_live_formal_chain(
         or not attribution_sidecar.is_file()
         or not signed_sidecar_matches(attribution, attribution_sidecar)
         or review.get("persistence_attribution_sha256") != _sha256(attribution)
-        or review.get("persistence_attribution_sidecar_sha256")
-        != _sha256(attribution_sidecar)
+        or review.get("persistence_attribution_sidecar_sha256") != _sha256(attribution_sidecar)
     ):
         raise ValueError("campaign persistence attribution is stale")
     g01_review_dir = prerequisite_dir / "review"
     g01_review = g01_review_dir / "review_manifest.json"
-    if (
-        g01_review_dir.is_symlink()
-        or g01_review.is_symlink()
-        or g01_review.resolve() != g01_review
-    ):
-        raise ValueError(
-            "publisher raw/prerequisite directories are not canonical live roots"
-        )
+    if g01_review_dir.is_symlink() or g01_review.is_symlink() or g01_review.resolve() != g01_review:
+        raise ValueError("publisher raw/prerequisite directories are not canonical live roots")
     if (
         not g01_review.is_file()
         or campaign.prerequisite_review_sha256 != _sha256(g01_review)
-        or review.get("campaign_prerequisite_review_sha256")
-        != campaign.prerequisite_review_sha256
+        or review.get("campaign_prerequisite_review_sha256") != campaign.prerequisite_review_sha256
     ):
         raise ValueError("Formal campaign no longer binds the current G01 review")
     lock = load_benchmark_execution_lock(
@@ -410,9 +390,7 @@ def _verify_gpu_decision(
         "native_profile": review.get("native_profile"),
         "native_config_sha256": selection.get("native_config_sha256"),
         "accelerator_review_manifest_sha256": selection.get("accelerator_review_manifest_sha256"),
-        "campaign_prerequisite_review_sha256": review.get(
-            "campaign_prerequisite_review_sha256"
-        ),
+        "campaign_prerequisite_review_sha256": review.get("campaign_prerequisite_review_sha256"),
     }
     if any(payload.get(field) != value for field, value in expected.items()):
         raise ValueError("campaign GPU decision/backend/workers/native/F-review lock differs")
@@ -577,9 +555,7 @@ def verify_canonical_registry_against_trusted(
         "status": published_review.get("status"),
         "generation_id": published_review.get("publication_generation"),
         "raw_manifest_sha256": published_review.get("raw_manifest_sha256"),
-        "raw_campaign_manifest_sha256": published_review.get(
-            "raw_campaign_manifest_sha256"
-        ),
+        "raw_campaign_manifest_sha256": published_review.get("raw_campaign_manifest_sha256"),
         "selected_backend": published_review.get("selected_backend"),
         "selected_exact_backend": published_review.get("selected_exact_backend"),
         "selected_workers": published_review.get("selected_workers"),
@@ -592,21 +568,16 @@ def verify_canonical_registry_against_trusted(
         "campaign_prerequisite_review_sha256": published_review.get(
             "campaign_prerequisite_review_sha256"
         ),
-        "source_review_manifest_sha256": published_review.get(
-            "source_review_manifest_sha256"
-        ),
+        "source_review_manifest_sha256": published_review.get("source_review_manifest_sha256"),
     }
-    if (
-        any(trusted.get(field) != value for field, value in trusted_review_fields.items())
-        or any(
-            not _is_sha256(trusted.get(field))
-            for field in (
-                "raw_manifest_sha256",
-                "raw_campaign_manifest_sha256",
-                "native_config_sha256",
-                "accelerator_review_manifest_sha256",
-                "campaign_prerequisite_review_sha256",
-            )
+    if any(trusted.get(field) != value for field, value in trusted_review_fields.items()) or any(
+        not _is_sha256(trusted.get(field))
+        for field in (
+            "raw_manifest_sha256",
+            "raw_campaign_manifest_sha256",
+            "native_config_sha256",
+            "accelerator_review_manifest_sha256",
+            "campaign_prerequisite_review_sha256",
         )
     ):
         raise ValueError("published review provenance does not match the trusted publication")
@@ -628,9 +599,7 @@ def verify_canonical_registry_against_trusted(
     expected_rows = [
         {
             "run_label": str(trusted["run_label"]),
-            "artifact_type": Path(relative).stem.removeprefix(
-                f"{trusted['run_label']}_"
-            ),
+            "artifact_type": Path(relative).stem.removeprefix(f"{trusted['run_label']}_"),
             "relative_path": relative,
             "sha256": checksum,
             "status": str(trusted["status"]),
@@ -706,9 +675,7 @@ def _publish_stage052_artifacts(
         "experiments/manifests/stage05.2_performance_benchmark_artifact_manifest.json"
     )
     trusted_destination = repository / trusted_relative
-    canonical_registry_relative = Path(
-        "experiments/registries/stage05.2_artifact_registry.csv"
-    )
+    canonical_registry_relative = Path("experiments/registries/stage05.2_artifact_registry.csv")
     canonical_registry_destination = repository / canonical_registry_relative
     registry_relative = Path("experiments/registries") / (
         f"{run_label}_{generation_id}_artifact_registry.csv"
@@ -736,8 +703,7 @@ def _publish_stage052_artifacts(
             for relative in (destination.relative_to(repository).as_posix(),)
         }
         versioned_review_relative = (
-            Path("experiments/summaries")
-            / f"{run_label}_{generation_id}_review_manifest.json"
+            Path("experiments/summaries") / f"{run_label}_{generation_id}_review_manifest.json"
         )
         published_review_files = {
             key: {

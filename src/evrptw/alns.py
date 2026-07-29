@@ -13,6 +13,8 @@ import numpy as np
 
 from evrptw.cache_incremental import (
     CacheIncrementalConfig,
+    CacheStore,
+    RouteCacheWriteBatch,
     RouteEvaluationCache,
     RoutePropagationSnapshot,
     StationReachabilityIndex,
@@ -26,11 +28,11 @@ from evrptw.candidate_control import (
     CandidatePlan,
 )
 from evrptw.candidate_transaction import (
-    CandidateScreeningDecision,
     CandidateTransactionDeadlineExceeded,
     CandidateTransactionRequest,
     NativeCandidateTransactionConfig,
     NativeCandidateTransactionRuntime,
+    NegativeCacheCommit,
     execute_candidate_transaction,
     native_screen_candidate_batch,
 )
@@ -209,6 +211,7 @@ class ALNSResult:
     exact_deadline_statistics: dict[str, object] = field(default_factory=dict)
     candidate_control_statistics: dict[str, object] = field(default_factory=dict)
     candidate_transaction_statistics: dict[str, object] = field(default_factory=dict)
+    candidate_transaction_events: tuple[dict[str, object], ...] = ()
     candidate_work_hash: str = ""
     route_result_hash: str = ""
     # Stage 4 adaptive-weight and search-control statistics.
@@ -351,6 +354,7 @@ class _Evaluator:
         self.incumbent_route_ledger = incumbent_route_ledger
         self.native_runtime = native_runtime
         self.pending_candidate_cache: dict[tuple[str, ...], ChargingSubproblemResult] = {}
+        self.pending_negative_screening_sequences: dict[tuple[str, ...], str] = {}
         self.backend_metrics = BackendMetrics(self.backend.value, batch_size)
         self.reachability_index = (
             StationReachabilityIndex(instance)
@@ -367,9 +371,7 @@ class _Evaluator:
             negative_screening_cache if negative_screening_cache is not None else {}
         )
         self.negative_screening_sequences = (
-            negative_screening_sequences
-            if negative_screening_sequences is not None
-            else {}
+            negative_screening_sequences if negative_screening_sequences is not None else {}
         )
         self.iteration: int | None = None
         self.operator = "initialization"
@@ -411,10 +413,12 @@ class _Evaluator:
             )
 
     def _discard_pending_candidate_cache(self, reason: str) -> None:
-        if not self.pending_candidate_cache:
+        if not self.pending_candidate_cache and not self.pending_negative_screening_sequences:
             return
         discarded = len(self.pending_candidate_cache)
+        discarded_negative = len(self.pending_negative_screening_sequences)
         self.pending_candidate_cache.clear()
+        self.pending_negative_screening_sequences.clear()
         if self.measurement_trace is not None:
             self.measurement_trace.events.append(
                 {
@@ -422,6 +426,7 @@ class _Evaluator:
                     "status": "discarded",
                     "reason": reason,
                     "discarded_entries": discarded,
+                    "discarded_negative_entries": discarded_negative,
                     "timestamp_seconds": self.measurement_trace._offset(),
                     "lane": self.lane,
                     "iteration": self.iteration,
@@ -430,54 +435,110 @@ class _Evaluator:
             )
 
     def _commit_pending_candidate_cache(self) -> None:
-        if not self.pending_candidate_cache:
+        if not self.pending_candidate_cache and not self.pending_negative_screening_sequences:
             return
         pending = tuple(self.pending_candidate_cache.items())
-        self.pending_candidate_cache.clear()
-        for sequence, result in pending:
+        pending_negative = dict(self.pending_negative_screening_sequences)
+        local_insertions: list[tuple[str, ...]] = []
+        negative_insertions: list[tuple[str, ...]] = []
+        route_cache_batch: RouteCacheWriteBatch | None = None
+        native_negative_commit: NegativeCacheCommit | None = None
+        stores: tuple[CacheStore, ...] = ()
+        try:
             if self.route_cache is None:
                 if self.local_cache_enabled:
-                    self.cache[sequence] = result
-                continue
-            store = self.route_cache.store(sequence, result)
-            if self.measurement_trace is None:
-                continue
-            for evicted in store.evicted:
+                    for sequence, result in pending:
+                        if sequence in self.cache:
+                            raise RuntimeError(
+                                "atomic candidate cache batch contains a local non-miss key"
+                            )
+                        local_insertions.append(sequence)
+                        self.cache[sequence] = result
+            else:
+                route_cache_batch = self.route_cache.begin_store_many_atomic(pending)
+                stores = route_cache_batch.stores
+            for sequence, reason in pending_negative.items():
+                existing = self.negative_screening_sequences.get(sequence)
+                if existing is not None and existing != reason:
+                    raise RuntimeError("candidate negative cache reason changed during commit")
+                if existing is None:
+                    negative_insertions.append(sequence)
+                    self.negative_screening_sequences[sequence] = reason
+            if pending_negative and self.candidate_transaction_runtime is not None:
+                if self.native_runtime is None:
+                    raise RuntimeError(
+                        "candidate transaction negative-cache commit lacks native runtime"
+                    )
+                native_negative_commit = (
+                    self.candidate_transaction_runtime.commit_negative_cache_entries(
+                        pending_negative,
+                        self.native_runtime.context.name_to_index,
+                    )
+                )
+            for store in stores:
+                if self.measurement_trace is None:
+                    continue
+                for evicted in store.evicted:
+                    self.measurement_trace.record_cache_event(
+                        operation="evict",
+                        route_key=evicted.route_key,
+                        cache_key_digest=evicted.digest,
+                        lane=self.lane,
+                        iteration=self.iteration,
+                        operator=self.operator,
+                        reason="lru_capacity_or_memory",
+                        current_entries=store.current_entries,
+                        current_bytes=store.current_bytes,
+                    )
                 self.measurement_trace.record_cache_event(
-                    operation="evict",
-                    route_key=evicted.route_key,
-                    cache_key_digest=evicted.digest,
+                    operation=("store" if store.stored else "oversize_not_cached"),
+                    route_key=store.key.route_key,
+                    cache_key_digest=store.key.digest,
                     lane=self.lane,
                     iteration=self.iteration,
                     operator=self.operator,
-                    reason="lru_capacity_or_memory",
+                    reason=store.reason,
+                    entry_bytes=store.entry_bytes,
                     current_entries=store.current_entries,
                     current_bytes=store.current_bytes,
                 )
-            self.measurement_trace.record_cache_event(
-                operation=("store" if store.stored else "oversize_not_cached"),
-                route_key=store.key.route_key,
-                cache_key_digest=store.key.digest,
-                lane=self.lane,
-                iteration=self.iteration,
-                operator=self.operator,
-                reason=store.reason,
-                entry_bytes=store.entry_bytes,
-                current_entries=store.current_entries,
-                current_bytes=store.current_bytes,
-            )
-        if self.measurement_trace is not None:
-            self.measurement_trace.events.append(
-                {
-                    "event_type": "candidate_cache_commit",
-                    "status": "committed",
-                    "committed_entries": len(pending),
-                    "timestamp_seconds": self.measurement_trace._offset(),
-                    "lane": self.lane,
-                    "iteration": self.iteration,
-                    "operator": self.operator,
-                }
-            )
+            if self.measurement_trace is not None:
+                self.measurement_trace.events.append(
+                    {
+                        "event_type": "candidate_cache_commit",
+                        "status": "committed",
+                        "committed_entries": len(pending),
+                        "committed_negative_entries": len(pending_negative),
+                        "timestamp_seconds": self.measurement_trace._offset(),
+                        "lane": self.lane,
+                        "iteration": self.iteration,
+                        "operator": self.operator,
+                    }
+                )
+            if route_cache_batch is not None:
+                assert self.route_cache is not None
+                self.route_cache.commit_store_batch(route_cache_batch)
+            if native_negative_commit is not None:
+                assert self.candidate_transaction_runtime is not None
+                self.candidate_transaction_runtime.commit_negative_cache_batch(
+                    native_negative_commit
+                )
+        except BaseException:
+            if native_negative_commit is not None and native_negative_commit.active:
+                assert self.candidate_transaction_runtime is not None
+                self.candidate_transaction_runtime.rollback_negative_cache_batch(
+                    native_negative_commit
+                )
+            if route_cache_batch is not None and route_cache_batch.active:
+                assert self.route_cache is not None
+                self.route_cache.rollback_store_batch(route_cache_batch)
+            for sequence in local_insertions:
+                self.cache.pop(sequence, None)
+            for sequence in negative_insertions:
+                self.negative_screening_sequences.pop(sequence, None)
+            raise
+        self.pending_candidate_cache.clear()
+        self.pending_negative_screening_sequences.clear()
 
     @contextmanager
     def measurement_context(
@@ -523,11 +584,10 @@ class _Evaluator:
     @property
     def candidate_transaction_enabled(self) -> bool:
         runtime = self.candidate_transaction_runtime
-        return (
-            runtime is not None
-            and runtime.config.implementation_mode
-            in {"batched_screening", "candidate_transaction"}
-        )
+        return runtime is not None and runtime.config.implementation_mode in {
+            "batched_screening",
+            "candidate_transaction",
+        }
 
     @property
     def pair_pruning_enabled(self) -> bool:
@@ -551,18 +611,13 @@ class _Evaluator:
     ) -> tuple[ChargingSubproblemResult, ...]:
         clean = tuple(sequence for sequence in sequences if sequence)
         if self.candidate_transaction_runtime is not None:
-            if (
-                self.candidate_transaction_runtime.config.implementation_mode
-                == "pair_pruning"
-            ):
+            if self.candidate_transaction_runtime.config.implementation_mode == "pair_pruning":
                 return self.route_batch(
                     clean,
                     route_change_status=route_change_status,
                 )
             if exact_budget is None:
-                raise ValueError(
-                    "native candidate transaction requires the operator exact budget"
-                )
+                raise ValueError("native candidate transaction requires the operator exact budget")
             return self._native_candidate_route_batch(
                 clean,
                 route_change_status=route_change_status,
@@ -595,9 +650,7 @@ class _Evaluator:
         if not clean:
             return ()
         if base_sequences is not None and len(base_sequences) != len(clean):
-            raise ValueError(
-                "candidate transaction base sequences must align with candidates"
-            )
+            raise ValueError("candidate transaction base sequences must align with candidates")
         effective_budget = exact_budget
         controller = self.exact_call_controller
         if controller is not None and controller.budget is not None:
@@ -633,12 +686,8 @@ class _Evaluator:
                 )
                 if propagation.status == "incremental":
                     self.incremental_propagations += 1
-                    self.incremental_reused_prefix_edges += (
-                        propagation.reused_prefix_edges
-                    )
-                    self.incremental_reused_suffix_edges += (
-                        propagation.reused_suffix_edges
-                    )
+                    self.incremental_reused_prefix_edges += propagation.reused_prefix_edges
+                    self.incremental_reused_suffix_edges += propagation.reused_suffix_edges
                     incremental_rows[index] = (
                         1.0,
                         propagation.distance_lower_bound,
@@ -657,33 +706,38 @@ class _Evaluator:
                 self.instance,
                 candidates,
                 native_runtime=native_runtime,
+                transaction_runtime=runtime,
                 negative_cache=self.negative_screening_sequences,
                 deadline=self.deadline,
                 incremental=incremental_rows,
             )
-            self.screening_calls += len(batch.decisions)
+            self.screening_calls += len(batch.sequences)
             self.screening_passes += sum(
-                decision.accepted for decision in batch.decisions
+                batch.accepted(index) for index in range(len(batch.sequences))
             )
             self.screening_rejections += sum(
-                not decision.accepted
-                and decision.native_status != "negative_cache_hit"
-                for decision in batch.decisions
+                not batch.accepted(index) and batch.native_status(index) != "negative_cache_hit"
+                for index in range(len(batch.sequences))
             )
             self.screening_cache_hits += batch.counters["negative_cache_hits"]
             self.screening_exact_call_blocked += sum(
-                not decision.accepted for decision in batch.decisions
+                not batch.accepted(index) for index in range(len(batch.sequences))
             )
-            for decision in batch.decisions:
-                if decision.reason:
-                    self.screening_reason_counts[decision.reason] = (
-                        self.screening_reason_counts.get(decision.reason, 0) + 1
+            for index in range(len(batch.sequences)):
+                reason = batch.reason(index)
+                if reason:
+                    self.screening_reason_counts[reason] = (
+                        self.screening_reason_counts.get(reason, 0) + 1
                     )
             return batch
 
-        def rejected(decision: CandidateScreeningDecision) -> ChargingSubproblemResult:
-            if decision.native_status != "negative_cache_hit":
-                self.negative_screening_sequences[decision.sequence] = decision.reason
+        def rejected(
+            sequence: tuple[str, ...],
+            reason: str,
+            native_status: str,
+        ) -> ChargingSubproblemResult:
+            if native_status != "negative_cache_hit":
+                self.pending_negative_screening_sequences[sequence] = reason
             return ChargingSubproblemResult(
                 False,
                 (),
@@ -695,21 +749,36 @@ class _Evaluator:
                 0,
                 0,
                 0.0,
-                f"cheap_screening:{decision.reason}",
+                f"cheap_screening:{reason}",
             )
 
         try:
             if runtime.config.implementation_mode == "batched_screening":
                 screening = screen_batch(clean)
+                screening_event = {
+                    "event_type": "native_candidate_screening_batch",
+                    "status": "committed",
+                    "lane": self.lane,
+                    "iteration": self.iteration,
+                    "operator": self.operator,
+                    "input_candidates": len(clean),
+                    "candidates": clean,
+                    "screening_pool_hash": screening.candidate_pool_hash,
+                    "screening_integrity_evidence": screening.integrity_evidence(),
+                    "counters": dict(screening.counters),
+                }
                 resolved: list[ChargingSubproblemResult | None] = [None] * len(clean)
                 waiting_indices: dict[tuple[str, ...], list[int]] = {}
                 known_results: dict[tuple[str, ...], ChargingSubproblemResult] = {}
                 exact_sequences: list[tuple[str, ...]] = []
-                for index, decision in enumerate(screening.decisions):
-                    if not decision.accepted:
-                        resolved[index] = rejected(decision)
+                for index, sequence in enumerate(screening.sequences):
+                    if not screening.accepted(index):
+                        resolved[index] = rejected(
+                            sequence,
+                            screening.reason(index),
+                            screening.native_status(index),
+                        )
                         continue
-                    sequence = decision.sequence
                     if sequence in waiting_indices:
                         waiting_indices[sequence].append(index)
                         continue
@@ -750,18 +819,12 @@ class _Evaluator:
                         resolved[index] = result
                 if any(result is None for result in resolved):
                     raise RuntimeError("batched screening lost an ordered result")
+                self._commit_pending_candidate_cache()
                 if self.measurement_trace is not None:
                     self.measurement_trace.events.append(
                         {
-                            "event_type": "native_candidate_screening_batch",
-                            "status": "committed",
                             "timestamp_seconds": self.measurement_trace._offset(),
-                            "lane": self.lane,
-                            "iteration": self.iteration,
-                            "operator": self.operator,
-                            "input_candidates": len(clean),
-                            "screening_pool_hash": screening.candidate_pool_hash,
-                            "counters": dict(screening.counters),
+                            **screening_event,
                         }
                     )
                 return tuple(result for result in resolved if result is not None)
@@ -784,8 +847,8 @@ class _Evaluator:
                     route_change_status,
                     stage_candidate_transaction=True,
                 ),
-                stage_cache_write=lambda sequence, result: (
-                    self.pending_candidate_cache.__setitem__(sequence, result)
+                stage_cache_write=lambda sequence, result: self.pending_candidate_cache.__setitem__(
+                    sequence, result
                 ),
                 commit_cache_writes=self._commit_pending_candidate_cache,
                 rollback_cache_writes=self._discard_pending_candidate_cache,
@@ -793,6 +856,9 @@ class _Evaluator:
                 skipped_result=_candidate_transaction_skip_result,
             )
         except CandidateTransactionDeadlineExceeded as error:
+            self._discard_pending_candidate_cache(
+                f"candidate_transaction_deadline:{error.boundary}"
+            )
             if self.measurement_trace is not None:
                 self.measurement_trace.record_deadline_boundary(
                     lane=self.lane,
@@ -802,6 +868,11 @@ class _Evaluator:
                     reason=str(error),
                 )
             raise _TimeLimitReached(clean[0]) from error
+        except BaseException as error:
+            self._discard_pending_candidate_cache(
+                f"candidate_transaction_failure:{type(error).__name__}:{error}"
+            )
+            raise
         runtime.record(transaction.audit)
         if self.measurement_trace is not None:
             self.measurement_trace.events.append(
@@ -1112,9 +1183,7 @@ class _Evaluator:
         )
         if self.measurement_trace is not None:
             decision_checks = (
-                _NEGATIVE_SEQUENCE_CACHE_HIT_CHECKS
-                if negative_cache_hit
-                else result.checks
+                _NEGATIVE_SEQUENCE_CACHE_HIT_CHECKS if negative_cache_hit else result.checks
             )
             self.measurement_trace.record_screening_decision(
                 sequence,
@@ -3007,10 +3076,7 @@ def _solve_alns(
                             and exact_call_controller.budget_reached
                         )
                     )
-                    if (
-                        quality_probe_accept
-                        and time.perf_counter() >= quality_evaluator.deadline
-                    ):
+                    if quality_probe_accept and time.perf_counter() >= quality_evaluator.deadline:
                         quality_probe_accept = False
                         if measurement_trace is not None:
                             measurement_trace.record_deadline_boundary(
@@ -3448,8 +3514,7 @@ def _solve_alns(
                     ),
                     boundary="before_candidate_commit",
                     reason=(
-                        "main candidate transaction reached the overall deadline "
-                        "before commit"
+                        "main candidate transaction reached the overall deadline before commit"
                     ),
                 )
         if profile is not OperatorProfile.BASELINE:
@@ -3938,19 +4003,13 @@ def _solve_alns(
         if solve_completed_at >= overall_deadline
         else "iteration_limit"
     )
-    if (
-        termination_reason == "wall_clock_deadline"
-        and measurement_trace is not None
-    ):
+    if termination_reason == "wall_clock_deadline" and measurement_trace is not None:
         measurement_trace.record_deadline_boundary(
             lane="solver_finalization",
             iteration=completed_iterations,
             operator="termination",
             boundary="solver_termination",
-            reason=(
-                "overall wall-clock deadline was confirmed after final solution "
-                "validation"
-            ),
+            reason=("overall wall-clock deadline was confirmed after final solution validation"),
         )
     return ALNSResult(
         feasible=True,
@@ -4043,6 +4102,11 @@ def _solve_alns(
             candidate_transaction_runtime.statistics()
             if candidate_transaction_runtime is not None
             else {}
+        ),
+        candidate_transaction_events=(
+            tuple(candidate_transaction_runtime.events)
+            if candidate_transaction_runtime is not None
+            else ()
         ),
         candidate_work_hash=(
             candidate_control_runtime.candidate_work_hash
@@ -4177,9 +4241,7 @@ def solve_alns(
         )
     if candidate_transaction_enabled and native_kernel_config is None:
         raise ValueError("Stage 5.2 candidate transactions require native kernels")
-    if candidate_transaction_enabled and (
-        screening_config is None or not screening_config.enabled
-    ):
+    if candidate_transaction_enabled and (screening_config is None or not screening_config.enabled):
         raise ValueError("Stage 5.2 candidate transactions require cheap screening")
     if candidate_transaction_enabled and (
         ExactChargingBackend(backend) is not ExactChargingBackend.CPU_BATCH

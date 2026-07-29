@@ -91,6 +91,13 @@ def _write_high_occupancy_e_bundle(tmp_path: Path) -> Path:
                                     "native_screening_median_occupancy": 32.0,
                                     "native_candidate_transaction_fallbacks": 0,
                                 },
+                                "candidate_transaction_events": [
+                                    {
+                                        "event_type": "native_candidate_transaction",
+                                        "status": "committed",
+                                        "input_candidates": 32,
+                                    }
+                                ],
                                 "backend_metrics": {
                                     "exact_calls": 1,
                                     "batch_launches": 1,

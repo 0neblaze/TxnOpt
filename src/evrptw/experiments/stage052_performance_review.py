@@ -13,6 +13,7 @@ import re
 import shutil
 import sqlite3
 import statistics
+import struct
 import subprocess
 import tempfile
 import uuid
@@ -35,7 +36,10 @@ from evrptw.artifacts import (
     signed_sidecar_matches,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
-from evrptw.candidate_transaction import NativeCandidateTransactionConfig
+from evrptw.candidate_transaction import (
+    CANDIDATE_TRANSACTION_SCHEMA_VERSION,
+    NativeCandidateTransactionConfig,
+)
 from evrptw.experiments.stage052_performance import (
     PERFORMANCE_INSTANCES,
     PERFORMANCE_SEEDS,
@@ -2425,6 +2429,26 @@ def _audit_cuda_runtime_identity(runtime: Mapping[str, object]) -> tuple[bool, s
     return True, "CUDA helper and Toolkit/nvcc identities independently replayed"
 
 
+def _accelerator_pilot_metadata_matches(
+    metadata: object,
+    selected_backend: object,
+) -> bool:
+    """Require the exact six-worker Stage 5.2 candidate-transaction runtime."""
+
+    return (
+        isinstance(metadata, Mapping)
+        and metadata.get("component") == Stage052Component.ACCELERATOR_PILOT.value
+        and metadata.get("backend") == "cpu_batch"
+        and metadata.get("execution_backend") == selected_backend
+        and metadata.get("accelerator_decision_mode") == "accelerator_pilot"
+        and metadata.get("native_kernel_config") == NativeKernelConfig().to_dict()
+        and metadata.get("candidate_transaction_config")
+        == NativeCandidateTransactionConfig().to_dict()
+        and metadata.get("worker_count") == 6
+        and metadata.get("staging_root", {}).get("alias") == "wsl_staging"
+    )
+
+
 def _review_accelerator_pilot_v2(
     *,
     raw_dir: Path,
@@ -2458,8 +2482,7 @@ def _review_accelerator_pilot_v2(
         if (
             not isinstance(artifact, Mapping)
             or artifact.get("schema_version") != "stage05.2-accelerator-pilot-artifact-v3"
-            or artifact.get("occupancy_metric")
-            != "native_candidate_screening_pool_size"
+            or artifact.get("occupancy_metric") != "native_candidate_screening_pool_size"
             or artifact.get("median_screening_occupancy") != expected_median
             or artifact.get("occupancy_inputs") != expected_occupancies
             or artifact.get("occupancy_input_count") != len(expected_occupancies)
@@ -2500,15 +2523,7 @@ def _review_accelerator_pilot_v2(
     }
     selected_backend = audited.get("selected_backend") if audited is not None else None
     selected_workers = metadata.get("worker_count") if isinstance(metadata, Mapping) else None
-    metadata_passed = (
-        isinstance(metadata, Mapping)
-        and metadata.get("component") == Stage052Component.ACCELERATOR_PILOT.value
-        and metadata.get("backend") == "cpu_batch"
-        and metadata.get("execution_backend") == selected_backend
-        and metadata.get("accelerator_decision_mode") == "accelerator_pilot"
-        and metadata.get("native_kernel_config") == NativeKernelConfig().to_dict()
-        and metadata.get("staging_root", {}).get("alias") == "wsl_staging"
-    )
+    metadata_passed = _accelerator_pilot_metadata_matches(metadata, selected_backend)
     gates["accelerator_pilot_metadata"] = {
         "passed": metadata_passed,
         "detail": "CUDA pilot metadata passed" if metadata_passed else "metadata mismatch",
@@ -2558,7 +2573,7 @@ def _review_accelerator_pilot_v2(
         "selected_optimization_profile": "cuda" if selected_backend == "cuda" else "native",
         "native_configuration": NativeKernelConfig().to_dict() if passed else None,
         "candidate_transaction_configuration": (
-            NativeCandidateTransactionConfig().to_dict() if passed else None
+            metadata.get("candidate_transaction_config") if passed else None
         ),
         "accelerator_runtime_identity": (
             dict(runtime) if passed and isinstance(runtime, Mapping) else None
@@ -2995,8 +3010,7 @@ def _review_accelerator_decision_only(
         and decision.get("selected_backend") == "native_cpu"
         and decision.get("selected_exact_backend") == "cpu_batch"
         and decision.get("threshold") == 32.0
-        and decision.get("occupancy_metric")
-        == "native_candidate_screening_pool_size"
+        and decision.get("occupancy_metric") == "native_candidate_screening_pool_size"
         and decision.get("input_count") == 9
         and decision.get("gpu_rows_present") is False
         and decision.get("fallback_used") is False
@@ -3018,9 +3032,7 @@ def _review_accelerator_decision_only(
                 "detail": str(error),
             }
         else:
-            observed_median = _strict_float(
-                decision.get("median_screening_occupancy")
-            )
+            observed_median = _strict_float(decision.get("median_screening_occupancy"))
             occupancy_passed = (
                 decision.get("inputs") == recomputed_inputs
                 and math.isclose(observed_median, recomputed_median, rel_tol=0.0, abs_tol=1e-12)
@@ -3052,7 +3064,7 @@ def _review_accelerator_decision_only(
             "detail": "decision metadata worker_count is invalid",
         }
     else:
-        worker_passed = selected_workers in {2, 4}
+        worker_passed = selected_workers == 6
         gates["worker_selection"] = {
             "passed": worker_passed,
             "detail": f"selected_workers={selected_workers}",
@@ -3132,9 +3144,7 @@ def _recompute_native_occupancies(raw_dir: Path) -> tuple[list[dict[str, object]
             raise ArtifactIntegrityError(f"invalid E fixed-work raw axis: {identity}")
         transaction = fixed.get("candidate_transaction_statistics")
         if not isinstance(transaction, Mapping):
-            raise ArtifactIntegrityError(
-                f"missing E candidate transaction statistics: {identity}"
-            )
+            raise ArtifactIntegrityError(f"missing E candidate transaction statistics: {identity}")
         transactions = _strict_int(
             transaction.get("native_candidate_transactions"),
             "native_candidate_transactions",
@@ -3149,17 +3159,22 @@ def _recompute_native_occupancies(raw_dir: Path) -> tuple[list[dict[str, object]
         )
         raw_occupancies = transaction.get("native_screening_occupancies")
         if not isinstance(raw_occupancies, (list, tuple)):
-            raise ArtifactIntegrityError(
-                f"missing E native screening occupancies: {identity}"
-            )
+            raise ArtifactIntegrityError(f"missing E native screening occupancies: {identity}")
         occupancies = [
-            _strict_int(value, "native_screening_occupancy")
-            for value in raw_occupancies
+            _strict_int(value, "native_screening_occupancy") for value in raw_occupancies
+        ]
+        raw_events = fixed.get("candidate_transaction_events")
+        if not isinstance(raw_events, list):
+            raise ArtifactIntegrityError(f"missing E raw candidate transaction events: {identity}")
+        event_occupancies = [
+            _strict_int(event.get("input_candidates"), "event input_candidates")
+            for event in raw_events
+            if isinstance(event, Mapping)
+            and event.get("event_type") == "native_candidate_transaction"
+            and event.get("status") == "committed"
         ]
         recomputed_median = statistics.median(occupancies) if occupancies else 0.0
-        recorded_median = _strict_float(
-            transaction.get("native_screening_median_occupancy")
-        )
+        recorded_median = _strict_float(transaction.get("native_screening_median_occupancy"))
         if (
             transactions <= 0
             or input_count <= 0
@@ -3168,10 +3183,9 @@ def _recompute_native_occupancies(raw_dir: Path) -> tuple[list[dict[str, object]
             or len(occupancies) != transactions
             or sum(occupancies) != input_count
             or recorded_median != recomputed_median
+            or event_occupancies != occupancies
         ):
-            raise ArtifactIntegrityError(
-                f"invalid E candidate transaction counters: {identity}"
-            )
+            raise ArtifactIntegrityError(f"invalid E candidate transaction counters: {identity}")
         values[identity] = float(recomputed_median)
     if observed_all != expected_all:
         raise ArtifactIntegrityError("accepted E raw shard scope is not exactly 12 bundles")
@@ -3724,9 +3738,7 @@ def _audit_native_ablation(
         "candidate_transaction",
     )
     expected_identities = {
-        (instance, seed)
-        for instance in PERFORMANCE_INSTANCES
-        for seed in PERFORMANCE_SEEDS
+        (instance, seed) for instance in PERFORMANCE_INSTANCES for seed in PERFORMANCE_SEEDS
     }
     observed: set[tuple[str, int]] = set()
     baseline: list[PerformanceObservation] = []
@@ -3757,18 +3769,19 @@ def _audit_native_ablation(
             continue
         instance = parse_schneider(benchmark_dir / f"{identity[0]}.txt")
         objectives: list[tuple[object, ...]] = []
+        order_signatures: list[str] = []
         for mode in expected_modes:
             row = axes.get(mode)
             if (
                 not isinstance(row, Mapping)
-                or row.get("schema_version") != "stage05.2-native-ablation-axis-v1"
+                or row.get("schema_version") != "stage05.2-native-ablation-axis-v2"
                 or row.get("implementation_mode") != mode
             ):
                 failures.append(f"{identity}/{mode}: invalid ablation schema")
                 continue
             records = row.get("candidate_records")
             routes = row.get("routes")
-            if not isinstance(records, list) or not isinstance(routes, list):
+            if not isinstance(records, Mapping) or not isinstance(routes, list):
                 failures.append(f"{identity}/{mode}: replay inputs are missing")
                 continue
             recomputed_hash = hashlib.sha256(
@@ -3810,8 +3823,59 @@ def _audit_native_ablation(
             )
             if started < 0 or completed < 0 or completed > started:
                 failures.append(f"{identity}/{mode}: exact counters are invalid")
+            failures.extend(
+                f"{identity}/{mode}: {failure}"
+                for failure in _audit_native_ablation_records(
+                    row,
+                    records,
+                    require_transaction=mode == "candidate_transaction",
+                    require_batched_screening=mode == "batched_screening",
+                    name_to_index={
+                        node.name: index for index, node in enumerate(instance.nodes)
+                    },
+                )
+            )
+            trace_records = records.get("trace_events")
+            route_records = records.get("route_evaluations")
+            if isinstance(trace_records, list) and isinstance(route_records, list):
+                order_payload = {
+                    "candidate_states": [
+                        {
+                            key: event.get(key)
+                            for key in (
+                                "lane",
+                                "iteration",
+                                "operator",
+                                "status",
+                                "current_route_keys",
+                                "candidate_route_keys",
+                                "accepted",
+                                "global_best",
+                            )
+                        }
+                        for event in trace_records
+                        if isinstance(event, Mapping)
+                        and event.get("event_type") == "candidate_state"
+                    ],
+                    "exact_route_order": [
+                        event.get("route_key")
+                        for event in route_records
+                        if isinstance(event, Mapping) and event.get("exact_started") is True
+                    ],
+                }
+                order_signatures.append(
+                    hashlib.sha256(
+                        json.dumps(
+                            order_payload,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ).encode("utf-8")
+                    ).hexdigest()
+                )
         if len(objectives) == len(expected_modes) and len(set(objectives)) != 1:
             failures.append(f"{identity}: fixed-work objectives changed across ablation")
+        if len(order_signatures) == len(expected_modes) and len(set(order_signatures)) != 1:
+            failures.append(f"{identity}: candidate/exact route order changed across ablation")
         if identity[0] == "c101C5":
             continue
         current = axes.get("current_native")
@@ -3862,6 +3926,374 @@ def _audit_native_ablation(
         f"aggregate={promotion.aggregate_median_saving:.6f}; "
         f"families={dict(promotion.family_median_savings)}",
     )
+
+
+def _audit_native_ablation_records(
+    row: Mapping[str, object],
+    records: Mapping[str, object],
+    *,
+    require_transaction: bool,
+    require_batched_screening: bool = False,
+    name_to_index: Mapping[str, int] | None = None,
+) -> list[str]:
+    """Independently reconcile exact/cache/deadline/transaction raw records."""
+
+    failures: list[str] = []
+    trace_events = records.get("trace_events")
+    route_evaluations = records.get("route_evaluations")
+    transaction_events = records.get("candidate_transaction_events")
+    neighborhood_events = records.get("neighborhood_events")
+    if (
+        not isinstance(trace_events, list)
+        or not isinstance(route_evaluations, list)
+        or not isinstance(transaction_events, list)
+        or not isinstance(neighborhood_events, list)
+    ):
+        return ["structured semantic record families are incomplete"]
+    trace_rows = [event for event in trace_events if isinstance(event, Mapping)]
+    route_rows = [event for event in route_evaluations if isinstance(event, Mapping)]
+    transaction_rows = [event for event in transaction_events if isinstance(event, Mapping)]
+    if len(trace_rows) != len(trace_events) or len(route_rows) != len(route_evaluations):
+        failures.append("semantic record family contains a non-object row")
+
+    started = sum(event.get("exact_started") is True for event in route_rows)
+    completed = sum(event.get("exact_completed") is True for event in route_rows)
+    if started != _strict_int(row.get("exact_started_calls"), "exact_started_calls"):
+        failures.append("exact started calls do not reconcile from route records")
+    if completed != _strict_int(row.get("exact_completed_calls"), "exact_completed_calls"):
+        failures.append("exact completed calls do not reconcile from route records")
+
+    cache_statistics = row.get("cache_statistics")
+    if isinstance(cache_statistics, Mapping) and cache_statistics:
+        cache_rows = [event for event in trace_rows if event.get("event_type") == "cache_event"]
+        operation_fields = {
+            "lookup": "cache_lookups",
+            "hit": "cache_hits",
+            "miss": "cache_misses",
+            "store": "cache_stores",
+            "evict": "cache_evictions",
+            "oversize_not_cached": "cache_oversize_not_cached",
+        }
+        for operation, field in operation_fields.items():
+            observed = sum(event.get("operation") == operation for event in cache_rows)
+            if observed != _strict_int(cache_statistics.get(field), field):
+                failures.append(f"{field} does not reconcile from cache events")
+
+    exact_budget_boundary_seen = False
+    deadline_boundary_lanes: set[str] = set()
+    for event in trace_rows:
+        event_type = event.get("event_type")
+        if event_type == "exact_budget_boundary":
+            exact_budget_boundary_seen = True
+            continue
+        if event_type == "deadline_boundary":
+            lane = event.get("lane")
+            if not isinstance(lane, str) or not lane:
+                failures.append("deadline boundary lacks a lane")
+                continue
+            deadline_boundary_lanes.add(lane)
+            continue
+        lane_terminated = (
+            exact_budget_boundary_seen or event.get("lane") in deadline_boundary_lanes
+        )
+        if not lane_terminated:
+            continue
+        if event_type == "candidate_state" and (
+            event.get("accepted") is True or event.get("global_best") is True
+        ):
+            failures.append("accepted/global-best event follows a terminal boundary")
+            break
+        if event_type == "cache_event" and event.get("operation") in {
+            "store",
+            "oversize_not_cached",
+        }:
+            failures.append("cache write follows a terminal boundary")
+            break
+
+    committed_screening_batches = [
+        event
+        for event in trace_rows
+        if event.get("event_type") == "native_candidate_screening_batch"
+        and event.get("status") == "committed"
+    ]
+    if require_batched_screening:
+        if not committed_screening_batches:
+            failures.append("batched screening evidence is missing")
+        for event in committed_screening_batches:
+            try:
+                screening_hash = _recompute_screening_hash(
+                    event,
+                    name_to_index=name_to_index,
+                )
+            except (ArtifactIntegrityError, TypeError, ValueError) as error:
+                failures.append(f"batched screening evidence is invalid: {error}")
+                break
+            if event.get("screening_pool_hash") != screening_hash:
+                failures.append("batched screening hash recomputation failed")
+                break
+    elif committed_screening_batches:
+        failures.append("non-batched ablation unexpectedly emitted screening batch events")
+
+    transaction_statistics = row.get("candidate_transaction_statistics")
+    if not isinstance(transaction_statistics, Mapping):
+        transaction_statistics = {}
+    committed_transactions = [
+        event
+        for event in transaction_rows
+        if event.get("event_type") == "native_candidate_transaction"
+        and event.get("status") == "committed"
+    ]
+    if require_transaction:
+        expected_transactions = _strict_int(
+            transaction_statistics.get("native_candidate_transactions"),
+            "native_candidate_transactions",
+        )
+        occupancies = [
+            _strict_int(event.get("input_candidates"), "input_candidates")
+            for event in committed_transactions
+        ]
+        recorded_occupancies = transaction_statistics.get("native_screening_occupancies")
+        if (
+            expected_transactions <= 0
+            or len(committed_transactions) != expected_transactions
+            or not isinstance(recorded_occupancies, (list, tuple))
+            or occupancies
+            != [_strict_int(value, "native_screening_occupancy") for value in recorded_occupancies]
+        ):
+            failures.append("candidate transaction occupancy does not replay")
+        for event in committed_transactions:
+            try:
+                screening_hash, transaction_hash = _recompute_transaction_hashes(
+                    event,
+                    name_to_index=name_to_index,
+                )
+            except (ArtifactIntegrityError, TypeError, ValueError) as error:
+                failures.append(f"candidate transaction evidence is invalid: {error}")
+                break
+            if (
+                event.get("screening_pool_hash") != screening_hash
+                or event.get("transaction_sha256") != transaction_hash
+            ):
+                failures.append("candidate transaction hash recomputation failed")
+                break
+        if (
+            _strict_int(
+                transaction_statistics.get("native_candidate_transaction_fallbacks"),
+                "native_candidate_transaction_fallbacks",
+            )
+            != 0
+        ):
+            failures.append("candidate transaction fallback is non-zero")
+    elif committed_transactions:
+        failures.append("non-transaction ablation unexpectedly emitted transaction events")
+
+    for event in neighborhood_events:
+        if not isinstance(event, Mapping):
+            failures.append("pair-pruning aggregate contains a non-object row")
+            break
+        route_indices = event.get("route_indices")
+        route_sequences = event.get("candidate_route_sequences")
+        if (
+            event.get("operator") != "route_merge"
+            or event.get("status") != "pair_prefilter_rejected_aggregate"
+            or event.get("reason") != "capacity_prefilter"
+            or not isinstance(route_indices, (list, tuple))
+            or len(route_indices) != 2
+            or not isinstance(route_sequences, (list, tuple))
+            or len(route_sequences) != 2
+            or any(not isinstance(sequence, (list, tuple)) for sequence in route_sequences)
+        ):
+            failures.append("pair-pruning aggregate is invalid")
+            break
+        skipped_count = len(route_sequences[0]) + len(route_sequences[1]) + 2
+        pair_identity = {
+            "left": {
+                "index": _strict_int(route_indices[0], "left route index"),
+                "sequence": route_sequences[0],
+            },
+            "reason": "capacity_prefilter",
+            "right": {
+                "index": _strict_int(route_indices[1], "right route index"),
+                "sequence": route_sequences[1],
+            },
+            "schema_version": "route-merge-pair-pruning-v1",
+            "skipped_candidate_count": skipped_count,
+        }
+        expected_digest = hashlib.sha256(
+            json.dumps(
+                pair_identity,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            _strict_int(event.get("aggregate_count"), "aggregate_count")
+            != skipped_count
+            or event.get("candidate_pool_hash") != expected_digest
+        ):
+            failures.append("pair-pruning aggregate recomputation failed")
+            break
+    return failures
+
+
+def _decode_hex_rows(
+    evidence: Mapping[str, object],
+    field: str,
+    count: int,
+    *,
+    kind: str = "q",
+) -> tuple[int | float, ...]:
+    raw = evidence.get(field)
+    if not isinstance(raw, str) or re.fullmatch(r"[0-9a-f]*", raw) is None:
+        raise ArtifactIntegrityError(f"invalid transaction evidence field: {field}")
+    payload = bytes.fromhex(raw)
+    if len(payload) != count * 8:
+        raise ArtifactIntegrityError(f"transaction evidence field has wrong length: {field}")
+    if count == 0:
+        return ()
+    return tuple(struct.unpack(f"<{count}{kind}", payload))
+
+
+def _recompute_transaction_hashes(
+    event: Mapping[str, object],
+    *,
+    name_to_index: Mapping[str, int] | None = None,
+) -> tuple[str, str]:
+    """Recompute native screening and transaction hashes from raw event bytes."""
+
+    candidate_count = _strict_int(event.get("input_candidates"), "input_candidates")
+    evidence = event.get("screening_integrity_evidence")
+    if not isinstance(evidence, Mapping):
+        raise ArtifactIntegrityError("transaction screening integrity evidence is missing")
+    candidate_ids = _decode_hex_rows(
+        evidence,
+        "candidate_ids_le_hex",
+        candidate_count,
+    )
+    statuses = _decode_hex_rows(evidence, "statuses_le_hex", candidate_count)
+    duplicate_of = _decode_hex_rows(
+        evidence,
+        "duplicate_of_le_hex",
+        candidate_count,
+    )
+    codes = _decode_hex_rows(evidence, "codes_le_hex", candidate_count * 16)
+    metrics = _decode_hex_rows(
+        evidence,
+        "metrics_le_hex",
+        candidate_count * 15,
+        kind="d",
+    )
+    offsets = _decode_hex_rows(
+        evidence,
+        "route_offsets_le_hex",
+        candidate_count + 1,
+    )
+    if not offsets or offsets[0] != 0:
+        raise ArtifactIntegrityError("transaction route offsets are invalid")
+    route_index_count = int(offsets[-1])
+    if route_index_count < 0 or any(
+        int(left) > int(right) for left, right in zip(offsets, offsets[1:], strict=False)
+    ):
+        raise ArtifactIntegrityError("transaction route offsets are not monotone")
+    route_indices = _decode_hex_rows(
+        evidence,
+        "route_indices_le_hex",
+        route_index_count,
+    )
+    counters = _decode_hex_rows(evidence, "counters_le_hex", 5)
+    if tuple(int(value) for value in candidate_ids) != tuple(range(candidate_count)):
+        raise ArtifactIntegrityError("transaction candidate IDs lost order")
+    if any(int(value) not in {0, 1, 2} for value in statuses):
+        raise ArtifactIntegrityError("transaction candidate status is invalid")
+    if (
+        int(counters[0]) != candidate_count
+        or int(counters[1]) + int(counters[2]) != candidate_count
+        or int(counters[3]) + int(counters[4]) != int(counters[1])
+    ):
+        raise ArtifactIntegrityError("transaction screening counters are inconsistent")
+    screening_bytes = bytearray()
+    for index in range(candidate_count):
+        begin = int(offsets[index])
+        end = int(offsets[index + 1])
+        for value in (
+            int(candidate_ids[index]),
+            int(statuses[index]),
+            int(duplicate_of[index]),
+            end - begin,
+            *(int(value) for value in route_indices[begin:end]),
+            *(int(value) for value in codes[index * 16 : (index + 1) * 16]),
+        ):
+            screening_bytes.extend(struct.pack("<q", value))
+        for metric_value in metrics[index * 15 : (index + 1) * 15]:
+            screening_bytes.extend(struct.pack("<d", float(metric_value)))
+    for counter_value in counters:
+        screening_bytes.extend(struct.pack("<q", int(counter_value)))
+    screening_hash = hashlib.sha256(screening_bytes).hexdigest()
+
+    candidates = event.get("candidates")
+    if (
+        not isinstance(candidates, (list, tuple))
+        or len(candidates) != candidate_count
+        or any(not isinstance(sequence, (list, tuple)) for sequence in candidates)
+    ):
+        raise ArtifactIntegrityError("transaction candidate order evidence is invalid")
+    if name_to_index is not None:
+        expected_route_indices = [
+            name_to_index.get(str(name), -1)
+            for sequence in candidates
+            for name in sequence
+        ]
+        expected_offsets = [0]
+        for sequence in candidates:
+            expected_offsets.append(expected_offsets[-1] + len(sequence))
+        if (
+            tuple(int(value) for value in route_indices)
+            != tuple(expected_route_indices)
+            or tuple(int(value) for value in offsets) != tuple(expected_offsets)
+        ):
+            raise ArtifactIntegrityError(
+                "transaction route indices do not match candidate sequences"
+            )
+    transaction_payload = {
+        "budget_skips": _strict_int(event.get("budget_skips"), "budget_skips"),
+        "cache_hits": _strict_int(event.get("cache_hits"), "cache_hits"),
+        "candidates": candidates,
+        "exact_budget": _strict_int(event.get("exact_budget"), "exact_budget"),
+        "exact_misses": _strict_int(event.get("exact_misses"), "exact_misses"),
+        "iteration": event.get("iteration"),
+        "lane": event.get("lane"),
+        "operator": event.get("operator"),
+        "schema_version": CANDIDATE_TRANSACTION_SCHEMA_VERSION,
+        "screening_pool_hash": screening_hash,
+    }
+    transaction_hash = hashlib.sha256(
+        json.dumps(
+            transaction_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return screening_hash, transaction_hash
+
+
+def _recompute_screening_hash(
+    event: Mapping[str, object],
+    *,
+    name_to_index: Mapping[str, int] | None = None,
+) -> str:
+    """Recompute only the native screening digest from a structured raw event."""
+
+    proxy = dict(event)
+    proxy.setdefault("budget_skips", 0)
+    proxy.setdefault("cache_hits", 0)
+    proxy.setdefault("exact_budget", 0)
+    proxy.setdefault("exact_misses", 0)
+    return _recompute_transaction_hashes(
+        proxy,
+        name_to_index=name_to_index,
+    )[0]
 
 
 def _component_gates(
@@ -4605,9 +5037,9 @@ def _validate_stage052_source_snapshot(
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
         return False, str(error)
     try:
-        matches = stage052_source_snapshot_contract(
-            observed
-        ) == stage052_source_snapshot_contract(current)
+        matches = stage052_source_snapshot_contract(observed) == stage052_source_snapshot_contract(
+            current
+        )
     except RuntimeError as error:
         return False, str(error)
     if not matches:

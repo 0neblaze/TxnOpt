@@ -4098,17 +4098,31 @@ py::tuple screen_route_batch_transaction_v2(
                 static_cast<char>((bits >> (byte * 8)) & 0xffU));
         }
     };
+    const auto append_f64 = [&append_i64](double value) {
+        std::uint64_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(value));
+        std::memcpy(&bits, &value, sizeof(bits));
+        append_i64(static_cast<std::int64_t>(bits));
+    };
     for (std::size_t index = 0; index < candidate_count; ++index) {
         const auto begin = static_cast<std::size_t>(offsets[index]);
         const auto end = static_cast<std::size_t>(offsets[index + 1]);
         append_i64(ids[index]);
         append_i64(statuses[index]);
         append_i64(duplicate_of[index]);
-        append_i64(outputs[index].codes[1]);
         append_i64(static_cast<std::int64_t>(end - begin));
         for (auto cursor = begin; cursor < end; ++cursor) {
             append_i64(routes[cursor]);
         }
+        for (const auto code : outputs[index].codes) {
+            append_i64(code);
+        }
+        for (const auto metric : outputs[index].metrics) {
+            append_f64(metric);
+        }
+    }
+    for (std::size_t index = 0; index < 5; ++index) {
+        append_i64(counter_values[index]);
     }
     const auto digest = py::cast<std::string>(
         py::module_::import("hashlib")

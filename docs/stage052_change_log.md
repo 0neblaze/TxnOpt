@@ -1517,3 +1517,23 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 - 实现提交前验证：editable native wheel 重建成功；完整 pytest 为 873 passed；
   Ruff 全仓通过；项目 strict mypy 为 71 个 source files 通过，三个本次修改的
   Stage 5.2 tools 另行 strict mypy 通过；`git diff --check` 通过。
+
+## 2026-07-29：Candidate transaction 最终审查加固
+
+- exact route cache、Python negative cache 与 solve-local native packed
+  negative cache 现在共用延迟 finalize 的 O(changes) rollback journals。任一 sibling
+  store、native commit 或完整性步骤失败都会撤销本事务的 exact/negative insertions
+  与 LRU eviction/statistics；不会保留部分 cache writes。
+- pair-capacity aggregate event 新增左右路线原始序列。reviewer 从两条路线、原始
+  route indices 和 `len(left)+len(right)+2` 独立重算 skipped count、canonical pair
+  identity 与 SHA-256，不再只检查 digest 格式。
+- batched-screening ablation 现在持久化 ordered candidates、ABI-v2 structured array
+  bytes 与 counters；reviewer 独立重算 screening SHA-256。deadline replay 改为
+  lane-local，process-wide exact-budget boundary 仍保持全局终止语义。
+- accelerator Pilot metadata gate 明确要求 6 workers、`cpu_batch`、选定 native
+  backend、ABI-v2 native config 与完全相等的
+  `NativeCandidateTransactionConfig`；review manifest 只复制已验证的原始配置。
+- editable native wheel 再次重建成功；focused suite 为 242 passed，完整 pytest 为
+  885 passed；Ruff 全仓、70 个 source files 的 strict mypy 与
+  `git diff --check` 全部通过。该结果仅完成实现验证，不构成性能 promotion、
+  Pilot/Formal readiness 或 `READY_FOR_STAGE05_3`。

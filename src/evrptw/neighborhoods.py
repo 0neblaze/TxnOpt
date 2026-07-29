@@ -2032,6 +2032,7 @@ def _route_merge_pair_capacity_event(
         "pair_prefilter_rejected_aggregate",
         "capacity_prefilter",
         route_indices=(left.index, right.index),
+        candidate_route_sequences=(left.sequence, right.sequence),
         prefilter_passed=False,
         aggregate_count=skipped_count,
         candidate_pool_hash=digest,

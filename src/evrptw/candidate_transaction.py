@@ -80,8 +80,7 @@ class NativeCandidateTransactionConfig:
             raise ValueError("disabled candidate transaction is ambiguous; pass None instead")
         if self.schema_version != CANDIDATE_TRANSACTION_SCHEMA_VERSION:
             raise ValueError(
-                f"candidate transaction schema must be "
-                f"{CANDIDATE_TRANSACTION_SCHEMA_VERSION!r}"
+                f"candidate transaction schema must be {CANDIDATE_TRANSACTION_SCHEMA_VERSION!r}"
             )
         if self.implementation_mode not in {
             "pair_pruning",
@@ -103,39 +102,63 @@ class NativeCandidateTransactionConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class CandidateScreeningDecision:
-    """One compact native screening result in original candidate order."""
-
-    candidate_id: int
-    sequence: CustomerSequence
-    accepted: bool
-    reason: str
-    native_status: str
-    duplicate_of: int | None = None
-    distance_lower_bound: float = 0.0
-
-
-@dataclass(frozen=True, slots=True)
 class CandidateScreeningBatch:
-    """Validated output of one native batched screening invocation."""
+    """Validated structured output of one native batched screening invocation."""
 
-    decisions: tuple[CandidateScreeningDecision, ...]
+    sequences: tuple[CustomerSequence, ...]
+    candidate_ids: npt.NDArray[np.int64]
+    statuses: npt.NDArray[np.int64]
+    duplicate_of: npt.NDArray[np.int64]
+    codes: npt.NDArray[np.int64]
+    metrics: npt.NDArray[np.float64]
+    route_offsets: npt.NDArray[np.int64]
+    route_indices: npt.NDArray[np.int64]
+    raw_counters: npt.NDArray[np.int64]
     counters: Mapping[str, int]
     candidate_pool_hash: str
 
     def __post_init__(self) -> None:
         if len(self.candidate_pool_hash) != 64 or any(
-            character not in "0123456789abcdef"
-            for character in self.candidate_pool_hash
+            character not in "0123456789abcdef" for character in self.candidate_pool_hash
         ):
             raise ValueError("native candidate-pool SHA-256 is invalid")
-        if tuple(decision.candidate_id for decision in self.decisions) != tuple(
-            range(len(self.decisions))
-        ):
+        expected = len(self.sequences)
+        if not np.array_equal(self.candidate_ids, np.arange(expected, dtype=np.int64)):
             raise ValueError("native screening decisions lost candidate order")
-        expected = len(self.decisions)
         if self.counters.get("input_candidates") != expected:
             raise ValueError("native screening input count is inconsistent")
+        if (
+            self.statuses.shape != (expected,)
+            or self.duplicate_of.shape != (expected,)
+            or self.codes.shape != (expected, 16)
+            or self.metrics.shape != (expected, 15)
+            or self.route_offsets.shape != (expected + 1,)
+            or self.raw_counters.shape != (5,)
+        ):
+            raise ValueError("native screening structured arrays lost candidate rows")
+
+    def accepted(self, index: int) -> bool:
+        return bool(self.codes[index, 0])
+
+    def reason(self, index: int) -> str:
+        return _SCREEN_REASONS[int(self.codes[index, 1])]
+
+    def native_status(self, index: int) -> str:
+        return _NATIVE_SCREEN_STATUSES[int(self.statuses[index])]
+
+    def integrity_evidence(self) -> dict[str, object]:
+        """Return compact byte evidence for independent ABI digest replay."""
+
+        return {
+            "candidate_ids_le_hex": self.candidate_ids.astype("<i8", copy=False).tobytes().hex(),
+            "statuses_le_hex": self.statuses.astype("<i8", copy=False).tobytes().hex(),
+            "duplicate_of_le_hex": self.duplicate_of.astype("<i8", copy=False).tobytes().hex(),
+            "codes_le_hex": self.codes.astype("<i8", copy=False).tobytes().hex(),
+            "metrics_le_hex": self.metrics.astype("<f8", copy=False).tobytes().hex(),
+            "route_offsets_le_hex": self.route_offsets.astype("<i8", copy=False).tobytes().hex(),
+            "route_indices_le_hex": self.route_indices.astype("<i8", copy=False).tobytes().hex(),
+            "counters_le_hex": self.raw_counters.astype("<i8", copy=False).tobytes().hex(),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +189,9 @@ class CandidateTransactionAudit:
     operator: str
     iteration: int | None
     input_candidates: int
+    candidates: tuple[CustomerSequence, ...]
+    exact_budget: int
+    screening_integrity_evidence: Mapping[str, object]
     screening_rejections: int
     cache_hits: int
     exact_misses: int
@@ -182,6 +208,16 @@ class CandidateTransactionResult[ResultT]:
 
 
 @dataclass(slots=True)
+class NegativeCacheCommit:
+    """O(changes) journal for solve-local packed negative-cache updates."""
+
+    added_sequences: tuple[CustomerSequence, ...]
+    entry_count_before: int
+    index_count_before: int
+    active: bool = True
+
+
+@dataclass(slots=True)
 class NativeCandidateTransactionRuntime:
     """Solve-local owner of compact transaction evidence."""
 
@@ -191,12 +227,23 @@ class NativeCandidateTransactionRuntime:
     input_candidate_count: int = 0
     screening_occupancies: list[int] = field(default_factory=list)
     fallback_count: int = 0
+    _negative_cache_initialized: bool = False
+    _negative_cache_sequences: set[CustomerSequence] = field(default_factory=set)
+    _negative_cache_offsets: npt.NDArray[np.int64] = field(
+        default_factory=lambda: np.empty(8, dtype=np.int64)
+    )
+    _negative_cache_indices: npt.NDArray[np.int64] = field(
+        default_factory=lambda: np.empty(16, dtype=np.int64)
+    )
+    _negative_cache_reason_codes: npt.NDArray[np.int64] = field(
+        default_factory=lambda: np.empty(8, dtype=np.int64)
+    )
+    _negative_cache_entry_count: int = 0
+    _negative_cache_index_count: int = 0
 
     def statistics(self) -> dict[str, object]:
         median_occupancy = (
-            0.0
-            if not self.screening_occupancies
-            else statistics.median(self.screening_occupancies)
+            0.0 if not self.screening_occupancies else statistics.median(self.screening_occupancies)
         )
         return {
             "native_candidate_transactions": self.transaction_count,
@@ -218,12 +265,118 @@ class NativeCandidateTransactionRuntime:
             }
         )
 
+    def packed_negative_cache(
+        self,
+        negative_cache: Mapping[CustomerSequence, str],
+        name_to_index: Mapping[str, int],
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+    ]:
+        """Return the amortized solve-local packed negative-cache state."""
+
+        if not self._negative_cache_initialized:
+            self._negative_cache_initialized = True
+            self._negative_cache_offsets[0] = 0
+            self.commit_negative_cache_entries(
+                dict(sorted(negative_cache.items())),
+                name_to_index,
+            )
+        elif len(negative_cache) != self._negative_cache_entry_count:
+            raise RuntimeError("negative cache changed outside the candidate transaction runtime")
+        return (
+            self._negative_cache_offsets[: self._negative_cache_entry_count + 1],
+            self._negative_cache_indices[: self._negative_cache_index_count],
+            self._negative_cache_reason_codes[: self._negative_cache_entry_count],
+        )
+
+    def commit_negative_cache_entries(
+        self,
+        entries: Mapping[CustomerSequence, str],
+        name_to_index: Mapping[str, int],
+    ) -> NegativeCacheCommit:
+        """Append committed entries without repacking prior cache contents."""
+
+        additions = [
+            (sequence, reason)
+            for sequence, reason in entries.items()
+            if sequence not in self._negative_cache_sequences
+        ]
+        if not additions:
+            if self._negative_cache_entry_count == 0:
+                self._negative_cache_offsets[0] = 0
+            return NegativeCacheCommit(
+                (),
+                self._negative_cache_entry_count,
+                self._negative_cache_index_count,
+            )
+        entry_count_before = self._negative_cache_entry_count
+        index_count_before = self._negative_cache_index_count
+        packed_routes = tuple(sequence for sequence, _reason in additions)
+        packed_offsets, packed_indices = _pack_route_rows(
+            packed_routes,
+            name_to_index,
+        )
+        try:
+            reason_codes = [_SCREEN_REASON_CODES[reason] for _sequence, reason in additions]
+        except KeyError as error:
+            raise ValueError("negative cache contains an unknown screening reason") from error
+        required_entries = self._negative_cache_entry_count + len(additions)
+        required_indices = self._negative_cache_index_count + len(packed_indices)
+        self._negative_cache_offsets = _grow_int64_buffer(
+            self._negative_cache_offsets,
+            required_entries + 1,
+        )
+        self._negative_cache_reason_codes = _grow_int64_buffer(
+            self._negative_cache_reason_codes,
+            required_entries,
+        )
+        self._negative_cache_indices = _grow_int64_buffer(
+            self._negative_cache_indices,
+            required_indices,
+        )
+        base_entry = self._negative_cache_entry_count
+        base_index = self._negative_cache_index_count
+        self._negative_cache_indices[base_index : base_index + len(packed_indices)] = packed_indices
+        self._negative_cache_offsets[base_entry + 1 : required_entries + 1] = (
+            packed_offsets[1:] + base_index
+        )
+        self._negative_cache_reason_codes[base_entry:required_entries] = reason_codes
+        self._negative_cache_sequences.update(packed_routes)
+        self._negative_cache_entry_count = required_entries
+        self._negative_cache_index_count = required_indices
+        return NegativeCacheCommit(
+            packed_routes,
+            entry_count_before,
+            index_count_before,
+        )
+
+    def commit_negative_cache_batch(self, commit: NegativeCacheCommit) -> None:
+        """Finalize a packed negative-cache update."""
+
+        if not commit.active:
+            raise RuntimeError("negative cache commit is no longer active")
+        commit.active = False
+
+    def rollback_negative_cache_batch(self, commit: NegativeCacheCommit) -> None:
+        """Undo a packed negative-cache append using its bounded journal."""
+
+        if not commit.active:
+            raise RuntimeError("negative cache commit is no longer active")
+        for sequence in commit.added_sequences:
+            self._negative_cache_sequences.remove(sequence)
+        self._negative_cache_entry_count = commit.entry_count_before
+        self._negative_cache_index_count = commit.index_count_before
+        commit.active = False
+
 
 def native_screen_candidate_batch(
     instance: Instance,
     candidates: tuple[CustomerSequence, ...],
     *,
     native_runtime: NativeKernelRuntime,
+    transaction_runtime: NativeCandidateTransactionRuntime,
     negative_cache: Mapping[CustomerSequence, str],
     deadline: float,
     incremental: npt.NDArray[np.float64] | None = None,
@@ -255,18 +408,12 @@ def native_screen_candidate_batch(
             shape=(len(candidates), 6),
         )
     )
-    negative_sequences = tuple(sorted(negative_cache))
-    negative_offsets, negative_indices = _pack_route_rows(
-        negative_sequences,
-        context.name_to_index,
-    )
-    try:
-        negative_reason_codes = np.ascontiguousarray(
-            [_SCREEN_REASON_CODES[negative_cache[sequence]] for sequence in negative_sequences],
-            dtype=np.int64,
+    negative_offsets, negative_indices, negative_reason_codes = (
+        transaction_runtime.packed_negative_cache(
+            negative_cache,
+            context.name_to_index,
         )
-    except KeyError as error:
-        raise ValueError("negative cache contains an unknown screening reason") from error
+    )
 
     from evrptw import _core as native_core
 
@@ -349,6 +496,8 @@ def native_screen_candidate_batch(
         statuses,
         duplicate_of,
         codes,
+        metrics,
+        raw_counters,
         route_offsets,
         route_indices,
     )
@@ -363,27 +512,24 @@ def native_screen_candidate_batch(
     }
     if (
         counters["input_candidates"] != len(candidates)
-        or counters["unique_candidates"] + counters["duplicate_candidates"]
-        != len(candidates)
+        or counters["unique_candidates"] + counters["duplicate_candidates"] != len(candidates)
         or counters["negative_cache_hits"] + counters["screened_candidates"]
         != counters["unique_candidates"]
     ):
         raise RuntimeError("native candidate screening counters are inconsistent")
-    decisions = tuple(
-        CandidateScreeningDecision(
-            candidate_id=index,
-            sequence=sequence,
-            accepted=bool(codes[index, 0]),
-            reason=_SCREEN_REASONS[reason_codes[index]],
-            native_status=_NATIVE_SCREEN_STATUSES[status_codes[index]],
-            duplicate_of=(
-                None if int(duplicate_of[index]) < 0 else int(duplicate_of[index])
-            ),
-            distance_lower_bound=float(metrics[index, 3]),
-        )
-        for index, sequence in enumerate(candidates)
+    return CandidateScreeningBatch(
+        candidates,
+        returned_ids,
+        statuses,
+        duplicate_of,
+        codes,
+        metrics,
+        route_offsets,
+        route_indices,
+        raw_counters,
+        counters,
+        digest,
     )
-    return CandidateScreeningBatch(decisions, counters, digest)
 
 
 def execute_candidate_transaction[ResultT](
@@ -395,7 +541,7 @@ def execute_candidate_transaction[ResultT](
     stage_cache_write: Callable[[CustomerSequence, ResultT], None],
     commit_cache_writes: Callable[[], None],
     rollback_cache_writes: Callable[[str], None],
-    rejected_result: Callable[[CandidateScreeningDecision], ResultT],
+    rejected_result: Callable[[CustomerSequence, str, str], ResultT],
     skipped_result: Callable[[str], ResultT],
     clock: Callable[[], float] = time.perf_counter,
 ) -> CandidateTransactionResult[ResultT]:
@@ -405,13 +551,10 @@ def execute_candidate_transaction[ResultT](
     try:
         _check_deadline(request, "before_native_screening", clock)
         screening = screen_batch(request.candidates)
-        if len(screening.decisions) != len(request.candidates):
+        if len(screening.sequences) != len(request.candidates):
             raise RuntimeError("native screening lost candidate rows")
-        for candidate_id, (sequence, decision) in enumerate(
-            zip(request.candidates, screening.decisions, strict=True)
-        ):
-            if decision.candidate_id != candidate_id or decision.sequence != sequence:
-                raise RuntimeError("native screening changed candidate identity or order")
+        if screening.sequences != request.candidates:
+            raise RuntimeError("native screening changed candidate identity or order")
 
         resolved: list[ResultT | None] = [None] * len(request.candidates)
         waiting_indices: dict[CustomerSequence, list[int]] = {}
@@ -422,14 +565,15 @@ def execute_candidate_transaction[ResultT](
         duplicate_candidates = 0
         known_resolution: dict[CustomerSequence, ResultT | None] = {}
 
-        for index, decision in enumerate(screening.decisions):
-            if decision.native_status == "duplicate":
+        for index, sequence in enumerate(screening.sequences):
+            native_status = screening.native_status(index)
+            reason = screening.reason(index)
+            if native_status == "duplicate":
                 duplicate_candidates += 1
-            if not decision.accepted:
+            if not screening.accepted(index):
                 screening_rejections += 1
-                resolved[index] = rejected_result(decision)
+                resolved[index] = rejected_result(sequence, reason, native_status)
                 continue
-            sequence = decision.sequence
             if sequence in waiting_indices:
                 waiting_indices[sequence].append(index)
                 continue
@@ -475,13 +619,14 @@ def execute_candidate_transaction[ResultT](
             exact_misses=len(exact_sequences),
             budget_skips=budget_skips,
         )
-        commit_cache_writes()
-        staged = False
         audit = CandidateTransactionAudit(
             lane=request.lane,
             operator=request.operator,
             iteration=request.iteration,
             input_candidates=len(request.candidates),
+            candidates=request.candidates,
+            exact_budget=request.exact_budget,
+            screening_integrity_evidence=screening.integrity_evidence(),
             screening_rejections=screening_rejections,
             cache_hits=cache_hits,
             exact_misses=len(exact_sequences),
@@ -490,14 +635,14 @@ def execute_candidate_transaction[ResultT](
             screening_pool_hash=screening.candidate_pool_hash,
             transaction_sha256=transaction_sha256,
         )
+        commit_cache_writes()
+        staged = False
         return CandidateTransactionResult(
             tuple(result for result in resolved if result is not None),
             audit,
         )
     except BaseException as error:
-        rollback_cache_writes(
-            f"candidate_transaction_rollback:{type(error).__name__}:{error}"
-        )
+        rollback_cache_writes(f"candidate_transaction_rollback:{type(error).__name__}:{error}")
         staged = False
         raise
     finally:
@@ -568,10 +713,20 @@ def _strict_array(
     if not isinstance(value, np.ndarray):
         raise RuntimeError(f"native {name} must be a NumPy array")
     if value.dtype != dtype or value.shape != shape or not value.flags.c_contiguous:
-        raise RuntimeError(
-            f"native {name} must be C-contiguous {dtype} with shape {shape}"
-        )
+        raise RuntimeError(f"native {name} must be C-contiguous {dtype} with shape {shape}")
     return value
+
+
+def _grow_int64_buffer(
+    current: npt.NDArray[np.int64],
+    required: int,
+) -> npt.NDArray[np.int64]:
+    if required <= len(current):
+        return current
+    capacity = max(required, max(8, len(current) * 2))
+    grown = np.empty(capacity, dtype=np.int64)
+    grown[: len(current)] = current
+    return grown
 
 
 def _native_screening_digest(
@@ -579,6 +734,8 @@ def _native_screening_digest(
     statuses: npt.NDArray[np.int64],
     duplicate_of: npt.NDArray[np.int64],
     codes: npt.NDArray[np.int64],
+    metrics: npt.NDArray[np.float64],
+    counters: npt.NDArray[np.int64],
     route_offsets: npt.NDArray[np.int64],
     route_indices: npt.NDArray[np.int64],
 ) -> str:
@@ -590,9 +747,13 @@ def _native_screening_digest(
             int(candidate_ids[index]),
             int(statuses[index]),
             int(duplicate_of[index]),
-            int(codes[index, 1]),
             end - begin,
             *(int(value) for value in route_indices[begin:end]),
+            *(int(value) for value in codes[index]),
         ):
             payload.extend(struct.pack("<q", value))
+        for value in metrics[index]:
+            payload.extend(struct.pack("<d", float(value)))
+    for value in counters:
+        payload.extend(struct.pack("<q", int(value)))
     return hashlib.sha256(payload).hexdigest()

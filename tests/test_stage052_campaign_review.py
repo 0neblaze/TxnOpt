@@ -888,8 +888,7 @@ def test_campaign_reviewer_replays_each_logical_event_stream_once() -> None:
     instance = parse_schneider(Path("data/schneider/c101C5.txt"))
     baseline = json.loads(
         Path(
-            "experiments/baselines/stage00/solutions/"
-            "c101C5-alns_exact_charging-2014.json"
+            "experiments/baselines/stage00/solutions/c101C5-alns_exact_charging-2014.json"
         ).read_text(encoding="utf-8")
     )
     routes = baseline["routes"]
@@ -898,16 +897,11 @@ def test_campaign_reviewer_replays_each_logical_event_stream_once() -> None:
     objective = SolutionObjective.from_report(instance, report).key
     customer_names = {customer.name for customer in instance.customers}
     full_route_keys = [
-        "route:" + "|".join(f"{len(str(node))}:{node}" for node in route)
-        for route in routes
+        "route:" + "|".join(f"{len(str(node))}:{node}" for node in route) for route in routes
     ]
     route_keys = [
         "route:"
-        + "|".join(
-            f"{len(str(node))}:{node}"
-            for node in route
-            if str(node) in customer_names
-        )
+        + "|".join(f"{len(str(node))}:{node}" for node in route if str(node) in customer_names)
         for route in routes
     ]
     events = [
@@ -1014,23 +1008,19 @@ def test_spawned_shard_summary_rejects_raw_payload_fields() -> None:
 
 
 def test_screening_definition_bound_gate_requires_native_state_below_limit() -> None:
-    passed, passed_detail = (
-        campaign_review_module._screening_definition_bound_gate(  # noqa: SLF001
-            [2_097_152, 1],
-            producer_memory_entries=2_097_152,
-            producer_backend="native_bounded_digest",
-            overflow_policy="fail_fast",
-            spill_backend="none",
-        )
+    passed, passed_detail = campaign_review_module._screening_definition_bound_gate(  # noqa: SLF001
+        [2_097_152, 1],
+        producer_memory_entries=2_097_152,
+        producer_backend="native_bounded_digest",
+        overflow_policy="fail_fast",
+        spill_backend="none",
     )
-    overflowed, overflowed_detail = (
-        campaign_review_module._screening_definition_bound_gate(  # noqa: SLF001
-            [2_097_153, 1],
-            producer_memory_entries=2_097_152,
-            producer_backend="native_bounded_digest",
-            overflow_policy="fail_fast",
-            spill_backend="none",
-        )
+    overflowed, overflowed_detail = campaign_review_module._screening_definition_bound_gate(  # noqa: SLF001
+        [2_097_153, 1],
+        producer_memory_entries=2_097_152,
+        producer_backend="native_bounded_digest",
+        overflow_policy="fail_fast",
+        spill_backend="none",
     )
 
     assert passed is True
@@ -1095,17 +1085,12 @@ def test_failed_spawned_shard_is_not_retried_and_cleans_scratch(
             expected_seed=2014,
         )
 
-    progress = [
-        json.loads(line)
-        for line in progress_path.read_text(encoding="utf-8").splitlines()
-    ]
+    progress = [json.loads(line) for line in progress_path.read_text(encoding="utf-8").splitlines()]
     assert sum(row["event"] == "campaign_shard_replay_start" for row in progress) == 1
     child_failure = next(
         row for row in progress if row["event"] == "campaign_shard_replay_child_failed"
     )
-    parent_failure = next(
-        row for row in progress if row["event"] == "campaign_shard_replay_failed"
-    )
+    parent_failure = next(row for row in progress if row["event"] == "campaign_shard_replay_failed")
     assert child_failure["child_pid"] != parent_failure["parent_pid"]
     assert child_failure["scratch_cleaned"] is True
     assert parent_failure["scratch_cleaned"] is True
@@ -1264,9 +1249,7 @@ def test_global_best_stream_summary_keeps_only_checkpoint_visible_events() -> No
         "route:" + "|".join(f"{len(str(node))}:{node}" for node in route) for route in routes
     ]
     customer_names = {customer.name for customer in instance.customers}
-    customer_sequences = [
-        [node for node in route if node in customer_names] for route in routes
-    ]
+    customer_sequences = [[node for node in route if node in customer_names] for route in routes]
     route_keys = [
         "route:" + "|".join(f"{len(str(node))}:{node}" for node in route)
         for route in customer_sequences
@@ -1294,11 +1277,7 @@ def test_global_best_stream_summary_keeps_only_checkpoint_visible_events() -> No
     assert len(summaries["wall_clock_30"]) == 1
 
     missing_full_routes = (
-        {
-            key: value
-            for key, value in events[0].items()
-            if key != "candidate_full_route_keys"
-        },
+        {key: value for key, value in events[0].items() if key != "candidate_full_route_keys"},
     )
     with pytest.raises(ValueError, match="lacks complete candidate route identity"):
         summarize_streamed_global_bests(
@@ -1392,12 +1371,10 @@ def _selection_inputs() -> tuple[dict[str, object], dict[str, object], dict[str,
         "scope": "performance",
         "backend": "cpu_batch",
         "execution_backend": "native_cpu",
-        "worker_count": 2,
+        "worker_count": 6,
         "optimization_profile": "native",
         "native_kernel_config": native,
-        "candidate_transaction_config": (
-            NativeCandidateTransactionConfig().to_dict()
-        ),
+        "candidate_transaction_config": (NativeCandidateTransactionConfig().to_dict()),
         "repository_revision": "a" * 40,
         "repository_dirty": False,
         "configuration_sha256": "6" * 64,
@@ -1419,12 +1396,10 @@ def _selection_inputs() -> tuple[dict[str, object], dict[str, object], dict[str,
         "campaign_prerequisite_review_sha256": "e" * 64,
         "selected_backend": "native_cpu",
         "selected_exact_backend": "cpu_batch",
-        "selected_workers": 2,
+        "selected_workers": 6,
         "selected_optimization_profile": "native",
         "native_configuration": native,
-        "candidate_transaction_configuration": (
-            NativeCandidateTransactionConfig().to_dict()
-        ),
+        "candidate_transaction_configuration": (NativeCandidateTransactionConfig().to_dict()),
     }
     identity: dict[str, object] = {
         "run_label": metadata["run_label"],
@@ -1553,7 +1528,7 @@ def _build_complete_pilot_campaign(
         "scope": "pilot",
         "backend": "cpu_batch",
         "execution_backend": "native_cpu",
-        "worker_count": 2,
+        "worker_count": 6,
         "worker_process_lifecycle": "one_shard_per_spawned_process",
         "worker_runtime_warmup": "in_memory_arrow_zstd1",
         "screening_definition_store": screening_definition_store_contract(),
@@ -1730,8 +1705,7 @@ def _build_complete_pilot_campaign(
                 "mode": "bounded_async_thread",
                 "queue_max_batches": 1,
                 "writer_thread_switch_interval_seconds": (
-                    campaign_review_module
-                    .STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS
+                    campaign_review_module.STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS
                 ),
                 "submitted_batches": 1,
                 "completed_batches": 1,
@@ -1752,8 +1726,9 @@ def _build_complete_pilot_campaign(
                         "event_token_sha256": hashlib.sha256(
                             b"".join(
                                 orjson.dumps(
-                                    campaign_review_module
-                                    ._pipeline_event_token_from_logical_row(event)  # noqa: SLF001
+                                    campaign_review_module._pipeline_event_token_from_logical_row(
+                                        event
+                                    )  # noqa: SLF001
                                 )
                                 + b"\n"
                                 for event in critical_events
@@ -1834,7 +1809,7 @@ def _build_complete_pilot_campaign(
         "schema_version": STAGE052_RESOURCE_SCHEMA_VERSION,
         "run_label": run_label,
         "component": "benchmark",
-        "configured_worker_count": 2,
+        "configured_worker_count": 6,
         "measurement_scope": STAGE052_RESOURCE_MEASUREMENT_SCOPE,
         "run_wall_seconds": 1080.0,
         "sample_interval_seconds": 0.05,
@@ -2027,7 +2002,7 @@ def _build_complete_pilot_campaign(
         prerequisite_review_sha256=prerequisite_hash,
         selected_backend="native_cpu",
         selected_exact_backend="cpu_batch",
-        selected_workers=2,
+        selected_workers=6,
         native_profile="stage05.2-native-kernels-v2",
         storage_policy_version="artifact-storage-v2",
         screening_schema_version="screening_decisions_v3",
@@ -2341,7 +2316,7 @@ def test_campaign_selection_lock_binds_f02_backend_worker_native_and_provenance(
     audit = validate_campaign_selection_lock(
         campaign_backend="native_cpu",
         campaign_exact_backend="cpu_batch",
-        campaign_workers=2,
+        campaign_workers=6,
         campaign_native_profile="stage05.2-native-kernels-v2",
         prerequisite_metadata=metadata,
         prerequisite_review=review,
@@ -2349,7 +2324,7 @@ def test_campaign_selection_lock_binds_f02_backend_worker_native_and_provenance(
     )
 
     assert audit.passed is True
-    assert audit.selection_lock["selected_workers"] == 2
+    assert audit.selection_lock["selected_workers"] == 6
     assert audit.selection_lock["native_kernel_config"] == metadata["native_kernel_config"]
     assert audit.selection_lock["accelerator_review_manifest_sha256"] == "b" * 64
 
@@ -2359,7 +2334,7 @@ def test_batch_runtime_provenance_ignores_telemetry_across_batches() -> None:
     audit = validate_campaign_selection_lock(
         campaign_backend="native_cpu",
         campaign_exact_backend="cpu_batch",
-        campaign_workers=2,
+        campaign_workers=6,
         campaign_native_profile="stage05.2-native-kernels-v2",
         prerequisite_metadata=prerequisite_metadata,
         prerequisite_review=review,
@@ -2373,7 +2348,7 @@ def test_batch_runtime_provenance_ignores_telemetry_across_batches() -> None:
         prerequisite_review_sha256="b" * 64,
         selected_backend="native_cpu",
         selected_exact_backend="cpu_batch",
-        selected_workers=2,
+        selected_workers=6,
         native_profile="stage05.2-native-kernels-v2",
         storage_policy_version="artifact-storage-v2",
         screening_schema_version="screening_decisions_v3",
@@ -2414,9 +2389,7 @@ def test_batch_runtime_provenance_ignores_telemetry_across_batches() -> None:
         metadata,
         campaign=campaign,
         selection_lock=audit.selection_lock,
-        configuration_selection_sha256=str(
-            prerequisite_metadata["configuration_sha256"]
-        ),
+        configuration_selection_sha256=str(prerequisite_metadata["configuration_sha256"]),
         source_snapshot=_SOURCE_SNAPSHOT,
     )
     second_metadata = {
@@ -2431,9 +2404,7 @@ def test_batch_runtime_provenance_ignores_telemetry_across_batches() -> None:
         second_metadata,
         campaign=campaign,
         selection_lock=audit.selection_lock,
-        configuration_selection_sha256=str(
-            prerequisite_metadata["configuration_sha256"]
-        ),
+        configuration_selection_sha256=str(prerequisite_metadata["configuration_sha256"]),
         source_snapshot=_SOURCE_SNAPSHOT,
     )
 
@@ -2453,7 +2424,7 @@ def test_campaign_selection_lock_binds_promoted_cuda_backend() -> None:
     audit = validate_campaign_selection_lock(
         campaign_backend="cuda",
         campaign_exact_backend="cpu_batch",
-        campaign_workers=2,
+        campaign_workers=6,
         campaign_native_profile="stage05.2-native-kernels-v2",
         prerequisite_metadata=metadata,
         prerequisite_review=review,
@@ -2473,7 +2444,7 @@ def test_campaign_selection_lock_rejects_f02_review_drift(field: str) -> None:
     audit = validate_campaign_selection_lock(
         campaign_backend="native_cpu",
         campaign_exact_backend="cpu_batch",
-        campaign_workers=2,
+        campaign_workers=6,
         campaign_native_profile="stage05.2-native-kernels-v2",
         prerequisite_metadata=metadata,
         prerequisite_review=review,
@@ -2495,7 +2466,7 @@ def test_campaign_selection_lock_rejects_incomplete_native_profile() -> None:
     audit = validate_campaign_selection_lock(
         campaign_backend="native_cpu",
         campaign_exact_backend="cpu_batch",
-        campaign_workers=2,
+        campaign_workers=6,
         campaign_native_profile="stage05.2-native-kernels-v2",
         prerequisite_metadata=metadata,
         prerequisite_review=review,
@@ -2656,7 +2627,7 @@ def _accepted_review(
                         "decision": "GPU_NOT_JUSTIFIED",
                         "selected_backend": "native_cpu",
                         "selected_exact_backend": "cpu_batch",
-                        "selected_workers": 4,
+                        "selected_workers": 6,
                         "native_profile": "stage05.2-native-kernels-v2",
                         "native_config_sha256": native_sha256,
                         "accelerator_review_manifest_sha256": "d" * 64,
@@ -2704,7 +2675,7 @@ def _accepted_review(
         "raw_campaign_manifest_sha256": "b" * 64,
         "selected_backend": "native_cpu",
         "selected_exact_backend": "cpu_batch",
-        "selected_workers": 4,
+        "selected_workers": 6,
         "native_profile": "stage05.2-native-kernels-v2",
         "accelerator_decision": "GPU_NOT_JUSTIFIED",
         "campaign_prerequisite_review_sha256": "e" * 64,
@@ -2715,14 +2686,12 @@ def _accepted_review(
         "selection_lock": {
             "selected_backend": "native_cpu",
             "selected_exact_backend": "cpu_batch",
-            "selected_workers": 4,
+            "selected_workers": 6,
             "native_profile": "stage05.2-native-kernels-v2",
             "native_config_sha256": native_sha256,
             "native_kernel_config": native,
             "candidate_transaction_config": candidate_transaction,
-            "candidate_transaction_config_sha256": (
-                candidate_transaction_sha256
-            ),
+            "candidate_transaction_config_sha256": (candidate_transaction_sha256),
             "accelerator_decision": "GPU_NOT_JUSTIFIED",
             "accelerator_review_manifest_sha256": "d" * 64,
         },
@@ -2762,6 +2731,28 @@ def _accepted_review(
         encoding="utf-8",
     )
     return manifest_path
+
+
+def test_current_publication_schema_rejects_non_six_worker_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review_path = _accepted_review(tmp_path)
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    review["selected_workers"] = 4
+    review["selection_lock"]["selected_workers"] = 4
+    _write_json(review_path, review)
+    monkeypatch.setattr(
+        "tools.publish_stage052_artifacts._verify_live_formal_chain",
+        lambda **_kwargs: None,
+    )
+
+    with pytest.raises(ValueError, match="selection lock"):
+        publish_stage052_artifacts(
+            review_manifest=review_path,
+            repository_root=tmp_path / "repository",
+            prerequisite_dir=tmp_path / "g01",
+        )
 
 
 def test_atomic_publisher_places_trusted_manifest_last(
@@ -3176,11 +3167,7 @@ def test_publisher_live_chain_rejects_raw_tamper_before_publication(
     external_active_root: bool,
 ) -> None:
     repository = tmp_path / "repository"
-    active_root = (
-        tmp_path / "stage052-active"
-        if external_active_root
-        else repository / "results"
-    )
+    active_root = tmp_path / "stage052-active" if external_active_root else repository / "results"
     raw_dir = active_root / "stage05.2_benchmark_attempt02"
     review_pointer = raw_dir / "review" / "review_manifest.json"
     review_pointer.parent.mkdir(parents=True)
@@ -3246,10 +3233,7 @@ def test_publisher_live_chain_rejects_raw_tamper_before_publication(
     with pytest.raises(ValueError, match="canonical live roots"):
         _verify_live_formal_chain(
             review_manifest=(
-                masqueraded_active_root
-                / raw_dir.name
-                / "review"
-                / "review_manifest.json"
+                masqueraded_active_root / raw_dir.name / "review" / "review_manifest.json"
             ),
             review=review,
             prerequisite_dir=masqueraded_active_root / prerequisite.name,
@@ -3287,10 +3271,7 @@ def test_publisher_live_chain_rejects_raw_tamper_before_publication(
     real_g01_review.rename(g01_review)
 
     retention_registry = (
-        repository
-        / "experiments"
-        / "registries"
-        / "stage05.2_retention_registry.csv"
+        repository / "experiments" / "registries" / "stage05.2_retention_registry.csv"
     )
     write_retention_registry(
         retention_registry,
@@ -3590,13 +3571,8 @@ def test_noncanonical_single_batch_pilot_cannot_receive_ready_review(
     assert review["selected_optimization_profile"] == "native"
     assert review["gates"]["campaign_planning_replay"]["passed"] is False
     assert review["gates"]["batch_shard_artifact_replay"]["passed"] is False
-    progress = [
-        json.loads(line)
-        for line in progress_path.read_text(encoding="utf-8").splitlines()
-    ]
-    completed = [
-        row for row in progress if row["event"] == "campaign_shard_replay_complete"
-    ]
+    progress = [json.loads(line) for line in progress_path.read_text(encoding="utf-8").splitlines()]
+    completed = [row for row in progress if row["event"] == "campaign_shard_replay_complete"]
     assert len(completed) == 36
     assert len({row["child_pid"] for row in completed}) == 36
     assert all(row["logical_pass_count"] == 1 for row in completed)
