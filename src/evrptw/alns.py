@@ -698,6 +698,23 @@ class _Evaluator:
                     )
                 else:
                     self.incremental_fallbacks += 1
+                if self.measurement_trace is not None:
+                    self.measurement_trace.record_incremental_propagation(
+                        operator=self.operator,
+                        lane=self.lane,
+                        iteration=self.iteration,
+                        base_sequence=base_sequence,
+                        candidate_sequence=candidate,
+                        status=propagation.status,
+                        reason=propagation.reason,
+                        distance_lower_bound=propagation.distance_lower_bound,
+                        min_time_window_slack=propagation.min_time_window_slack,
+                        finish_time=propagation.finish_time,
+                        reused_prefix_edges=propagation.reused_prefix_edges,
+                        reused_suffix_edges=propagation.reused_suffix_edges,
+                        recomputed_forward_edges=propagation.recomputed_forward_edges,
+                        recomputed_backward_edges=propagation.recomputed_backward_edges,
+                    )
 
         def screen_batch(
             candidates: tuple[tuple[str, ...], ...],
@@ -821,11 +838,39 @@ class _Evaluator:
                     raise RuntimeError("batched screening lost an ordered result")
                 self._commit_pending_candidate_cache()
                 if self.measurement_trace is not None:
-                    self.measurement_trace.events.append(
+                    screening_passes = sum(
+                        screening.accepted(index) for index in range(len(screening.sequences))
+                    )
+                    screening_cache_hits = screening.counters["negative_cache_hits"]
+                    screening_exact_call_blocked = len(screening.sequences) - screening_passes
+                    screening_rejections = (
+                        screening_exact_call_blocked - screening_cache_hits
+                    )
+                    screening_reason_counts: dict[str, int] = {}
+                    for index in range(len(screening.sequences)):
+                        reason = screening.reason(index)
+                        if reason:
+                            screening_reason_counts[reason] = (
+                                screening_reason_counts.get(reason, 0) + 1
+                            )
+                    self.measurement_trace.record_screening_aggregate(
                         {
                             "timestamp_seconds": self.measurement_trace._offset(),
+                            "screening_passes": screening_passes,
+                            "screening_rejections": screening_rejections,
+                            "screening_cache_hits": screening_cache_hits,
+                            "screening_exact_call_blocked": screening_exact_call_blocked,
+                            "screening_reason_counts": dict(
+                                sorted(screening_reason_counts.items())
+                            ),
                             **screening_event,
-                        }
+                        },
+                        calls=len(screening.sequences),
+                        passes=screening_passes,
+                        rejections=screening_rejections,
+                        cache_hits=screening_cache_hits,
+                        exact_call_blocked=screening_exact_call_blocked,
+                        reason_counts=screening_reason_counts,
                     )
                 return tuple(result for result in resolved if result is not None)
             transaction = execute_candidate_transaction(
@@ -875,13 +920,19 @@ class _Evaluator:
             raise
         runtime.record(transaction.audit)
         if self.measurement_trace is not None:
-            self.measurement_trace.events.append(
+            self.measurement_trace.record_screening_aggregate(
                 {
                     "event_type": "native_candidate_transaction",
                     "status": "committed",
                     "timestamp_seconds": self.measurement_trace._offset(),
                     **asdict(transaction.audit),
-                }
+                },
+                calls=transaction.audit.input_candidates,
+                passes=transaction.audit.screening_passes,
+                rejections=transaction.audit.screening_rejections,
+                cache_hits=transaction.audit.screening_cache_hits,
+                exact_call_blocked=transaction.audit.screening_exact_call_blocked,
+                reason_counts=transaction.audit.screening_reason_counts,
             )
         return transaction.ordered_results
 

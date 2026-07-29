@@ -35,7 +35,7 @@ CandidateImplementationMode = Literal[
     "batched_screening",
     "candidate_transaction",
 ]
-_SCREEN_REASONS = {
+SCREEN_REASON_BY_CODE = {
     0: "",
     1: "route_structure_prefilter",
     2: "capacity_prefilter",
@@ -47,7 +47,7 @@ _SCREEN_REASONS = {
     8: "time_window_prefilter",
     9: "energy_prefilter",
 }
-_SCREEN_REASON_CODES = {reason: code for code, reason in _SCREEN_REASONS.items()}
+_SCREEN_REASON_CODES = {reason: code for code, reason in SCREEN_REASON_BY_CODE.items()}
 _NATIVE_SCREEN_STATUSES = {
     0: "screened",
     1: "duplicate",
@@ -141,7 +141,7 @@ class CandidateScreeningBatch:
         return bool(self.codes[index, 0])
 
     def reason(self, index: int) -> str:
-        return _SCREEN_REASONS[int(self.codes[index, 1])]
+        return SCREEN_REASON_BY_CODE[int(self.codes[index, 1])]
 
     def native_status(self, index: int) -> str:
         return _NATIVE_SCREEN_STATUSES[int(self.statuses[index])]
@@ -192,7 +192,11 @@ class CandidateTransactionAudit:
     candidates: tuple[CustomerSequence, ...]
     exact_budget: int
     screening_integrity_evidence: Mapping[str, object]
+    screening_passes: int
     screening_rejections: int
+    screening_cache_hits: int
+    screening_exact_call_blocked: int
+    screening_reason_counts: Mapping[str, int]
     cache_hits: int
     exact_misses: int
     budget_skips: int
@@ -486,7 +490,7 @@ def native_screen_candidate_batch(
     if not np.array_equal(returned_ids, candidate_ids):
         raise RuntimeError("native candidate screening changed candidate ids")
     reason_codes = tuple(int(code) for code in codes[:, 1])
-    if any(code not in _SCREEN_REASONS for code in reason_codes):
+    if any(code not in SCREEN_REASON_BY_CODE for code in reason_codes):
         raise RuntimeError("native candidate screening returned an unknown reason")
     status_codes = tuple(int(status) for status in statuses)
     if any(status not in _NATIVE_SCREEN_STATUSES for status in status_codes):
@@ -560,7 +564,11 @@ def execute_candidate_transaction[ResultT](
         waiting_indices: dict[CustomerSequence, list[int]] = {}
         exact_sequences: list[CustomerSequence] = []
         cache_hits = 0
+        screening_passes = 0
         screening_rejections = 0
+        screening_cache_hits = 0
+        screening_exact_call_blocked = 0
+        screening_reason_counts: dict[str, int] = {}
         budget_skips = 0
         duplicate_candidates = 0
         known_resolution: dict[CustomerSequence, ResultT | None] = {}
@@ -571,9 +579,18 @@ def execute_candidate_transaction[ResultT](
             if native_status == "duplicate":
                 duplicate_candidates += 1
             if not screening.accepted(index):
-                screening_rejections += 1
+                screening_exact_call_blocked += 1
+                if native_status == "negative_cache_hit":
+                    screening_cache_hits += 1
+                else:
+                    screening_rejections += 1
+                if reason:
+                    screening_reason_counts[reason] = (
+                        screening_reason_counts.get(reason, 0) + 1
+                    )
                 resolved[index] = rejected_result(sequence, reason, native_status)
                 continue
+            screening_passes += 1
             if sequence in waiting_indices:
                 waiting_indices[sequence].append(index)
                 continue
@@ -627,7 +644,11 @@ def execute_candidate_transaction[ResultT](
             candidates=request.candidates,
             exact_budget=request.exact_budget,
             screening_integrity_evidence=screening.integrity_evidence(),
+            screening_passes=screening_passes,
             screening_rejections=screening_rejections,
+            screening_cache_hits=screening_cache_hits,
+            screening_exact_call_blocked=screening_exact_call_blocked,
+            screening_reason_counts=dict(sorted(screening_reason_counts.items())),
             cache_hits=cache_hits,
             exact_misses=len(exact_sequences),
             budget_skips=budget_skips,

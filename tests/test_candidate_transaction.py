@@ -19,7 +19,7 @@ from evrptw.candidate_transaction import (
 )
 from evrptw.charging import ChargingSubproblemResult
 from evrptw.cpu_batch import ExactChargingBackend
-from evrptw.measurement import CheapScreeningConfig
+from evrptw.measurement import CheapScreeningConfig, MeasurementConfig, Stage03Trace
 from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.native_kernels import NativeKernelConfig, NativeKernelRuntime
 
@@ -379,9 +379,14 @@ def test_route_evaluator_delegates_ordered_pool_to_native_candidate_transaction(
     )
     native_runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
     transaction_runtime = NativeCandidateTransactionRuntime(NativeCandidateTransactionConfig())
+    trace = Stage03Trace(
+        MeasurementConfig(),
+        screening_config=CheapScreeningConfig(),
+    )
     evaluator = _Evaluator(
         instance,
         deadline=time.perf_counter() + 10.0,
+        measurement_trace=trace,
         screening_config=CheapScreeningConfig(),
         backend=ExactChargingBackend.CPU_BATCH,
         native_runtime=native_runtime,
@@ -404,6 +409,15 @@ def test_route_evaluator_delegates_ordered_pool_to_native_candidate_transaction(
     assert native_runtime.statistics()["native_screening_batch_occupancies"] == (3,)
     assert tuple(evaluator.propagation_snapshots) == (("C1",),)
     assert evaluator.incremental_propagations == 3
+    assert len(trace.incremental_propagations) == 3
+    assert trace.screening_counts == {
+        "screening_calls": 3,
+        "screening_passes": 2,
+        "screening_rejections": 1,
+        "screening_cache_hits": 0,
+        "screening_exact_call_blocked": 1,
+        "screening_reason_counts": {"capacity_prefilter": 1},
+    }
 
 
 def test_route_evaluator_batched_screening_ablation_preserves_budget_and_order() -> None:

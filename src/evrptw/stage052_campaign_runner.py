@@ -122,12 +122,21 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
     }
 )
 _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
-    "src/evrptw/alns.py": "87c7e209908b82ba959fd507b45b4e5073a39a231aa3d43e50bf2becfa3809a6",
+    "src/evrptw/alns.py": "ca96a7ed1598f36aa2e649e457e1a1a3a7006ac060d1ec4bd240e5391e45244c",
+    "src/evrptw/candidate_transaction.py": (
+        "abd6d1543ab669d1d5a8fd5341cc4ef21307bb28c382b4f6c3151c94bbfc5609"
+    ),
+    "src/evrptw/measurement.py": (
+        "c6be1109595b3f6d687074fe708c5c1fb46b70d79068579cf89893edb0880dcd"
+    ),
     "tests/test_alns_wall_clock_only.py": (
         "0bf741d1e4929564882dd8ff48775f0c589e957328aa00c7309176656fd16481"
     ),
     "tests/test_artifacts_v3.py": (
         "efb81c96a602b0820ee5539d4c2a524d578f99573152d459bd7c49b8221eaecf"
+    ),
+    "tests/test_candidate_transaction.py": (
+        "bff41041aca2611a6edcdb30f2067e3a965a2787f5f114fcaeda038e7b5c4c46"
     ),
 }
 

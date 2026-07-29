@@ -1008,6 +1008,9 @@ def test_campaign_successor_revision_accepts_only_exact_pinned_producer_fix(
         "src/evrptw/alns.py",
         "tests/test_alns_wall_clock_only.py",
         "tests/test_artifacts_v3.py",
+        "src/evrptw/candidate_transaction.py",
+        "src/evrptw/measurement.py",
+        "tests/test_candidate_transaction.py",
     )
     for index, relative in enumerate(pinned_paths):
         destination = repository / relative
@@ -1043,7 +1046,7 @@ def test_campaign_successor_revision_accepts_only_exact_pinned_producer_fix(
         repository,
         predecessor_revision=predecessor,
         current_revision=successor,
-    ) == (pinned_paths[2],)
+    ) == tuple(sorted(pinned_paths[2:]))
 
     with (repository / pinned_paths[0]).open("ab") as stream:
         stream.write(b"# unapproved change\n")

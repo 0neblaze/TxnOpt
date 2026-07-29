@@ -1554,3 +1554,34 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   三个 ablation mode 保持历史内存路径。focused streaming/native suite 为
   198 passed，Ruff、strict mypy 与 `git diff --check` 通过。修复必须形成新 commit、
   wheel、read-only snapshot 与 attempt17，E16 不参与 promotion。
+
+## 2026-07-29：E17 启动失败、E18 trace reconciliation 拒绝与聚合对账修复
+
+- `stage05.2_native_kernels_attempt17` 在创建 shard 前失败。Windows hidden host
+  launcher 使用 `Start-Process -ArgumentList` 时拆分了 `bash -lc` command string，
+  导致相对 `configs/stage052_performance.toml` 从错误工作目录读取并报告缺少
+  `candidate_transaction`。外部启动日志保留；该 label 不复用。后续 launcher 改用
+  `ProcessStartInfo.ArgumentList` 逐参数传递并把 config 固定为绝对路径。
+- `stage05.2_native_kernels_attempt18` 在 clean commit `51128e9` 的 non-editable
+  producer wheel 和 read-only source snapshot 上完成 12/12 performance shards，
+  producer failure count 为零。独立 `systemd --user` reviewer 随后在
+  `c101_21/2014` fail fast：三个主轴的 trace reconciliation 都缺少 candidate
+  transaction 批量路径产生的 4 条 screening/incremental propagation 计数，因此该
+  attempt 保留为 rejected evidence，不进入 promotion。
+- 根因是 native batch 已正确增加 solver screening/cache/propagation statistics，
+  但 trace 仍只统计逐条 `ScreeningDecision` 与旧 incremental event；紧凑 transaction
+  event 未参与同一 producer reconciliation。修复新增 compact screening aggregate
+  counters，不逐候选构造 Python screening object；同时为批量路径记录既有结构化
+  incremental propagation event。transaction audit 现在区分 pass、safe rejection、
+  negative-cache hit 和 exact-call-blocked，并携带 reason counts。
+- independent reviewer 从 ABI-v2 statuses/codes/counters bytes 重新计算上述 aggregate
+  fields；任何计数或 reason mismatch 都是完整性错误。fixed-work streaming 与
+  non-streaming trace 共用同一 aggregate reconciliation 语义。
+- campaign successor gate 同步固定本次 producer/reconciliation surface：
+  `alns.py`、`candidate_transaction.py`、`measurement.py` 及对应 regression tests
+  均绑定精确 SHA-256；测试覆盖从旧 producer revision 到包含整组修复的新 revision，
+  防止后续 Pilot/Formal 在 source preflight 把合法修复误判为 non-G drift。
+- 修复后的 focused candidate/streaming/native review suite 为 74 passed；完整 pytest
+  为 887 passed；Ruff、70 个 source files 的 strict mypy 与 `git diff --check`
+  通过。E18 仍为不可变失败证据；下一次性能运行必须使用新 commit、wheel、snapshot
+  和 attempt label。

@@ -322,6 +322,20 @@ class Stage03Trace:
         init=False,
         repr=False,
     )
+    _aggregate_screening_calls: int = field(default=0, init=False, repr=False)
+    _aggregate_screening_passes: int = field(default=0, init=False, repr=False)
+    _aggregate_screening_rejections: int = field(default=0, init=False, repr=False)
+    _aggregate_screening_cache_hits: int = field(default=0, init=False, repr=False)
+    _aggregate_screening_exact_call_blocked: int = field(
+        default=0,
+        init=False,
+        repr=False,
+    )
+    _aggregate_screening_reason_counts: dict[str, int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._validate_screening_route_dictionary()
@@ -662,6 +676,39 @@ class Stage03Trace:
             }
         )
 
+    def record_screening_aggregate(
+        self,
+        event: Mapping[str, object],
+        *,
+        calls: int,
+        passes: int,
+        rejections: int,
+        cache_hits: int,
+        exact_call_blocked: int,
+        reason_counts: Mapping[str, int],
+    ) -> None:
+        """Record one compact native batch without constructing per-candidate decisions."""
+
+        values = (calls, passes, rejections, cache_hits, exact_call_blocked)
+        if any(value < 0 for value in values):
+            raise ValueError("screening aggregate counts must be non-negative")
+        if passes + exact_call_blocked != calls:
+            raise ValueError("screening aggregate pass/blocked counts do not cover the batch")
+        if rejections + cache_hits != exact_call_blocked:
+            raise ValueError("screening aggregate rejection/cache counts do not cover blocked rows")
+        if any(not reason or count <= 0 for reason, count in reason_counts.items()):
+            raise ValueError("screening aggregate reasons must be named positive counts")
+        self._aggregate_screening_calls += calls
+        self._aggregate_screening_passes += passes
+        self._aggregate_screening_rejections += rejections
+        self._aggregate_screening_cache_hits += cache_hits
+        self._aggregate_screening_exact_call_blocked += exact_call_blocked
+        for reason, count in reason_counts.items():
+            self._aggregate_screening_reason_counts[reason] = (
+                self._aggregate_screening_reason_counts.get(reason, 0) + count
+            )
+        self.events.append(dict(event))
+
     def record_deadline_boundary(
         self,
         *,
@@ -971,47 +1018,82 @@ class Stage03Trace:
 
     @property
     def screening_counts(self) -> dict[str, object]:
+        aggregate_reasons = Counter(self._aggregate_screening_reason_counts)
         if self._stream_summary is not None:
             summary = self._stream_summary
             if self._typed_screening_append is not None:
+                reasons = Counter(self._typed_screening_reason_counts)
+                reasons.update(aggregate_reasons)
                 return {
-                    "screening_calls": int(summary.counts["screening_decisions"]),
-                    "screening_passes": self._typed_screening_passes,
-                    "screening_rejections": self._typed_screening_rejections,
-                    "screening_cache_hits": self._typed_screening_cache_hits,
+                    "screening_calls": (
+                        int(summary.counts["screening_decisions"])
+                        + self._aggregate_screening_calls
+                    ),
+                    "screening_passes": (
+                        self._typed_screening_passes + self._aggregate_screening_passes
+                    ),
+                    "screening_rejections": (
+                        self._typed_screening_rejections
+                        + self._aggregate_screening_rejections
+                    ),
+                    "screening_cache_hits": (
+                        self._typed_screening_cache_hits
+                        + self._aggregate_screening_cache_hits
+                    ),
                     "screening_exact_call_blocked": (
                         self._typed_screening_exact_call_blocked
+                        + self._aggregate_screening_exact_call_blocked
                     ),
-                    "screening_reason_counts": dict(
-                        sorted(self._typed_screening_reason_counts.items())
-                    ),
+                    "screening_reason_counts": dict(sorted(reasons.items())),
                 }
+            reasons = Counter(summary.screening_reasons)
+            reasons.update(aggregate_reasons)
             return {
-                "screening_calls": int(summary.counts["screening_decisions"]),
-                "screening_passes": int(summary.counts["screening_status:pass"]),
-                "screening_rejections": int(summary.counts["screening_status:rejected"]),
-                "screening_cache_hits": int(summary.counts["screening_negative_cache_hit"]),
-                "screening_exact_call_blocked": int(summary.counts["screening_exact_call_blocked"]),
-                "screening_reason_counts": dict(sorted(summary.screening_reasons.items())),
+                "screening_calls": (
+                    int(summary.counts["screening_decisions"])
+                    + self._aggregate_screening_calls
+                ),
+                "screening_passes": (
+                    int(summary.counts["screening_status:pass"])
+                    + self._aggregate_screening_passes
+                ),
+                "screening_rejections": (
+                    int(summary.counts["screening_status:rejected"])
+                    + self._aggregate_screening_rejections
+                ),
+                "screening_cache_hits": (
+                    int(summary.counts["screening_negative_cache_hit"])
+                    + self._aggregate_screening_cache_hits
+                ),
+                "screening_exact_call_blocked": (
+                    int(summary.counts["screening_exact_call_blocked"])
+                    + self._aggregate_screening_exact_call_blocked
+                ),
+                "screening_reason_counts": dict(sorted(reasons.items())),
             }
         reason_counts: Counter[str] = Counter()
         for decision in self.screening_decisions:
             if decision.reason:
                 reason_counts[decision.reason] += 1
+        reason_counts.update(aggregate_reasons)
         return {
-            "screening_calls": len(self.screening_decisions),
+            "screening_calls": len(self.screening_decisions) + self._aggregate_screening_calls,
             "screening_passes": sum(
                 decision.status == "pass" for decision in self.screening_decisions
-            ),
+            )
+            + self._aggregate_screening_passes,
             "screening_rejections": sum(
                 decision.status == "rejected" for decision in self.screening_decisions
-            ),
+            )
+            + self._aggregate_screening_rejections,
             "screening_cache_hits": sum(
                 decision.negative_cache_hit for decision in self.screening_decisions
-            ),
+            )
+            + self._aggregate_screening_cache_hits,
             "screening_exact_call_blocked": sum(
                 decision.exact_call_blocked for decision in self.screening_decisions
-            ),
+            )
+            + self._aggregate_screening_exact_call_blocked,
             "screening_reason_counts": dict(sorted(reason_counts.items())),
         }
 

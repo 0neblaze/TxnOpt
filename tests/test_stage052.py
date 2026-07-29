@@ -2073,6 +2073,11 @@ def test_native_ablation_semantics_replay_exact_cache_and_transaction_events() -
         "iteration": 1,
         "lane": "legacy",
         "operator": "route_merge",
+        "screening_passes": 2,
+        "screening_rejections": 0,
+        "screening_cache_hits": 0,
+        "screening_exact_call_blocked": 0,
+        "screening_reason_counts": {},
         "screening_integrity_evidence": {
             "candidate_ids_le_hex": np.array([0, 1], dtype="<i8").tobytes().hex(),
             "statuses_le_hex": np.zeros(2, dtype="<i8").tobytes().hex(),
@@ -2154,6 +2159,11 @@ def test_native_ablation_replays_batched_screening_bytes_and_lane_deadlines() ->
         "iteration": 2,
         "lane": "constraint",
         "operator": "route_merge",
+        "screening_passes": 2,
+        "screening_rejections": 0,
+        "screening_cache_hits": 0,
+        "screening_exact_call_blocked": 0,
+        "screening_reason_counts": {},
         "screening_integrity_evidence": {
             "candidate_ids_le_hex": np.array([0, 1], dtype="<i8").tobytes().hex(),
             "statuses_le_hex": np.zeros(2, dtype="<i8").tobytes().hex(),
@@ -2170,11 +2180,16 @@ def test_native_ablation_replays_batched_screening_bytes_and_lane_deadlines() ->
         key: value
         for key, value in transaction_event.items()
         if key
-        in {
-            "candidates",
-            "input_candidates",
-            "screening_integrity_evidence",
-        }
+            in {
+                "candidates",
+                "input_candidates",
+                "screening_cache_hits",
+                "screening_exact_call_blocked",
+                "screening_integrity_evidence",
+                "screening_passes",
+                "screening_reason_counts",
+                "screening_rejections",
+            }
     }
     screening_event.update(
         {

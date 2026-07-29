@@ -38,6 +38,7 @@ from evrptw.artifacts import (
 from evrptw.best_known import BEST_KNOWN_VALUES
 from evrptw.candidate_transaction import (
     CANDIDATE_TRANSACTION_SCHEMA_VERSION,
+    SCREEN_REASON_BY_CODE,
     NativeCandidateTransactionConfig,
 )
 from evrptw.experiments.stage052_performance import (
@@ -4212,6 +4213,24 @@ def _recompute_transaction_hashes(
         or int(counters[3]) + int(counters[4]) != int(counters[1])
     ):
         raise ArtifactIntegrityError("transaction screening counters are inconsistent")
+    screening_passes = sum(bool(int(codes[index * 16])) for index in range(candidate_count))
+    screening_cache_hits = sum(int(status) == 2 for status in statuses)
+    screening_exact_call_blocked = candidate_count - screening_passes
+    screening_rejections = screening_exact_call_blocked - screening_cache_hits
+    screening_reason_counts: dict[str, int] = {}
+    for index in range(candidate_count):
+        reason = SCREEN_REASON_BY_CODE[int(codes[index * 16 + 1])]
+        if reason:
+            screening_reason_counts[reason] = screening_reason_counts.get(reason, 0) + 1
+    expected_screening_summary = {
+        "screening_passes": screening_passes,
+        "screening_rejections": screening_rejections,
+        "screening_cache_hits": screening_cache_hits,
+        "screening_exact_call_blocked": screening_exact_call_blocked,
+        "screening_reason_counts": dict(sorted(screening_reason_counts.items())),
+    }
+    if any(event.get(field) != expected for field, expected in expected_screening_summary.items()):
+        raise ArtifactIntegrityError("transaction screening aggregate does not replay")
     screening_bytes = bytearray()
     for index in range(candidate_count):
         begin = int(offsets[index])
