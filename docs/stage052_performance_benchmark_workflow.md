@@ -210,6 +210,9 @@ F 只接受当前 E raw/review identity，并独立重算 occupancy；median <32
 decision-only `GPU_NOT_JUSTIFIED`，median >=32 则必须执行 registered helper 并
 通过语义相等与 15%/3% 门槛。缺失 helper、CPU fallback 或缺少经过审查的 G
 campaign adapter 均为 `NOT_READY`。
+E 保持 accepted D selection 的 CPU worker width（当前为 4）；F 的 metadata 与
+campaign adapter 固定使用 6 workers，为后续 G 的用户锁定配置提供同一执行合同。
+这两个 worker count 属于相邻阶段的不同角色，不得要求数值相等。
 
 ## G. Pipeline pilot 与正式分层预算
 

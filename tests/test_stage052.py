@@ -45,6 +45,7 @@ from evrptw.experiments.stage052_performance import (
     _run_v2_tasks,
     _ShardTask,
     _stage052_anytime_checkpoints,
+    _validate_accelerator_worker_transition,
     _verify_performance_staging_root,
     axes_for_scope,
     load_stage052_config,
@@ -2700,6 +2701,24 @@ def test_accelerator_pilot_metadata_requires_six_workers_and_transaction_config(
         {key: value for key, value in metadata.items() if key != "candidate_transaction_config"},
         "native_cpu",
     )
+
+
+def test_accelerator_worker_transition_inherits_evidence_but_uses_six_worker_adapter() -> None:
+    _validate_accelerator_worker_transition(
+        native_worker_count=4,
+        accelerator_worker_count=6,
+    )
+
+    with pytest.raises(ValueError, match="invalid E worker count"):
+        _validate_accelerator_worker_transition(
+            native_worker_count=6,
+            accelerator_worker_count=6,
+        )
+    with pytest.raises(ValueError, match="fixed six-worker"):
+        _validate_accelerator_worker_transition(
+            native_worker_count=4,
+            accelerator_worker_count=4,
+        )
 
 
 def test_pair_pruning_aggregate_is_independently_recomputed() -> None:

@@ -1937,3 +1937,27 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   performance promotion aggregate 为 `0.713761`，C/R/RC 分别为
   `0.783280`、`0.692386`、`0.713761`。E32 review 不回写，修复使用新
   commit/wheel/attempt label。
+
+## 2026-07-29：E33 accepted 与 F18 worker contract contradiction
+
+- `stage05.2_native_kernels_attempt33` 在 clean commit
+  `2d9a5f202064a305d588de2d56bead1253ee2b43` 上完成 12/12 shards、36/36 axes；
+  raw manifest SHA-256 为
+  `ee08673f4bcbd0a616f9bda1f81f0a8eb0c14108df38aa5491d3ac745d4956ff`。
+  独立 reviewer exit 0、raw unchanged、aggregate peak RSS
+  2,402,344,960 bytes、swap 0；review manifest SHA-256 为
+  `6df1b8e98238699cc4692cf3f9be91627a41e9bae716603ff8e6f5e193434a18`，
+  status 为 `READY_FOR_STAGE052_ACCELERATOR_DECISION`。
+- E33 performance promotion aggregate 为 `0.709855`，C/R/RC 分别为
+  `0.773610`、`0.707182`、`0.655874`；四步 native ablation aggregate 为
+  `0.225312`，C/R/RC 分别为 `0.209141`、`0.263753`、`0.290641`。全部
+  semantics、native execution、resource、persistence 与 zero-fallback gate 通过。
+- E33 的 9 个 100-customer fixed-work candidate screening occupancy 为
+  `4, 4, 4, 19, 25.5, 35, 41, 45, 63`，独立中位数为 `25.5 < 32`；
+  F 必须走 decision-only `GPU_NOT_JUSTIFIED`，不得启动 CUDA helper。
+- `stage05.2_accelerator_pilot_attempt18` 在 raw 创建前由入口拒绝：
+  `Stage 5.2 worker_count is invalid for the selected component`。根因是 F 入口只允许
+  6 workers，但后续又错误要求 F worker count 等于 accepted E 的 4；当前 reviewer
+  与 G adapter 均明确要求 F 为 6。修复保留 E 的 accepted D width（4），同时固定
+  F/G adapter width 为 6，并只验证 E predecessor width 属于合法的 1/2/4 selection。
+  F18 日志与 stale host receipt 保留，修复使用新 commit 与 attempt label。

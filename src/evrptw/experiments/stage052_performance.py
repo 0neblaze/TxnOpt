@@ -636,11 +636,10 @@ def run_stage052(
             predecessor_workers = _strict_int(
                 predecessor_metadata.get("worker_count"), "worker_count"
             )
-            if worker_count != predecessor_workers:
-                raise ValueError(
-                    "accelerator_pilot worker_count must equal the accepted E worker count "
-                    f"({predecessor_workers})"
-                )
+            _validate_accelerator_worker_transition(
+                native_worker_count=predecessor_workers,
+                accelerator_worker_count=worker_count,
+            )
             if predecessor_metadata.get("native_kernel_config") != NativeKernelConfig().to_dict():
                 raise ValueError("accelerator_pilot requires complete accepted native kernels")
             if (
@@ -944,6 +943,19 @@ def run_stage052(
     if timing_evidence_path is not None:
         outputs["timing_evidence"] = timing_evidence_path
     return outputs
+
+
+def _validate_accelerator_worker_transition(
+    *,
+    native_worker_count: int,
+    accelerator_worker_count: int,
+) -> None:
+    """Keep E on its selected CPU width and reserve six workers for F/G."""
+
+    if native_worker_count not in {1, 2, 4}:
+        raise ValueError("accelerator_pilot prerequisite has an invalid E worker count")
+    if accelerator_worker_count != 6:
+        raise ValueError("accelerator_pilot requires the fixed six-worker campaign adapter")
 
 
 def _seal_campaign_startup_failure(
