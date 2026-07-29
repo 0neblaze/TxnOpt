@@ -58,6 +58,7 @@ from evrptw.experiments.stage052_performance_review import (
     _bind_persistence_attribution_review,
     _expected_native_screening_invocations,
     _native_exact_counters_reconcile,
+    _native_fixed_work_core_record,
     _prerequisite_binding_matches,
     _prior_review_manifest_history,
     _recompute_native_occupancies,
@@ -1332,6 +1333,60 @@ def test_native_exact_counters_allow_only_audited_predispatch_interrupts() -> No
             "completed_calls": 3,
             "interrupted_calls": 2,
         }
+    )
+
+
+def test_native_fixed_work_core_record_excludes_acceleration_diagnostics() -> None:
+    candidate_state = {
+        "record_type": "candidate_state",
+        "event_type": "candidate_state",
+        "benchmark_axis": "fixed_work",
+        "lane": "legacy",
+        "iteration": 4,
+        "operator": "route_merge",
+        "status": "accepted",
+        "accepted": True,
+        "global_best": False,
+        "current_objective_key": [3, 10.0, 0.0, 0],
+        "candidate_objective_key": [3, 9.0, 0.0, 0],
+        "current_route_keys": ["route:a"],
+        "candidate_route_keys": ["route:b"],
+        "native_screening_batch_invocations": 7,
+    }
+    assert _native_fixed_work_core_record(candidate_state) == {
+        "record": "candidate_state",
+        "lane": "legacy",
+        "iteration": 4,
+        "operator": "route_merge",
+        "status": "accepted",
+        "accepted": True,
+        "global_best": False,
+        "current_objective_key": [3, 10.0, 0.0, 0],
+        "candidate_objective_key": [3, 9.0, 0.0, 0],
+        "current_route_keys": ["route:a"],
+        "candidate_route_keys": ["route:b"],
+    }
+    assert (
+        _native_fixed_work_core_record(
+            {
+                "record_type": "screening_decision",
+                "event_type": "screening_decision",
+                "benchmark_axis": "fixed_work",
+            }
+        )
+        is None
+    )
+    assert (
+        _native_fixed_work_core_record(
+            {
+                "record_type": "route_evaluation",
+                "event_type": "route_evaluation",
+                "benchmark_axis": "fixed_work",
+                "status": "cache_hit",
+                "exact_started": False,
+            }
+        )
+        is None
     )
 
 

@@ -77,7 +77,11 @@ fixed-work 是性能因果结论的主轴；wall-clock 用于判断实际吞吐�
 
 对 B、E 和任何拟替换正式 backend 的实现，使用相对于“声明的直接前一 accepted configuration”的 paired comparison（配对比较）：
 
-1. fixed-work objective、validator、started/completed exact-call ordering、candidate decision、cache lifecycle 和 critical events 完全一致；
+1. fixed-work objective、validator、started/completed exact-call ordering、candidate
+   decision、solution、acceptance/global-best 与 deadline critical events 完全一致；
+   safe deduplication/batching（安全去重／批处理）可改变 screening/negative-cache
+   diagnostic lookup count，但每个实现的 exact/cache lifecycle、transaction hash 和
+   zero-fallback 必须由独立 raw replay 分别通过；
 2. 全部 100-customer 配对的 aggregate paired median end-to-end time（总体配对中位端到端时间）至少降低 15%；
 3. C、R、RC 任一 family 的 family median 不得回退超过 3%；
 4. 逐实例异常值、最差 pair 和置信区间完整报告，不能只给总中位数；
@@ -337,9 +341,13 @@ constraint-lane slice 不得被 legacy/quality lane 的提前 boundary 错误截
 storage semantic replay（存储语义重放）必须在读取 canonical record（规范记录）时
 直接更新每个 axis 的 SHA-256；禁止构建完整的 per-axis event list（逐轴事件列表）。
 多个 raw bundle 严格按输入顺序处理，每个 bundle 使用一个新的 `spawn` 子进程，父
-进程只接收小型 digest map（摘要映射）。只有需要 exact equality 的 fixed-work axis
-digest 不一致时才执行字段级重放；wall-clock axis 的预期 trajectory 差异只写一条
-aggregate digest row（聚合摘要行），不得展开为数十 GiB 的逐事件差异。字段级重放使用
+进程只接收小型 digest map（摘要映射）。storage-only replacement（仅存储替换）对
+fixed-work canonical digest 要求 exact equality；native candidate transaction
+这种会新增 transaction/screening observability 的跨实现比较，改用只包含
+solution/objective、candidate-state order、ordered exact-route result 和 deadline
+boundary 的 core semantic digest，并由独立 ABI/cache gate 复核被排除的诊断字段。
+wall-clock 与跨实现 full-storage digest 的预期差异只写 aggregate digest row（聚合摘要
+行），不得展开为数十 GiB 的逐事件差异。确需字段级重放时使用
 ext4 上的临时 SQLite spool；spool 每条 canonical record 只保存一行压缩
 payload 和 digest，比较时才展开字段，禁止按每个 field 写一行造成磁盘与 cgroup
 page-cache 放大。spool 只保存 comparison bundle（对照证据）；candidate bundle（候选

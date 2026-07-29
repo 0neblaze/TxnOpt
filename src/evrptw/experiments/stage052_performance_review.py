@@ -1015,6 +1015,181 @@ def replay_stage052_storage_semantics_many(
     return results
 
 
+def _native_fixed_work_core_record(
+    event: Mapping[str, object],
+) -> dict[str, object] | None:
+    """Select search-semantic fields while excluding acceleration diagnostics."""
+
+    event_type = event.get("event_type")
+    record_type = event.get("record_type")
+    if event_type == "candidate_state":
+        candidate_fields = (
+            "lane",
+            "iteration",
+            "operator",
+            "status",
+            "accepted",
+            "global_best",
+            "current_objective_key",
+            "candidate_objective_key",
+            "current_route_keys",
+            "candidate_route_keys",
+        )
+        return {
+            "record": "candidate_state",
+            **{field: event.get(field) for field in candidate_fields},
+        }
+    if record_type == "route_evaluation" and event.get("exact_started") is True:
+        exact_fields = (
+            "lane",
+            "iteration",
+            "operator",
+            "route_key",
+            "status",
+            "failure_reason",
+            "exact_started",
+            "exact_completed",
+            "feasible",
+        )
+        return {
+            "record": "exact_route",
+            **{field: event.get(field) for field in exact_fields},
+        }
+    if event_type == "deadline_boundary":
+        deadline_fields = (
+            "lane",
+            "iteration",
+            "operator",
+            "reason",
+            "deadline_boundary",
+            "boundary",
+        )
+        return {
+            "record": "deadline_boundary",
+            **{field: event.get(field) for field in deadline_fields},
+        }
+    return None
+
+
+def _replay_native_fixed_work_core_semantics(
+    raw_dir: Path,
+) -> dict[StorageReplayIdentity, str]:
+    """Hash only fixed-work search outcomes and ordered exact work."""
+
+    reader = ArtifactReader(raw_dir)
+    raw_payloads: dict[tuple[str, int], Mapping[str, object]] = {}
+    solution_payloads: dict[tuple[str, int], Mapping[str, object]] = {}
+    event_paths: dict[tuple[str, int], str] = {}
+    for reference in reader.manifest.get("artifacts", ()):
+        if not isinstance(reference, Mapping):
+            continue
+        artifact_type = reference.get("artifact_type")
+        if artifact_type not in {"raw", "solution", "events"}:
+            continue
+        if artifact_type == "events" and reference.get("artifact_subtype") != "critical":
+            continue
+        relative = str(reference.get("relative_path", ""))
+        parts = Path(relative).parts
+        if len(parts) < 2:
+            raise ArtifactIntegrityError(
+                f"native fixed-work artifact path is invalid: {relative}"
+            )
+        if re.fullmatch(r"[0-9]+", parts[1]) is None:
+            raise ArtifactIntegrityError(f"native fixed-work seed path is invalid: {relative}")
+        shard = (parts[0], int(parts[1]))
+        if artifact_type in {"raw", "solution"}:
+            payload = reader.read_json(relative)
+            if not isinstance(payload, Mapping):
+                raise ArtifactIntegrityError(
+                    f"native fixed-work {artifact_type} payload is invalid: {shard}"
+                )
+            target = raw_payloads if artifact_type == "raw" else solution_payloads
+            if shard in target:
+                raise ArtifactIntegrityError(
+                    f"duplicate native fixed-work {artifact_type} payload: {shard}"
+                )
+            target[shard] = payload
+        elif artifact_type == "events":
+            if shard in event_paths:
+                raise ArtifactIntegrityError(
+                    f"duplicate native fixed-work event stream: {shard}"
+                )
+            event_paths[shard] = relative
+    if (
+        not raw_payloads
+        or set(solution_payloads) != set(raw_payloads)
+        or set(event_paths) != set(raw_payloads)
+    ):
+        raise ArtifactIntegrityError("native fixed-work shard evidence is incomplete")
+
+    hashers: dict[StorageReplayIdentity, Any] = {}
+    core_counts: dict[StorageReplayIdentity, dict[str, int]] = {}
+    for shard, raw_payload in raw_payloads.items():
+        raw_axes = raw_payload.get("axes")
+        solution_axes = solution_payloads[shard].get("axes")
+        if not isinstance(raw_axes, Mapping) or not isinstance(solution_axes, Mapping):
+            raise ArtifactIntegrityError(f"native fixed-work axes are missing: {shard}")
+        for axis, raw_axis in raw_axes.items():
+            if not str(axis).startswith("fixed_work"):
+                continue
+            solution_axis = solution_axes.get(axis)
+            if not isinstance(raw_axis, Mapping) or not isinstance(solution_axis, Mapping):
+                raise ArtifactIntegrityError(
+                    f"native fixed-work axis payload is invalid: {shard}/{axis}"
+                )
+            identity = (shard[0], shard[1], str(axis))
+            if identity in hashers:
+                raise ArtifactIntegrityError(f"duplicate native fixed-work identity: {identity}")
+            summary = {
+                "record": "fixed_work_summary",
+                "initial_objective_key": raw_axis.get("initial_objective_key"),
+                "objective_key": raw_axis.get("objective_key"),
+                "started_calls": raw_axis.get("started_calls"),
+                "completed_calls": raw_axis.get("completed_calls"),
+                "effective_iterations": raw_axis.get("effective_iterations"),
+                "termination_reason": raw_axis.get("termination_reason"),
+                "unique_route_semantics": raw_axis.get("unique_route_semantics"),
+                "valid": raw_axis.get("valid"),
+                "validator_passed": raw_axis.get("validator_passed"),
+                "solution_objective_key": solution_axis.get("objective_key"),
+                "solution_routes": solution_axis.get("routes"),
+                "solution_feasible": solution_axis.get("feasible"),
+            }
+            hasher = hashlib.sha256()
+            hasher.update(_canonical_json_bytes(summary) + b"\n")
+            hashers[identity] = hasher
+            core_counts[identity] = {
+                "candidate_state": 0,
+                "exact_route": 0,
+                "deadline_boundary": 0,
+            }
+
+    for shard, relative in event_paths.items():
+        for event in reader.iter_events(relative):
+            axis = event.get("benchmark_axis")
+            identity = (shard[0], shard[1], str(axis))
+            axis_hasher = hashers.get(identity)
+            if axis_hasher is None:
+                continue
+            core_record = _native_fixed_work_core_record(event)
+            if core_record is None:
+                continue
+            record_type = str(core_record["record"])
+            core_counts[identity][record_type] += 1
+            axis_hasher.update(_canonical_json_bytes(core_record) + b"\n")
+
+    if len(hashers) != 24:
+        raise ArtifactIntegrityError(
+            f"native fixed-work core scope mismatch: expected=24 observed={len(hashers)}"
+        )
+    for identity, counts in core_counts.items():
+        if counts["candidate_state"] <= 0 or counts["exact_route"] <= 0:
+            raise ArtifactIntegrityError(
+                f"native fixed-work core events are incomplete: {identity}"
+            )
+    return {identity: hashers[identity].hexdigest() for identity in sorted(hashers)}
+
+
 @contextmanager
 def _semantic_record_spool() -> Iterator[sqlite3.Connection]:
     root = _review_temporary_root()
@@ -2351,7 +2526,9 @@ def review_stage052(
             raw_dir,
             semantic_comparisons,
             semantic_mismatches_path,
-            detailed_axis_prefixes=("fixed_work",),
+            detailed_axis_prefixes=(
+                () if selected is Stage052Component.NATIVE_KERNELS else ("fixed_work",)
+            ),
         )
         return _publish_review_generation(
             review_dir=review_dir,
@@ -4770,18 +4947,16 @@ def _component_gates(
                         "detail": ablation_detail,
                     }
                 }
-            replay_maps = replay_stage052_storage_semantics_many((comparison, raw_dir))
-            fixed_identities = {
-                identity for identity in replay_maps[0] if identity[2].startswith("fixed_work")
-            }
+            native_replay_maps = (
+                _replay_native_fixed_work_core_semantics(comparison),
+                _replay_native_fixed_work_core_semantics(raw_dir),
+            )
+            fixed_identities = set(native_replay_maps[0])
             replay_equal = (
                 len(fixed_identities) == 24
-                and {
-                    identity for identity in replay_maps[1] if identity[2].startswith("fixed_work")
-                }
-                == fixed_identities
+                and set(native_replay_maps[1]) == fixed_identities
                 and all(
-                    replay_maps[0][identity] == replay_maps[1][identity]
+                    native_replay_maps[0][identity] == native_replay_maps[1][identity]
                     for identity in fixed_identities
                 )
             )
@@ -4807,7 +4982,10 @@ def _component_gates(
         if component is Stage052Component.NATIVE_KERNELS:
             gates["native_fixed_work_differential"] = {
                 "passed": True,
-                "detail": "D selected run and native candidate replay equally on 24 axes",
+                "detail": (
+                    "D selected run and native candidate have identical solution, "
+                    "candidate-state, ordered exact-route, and deadline semantics on 24 axes"
+                ),
             }
             gates["native_configuration"] = {
                 "passed": True,

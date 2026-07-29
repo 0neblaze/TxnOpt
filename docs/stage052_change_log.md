@@ -1880,3 +1880,32 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   并继续要求 native/protocol fallback 为零。新增回归测试同时拒绝没有
   interrupted evidence 的 invocation gap；修复后的审计函数已对 E30 全部
   36 axes 重算通过。E30 review 不回写，修复使用新 commit/wheel/attempt label。
+
+## 2026-07-29：E31 fixed-work core semantic differential
+
+- `stage05.2_native_kernels_attempt31` 在 clean commit
+  `6b98bfdfe750563d742aa8cd29c6dac1df20c1f4` 上完成 12/12 shards 与
+  36/36 axes；raw manifest SHA-256 为
+  `e7aef963d27b58c8280931bd5cdc1cd8b117532740da1c500d0d070711c9dcad`。
+  独立 reviewer service exit 0、raw manifest unchanged、swap 0，review manifest
+  SHA-256 为
+  `a859c11239bd6b4892e25b03bc19738e1cdfa424c1c4f5647a82ab714a0d2fef`，
+  但状态为 `NOT_READY`，唯一失败 gate 为
+  `native_fixed_work_differential`。
+- E31 的四步 ablation raw replay 实际通过：100-customer aggregate paired
+  median saving 为 `0.182139`，C/R/RC family 分别为
+  `0.182139`、`0.234702`、`0.140098`；四个 mode 的 objective、
+  candidate-state order、ordered exact-route work、validator、cache/deadline 和
+  zero-fallback gate 全部通过。
+- 失败根因是跨实现 differential 复用了 storage-only full canonical event
+  equality。candidate transaction 合法新增 transaction events、batched-screening
+  statistics 并减少重复 diagnostic cache-hit，因此 full event stream 必然不同；
+  reviewer 还把该预期差异展开成 2.7-GB `semantic_mismatches.csv`。这不是 search
+  semantic regression。
+- 修复新增 streaming core semantic digest，只包含 solution/objective、
+  candidate-state order、ordered exact-route results 与 deadline boundaries；
+  transaction/screening/cache diagnostics 仍由每个 ablation mode 的独立 raw
+  replay 审计。该 digest 已对 accepted D predecessor attempt21 与 E31 的
+  24/24 fixed-work axes 实测完全相等。native full-storage mismatch publication
+  仅保留 aggregate rows，不再展开字段级差异。E31 review 不回写，修复使用新
+  commit/wheel/attempt label。
