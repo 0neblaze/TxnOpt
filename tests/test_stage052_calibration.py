@@ -518,15 +518,16 @@ def test_attempt73_memory_floor_uses_sealed_long_shard_resource_peaks(
 
 def _write_failed_formal_memory_floor(
     campaign_dir: Path,
+    *,
+    failure_reason: str = (
+        "RuntimeError: batch process-tree aggregate RSS exceeds its campaign lock"
+    ),
 ) -> tuple[Path, dict[str, object]]:
     run_label = "stage05.2_benchmark_attempt90"
     batch_id = "batch0003"
     batch_dir = campaign_dir / batch_id
     control_dir = batch_dir / "control"
     control_dir.mkdir(parents=True)
-    failure_reason = (
-        "RuntimeError: batch process-tree aggregate RSS exceeds its campaign lock"
-    )
     resource_path = control_dir / f"{run_label}_resource_summary.json"
     resource = {
         "schema_version": "stage05.2-run-resource-v3",
@@ -646,6 +647,44 @@ def test_failed_formal_memory_floor_requires_signed_failure_chain(
         resource_summary_sha256=hashlib.sha256(resource_path.read_bytes()).hexdigest(),
         campaign_geometry_contribution=0,
     )
+
+
+def test_failed_formal_memory_floor_accepts_process_rss_guard_failure(
+    tmp_path: Path,
+) -> None:
+    campaign_dir = tmp_path / "stage05.2_benchmark_attempt99"
+    resource_path, _ = _write_failed_formal_memory_floor(
+        campaign_dir,
+        failure_reason=(
+            "RuntimeError: worker failure RuntimeError: runtime guard aborted "
+            "Stage 5.2 work: process RSS hard limit exceeded: pid=63832 "
+            "observed=3993497600 limit=3991904256; process-pool abort failure "
+            "RuntimeError: pid=63833: survived terminate and kill"
+        ),
+    )
+
+    floor = load_failed_formal_memory_floor(
+        campaign_dir,
+        batch_id="batch0003",
+    )
+
+    assert floor.per_worker_peak_rss_bytes == 3_326_586_880
+    assert floor.resource_summary_sha256 == hashlib.sha256(
+        resource_path.read_bytes()
+    ).hexdigest()
+
+
+def test_failed_formal_memory_floor_rejects_non_memory_worker_failure(
+    tmp_path: Path,
+) -> None:
+    campaign_dir = tmp_path / "stage05.2_benchmark_attempt99"
+    _write_failed_formal_memory_floor(
+        campaign_dir,
+        failure_reason="RuntimeError: worker failure: unexpected exit",
+    )
+
+    with pytest.raises(RuntimeError, match="campaign identity"):
+        load_failed_formal_memory_floor(campaign_dir, batch_id="batch0003")
 
 
 def test_failed_formal_memory_floor_rejects_unbound_resource_edit(

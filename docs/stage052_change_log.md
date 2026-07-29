@@ -2092,3 +2092,33 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   status 为 `READY_FOR_STAGE052_FORMAL_BENCHMARK`。该 Pilot 是后续新 Formal
   campaign 的唯一 campaign prerequisite；它本身不构成
   `READY_FOR_STAGE05_3`。
+
+## 2026-07-30：G Formal98 prerequisite lock 与 Formal99 memory floor
+
+- `stage05.2_benchmark_attempt98` 在任何 shard 启动前 fail fast：sealed local
+  campaign lock 仍只绑定 Pilot 的 accelerator predecessor，没有绑定新接受的
+  `stage05.2_benchmark_attempt97`。Attempt98 startup evidence、host exit 1 与
+  controller log 原样保留；新 snapshot 使用 `upsert_stage052_campaign_lock`
+  验证并加入 Pilot97 的 exact raw/review/config/runtime identity。
+- `stage05.2_benchmark_attempt99` 在 clean commit
+  `a2eac7f24849c2c6d717015ec6df99c0308fd401` 上通过 Formal preflight，并生成精确
+  920 shards、2,040 axes、229,200 declared solver seconds、10,400 checkpoints、
+  12 batches、6 workers 的签名计划。前六批共 637 shards 完成并归档；`batch0007`
+  的 53/53 shard manifests 亦已落盘，但在整批 commit 前由 runtime guard fail
+  fast，因此 Attempt99 不贡献 readiness geometry。
+- 唯一根失败是 worker PID 63832 的 RSS 达
+  `3,993,497,600` bytes，超过冻结的 `3,991,904,256`-byte per-worker hard
+  limit `1,593,344` bytes（约 0.04%）。同批 process-tree aggregate peak 为
+  `20,060,610,560` bytes，仍低于原 `22,184,042,496`-byte aggregate limit；
+  swap/fallback 未被用作继续执行手段。abort 后 PID 63833 未在 terminate/kill
+  窗口内退出，进程池整体中止；campaign、batch0007 partial artifact manifest、
+  resource summary、PID peaks、host exit 1 与六个不可变 archive batches 全部保留。
+- 根因是 resource calibration loader 仅接受旧的 aggregate-RSS Formal failure
+  作为零 geometry memory floor，无法消费同样签名且完整绑定的 per-process RSS
+  hard-limit failure。loader 现在只新增该 fail-fast memory reason 到显式白名单；
+  campaign/batch/artifact/resource/PID/SHA-256、6-worker、row-group、queue-depth
+  与 partial-evidence 绑定保持严格，普通 worker failure 继续被拒绝。
+- 两位 `attemptNN` 空间已到 `attempt99`；修复后的新 Formal 使用下一未占用的合法
+  `stage05.2_benchmark_rerun01`，以新 commit、wheels、sealed source snapshot 和
+  使用 Attempt99 batch0007 签名 memory floor 重新校准的 6-worker contract 从零
+  执行。Attempt99 不续跑、不导入 shard。

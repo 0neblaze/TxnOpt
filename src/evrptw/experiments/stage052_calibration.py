@@ -72,12 +72,24 @@ _PARQUET_CONFIGURATIONS = (
     (262_144, 1),
     (262_144, 2),
 )
+_FAILED_FORMAL_MEMORY_FLOOR_REASONS = (
+    "aggregate RSS exceeds its campaign lock",
+    "runtime guard aborted Stage 5.2 work: process RSS hard limit exceeded:",
+)
 
 
 def _integer(value: object, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise RuntimeError(f"calibration {field_name} is not an integer")
     return value
+
+
+def _is_failed_formal_memory_floor_reason(reason: object) -> bool:
+    """Recognize only fail-fast producer memory-limit failures."""
+
+    return isinstance(reason, str) and any(
+        marker in reason for marker in _FAILED_FORMAL_MEMORY_FLOOR_REASONS
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,8 +208,7 @@ def load_failed_formal_memory_floor(
         != "stage05.2-campaign-manifest-v2"
         or campaign_manifest.get("scope") != "formal"
         or campaign_manifest.get("status") != "failed"
-        or not isinstance(failure_reason, str)
-        or "aggregate RSS exceeds its campaign lock" not in failure_reason
+        or not _is_failed_formal_memory_floor_reason(failure_reason)
         or not isinstance(selected_workers, int)
         or isinstance(selected_workers, bool)
         or not isinstance(campaign_contract, dict)
