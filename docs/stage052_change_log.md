@@ -1778,3 +1778,38 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   state order 与 exact route order 哈希完全相同；batched/full 均为一次
   45-candidate batch，fallback 为零。该 scratch 仅作修复前验证，不消费 canonical
   attempt label；新 evidence 必须使用新 commit、wheel、只读 snapshot 和 attempt27。
+
+## 2026-07-29：E27 promotion timing 封套失败与 v4 修复
+
+- `stage05.2_native_kernels_attempt27` 使用 clean commit `50ad1b4`、producer
+  wheel SHA-256
+  `0e203ed30f0c4061c77bf5cd38d9cfce6abb02ea3192a2c990a2427429c3cf28`
+  和只读 ext4 source snapshot 完成 12/12 shards、36/36 axes；producer manifest
+  SHA-256 为
+  `673587999b8089564a8d7738a9d39aea31787265cc49238350005a30c1697a73`。
+  Windows Scheduled Task host run 为 `20260729T104556Z-277`，launch nonce 为
+  `754761285aa94085a6bfd39d6ceeee16`。
+- 独立 reviewer wheel SHA-256 为
+  `a0d9066c469f95c1301e25afd3b819385d8d92641f6e03c796cf13cbc56bc112`。
+  transient `systemd --user` reviewer 完成两层 attempt27/attempt21 raw replay，
+  finalized receipt 记录 exit 0、raw manifest 前后 SHA-256 相等、cgroup peak
+  5,369,712,640 bytes、swap 0，并原子发布 generation
+  `58a3f5030331094997d203421fe820e30099e91d7be9030dfaf3185d75ea344b`。
+- E27 独立复核为 `NOT_READY`，唯一失败 gate 为 `native_ablation`：100-customer
+  aggregate paired median saving 为 12.5481%，低于 15%；C/R/RC family savings
+  分别为 8.2216%、12.5481%、19.5177%，没有 family regression。其余 scope、
+  source/runtime、validator/objective、worker selection、persistence、resource、
+  staging 与 replay gates 全部通过。E27 保持不可变，不进入 accelerator decision。
+- 根因是四步消融使用了不同 instrumentation envelope。完整
+  `candidate_transaction` 计时取自正式 fixed-work axis，带 asynchronous trace
+  streaming；`current_native`、`pair_pruning` 与 `batched_screening` 则由单独的
+  in-memory trace 路径计时。runner 虽扣除了实际持久化时间，但没有也不能可靠扣除
+  serialization 与 queue management，因此只给完整事务增加了额外成本。C5 控制的
+  完整事务相对 current native 慢 27%--58%，与该单边插桩偏差一致。
+- native ablation axis 升级为 v4。四个模式现在严格按
+  `current_native -> pair_pruning -> batched_screening -> candidate_transaction`
+  在相同 `in_memory_measurement_trace_no_stream_sink_v1` 封套中独立运行；正式
+  fixed-work streaming axis 继续保留为 campaign/resource/persistence evidence，
+  但不再替换其中一个 promotion timing。每个 ablation row 显式声明 timing
+  envelope，reviewer 对旧 schema、缺失或混用 envelope fail fast。E27 不回写；
+  修复必须使用新 commit、wheel、只读 snapshot 和新 attempt label。

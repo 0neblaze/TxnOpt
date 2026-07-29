@@ -147,6 +147,8 @@ from evrptw.validation import validate_routes
 
 STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS = 0.5
 STAGE052_SCHEMA_VERSION = "stage05.2-performance-v1"
+NATIVE_ABLATION_AXIS_SCHEMA_VERSION = "stage05.2-native-ablation-axis-v4"
+NATIVE_ABLATION_TIMING_ENVELOPE = "in_memory_measurement_trace_no_stream_sink_v1"
 _RETENTION_REGISTRY = Path("experiments/registries/stage05.2_retention_registry.csv")
 PERFORMANCE_INSTANCES = ("c101C5", "c101_21", "r101_21", "rc101_21")
 PERFORMANCE_SEEDS = (2014, 2015, 2016)
@@ -5213,16 +5215,6 @@ def _run_and_persist_v2_shard(
                 if task.component == Stage052Component.BENCHMARK.value
                 else [],
             }
-            if (
-                task.component == Stage052Component.NATIVE_KERNELS.value
-                and axis.name == "fixed_work"
-            ):
-                ablation_axes["candidate_transaction"] = _native_ablation_record(
-                    instance,
-                    result,
-                    implementation_mode="candidate_transaction",
-                    solver_seconds=solver_seconds,
-                )
             solution_axes[axis.name] = {
                 "routes": [list(route) for route in result.routes],
                 "objective_key": objective_key,
@@ -5287,8 +5279,18 @@ def _run_and_persist_v2_shard(
                         implementation_mode="batched_screening",
                     ),
                 ),
+                (
+                    "candidate_transaction",
+                    replace(
+                        config.candidate_transaction,
+                        implementation_mode="candidate_transaction",
+                    ),
+                ),
             )
             for implementation_mode, transaction_config in ablation_configs:
+                # All promotion timings must use one instrumentation envelope.
+                # The primary fixed-work axis streams evidence asynchronously,
+                # while these controlled ablations retain traces in memory.
                 started = time.perf_counter()
                 result = _solve_stage052_axis(
                     instance,
@@ -5579,7 +5581,8 @@ def _native_ablation_record(
         ).encode("utf-8")
     ).hexdigest()
     return {
-        "schema_version": "stage05.2-native-ablation-axis-v3",
+        "schema_version": NATIVE_ABLATION_AXIS_SCHEMA_VERSION,
+        "timing_envelope": NATIVE_ABLATION_TIMING_ENVELOPE,
         "implementation_mode": implementation_mode,
         "objective_key": list(result.objective.key),
         "routes": [list(route) for route in result.routes],

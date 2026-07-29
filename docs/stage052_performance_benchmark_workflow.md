@@ -178,6 +178,11 @@ differential test（差分测试），再进入完整性能 scope。E 的组合�
 accepted D selection，并重新执行 Python/native equality、15%/3% performance、36%
 persistence、每 worker 4,357,382,144-byte RSS、process-tree 12-GiB RSS 和
 zero-fallback gate。旧 E 失败原因进入 change log，不进入长期政策正文。
+四步 native ablation 的 promotion timing 必须全部来自同一个
+`in_memory_measurement_trace_no_stream_sink_v1` instrumentation envelope；正式
+fixed-work axis 的 asynchronous streaming timing 只用于 campaign/resource/
+persistence evidence，不得只替换其中一个 ablation mode 的计时。每个 v4 ablation
+axis 必须显式记录该 envelope，reviewer 对缺失或不同值 fail fast。
 
 ## F. Conditional accelerator pilot
 

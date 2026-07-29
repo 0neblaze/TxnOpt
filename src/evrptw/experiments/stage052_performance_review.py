@@ -42,6 +42,8 @@ from evrptw.candidate_transaction import (
     NativeCandidateTransactionConfig,
 )
 from evrptw.experiments.stage052_performance import (
+    NATIVE_ABLATION_AXIS_SCHEMA_VERSION,
+    NATIVE_ABLATION_TIMING_ENVELOPE,
     PERFORMANCE_INSTANCES,
     PERFORMANCE_SEEDS,
     STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS,
@@ -3803,7 +3805,8 @@ def _audit_native_ablation(
             row = axes.get(mode)
             if (
                 not isinstance(row, Mapping)
-                or row.get("schema_version") != "stage05.2-native-ablation-axis-v3"
+                or row.get("schema_version") != NATIVE_ABLATION_AXIS_SCHEMA_VERSION
+                or row.get("timing_envelope") != NATIVE_ABLATION_TIMING_ENVELOPE
                 or row.get("implementation_mode") != mode
             ):
                 failures.append(f"{identity}/{mode}: invalid ablation schema")

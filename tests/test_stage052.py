@@ -2175,6 +2175,62 @@ def test_native_ablation_mode_identity_accepts_canonical_json_key_order() -> Non
     )
 
 
+def test_native_ablation_record_declares_equal_in_memory_timing_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace = SimpleNamespace(
+        stream_sink=None,
+        events=[],
+        route_evaluations=[],
+        reconcile=lambda _result: {"status": "pass"},
+    )
+    result = SimpleNamespace(
+        measurement_trace=trace,
+        objective=SimpleNamespace(key=(1, 2.0, 0.0, 0)),
+        routes=(("D0", "C1", "D0"),),
+        candidate_transaction_events=(),
+        neighborhood_events=(),
+        exact_started_calls=0,
+        exact_completed_calls=0,
+        cache_incremental_statistics={},
+        exact_deadline_statistics={},
+        candidate_transaction_statistics={},
+        termination_reason="fixed_work_budget",
+        backend_metrics={},
+        screening_statistics={},
+    )
+    instance = Instance(
+        "equal_ablation_envelope",
+        (
+            Node("D0", NodeType.DEPOT, 0, 0, 0, 0, 100, 0),
+            Node("C1", NodeType.CUSTOMER, 1, 0, 1, 0, 100, 0),
+        ),
+        Vehicle(10, 10, 1, 1, 1),
+        distance_backend="python",
+    )
+    monkeypatch.setattr(
+        stage052_performance,
+        "validate_routes",
+        lambda *_args, **_kwargs: SimpleNamespace(feasible=True),
+    )
+
+    record = _native_ablation_record(
+        instance,
+        result,
+        implementation_mode="candidate_transaction",
+        solver_seconds=1.0,
+    )
+
+    assert (
+        record["schema_version"]
+        == stage052_performance.NATIVE_ABLATION_AXIS_SCHEMA_VERSION
+    )
+    assert (
+        record["timing_envelope"]
+        == stage052_performance.NATIVE_ABLATION_TIMING_ENVELOPE
+    )
+
+
 def test_native_ablation_allows_an_observable_zero_work_batch() -> None:
     row = {
         "exact_started_calls": 0,
