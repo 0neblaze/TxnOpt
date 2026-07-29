@@ -1813,3 +1813,24 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   但不再替换其中一个 promotion timing。每个 ablation row 显式声明 timing
   envelope，reviewer 对旧 schema、缺失或混用 envelope fail fast。E27 不回写；
   修复必须使用新 commit、wheel、只读 snapshot 和新 attempt label。
+
+## 2026-07-29：E28 sealed snapshot 本地配置遗漏
+
+- `stage05.2_native_kernels_attempt28` 由 audited Windows Scheduled Task host run
+  `20260729T113702Z-417` 启动，launch nonce 为
+  `f01039fbde7a421ab50934ec13086cee`，controller SHA-256 为
+  `8e07e2a335b34a6ffe68cfbd83c3de2143f3aca533c2c104d1dd13eded664499`。
+  它使用 clean commit `64ff84d`、producer wheel SHA-256
+  `926c0768cdcdbb41aeb0b4a2a20f7dcecffc2f9bec99e73b3498b954cfa16354`
+  与只读 ext4 source snapshot。
+- producer 在创建 output directory 或 shard 前 fail fast，Windows Scheduled Task
+  与 Linux host controller 均记录 exit code 1。直接原因为 sealed snapshot 缺少
+  ignored but required（被忽略但必需）的
+  `configs/stage052_storage_roots.local.toml`；runner 因而拒绝解析 storage root
+  locator。attempt28 只保留 producer log、controller、host/launch evidence，
+  不存在 raw shard、manifest 或 review。
+- 根因是手工 snapshot packaging 只复制了 Schneider data 与新 runtime identity，
+  没有复制当前 checkout 中完整的七项本地 control files：campaign lock 及 sidecar、
+  resource calibration 及 sidecar、review calibration 及 sidecar、storage roots。
+  下一 snapshot 必须在冻结为只读前逐项复制并验证这些七项，再单独生成当前
+  runtime identity；attempt28 label 不复用。
