@@ -14,6 +14,7 @@ import pytest
 
 import evrptw.stage052_campaign_runner as campaign_runner
 from evrptw.artifacts import ArtifactReader, ArtifactStorageConfig
+from evrptw.candidate_transaction import NativeCandidateTransactionConfig
 from evrptw.experiments import stage052_performance
 from evrptw.experiments.stage052_performance import (
     _build_campaign_batch_tasks,
@@ -395,7 +396,7 @@ def _accepted_f02_payloads() -> tuple[dict[str, object], dict[str, object], str]
         "screening": True,
         "propagation": True,
         "distance_matrix": True,
-        "abi_version": "stage05.2-native-kernels-v1",
+        "abi_version": "stage05.2-native-kernels-v2",
         "context_policy": "pack_once_per_solve",
         "failure_policy": "fail_fast_no_fallback",
     }
@@ -427,6 +428,9 @@ def _accepted_f02_payloads() -> tuple[dict[str, object], dict[str, object], str]
         "optimization_profile": "native",
         "worker_count": 2,
         "native_kernel_config": native,
+        "candidate_transaction_config": (
+            NativeCandidateTransactionConfig().to_dict()
+        ),
         "repository_revision": "a" * 40,
         "runtime_identity": runtime,
         "configuration_sha256": "4" * 64,
@@ -446,6 +450,9 @@ def _accepted_f02_payloads() -> tuple[dict[str, object], dict[str, object], str]
         "selected_exact_backend": "cpu_batch",
         "selected_workers": 2,
         "native_configuration": native,
+        "candidate_transaction_configuration": (
+            NativeCandidateTransactionConfig().to_dict()
+        ),
     }
     return metadata, review, raw_manifest_sha
 
@@ -1191,7 +1198,7 @@ def _pilot_config() -> BenchmarkCampaignConfig:
         selected_backend="native_cpu",
         selected_exact_backend="cpu_batch",
         selected_workers=2,
-        native_profile="stage05.2-native-kernels-v1",
+        native_profile="stage05.2-native-kernels-v2",
     )
 
 
@@ -1387,7 +1394,7 @@ def test_campaign_task_ordinals_cover_exact_pilot_and_formal_bounds() -> None:
         selected_backend="native_cpu",
         selected_exact_backend="cpu_batch",
         selected_workers=2,
-        native_profile="stage05.2-native-kernels-v1",
+        native_profile="stage05.2-native-kernels-v2",
     ).build_plan(observations)
     formal_tasks = [
         task
@@ -1699,7 +1706,7 @@ def test_runtime_evidence_allows_the_audited_24_thread_machine_headroom() -> Non
         selected_backend="native_cpu",
         selected_exact_backend="cpu_batch",
         selected_workers=4,
-        native_profile="stage05.2-native-kernels-v1",
+        native_profile="stage05.2-native-kernels-v2",
     )
 
     evidence = BatchRuntimeEvidence.from_snapshots(
@@ -1720,7 +1727,7 @@ def test_runtime_evidence_allows_attempt56_observed_campaign_load() -> None:
         selected_backend="native_cpu",
         selected_exact_backend="cpu_batch",
         selected_workers=4,
-        native_profile="stage05.2-native-kernels-v1",
+        native_profile="stage05.2-native-kernels-v2",
     )
 
     evidence = BatchRuntimeEvidence.from_snapshots(
@@ -1739,7 +1746,7 @@ def test_runtime_evidence_records_load_beyond_old_machine_headroom() -> None:
         selected_backend="native_cpu",
         selected_exact_backend="cpu_batch",
         selected_workers=4,
-        native_profile="stage05.2-native-kernels-v1",
+        native_profile="stage05.2-native-kernels-v2",
     )
 
     evidence = BatchRuntimeEvidence.from_snapshots(

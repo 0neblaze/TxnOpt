@@ -35,8 +35,17 @@ exact_charging = true
 screening = true
 propagation = true
 distance_matrix = true
-abi_version = "stage05.2-native-kernels-v1"
+abi_version = "stage05.2-native-kernels-v2"
 context_policy = "pack_once_per_solve"
+failure_policy = "fail_fast_no_fallback"
+
+[candidate_transaction]
+enabled = true
+implementation_mode = "candidate_transaction"
+schema_version = "stage05.2-native-candidate-transaction-v1"
+candidate_order_policy = "existing_operator_order"
+exact_budget_policy = "existing_operator_exact_evaluation_budget"
+cache_write_policy = "staged_atomic_commit"
 failure_policy = "fail_fast_no_fallback"
 
 # Optional fail-fast CUDA pilot adapter. Set `helper_path` only to an executable

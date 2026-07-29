@@ -53,6 +53,7 @@ from evrptw.artifacts import (
     signed_sidecar_matches,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
+from evrptw.candidate_transaction import NativeCandidateTransactionConfig
 from evrptw.environment import collect_environment
 from evrptw.exact_deadline import ExactDeadlineConfig
 from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES
@@ -173,9 +174,14 @@ PER_RUN_FIELDS = (
     "native_fallbacks",
     "native_screening_seconds",
     "native_screening_invocations",
+    "native_screening_batch_invocations",
+    "native_screening_batch_candidates",
+    "native_screening_median_occupancy",
     "native_propagation_seconds",
     "native_propagation_invocations",
     "native_protocol_fallbacks",
+    "native_candidate_transactions",
+    "native_candidate_transaction_fallbacks",
     "exact_started_calls",
     "exact_completed_calls",
     "effective_iterations",
@@ -284,6 +290,7 @@ class Stage052Config:
     max_iterations: int
     batch_size: int
     native_kernels: NativeKernelConfig
+    candidate_transaction: NativeCandidateTransactionConfig
     v1_storage: ArtifactStorageConfig
     v2_storage: ArtifactStorageConfig
     runtime_identity_manifest: Path
@@ -332,6 +339,9 @@ def load_stage052_config(path: Path) -> Stage052Config:
             max_iterations=int(runtime["max_iterations"]),
             batch_size=int(runtime["batch_size"]),
             native_kernels=NativeKernelConfig(**dict(payload["native_kernels"])),
+            candidate_transaction=NativeCandidateTransactionConfig(
+                **dict(payload["candidate_transaction"])
+            ),
             v1_storage=v1,
             v2_storage=v2,
             runtime_identity_manifest=Path(str(runtime["identity_manifest"])),
@@ -640,6 +650,13 @@ def run_stage052(
                 )
             if predecessor_metadata.get("native_kernel_config") != NativeKernelConfig().to_dict():
                 raise ValueError("accelerator_pilot requires complete accepted native kernels")
+            if (
+                predecessor_metadata.get("candidate_transaction_config")
+                != NativeCandidateTransactionConfig().to_dict()
+            ):
+                raise ValueError(
+                    "accelerator_pilot requires the accepted native candidate transaction"
+                )
             accelerator_decision_payload = _accelerator_decision_inputs(
                 prerequisite_path,
                 prerequisite=identities["native_selection"],
@@ -746,6 +763,16 @@ def run_stage052(
             }
             else None
         ),
+        "candidate_transaction_config": (
+            config.candidate_transaction.to_dict()
+            if selected
+            in {
+                Stage052Component.NATIVE_KERNELS,
+                Stage052Component.ACCELERATOR_PILOT,
+                Stage052Component.BENCHMARK,
+            }
+            else None
+        ),
         "persistence_attribution": (
             "decision_only_no_solver_persistence"
             if accelerator_decision_payload is not None
@@ -787,8 +814,8 @@ def run_stage052(
     with persistence_recorder.record("parent_write_control"):
         parent_writer.write_control(metadata=metadata, configuration_path=resolved_config)
     if accelerator_decision_payload is not None:
-        accelerator_mode = accelerator_decision_payload.get("schema_version") == (
-            "stage05.2-accelerator-pilot-artifact-v2"
+        accelerator_mode = _accelerator_mode(accelerator_decision_payload) == (
+            "accelerator_pilot"
         )
         artifact_type = "accelerator_pilot" if accelerator_mode else "accelerator_decision"
         decision_path = resolved_output / "control" / f"{run_label}_{artifact_type}.json"
@@ -1171,7 +1198,7 @@ def _run_benchmark_campaign_impl(
             selected_backend=selection_lock.selected_backend,
             selected_exact_backend="cpu_batch",
             selected_workers=worker_count,
-            native_profile="stage05.2-native-kernels-v1",
+            native_profile=config.native_kernels.abi_version,
             producer_resource_contract=producer_resource_contract,
         )
         if scope == "pilot"
@@ -1182,7 +1209,7 @@ def _run_benchmark_campaign_impl(
             selected_backend=selection_lock.selected_backend,
             selected_exact_backend="cpu_batch",
             selected_workers=worker_count,
-            native_profile="stage05.2-native-kernels-v1",
+            native_profile=config.native_kernels.abi_version,
             producer_resource_contract=producer_resource_contract,
         )
     )
@@ -1252,8 +1279,9 @@ def _run_benchmark_campaign_impl(
         "execution_backend": selection_lock.selected_backend,
         "optimization_profile": ("cuda" if selection_lock.selected_backend == "cuda" else "native"),
         "worker_count": worker_count,
-        "native_profile": "stage05.2-native-kernels-v1",
+        "native_profile": config.native_kernels.abi_version,
         "native_kernel_config": config.native_kernels.to_dict(),
+        "candidate_transaction_config": config.candidate_transaction.to_dict(),
         "repository_revision": revision,
         "repository_dirty": False,
         "configuration_sha256": _sha256(config_path),
@@ -1885,6 +1913,7 @@ def _run_benchmark_batch(
         "worker_runtime_warmup": "in_memory_arrow_zstd1",
         "native_profile": campaign_config.native_profile,
         "native_kernel_config": config.native_kernels.to_dict(),
+        "candidate_transaction_config": config.candidate_transaction.to_dict(),
         "repository_revision": repository_revision,
         "repository_dirty": False,
         "configuration_sha256": _sha256(config_path),
@@ -2888,6 +2917,49 @@ def _stage052_metadata(raw_dir: Path) -> dict[str, object]:
     return payload
 
 
+def _screening_occupancy_from_axis(
+    axis: Mapping[str, object],
+    *,
+    identity: tuple[str, int],
+) -> float:
+    transaction = axis.get("candidate_transaction_statistics")
+    if not isinstance(transaction, Mapping):
+        raise ValueError(f"missing E candidate transaction statistics: {identity}")
+    transactions = _strict_int(
+        transaction.get("native_candidate_transactions"),
+        "native_candidate_transactions",
+    )
+    input_count = _strict_int(
+        transaction.get("native_candidate_input_count"),
+        "native_candidate_input_count",
+    )
+    fallback_count = _strict_int(
+        transaction.get("native_candidate_transaction_fallbacks"),
+        "native_candidate_transaction_fallbacks",
+    )
+    raw_occupancies = transaction.get("native_screening_occupancies")
+    if not isinstance(raw_occupancies, (list, tuple)):
+        raise ValueError(f"missing E native screening occupancies: {identity}")
+    occupancies = [
+        _strict_int(value, "native_screening_occupancy") for value in raw_occupancies
+    ]
+    recomputed_median = statistics.median(occupancies) if occupancies else 0.0
+    recorded_median = _strict_float(
+        transaction.get("native_screening_median_occupancy")
+    )
+    if (
+        transactions <= 0
+        or input_count <= 0
+        or fallback_count != 0
+        or len(occupancies) != transactions
+        or any(value <= 0 for value in occupancies)
+        or sum(occupancies) != input_count
+        or recorded_median != recomputed_median
+    ):
+        raise ValueError(f"invalid E candidate transaction counters: {identity}")
+    return float(recomputed_median)
+
+
 def _accelerator_decision_inputs(
     raw_dir: Path,
     *,
@@ -2938,24 +3010,10 @@ def _accelerator_decision_inputs(
             or fixed.get("valid") is not True
         ):
             raise ValueError(f"invalid E fixed-work raw axis: {identity}")
-        backend = fixed.get("backend_metrics")
-        if not isinstance(backend, Mapping):
-            raise ValueError(f"missing E raw backend metrics: {identity}")
-        exact_calls = _strict_int(backend.get("exact_calls"), "exact_calls")
-        batch_launches = _strict_int(backend.get("batch_launches"), "batch_launches")
-        raw_occupancies = backend.get("launch_occupancies")
-        if not isinstance(raw_occupancies, list):
-            raise ValueError(f"missing E raw launch occupancies: {identity}")
-        occupancies = [_strict_int(value, "launch_occupancy") for value in raw_occupancies]
-        if (
-            exact_calls <= 0
-            or batch_launches <= 0
-            or any(value <= 0 for value in occupancies)
-            or len(occupancies) != batch_launches
-            or sum(occupancies) != exact_calls
-        ):
-            raise ValueError(f"invalid E raw occupancy counters: {identity}")
-        values[identity] = statistics.median(occupancies)
+        values[identity] = _screening_occupancy_from_axis(
+            fixed,
+            identity=identity,
+        )
         semantic_digest = fixed.get("semantic_digest")
         if isinstance(semantic_digest, str) and semantic_digest:
             raw_semantic_digests[identity] = semantic_digest
@@ -2973,7 +3031,7 @@ def _accelerator_decision_inputs(
             "instance": instance,
             "seed": seed,
             "axis": "fixed_work",
-            "median_batch_occupancy": values[(instance, seed)],
+            "median_screening_occupancy": values[(instance, seed)],
         }
         for instance, seed in sorted(values)
     ]
@@ -3030,20 +3088,23 @@ def _accelerator_decision_inputs(
             executor=executor,
         )
         return {
-            "schema_version": "stage05.2-accelerator-pilot-artifact-v2",
+            "schema_version": "stage05.2-accelerator-pilot-artifact-v3",
+            "occupancy_metric": "native_candidate_screening_pool_size",
+            "median_screening_occupancy": median,
             "occupancy_input_count": len(ordered),
             "occupancy_inputs": ordered,
             "native_prerequisite": prerequisite_dict,
             "pilot": pilot,
         }
     return {
-        "schema_version": "stage05.2-accelerator-decision-v1",
+        "schema_version": "stage05.2-accelerator-decision-v2",
         "decision_mode": "decision_only",
         "decision": "GPU_NOT_JUSTIFIED",
         "selected_backend": "native_cpu",
         "selected_exact_backend": "cpu_batch",
         "threshold": 32.0,
-        "median_batch_occupancy": median,
+        "occupancy_metric": "native_candidate_screening_pool_size",
+        "median_screening_occupancy": median,
         "input_count": len(ordered),
         "inputs": ordered,
         "native_prerequisite": prerequisite_dict,
@@ -3053,9 +3114,15 @@ def _accelerator_decision_inputs(
 
 
 def _accelerator_mode(payload: Mapping[str, object]) -> str:
-    if payload.get("schema_version") == "stage05.2-accelerator-decision-v1":
+    if payload.get("schema_version") in {
+        "stage05.2-accelerator-decision-v1",
+        "stage05.2-accelerator-decision-v2",
+    }:
         return "decision_only"
-    if payload.get("schema_version") == "stage05.2-accelerator-pilot-artifact-v2":
+    if payload.get("schema_version") in {
+        "stage05.2-accelerator-pilot-artifact-v2",
+        "stage05.2-accelerator-pilot-artifact-v3",
+    }:
         return "accelerator_pilot"
     raise ValueError("unknown accelerator evidence schema")
 
@@ -3357,6 +3424,11 @@ def _run_and_persist_shard(
             native_kernel_config=(
                 config.native_kernels if instance.distance_backend == "native" else None
             ),
+            candidate_transaction_config=(
+                config.candidate_transaction
+                if instance.distance_backend == "native"
+                else None
+            ),
         )
         solver_times[axis.name] = time.perf_counter() - started
     shard_writer = writer or ArtifactBundleWriter(
@@ -3416,6 +3488,18 @@ def _run_and_persist_shard(
                 "native_screening_invocations": result.screening_statistics.get(
                     "native_screening_invocations", 0
                 ),
+                "native_screening_batch_invocations": result.screening_statistics.get(
+                    "native_screening_batch_invocations", 0
+                ),
+                "native_screening_batch_candidates": result.screening_statistics.get(
+                    "native_screening_batch_candidates", 0
+                ),
+                "native_screening_median_occupancy": (
+                    result.candidate_transaction_statistics.get(
+                        "native_screening_median_occupancy",
+                        0,
+                    )
+                ),
                 "native_propagation_seconds": result.screening_statistics.get(
                     "native_propagation_seconds", 0.0
                 ),
@@ -3424,6 +3508,18 @@ def _run_and_persist_shard(
                 ),
                 "native_protocol_fallbacks": result.screening_statistics.get(
                     "native_protocol_fallbacks", 0
+                ),
+                "native_candidate_transactions": (
+                    result.candidate_transaction_statistics.get(
+                        "native_candidate_transactions",
+                        0,
+                    )
+                ),
+                "native_candidate_transaction_fallbacks": (
+                    result.candidate_transaction_statistics.get(
+                        "native_candidate_transaction_fallbacks",
+                        0,
+                    )
                 ),
                 "exact_started_calls": result.exact_started_calls,
                 "exact_completed_calls": result.exact_completed_calls,
@@ -4953,6 +5049,7 @@ def _run_and_persist_v2_shard(
     live_persistence_ns_by_axis: dict[str, int] = {}
     solver_persistence_ns_by_axis: dict[str, int] = {}
     event_counts: dict[str, int] = {}
+    ablation_axes: dict[str, object] = {}
     failures: list[str] = []
     active_trace_stream: _Stage052TraceStreamSink | None = None
     try:
@@ -5041,6 +5138,9 @@ def _run_and_persist_v2_shard(
             raw_axes[axis.name] = {
                 "backend": result.charging_backend,
                 "backend_metrics": result.backend_metrics,
+                "candidate_transaction_statistics": (
+                    getattr(result, "candidate_transaction_statistics", {})
+                ),
                 "objective_key": objective_key,
                 "initial_objective_key": initial_objective_key,
                 "runtime_seconds": result.runtime_seconds,
@@ -5069,6 +5169,16 @@ def _run_and_persist_v2_shard(
                 if task.component == Stage052Component.BENCHMARK.value
                 else [],
             }
+            if (
+                task.component == Stage052Component.NATIVE_KERNELS.value
+                and axis.name == "fixed_work"
+            ):
+                ablation_axes["candidate_transaction"] = _native_ablation_record(
+                    instance,
+                    result,
+                    implementation_mode="candidate_transaction",
+                    solver_seconds=solver_seconds,
+                )
             solution_axes[axis.name] = {
                 "routes": [list(route) for route in result.routes],
                 "objective_key": objective_key,
@@ -5112,6 +5222,59 @@ def _run_and_persist_v2_shard(
                 "post_artifact_gc_ns": axis_completed_ns - artifact_preparation_completed_ns,
             }
 
+        if task.component == Stage052Component.NATIVE_KERNELS.value:
+            fixed_axis = next(axis for axis in axes if axis.name == "fixed_work")
+            ablation_configs: tuple[
+                tuple[str, NativeCandidateTransactionConfig | None],
+                ...,
+            ] = (
+                ("current_native", None),
+                (
+                    "pair_pruning",
+                    replace(
+                        config.candidate_transaction,
+                        implementation_mode="pair_pruning",
+                    ),
+                ),
+                (
+                    "batched_screening",
+                    replace(
+                        config.candidate_transaction,
+                        implementation_mode="batched_screening",
+                    ),
+                ),
+            )
+            for implementation_mode, transaction_config in ablation_configs:
+                started = time.perf_counter()
+                result = _solve_stage052_axis(
+                    instance,
+                    seed=task.seed,
+                    axis=fixed_axis,
+                    config=config,
+                    stage04=stage04,
+                    stage02=stage02,
+                    candidate_transaction_config=transaction_config,
+                    override_candidate_transaction=True,
+                )
+                solver_seconds = time.perf_counter() - started
+                ablation_axes[implementation_mode] = _native_ablation_record(
+                    instance,
+                    result,
+                    implementation_mode=implementation_mode,
+                    solver_seconds=solver_seconds,
+                )
+                del result
+                gc.collect()
+            ablation_axes = {
+                mode: ablation_axes[mode]
+                for mode in (
+                    "current_native",
+                    "pair_pruning",
+                    "batched_screening",
+                    "candidate_transaction",
+                )
+            }
+
         finalize_started_ns = time.perf_counter_ns()
         shard.flush()
         shard.finalize(
@@ -5124,6 +5287,7 @@ def _run_and_persist_v2_shard(
                 "seed": task.seed,
                 "worker_count": task.worker_count,
                 "axes": raw_axes,
+                "ablation_axes": ablation_axes,
             },
             solution_payload={
                 "schema_version": STAGE052_SCHEMA_VERSION,
@@ -5231,6 +5395,8 @@ def _solve_stage052_axis(
     stage04: Any,
     stage02: Any,
     trace_sink: MeasurementTraceSink | None = None,
+    candidate_transaction_config: NativeCandidateTransactionConfig | None = None,
+    override_candidate_transaction: bool = False,
 ) -> ALNSResult:
     exact_deadline = (
         ExactDeadlineConfig.fixed_exact_calls(
@@ -5260,6 +5426,15 @@ def _solve_stage052_axis(
         native_kernel_config=(
             config.native_kernels if instance.distance_backend == "native" else None
         ),
+        candidate_transaction_config=(
+            (
+                candidate_transaction_config
+                if override_candidate_transaction
+                else getattr(config, "candidate_transaction", None)
+            )
+            if instance.distance_backend == "native"
+            else None
+        ),
         # Neighborhood events do not carry timestamps.  Stream them to the
         # measured-volume scratch spool and merge them after the timestamped
         # trace families so v3 preserves the accepted v1 canonical order
@@ -5270,6 +5445,83 @@ def _solve_stage052_axis(
             else None
         ),
     )
+
+
+def _native_ablation_record(
+    instance: Instance,
+    result: ALNSResult,
+    *,
+    implementation_mode: str,
+    solver_seconds: float,
+) -> dict[str, object]:
+    trace = result.measurement_trace
+    if trace is None or result.objective is None:
+        raise RuntimeError("native ablation requires a complete trace and objective")
+    validation = validate_routes(instance, [list(route) for route in result.routes])
+    reconciliation = trace.reconcile(result)
+    records = [
+        {
+            key: event.get(key)
+            for key in (
+                "event_type",
+                "lane",
+                "iteration",
+                "operator",
+                "kind",
+                "status",
+                "route_key",
+                "accepted",
+                "global_best",
+                "exact_started",
+                "exact_completed",
+                "boundary",
+            )
+            if key in event
+        }
+        for event in trace.events
+        if event.get("event_type")
+        in {
+            "candidate_state",
+            "route_evaluation",
+            "cache_event",
+            "exact_budget_boundary",
+            "deadline_boundary",
+            "native_candidate_screening_batch",
+            "native_candidate_transaction",
+        }
+    ]
+    candidate_order_sha256 = hashlib.sha256(
+        json.dumps(
+            records,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema_version": "stage05.2-native-ablation-axis-v1",
+        "implementation_mode": implementation_mode,
+        "objective_key": list(result.objective.key),
+        "routes": [list(route) for route in result.routes],
+        "validator_passed": validation.feasible,
+        "trace_reconciliation": reconciliation,
+        "candidate_records": records,
+        "candidate_order_sha256": candidate_order_sha256,
+        "solver_seconds": solver_seconds,
+        "exact_started_calls": result.exact_started_calls,
+        "exact_completed_calls": result.exact_completed_calls,
+        "cache_statistics": result.cache_incremental_statistics,
+        "deadline_statistics": result.exact_deadline_statistics,
+        "candidate_transaction_statistics": result.candidate_transaction_statistics,
+        "termination_reason": result.termination_reason,
+        "fallback_used": bool(
+            result.backend_metrics.get("native_fallbacks", 0)
+            or result.screening_statistics.get("native_protocol_fallbacks", 0)
+            or result.candidate_transaction_statistics.get(
+                "native_candidate_transaction_fallbacks",
+                0,
+            )
+        ),
+    }
 
 
 def _checkpoint_objective_key(value: object) -> ObjectiveKey:
@@ -5412,6 +5664,11 @@ def _stage052_row_draft(
     storage: ArtifactStorageConfig,
 ) -> dict[str, object]:
     backend = result.backend_metrics
+    candidate_transaction_statistics = getattr(
+        result,
+        "candidate_transaction_statistics",
+        {},
+    )
     objective = result.objective
     batch_launches, median_batch_occupancy = _launch_occupancy_summary(backend)
     return {
@@ -5440,6 +5697,18 @@ def _stage052_row_draft(
         "native_screening_invocations": result.screening_statistics.get(
             "native_screening_invocations", 0
         ),
+        "native_screening_batch_invocations": result.screening_statistics.get(
+            "native_screening_batch_invocations", 0
+        ),
+        "native_screening_batch_candidates": result.screening_statistics.get(
+            "native_screening_batch_candidates", 0
+        ),
+        "native_screening_median_occupancy": (
+            candidate_transaction_statistics.get(
+                "native_screening_median_occupancy",
+                0,
+            )
+        ),
         "native_propagation_seconds": result.screening_statistics.get(
             "native_propagation_seconds", 0.0
         ),
@@ -5448,6 +5717,16 @@ def _stage052_row_draft(
         ),
         "native_protocol_fallbacks": result.screening_statistics.get(
             "native_protocol_fallbacks", 0
+        ),
+        "native_candidate_transactions": candidate_transaction_statistics.get(
+            "native_candidate_transactions",
+            0,
+        ),
+        "native_candidate_transaction_fallbacks": (
+            candidate_transaction_statistics.get(
+                "native_candidate_transaction_fallbacks",
+                0,
+            )
         ),
         "exact_started_calls": result.exact_started_calls,
         "exact_completed_calls": result.exact_completed_calls,
@@ -5542,6 +5821,9 @@ def _persist_shard(
         raw_axes[axis] = {
             "backend": result.charging_backend,
             "backend_metrics": result.backend_metrics,
+            "candidate_transaction_statistics": (
+                result.candidate_transaction_statistics
+            ),
             "objective_key": objective_key,
             "runtime_seconds": result.runtime_seconds,
             "effective_iterations": result.effective_iterations,

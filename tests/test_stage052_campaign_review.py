@@ -26,6 +26,7 @@ from evrptw.artifacts import (
     screening_definition_store_contract,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
+from evrptw.candidate_transaction import NativeCandidateTransactionConfig
 from evrptw.experiments.stage052_campaign_review import (
     COMPACT_TRACE_SCHEMA_FINGERPRINTS,
     CampaignGeometryRecord,
@@ -69,6 +70,7 @@ from evrptw.stage052_evidence import (
     Stage052PrerequisiteIdentity,
     verify_stage052_review_files,
 )
+from evrptw.stage052_retention import RetentionRecord, write_retention_registry
 from evrptw.validation import validate_routes
 from tools.publish_stage052_artifacts import (
     _verify_live_formal_chain,
@@ -326,7 +328,7 @@ def test_rolling_capacity_replay_uses_canonical_campaign_reserves() -> None:
         selected_backend="native_cpu",
         selected_exact_backend="cpu_batch",
         selected_workers=4,
-        native_profile="stage05.2-native-kernels-v1",
+        native_profile="stage05.2-native-kernels-v2",
     )
     staging = VolumeIdentity(device_uuid="staging-ext4", filesystem="ext4")
     archive = VolumeIdentity(device_uuid="archive-9p", filesystem="9p")
@@ -449,7 +451,7 @@ def test_campaign_planning_replay_requires_canonical_pilot_next_fit(
         selected_backend="native_cpu",
         selected_exact_backend="cpu_batch",
         selected_workers=2,
-        native_profile="stage05.2-native-kernels-v1",
+        native_profile="stage05.2-native-kernels-v2",
     )
     plan = config.build_plan()
     free_by_alias = {"staging": 200 * 1024**3, "archive": 200 * 1024**3}
@@ -1366,7 +1368,7 @@ def _selection_inputs() -> tuple[dict[str, object], dict[str, object], dict[str,
         "screening": True,
         "propagation": True,
         "distance_matrix": True,
-        "abi_version": "stage05.2-native-kernels-v1",
+        "abi_version": "stage05.2-native-kernels-v2",
         "context_policy": "pack_once_per_solve",
         "failure_policy": "fail_fast_no_fallback",
     }
@@ -1393,6 +1395,9 @@ def _selection_inputs() -> tuple[dict[str, object], dict[str, object], dict[str,
         "worker_count": 2,
         "optimization_profile": "native",
         "native_kernel_config": native,
+        "candidate_transaction_config": (
+            NativeCandidateTransactionConfig().to_dict()
+        ),
         "repository_revision": "a" * 40,
         "repository_dirty": False,
         "configuration_sha256": "6" * 64,
@@ -1417,6 +1422,9 @@ def _selection_inputs() -> tuple[dict[str, object], dict[str, object], dict[str,
         "selected_workers": 2,
         "selected_optimization_profile": "native",
         "native_configuration": native,
+        "candidate_transaction_configuration": (
+            NativeCandidateTransactionConfig().to_dict()
+        ),
     }
     identity: dict[str, object] = {
         "run_label": metadata["run_label"],
@@ -1549,7 +1557,7 @@ def _build_complete_pilot_campaign(
         "worker_process_lifecycle": "one_shard_per_spawned_process",
         "worker_runtime_warmup": "in_memory_arrow_zstd1",
         "screening_definition_store": screening_definition_store_contract(),
-        "native_profile": "stage05.2-native-kernels-v1",
+        "native_profile": "stage05.2-native-kernels-v2",
         "native_kernel_config": predecessor_metadata["native_kernel_config"],
         "repository_revision": predecessor_metadata["repository_revision"],
         "repository_dirty": False,
@@ -2020,7 +2028,7 @@ def _build_complete_pilot_campaign(
         selected_backend="native_cpu",
         selected_exact_backend="cpu_batch",
         selected_workers=2,
-        native_profile="stage05.2-native-kernels-v1",
+        native_profile="stage05.2-native-kernels-v2",
         storage_policy_version="artifact-storage-v2",
         screening_schema_version="screening_decisions_v3",
         storage_roots={"staging": volume, "archive": volume},
@@ -2334,7 +2342,7 @@ def test_campaign_selection_lock_binds_f02_backend_worker_native_and_provenance(
         campaign_backend="native_cpu",
         campaign_exact_backend="cpu_batch",
         campaign_workers=2,
-        campaign_native_profile="stage05.2-native-kernels-v1",
+        campaign_native_profile="stage05.2-native-kernels-v2",
         prerequisite_metadata=metadata,
         prerequisite_review=review,
         prerequisite_identity=identity,
@@ -2352,7 +2360,7 @@ def test_batch_runtime_provenance_ignores_telemetry_across_batches() -> None:
         campaign_backend="native_cpu",
         campaign_exact_backend="cpu_batch",
         campaign_workers=2,
-        campaign_native_profile="stage05.2-native-kernels-v1",
+        campaign_native_profile="stage05.2-native-kernels-v2",
         prerequisite_metadata=prerequisite_metadata,
         prerequisite_review=review,
         prerequisite_identity=identity,
@@ -2366,7 +2374,7 @@ def test_batch_runtime_provenance_ignores_telemetry_across_batches() -> None:
         selected_backend="native_cpu",
         selected_exact_backend="cpu_batch",
         selected_workers=2,
-        native_profile="stage05.2-native-kernels-v1",
+        native_profile="stage05.2-native-kernels-v2",
         storage_policy_version="artifact-storage-v2",
         screening_schema_version="screening_decisions_v3",
         producer_resource_contract=None,
@@ -2446,7 +2454,7 @@ def test_campaign_selection_lock_binds_promoted_cuda_backend() -> None:
         campaign_backend="cuda",
         campaign_exact_backend="cpu_batch",
         campaign_workers=2,
-        campaign_native_profile="stage05.2-native-kernels-v1",
+        campaign_native_profile="stage05.2-native-kernels-v2",
         prerequisite_metadata=metadata,
         prerequisite_review=review,
         prerequisite_identity=identity,
@@ -2466,7 +2474,7 @@ def test_campaign_selection_lock_rejects_f02_review_drift(field: str) -> None:
         campaign_backend="native_cpu",
         campaign_exact_backend="cpu_batch",
         campaign_workers=2,
-        campaign_native_profile="stage05.2-native-kernels-v1",
+        campaign_native_profile="stage05.2-native-kernels-v2",
         prerequisite_metadata=metadata,
         prerequisite_review=review,
         prerequisite_identity=identity,
@@ -2488,7 +2496,7 @@ def test_campaign_selection_lock_rejects_incomplete_native_profile() -> None:
         campaign_backend="native_cpu",
         campaign_exact_backend="cpu_batch",
         campaign_workers=2,
-        campaign_native_profile="stage05.2-native-kernels-v1",
+        campaign_native_profile="stage05.2-native-kernels-v2",
         prerequisite_metadata=metadata,
         prerequisite_review=review,
         prerequisite_identity=identity,
@@ -2626,8 +2634,16 @@ def _accepted_review(
     publication_files: dict[str, dict[str, str]] = {}
     selection_metadata, _, _ = _selection_inputs()
     native = selection_metadata["native_kernel_config"]
+    candidate_transaction = selection_metadata["candidate_transaction_config"]
     native_sha256 = hashlib.sha256(
         json.dumps(native, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    candidate_transaction_sha256 = hashlib.sha256(
+        json.dumps(
+            candidate_transaction,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
     ).hexdigest()
     for key, name in targets.items():
         path = generation / name
@@ -2641,7 +2657,7 @@ def _accepted_review(
                         "selected_backend": "native_cpu",
                         "selected_exact_backend": "cpu_batch",
                         "selected_workers": 4,
-                        "native_profile": "stage05.2-native-kernels-v1",
+                        "native_profile": "stage05.2-native-kernels-v2",
                         "native_config_sha256": native_sha256,
                         "accelerator_review_manifest_sha256": "d" * 64,
                         "campaign_prerequisite_review_sha256": "e" * 64,
@@ -2689,18 +2705,24 @@ def _accepted_review(
         "selected_backend": "native_cpu",
         "selected_exact_backend": "cpu_batch",
         "selected_workers": 4,
-        "native_profile": "stage05.2-native-kernels-v1",
+        "native_profile": "stage05.2-native-kernels-v2",
         "accelerator_decision": "GPU_NOT_JUSTIFIED",
         "campaign_prerequisite_review_sha256": "e" * 64,
         "native_kernel_config": native,
         "native_configuration": native,
+        "candidate_transaction_config": candidate_transaction,
+        "candidate_transaction_configuration": candidate_transaction,
         "selection_lock": {
             "selected_backend": "native_cpu",
             "selected_exact_backend": "cpu_batch",
             "selected_workers": 4,
-            "native_profile": "stage05.2-native-kernels-v1",
+            "native_profile": "stage05.2-native-kernels-v2",
             "native_config_sha256": native_sha256,
             "native_kernel_config": native,
+            "candidate_transaction_config": candidate_transaction,
+            "candidate_transaction_config_sha256": (
+                candidate_transaction_sha256
+            ),
             "accelerator_decision": "GPU_NOT_JUSTIFIED",
             "accelerator_review_manifest_sha256": "d" * 64,
         },
@@ -3147,11 +3169,19 @@ def test_publisher_rejects_source_toctou_before_any_tracked_replace(
     assert not list((repository / "experiments").rglob("*.json"))
 
 
+@pytest.mark.parametrize("external_active_root", (False, True))
 def test_publisher_live_chain_rejects_raw_tamper_before_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    external_active_root: bool,
 ) -> None:
-    raw_dir = tmp_path / "results/stage05.2_benchmark_attempt02"
+    repository = tmp_path / "repository"
+    active_root = (
+        tmp_path / "stage052-active"
+        if external_active_root
+        else repository / "results"
+    )
+    raw_dir = active_root / "stage05.2_benchmark_attempt02"
     review_pointer = raw_dir / "review" / "review_manifest.json"
     review_pointer.parent.mkdir(parents=True)
     raw_manifest = raw_dir / "manifest_stage05.2_benchmark_attempt02.json"
@@ -3160,7 +3190,7 @@ def test_publisher_live_chain_rejects_raw_tamper_before_publication(
     campaign_path.write_text("campaign\n", encoding="utf-8")
     attribution = raw_dir / "control/stage05.2_benchmark_attempt02_persistence_attribution.json"
     _write_signed_json(attribution, {"status": "complete"})
-    prerequisite = tmp_path / "results/stage05.2_benchmark_attempt01"
+    prerequisite = active_root / "stage05.2_benchmark_attempt01"
     g01_review = prerequisite / "review/review_manifest.json"
     _write_json(g01_review, {"status": "READY_FOR_STAGE052_FORMAL_BENCHMARK"})
     review = {
@@ -3207,8 +3237,103 @@ def test_publisher_live_chain_rejects_raw_tamper_before_publication(
         review_manifest=review_pointer,
         review=review,
         prerequisite_dir=prerequisite,
-        repository_root=tmp_path,
+        repository_root=repository,
+        active_results_root=active_root if external_active_root else None,
     )
+    active_parent_alias = tmp_path / "active-parent-alias"
+    active_parent_alias.symlink_to(active_root.parent, target_is_directory=True)
+    masqueraded_active_root = active_parent_alias / active_root.name
+    with pytest.raises(ValueError, match="canonical live roots"):
+        _verify_live_formal_chain(
+            review_manifest=(
+                masqueraded_active_root
+                / raw_dir.name
+                / "review"
+                / "review_manifest.json"
+            ),
+            review=review,
+            prerequisite_dir=masqueraded_active_root / prerequisite.name,
+            repository_root=repository,
+            active_results_root=masqueraded_active_root,
+        )
+    active_parent_alias.unlink()
+
+    real_g01_review_dir = tmp_path / "real-g01-review"
+    g01_review.parent.rename(real_g01_review_dir)
+    g01_review.parent.symlink_to(real_g01_review_dir, target_is_directory=True)
+    with pytest.raises(ValueError, match="canonical live roots"):
+        _verify_live_formal_chain(
+            review_manifest=review_pointer,
+            review=review,
+            prerequisite_dir=prerequisite,
+            repository_root=repository,
+            active_results_root=active_root if external_active_root else None,
+        )
+    g01_review.parent.unlink()
+    real_g01_review_dir.rename(g01_review.parent)
+
+    real_g01_review = tmp_path / "real-g01-review-manifest.json"
+    g01_review.rename(real_g01_review)
+    g01_review.symlink_to(real_g01_review)
+    with pytest.raises(ValueError, match="canonical live roots"):
+        _verify_live_formal_chain(
+            review_manifest=review_pointer,
+            review=review,
+            prerequisite_dir=prerequisite,
+            repository_root=repository,
+            active_results_root=active_root if external_active_root else None,
+        )
+    g01_review.unlink()
+    real_g01_review.rename(g01_review)
+
+    retention_registry = (
+        repository
+        / "experiments"
+        / "registries"
+        / "stage05.2_retention_registry.csv"
+    )
+    write_retention_registry(
+        retention_registry,
+        (
+            RetentionRecord(
+                run_label=prerequisite.name,
+                component="benchmark",
+                status="complete",
+                evidence_completeness="complete",
+                source_commit="a" * 40,
+                prerequisite_run_labels=(),
+                original_relative_path=prerequisite.name,
+                file_count=1,
+                byte_count=1,
+                tree_sha256="b" * 64,
+                archive_root_alias="d_archive",
+                archive_relative_path=f"stage05.2/history/{prerequisite.name}",
+                disposition="archived",
+                verification_status="verified",
+                archived_at_utc="2026-07-29T00:00:00Z",
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="retention registry"):
+        _verify_live_formal_chain(
+            review_manifest=review_pointer,
+            review=review,
+            prerequisite_dir=prerequisite,
+            repository_root=repository,
+            active_results_root=active_root if external_active_root else None,
+        )
+    retention_registry.unlink()
+
+    wrong_active_root = tmp_path / "wrong-active"
+    wrong_active_root.mkdir()
+    with pytest.raises(ValueError, match="canonical live roots"):
+        _verify_live_formal_chain(
+            review_manifest=review_pointer,
+            review=review,
+            prerequisite_dir=prerequisite,
+            repository_root=repository,
+            active_results_root=wrong_active_root,
+        )
     raw_manifest.write_text("tampered\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="no longer binds"):
@@ -3216,7 +3341,8 @@ def test_publisher_live_chain_rejects_raw_tamper_before_publication(
             review_manifest=review_pointer,
             review=review,
             prerequisite_dir=prerequisite,
-            repository_root=tmp_path,
+            repository_root=repository,
+            active_results_root=active_root if external_active_root else None,
         )
     raw_manifest.write_text("raw\n", encoding="utf-8")
     _write_json(g01_review, {"status": "NOT_READY"})
@@ -3225,7 +3351,8 @@ def test_publisher_live_chain_rejects_raw_tamper_before_publication(
             review_manifest=review_pointer,
             review=review,
             prerequisite_dir=prerequisite,
-            repository_root=tmp_path,
+            repository_root=repository,
+            active_results_root=active_root if external_active_root else None,
         )
 
 

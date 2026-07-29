@@ -84,10 +84,17 @@ def _write_high_occupancy_e_bundle(tmp_path: Path) -> Path:
                                 "valid": True,
                                 "end_to_end_seconds": 10.0,
                                 "semantic_digest": f"{instance}:{seed}",
+                                "candidate_transaction_statistics": {
+                                    "native_candidate_transactions": 1,
+                                    "native_candidate_input_count": 32,
+                                    "native_screening_occupancies": [32],
+                                    "native_screening_median_occupancy": 32.0,
+                                    "native_candidate_transaction_fallbacks": 0,
+                                },
                                 "backend_metrics": {
-                                    "exact_calls": 32,
+                                    "exact_calls": 1,
                                     "batch_launches": 1,
-                                    "launch_occupancies": [32],
+                                    "launch_occupancies": [1],
                                 },
                             }
                         },
@@ -157,7 +164,8 @@ def test_runner_input_branch_persists_partial_payload_when_helper_is_missing(
         accelerator_backend="cuda",
     )
 
-    assert payload["schema_version"] == "stage05.2-accelerator-pilot-artifact-v2"
+    assert payload["schema_version"] == "stage05.2-accelerator-pilot-artifact-v3"
+    assert payload["occupancy_metric"] == "native_candidate_screening_pool_size"
     pilot = payload["pilot"]
     assert isinstance(pilot, dict)
     assert pilot["status"] == "partial"

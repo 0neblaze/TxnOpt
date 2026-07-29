@@ -18,7 +18,11 @@ import numpy.typing as npt
 
 from evrptw.models import Instance, NodeType
 
-NATIVE_KERNEL_ABI_VERSION = "stage05.2-native-kernels-v1"
+NATIVE_KERNEL_ABI_VERSION = "stage05.2-native-kernels-v2"
+LEGACY_NATIVE_KERNEL_ABI_VERSION = "stage05.2-native-kernels-v1"
+SUPPORTED_NATIVE_KERNEL_ABI_VERSIONS = frozenset(
+    {LEGACY_NATIVE_KERNEL_ABI_VERSION, NATIVE_KERNEL_ABI_VERSION}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,8 +41,11 @@ class NativeKernelConfig:
     def __post_init__(self) -> None:
         if not self.enabled:
             raise ValueError("disabled native configuration is ambiguous; pass None instead")
-        if self.abi_version != NATIVE_KERNEL_ABI_VERSION:
-            raise ValueError(f"native kernel ABI must be {NATIVE_KERNEL_ABI_VERSION!r}")
+        if self.abi_version not in SUPPORTED_NATIVE_KERNEL_ABI_VERSIONS:
+            raise ValueError(
+                "native kernel ABI must be one of "
+                f"{sorted(SUPPORTED_NATIVE_KERNEL_ABI_VERSIONS)!r}"
+            )
         if not all(
             (
                 self.exact_charging,
@@ -100,6 +107,9 @@ class NativeKernelRuntime:
     _packing_claimed: bool = False
     screening_invocations: int = 0
     propagation_invocations: int = 0
+    screening_batch_invocations: int = 0
+    screening_batch_candidates: int = 0
+    screening_batch_occupancies: list[int] = field(default_factory=list)
     screening_seconds: float = 0.0
     propagation_seconds: float = 0.0
     fallback_count: int = 0
@@ -118,18 +128,34 @@ class NativeKernelRuntime:
         self._packing_claimed = True
         return self.context.packing_seconds
 
-    def record_screening(self, elapsed_seconds: float) -> None:
+    def record_screening(
+        self,
+        elapsed_seconds: float,
+        *,
+        batch_candidates: int | None = None,
+    ) -> None:
         self.screening_invocations += 1
         self.screening_seconds += elapsed_seconds
+        if batch_candidates is not None:
+            if batch_candidates < 0:
+                raise ValueError("native screening batch occupancy cannot be negative")
+            self.screening_batch_invocations += 1
+            self.screening_batch_candidates += batch_candidates
+            self.screening_batch_occupancies.append(batch_candidates)
 
     def record_propagation(self, elapsed_seconds: float) -> None:
         self.propagation_invocations += 1
         self.propagation_seconds += elapsed_seconds
 
-    def statistics(self) -> dict[str, int | float]:
+    def statistics(self) -> dict[str, object]:
         return {
             "native_screening_invocations": self.screening_invocations,
             "native_propagation_invocations": self.propagation_invocations,
+            "native_screening_batch_invocations": self.screening_batch_invocations,
+            "native_screening_batch_candidates": self.screening_batch_candidates,
+            "native_screening_batch_occupancies": tuple(
+                self.screening_batch_occupancies
+            ),
             "native_screening_seconds": self.screening_seconds,
             "native_propagation_seconds": self.propagation_seconds,
             "native_protocol_fallbacks": self.fallback_count,

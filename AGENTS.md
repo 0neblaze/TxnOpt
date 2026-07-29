@@ -11,11 +11,13 @@
 - Large raw evidence remains external. Public Git tracks only code,
   configuration, tests, curated summaries, registries, manifests, review
   products, and the lightweight `artifacts/index.json`.
-- Stage 5.2 Pilot `stage05.2_benchmark_attempt82` is accepted for the current
-  native bounded-digest producer revision. Formal Attempt83 is immutable
-  interrupted evidence; Attempts 84--86 failed before creating raw evidence and
-  their labels are not reusable. The corrected runtime capability contract
-  requires a new Formal label; Stages 6--8 are roadmap items only.
+- Historical Pilot `stage05.2_benchmark_attempt82` is accepted only for its
+  sealed native bounded-digest producer revision. Formal Attempt92 is immutable
+  `superseded_partial` evidence: six archived batches remain external, its
+  unfinished batch0007 and host exit 143 are bound by a supersession receipt,
+  and none of its shards may be imported. The ABI-v2 candidate-transaction
+  implementation requires a new Pilot and Formal label before Stage 5.3;
+  Stages 6--8 are roadmap items only.
 - Apache-2.0 applies only to original code and documentation. Benchmark data,
   papers, commercial solvers, and third-party repositories remain under their
   own terms.
@@ -567,11 +569,17 @@ this repository or one of its subdirectories.
   hard-coded attempt number in policy documentation.
 - Full Stage 5.2 evidence exists in the active staging root only while it is
   being produced or reviewed. Complete, partial, failed, `NOT_READY`, and
-  superseded runs are checksum-verified and archived under the configured
-  `d_archive` alias at `stage05.2/history/<run_label>/`; the workspace retains
-  only the signed retention inventory, lightweight registry, change log, and
-  independently published summaries. Archive failure or identity mismatch
-  retains the source and fails immediately.
+  superseded run metadata trees are checksum-verified and archived under the
+  configured `d_archive` alias at `stage05.2/history/<run_label>/`; the
+  workspace retains only the signed retention inventory, lightweight registry,
+  change log, and independently published summaries. For batched campaigns,
+  already archived batch trees remain at the exact signed logical paths
+  `d_archive/<run_label>/batchNNNN`; moving them below `stage05.2/history`
+  would invalidate the immutable campaign manifest. The archived metadata tree
+  binds the accepted review manifest, whose `storage_publication_identity`
+  binds each external batch by alias, relative path, file/byte count, and tree
+  SHA-256. Archive failure or identity mismatch retains the source and fails
+  immediately.
 - Retention audit rejects active, planned, unknown, or otherwise unsealed runs
   by default. The one-time pre-redesign historical override must bind the
   expected directory count and byte count. Same-volume archival uses atomic
@@ -583,7 +591,19 @@ this repository or one of its subdirectories.
   `stage05.2_retention_registry.csv` plus the local storage-root locator. The
   resolver must recheck the registered file count, byte count, and tree SHA-256
   before returning a path to an existing runner or reviewer; policy files and
-  callers must not embed the machine-local archive path.
+  callers must not embed the machine-local archive path. A retained batched
+  campaign additionally rechecks the top-level campaign-manifest sidecar and
+  every external batch's manifest and persistence-envelope sidecars, signed
+  logical path, tree SHA-256, byte count, nonzero recomputed file count, and
+  absence of `.incoming` before returning its metadata path. Accepted campaigns
+  additionally compare the explicit file count in
+  `storage_publication_identity`. For an interrupted or unreviewed campaign,
+  only batches already marked `archived` in its signed campaign manifest are
+  resolved externally; their signed tree digest covers every ordered relative
+  file path and size and therefore cryptographically binds the recomputed file
+  count even though no accepted review identity exists. Partial batches still
+  in the active root remain covered directly by the metadata retention tree and
+  never contribute to a replacement campaign geometry.
 - A registered archive tree is immutable. Reviewers may consume it as a
   comparison, prerequisite, or replay input, but may not publish a new review
   generation inside it. A run that still needs review publication remains in
@@ -617,11 +637,28 @@ this repository or one of its subdirectories.
   must be at least 15%, no C/R/RC family may regress by more than 3%,
   persistence must remain at most 36%, each worker RSS at most 4,357,382,144
   bytes, and process-tree RSS at most 12 GiB.
-- The accelerator gate independently recomputes 100-customer batch occupancy.
-  Median below 32 publishes `GPU_NOT_JUSTIFIED`; median at least 32 requires the
-  registered helper, exact fixed-work equality, at least 15% aggregate
-  improvement, and no family regression over 3%. Missing helper, fallback, or
-  an unaudited campaign adapter is `NOT_READY`.
+- Stage 5.2 native kernels use ABI
+  `stage05.2-native-kernels-v2`. `NativeCandidateTransactionConfig` is an
+  explicit `solve_alns()` opt-in and preserves the existing operator order and
+  operator exact-evaluation budgets. Its four-step fixed-work ablation is
+  `current_native` → `pair_pruning` → `batched_screening` →
+  `candidate_transaction`. Pair pruning emits one ordered aggregate identity
+  and exact skipped-candidate count; native screening owns ragged packing,
+  canonical identity, batch deduplication, negative-cache lookup, safe
+  screening, counters, and SHA-256. Full transactions order screening, cache
+  lookup, ordered `cpu_batch`, staged cache writes, deadline/budget checks, and
+  atomic commit/rollback. Native, worker, deadline, or integrity failure is
+  fail-fast with zero Python, serial, CUDA, or `cpu_scalar` fallback. Historical
+  Stage 3.4 `CandidateControlConfig` remains a separate path.
+- The accelerator gate independently recomputes median 100-customer native
+  candidate screening-pool occupancy from raw candidate-transaction
+  statistics; exact-backend launch occupancy is not a substitute. Median below
+  32 publishes `GPU_NOT_JUSTIFIED`; median at least 32 requires one wave-owned
+  registered CUDA helper, exact fixed-work equality, at least 15% aggregate
+  improvement, and no family regression over 3%. A complete but non-promoting
+  CUDA pilot publishes `NATIVE_CPU_RETAINED`; only a passing pilot publishes
+  `ACCELERATOR_PROMOTED`. Missing helper, fallback, or an unaudited campaign
+  adapter is `NOT_READY`.
 - The pipeline pilot is exactly 12 instances x 3 seeds x one 30-second axis and
   exercises resource sampling, failure recovery, bounded replay, 1/5/10/30
   second anytime checkpoints, configured archive roots, and interrupted

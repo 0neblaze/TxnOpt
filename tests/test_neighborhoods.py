@@ -31,6 +31,8 @@ class FakeEvaluator:
     instance: Instance
     maximum_customers_per_route: int = 2
     calls: int = 0
+    candidate_transaction_enabled: bool = False
+    pair_pruning_enabled: bool = False
 
     def route(self, sequence: tuple[str, ...]) -> ChargingSubproblemResult:
         self.calls += 1
@@ -189,7 +191,11 @@ def test_vehicle_repair_screens_time_windows_before_exact_evaluation() -> None:
 
 def test_route_merge_capacity_prefilter_avoids_exact_merged_route_evaluation() -> None:
     instance = _instance(load_capacity=1.0)
-    evaluator = FakeEvaluator(instance)
+    evaluator = FakeEvaluator(
+        instance,
+        candidate_transaction_enabled=True,
+        pair_pruning_enabled=True,
+    )
     sequences = (("C1",), ("C2",))
 
     before = evaluator.calls
@@ -197,7 +203,73 @@ def test_route_merge_capacity_prefilter_avoids_exact_merged_route_evaluation() -
 
     assert proposal.sequences is None
     assert evaluator.calls == before + len(sequences)
-    assert any(event.reason == "capacity_prefilter" for event in proposal.events)
+    aggregate = next(
+        event
+        for event in proposal.events
+        if event.status == "pair_prefilter_rejected_aggregate"
+    )
+    assert aggregate.reason == "capacity_prefilter"
+    assert aggregate.route_indices == (0, 1)
+    assert aggregate.aggregate_count == 4
+    assert len(aggregate.candidate_pool_hash) == 64
+
+
+def test_route_merge_pair_capacity_hash_is_stable_and_boundary_is_inclusive() -> None:
+    rejected_instance = _instance(load_capacity=1.0)
+    sequences = (("C1",), ("C2",))
+
+    first = propose_route_merge(
+        rejected_instance,
+        sequences,
+        FakeEvaluator(
+            rejected_instance,
+            candidate_transaction_enabled=True,
+            pair_pruning_enabled=True,
+        ),
+    )
+    second = propose_route_merge(
+        rejected_instance,
+        sequences,
+        FakeEvaluator(
+            rejected_instance,
+            candidate_transaction_enabled=True,
+            pair_pruning_enabled=True,
+        ),
+    )
+    first_event = next(
+        event for event in first.events if event.status == "pair_prefilter_rejected_aggregate"
+    )
+    second_event = next(
+        event for event in second.events if event.status == "pair_prefilter_rejected_aggregate"
+    )
+
+    assert first_event.candidate_pool_hash == second_event.candidate_pool_hash
+
+    boundary_instance = _instance(load_capacity=2.0)
+    boundary = propose_route_merge(
+        boundary_instance,
+        sequences,
+        FakeEvaluator(
+            boundary_instance,
+            candidate_transaction_enabled=True,
+            pair_pruning_enabled=True,
+        ),
+    )
+    assert all(
+        event.status != "pair_prefilter_rejected_aggregate" for event in boundary.events
+    )
+    assert boundary.sequences is not None
+
+
+def test_route_merge_pair_pruning_is_stage052_opt_in() -> None:
+    instance = _instance(load_capacity=1.0)
+
+    historical = propose_route_merge(instance, (("C1",), ("C2",)), FakeEvaluator(instance))
+
+    assert all(
+        event.status != "pair_prefilter_rejected_aggregate"
+        for event in historical.events
+    )
 
 
 def test_route_merge_produces_one_route_after_safe_prefilters() -> None:

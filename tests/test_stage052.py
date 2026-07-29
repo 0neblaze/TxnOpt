@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import statistics
 import subprocess
 import sys
 import time
@@ -1975,7 +1976,9 @@ def test_accelerator_decision_recomputes_exactly_nine_e_occupancies(
     for instance in PERFORMANCE_INSTANCES:
         for seed in PERFORMANCE_SEEDS:
             occupancy = 1 if instance == "c101C5" else next(values)
-            launch_occupancies = [occupancy, occupancy, 100] if occupancy == 9 else [occupancy]
+            screening_occupancies = (
+                [occupancy, occupancy, 100] if occupancy == 9 else [occupancy]
+            )
             if instance != "c101C5":
                 expected_values.append(float(occupancy))
             shard = raw_dir / instance / str(seed)
@@ -1992,10 +1995,25 @@ def test_accelerator_decision_recomputes_exactly_nine_e_occupancies(
                             "fixed_work": {
                                 "validator_passed": True,
                                 "valid": True,
+                                "candidate_transaction_statistics": {
+                                    "native_candidate_transactions": len(
+                                        screening_occupancies
+                                    ),
+                                    "native_candidate_input_count": sum(
+                                        screening_occupancies
+                                    ),
+                                    "native_screening_occupancies": (
+                                        screening_occupancies
+                                    ),
+                                    "native_screening_median_occupancy": (
+                                        statistics.median(screening_occupancies)
+                                    ),
+                                    "native_candidate_transaction_fallbacks": 0,
+                                },
                                 "backend_metrics": {
-                                    "exact_calls": sum(launch_occupancies),
-                                    "batch_launches": len(launch_occupancies),
-                                    "launch_occupancies": launch_occupancies,
+                                    "exact_calls": 1,
+                                    "batch_launches": 1,
+                                    "launch_occupancies": [1],
                                 },
                             }
                         },
@@ -2012,13 +2030,15 @@ def test_accelerator_decision_recomputes_exactly_nine_e_occupancies(
         accelerator_backend="cuda",
     )
     assert payload["decision"] == "GPU_NOT_JUSTIFIED"
-    assert payload["median_batch_occupancy"] == pytest.approx(5.0)
+    assert payload["median_screening_occupancy"] == pytest.approx(5.0)
     assert payload["input_count"] == 9
     assert payload["gpu_rows_present"] is False
     independently_recomputed, independent_median = _recompute_native_occupancies(raw_dir)
     assert independently_recomputed == payload["inputs"]
     assert independent_median == pytest.approx(5.0)
-    assert [item["median_batch_occupancy"] for item in payload["inputs"]] == expected_values
+    assert [
+        item["median_screening_occupancy"] for item in payload["inputs"]
+    ] == expected_values
 
 
 def test_instance_lookup_and_distance_matrix_are_stable() -> None:

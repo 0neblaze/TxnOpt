@@ -35,6 +35,7 @@ from evrptw.artifacts import (
     signed_sidecar_matches,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
+from evrptw.candidate_transaction import NativeCandidateTransactionConfig
 from evrptw.experiments.stage052_performance import (
     PERFORMANCE_INSTANCES,
     PERFORMANCE_SEEDS,
@@ -2328,6 +2329,9 @@ def review_stage052(
         review_manifest["selected_workers"] = job_parallel_selection.selected_workers
         review_manifest["performance_predecessor"] = job_parallel_selection.selected_run_label
         review_manifest["native_configuration"] = NativeKernelConfig().to_dict()
+        review_manifest["candidate_transaction_configuration"] = (
+            NativeCandidateTransactionConfig().to_dict()
+        )
     semantic_comparisons = comparison_dirs
     if selected is Stage052Component.ARTIFACT_STREAMING and not semantic_comparisons:
         semantic_comparisons = (supplied_prerequisites["hot_path_predecessor"],)
@@ -2453,7 +2457,10 @@ def _review_accelerator_pilot_v2(
         pilot = artifact.get("pilot") if isinstance(artifact, Mapping) else None
         if (
             not isinstance(artifact, Mapping)
-            or artifact.get("schema_version") != "stage05.2-accelerator-pilot-artifact-v2"
+            or artifact.get("schema_version") != "stage05.2-accelerator-pilot-artifact-v3"
+            or artifact.get("occupancy_metric")
+            != "native_candidate_screening_pool_size"
+            or artifact.get("median_screening_occupancy") != expected_median
             or artifact.get("occupancy_inputs") != expected_occupancies
             or artifact.get("occupancy_input_count") != len(expected_occupancies)
             or artifact.get("native_prerequisite") != predecessor.to_dict()
@@ -2550,6 +2557,9 @@ def _review_accelerator_pilot_v2(
         "selected_workers": selected_workers if passed else None,
         "selected_optimization_profile": "cuda" if selected_backend == "cuda" else "native",
         "native_configuration": NativeKernelConfig().to_dict() if passed else None,
+        "candidate_transaction_configuration": (
+            NativeCandidateTransactionConfig().to_dict() if passed else None
+        ),
         "accelerator_runtime_identity": (
             dict(runtime) if passed and isinstance(runtime, Mapping) else None
         ),
@@ -2772,6 +2782,9 @@ def _review_accelerator_metal_pilot(
         "selected_workers": selected_workers if passed else None,
         "selected_optimization_profile": expected_profile if passed else None,
         "native_configuration": NativeKernelConfig().to_dict() if passed else None,
+        "candidate_transaction_configuration": (
+            NativeCandidateTransactionConfig().to_dict() if passed else None
+        ),
         "metal_runtime_identity": (
             dict(runtime) if passed and isinstance(runtime, Mapping) else None
         ),
@@ -2966,7 +2979,8 @@ def _review_accelerator_decision_only(
         "selected_backend",
         "selected_exact_backend",
         "threshold",
-        "median_batch_occupancy",
+        "occupancy_metric",
+        "median_screening_occupancy",
         "input_count",
         "inputs",
         "native_prerequisite",
@@ -2975,12 +2989,14 @@ def _review_accelerator_decision_only(
     }
     schema_passed = (
         set(decision) == expected_keys
-        and decision.get("schema_version") == "stage05.2-accelerator-decision-v1"
+        and decision.get("schema_version") == "stage05.2-accelerator-decision-v2"
         and decision.get("decision_mode") == "decision_only"
         and decision.get("decision") == "GPU_NOT_JUSTIFIED"
         and decision.get("selected_backend") == "native_cpu"
         and decision.get("selected_exact_backend") == "cpu_batch"
         and decision.get("threshold") == 32.0
+        and decision.get("occupancy_metric")
+        == "native_candidate_screening_pool_size"
         and decision.get("input_count") == 9
         and decision.get("gpu_rows_present") is False
         and decision.get("fallback_used") is False
@@ -3002,7 +3018,9 @@ def _review_accelerator_decision_only(
                 "detail": str(error),
             }
         else:
-            observed_median = _strict_float(decision.get("median_batch_occupancy"))
+            observed_median = _strict_float(
+                decision.get("median_screening_occupancy")
+            )
             occupancy_passed = (
                 decision.get("inputs") == recomputed_inputs
                 and math.isclose(observed_median, recomputed_median, rel_tol=0.0, abs_tol=1e-12)
@@ -3058,6 +3076,9 @@ def _review_accelerator_decision_only(
         "selected_workers": selected_workers if passed else None,
         "selected_optimization_profile": "native" if passed else None,
         "native_configuration": NativeKernelConfig().to_dict() if passed else None,
+        "candidate_transaction_configuration": (
+            NativeCandidateTransactionConfig().to_dict() if passed else None
+        ),
         "gates": gates,
     }
     _bind_persistence_attribution_review(manifest, raw_dir=raw_dir, metadata=metadata)
@@ -3109,24 +3130,49 @@ def _recompute_native_occupancies(raw_dir: Path) -> tuple[list[dict[str, object]
             or fixed.get("valid") is not True
         ):
             raise ArtifactIntegrityError(f"invalid E fixed-work raw axis: {identity}")
-        backend = fixed.get("backend_metrics")
-        if not isinstance(backend, Mapping):
-            raise ArtifactIntegrityError(f"missing E raw backend metrics: {identity}")
-        exact_calls = _strict_int(backend.get("exact_calls"), "exact_calls")
-        batch_launches = _strict_int(backend.get("batch_launches"), "batch_launches")
-        raw_occupancies = backend.get("launch_occupancies")
-        if not isinstance(raw_occupancies, list):
-            raise ArtifactIntegrityError(f"missing E raw launch occupancies: {identity}")
-        occupancies = [_strict_int(value, "launch_occupancy") for value in raw_occupancies]
+        transaction = fixed.get("candidate_transaction_statistics")
+        if not isinstance(transaction, Mapping):
+            raise ArtifactIntegrityError(
+                f"missing E candidate transaction statistics: {identity}"
+            )
+        transactions = _strict_int(
+            transaction.get("native_candidate_transactions"),
+            "native_candidate_transactions",
+        )
+        input_count = _strict_int(
+            transaction.get("native_candidate_input_count"),
+            "native_candidate_input_count",
+        )
+        fallback_count = _strict_int(
+            transaction.get("native_candidate_transaction_fallbacks"),
+            "native_candidate_transaction_fallbacks",
+        )
+        raw_occupancies = transaction.get("native_screening_occupancies")
+        if not isinstance(raw_occupancies, (list, tuple)):
+            raise ArtifactIntegrityError(
+                f"missing E native screening occupancies: {identity}"
+            )
+        occupancies = [
+            _strict_int(value, "native_screening_occupancy")
+            for value in raw_occupancies
+        ]
+        recomputed_median = statistics.median(occupancies) if occupancies else 0.0
+        recorded_median = _strict_float(
+            transaction.get("native_screening_median_occupancy")
+        )
         if (
-            exact_calls <= 0
-            or batch_launches <= 0
+            transactions <= 0
+            or input_count <= 0
+            or fallback_count != 0
             or any(value <= 0 for value in occupancies)
-            or len(occupancies) != batch_launches
-            or sum(occupancies) != exact_calls
+            or len(occupancies) != transactions
+            or sum(occupancies) != input_count
+            or recorded_median != recomputed_median
         ):
-            raise ArtifactIntegrityError(f"invalid E raw occupancy counters: {identity}")
-        values[identity] = statistics.median(occupancies)
+            raise ArtifactIntegrityError(
+                f"invalid E candidate transaction counters: {identity}"
+            )
+        values[identity] = float(recomputed_median)
     if observed_all != expected_all:
         raise ArtifactIntegrityError("accepted E raw shard scope is not exactly 12 bundles")
     if set(values) != expected:
@@ -3136,7 +3182,7 @@ def _recompute_native_occupancies(raw_dir: Path) -> tuple[list[dict[str, object]
             "instance": instance,
             "seed": seed,
             "axis": "fixed_work",
-            "median_batch_occupancy": values[(instance, seed)],
+            "median_screening_occupancy": values[(instance, seed)],
         }
         for instance, seed in sorted(values)
     ]
@@ -3664,6 +3710,160 @@ def _replay_solutions(reader: ArtifactReader, *, benchmark_dir: Path) -> tuple[b
     )
 
 
+def _audit_native_ablation(
+    raw_dir: Path,
+    *,
+    benchmark_dir: Path,
+) -> tuple[bool, str]:
+    """Replay the fixed four-step Stage 5.2 native ablation from raw shards."""
+
+    expected_modes = (
+        "current_native",
+        "pair_pruning",
+        "batched_screening",
+        "candidate_transaction",
+    )
+    expected_identities = {
+        (instance, seed)
+        for instance in PERFORMANCE_INSTANCES
+        for seed in PERFORMANCE_SEEDS
+    }
+    observed: set[tuple[str, int]] = set()
+    baseline: list[PerformanceObservation] = []
+    candidate: list[PerformanceObservation] = []
+    failures: list[str] = []
+    reader = ArtifactReader(raw_dir)
+    raw_references = [
+        item
+        for item in reader.manifest.get("artifacts", ())
+        if isinstance(item, Mapping) and item.get("artifact_type") == "raw"
+    ]
+    for reference in raw_references:
+        payload = reader.read_json(str(reference.get("relative_path", "")))
+        if not isinstance(payload, Mapping):
+            failures.append("raw ablation payload is not an object")
+            continue
+        identity = (
+            str(payload.get("instance", "")),
+            _strict_int(payload.get("seed"), "seed"),
+        )
+        if identity in observed:
+            failures.append(f"duplicate ablation shard: {identity}")
+            continue
+        observed.add(identity)
+        axes = payload.get("ablation_axes")
+        if not isinstance(axes, Mapping) or tuple(axes) != expected_modes:
+            failures.append(f"{identity}: four ordered ablation modes are missing")
+            continue
+        instance = parse_schneider(benchmark_dir / f"{identity[0]}.txt")
+        objectives: list[tuple[object, ...]] = []
+        for mode in expected_modes:
+            row = axes.get(mode)
+            if (
+                not isinstance(row, Mapping)
+                or row.get("schema_version") != "stage05.2-native-ablation-axis-v1"
+                or row.get("implementation_mode") != mode
+            ):
+                failures.append(f"{identity}/{mode}: invalid ablation schema")
+                continue
+            records = row.get("candidate_records")
+            routes = row.get("routes")
+            if not isinstance(records, list) or not isinstance(routes, list):
+                failures.append(f"{identity}/{mode}: replay inputs are missing")
+                continue
+            recomputed_hash = hashlib.sha256(
+                json.dumps(
+                    records,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            if recomputed_hash != row.get("candidate_order_sha256"):
+                failures.append(f"{identity}/{mode}: candidate order hash mismatch")
+            report = validate_routes(
+                instance,
+                [list(map(str, route)) for route in routes],
+            )
+            replayed_objective = SolutionObjective.from_report(instance, report).key
+            recorded_objective = row.get("objective_key")
+            if not isinstance(recorded_objective, list):
+                failures.append(f"{identity}/{mode}: objective is missing")
+                continue
+            if list(replayed_objective) != recorded_objective:
+                failures.append(f"{identity}/{mode}: objective replay mismatch")
+            objectives.append(tuple(recorded_objective))
+            reconciliation = row.get("trace_reconciliation")
+            if (
+                row.get("validator_passed") is not True
+                or not isinstance(reconciliation, Mapping)
+                or reconciliation.get("status") != "pass"
+                or row.get("fallback_used") is not False
+            ):
+                failures.append(f"{identity}/{mode}: validator/trace/fallback gate failed")
+            started = _strict_int(
+                row.get("exact_started_calls"),
+                "exact_started_calls",
+            )
+            completed = _strict_int(
+                row.get("exact_completed_calls"),
+                "exact_completed_calls",
+            )
+            if started < 0 or completed < 0 or completed > started:
+                failures.append(f"{identity}/{mode}: exact counters are invalid")
+        if len(objectives) == len(expected_modes) and len(set(objectives)) != 1:
+            failures.append(f"{identity}: fixed-work objectives changed across ablation")
+        if identity[0] == "c101C5":
+            continue
+        current = axes.get("current_native")
+        full = axes.get("candidate_transaction")
+        if isinstance(current, Mapping) and isinstance(full, Mapping):
+            objective_digest = hashlib.sha256(
+                json.dumps(
+                    current.get("objective_key"),
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            baseline.append(
+                PerformanceObservation(
+                    identity[0],
+                    identity[1],
+                    100,
+                    _strict_float(current.get("solver_seconds")),
+                    objective_digest,
+                )
+            )
+            candidate.append(
+                PerformanceObservation(
+                    identity[0],
+                    identity[1],
+                    100,
+                    _strict_float(full.get("solver_seconds")),
+                    objective_digest,
+                )
+            )
+    if observed != expected_identities:
+        failures.append(
+            "native ablation scope mismatch: "
+            f"expected={len(expected_identities)} observed={len(observed)}"
+        )
+    if failures:
+        return False, "; ".join(failures[:20])
+    promotion = evaluate_promotion(baseline, candidate)
+    if not promotion.passed:
+        return (
+            False,
+            "candidate transaction ablation promotion failed: "
+            f"{promotion.detail}; aggregate={promotion.aggregate_median_saving:.6f}; "
+            f"families={dict(promotion.family_median_savings)}",
+        )
+    return (
+        True,
+        "four-step ablation replay passed; "
+        f"aggregate={promotion.aggregate_median_saving:.6f}; "
+        f"families={dict(promotion.family_median_savings)}",
+    )
+
+
 def _component_gates(
     component: Stage052Component,
     rows: Sequence[Mapping[str, object]],
@@ -3737,6 +3937,19 @@ def _component_gates(
                         "detail": "complete opt-in native kernel configuration is required",
                     }
                 }
+            if (
+                metadata.get("candidate_transaction_config")
+                != NativeCandidateTransactionConfig().to_dict()
+            ):
+                return {
+                    "candidate_transaction_configuration": {
+                        "passed": False,
+                        "detail": (
+                            "complete Stage 5.2 native candidate transaction "
+                            "configuration is required"
+                        ),
+                    }
+                }
             if prerequisite_identity is None:
                 return {
                     "native_producer_contract": {
@@ -3764,6 +3977,17 @@ def _component_gates(
                     "native_execution": {
                         "passed": False,
                         "detail": native_detail,
+                    }
+                }
+            ablation_passed, ablation_detail = _audit_native_ablation(
+                raw_dir,
+                benchmark_dir=benchmark_dir,
+            )
+            if not ablation_passed:
+                return {
+                    "native_ablation": {
+                        "passed": False,
+                        "detail": ablation_detail,
                     }
                 }
             replay_maps = replay_stage052_storage_semantics_many((comparison, raw_dir))
@@ -3809,6 +4033,10 @@ def _component_gates(
                 "passed": True,
                 "detail": NativeKernelConfig().abi_version,
             }
+            gates["candidate_transaction_configuration"] = {
+                "passed": True,
+                "detail": NativeCandidateTransactionConfig().implementation_mode,
+            }
             gates["native_execution"] = {
                 "passed": True,
                 "detail": native_detail,
@@ -3816,6 +4044,10 @@ def _component_gates(
             gates["native_producer_contract"] = {
                 "passed": True,
                 "detail": producer_detail,
+            }
+            gates["native_ablation"] = {
+                "passed": True,
+                "detail": ablation_detail,
             }
         return gates
     if component is Stage052Component.ARTIFACT_STREAMING:

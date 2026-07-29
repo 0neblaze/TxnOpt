@@ -918,6 +918,10 @@ class Stage03Trace:
                 self.result_summary["candidate_control_statistics"] = cast(
                     Any, result
                 ).candidate_control_statistics
+            if hasattr(result, "candidate_transaction_statistics"):
+                self.result_summary["candidate_transaction_statistics"] = cast(
+                    Any, result
+                ).candidate_transaction_statistics
 
     @property
     def started_calls(self) -> int:

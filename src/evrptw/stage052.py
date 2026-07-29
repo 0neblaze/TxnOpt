@@ -14,6 +14,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
+from evrptw.native_kernels import NATIVE_KERNEL_ABI_VERSION
+
 STAGE052_MAXIMUM_PERSISTENCE_RATIO = 0.36
 
 
@@ -191,7 +193,7 @@ _CURRENT_COMPONENT_CONTRACTS: Mapping[
         "selected",
         "artifact-storage-v2",
         "screening_decisions_v3",
-        "stage05.2-native-kernels-v1",
+        NATIVE_KERNEL_ABI_VERSION,
         "READY_FOR_STAGE052_ACCELERATOR_DECISION",
     ),
     (Stage052Component.ACCELERATOR_PILOT, "performance"): (
@@ -207,7 +209,7 @@ _CURRENT_COMPONENT_CONTRACTS: Mapping[
         "selected",
         "artifact-storage-v2",
         "screening_decisions_v3",
-        "stage05.2-native-kernels-v1",
+        NATIVE_KERNEL_ABI_VERSION,
         "READY_FOR_STAGE052_BENCHMARK",
     ),
     (Stage052Component.BENCHMARK, "pilot"): (
@@ -224,7 +226,7 @@ _CURRENT_COMPONENT_CONTRACTS: Mapping[
         "selected",
         "artifact-storage-v2",
         "screening_decisions_v3",
-        "stage05.2-native-kernels-v1",
+        NATIVE_KERNEL_ABI_VERSION,
         "READY_FOR_STAGE052_FORMAL_BENCHMARK",
     ),
     (Stage052Component.BENCHMARK, "formal"): (
@@ -240,7 +242,7 @@ _CURRENT_COMPONENT_CONTRACTS: Mapping[
         "selected",
         "artifact-storage-v2",
         "screening_decisions_v3",
-        "stage05.2-native-kernels-v1",
+        NATIVE_KERNEL_ABI_VERSION,
         "READY_FOR_STAGE05_3",
     ),
 }

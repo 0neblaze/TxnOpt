@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
+import shutil
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -10,14 +12,27 @@ from pathlib import Path
 import pytest
 
 import evrptw.stage052_retention as retention
+from evrptw.stage052_campaign import (
+    BatchManifest,
+    CampaignManifest,
+    StorageRoot,
+    StorageRootLocator,
+    VolumeIdentity,
+    directory_byte_count,
+    directory_checksum,
+    directory_file_count,
+)
+from evrptw.stage052_evidence import CAMPAIGN_PILOT_GATES
 from evrptw.stage052_retention import (
     RetentionIntegrityError,
     Stage052RetentionPolicy,
     archive_stage052_inventory,
     archive_stage052_inventory_to_registry,
     audit_stage052_runs,
+    create_supersession_receipt,
     load_retention_inventory,
     resolve_retained_run,
+    resolve_retained_run_from_locator,
     write_retention_inventory,
     write_retention_registry,
 )
@@ -57,6 +72,293 @@ def _policy() -> Stage052RetentionPolicy:
     )
 
 
+def test_supersession_receipt_seals_interrupted_campaign_without_rewriting_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "results"
+    run_label = "stage05.2_benchmark_attempt92"
+    run = _run(
+        source,
+        run_label,
+        status="planned",
+        completeness="partial",
+    )
+    campaign = {
+        "schema_version": "stage05.2-campaign-manifest-v1",
+        "run_label": run_label,
+        "status": "planned",
+        "scope": "formal",
+        "batches": [
+            {"batch_id": f"batch{index:04d}", "status": "archived" if index <= 6 else "planned"}
+            for index in range(1, 13)
+        ],
+    }
+    campaign_bytes = (json.dumps(campaign, indent=2, sort_keys=True) + "\n").encode()
+    campaign_path = run / "campaign_manifest.json"
+    campaign_path.write_bytes(campaign_bytes)
+    campaign_path.with_suffix(".sha256").write_text(
+        hashlib.sha256(campaign_bytes).hexdigest() + "\n",
+        encoding="ascii",
+    )
+    (run / "batch0007").mkdir()
+    host_log = tmp_path / "task-host.log"
+    host_log.write_text(
+        "\n".join(
+            (
+                "HOST_STARTED 2026-07-28T20:00:39Z pid=460 ppid=459 "
+                "run_id=20260728T200039Z-460 "
+                "launch_nonce=fc094d4828bf457681bda14091f98e70 "
+                "controller_sha256=" + "a" * 64,
+                "HOST_CONTROLLER_FAILED 2026-07-29T02:14:23Z "
+                "run_id=20260728T200039Z-460 exit_code=143",
+                "HOST_STOPPED 2026-07-29T02:14:23Z pid=460 exit_code=143",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(retention, "_matching_run_processes", lambda _run_label: ())
+    original_manifest_sha256 = hashlib.sha256(campaign_path.read_bytes()).hexdigest()
+
+    receipt_sha256 = create_supersession_receipt(
+        run,
+        host_log=host_log,
+        host_run_id="20260728T200039Z-460",
+        launch_nonce="fc094d4828bf457681bda14091f98e70",
+        expected_exit_code=143,
+        reason="operator_terminated_for_candidate_transaction_redesign",
+        created_at_utc="2026-07-29T03:00:00Z",
+    )
+    inventory = audit_stage052_runs(source, _policy())
+
+    assert hashlib.sha256(campaign_path.read_bytes()).hexdigest() == original_manifest_sha256
+    assert inventory.records[0].status == "superseded"
+    assert inventory.records[0].evidence_completeness == "partial"
+    receipt_path = run / "control" / "supersession_receipt.json"
+    assert hashlib.sha256(receipt_path.read_bytes()).hexdigest() == receipt_sha256
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["archived_batch_ids"] == [
+        "batch0001",
+        "batch0002",
+        "batch0003",
+        "batch0004",
+        "batch0005",
+        "batch0006",
+    ]
+    assert receipt["planned_batch_ids"] == [
+        "batch0007",
+        "batch0008",
+        "batch0009",
+        "batch0010",
+        "batch0011",
+        "batch0012",
+    ]
+    assert receipt["active_process_count"] == 0
+
+
+def test_supersession_receipt_rejects_live_campaign_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _run(
+        tmp_path / "results",
+        "stage05.2_benchmark_attempt92",
+        status="planned",
+        completeness="partial",
+    )
+    campaign = {
+        "run_label": run.name,
+        "status": "planned",
+        "scope": "formal",
+        "batches": [{"batch_id": "batch0001", "status": "archived"}],
+    }
+    payload = (json.dumps(campaign, sort_keys=True) + "\n").encode()
+    (run / "campaign_manifest.json").write_bytes(payload)
+    (run / "campaign_manifest.sha256").write_text(
+        hashlib.sha256(payload).hexdigest() + "\n",
+        encoding="ascii",
+    )
+    host_log = tmp_path / "task-host.log"
+    host_log.write_text(
+        "HOST_CONTROLLER_FAILED 2026-07-29T02:14:23Z "
+        "run_id=20260728T200039Z-460 exit_code=143\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(retention, "_matching_run_processes", lambda _run_label: (1234,))
+
+    with pytest.raises(RetentionIntegrityError, match="still has active processes"):
+        create_supersession_receipt(
+            run,
+            host_log=host_log,
+            host_run_id="20260728T200039Z-460",
+            launch_nonce="fc094d4828bf457681bda14091f98e70",
+            expected_exit_code=143,
+            reason="operator_terminated_for_candidate_transaction_redesign",
+        )
+
+
+def _campaign_with_external_batch(
+    source: Path,
+    archive: Path,
+) -> tuple[Path, Path, StorageRootLocator, Path]:
+    run_label = "stage05.2_benchmark_attempt01"
+    run = _run(
+        source,
+        run_label,
+        status="complete",
+        completeness="complete",
+    )
+    volume = VolumeIdentity(device_uuid="fixture-device", filesystem="fixturefs")
+    locator = StorageRootLocator(
+        {"d_archive": StorageRoot("d_archive", archive, volume)}
+    )
+    locator_path = source.parent / "stage052_storage_roots.local.toml"
+    locator_path.write_text(
+        "\n".join(
+            (
+                "[roots.d_archive]",
+                f"absolute_path = {json.dumps(str(archive))}",
+                'device_uuid = "fixture-device"',
+                'filesystem = "fixturefs"',
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    batch_dir = archive / run_label / "batch0001"
+    batch_dir.mkdir(parents=True)
+    (batch_dir / "payload.bin").write_bytes(b"x" * 128)
+    shard_ids = tuple(f"shard{index:04d}" for index in range(1, 37))
+    batch = BatchManifest(
+        run_label=run_label,
+        batch_id="batch0001",
+        status="archived",
+        root_alias="d_archive",
+        archive_root_alias="d_archive",
+        logical_path=f"{run_label}/batch0001",
+        volume=volume,
+        shard_ids=shard_ids,
+        estimated_bytes=128,
+        checksum_sha256=directory_checksum(batch_dir),
+        actual_bytes=directory_byte_count(batch_dir),
+        row_count=1,
+        physical_schema="screening_decisions_v3",
+        resource_summary_sha256="b" * 64,
+        persistence_attribution_sha256="c" * 64,
+        control_persistence_seconds=0.01,
+        persistence_ratio=0.01,
+        shard_manifest_sha256_by_id={shard_id: "d" * 64 for shard_id in shard_ids},
+        shard_actual_bytes_by_id={shard_id: 1 for shard_id in shard_ids},
+        transfer_mode="same_volume_atomic_rename",
+        archive_transfer_seconds=0.01,
+    )
+    batch_manifest = (
+        json.dumps(batch.to_dict(), indent=2, sort_keys=True) + "\n"
+    ).encode()
+    (batch_dir / "batch_manifest.json").write_bytes(batch_manifest)
+    (batch_dir / "batch_manifest.sha256").write_text(
+        hashlib.sha256(batch_manifest).hexdigest() + "\n",
+        encoding="ascii",
+    )
+    envelope = b'{"schema_version":"fixture-envelope-v1"}\n'
+    envelope_sha256 = hashlib.sha256(envelope).hexdigest()
+    (batch_dir / "batch_persistence_envelope.json").write_bytes(envelope)
+    (batch_dir / "batch_persistence_envelope.sha256").write_text(
+        envelope_sha256 + "\n",
+        encoding="ascii",
+    )
+    campaign = CampaignManifest(
+        run_label=run_label,
+        status="complete",
+        scope="pilot",
+        configuration_sha256="e" * 64,
+        prerequisite_review_sha256="f" * 64,
+        selected_backend="native_cpu",
+        selected_exact_backend="cpu_batch",
+        selected_workers=6,
+        native_profile="stage05.2-native-kernels-v1",
+        storage_policy_version="artifact-storage-v2",
+        screening_schema_version="screening_decisions_v3",
+        storage_roots={"d_archive": volume},
+        shard_count=36,
+        axis_count=36,
+        declared_solver_seconds=1_080,
+        checkpoint_count=144,
+        batches=(batch,),
+        batch_persistence_envelope_sha256_by_id={
+            "batch0001": envelope_sha256
+        },
+    )
+    campaign_path = run / "campaign_manifest.json"
+    campaign_bytes = (
+        json.dumps(campaign.to_dict(), indent=2, sort_keys=True) + "\n"
+    ).encode()
+    campaign_path.write_bytes(campaign_bytes)
+    campaign_path.with_suffix(".sha256").write_text(
+        hashlib.sha256(campaign_bytes).hexdigest() + "\n",
+        encoding="ascii",
+    )
+    storage_identity = {
+        "schema_version": "stage05.2-storage-publication-identity-v1",
+        "run_label": run_label,
+        "batches": [
+            {
+                "root_alias": "d_archive",
+                "relative_path": f"{run_label}/batch0001",
+                "file_count": directory_file_count(batch_dir),
+                "byte_count": directory_byte_count(batch_dir),
+                "tree_sha256": directory_checksum(batch_dir),
+            }
+        ],
+    }
+    review = {
+        "schema_version": "stage05.2-campaign-review-v2",
+        "run_label": run_label,
+        "component": "benchmark",
+        "scope": "pilot",
+        "status": "READY_FOR_STAGE052_FORMAL_BENCHMARK",
+        "gates": {
+            gate: {"passed": True, "detail": "fixture"}
+            for gate in sorted(CAMPAIGN_PILOT_GATES)
+        },
+        "review_execution_required": True,
+        "storage_publication_identity": storage_identity,
+        "storage_publication_identity_sha256": hashlib.sha256(
+            json.dumps(
+                storage_identity,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest(),
+    }
+    review_dir = run / "review"
+    review_dir.mkdir()
+    review_manifest = review_dir / "review_manifest.json"
+    review_manifest.write_text(
+        json.dumps(review, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (review_dir / "review_execution.json").write_text(
+        json.dumps(
+            {
+                "run_label": run_label,
+                "finalized": True,
+                "status": "completed",
+                "systemd_service_result": "success",
+                "cgroup_memory_peak_status": "verified",
+                "raw_manifest_unchanged": True,
+                "review_manifest_sha256": hashlib.sha256(
+                    review_manifest.read_bytes()
+                ).hexdigest(),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return run, batch_dir, locator, locator_path
+
+
 def _directory_bytes(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
 
@@ -91,6 +393,38 @@ def test_audit_records_status_identity_size_and_prerequisites(tmp_path: Path) ->
     assert record.file_count == 2
     assert len(record.tree_sha256) == 64
     assert record.disposition == "planned_archive"
+
+
+def test_audit_selects_only_explicit_immutable_run_labels(tmp_path: Path) -> None:
+    source = tmp_path / "results"
+    selected = _run(
+        source,
+        "stage05.2_benchmark_attempt01",
+        status="complete",
+        completeness="complete",
+    )
+    untouched = _run(
+        source,
+        "stage05.2_benchmark_attempt02",
+        status="failed",
+        completeness="partial",
+    )
+
+    inventory = audit_stage052_runs(
+        source,
+        _policy(),
+        run_labels=(selected.name,),
+    )
+
+    assert tuple(record.run_label for record in inventory.records) == (selected.name,)
+    assert selected.is_dir()
+    assert untouched.is_dir()
+    with pytest.raises(RetentionIntegrityError, match="selected run is missing"):
+        audit_stage052_runs(
+            source,
+            _policy(),
+            run_labels=("stage05.2_benchmark_attempt03",),
+        )
 
 
 def test_repository_config_declares_single_current_retention_policy() -> None:
@@ -311,6 +645,268 @@ def test_registry_conflict_is_rejected_before_archive_moves_source(tmp_path: Pat
             inventory_sha256=inventory_sha256,
             archive_root=archive,
             registry_path=registry,
+        )
+
+    assert run.is_dir()
+    assert not (archive / "stage05.2/history" / run.name).exists()
+
+
+def test_campaign_archive_preserves_and_reverifies_signed_external_batches(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    registry = tmp_path / "retention.csv"
+    run, batch_dir, locator, locator_path = _campaign_with_external_batch(
+        source,
+        archive,
+    )
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+
+    archived = archive_stage052_inventory_to_registry(
+        inventory_path,
+        inventory_sha256=inventory_sha256,
+        archive_root=archive,
+        registry_path=registry,
+        storage_root_locator=locator,
+    )
+
+    retained = archive / "stage05.2/history" / run.name
+    assert archived[0].verification_status == "verified"
+    assert not run.exists()
+    assert retained.is_dir()
+    assert batch_dir == archive / run.name / "batch0001"
+    assert (batch_dir / "payload.bin").read_bytes() == b"x" * 128
+    assert (
+        resolve_retained_run_from_locator(
+            run.name,
+            registry_path=registry,
+            storage_root_locator_path=locator_path,
+        )
+        == retained
+    )
+
+    (batch_dir / "payload.bin").write_bytes(b"tampered")
+    with pytest.raises(
+        RetentionIntegrityError,
+        match="campaign external storage identity mismatch",
+    ):
+        resolve_retained_run_from_locator(
+            run.name,
+            registry_path=registry,
+            storage_root_locator_path=locator_path,
+        )
+
+
+def test_ready_campaign_without_storage_identity_blocks_metadata_archive(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    registry = tmp_path / "retention.csv"
+    run, _, locator, _ = _campaign_with_external_batch(source, archive)
+    review_path = run / "review" / "review_manifest.json"
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    review.pop("storage_publication_identity")
+    review.pop("storage_publication_identity_sha256")
+    review_path.write_text(
+        json.dumps(review, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    execution_path = run / "review" / "review_execution.json"
+    execution = json.loads(execution_path.read_text(encoding="utf-8"))
+    execution["review_manifest_sha256"] = hashlib.sha256(
+        review_path.read_bytes()
+    ).hexdigest()
+    execution_path.write_text(
+        json.dumps(execution, sort_keys=True),
+        encoding="utf-8",
+    )
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+
+    with pytest.raises(
+        RetentionIntegrityError,
+        match="storage publication identity is missing",
+    ):
+        archive_stage052_inventory_to_registry(
+            inventory_path,
+            inventory_sha256=inventory_sha256,
+            archive_root=archive,
+            registry_path=registry,
+            storage_root_locator=locator,
+        )
+
+    assert run.is_dir()
+    assert not (archive / "stage05.2/history" / run.name).exists()
+
+
+def test_not_ready_campaign_with_storage_identity_archives_as_failed_evidence(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    registry = tmp_path / "retention.csv"
+    run, batch_dir, locator, _ = _campaign_with_external_batch(source, archive)
+    review_path = run / "review" / "review_manifest.json"
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    review["status"] = "NOT_READY"
+    first_gate = next(iter(review["gates"].values()))
+    first_gate["passed"] = False
+    review_path.write_text(
+        json.dumps(review, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    execution_path = run / "review" / "review_execution.json"
+    execution = json.loads(execution_path.read_text(encoding="utf-8"))
+    execution["review_manifest_sha256"] = hashlib.sha256(
+        review_path.read_bytes()
+    ).hexdigest()
+    execution_path.write_text(
+        json.dumps(execution, sort_keys=True),
+        encoding="utf-8",
+    )
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+
+    archived = archive_stage052_inventory_to_registry(
+        inventory_path,
+        inventory_sha256=inventory_sha256,
+        archive_root=archive,
+        registry_path=registry,
+        storage_root_locator=locator,
+    )
+
+    assert archived[0].verification_status == "verified"
+    assert not run.exists()
+    assert (archive / "stage05.2/history" / run.name).is_dir()
+    assert batch_dir.is_dir()
+
+
+def test_interrupted_campaign_external_batch_drift_blocks_metadata_archive(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    registry = tmp_path / "retention.csv"
+    run, batch_dir, locator, _ = _campaign_with_external_batch(source, archive)
+    shutil.rmtree(run / "review")
+    campaign_path = run / "campaign_manifest.json"
+    campaign = json.loads(campaign_path.read_text(encoding="utf-8"))
+    campaign["status"] = "planned"
+    campaign_path.write_text(
+        json.dumps(campaign, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    campaign_path.with_suffix(".sha256").write_text(
+        hashlib.sha256(campaign_path.read_bytes()).hexdigest() + "\n",
+        encoding="ascii",
+    )
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+    (batch_dir / "payload.bin").write_bytes(b"tampered")
+
+    with pytest.raises(
+        RetentionIntegrityError,
+        match="campaign external storage identity mismatch",
+    ):
+        archive_stage052_inventory_to_registry(
+            inventory_path,
+            inventory_sha256=inventory_sha256,
+            archive_root=archive,
+            registry_path=registry,
+            storage_root_locator=locator,
+        )
+
+    assert run.is_dir()
+    assert not (archive / "stage05.2/history" / run.name).exists()
+
+
+def test_campaign_storage_parent_symlink_blocks_metadata_archive(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    registry = tmp_path / "retention.csv"
+    run, batch_dir, locator, _ = _campaign_with_external_batch(source, archive)
+    signed_parent = batch_dir.parent
+    physical_parent = archive / "physical-campaign-storage"
+    signed_parent.rename(physical_parent)
+    signed_parent.symlink_to(physical_parent, target_is_directory=True)
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+
+    with pytest.raises(
+        RetentionIntegrityError,
+        match="path or transfer state is unsafe",
+    ):
+        archive_stage052_inventory_to_registry(
+            inventory_path,
+            inventory_sha256=inventory_sha256,
+            archive_root=archive,
+            registry_path=registry,
+            storage_root_locator=locator,
+        )
+
+    assert run.is_dir()
+    assert not (archive / "stage05.2/history" / run.name).exists()
+
+
+def test_campaign_incoming_transfer_blocks_metadata_archive(tmp_path: Path) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    registry = tmp_path / "retention.csv"
+    run, batch_dir, locator, _ = _campaign_with_external_batch(source, archive)
+    incoming = batch_dir.with_name(f"{batch_dir.name}.incoming")
+    incoming.mkdir()
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+
+    with pytest.raises(
+        RetentionIntegrityError,
+        match="path or transfer state is unsafe",
+    ):
+        archive_stage052_inventory_to_registry(
+            inventory_path,
+            inventory_sha256=inventory_sha256,
+            archive_root=archive,
+            registry_path=registry,
+            storage_root_locator=locator,
+        )
+
+    assert run.is_dir()
+    assert not (archive / "stage05.2/history" / run.name).exists()
+
+
+def test_campaign_manifest_sidecar_drift_blocks_metadata_archive(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "results"
+    archive = tmp_path / "archive"
+    registry = tmp_path / "retention.csv"
+    run, _, locator, _ = _campaign_with_external_batch(source, archive)
+    (run / "campaign_manifest.sha256").write_text("0" * 64 + "\n", encoding="ascii")
+    inventory = audit_stage052_runs(source, _policy())
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+
+    with pytest.raises(
+        RetentionIntegrityError,
+        match="campaign manifest is invalid",
+    ):
+        archive_stage052_inventory_to_registry(
+            inventory_path,
+            inventory_sha256=inventory_sha256,
+            archive_root=archive,
+            registry_path=registry,
+            storage_root_locator=locator,
         )
 
     assert run.is_dir()

@@ -945,6 +945,9 @@ def _route_batch_with_status(
 def _candidate_route_batch_with_status(
     evaluator: RouteEvaluator,
     sequences: Iterable[CustomerSequence],
+    *,
+    exact_budget: int | None = None,
+    base_sequences: Iterable[CustomerSequence] | None = None,
 ) -> tuple[ChargingSubproblemResult, ...]:
     """Evaluate an ordered Stage 3.4 candidate pool through its public seam."""
 
@@ -959,6 +962,10 @@ def _candidate_route_batch_with_status(
                 ordered,
                 route_change_status="changed",
                 prescreened=True,
+                exact_budget=exact_budget,
+                base_sequences=(
+                    None if base_sequences is None else tuple(base_sequences)
+                ),
             )
         )
     return _route_batch_with_status(evaluator, ordered, "changed")
@@ -1866,14 +1873,33 @@ def propose_route_merge(
         for position, left in enumerate(profiles)
         for right in profiles[position + 1 :]
     )
+    if bool(getattr(evaluator, "pair_pruning_enabled", False)):
+        capacity_feasible_pairs: list[
+            tuple[
+                tuple[int, float, float, float, int, int],
+                _RouteProfile,
+                _RouteProfile,
+            ]
+        ] = []
+        for pair in pairs:
+            _, left, right = pair
+            capacity_event = _route_merge_pair_capacity_event(instance, left, right)
+            if capacity_event is None:
+                capacity_feasible_pairs.append(pair)
+            else:
+                events.append(capacity_event)
+        pairs = capacity_feasible_pairs
 
-    if bool(getattr(evaluator, "candidate_control_enabled", False)):
+    if bool(getattr(evaluator, "candidate_control_enabled", False)) or bool(
+        getattr(evaluator, "candidate_transaction_enabled", False)
+    ):
         return _propose_controlled_route_merge(
             instance,
             sequences,
             evaluator,
             pairs,
             events,
+            config,
         )
 
     best: tuple[SolutionObjective, CustomerSequence, int, int] | None = None
@@ -1976,21 +2002,66 @@ def propose_route_merge(
     return MoveProposal("route_merge", tuple(new_sequences), tuple(events))
 
 
+def _route_merge_pair_capacity_event(
+    instance: Instance,
+    left: _RouteProfile,
+    right: _RouteProfile,
+) -> NeighborhoodEvent | None:
+    """Reject an over-capacity pair once before constructing its permutations."""
+
+    if left.demand + right.demand <= instance.vehicle.load_capacity + _EPSILON:
+        return None
+    skipped_count = len(left.sequence) + len(right.sequence) + 2
+    pair_identity = {
+        "left": {"index": left.index, "sequence": left.sequence},
+        "reason": "capacity_prefilter",
+        "right": {"index": right.index, "sequence": right.sequence},
+        "schema_version": "route-merge-pair-pruning-v1",
+        "skipped_candidate_count": skipped_count,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            pair_identity,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return NeighborhoodEvent(
+        "route_merge",
+        "pair_prefilter_rejected_aggregate",
+        "capacity_prefilter",
+        route_indices=(left.index, right.index),
+        prefilter_passed=False,
+        aggregate_count=skipped_count,
+        candidate_pool_hash=digest,
+    )
+
+
 def _propose_controlled_route_merge(
     instance: Instance,
     sequences: RouteSequences,
     evaluator: RouteEvaluator,
     pairs: list[tuple[tuple[int, float, float, float, int, int], _RouteProfile, _RouteProfile]],
     events: list[NeighborhoodEvent],
+    config: VehicleOperatorConfig,
 ) -> MoveProposal:
     """Rank the complete merge pool before spending the shared round budget."""
 
-    metadata: dict[CustomerSequence, tuple[int, int, CustomerSequence]] = {}
+    metadata: dict[
+        CustomerSequence,
+        tuple[int, int, CustomerSequence, CustomerSequence],
+    ] = {}
     candidates: list[CustomerSequence] = []
+    base_sequences: list[CustomerSequence] = []
     prefilter_counts: Counter[str] = Counter()
     prefilter_digest = hashlib.sha256()
     for _, left, right in pairs:
-        for merged, source_sequence in _controlled_merge_orders(instance, left, right):
+        for merged, source_sequence, target_sequence in _controlled_merge_orders(
+            instance,
+            left,
+            right,
+        ):
             # Full Stage 3.4 pools can contain tens of thousands of ordinary
             # rejections. Use the same safe screener and persist an aggregate
             # reason/hash below instead of materialising duplicate trace rows.
@@ -2005,8 +2076,14 @@ def _propose_controlled_route_merge(
                 )
                 continue
             if merged not in metadata:
-                metadata[merged] = (left.index, right.index, source_sequence)
+                metadata[merged] = (
+                    left.index,
+                    right.index,
+                    source_sequence,
+                    target_sequence,
+                )
                 candidates.append(merged)
+                base_sequences.append(target_sequence)
     events.extend(
         NeighborhoodEvent(
             "route_merge",
@@ -2020,15 +2097,23 @@ def _propose_controlled_route_merge(
     )
 
     before_calls = evaluator.calls
-    results = _candidate_route_batch_with_status(evaluator, candidates)
+    results = _candidate_route_batch_with_status(
+        evaluator,
+        candidates,
+        exact_budget=config.route_merge_exact_evaluation_budget,
+        base_sequences=base_sequences,
+    )
     exact_evaluations = evaluator.calls - before_calls
     best: tuple[SolutionObjective, CustomerSequence, int, int] | None = None
     result_counts: Counter[tuple[str, str]] = Counter()
     result_digest = hashlib.sha256()
     for merged, result in zip(candidates, results, strict=True):
-        left_index, right_index, _source_sequence = metadata[merged]
+        left_index, right_index, _source_sequence, _target_sequence = metadata[merged]
         if result.failure_reason.startswith("candidate_control:"):
             status = "candidate_control_skipped"
+            reason = result.failure_reason
+        elif result.failure_reason.startswith("candidate_transaction:"):
+            status = "candidate_transaction_skipped"
             reason = result.failure_reason
         elif not result.feasible:
             status = "exact_infeasible"
@@ -2101,22 +2186,29 @@ def _controlled_merge_orders(
     _instance: Instance,
     left: _RouteProfile,
     right: _RouteProfile,
-) -> tuple[tuple[CustomerSequence, CustomerSequence], ...]:
+) -> tuple[tuple[CustomerSequence, CustomerSequence, CustomerSequence], ...]:
     """Generate deterministic complete orders, including non-block interleavings."""
 
-    output: list[tuple[CustomerSequence, CustomerSequence]] = []
+    output: list[
+        tuple[CustomerSequence, CustomerSequence, CustomerSequence]
+    ] = []
     seen: set[CustomerSequence] = set()
 
-    def add(sequence: CustomerSequence, source: CustomerSequence) -> None:
+    def add(
+        sequence: CustomerSequence,
+        source: CustomerSequence,
+        target: CustomerSequence,
+    ) -> None:
         if sequence not in seen:
             seen.add(sequence)
-            output.append((sequence, source))
+            output.append((sequence, source, target))
 
     for source, target in ((left, right), (right, left)):
         for position in range(len(target.sequence) + 1):
             add(
                 target.sequence[:position] + source.sequence + target.sequence[position:],
                 source.sequence,
+                target.sequence,
             )
     return tuple(output)
 

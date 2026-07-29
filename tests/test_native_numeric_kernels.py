@@ -9,6 +9,7 @@ import pytest
 from evrptw._core import (
     exact_charging_batch_numeric,
     propagate_routes_numeric,
+    screen_route_batch_transaction_v2,
     screen_routes_numeric,
 )
 from evrptw.cache_incremental import (
@@ -519,6 +520,73 @@ def test_screen_routes_numeric_frozen_and_failure_differential() -> None:
     )
     _assert_screen_matches_python(tight, ("C1",))
     _assert_screen_matches_python(tight, ("C1",), full=False)
+
+
+def test_screen_route_batch_transaction_v2_preserves_order_and_cache_semantics() -> None:
+    instance = _instance()
+    scalar_inputs = _screen_pack(instance, ("C1",), full=True)
+    common = scalar_inputs[:8]
+    c1_index = next(
+        index for index, node in enumerate(instance.nodes) if node.name == "C1"
+    )
+    route_offsets = np.asarray([0, 1, 2, 3, 3], dtype=np.int64)
+    route_indices = np.asarray([c1_index, -1, c1_index], dtype=np.int64)
+    candidate_ids = np.asarray([10, 11, 12, 13], dtype=np.int64)
+    options = scalar_inputs[9]
+    incremental = np.zeros((4, 6), dtype=np.float64)
+    negative_offsets = np.asarray([0, 0], dtype=np.int64)
+    negative_indices = np.asarray([], dtype=np.int64)
+    negative_reason_codes = np.asarray([1], dtype=np.int64)
+
+    first = screen_route_batch_transaction_v2(
+        *common,
+        route_offsets,
+        route_indices,
+        candidate_ids,
+        options,
+        incremental,
+        negative_offsets,
+        negative_indices,
+        negative_reason_codes,
+    )
+    second = screen_route_batch_transaction_v2(
+        *common,
+        route_offsets,
+        route_indices,
+        candidate_ids,
+        options,
+        incremental,
+        negative_offsets,
+        negative_indices,
+        negative_reason_codes,
+    )
+
+    (
+        returned_ids,
+        statuses,
+        duplicate_of,
+        codes,
+        metrics,
+        counters,
+        digest,
+    ) = first
+    scalar_codes, scalar_metrics = screen_routes_numeric(*scalar_inputs)
+    np.testing.assert_array_equal(returned_ids, candidate_ids)
+    np.testing.assert_array_equal(statuses, np.asarray([0, 0, 1, 2], dtype=np.int64))
+    np.testing.assert_array_equal(
+        duplicate_of,
+        np.asarray([-1, -1, 10, -1], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(codes[0], scalar_codes)
+    np.testing.assert_allclose(metrics[0], scalar_metrics, equal_nan=True)
+    np.testing.assert_array_equal(codes[2], codes[0])
+    np.testing.assert_allclose(metrics[2], metrics[0], equal_nan=True)
+    assert codes[1, 1] == 1
+    assert codes[3, 1] == 1
+    np.testing.assert_array_equal(counters, np.asarray([4, 3, 1, 1, 2], dtype=np.int64))
+    assert isinstance(digest, str)
+    assert len(digest) == 64
+    assert second[-1] == digest
 
 
 def test_screen_routes_numeric_randomized_python_differential() -> None:

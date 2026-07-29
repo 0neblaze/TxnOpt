@@ -3826,6 +3826,304 @@ py::tuple screen_routes_numeric(
     return py::make_tuple(std::move(codes), std::move(metrics));
 }
 
+py::tuple screen_route_batch_transaction_v2(
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle candidate_ids,
+    py::handle options,
+    py::handle incremental,
+    py::handle negative_offsets,
+    py::handle negative_indices,
+    py::handle negative_reason_codes) {
+    auto kind_array = checked_array<std::int64_t>(node_kind, "node_kind", 1);
+    auto demand_array = checked_array<double>(demand, "demand", 1);
+    auto ready_array = checked_array<double>(ready_time, "ready_time", 1);
+    auto due_array = checked_array<double>(due_date, "due_date", 1);
+    auto service_array = checked_array<double>(service_time, "service_time", 1);
+    auto distance_array = checked_array<double>(distance, "distance", 2);
+    auto reachable_array = checked_array<std::uint8_t>(reachable, "reachable", 2);
+    auto vehicle_array = checked_array<double>(vehicle, "vehicle", 1);
+    auto offsets_array = checked_array<std::int64_t>(route_offsets, "route_offsets", 1);
+    auto routes_array = checked_array<std::int64_t>(route_indices, "route_indices", 1);
+    auto ids_array = checked_array<std::int64_t>(candidate_ids, "candidate_ids", 1);
+    auto options_array = checked_array<double>(options, "options", 1);
+    auto incremental_array = checked_array<double>(incremental, "incremental", 2);
+    auto negative_offsets_array = checked_array<std::int64_t>(
+        negative_offsets, "negative_offsets", 1);
+    auto negative_routes_array = checked_array<std::int64_t>(
+        negative_indices, "negative_indices", 1);
+    auto negative_reasons_array = checked_array<std::int64_t>(
+        negative_reason_codes, "negative_reason_codes", 1);
+
+    const auto node_count = static_cast<std::size_t>(kind_array.request().shape[0]);
+    const auto candidate_count = static_cast<std::size_t>(ids_array.request().shape[0]);
+    const auto negative_count = static_cast<std::size_t>(
+        negative_reasons_array.request().shape[0]);
+    if (node_count == 0
+        || demand_array.request().shape[0] != kind_array.request().shape[0]
+        || ready_array.request().shape[0] != kind_array.request().shape[0]
+        || due_array.request().shape[0] != kind_array.request().shape[0]
+        || service_array.request().shape[0] != kind_array.request().shape[0]) {
+        throw std::invalid_argument(
+            "batch screening node arrays must share one non-zero length");
+    }
+    if (distance_array.request().shape[0] != kind_array.request().shape[0]
+        || distance_array.request().shape[1] != kind_array.request().shape[0]
+        || reachable_array.request().shape[0] != kind_array.request().shape[0]
+        || reachable_array.request().shape[1] != kind_array.request().shape[0]) {
+        throw std::invalid_argument(
+            "batch screening distance and reachable must have shape (n, n)");
+    }
+    if (vehicle_array.request().shape[0] != 5
+        || options_array.request().shape[0] != 4) {
+        throw std::invalid_argument(
+            "batch screening vehicle/options shape is invalid");
+    }
+    if (offsets_array.request().shape[0]
+            != static_cast<py::ssize_t>(candidate_count + 1)
+        || incremental_array.request().shape[0]
+            != static_cast<py::ssize_t>(candidate_count)
+        || incremental_array.request().shape[1] != 6) {
+        throw std::invalid_argument(
+            "batch screening candidate arrays do not share one row count");
+    }
+    if (negative_offsets_array.request().shape[0]
+            != static_cast<py::ssize_t>(negative_count + 1)) {
+        throw std::invalid_argument(
+            "batch screening negative-cache arrays do not share one row count");
+    }
+
+    const auto* kinds = checked_data<std::int64_t>(kind_array);
+    const auto* demands = checked_data<double>(demand_array);
+    const auto* ready = checked_data<double>(ready_array);
+    const auto* due = checked_data<double>(due_array);
+    const auto* service = checked_data<double>(service_array);
+    const auto* distances = checked_data<double>(distance_array);
+    const auto* reachable_values = checked_data<std::uint8_t>(reachable_array);
+    const auto* vehicle_values = checked_data<double>(vehicle_array);
+    const auto* offsets = checked_data<std::int64_t>(offsets_array);
+    const auto* routes = checked_data<std::int64_t>(routes_array);
+    const auto* ids = checked_data<std::int64_t>(ids_array);
+    const auto* option_values = checked_data<double>(options_array);
+    const auto* incremental_values = checked_data<double>(incremental_array);
+    const auto* negative_route_offsets = checked_data<std::int64_t>(
+        negative_offsets_array);
+    const auto* negative_routes = checked_data<std::int64_t>(negative_routes_array);
+    const auto* negative_reasons = checked_data<std::int64_t>(
+        negative_reasons_array);
+    const auto routes_size = static_cast<std::int64_t>(routes_array.request().shape[0]);
+    const auto negative_routes_size = static_cast<std::int64_t>(
+        negative_routes_array.request().shape[0]);
+    if (option_values[1] <= 0.0 || !std::isfinite(option_values[1])) {
+        throw std::invalid_argument(
+            "batch screening epsilon must be finite and positive");
+    }
+
+    auto validate_offsets = [](
+        const std::int64_t* values,
+        std::size_t count,
+        std::int64_t terminal,
+        const char* name) {
+        if (values[0] != 0 || values[count] != terminal) {
+            throw std::invalid_argument(std::string(name) + " boundary is invalid");
+        }
+        for (std::size_t index = 0; index < count; ++index) {
+            if (values[index] < 0 || values[index] > values[index + 1]) {
+                throw std::invalid_argument(
+                    std::string(name) + " must be monotonic");
+            }
+        }
+    };
+    validate_offsets(offsets, candidate_count, routes_size, "route_offsets");
+    validate_offsets(
+        negative_route_offsets,
+        negative_count,
+        negative_routes_size,
+        "negative_offsets");
+
+    std::unordered_set<std::int64_t> unique_ids;
+    for (std::size_t index = 0; index < candidate_count; ++index) {
+        if (!unique_ids.insert(ids[index]).second) {
+            throw std::invalid_argument("candidate_ids must be unique");
+        }
+    }
+    std::int64_t depot = -1;
+    std::vector<std::int64_t> recharge_nodes;
+    for (std::size_t node = 0; node < node_count; ++node) {
+        if (kinds[node] == depot_kind) {
+            if (depot >= 0) {
+                throw std::invalid_argument(
+                    "node_kind must contain exactly one depot");
+            }
+            depot = static_cast<std::int64_t>(node);
+            recharge_nodes.push_back(depot);
+        } else if (kinds[node] == station_kind) {
+            recharge_nodes.push_back(static_cast<std::int64_t>(node));
+        } else if (kinds[node] != customer_kind) {
+            throw std::invalid_argument("node_kind contains an unknown code");
+        }
+    }
+    if (depot < 0) {
+        throw std::invalid_argument("node_kind must contain exactly one depot");
+    }
+
+    auto canonical_key = [](
+        const std::int64_t* values,
+        std::size_t count) {
+        std::string key;
+        key.reserve((count + 1) * sizeof(std::int64_t));
+        const auto append_i64 = [&key](std::int64_t value) {
+            const auto bits = static_cast<std::uint64_t>(value);
+            for (std::size_t byte = 0; byte < 8; ++byte) {
+                key.push_back(static_cast<char>((bits >> (byte * 8)) & 0xffU));
+            }
+        };
+        append_i64(static_cast<std::int64_t>(count));
+        for (std::size_t index = 0; index < count; ++index) {
+            append_i64(values[index]);
+        }
+        return key;
+    };
+    std::unordered_map<std::string, std::int64_t> negative_cache;
+    for (std::size_t index = 0; index < negative_count; ++index) {
+        if (negative_reasons[index] < screen_reason_structure
+            || negative_reasons[index] > screen_reason_legacy_energy) {
+            throw std::invalid_argument(
+                "negative_reason_codes contains an unknown reason");
+        }
+        const auto begin = static_cast<std::size_t>(negative_route_offsets[index]);
+        const auto end = static_cast<std::size_t>(negative_route_offsets[index + 1]);
+        const auto key = canonical_key(negative_routes + begin, end - begin);
+        if (!negative_cache.emplace(key, negative_reasons[index]).second) {
+            throw std::invalid_argument(
+                "negative-cache route identities must be unique");
+        }
+    }
+
+    std::vector<ScreenOutput> outputs(candidate_count);
+    std::vector<std::int64_t> statuses(candidate_count, 0);
+    std::vector<std::int64_t> duplicate_of(candidate_count, -1);
+    std::unordered_map<std::string, std::size_t> first_by_key;
+    std::int64_t duplicate_count = 0;
+    std::int64_t negative_hit_count = 0;
+    std::int64_t screened_count = 0;
+    {
+        py::gil_scoped_release release;
+        for (std::size_t index = 0; index < candidate_count; ++index) {
+            const auto begin = static_cast<std::size_t>(offsets[index]);
+            const auto end = static_cast<std::size_t>(offsets[index + 1]);
+            const auto key = canonical_key(routes + begin, end - begin);
+            const auto duplicate = first_by_key.find(key);
+            if (duplicate != first_by_key.end()) {
+                statuses[index] = 1;
+                duplicate_of[index] = ids[duplicate->second];
+                outputs[index] = outputs[duplicate->second];
+                ++duplicate_count;
+                continue;
+            }
+            first_by_key.emplace(key, index);
+            const auto negative = negative_cache.find(key);
+            if (negative != negative_cache.end()) {
+                statuses[index] = 2;
+                outputs[index].codes[0] = 0;
+                outputs[index].codes[1] = negative->second;
+                ++negative_hit_count;
+                continue;
+            }
+            outputs[index] = run_screen_route(
+                kinds,
+                demands,
+                ready,
+                due,
+                service,
+                distances,
+                reachable_values,
+                vehicle_values,
+                routes + begin,
+                end - begin,
+                node_count,
+                depot,
+                recharge_nodes,
+                option_values,
+                incremental_values + index * 6);
+            ++screened_count;
+        }
+    }
+
+    py::array_t<std::int64_t> returned_ids(candidate_count);
+    py::array_t<std::int64_t> status_array(candidate_count);
+    py::array_t<std::int64_t> duplicate_array(candidate_count);
+    py::array_t<std::int64_t> codes_array(
+        {static_cast<py::ssize_t>(candidate_count), py::ssize_t(16)});
+    py::array_t<double> metrics_array(
+        {static_cast<py::ssize_t>(candidate_count), py::ssize_t(15)});
+    std::copy(ids, ids + candidate_count, checked_data(returned_ids));
+    std::copy(statuses.begin(), statuses.end(), checked_data(status_array));
+    std::copy(
+        duplicate_of.begin(), duplicate_of.end(), checked_data(duplicate_array));
+    auto* code_output = checked_data(codes_array);
+    auto* metric_output = checked_data(metrics_array);
+    for (std::size_t index = 0; index < candidate_count; ++index) {
+        std::copy(
+            outputs[index].codes.begin(),
+            outputs[index].codes.end(),
+            code_output + index * 16);
+        std::copy(
+            outputs[index].metrics.begin(),
+            outputs[index].metrics.end(),
+            metric_output + index * 15);
+    }
+    py::array_t<std::int64_t> counters(5);
+    auto* counter_values = checked_data(counters);
+    counter_values[0] = static_cast<std::int64_t>(candidate_count);
+    counter_values[1] =
+        static_cast<std::int64_t>(candidate_count) - duplicate_count;
+    counter_values[2] = duplicate_count;
+    counter_values[3] = negative_hit_count;
+    counter_values[4] = screened_count;
+
+    std::string evidence;
+    const auto append_i64 = [&evidence](std::int64_t value) {
+        const auto bits = static_cast<std::uint64_t>(value);
+        for (std::size_t byte = 0; byte < 8; ++byte) {
+            evidence.push_back(
+                static_cast<char>((bits >> (byte * 8)) & 0xffU));
+        }
+    };
+    for (std::size_t index = 0; index < candidate_count; ++index) {
+        const auto begin = static_cast<std::size_t>(offsets[index]);
+        const auto end = static_cast<std::size_t>(offsets[index + 1]);
+        append_i64(ids[index]);
+        append_i64(statuses[index]);
+        append_i64(duplicate_of[index]);
+        append_i64(outputs[index].codes[1]);
+        append_i64(static_cast<std::int64_t>(end - begin));
+        for (auto cursor = begin; cursor < end; ++cursor) {
+            append_i64(routes[cursor]);
+        }
+    }
+    const auto digest = py::cast<std::string>(
+        py::module_::import("hashlib")
+            .attr("sha256")(py::bytes(evidence))
+            .attr("hexdigest")());
+    return py::make_tuple(
+        std::move(returned_ids),
+        std::move(status_array),
+        std::move(duplicate_array),
+        std::move(codes_array),
+        std::move(metrics_array),
+        std::move(counters),
+        digest);
+}
+
 py::tuple propagate_routes_numeric(
     py::handle node_kind,
     py::handle ready_time,
@@ -4031,6 +4329,25 @@ PYBIND11_MODULE(_core, module) {
         py::arg("route_indices"),
         py::arg("options"),
         py::arg("incremental"));
+    module.def(
+        "screen_route_batch_transaction_v2",
+        &screen_route_batch_transaction_v2,
+        py::arg("node_kind"),
+        py::arg("demand"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("reachable"),
+        py::arg("vehicle"),
+        py::arg("route_offsets"),
+        py::arg("route_indices"),
+        py::arg("candidate_ids"),
+        py::arg("options"),
+        py::arg("incremental"),
+        py::arg("negative_offsets"),
+        py::arg("negative_indices"),
+        py::arg("negative_reason_codes"));
     module.def(
         "propagate_routes_numeric",
         &propagate_routes_numeric,

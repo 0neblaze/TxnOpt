@@ -130,6 +130,32 @@ def screen_routes_numeric(
     npt.NDArray[np.int64],
     npt.NDArray[np.float64],
 ]: ...
+def screen_route_batch_transaction_v2(
+    node_kind: npt.NDArray[np.int64],
+    demand: npt.NDArray[np.float64],
+    ready_time: npt.NDArray[np.float64],
+    due_date: npt.NDArray[np.float64],
+    service_time: npt.NDArray[np.float64],
+    distance: npt.NDArray[np.float64],
+    reachable: npt.NDArray[np.uint8],
+    vehicle: npt.NDArray[np.float64],
+    route_offsets: npt.NDArray[np.int64],
+    route_indices: npt.NDArray[np.int64],
+    candidate_ids: npt.NDArray[np.int64],
+    options: npt.NDArray[np.float64],
+    incremental: npt.NDArray[np.float64],
+    negative_offsets: npt.NDArray[np.int64],
+    negative_indices: npt.NDArray[np.int64],
+    negative_reason_codes: npt.NDArray[np.int64],
+) -> tuple[
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.float64],
+    npt.NDArray[np.int64],
+    str,
+]: ...
 def propagate_routes_numeric(
     node_kind: npt.NDArray[np.int64],
     ready_time: npt.NDArray[np.float64],

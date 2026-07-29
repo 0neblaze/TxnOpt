@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, cast
 
+import numpy as np
+
 from evrptw.cache_incremental import (
     CacheIncrementalConfig,
     RouteEvaluationCache,
@@ -22,6 +24,15 @@ from evrptw.candidate_control import (
     CandidateControlConfig,
     CandidateControlRuntime,
     CandidatePlan,
+)
+from evrptw.candidate_transaction import (
+    CandidateScreeningDecision,
+    CandidateTransactionDeadlineExceeded,
+    CandidateTransactionRequest,
+    NativeCandidateTransactionConfig,
+    NativeCandidateTransactionRuntime,
+    execute_candidate_transaction,
+    native_screen_candidate_batch,
 )
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
 from evrptw.cpu_batch import (
@@ -197,6 +208,7 @@ class ALNSResult:
     termination_reason: str = ""
     exact_deadline_statistics: dict[str, object] = field(default_factory=dict)
     candidate_control_statistics: dict[str, object] = field(default_factory=dict)
+    candidate_transaction_statistics: dict[str, object] = field(default_factory=dict)
     candidate_work_hash: str = ""
     route_result_hash: str = ""
     # Stage 4 adaptive-weight and search-control statistics.
@@ -272,6 +284,22 @@ def _candidate_control_skip_result(reason: str) -> ChargingSubproblemResult:
     )
 
 
+def _candidate_transaction_skip_result(reason: str) -> ChargingSubproblemResult:
+    return ChargingSubproblemResult(
+        False,
+        (),
+        float("inf"),
+        0.0,
+        0.0,
+        0.0,
+        0,
+        0,
+        0,
+        0.0,
+        f"candidate_transaction:{reason}",
+    )
+
+
 class _Evaluator:
     def __init__(
         self,
@@ -282,6 +310,7 @@ class _Evaluator:
         lane: str = "legacy",
         screening_config: CheapScreeningConfig | None = None,
         negative_screening_cache: dict[str, ScreeningResult] | None = None,
+        negative_screening_sequences: dict[tuple[str, ...], str] | None = None,
         cache_incremental_config: CacheIncrementalConfig | None = None,
         route_cache: RouteEvaluationCache | None = None,
         backend: ExactChargingBackend | str = ExactChargingBackend.CPU_SCALAR,
@@ -290,6 +319,7 @@ class _Evaluator:
         batch_work_enabled: bool = False,
         exact_call_controller: ExactCallController | None = None,
         candidate_control_runtime: CandidateControlRuntime | None = None,
+        candidate_transaction_runtime: NativeCandidateTransactionRuntime | None = None,
         incumbent_route_ledger: _IncumbentRouteLedger | None = None,
         native_runtime: NativeKernelRuntime | None = None,
     ) -> None:
@@ -317,6 +347,7 @@ class _Evaluator:
         self.batch_work_enabled = batch_work_enabled
         self.exact_call_controller = exact_call_controller
         self.candidate_control_runtime = candidate_control_runtime
+        self.candidate_transaction_runtime = candidate_transaction_runtime
         self.incumbent_route_ledger = incumbent_route_ledger
         self.native_runtime = native_runtime
         self.pending_candidate_cache: dict[tuple[str, ...], ChargingSubproblemResult] = {}
@@ -334,6 +365,11 @@ class _Evaluator:
         self.incremental_reused_suffix_edges = 0
         self.negative_screening_cache = (
             negative_screening_cache if negative_screening_cache is not None else {}
+        )
+        self.negative_screening_sequences = (
+            negative_screening_sequences
+            if negative_screening_sequences is not None
+            else {}
         )
         self.iteration: int | None = None
         self.operator = "initialization"
@@ -485,6 +521,19 @@ class _Evaluator:
         return self.candidate_control_runtime is not None
 
     @property
+    def candidate_transaction_enabled(self) -> bool:
+        runtime = self.candidate_transaction_runtime
+        return (
+            runtime is not None
+            and runtime.config.implementation_mode
+            in {"batched_screening", "candidate_transaction"}
+        )
+
+    @property
+    def pair_pruning_enabled(self) -> bool:
+        return self.candidate_transaction_runtime is not None
+
+    @property
     def candidate_control_route_change_limit(self) -> int | None:
         runtime = self.candidate_control_runtime
         if runtime is None:
@@ -497,8 +546,29 @@ class _Evaluator:
         *,
         route_change_status: str = "changed",
         prescreened: bool = False,
+        exact_budget: int | None = None,
+        base_sequences: Sequence[tuple[str, ...]] | None = None,
     ) -> tuple[ChargingSubproblemResult, ...]:
         clean = tuple(sequence for sequence in sequences if sequence)
+        if self.candidate_transaction_runtime is not None:
+            if (
+                self.candidate_transaction_runtime.config.implementation_mode
+                == "pair_pruning"
+            ):
+                return self.route_batch(
+                    clean,
+                    route_change_status=route_change_status,
+                )
+            if exact_budget is None:
+                raise ValueError(
+                    "native candidate transaction requires the operator exact budget"
+                )
+            return self._native_candidate_route_batch(
+                clean,
+                route_change_status=route_change_status,
+                exact_budget=exact_budget,
+                base_sequences=base_sequences,
+            )
         if self.candidate_control_runtime is not None:
             return self._controlled_candidate_route_batch(
                 clean,
@@ -509,6 +579,240 @@ class _Evaluator:
             clean,
             route_change_status=route_change_status,
         )
+
+    def _native_candidate_route_batch(
+        self,
+        clean: tuple[tuple[str, ...], ...],
+        *,
+        route_change_status: str,
+        exact_budget: int,
+        base_sequences: Sequence[tuple[str, ...]] | None,
+    ) -> tuple[ChargingSubproblemResult, ...]:
+        runtime = self.candidate_transaction_runtime
+        native_runtime = self.native_runtime
+        if runtime is None or native_runtime is None:
+            raise RuntimeError("native candidate transaction runtime is incomplete")
+        if not clean:
+            return ()
+        if base_sequences is not None and len(base_sequences) != len(clean):
+            raise ValueError(
+                "candidate transaction base sequences must align with candidates"
+            )
+        effective_budget = exact_budget
+        controller = self.exact_call_controller
+        if controller is not None and controller.budget is not None:
+            effective_budget = min(
+                effective_budget,
+                max(0, controller.budget - controller.started_calls),
+            )
+
+        incremental_rows = np.zeros((len(clean), 6), dtype=np.float64)
+        if base_sequences is not None:
+            epsilon = (
+                self.screening_config.epsilon
+                if self.screening_config is not None
+                else native_runtime.context.reachability_epsilon
+            )
+            for index, (base_sequence, candidate) in enumerate(
+                zip(base_sequences, clean, strict=True)
+            ):
+                base_snapshot = self.propagation_snapshots.get(base_sequence)
+                if base_snapshot is None:
+                    base_snapshot = build_route_propagation_snapshot(
+                        self.instance,
+                        base_sequence,
+                        epsilon=epsilon,
+                    )
+                    self.propagation_snapshots[base_sequence] = base_snapshot
+                propagation = incremental_route_propagation(
+                    self.instance,
+                    base_snapshot,
+                    candidate,
+                    epsilon=epsilon,
+                    native_runtime=native_runtime,
+                )
+                if propagation.status == "incremental":
+                    self.incremental_propagations += 1
+                    self.incremental_reused_prefix_edges += (
+                        propagation.reused_prefix_edges
+                    )
+                    self.incremental_reused_suffix_edges += (
+                        propagation.reused_suffix_edges
+                    )
+                    incremental_rows[index] = (
+                        1.0,
+                        propagation.distance_lower_bound,
+                        propagation.min_time_window_slack,
+                        propagation.finish_time,
+                        float(propagation.forward_feasible),
+                        float(propagation.backward_feasible),
+                    )
+                else:
+                    self.incremental_fallbacks += 1
+
+        def screen_batch(
+            candidates: tuple[tuple[str, ...], ...],
+        ) -> Any:
+            batch = native_screen_candidate_batch(
+                self.instance,
+                candidates,
+                native_runtime=native_runtime,
+                negative_cache=self.negative_screening_sequences,
+                deadline=self.deadline,
+                incremental=incremental_rows,
+            )
+            self.screening_calls += len(batch.decisions)
+            self.screening_passes += sum(
+                decision.accepted for decision in batch.decisions
+            )
+            self.screening_rejections += sum(
+                not decision.accepted
+                and decision.native_status != "negative_cache_hit"
+                for decision in batch.decisions
+            )
+            self.screening_cache_hits += batch.counters["negative_cache_hits"]
+            self.screening_exact_call_blocked += sum(
+                not decision.accepted for decision in batch.decisions
+            )
+            for decision in batch.decisions:
+                if decision.reason:
+                    self.screening_reason_counts[decision.reason] = (
+                        self.screening_reason_counts.get(decision.reason, 0) + 1
+                    )
+            return batch
+
+        def rejected(decision: CandidateScreeningDecision) -> ChargingSubproblemResult:
+            if decision.native_status != "negative_cache_hit":
+                self.negative_screening_sequences[decision.sequence] = decision.reason
+            return ChargingSubproblemResult(
+                False,
+                (),
+                float("inf"),
+                0.0,
+                0.0,
+                0.0,
+                0,
+                0,
+                0,
+                0.0,
+                f"cheap_screening:{decision.reason}",
+            )
+
+        try:
+            if runtime.config.implementation_mode == "batched_screening":
+                screening = screen_batch(clean)
+                resolved: list[ChargingSubproblemResult | None] = [None] * len(clean)
+                waiting_indices: dict[tuple[str, ...], list[int]] = {}
+                known_results: dict[tuple[str, ...], ChargingSubproblemResult] = {}
+                exact_sequences: list[tuple[str, ...]] = []
+                for index, decision in enumerate(screening.decisions):
+                    if not decision.accepted:
+                        resolved[index] = rejected(decision)
+                        continue
+                    sequence = decision.sequence
+                    if sequence in waiting_indices:
+                        waiting_indices[sequence].append(index)
+                        continue
+                    known = known_results.get(sequence)
+                    if known is not None:
+                        resolved[index] = known
+                        continue
+                    cached = self._lookup_cached_result(
+                        sequence,
+                        route_change_status,
+                    )[0]
+                    if cached is not None:
+                        known_results[sequence] = cached
+                        resolved[index] = cached
+                        continue
+                    if len(exact_sequences) >= effective_budget:
+                        skipped = _candidate_transaction_skip_result(
+                            "operator_exact_budget_exhausted"
+                        )
+                        known_results[sequence] = skipped
+                        resolved[index] = skipped
+                        continue
+                    waiting_indices[sequence] = [index]
+                    exact_sequences.append(sequence)
+                if time.perf_counter() >= self.deadline:
+                    raise CandidateTransactionDeadlineExceeded("before_exact_batch")
+                exact_results = self._solve_uncached_batch(
+                    tuple(exact_sequences),
+                    route_change_status,
+                )
+                for sequence, result in zip(
+                    exact_sequences,
+                    exact_results,
+                    strict=True,
+                ):
+                    known_results[sequence] = result
+                    for index in waiting_indices[sequence]:
+                        resolved[index] = result
+                if any(result is None for result in resolved):
+                    raise RuntimeError("batched screening lost an ordered result")
+                if self.measurement_trace is not None:
+                    self.measurement_trace.events.append(
+                        {
+                            "event_type": "native_candidate_screening_batch",
+                            "status": "committed",
+                            "timestamp_seconds": self.measurement_trace._offset(),
+                            "lane": self.lane,
+                            "iteration": self.iteration,
+                            "operator": self.operator,
+                            "input_candidates": len(clean),
+                            "screening_pool_hash": screening.candidate_pool_hash,
+                            "counters": dict(screening.counters),
+                        }
+                    )
+                return tuple(result for result in resolved if result is not None)
+            transaction = execute_candidate_transaction(
+                CandidateTransactionRequest(
+                    clean,
+                    lane=self.lane,
+                    operator=self.operator,
+                    iteration=self.iteration,
+                    exact_budget=effective_budget,
+                    deadline=self.deadline,
+                ),
+                screen_batch=screen_batch,
+                cache_lookup=lambda sequence: self._lookup_cached_result(
+                    sequence,
+                    route_change_status,
+                )[0],
+                exact_batch=lambda sequences: self._solve_uncached_batch(
+                    sequences,
+                    route_change_status,
+                    stage_candidate_transaction=True,
+                ),
+                stage_cache_write=lambda sequence, result: (
+                    self.pending_candidate_cache.__setitem__(sequence, result)
+                ),
+                commit_cache_writes=self._commit_pending_candidate_cache,
+                rollback_cache_writes=self._discard_pending_candidate_cache,
+                rejected_result=rejected,
+                skipped_result=_candidate_transaction_skip_result,
+            )
+        except CandidateTransactionDeadlineExceeded as error:
+            if self.measurement_trace is not None:
+                self.measurement_trace.record_deadline_boundary(
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    boundary=error.boundary,
+                    reason=str(error),
+                )
+            raise _TimeLimitReached(clean[0]) from error
+        runtime.record(transaction.audit)
+        if self.measurement_trace is not None:
+            self.measurement_trace.events.append(
+                {
+                    "event_type": "native_candidate_transaction",
+                    "status": "committed",
+                    "timestamp_seconds": self.measurement_trace._offset(),
+                    **asdict(transaction.audit),
+                }
+            )
+        return transaction.ordered_results
 
     def record_candidate_screening_aggregate(
         self,
@@ -1491,6 +1795,7 @@ class _Evaluator:
         route_change_status: str,
         *,
         candidate_control_reserved: bool = False,
+        stage_candidate_transaction: bool = False,
     ) -> tuple[ChargingSubproblemResult, ...]:
         """Solve a non-empty ordered group of known cache misses."""
 
@@ -1679,8 +1984,9 @@ class _Evaluator:
             cache_key_digest = (
                 self.route_cache.make_key(sequence).digest if self.route_cache is not None else ""
             )
-            if self.exact_call_controller is not None and not (
-                partial_budget_batch or transactional_deadline
+            if stage_candidate_transaction or (
+                self.exact_call_controller is not None
+                and not (partial_budget_batch or transactional_deadline)
             ):
                 self.pending_candidate_cache[sequence] = result
             elif (
@@ -1886,6 +2192,7 @@ def _solve_alns(
     disable_cache: bool = False,
     exact_call_controller: ExactCallController | None = None,
     candidate_control_runtime: CandidateControlRuntime | None = None,
+    candidate_transaction_config: NativeCandidateTransactionConfig | None = None,
     initial_customer_sequences: tuple[tuple[str, ...], ...] | None = None,
     initial_solution_provenance: Mapping[str, object] | None = None,
     stage04_config: Stage04Config | None = None,
@@ -1941,6 +2248,14 @@ def _solve_alns(
     negative_screening_cache: dict[str, ScreeningResult] | None = (
         {} if screening_config is not None and screening_config.enabled else None
     )
+    negative_screening_sequences: dict[tuple[str, ...], str] | None = (
+        {} if candidate_transaction_config is not None else None
+    )
+    candidate_transaction_runtime = (
+        NativeCandidateTransactionRuntime(candidate_transaction_config)
+        if candidate_transaction_config is not None
+        else None
+    )
     shared_route_cache = (
         RouteEvaluationCache(instance, cache_incremental_config)
         if cache_enabled
@@ -1977,6 +2292,7 @@ def _solve_alns(
         lane="legacy",
         screening_config=screening_config,
         negative_screening_cache=negative_screening_cache,
+        negative_screening_sequences=negative_screening_sequences,
         cache_incremental_config=cache_incremental_config,
         route_cache=lane_route_caches[0],
         backend=backend,
@@ -1985,6 +2301,7 @@ def _solve_alns(
         batch_work_enabled=batch_work_enabled,
         exact_call_controller=exact_call_controller,
         candidate_control_runtime=candidate_control_runtime,
+        candidate_transaction_runtime=candidate_transaction_runtime,
         incumbent_route_ledger=incumbent_route_ledger,
         native_runtime=native_runtime,
     )
@@ -1997,6 +2314,7 @@ def _solve_alns(
         lane="quality_shadow",
         screening_config=screening_config,
         negative_screening_cache=negative_screening_cache,
+        negative_screening_sequences=negative_screening_sequences,
         cache_incremental_config=cache_incremental_config,
         route_cache=lane_route_caches[1],
         backend=backend,
@@ -2005,6 +2323,7 @@ def _solve_alns(
         batch_work_enabled=batch_work_enabled,
         exact_call_controller=exact_call_controller,
         candidate_control_runtime=candidate_control_runtime,
+        candidate_transaction_runtime=candidate_transaction_runtime,
         incumbent_route_ledger=incumbent_route_ledger,
         native_runtime=native_runtime,
     )
@@ -2019,6 +2338,7 @@ def _solve_alns(
         lane="constraint_lane",
         screening_config=screening_config,
         negative_screening_cache=negative_screening_cache,
+        negative_screening_sequences=negative_screening_sequences,
         cache_incremental_config=cache_incremental_config,
         route_cache=lane_route_caches[2],
         backend=backend,
@@ -2027,6 +2347,7 @@ def _solve_alns(
         batch_work_enabled=batch_work_enabled,
         exact_call_controller=exact_call_controller,
         candidate_control_runtime=candidate_control_runtime,
+        candidate_transaction_runtime=candidate_transaction_runtime,
         incumbent_route_ledger=incumbent_route_ledger,
         native_runtime=native_runtime,
     )
@@ -3718,6 +4039,11 @@ def _solve_alns(
         candidate_control_statistics=(
             candidate_control_runtime.statistics() if candidate_control_runtime is not None else {}
         ),
+        candidate_transaction_statistics=(
+            candidate_transaction_runtime.statistics()
+            if candidate_transaction_runtime is not None
+            else {}
+        ),
         candidate_work_hash=(
             candidate_control_runtime.candidate_work_hash
             if candidate_control_runtime is not None
@@ -3811,6 +4137,7 @@ def solve_alns(
     initial_solution_provenance: Mapping[str, object] | None = None,
     stage04_config: Stage04Config | None = None,
     native_kernel_config: NativeKernelConfig | None = None,
+    candidate_transaction_config: NativeCandidateTransactionConfig | None = None,
     neighborhood_event_sink: Callable[[Mapping[str, object]], None] | None = None,
 ) -> ALNSResult:
     """Solve ALNS with opt-in Stage 3.0--3.4 and Stage 4 evaluation layers.
@@ -3842,6 +4169,22 @@ def solve_alns(
             "native kernels cannot be combined with candidate-control workers without "
             "an explicit native worker protocol"
         )
+    candidate_transaction_enabled = candidate_transaction_config is not None
+    if candidate_transaction_enabled and candidate_control_enabled:
+        raise ValueError(
+            "Stage 5.2 candidate transactions cannot modify the historical "
+            "Stage 3.4 candidate-control path"
+        )
+    if candidate_transaction_enabled and native_kernel_config is None:
+        raise ValueError("Stage 5.2 candidate transactions require native kernels")
+    if candidate_transaction_enabled and (
+        screening_config is None or not screening_config.enabled
+    ):
+        raise ValueError("Stage 5.2 candidate transactions require cheap screening")
+    if candidate_transaction_enabled and (
+        ExactChargingBackend(backend) is not ExactChargingBackend.CPU_BATCH
+    ):
+        raise ValueError("Stage 5.2 candidate transactions require cpu_batch")
     if initial_customer_sequences is not None:
         if not candidate_control_enabled:
             raise ValueError("an inherited initial solution requires candidate control")
@@ -3922,6 +4265,7 @@ def solve_alns(
                 initial_solution_provenance=initial_solution_provenance,
                 stage04_config=stage04_config,
                 native_kernel_config=native_kernel_config,
+                candidate_transaction_config=candidate_transaction_config,
                 neighborhood_event_sink=neighborhood_event_sink,
             )
         finally:
@@ -3961,6 +4305,7 @@ def solve_alns(
             initial_solution_provenance=initial_solution_provenance,
             stage04_config=stage04_config,
             native_kernel_config=native_kernel_config,
+            candidate_transaction_config=candidate_transaction_config,
             neighborhood_event_sink=neighborhood_event_sink,
         )
     except BaseException as error:
@@ -5101,7 +5446,7 @@ def _aggregate_screening_statistics(
         total_runtime += float(statistics["screening_runtime_seconds"])
         for reason, count in dict(statistics["screening_reason_counts"]).items():
             reason_counts[str(reason)] = reason_counts.get(str(reason), 0) + int(count)
-    native_statistics: dict[str, int | float] = (
+    native_statistics: dict[str, object] = (
         native_runtime.statistics() if native_runtime is not None else {}
     )
     return {

@@ -37,6 +37,15 @@ current chain（当前证据链）由 signed manifest（签名清单）、prereq
 语义变化仍从受影响的最早 gate 重跑；reviewer-only 修复可以复用同一 raw，但每个
 review generation 继续保持内容寻址和不可变。
 
+Formal atomic publisher（正式原子发布器）必须同时重新打开当前 Formal raw 与其
+accepted Pilot prerequisite（已接受先决 Pilot）。默认 live evidence root（活动证据
+根目录）仍为 `<repository>/results`；使用独立 ext4 active root 时必须通过
+`--active-results-root` 显式传入，并要求 Formal 与 Pilot 都是该根目录的直接子目录。
+publisher 的 resolved path identity（解析后路径身份）拒绝 symlink（符号链接）绕过；
+操作流程不得用 bind-mount path masquerading（绑定挂载路径伪装）规避显式参数，也
+不得把 retention registry 已登记的 immutable archive（不可变归档）作为新的
+publication source（发布源）。
+
 归档后的 run 以 run label 交给 `resolve_retained_run`；该接口根据 registry 中的
 archive alias 和本机 ignored storage-root locator 定位目录，重新验证文件数、字节数与
 tree SHA-256 后，才把普通 `Path` 交给现有 prerequisite verifier 或 reviewer。仍标记为
@@ -172,9 +181,16 @@ zero-fallback gate。旧 E 失败原因进入 change log，不进入长期政策
 
 ## F. Conditional accelerator pilot
 
-只有 E 后 median route batch occupancy ≥ 32 才启动。否则直接发布带证据的 `GPU_NOT_JUSTIFIED`。pilot 必须记录 packing、host-to-device、kernel、device-to-host、synchronisation 和 total end-to-end time。
+只有 E 后 median native candidate screening occupancy（原生候选筛选中位占用度）
+≥ 32 才启动。该值必须从 fixed-work raw 的 candidate transaction statistics
+独立重算；exact backend launch occupancy 不能代替。否则直接发布带证据的
+`GPU_NOT_JUSTIFIED`。pilot 必须记录 packing、host-to-device、kernel、
+device-to-host、synchronisation 和 total end-to-end time。
 
-GPU/Metal/MPS promotion 同时要求：fixed-work 语义一致；相对 E selected native CPU，全部 100-customer 配对的总体端到端中位时间至少降低 15%；C、R、RC 任一 family 的 family median 回退不超过 3%。任一条件失败即保留 native CPU。正式 runner 不得设置隐式 CPU fallback。
+CUDA promotion 同时要求：fixed-work 语义一致；相对 E selected native CPU，
+全部 100-customer 配对的总体端到端中位时间至少降低 15%；C、R、RC 任一
+family 的 family median 回退不超过 3%。完整但未达 promotion gate 的 pilot
+发布 `NATIVE_CPU_RETAINED`。正式 runner 不得设置隐式 CPU fallback。
 
 F 只接受当前 E raw/review identity，并独立重算 occupancy；median <32 才允许
 decision-only `GPU_NOT_JUSTIFIED`，median >=32 则必须执行 registered helper 并
@@ -264,14 +280,37 @@ anytime checkpoints 为预算范围内的 `1/5/10/30/60/120/300 s`。small insta
 
 - `python -m evrptw.stage052_retention audit` 只读枚举 Stage 5.2 运行，记录状态、
   completeness、source commit、prerequisite run labels、文件数、字节数和完整 tree
-  SHA-256，并生成带 sidecar 的 inventory。
+  SHA-256，并生成带 sidecar 的 inventory。共享 active root 中存在多个 immutable
+  attempt 时，必须用可重复的 `--run-label` 精确选择本次归档范围；不得为了缩小
+  inventory 而临时移动、链接或伪装其他 run。
 - `python -m evrptw.stage052_retention archive` 必须显式绑定 inventory SHA-256。
   同盘目标使用原子迁移；跨盘先写目标卷隐藏临时目录，复验后在目标卷原子落位，再
   清理 source。source 漂移、目标冲突或校验失败均保留 source 并 fail fast；中断留下
   的临时副本可在源完整时安全重建并重试。
-- 完整 raw 保存在 `d_archive/stage05.2/history/<run_label>/`。仓库只跟踪
-  `experiments/registries/stage05.2_retention_registry.csv`、最终科学汇总和
-  `docs/stage052_change_log.md`；registry 不记录本机绝对路径。
+- 非 campaign run 的完整 raw 保存在
+  `d_archive/stage05.2/history/<run_label>/`。batched campaign（分批 campaign）
+  的 top-level metadata/review tree（顶层元数据/审查树）归档到该位置，但已经由
+  signed campaign manifest（签名 campaign 清单）锁定的 batch tree 继续保留在
+  `d_archive/<run_label>/batchNNNN`；不得为了物理合并而改写 manifest 或搬动 batch。
+  metadata tree 的 retention SHA-256 绑定 accepted review manifest（已接受审查
+  清单），后者再通过 `storage_publication_identity` 绑定每个外部 batch 的 alias、
+  relative path、file/byte count 和 tree SHA-256。
+- campaign metadata 移动前，retention 必须先复验 top-level campaign manifest
+  sidecar，再使用 storage-root locator 逐 batch 复验 manifest/envelope sidecar、
+  signed logical path、nonzero recomputed file count、byte count、tree SHA-256，
+  并确认不存在 `.incoming`。accepted campaign 还必须将 file count 与
+  `storage_publication_identity` 的显式值比较；interrupted/unreviewed campaign
+  没有 accepted identity，但 signed tree digest 对每个有序 relative file path
+  及 size 编码，因此同时对重新计算的 file count 作密码学承诺。以后通过 locator
+  解析该归档时重复同一复验；任何漂移均 fail fast，不能只返回仍然存在的 metadata
+  path。
+- interrupted/unreviewed campaign（中断或未审查 campaign）没有 accepted
+  `storage_publication_identity` 时，只复验其 signed campaign manifest 中已经标为
+  `archived` 的 batch；仍在 active root 的 partial batch 由 metadata retention tree
+  直接覆盖。不得把 planned batch 伪装成 archived，也不得把这些 batch 计入新 Formal
+  geometry。
+- 仓库只跟踪 `experiments/registries/stage05.2_retention_registry.csv`、最终科学
+  汇总和 `docs/stage052_change_log.md`；registry 不记录本机绝对路径。
 - change log 按时间追加原因、修改范围、行为与证据影响、验证结果、失效运行和新运行
   identity。后续改进直接进入当前 Stage 5.2 实现，不复制新版本目录或模块。
 

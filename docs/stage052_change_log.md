@@ -1426,3 +1426,94 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   清除后台不会终止已启动的 WSL 计算。客户端在线时只读监控日志、资源、manifest
   与 receipt；失败后保留证据并由人工审查根因，再以新 label 启动，不自动修改代码
   或静默重试。
+
+## 2026-07-29：G77 external active root 发布与 split campaign retention
+
+- 原因：新 Pilot/Formal 的权威 active writer 位于独立 ext4
+  `/home/oneblaze/stage052-active`，而 atomic publisher 仍把 live raw 和
+  prerequisite 写死为 `<repository>/results`；同时 batched campaign 已把每个
+  verified batch 原子归档到 signed logical path
+  `d_archive/<run_label>/batchNNNN`，旧 retention 文档却仍把完整 run 描述为一个
+  `stage05.2/history/<run_label>` 目录。继续沿用旧假设会阻断合法发布，或诱导人为
+  搬动 batch、改写 immutable campaign manifest。
+- 修改范围：publisher 新增显式 `--active-results-root`，要求 Formal 与 accepted
+  Pilot 都是该 resolved root 的直接子目录并拒绝 symlink path masquerading；
+  `stage052_retention audit` 新增可重复 `--run-label`，可在共享 active root 中精确
+  选择 immutable attempt。campaign metadata/review tree 仍归档到
+  `stage05.2/history/<run_label>`，已签名 batch 保持原 logical path，不复制、不
+  hardlink、不物理合并。
+- retention archive 和 locator resolver 现在通过同一深模块复验 top-level
+  campaign manifest sidecar 及外部 batch：batch manifest/sidecar、persistence
+  envelope/sidecar、alias、relative path、file/byte count、tree SHA-256 和
+  `.incoming` absence。accepted campaign 使用 review 中的
+  `storage_publication_identity`；Attempt73 这类 interrupted/unreviewed campaign
+  只复验 signed campaign manifest 中已经标为 `archived` 的 batch，active partial
+  batch 继续由 metadata retention tree 覆盖且不贡献 replacement Formal geometry。
+- 科学证据影响：不修改正在运行的 sealed producer/reviewer snapshot，不改变
+  6-worker、native Arrow replay、920-shard geometry、objective、event audit 或任何
+  gate。当前 Formal `stage05.2_benchmark_attempt92` 仍在运行，不能据此声明
+  `READY_FOR_STAGE05_3`。
+- 当前验证：修改文件已通过 Python syntax compilation 和 `git diff --check`。
+  targeted/full pytest、Ruff、strict mypy、publication dry-run、实际 archive 与
+  retained resolver re-audit 明确延后到 Formal producer/reviewer 性能证据结束后，
+  以避免争用 CPU/磁盘污染 wall-clock evidence；完成结果必须另行追加记录。
+
+## 2026-07-29：G78 publication/retention path 与 review-state hardening
+
+- 原因：两轴只读 review 发现，retention 仅按
+  `storage_publication_identity` 字段是否存在区分 accepted review，会把正常
+  `NOT_READY` campaign 错当成 READY 并阻断失败证据归档，也会把缺失该字段的畸形
+  READY review 降级成 unreviewed；publisher 仍可能跟随 Pilot `review/` 或
+  `review_manifest.json` symlink，retention 也只拒绝末级 batch symlink、未拒绝
+  signed `<run_label>` 父目录 symlink。
+- 修改范围：campaign retention 改为先按 review status/scope 分类；Pilot/Formal
+  READY 必须完整验证 storage identity、mandatory gates 和 finalized execution
+  receipt，`NOT_READY`/中断/未审查证据则只按 signed campaign manifest 复验已经
+  archived 的 batches。external storage root 到 batch 的每个路径组件均禁止
+  symlink；其 nonzero file count 会重新计算，signed tree digest 对每个 relative
+  file path/size 编码并绑定该 count，accepted review 还要求显式 count 相等。
+  publisher 对 active root、raw、prerequisite 和 review 的每个路径组件拒绝
+  symlink，同时读取 tracked retention registry，拒绝任何已登记 immutable run
+  再次作为 live publication source。
+- 回归覆盖：新增 READY 缺 storage identity、NOT_READY 仍含 storage identity、
+  external batch 父目录 symlink、Pilot review directory/file symlink，以及
+  retention-registry publication source 的负向测试。
+- 科学证据影响：修复只作用于后续 publication/retention boundary，不修改
+  `fed049d` sealed producer/reviewer runtime、Formal92 geometry、6-worker 计算或
+  native Arrow replay。当前仅完成 Python syntax compilation 和
+  `git diff --check`；pytest、Ruff、strict mypy 与实际 archive 仍须在 Formal
+  性能链结束后执行并另行追加结果。
+
+## 2026-07-29：Attempt92 supersession 与 ABI-v2 candidate transaction
+
+- Attempt92 已停止且不会续跑。新增 signed supersession receipt，绑定原 campaign
+  manifest、6 个外部 archived batches、未完成 batch0007 所在活动树
+  `130c96702ce5456f5c9e2fc7170ffbfec92714f03f31767d19f72bfb27c9f8b7`、
+  Windows host run `20260728T200039Z-460`、launch nonce
+  `fc094d4828bf457681bda14091f98e70`、exit code 143 与进程不存在证明。receipt
+  SHA-256 为
+  `bb3c8ee92bfd3d34190bdabf9b1abec8b5f9970451bdb60ba6529995622696aa`。
+  retention inventory SHA-256 为
+  `1d1faabf2dd8d300e1256e0440d9d35929127cc75e9c85ea423d75ad8a308db8`。
+- 用户确认后执行“先归档后清理”。metadata/activity tree 已完成 checksum-verified
+  archive，活动目录不存在；6 个外部 batch 保持原 signed logical path，不移动、
+  不复制、不导入。retention registry 记录 `superseded/partial/archived/verified`。
+- 新 native ABI 为 `stage05.2-native-kernels-v2`。新增 ragged batch screening
+  接口与 `NativeCandidateTransactionConfig` deep module，固定顺序为 candidate
+  generation → pair pruning → native batch screening → original-order cache lookup
+  → ordered `cpu_batch` → staged writes → deadline/budget validation → atomic commit
+  或 rollback。任何 native/worker/deadline/integrity 错误均 fail fast，fallback
+  计数必须为零。
+- fixed-work E evidence 新增四步消融：`current_native`、`pair_pruning`、
+  `batched_screening`、`candidate_transaction`。每个 shard 持久化原候选顺序记录及
+  可重算 SHA-256、objective/validator、exact/cache/deadline counters 与 routes；
+  reviewer 独立重算并应用 aggregate ≥15%、C/R/RC family regression ≤3% gate。
+- accelerator decision 改为独立重算 native candidate screening occupancy；
+  不再使用 exact backend launch occupancy。31/32 边界保持硬门槛，CUDA 仅在
+  median ≥32 时执行；低于门槛发布 `GPU_NOT_JUSTIFIED`。
+- 当前定向验证为 270 passed；native rebuild、完整 pytest、Ruff、strict mypy、
+  Pilot/Formal 与 publication 结果将在各自完成后继续 append-only 追加。此条目
+  不构成 `READY_FOR_STAGE05_3`。
+- 实现提交前验证：editable native wheel 重建成功；完整 pytest 为 873 passed；
+  Ruff 全仓通过；项目 strict mypy 为 71 个 source files 通过，三个本次修改的
+  Stage 5.2 tools 另行 strict mypy 通过；`git diff --check` 通过。

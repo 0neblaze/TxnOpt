@@ -51,11 +51,13 @@ from evrptw.artifacts import (
     signed_sidecar_matches,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
+from evrptw.candidate_transaction import NativeCandidateTransactionConfig
 from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES
 from evrptw.experiments.stage052_performance import (
     STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS,
 )
 from evrptw.models import Instance
+from evrptw.native_kernels import NATIVE_KERNEL_ABI_VERSION
 from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
@@ -336,6 +338,10 @@ def validate_campaign_selection_lock(
     native = prerequisite_metadata.get("native_kernel_config")
     runtime = prerequisite_metadata.get("runtime_identity")
     provenance = prerequisite_metadata.get("performance_provenance")
+    candidate_transaction = prerequisite_metadata.get("candidate_transaction_config")
+    review_candidate_transaction = prerequisite_review.get(
+        "candidate_transaction_configuration"
+    )
     review_native = prerequisite_review.get("native_configuration")
     alternate_review_native = prerequisite_review.get("native_kernel_config")
     if review_native is None:
@@ -347,7 +353,7 @@ def validate_campaign_selection_lock(
         "screening": True,
         "propagation": True,
         "distance_matrix": True,
-        "abi_version": "stage05.2-native-kernels-v1",
+        "abi_version": NATIVE_KERNEL_ABI_VERSION,
         "context_policy": "pack_once_per_solve",
         "failure_policy": "fail_fast_no_fallback",
     }
@@ -379,13 +385,20 @@ def validate_campaign_selection_lock(
     ):
         failures.append("selected worker count does not agree")
     if (
-        campaign_native_profile != "stage05.2-native-kernels-v1"
+        campaign_native_profile != NATIVE_KERNEL_ABI_VERSION
         or not isinstance(native, Mapping)
         or dict(native) != required_native_configuration
         or review_native != native
         or (alternate_review_native is not None and alternate_review_native != native)
     ):
         failures.append("native configuration does not agree")
+    required_candidate_transaction = NativeCandidateTransactionConfig().to_dict()
+    if (
+        not isinstance(candidate_transaction, Mapping)
+        or dict(candidate_transaction) != required_candidate_transaction
+        or review_candidate_transaction != candidate_transaction
+    ):
+        failures.append("candidate transaction configuration does not agree")
     if (
         prerequisite_metadata.get("optimization_profile") != expected_profile
         or prerequisite_review.get("selected_optimization_profile") != expected_profile
@@ -450,6 +463,7 @@ def validate_campaign_selection_lock(
     if failures:
         return CampaignSelectionLockAudit(False, "; ".join(failures), {})
     assert isinstance(native, Mapping)
+    assert isinstance(candidate_transaction, Mapping)
     assert isinstance(runtime, Mapping)
     assert isinstance(provenance, Mapping)
     assert isinstance(revision, str)
@@ -464,6 +478,10 @@ def validate_campaign_selection_lock(
         "selected_exact_backend": "cpu_batch",
         "selected_workers": campaign_workers,
         "native_profile": campaign_native_profile,
+        "candidate_transaction_config": dict(candidate_transaction),
+        "candidate_transaction_config_sha256": _canonical_sha256(
+            candidate_transaction
+        ),
         "selected_optimization_profile": expected_profile,
         "accelerator_decision": accelerator_decision,
         "repository_revision": revision,
@@ -3860,7 +3878,7 @@ def _verify_accelerator_prerequisite(
         != campaign.producer_resource_contract.selected_workers
         or selection_lock.get("selected_workers") != campaign.selected_workers
         or selection_lock.get("native_kernel_config") is None
-        or campaign.native_profile != "stage05.2-native-kernels-v1"
+        or campaign.native_profile != NATIVE_KERNEL_ABI_VERSION
     ):
         raise ArtifactIntegrityError(
             "accepted Pilot scientific lock or successor resource contract does not agree"
@@ -3938,7 +3956,7 @@ def _verify_campaign_review_prerequisite(
         or payload.get("selected_backend") != expected_backend
         or payload.get("selected_exact_backend") != "cpu_batch"
         or payload.get("selected_workers") not in {2, 4, 5, 6}
-        or payload.get("native_profile") != "stage05.2-native-kernels-v1"
+        or payload.get("native_profile") != NATIVE_KERNEL_ABI_VERSION
         or not isinstance(native, Mapping)
         or payload.get("native_kernel_config") != native
         or selection.get("selected_backend") != payload.get("selected_backend")
@@ -4367,7 +4385,7 @@ def _audit_campaign(
         and campaign.run_label == campaign_dir.name
         and campaign.selected_backend in {"native_cpu", "cuda"}
         and campaign.selected_exact_backend == "cpu_batch"
-        and campaign.native_profile == "stage05.2-native-kernels-v1"
+        and campaign.native_profile == NATIVE_KERNEL_ABI_VERSION
     )
     gates["campaign_identity"] = {
         "passed": campaign_identity,
@@ -4443,6 +4461,8 @@ def _audit_campaign(
             and selection_lock.get("selected_workers") == campaign.selected_workers
             and selection_lock.get("native_profile") == campaign.native_profile
             and selection_lock.get("native_kernel_config") is not None
+            and selection_lock.get("candidate_transaction_config")
+            == NativeCandidateTransactionConfig().to_dict()
             and selection_lock.get("producer_resource_contract")
             == (
                 campaign.producer_resource_contract.to_dict()
@@ -5660,6 +5680,12 @@ def review_stage052_campaign(
         "native_profile": evidence.selection_lock.get("native_profile"),
         "native_kernel_config": evidence.selection_lock.get("native_kernel_config"),
         "native_configuration": evidence.selection_lock.get("native_kernel_config"),
+        "candidate_transaction_config": evidence.selection_lock.get(
+            "candidate_transaction_config"
+        ),
+        "candidate_transaction_configuration": evidence.selection_lock.get(
+            "candidate_transaction_config"
+        ),
         "accelerator_decision": evidence.selection_lock.get("accelerator_decision"),
         "selection_lock": dict(evidence.selection_lock),
         "replay_backend": FORMAL_REPLAY_BACKEND,

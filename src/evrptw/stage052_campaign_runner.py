@@ -31,6 +31,8 @@ from evrptw.artifacts import (
     atomic_write_signed_json,
     signed_sidecar_matches,
 )
+from evrptw.candidate_transaction import NativeCandidateTransactionConfig
+from evrptw.native_kernels import NATIVE_KERNEL_ABI_VERSION
 from evrptw.stage052 import STAGE052_MAXIMUM_PERSISTENCE_RATIO
 from evrptw.stage052_campaign import (
     RUNTIME_LOAD_POLICY,
@@ -120,7 +122,7 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
     }
 )
 _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
-    "src/evrptw/alns.py": "392164b1fd53541c2a13924dcc95ceb82a71d591c025910070594c297582163a",
+    "src/evrptw/alns.py": "1b50e6b726976ab7284176da29cb4dcde1bb4e6a04df72072f512afc4f4f13e1",
     "tests/test_alns_wall_clock_only.py": (
         "0bf741d1e4929564882dd8ff48775f0c589e957328aa00c7309176656fd16481"
     ),
@@ -799,6 +801,8 @@ class BenchmarkExecutionLock:
     configuration_selection_sha256: str
     native_config_sha256: str
     native_kernel_config: Mapping[str, object]
+    candidate_transaction_config_sha256: str
+    candidate_transaction_config: Mapping[str, object]
     instance_sha256: Mapping[str, str]
     staging_root_alias: str | None = None
     archive_root_aliases_exercised: tuple[str, ...] = ()
@@ -874,7 +878,7 @@ class BenchmarkExecutionLock:
             "screening": True,
             "propagation": True,
             "distance_matrix": True,
-            "abi_version": "stage05.2-native-kernels-v1",
+            "abi_version": NATIVE_KERNEL_ABI_VERSION,
             "context_policy": "pack_once_per_solve",
             "failure_policy": "fail_fast_no_fallback",
         }
@@ -885,6 +889,21 @@ class BenchmarkExecutionLock:
         compatibility_native = review_manifest.get("native_kernel_config")
         if compatibility_native is not None and compatibility_native != native:
             raise RuntimeError("accepted benchmark review native compatibility field mismatch")
+        candidate_transaction = _mapping(
+            metadata.get("candidate_transaction_config"),
+            "candidate transaction config",
+        )
+        if candidate_transaction != NativeCandidateTransactionConfig().to_dict():
+            raise RuntimeError(
+                "accepted benchmark candidate transaction profile is incomplete"
+            )
+        if (
+            review_manifest.get("candidate_transaction_configuration")
+            != candidate_transaction
+        ):
+            raise RuntimeError(
+                "accepted benchmark review candidate transaction configuration mismatch"
+            )
         runtime = _mapping(metadata.get("runtime_identity"), "runtime identity")
         inputs = _mapping(metadata.get("performance_provenance"), "input provenance")
         config_sha = _sha256(metadata.get("configuration_sha256"), "configuration digest")
@@ -952,6 +971,10 @@ class BenchmarkExecutionLock:
             ),
             native_config_sha256=_canonical_sha256(native),
             native_kernel_config=dict(native),
+            candidate_transaction_config_sha256=_canonical_sha256(
+                candidate_transaction
+            ),
+            candidate_transaction_config=dict(candidate_transaction),
             instance_sha256=_instance_hashes(inputs),
             staging_root_alias=staging_root_alias,
             archive_root_aliases_exercised=archive_root_aliases_exercised,
@@ -974,6 +997,12 @@ class BenchmarkExecutionLock:
             "configuration_selection_sha256": self.configuration_selection_sha256,
             "native_config_sha256": self.native_config_sha256,
             "native_kernel_config": dict(self.native_kernel_config),
+            "candidate_transaction_config_sha256": (
+                self.candidate_transaction_config_sha256
+            ),
+            "candidate_transaction_config": dict(
+                self.candidate_transaction_config
+            ),
             "instance_sha256": dict(sorted(self.instance_sha256.items())),
             "staging_root_alias": self.staging_root_alias,
             "archive_root_aliases_exercised": list(self.archive_root_aliases_exercised),

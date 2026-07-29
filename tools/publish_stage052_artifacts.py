@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Final
 
 from evrptw.artifacts import signed_sidecar_matches
+from evrptw.candidate_transaction import NativeCandidateTransactionConfig
+from evrptw.native_kernels import NATIVE_KERNEL_ABI_VERSION
 
 PUBLICATION_SCHEMA: Final = "stage05.2-performance-benchmark-publication-v1"
 REVIEW_SCHEMA: Final = "stage05.2-campaign-review-v2"
@@ -108,23 +110,28 @@ def _load_review_manifest(
         raise ValueError("campaign review raw/campaign manifest hash is invalid")
     selection = payload.get("selection_lock")
     native = payload.get("native_configuration")
+    candidate_transaction = payload.get("candidate_transaction_configuration")
     accelerator_decision = payload.get("accelerator_decision")
     is_current_schema = payload.get("schema_version") == REVIEW_SCHEMA
     allowed_producer_workers = {4, 5, 6} if is_current_schema else {2, 4}
     expected_backend = {
         "GPU_NOT_JUSTIFIED": "native_cpu",
         "NATIVE_CPU_RETAINED": "native_cpu",
-        "ACCELERATOR_PROMOTED": "metal",
+        "ACCELERATOR_PROMOTED": "cuda",
     }.get(accelerator_decision if isinstance(accelerator_decision, str) else "")
     if (
         not isinstance(selection, Mapping)
         or not isinstance(native, Mapping)
+        or not isinstance(candidate_transaction, Mapping)
         or payload.get("native_kernel_config") != native
+        or payload.get("candidate_transaction_config") != candidate_transaction
+        or dict(candidate_transaction)
+        != NativeCandidateTransactionConfig().to_dict()
         or expected_backend is None
         or payload.get("selected_backend") != expected_backend
         or payload.get("selected_exact_backend") != "cpu_batch"
         or payload.get("selected_workers") not in allowed_producer_workers
-        or payload.get("native_profile") != "stage05.2-native-kernels-v1"
+        or payload.get("native_profile") != NATIVE_KERNEL_ABI_VERSION
         or selection.get("selected_backend") != payload.get("selected_backend")
         or selection.get("selected_exact_backend")
         != payload.get("selected_exact_backend")
@@ -132,6 +139,15 @@ def _load_review_manifest(
         or selection.get("native_profile") != payload.get("native_profile")
         or selection.get("accelerator_decision") != payload.get("accelerator_decision")
         or selection.get("native_kernel_config") != native
+        or selection.get("candidate_transaction_config") != candidate_transaction
+        or selection.get("candidate_transaction_config_sha256")
+        != hashlib.sha256(
+            json.dumps(
+                candidate_transaction,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         or selection.get("native_config_sha256")
         != hashlib.sha256(
             json.dumps(native, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -262,19 +278,57 @@ def _verify_live_formal_chain(
     review: Mapping[str, object],
     prerequisite_dir: Path,
     repository_root: Path,
+    active_results_root: Path | None = None,
 ) -> None:
     """Re-open the current G02 raw bundle and current accepted G01 prerequisite."""
 
     from evrptw.artifacts import ArtifactReader
     from evrptw.stage052_campaign import load_campaign_manifest
     from evrptw.stage052_campaign_runner import load_benchmark_execution_lock
+    from evrptw.stage052_retention import (
+        load_retention_registry,
+        path_uses_symlink,
+    )
 
-    raw_dir = review_manifest.parent.parent.resolve()
-    canonical_results = repository_root.resolve() / "results"
-    if raw_dir != (canonical_results / raw_dir.name).resolve() or prerequisite_dir.resolve() != (
-        canonical_results / prerequisite_dir.name
-    ).resolve():
+    raw_candidate = review_manifest.parent.parent
+    configured_results = (
+        active_results_root
+        if active_results_root is not None
+        else repository_root.resolve() / "results"
+    )
+    if (
+        path_uses_symlink(configured_results)
+        or path_uses_symlink(raw_candidate)
+        or path_uses_symlink(prerequisite_dir)
+        or path_uses_symlink(review_manifest)
+    ):
         raise ValueError("publisher raw/prerequisite directories are not canonical live roots")
+    raw_dir = raw_candidate.resolve()
+    canonical_results = configured_results.resolve()
+    prerequisite_dir = prerequisite_dir.resolve()
+    if (
+        not canonical_results.is_dir()
+        or raw_dir.parent != canonical_results
+        or prerequisite_dir.parent != canonical_results
+    ):
+        raise ValueError("publisher raw/prerequisite directories are not canonical live roots")
+    retention_registry = (
+        repository_root.resolve()
+        / "experiments"
+        / "registries"
+        / "stage05.2_retention_registry.csv"
+    )
+    if retention_registry.is_file():
+        try:
+            retained_labels = {
+                record.run_label for record in load_retention_registry(retention_registry)
+            }
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise ValueError("publisher retention registry is invalid") from error
+        if raw_dir.name in retained_labels or prerequisite_dir.name in retained_labels:
+            raise ValueError(
+                "publisher cannot use a run recorded in the retention registry"
+            )
     expected_pointer = raw_dir / "review" / "review_manifest.json"
     if review_manifest.resolve() != expected_pointer:
         raise ValueError("publisher requires the current raw review manifest pointer")
@@ -301,7 +355,16 @@ def _verify_live_formal_chain(
         != _sha256(attribution_sidecar)
     ):
         raise ValueError("campaign persistence attribution is stale")
-    g01_review = prerequisite_dir.resolve() / "review" / "review_manifest.json"
+    g01_review_dir = prerequisite_dir / "review"
+    g01_review = g01_review_dir / "review_manifest.json"
+    if (
+        g01_review_dir.is_symlink()
+        or g01_review.is_symlink()
+        or g01_review.resolve() != g01_review
+    ):
+        raise ValueError(
+            "publisher raw/prerequisite directories are not canonical live roots"
+        )
     if (
         not g01_review.is_file()
         or campaign.prerequisite_review_sha256 != _sha256(g01_review)
@@ -591,6 +654,7 @@ def _publish_stage052_artifacts(
     checkpoint: Callable[[str], None] | None = None,
     prerequisite_dir: Path | None = None,
     verify_live_formal_chain: bool = False,
+    active_results_root: Path | None = None,
 ) -> dict[str, Path]:
     """Publish data first and replace the trusted manifest as the final step.
 
@@ -615,6 +679,7 @@ def _publish_stage052_artifacts(
             review=source_manifest,
             prerequisite_dir=prerequisite_dir,
             repository_root=repository_root,
+            active_results_root=active_results_root,
         )
     sources = _verified_sources(review_manifest, source_manifest)
     _verify_gpu_decision(sources["gpu_decision"], review=source_manifest)
@@ -792,6 +857,7 @@ def _publish_stage052_artifacts(
                 review=final_source_manifest,
                 prerequisite_dir=prerequisite_dir,
                 repository_root=repository_root,
+                active_results_root=active_results_root,
             )
         os.replace(trusted_staged, trusted_destination)
         _fsync_directory(trusted_destination.parent)
@@ -831,6 +897,7 @@ def publish_stage052_artifacts(
     repository_root: Path,
     prerequisite_dir: Path,
     checkpoint: Callable[[str], None] | None = None,
+    active_results_root: Path | None = None,
 ) -> dict[str, Path]:
     """Atomically publish only an accepted G02 Formal review."""
 
@@ -842,6 +909,7 @@ def publish_stage052_artifacts(
         checkpoint=checkpoint,
         prerequisite_dir=prerequisite_dir,
         verify_live_formal_chain=True,
+        active_results_root=active_results_root,
     )
 
 
@@ -885,11 +953,21 @@ def main() -> int:
     parser.add_argument("--review-manifest", type=Path, required=True)
     parser.add_argument("--repository-root", type=Path, default=Path.cwd())
     parser.add_argument("--prerequisite-dir", type=Path, required=True)
+    parser.add_argument(
+        "--active-results-root",
+        type=Path,
+        help=(
+            "explicit live evidence root containing both the Formal campaign "
+            "and its accepted Pilot prerequisite; defaults to "
+            "<repository-root>/results"
+        ),
+    )
     arguments = parser.parse_args()
     outputs = publish_stage052_artifacts(
         review_manifest=arguments.review_manifest,
         repository_root=arguments.repository_root,
         prerequisite_dir=arguments.prerequisite_dir,
+        active_results_root=arguments.active_results_root,
     )
     for key, path in outputs.items():
         print(f"{key}: {path}")
