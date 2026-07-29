@@ -2027,3 +2027,22 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   identity 检查保持不变。
 - Pilot94 raw 与失败 review 不回写、不晋级；修复使用新 commit、producer/reviewer
   wheels、sealed source snapshot 与新 Pilot label。
+
+## 2026-07-30：G Pilot95 reviewer host-liveness interruption
+
+- `stage05.2_benchmark_attempt95` 在 clean commit
+  `031822a9cf598ee0cddcb4ad6aa708056d41c0b8` 上完成 36/36 shards、36/36
+  axes、1,080 declared solver seconds 与 144 checkpoints；三个 batch 均归档，
+  Windows Scheduled Task、WSL controller 与 completion receipt 均 exit 0。
+- 独立 reviewer 已通过 accelerator prerequisite、batch0001/0002 provenance 与
+  24/36 native Arrow shard replays；已完成的每个 replay 均为
+  `logical_pass_count=1`、`scratch_cleaned=true`、`native_fallback_count=0`。
+  process-tree peak RSS 为 1,320,587,264 bytes、swap 0，未触发 2,562,322,514-byte
+  guard。
+- reviewer 在 24/36 后被外部 WSL host lifecycle 中断；raw manifest 前后
+  SHA-256 相等，未生成或发布 review manifest。根因不是 reviewer timeout 或
+  scientific gate，而是 launcher 返回后未启动 Windows-side WSL keeper，导致没有
+  长期 Windows WSL client 时 transient user service 随 WSL idle shutdown 停止。
+- Pilot95 raw、partial progress 与未最终化的 interrupted service receipt 原样保留，
+  不晋级、不重试同一 label。后续 reviewer launch 必须同时启动 wave-owned Windows
+  `wsl.exe` keeper，并由 keeper 轮询该 exact unit 至终态；修复从新 Pilot label 建链。
