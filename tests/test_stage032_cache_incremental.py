@@ -156,6 +156,23 @@ def test_incremental_relocation_propagation_reuses_prefix_and_matches_distance()
     assert result.recomputed_forward_edges > 0
 
 
+def test_incremental_propagation_reuses_suffix_when_candidate_is_longer() -> None:
+    instance = _instance()
+    base = build_route_propagation_snapshot(instance, ("C3",))
+    candidate = ("C1", "C2", "C3")
+    full = build_route_propagation_snapshot(instance, candidate)
+
+    result = incremental_route_propagation(instance, base, candidate)
+
+    assert result.status == "incremental"
+    assert result.accepted
+    assert result.backward_feasible
+    assert result.reused_suffix_edges == 1
+    assert result.distance_lower_bound == pytest.approx(full.total_distance)
+    assert result.min_time_window_slack == pytest.approx(full.min_time_window_slack)
+    assert result.finish_time == pytest.approx(full.finish_time)
+
+
 def test_incremental_propagation_reports_time_window_failure_and_fallback() -> None:
     instance = _instance(due_c3=2.0)
     base = build_route_propagation_snapshot(instance, ("C1", "C2"))

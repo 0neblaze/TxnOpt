@@ -600,7 +600,7 @@ def incremental_route_propagation(
     latest_departures = [0.0] * len(candidate_chain)
     latest_departures[-1] = instance.depot.due_date
     backward_start = candidate_suffix_start
-    if suffix_nodes > 0 and candidate_suffix_start < len(base.latest_departures):
+    if suffix_nodes > 0:
         latest_departures[candidate_suffix_start:] = base.latest_departures[
             len(base.latest_departures) - suffix_nodes :
         ]

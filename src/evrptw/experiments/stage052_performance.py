@@ -5579,7 +5579,7 @@ def _native_ablation_record(
         ).encode("utf-8")
     ).hexdigest()
     return {
-        "schema_version": "stage05.2-native-ablation-axis-v2",
+        "schema_version": "stage05.2-native-ablation-axis-v3",
         "implementation_mode": implementation_mode,
         "objective_key": list(result.objective.key),
         "routes": [list(route) for route in result.routes],
@@ -5592,6 +5592,20 @@ def _native_ablation_record(
         "exact_completed_calls": result.exact_completed_calls,
         "cache_statistics": result.cache_incremental_statistics,
         "deadline_statistics": result.exact_deadline_statistics,
+        "screening_statistics": {
+            "native_screening_batch_candidates": result.screening_statistics.get(
+                "native_screening_batch_candidates",
+                0,
+            ),
+            "native_screening_batch_invocations": result.screening_statistics.get(
+                "native_screening_batch_invocations",
+                0,
+            ),
+            "native_protocol_fallbacks": result.screening_statistics.get(
+                "native_protocol_fallbacks",
+                0,
+            ),
+        },
         "candidate_transaction_statistics": result.candidate_transaction_statistics,
         "termination_reason": result.termination_reason,
         "fallback_used": bool(

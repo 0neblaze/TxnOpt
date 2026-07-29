@@ -273,6 +273,37 @@ def test_route_merge_pair_pruning_is_stage052_opt_in() -> None:
     )
 
 
+def test_native_route_merge_preserves_duplicate_candidate_positions() -> None:
+    instance = _instance()
+
+    class RecordingEvaluator(FakeEvaluator):
+        ordered_candidates: tuple[tuple[str, ...], ...] = ()
+
+        def candidate_route_batch(
+            self,
+            sequences: tuple[tuple[str, ...], ...],
+            **_kwargs: object,
+        ) -> tuple[ChargingSubproblemResult, ...]:
+            self.ordered_candidates = sequences
+            return tuple(self.route(sequence) for sequence in sequences)
+
+    evaluator = RecordingEvaluator(
+        instance,
+        candidate_transaction_enabled=True,
+        pair_pruning_enabled=True,
+    )
+
+    proposal = propose_route_merge(instance, (("C1",), ("C2",)), evaluator)
+
+    assert proposal.sequences is not None
+    assert evaluator.ordered_candidates == (
+        ("C1", "C2"),
+        ("C2", "C1"),
+        ("C2", "C1"),
+        ("C1", "C2"),
+    )
+
+
 def test_route_merge_produces_one_route_after_safe_prefilters() -> None:
     instance = _instance()
     evaluator = FakeEvaluator(instance)

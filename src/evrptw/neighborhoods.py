@@ -2049,12 +2049,15 @@ def _propose_controlled_route_merge(
 ) -> MoveProposal:
     """Rank the complete merge pool before spending the shared round budget."""
 
-    metadata: dict[
-        CustomerSequence,
+    metadata: list[
         tuple[int, int, CustomerSequence, CustomerSequence],
-    ] = {}
+    ] = []
     candidates: list[CustomerSequence] = []
     base_sequences: list[CustomerSequence] = []
+    seen_candidates: set[CustomerSequence] = set()
+    preserve_duplicate_candidates = bool(
+        getattr(evaluator, "candidate_transaction_enabled", False)
+    )
     prefilter_counts: Counter[str] = Counter()
     prefilter_digest = hashlib.sha256()
     for _, left, right in pairs:
@@ -2062,6 +2065,7 @@ def _propose_controlled_route_merge(
             instance,
             left,
             right,
+            preserve_duplicates=preserve_duplicate_candidates,
         ):
             # Full Stage 3.4 pools can contain tens of thousands of ordinary
             # rejections. Use the same safe screener and persist an aggregate
@@ -2076,15 +2080,19 @@ def _propose_controlled_route_merge(
                     ).encode()
                 )
                 continue
-            if merged not in metadata:
-                metadata[merged] = (
+            if not preserve_duplicate_candidates and merged in seen_candidates:
+                continue
+            seen_candidates.add(merged)
+            metadata.append(
+                (
                     left.index,
                     right.index,
                     source_sequence,
                     target_sequence,
                 )
-                candidates.append(merged)
-                base_sequences.append(target_sequence)
+            )
+            candidates.append(merged)
+            base_sequences.append(target_sequence)
     events.extend(
         NeighborhoodEvent(
             "route_merge",
@@ -2108,8 +2116,13 @@ def _propose_controlled_route_merge(
     best: tuple[SolutionObjective, CustomerSequence, int, int] | None = None
     result_counts: Counter[tuple[str, str]] = Counter()
     result_digest = hashlib.sha256()
-    for merged, result in zip(candidates, results, strict=True):
-        left_index, right_index, _source_sequence, _target_sequence = metadata[merged]
+    for merged, result, candidate_metadata in zip(
+        candidates,
+        results,
+        metadata,
+        strict=True,
+    ):
+        left_index, right_index, _source_sequence, _target_sequence = candidate_metadata
         if result.failure_reason.startswith("candidate_control:"):
             status = "candidate_control_skipped"
             reason = result.failure_reason
@@ -2187,6 +2200,8 @@ def _controlled_merge_orders(
     _instance: Instance,
     left: _RouteProfile,
     right: _RouteProfile,
+    *,
+    preserve_duplicates: bool = False,
 ) -> tuple[tuple[CustomerSequence, CustomerSequence, CustomerSequence], ...]:
     """Generate deterministic complete orders, including non-block interleavings."""
 
@@ -2200,9 +2215,10 @@ def _controlled_merge_orders(
         source: CustomerSequence,
         target: CustomerSequence,
     ) -> None:
-        if sequence not in seen:
-            seen.add(sequence)
-            output.append((sequence, source, target))
+        if not preserve_duplicates and sequence in seen:
+            return
+        seen.add(sequence)
+        output.append((sequence, source, target))
 
     for source, target in ((left, right), (right, left)):
         for position in range(len(target.sequence) + 1):

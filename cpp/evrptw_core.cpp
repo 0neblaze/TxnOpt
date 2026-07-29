@@ -3659,7 +3659,7 @@ PropagationOutput run_incremental_propagation(
     std::vector<double> latest(candidate_size, 0.0);
     latest[candidate_size - 1] = due[candidate_chain[candidate_size - 1]];
     const auto backward_start = candidate_suffix_start;
-    if (suffix_nodes > 0 && candidate_suffix_start < base_size) {
+    if (suffix_nodes > 0) {
         std::copy(
             base_latest + (base_size - suffix_nodes),
             base_latest + base_size,

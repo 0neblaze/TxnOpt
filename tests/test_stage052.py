@@ -2148,6 +2148,76 @@ def test_native_ablation_semantics_replay_exact_cache_and_transaction_events() -
     assert "candidate transaction hash recomputation failed" in failures
 
 
+def test_native_ablation_mode_identity_accepts_canonical_json_key_order() -> None:
+    expected_modes = (
+        "current_native",
+        "pair_pruning",
+        "batched_screening",
+        "candidate_transaction",
+    )
+    canonical_payload = json.loads(
+        json.dumps(
+            {"ablation_axes": {mode: {} for mode in expected_modes}},
+            sort_keys=True,
+        )
+    )
+
+    axes = canonical_payload["ablation_axes"]
+    assert tuple(axes) != expected_modes
+    assert stage052_review._has_exact_native_ablation_modes(axes, expected_modes)
+    assert not stage052_review._has_exact_native_ablation_modes(
+        {**axes, "unexpected_mode": {}},
+        expected_modes,
+    )
+    assert not stage052_review._has_exact_native_ablation_modes(
+        {mode: axes[mode] for mode in expected_modes[:-1]},
+        expected_modes,
+    )
+
+
+def test_native_ablation_allows_an_observable_zero_work_batch() -> None:
+    row = {
+        "exact_started_calls": 0,
+        "exact_completed_calls": 0,
+        "cache_statistics": {},
+        "screening_statistics": {
+            "native_screening_batch_invocations": 0,
+            "native_screening_batch_candidates": 0,
+        },
+        "candidate_transaction_statistics": {
+            "native_candidate_transactions": 0,
+            "native_candidate_input_count": 0,
+            "native_screening_occupancies": [],
+            "native_screening_median_occupancy": 0.0,
+            "native_candidate_transaction_fallbacks": 0,
+        },
+    }
+    records = {
+        "trace_events": [],
+        "route_evaluations": [],
+        "candidate_transaction_events": [],
+        "neighborhood_events": [],
+    }
+
+    assert (
+        _audit_native_ablation_records(
+            row,
+            records,
+            require_transaction=False,
+            require_batched_screening=True,
+        )
+        == []
+    )
+    assert (
+        _audit_native_ablation_records(
+            row,
+            records,
+            require_transaction=True,
+        )
+        == []
+    )
+
+
 def test_native_screening_batch_counter_replay_includes_in_batch_cache_hits() -> None:
     screening_codes = np.zeros((2, 16), dtype="<i8")
     screening_codes[:, 0] = 1

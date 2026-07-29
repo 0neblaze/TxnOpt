@@ -23,7 +23,7 @@ from concurrent.futures import Future, ProcessPoolExecutor
 from contextlib import contextmanager
 from multiprocessing import get_context
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 import orjson
 
@@ -3793,7 +3793,7 @@ def _audit_native_ablation(
             continue
         observed.add(identity)
         axes = payload.get("ablation_axes")
-        if not isinstance(axes, Mapping) or tuple(axes) != expected_modes:
+        if not _has_exact_native_ablation_modes(axes, expected_modes):
             failures.append(f"{identity}: four ordered ablation modes are missing")
             continue
         instance = parse_schneider(benchmark_dir / f"{identity[0]}.txt")
@@ -3803,7 +3803,7 @@ def _audit_native_ablation(
             row = axes.get(mode)
             if (
                 not isinstance(row, Mapping)
-                or row.get("schema_version") != "stage05.2-native-ablation-axis-v2"
+                or row.get("schema_version") != "stage05.2-native-ablation-axis-v3"
                 or row.get("implementation_mode") != mode
             ):
                 failures.append(f"{identity}/{mode}: invalid ablation schema")
@@ -3957,6 +3957,19 @@ def _audit_native_ablation(
     )
 
 
+def _has_exact_native_ablation_modes(
+    axes: object,
+    expected_modes: Sequence[str],
+) -> TypeGuard[Mapping[str, object]]:
+    """Verify exact mode identity without trusting JSON object key order."""
+
+    return (
+        isinstance(axes, Mapping)
+        and len(axes) == len(expected_modes)
+        and all(mode in axes for mode in expected_modes)
+    )
+
+
 def _audit_native_ablation_records(
     row: Mapping[str, object],
     records: Mapping[str, object],
@@ -4046,8 +4059,36 @@ def _audit_native_ablation_records(
         and event.get("status") == "committed"
     ]
     if require_batched_screening:
-        if not committed_screening_batches:
+        screening_statistics = row.get("screening_statistics")
+        zero_batch_evidence = (
+            isinstance(screening_statistics, Mapping)
+            and _strict_int(
+                screening_statistics.get("native_screening_batch_invocations"),
+                "native_screening_batch_invocations",
+            )
+            == 0
+            and _strict_int(
+                screening_statistics.get("native_screening_batch_candidates"),
+                "native_screening_batch_candidates",
+            )
+            == 0
+        )
+        if not committed_screening_batches and not zero_batch_evidence:
             failures.append("batched screening evidence is missing")
+        if isinstance(screening_statistics, Mapping):
+            if len(committed_screening_batches) != _strict_int(
+                screening_statistics.get("native_screening_batch_invocations"),
+                "native_screening_batch_invocations",
+            ):
+                failures.append("batched screening invocation count does not replay")
+            if sum(
+                _strict_int(event.get("input_candidates"), "input_candidates")
+                for event in committed_screening_batches
+            ) != _strict_int(
+                screening_statistics.get("native_screening_batch_candidates"),
+                "native_screening_batch_candidates",
+            ):
+                failures.append("batched screening candidate count does not replay")
         for event in committed_screening_batches:
             try:
                 screening_hash = _recompute_screening_hash(
@@ -4083,13 +4124,31 @@ def _audit_native_ablation_records(
         ]
         recorded_occupancies = transaction_statistics.get("native_screening_occupancies")
         if (
-            expected_transactions <= 0
+            expected_transactions < 0
             or len(committed_transactions) != expected_transactions
             or not isinstance(recorded_occupancies, (list, tuple))
             or occupancies
             != [_strict_int(value, "native_screening_occupancy") for value in recorded_occupancies]
         ):
             failures.append("candidate transaction occupancy does not replay")
+        if (
+            "native_candidate_input_count" in transaction_statistics
+            and sum(occupancies)
+            != _strict_int(
+                transaction_statistics.get("native_candidate_input_count"),
+                "native_candidate_input_count",
+            )
+        ):
+            failures.append("candidate transaction input count does not replay")
+        if "native_screening_median_occupancy" in transaction_statistics:
+            recorded_median = _strict_float(
+                transaction_statistics.get("native_screening_median_occupancy")
+            )
+            recomputed_median = (
+                float(statistics.median(occupancies)) if occupancies else 0.0
+            )
+            if recorded_median != recomputed_median:
+                failures.append("candidate transaction median occupancy does not replay")
         for event in committed_transactions:
             try:
                 screening_hash, transaction_hash = _recompute_transaction_hashes(

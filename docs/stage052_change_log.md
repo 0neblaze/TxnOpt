@@ -1736,3 +1736,45 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   `.NET ProcessStartInfo.ArgumentList.Add()` 逐参数传递，并在 review 启动后独立
   验证 Windows keepalive PID 存活及 WSL command line 完整。新证据使用新 commit、
   wheel、read-only snapshot 和 attempt26 label。
+
+## 2026-07-29：E26 完整独立复核与 native ablation 根因修复
+
+- `stage05.2_native_kernels_attempt26` 使用 clean commit `e20777b`、producer wheel
+  SHA-256
+  `bee0bcb6d06b5939f65c980695f7a3a6479d502b47ac801208540f89c67f1c4b`
+  和只读 ext4 source snapshot 完成 12/12 shards、36/36 axes。Windows Scheduled
+  Task host run 为 `20260729T094159Z-466`，launch nonce 为
+  `096923d976304e66987309f7ad6022e5`；producer manifest SHA-256 为
+  `0816a9c81d48363a310e34615f8a764f5c268ab08fd6e8a6a4e48796ccb8c877`。
+- 独立 reviewer wheel SHA-256 为
+  `c8be024383d0648589972d2ed8a3c2ebdfc24398274a221248042fe7e386eb86`。
+  Windows keepalive 使用 `ProcessStartInfo.ArgumentList.Add()` 后持续绑定 WSL；
+  transient `systemd --user` reviewer 完成 attempt26 与
+  `stage05.2_job_parallel_attempt21` 的全部 raw replay，并以 exit 0 原子发布 review。
+  finalized receipt 记录 raw manifest 前后不变、cgroup peak 5,369,487,360 bytes、
+  swap 0。
+- E26 独立复核为 `NOT_READY`，且唯一失败 gate 为 `native_ablation`；其余 exact
+  scope、worker selection、optimization profile、persistence、prerequisite、
+  validator/objective replay、resource、runtime/source snapshot 与 staging root
+  gates 全部通过。该 review generation 保持不可变，不重写、不进入 accelerator
+  decision。
+- 第一项 reviewer 根因是把 canonical JSON object 的字典 key 顺序误当成 ablation
+  实验顺序。producer raw 实际包含全部四模式；规范化 JSON 按 key 排序，科学顺序则
+  已由固定 `current_native -> pair_pruning -> batched_screening ->
+  candidate_transaction` 循环控制。修复后 gate 验证精确 mode identity set，并继续
+  按固定顺序逐项重放 schema、objective、candidate/exact order 与 audit bytes。
+- 只读诊断随后暴露两项真实 producer 语义错误。其一，native route-merge pool 在
+  进入 ABI v2 前由 Python 去掉重复候选位置，改变 exact-call order 和 100-call
+  budget boundary；现在仅 Stage 5.2 transaction 保留全部原位置并由 native batch
+  执行批内 dedup，Stage 3.4 historical candidate-control path 保持不变。其二，
+  candidate 比 base propagation snapshot 更长时，Python 与 C++ 的 backward
+  suffix copy 错把 candidate suffix index 与 base length 比较，导致可行路线被错误
+  标记为 `backward_time_window_prefilter`；两端已同步按 suffix length 复制并新增
+  full-propagation differential test。
+- native ablation axis 升级为 v3，显式记录 batch invocation/candidate counters；
+  reviewer 允许可观察的 `0/0` zero-work batch，同时对非零批次从 raw integrity
+  bytes 重新计算 invocation、candidate count、occupancy、median 与 transaction
+  hash。修复后单个 `r101_21/2014` scratch shard 的四模式 objective、candidate
+  state order 与 exact route order 哈希完全相同；batched/full 均为一次
+  45-candidate batch，fallback 为零。该 scratch 仅作修复前验证，不消费 canonical
+  attempt label；新 evidence 必须使用新 commit、wheel、只读 snapshot 和 attempt27。

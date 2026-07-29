@@ -818,6 +818,18 @@ def test_propagate_routes_numeric_frozen_unchanged_and_fallback_differential() -
     _assert_propagation_matches_python(instance, base, base.sequence)
     _assert_propagation_matches_python(instance, base, ("C1", "C1"))
     _assert_propagation_matches_python(instance, base, ("unknown",))
+    short_base = build_route_propagation_snapshot(instance, ("C3",))
+    expanded = incremental_route_propagation(
+        instance,
+        short_base,
+        ("C1", "C2", "C3"),
+    )
+    assert expanded.accepted
+    _assert_propagation_matches_python(
+        instance,
+        short_base,
+        ("C1", "C2", "C3"),
+    )
 
 
 def test_propagate_routes_numeric_randomized_python_differential() -> None:
