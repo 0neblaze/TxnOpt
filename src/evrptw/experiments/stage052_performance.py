@@ -4001,6 +4001,21 @@ def _abort_v2_shard_after_failure(
         ) from original_error
 
 
+_NATIVE_ABLATION_TRACE_EVENT_TYPES = frozenset(
+    {
+        "candidate_state",
+        "cache_event",
+        "candidate_cache_commit",
+        "candidate_cache_rollback",
+        "exact_budget_boundary",
+        "deadline_boundary",
+        "native_candidate_screening_batch",
+        "native_candidate_transaction",
+    }
+)
+_NATIVE_ABLATION_MAX_AUDIT_ROWS = 65_536
+
+
 class _Stage052TraceStreamSink(MeasurementTraceSink):
     """Bridge live measurement callbacks into one open typed Parquet shard."""
 
@@ -4045,6 +4060,9 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._neighborhood_read_offset = 0
         self._legacy_negative_screening_evidence: dict[str, tuple[object, ...]] = {}
         self._typed_negative_screening_evidence: dict[str, int] = {}
+        self._native_ablation_trace_events: list[dict[str, object]] = []
+        self._native_ablation_route_evaluations: list[RouteEvaluationTrace] = []
+        self._native_ablation_neighborhood_events: list[dict[str, object]] = []
         self._semantic_event_digest = hashlib.sha256()
         self._initial_objective_key: ObjectiveKey | None = None
         self._visible_global_bests: dict[int, AcceptedGlobalBest] = {}
@@ -4075,6 +4093,11 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
+            self._append_native_ablation_audit_row(
+                self._native_ablation_route_evaluations,
+                record,
+                family="route_evaluations",
+            )
             if self._pending_cache_lookup is not None:
                 self._flush_pending_lookup()
             register_identity = getattr(
@@ -4137,6 +4160,12 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
+            if event.get("event_type") in _NATIVE_ABLATION_TRACE_EVENT_TYPES:
+                self._append_native_ablation_audit_row(
+                    self._native_ablation_trace_events,
+                    dict(event),
+                    family="trace_events",
+                )
             payload = dict(event)
             payload["record_type"] = str(event.get("event_type", "event"))
             self._queue_owned(payload)
@@ -4416,6 +4445,12 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         previously_recorded_ns = self.persistence_nanoseconds
         try:
             for raw_event in events:
+                if raw_event.get("status") == "pair_prefilter_rejected_aggregate":
+                    self._append_native_ablation_audit_row(
+                        self._native_ablation_neighborhood_events,
+                        dict(raw_event),
+                        family="neighborhood_events",
+                    )
                 payload = _route_reference_event(raw_event, route_dictionary)
                 payload["record_type"] = "neighborhood_event"
                 self._spool_neighborhood_event(payload)
@@ -4433,6 +4468,12 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         started_ns = time.perf_counter_ns()
         previously_recorded_ns = self.persistence_nanoseconds
         try:
+            if event.get("status") == "pair_prefilter_rejected_aggregate":
+                self._append_native_ablation_audit_row(
+                    self._native_ablation_neighborhood_events,
+                    dict(event),
+                    family="neighborhood_events",
+                )
             payload = _route_reference_event(event, {})
             payload["record_type"] = "neighborhood_event"
             self._spool_neighborhood_event(payload)
@@ -4444,6 +4485,35 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                 self.persistence_nanoseconds += max(0, elapsed_ns - nested_ns)
             finally:
                 self._end_async_producer_turn()
+
+    def _append_native_ablation_audit_row(
+        self,
+        rows: list[Any],
+        row: Any,
+        *,
+        family: str,
+    ) -> None:
+        if self.axis_name != "fixed_work":
+            return
+        if len(rows) >= _NATIVE_ABLATION_MAX_AUDIT_ROWS:
+            raise RuntimeError(
+                f"native ablation {family} exceeds bounded audit row limit "
+                f"{_NATIVE_ABLATION_MAX_AUDIT_ROWS}"
+            )
+        rows.append(row)
+
+    def native_ablation_records(self) -> dict[str, tuple[object, ...]]:
+        """Return the bounded semantic rows needed by the E fixed-work replay."""
+
+        if self.axis_name != "fixed_work":
+            raise RuntimeError("native ablation audit rows require the fixed_work axis")
+        return {
+            "trace_events": tuple(dict(event) for event in self._native_ablation_trace_events),
+            "route_evaluations": tuple(self._native_ablation_route_evaluations),
+            "neighborhood_events": tuple(
+                dict(event) for event in self._native_ablation_neighborhood_events
+            ),
+        }
 
     def finish(self) -> None:
         self._flush_serialized_producer_meter()
@@ -5433,24 +5503,41 @@ def _native_ablation_record(
         raise RuntimeError("native ablation requires a complete trace and objective")
     validation = validate_routes(instance, [list(route) for route in result.routes])
     reconciliation = trace.reconcile(result)
-    trace_event_types = {
-        "candidate_state",
-        "cache_event",
-        "candidate_cache_commit",
-        "candidate_cache_rollback",
-        "exact_budget_boundary",
-        "deadline_boundary",
-        "native_candidate_screening_batch",
-        "native_candidate_transaction",
-    }
+    audit_records: Mapping[str, object] | None = None
+    audit_loader = getattr(trace.stream_sink, "native_ablation_records", None)
+    if callable(audit_loader):
+        loaded = audit_loader()
+        if not isinstance(loaded, Mapping):
+            raise RuntimeError("native ablation stream audit payload is invalid")
+        audit_records = loaded
+    if audit_records is None:
+        trace_event_source: Iterable[Mapping[str, object]] = trace.events
+        route_evaluation_source: Iterable[RouteEvaluationTrace] = trace.route_evaluations
+        neighborhood_event_source: Iterable[Mapping[str, object]] = result.neighborhood_events
+    else:
+        trace_rows = audit_records.get("trace_events")
+        route_rows = audit_records.get("route_evaluations")
+        neighborhood_rows = audit_records.get("neighborhood_events")
+        if (
+            not isinstance(trace_rows, (list, tuple))
+            or not isinstance(route_rows, (list, tuple))
+            or not isinstance(neighborhood_rows, (list, tuple))
+            or any(not isinstance(event, Mapping) for event in trace_rows)
+            or any(not isinstance(event, RouteEvaluationTrace) for event in route_rows)
+            or any(not isinstance(event, Mapping) for event in neighborhood_rows)
+        ):
+            raise RuntimeError("native ablation stream audit families are invalid")
+        trace_event_source = trace_rows
+        route_evaluation_source = route_rows
+        neighborhood_event_source = neighborhood_rows
     trace_events = [
         {
             key: value
             for key, value in event.items()
             if key not in {"timestamp_seconds", "runtime_seconds"}
         }
-        for event in trace.events
-        if event.get("event_type") in trace_event_types
+        for event in trace_event_source
+        if event.get("event_type") in _NATIVE_ABLATION_TRACE_EVENT_TYPES
     ]
     route_evaluations = [
         {
@@ -5466,7 +5553,7 @@ def _native_ablation_record(
                 }
             },
         }
-        for event in trace.route_evaluations
+        for event in route_evaluation_source
     ]
     transaction_events = [dict(event) for event in result.candidate_transaction_events]
     neighborhood_events = [
@@ -5475,7 +5562,7 @@ def _native_ablation_record(
             for key, value in event.items()
             if key not in {"timestamp_seconds", "runtime_seconds"}
         }
-        for event in result.neighborhood_events
+        for event in neighborhood_event_source
         if event.get("status") == "pair_prefilter_rejected_aggregate"
     ]
     records = {

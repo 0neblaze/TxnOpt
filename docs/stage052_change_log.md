@@ -1537,3 +1537,20 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   885 passed；Ruff 全仓、70 个 source files 的 strict mypy 与
   `git diff --check` 全部通过。该结果仅完成实现验证，不构成性能 promotion、
   Pilot/Formal readiness 或 `READY_FOR_STAGE05_3`。
+
+## 2026-07-29：E16 streaming audit materialization 失败与有界审计流
+
+- `stage05.2_native_kernels_attempt16` 在新 frozen commit `cb41aa1`、non-editable
+  wheel 与 read-only source snapshot 上启动后 fail fast。首批 fixed-work trace 已
+  externalized 到 Parquet，但 `_native_ablation_record` 仍尝试迭代完整
+  `trace.events`，触发 `events were externalized during solve and cannot be
+  materialized in memory`。该 attempt 为 partial evidence，不续跑、不导入、不复用
+  label。
+- 根因修复是在现有 streaming sink 内增加 fixed-work 专用 semantic audit stream：
+  只保留 candidate/cache/boundary/native transaction 关键事件、ordered route
+  evaluations 与 pair-pruning aggregates；每个 family 硬限制 65,536 rows，越界
+  直接失败。完整主事件流继续只写 Parquet，不重新物化、不添加 Python fallback。
+- `_native_ablation_record` 在 streaming 模式读取上述有界审计流；非 streaming 的
+  三个 ablation mode 保持历史内存路径。focused streaming/native suite 为
+  198 passed，Ruff、strict mypy 与 `git diff --check` 通过。修复必须形成新 commit、
+  wheel、read-only snapshot 与 attempt17，E16 不参与 promotion。

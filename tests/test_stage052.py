@@ -38,6 +38,7 @@ from evrptw.experiments.stage052_performance import (
     _accelerator_decision_inputs,
     _ensure_partial_shard_failure,
     _launch_occupancy_summary,
+    _native_ablation_record,
     _require_clean_stage052_repository,
     _run_and_persist_v2_shard,
     _run_v2_shard_task,
@@ -72,6 +73,7 @@ from evrptw.experiments.stage052_performance_review import (
 from evrptw.experiments.stage052_performance_review import (
     _strict_float as _review_strict_float,
 )
+from evrptw.measurement import RouteEvaluationTrace
 from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.native_kernels import NATIVE_KERNEL_ABI_VERSION, NativeKernelConfig
 from evrptw.stage052 import (
@@ -2314,6 +2316,102 @@ def test_pair_pruning_aggregate_is_independently_recomputed() -> None:
         require_transaction=False,
     )
     assert "pair-pruning aggregate recomputation failed" in failures
+
+
+def test_native_ablation_record_reads_bounded_stream_audit_without_materializing_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    route_evaluation = RouteEvaluationTrace(
+        evaluation_id=1,
+        route_key="route:2:C1",
+        lane="legacy",
+        iteration=1,
+        operator="repair",
+        kind="exact_call",
+        started_at=0.1,
+        completed_at=0.2,
+        duration_seconds=0.1,
+        exact_started=True,
+        exact_completed=True,
+        feasible=True,
+        failure_reason="",
+        labels_generated=0,
+        labels_expanded=0,
+        labels_pruned=0,
+        deadline_boundary="",
+        cache_key_digest="",
+        route_change_status="changed",
+        status="completed",
+    )
+    pair_event = {
+        "operator": "route_merge",
+        "status": "pair_prefilter_rejected_aggregate",
+        "reason": "capacity_prefilter",
+        "route_indices": [0, 1],
+        "candidate_route_sequences": [["C1"], ["C2"]],
+        "aggregate_count": 4,
+        "candidate_pool_hash": "a" * 64,
+    }
+
+    class AuditSink:
+        def native_ablation_records(self) -> dict[str, tuple[object, ...]]:
+            return {
+                "trace_events": (
+                    {
+                        "event_type": "candidate_state",
+                        "lane": "legacy",
+                        "iteration": 1,
+                        "accepted": False,
+                    },
+                ),
+                "route_evaluations": (route_evaluation,),
+                "neighborhood_events": (pair_event,),
+            }
+
+    trace = SimpleNamespace(
+        stream_sink=AuditSink(),
+        reconcile=lambda _result: {"status": "pass"},
+    )
+    result = SimpleNamespace(
+        measurement_trace=trace,
+        objective=SimpleNamespace(key=(1, 2.0, 0.0, 0)),
+        routes=(("D0", "C1", "D0"),),
+        candidate_transaction_events=(),
+        neighborhood_events=(),
+        exact_started_calls=1,
+        exact_completed_calls=1,
+        cache_incremental_statistics={},
+        exact_deadline_statistics={},
+        candidate_transaction_statistics={},
+        termination_reason="fixed_work_budget",
+        backend_metrics={},
+        screening_statistics={},
+    )
+    instance = Instance(
+        "streaming_native_ablation",
+        (
+            Node("D0", NodeType.DEPOT, 0, 0, 0, 0, 100, 0),
+            Node("C1", NodeType.CUSTOMER, 1, 0, 1, 0, 100, 0),
+        ),
+        Vehicle(10, 10, 1, 1, 1),
+        distance_backend="python",
+    )
+    monkeypatch.setattr(
+        stage052_performance,
+        "validate_routes",
+        lambda *_args, **_kwargs: SimpleNamespace(feasible=True),
+    )
+
+    record = _native_ablation_record(
+        instance,
+        result,
+        implementation_mode="candidate_transaction",
+        solver_seconds=1.0,
+    )
+
+    assert record["candidate_records"]["trace_events"][0]["event_type"] == "candidate_state"
+    assert record["candidate_records"]["route_evaluations"][0]["route_key"] == "route:2:C1"
+    assert record["candidate_records"]["neighborhood_events"] == [pair_event]
 
 
 def test_instance_lookup_and_distance_matrix_are_stable() -> None:

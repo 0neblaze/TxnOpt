@@ -312,6 +312,77 @@ def test_stage052_trace_sink_appends_to_open_shard_before_solver_returns() -> No
     assert sink.persisted_family_counts["events"] == 1
 
 
+def test_fixed_work_trace_sink_retains_only_bounded_native_ablation_audit_rows() -> None:
+    shard = _RecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+    )
+    route_evaluation = RouteEvaluationTrace(
+        evaluation_id=1,
+        route_key="route:2:C1",
+        lane="legacy",
+        iteration=1,
+        operator="repair",
+        kind="exact_call",
+        started_at=0.1,
+        completed_at=0.2,
+        duration_seconds=0.1,
+        exact_started=True,
+        exact_completed=True,
+        feasible=True,
+        failure_reason="",
+    )
+    sink.append_route_evaluation(route_evaluation)
+    sink.append_event(
+        {
+            "event_type": "candidate_state",
+            "lane": "legacy",
+            "iteration": 1,
+            "operator": "repair",
+            "accepted": False,
+            "global_best": False,
+            "current_objective_key": [2, 10.0, 0.0, 0],
+            "timestamp_seconds": 0.3,
+        }
+    )
+    sink.append_event(
+        {
+            "event_type": "timing_diagnostic",
+            "lane": "legacy",
+            "iteration": 1,
+            "timestamp_seconds": 0.4,
+        }
+    )
+    pair_event = {
+        "operator": "route_merge",
+        "status": "pair_prefilter_rejected_aggregate",
+        "reason": "capacity_prefilter",
+        "route_indices": [0, 1],
+        "candidate_route_sequences": [["C1"], ["C2"]],
+        "aggregate_count": 4,
+        "candidate_pool_hash": "a" * 64,
+    }
+    sink.append_neighborhood_event(pair_event)
+
+    audit = sink.native_ablation_records()
+
+    assert audit["trace_events"] == (
+        {
+            "event_type": "candidate_state",
+            "lane": "legacy",
+            "iteration": 1,
+            "operator": "repair",
+            "accepted": False,
+            "global_best": False,
+            "current_objective_key": [2, 10.0, 0.0, 0],
+            "timestamp_seconds": 0.3,
+        },
+    )
+    assert audit["route_evaluations"] == (route_evaluation,)
+    assert audit["neighborhood_events"] == (pair_event,)
+
+
 def test_repeated_route_timings_and_exact_calls_are_retained() -> None:
     shard = _RecordingShard()
     sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
