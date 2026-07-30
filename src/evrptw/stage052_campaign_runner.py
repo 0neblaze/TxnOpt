@@ -141,7 +141,7 @@ _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
         "0bf741d1e4929564882dd8ff48775f0c589e957328aa00c7309176656fd16481"
     ),
     "tests/test_artifacts_v3.py": (
-        "82f757eeae425be54752079b2e7ad2c2524456be61ee342923a837da84f0696d"
+        "2a6a86b10899af8618c47d0b50017cc27324e2147ef4d2646af9d17ad452bd3c"
     ),
     "tests/test_candidate_transaction.py": (
         "88366a8283de49512b06554b2a1293c6558d8eb5360ee91b6479848001d574b0"

@@ -55,7 +55,10 @@ ROUTE_IDENTITY_MEMORY_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
 # Formal Stage 5.2 shards contain far fewer identities than this bound, so keep
 # their full SHA-256 collision proof in memory and spill only oversized shards.
 UNIQUE_ROUTE_IDENTITY_MEMORY_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
-ROUTE_ID_RESOLUTION_CACHE_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
+# Route-ID resolution and sparse-event extras are pure recomputation memos.
+# Keep them to one live screening transaction; eviction never removes the
+# disk-backed route identity or the canonical event payload written to Parquet.
+ROUTE_ID_RESOLUTION_CACHE_ENTRIES = LIVE_SCREENING_TRANSACTION_ROWS
 SCREENING_DEFINITION_HOT_CACHE_ENTRIES = 524_288
 # A producer needs only the full SHA-256 collision token because the canonical
 # definition payload is already written to Parquet.  The native bounded store
@@ -85,11 +88,13 @@ def screening_definition_store_contract() -> dict[str, object]:
     """Return the signed bounded producer identity-store contract."""
 
     return {
-        "schema_version": "stage05.2-screening-definition-store-v4",
+        "schema_version": "stage05.2-screening-definition-store-v5",
         "producer_backend": "native_bounded_digest",
         "producer_memory_entries": SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES,
         "producer_memo_entries": SCREENING_DEFINITION_NATIVE_MEMO_ENTRIES,
         "producer_memo_eviction_policy": "fifo_safe_recompute",
+        "recomputable_memo_entries": ROUTE_ID_RESOLUTION_CACHE_ENTRIES,
+        "recomputable_memo_eviction_policy": "fifo_safe_recompute",
         "identity_collision_proof": "full_sha256",
         "overflow_policy": "fail_fast",
         "spill_backend": "none",

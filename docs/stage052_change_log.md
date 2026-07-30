@@ -2381,3 +2381,38 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   新 wheels/venvs/runtime/sealed source 与新未占用 Formal memory probe 上复核。
   在该 probe 通过 signed v3、exit 0、exact scope、cgroup swap 0、per-worker RSS、
   clean provenance 和 20% headroom 前，状态仍为 `NOT_READY`。
+
+## 2026-07-31：G Formal memory attempt14 与可重算 sparse memo 限界
+
+- `stage05.2_formal_memory_probe_attempt14` 使用 clean commit
+  `c4f63af51d35dd581d6e53902909a11d521a5ed1`、exact `r205_21` seeds
+  2014--2019、固定 6 workers、16,384-row、queue depth 1，在 dedicated transient
+  unit 中完成 wall-clock 30/60/300 三轴 scope。service exit 0，signed v3 report
+  SHA-256 为
+  `4752e0712ce7704479e9c166a1971a1fb628d0bd9514fb39438d089f1edc1bb3`；
+  aggregate cgroup physical peak `21,280,231,424` bytes，最高 per-worker RSS
+  `4,138,356,736` bytes，cgroup swap peak 0，fallback count 0。20% headroom
+  需要 `25,536,277,709` bytes，超过 host capacity `25,196,941,312` bytes
+  `339,336,397` bytes。因此 attempt14 是不可变 complete diagnostic evidence，
+  但 resource calibration 与 Formal rerun03 仍被阻塞，状态为 `NOT_READY`。
+- attempt14 的 worker 同时完成说明剩余差额不是由未完成 scope 估算。通过只读 raw
+  复核，`cache_event` 与 `route_evaluation` 的可选 extras 组合分别达到约
+  85,000 与 52,000 个，而 exact route LRU 仅约 4,096 entries、约 2.2 MiB；
+  因此 solver exact cache 不是主要 retained state。另一个 disposable full-identity
+  seam 在 900,000 definitions 与 419,000 routes 附近只增加约 106 MiB RSS，
+  也否定了直接缩小 2,097,152 definition identity capacity 的方向。
+- 使用 attempt14 seed 2018 的真实 extras 进行独立 RSS A/B：将可重算 sparse-extras
+  memo 从 65,536 限到 8,192，单进程减少约 40.7 MiB；对 route-ID resolution memo
+  做同样限界，再减少约 28.4 MiB。合计约 69 MiB/worker，高于当前 gate 差额所需的
+  约 47 MiB/worker。该 A/B 只证明新 probe 值得运行，不作为 readiness evidence。
+- route-ID resolution、route-evaluation extras 与 cache-event extras 都是纯
+  deterministic recomputation memo：淘汰后重新解析 canonical route key 或重建
+  canonical JSON，输出 row 必须逐字段相同。三者统一绑定一个 8,192-row live
+  transaction 与 FIFO safe-recompute policy；signed contract 升级为
+  `stage05.2-screening-definition-store-v5`。完整 definition full-SHA-256 state、
+  disk-backed route identity、完整 payload/collision proof 和 Parquet rows 均不删除。
+  回归测试强制 memo 淘汰后 route-evaluation/cache-event row 除 event ID 外完全相同。
+- 新实现必须通过 clean commit、完整质量门槛、双轴 code review、新
+  wheels/venvs/runtime/sealed source，并使用下一未占用 Formal memory probe label。
+  只有该 probe 的 signed v3、exit 0、exact scope、cgroup swap 0、per-worker RSS、
+  clean provenance 与 20% headroom 全部通过，才允许生成 resource contract。

@@ -549,6 +549,112 @@ def test_sparse_route_event_fast_normalizer_matches_general(
     )
 
 
+def test_recomputable_sparse_memos_evict_without_changing_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(artifacts_module, "ROUTE_ID_RESOLUTION_CACHE_ENTRIES", 2)
+    writer = _v3_writer(tmp_path, attempt=96)
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+
+    def route_evaluation(index: int) -> artifacts_module.DeferredRouteEvaluation:
+        return artifacts_module.DeferredRouteEvaluation(
+            "route_evaluation",
+            "wall_clock_30",
+            (
+                index + 1,
+                f"route:2:C{index}",
+                "legacy",
+                index,
+                "relocate",
+                "exact_call",
+                float(index),
+                float(index) + 0.1,
+                0.1,
+                True,
+                True,
+                True,
+                "",
+                index,
+                index + 1,
+                index + 2,
+                "",
+                f"digest-{index}",
+                "changed",
+                "completed_feasible",
+            ),
+        )
+
+    first = shard._deferred_route_evaluation_row(  # noqa: SLF001
+        route_evaluation(0),
+        event_id=1,
+    )
+    for index in range(1, 3):
+        shard._deferred_route_evaluation_row(  # noqa: SLF001
+            route_evaluation(index),
+            event_id=index + 1,
+        )
+    replayed = shard._deferred_route_evaluation_row(  # noqa: SLF001
+        route_evaluation(0),
+        event_id=99,
+    )
+
+    assert replayed[1:] == first[1:]
+    assert len(shard._resolved_route_ids) <= 2  # noqa: SLF001
+    assert len(shard._route_evaluation_extras_cache) <= 2  # noqa: SLF001
+
+    def cache_event(index: int) -> artifacts_module.DeferredCacheEvent:
+        return artifacts_module.DeferredCacheEvent(
+            "cache_event",
+            "wall_clock_30",
+            (
+                f"route:2:K{index}",
+                "legacy",
+                index,
+                "relocate",
+                float(index),
+                float(index),
+                float(index) + 0.1,
+                0.1,
+                "miss",
+                "lookup_result",
+                f"cache-digest-{index}",
+                index + 10,
+                index + 20,
+                index + 30,
+                index + 40,
+                index + 50,
+                "miss",
+                63,
+            ),
+        )
+
+    first_cache = shard._deferred_cache_event_row(  # noqa: SLF001
+        cache_event(0),
+        event_id=100,
+    )
+    for index in range(1, 3):
+        shard._deferred_cache_event_row(  # noqa: SLF001
+            cache_event(index),
+            event_id=index + 100,
+        )
+    replayed_cache = shard._deferred_cache_event_row(  # noqa: SLF001
+        cache_event(0),
+        event_id=199,
+    )
+
+    assert replayed_cache[1:] == first_cache[1:]
+    assert len(shard._resolved_route_ids) <= 2  # noqa: SLF001
+    assert len(shard._cache_event_extras_cache) <= 2  # noqa: SLF001
+    shard.abort("bounded recomputation fixture")
+    writer.finalize(status="partial", evidence_completeness="partial")
+
+
 def test_screening_definition_store_spills_and_detects_disk_collisions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -667,11 +773,13 @@ def test_screening_definition_store_contract_binds_native_producer_limit() -> No
     contract = artifacts_module.screening_definition_store_contract()
 
     assert contract == {
-        "schema_version": "stage05.2-screening-definition-store-v4",
+        "schema_version": "stage05.2-screening-definition-store-v5",
         "producer_backend": "native_bounded_digest",
         "producer_memory_entries": 2_097_152,
         "producer_memo_entries": 8_192,
         "producer_memo_eviction_policy": "fifo_safe_recompute",
+        "recomputable_memo_entries": 8_192,
+        "recomputable_memo_eviction_policy": "fifo_safe_recompute",
         "identity_collision_proof": "full_sha256",
         "overflow_policy": "fail_fast",
         "spill_backend": "none",

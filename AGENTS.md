@@ -1034,9 +1034,14 @@ The executable workflow and gate table are maintained in
   atomically, and fails fast on collision or overflow. Its separate native
   definition-key memo is capped at 8,192 entries with FIFO safe recomputation;
   memo eviction never removes the complete 2,097,152-entry full-SHA-256
-  collision state. Signed metadata uses
-  `stage05.2-screening-definition-store-v4` and binds both limits, the memo
-  eviction policy, and `identity_collision_proof=full_sha256`. Producer SQLite
+  collision state. Route-ID resolution plus route-evaluation/cache-event sparse
+  extras JSON use a separate 8,192-entry FIFO safe-recomputation memo. Eviction
+  from these three Python memos may only repeat deterministic route-key parsing
+  or canonical JSON construction; it may not remove the disk-backed route
+  identity, full digest/payload collision state, or any Parquet row. Signed
+  metadata uses `stage05.2-screening-definition-store-v5` and binds both native
+  limits, the recomputable-memo limit and eviction policies, and
+  `identity_collision_proof=full_sha256`. Producer SQLite
   spill, producer scratch state, and fallback are forbidden. Review/read stores
   retain the payload they must resolve and may use their separate bounded
   payload-retaining SQLite path. Exact-route evaluation route and unique-route
