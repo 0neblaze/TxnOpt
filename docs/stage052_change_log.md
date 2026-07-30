@@ -2122,3 +2122,28 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   `stage05.2_benchmark_rerun01`，以新 commit、wheels、sealed source snapshot 和
   使用 Attempt99 batch0007 签名 memory floor 重新校准的 6-worker contract 从零
   执行。Attempt99 不续跑、不导入 shard。
+
+## 2026-07-30：G Formal rerun01 resource recalibration
+
+- `stage05.2_resource_calibration_attempt05` 由 transient user service 启动后，
+  Windows-side WSL keeper 在 service active 状态可见前提前退出；WSL idle
+  shutdown 随后终止校准。该 label 的 partial 目录仅含未完成的 measurement
+  目录、不含 calibration report 或 producer resource contract，原样保留且不复用。
+- `stage05.2_resource_calibration_attempt06` 改由 Windows-side `wsl.exe` 直接
+  托管完整 non-editable producer process，在 clean commit
+  `2f97f9f6d205b2827719dc8e6027f1bcfa1a6fcc` 上完成。签名 report SHA-256 为
+  `8f421fb032dd7e979921a613a504220c1c824cc2b9158282dc636e760e923576`，
+  contract SHA-256 为
+  `23b5e2ada31f816f8ae2b0aa4be23ca1d2795ffaa861e5b6bf5df2296480fb0f`；
+  calibration digest 为
+  `086f3bb8175f8ae51c8a3d8ef75f20415d988244a6cd106600409917b9aa5ede`。
+- 新 contract 保持用户锁定的 6 workers、row group `262144`、queue depth `2`，
+  并精确绑定 Attempt99 `batch0007` resource summary
+  `cdaa627f53d14ce9a34d0054eb22cbaf4d388c80147980d428842c358599a7e5`。
+  memory floor 为 aggregate `20,060,610,560` bytes、per-worker
+  `3,993,497,600` bytes；20% headroom 后的 hard limits 分别为
+  `24,072,732,672` 与 `4,792,197,120` bytes，未改变 Formal work geometry，
+  未使用 worker downgrade、swap 或 fallback。
+- `stage05.2_benchmark_rerun01` 将从零使用该 content-addressed contract、
+  新 commit/wheels 与新 sealed source snapshot；Attempt99 的 637 archived
+  shards 和 batch0007 partial shards 均不导入。
