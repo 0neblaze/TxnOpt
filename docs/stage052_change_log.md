@@ -2342,3 +2342,42 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   output root。下一 sealed source 必须实体化并核验 Schneider input，使用新的 clean
   commit、wheels/venvs/runtime 与未占用 probe label；resource calibration 和 Formal
   rerun03 继续阻塞，状态仍为 `NOT_READY`。
+
+## 2026-07-31：G Formal memory attempt13 与 retained hot-state 根因修复
+
+- `stage05.2_formal_memory_probe_attempt13` 使用 clean commit
+  `e3a4edd50e3800b24455712ef2a3c330570c2a69`、exact `r205_21` seeds
+  2014--2019、固定 6 workers、16,384-row、queue depth 1，在 dedicated transient
+  unit 中完成 6/6 shards。service exit 0，signed v3 report SHA-256 为
+  `7433086ffc1becc86b3402bfe70c33511c19f912d2dc2ff12f9a5115dc698957`；
+  aggregate cgroup peak `23,965,954,048` bytes，最高 per-worker RSS
+  `4,734,369,792` bytes，cgroup swap peak `8,192` bytes。20% headroom 需要
+  `28,759,144,858` bytes，超过 host capacity `25,196,933,120` bytes
+  `3,562,211,738` bytes，因此 attempt13 是不可变 complete diagnostic evidence，
+  但不满足 resource gate；resource calibration 与 Formal rerun03 继续阻塞。
+- 独立 disposable cgroup harness 同时读到 direct cgroup peak
+  `1,232,916,480` bytes，而 systemd terminal 仅报告 `512.0K`。因此 WSL user
+  manager 的 terminal `Memory peak` 会严重低报，不能覆盖 signed report 的 direct
+  dedicated-cgroup sampling；attempt13 的非零 swap 同样按原始证据保留，不人工
+  改写为通过。
+- TDD memory-composition seam 对实际 native store 分项测量：完整
+  2,097,152-capacity definition identity store 在 1,226,847-entry Formal 上界附近
+  只增加约 96 MiB RSS，因此继续保留完整 full-SHA-256 collision proof。相反，
+  65,536-entry native definition memo 的 synthetic persistent delta 约 329 MiB；
+  route dictionary/unique-route identity 的两个 262,144-entry hot stores 合计约
+  360 MiB。主因是可重算/可精确 spill 的 retained hot state，不是 identity capacity。
+- 修复将 native/Python definition-key memo 绑定到一个 8,192-row live screening
+  transaction，并将 signed contract 升级为
+  `stage05.2-screening-definition-store-v4`。route dictionary identity 与 exact
+  unique-route identity 的内存阈值各降至一个 65,536-row Parquet group；超过阈值
+  继续使用既有 shard-local SQLite 保存完整 digest/payload，duplicate/collision
+  proof 不变。新增 native cache size/capacity 只读 introspection，使测试能核对真实
+  C++ capsule bound，而不是只信 Python 常量；campaign successor 的 pinned
+  producer-fix SHA-256 同步更新，旧 native/test 内容不能绕过 exact pin。
+- 同一 disposable synthetic seam 的修复后 persistent delta：definition memo 约
+  192 MiB，route/unique identity hot state 合计约 7.8 MiB；估算每 worker 合计减少
+  约 523 MiB，六 worker 约 3.14 GiB。该数值只用于决定下一 probe 是否值得运行，
+  不是 readiness evidence；必须在新 clean commit、完整质量门槛、双轴 code review、
+  新 wheels/venvs/runtime/sealed source 与新未占用 Formal memory probe 上复核。
+  在该 probe 通过 signed v3、exit 0、exact scope、cgroup swap 0、per-worker RSS、
+  clean provenance 和 20% headroom 前，状态仍为 `NOT_READY`。

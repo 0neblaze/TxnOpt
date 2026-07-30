@@ -128,7 +128,7 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
 )
 _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
     "cpp/evrptw_core.cpp": (
-        "b47d77b3b67d6fe4cd00357695bc18cbb17a282518897b8f5db4a597e2aaae3d"
+        "97005f14a9c1d5356e193aa4d4e446939613b51562b4b57be9d64d2a615a27cf"
     ),
     "src/evrptw/alns.py": "e5a3c1bf27cfda6d36ee24a3cdba24880379209b7eb0e2e58ed9b115bbfbf38b",
     "src/evrptw/candidate_transaction.py": (
@@ -141,7 +141,7 @@ _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
         "0bf741d1e4929564882dd8ff48775f0c589e957328aa00c7309176656fd16481"
     ),
     "tests/test_artifacts_v3.py": (
-        "9cee5ea75470e4ac82b227983aafeb4e7a633d97784bb8795d6edaa017b4742a"
+        "82f757eeae425be54752079b2e7ad2c2524456be61ee342923a837da84f0696d"
     ),
     "tests/test_candidate_transaction.py": (
         "88366a8283de49512b06554b2a1293c6558d8eb5360ee91b6479848001d574b0"
@@ -150,7 +150,7 @@ _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
         "cd8cbcf415b30c3d29d53aca8fecd22bd3ded62099de621b9cbf8c011d827de1"
     ),
     "tests/test_stage052_streaming_trace.py": (
-        "2469fb34967f2ac45ee3f90cb9dc657a06706cdf5c0c8c357b6fdaca20e3b0c4"
+        "677186726e44696044e13d982a775f92c4558eccb7820bfae15d3868a364f188"
     ),
 }
 

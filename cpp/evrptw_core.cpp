@@ -910,6 +910,32 @@ py::capsule create_stage052_screening_definition_cache(
     return capsule;
 }
 
+Stage052ScreeningDefinitionCache* stage052_screening_definition_cache(
+    const py::object& definition_cache) {
+    auto* cache = static_cast<Stage052ScreeningDefinitionCache*>(
+        PyCapsule_GetPointer(
+            definition_cache.ptr(), STAGE052_SCREENING_CACHE_CAPSULE));
+    if (cache == nullptr) {
+        PyErr_Clear();
+        throw std::invalid_argument(
+            "Stage 5.2 native screening definition cache is invalid");
+    }
+    return cache;
+}
+
+py::ssize_t stage052_screening_definition_cache_size(
+    const py::object& definition_cache) {
+    return static_cast<py::ssize_t>(
+        stage052_screening_definition_cache(definition_cache)
+            ->definitions.size());
+}
+
+py::ssize_t stage052_screening_definition_cache_capacity(
+    const py::object& definition_cache) {
+    return static_cast<py::ssize_t>(
+        stage052_screening_definition_cache(definition_cache)->capacity);
+}
+
 void append_stage052_signature(
     Stage052CanonicalSignature& signature,
     const std::uint64_t value) {
@@ -4283,6 +4309,14 @@ PYBIND11_MODULE(_core, module) {
         "create_stage052_screening_definition_cache",
         &create_stage052_screening_definition_cache,
         py::arg("capacity") = 262144);
+    module.def(
+        "stage052_screening_definition_cache_size",
+        &stage052_screening_definition_cache_size,
+        py::arg("definition_cache"));
+    module.def(
+        "stage052_screening_definition_cache_capacity",
+        &stage052_screening_definition_cache_capacity,
+        py::arg("definition_cache"));
     module.def(
         "create_stage052_definition_identity_store",
         &create_stage052_definition_identity_store,

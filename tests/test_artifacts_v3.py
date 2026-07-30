@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -366,6 +367,18 @@ def test_route_identity_store_delays_sqlite_spill_and_remains_bounded(
         store.close()
 
 
+def test_default_route_identity_hot_bound_fits_one_parquet_group_per_store(
+    tmp_path: Path,
+) -> None:
+    store = artifacts_module._DiskBackedRouteIdentityStore(  # noqa: SLF001
+        scratch_root=tmp_path,
+    )
+    try:
+        assert store.hot_entry_limit == 196_624
+    finally:
+        store.close()
+
+
 def test_route_identity_store_does_not_query_sqlite_before_spill(
     tmp_path: Path,
 ) -> None:
@@ -654,10 +667,10 @@ def test_screening_definition_store_contract_binds_native_producer_limit() -> No
     contract = artifacts_module.screening_definition_store_contract()
 
     assert contract == {
-        "schema_version": "stage05.2-screening-definition-store-v3",
+        "schema_version": "stage05.2-screening-definition-store-v4",
         "producer_backend": "native_bounded_digest",
         "producer_memory_entries": 2_097_152,
-        "producer_memo_entries": 65_536,
+        "producer_memo_entries": 8_192,
         "producer_memo_eviction_policy": "fifo_safe_recompute",
         "identity_collision_proof": "full_sha256",
         "overflow_policy": "fail_fast",
@@ -1269,7 +1282,7 @@ def test_v3_prepared_screening_cache_eviction_rehydrates_exact_definition(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(artifacts_module, "SCREENING_DEFINITION_HOT_CACHE_ENTRIES", 1)
+    monkeypatch.setattr(artifacts_module, "SCREENING_DEFINITION_NATIVE_MEMO_ENTRIES", 1)
     writer = _v3_writer(tmp_path, attempt=97)
     shard = writer.open_v2_shard(
         instance="toy",
@@ -2281,14 +2294,32 @@ def test_v3_row_groups_and_simultaneous_buffers_stay_bounded(tmp_path: Path) -> 
         shard_ordinal=0,
         worker_identity="worker-0",
     )
+
+    def unique_screening_events() -> Iterable[dict[str, object]]:
+        for index in range(65_537):
+            event = _screening_event(
+                decision_id=index,
+                started_at=float(index),
+            )
+            event["distance_lower_bound"] = float(index)
+            yield event
+
     shard.append(
         route_dictionary={"route:2:C1": ("C1",)},
-        critical_events=(
-            _screening_event(decision_id=index, started_at=float(index)) for index in range(65_537)
-        ),
+        critical_events=unique_screening_events(),
     )
     assert shard.max_buffered_groups_observed <= 2
     assert shard.max_pending_screening_transaction_rows_observed <= 65_536
+    assert (
+        shard.screening_definition_memo_entries
+        <= artifacts_module.screening_definition_store_contract()["producer_memo_entries"]
+    )
+    assert shard.native_screening_definition_memo_capacity == 8_192
+    assert (
+        shard.native_screening_definition_memo_entries
+        <= shard.native_screening_definition_memo_capacity
+    )
+    assert shard.screening_definition_identity_count == 65_537
     shard.finalize(
         raw_payload={},
         solution_payload={},

@@ -874,6 +874,8 @@ def test_native_negative_marker_compares_full_signature_after_route_guard_evicti
         )
 
     native_cache = _core.create_stage052_screening_definition_cache(capacity=4)
+    assert _core.stage052_screening_definition_cache_capacity(native_cache) == 4
+    assert _core.stage052_screening_definition_cache_size(native_cache) == 0
     negative_evidence_cache: dict[object, tuple[object, ...]] = {}
     columns, pending, remaining, observed = _core.pack_stage052_screening_transactions(
         (
@@ -896,6 +898,7 @@ def test_native_negative_marker_compares_full_signature_after_route_guard_evicti
     assert remaining == []
     assert len(observed) == 2
     assert negative_evidence_cache == {}
+    assert _core.stage052_screening_definition_cache_size(native_cache) == 2
 
 
 def test_native_screening_cache_preserves_canonical_numeric_identity() -> None:

@@ -46,12 +46,15 @@ SUPPORTED_SCREENING_SCHEMAS = frozenset(
     {SCREENING_DECISIONS_V1, SCREENING_DECISIONS_V2, SCREENING_DECISIONS_V3}
 )
 V2_PARQUET_ROW_GROUP_SIZE = 65_536
+# Keep live producer memo state to one compact screening transaction.  Full
+# identity/collision state remains independently retained below.
+LIVE_SCREENING_TRANSACTION_ROWS = 8_192
 ROUTE_IDENTITY_HOT_CACHE_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
-ROUTE_IDENTITY_MEMORY_ENTRIES = 262_144
+ROUTE_IDENTITY_MEMORY_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
 # Exact-route evaluation identities are independent of the route dictionary.
 # Formal Stage 5.2 shards contain far fewer identities than this bound, so keep
 # their full SHA-256 collision proof in memory and spill only oversized shards.
-UNIQUE_ROUTE_IDENTITY_MEMORY_ENTRIES = 262_144
+UNIQUE_ROUTE_IDENTITY_MEMORY_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
 ROUTE_ID_RESOLUTION_CACHE_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
 SCREENING_DEFINITION_HOT_CACHE_ENTRIES = 524_288
 # A producer needs only the full SHA-256 collision token because the canonical
@@ -61,12 +64,11 @@ SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES = 2_097_152
 # The native producer memo retains Python definition keys only to avoid
 # recomputing identities.  Eviction is semantically neutral because the
 # collision-proof identity store above remains complete for the whole shard.
-SCREENING_DEFINITION_NATIVE_MEMO_ENTRIES = 65_536
+SCREENING_DEFINITION_NATIVE_MEMO_ENTRIES = LIVE_SCREENING_TRANSACTION_ROWS
 ROUTE_IDENTITY_COUNTER_NAMESPACES = 16
 MAX_SCREENING_CHECKS_PER_DECISION = 8
-# Keep live definition/occurrence transactions at or below one 65,536-row Parquet
-# group while amortising collision checks and typed-column appends.
-LIVE_SCREENING_TRANSACTION_ROWS = 8_192
+# Keep prepared definition/occurrence transactions at or below one Parquet
+# group while amortising typed-column appends.
 LIVE_PREPARED_SCREENING_TRANSACTION_ROWS = V2_PARQUET_ROW_GROUP_SIZE
 UNIQUE_ROUTE_IDENTITY_SEMANTICS = frozenset(
     {"legacy_started", "completed_shared", "completed_lane"}
@@ -83,7 +85,7 @@ def screening_definition_store_contract() -> dict[str, object]:
     """Return the signed bounded producer identity-store contract."""
 
     return {
-        "schema_version": "stage05.2-screening-definition-store-v3",
+        "schema_version": "stage05.2-screening-definition-store-v4",
         "producer_backend": "native_bounded_digest",
         "producer_memory_entries": SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES,
         "producer_memo_entries": SCREENING_DEFINITION_NATIVE_MEMO_ENTRIES,
@@ -5278,7 +5280,7 @@ class ArtifactV2ShardSession:
                         )
                         if (
                             len(self._prepared_screening_definition_cache)
-                            > SCREENING_DEFINITION_HOT_CACHE_ENTRIES
+                            > SCREENING_DEFINITION_NATIVE_MEMO_ENTRIES
                         ):
                             self._prepared_screening_definition_cache.popitem(last=False)
                         if route_id not in self._route_digests:
@@ -5882,7 +5884,7 @@ class ArtifactV2ShardSession:
             _screening_definition_identity(definition_payload)
         )
         self._screening_definition_cache[cache_key] = (tail, definition_id)
-        if len(self._screening_definition_cache) > SCREENING_DEFINITION_HOT_CACHE_ENTRIES:
+        if len(self._screening_definition_cache) > SCREENING_DEFINITION_NATIVE_MEMO_ENTRIES:
             self._screening_definition_cache.pop(
                 next(iter(self._screening_definition_cache))
             )
@@ -5955,7 +5957,7 @@ class ArtifactV2ShardSession:
             precomputed,
             definition_id,
         )
-        if len(self._screening_definition_cache) > SCREENING_DEFINITION_HOT_CACHE_ENTRIES:
+        if len(self._screening_definition_cache) > SCREENING_DEFINITION_NATIVE_MEMO_ENTRIES:
             self._screening_definition_cache.pop(next(iter(self._screening_definition_cache)))
         if self._screening_definition_store is None:
             self._screening_definition_store = _BoundedScreeningDefinitionStore(
@@ -6279,6 +6281,43 @@ class ArtifactV2ShardSession:
         return self._max_pending_screening_transaction_rows_observed
 
     @property
+    def screening_definition_memo_entries(self) -> int:
+        """Current live Python memo entries used to avoid definition recomputation."""
+
+        return max(
+            len(self._screening_definition_cache),
+            len(self._prepared_screening_definition_cache),
+        )
+
+    @property
+    def native_screening_definition_memo_entries(self) -> int:
+        """Current native definition-key memo entries for the live shard."""
+
+        from evrptw import _core as native_core
+
+        return native_core.stage052_screening_definition_cache_size(
+            self._deferred_native_screening_occurrence_cache
+        )
+
+    @property
+    def native_screening_definition_memo_capacity(self) -> int:
+        """Hard native definition-key memo capacity bound for the live shard."""
+
+        from evrptw import _core as native_core
+
+        return native_core.stage052_screening_definition_cache_capacity(
+            self._deferred_native_screening_occurrence_cache
+        )
+
+    @property
+    def screening_definition_identity_count(self) -> int:
+        """Number of full SHA-256 definition identities retained for this shard."""
+
+        if self._screening_definition_store is None:
+            return 0
+        return self._screening_definition_store.entry_count
+
+    @property
     def scratch_directory(self) -> Path:
         """Measured-volume directory for bounded live-stream scratch files."""
 
@@ -6454,7 +6493,10 @@ class ArtifactV2ShardSession:
                 None,
                 definition_id,
             )
-            if len(self._screening_definition_cache) > SCREENING_DEFINITION_HOT_CACHE_ENTRIES:
+            if (
+                len(self._screening_definition_cache)
+                > SCREENING_DEFINITION_NATIVE_MEMO_ENTRIES
+            ):
                 self._screening_definition_cache.pop(next(iter(self._screening_definition_cache)))
             if self._screening_definition_store is None:
                 self._screening_definition_store = _BoundedScreeningDefinitionStore(

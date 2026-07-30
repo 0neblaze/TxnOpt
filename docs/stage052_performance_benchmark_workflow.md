@@ -299,15 +299,19 @@ producer 的 screening-definition identity state（筛选定义身份状态）�
 `register_many` 必须在任何写入前完成批内去重、已有身份碰撞检查和容量检查，使碰撞或
 overflow（越界）整批 fail fast 且不留下前缀写入。producer 禁止 SQLite spill、
 scratch directory 和 Python fallback。可丢弃的 native definition-key memo（原生定义键
-备忘缓存）与 collision state 分离，固定为 65,536 entries；FIFO eviction（先进先出
+备忘缓存）与 collision state 分离，固定为 8,192 entries，即一个 live screening
+transaction（活动筛选事务）；FIFO eviction（先进先出
 淘汰）只触发 full-SHA-256 identity 的安全重算，不删除全 shard collision proof。
-signed batch metadata 必须记录 v3 store contract；independent reviewer 必须确认整条
+signed batch metadata 必须记录 v4 store contract；independent reviewer 必须确认整条
 campaign 只有一个相同合同，并证明每个
 signed shard descriptor 的 definition row count 均不超过当次 raw 中签入的 hard
 limit。review/read 的 payload-retaining compatibility store（载荷保留兼容存储）与
-exact-route identity store 保持各自独立的 bounded SQLite 路径，不得被误报成 producer
-fallback。只有同时通过 native bound、零 fallback、36% persistence gate 与 shard
-cleanup gate，才允许新的 Formal。
+exact-route identity store 保持各自独立的 bounded SQLite 路径。route dictionary
+identity 与 exact unique-route identity 各自最多保留一个 65,536-row Parquet group
+的 hot state（热状态），超过后将完整 digest/payload 原子写入 shard-local SQLite；
+这不是 producer definition fallback，也不得削弱 duplicate/collision proof。只有同时
+通过 native bound、零 fallback、36% persistence gate 与 shard cleanup gate，才允许
+新的 Formal。
 
 Candidate transaction（候选事务）的 safe-rejection caches（安全拒绝缓存）同样不得
 无界增长。scalar screening result（标量筛选结果）使用 65,536-entry solve-local LRU；

@@ -998,7 +998,7 @@ The executable workflow and gate table are maintained in
   publication; the optimization may not drop, aggregate, or reorder occurrences. High-cardinality
   definition, occurrence, and event Parquet streams disable dictionary encoding and statistics while
   retaining the canonical typed schema and Zstandard level 1.
-  Repeated screening definitions use a shard-local native capsule with a hard 262,144-entry FIFO
+  Repeated screening definitions use a shard-local native capsule with a hard 8,192-entry FIFO
   bound. Its composite hash is only a lookup accelerator: every hit must pass exact field equality,
   and every miss must retain an owning exact key before publishing the canonical definition identity.
   Canonical typed signatures distinguish booleans from numerics and preserve IEEE-754 signed zero;
@@ -1032,18 +1032,19 @@ The executable workflow and gate table are maintained in
   `native_bounded_digest` store: it retains the full SHA-256 digest without a
   duplicate JSON payload, has a hard 2,097,152-entry limit, validates each batch
   atomically, and fails fast on collision or overflow. Its separate native
-  definition-key memo is capped at 65,536 entries with FIFO safe recomputation;
+  definition-key memo is capped at 8,192 entries with FIFO safe recomputation;
   memo eviction never removes the complete 2,097,152-entry full-SHA-256
   collision state. Signed metadata uses
-  `stage05.2-screening-definition-store-v3` and binds both limits, the memo
+  `stage05.2-screening-definition-store-v4` and binds both limits, the memo
   eviction policy, and `identity_collision_proof=full_sha256`. Producer SQLite
   spill, producer scratch state, and fallback are forbidden. Review/read stores
   retain the payload they must resolve and may use their separate bounded
-  payload-retaining SQLite path. Exact-route evaluation identities likewise
-  remain in a bounded in-memory full-digest/payload store and spill to
-  shard-local SQLite only after their declared hard limit. Removing collision
-  checks, making any store unbounded, or returning to per-event SQLite identity
-  queries is forbidden.
+  payload-retaining SQLite path. Exact-route evaluation route and unique-route
+  identity stores retain at most one 65,536-row Parquet group each in memory,
+  then spill exact full-digest/payload state to shard-local SQLite. Spill does
+  not weaken duplicate or collision checks. Removing collision checks, making
+  any store unbounded, or returning to per-event SQLite identity queries is
+  forbidden.
 - Process-tree resource identity includes only a process whose positive RSS and CPU times were both
   captured in one successful sample. A half-sampled, zero-RSS, or already-exited transient process
   is not measured worker evidence and must not be emitted with a fabricated zero peak.
