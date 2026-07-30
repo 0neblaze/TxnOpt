@@ -55,9 +55,11 @@ from evrptw.stage052_campaign import (
     maximum_process_average_cores_over_windows,
 )
 from evrptw.stage052_evidence import (
+    STAGE052_PREVIOUS_RESOURCE_SCHEMA_VERSION,
     STAGE052_RESOURCE_SCHEMA_VERSION,
     PersistenceInterval,
     RunResourceSummary,
+    is_stage052_dedicated_cgroup_path,
     verify_stage052_campaign_gate_set,
     verify_stage052_review_files,
 )
@@ -770,8 +772,16 @@ def validate_batch_measurements(
         )
     if not runtime_evidence.passed:
         raise RuntimeError(f"batch runtime capability violation: {runtime_evidence.failure_reason}")
+    allowed_resource_schemas = (
+        {STAGE052_RESOURCE_SCHEMA_VERSION}
+        if producer_resource_contract is not None
+        else {
+            STAGE052_PREVIOUS_RESOURCE_SCHEMA_VERSION,
+            STAGE052_RESOURCE_SCHEMA_VERSION,
+        }
+    )
     if (
-        resource_summary.schema_version != STAGE052_RESOURCE_SCHEMA_VERSION
+        resource_summary.schema_version not in allowed_resource_schemas
         or resource_summary.configured_worker_count != expected_workers
         or resource_summary.status != "complete"
     ):
@@ -785,8 +795,24 @@ def validate_batch_measurements(
         # Historical Stage 5.2 evidence remains readable under its frozen limits.
         aggregate_limit = AGGREGATE_RSS_LIMIT_BYTES
         per_worker_limit = PER_WORKER_RSS_LIMIT_BYTES
-    if resource_summary.aggregate_peak_rss_bytes > aggregate_limit:
-        raise RuntimeError("batch process-tree aggregate RSS exceeds its campaign lock")
+    if producer_resource_contract is not None:
+        if (
+            resource_summary.aggregate_memory_source != "cgroup_v2"
+            or not is_stage052_dedicated_cgroup_path(
+                resource_summary.cgroup_path
+            )
+            or resource_summary.cgroup_swap_peak_bytes != 0
+        ):
+            raise RuntimeError(
+                "batch aggregate memory is not bound to a swap-free "
+                "isolated cgroup v2 service"
+            )
+        if resource_summary.aggregate_peak_memory_bytes > aggregate_limit:
+            raise RuntimeError("batch cgroup v2 memory exceeds its campaign lock")
+    elif resource_summary.aggregate_peak_rss_bytes > aggregate_limit:
+        raise RuntimeError(
+            "batch process-tree aggregate RSS exceeds its historical campaign lock"
+        )
     descendants = set(resource_summary.descendant_pids)
     process_peaks = dict(resource_summary.process_peak_rss_bytes)
     if not descendants or not descendants.issubset(process_peaks):
@@ -1045,25 +1071,36 @@ class BenchmarkExecutionLock:
                     "producer resource contract differs from the accepted Pilot lock"
                 )
             if predecessor != contract:
+                assert formal_recalibration is not None
+                if formal_recalibration.aggregate_memory_source == "cgroup_v2":
+                    aggregate_memory_invalid = (
+                        formal_recalibration.replacement_aggregate_peak_memory_bytes
+                        != contract.selected_aggregate_peak_rss_bytes
+                        or contract.aggregate_memory_limit_bytes
+                        < contract.selected_aggregate_peak_rss_bytes
+                    )
+                else:
+                    aggregate_memory_invalid = (
+                        contract.selected_aggregate_peak_rss_bytes
+                        < predecessor.selected_aggregate_peak_rss_bytes
+                        or contract.aggregate_memory_limit_bytes
+                        < predecessor.aggregate_memory_limit_bytes
+                        or formal_recalibration.predecessor_aggregate_peak_rss_bytes
+                        != contract.selected_aggregate_peak_rss_bytes
+                    )
                 if (
                     predecessor.selected_workers != contract.selected_workers
                     or predecessor.selected_workers != self.selected_workers
                     or predecessor.row_group_size != contract.row_group_size
                     or predecessor.queue_depth != contract.queue_depth
-                    or contract.selected_aggregate_peak_rss_bytes
-                    < predecessor.selected_aggregate_peak_rss_bytes
+                    or aggregate_memory_invalid
                     or contract.selected_per_worker_peak_rss_bytes
                     < predecessor.selected_per_worker_peak_rss_bytes
-                    or contract.aggregate_memory_limit_bytes
-                    < predecessor.aggregate_memory_limit_bytes
                     or contract.per_worker_memory_limit_bytes
                     < predecessor.per_worker_memory_limit_bytes
-                    or formal_recalibration is None
                     or formal_recalibration.campaign_geometry_contribution != 0
                     or formal_recalibration.replacement_contract_sha256
                     != _canonical_sha256(contract.to_dict())
-                    or formal_recalibration.predecessor_aggregate_peak_rss_bytes
-                    != contract.selected_aggregate_peak_rss_bytes
                     or formal_recalibration.predecessor_per_worker_peak_rss_bytes
                     != contract.selected_per_worker_peak_rss_bytes
                 ):

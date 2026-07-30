@@ -855,6 +855,21 @@ this repository or one of its subdirectories.
   its own. Host shutdown, reboot, explicit sleep/hibernate, `wsl --shutdown`,
   or manual task termination remain explicit external interruptions rather
   than lifecycle guarantees.
+- Formal producer batches and Formal memory calibration must additionally run
+  inside one dedicated transient `systemd --user` service cgroup. The aggregate
+  hard gate reads cgroup v2 `memory.current`; `memory.peak` and
+  `memory.swap.peak` are signed into resource v4 evidence. Summed process-tree
+  RSS remains compatibility telemetry only because it double-counts shared
+  mappings across spawned workers. Per-worker RSS remains an independent hard
+  gate. `/`, `/init.scope`, a shared user service, missing cgroup files, or
+  nonzero swap fail before readiness work; there is no process-RSS aggregate
+  fallback.
+- Resource recalibration report v2 remains readable as immutable Attempt99
+  history. New v3 recalibration binds
+  `stage05.2_benchmark_rerun02/batch0008`, treats that run's summed RSS only as
+  failure provenance, and derives the replacement aggregate limit from the
+  complete R205 cgroup measurement with 20% headroom. It retains the failed
+  batch's per-worker RSS floor and the locked six-worker topology.
 - On the Windows/WSL2 formal host, long-running Stage 5.2 reviewers must run as
   transient `systemd --user` services rather than Codex desktop child
   processes. Review workers, `MemoryHigh`, `MemoryMax`, `MemorySwapMax=0`, and

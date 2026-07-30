@@ -35,7 +35,8 @@ from evrptw.stage052 import (
 from evrptw.stage052_platform import read_windows_wsl_power_status
 
 STAGE052_REVIEW_SCHEMA_VERSION = "stage05.2-review-v1"
-STAGE052_RESOURCE_SCHEMA_VERSION = "stage05.2-run-resource-v3"
+STAGE052_RESOURCE_SCHEMA_VERSION = "stage05.2-run-resource-v4"
+STAGE052_PREVIOUS_RESOURCE_SCHEMA_VERSION = "stage05.2-run-resource-v3"
 STAGE052_LEGACY_RESOURCE_SCHEMA_VERSION = "stage05.2-run-resource-v2"
 STAGE052_RUNTIME_IDENTITY_SCHEMA_VERSION = "stage05.2-runtime-identity-v2"
 STAGE052_CAMPAIGN_LOCK_SCHEMA_VERSION = "stage05.2-campaign-lock-v1"
@@ -1929,6 +1930,90 @@ def verify_stage052_evidence_input(
     return identity
 
 
+def is_stage052_dedicated_cgroup_path(value: object) -> bool:
+    """Return whether a cgroup path names one Stage 5.2 transient service."""
+
+    if not isinstance(value, str) or not value.startswith("/"):
+        return False
+    name = Path(value).name
+    return name.startswith("stage052-") and name.endswith(".service")
+
+
+@dataclass(frozen=True, slots=True)
+class CgroupV2MemorySource:
+    """Read actual aggregate memory from one isolated cgroup v2 service."""
+
+    cgroup_path: Path
+    relative_path: str
+
+    def __post_init__(self) -> None:
+        resolved = self.cgroup_path.resolve(strict=True)
+        if not resolved.is_dir():
+            raise ValueError("cgroup v2 memory source must be a directory")
+        if (
+            self.relative_path in {"/", "/init.scope"}
+            or not is_stage052_dedicated_cgroup_path(self.relative_path)
+        ):
+            raise ValueError("cgroup v2 memory source is not an isolated service")
+        required = (
+            "memory.current",
+            "memory.peak",
+            "memory.swap.current",
+            "memory.swap.peak",
+        )
+        if any(not (resolved / name).is_file() for name in required):
+            raise ValueError("cgroup v2 memory source files are incomplete")
+        object.__setattr__(self, "cgroup_path", resolved)
+
+    @classmethod
+    def discover(
+        cls,
+        *,
+        proc_self_cgroup: Path = Path("/proc/self/cgroup"),
+        cgroup_root: Path = Path("/sys/fs/cgroup"),
+    ) -> CgroupV2MemorySource:
+        """Discover this process's dedicated cgroup v2 systemd service."""
+
+        try:
+            entries = proc_self_cgroup.read_text(encoding="ascii").splitlines()
+        except OSError as error:
+            raise RuntimeError("cannot read the process cgroup v2 identity") from error
+        unified = [
+            entry.removeprefix("0::")
+            for entry in entries
+            if entry.startswith("0::")
+        ]
+        if len(unified) != 1:
+            raise RuntimeError("process does not have one cgroup v2 unified identity")
+        relative_path = unified[0]
+        try:
+            return cls(
+                cgroup_path=cgroup_root / relative_path.lstrip("/"),
+                relative_path=relative_path,
+            )
+        except (OSError, ValueError) as error:
+            raise RuntimeError(
+                "Stage 5.2 aggregate memory gate requires an isolated "
+                "systemd service cgroup"
+            ) from error
+
+    def sample(self) -> tuple[int, int, int]:
+        """Return current memory, peak memory, and peak swap in bytes."""
+
+        values: list[int] = []
+        for name in ("memory.current", "memory.peak", "memory.swap.peak"):
+            try:
+                raw = (self.cgroup_path / name).read_text(encoding="ascii").strip()
+                value = int(raw)
+            except (OSError, ValueError) as error:
+                raise RuntimeError(f"cannot read cgroup v2 {name}") from error
+            if value < 0:
+                raise RuntimeError(f"cgroup v2 {name} is negative")
+            values.append(value)
+        current, peak, swap_peak = values
+        return current, max(current, peak), swap_peak
+
+
 @dataclass(frozen=True, slots=True)
 class RunResourceSummary:
     schema_version: str
@@ -1950,6 +2035,10 @@ class RunResourceSummary:
     load1_sample_count: int
     sample_count: int
     status: str
+    aggregate_memory_source: str = "process_tree_rss_telemetry"
+    aggregate_peak_memory_bytes: int = 0
+    cgroup_path: str | None = None
+    cgroup_swap_peak_bytes: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -1961,7 +2050,7 @@ class RunResourceSummary:
 
 
 class ProcessTreeResourceSampler:
-    """Sample simultaneous RSS and CPU usage for one process tree."""
+    """Sample process RSS telemetry and cgroup-backed aggregate memory."""
 
     def __init__(
         self,
@@ -1971,31 +2060,37 @@ class ProcessTreeResourceSampler:
         configured_worker_count: int,
         interval_seconds: float = 0.05,
         parent_pid: int | None = None,
-        aggregate_rss_limit_bytes: int | None = None,
+        aggregate_memory_limit_bytes: int | None = None,
         per_process_rss_limit_bytes: int | None = None,
+        aggregate_memory_source: CgroupV2MemorySource | None = None,
     ) -> None:
         if interval_seconds <= 0.0:
             raise ValueError("resource sample interval must be positive")
         if configured_worker_count not in {1, 2, 4, 5, 6, 8}:
             raise ValueError("configured worker count must be 1, 2, 4, 5, 6, or 8")
         if (
-            aggregate_rss_limit_bytes is not None
-            and aggregate_rss_limit_bytes <= 0
+            aggregate_memory_limit_bytes is not None
+            and aggregate_memory_limit_bytes <= 0
         ):
-            raise ValueError("aggregate RSS limit must be positive")
+            raise ValueError("aggregate memory limit must be positive")
         if per_process_rss_limit_bytes is not None and per_process_rss_limit_bytes <= 0:
             raise ValueError("per-process RSS limit must be positive")
+        if aggregate_memory_limit_bytes is not None and aggregate_memory_source is None:
+            aggregate_memory_source = CgroupV2MemorySource.discover()
         self.run_label = run_label
         self.component = component
         self.configured_worker_count = configured_worker_count
         self.interval_seconds = interval_seconds
         self.parent_pid = parent_pid or os.getpid()
-        self.aggregate_rss_limit_bytes = aggregate_rss_limit_bytes
+        self.aggregate_memory_limit_bytes = aggregate_memory_limit_bytes
+        self.aggregate_memory_source = aggregate_memory_source
         self.per_process_rss_limit_bytes = per_process_rss_limit_bytes
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._started = 0.0
         self._peak_rss = 0
+        self._aggregate_peak_memory = 0
+        self._cgroup_swap_peak = 0
         self._active_core_samples: list[float] = []
         self._process_peak_rss: dict[int, int] = {}
         self._load1_samples: list[float] = []
@@ -2033,6 +2128,26 @@ class ProcessTreeResourceSampler:
             parent_pid=self.parent_pid,
             descendant_pids=tuple(sorted(self._descendant_pids)),
             aggregate_peak_rss_bytes=self._peak_rss,
+            aggregate_memory_source=(
+                "cgroup_v2"
+                if self.aggregate_memory_source is not None
+                else "process_tree_rss_telemetry"
+            ),
+            aggregate_peak_memory_bytes=(
+                self._aggregate_peak_memory
+                if self.aggregate_memory_source is not None
+                else self._peak_rss
+            ),
+            cgroup_path=(
+                self.aggregate_memory_source.relative_path
+                if self.aggregate_memory_source is not None
+                else None
+            ),
+            cgroup_swap_peak_bytes=(
+                self._cgroup_swap_peak
+                if self.aggregate_memory_source is not None
+                else None
+            ),
             process_peak_rss_bytes=tuple(sorted(self._process_peak_rss.items())),
             mean_active_cores=(
                 sum(self._active_core_samples) / len(self._active_core_samples)
@@ -2103,16 +2218,32 @@ class ProcessTreeResourceSampler:
                     except (psutil.NoSuchProcess, psutil.ZombieProcess):
                         continue
                 self._peak_rss = max(self._peak_rss, rss)
+                aggregate_memory = rss
+                if self.aggregate_memory_source is not None:
+                    (
+                        aggregate_memory,
+                        sampled_peak,
+                        sampled_swap_peak,
+                    ) = self.aggregate_memory_source.sample()
+                    self._aggregate_peak_memory = max(
+                        self._aggregate_peak_memory,
+                        sampled_peak,
+                    )
+                    self._cgroup_swap_peak = max(
+                        self._cgroup_swap_peak,
+                        sampled_swap_peak,
+                    )
                 self._sample_count += 1
                 self._load1_samples.append(float(os.getloadavg()[0]))
                 violations: list[str] = []
                 if (
-                    self.aggregate_rss_limit_bytes is not None
-                    and rss > self.aggregate_rss_limit_bytes
+                    self.aggregate_memory_limit_bytes is not None
+                    and aggregate_memory > self.aggregate_memory_limit_bytes
                 ):
                     violations.append(
-                        "aggregate RSS hard limit exceeded: "
-                        f"observed={rss} limit={self.aggregate_rss_limit_bytes}"
+                        "cgroup v2 memory hard limit exceeded: "
+                        f"observed={aggregate_memory} "
+                        f"limit={self.aggregate_memory_limit_bytes}"
                     )
                 if largest_process_violation is not None:
                     process_pid, process_rss = largest_process_violation
@@ -2152,6 +2283,7 @@ def validate_worker_ownership(
     schema_version = resource_summary.get("schema_version")
     if schema_version not in {
         STAGE052_LEGACY_RESOURCE_SCHEMA_VERSION,
+        STAGE052_PREVIOUS_RESOURCE_SCHEMA_VERSION,
         STAGE052_RESOURCE_SCHEMA_VERSION,
     }:
         return False, "unsupported resource summary schema", ()
@@ -2213,7 +2345,10 @@ def validate_worker_ownership(
         return False, "resource descendant_pids are invalid", ()
     if len(descendants) != len(set(descendants)) or parent_pid in descendants:
         return False, "resource process identities are duplicate", ()
-    if schema_version == STAGE052_RESOURCE_SCHEMA_VERSION:
+    if schema_version in {
+        STAGE052_PREVIOUS_RESOURCE_SCHEMA_VERSION,
+        STAGE052_RESOURCE_SCHEMA_VERSION,
+    }:
         process_peaks = resource_summary.get("process_peak_rss_bytes")
         if not isinstance(process_peaks, Mapping):
             return False, "resource process_peak_rss_bytes is invalid", ()
@@ -2244,6 +2379,32 @@ def validate_worker_ownership(
             return False, "resource load1 summary is invalid", ()
         if resource_summary.get("load1_sample_count") != sample_count:
             return False, "resource load1 sample count does not reconcile", ()
+    if schema_version == STAGE052_RESOURCE_SCHEMA_VERSION:
+        aggregate_memory_source = resource_summary.get("aggregate_memory_source")
+        aggregate_peak_memory = resource_summary.get("aggregate_peak_memory_bytes")
+        cgroup_path = resource_summary.get("cgroup_path")
+        cgroup_swap_peak = resource_summary.get("cgroup_swap_peak_bytes")
+        if aggregate_memory_source not in {
+            "cgroup_v2",
+            "process_tree_rss_telemetry",
+        }:
+            return False, "resource aggregate memory source is invalid", ()
+        if (
+            isinstance(aggregate_peak_memory, bool)
+            or not isinstance(aggregate_peak_memory, int)
+            or aggregate_peak_memory <= 0
+        ):
+            return False, "resource aggregate memory peak is invalid", ()
+        if aggregate_memory_source == "cgroup_v2":
+            if (
+                not is_stage052_dedicated_cgroup_path(cgroup_path)
+                or isinstance(cgroup_swap_peak, bool)
+                or not isinstance(cgroup_swap_peak, int)
+                or cgroup_swap_peak < 0
+            ):
+                return False, "resource cgroup v2 evidence is invalid", ()
+        elif cgroup_path is not None or cgroup_swap_peak is not None:
+            return False, "resource RSS telemetry has unexpected cgroup evidence", ()
     allowed_pids = {parent_pid} if expected_workers == 1 else set(descendants)
     owners: set[int] = set()
     ordinals: set[int] = set()
@@ -2282,6 +2443,7 @@ def abort_process_executor(executor: Any) -> None:
         executor.shutdown(wait=False, cancel_futures=True)
         raise RuntimeError("executor process identities are unavailable during abort")
     workers = tuple(processes.values())
+    executor.shutdown(wait=False, cancel_futures=True)
     termination_errors: list[str] = []
     for process in workers:
         try:
@@ -2293,7 +2455,10 @@ def abort_process_executor(executor: Any) -> None:
             process.join(timeout=2.0)
             if process.is_alive():
                 process.kill()
-                process.join(timeout=2.0)
+                # SIGKILL is immediate, but the operating system can take
+                # longer to reap a memory-pressured process tree.  Do not
+                # declare failure while the worker is merely awaiting reap.
+                process.join(timeout=10.0)
             if process.is_alive():
                 termination_errors.append(
                     f"pid={getattr(process, 'pid', '?')}: survived terminate and kill"

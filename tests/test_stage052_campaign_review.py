@@ -1817,6 +1817,10 @@ def _build_complete_pilot_campaign(
         "parent_pid": 100,
         "descendant_pids": list(range(101, 137)),
         "aggregate_peak_rss_bytes": 3_000_000,
+        "aggregate_memory_source": "cgroup_v2",
+        "aggregate_peak_memory_bytes": 2_500_000,
+        "cgroup_path": "/stage052-test.service",
+        "cgroup_swap_peak_bytes": 0,
         "process_peak_rss_bytes": {
             "100": 1_000_000,
             **{str(pid): 1_000_000 for pid in range(101, 137)},

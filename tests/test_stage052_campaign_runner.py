@@ -154,6 +154,84 @@ def test_formal_execution_lock_requires_signed_recalibration_for_memory_drift() 
         )
 
 
+def test_formal_execution_lock_accepts_cgroup_peak_below_predecessor_rss() -> None:
+    locked = ProducerResourceContract(
+        selected_workers=6,
+        available_memory_bytes=30_000_000_000,
+        selected_aggregate_peak_rss_bytes=20_000_000_000,
+        selected_per_worker_peak_rss_bytes=4_000_000_000,
+        aggregate_memory_limit_bytes=24_000_000_000,
+        per_worker_memory_limit_bytes=4_800_000_000,
+        semantic_digest="a" * 64,
+        calibration_digest="b" * 64,
+        row_group_size=65_536,
+        queue_depth=1,
+    )
+    cgroup_contract = ProducerResourceContract(
+        selected_workers=6,
+        available_memory_bytes=30_000_000_000,
+        selected_aggregate_peak_rss_bytes=3_000_000_000,
+        selected_per_worker_peak_rss_bytes=4_700_000_000,
+        aggregate_memory_limit_bytes=3_600_000_000,
+        per_worker_memory_limit_bytes=5_640_000_000,
+        semantic_digest="a" * 64,
+        calibration_digest="d" * 64,
+        row_group_size=65_536,
+        queue_depth=1,
+    )
+    execution_lock = BenchmarkExecutionLock(
+        prerequisite_run_label="stage05.2_benchmark_attempt97",
+        raw_manifest_sha256="1" * 64,
+        selected_backend="native_cpu",
+        selected_exact_backend="cpu_batch",
+        selected_workers=6,
+        repository_revision="2" * 40,
+        runtime_identity_sha256="3" * 64,
+        runtime_contract_sha256="4" * 64,
+        runtime_selection_sha256="5" * 64,
+        input_provenance_sha256="6" * 64,
+        configuration_sha256="7" * 64,
+        configuration_selection_sha256="8" * 64,
+        native_config_sha256="9" * 64,
+        native_kernel_config={"abi": "v2"},
+        candidate_transaction_config_sha256="a" * 64,
+        candidate_transaction_config={"enabled": True},
+        instance_sha256={"c101_21": "b" * 64},
+        producer_resource_contract=locked.to_dict(),
+    )
+    evidence = FormalResourceRecalibrationEvidence(
+        report_run_label="stage05.2_resource_calibration_attempt07",
+        report_sha256="c" * 64,
+        report_sidecar_sha256="d" * 64,
+        replacement_contract_sha256=_sha256_json(cgroup_contract.to_dict()),
+        predecessor_run_label="stage05.2_benchmark_rerun02",
+        predecessor_batch_id="batch0008",
+        predecessor_resource_summary_sha256="e" * 64,
+        predecessor_aggregate_peak_rss_bytes=24_099_033_088,
+        predecessor_per_worker_peak_rss_bytes=4_700_000_000,
+        formal_memory_semantic_digest="9" * 64,
+        calibration_repository_revision="f" * 40,
+        aggregate_memory_source="cgroup_v2",
+        replacement_aggregate_peak_memory_bytes=3_000_000_000,
+    )
+
+    selection = execution_lock.with_producer_resource_contract(
+        cgroup_contract,
+        formal_recalibration=evidence,
+    )
+
+    assert selection["producer_resource_contract"] == cgroup_contract.to_dict()
+    assert selection["producer_resource_recalibration"] == evidence.to_dict()
+    with pytest.raises(RuntimeError, match="exact zero-geometry evidence"):
+        execution_lock.with_producer_resource_contract(
+            cgroup_contract,
+            formal_recalibration=replace(
+                evidence,
+                replacement_aggregate_peak_memory_bytes=3_000_000_001,
+            ),
+        )
+
+
 def _record_stage052_worker_pid(_: object) -> list[dict[str, object]]:
     return [{"worker_pid": os.getpid()}]
 

@@ -100,6 +100,7 @@ from evrptw.stage052 import (
 from evrptw.stage052_campaign import VolumeIdentity
 from evrptw.stage052_evidence import (
     BatchPersistenceEnvelope,
+    CgroupV2MemorySource,
     JobParallelSelectionIdentity,
     PersistenceInterval,
     ProcessTreeResourceSampler,
@@ -3825,7 +3826,8 @@ def test_process_tree_resource_summary_includes_live_child() -> None:
     assert summary.status == "complete"
 
 
-def test_process_tree_resource_sampler_exposes_hard_rss_abort(
+def test_process_tree_resource_sampler_uses_cgroup_memory_for_aggregate_gate(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeProcess:
@@ -3848,15 +3850,26 @@ def test_process_tree_resource_sampler_exposes_hard_rss_abort(
         def cpu_times(self) -> SimpleNamespace:
             return SimpleNamespace(user=0.1, system=0.1)
 
+    cgroup = tmp_path / "stage052-formal.service"
+    cgroup.mkdir()
+    (cgroup / "memory.current").write_text("800\n", encoding="ascii")
+    (cgroup / "memory.peak").write_text("850\n", encoding="ascii")
+    (cgroup / "memory.swap.current").write_text("0\n", encoding="ascii")
+    (cgroup / "memory.swap.peak").write_text("0\n", encoding="ascii")
+    memory_source = CgroupV2MemorySource(
+        cgroup_path=cgroup,
+        relative_path="/stage052-formal.service",
+    )
     sampler = ProcessTreeResourceSampler(
         run_label="stage05.2_benchmark_attempt99",
         component="benchmark",
         configured_worker_count=6,
         interval_seconds=0.001,
-        aggregate_rss_limit_bytes=1_000,
+        aggregate_memory_limit_bytes=1_000,
         per_process_rss_limit_bytes=900,
+        aggregate_memory_source=memory_source,
     )
-    parent = FakeProcess(sampler.parent_pid, 200)
+    parent = FakeProcess(sampler.parent_pid, 600)
     oversized_worker = FakeProcess(999_997, 950)
     monkeypatch.setattr(sampler, "_processes", lambda: [parent, oversized_worker])
 
@@ -3867,12 +3880,38 @@ def test_process_tree_resource_sampler_exposes_hard_rss_abort(
     reason = sampler.abort_reason()
     summary = sampler.stop()
 
-    assert reason == (
-        "aggregate RSS hard limit exceeded: observed=1150 limit=1000; "
-        "process RSS hard limit exceeded: pid=999997 observed=950 limit=900"
-    )
-    assert summary.aggregate_peak_rss_bytes == 1_150
+    assert reason == "process RSS hard limit exceeded: pid=999997 observed=950 limit=900"
+    assert summary.aggregate_peak_rss_bytes == 1_550
+    assert summary.aggregate_memory_source == "cgroup_v2"
+    assert summary.aggregate_peak_memory_bytes == 850
+    assert summary.cgroup_path == "/stage052-formal.service"
+    assert summary.cgroup_swap_peak_bytes == 0
     assert dict(summary.process_peak_rss_bytes)[oversized_worker.pid] == 950
+
+    (cgroup / "memory.current").write_text("1001\n", encoding="ascii")
+    aggregate_sampler = ProcessTreeResourceSampler(
+        run_label="stage05.2_benchmark_attempt99",
+        component="benchmark",
+        configured_worker_count=6,
+        interval_seconds=0.001,
+        aggregate_memory_limit_bytes=1_000,
+        aggregate_memory_source=memory_source,
+    )
+    monkeypatch.setattr(
+        aggregate_sampler,
+        "_processes",
+        lambda: [FakeProcess(aggregate_sampler.parent_pid, 600), oversized_worker],
+    )
+    aggregate_sampler.start()
+    deadline = time.monotonic() + 0.5
+    while aggregate_sampler.abort_reason() is None and time.monotonic() < deadline:
+        time.sleep(0.001)
+    aggregate_reason = aggregate_sampler.abort_reason()
+    aggregate_sampler.stop()
+    assert aggregate_reason == (
+        "cgroup v2 memory hard limit exceeded: observed=1001 limit=1000"
+    )
+
     task_started = False
 
     def task_runner(_task: object) -> list[dict[str, object]]:
@@ -3882,15 +3921,62 @@ def test_process_tree_resource_sampler_exposes_hard_rss_abort(
 
     with pytest.raises(
         RuntimeError,
-        match="runtime guard aborted Stage 5.2 work: aggregate RSS hard limit exceeded",
+        match="runtime guard aborted Stage 5.2 work: "
+        "cgroup v2 memory hard limit exceeded",
     ):
         _run_v2_tasks(
             [SimpleNamespace(instance_name="c201_21", seed=2018)],  # type: ignore[arg-type]
             worker_count=1,
-            abort_reason=sampler.abort_reason,
+            abort_reason=aggregate_sampler.abort_reason,
             _task_runner=task_runner,  # type: ignore[arg-type]
         )
     assert task_started is False
+
+
+def test_cgroup_memory_source_discovery_rejects_shared_init_scope(
+    tmp_path: Path,
+) -> None:
+    proc_identity = tmp_path / "self.cgroup"
+    proc_identity.write_text("0::/init.scope\n", encoding="ascii")
+    cgroup_root = tmp_path / "cgroup"
+    init_scope = cgroup_root / "init.scope"
+    init_scope.mkdir(parents=True)
+    for name in (
+        "memory.current",
+        "memory.peak",
+        "memory.swap.current",
+        "memory.swap.peak",
+    ):
+        (init_scope / name).write_text("0\n", encoding="ascii")
+
+    with pytest.raises(
+        RuntimeError,
+        match="requires an isolated systemd service cgroup",
+    ):
+        CgroupV2MemorySource.discover(
+            proc_self_cgroup=proc_identity,
+            cgroup_root=cgroup_root,
+        )
+
+
+def test_cgroup_memory_source_rejects_shared_user_manager(
+    tmp_path: Path,
+) -> None:
+    cgroup = tmp_path / "user@1000.service"
+    cgroup.mkdir()
+    for name in (
+        "memory.current",
+        "memory.peak",
+        "memory.swap.current",
+        "memory.swap.peak",
+    ):
+        (cgroup / name).write_text("0\n", encoding="ascii")
+
+    with pytest.raises(ValueError, match="not an isolated service"):
+        CgroupV2MemorySource(
+            cgroup_path=cgroup,
+            relative_path="/user.slice/user-1000.slice/user@1000.service",
+        )
 
 
 def test_process_tree_resource_summary_excludes_half_sampled_transient_child(
@@ -3977,6 +4063,47 @@ def test_process_tree_resource_summary_excludes_zero_rss_exited_child(
     assert parent.pid in dict(summary.process_peak_rss_bytes)
     assert exited.pid not in summary.descendant_pids
     assert exited.pid not in dict(summary.process_peak_rss_bytes)
+
+
+def test_performance_resource_gate_uses_cgroup_peak_not_summed_rss(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_label = "stage05.2_native_kernels_attempt99"
+    raw_dir = tmp_path / run_label
+    resource = {
+        "schema_version": stage052_evidence.STAGE052_RESOURCE_SCHEMA_VERSION,
+        "aggregate_memory_source": "cgroup_v2",
+        "aggregate_peak_memory_bytes": 2_500_000_000,
+        "aggregate_peak_rss_bytes": 24_099_033_088,
+        "cgroup_path": "/stage052-review-test.service",
+        "cgroup_swap_peak_bytes": 0,
+        "process_peak_rss_bytes": {"101": 1_000_000_000},
+    }
+    monkeypatch.setattr(
+        stage052_review,
+        "_load_resource_summary",
+        lambda _raw_dir: resource,
+    )
+    monkeypatch.setattr(
+        stage052_review,
+        "_load_shard_manifests",
+        lambda _raw_dir: [],
+    )
+    monkeypatch.setattr(
+        stage052_review,
+        "validate_worker_ownership",
+        lambda *_args, **_kwargs: (True, "ownership valid", (101,)),
+    )
+
+    passed, detail = stage052_review._validate_resource_limits(
+        raw_dir,
+        component=Stage052Component.NATIVE_KERNELS,
+        expected_workers=1,
+    )
+
+    assert passed
+    assert "cgroup v2 aggregate memory 2500000000" in detail
 
 
 def test_worker_ownership_requires_actual_sampled_pids() -> None:
@@ -4098,10 +4225,57 @@ def test_parallel_pool_terminates_all_workers_before_recording_failure(
 
     assert events == [
         "cancel",
+        "shutdown:False:True",
         "terminate",
         "join:2.0",
         "shutdown:True:True",
         "failure_evidence",
+    ]
+
+
+def test_parallel_pool_reaps_worker_after_kill_escalation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class StubbornProcess:
+        pid = 998
+
+        def __init__(self) -> None:
+            self.alive = True
+            self.killed = False
+
+        def terminate(self) -> None:
+            events.append("terminate")
+
+        def kill(self) -> None:
+            events.append("kill")
+            self.killed = True
+
+        def join(self, *, timeout: float) -> None:
+            events.append(f"join:{timeout}")
+            if self.killed and timeout >= 10.0:
+                self.alive = False
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    class FakeExecutor:
+        def __init__(self) -> None:
+            self._processes = {1: StubbornProcess()}
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool = False) -> None:
+            events.append(f"shutdown:{wait}:{cancel_futures}")
+
+    stage052_evidence.abort_process_executor(FakeExecutor())
+
+    assert events == [
+        "shutdown:False:True",
+        "terminate",
+        "join:2.0",
+        "kill",
+        "join:10.0",
+        "shutdown:True:True",
     ]
 
 

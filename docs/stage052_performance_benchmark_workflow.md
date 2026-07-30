@@ -252,18 +252,25 @@ source path 变化都 fail fast，并要求新的 prerequisite。
 Attempt73 的只读大型 shard 与固定高内存 scope 上比较 4/5/6 workers，并按用户要求
 增加 8-worker stress probe（压力探针）。6 workers 相对 4 workers 达到既定吞吐门槛，
 不使用 swap/fallback 且语义摘要一致；8 workers 仅为排除性测试，吞吐显著低于 6，
-因此 replacement Pilot/Formal 固定 6 workers。resource gate 使用实际 per-worker/
-process-tree peak、机器可用能力和明确的 operating headroom（运行余量），不再把
-可用内存的任意固定百分比作为 publication gate（发布门槛）。最终 worker 数、
-per-worker/process-tree limits、Parquet row group 65,536/262,144 与 queue depth 1/2
+因此 replacement Pilot/Formal 固定 6 workers。resource gate 使用实际 per-worker
+RSS 与隔离 cgroup v2 的 `memory.current`/`memory.peak`、机器可用能力和明确的
+operating headroom（运行余量）；process-tree RSS 总和因会重复计算 spawned workers
+共享映射，只保留为 compatibility telemetry（兼容遥测），不再作为 aggregate hard
+gate（聚合硬门槛），也不再把可用内存的任意固定百分比作为 publication gate
+（发布门槛）。最终 worker 数、per-worker/cgroup limits、Parquet row group
+65,536/262,144 与 queue depth 1/2
 写入 signed resource contract（签名资源合同），Formal 原样继承。Independent
 reviewer 单独校准 1/2/4 workers，并由 parent baseline 与 per-child p99 RSS 推导
 `MemoryHigh`、内部 guard 和 `MemoryMax`；swap 固定为 0，资源上限必须容纳已选并发
 且不得触发持续 throttling（限流）。
 
 若完整 Formal 在零 readiness geometry（就绪几何）贡献的 partial batch 中仅因已签名
-aggregate/per-worker RSS hard limit fail fast，replacement Formal 可以使用新的
-signed v2 calibration report 重新冻结 resource envelope（资源封套）。memory
+aggregate/per-worker hard limit fail fast，replacement Formal 可以使用新的
+signed calibration report 重新冻结 resource envelope（资源封套）。v2 report
+仅用于读取 Attempt99 历史；新 v3 report 必须绑定 rerun02/batch0008，并从隔离
+systemd service 的 cgroup v2 实际内存重测 aggregate peak。失败 predecessor 的
+process-tree RSS 总和只作为不可变 failure provenance，不可作为物理内存 floor。
+memory
 capacity/peaks/limits 与 calibration/semantic digests 可以重测，但原
 worker/row-group/queue-depth 拓扑及独立 scientific execution selection lock 不变。
 report 必须绑定失败 run/batch/resource summary、clean calibration revision、
@@ -271,9 +278,12 @@ exact unique `{4,5,6}` worker identity set 的 cross-worker semantic equality、
 exact replacement-contract digest、精确 20% headroom、零
 swap/fallback/resource-limit failure 与
 `campaign_geometry_contribution=0`；producer 和
-independent reviewer 必须通过同一 loader 重算。Formal memory probe 保留其自身
-可验证的 semantic digest，并且 aggregate/per-worker peak 不得超过 replacement
-contract 的对应 selected peak。任何缺失 report、checksum 不一致、worker identity
+independent reviewer 必须通过同一 loader 重算。Formal memory probe 必须在独立
+`systemd --user` service 中运行，保留其自身可验证的 semantic digest、cgroup path、
+`memory.peak` 与 `memory.swap.peak`，并且 cgroup aggregate/per-worker peak 不得超过
+replacement contract 的对应 selected peak。`/init.scope`、共享 cgroup、缺失
+memory controller 文件或任何 aggregate RSS fallback 均 fail fast。任何缺失
+report、checksum 不一致、worker identity
 缺失或重复、拓扑变化、memory floor 降低或非零 geometry 都继续拒绝，失败 label
 不续跑、不导入 shard。
 

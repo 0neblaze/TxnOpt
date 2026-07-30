@@ -49,7 +49,11 @@ from evrptw.experiments.stage052_performance import (
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
 from evrptw.stage052 import Stage052Component
-from evrptw.stage052_evidence import ProcessTreeResourceSampler, RunResourceSummary
+from evrptw.stage052_evidence import (
+    ProcessTreeResourceSampler,
+    RunResourceSummary,
+    is_stage052_dedicated_cgroup_path,
+)
 from evrptw.stage052_resources import (
     ParquetBenchmark,
     ProducerBenchmark,
@@ -62,8 +66,8 @@ from evrptw.stage052_resources import (
 
 _CALIBRATION_INSTANCES = ("c101_21", "r101_21", "rc101_21")
 _CALIBRATION_SEEDS = (2014, 2015)
-_FORMAL_MEMORY_INSTANCE = "c203_21"
-_FORMAL_MEMORY_SEEDS = tuple(range(2015, 2023))
+_FORMAL_MEMORY_INSTANCE = "r205_21"
+_FORMAL_MEMORY_SEEDS = tuple(range(2014, 2022))
 _PRODUCER_WORKERS = (4, 5, 6)
 _PRODUCER_PROBE_WORKERS = (4, 5, 6, 8)
 _PARQUET_CONFIGURATIONS = (
@@ -96,10 +100,36 @@ def _is_failed_formal_memory_floor_reason(reason: object) -> bool:
 class MeasuredProducerCandidate:
     benchmark: ProducerBenchmark
     per_worker_peak_rss_bytes: int
+    aggregate_memory_source: str = "process_tree_rss_telemetry"
+    cgroup_path: str | None = None
+    cgroup_swap_peak_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if self.per_worker_peak_rss_bytes <= 0:
             raise ValueError("per-worker peak RSS must be positive")
+        if self.aggregate_memory_source not in {
+            "cgroup_v2",
+            "process_tree_rss_telemetry",
+        }:
+            raise ValueError("aggregate memory source is invalid")
+        if self.aggregate_memory_source == "cgroup_v2":
+            if (
+                self.cgroup_path is None
+                or not is_stage052_dedicated_cgroup_path(self.cgroup_path)
+                or self.cgroup_swap_peak_bytes is None
+                or self.cgroup_swap_peak_bytes < 0
+            ):
+                raise ValueError("cgroup v2 aggregate memory evidence is incomplete")
+        elif self.cgroup_path is not None or self.cgroup_swap_peak_bytes is not None:
+            raise ValueError("RSS telemetry cannot claim cgroup v2 evidence")
+
+
+class FormalMemoryMeasurementError(RuntimeError):
+    """A failed Formal probe with its completed resource observation attached."""
+
+    def __init__(self, cause: BaseException, resource: RunResourceSummary) -> None:
+        super().__init__(f"{type(cause).__name__}: {cause}")
+        self.resource_summary = resource.to_dict()
 
 
 @dataclass(frozen=True, slots=True)
@@ -699,13 +729,16 @@ def _summarize_producer_measurement(
         benchmark=ProducerBenchmark(
             workers=workers,
             throughput=total_exact_calls / elapsed,
-            aggregate_peak_rss_bytes=resource.aggregate_peak_rss_bytes,
+            aggregate_peak_rss_bytes=resource.aggregate_peak_memory_bytes,
             semantic_digest=aggregate_digest,
             swap_peak_bytes=swap_peak_bytes,
             fallback_count=fallback_count,
             resource_limit_exceeded=False,
         ),
         per_worker_peak_rss_bytes=per_worker_peak,
+        aggregate_memory_source=resource.aggregate_memory_source,
+        cgroup_path=resource.cgroup_path,
+        cgroup_swap_peak_bytes=resource.cgroup_swap_peak_bytes,
     )
 
 
@@ -830,9 +863,9 @@ def benchmark_formal_memory_candidate(
     config_path: Path,
     output_root: Path,
     run_label: str,
-    aggregate_rss_limit_bytes: int,
+    aggregate_memory_limit_bytes: int,
 ) -> MeasuredProducerCandidate:
-    """Measure complete Formal axes on one bounded high-memory C-family wave."""
+    """Measure complete Formal axes on the failed high-memory R205 wave."""
 
     if workers not in _PRODUCER_PROBE_WORKERS:
         raise ValueError("Formal memory calibration workers must be 4, 5, 6, or 8")
@@ -840,8 +873,8 @@ def benchmark_formal_memory_candidate(
         raise ValueError("Formal memory calibration row group size is invalid")
     if queue_depth not in {1, 2}:
         raise ValueError("Formal memory calibration queue depth is invalid")
-    if aggregate_rss_limit_bytes <= 0:
-        raise ValueError("Formal memory calibration RSS limit must be positive")
+    if aggregate_memory_limit_bytes <= 0:
+        raise ValueError("Formal memory calibration aggregate limit must be positive")
     config = load_stage052_config(config_path)
     storage = replace(
         config.v2_storage,
@@ -869,7 +902,7 @@ def benchmark_formal_memory_candidate(
         component="formal_memory_calibration",
         configured_worker_count=workers,
         interval_seconds=0.02,
-        aggregate_rss_limit_bytes=aggregate_rss_limit_bytes,
+        aggregate_memory_limit_bytes=aggregate_memory_limit_bytes,
     )
     swap_baseline = int(psutil.swap_memory().used)
     swap_peak = swap_baseline
@@ -884,6 +917,8 @@ def benchmark_formal_memory_candidate(
     sampler.start()
     swap_thread.start()
     started = time.perf_counter()
+    measurement_error: BaseException | None = None
+    rows: list[dict[str, object]] = []
     try:
         rows = _run_v2_tasks(
             tasks,
@@ -891,11 +926,18 @@ def benchmark_formal_memory_candidate(
             abort_reason=sampler.abort_reason,
             _task_runner=_formal_memory_shard_runner,
         )
+    except BaseException as error:
+        measurement_error = error
     finally:
         elapsed = time.perf_counter() - started
         swap_stop.set()
         swap_thread.join()
         resource = sampler.stop()
+    if measurement_error is not None:
+        raise FormalMemoryMeasurementError(
+            measurement_error,
+            resource,
+        ) from measurement_error
     if len(rows) != len(tasks) * 3 or any(row.get("failure_status") for row in rows):
         raise RuntimeError("Formal memory calibration did not complete its exact scope")
     return _summarize_producer_measurement(
@@ -1105,11 +1147,19 @@ def run_stage052_resource_calibration(
         config_path=resolved_config,
         output_root=output_root,
         run_label=run_label,
-        aggregate_rss_limit_bytes=memory_capacity,
+        aggregate_memory_limit_bytes=memory_capacity,
     )
     formal_benchmark = formal_memory_measurement.benchmark
     if formal_benchmark.workers != preliminary_selection.selected_workers:
         raise RuntimeError("Formal memory measurement used the wrong producer worker count")
+    if (
+        formal_memory_measurement.aggregate_memory_source != "cgroup_v2"
+        or formal_memory_measurement.cgroup_path is None
+        or formal_memory_measurement.cgroup_swap_peak_bytes != 0
+    ):
+        raise RuntimeError(
+            "Formal memory measurement must use a swap-free isolated cgroup v2 service"
+        )
     if (
         formal_benchmark.swap_peak_bytes > 0
         or formal_benchmark.fallback_count > 0
@@ -1127,14 +1177,11 @@ def run_stage052_resource_calibration(
             "failed Formal memory floor worker count does not match "
             "the selected producer contract"
         )
-    selected_aggregate_peak = max(
-        formal_benchmark.aggregate_peak_rss_bytes,
-        (
-            formal_campaign_memory_floor.aggregate_peak_rss_bytes
-            if formal_campaign_memory_floor is not None
-            else 0
-        ),
-    )
+    # The failed Formal predecessor used a sum of process RSS values, which
+    # double-counts shared pages and is not commensurate with cgroup memory.
+    # It remains bound as failure provenance but cannot be reused as a physical
+    # aggregate-memory floor.
+    selected_aggregate_peak = formal_benchmark.aggregate_peak_rss_bytes
     selected_per_worker_peak = max(
         formal_memory_measurement.per_worker_peak_rss_bytes,
         (
@@ -1147,10 +1194,7 @@ def run_stage052_resource_calibration(
         MeasuredProducerCandidate(
             benchmark=replace(
                 measurement.benchmark,
-                aggregate_peak_rss_bytes=max(
-                    measurement.benchmark.aggregate_peak_rss_bytes,
-                    selected_aggregate_peak,
-                ),
+                aggregate_peak_rss_bytes=selected_aggregate_peak,
             ),
             per_worker_peak_rss_bytes=max(
                 measurement.per_worker_peak_rss_bytes,
@@ -1178,7 +1222,7 @@ def run_stage052_resource_calibration(
     atomic_write_signed_json(
         output_root / "calibration_report.json",
         {
-            "schema_version": "stage05.2-resource-calibration-report-v2",
+            "schema_version": "stage05.2-resource-calibration-report-v3",
             "corpus_role": "read_only_benchmark_differential_only",
             "corpus_path": str(corpus_dir),
             "campaign_geometry_contribution": 0,
@@ -1254,9 +1298,9 @@ def run_stage052_formal_memory_probe(
     operating_reserve_bytes = 1024**3
     if memory_capacity <= operating_reserve_bytes:
         raise RuntimeError("Formal memory probe host capacity is too small")
-    aggregate_rss_limit_bytes = memory_capacity - operating_reserve_bytes
+    aggregate_memory_limit_bytes = memory_capacity - operating_reserve_bytes
     base_payload: dict[str, object] = {
-        "schema_version": "stage05.2-formal-memory-probe-v2",
+        "schema_version": "stage05.2-formal-memory-probe-v3",
         "run_label": run_label,
         "corpus_role": "exploratory_only_zero_campaign_geometry",
         "campaign_geometry_contribution": 0,
@@ -1265,7 +1309,8 @@ def run_stage052_formal_memory_probe(
         "queue_depth": queue_depth,
         "memory_capacity_bytes": memory_capacity,
         "operating_reserve_bytes": operating_reserve_bytes,
-        "aggregate_rss_abort_limit_bytes": aggregate_rss_limit_bytes,
+        "aggregate_memory_source": "cgroup_v2",
+        "aggregate_memory_abort_limit_bytes": aggregate_memory_limit_bytes,
         "formal_memory_scope": {
             "instance": _FORMAL_MEMORY_INSTANCE,
             "seeds": list(_FORMAL_MEMORY_SEEDS[:workers]),
@@ -1295,7 +1340,7 @@ def run_stage052_formal_memory_probe(
             config_path=resolved_config,
             output_root=output_root,
             run_label=run_label,
-            aggregate_rss_limit_bytes=aggregate_rss_limit_bytes,
+            aggregate_memory_limit_bytes=aggregate_memory_limit_bytes,
         )
         if measured.benchmark.workers != workers:
             raise RuntimeError("Formal memory probe returned the wrong worker count")
@@ -1305,6 +1350,7 @@ def run_stage052_formal_memory_probe(
             "status": "failed",
             "failure_reason": f"{type(error).__name__}: {error}",
             "measurement": None,
+            "resource_summary": getattr(error, "resource_summary", None),
         }
         try:
             seal(failed_payload)
@@ -1319,6 +1365,7 @@ def run_stage052_formal_memory_probe(
         "status": "complete",
         "failure_reason": None,
         "measurement": asdict(measured),
+        "resource_summary": None,
     }
     seal(payload)
     return payload

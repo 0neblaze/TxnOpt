@@ -47,6 +47,9 @@ def test_calibration_runs_every_candidate_and_seals_selected_contract(
                 resource_limit_exceeded=False,
             ),
             per_worker_peak_rss_bytes=3 * 1024**3,
+            aggregate_memory_source="cgroup_v2",
+            cgroup_path="/stage052-calibration.service",
+            cgroup_swap_peak_bytes=0,
         )
 
     def parquet_runner(**kwargs) -> ParquetBenchmark:
@@ -80,6 +83,9 @@ def test_calibration_runs_every_candidate_and_seals_selected_contract(
                 resource_limit_exceeded=False,
             ),
             per_worker_peak_rss_bytes=3 * 1024**3,
+            aggregate_memory_source="cgroup_v2",
+            cgroup_path="/stage052-calibration.service",
+            cgroup_swap_peak_bytes=0,
         )
 
     monkeypatch.setattr(
@@ -118,6 +124,7 @@ def test_calibration_runs_every_candidate_and_seals_selected_contract(
         (262_144, 2),
     ]
     assert contract.selected_workers == 6
+    assert contract.selected_aggregate_peak_rss_bytes == 9 * 1024**3
     assert contract.row_group_size == 65_536
     assert contract.queue_depth == 1
     assert load_producer_resource_contract(contract_path) == contract
@@ -185,6 +192,9 @@ def test_calibration_contract_includes_selected_formal_memory_measurement(
                 resource_limit_exceeded=False,
             ),
             per_worker_peak_rss_bytes=3 * 1024**3,
+            aggregate_memory_source="cgroup_v2",
+            cgroup_path="/stage052-calibration.service",
+            cgroup_swap_peak_bytes=0,
         )
 
     monkeypatch.setattr(
@@ -227,7 +237,7 @@ def test_calibration_contract_includes_selected_formal_memory_measurement(
 
     assert formal_calls == [(6, 262_144, 2)]
     assert contract.selected_workers == 6
-    assert contract.selected_aggregate_peak_rss_bytes == 15 * 1024**3
+    assert contract.selected_aggregate_peak_rss_bytes == 14 * 1024**3
     assert contract.selected_per_worker_peak_rss_bytes == 3_300_000_000
     report = json.loads(
         (tmp_path / "calibration" / "calibration_report.json").read_text(
@@ -274,6 +284,25 @@ def test_calibration_contract_includes_selected_formal_memory_measurement(
         )
 
 
+def test_measured_producer_candidate_rejects_shared_user_manager_cgroup() -> None:
+    with pytest.raises(ValueError, match="cgroup v2 aggregate memory evidence"):
+        MeasuredProducerCandidate(
+            benchmark=ProducerBenchmark(
+                workers=6,
+                throughput=1.0,
+                aggregate_peak_rss_bytes=1024,
+                semantic_digest="a" * 64,
+                swap_peak_bytes=0,
+                fallback_count=0,
+                resource_limit_exceeded=False,
+            ),
+            per_worker_peak_rss_bytes=1024,
+            aggregate_memory_source="cgroup_v2",
+            cgroup_path="/user.slice/user-1000.slice/user@1000.service",
+            cgroup_swap_peak_bytes=0,
+        )
+
+
 def test_formal_memory_probe_seals_non_campaign_measurement(
     tmp_path: Path,
     monkeypatch,
@@ -286,7 +315,7 @@ def test_formal_memory_probe_seals_non_campaign_measurement(
                 int(kwargs["workers"]),
                 int(kwargs["row_group_size"]),
                 int(kwargs["queue_depth"]),
-                int(kwargs["aggregate_rss_limit_bytes"]),
+                int(kwargs["aggregate_memory_limit_bytes"]),
             )
         )
         return MeasuredProducerCandidate(
@@ -325,8 +354,8 @@ def test_formal_memory_probe_seals_non_campaign_measurement(
     assert calls == [(6, 65_536, 2, 23 * 1024**3)]
     assert payload["campaign_geometry_contribution"] == 0
     assert payload["formal_memory_scope"] == {
-        "instance": "c203_21",
-        "seeds": [2015, 2016, 2017, 2018, 2019, 2020],
+        "instance": "r205_21",
+        "seeds": [2014, 2015, 2016, 2017, 2018, 2019],
         "axes": ["wall_clock_30", "wall_clock_60", "wall_clock_300"],
     }
     report_path = output_root / "formal_memory_probe_report.json"

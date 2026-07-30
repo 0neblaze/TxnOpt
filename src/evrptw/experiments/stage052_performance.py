@@ -1982,7 +1982,7 @@ def _run_benchmark_batch(
         component=Stage052Component.BENCHMARK.value,
         configured_worker_count=campaign_config.selected_workers,
         interval_seconds=0.05,
-        aggregate_rss_limit_bytes=(
+        aggregate_memory_limit_bytes=(
             campaign_config.producer_resource_contract.aggregate_memory_limit_bytes
             if campaign_config.producer_resource_contract is not None
             else AGGREGATE_RSS_LIMIT_BYTES

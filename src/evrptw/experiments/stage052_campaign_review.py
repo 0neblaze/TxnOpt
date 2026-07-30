@@ -103,6 +103,7 @@ from evrptw.stage052_evidence import (
     BatchPersistenceEnvelope,
     Stage052PersistenceAttribution,
     abort_process_executor,
+    is_stage052_dedicated_cgroup_path,
     stage052_source_snapshot_contract,
     validate_worker_ownership,
     verify_stage052_campaign_gate_set,
@@ -2688,7 +2689,7 @@ def _validate_batch_resources(
     if not ownership:
         return False, detail, {}
     if resource.get("schema_version") != STAGE052_RESOURCE_SCHEMA_VERSION:
-        return False, "batch resource evidence must use resource v3", {}
+        return False, "batch resource evidence must use resource v4", {}
     process_peaks = resource.get("process_peak_rss_bytes")
     if not isinstance(process_peaks, Mapping):
         return False, "batch process peak RSS mapping is missing", {}
@@ -2697,9 +2698,25 @@ def _validate_batch_resources(
             int(str(pid)): _strict_int(value, "process peak RSS")
             for pid, value in process_peaks.items()
         }
-        aggregate = _strict_int(resource.get("aggregate_peak_rss_bytes"), "aggregate peak RSS")
+        aggregate_rss = _strict_int(
+            resource.get("aggregate_peak_rss_bytes"),
+            "aggregate peak RSS",
+        )
+        aggregate_memory = _strict_int(
+            resource.get("aggregate_peak_memory_bytes"),
+            "aggregate peak memory",
+        )
+        cgroup_swap_peak = _strict_int(
+            resource.get("cgroup_swap_peak_bytes"),
+            "cgroup swap peak",
+        )
     except (ValueError, ArtifactIntegrityError) as error:
         return False, str(error), {}
+    if (
+        resource.get("aggregate_memory_source") != "cgroup_v2"
+        or not is_stage052_dedicated_cgroup_path(resource.get("cgroup_path"))
+    ):
+        return False, "batch aggregate memory is not bound to an isolated cgroup v2 service", {}
     worker_peak = max((normalized_peaks.get(pid, 0) for pid in owners), default=0)
     if producer_resource_contract is not None:
         if producer_resource_contract.selected_workers != workers:
@@ -2711,12 +2728,21 @@ def _validate_batch_resources(
         per_worker_limit = PER_WORKER_RSS_LIMIT_BYTES
         aggregate_limit = AGGREGATE_RSS_LIMIT_BYTES
         contract_source = "historical_fixed"
-    passed = worker_peak > 0 and worker_peak <= per_worker_limit and aggregate <= aggregate_limit
+    passed = (
+        worker_peak > 0
+        and worker_peak <= per_worker_limit
+        and aggregate_memory <= aggregate_limit
+        and cgroup_swap_peak == 0
+    )
     summary = {
         "configured_workers": workers,
         "owner_pids": list(owners),
         "per_worker_peak_rss_bytes": worker_peak,
-        "aggregate_peak_rss_bytes": aggregate,
+        "aggregate_peak_rss_bytes": aggregate_rss,
+        "aggregate_peak_memory_bytes": aggregate_memory,
+        "aggregate_memory_source": "cgroup_v2",
+        "cgroup_path": resource.get("cgroup_path"),
+        "cgroup_swap_peak_bytes": cgroup_swap_peak,
         "per_worker_limit_bytes": per_worker_limit,
         "aggregate_limit_bytes": aggregate_limit,
         "resource_contract_source": contract_source,
@@ -2727,9 +2753,9 @@ def _validate_batch_resources(
     }
     return (
         passed,
-        "per-worker and process-tree campaign resource limits passed"
+        "per-worker RSS and cgroup v2 campaign resource limits passed"
         if passed
-        else "per-worker or process-tree campaign resource limit failed",
+        else "per-worker RSS, cgroup v2 memory, or swap campaign limit failed",
         summary,
     )
 

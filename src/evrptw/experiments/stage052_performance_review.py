@@ -84,6 +84,7 @@ from evrptw.stage052_evidence import (
     Stage052PrerequisiteIdentity,
     _same_producer_machine_ignoring_review_memory,
     abort_process_executor,
+    is_stage052_dedicated_cgroup_path,
     stage052_source_snapshot_contract,
     validate_worker_ownership,
     verify_frozen_stage052_producer_runtime_identity,
@@ -5497,7 +5498,7 @@ def _validate_resource_limits(
     except (ArtifactIntegrityError, KeyError, OSError, TypeError, ValueError) as error:
         return False, str(error)
     if resource.get("schema_version") != STAGE052_RESOURCE_SCHEMA_VERSION:
-        return False, "current evidence requires stage05.2-run-resource-v3"
+        return False, "current evidence requires stage05.2-run-resource-v4"
     ownership_passed, ownership_detail, owners = validate_worker_ownership(
         resource,
         shard_manifests,
@@ -5514,7 +5515,7 @@ def _validate_resource_limits(
         process_peaks = {
             int(str(pid)): _strict_int(peak, "peak_rss") for pid, peak in raw_peaks.items()
         }
-        aggregate_peak = _strict_int(
+        aggregate_peak_rss = _strict_int(
             resource.get("aggregate_peak_rss_bytes"), "aggregate_peak_rss_bytes"
         )
     except (TypeError, ValueError) as error:
@@ -5526,14 +5527,43 @@ def _validate_resource_limits(
     }
     if oversized_workers:
         return False, f"per-worker RSS exceeds limit: {oversized_workers}"
+    aggregate_memory_source = resource.get("aggregate_memory_source")
+    if aggregate_memory_source == "cgroup_v2":
+        cgroup_path = resource.get("cgroup_path")
+        if not isinstance(cgroup_path, str) or not is_stage052_dedicated_cgroup_path(
+            cgroup_path
+        ):
+            return (
+                False,
+                "cgroup v2 aggregate memory path is not a dedicated Stage 5.2 service",
+            )
+        try:
+            aggregate_peak = _strict_int(
+                resource.get("aggregate_peak_memory_bytes"),
+                "aggregate_peak_memory_bytes",
+            )
+            swap_peak = _strict_int(
+                resource.get("cgroup_swap_peak_bytes"),
+                "cgroup_swap_peak_bytes",
+            )
+        except (TypeError, ValueError) as error:
+            return False, str(error)
+        if swap_peak != 0:
+            return False, f"cgroup swap peak is nonzero: {swap_peak}"
+        aggregate_label = "cgroup v2 aggregate memory"
+    elif aggregate_memory_source == "process_tree_rss_telemetry":
+        aggregate_peak = aggregate_peak_rss
+        aggregate_label = "process-tree aggregate RSS"
+    else:
+        return False, "aggregate_memory_source is invalid"
     if aggregate_peak > _PROCESS_TREE_RSS_LIMIT_BYTES:
         return False, (
-            f"process-tree aggregate RSS {aggregate_peak} exceeds {_PROCESS_TREE_RSS_LIMIT_BYTES}"
+            f"{aggregate_label} {aggregate_peak} exceeds {_PROCESS_TREE_RSS_LIMIT_BYTES}"
         )
     return (
         True,
         f"per-worker RSS <= {_PER_WORKER_STORAGE_RSS_LIMIT_BYTES}; "
-        f"aggregate RSS {aggregate_peak} <= {_PROCESS_TREE_RSS_LIMIT_BYTES}",
+        f"{aggregate_label} {aggregate_peak} <= {_PROCESS_TREE_RSS_LIMIT_BYTES}",
     )
 
 

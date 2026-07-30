@@ -2173,3 +2173,30 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   文件。缺失/篡改 report、非零 geometry、拓扑变化、降低 memory floor 或 checksum
   不一致全部 fail fast。修复后的 replacement 使用新 commit、wheels、sealed
   snapshot 与 `stage05.2_benchmark_rerun02` 从零执行。
+
+## 2026-07-30：G Formal rerun02 aggregate-memory accounting 根因修复
+
+- `stage05.2_benchmark_rerun02` 在 clean commit
+  `c45d748aa0a59808d777f88989a168a1325900b4` 上完成并归档 batch0001--0007，
+  共 678/920 shards；batch0008 在 `r205_21` wave 中完成 12 shards 后触发
+  aggregate guard。raw 显示 process-tree RSS 总和
+  `24,099,033,088` bytes，内部门槛 `24,072,732,672` bytes；Windows host/
+  controller exit 1，batch0008 partial evidence 与前七个不可变 archive batches
+  全部保留，attempt99、rerun01、rerun02 均不续跑、不导入 shard。
+- 同一失败 wave 的独立 transient systemd probe 显示 cgroup physical peak 仅约
+  2.5 GiB、swap 0，而内部进程 RSS 总和约 24.1 GiB。根因是六个 spawned workers
+  的共享映射被逐进程 RSS 累加六次；它不是物理内存耗尽、page-cache 累积或
+  row-group/queue-depth 不足。
+- resource evidence 升级为 v4：aggregate hard gate 只读 dedicated cgroup v2
+  `memory.current`，签入 `memory.peak`、`memory.swap.peak` 与 exact cgroup path；
+  process-tree aggregate RSS 继续保留为兼容遥测，per-worker RSS 继续独立硬限制。
+  Formal 有 aggregate limit 时若处于 `/init.scope`、共享 user service、缺少 memory
+  controller 文件或无法验证 service cgroup，必须在工作开始前 fail fast，不提供
+  RSS fallback。
+- Formal memory probe 改为失败时也封存完整 resource summary；worker abort 先
+  shutdown/cancel，再 terminate，并给 SIGKILL 后的操作系统 reap 10 秒有界窗口，
+  survivor 仍作为显式失败。新 calibration report v3 精确绑定
+  `rerun02/batch0008` resource summary
+  `ec5e8eb43562b983ac0b3d733da446f45fa59407b278dff93323ce4d6e6e6253`；
+  predecessor RSS 总和仅作失败 provenance，replacement aggregate floor 必须来自
+  完整 R205 cgroup measurement，per-worker floor 与固定 6-worker topology 保持。
