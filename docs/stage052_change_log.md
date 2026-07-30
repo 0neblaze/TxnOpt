@@ -2522,3 +2522,31 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   batch、artifact、run metadata、resource summary、worker/row-group/queue-depth
   或 checksum binding。新增回归测试覆盖 rerun02 的精确 failure-reason 形状；
   非内存 worker failure 仍必须 fail fast。
+
+## 2026-07-31：G Resource calibration attempt07 physical-lock failure
+
+- aggregate RSS floor 兼容修复在 clean commit
+  `a3c9c97d5f96694953df6f3135def0bf3839cbb5` 通过 952 项完整测试、Ruff、
+  71 source files strict mypy、diff-check 与双轴 code review；新
+  producer/reviewer wheel SHA-256 为
+  `d8087c67db5ca1ce2b1fc9813c00108f09cc1dcd52ffff6b474404794b63d3a8`。
+  `stage05.2_resource_calibration_attempt07` 使用该 clean runtime、固定 6 workers
+  和 rerun02/batch0008 exact resource-summary SHA-256
+  `ec5e8eb43562b983ac0b3d733da446f45fa59407b278dff93323ce4d6e6e6253`
+  启动于 Windows-side keeper 持有的 dedicated transient user service。
+- full calibration 虽然测量了 16,384/1 low-memory pair，却忽略 CLI physical
+  configuration，按独立 Parquet persistence timing 自动选择 262,144/2，并把该 pair
+  用于最终 `r205_21` Formal memory measurement。约 6 分 49 秒后 cgroup 达到
+  `MemoryMax=24,123,191,296` bytes，systemd 以 `oom-kill` 终止 unit；
+  memory swap peak 0。output root 保留 258 个 partial files，但未生成
+  calibration report、signed contract 或 readiness geometry。attempt07 是不可变
+  host/resource failure evidence，不续跑、不导入、不复用。
+- 根因是 formal probe 与 full calibration 之间缺少 exact physical-configuration
+  binding。修复保留完整 6-combination measurement，但允许调用方显式锁定一个已测
+  `(row_group_size, queue_depth)`；locked pair 必须存在、与 65,536/1 baseline
+  semantic digest 相同且不超过 host memory capability，否则 fail fast。
+  CLI 只有在 row-group 与 queue-depth 同时显式提供时才形成该 lock；缺一项拒绝，
+  两项均省略时才保留历史 performance selection。signed v3 report 记录
+  `parquet_policy=user_locked`，Formal memory measurement 与最终 contract 必须复用
+  同一 exact pair。replacement calibration 必须使用新 clean commit/runtime/sealed
+  source 与下一未占用 label。

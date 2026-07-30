@@ -984,7 +984,9 @@ The executable workflow and gate table are maintained in
   65,536, or 262,144 Parquet rows per group and buffer at most two non-empty
   row groups per family. The live trace buffer must use the selected physical
   row-group size; 16,384 is the explicit low-memory candidate and is not an
-  implicit fallback. A worker writes only its own shard;
+  implicit fallback. Once a Formal memory probe passes, full resource
+  calibration must explicitly lock that exact row-group/queue-depth pair;
+  persistence-only timing may not silently reselect a different pair. A worker writes only its own shard;
   the parent never merges event
   rows in memory. Shard-local event identity is deterministic from canonical
   shard ordinal plus local event ID, so review never depends on worker

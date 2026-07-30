@@ -265,6 +265,49 @@ def test_calibration_contract_includes_selected_formal_memory_measurement(
     assert report["formal_campaign_memory_floor"]["row_group_size"] == 65_536
     assert report["selection"]["row_group_size"] == 262_144
 
+    formal_calls.clear()
+    locked_contract = run_stage052_resource_calibration(
+        corpus_dir=tmp_path / "corpus",
+        output_root=tmp_path / "locked-calibration",
+        contract_path=tmp_path / "locked-contract.json",
+        root=tmp_path,
+        config_path=tmp_path / "config.toml",
+        producer_runner=producer_runner,
+        parquet_runner=parquet_runner,
+        formal_memory_runner=formal_memory_runner,
+        formal_campaign_memory_floor=FormalCampaignMemoryFloor(
+            workers=6,
+            aggregate_peak_rss_bytes=15 * 1024**3,
+            per_worker_peak_rss_bytes=3_300_000_000,
+            row_group_size=65_536,
+            queue_depth=2,
+            run_label="stage05.2_benchmark_attempt90",
+            batch_id="batch0003",
+            resource_summary_sha256="e" * 64,
+        ),
+        memory_floor=ProducerMemoryFloor(
+            four_worker_aggregate_peak_rss_bytes=1024,
+            per_worker_peak_rss_bytes=1024,
+            source_sha256_by_batch={
+                "batch0001": "c" * 64,
+                "batch0002": "d" * 64,
+            },
+        ),
+        locked_parquet_configuration=(16_384, 1),
+    )
+
+    assert formal_calls == [(6, 16_384, 1)]
+    assert (locked_contract.row_group_size, locked_contract.queue_depth) == (
+        16_384,
+        1,
+    )
+    locked_report = json.loads(
+        (tmp_path / "locked-calibration" / "calibration_report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert locked_report["selection"]["parquet_policy"] == "user_locked"
+
     with pytest.raises(RuntimeError, match="floor worker count"):
         run_stage052_resource_calibration(
             corpus_dir=tmp_path / "corpus",
@@ -612,6 +655,10 @@ def test_calibration_cli_requires_and_loads_failed_formal_memory_floor(
             str(tmp_path / "attempt90"),
             "--formal-memory-floor-batch-id",
             "batch0003",
+            "--row-group-size",
+            "16384",
+            "--queue-depth",
+            "1",
             "--config",
             str(tmp_path / "config.toml"),
         ],
@@ -621,6 +668,7 @@ def test_calibration_cli_requires_and_loads_failed_formal_memory_floor(
     assert load_calls == [((tmp_path / "attempt90").resolve(), "batch0003")]
     assert calibration_calls[0]["formal_campaign_memory_floor"] == floor
     assert calibration_calls[0]["root"] == (tmp_path / "repository").resolve()
+    assert calibration_calls[0]["locked_parquet_configuration"] == (16_384, 1)
 
 
 def test_attempt73_memory_floor_uses_sealed_long_shard_resource_peaks(

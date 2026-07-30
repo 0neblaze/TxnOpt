@@ -926,6 +926,7 @@ def select_parquet_configuration(
     results: Sequence[ParquetBenchmark],
     *,
     available_memory_bytes: int,
+    locked_configuration: tuple[int, int] | None = None,
 ) -> ParquetBenchmark:
     """Select a changed Parquet setting only after a >=10% critical-path win."""
 
@@ -944,6 +945,23 @@ def select_parquet_configuration(
     if baseline is None:
         raise ValueError("persistence calibration requires the 65,536/1 baseline")
     memory_budget = available_memory_bytes
+    if locked_configuration is not None:
+        locked = next(
+            (
+                result
+                for result in results
+                if (result.row_group_size, result.queue_depth)
+                == locked_configuration
+            ),
+            None,
+        )
+        if locked is None:
+            raise ValueError("locked persistence configuration was not calibrated")
+        if locked.semantic_digest != baseline.semantic_digest:
+            raise RuntimeError("locked persistence configuration changes semantics")
+        if locked.aggregate_peak_rss_bytes > memory_budget:
+            raise RuntimeError("locked persistence configuration exceeds memory")
+        return locked
     eligible = [
         result
         for result in results

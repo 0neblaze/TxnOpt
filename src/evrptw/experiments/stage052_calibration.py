@@ -1026,6 +1026,7 @@ def create_resource_contract(
     parquet_measurements: Sequence[ParquetBenchmark],
     available_memory_bytes: int,
     locked_workers: int | None = None,
+    locked_parquet_configuration: tuple[int, int] | None = None,
 ) -> tuple[ProducerResourceContract, ProducerSelection, ParquetBenchmark]:
     """Apply all deterministic selection gates to measured observations."""
 
@@ -1052,6 +1053,7 @@ def create_resource_contract(
     selected_parquet = select_parquet_configuration(
         parquet_measurements,
         available_memory_bytes=available_memory_bytes,
+        locked_configuration=locked_parquet_configuration,
     )
     selected_measurement = next(
         item
@@ -1088,6 +1090,7 @@ def run_stage052_resource_calibration(
     ] = benchmark_formal_memory_candidate,
     formal_campaign_memory_floor: FormalCampaignMemoryFloor | None = None,
     locked_workers: int = 6,
+    locked_parquet_configuration: tuple[int, int] | None = None,
 ) -> ProducerResourceContract:
     """Run all candidates, select once, and atomically publish a signed contract."""
 
@@ -1141,6 +1144,7 @@ def run_stage052_resource_calibration(
         parquet_measurements=parquet_measurements,
         available_memory_bytes=memory_capacity,
         locked_workers=locked_workers,
+        locked_parquet_configuration=locked_parquet_configuration,
     )
     formal_memory_measurement = formal_memory_runner(
         workers=preliminary_selection.selected_workers,
@@ -1213,6 +1217,7 @@ def run_stage052_resource_calibration(
         parquet_measurements=parquet_measurements,
         available_memory_bytes=memory_capacity,
         locked_workers=locked_workers,
+        locked_parquet_configuration=locked_parquet_configuration,
     )
     if selection.selected_workers != preliminary_selection.selected_workers:
         raise RuntimeError(
@@ -1263,6 +1268,11 @@ def run_stage052_resource_calibration(
                 "policy": "user_locked",
                 "locked_workers": locked_workers,
                 "selected_workers": selection.selected_workers,
+                "parquet_policy": (
+                    "user_locked"
+                    if locked_parquet_configuration is not None
+                    else "performance_selected"
+                ),
                 "rejected_reasons": dict(selection.rejected_reasons),
                 "row_group_size": selected_parquet.row_group_size,
                 "queue_depth": selected_parquet.queue_depth,
@@ -1479,13 +1489,11 @@ def main() -> int:
         "--row-group-size",
         type=int,
         choices=(16_384, 65_536, 262_144),
-        default=65_536,
     )
     parser.add_argument(
         "--queue-depth",
         type=int,
         choices=(1, 2),
-        default=2,
     )
     parser.add_argument(
         "--config",
@@ -1506,11 +1514,15 @@ def main() -> int:
         parser.error(
             "--probe-workers and --formal-memory-probe-workers are mutually exclusive"
         )
+    row_group_size = (
+        65_536 if arguments.row_group_size is None else arguments.row_group_size
+    )
+    queue_depth = 2 if arguments.queue_depth is None else arguments.queue_depth
     if arguments.formal_memory_probe_workers is not None:
         payload = run_stage052_formal_memory_probe(
             workers=arguments.formal_memory_probe_workers,
-            row_group_size=arguments.row_group_size,
-            queue_depth=arguments.queue_depth,
+            row_group_size=row_group_size,
+            queue_depth=queue_depth,
             output_root=arguments.output_root.resolve(),
             root=resolved_repository,
             config_path=resolved_config,
@@ -1541,6 +1553,16 @@ def main() -> int:
         parser.error(
             "--formal-memory-floor-dir is required for resource calibration"
         )
+    if (arguments.row_group_size is None) != (arguments.queue_depth is None):
+        parser.error(
+            "--row-group-size and --queue-depth must be supplied together "
+            "when locking resource calibration"
+        )
+    locked_parquet_configuration = (
+        None
+        if arguments.row_group_size is None
+        else (row_group_size, queue_depth)
+    )
     formal_campaign_memory_floor = load_failed_formal_memory_floor(
         arguments.formal_memory_floor_dir.resolve(),
         batch_id=arguments.formal_memory_floor_batch_id,
@@ -1554,6 +1576,7 @@ def main() -> int:
         run_label=arguments.run_label,
         require_clean_source=not arguments.allow_dirty_source,
         formal_campaign_memory_floor=formal_campaign_memory_floor,
+        locked_parquet_configuration=locked_parquet_configuration,
     )
     print(json.dumps(contract.to_dict(), indent=2, sort_keys=True))
     return 0

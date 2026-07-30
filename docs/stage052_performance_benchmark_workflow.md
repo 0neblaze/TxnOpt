@@ -258,8 +258,12 @@ operating headroom（运行余量）；process-tree RSS 总和因会重复计算
 共享映射，只保留为 compatibility telemetry（兼容遥测），不再作为 aggregate hard
 gate（聚合硬门槛），也不再把可用内存的任意固定百分比作为 publication gate
 （发布门槛）。最终 worker 数、per-worker/cgroup limits、Parquet row group
-65,536/262,144 与 queue depth 1/2
-写入 signed resource contract（签名资源合同），Formal 原样继承。Independent
+16,384/65,536/262,144 与 queue depth 1/2
+写入 signed resource contract（签名资源合同），Formal 原样继承。通过独立
+Formal memory probe 的低内存 row-group/queue-depth pair 必须作为显式
+locked configuration（锁定配置）传入后续 full resource calibration；full
+calibration 不得忽略该 pair 后按 persistence-only timing（仅持久化耗时）自动重选。
+Independent
 reviewer 单独校准 1/2/4 workers，并由 parent baseline 与 per-child p99 RSS 推导
 `MemoryHigh`、内部 guard 和 `MemoryMax`；swap 固定为 0，资源上限必须容纳已选并发
 且不得触发持续 throttling（限流）。
@@ -271,8 +275,10 @@ signed calibration report 重新冻结 resource envelope（资源封套）。v2 
 systemd service 的 cgroup v2 实际内存重测 aggregate peak。失败 predecessor 的
 process-tree RSS 总和只作为不可变 failure provenance，不可作为物理内存 floor。
 memory
-capacity/peaks/limits 与 calibration/semantic digests 可以重测，但原
-worker/row-group/queue-depth 拓扑及独立 scientific execution selection lock 不变。
+capacity/peaks/limits 与 calibration/semantic digests 可以重测；worker 拓扑及
+independent scientific execution selection lock 不变。row-group/queue-depth 是
+physical persistence topology（物理持久化拓扑），只能由新 signed Formal memory
+probe 的 exact pair 替换，并由 full calibration 显式锁定，不能成为运行时 fallback。
 report 必须绑定失败 run/batch/resource summary、clean calibration revision、
 exact unique `{4,5,6}` worker identity set 的 cross-worker semantic equality、
 exact replacement-contract digest、精确 20% headroom、零

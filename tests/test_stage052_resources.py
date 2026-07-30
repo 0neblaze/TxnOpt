@@ -748,6 +748,39 @@ def test_parquet_benchmark_accepts_low_memory_row_group() -> None:
     assert benchmark.row_group_size == 16_384
 
 
+def test_parquet_tuning_preserves_explicit_low_memory_configuration() -> None:
+    low_memory = ParquetBenchmark(
+        row_group_size=16_384,
+        queue_depth=1,
+        persistence_seconds=110.0,
+        aggregate_peak_rss_bytes=4 * 1024**3,
+        semantic_digest="a" * 64,
+    )
+    baseline = ParquetBenchmark(
+        row_group_size=65_536,
+        queue_depth=1,
+        persistence_seconds=100.0,
+        aggregate_peak_rss_bytes=8 * 1024**3,
+        semantic_digest="a" * 64,
+    )
+    faster = ParquetBenchmark(
+        row_group_size=262_144,
+        queue_depth=2,
+        persistence_seconds=80.0,
+        aggregate_peak_rss_bytes=13 * 1024**3,
+        semantic_digest="a" * 64,
+    )
+
+    assert (
+        select_parquet_configuration(
+            (low_memory, baseline, faster),
+            available_memory_bytes=16 * 1024**3,
+            locked_configuration=(16_384, 1),
+        )
+        == low_memory
+    )
+
+
 def test_capability_contract_fails_fast_on_missing_atomic_filesystem_support() -> None:
     requirement = CapabilityRequirement(
         workers=4,
