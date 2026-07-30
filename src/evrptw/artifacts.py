@@ -49,6 +49,7 @@ V2_PARQUET_ROW_GROUP_SIZE = 65_536
 # Keep live producer memo state to one compact screening transaction.  Full
 # identity/collision state remains independently retained below.
 LIVE_SCREENING_TRANSACTION_ROWS = 8_192
+TYPED_NEGATIVE_EVIDENCE_GUARD_ENTRIES = LIVE_SCREENING_TRANSACTION_ROWS
 ROUTE_IDENTITY_HOT_CACHE_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
 ROUTE_IDENTITY_MEMORY_ENTRIES = V2_PARQUET_ROW_GROUP_SIZE
 # Exact-route evaluation identities are independent of the route dictionary.
@@ -88,13 +89,17 @@ def screening_definition_store_contract() -> dict[str, object]:
     """Return the signed bounded producer identity-store contract."""
 
     return {
-        "schema_version": "stage05.2-screening-definition-store-v5",
+        "schema_version": "stage05.2-screening-definition-store-v6",
         "producer_backend": "native_bounded_digest",
         "producer_memory_entries": SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES,
         "producer_memo_entries": SCREENING_DEFINITION_NATIVE_MEMO_ENTRIES,
         "producer_memo_eviction_policy": "fifo_safe_recompute",
         "recomputable_memo_entries": ROUTE_ID_RESOLUTION_CACHE_ENTRIES,
         "recomputable_memo_eviction_policy": "fifo_safe_recompute",
+        "typed_negative_evidence_guard_entries": (
+            TYPED_NEGATIVE_EVIDENCE_GUARD_ENTRIES
+        ),
+        "typed_negative_evidence_guard_eviction_policy": "fifo_safe_recompute",
         "identity_collision_proof": "full_sha256",
         "overflow_policy": "fail_fast",
         "spill_backend": "none",

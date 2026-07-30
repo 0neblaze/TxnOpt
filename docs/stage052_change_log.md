@@ -2416,3 +2416,42 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   wheels/venvs/runtime/sealed source，并使用下一未占用 Formal memory probe label。
   只有该 probe 的 signed v3、exit 0、exact scope、cgroup swap 0、per-worker RSS、
   clean provenance 与 20% headroom 全部通过，才允许生成 resource contract。
+
+## 2026-07-31：G Formal memory attempt15 与 typed negative-evidence guard 根因
+
+- `stage05.2_formal_memory_probe_attempt15` 使用 clean commit
+  `5902043c0cb8c998368061706c47426cb88d1aa0`、producer/reviewer wheel
+  SHA-256
+  `beea1a720d2dfd8c07c92cba5de97929095bbe441a5e10c6263b5bcd2fab99e5`、
+  exact `r205_21` seeds 2014--2019、固定 6 workers、16,384-row、queue depth 1，
+  在 Windows-side `wsl.exe` keeper 持有的 dedicated transient unit 中完成全部
+  wall-clock 30/60/300 轴。signed v3 report SHA-256 为
+  `c9d8c7258bbd6d9c5268ba626e484a16d4ca5a71a57b7ef4e6dab24db2c8a592`；
+  service exit 0、aggregate cgroup peak `21,451,608,064` bytes、最高
+  per-worker RSS `4,182,781,952` bytes、cgroup swap peak 0、fallback count 0。
+  20% headroom 需要 `25,741,929,677` bytes，超过 host capacity
+  `25,196,937,216` bytes `544,992,461` bytes。因此 attempt15 是不可变 complete
+  diagnostic evidence，但仍为 `NOT_READY`；resource calibration 与 Formal
+  rerun03 不得启动。
+- attempt15 与 attempt14 的真实峰值差异证明 8,192-entry route-ID/sparse-extras
+  memo 不是峰值主导项。只读重放 screening definitions 与 route dictionary 后，
+  每个 seed 有 `214,188`--`282,330` 条 unique negative-cache route identity；
+  当前 typed trace guard 会达到原 262,144-entry 上限，并为每条路线同时保留完整
+  route key、positive token 与 complete binary signature。
+- 使用 attempt15 seed 2015 的 `282,330` 个真实 negative route keys 做独立 RSS
+  A/B，保持相同完整 signature 形状：262,144-entry guard 增加
+  `153,911,296` bytes，而 8,192-entry guard 不再形成可测的额外 persistent delta。
+  约 154 MiB/worker、六 worker 约 924 MiB 的差额超过 attempt15 所需的约
+  545 MiB，因此该根因修复值得进入下一 probe；该 A/B 仍不是 readiness evidence。
+- typed negative-evidence route guard 仅验证同一路线在仍驻留时的
+  `(token, complete signature)` 一致性。既有设计已经把同一完整 pair 放入 deferred
+  occurrence，native occurrence cache 即使在 route-guard 淘汰后仍比较完整 signature；
+  因此 FIFO eviction 只导致 safe recomputation，不删除 definition、occurrence、
+  full-SHA-256 collision state 或 Parquet row。guard 固定为一个 8,192-row live
+  transaction，signed contract 升级为
+  `stage05.2-screening-definition-store-v6` 并显式绑定 limit/policy。红测先证明
+  三个 unique routes 不会按 2-entry test bound 淘汰，修复后验证淘汰与首次路线重现
+  均不改变 evidence row。
+- 新修复仍必须形成新的 clean commit、完整质量门槛、双轴 code review、新
+  wheels/venvs/runtime/sealed source，并使用下一未占用 Formal memory probe label；
+  attempt15 不续跑、不复用、不导入。

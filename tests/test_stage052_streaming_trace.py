@@ -1755,6 +1755,71 @@ def test_v3_typed_negative_result_identity_roundtrips(tmp_path: Path) -> None:
     assert rows[0]["checks"] == rows[1]["checks"]
 
 
+def test_v3_typed_negative_identity_guard_evicts_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        stage052_performance,
+        "TYPED_NEGATIVE_EVIDENCE_GUARD_ENTRIES",
+        2,
+    )
+    run_label = "stage05.2_artifact_streaming_attempt95"
+    writer = ArtifactBundleWriter(
+        tmp_path / "results" / run_label,
+        ArtifactRunContext("stage05.2", "artifact_streaming", run_label),
+        ArtifactStorageConfig(
+            storage_policy_version="artifact-storage-v2",
+            screening_schema_version="screening_decisions_v3",
+        ),
+    )
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,
+        axis_name="fixed_work",
+        buffer_rows=8,
+    )
+    trace = Stage03Trace(config=MeasurementConfig(stream_sink=sink))
+    common = {
+        "lane": "legacy",
+        "iteration": 1,
+        "operator": "repair",
+        "status": "negative_cache_hit",
+        "first_failed_check": "capacity",
+        "reason": "capacity",
+        "checks": (
+            ScreeningCheckTrace("negative_sequence_cache", "hit", True, "reused"),
+        ),
+        "demand": 2.5,
+        "min_time_window_slack": 1.0,
+        "distance_lower_bound": 3.0,
+        "distance_increment_lower_bound": None,
+        "single_segment_reachable": True,
+        "structural_energy_lower_bound": 4.0,
+        "negative_cache_hit": True,
+        "exact_call_blocked": True,
+        "negative_evidence_token": 73,
+        "negative_evidence_signature": b"complete-evidence-signature",
+    }
+    for customer in ("C1", "C2", "C3", "C1"):
+        trace.record_screening_decision((customer,), **common)  # type: ignore[arg-type]
+
+    assert len(sink._typed_negative_screening_evidence) <= 2  # noqa: SLF001
+    sink.close()
+    shard.finalize(
+        raw_payload={},
+        solution_payload={},
+        trace_payload={},
+        environment_payload={},
+    )
+    writer.finalize()
+
+
 def test_v3_writer_fails_fast_on_negative_cache_evidence_drift(tmp_path: Path) -> None:
     run_label = "stage05.2_artifact_streaming_attempt92"
     writer = ArtifactBundleWriter(

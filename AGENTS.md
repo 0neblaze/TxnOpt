@@ -1039,9 +1039,13 @@ The executable workflow and gate table are maintained in
   from these three Python memos may only repeat deterministic route-key parsing
   or canonical JSON construction; it may not remove the disk-backed route
   identity, full digest/payload collision state, or any Parquet row. Signed
-  metadata uses `stage05.2-screening-definition-store-v5` and binds both native
+  metadata uses `stage05.2-screening-definition-store-v6` and binds both native
   limits, the recomputable-memo limit and eviction policies, and
-  `identity_collision_proof=full_sha256`. Producer SQLite
+  `identity_collision_proof=full_sha256`. The typed negative-evidence
+  route guard also retains at most 8,192 complete `(token, signature)` values
+  with FIFO safe recomputation. Evicting that guard may not weaken the full
+  signature carried by the deferred occurrence or its downstream collision
+  check. Producer SQLite
   spill, producer scratch state, and fallback are forbidden. Review/read stores
   retain the payload they must resolve and may use their separate bounded
   payload-retaining SQLite path. Exact-route evaluation route and unique-route

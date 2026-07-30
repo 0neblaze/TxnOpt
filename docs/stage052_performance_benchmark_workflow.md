@@ -304,9 +304,12 @@ transaction（活动筛选事务）；FIFO eviction（先进先出
 淘汰）只触发 full-SHA-256 identity 的安全重算，不删除全 shard collision proof。
 route-ID resolution（路线身份解析）以及 route-evaluation/cache-event sparse extras
 JSON（路线评估／缓存事件稀疏附加字段）属于可确定性重算的 Python memo，统一固定为
-8,192 entries 和 FIFO safe recomputation。淘汰只允许重复 canonical route-key parsing
+8,192 entries 和 FIFO safe recomputation。typed negative-evidence route guard
+同样固定为 8,192 个完整 `(token, signature)`，其淘汰只允许重新计算相同完整签名；
+deferred occurrence 与 native collision check 仍必须携带和比较完整 signature，禁止
+降为 marker-only identity。淘汰只允许重复 canonical route-key parsing
 或 canonical JSON construction；不得删除 disk-backed route identity、完整 digest/payload
-collision state 或任何 Parquet row。signed batch metadata 必须记录 v5 store contract；
+collision state 或任何 Parquet row。signed batch metadata 必须记录 v6 store contract；
 independent reviewer 必须确认整条
 campaign 只有一个相同合同，并证明每个
 signed shard descriptor 的 definition row count 均不超过当次 raw 中签入的 hard

@@ -35,6 +35,7 @@ import pyarrow.parquet as pq
 from evrptw.alns import ALNSResult, solve_alns
 from evrptw.artifacts import (
     ARTIFACT_STORAGE_V2,
+    TYPED_NEGATIVE_EVIDENCE_GUARD_ENTRIES,
     ArtifactBundleWriter,
     ArtifactIntegrityError,
     ArtifactReader,
@@ -4318,7 +4319,10 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                             )
                         else:
                             stable_evidence_identity = cached_identity
-                        if len(self._typed_negative_screening_evidence) > 262_144:
+                        if (
+                            len(self._typed_negative_screening_evidence)
+                            > TYPED_NEGATIVE_EVIDENCE_GUARD_ENTRIES
+                        ):
                             self._typed_negative_screening_evidence.pop(
                                 next(iter(self._typed_negative_screening_evidence))
                             )
