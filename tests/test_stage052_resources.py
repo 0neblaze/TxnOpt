@@ -19,6 +19,7 @@ from evrptw.stage052_resources import (
     RuntimeIdentity,
     derive_producer_resource_contract,
     derive_review_memory_contract,
+    load_formal_resource_recalibration_evidence,
     load_producer_resource_contract,
     load_review_memory_contract,
     select_parquet_configuration,
@@ -26,6 +27,354 @@ from evrptw.stage052_resources import (
     validate_capabilities,
     verify_filesystem_capabilities,
 )
+
+
+def _write_formal_recalibration_report(
+    path: Path,
+    contract: ProducerResourceContract,
+) -> None:
+    payload = {
+        "schema_version": "stage05.2-resource-calibration-report-v2",
+        "run_label": "stage05.2_resource_calibration_attempt06",
+        "campaign_geometry_contribution": 0,
+        "memory_capacity_bytes": contract.available_memory_bytes,
+        "contract": contract.to_dict(),
+        "selection": {
+            "policy": "user_locked",
+            "locked_workers": contract.selected_workers,
+            "selected_workers": contract.selected_workers,
+            "row_group_size": contract.row_group_size,
+            "queue_depth": contract.queue_depth,
+            "rejected_reasons": {},
+        },
+        "formal_campaign_memory_floor": {
+            "run_label": "stage05.2_benchmark_attempt99",
+            "batch_id": "batch0007",
+            "workers": contract.selected_workers,
+            "aggregate_peak_rss_bytes": contract.selected_aggregate_peak_rss_bytes,
+            "per_worker_peak_rss_bytes": contract.selected_per_worker_peak_rss_bytes,
+            "row_group_size": contract.row_group_size,
+            "queue_depth": contract.queue_depth,
+            "resource_summary_sha256": (
+                "cdaa627f53d14ce9a34d0054eb22cbaf4d388c80147980d428842c358599a7e5"
+            ),
+            "campaign_geometry_contribution": 0,
+        },
+        "formal_memory_measurement": {
+            "benchmark": {
+                "workers": contract.selected_workers,
+                "throughput": 1.0,
+                "aggregate_peak_rss_bytes": (
+                    contract.selected_aggregate_peak_rss_bytes
+                ),
+                "semantic_digest": "9" * 64,
+                "swap_peak_bytes": 0,
+                "fallback_count": 0,
+                "resource_limit_exceeded": False,
+            },
+            "per_worker_peak_rss_bytes": (
+                contract.selected_per_worker_peak_rss_bytes
+            ),
+        },
+        "fresh_producer_measurements": [
+            {
+                "workers": workers,
+                "throughput": 1.0,
+                "aggregate_peak_rss_bytes": (
+                    contract.selected_aggregate_peak_rss_bytes
+                    if workers == contract.selected_workers
+                    else contract.selected_aggregate_peak_rss_bytes // 2
+                ),
+                "per_worker_peak_rss_bytes": (
+                    contract.selected_per_worker_peak_rss_bytes
+                    if workers == contract.selected_workers
+                    else contract.selected_per_worker_peak_rss_bytes // 2
+                ),
+                "semantic_digest": contract.semantic_digest,
+                "swap_peak_bytes": 0,
+                "fallback_count": 0,
+                "resource_limit_exceeded": False,
+            }
+            for workers in (4, 5, 6)
+        ],
+        "producer_measurements": [
+            {
+                "workers": workers,
+                "throughput": 1.0,
+                "aggregate_peak_rss_bytes": (
+                    contract.selected_aggregate_peak_rss_bytes
+                    if workers == contract.selected_workers
+                    else contract.selected_aggregate_peak_rss_bytes // 2
+                ),
+                "per_worker_peak_rss_bytes": (
+                    contract.selected_per_worker_peak_rss_bytes
+                    if workers == contract.selected_workers
+                    else contract.selected_per_worker_peak_rss_bytes // 2
+                ),
+                "semantic_digest": contract.semantic_digest,
+                "swap_peak_bytes": 0,
+                "fallback_count": 0,
+                "resource_limit_exceeded": False,
+            }
+            for workers in (4, 5, 6)
+        ],
+        "provenance": {
+            "repository_dirty": False,
+            "dirty_path_count": 0,
+            "repository_revision": "d" * 40,
+            "configuration_sha256": "e" * 64,
+            "native_extension_sha256": "f" * 64,
+            "python_abi": "cpython-313",
+        },
+    }
+    raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    path.write_bytes(raw)
+    path.with_suffix(".sha256").write_text(
+        hashlib.sha256(raw).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_formal_resource_recalibration_binds_zero_geometry_memory_floor(
+    tmp_path: Path,
+) -> None:
+    contract = ProducerResourceContract(
+        selected_workers=6,
+        available_memory_bytes=30_000_000_000,
+        selected_aggregate_peak_rss_bytes=20_000_000_000,
+        selected_per_worker_peak_rss_bytes=4_000_000_000,
+        aggregate_memory_limit_bytes=24_000_000_000,
+        per_worker_memory_limit_bytes=4_800_000_000,
+        semantic_digest="a" * 64,
+        calibration_digest="b" * 64,
+        row_group_size=262_144,
+        queue_depth=2,
+    )
+    report_path = tmp_path / "stage052_resource_calibration.local.report.json"
+    _write_formal_recalibration_report(report_path, contract)
+
+    evidence = load_formal_resource_recalibration_evidence(report_path, contract)
+
+    assert evidence.report_run_label == "stage05.2_resource_calibration_attempt06"
+    assert evidence.predecessor_run_label == "stage05.2_benchmark_attempt99"
+    assert evidence.predecessor_batch_id == "batch0007"
+    assert evidence.predecessor_resource_summary_sha256 == (
+        "cdaa627f53d14ce9a34d0054eb22cbaf4d388c80147980d428842c358599a7e5"
+    )
+    assert evidence.formal_memory_semantic_digest == "9" * 64
+    assert evidence.campaign_geometry_contribution == 0
+    assert evidence.to_dict()["report_sha256"] == hashlib.sha256(
+        report_path.read_bytes()
+    ).hexdigest()
+
+
+def test_formal_resource_recalibration_rejects_nonzero_geometry(
+    tmp_path: Path,
+) -> None:
+    contract = ProducerResourceContract(
+        selected_workers=6,
+        available_memory_bytes=30_000_000_000,
+        selected_aggregate_peak_rss_bytes=20_000_000_000,
+        selected_per_worker_peak_rss_bytes=4_000_000_000,
+        aggregate_memory_limit_bytes=24_000_000_000,
+        per_worker_memory_limit_bytes=4_800_000_000,
+        semantic_digest="a" * 64,
+        calibration_digest="b" * 64,
+        row_group_size=262_144,
+        queue_depth=2,
+    )
+    report_path = tmp_path / "stage052_resource_calibration.local.report.json"
+    _write_formal_recalibration_report(report_path, contract)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload["formal_campaign_memory_floor"]["campaign_geometry_contribution"] = 1
+    raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    report_path.write_bytes(raw)
+    report_path.with_suffix(".sha256").write_text(
+        hashlib.sha256(raw).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="zero readiness geometry"):
+        load_formal_resource_recalibration_evidence(report_path, contract)
+
+
+@pytest.mark.parametrize(
+    "field_path",
+    [
+        ("campaign_geometry_contribution",),
+        ("formal_campaign_memory_floor", "campaign_geometry_contribution"),
+        ("formal_memory_measurement", "benchmark", "swap_peak_bytes"),
+        ("formal_memory_measurement", "benchmark", "fallback_count"),
+        ("provenance", "dirty_path_count"),
+    ],
+)
+def test_formal_resource_recalibration_rejects_boolean_zero_evidence(
+    tmp_path: Path,
+    field_path: tuple[str, ...],
+) -> None:
+    contract = ProducerResourceContract(
+        selected_workers=6,
+        available_memory_bytes=30_000_000_000,
+        selected_aggregate_peak_rss_bytes=20_000_000_000,
+        selected_per_worker_peak_rss_bytes=4_000_000_000,
+        aggregate_memory_limit_bytes=24_000_000_000,
+        per_worker_memory_limit_bytes=4_800_000_000,
+        semantic_digest="a" * 64,
+        calibration_digest="b" * 64,
+        row_group_size=262_144,
+        queue_depth=2,
+    )
+    report_path = tmp_path / "stage052_resource_calibration.local.report.json"
+    _write_formal_recalibration_report(report_path, contract)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    target = payload
+    for field_name in field_path[:-1]:
+        target = target[field_name]
+    target[field_path[-1]] = False
+    raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    report_path.write_bytes(raw)
+    report_path.with_suffix(".sha256").write_text(
+        hashlib.sha256(raw).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError):
+        load_formal_resource_recalibration_evidence(report_path, contract)
+
+
+def test_formal_resource_recalibration_rejects_swap_or_fallback(
+    tmp_path: Path,
+) -> None:
+    contract = ProducerResourceContract(
+        selected_workers=6,
+        available_memory_bytes=30_000_000_000,
+        selected_aggregate_peak_rss_bytes=20_000_000_000,
+        selected_per_worker_peak_rss_bytes=4_000_000_000,
+        aggregate_memory_limit_bytes=24_000_000_000,
+        per_worker_memory_limit_bytes=4_800_000_000,
+        semantic_digest="a" * 64,
+        calibration_digest="b" * 64,
+        row_group_size=262_144,
+        queue_depth=2,
+    )
+    report_path = tmp_path / "stage052_resource_calibration.local.report.json"
+    _write_formal_recalibration_report(report_path, contract)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload["formal_memory_measurement"]["benchmark"]["swap_peak_bytes"] = 1
+    raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    report_path.write_bytes(raw)
+    report_path.with_suffix(".sha256").write_text(
+        hashlib.sha256(raw).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="swap/fallback"):
+        load_formal_resource_recalibration_evidence(report_path, contract)
+
+
+@pytest.mark.parametrize(
+    ("field_path", "invalid_value"),
+    [
+        (("benchmark", "workers"), 5),
+        (("benchmark", "aggregate_peak_rss_bytes"), 20_000_000_001),
+        (("per_worker_peak_rss_bytes",), 4_000_000_001),
+    ],
+)
+def test_formal_resource_recalibration_rejects_formal_probe_peak_drift(
+    tmp_path: Path,
+    field_path: tuple[str, ...],
+    invalid_value: int,
+) -> None:
+    contract = ProducerResourceContract(
+        selected_workers=6,
+        available_memory_bytes=30_000_000_000,
+        selected_aggregate_peak_rss_bytes=20_000_000_000,
+        selected_per_worker_peak_rss_bytes=4_000_000_000,
+        aggregate_memory_limit_bytes=24_000_000_000,
+        per_worker_memory_limit_bytes=4_800_000_000,
+        semantic_digest="a" * 64,
+        calibration_digest="b" * 64,
+        row_group_size=262_144,
+        queue_depth=2,
+    )
+    report_path = tmp_path / "stage052_resource_calibration.local.report.json"
+    _write_formal_recalibration_report(report_path, contract)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    target = payload["formal_memory_measurement"]
+    for field_name in field_path[:-1]:
+        target = target[field_name]
+    target[field_path[-1]] = invalid_value
+    raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    report_path.write_bytes(raw)
+    report_path.with_suffix(".sha256").write_text(
+        hashlib.sha256(raw).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="Formal memory measurement/contract mismatch"):
+        load_formal_resource_recalibration_evidence(report_path, contract)
+
+
+def test_formal_resource_recalibration_requires_complete_worker_identity_set(
+    tmp_path: Path,
+) -> None:
+    contract = ProducerResourceContract(
+        selected_workers=6,
+        available_memory_bytes=30_000_000_000,
+        selected_aggregate_peak_rss_bytes=20_000_000_000,
+        selected_per_worker_peak_rss_bytes=4_000_000_000,
+        aggregate_memory_limit_bytes=24_000_000_000,
+        per_worker_memory_limit_bytes=4_800_000_000,
+        semantic_digest="a" * 64,
+        calibration_digest="b" * 64,
+        row_group_size=262_144,
+        queue_depth=2,
+    )
+    report_path = tmp_path / "stage052_resource_calibration.local.report.json"
+    _write_formal_recalibration_report(report_path, contract)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload["fresh_producer_measurements"] = payload[
+        "fresh_producer_measurements"
+    ][1:]
+    raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    report_path.write_bytes(raw)
+    report_path.with_suffix(".sha256").write_text(
+        hashlib.sha256(raw).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="worker identity set"):
+        load_formal_resource_recalibration_evidence(report_path, contract)
+
+
+def test_formal_resource_recalibration_requires_exact_attempt99_failure_identity(
+    tmp_path: Path,
+) -> None:
+    contract = ProducerResourceContract(
+        selected_workers=6,
+        available_memory_bytes=30_000_000_000,
+        selected_aggregate_peak_rss_bytes=20_000_000_000,
+        selected_per_worker_peak_rss_bytes=4_000_000_000,
+        aggregate_memory_limit_bytes=24_000_000_000,
+        per_worker_memory_limit_bytes=4_800_000_000,
+        semantic_digest="a" * 64,
+        calibration_digest="b" * 64,
+        row_group_size=262_144,
+        queue_depth=2,
+    )
+    report_path = tmp_path / "stage052_resource_calibration.local.report.json"
+    _write_formal_recalibration_report(report_path, contract)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload["formal_campaign_memory_floor"]["batch_id"] = "batch0008"
+    raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    report_path.write_bytes(raw)
+    report_path.with_suffix(".sha256").write_text(
+        hashlib.sha256(raw).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="Attempt99 batch0007"):
+        load_formal_resource_recalibration_evidence(report_path, contract)
 
 
 def _producer_result(

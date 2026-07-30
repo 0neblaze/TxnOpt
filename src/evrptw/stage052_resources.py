@@ -11,12 +11,13 @@ import hashlib
 import json
 import math
 import os
+import re
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Final
+from typing import Final, cast
 
 from evrptw.stage052_platform import durable_replace, sync_directory
 
@@ -26,6 +27,13 @@ _THROUGHPUT_TIE_FRACTION: Final = 0.05
 _MINIMUM_PERSISTENCE_IMPROVEMENT: Final = 0.10
 _PRODUCER_WORKERS: Final = frozenset({4, 5, 6, 8})
 _REQUIRED_PRODUCER_CALIBRATION_WORKERS: Final = frozenset({4, 5, 6})
+_FORMAL_RECALIBRATION_PREDECESSOR_RUN_LABEL: Final = (
+    "stage05.2_benchmark_attempt99"
+)
+_FORMAL_RECALIBRATION_PREDECESSOR_BATCH_ID: Final = "batch0007"
+_FORMAL_RECALIBRATION_RESOURCE_SUMMARY_SHA256: Final = (
+    "cdaa627f53d14ce9a34d0054eb22cbaf4d388c80147980d428842c358599a7e5"
+)
 _ROW_GROUP_SIZES: Final = frozenset({65_536, 262_144})
 _QUEUE_DEPTHS: Final = frozenset({1, 2})
 
@@ -34,6 +42,10 @@ def _is_sha256(value: str) -> bool:
     return len(value) == _SHA256_LENGTH and all(
         character in "0123456789abcdef" for character in value
     )
+
+
+def _is_exact_zero_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value == 0
 
 
 def _positive_int(value: int, field_name: str) -> None:
@@ -334,6 +346,297 @@ class ProducerResourceContract:
             row_group_size=integer("row_group_size"),
             queue_depth=integer("queue_depth"),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class FormalResourceRecalibrationEvidence:
+    """Signed zero-geometry evidence authorizing one Formal memory-limit update."""
+
+    report_run_label: str
+    report_sha256: str
+    report_sidecar_sha256: str
+    replacement_contract_sha256: str
+    predecessor_run_label: str
+    predecessor_batch_id: str
+    predecessor_resource_summary_sha256: str
+    predecessor_aggregate_peak_rss_bytes: int
+    predecessor_per_worker_peak_rss_bytes: int
+    formal_memory_semantic_digest: str
+    calibration_repository_revision: str
+    campaign_geometry_contribution: int = 0
+
+    def to_dict(self) -> dict[str, int | str]:
+        return {
+            "schema_version": "stage05.2-formal-resource-recalibration-v1",
+            "report_run_label": self.report_run_label,
+            "report_sha256": self.report_sha256,
+            "report_sidecar_sha256": self.report_sidecar_sha256,
+            "replacement_contract_sha256": self.replacement_contract_sha256,
+            "predecessor_run_label": self.predecessor_run_label,
+            "predecessor_batch_id": self.predecessor_batch_id,
+            "predecessor_resource_summary_sha256": (
+                self.predecessor_resource_summary_sha256
+            ),
+            "predecessor_aggregate_peak_rss_bytes": (
+                self.predecessor_aggregate_peak_rss_bytes
+            ),
+            "predecessor_per_worker_peak_rss_bytes": (
+                self.predecessor_per_worker_peak_rss_bytes
+            ),
+            "formal_memory_semantic_digest": self.formal_memory_semantic_digest,
+            "calibration_repository_revision": self.calibration_repository_revision,
+            "campaign_geometry_contribution": self.campaign_geometry_contribution,
+        }
+
+
+def load_formal_resource_recalibration_evidence(
+    report_path: Path,
+    contract: ProducerResourceContract,
+) -> FormalResourceRecalibrationEvidence:
+    """Verify a signed recalibration report against its exact producer contract."""
+
+    sidecar_path = report_path.with_suffix(".sha256")
+    try:
+        raw = report_path.read_bytes()
+        sidecar_raw = sidecar_path.read_bytes()
+        declared = sidecar_raw.decode("utf-8").strip()
+        payload = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"Formal resource recalibration report is unreadable: {report_path}"
+        ) from error
+    observed = hashlib.sha256(raw).hexdigest()
+    if declared != observed:
+        raise RuntimeError("Formal resource recalibration report checksum mismatch")
+    if not isinstance(payload, Mapping):
+        raise RuntimeError("Formal resource recalibration report must be a JSON object")
+    if payload.get("schema_version") != "stage05.2-resource-calibration-report-v2":
+        raise RuntimeError("Formal resource recalibration report schema is unsupported")
+    report_run_label = payload.get("run_label")
+    if not isinstance(report_run_label, str) or re.fullmatch(
+        r"stage05\.2_resource_calibration_(?:attempt|rerun)\d{2}",
+        report_run_label,
+    ) is None:
+        raise RuntimeError("Formal resource recalibration report label is invalid")
+    if not _is_exact_zero_int(payload.get("campaign_geometry_contribution")):
+        raise RuntimeError("Formal resource recalibration must contribute zero readiness geometry")
+    if payload.get("memory_capacity_bytes") != contract.available_memory_bytes:
+        raise RuntimeError("Formal resource recalibration memory capacity mismatch")
+    raw_contract = payload.get("contract")
+    if not isinstance(raw_contract, Mapping):
+        raise RuntimeError("Formal resource recalibration contract is missing")
+    try:
+        reported_contract = ProducerResourceContract.from_dict(raw_contract)
+    except ValueError as error:
+        raise RuntimeError("Formal resource recalibration contract is invalid") from error
+    if reported_contract != contract:
+        raise RuntimeError("Formal resource recalibration report/contract mismatch")
+    if (
+        contract.aggregate_memory_limit_bytes
+        != math.ceil(contract.selected_aggregate_peak_rss_bytes * 1.20)
+        or contract.per_worker_memory_limit_bytes
+        != math.ceil(contract.selected_per_worker_peak_rss_bytes * 1.20)
+    ):
+        raise RuntimeError("Formal resource recalibration does not preserve 20% headroom")
+
+    selection = payload.get("selection")
+    if not isinstance(selection, Mapping) or (
+        selection.get("policy") != "user_locked"
+        or selection.get("locked_workers") != contract.selected_workers
+        or selection.get("selected_workers") != contract.selected_workers
+        or selection.get("row_group_size") != contract.row_group_size
+        or selection.get("queue_depth") != contract.queue_depth
+    ):
+        raise RuntimeError("Formal resource recalibration changed the locked topology")
+
+    def zero_resource_measurement(
+        raw_measurement: object,
+        label: str,
+        *,
+        require_per_worker: bool,
+    ) -> Mapping[str, object]:
+        if not isinstance(raw_measurement, Mapping):
+            raise RuntimeError(
+                f"Formal resource recalibration {label} measurement is missing"
+            )
+        workers = raw_measurement.get("workers")
+        throughput = raw_measurement.get("throughput")
+        aggregate_peak = raw_measurement.get("aggregate_peak_rss_bytes")
+        semantic_digest = raw_measurement.get("semantic_digest")
+        per_worker_peak = raw_measurement.get("per_worker_peak_rss_bytes")
+        if (
+            isinstance(workers, bool)
+            or not isinstance(workers, int)
+            or workers <= 0
+            or isinstance(throughput, bool)
+            or not isinstance(throughput, (int, float))
+            or not math.isfinite(float(throughput))
+            or throughput <= 0
+            or isinstance(aggregate_peak, bool)
+            or not isinstance(aggregate_peak, int)
+            or aggregate_peak <= 0
+            or not isinstance(semantic_digest, str)
+            or not _is_sha256(semantic_digest)
+            or (
+                require_per_worker
+                and (
+                    isinstance(per_worker_peak, bool)
+                    or not isinstance(per_worker_peak, int)
+                    or per_worker_peak <= 0
+                )
+            )
+        ):
+            raise RuntimeError(
+                f"Formal resource recalibration {label} measurement is invalid"
+            )
+        if (
+            not _is_exact_zero_int(raw_measurement.get("swap_peak_bytes"))
+            or not _is_exact_zero_int(raw_measurement.get("fallback_count"))
+            or raw_measurement.get("resource_limit_exceeded") is not False
+        ):
+            raise RuntimeError(
+                f"Formal resource recalibration {label} has swap/fallback/resource failure"
+            )
+        return raw_measurement
+
+    formal_memory = payload.get("formal_memory_measurement")
+    if not isinstance(formal_memory, Mapping):
+        raise RuntimeError("Formal resource recalibration memory measurement is missing")
+    formal_benchmark = zero_resource_measurement(
+        formal_memory.get("benchmark"),
+        "Formal memory",
+        require_per_worker=False,
+    )
+    formal_per_worker = formal_memory.get("per_worker_peak_rss_bytes")
+    if (
+        isinstance(formal_per_worker, bool)
+        or not isinstance(formal_per_worker, int)
+        or formal_per_worker <= 0
+    ):
+        raise RuntimeError(
+            "Formal resource recalibration Formal per-worker measurement is invalid"
+        )
+    if (
+        formal_benchmark.get("workers") != contract.selected_workers
+        or cast(int, formal_benchmark["aggregate_peak_rss_bytes"])
+        > contract.selected_aggregate_peak_rss_bytes
+        or formal_per_worker > contract.selected_per_worker_peak_rss_bytes
+    ):
+        raise RuntimeError(
+            "Formal resource recalibration Formal memory measurement/contract mismatch"
+        )
+    validated_measurements: dict[str, list[Mapping[str, object]]] = {}
+    for field_name in ("fresh_producer_measurements", "producer_measurements"):
+        raw_measurements = payload.get(field_name)
+        if not isinstance(raw_measurements, list) or not raw_measurements:
+            raise RuntimeError(
+                f"Formal resource recalibration {field_name} are missing"
+            )
+        validated_measurements[field_name] = [
+            zero_resource_measurement(
+                item,
+                field_name,
+                require_per_worker=True,
+            )
+            for item in raw_measurements
+        ]
+        worker_identities = [
+            cast(int, item["workers"])
+            for item in validated_measurements[field_name]
+        ]
+        if (
+            len(worker_identities) != len(set(worker_identities))
+            or set(worker_identities) != _REQUIRED_PRODUCER_CALIBRATION_WORKERS
+        ):
+            raise RuntimeError(
+                f"Formal resource recalibration {field_name} worker identity set "
+                "must be exactly {4, 5, 6}"
+            )
+        if any(
+            item.get("semantic_digest") != contract.semantic_digest
+            for item in validated_measurements[field_name]
+        ):
+            raise RuntimeError(
+                f"Formal resource recalibration {field_name} semantic digest drift"
+            )
+    selected_measurements = [
+        item
+        for item in validated_measurements["producer_measurements"]
+        if item.get("workers") == contract.selected_workers
+    ]
+    if len(selected_measurements) != 1 or (
+        selected_measurements[0].get("aggregate_peak_rss_bytes")
+        != contract.selected_aggregate_peak_rss_bytes
+        or selected_measurements[0].get("per_worker_peak_rss_bytes")
+        != contract.selected_per_worker_peak_rss_bytes
+    ):
+        raise RuntimeError(
+            "Formal resource recalibration selected measurement/contract mismatch"
+        )
+    floor = payload.get("formal_campaign_memory_floor")
+    if not isinstance(floor, Mapping):
+        raise RuntimeError("Formal resource recalibration memory floor is missing")
+    predecessor_run_label = floor.get("run_label")
+    predecessor_batch_id = floor.get("batch_id")
+    resource_summary_sha256 = floor.get("resource_summary_sha256")
+    if (
+        predecessor_run_label != _FORMAL_RECALIBRATION_PREDECESSOR_RUN_LABEL
+        or predecessor_batch_id != _FORMAL_RECALIBRATION_PREDECESSOR_BATCH_ID
+        or resource_summary_sha256
+        != _FORMAL_RECALIBRATION_RESOURCE_SUMMARY_SHA256
+    ):
+        raise RuntimeError(
+            "Formal resource recalibration must bind exact Attempt99 batch0007 "
+            "resource-summary identity"
+        )
+    if not _is_exact_zero_int(floor.get("campaign_geometry_contribution")):
+        raise RuntimeError("Formal memory floor must contribute zero readiness geometry")
+    if (
+        floor.get("workers") != contract.selected_workers
+        or floor.get("row_group_size") != contract.row_group_size
+        or floor.get("queue_depth") != contract.queue_depth
+        or floor.get("aggregate_peak_rss_bytes")
+        != contract.selected_aggregate_peak_rss_bytes
+        or floor.get("per_worker_peak_rss_bytes")
+        != contract.selected_per_worker_peak_rss_bytes
+    ):
+        raise RuntimeError("Formal resource recalibration memory floor/contract mismatch")
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise RuntimeError("Formal resource recalibration provenance is missing")
+    revision = provenance.get("repository_revision")
+    if (
+        provenance.get("repository_dirty") is not False
+        or not _is_exact_zero_int(provenance.get("dirty_path_count"))
+        or not isinstance(revision, str)
+        or re.fullmatch(r"[0-9a-f]{40}", revision) is None
+        or not _is_sha256(str(provenance.get("configuration_sha256", "")))
+        or not _is_sha256(str(provenance.get("native_extension_sha256", "")))
+        or provenance.get("python_abi") != "cpython-313"
+    ):
+        raise RuntimeError("Formal resource recalibration provenance is invalid")
+    return FormalResourceRecalibrationEvidence(
+        report_run_label=report_run_label,
+        report_sha256=observed,
+        report_sidecar_sha256=hashlib.sha256(sidecar_raw).hexdigest(),
+        replacement_contract_sha256=hashlib.sha256(
+            json.dumps(
+                contract.to_dict(),
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest(),
+        predecessor_run_label=predecessor_run_label,
+        predecessor_batch_id=predecessor_batch_id,
+        predecessor_resource_summary_sha256=resource_summary_sha256,
+        predecessor_aggregate_peak_rss_bytes=contract.selected_aggregate_peak_rss_bytes,
+        predecessor_per_worker_peak_rss_bytes=contract.selected_per_worker_peak_rss_bytes,
+        formal_memory_semantic_digest=cast(
+            str,
+            formal_benchmark["semantic_digest"],
+        ),
+        calibration_repository_revision=revision,
+    )
 
 
 def derive_producer_resource_contract(

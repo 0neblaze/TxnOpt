@@ -139,6 +139,7 @@ from evrptw.stage052_evidence import (
 from evrptw.stage052_platform import peak_rss_bytes
 from evrptw.stage052_remediation import Stage052RemediationResult
 from evrptw.stage052_resources import (
+    load_formal_resource_recalibration_evidence,
     load_producer_resource_contract,
     verify_filesystem_capabilities,
 )
@@ -1132,13 +1133,25 @@ def _run_benchmark_campaign_impl(
     producer_resource_contract = load_producer_resource_contract(
         _resolve(root, config.resource_calibration_contract)
     )
+    recalibration_report = (
+        root / "configs" / "stage052_resource_calibration.local.report.json"
+    )
+    formal_recalibration = (
+        load_formal_resource_recalibration_evidence(
+            recalibration_report,
+            producer_resource_contract,
+        )
+        if scope == "formal" and recalibration_report.is_file()
+        else None
+    )
     storage = replace(
         storage,
         parquet_row_group_size=producer_resource_contract.row_group_size,
         parquet_queue_depth=producer_resource_contract.queue_depth,
     )
     effective_selection_lock = selection_lock.with_producer_resource_contract(
-        producer_resource_contract
+        producer_resource_contract,
+        formal_recalibration=formal_recalibration,
     )
     if worker_count != producer_resource_contract.selected_workers:
         raise ValueError(
@@ -1179,6 +1192,7 @@ def _run_benchmark_campaign_impl(
         input_provenance=performance_provenance,
         native_kernel_config=config.native_kernels.to_dict(),
         producer_resource_contract=producer_resource_contract,
+        formal_recalibration=formal_recalibration,
         repository=root,
         storage_migration=storage_migration,
     )

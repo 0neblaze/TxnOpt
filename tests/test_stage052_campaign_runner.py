@@ -64,13 +64,94 @@ from evrptw.stage052_evidence import (
     validate_worker_ownership,
 )
 from evrptw.stage052_platform import WindowsWslPowerStatus
-from evrptw.stage052_resources import ProducerResourceContract
+from evrptw.stage052_resources import (
+    FormalResourceRecalibrationEvidence,
+    ProducerResourceContract,
+)
 
 
 def _sha256_json(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def test_formal_execution_lock_requires_signed_recalibration_for_memory_drift() -> None:
+    locked = ProducerResourceContract(
+        selected_workers=6,
+        available_memory_bytes=30_000_000_000,
+        selected_aggregate_peak_rss_bytes=18_000_000_000,
+        selected_per_worker_peak_rss_bytes=3_000_000_000,
+        aggregate_memory_limit_bytes=21_600_000_000,
+        per_worker_memory_limit_bytes=3_600_000_000,
+        semantic_digest="a" * 64,
+        calibration_digest="b" * 64,
+        row_group_size=262_144,
+        queue_depth=2,
+    )
+    recalibrated = ProducerResourceContract(
+        selected_workers=6,
+        available_memory_bytes=30_000_000_000,
+        selected_aggregate_peak_rss_bytes=20_000_000_000,
+        selected_per_worker_peak_rss_bytes=4_000_000_000,
+        aggregate_memory_limit_bytes=24_000_000_000,
+        per_worker_memory_limit_bytes=4_800_000_000,
+        semantic_digest="a" * 64,
+        calibration_digest="d" * 64,
+        row_group_size=262_144,
+        queue_depth=2,
+    )
+    execution_lock = BenchmarkExecutionLock(
+        prerequisite_run_label="stage05.2_benchmark_attempt97",
+        raw_manifest_sha256="1" * 64,
+        selected_backend="native_cpu",
+        selected_exact_backend="cpu_batch",
+        selected_workers=6,
+        repository_revision="2" * 40,
+        runtime_identity_sha256="3" * 64,
+        runtime_contract_sha256="4" * 64,
+        runtime_selection_sha256="5" * 64,
+        input_provenance_sha256="6" * 64,
+        configuration_sha256="7" * 64,
+        configuration_selection_sha256="8" * 64,
+        native_config_sha256="9" * 64,
+        native_kernel_config={"abi": "v2"},
+        candidate_transaction_config_sha256="a" * 64,
+        candidate_transaction_config={"enabled": True},
+        instance_sha256={"c101_21": "b" * 64},
+        producer_resource_contract=locked.to_dict(),
+    )
+    evidence = FormalResourceRecalibrationEvidence(
+        report_run_label="stage05.2_resource_calibration_attempt06",
+        report_sha256="c" * 64,
+        report_sidecar_sha256="d" * 64,
+        replacement_contract_sha256=_sha256_json(recalibrated.to_dict()),
+        predecessor_run_label="stage05.2_benchmark_attempt99",
+        predecessor_batch_id="batch0007",
+        predecessor_resource_summary_sha256="e" * 64,
+        predecessor_aggregate_peak_rss_bytes=20_000_000_000,
+        predecessor_per_worker_peak_rss_bytes=4_000_000_000,
+        formal_memory_semantic_digest="9" * 64,
+        calibration_repository_revision="f" * 40,
+    )
+
+    with pytest.raises(RuntimeError, match="accepted Pilot lock"):
+        execution_lock.with_producer_resource_contract(recalibrated)
+
+    selection = execution_lock.with_producer_resource_contract(
+        recalibrated,
+        formal_recalibration=evidence,
+    )
+
+    assert selection["producer_resource_contract"] == recalibrated.to_dict()
+    assert selection["predecessor_producer_resource_contract"] == locked.to_dict()
+    assert selection["producer_resource_recalibration"] == evidence.to_dict()
+
+    with pytest.raises(RuntimeError, match="exact zero-geometry evidence"):
+        execution_lock.with_producer_resource_contract(
+            replace(recalibrated, semantic_digest="c" * 64),
+            formal_recalibration=evidence,
+        )
 
 
 def _record_stage052_worker_pid(_: object) -> list[dict[str, object]]:
@@ -2226,7 +2307,7 @@ def _patch_dispatcher_dependencies(
             "selected_exact_backend": "cpu_batch",
             "selected_workers": 4,
         },
-        with_producer_resource_contract=lambda contract: {
+        with_producer_resource_contract=lambda contract, **_kwargs: {
             "selected_backend": "native_cpu",
             "selected_exact_backend": "cpu_batch",
             "selected_workers": contract.selected_workers,

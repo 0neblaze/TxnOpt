@@ -66,7 +66,10 @@ from evrptw.stage052_platform import (
     read_windows_wsl_power_status,
     read_wsl_ac_power_online,
 )
-from evrptw.stage052_resources import ProducerResourceContract
+from evrptw.stage052_resources import (
+    FormalResourceRecalibrationEvidence,
+    ProducerResourceContract,
+)
 
 PER_WORKER_RSS_LIMIT_BYTES = 8 * 1024**3
 AGGREGATE_RSS_LIMIT_BYTES = 20 * 1024**3
@@ -1028,14 +1031,53 @@ class BenchmarkExecutionLock:
     def with_producer_resource_contract(
         self,
         contract: ProducerResourceContract,
+        *,
+        formal_recalibration: FormalResourceRecalibrationEvidence | None = None,
     ) -> dict[str, object]:
         """Apply a new Pilot calibration without rewriting predecessor evidence."""
 
         if self.producer_resource_contract is not None:
-            if dict(self.producer_resource_contract) != contract.to_dict():
+            predecessor = ProducerResourceContract.from_dict(
+                self.producer_resource_contract
+            )
+            if predecessor != contract and formal_recalibration is None:
                 raise RuntimeError(
                     "producer resource contract differs from the accepted Pilot lock"
                 )
+            if predecessor != contract:
+                if (
+                    predecessor.selected_workers != contract.selected_workers
+                    or predecessor.selected_workers != self.selected_workers
+                    or predecessor.row_group_size != contract.row_group_size
+                    or predecessor.queue_depth != contract.queue_depth
+                    or contract.selected_aggregate_peak_rss_bytes
+                    < predecessor.selected_aggregate_peak_rss_bytes
+                    or contract.selected_per_worker_peak_rss_bytes
+                    < predecessor.selected_per_worker_peak_rss_bytes
+                    or contract.aggregate_memory_limit_bytes
+                    < predecessor.aggregate_memory_limit_bytes
+                    or contract.per_worker_memory_limit_bytes
+                    < predecessor.per_worker_memory_limit_bytes
+                    or formal_recalibration is None
+                    or formal_recalibration.campaign_geometry_contribution != 0
+                    or formal_recalibration.replacement_contract_sha256
+                    != _canonical_sha256(contract.to_dict())
+                    or formal_recalibration.predecessor_aggregate_peak_rss_bytes
+                    != contract.selected_aggregate_peak_rss_bytes
+                    or formal_recalibration.predecessor_per_worker_peak_rss_bytes
+                    != contract.selected_per_worker_peak_rss_bytes
+                ):
+                    raise RuntimeError(
+                        "Formal resource-envelope recalibration changed topology, "
+                        "reduced a memory floor, or lacks exact zero-geometry evidence"
+                    )
+                payload = self.to_dict()
+                payload["predecessor_producer_resource_contract"] = predecessor.to_dict()
+                payload["producer_resource_contract"] = contract.to_dict()
+                payload["producer_resource_recalibration"] = (
+                    formal_recalibration.to_dict()
+                )
+                return payload
             return self.to_dict()
         payload = self.to_dict()
         payload["predecessor_selected_workers"] = self.selected_workers
@@ -1089,6 +1131,7 @@ class BenchmarkExecutionLock:
         input_provenance: object,
         native_kernel_config: object,
         producer_resource_contract: ProducerResourceContract | None = None,
+        formal_recalibration: FormalResourceRecalibrationEvidence | None = None,
         repository: Path | None = None,
         storage_migration: Mapping[str, object] | None = None,
     ) -> None:
@@ -1105,13 +1148,14 @@ class BenchmarkExecutionLock:
         )
         if selected_workers != expected_workers:
             raise RuntimeError("benchmark worker count differs from its frozen selection")
-        if self.producer_resource_contract is not None and (
-            producer_resource_contract is None
-            or dict(self.producer_resource_contract)
-            != producer_resource_contract.to_dict()
-        ):
-            raise RuntimeError(
-                "benchmark producer resource contract differs from accepted Pilot"
+        if self.producer_resource_contract is not None:
+            if producer_resource_contract is None:
+                raise RuntimeError(
+                    "benchmark producer resource contract differs from accepted Pilot"
+                )
+            self.with_producer_resource_contract(
+                producer_resource_contract,
+                formal_recalibration=formal_recalibration,
             )
         observed_configuration_selection = (
             configuration_sha256

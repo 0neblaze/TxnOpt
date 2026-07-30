@@ -261,6 +261,22 @@ reviewer 单独校准 1/2/4 workers，并由 parent baseline 与 per-child p99 R
 `MemoryHigh`、内部 guard 和 `MemoryMax`；swap 固定为 0，资源上限必须容纳已选并发
 且不得触发持续 throttling（限流）。
 
+若完整 Formal 在零 readiness geometry（就绪几何）贡献的 partial batch 中仅因已签名
+aggregate/per-worker RSS hard limit fail fast，replacement Formal 可以使用新的
+signed v2 calibration report 重新冻结 resource envelope（资源封套）。memory
+capacity/peaks/limits 与 calibration/semantic digests 可以重测，但原
+worker/row-group/queue-depth 拓扑及独立 scientific execution selection lock 不变。
+report 必须绑定失败 run/batch/resource summary、clean calibration revision、
+exact unique `{4,5,6}` worker identity set 的 cross-worker semantic equality、
+exact replacement-contract digest、精确 20% headroom、零
+swap/fallback/resource-limit failure 与
+`campaign_geometry_contribution=0`；producer 和
+independent reviewer 必须通过同一 loader 重算。Formal memory probe 保留其自身
+可验证的 semantic digest，并且 aggregate/per-worker peak 不得超过 replacement
+contract 的对应 selected peak。任何缺失 report、checksum 不一致、worker identity
+缺失或重复、拓扑变化、memory floor 降低或非零 geometry 都继续拒绝，失败 label
+不续跑、不导入 shard。
+
 producer 的 screening-definition identity state（筛选定义身份状态）固定使用
 `native_bounded_digest`（原生有界摘要）backend，保存完整 SHA-256 collision token
 （碰撞令牌）而不复制 JSON payload。hard limit 固定为 2,097,152 unique definitions；

@@ -2147,3 +2147,29 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 - `stage05.2_benchmark_rerun01` 将从零使用该 content-addressed contract、
   新 commit/wheels 与新 sealed source snapshot；Attempt99 的 637 archived
   shards 和 batch0007 partial shards 均不导入。
+
+## 2026-07-30：G Formal rerun01 resource-lock protocol
+
+- `stage05.2_benchmark_rerun01` 在任何 output directory 或 shard 创建前 fail
+  fast；sealed runtime/source preflight 已通过，但 accepted Pilot97 selection
+  lock 仍冻结旧 producer resource contract，因此拒绝 Attempt99-derived contract。
+  Windows host/controller exit 1、launch nonce 与 pre-dispatch log 原样保留，
+  rerun01 label 不复用。
+- 根因是 resource calibration 已能安全消费 Attempt99 的 per-process RSS failure，
+  但 producer/reviewer 的 campaign selection-lock protocol 尚无显式表达
+  replacement Formal memory-only recalibration 的字段。直接替换 contract 会失去
+  Pilot lock 的审计意义，因此没有绕过或放宽 equality gate。
+- 新 public loader 验证 signed v2 calibration report/sidecar、clean calibration
+  revision、Attempt99/batch0007/resource-summary identity、零 readiness geometry、
+  固定 6-worker/row-group/queue-depth topology、fresh/producer 两组各自精确且唯一的
+  `{4,5,6}` worker identity set、跨 worker semantic equality、完整 20% headroom，
+  以及 report 与 exact contract equality。独立 Formal memory probe 使用其自身的
+  可验证 semantic digest，aggregate/per-worker peak 均不得超过 replacement
+  contract 的对应 selected peak。`BenchmarkExecutionLock` 仅在该 evidence 存在时
+  允许 memory floor 单调增加，并在 effective selection lock 中同时保留 predecessor
+  contract、replacement contract 与 recalibration receipt。
+- producer 和 independent Formal reviewer 通过同一 loader 与 execution-lock
+  method 重算；source snapshot allowlist 仅新增 report 与 sidecar 两个固定本地
+  文件。缺失/篡改 report、非零 geometry、拓扑变化、降低 memory floor 或 checksum
+  不一致全部 fail fast。修复后的 replacement 使用新 commit、wheels、sealed
+  snapshot 与 `stage05.2_benchmark_rerun02` 从零执行。

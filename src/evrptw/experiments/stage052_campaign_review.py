@@ -114,6 +114,7 @@ from evrptw.stage052_replay import replay_verified_shard, verified_artifact_shar
 from evrptw.stage052_resources import (
     ProducerResourceContract,
     ReviewMemoryContract,
+    load_formal_resource_recalibration_evidence,
     load_review_memory_contract,
     verify_filesystem_capabilities,
 )
@@ -4390,6 +4391,34 @@ def _audit_campaign(
             if not isinstance(raw_selection, Mapping):
                 raise ArtifactIntegrityError("accepted pilot selection lock is missing")
             selection_lock = dict(raw_selection)
+            if campaign.producer_resource_contract is None:
+                raise ArtifactIntegrityError(
+                    "Formal campaign lacks its producer resource contract"
+                )
+            accepted = load_benchmark_execution_lock(
+                prerequisite_dir,
+                expected_scope="pilot",
+                expected_status=PILOT_READY,
+            )
+            recalibration_path = (
+                source_root
+                / "configs"
+                / "stage052_resource_calibration.local.report.json"
+            )
+            recalibration = (
+                load_formal_resource_recalibration_evidence(
+                    recalibration_path,
+                    campaign.producer_resource_contract,
+                )
+                if recalibration_path.is_file()
+                else None
+            )
+            selection_lock.update(
+                accepted.with_producer_resource_contract(
+                    campaign.producer_resource_contract,
+                    formal_recalibration=recalibration,
+                )
+            )
         else:
             prerequisite_payload, prerequisite_hash, selection_lock = (
                 _verify_accelerator_prerequisite(

@@ -648,6 +648,8 @@ def verify_stage052_source_snapshot(root: Path) -> dict[str, object]:
         "configs/stage052_campaign_lock.local.json",
         "configs/stage052_campaign_lock.local.sha256",
         "configs/stage052_resource_calibration.local.json",
+        "configs/stage052_resource_calibration.local.report.json",
+        "configs/stage052_resource_calibration.local.report.sha256",
         "configs/stage052_resource_calibration.local.sha256",
         "configs/stage052_review_calibration.local.json",
         "configs/stage052_review_calibration.local.sha256",

@@ -617,6 +617,20 @@ this repository or one of its subdirectories.
   are computed over expanded logical events, so physical IDs and compression
   layout cannot change replay. Persistence is at most 36% of end-to-end time
   and peak RSS is at most 50% of the Stage 5.2 v1 baseline.
+- A replacement Formal may update only the resource-envelope fields of the
+  accepted Pilot producer resource contract when a signed v2 calibration report
+  binds a failed Formal batch with zero readiness-geometry contribution. Memory
+  capacity/peaks/limits and their calibration/semantic digests may be
+  remeasured; the worker/row-group/queue-depth topology and the separate
+  scientific execution selection lock remain fixed. The producer and
+  independent reviewer must replay the same report/sidecar, failed
+  run/batch/resource-summary identity, clean calibration revision, cross-worker
+  semantic equality across the exact unique worker identity set `{4, 5, 6}`,
+  exact replacement-contract digest, exact 20% headroom, and zero
+  swap/fallback/resource-limit failures. The independent Formal memory probe
+  retains its own valid semantic digest and must fit below the replacement
+  contract's selected aggregate and per-worker peaks. Missing or mismatched
+  evidence, lower floors, topology changes, or shard reuse fail fast.
 - Job-parallel selection compares 1/2/4 workers on the fixed four-instance,
   three-seed scope. Two workers require at least 1.5x speedup and at most 12 GiB
   aggregate RSS; four workers are selected only at 2.5x and at most 12 GiB.
