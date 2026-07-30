@@ -4119,7 +4119,9 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._neighborhood_spool_path: Path | None = None
         self._neighborhood_read_offset = 0
         self._legacy_negative_screening_evidence: dict[str, tuple[object, ...]] = {}
-        self._typed_negative_screening_evidence: dict[str, int] = {}
+        self._typed_negative_screening_evidence: dict[
+            str, tuple[int, bytes | None]
+        ] = {}
         self._native_ablation_trace_events: list[dict[str, object]] = []
         self._native_ablation_route_evaluations: list[RouteEvaluationTrace] = []
         self._native_ablation_neighborhood_events: list[dict[str, object]] = []
@@ -4275,6 +4277,7 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         structural_energy_lower_bound: float,
         checks: tuple[ScreeningCheckTrace, ...],
         negative_evidence_token: int | None = None,
+        negative_evidence_signature: bytes | None = None,
     ) -> None:
         """Append normalized screening fields without a transient decision object."""
 
@@ -4296,21 +4299,30 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                             raise RuntimeError(
                                 "negative screening evidence token must be a positive integer"
                             )
-                        cached_token = self._typed_negative_screening_evidence.get(route_key)
-                        if cached_token is None:
+                        evidence_identity = (
+                            negative_evidence_token,
+                            negative_evidence_signature,
+                        )
+                        cached_identity = self._typed_negative_screening_evidence.get(
+                            route_key
+                        )
+                        if cached_identity is None:
                             self._typed_negative_screening_evidence[route_key] = (
-                                negative_evidence_token
+                                evidence_identity
                             )
-                        elif cached_token != negative_evidence_token:
+                            stable_evidence_identity = evidence_identity
+                        elif cached_identity != evidence_identity:
                             raise RuntimeError(
                                 "negative screening cache returned inconsistent evidence "
                                 "identity for one route"
                             )
+                        else:
+                            stable_evidence_identity = cached_identity
                         if len(self._typed_negative_screening_evidence) > 262_144:
                             self._typed_negative_screening_evidence.pop(
                                 next(iter(self._typed_negative_screening_evidence))
                             )
-                        negative_evidence_marker = negative_evidence_token
+                        negative_evidence_marker = stable_evidence_identity
                 else:
                     negative_evidence_marker = None
                 self._event_buffer.append(

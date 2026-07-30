@@ -127,12 +127,15 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
     }
 )
 _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
-    "src/evrptw/alns.py": "21d62bd2f006277725b473c08d8dfa9e4520e5ad4a43d396519aa5cd3803ad9c",
+    "cpp/evrptw_core.cpp": (
+        "b47d77b3b67d6fe4cd00357695bc18cbb17a282518897b8f5db4a597e2aaae3d"
+    ),
+    "src/evrptw/alns.py": "e5a3c1bf27cfda6d36ee24a3cdba24880379209b7eb0e2e58ed9b115bbfbf38b",
     "src/evrptw/candidate_transaction.py": (
         "1d510f58b5ca6e68962716e8eabb676d8a4e4e96cea1beac690b82172e987e72"
     ),
     "src/evrptw/measurement.py": (
-        "c6be1109595b3f6d687074fe708c5c1fb46b70d79068579cf89893edb0880dcd"
+        "3e6b5cbfa63a881834d03e14167c0f940b505e5d81400296cd56930bc401917f"
     ),
     "tests/test_alns_wall_clock_only.py": (
         "0bf741d1e4929564882dd8ff48775f0c589e957328aa00c7309176656fd16481"
@@ -141,10 +144,13 @@ _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
         "9cee5ea75470e4ac82b227983aafeb4e7a633d97784bb8795d6edaa017b4742a"
     ),
     "tests/test_candidate_transaction.py": (
-        "4d19ab4201d5d5421e18f9667c1cdc974bed80fcb0f2a6c82c14392783630ece"
+        "88366a8283de49512b06554b2a1293c6558d8eb5360ee91b6479848001d574b0"
     ),
     "tests/test_stage033_exact_deadline.py": (
         "cd8cbcf415b30c3d29d53aca8fecd22bd3ded62099de621b9cbf8c011d827de1"
+    ),
+    "tests/test_stage052_streaming_trace.py": (
+        "2469fb34967f2ac45ee3f90cb9dc657a06706cdf5c0c8c357b6fdaca20e3b0c4"
     ),
 }
 

@@ -1166,11 +1166,13 @@ def test_campaign_successor_revision_accepts_only_exact_pinned_producer_fix(
     pinned_paths = (
         "src/evrptw/alns.py",
         "tests/test_alns_wall_clock_only.py",
+        "cpp/evrptw_core.cpp",
         "tests/test_artifacts_v3.py",
         "src/evrptw/candidate_transaction.py",
         "src/evrptw/measurement.py",
         "tests/test_candidate_transaction.py",
         "tests/test_stage033_exact_deadline.py",
+        "tests/test_stage052_streaming_trace.py",
     )
     for index, relative in enumerate(pinned_paths):
         destination = repository / relative

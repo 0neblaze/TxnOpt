@@ -2280,3 +2280,40 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   `identity_collision_proof=full_sha256`。在新 clean commit、完整质量门槛、
   双轴 code review、新 wheels/venvs/runtime/sealed source 和下一未占用 memory
   probe label 完成前，状态仍为 `NOT_READY`。
+
+## 2026-07-30：G Formal memory attempt11 evidence-token 根因修复
+
+- bounded safe-rejection 修复在 clean commit
+  `a2a16335a478c6f0bf63e806712b0ef936c72ee7` 上通过完整 pytest 943、
+  Ruff、strict mypy、diff-check 与双轴 code review；producer/reviewer wheel
+  SHA-256 均为
+  `91f4a5fb67dc3e8136bec2bbcaa8b10bbb58221ce1714b888400d94ca8f9bd46`。
+  `stage05.2_formal_memory_probe_attempt11` 使用 exact `r205_21` seeds
+  2014--2019、固定 6 workers、16,384-row、queue depth 1，并由 Windows-side
+  `wsl.exe` keeper 持有 dedicated transient unit。
+- attempt11 在约 92 秒后 fail fast；signed v3 failure report SHA-256 为
+  `abc23985028e827f37a65a9b0ee9f035c63b5a767eef5455247d891606f8cf46`，
+  exit 1、clean `a2a1633` provenance、cgroup physical peak
+  `7,178,526,720` bytes、cgroup swap peak 0，最高 worker RSS
+  `1,328,115,712` bytes。该 peak 是失败前 partial scope 的诊断值，不是完整
+  Formal memory acceptance measurement；attempt11 原样保留且不复用。
+- seed 2017 的原始 partial failure 首先记录
+  `negative screening cache returned inconsistent evidence identity for one route`；
+  其他 worker 的 `no default __reduce__ due to non-trivial __cinit__` 是并行失败
+  传播/清理时的次生序列化错误。根因是 bounded LRU 淘汰后，同一路线的等价安全
+  拒绝被重新计算为新的 Python object，而 streamed evidence 仍使用 `id(result)`
+  作为持久身份 marker。
+- Stage 5.2 bounded LRU 路径现在用 collision-free canonical route key 与完整
+  normalized screening result 的 SHA-256 派生稳定正整数 lookup marker。等价安全
+  重算保持同一 marker；stream sink 同时保存无 hash 截断的完整 compact binary typed
+  result signature（字符串长度前缀、bool/None type tag、IEEE-754 原始 64-bit float），
+  并对 marker 与完整 bytes 比较，因此 63-bit marker 截断或碰撞不能隐藏任一筛选
+  证据字段变化，也不会恢复 object-heavy evidence retention。相同的
+  `(marker, complete signature)` 复合值继续进入 deferred native occurrence identity；
+  即使 route-key guard 已 FIFO 淘汰，旧 marker-only occurrence 也不能绕过完整签名。
+  未启用 bounded LRU 的历史路径保持原有 object-identity 行为。回归测试覆盖等价
+  重算、相同 marker 下的证据变化、guard-eviction 后的 native occurrence collision
+  路径和实际 LRU evict/recompute/hit 序列。新修复必须重新完成
+  clean commit、完整质量门槛、双轴 code review、wheels/venvs/runtime/sealed
+  source，并使用下一未占用 probe label；resource calibration 与 Formal rerun03
+  继续阻塞，状态为 `NOT_READY`。

@@ -309,6 +309,14 @@ Python sequence mapping 与 packed native ABI state 使用 65,536-entry generati
 cache（分代缓存）。容量将溢出时，当前 candidate transaction 必须原子替换两侧分代；
 worker、deadline、integrity 或 commit 失败必须恢复旧分代。淘汰只允许导致后续 safe
 screening 重算，不得增加 exact call、改变 candidate order 或削弱 collision proof。
+bounded LRU 的 negative-hit marker 必须由 collision-free canonical route key 与完整
+normalized screening result 稳定派生：等价重算保持 marker。该 marker 仅是 lookup
+accelerator；route-key consistency guard 还必须比较完整 compact binary typed result
+signature（长度前缀字符串、显式 type tag、原始 IEEE-754 bits），使 63-bit 截断或碰撞
+无法隐藏任一证据字段变化并 fail fast，同时避免恢复 object-heavy evidence retention。
+deferred native occurrence identity 也必须使用 `(marker, complete signature)` 复合值，
+不得在 route-key guard 淘汰后退化为 marker-only cache hit。
+不得使用会随对象生命周期变化的地址作为持久 marker。
 raw result/transaction statistics 必须签入 capacity、current/peak、stores、evictions
 与 rollovers，independent reviewer 对缺失、无界或内部不一致证据 fail fast。
 

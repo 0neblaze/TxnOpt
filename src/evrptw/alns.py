@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import itertools
+import json
 import math
 import random
+import struct
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -131,6 +134,77 @@ _NEGATIVE_SEQUENCE_CACHE_HIT_CHECKS = (
         "reused a previously recorded safe screening rejection",
     ),
 )
+
+
+def _negative_screening_evidence_token(
+    route_key: str,
+    result: ScreeningResult,
+) -> int:
+    """Return a stable positive identity for equivalent safe-rejection evidence."""
+
+    payload = json.dumps(
+        {"route_key": route_key, "screening_result": asdict(result)},
+        allow_nan=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    token = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
+        (1 << 63) - 1
+    )
+    return token or 1
+
+
+def _screening_text_identity(value: str) -> bytes:
+    encoded = value.encode("utf-8")
+    return struct.pack(">I", len(encoded)) + encoded
+
+
+def _screening_optional_float_identity(value: float | None) -> bytes:
+    return b"\x00" if value is None else b"\x01" + struct.pack(">d", float(value))
+
+
+def _negative_screening_evidence_signature(
+    route_key: str,
+    result: ScreeningResult,
+) -> bytes:
+    """Encode the complete collision-free typed identity of cached evidence."""
+
+    parts = [
+        b"screening-result-v1",
+        _screening_text_identity(route_key),
+        bytes((result.accepted,)),
+        _screening_text_identity(result.reason),
+        struct.pack(">d", result.demand),
+        struct.pack(">d", result.optimistic_finish_time),
+        bytes((result.energy_reachable,)),
+        struct.pack(">I", len(result.checks)),
+    ]
+    for check in result.checks:
+        parts.extend(
+            (
+                _screening_text_identity(check.check),
+                _screening_text_identity(check.status),
+                (
+                    b"\x00"
+                    if check.value is None
+                    else b"\x01" + bytes((check.value,))
+                    if isinstance(check.value, bool)
+                    else b"\x02" + struct.pack(">d", float(check.value))
+                ),
+                _screening_text_identity(check.reason),
+            )
+        )
+    parts.extend(
+        (
+            _screening_text_identity(result.first_failed_check),
+            struct.pack(">d", result.min_time_window_slack),
+            struct.pack(">d", result.distance_lower_bound),
+            _screening_optional_float_identity(result.distance_increment_lower_bound),
+            bytes((result.single_segment_reachable,)),
+            struct.pack(">d", result.structural_energy_lower_bound),
+        )
+    )
+    return b"".join(parts)
 
 
 @dataclass(slots=True)
@@ -1295,6 +1369,21 @@ class _Evaluator:
             decision_checks = (
                 _NEGATIVE_SEQUENCE_CACHE_HIT_CHECKS if negative_cache_hit else result.checks
             )
+            negative_evidence_token = None
+            negative_evidence_signature = None
+            if negative_cache_hit:
+                if isinstance(
+                    self.negative_screening_cache,
+                    BoundedScreeningResultCache,
+                ):
+                    negative_evidence_token = _negative_screening_evidence_token(
+                        key, result
+                    )
+                    negative_evidence_signature = (
+                        _negative_screening_evidence_signature(key, result)
+                    )
+                else:
+                    negative_evidence_token = id(result)
             self.measurement_trace.record_screening_decision(
                 sequence,
                 lane=self.lane,
@@ -1315,7 +1404,8 @@ class _Evaluator:
                 started_at=self.measurement_trace._offset(started),
                 completed_at=self.measurement_trace._offset(completed),
                 registered_route_key=key,
-                negative_evidence_token=id(result) if negative_cache_hit else None,
+                negative_evidence_token=negative_evidence_token,
+                negative_evidence_signature=negative_evidence_signature,
             )
             if incremental_metrics is not None:
                 self.measurement_trace.record_incremental_propagation(

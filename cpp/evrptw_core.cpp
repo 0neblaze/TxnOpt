@@ -1647,6 +1647,29 @@ py::tuple pack_stage052_screening_transactions(
                         "Stage 5.2 negative evidence token must be positive");
                 }
                 trusted_producer_token = true;
+            } else if (
+                PyTuple_Check(values[19].ptr())
+                && PyTuple_GET_SIZE(values[19].ptr()) == 2) {
+                PyObject* token = PyTuple_GET_ITEM(values[19].ptr(), 0);
+                PyObject* signature = PyTuple_GET_ITEM(values[19].ptr(), 1);
+                if (
+                    PyLong_Check(token)
+                    && !PyBool_Check(token)
+                    && PyBytes_Check(signature)
+                    && PyBytes_GET_SIZE(signature) > 0) {
+                    const unsigned long long converted =
+                        PyLong_AsUnsignedLongLong(token);
+                    if (
+                        converted == static_cast<unsigned long long>(-1)
+                        && PyErr_Occurred()) {
+                        throw py::error_already_set();
+                    }
+                    if (converted == 0) {
+                        throw std::invalid_argument(
+                            "Stage 5.2 negative evidence token must be positive");
+                    }
+                    trusted_producer_token = true;
+                }
             }
             if (!trusted_producer_token) {
                 PyObject* cached_evidence =

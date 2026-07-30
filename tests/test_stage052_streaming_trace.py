@@ -839,6 +839,65 @@ def test_native_screening_transaction_cache_rejects_non_capsule() -> None:
         )
 
 
+def test_native_negative_marker_compares_full_signature_after_route_guard_eviction() -> None:
+    from evrptw import _core
+
+    def deferred(
+        decision_id: int,
+        demand: float,
+        signature: bytes,
+    ) -> DeferredScreeningDecision:
+        return DeferredScreeningDecision(
+            axis_name="fixed_work",
+            values=(
+                decision_id,
+                "route:2:C1",
+                "legacy",
+                3,
+                "repair",
+                0.1,
+                0.2,
+                "negative_cache_hit",
+                "capacity",
+                demand,
+                None,
+                3.0,
+                True,
+                "capacity",
+                1.0,
+                True,
+                True,
+                4.0,
+                (ScreeningCheckTrace("negative_sequence_cache", "hit", True, "reused"),),
+                (73, signature),
+            ),
+        )
+
+    native_cache = _core.create_stage052_screening_definition_cache(capacity=4)
+    negative_evidence_cache: dict[object, tuple[object, ...]] = {}
+    columns, pending, remaining, observed = _core.pack_stage052_screening_transactions(
+        (
+            deferred(1, 2.5, b"complete-signature-a"),
+            deferred(2, 9.0, b"complete-signature-b"),
+        ),
+        native_cache,
+        negative_evidence_cache,
+        {},
+        {},
+        {},
+        artifact_module._stable_route_id,  # noqa: SLF001
+        artifact_module._stable_dictionary_id,  # noqa: SLF001
+        artifact_module._screening_definition_identity,  # noqa: SLF001
+        1,
+    )
+
+    assert columns[1][0] != columns[1][1]
+    assert len(pending) == 2
+    assert remaining == []
+    assert len(observed) == 2
+    assert negative_evidence_cache == {}
+
+
 def test_native_screening_cache_preserves_canonical_numeric_identity() -> None:
     from evrptw import _core
 
@@ -1658,9 +1717,19 @@ def test_v3_typed_negative_result_identity_roundtrips(tmp_path: Path) -> None:
         "negative_cache_hit": True,
         "exact_call_blocked": True,
         "negative_evidence_token": 73,
+        "negative_evidence_signature": b"full-evidence-signature-a",
     }
     trace.record_screening_decision(("C1",), **common)  # type: ignore[arg-type]
     trace.record_screening_decision(("C1",), **common)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="inconsistent evidence identity"):
+        trace.record_screening_decision(  # type: ignore[arg-type]
+            ("C1",),
+            **{
+                **common,
+                "demand": 9.0,
+                "negative_evidence_signature": b"full-evidence-signature-b",
+            },
+        )
     with pytest.raises(RuntimeError, match="inconsistent evidence identity"):
         trace.record_screening_decision(  # type: ignore[arg-type]
             ("C1",),

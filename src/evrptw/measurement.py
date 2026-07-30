@@ -840,6 +840,7 @@ class Stage03Trace:
         completed_at: float | None = None,
         registered_route_key: str | None = None,
         negative_evidence_token: int | None = None,
+        negative_evidence_signature: bytes | None = None,
     ) -> int:
         """Append one auditable Stage 3.1 screening decision.
 
@@ -905,6 +906,7 @@ class Stage03Trace:
                 normalized_energy,
                 checks,
                 negative_evidence_token,
+                negative_evidence_signature,
             )
             self.screening_decisions.increment_external_count()
             return decision_id

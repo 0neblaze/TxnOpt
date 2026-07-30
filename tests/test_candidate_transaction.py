@@ -7,7 +7,12 @@ import numpy as np
 import pytest
 
 import evrptw.candidate_transaction as candidate_transaction_module
-from evrptw.alns import _Evaluator, solve_alns
+from evrptw.alns import (
+    _Evaluator,
+    _negative_screening_evidence_signature,
+    _negative_screening_evidence_token,
+    solve_alns,
+)
 from evrptw.cache_incremental import CacheIncrementalConfig, RouteEvaluationCache
 from evrptw.candidate_transaction import (
     BoundedNegativeSequenceCache,
@@ -115,6 +120,79 @@ def test_stage052_negative_screening_result_cache_has_an_auditable_lru_bound() -
         "stores": 3,
         "evictions": 1,
     }
+
+
+def test_negative_screening_evidence_token_survives_equivalent_lru_recompute() -> None:
+    instance = _fixture_instance("stable_negative_evidence_token")
+    first_evaluator = _Evaluator(
+        instance,
+        deadline=time.perf_counter() + 10.0,
+        screening_config=CheapScreeningConfig(),
+        negative_screening_cache=BoundedScreeningResultCache(capacity=1),
+    )
+    second_evaluator = _Evaluator(
+        instance,
+        deadline=time.perf_counter() + 10.0,
+        screening_config=CheapScreeningConfig(),
+        negative_screening_cache=BoundedScreeningResultCache(capacity=1),
+    )
+    route_key = "route:2:C1|2:C2"
+    first = first_evaluator.screen(("C1", "C2"))
+    recomputed = second_evaluator.screen(("C1", "C2"))
+    different = second_evaluator.screen(("C1",))
+
+    first_token = _negative_screening_evidence_token(route_key, first)
+    assert first_token == _negative_screening_evidence_token(route_key, recomputed)
+    assert first_token != _negative_screening_evidence_token(route_key, different)
+    first_signature = _negative_screening_evidence_signature(route_key, first)
+    assert first_signature == _negative_screening_evidence_signature(
+        route_key, recomputed
+    )
+    assert first_signature != _negative_screening_evidence_signature(
+        route_key, different
+    )
+    assert 0 < first_token < 2**63
+
+
+def test_bounded_lru_recompute_emits_one_stable_streaming_evidence_token() -> None:
+    class RecordingTrace:
+        def __init__(self) -> None:
+            self.tokens: list[int] = []
+
+        @staticmethod
+        def register_route(sequence: tuple[str, ...]) -> str:
+            return "route:" + "|".join(
+                f"{len(customer)}:{customer}" for customer in sequence
+            )
+
+        @staticmethod
+        def _offset(value: float) -> float:
+            return value
+
+        def record_screening_decision(self, *_args: object, **kwargs: object) -> int:
+            token = kwargs["negative_evidence_token"]
+            if token is not None:
+                assert isinstance(token, int)
+                self.tokens.append(token)
+            return 1
+
+    trace = RecordingTrace()
+    evaluator = _Evaluator(
+        _fixture_instance("stable_streaming_negative_evidence_token"),
+        deadline=time.perf_counter() + 10.0,
+        measurement_trace=trace,  # type: ignore[arg-type]
+        screening_config=CheapScreeningConfig(),
+        negative_screening_cache=BoundedScreeningResultCache(capacity=1),
+    )
+
+    evaluator.screen(("C1", "C2"))
+    evaluator.screen(("C1", "C2"))
+    evaluator.screen(("C2", "C1"))
+    evaluator.screen(("C1", "C2"))
+    evaluator.screen(("C1", "C2"))
+
+    assert len(trace.tokens) == 2
+    assert trace.tokens[0] == trace.tokens[1]
 
 
 def test_stage052_negative_sequence_cache_rollover_is_atomic_and_bounded() -> None:

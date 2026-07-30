@@ -672,7 +672,13 @@ this repository or one of its subdirectories.
   native ABI state in one candidate transaction and must be reversible on
   failure. Eviction may cause safe screening to run again, but it may not admit
   an infeasible route, consume exact work, change candidate order, or weaken
-  full SHA-256 collision proof. Raw statistics record capacity, current/peak
+  full SHA-256 collision proof. A bounded-LRU negative hit uses a stable
+  positive lookup marker derived from the collision-free canonical route key
+  plus the complete normalized screening result; equivalent post-eviction
+  recomputation must keep the marker. The route-key consistency guard must also
+  compare the complete, compact binary typed result signature, so marker
+  truncation or collision cannot hide an evidence-field change without restoring
+  object-heavy evidence retention. Raw statistics record capacity, current/peak
   entries, stores, evictions, and rollovers; the independent reviewer rejects
   missing, unbounded, or internally inconsistent cache evidence.
 - The accelerator gate independently recomputes median 100-customer native
@@ -992,13 +998,19 @@ The executable workflow and gate table are maintained in
   Canonical typed signatures distinguish booleans from numerics and preserve IEEE-754 signed zero;
   negative-evidence drift uses the same signature. Probabilistic hash-only identity, unbounded cache
   growth, Python-loose numeric equality, or collision aliasing is forbidden.
-  The typed producer may bind a negative-cache occurrence to the positive integer identity of the
-  still-live frozen `ScreeningResult` returned by ALNS. The sink must maintain a bounded
-  route-key-to-token consistency map and fail fast if one route changes token. This process-local
-  accelerator is never persisted and is excluded from definition identity, event tokens, semantic
-  digests, and replay. Only the trusted typed path may use it; manual and legacy rows continue through
-  the complete field/signature collision check. The fixed negative-cache-hit check tuple is reused
-  as one immutable value rather than reconstructed per occurrence.
+  The typed producer may bind a negative-cache occurrence to a positive integer marker. Historical
+  unbounded paths use the identity of the still-live frozen `ScreeningResult`; the Stage 5.2 bounded
+  LRU path derives the marker from the collision-free route key and complete normalized screening
+  result so an equivalent eviction/recompute cycle remains stable. The marker is only a lookup
+  accelerator: the sink must maintain a bounded route-key-to-marker-and-complete-compact-binary-
+  typed-signature consistency map and fail fast if either differs. Full typed byte equality, not
+  the truncated marker, establishes evidence consistency. The deferred native occurrence identity
+  carries the same `(marker, complete signature)` pair, so route-guard eviction cannot expose a
+  stale marker-only occurrence hit.
+  This process-local accelerator is never persisted and is excluded from definition identity, event
+  tokens, semantic digests, and replay. Only the trusted typed path may use it; manual and legacy rows
+  continue through the complete field/signature collision check. The fixed negative-cache-hit check
+  tuple is reused as one immutable value rather than reconstructed per occurrence.
   Sparse screening-definition transactions are persisted immediately after collision-store
   registration and do not enter the two-buffer high-volume working set. The two bounded non-empty
   Parquet buffers remain available to occurrence and event streams so a sparse definition sink
