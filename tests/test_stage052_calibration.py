@@ -319,6 +319,9 @@ def test_formal_memory_probe_seals_non_campaign_measurement(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    instance_path = tmp_path / "data" / "schneider" / "r205_21.txt"
+    instance_path.parent.mkdir(parents=True)
+    instance_path.write_text("formal-memory-probe fixture\n", encoding="utf-8")
     calls: list[tuple[int, int, int, int]] = []
 
     def runner(**kwargs) -> MeasuredProducerCandidate:
@@ -379,6 +382,10 @@ def test_formal_memory_probe_seals_failure_before_reraising(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    instance_path = tmp_path / "data" / "schneider" / "r205_21.txt"
+    instance_path.parent.mkdir(parents=True)
+    instance_path.write_text("formal-memory-probe fixture\n", encoding="utf-8")
+
     def runner(**kwargs) -> MeasuredProducerCandidate:
         del kwargs
         raise RuntimeError("runtime guard aborted Stage 5.2 work: aggregate RSS")
@@ -414,6 +421,94 @@ def test_formal_memory_probe_seals_failure_before_reraising(
     assert payload["measurement"] is None
     assert payload["campaign_geometry_contribution"] == 0
     assert signed_sidecar_matches(report_path, report_path.with_suffix(".sha256"))
+
+
+def test_formal_memory_probe_rejects_missing_instance_before_consuming_label(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runner_called = False
+
+    def runner(**kwargs) -> MeasuredProducerCandidate:
+        del kwargs
+        nonlocal runner_called
+        runner_called = True
+        raise AssertionError("runner must not start without the exact probe input")
+
+    monkeypatch.setattr(
+        stage052_calibration.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(
+            available=23 * 1024**3,
+            total=24 * 1024**3,
+        ),
+    )
+    output_root = tmp_path / "missing-input-formal-memory-probe"
+
+    with pytest.raises(FileNotFoundError, match="r205_21.txt"):
+        stage052_calibration.run_stage052_formal_memory_probe(
+            workers=6,
+            row_group_size=16_384,
+            queue_depth=1,
+            output_root=output_root,
+            root=tmp_path,
+            config_path=tmp_path / "config.toml",
+            run_label="stage05.2_formal_memory_probe_attempt12",
+            runner=runner,
+        )
+
+    assert not runner_called
+    assert not output_root.exists()
+
+
+def test_formal_memory_probe_rejects_external_instance_symlink_before_workers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = tmp_path / "repository"
+    (repository / "data").mkdir(parents=True)
+    external_data = tmp_path / "external-schneider"
+    external_data.mkdir()
+    (external_data / "r205_21.txt").write_text(
+        "external formal-memory-probe fixture\n",
+        encoding="utf-8",
+    )
+    (repository / "data" / "schneider").symlink_to(
+        external_data,
+        target_is_directory=True,
+    )
+    runner_called = False
+
+    def runner(**kwargs) -> MeasuredProducerCandidate:
+        del kwargs
+        nonlocal runner_called
+        runner_called = True
+        raise AssertionError("runner must not start with an external input symlink")
+
+    monkeypatch.setattr(
+        stage052_calibration.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(
+            available=23 * 1024**3,
+            total=24 * 1024**3,
+        ),
+    )
+    output_root = tmp_path / "symlinked-input-formal-memory-probe"
+
+    with pytest.raises(RuntimeError, match="snapshot-local ordinary file"):
+        stage052_calibration.run_stage052_formal_memory_probe(
+            workers=6,
+            row_group_size=16_384,
+            queue_depth=1,
+            output_root=output_root,
+            root=repository,
+            config_path=repository / "config.toml",
+            run_label="stage05.2_formal_memory_probe_attempt13",
+            runner=runner,
+        )
+
+    assert not runner_called
+    assert not output_root.exists()
 
 
 def test_calibration_cli_runs_formal_memory_probe_without_corpus(

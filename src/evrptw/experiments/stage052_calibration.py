@@ -1295,6 +1295,33 @@ def run_stage052_formal_memory_probe(
     )
     if output_root.exists():
         raise FileExistsError(output_root)
+    formal_memory_instance_relative_path = (
+        Path("data") / "schneider" / f"{_FORMAL_MEMORY_INSTANCE}.txt"
+    )
+    formal_memory_instance_path = repository / formal_memory_instance_relative_path
+    path_component = repository
+    for component in formal_memory_instance_relative_path.parts:
+        path_component /= component
+        if path_component.is_symlink():
+            raise RuntimeError(
+                "Formal memory probe exact input must be a snapshot-local "
+                f"ordinary file: {formal_memory_instance_path}"
+            )
+    if not formal_memory_instance_path.is_file():
+        raise FileNotFoundError(
+            "Formal memory probe exact input is unavailable: "
+            f"{formal_memory_instance_path}"
+        )
+    if not formal_memory_instance_path.resolve(strict=True).is_relative_to(repository):
+        raise RuntimeError(
+            "Formal memory probe exact input resolves outside the source snapshot: "
+            f"{formal_memory_instance_path}"
+        )
+    if formal_memory_instance_path.stat().st_size <= 0:
+        raise RuntimeError(
+            "Formal memory probe exact input is empty: "
+            f"{formal_memory_instance_path}"
+        )
     output_root.mkdir(parents=True)
     memory_capacity = int(psutil.virtual_memory().total)
     operating_reserve_bytes = 1024**3

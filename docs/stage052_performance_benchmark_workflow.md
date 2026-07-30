@@ -287,6 +287,12 @@ report、checksum 不一致、worker identity
 缺失或重复、拓扑变化、memory floor 降低或非零 geometry 都继续拒绝，失败 label
 不续跑、不导入 shard。
 
+sealed source snapshot 不能只做 Git clone：Schneider benchmark 是 ignored input，
+必须在启动前以 snapshot-local ordinary files（快照内普通文件）实体化，并核对 exact
+probe instance 非空。Formal memory probe 在创建 output root 和提交 worker work
+之前执行该门槛；缺失输入不得进入内存测量。若 transient unit 已使用某 label 启动，
+即使此门槛立即失败，该 label 仍作为不可变 failure evidence 保留并由新 label 替代。
+
 producer 的 screening-definition identity state（筛选定义身份状态）固定使用
 `native_bounded_digest`（原生有界摘要）backend，保存完整 SHA-256 collision token
 （碰撞令牌）而不复制 JSON payload。hard limit 固定为 2,097,152 unique definitions；

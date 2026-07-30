@@ -2317,3 +2317,28 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   clean commit、完整质量门槛、双轴 code review、wheels/venvs/runtime/sealed
   source，并使用下一未占用 probe label；resource calibration 与 Formal rerun03
   继续阻塞，状态为 `NOT_READY`。
+
+## 2026-07-30：G Formal memory attempt12 sealed-input preflight
+
+- attempt11 的稳定 evidence identity 修复在 clean commit
+  `20302404a301e6a5aa219a7d70e59bc988c3979b` 上通过完整 pytest 946、
+  Ruff、strict mypy、diff-check 与双轴 code review。producer/reviewer wheel
+  SHA-256 均为
+  `6600f4c1d17f490db1c9c92598d7f66f060796cc804720cce34ef2b704216dd5`，
+  reviewer wheel provenance sidecar 绑定同一完整 revision。
+- `stage05.2_formal_memory_probe_attempt12` 使用该 clean runtime、固定 6 workers、
+  16,384-row、queue depth 1 和正确的 Windows-side `wsl.exe` keeper 启动；dedicated
+  transient unit 与 sealed working directory 均已建立。但新 sealed checkout 只做了
+  Git clone，没有实体化 Git-ignored Schneider input，因缺少
+  `data/schneider/r205_21.txt` 在约 1.09 秒内 fail fast。signed v3 failure report
+  SHA-256 为
+  `01bb9ed520b0028d8cf053185db26c7a242f2b5c9159b133fbe0fc49b5f107d3`；
+  exit 1、clean `2030240` provenance、cgroup swap peak 0。该运行没有完成任何
+  memory acceptance geometry；attempt12 原样保留且不续跑、不复用。
+- 根因是 active checkout 的 `data/schneider` 为 ignored symlink，而历史 sealed
+  sources 使用 snapshot-local ordinary file copies；普通 clone 无法携带该输入。
+  Formal memory probe 现在在创建 output root 和提交 worker work 前要求 exact
+  `r205_21.txt` 存在且非空。回归测试证明缺失输入不会调用 runner，也不会创建
+  output root。下一 sealed source 必须实体化并核验 Schneider input，使用新的 clean
+  commit、wheels/venvs/runtime 与未占用 probe label；resource calibration 和 Formal
+  rerun03 继续阻塞，状态仍为 `NOT_READY`。

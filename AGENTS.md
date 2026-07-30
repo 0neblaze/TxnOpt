@@ -567,6 +567,12 @@ this repository or one of its subdirectories.
   the repository workspace. Current-chain truth comes from signed manifests,
   prerequisite references, and `stage05.2_retention_registry.csv`, never from a
   hard-coded attempt number in policy documentation.
+- Every sealed Stage 5.2 source snapshot must materialize the required ignored
+  benchmark inputs as ordinary snapshot-local files; a Git clone alone is not a
+  complete producer source. Formal memory probing verifies the exact non-empty
+  instance input before creating its output root or starting worker work.
+  Missing ignored input fails before scientific execution, and any unit label
+  already launched for that failure remains consumed and immutable.
 - Full Stage 5.2 evidence exists in the active staging root only while it is
   being produced or reviewed. Complete, partial, failed, `NOT_READY`, and
   superseded run metadata trees are checksum-verified and archived under the
