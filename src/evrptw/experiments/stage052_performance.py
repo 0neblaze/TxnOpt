@@ -134,7 +134,14 @@ from evrptw.stage052_evidence import (
 )
 from evrptw.stage052_platform import peak_rss_bytes
 from evrptw.stage052_remediation import Stage052RemediationResult
-from evrptw.stage052_retention import resolve_retained_run_from_locator
+from evrptw.storage_governance import (
+    ExperimentStorageGovernance,
+    GovernancePolicy,
+    StartRequest,
+    load_capacity_observation,
+    preflight_cli_attempt,
+    resolve_run_from_locator,
+)
 from evrptw.validation import validate_routes
 
 STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS = 0.5
@@ -350,7 +357,10 @@ def load_stage052_config(path: Path) -> Stage052Config:
         raise ValueError("current Stage 5.2 streaming storage requires screening_decisions_v3")
     if config.max_iterations != 1000 or config.batch_size <= 0:
         raise ValueError("Stage 5.2 requires 1000 iterations and a positive batch size")
-    if config.staging_root_alias != "wsl_staging" or config.archive_root_aliases != ("d_archive",):
+    if (
+        config.staging_root_alias != "wsl_staging"
+        or config.archive_root_aliases != ("e_archive",)
+    ):
         raise ValueError("Stage 5.2 campaign storage root aliases are fixed")
     if (
         config.accelerator_backend != "cuda"
@@ -542,10 +552,15 @@ def run_stage052(
                 r"stage05\.2_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}",
                 supplied_input.as_posix(),
             ):
-                resolved_input = resolve_retained_run_from_locator(
+                resolved_input = resolve_run_from_locator(
                     supplied_input.as_posix(),
-                    registry_path=_resolve(root, retention_registry_path),
+                    policy_path=(
+                        resolved_config.parent
+                        / "experiment_storage_governance.toml"
+                    ),
                     storage_root_locator_path=_resolve(root, config.storage_root_locator),
+                    legacy_registry_path=_resolve(root, retention_registry_path),
+                    volume_probe=probe_volume_identity,
                 )
             else:
                 resolved_input = ordinary_input
@@ -1113,18 +1128,7 @@ def _run_benchmark_campaign_impl(
         )
     locator_path = _resolve(root, config.storage_root_locator)
     locator = StorageRootLocator.from_toml(locator_path)
-    verify_campaign_root_locations(repository_root=root, locator=locator)
-    for alias in (config.staging_root_alias, *config.archive_root_aliases):
-        locator.resolve(alias).absolute_path.mkdir(parents=True, exist_ok=True)
-    locator.verify_all(
-        probe_volume_identity,
-        (config.staging_root_alias, *config.archive_root_aliases),
-    )
     staging = locator.resolve(config.staging_root_alias)
-    if staging.absolute_path.resolve() != output_dir.resolve().parent:
-        raise RuntimeError("benchmark active writes must use the configured ext4 staging root")
-    if output_dir != staging.absolute_path / run_label:
-        raise RuntimeError("benchmark output is not below the verified staging root")
     campaign_config = (
         BenchmarkCampaignConfig.pilot(
             run_label=run_label,
@@ -1170,6 +1174,51 @@ def _run_benchmark_campaign_impl(
     )
     if observed_geometry != expected_geometry:
         raise RuntimeError(f"benchmark {scope} geometry mismatch: {observed_geometry}")
+    governance_plan_sha256 = _canonical_mapping_sha256(
+        {
+            "campaign_config": campaign_config.to_dict(),
+            "campaign_plan": plan.to_dict(),
+        }
+    )
+    governance = ExperimentStorageGovernance(
+        policy=GovernancePolicy.from_toml(
+            config_path.parent / "experiment_storage_governance.toml"
+        ),
+        locator=locator,
+        state_root=staging.absolute_path / ".storage-governance",
+        retention_state_root=(
+            locator.resolve(config.archive_root_aliases[0]).absolute_path
+            / ".storage-governance"
+        ),
+        free_space=free_bytes,
+        volume_probe=probe_volume_identity,
+        legacy_registry_path=root / _RETENTION_REGISTRY,
+    )
+    governance_start_request = StartRequest(
+        stage_id="stage05.2",
+        run_label=run_label,
+        run_dir=output_dir,
+        staging_root_alias=config.staging_root_alias,
+        host_root_alias="d_archive",
+        archive_root_alias=config.archive_root_aliases[0],
+        planned_archive_bytes=plan.estimated_bytes,
+        max_active_workspace_bytes=campaign_config.external_active_workspace_bytes,
+        projected_host_growth_bytes=(
+            campaign_config.external_active_workspace_bytes
+        ),
+        stage_plan_sha256=governance_plan_sha256,
+    )
+    start_permit = governance.preflight_run(governance_start_request)
+    verify_campaign_root_locations(
+        repository_root=root,
+        locator=locator,
+        staging_root_alias=config.staging_root_alias,
+        archive_root_aliases=config.archive_root_aliases,
+    )
+    if staging.absolute_path.resolve() != output_dir.resolve().parent:
+        raise RuntimeError("benchmark active writes must use the configured ext4 staging root")
+    if output_dir != staging.absolute_path / run_label:
+        raise RuntimeError("benchmark output is not below the verified staging root")
     free_by_alias = {
         alias: free_bytes(locator.resolve(alias).absolute_path)
         for alias in (config.staging_root_alias, *config.archive_root_aliases)
@@ -1235,6 +1284,10 @@ def _run_benchmark_campaign_impl(
             (config.staging_root_alias, *config.archive_root_aliases)
         ),
         "campaign_capacity_plan": capacity.to_dict(),
+        "storage_governance_start_permit": {
+            "stage_plan_sha256": start_permit.stage_plan_sha256,
+            "observation_sha256": start_permit.observation_sha256,
+        },
         "persistence_attribution": "primary_active_writes_v1",
         "benchmark_execution_lock": selection_lock.to_dict(),
         "stage051_prerequisite": dict(stage051_prerequisite),
@@ -1327,6 +1380,46 @@ def _run_benchmark_campaign_impl(
 
     def verify_and_record_capacity(*, batch_id: str, phase: str) -> None:
         try:
+            batch_index = next(
+                index
+                for index, batch in enumerate(campaign.batches)
+                if batch.batch_id == batch_id
+            )
+        except StopIteration as error:
+            raise RuntimeError(
+                f"rolling capacity batch is not in the campaign: {batch_id}"
+            ) from error
+        future = campaign.batches[batch_index + 1 :]
+        if phase == "pre_dispatch":
+            remaining_archive_bytes = sum(
+                batch.estimated_bytes for batch in campaign.batches[batch_index:]
+            )
+        elif phase == "pre_archive":
+            current_actual_bytes = campaign.batches[batch_index].actual_bytes
+            if current_actual_bytes is None:
+                raise RuntimeError(
+                    f"verified batch lacks actual bytes: {batch_id}"
+                )
+            remaining_archive_bytes = current_actual_bytes + sum(
+                batch.estimated_bytes for batch in future
+            )
+        elif phase == "post_archive":
+            remaining_archive_bytes = sum(
+                batch.estimated_bytes for batch in future
+            )
+        else:
+            raise RuntimeError(f"unsupported rolling capacity phase: {phase}")
+        permit = governance.preflight_run(
+            replace(
+                governance_start_request,
+                planned_archive_bytes=remaining_archive_bytes,
+            )
+        )
+        governance_observation = load_capacity_observation(
+            permit.observation_path,
+            expected_sha256=permit.observation_sha256,
+        )
+        try:
             observation = verify_rolling_campaign_capacity(
                 config=campaign_config,
                 campaign=campaign,
@@ -1339,6 +1432,8 @@ def _run_benchmark_campaign_impl(
         except RollingCampaignCapacityError as error:
             record_capacity(error.observation)
             raise
+        observation["governance_observation_sha256"] = permit.observation_sha256
+        observation["governance_observation"] = governance_observation
         record_capacity(observation)
 
     try:
@@ -5719,6 +5814,12 @@ def main() -> int:
     parser.add_argument("--storage-migration-evidence-dir", type=Path)
     arguments = parser.parse_args()
     named_prerequisites = _parse_prerequisite_bindings(arguments.prerequisite)
+    if arguments.component != Stage052Component.BENCHMARK.value:
+        preflight_cli_attempt(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            run_label=arguments.run_label,
+        )
     outputs = run_stage052(
         config_path=arguments.config,
         output_dir=arguments.output_dir,

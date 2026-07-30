@@ -561,27 +561,36 @@ this repository or one of its subdirectories.
   not version names. A failed or interrupted run consumes its label and shards
   may never be imported into another run, but bulky evidence need not remain in
   the repository workspace. Current-chain truth comes from signed manifests,
-  prerequisite references, and `stage05.2_retention_registry.csv`, never from a
+  prerequisite references, and the newest verified v2 registry generation
+  stored with the bound `e_archive` governance state. The tracked
+  `stage05.2_retention_registry.csv` is the immutable v1 compatibility source,
+  never a competing current v2 truth source; neither may be replaced by a
   hard-coded attempt number in policy documentation.
 - Full Stage 5.2 evidence exists in the active staging root only while it is
-  being produced or reviewed. Complete, partial, failed, `NOT_READY`, and
-  superseded runs are checksum-verified and archived under the configured
-  `d_archive` alias at `stage05.2/history/<run_label>/`; the workspace retains
-  only the signed retention inventory, lightweight registry, change log, and
-  independently published summaries. Archive failure or identity mismatch
-  retains the source and fails immediately.
-- Retention audit rejects active, planned, unknown, or otherwise unsealed runs
-  by default. The one-time pre-redesign historical override must bind the
-  expected directory count and byte count. Same-volume archival uses atomic
-  rename; cross-volume archival copies to a hidden target-volume temporary
-  directory, verifies the full identity, atomically publishes it on that
-  volume, and only then removes the source. Registry updates merge by immutable
-  run identity and may never replace unrelated historical rows.
-- Archived prerequisite or review input is resolved by run label through
-  `stage05.2_retention_registry.csv` plus the local storage-root locator. The
-  resolver must recheck the registered file count, byte count, and tree SHA-256
-  before returning a path to an existing runner or reviewer; policy files and
-  callers must not embed the machine-local archive path.
+  being produced or reviewed. New long-term generations publish under the
+  bound `e_archive` role; `d_archive` remains a host-capacity and legacy
+  resolution role. Accepted/current-chain and unique-root-cause failures retain
+  complete raw evidence. A signed adjudication may reduce a superseded
+  duplicate failure to audit-only control manifests, reviews, logs, checksums,
+  failure evidence, and its failure-triggering representative shard. Unknown
+  status, root cause, or seal identity always fails closed to full retention.
+- Retention audit rejects active, planned, or otherwise unsealed runs by
+  default. Cross-volume archival copies to a hidden target-volume incoming
+  generation, verifies every file and logical identity, atomically publishes
+  it, and registers `(run_label, segment_id, generation)` without rewriting the
+  source manifest. Historical D/WSL migration cleanup is a separate destructive
+  action that requires an exact verified deletion list and literal user
+  confirmation `确认`; no historical source is deleted merely because a
+  retention generation exists. This confirmation boundary does not replace the
+  explicitly configured same-attempt rolling-batch handoff needed to preserve
+  the Stage 5.2 active-workspace cap.
+- Archived prerequisite or review input is resolved by run label through the
+  newest verified v2 registry generation under `e_archive`, with
+  `stage05.2_retention_registry.csv` as the v1-only fallback, plus the local
+  storage-root locator. The resolver must recheck the registered file count,
+  byte count, tree SHA-256, and any required full-replay receipt before
+  returning a path to an existing runner or reviewer; policy files and callers
+  must not embed the machine-local archive path.
 - A registered archive tree is immutable. Reviewers may consume it as a
   comparison, prerequisite, or replay input, but may not publish a new review
   generation inside it. A run that still needs review publication remains in
@@ -687,13 +696,27 @@ this repository or one of its subdirectories.
   Batch target/hard cap remains 24/32 GiB and shard hard cap remains 2 GiB.
   Producer, retention, performance review, and campaign review must all use the
   shared cross-platform `probe_volume_identity`; WSL uses `findmnt`, DrvFS
-  additionally binds the Windows NVMe identity, and macOS uses `diskutil`.
+  additionally binds the Windows physical-disk model, serial, and BusType, and
+  macOS uses `diskutil`. Bound NTFS USB archives are allowed; ExFAT/FAT,
+  disconnected devices, serial mismatch, and drive-letter drift are rejected.
   Reviewer-local platform probes are forbidden contract drift.
   Campaign rolling-capacity replay must derive its reserves from the rebuilt
   identity-matched `BenchmarkCampaignConfig`: WSL active/future staging uses
-  50 GiB safety plus 32 GiB active workspace, final WSL safety is 50 GiB, and
-  internal archive safety is 50 GiB. Reviewer-local reserve constants or lower
-  thresholds are forbidden contract drift.
+  50 GiB safety plus at least 32 GiB active workspace. Every Stage 0--8 attempt
+  must submit a replayable plan before its run directory or workers exist.
+  Dynamic stop gates require E free bytes of planned archive plus 200 GiB, D
+  free bytes of projected WSL growth plus 200 GiB, and WSL free bytes of active
+  workspace plus 50 GiB. A locked permit ledger prevents concurrent
+  over-reservation; permits do not expire without audit. Reviewer-local reserve
+  constants or lower thresholds are forbidden contract drift.
+- Rebuildable cache, venv, build, or temporary spool cleanup is allowed only
+  from an exact allowlist after an independent keeper-reference scan. Every
+  execution must match a signed dry-run identity. Venv/build cleanup also
+  requires a signed isolated-rebuild proof plus a live rebuild verifier; missing
+  inputs, active locks, manifest references, identity drift, or smoke-test
+  mismatch retain the asset. Git repositories, sealed source, registries,
+  manifests, reviews, checksums, active runs, and unsealed runs are never
+  automatic-cleanup candidates.
   The sealed reviewer wheel must include and source-bind every tracked
   `tools` Python module used by review or publication dry-run paths; isolated
   `python -I` review services may not depend on an unsealed checkout import.

@@ -100,7 +100,59 @@ def test_repository_config_declares_single_current_retention_policy() -> None:
         repository / "configs" / "stage052_performance.toml"
     )
 
-    assert policy == _policy()
+    assert policy.archive_root_alias == "e_archive"
+    assert policy.archive_relative_base == "stage05.2/history"
+    assert policy.workspace_full_evidence == "active_only"
+
+
+def test_legacy_retention_cli_cannot_publish_and_delete_e_archive_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "results"
+    run = _run(
+        source,
+        "stage05.2_native_kernels_attempt98",
+        status="accepted",
+        completeness="complete",
+    )
+    policy = Stage052RetentionPolicy(
+        archive_root_alias="e_archive",
+        archive_relative_base="stage05.2/history",
+    )
+    inventory = audit_stage052_runs(source, policy)
+    inventory_path = tmp_path / "inventory.json"
+    inventory_sha256 = write_retention_inventory(inventory_path, inventory)
+    locator_path = tmp_path / "storage-roots.toml"
+    locator_path.write_text(
+        "\n".join(
+            (
+                "[roots.e_archive]",
+                f'absolute_path = "{(tmp_path / "e-archive").as_posix()}"',
+                'device_uuid = "usb-test-serial"',
+                'filesystem = "ntfs"',
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RetentionIntegrityError, match="retention v1 cannot publish"):
+        retention.main(
+            (
+                "archive",
+                "--inventory",
+                str(inventory_path),
+                "--inventory-sha256",
+                inventory_sha256,
+                "--storage-root-locator",
+                str(locator_path),
+                "--registry",
+                str(tmp_path / "registry.csv"),
+            )
+        )
+
+    assert run.is_dir()
+    assert not (tmp_path / "e-archive").exists()
 
 
 def test_audit_uses_run_status_not_nested_prerequisite_status(tmp_path: Path) -> None:

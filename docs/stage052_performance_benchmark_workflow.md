@@ -32,7 +32,10 @@ Stage 5.2 只维护一套当前代码。下表 A--G 是同一实现内部必须�
 F 可以以 `GPU_NOT_JUSTIFIED` 通过；A--E 和 G 不得跳过。
 
 current chain（当前证据链）由 signed manifest（签名清单）、prerequisite identity
-（先决身份）和 `experiments/registries/stage05.2_retention_registry.csv` 共同确定。
+（先决身份）和 `e_archive/.storage-governance` 中最新 verified v2 registry
+generation（已验证注册表代次）共同确定。tracked
+`experiments/registries/stage05.2_retention_registry.csv` 仅为不可变 v1 compatibility
+fallback（兼容回退），不是共同的 current-chain truth source（当前证据链事实源）。
 政策文档不得硬编码某次 attempt 为永久 current。producer/storage/native/config
 语义变化仍从受影响的最早 gate 重跑；reviewer-only 修复可以复用同一 raw，但每个
 review generation 继续保持内容寻址和不可变。
@@ -192,7 +195,8 @@ archive root 和 interrupted publication dry run。所有 36 bundles 完整且�
 报告 `READY_FOR_STAGE052_FORMAL_BENCHMARK` 后才开放 Formal。
 
 Campaign active writes 与归档目标只通过 ignored root locator（忽略的根目录定位器）
-中的 `wsl_staging` 和 `d_archive` aliases 解析。绝对路径不得写入 tracked artifact。
+中的 `wsl_staging`、legacy `d_archive` 与长期 `e_archive` aliases 解析。绝对路径不得
+写入 tracked artifact。
 next-fit partitioning 的 target/hard cap 为 24/32 GiB，单 shard hard cap 2 GiB，并
 持续满足 locator 声明的容量 reserve。
 
@@ -249,11 +253,13 @@ connection 并清理临时目录。Pilot 必须由 signed shard descriptor 的 r
 
 producer、retention、performance reviewer 与 campaign reviewer 必须调用同一个
 cross-platform `probe_volume_identity`：WSL 用 `findmnt`，DrvFS 额外绑定 Windows
-NVMe identity，macOS 才使用 `diskutil`。reviewer 不得复制或硬编码单一平台 probe。
+physical-disk identity（物理磁盘身份），macOS 才使用 `diskutil`。reviewer 不得复制或
+硬编码单一平台 probe。
 rolling-capacity replay 必须从重建且与 campaign identity 一致的 canonical
 `BenchmarkCampaignConfig` 读取 reserve：WSL active/future workspace 为
-`50 + 32 = 82 GiB`，final WSL safety 为 `50 GiB`，D archive internal safety 为
-`50 GiB`。reviewer 不得另设 magic constants（魔法常量）或降低 producer 门槛。
+`50 + 32 = 82 GiB`，final WSL safety 为 `50 GiB`，E archive safety 为
+`200 GiB`，D host/VHDX safety 为 `200 GiB`。D archive 的既有 v1 证据保持只读。
+reviewer 不得另设 magic constants（魔法常量）或降低 producer 门槛。
 
 ### Formal budget matrix
 
@@ -271,13 +277,18 @@ anytime checkpoints 为预算范围内的 `1/5/10/30/60/120/300 s`。small insta
 - `python -m evrptw.stage052_retention audit` 只读枚举 Stage 5.2 运行，记录状态、
   completeness、source commit、prerequisite run labels、文件数、字节数和完整 tree
   SHA-256，并生成带 sidecar 的 inventory。
-- `python -m evrptw.stage052_retention archive` 必须显式绑定 inventory SHA-256。
-  同盘目标使用原子迁移；跨盘先写目标卷隐藏临时目录，复验后在目标卷原子落位，再
-  清理 source。source 漂移、目标冲突或校验失败均保留 source 并 fail fast；中断留下
-  的临时副本可在源完整时安全重建并重试。
-- 完整 raw 保存在 `d_archive/stage05.2/history/<run_label>/`。仓库只跟踪
-  `experiments/registries/stage05.2_retention_registry.csv`、最终科学汇总和
-  `docs/stage052_change_log.md`；registry 不记录本机绝对路径。
+- legacy `python -m evrptw.stage052_retention` 仅用于 v1 audit/read/resolve；其 archive
+  命令不得向 `e_archive` 发布。E 盘新 generation 必须走 experiment retention v2：
+  跨盘先写目标卷隐藏 incoming generation，复验、独立 replay 并登记后，historical
+  D/WSL source 仍保持原位，直至生成精确删除清单并取得字面 `确认`。
+- future benchmark attempt 的 verified batch 可按预先配置执行 same-attempt rolling
+  handoff：目标卷完整校验、原子发布后清理该 batch 的 staging source，以维持 32 GiB
+  active-workspace cap。该路径不授权清理本轮历史迁移源。
+- 新完整 raw generation 保存在
+  `e_archive/stage05.2/generations/<run_label>/<generation>/`；既有
+  `d_archive/stage05.2/history/<run_label>/` 由 v1 resolver 保持只读可解析。reduced
+  duplicate 是 audit-only，不能作为 comparison/prerequisite。registry 不记录本机
+  绝对路径。
 - change log 按时间追加原因、修改范围、行为与证据影响、验证结果、失效运行和新运行
   identity。后续改进直接进入当前 Stage 5.2 实现，不复制新版本目录或模块。
 
@@ -428,7 +439,9 @@ verifier 才能消费该 READY。
 必须发布：
 
 - `experiments/registries/stage05.2_artifact_registry.csv`；
-- `experiments/registries/stage05.2_retention_registry.csv`；
+- `e_archive/.storage-governance` 中最新 verified v2 retention registry generation；
+- 既有 `experiments/registries/stage05.2_retention_registry.csv` 保持不可变，仅供 v1
+  compatibility fallback，不由 v2 publication（发布）改写；
 - `experiments/manifests/stage05.2_performance_benchmark_artifact_manifest.json`；
 - per-run、per-family、per-budget、anytime、resource 和 persistence summaries；
 - performance gate、GPU decision、failure analysis 和 review report。

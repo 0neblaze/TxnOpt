@@ -11,3 +11,8 @@ filesystem = "ext4"
 absolute_path = "/mnt/d/FURP-2026-Yiyang-GUO-EVRP-TW-results"
 device_uuid = "REPLACE_WITH_D_NVME_IDENTITY"
 filesystem = "9p"
+
+[roots.e_archive]
+absolute_path = "/mnt/e/Reproducible-EVRPTW-archive"
+device_uuid = "REPLACE_WITH_USB_DISK_MODEL_AND_SERIAL_IDENTITY"
+filesystem = "9p"

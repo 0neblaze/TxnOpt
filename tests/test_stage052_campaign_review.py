@@ -68,6 +68,11 @@ from evrptw.stage052_evidence import (
     Stage052PrerequisiteIdentity,
     verify_stage052_review_files,
 )
+from evrptw.storage_governance import (
+    compute_tree_sha256,
+    write_migration_dry_run,
+    write_storage_migration_attestation,
+)
 from evrptw.validation import validate_routes
 from tools.publish_stage052_artifacts import (
     _verify_live_formal_chain,
@@ -298,6 +303,98 @@ def test_successor_review_verifies_the_migration_predecessor_campaign(
     assert calls == [predecessor]
 
 
+def test_campaign_review_consumes_cross_role_v2_migration(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "d-archive"
+    destination_root = tmp_path / "e-archive"
+    source = source_root / "run"
+    destination = destination_root / "run"
+    (source / "batch").mkdir(parents=True)
+    (destination / "batch").mkdir(parents=True)
+    (source / "batch" / "data.bin").write_bytes(b"payload")
+    (destination / "batch" / "data.bin").write_bytes(b"payload")
+    source_volume = VolumeIdentity("d-volume", "ntfs")
+    destination_volume = VolumeIdentity("e-volume", "ntfs")
+    locator = StorageRootLocator(
+        {
+            "d_archive": StorageRoot(
+                "d_archive",
+                source_root,
+                source_volume,
+            ),
+            "e_archive": StorageRoot(
+                "e_archive",
+                destination_root,
+                destination_volume,
+            ),
+        }
+    )
+    dry_run = tmp_path / "migration-dry-run.json"
+    planned_mapping = {
+        "logical_id": "campaign-run",
+        "source_relative_path": "run",
+        "destination_relative_path": "run",
+        "file_count": 1,
+        "byte_count": len(b"payload"),
+        "tree_sha256": compute_tree_sha256(source),
+        "source_root_alias": "d_archive",
+        "destination_root_alias": "e_archive",
+    }
+    dry_run_sha256 = write_migration_dry_run(
+        dry_run,
+        {
+            "schema_version": "experiment-storage-migration-dry-run-v1",
+            "source_deletion_authorized": False,
+            "retention_default": "unknown_full",
+            "full_retention_upper_bound_bytes": len(b"payload"),
+            "sources": [
+                {
+                    "logical_id": "campaign-run",
+                    "root_alias": "d_archive",
+                    "relative_path": "run",
+                    "file_count": 1,
+                    "byte_count": len(b"payload"),
+                    "tree_sha256": compute_tree_sha256(source),
+                }
+            ],
+            "planned_mappings": [planned_mapping],
+        },
+    )
+    attestation = tmp_path / "migration-attestation.json"
+    write_storage_migration_attestation(
+        attestation,
+        migration_id="d-to-e-test",
+        source_root_alias="d_archive",
+        destination_root_alias="e_archive",
+        source_root=source_root,
+        destination_root=destination_root,
+        source_volume=source_volume,
+        destination_volume=destination_volume,
+        mappings=(("campaign-run", "run", "run"),),
+        dry_run_path=dry_run,
+        dry_run_sha256=dry_run_sha256,
+    )
+    campaign = SimpleNamespace(
+        storage_roots={"d_archive": source_volume},
+        batches=(SimpleNamespace(logical_path="run/batch"),),
+    )
+
+    verified = _verify_review_storage_migration(
+        attestation,
+        campaign=campaign,  # type: ignore[arg-type]
+        campaign_dir=source,
+        locator=locator,
+        volume_probe=lambda path: (
+            source_volume if path == source_root else destination_volume
+        ),
+        evidence_dir=None,
+    )
+
+    assert verified["source_root_alias"] == "d_archive"
+    assert verified["destination_root_alias"] == "e_archive"
+
+
 def test_rolling_capacity_replay_uses_canonical_campaign_reserves() -> None:
     gib = 1024**3
     config = BenchmarkCampaignConfig.pilot(
@@ -331,7 +428,7 @@ def test_rolling_capacity_replay_uses_canonical_campaign_reserves() -> None:
         staging_root_alias="staging",
         archive_root_aliases=("archive",),
     ) == {
-        "archive-9p": 52 * gib,
+        "archive-9p": 202 * gib,
         "staging-ext4": 82 * gib,
     }
     assert campaign_review_module._expected_rolling_capacity_required(
@@ -342,7 +439,7 @@ def test_rolling_capacity_replay_uses_canonical_campaign_reserves() -> None:
         staging_root_alias="staging",
         archive_root_aliases=("archive",),
     ) == {
-        "archive-9p": 53 * gib,
+        "archive-9p": 203 * gib,
         "staging-ext4": 50 * gib,
     }
     assert campaign_review_module._expected_rolling_capacity_required(
@@ -353,7 +450,7 @@ def test_rolling_capacity_replay_uses_canonical_campaign_reserves() -> None:
         staging_root_alias="staging",
         archive_root_aliases=("archive",),
     ) == {
-        "archive-9p": 50 * gib,
+        "archive-9p": 200 * gib,
         "staging-ext4": 50 * gib,
     }
 

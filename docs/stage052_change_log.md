@@ -5,8 +5,10 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 不得为整理历史而改写旧条目。
 
 每条记录至少包含：原因、修改范围、行为变化、证据影响、失效或迁移的运行身份、验证
-结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
-`experiments/registries/stage05.2_retention_registry.csv` 记录。
+结果及后续运行要求。大型 raw evidence（原始证据）的当前物理位置由 `e_archive`
+中的签名 v2 registry generation（注册表代次）记录；tracked
+`experiments/registries/stage05.2_retention_registry.csv` 保持为不可变 v1
+compatibility fallback（兼容回退）。
 
 ## 2026-07-26：G56 24-thread saturation runtime guard 修复
 
@@ -1173,3 +1175,40 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   路径；`src/evrptw/objective.py` 等非G路径仍由现有负向回归拒绝。修复前的最小
   successor fixture 稳定失败，修复后必须返回 runner 与 config-test 两条精确路径。
   Attempt68 不复用；新 sealed revision 必须从下一最低未占用 Pilot label 启动。
+
+## 2026-07-31：Stage 0--8 storage governance v2 与 E 盘归档入口
+
+- 原因：Stage 5.2 active/history/benchmark raw 的现有投影已超过 600 GiB，旧的
+  “所有失败永久完整保留 + D 盘 50 GiB reserve”合同不能继续作为未来 Stage 的容量
+  边界。E 盘已作为新的单份长期 archive（归档）介质接入，但 SHA-256 内容一致性不等于
+  backup（备份）；删除已验证源之后不存在介质故障回滚。
+- 新增 `evrptw.storage_governance` deep module（深模块）：
+  `preflight_run` 在 run directory/worker 创建前验证 experiment plan、三卷 identity、
+  动态容量和唯一 run label，并通过带锁 ledger 预留容量；失败 observation 带 SHA-256
+  sidecar 持久化，permit 未经审计不自动释放。
+- 动态 stop gate 固定为 E `planned archive + 200 GiB`、D
+  `projected WSL growth + 200 GiB`、WSL ext4
+  `active workspace + 50 GiB`；Stage 5.2 active workspace 至少 32 GiB。benchmark
+  producer 已在 output directory 创建前取得 permit，并把 plan/observation identity
+  写入 control metadata。Stage 0--5.1 及 Stage 5.2 非 benchmark producer CLI 也在
+  调用各自 runner 前经过同一 preflight；后续 Stage 6--8 producer 必须复用该入口。
+  benchmark 每次 batch dispatch/archive 前重新使用同一 permit identity 复测三卷容量。
+- retention v2 将 evidence 分为 `accepted_full`、`unique_failure_full`、
+  `duplicate_failure_reduced`、`rebuildable` 与 `unknown_full`。duplicate reduction
+  必须加载并复验签名 adjudication、匹配已完整保存的 canonical root-cause
+  representative，并生成 immutable projection manifest；reduced generation 明确为
+  audit-only。v2 resolver 优先选择最新 verified generation，并回退读取既有 Stage 5.2
+  v1 registry。accepted/unique full generation 还必须登记签名 independent replay
+  receipt，绑定 archive tree、verifier identity、validator/objective/raw-review replay；
+  resolver 每次重新验证该回执。
+- archive role 从硬编码 `d_archive` 改为 `e_archive`。共享 volume probe 允许绑定
+  model/serial/BusType 的 NTFS USB physical disk，同时拒绝 FAT/ExFAT、虚拟/未知设备、
+  序列号或盘符漂移。`d_archive` 保留为 legacy resolver 和 WSL VHDX host-capacity role。
+- rebuildable maintenance 默认 dry run，只允许精确 allowlist、无 active lock、超过
+  retention period、keeper 零引用且 tree identity 一致的 cache/spool；venv/build
+  还必须具有签名 isolated rebuild + hash/smoke-test proof。缺少任何证据均 fail closed。
+  实际 apply 必须绑定内容完全一致的签名 dry-run receipt；开始、失败和完成状态分别保留
+  签名回执，避免清理清单在审计后漂移。
+- 本条只发布代码、配置和只读迁移入口；尚未复制或删除 Stage 5.2 raw，也未 compact
+  VHDX。任何物理迁移后的源删除仍需逐目录报告 source/target/bytes/hash/可释放空间和
+  单份介质风险，并等待用户字面确认 `确认`。

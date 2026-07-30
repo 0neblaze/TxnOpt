@@ -144,7 +144,7 @@ def test_pilot_campaign_uses_exact_stage0_scope_and_shared_manifest_contract(
         locator,
         free_bytes_by_alias={
             "transfer_staging": 82 * 1024**3,
-            "internal_archive": 50 * 1024**3 + plan.estimated_bytes,
+            "internal_archive": 200 * 1024**3 + plan.estimated_bytes,
         },
     )
     campaign = CampaignManifest.planned(
@@ -339,7 +339,7 @@ def test_campaign_capacity_preserves_external_workspace_and_internal_reserve(
     )
     plan = config.build_plan(_pilot_observations())
     external_floor = 82 * 1024**3
-    internal_free = 50 * 1024**3 + plan.estimated_bytes
+    internal_free = 200 * 1024**3 + plan.estimated_bytes
 
     capacity = config.plan_archive_roots(
         plan,
@@ -543,7 +543,7 @@ def test_campaign_and_batch_manifests_are_path_free_and_completion_gated(
         locator,
         free_bytes_by_alias={
             "transfer_staging": 82 * 1024**3,
-            "internal_archive": 50 * 1024**3 + plan.estimated_bytes,
+            "internal_archive": 200 * 1024**3 + plan.estimated_bytes,
         },
     )
     campaign = CampaignManifest.planned(

@@ -38,6 +38,7 @@ from evrptw.models import Instance, NodeType
 from evrptw.neighborhoods import VehicleOperatorConfig
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
+from evrptw.storage_governance import preflight_cli_attempt
 
 STAGE034_SCHEMA_VERSION = "stage034-control-parallel-v1"
 STAGE034_RUN_LABEL = re.compile(r"stage03\.4_control_parallel_(?:attempt|rerun)[0-9]{2}")
@@ -455,6 +456,11 @@ def main() -> int:
     parser.add_argument("--run-label", required=True)
     parser.add_argument("--smoke-review-dir", type=Path)
     arguments = parser.parse_args()
+    preflight_cli_attempt(
+        config_path=arguments.config,
+        output_dir=arguments.output_dir,
+        run_label=arguments.run_label,
+    )
     outputs = run_stage034(
         config_path=arguments.config,
         output_dir=arguments.output_dir,

@@ -104,14 +104,18 @@ from evrptw.stage052_evidence import (
     verify_stage052_review_files,
     verify_stage052_source_snapshot,
 )
-from evrptw.stage052_retention import (
-    load_retention_registry,
-    resolve_retained_run_from_locator,
-)
 from evrptw.stage052_review_service import ReviewProcessMemoryGuard, ReviewProgressLog
 from evrptw.stage052_storage_migration import (
     verify_campaign_storage_migration,
     verify_successor_storage_migration_evidence,
+)
+from evrptw.storage_governance import (
+    GovernancePolicy,
+    StorageGovernanceError,
+    is_retained_path_from_locator,
+    load_storage_migration_attestation,
+    resolve_run_from_locator,
+    verify_storage_migration_attestation,
 )
 from evrptw.validation import validate_routes
 
@@ -131,17 +135,109 @@ def _verify_review_storage_migration(
 ) -> dict[str, object]:
     """Verify either a retrospective migration or its reviewed predecessor."""
 
-    if evidence_dir is None:
-        return verify_campaign_storage_migration(
+    if evidence_dir is not None:
+        return verify_successor_storage_migration_evidence(
             path,
-            campaign=campaign,
-            campaign_dir=campaign_dir,
+            evidence_dir=evidence_dir,
             locator=locator,
             volume_probe=volume_probe,
         )
-    return verify_successor_storage_migration_evidence(
+    try:
+        untrusted = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError) as error:
+        raise StorageGovernanceError(
+            "storage migration attestation is unreadable"
+        ) from error
+    if (
+        isinstance(untrusted, Mapping)
+        and untrusted.get("schema_version")
+        == "experiment-storage-role-migration-v2"
+    ):
+        payload = load_storage_migration_attestation(path)
+        source_alias = payload.get("source_root_alias")
+        destination_alias = payload.get("destination_root_alias")
+        dry_run_relative = payload.get("dry_run_relative_path")
+        source_volume_payload = payload.get("source_volume_identity")
+        destination_volume_payload = payload.get(
+            "destination_volume_identity"
+        )
+        if (
+            not isinstance(source_alias, str)
+            or not isinstance(destination_alias, str)
+            or not isinstance(dry_run_relative, str)
+            or Path(dry_run_relative).name != dry_run_relative
+            or not isinstance(source_volume_payload, Mapping)
+            or not isinstance(destination_volume_payload, Mapping)
+        ):
+            raise StorageGovernanceError(
+                "v2 cross-role migration identity is invalid"
+            )
+        source_volume = VolumeIdentity.from_dict(source_volume_payload)
+        destination_volume = VolumeIdentity.from_dict(
+            destination_volume_payload
+        )
+        source_root = locator.resolve(source_alias)
+        destination_root = locator.resolve(destination_alias)
+        if (
+            source_root.volume != source_volume
+            or destination_root.volume != destination_volume
+        ):
+            raise StorageGovernanceError(
+                "v2 migration locator roles do not match the attestation"
+            )
+        verified = verify_storage_migration_attestation(
+            path,
+            expected_sha256=_sha256(path),
+            source_root_alias=source_alias,
+            destination_root_alias=destination_alias,
+            source_root=source_root.absolute_path,
+            destination_root=destination_root.absolute_path,
+            source_volume=source_volume,
+            destination_volume=destination_volume,
+            dry_run_path=path.parent / dry_run_relative,
+            volume_probe=volume_probe,
+        )
+        if campaign.storage_roots.get(source_alias) != source_volume:
+            raise StorageGovernanceError(
+                "v2 migration source role does not match the campaign"
+            )
+        raw_mappings = verified.get("mappings")
+        if not isinstance(raw_mappings, list):
+            raise StorageGovernanceError(
+                "v2 migration mappings are invalid"
+            )
+        mapped_prefixes = {
+            (
+                str(record.get("source_relative_path")),
+                str(record.get("destination_relative_path")),
+            )
+            for record in raw_mappings
+            if isinstance(record, Mapping)
+        }
+        if not mapped_prefixes or any(
+            not any(
+                (
+                    batch.logical_path == source_prefix
+                    or batch.logical_path.startswith(f"{source_prefix}/")
+                )
+                and (
+                    batch.logical_path == destination_prefix
+                    or batch.logical_path.startswith(
+                        f"{destination_prefix}/"
+                    )
+                )
+                for source_prefix, destination_prefix in mapped_prefixes
+            )
+            for batch in campaign.batches
+        ):
+            raise StorageGovernanceError(
+                "v2 migration does not cover every campaign batch"
+            )
+        return verified
+    return verify_campaign_storage_migration(
         path,
-        evidence_dir=evidence_dir,
+        campaign=campaign,
+        campaign_dir=campaign_dir,
         locator=locator,
         volume_probe=volume_probe,
     )
@@ -3221,6 +3317,14 @@ def _audit_campaign_controls(
         for observation_index, observation in enumerate(observations):
             if not isinstance(observation, Mapping):
                 raise ArtifactIntegrityError("rolling capacity observation is invalid")
+            if "e_archive" in config.archive_root_aliases:
+                _verify_shared_governance_observation(
+                    observation=observation,
+                    observation_index=observation_index,
+                    campaign=campaign,
+                    config=config,
+                    locator=locator,
+                )
             free = observation.get("free_bytes_by_device")
             required = observation.get("required_bytes_by_device")
             batch_index = observation_index // 3
@@ -3524,6 +3628,117 @@ def _audit_campaign_controls(
         return True, "rolling capacity and all pilot campaign drills replayed"
     except (ArtifactIntegrityError, OSError, TypeError, ValueError) as error:
         return False, str(error)
+
+
+def _verify_shared_governance_observation(
+    *,
+    observation: Mapping[str, object],
+    observation_index: int,
+    campaign: CampaignManifest,
+    config: BenchmarkCampaignConfig,
+    locator: StorageRootLocator,
+) -> None:
+    """Replay the shared policy and the phase-specific remaining projection."""
+
+    policy = GovernancePolicy.from_toml(
+        repository_root() / "configs" / "experiment_storage_governance.toml"
+    )
+    batch_index = observation_index // 3
+    phase = ("pre_dispatch", "pre_archive", "post_archive")[
+        observation_index % 3
+    ]
+    try:
+        current = campaign.batches[batch_index]
+    except IndexError as error:
+        raise ArtifactIntegrityError(
+            "shared governance campaign batch is invalid"
+        ) from error
+    future = campaign.batches[batch_index + 1 :]
+    if phase == "pre_dispatch":
+        remaining_archive_bytes = sum(
+            batch.estimated_bytes for batch in campaign.batches[batch_index:]
+        )
+    elif phase == "pre_archive":
+        if current.actual_bytes is None:
+            raise ArtifactIntegrityError(
+                "shared governance actual batch bytes are missing"
+            )
+        remaining_archive_bytes = current.actual_bytes + sum(
+            batch.estimated_bytes for batch in future
+        )
+    else:
+        remaining_archive_bytes = sum(
+            batch.estimated_bytes for batch in future
+        )
+    governance_aliases = (
+        config.staging_root_alias,
+        "d_archive",
+        config.archive_root_aliases[0],
+    )
+    governance_required = {
+        config.staging_root_alias: (
+            policy.staging_safety_reserve_bytes
+            + max(
+                config.external_active_workspace_bytes,
+                policy.stage052_active_workspace_floor_bytes,
+            )
+        ),
+        "d_archive": (
+            policy.host_reserve_bytes
+            + config.external_active_workspace_bytes
+        ),
+        config.archive_root_aliases[0]: (
+            policy.archive_reserve_bytes + remaining_archive_bytes
+        ),
+    }
+    governance_observation = observation.get("governance_observation")
+    governance_sha256 = observation.get("governance_observation_sha256")
+    if not isinstance(governance_observation, Mapping):
+        raise ArtifactIntegrityError(
+            "shared governance capacity observation is missing"
+        )
+    canonical_governance = (
+        json.dumps(
+            dict(governance_observation),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    governance_free = governance_observation.get("free_bytes_by_alias")
+    observed_governance_required = governance_observation.get(
+        "required_bytes_by_alias"
+    )
+    governance_volumes = governance_observation.get(
+        "volume_identities_by_alias"
+    )
+    if (
+        not isinstance(governance_sha256, str)
+        or hashlib.sha256(canonical_governance).hexdigest()
+        != governance_sha256
+        or governance_observation.get("schema_version")
+        != "experiment-storage-governance-v1"
+        or governance_observation.get("stage_id") != "stage05.2"
+        or governance_observation.get("run_label") != campaign.run_label
+        or governance_observation.get("passed") is not True
+        or governance_observation.get("identity_errors") != []
+        or governance_observation.get("measurement_errors_by_alias") != {}
+        or governance_volumes != locator.tracked_payload(governance_aliases)
+        or observed_governance_required != governance_required
+        or not isinstance(governance_free, Mapping)
+        or set(governance_free) != set(governance_aliases)
+        or any(
+            _strict_int(
+                governance_free[alias],
+                "shared governance free bytes",
+            )
+            < governance_required[alias]
+            for alias in governance_aliases
+        )
+    ):
+        raise ArtifactIntegrityError(
+            "shared D/E/WSL governance replay failed"
+        )
 
 
 def _expected_rolling_capacity_required(
@@ -3890,12 +4105,11 @@ def _independent_capacity_plan(
             reserve = external_floor
         else:
             filesystem = root.volume.filesystem.casefold()
-            if alias == "d_archive":
-                if filesystem not in {"9p", "ntfs"}:
-                    raise ArtifactIntegrityError("D campaign archive must use WSL 9p/NTFS")
-            elif filesystem != "apfs":
-                raise ArtifactIntegrityError("historical internal archive must use APFS")
-            reserve = 50 * GIB
+            if filesystem not in {"9p", "ntfs", "apfs"}:
+                raise ArtifactIntegrityError(
+                    "campaign archive must use WSL 9p, NTFS, or APFS"
+                )
+            reserve = 200 * GIB
         usable[device] = max(0, free_by_device[device] - reserve)
     if sum(usable.values()) < plan.estimated_bytes:
         raise ArtifactIntegrityError("campaign capacity is insufficient after fixed reserves")
@@ -5422,17 +5636,19 @@ def main() -> int:
         and not storage_migration_evidence_dir.is_dir()
     ):
         parser.error("--storage-migration-evidence-dir must be an existing directory")
-    for record in load_retention_registry(registry_path):
-        if record.run_label != campaign_dir.name:
-            continue
-        registered_path = locator.resolve(record.archive_root_alias).absolute_path.joinpath(
-            *Path(record.archive_relative_path).parts
+    if is_retained_path_from_locator(
+        campaign_dir,
+        policy_path=(
+            root / "configs" / "experiment_storage_governance.toml"
+        ).resolve(),
+        storage_root_locator_path=(root / arguments.storage_roots).resolve(),
+        legacy_registry_path=registry_path,
+        volume_probe=probe_volume_identity,
+    ):
+        parser.error(
+            "--campaign-dir cannot be immutable archived evidence; archived runs "
+            "are read-only prerequisite/replay inputs"
         )
-        if registered_path.resolve() == campaign_dir:
-            parser.error(
-                "--campaign-dir cannot be immutable archived evidence; archived runs "
-                "are read-only prerequisite/replay inputs"
-            )
     ordinary_prerequisite = (
         arguments.prerequisite_dir
         if arguments.prerequisite_dir.is_absolute()
@@ -5441,10 +5657,14 @@ def main() -> int:
     prerequisite_dir = (
         ordinary_prerequisite.resolve()
         if ordinary_prerequisite.exists()
-        else resolve_retained_run_from_locator(
+        else resolve_run_from_locator(
             arguments.prerequisite_dir.as_posix(),
-            registry_path=(root / arguments.retention_registry).resolve(),
+            policy_path=(
+                root / "configs" / "experiment_storage_governance.toml"
+            ).resolve(),
             storage_root_locator_path=(root / arguments.storage_roots).resolve(),
+            legacy_registry_path=(root / arguments.retention_registry).resolve(),
+            volume_probe=probe_volume_identity,
         )
     )
     progress_path = arguments.progress_log.resolve()

@@ -1123,6 +1123,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     locator = StorageRootLocator.from_toml(arguments.storage_root_locator)
     alias = approved.policy.archive_root_alias
+    if alias == "e_archive":
+        raise RetentionIntegrityError(
+            "legacy Stage 5.2 retention v1 cannot publish to e_archive; "
+            "use experiment retention v2 so historical source deletion remains "
+            "a separately confirmed action"
+        )
     locator.verify_all(probe_volume_identity, (alias,))
     records = archive_stage052_inventory_to_registry(
         arguments.inventory,

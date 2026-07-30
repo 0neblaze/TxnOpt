@@ -34,6 +34,7 @@ from evrptw.best_known import (
     TOTAL_INSTANCES,
 )
 from evrptw.environment import collect_environment
+from evrptw.storage_governance import preflight_cli_attempt
 
 STAGE051_SCHEMA_VERSION = "stage05.1-best-known-v6"
 STAGE051_RUN_LABEL = re.compile(r"^stage05\.1_best_known_(?:attempt|rerun)[0-9]{2}$")
@@ -528,6 +529,11 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--run-label", required=True)
     arguments = parser.parse_args()
+    preflight_cli_attempt(
+        config_path=arguments.config,
+        output_dir=arguments.output_dir,
+        run_label=arguments.run_label,
+    )
     outputs = run_stage051_best_known(
         config_path=arguments.config,
         output_dir=arguments.output_dir,

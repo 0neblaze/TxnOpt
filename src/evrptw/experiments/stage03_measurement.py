@@ -51,6 +51,7 @@ from evrptw.objective import (
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
 from evrptw.stage052_platform import peak_rss_bytes
+from evrptw.storage_governance import preflight_cli_attempt
 from evrptw.validation import validate_routes
 
 SCHEMA_VERSION = "1"
@@ -1582,6 +1583,11 @@ def main() -> int:
     parser.add_argument("--summary-dir", type=Path)
     parser.add_argument("--smoke-review-dir", type=Path)
     arguments = parser.parse_args()
+    preflight_cli_attempt(
+        config_path=arguments.config,
+        output_dir=arguments.output_dir,
+        run_label=arguments.run_label,
+    )
     outputs = run_stage03(
         config_path=arguments.config,
         output_dir=arguments.output_dir,

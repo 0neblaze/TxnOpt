@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from evrptw.experiments.stage03_measurement import load_config, run_stage03
+from evrptw.storage_governance import preflight_cli_attempt
 
 
 def run_stage032(
@@ -50,6 +51,11 @@ def main() -> int:
     parser.add_argument("--summary-dir", type=Path)
     parser.add_argument("--smoke-review-dir", type=Path)
     arguments = parser.parse_args()
+    preflight_cli_attempt(
+        config_path=arguments.config,
+        output_dir=arguments.output_dir,
+        run_label=arguments.run_label,
+    )
     outputs = run_stage032(
         config_path=arguments.config,
         output_dir=arguments.output_dir,

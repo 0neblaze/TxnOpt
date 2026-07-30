@@ -18,11 +18,11 @@ identity_manifest = "configs/stage052_runtime_identity.local.json"
 storage_root_locator = "configs/stage052_storage_roots.local.toml"
 lock_manifest = "configs/stage052_campaign_lock.local.json"
 staging_root_alias = "wsl_staging"
-archive_root_aliases = ["d_archive"]
+archive_root_aliases = ["e_archive"]
 
 [retention]
 policy_version = "stage05.2-single-current-v1"
-archive_root_alias = "d_archive"
+archive_root_alias = "e_archive"
 archive_relative_base = "stage05.2/history"
 workspace_full_evidence = "active_only"
 completed_action = "archive"

@@ -61,6 +61,7 @@ from evrptw.stage052_evidence import (
     validate_worker_ownership,
 )
 from evrptw.stage052_platform import WindowsWslPowerStatus
+from evrptw.storage_governance import StorageCapacityError
 
 
 def _sha256_json(value: object) -> str:
@@ -982,7 +983,7 @@ def test_stage052_config_routes_campaign_storage_through_ignored_locator() -> No
 
     assert config.storage_root_locator == Path("configs/stage052_storage_roots.local.toml")
     assert config.staging_root_alias == "wsl_staging"
-    assert config.archive_root_aliases == ("d_archive",)
+    assert config.archive_root_aliases == ("e_archive",)
 
 
 def test_campaign_root_location_drift_is_rejected_before_writes(tmp_path: Path) -> None:
@@ -1005,12 +1006,11 @@ def test_campaign_root_location_drift_is_rejected_before_writes(tmp_path: Path) 
 
 
 @pytest.mark.parametrize(
-    ("archive_path", "filesystem"),
-    ((Path("/mnt/e/stage052"), "9p"), (Path("/mnt/d/stage052"), "exfat")),
+    "filesystem",
+    ("exfat", "fat32"),
 )
 def test_campaign_root_preflight_rejects_forbidden_storage(
     tmp_path: Path,
-    archive_path: Path,
     filesystem: str,
 ) -> None:
     locator = StorageRootLocator(
@@ -1018,14 +1018,50 @@ def test_campaign_root_preflight_rejects_forbidden_storage(
             "wsl_staging": StorageRoot(
                 "wsl_staging", tmp_path / "staging", VolumeIdentity("wsl", "ext4")
             ),
-            "d_archive": StorageRoot(
-                "d_archive", archive_path, VolumeIdentity("archive", filesystem)
+            "e_archive": StorageRoot(
+                "e_archive",
+                tmp_path / "e-archive",
+                VolumeIdentity("usb-archive", filesystem),
             ),
         }
     )
 
     with pytest.raises(RuntimeError, match="forbidden|ExFAT"):
-        verify_campaign_root_locations(repository_root=tmp_path, locator=locator)
+        verify_campaign_root_locations(
+            repository_root=tmp_path,
+            locator=locator,
+            archive_root_aliases=("e_archive",),
+        )
+
+
+def test_campaign_root_preflight_accepts_bound_ntfs_usb_archive(
+    tmp_path: Path,
+) -> None:
+    locator = StorageRootLocator(
+        {
+            "wsl_staging": StorageRoot(
+                "wsl_staging",
+                tmp_path / "staging",
+                VolumeIdentity("wsl-ext4", "ext4"),
+            ),
+            "d_archive": StorageRoot(
+                "d_archive",
+                tmp_path / "d-legacy",
+                VolumeIdentity("nvme-legacy", "9p"),
+            ),
+            "e_archive": StorageRoot(
+                "e_archive",
+                tmp_path / "e-archive",
+                VolumeIdentity("usb-rog-esd-s1c-167320pa0dcs", "9p"),
+            ),
+        }
+    )
+
+    verify_campaign_root_locations(
+        repository_root=tmp_path,
+        locator=locator,
+        archive_root_aliases=("e_archive",),
+    )
 
 
 def test_wsl_volume_probe_records_ext4_mount_identity(
@@ -1080,6 +1116,7 @@ def test_wsl_volume_probe_records_d_nvme_identity(
                     "FriendlyName": "Samsung SSD 990 EVO Plus 1TB",
                     "SerialNumber": "0025_3854_5141_BD22.",
                     "BusType": "NVMe",
+                    "FileSystem": "NTFS",
                 }
             )
         )
@@ -1089,6 +1126,79 @@ def test_wsl_volume_probe_records_d_nvme_identity(
     assert campaign_runner.probe_volume_identity(Path("/mnt/d/archive")) == (
         VolumeIdentity("nvme-samsung-ssd-990-evo-plus-1tb-0025-3854-5141-bd22", "9p")
     )
+
+
+@pytest.mark.formal_environment
+def test_wsl_volume_probe_records_e_usb_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def fake_run(arguments: tuple[str, ...], **_: object) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    {
+                        "filesystems": [
+                            {"source": "E:\\", "fstype": "9p", "uuid": None}
+                        ]
+                    }
+                )
+            )
+        return SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    "FriendlyName": "ROG ESD-S1C",
+                    "SerialNumber": "167320PA0DCS",
+                    "BusType": "USB",
+                    "FileSystem": "NTFS",
+                }
+            )
+        )
+
+    monkeypatch.setattr(campaign_runner.subprocess, "run", fake_run)
+
+    assert campaign_runner.probe_volume_identity(Path("/mnt/e/archive")) == (
+        VolumeIdentity("usb-rog-esd-s1c-167320pa0dcs", "9p")
+    )
+
+
+@pytest.mark.formal_environment
+def test_wsl_volume_probe_rejects_non_ntfs_windows_backing_filesystem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def fake_run(arguments: tuple[str, ...], **_: object) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    {
+                        "filesystems": [
+                            {"source": "E:\\", "fstype": "9p", "uuid": None}
+                        ]
+                    }
+                )
+            )
+        return SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    "FriendlyName": "ROG ESD-S1C",
+                    "SerialNumber": "167320PA0DCS",
+                    "BusType": "USB",
+                    "FileSystem": "ExFAT",
+                }
+            )
+        )
+
+    monkeypatch.setattr(campaign_runner.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="backing filesystem must be NTFS"):
+        campaign_runner.probe_volume_identity(Path("/mnt/e/archive"))
 
 
 def test_rolling_capacity_failure_carries_complete_observation(tmp_path: Path) -> None:
@@ -1843,6 +1953,11 @@ def _dispatcher_locator(tmp_path: Path) -> StorageRootLocator:
         {
             "wsl_staging": StorageRoot("wsl_staging", tmp_path / "wsl-active", internal),
             "d_archive": StorageRoot("d_archive", tmp_path / "archive-d", d_drive),
+            "e_archive": StorageRoot(
+                "e_archive",
+                tmp_path / "archive-e",
+                VolumeIdentity("e-usb-device", "9p"),
+            ),
             "transfer_staging": StorageRoot("transfer_staging", tmp_path / "results", external),
             "transfer_archive": StorageRoot(
                 "transfer_archive", tmp_path / "archive-external", external
@@ -2468,6 +2583,34 @@ def test_rolling_capacity_deficit_is_signed_before_campaign_aborts(
     assert summary["observations"] == [journal]
     assert load_campaign_manifest(output_dir / "campaign_manifest.json").status == "failed"
     assert batch_calls == []
+
+
+def test_stage052_stop_gate_blocks_before_run_directory_and_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observation = {
+        "schema_version": "experiment-storage-governance-v1",
+        "run_label": "stage05.2_benchmark_attempt01",
+        "deficits_by_alias": {"e_archive": 1},
+        "passed": False,
+    }
+
+    def reject_start(*_args: object, **_kwargs: object) -> object:
+        raise StorageCapacityError(observation=observation)
+
+    monkeypatch.setattr(
+        stage052_performance.ExperimentStorageGovernance,
+        "preflight_run",
+        reject_start,
+    )
+    output = tmp_path / "wsl-active" / "stage05.2_benchmark_attempt01"
+
+    with pytest.raises(StorageCapacityError) as caught:
+        _run_patched_pilot(tmp_path, monkeypatch)
+
+    assert caught.value.observation == observation
+    assert not output.exists()
 
 
 def test_post_complete_attribution_failure_reseals_campaign_as_failed_partial(

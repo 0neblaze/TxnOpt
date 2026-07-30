@@ -2199,7 +2199,7 @@ class BenchmarkCampaignConfig:
     shard_hard_cap_bytes: int = 2 * GIB
     external_safety_reserve_bytes: int = 50 * GIB
     external_active_workspace_bytes: int = 32 * GIB
-    internal_safety_reserve_bytes: int = 50 * GIB
+    internal_safety_reserve_bytes: int = 200 * GIB
     required_power_source: str = "AC Power"
     preflight_window_count: int = 2
     preflight_window_seconds: float = 30.0
@@ -2249,7 +2249,7 @@ class BenchmarkCampaignConfig:
             or self.shard_hard_cap_bytes != 2 * GIB
             or self.external_safety_reserve_bytes != 50 * GIB
             or self.external_active_workspace_bytes != 32 * GIB
-            or self.internal_safety_reserve_bytes != 50 * GIB
+            or self.internal_safety_reserve_bytes != 200 * GIB
         ):
             raise ValueError("Stage 5.2 storage byte limits are fixed")
         if not (
@@ -2336,7 +2336,7 @@ class BenchmarkCampaignConfig:
         shard_hard_cap_bytes: int = 2 * GIB,
         external_safety_reserve_bytes: int = 50 * GIB,
         external_active_workspace_bytes: int = 32 * GIB,
-        internal_safety_reserve_bytes: int = 50 * GIB,
+        internal_safety_reserve_bytes: int = 200 * GIB,
     ) -> BenchmarkCampaignConfig:
         """Build the canonical 92 x 10 configuration."""
 
@@ -2374,7 +2374,7 @@ class BenchmarkCampaignConfig:
         shard_hard_cap_bytes: int = 2 * GIB,
         external_safety_reserve_bytes: int = 50 * GIB,
         external_active_workspace_bytes: int = 32 * GIB,
-        internal_safety_reserve_bytes: int = 50 * GIB,
+        internal_safety_reserve_bytes: int = 200 * GIB,
     ) -> BenchmarkCampaignConfig:
         """Build the fixed Stage 0 12-instance x three-seed G01 scope."""
 
@@ -2589,11 +2589,10 @@ class BenchmarkCampaignConfig:
                 reserve = external_floor
             else:
                 filesystem = root.volume.filesystem.casefold()
-                if alias == "d_archive":
-                    if filesystem not in {"9p", "ntfs"}:
-                        raise RuntimeError("D archive root must resolve to WSL 9p/NTFS")
-                elif filesystem != "apfs":
-                    raise RuntimeError(f"historical internal archive root must use APFS: {alias}")
+                if filesystem not in {"9p", "ntfs", "apfs"}:
+                    raise RuntimeError(
+                        f"archive root must use WSL 9p, NTFS, or APFS: {alias}"
+                    )
                 reserve = self.internal_safety_reserve_bytes
             usable[device] = max(0, free_values[device] - reserve)
 
