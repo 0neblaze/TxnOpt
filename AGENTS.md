@@ -664,6 +664,17 @@ this repository or one of its subdirectories.
   atomic commit/rollback. Native, worker, deadline, or integrity failure is
   fail-fast with zero Python, serial, CUDA, or `cpu_scalar` fallback. Historical
   Stage 3.4 `CandidateControlConfig` remains a separate path.
+- Stage 5.2 safe-rejection acceleration is bounded independently from the
+  collision-proof identity stores. The scalar `ScreeningResult` cache is a
+  65,536-entry solve-local LRU; the Python/native sequence cache is a
+  65,536-entry generation cache whose atomic rollover drops only safe
+  re-screenable rejections. Rollover must replace the Python mapping and packed
+  native ABI state in one candidate transaction and must be reversible on
+  failure. Eviction may cause safe screening to run again, but it may not admit
+  an infeasible route, consume exact work, change candidate order, or weaken
+  full SHA-256 collision proof. Raw statistics record capacity, current/peak
+  entries, stores, evictions, and rollovers; the independent reviewer rejects
+  missing, unbounded, or internally inconsistent cache evidence.
 - The accelerator gate independently recomputes median 100-customer native
   candidate screening-pool occupancy from raw candidate-transaction
   statistics; exact-backend launch occupancy is not a substitute. Median below
@@ -1002,9 +1013,14 @@ The executable workflow and gate table are maintained in
 - Producer screening-definition collision state uses the native
   `native_bounded_digest` store: it retains the full SHA-256 digest without a
   duplicate JSON payload, has a hard 2,097,152-entry limit, validates each batch
-  atomically, and fails fast on collision or overflow. Producer SQLite spill,
-  producer scratch state, and fallback are forbidden. Review/read stores retain
-  the payload they must resolve and may use their separate bounded
+  atomically, and fails fast on collision or overflow. Its separate native
+  definition-key memo is capped at 65,536 entries with FIFO safe recomputation;
+  memo eviction never removes the complete 2,097,152-entry full-SHA-256
+  collision state. Signed metadata uses
+  `stage05.2-screening-definition-store-v3` and binds both limits, the memo
+  eviction policy, and `identity_collision_proof=full_sha256`. Producer SQLite
+  spill, producer scratch state, and fallback are forbidden. Review/read stores
+  retain the payload they must resolve and may use their separate bounded
   payload-retaining SQLite path. Exact-route evaluation identities likewise
   remain in a bounded in-memory full-digest/payload store and spill to
   shard-local SQLite only after their declared hard limit. Removing collision

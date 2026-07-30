@@ -58,6 +58,10 @@ SCREENING_DEFINITION_HOT_CACHE_ENTRIES = 524_288
 # definition payload is already written to Parquet.  The native bounded store
 # retains those tokens without a disposable SQLite hot-path dependency.
 SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES = 2_097_152
+# The native producer memo retains Python definition keys only to avoid
+# recomputing identities.  Eviction is semantically neutral because the
+# collision-proof identity store above remains complete for the whole shard.
+SCREENING_DEFINITION_NATIVE_MEMO_ENTRIES = 65_536
 ROUTE_IDENTITY_COUNTER_NAMESPACES = 16
 MAX_SCREENING_CHECKS_PER_DECISION = 8
 # Keep live definition/occurrence transactions at or below one 65,536-row Parquet
@@ -79,9 +83,12 @@ def screening_definition_store_contract() -> dict[str, object]:
     """Return the signed bounded producer identity-store contract."""
 
     return {
-        "schema_version": "stage05.2-screening-definition-store-v2",
+        "schema_version": "stage05.2-screening-definition-store-v3",
         "producer_backend": "native_bounded_digest",
         "producer_memory_entries": SCREENING_DEFINITION_PRODUCER_MEMORY_ENTRIES,
+        "producer_memo_entries": SCREENING_DEFINITION_NATIVE_MEMO_ENTRIES,
+        "producer_memo_eviction_policy": "fifo_safe_recompute",
+        "identity_collision_proof": "full_sha256",
         "overflow_policy": "fail_fast",
         "spill_backend": "none",
         "scratch_cleanup": "not_applicable",
@@ -4862,7 +4869,9 @@ class ArtifactV2ShardSession:
         from evrptw import _core as native_core
 
         self._deferred_native_screening_occurrence_cache: object = (
-            native_core.create_stage052_screening_definition_cache()
+            native_core.create_stage052_screening_definition_cache(
+                capacity=SCREENING_DEFINITION_NATIVE_MEMO_ENTRIES
+            )
         )
         self._prepared_screening_definition_cache: OrderedDict[
             int, tuple[PreparedScreeningDefinition, int]

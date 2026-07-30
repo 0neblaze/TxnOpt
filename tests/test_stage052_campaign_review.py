@@ -600,6 +600,17 @@ def test_native_axis_allows_deadline_interrupt_before_native_invocation() -> Non
         "backend": "cpu_batch",
         "started_calls": 2,
         "completed_calls": 1,
+        "candidate_transaction_statistics": {
+            "negative_screening_sequence_cache": {
+                "backend": "bounded_generation_safe_rejection",
+                "capacity": 65_536,
+                "current_entries": 12,
+                "peak_entries": 12,
+                "stores": 12,
+                "evictions": 0,
+                "rollovers": 0,
+            }
+        },
         "backend_metrics": {
             "exact_calls": 2,
             "batch_launches": 2,
@@ -614,7 +625,19 @@ def test_native_axis_allows_deadline_interrupt_before_native_invocation() -> Non
             "exact_started_calls": 2,
             "exact_completed_calls": 1,
             "exact_interrupted_calls": 1,
-            "screening_statistics": {"native_protocol_fallbacks": 0},
+            "screening_statistics": {
+                "native_protocol_fallbacks": 0,
+                "negative_screening_result_cache": {
+                    "backend": "bounded_lru_safe_rejection",
+                    "capacity": 65_536,
+                    "current_entries": 65_536,
+                    "peak_entries": 65_536,
+                    "hits": 3,
+                    "misses": 70_000,
+                    "stores": 70_000,
+                    "evictions": 4_464,
+                },
+            },
         },
         "persistence_pipeline": {
             "mode": "bounded_async_thread",
@@ -645,6 +668,45 @@ def test_native_axis_allows_deadline_interrupt_before_native_invocation() -> Non
     passed, detail = campaign_review_module._native_axis_valid(raw_axis, trace_axis)
 
     assert passed, detail
+
+
+def test_reviewer_rejects_unbounded_negative_screening_result_cache() -> None:
+    passed, detail = (
+        campaign_review_module._bounded_negative_screening_result_cache_valid(  # noqa: SLF001
+            {
+                "backend": "unbounded_dict",
+                "capacity": 0,
+                "current_entries": 70_000,
+                "peak_entries": 70_000,
+                "hits": 3,
+                "misses": 70_000,
+                "stores": 70_000,
+                "evictions": 0,
+            }
+        )
+    )
+
+    assert passed is False
+    assert "negative screening result cache" in detail
+
+
+def test_reviewer_rejects_unbounded_negative_screening_sequence_cache() -> None:
+    passed, detail = (
+        campaign_review_module._bounded_negative_screening_sequence_cache_valid(  # noqa: SLF001
+            {
+                "backend": "unbounded_mapping",
+                "capacity": 0,
+                "current_entries": 70_000,
+                "peak_entries": 70_000,
+                "stores": 70_000,
+                "evictions": 0,
+                "rollovers": 0,
+            }
+        )
+    )
+
+    assert passed is False
+    assert "negative screening sequence cache" in detail
 
 
 def test_streaming_event_audit_treats_interrupted_exact_as_deadline_boundary() -> None:
@@ -1665,6 +1727,17 @@ def _build_complete_pilot_campaign(
         )
         raw_axis = {
             "backend": "cpu_batch",
+            "candidate_transaction_statistics": {
+                "negative_screening_sequence_cache": {
+                    "backend": "bounded_generation_safe_rejection",
+                    "capacity": 65_536,
+                    "current_entries": 0,
+                    "peak_entries": 0,
+                    "stores": 0,
+                    "evictions": 0,
+                    "rollovers": 0,
+                }
+            },
             "backend_metrics": {
                 "exact_calls": 0,
                 "batch_launches": 0,
@@ -1700,7 +1773,19 @@ def _build_complete_pilot_campaign(
                 "exact_started_calls": 0,
                 "exact_completed_calls": 0,
                 "exact_interrupted_calls": 0,
-                "screening_statistics": {"native_protocol_fallbacks": 0},
+                "screening_statistics": {
+                    "native_protocol_fallbacks": 0,
+                    "negative_screening_result_cache": {
+                        "backend": "bounded_lru_safe_rejection",
+                        "capacity": 65_536,
+                        "current_entries": 0,
+                        "peak_entries": 0,
+                        "hits": 0,
+                        "misses": 0,
+                        "stores": 0,
+                        "evictions": 0,
+                    },
+                },
             },
             "persistence_pipeline": {
                 "mode": "bounded_async_thread",

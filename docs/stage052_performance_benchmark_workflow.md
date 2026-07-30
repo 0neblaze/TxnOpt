@@ -292,13 +292,25 @@ producer 的 screening-definition identity state（筛选定义身份状态）�
 （碰撞令牌）而不复制 JSON payload。hard limit 固定为 2,097,152 unique definitions；
 `register_many` 必须在任何写入前完成批内去重、已有身份碰撞检查和容量检查，使碰撞或
 overflow（越界）整批 fail fast 且不留下前缀写入。producer 禁止 SQLite spill、
-scratch directory 和 Python fallback。signed batch metadata 必须记录 v2 store
-contract；independent reviewer 必须确认整条 campaign 只有一个相同合同，并证明每个
+scratch directory 和 Python fallback。可丢弃的 native definition-key memo（原生定义键
+备忘缓存）与 collision state 分离，固定为 65,536 entries；FIFO eviction（先进先出
+淘汰）只触发 full-SHA-256 identity 的安全重算，不删除全 shard collision proof。
+signed batch metadata 必须记录 v3 store contract；independent reviewer 必须确认整条
+campaign 只有一个相同合同，并证明每个
 signed shard descriptor 的 definition row count 均不超过当次 raw 中签入的 hard
 limit。review/read 的 payload-retaining compatibility store（载荷保留兼容存储）与
 exact-route identity store 保持各自独立的 bounded SQLite 路径，不得被误报成 producer
 fallback。只有同时通过 native bound、零 fallback、36% persistence gate 与 shard
 cleanup gate，才允许新的 Formal。
+
+Candidate transaction（候选事务）的 safe-rejection caches（安全拒绝缓存）同样不得
+无界增长。scalar screening result（标量筛选结果）使用 65,536-entry solve-local LRU；
+Python sequence mapping 与 packed native ABI state 使用 65,536-entry generation
+cache（分代缓存）。容量将溢出时，当前 candidate transaction 必须原子替换两侧分代；
+worker、deadline、integrity 或 commit 失败必须恢复旧分代。淘汰只允许导致后续 safe
+screening 重算，不得增加 exact call、改变 candidate order 或削弱 collision proof。
+raw result/transaction statistics 必须签入 capacity、current/peak、stores、evictions
+与 rollovers，independent reviewer 对缺失、无界或内部不一致证据 fail fast。
 
 producer、retention、performance reviewer 与 campaign reviewer 必须调用同一个
 cross-platform `probe_volume_identity`：WSL 用 `findmnt`，DrvFS 额外绑定 Windows

@@ -654,9 +654,12 @@ def test_screening_definition_store_contract_binds_native_producer_limit() -> No
     contract = artifacts_module.screening_definition_store_contract()
 
     assert contract == {
-        "schema_version": "stage05.2-screening-definition-store-v2",
+        "schema_version": "stage05.2-screening-definition-store-v3",
         "producer_backend": "native_bounded_digest",
         "producer_memory_entries": 2_097_152,
+        "producer_memo_entries": 65_536,
+        "producer_memo_eviction_policy": "fifo_safe_recompute",
+        "identity_collision_proof": "full_sha256",
         "overflow_policy": "fail_fast",
         "spill_backend": "none",
         "scratch_cleanup": "not_applicable",

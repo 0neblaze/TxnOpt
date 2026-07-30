@@ -51,7 +51,11 @@ from evrptw.artifacts import (
     signed_sidecar_matches,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
-from evrptw.candidate_transaction import NativeCandidateTransactionConfig
+from evrptw.candidate_transaction import (
+    STAGE052_NEGATIVE_SCREENING_RESULT_CACHE_ENTRIES,
+    STAGE052_NEGATIVE_SEQUENCE_CACHE_ENTRIES,
+    NativeCandidateTransactionConfig,
+)
 from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES
 from evrptw.experiments.stage052_performance import (
     STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS,
@@ -1213,6 +1217,94 @@ def _objective_key(value: object, field: str) -> tuple[int, float, float, int]:
     return objective.key
 
 
+def _bounded_negative_screening_result_cache_valid(
+    raw: object,
+) -> tuple[bool, str]:
+    if not isinstance(raw, Mapping):
+        return False, "bounded negative screening result cache statistics are missing"
+    try:
+        capacity = _strict_int(raw.get("capacity"), "negative cache capacity")
+        current_entries = _strict_int(
+            raw.get("current_entries"),
+            "negative cache current_entries",
+        )
+        peak_entries = _strict_int(
+            raw.get("peak_entries"),
+            "negative cache peak_entries",
+        )
+        hits = _strict_int(raw.get("hits"), "negative cache hits")
+        misses = _strict_int(raw.get("misses"), "negative cache misses")
+        stores = _strict_int(raw.get("stores"), "negative cache stores")
+        evictions = _strict_int(raw.get("evictions"), "negative cache evictions")
+    except ArtifactIntegrityError as error:
+        return False, str(error)
+    passed = (
+        raw.get("backend") == "bounded_lru_safe_rejection"
+        and capacity == STAGE052_NEGATIVE_SCREENING_RESULT_CACHE_ENTRIES
+        and 0 <= current_entries <= peak_entries <= capacity
+        and hits >= 0
+        and misses >= 0
+        and stores >= 0
+        and evictions >= 0
+        and current_entries == stores - evictions
+        and peak_entries == min(capacity, stores)
+    )
+    return (
+        passed,
+        (
+            "bounded negative screening result cache statistics passed"
+            if passed
+            else "negative screening result cache is unbounded or internally inconsistent"
+        ),
+    )
+
+
+def _bounded_negative_screening_sequence_cache_valid(
+    raw: object,
+) -> tuple[bool, str]:
+    if not isinstance(raw, Mapping):
+        return False, "bounded negative screening sequence cache statistics are missing"
+    try:
+        capacity = _strict_int(raw.get("capacity"), "negative sequence cache capacity")
+        current_entries = _strict_int(
+            raw.get("current_entries"),
+            "negative sequence cache current_entries",
+        )
+        peak_entries = _strict_int(
+            raw.get("peak_entries"),
+            "negative sequence cache peak_entries",
+        )
+        stores = _strict_int(raw.get("stores"), "negative sequence cache stores")
+        evictions = _strict_int(
+            raw.get("evictions"),
+            "negative sequence cache evictions",
+        )
+        rollovers = _strict_int(
+            raw.get("rollovers"),
+            "negative sequence cache rollovers",
+        )
+    except ArtifactIntegrityError as error:
+        return False, str(error)
+    passed = (
+        raw.get("backend") == "bounded_generation_safe_rejection"
+        and capacity == STAGE052_NEGATIVE_SEQUENCE_CACHE_ENTRIES
+        and 0 <= current_entries <= peak_entries <= capacity
+        and stores >= 0
+        and evictions >= 0
+        and rollovers >= 0
+        and current_entries == stores - evictions
+        and rollovers <= evictions
+    )
+    return (
+        passed,
+        (
+            "bounded negative screening sequence cache statistics passed"
+            if passed
+            else "negative screening sequence cache is unbounded or internally inconsistent"
+        ),
+    )
+
+
 def _native_axis_valid(
     raw_axis: Mapping[str, object],
     trace_axis: Mapping[str, object],
@@ -1225,6 +1317,16 @@ def _native_axis_valid(
         or not isinstance(result, Mapping)
     ):
         return False, "cpu_batch backend/result summary is missing"
+    transaction_statistics = raw_axis.get("candidate_transaction_statistics")
+    if not isinstance(transaction_statistics, Mapping):
+        return False, "candidate transaction statistics are missing"
+    sequence_cache_passed, sequence_cache_detail = (
+        _bounded_negative_screening_sequence_cache_valid(
+            transaction_statistics.get("negative_screening_sequence_cache")
+        )
+    )
+    if not sequence_cache_passed:
+        return False, sequence_cache_detail
     try:
         started = _strict_int(raw_axis.get("started_calls"), "started_calls")
         completed = _strict_int(raw_axis.get("completed_calls"), "completed_calls")
@@ -1336,6 +1438,13 @@ def _native_axis_valid(
         )
     except ArtifactIntegrityError as error:
         return False, str(error)
+    negative_cache_passed, negative_cache_detail = (
+        _bounded_negative_screening_result_cache_valid(
+            screening.get("negative_screening_result_cache")
+        )
+    )
+    if not negative_cache_passed:
+        return False, negative_cache_detail
     passed = (
         started == exact_calls == sum(occupancies)
         and completed == trace_completed

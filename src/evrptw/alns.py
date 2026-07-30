@@ -28,11 +28,16 @@ from evrptw.candidate_control import (
     CandidatePlan,
 )
 from evrptw.candidate_transaction import (
+    STAGE052_NEGATIVE_SCREENING_RESULT_CACHE_ENTRIES,
+    STAGE052_NEGATIVE_SEQUENCE_CACHE_ENTRIES,
+    BoundedNegativeSequenceCache,
+    BoundedScreeningResultCache,
     CandidateTransactionDeadlineExceeded,
     CandidateTransactionRequest,
     NativeCandidateTransactionConfig,
     NativeCandidateTransactionRuntime,
     NegativeCacheCommit,
+    NegativeSequenceCacheBatch,
     execute_candidate_transaction,
     native_screen_candidate_batch,
 )
@@ -312,8 +317,14 @@ class _Evaluator:
         measurement_trace: Stage03Trace | None = None,
         lane: str = "legacy",
         screening_config: CheapScreeningConfig | None = None,
-        negative_screening_cache: dict[str, ScreeningResult] | None = None,
-        negative_screening_sequences: dict[tuple[str, ...], str] | None = None,
+        negative_screening_cache: (
+            dict[str, ScreeningResult]
+            | BoundedScreeningResultCache[ScreeningResult]
+            | None
+        ) = None,
+        negative_screening_sequences: (
+            dict[tuple[str, ...], str] | BoundedNegativeSequenceCache | None
+        ) = None,
         cache_incremental_config: CacheIncrementalConfig | None = None,
         route_cache: RouteEvaluationCache | None = None,
         backend: ExactChargingBackend | str = ExactChargingBackend.CPU_SCALAR,
@@ -441,6 +452,7 @@ class _Evaluator:
         pending_negative = dict(self.pending_negative_screening_sequences)
         local_insertions: list[tuple[str, ...]] = []
         negative_insertions: list[tuple[str, ...]] = []
+        negative_sequence_batch: NegativeSequenceCacheBatch | None = None
         route_cache_batch: RouteCacheWriteBatch | None = None
         native_negative_commit: NegativeCacheCommit | None = None
         stores: tuple[CacheStore, ...] = ()
@@ -457,24 +469,47 @@ class _Evaluator:
             else:
                 route_cache_batch = self.route_cache.begin_store_many_atomic(pending)
                 stores = route_cache_batch.stores
-            for sequence, reason in pending_negative.items():
-                existing = self.negative_screening_sequences.get(sequence)
-                if existing is not None and existing != reason:
-                    raise RuntimeError("candidate negative cache reason changed during commit")
-                if existing is None:
-                    negative_insertions.append(sequence)
-                    self.negative_screening_sequences[sequence] = reason
+            if isinstance(
+                self.negative_screening_sequences,
+                BoundedNegativeSequenceCache,
+            ):
+                negative_sequence_batch = (
+                    self.negative_screening_sequences.begin_store_many_atomic(
+                        pending_negative
+                    )
+                )
+            else:
+                for sequence, reason in pending_negative.items():
+                    existing = self.negative_screening_sequences.get(sequence)
+                    if existing is not None and existing != reason:
+                        raise RuntimeError(
+                            "candidate negative cache reason changed during commit"
+                        )
+                    if existing is None:
+                        negative_insertions.append(sequence)
+                        self.negative_screening_sequences[sequence] = reason
             if pending_negative and self.candidate_transaction_runtime is not None:
                 if self.native_runtime is None:
                     raise RuntimeError(
                         "candidate transaction negative-cache commit lacks native runtime"
                     )
-                native_negative_commit = (
-                    self.candidate_transaction_runtime.commit_negative_cache_entries(
-                        pending_negative,
-                        self.native_runtime.context.name_to_index,
+                if (
+                    negative_sequence_batch is not None
+                    and negative_sequence_batch.rollover
+                ):
+                    native_negative_commit = (
+                        self.candidate_transaction_runtime.replace_negative_cache_entries(
+                            self.negative_screening_sequences,
+                            self.native_runtime.context.name_to_index,
+                        )
                     )
-                )
+                else:
+                    native_negative_commit = (
+                        self.candidate_transaction_runtime.commit_negative_cache_entries(
+                            pending_negative,
+                            self.native_runtime.context.name_to_index,
+                        )
+                    )
             for store in stores:
                 if self.measurement_trace is None:
                     continue
@@ -523,6 +558,14 @@ class _Evaluator:
                 self.candidate_transaction_runtime.commit_negative_cache_batch(
                     native_negative_commit
                 )
+            if negative_sequence_batch is not None:
+                assert isinstance(
+                    self.negative_screening_sequences,
+                    BoundedNegativeSequenceCache,
+                )
+                self.negative_screening_sequences.commit_store_batch(
+                    negative_sequence_batch
+                )
         except BaseException:
             if native_negative_commit is not None and native_negative_commit.active:
                 assert self.candidate_transaction_runtime is not None
@@ -534,8 +577,18 @@ class _Evaluator:
                 self.route_cache.rollback_store_batch(route_cache_batch)
             for sequence in local_insertions:
                 self.cache.pop(sequence, None)
-            for sequence in negative_insertions:
-                self.negative_screening_sequences.pop(sequence, None)
+            if negative_sequence_batch is not None and negative_sequence_batch.active:
+                assert isinstance(
+                    self.negative_screening_sequences,
+                    BoundedNegativeSequenceCache,
+                )
+                self.negative_screening_sequences.rollback_store_batch(
+                    negative_sequence_batch
+                )
+            else:
+                assert isinstance(self.negative_screening_sequences, dict)
+                for sequence in negative_insertions:
+                    self.negative_screening_sequences.pop(sequence, None)
             raise
         self.pending_candidate_cache.clear()
         self.pending_negative_screening_sequences.clear()
@@ -1217,7 +1270,13 @@ class _Evaluator:
         else:
             self.screening_rejections += 1
             if self.screening_config.negative_sequence_cache:
-                self.negative_screening_cache[key] = result
+                if isinstance(
+                    self.negative_screening_cache,
+                    BoundedScreeningResultCache,
+                ):
+                    self.negative_screening_cache.store(key, result)
+                else:
+                    self.negative_screening_cache[key] = result
         if result.reason:
             self.screening_reason_counts[result.reason] = (
                 self.screening_reason_counts.get(result.reason, 0) + 1
@@ -1297,7 +1356,7 @@ class _Evaluator:
         return self.route(sequence, route_change_status=route_change_status)
 
     def screening_statistics(self) -> dict[str, object]:
-        return {
+        statistics: dict[str, object] = {
             "screening_calls": self.screening_calls,
             "screening_passes": self.screening_passes,
             "screening_rejections": self.screening_rejections,
@@ -1306,6 +1365,14 @@ class _Evaluator:
             "screening_runtime_seconds": self.screening_runtime,
             "screening_reason_counts": dict(sorted(self.screening_reason_counts.items())),
         }
+        if isinstance(
+            self.negative_screening_cache,
+            BoundedScreeningResultCache,
+        ):
+            statistics["negative_screening_result_cache"] = (
+                self.negative_screening_cache.statistics()
+            )
+        return statistics
 
     def incremental_statistics(self) -> dict[str, object]:
         reachability = (
@@ -2365,11 +2432,29 @@ def _solve_alns(
     if legacy_lane_budget <= 0.0:
         raise ValueError("constraint lane time budget must be smaller than the time limit")
     legacy_deadline = started + legacy_lane_budget
-    negative_screening_cache: dict[str, ScreeningResult] | None = (
-        {} if screening_config is not None and screening_config.enabled else None
+    negative_screening_cache: (
+        dict[str, ScreeningResult]
+        | BoundedScreeningResultCache[ScreeningResult]
+        | None
+    ) = (
+        (
+            BoundedScreeningResultCache(
+                capacity=STAGE052_NEGATIVE_SCREENING_RESULT_CACHE_ENTRIES
+            )
+            if candidate_transaction_config is not None
+            else {}
+        )
+        if screening_config is not None and screening_config.enabled
+        else None
     )
-    negative_screening_sequences: dict[tuple[str, ...], str] | None = (
-        {} if candidate_transaction_config is not None else None
+    negative_screening_sequences: (
+        dict[tuple[str, ...], str] | BoundedNegativeSequenceCache | None
+    ) = (
+        BoundedNegativeSequenceCache(
+            capacity=STAGE052_NEGATIVE_SEQUENCE_CACHE_ENTRIES
+        )
+        if candidate_transaction_config is not None
+        else None
     )
     candidate_transaction_runtime = (
         NativeCandidateTransactionRuntime(candidate_transaction_config)
@@ -5544,6 +5629,7 @@ def _aggregate_screening_statistics(
     native_runtime: NativeKernelRuntime | None = None,
 ) -> dict[str, object]:
     reason_counts: dict[str, int] = {}
+    negative_result_cache_statistics: dict[str, object] | None = None
     total_runtime = 0.0
     totals = {
         "screening_calls": 0,
@@ -5554,6 +5640,19 @@ def _aggregate_screening_statistics(
     }
     for evaluator in evaluators:
         statistics = cast(Any, evaluator.screening_statistics())
+        raw_negative_result_cache = statistics.get(
+            "negative_screening_result_cache"
+        )
+        if raw_negative_result_cache is not None:
+            observed = dict(cast(Mapping[str, object], raw_negative_result_cache))
+            if (
+                negative_result_cache_statistics is not None
+                and negative_result_cache_statistics != observed
+            ):
+                raise RuntimeError(
+                    "ALNS lanes observed inconsistent bounded negative-cache state"
+                )
+            negative_result_cache_statistics = observed
         for field_name in totals:
             totals[field_name] += int(statistics[field_name])
         total_runtime += float(statistics["screening_runtime_seconds"])
@@ -5562,12 +5661,17 @@ def _aggregate_screening_statistics(
     native_statistics: dict[str, object] = (
         native_runtime.statistics() if native_runtime is not None else {}
     )
-    return {
+    output: dict[str, object] = {
         **totals,
         "screening_runtime_seconds": total_runtime,
         "screening_reason_counts": dict(sorted(reason_counts.items())),
         **native_statistics,
     }
+    if negative_result_cache_statistics is not None:
+        output["negative_screening_result_cache"] = (
+            negative_result_cache_statistics
+        )
+    return output
 
 
 def _unique_route_caches(

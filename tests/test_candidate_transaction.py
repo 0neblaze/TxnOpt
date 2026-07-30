@@ -10,6 +10,8 @@ import evrptw.candidate_transaction as candidate_transaction_module
 from evrptw.alns import _Evaluator, solve_alns
 from evrptw.cache_incremental import CacheIncrementalConfig, RouteEvaluationCache
 from evrptw.candidate_transaction import (
+    BoundedNegativeSequenceCache,
+    BoundedScreeningResultCache,
     CandidateScreeningBatch,
     CandidateTransactionDeadlineExceeded,
     CandidateTransactionRequest,
@@ -87,6 +89,143 @@ def _feasible_result() -> ChargingSubproblemResult:
         0,
         0.0,
         "",
+    )
+
+
+def test_stage052_negative_screening_result_cache_has_an_auditable_lru_bound() -> None:
+    cache = BoundedScreeningResultCache[str](capacity=2)
+    first = object()
+    second = object()
+    third = object()
+
+    assert cache.get("missing") is None
+    assert cache.store("first", first) is None
+    assert cache.store("second", second) is None
+    assert cache.get("first") is first
+    assert cache.store("third", third) == ("second", second)
+    assert cache.get("second") is None
+    assert cache.get("third") is third
+    assert cache.statistics() == {
+        "backend": "bounded_lru_safe_rejection",
+        "capacity": 2,
+        "current_entries": 2,
+        "peak_entries": 2,
+        "hits": 2,
+        "misses": 2,
+        "stores": 3,
+        "evictions": 1,
+    }
+
+
+def test_stage052_negative_sequence_cache_rollover_is_atomic_and_bounded() -> None:
+    cache = BoundedNegativeSequenceCache(capacity=2)
+    first = (("C1",), "capacity")
+    second = (("C2",), "capacity")
+    third = (("C1", "C2"), "capacity")
+
+    initial = cache.begin_store_many_atomic(dict((first, second)))
+    cache.commit_store_batch(initial)
+    assert dict(cache.items()) == dict((first, second))
+
+    rolled_back = cache.begin_store_many_atomic(dict((third,)))
+    assert dict(cache.items()) == dict((third,))
+    cache.rollback_store_batch(rolled_back)
+    assert dict(cache.items()) == dict((first, second))
+
+    committed = cache.begin_store_many_atomic(dict((third,)))
+    cache.commit_store_batch(committed)
+
+    assert dict(cache.items()) == dict((third,))
+    assert cache.statistics() == {
+        "backend": "bounded_generation_safe_rejection",
+        "capacity": 2,
+        "current_entries": 1,
+        "peak_entries": 2,
+        "stores": 3,
+        "evictions": 2,
+        "rollovers": 1,
+    }
+
+
+def test_native_negative_sequence_cache_replacement_is_reversible() -> None:
+    runtime = NativeCandidateTransactionRuntime(NativeCandidateTransactionConfig())
+    names = {"C1": 0, "C2": 1, "C3": 2}
+    initial = runtime.commit_negative_cache_entries(
+        {("C1",): "capacity_prefilter", ("C2",): "capacity_prefilter"},
+        names,
+    )
+    runtime.commit_negative_cache_batch(initial)
+
+    replacement = runtime.replace_negative_cache_entries(
+        {("C3",): "capacity_prefilter"},
+        names,
+    )
+    runtime.commit_negative_cache_batch(replacement)
+    offsets, indices, reasons = runtime.packed_negative_cache(
+        {("C3",): "capacity_prefilter"},
+        names,
+    )
+    assert offsets.tolist() == [0, 1]
+    assert indices.tolist() == [2]
+    assert len(reasons) == 1
+    assert runtime.statistics()["negative_screening_sequence_cache"] == {
+        "backend": "bounded_generation_safe_rejection",
+        "capacity": 65_536,
+        "current_entries": 1,
+        "peak_entries": 2,
+        "stores": 3,
+        "evictions": 2,
+        "rollovers": 1,
+    }
+
+    rolled_back = runtime.replace_negative_cache_entries(
+        {("C1",): "capacity_prefilter"},
+        names,
+    )
+    runtime.rollback_negative_cache_batch(rolled_back)
+    offsets, indices, _reasons = runtime.packed_negative_cache(
+        {("C3",): "capacity_prefilter"},
+        names,
+    )
+    assert offsets.tolist() == [0, 1]
+    assert indices.tolist() == [2]
+
+
+def test_evaluator_rescreens_an_evicted_safe_rejection_without_exact_work() -> None:
+    cache = BoundedScreeningResultCache(capacity=1)
+    evaluator = _Evaluator(
+        _fixture_instance("bounded_negative_result_cache_fixture"),
+        deadline=time.perf_counter() + 10.0,
+        screening_config=CheapScreeningConfig(),
+        negative_screening_cache=cache,
+    )
+
+    first = evaluator.screen(("C1", "C2"))
+    second = evaluator.screen(("C2", "C1"))
+    replayed = evaluator.screen(("C1", "C2"))
+    cached = evaluator.screen(("C1", "C2"))
+
+    assert not first.accepted
+    assert not second.accepted
+    assert replayed == first
+    assert cached == first
+    assert evaluator.calls == 0
+    assert evaluator.screening_calls == 4
+    assert evaluator.screening_cache_hits == 1
+    expected_statistics = {
+        "backend": "bounded_lru_safe_rejection",
+        "capacity": 1,
+        "current_entries": 1,
+        "peak_entries": 1,
+        "hits": 1,
+        "misses": 3,
+        "stores": 3,
+        "evictions": 2,
+    }
+    assert cache.statistics() == expected_statistics
+    assert (
+        evaluator.screening_statistics()["negative_screening_result_cache"]
+        == expected_statistics
     )
 
 
@@ -432,6 +571,52 @@ def test_worker_failure_rolls_back_staged_negative_cache(
 
     assert evaluator.negative_screening_sequences == {("original",): "capacity_prefilter"}
     assert evaluator.pending_negative_screening_sequences == {}
+
+
+def test_candidate_transaction_rescreens_after_bounded_negative_sequence_rollover() -> None:
+    instance = _fixture_instance("bounded_negative_sequence_integration")
+    native_runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+    transaction_runtime = NativeCandidateTransactionRuntime(
+        NativeCandidateTransactionConfig()
+    )
+    negative_cache = BoundedNegativeSequenceCache(capacity=1)
+    evaluator = _Evaluator(
+        instance,
+        deadline=time.perf_counter() + 10.0,
+        screening_config=CheapScreeningConfig(),
+        backend=ExactChargingBackend.CPU_BATCH,
+        native_runtime=native_runtime,
+        candidate_transaction_runtime=transaction_runtime,
+        negative_screening_sequences=negative_cache,
+    )
+    evaluator.operator = "route_merge"
+
+    first = evaluator.candidate_route_batch((("C1", "C2"),), exact_budget=0)
+    second = evaluator.candidate_route_batch((("C2", "C1"),), exact_budget=0)
+    replayed = evaluator.candidate_route_batch((("C1", "C2"),), exact_budget=0)
+
+    assert first == replayed
+    assert not first[0].feasible
+    assert not second[0].feasible
+    assert evaluator.calls == 0
+    assert negative_cache.statistics() == {
+        "backend": "bounded_generation_safe_rejection",
+        "capacity": 1,
+        "current_entries": 1,
+        "peak_entries": 1,
+        "stores": 3,
+        "evictions": 2,
+        "rollovers": 2,
+    }
+    assert transaction_runtime.statistics()["negative_screening_sequence_cache"] == {
+        "backend": "bounded_generation_safe_rejection",
+        "capacity": 65_536,
+        "current_entries": 1,
+        "peak_entries": 1,
+        "stores": 3,
+        "evictions": 2,
+        "rollovers": 2,
+    }
 
 
 def test_route_evaluator_delegates_ordered_pool_to_native_candidate_transaction() -> None:

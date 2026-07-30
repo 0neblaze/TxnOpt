@@ -14,7 +14,8 @@ import math
 import statistics
 import struct
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections import OrderedDict
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
@@ -28,6 +29,8 @@ from evrptw.native_kernels import (
 )
 
 CANDIDATE_TRANSACTION_SCHEMA_VERSION = "stage05.2-native-candidate-transaction-v1"
+STAGE052_NEGATIVE_SCREENING_RESULT_CACHE_ENTRIES = 65_536
+STAGE052_NEGATIVE_SEQUENCE_CACHE_ENTRIES = 65_536
 
 CustomerSequence = tuple[str, ...]
 CandidateImplementationMode = Literal[
@@ -53,6 +56,179 @@ _NATIVE_SCREEN_STATUSES = {
     1: "duplicate",
     2: "negative_cache_hit",
 }
+
+
+class BoundedScreeningResultCache[ResultT]:
+    """Solve-local LRU for safe screening rejections.
+
+    Eviction changes only whether a later route is safely screened again.  It
+    cannot admit an infeasible route, consume exact work, or change candidate
+    order.  Stage 5.2 records the bound and every eviction in its compact
+    runtime statistics.
+    """
+
+    def __init__(self, *, capacity: int) -> None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+            raise ValueError("screening result cache capacity must be a positive integer")
+        self.capacity = capacity
+        self._entries: OrderedDict[str, ResultT] = OrderedDict()
+        self._peak_entries = 0
+        self._hits = 0
+        self._misses = 0
+        self._stores = 0
+        self._evictions = 0
+
+    def get(self, key: str) -> ResultT | None:
+        value = self._entries.get(key)
+        if value is None:
+            self._misses += 1
+            return None
+        self._entries.move_to_end(key)
+        self._hits += 1
+        return value
+
+    def store(self, key: str, value: ResultT) -> tuple[str, ResultT] | None:
+        self._stores += 1
+        if key in self._entries:
+            self._entries[key] = value
+            self._entries.move_to_end(key)
+            return None
+        self._entries[key] = value
+        if len(self._entries) <= self.capacity:
+            self._peak_entries = max(self._peak_entries, len(self._entries))
+            return None
+        self._evictions += 1
+        evicted = self._entries.popitem(last=False)
+        self._peak_entries = max(self._peak_entries, len(self._entries))
+        return evicted
+
+    def statistics(self) -> dict[str, object]:
+        return {
+            "backend": "bounded_lru_safe_rejection",
+            "capacity": self.capacity,
+            "current_entries": len(self._entries),
+            "peak_entries": self._peak_entries,
+            "hits": self._hits,
+            "misses": self._misses,
+            "stores": self._stores,
+            "evictions": self._evictions,
+        }
+
+
+@dataclass(slots=True)
+class NegativeSequenceCacheBatch:
+    """Reversible update journal for the bounded safe-rejection cache."""
+
+    added_sequences: tuple[CustomerSequence, ...]
+    previous_entries: OrderedDict[CustomerSequence, str] | None
+    evicted_count: int
+    rollover: bool
+    active: bool = True
+
+
+class BoundedNegativeSequenceCache(Mapping[CustomerSequence, str]):
+    """Bounded generation cache for native safe-screening rejections.
+
+    When a committed batch would exceed the fixed capacity, the cache starts a
+    new generation containing that batch.  Dropped entries are safe to
+    recompute and never reach exact work merely because they were evicted.
+    """
+
+    def __init__(self, *, capacity: int) -> None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+            raise ValueError("negative sequence cache capacity must be a positive integer")
+        self.capacity = capacity
+        self._entries: OrderedDict[CustomerSequence, str] = OrderedDict()
+        self._active_batch: NegativeSequenceCacheBatch | None = None
+        self._peak_entries = 0
+        self._stores = 0
+        self._evictions = 0
+        self._rollovers = 0
+
+    def __getitem__(self, key: CustomerSequence) -> str:
+        return self._entries[key]
+
+    def __iter__(self) -> Iterator[CustomerSequence]:
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def begin_store_many_atomic(
+        self,
+        entries: Mapping[CustomerSequence, str],
+    ) -> NegativeSequenceCacheBatch:
+        if self._active_batch is not None:
+            raise RuntimeError("negative sequence cache already has an active batch")
+        for sequence, reason in entries.items():
+            existing = self._entries.get(sequence)
+            if existing is not None and existing != reason:
+                raise RuntimeError("candidate negative cache reason changed during commit")
+        additions = tuple(
+            sequence for sequence in entries if sequence not in self._entries
+        )
+        rollover = len(self._entries) + len(additions) > self.capacity
+        previous_entries: OrderedDict[CustomerSequence, str] | None = None
+        evicted_count = 0
+        if rollover:
+            replacement = OrderedDict(entries.items())
+            if len(replacement) > self.capacity:
+                raise RuntimeError(
+                    "one candidate transaction exceeds the negative sequence cache capacity"
+                )
+            previous_entries = self._entries
+            evicted_count = sum(
+                sequence not in replacement for sequence in previous_entries
+            )
+            self._entries = replacement
+        else:
+            for sequence in additions:
+                self._entries[sequence] = entries[sequence]
+        batch = NegativeSequenceCacheBatch(
+            added_sequences=additions,
+            previous_entries=previous_entries,
+            evicted_count=evicted_count,
+            rollover=rollover,
+        )
+        self._active_batch = batch
+        return batch
+
+    def commit_store_batch(self, batch: NegativeSequenceCacheBatch) -> None:
+        self._require_active(batch)
+        self._stores += len(batch.added_sequences)
+        self._evictions += batch.evicted_count
+        self._rollovers += int(batch.rollover)
+        self._peak_entries = max(self._peak_entries, len(self._entries))
+        batch.active = False
+        batch.previous_entries = None
+        self._active_batch = None
+
+    def rollback_store_batch(self, batch: NegativeSequenceCacheBatch) -> None:
+        self._require_active(batch)
+        if batch.rollover:
+            assert batch.previous_entries is not None
+            self._entries = batch.previous_entries
+        else:
+            for sequence in batch.added_sequences:
+                self._entries.pop(sequence, None)
+        batch.active = False
+        batch.previous_entries = None
+        self._active_batch = None
+
+    def statistics(self) -> dict[str, object]:
+        return {
+            "backend": "bounded_generation_safe_rejection",
+            "capacity": self.capacity,
+            "current_entries": len(self._entries),
+            "peak_entries": self._peak_entries,
+            "stores": self._stores,
+            "evictions": self._evictions,
+            "rollovers": self._rollovers,
+        }
+
+    def _require_active(self, batch: NegativeSequenceCacheBatch) -> None:
+        if self._active_batch is not batch or not batch.active:
+            raise RuntimeError("negative sequence cache batch is no longer active")
 
 
 class CandidateTransactionDeadlineExceeded(RuntimeError):
@@ -218,6 +394,14 @@ class NegativeCacheCommit:
     added_sequences: tuple[CustomerSequence, ...]
     entry_count_before: int
     index_count_before: int
+    stores_before: int = 0
+    evictions_before: int = 0
+    rollovers_before: int = 0
+    peak_entries_before: int = 0
+    previous_sequences: set[CustomerSequence] | None = None
+    previous_offsets: npt.NDArray[np.int64] | None = None
+    previous_indices: npt.NDArray[np.int64] | None = None
+    previous_reason_codes: npt.NDArray[np.int64] | None = None
     active: bool = True
 
 
@@ -244,6 +428,10 @@ class NativeCandidateTransactionRuntime:
     )
     _negative_cache_entry_count: int = 0
     _negative_cache_index_count: int = 0
+    _negative_cache_peak_entries: int = 0
+    _negative_cache_stores: int = 0
+    _negative_cache_evictions: int = 0
+    _negative_cache_rollovers: int = 0
 
     def statistics(self) -> dict[str, object]:
         median_occupancy = (
@@ -255,6 +443,15 @@ class NativeCandidateTransactionRuntime:
             "native_screening_occupancies": tuple(self.screening_occupancies),
             "native_screening_median_occupancy": median_occupancy,
             "native_candidate_transaction_fallbacks": self.fallback_count,
+            "negative_screening_sequence_cache": {
+                "backend": "bounded_generation_safe_rejection",
+                "capacity": STAGE052_NEGATIVE_SEQUENCE_CACHE_ENTRIES,
+                "current_entries": self._negative_cache_entry_count,
+                "peak_entries": self._negative_cache_peak_entries,
+                "stores": self._negative_cache_stores,
+                "evictions": self._negative_cache_evictions,
+                "rollovers": self._negative_cache_rollovers,
+            },
         }
 
     def record(self, audit: CandidateTransactionAudit) -> None:
@@ -314,9 +511,17 @@ class NativeCandidateTransactionRuntime:
                 (),
                 self._negative_cache_entry_count,
                 self._negative_cache_index_count,
+                stores_before=self._negative_cache_stores,
+                evictions_before=self._negative_cache_evictions,
+                rollovers_before=self._negative_cache_rollovers,
+                peak_entries_before=self._negative_cache_peak_entries,
             )
         entry_count_before = self._negative_cache_entry_count
         index_count_before = self._negative_cache_index_count
+        stores_before = self._negative_cache_stores
+        evictions_before = self._negative_cache_evictions
+        rollovers_before = self._negative_cache_rollovers
+        peak_entries_before = self._negative_cache_peak_entries
         packed_routes = tuple(sequence for sequence, _reason in additions)
         packed_offsets, packed_indices = _pack_route_rows(
             packed_routes,
@@ -327,6 +532,10 @@ class NativeCandidateTransactionRuntime:
         except KeyError as error:
             raise ValueError("negative cache contains an unknown screening reason") from error
         required_entries = self._negative_cache_entry_count + len(additions)
+        if required_entries > STAGE052_NEGATIVE_SEQUENCE_CACHE_ENTRIES:
+            raise RuntimeError(
+                "negative cache append exceeds the bounded generation capacity"
+            )
         required_indices = self._negative_cache_index_count + len(packed_indices)
         self._negative_cache_offsets = _grow_int64_buffer(
             self._negative_cache_offsets,
@@ -350,10 +559,90 @@ class NativeCandidateTransactionRuntime:
         self._negative_cache_sequences.update(packed_routes)
         self._negative_cache_entry_count = required_entries
         self._negative_cache_index_count = required_indices
+        self._negative_cache_stores += len(additions)
+        self._negative_cache_peak_entries = max(
+            self._negative_cache_peak_entries,
+            required_entries,
+        )
         return NegativeCacheCommit(
             packed_routes,
             entry_count_before,
             index_count_before,
+            stores_before=stores_before,
+            evictions_before=evictions_before,
+            rollovers_before=rollovers_before,
+            peak_entries_before=peak_entries_before,
+        )
+
+    def replace_negative_cache_entries(
+        self,
+        entries: Mapping[CustomerSequence, str],
+        name_to_index: Mapping[str, int],
+    ) -> NegativeCacheCommit:
+        """Atomically start a bounded safe-rejection cache generation."""
+
+        if len(entries) > STAGE052_NEGATIVE_SEQUENCE_CACHE_ENTRIES:
+            raise RuntimeError(
+                "negative cache replacement exceeds the bounded generation capacity"
+            )
+        packed_routes = tuple(entries)
+        packed_offsets, packed_indices = _pack_route_rows(
+            packed_routes,
+            name_to_index,
+        )
+        try:
+            reason_codes = np.asarray(
+                [_SCREEN_REASON_CODES[entries[sequence]] for sequence in packed_routes],
+                dtype=np.int64,
+            )
+        except KeyError as error:
+            raise ValueError("negative cache contains an unknown screening reason") from error
+        previous_sequences = self._negative_cache_sequences
+        previous_offsets = self._negative_cache_offsets
+        previous_indices = self._negative_cache_indices
+        previous_reason_codes = self._negative_cache_reason_codes
+        entry_count_before = self._negative_cache_entry_count
+        index_count_before = self._negative_cache_index_count
+        stores_before = self._negative_cache_stores
+        evictions_before = self._negative_cache_evictions
+        rollovers_before = self._negative_cache_rollovers
+        peak_entries_before = self._negative_cache_peak_entries
+        next_sequences = set(packed_routes)
+        self._negative_cache_sequences = next_sequences
+        self._negative_cache_offsets = np.ascontiguousarray(
+            packed_offsets,
+            dtype=np.int64,
+        )
+        self._negative_cache_indices = np.ascontiguousarray(
+            packed_indices,
+            dtype=np.int64,
+        )
+        self._negative_cache_reason_codes = reason_codes
+        self._negative_cache_entry_count = len(packed_routes)
+        self._negative_cache_index_count = len(packed_indices)
+        self._negative_cache_stores += sum(
+            sequence not in previous_sequences for sequence in next_sequences
+        )
+        self._negative_cache_evictions += sum(
+            sequence not in next_sequences for sequence in previous_sequences
+        )
+        self._negative_cache_rollovers += 1
+        self._negative_cache_peak_entries = max(
+            self._negative_cache_peak_entries,
+            len(packed_routes),
+        )
+        return NegativeCacheCommit(
+            (),
+            entry_count_before,
+            index_count_before,
+            stores_before=stores_before,
+            evictions_before=evictions_before,
+            rollovers_before=rollovers_before,
+            peak_entries_before=peak_entries_before,
+            previous_sequences=previous_sequences,
+            previous_offsets=previous_offsets,
+            previous_indices=previous_indices,
+            previous_reason_codes=previous_reason_codes,
         )
 
     def commit_negative_cache_batch(self, commit: NegativeCacheCommit) -> None:
@@ -361,6 +650,10 @@ class NativeCandidateTransactionRuntime:
 
         if not commit.active:
             raise RuntimeError("negative cache commit is no longer active")
+        commit.previous_sequences = None
+        commit.previous_offsets = None
+        commit.previous_indices = None
+        commit.previous_reason_codes = None
         commit.active = False
 
     def rollback_negative_cache_batch(self, commit: NegativeCacheCommit) -> None:
@@ -368,10 +661,27 @@ class NativeCandidateTransactionRuntime:
 
         if not commit.active:
             raise RuntimeError("negative cache commit is no longer active")
-        for sequence in commit.added_sequences:
-            self._negative_cache_sequences.remove(sequence)
+        if commit.previous_sequences is not None:
+            assert commit.previous_offsets is not None
+            assert commit.previous_indices is not None
+            assert commit.previous_reason_codes is not None
+            self._negative_cache_sequences = commit.previous_sequences
+            self._negative_cache_offsets = commit.previous_offsets
+            self._negative_cache_indices = commit.previous_indices
+            self._negative_cache_reason_codes = commit.previous_reason_codes
+        else:
+            for sequence in commit.added_sequences:
+                self._negative_cache_sequences.remove(sequence)
         self._negative_cache_entry_count = commit.entry_count_before
         self._negative_cache_index_count = commit.index_count_before
+        self._negative_cache_stores = commit.stores_before
+        self._negative_cache_evictions = commit.evictions_before
+        self._negative_cache_rollovers = commit.rollovers_before
+        self._negative_cache_peak_entries = commit.peak_entries_before
+        commit.previous_sequences = None
+        commit.previous_offsets = None
+        commit.previous_indices = None
+        commit.previous_reason_codes = None
         commit.active = False
 
 

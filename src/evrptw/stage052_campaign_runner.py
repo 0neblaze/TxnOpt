@@ -127,9 +127,9 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
     }
 )
 _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
-    "src/evrptw/alns.py": "b9a6a1161a9ca896eacfbb70f012dec701e73608725d98986468b1817de3c0f9",
+    "src/evrptw/alns.py": "21d62bd2f006277725b473c08d8dfa9e4520e5ad4a43d396519aa5cd3803ad9c",
     "src/evrptw/candidate_transaction.py": (
-        "c0abce4161b2da030857549b0d5a444c787b422a67c402775b84718cb9085e19"
+        "1d510f58b5ca6e68962716e8eabb676d8a4e4e96cea1beac690b82172e987e72"
     ),
     "src/evrptw/measurement.py": (
         "c6be1109595b3f6d687074fe708c5c1fb46b70d79068579cf89893edb0880dcd"
@@ -138,10 +138,10 @@ _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
         "0bf741d1e4929564882dd8ff48775f0c589e957328aa00c7309176656fd16481"
     ),
     "tests/test_artifacts_v3.py": (
-        "efb81c96a602b0820ee5539d4c2a524d578f99573152d459bd7c49b8221eaecf"
+        "9cee5ea75470e4ac82b227983aafeb4e7a633d97784bb8795d6edaa017b4742a"
     ),
     "tests/test_candidate_transaction.py": (
-        "8ddaba9e9de50e504739345a282600d5ab12dd4285967cd83f813f1c93c5f01f"
+        "4d19ab4201d5d5421e18f9667c1cdc974bed80fcb0f2a6c82c14392783630ece"
     ),
     "tests/test_stage033_exact_deadline.py": (
         "cd8cbcf415b30c3d29d53aca8fecd22bd3ded62099de621b9cbf8c011d827de1"

@@ -2238,3 +2238,45 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   resource calibration 或 readiness。替代探针必须先验证 keeper 能跨过一个
   transient unit 生命周期，再使用新 clean commit/wheels/sealed source 与新
   label 从零运行。
+
+## 2026-07-30：G Formal memory attempt10 与 bounded safe-rejection 根因修复
+
+- `stage05.2_formal_memory_probe_attempt10` 使用 clean commit
+  `6e9112a44025d1f41803260165898356fd3a5577`、exact `r205_21` seeds
+  2014--2019、固定 6 workers、16,384-row、queue depth 1，并由经过 lifecycle
+  smoke 的 Windows-side keeper 持有 dedicated transient unit。signed v3 failure
+  report SHA-256 为
+  `182e9aae3e01ffccbb2c1decf472cbac2fe43446db3f8d2799026c877d1e4852`；
+  exit 1、cgroup swap peak 0、clean provenance。约 34 分 44 秒后 direct cgroup
+  guard 观察到 `memory.current=24,124,645,376` bytes 超过
+  `24,123,195,392`-byte limit；resource summary peak 为
+  `24,133,230,592` bytes，20% headroom 为 `28,959,876,711` bytes，高于 host
+  capacity `25,196,937,216` bytes。
+- attempt10 比 65,536-row attempt07 的 `24,123,187,200`-byte peak 反而高
+  `10,043,392` bytes（0.0416%），因此 row-group 16,384 方向被实证否定。
+  attempt10 原样保留且不复用；resource calibration 与 Formal rerun03 继续阻塞。
+  terminal journal 的约 5.5 GiB 峰值不覆盖 signed report：独立 single/
+  multiprocess cgroup harness 已证明 direct `memory.current`/`memory.peak`
+  采样与 live systemd 值一致，Stage 5.2 resource gate 继续使用 dedicated-cgroup
+  direct sampling。
+- 对 rerun02 最大 screening shard（1,226,847 definitions）的只读重放分离了三种
+  working set。完整 1,250,000-entry SHA-256 identity store 的 RSS 增量约
+  102 MiB，因此降低 2,097,152 collision capacity 既会破坏 exact proof，也不足以
+  修复多 GiB 峰值。相反，442,044-entry scalar safe-rejection result mapping
+  增量约 656 MiB，262,144-entry native definition memo 增量约 469 MiB；同一
+  raw shard 另有 442,044 unique rejected routes，证明可丢弃 memo/cache 才是主要
+  可控增长源。
+- 当前修复保留完整 2,097,152-entry full-SHA-256 collision state；将 scalar
+  safe-rejection result 设为可审计 65,536-entry LRU，将 Python/native packed
+  safe-rejection sequence state 设为 65,536-entry atomic generation cache，并将
+  producer definition-key memo 设为 65,536-entry FIFO safe-recompute cache。
+  Python/native generation rollover 共用 candidate transaction commit/rollback；
+  淘汰只触发 safe screening 重算，不改变 candidate order、objective、exact budget、
+  exact/cache/deadline semantics 或 collision proof。
+- raw screening/candidate-transaction statistics 记录 capacity、current/peak、
+  stores、evictions 与 rollovers；campaign reviewer 拒绝无界、缺失或内部不一致的
+  cache evidence。signed screening-definition contract 升级为 v3，分别绑定完整
+  collision capacity、memo capacity、FIFO safe-recompute policy 与
+  `identity_collision_proof=full_sha256`。在新 clean commit、完整质量门槛、
+  双轴 code review、新 wheels/venvs/runtime/sealed source 和下一未占用 memory
+  probe label 完成前，状态仍为 `NOT_READY`。
