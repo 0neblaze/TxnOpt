@@ -292,6 +292,10 @@ sealed source snapshot 不能只做 Git clone：Schneider benchmark 是 ignored 
 probe instance 非空。Formal memory probe 在创建 output root 和提交 worker work
 之前执行该门槛；缺失输入不得进入内存测量。若 transient unit 已使用某 label 启动，
 即使此门槛立即失败，该 label 仍作为不可变 failure evidence 保留并由新 label 替代。
+所有 calibration CLI 必须显式传入 clean ext4 checkout 的
+`--repository-root`；service working directory 不再承担隐式 source binding。
+缺少该参数必须在 argparse 阶段 fail fast，避免从 `/home/oneblaze` 等非 worktree
+目录启动后才消费 evidence label。
 
 producer 的 screening-definition identity state（筛选定义身份状态）固定使用
 `native_bounded_digest`（原生有界摘要）backend，保存完整 SHA-256 collision token

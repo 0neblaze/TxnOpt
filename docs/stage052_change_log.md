@@ -2455,3 +2455,23 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 - 新修复仍必须形成新的 clean commit、完整质量门槛、双轴 code review、新
   wheels/venvs/runtime/sealed source，并使用下一未占用 Formal memory probe label；
   attempt15 不续跑、不复用、不导入。
+
+## 2026-07-31：G Formal memory attempt16 host-working-directory failure
+
+- `stage05.2_formal_memory_probe_attempt16` 绑定 clean commit
+  `3ee20fa9ec71bd84f4a0962bb09f6812f8ad7a20` 和 wheel SHA-256
+  `8ee0dfd106f127cd70d1be6790765e7bf24efeda3377c0afdf512cd42662c477`，
+  但 Windows-side keeper 构造的 transient `systemd --user` invocation 漏掉了
+  working directory。三次 host invocation 均在约 0.3 秒内由
+  `repository_root()` fail fast：当前目录 `/home/oneblaze` 和 installed wheel
+  均不是 Git worktree；service status 1，memory peak 不超过 760 KiB、swap peak 0。
+  solver、worker 与 output root 均未创建，因此没有 signed v3 report 或 readiness
+  geometry。journal 是该 label 的不可变 host failure evidence；attempt16 不续跑、
+  不复用、不导入。
+- 根因不是 candidate transaction，而是 calibration CLI 把 repository identity
+  隐式依赖于 process cwd。红测先证明 CLI 不接受显式 repository root；修复后
+  `--repository-root` 成为所有 probe/calibration mode 的必需参数，并作为 `root`
+  显式传入 deep runner。后续 systemd command 不再依赖 WorkingDirectory 才能定位
+  source；缺少 binding 会在 argparse 阶段、启动 evidence 前失败。
+- 该 host-orchestration 修复必须再次形成 clean commit、完整质量门槛、双轴
+  code review、新 wheels/venvs/runtime/sealed source，并使用下一未占用 label。

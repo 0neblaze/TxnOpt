@@ -533,6 +533,8 @@ def test_calibration_cli_runs_formal_memory_probe_without_corpus(
             "stage052_calibration",
             "--output-root",
             str(tmp_path / "probe"),
+            "--repository-root",
+            str(tmp_path / "repository"),
             "--run-label",
             "stage05.2_formal_memory_probe_attempt01",
             "--formal-memory-probe-workers",
@@ -552,6 +554,7 @@ def test_calibration_cli_runs_formal_memory_probe_without_corpus(
     assert calls[0]["row_group_size"] == 65_536
     assert calls[0]["queue_depth"] == 2
     assert calls[0]["output_root"] == (tmp_path / "probe").resolve()
+    assert calls[0]["root"] == (tmp_path / "repository").resolve()
 
 
 def test_calibration_cli_requires_and_loads_failed_formal_memory_floor(
@@ -598,6 +601,8 @@ def test_calibration_cli_requires_and_loads_failed_formal_memory_floor(
             str(tmp_path / "attempt73"),
             "--output-root",
             str(tmp_path / "calibration"),
+            "--repository-root",
+            str(tmp_path / "repository"),
             "--contract-path",
             str(tmp_path / "contract.json"),
             "--formal-memory-floor-dir",
@@ -612,6 +617,7 @@ def test_calibration_cli_requires_and_loads_failed_formal_memory_floor(
     assert stage052_calibration.main() == 0
     assert load_calls == [((tmp_path / "attempt90").resolve(), "batch0003")]
     assert calibration_calls[0]["formal_campaign_memory_floor"] == floor
+    assert calibration_calls[0]["root"] == (tmp_path / "repository").resolve()
 
 
 def test_attempt73_memory_floor_uses_sealed_long_shard_resource_peaks(

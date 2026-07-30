@@ -1450,6 +1450,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Calibrate Stage 5.2 producer resources")
     parser.add_argument("--corpus-dir", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument(
+        "--repository-root",
+        type=Path,
+        required=True,
+        help="Explicit clean Git worktree used for source and input identity",
+    )
     parser.add_argument("--contract-path", type=Path)
     parser.add_argument("--formal-memory-floor-dir", type=Path)
     parser.add_argument(
@@ -1499,6 +1505,7 @@ def main() -> int:
             row_group_size=arguments.row_group_size,
             queue_depth=arguments.queue_depth,
             output_root=arguments.output_root.resolve(),
+            root=arguments.repository_root.resolve(),
             config_path=arguments.config.resolve(),
             run_label=arguments.run_label,
         )
@@ -1511,6 +1518,7 @@ def main() -> int:
             workers=arguments.probe_workers,
             corpus_dir=arguments.corpus_dir.resolve(),
             output_root=arguments.output_root.resolve(),
+            root=arguments.repository_root.resolve(),
             config_path=arguments.config.resolve(),
             run_label=arguments.run_label,
         )
@@ -1534,6 +1542,7 @@ def main() -> int:
         corpus_dir=arguments.corpus_dir.resolve(),
         output_root=arguments.output_root.resolve(),
         contract_path=arguments.contract_path.resolve(),
+        root=arguments.repository_root.resolve(),
         config_path=arguments.config.resolve(),
         run_label=arguments.run_label,
         require_clean_source=not arguments.allow_dirty_source,
