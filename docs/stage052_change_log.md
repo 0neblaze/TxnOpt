@@ -2497,3 +2497,28 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   `git clone --local --no-hardlinks` 创建，随后把 exact `r205_21` 实体化为 snapshot
   内 ordinary file。启动前必须独立验证 `.git` 存在、HEAD 精确、status clean、
   input 非 symlink 且 SHA-256 精确；缺一项不得启动下一 label。
+
+## 2026-07-31：G Formal memory attempt18 通过与 rerun02 floor 兼容修复
+
+- `stage05.2_formal_memory_probe_attempt18` 使用 clean commit
+  `fac294b89e107826b021f61634026bdf2654f7b0`、producer/reviewer wheel
+  SHA-256
+  `519e3b0b6bae1bbfef22c94e07fa8806624deb05272f26b9382d184f011b152e`，
+  exact `r205_21` seeds 2014--2019、固定 6 workers、16,384-row、queue depth 1，
+  在 Windows-side keeper 持有的 dedicated transient user service 中完成全部
+  wall-clock 30/60/300 轴。signed v3 report SHA-256 为
+  `7390cf82f7638ee4609e4b897d76456b32e562a16abfa18099c40bf0760efbc6`；
+  service exit 0、aggregate cgroup peak `18,879,209,472` bytes、最高
+  per-worker RSS `3,699,142,656` bytes、cgroup swap peak 0、fallback count 0。
+  20% headroom 为 `22,655,051,367` bytes，低于 host capacity
+  `25,196,933,120` bytes，余量 `2,541,881,753` bytes；因此该 probe 通过
+  resource-calibration prerequisite，但本身仍不贡献 Formal campaign geometry。
+- resource calibration 的预检随后正确拒绝消费新 label：现有 failed-Formal floor
+  loader 只认可历史的 campaign-lock 与 per-process RSS failure marker，未认可
+  rerun02 batch0008 已签名的 aggregate RSS hard-limit marker。该 evidence chain
+  的 resource summary SHA-256 仍精确为
+  `ec5e8eb43562b983ac0b3d733da446f45fa59407b278dff93323ce4d6e6e6253`；
+  兼容修复仅扩展 fail-fast memory reason allowlist，不放宽 signed campaign、
+  batch、artifact、run metadata、resource summary、worker/row-group/queue-depth
+  或 checksum binding。新增回归测试覆盖 rerun02 的精确 failure-reason 形状；
+  非内存 worker failure 仍必须 fail fast。

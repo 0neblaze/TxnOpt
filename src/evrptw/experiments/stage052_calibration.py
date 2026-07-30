@@ -80,6 +80,7 @@ _PARQUET_CONFIGURATIONS = (
 )
 _FAILED_FORMAL_MEMORY_FLOOR_REASONS = (
     "aggregate RSS exceeds its campaign lock",
+    "runtime guard aborted Stage 5.2 work: aggregate RSS hard limit exceeded:",
     "runtime guard aborted Stage 5.2 work: process RSS hard limit exceeded:",
 )
 

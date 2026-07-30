@@ -819,6 +819,31 @@ def test_failed_formal_memory_floor_accepts_process_rss_guard_failure(
     ).hexdigest()
 
 
+def test_failed_formal_memory_floor_accepts_aggregate_rss_guard_failure(
+    tmp_path: Path,
+) -> None:
+    campaign_dir = tmp_path / "stage05.2_benchmark_rerun02"
+    resource_path, _ = _write_failed_formal_memory_floor(
+        campaign_dir,
+        failure_reason=(
+            "RuntimeError: worker failure RuntimeError: runtime guard aborted "
+            "Stage 5.2 work: aggregate RSS hard limit exceeded: "
+            "observed=24073318400 limit=24072732672; process-pool abort failure "
+            "RuntimeError: pid=70242: survived terminate and kill"
+        ),
+    )
+
+    floor = load_failed_formal_memory_floor(
+        campaign_dir,
+        batch_id="batch0003",
+    )
+
+    assert floor.aggregate_peak_rss_bytes == 18_449_874_944
+    assert floor.resource_summary_sha256 == hashlib.sha256(
+        resource_path.read_bytes()
+    ).hexdigest()
+
+
 def test_failed_formal_memory_floor_rejects_non_memory_worker_failure(
     tmp_path: Path,
 ) -> None:
