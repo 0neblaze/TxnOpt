@@ -2221,3 +2221,20 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   row-group selection；这不是静默 fallback，也不改变 candidate order、
   objective、exact/cache/deadline 或 evidence schema。下一次内存探针必须使用
   新 clean commit/wheels/sealed source 与新 label。
+
+## 2026-07-30：G Formal memory attempt09 keeper 失败
+
+- 低内存根因修复在 clean commit
+  `3ca5297f65ad97066413fae61e0585238b866fae` 上通过完整 pytest 936、
+  Ruff、strict mypy、diff-check 与双轴独立 code review；producer/reviewer
+  wheel SHA-256 均为
+  `08227d49b0613d76e33f361bd72774457fb8e57c75a418a3edb255fb13ee8e71`。
+- `stage05.2_formal_memory_probe_attempt09` 使用 16,384-row、queue depth 1、
+  exact `r205_21` seeds 2014--2019 与固定 6 workers 启动，但 Windows-side
+  `wsl.exe` keeper 的参数转义错误使 keeper 立即退出。WSL 随后停止 dedicated
+  transient unit；journal 记录约 3 分 14 秒 CPU、2.3 GiB service memory peak
+  与 swap 0，但探针未完成，也未封存 signed v3 report。
+- attempt09 是不可变 partial failure evidence，不续跑、不复用 label，也不参与
+  resource calibration 或 readiness。替代探针必须先验证 keeper 能跨过一个
+  transient unit 生命周期，再使用新 clean commit/wheels/sealed source 与新
+  label 从零运行。
