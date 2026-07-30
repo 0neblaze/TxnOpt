@@ -951,8 +951,11 @@ The executable workflow and gate table are maintained in
   control-manifest finalisation. Attempt-specific remediation history belongs
   in manifests, the retention registry, and the change log rather than this
   standing policy.
-- Current v3 physical writers use 65,536-row Parquet row groups and buffer at
-  most two non-empty row groups per family. A worker writes only its own shard;
+- Current v3 physical writers support signed calibration choices of 16,384,
+  65,536, or 262,144 Parquet rows per group and buffer at most two non-empty
+  row groups per family. The live trace buffer must use the selected physical
+  row-group size; 16,384 is the explicit low-memory candidate and is not an
+  implicit fallback. A worker writes only its own shard;
   the parent never merges event
   rows in memory. Shard-local event identity is deterministic from canonical
   shard ordinal plus local event ID, so review never depends on worker

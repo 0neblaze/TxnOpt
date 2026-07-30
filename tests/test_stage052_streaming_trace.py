@@ -2060,8 +2060,33 @@ def test_stage052_trace_sink_rejects_oversized_async_callback_batch() -> None:
             shard=_RecordingShard(),
             axis_name="fixed_work",
             buffer_rows=65_537,
+            physical_row_group_rows=65_536,
             async_persistence=True,
         )
+
+
+def test_stage052_trace_sink_uses_selected_physical_buffer_limits() -> None:
+    large = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=_RecordingShard(),
+        axis_name="wall_clock_300",
+        buffer_rows=262_144,
+        physical_row_group_rows=262_144,
+        async_persistence=True,
+    )
+    assert large._buffer_rows == 262_144  # noqa: SLF001
+    assert large._neighborhood_buffer_rows == 262_144  # noqa: SLF001
+    large.close()
+
+    low_memory = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=_RecordingShard(),
+        axis_name="wall_clock_300",
+        buffer_rows=16_384,
+        physical_row_group_rows=16_384,
+        async_persistence=True,
+    )
+    assert low_memory._buffer_rows == 16_384  # noqa: SLF001
+    assert low_memory._neighborhood_buffer_rows == 16_384  # noqa: SLF001
+    low_memory.close()
 
 
 def test_stage052_trace_sink_async_pipeline_surfaces_writer_failure() -> None:

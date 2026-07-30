@@ -57,6 +57,8 @@ def test_calibration_runs_every_candidate_and_seals_selected_contract(
         queue_depth = int(kwargs["queue_depth"])
         observed_parquet.append((row_group_size, queue_depth))
         elapsed = {
+            (16_384, 1): 101.0,
+            (16_384, 2): 99.0,
             (65_536, 1): 100.0,
             (65_536, 2): 95.0,
             (262_144, 1): 92.0,
@@ -78,7 +80,9 @@ def test_calibration_runs_every_candidate_and_seals_selected_contract(
                 throughput=1.0,
                 aggregate_peak_rss_bytes=9 * 1024**3,
                 semantic_digest="c" * 64,
-                swap_peak_bytes=0,
+                # Host-wide swap is telemetry only. The isolated cgroup swap
+                # counter below is the hard Formal resource gate.
+                swap_peak_bytes=12_345,
                 fallback_count=0,
                 resource_limit_exceeded=False,
             ),
@@ -118,6 +122,8 @@ def test_calibration_runs_every_candidate_and_seals_selected_contract(
 
     assert observed_workers == [4, 5, 6]
     assert observed_parquet == [
+        (16_384, 1),
+        (16_384, 2),
         (65_536, 1),
         (65_536, 2),
         (262_144, 1),
@@ -136,6 +142,10 @@ def test_calibration_runs_every_candidate_and_seals_selected_contract(
     )
     assert report["selection"]["policy"] == "user_locked"
     assert report["selection"]["locked_workers"] == 6
+    assert (
+        report["formal_memory_measurement"]["benchmark"]["swap_peak_bytes"]
+        == 12_345
+    )
 
 
 def test_calibration_contract_includes_selected_formal_memory_measurement(
@@ -163,6 +173,8 @@ def test_calibration_contract_includes_selected_formal_memory_measurement(
         row_group_size = int(kwargs["row_group_size"])
         queue_depth = int(kwargs["queue_depth"])
         elapsed = {
+            (16_384, 1): 110.0,
+            (16_384, 2): 105.0,
             (65_536, 1): 100.0,
             (65_536, 2): 80.0,
             (262_144, 1): 90.0,

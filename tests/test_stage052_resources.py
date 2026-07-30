@@ -194,6 +194,10 @@ def test_formal_resource_recalibration_v3_binds_cgroup_memory_and_rerun02(
             "cgroup_swap_peak_bytes": 0,
         }
     )
+    payload["formal_memory_measurement"]["benchmark"]["swap_peak_bytes"] = 123
+    for field_name in ("fresh_producer_measurements", "producer_measurements"):
+        for measurement in payload[field_name]:
+            measurement["swap_peak_bytes"] = 456
     payload["formal_campaign_memory_floor"].update(
         {
             "run_label": "stage05.2_benchmark_rerun02",
@@ -570,7 +574,7 @@ def test_producer_selection_can_compare_an_optional_eight_worker_probe() -> None
     assert selected.candidate_workers == (4, 5, 6, 8)
 
 
-def test_producer_selection_rejects_swap_fallback_digest_drift_and_memory_pressure() -> None:
+def test_producer_selection_treats_host_swap_as_telemetry() -> None:
     results = (
         _producer_result(4, 100.0, rss_gib=8.0),
         _producer_result(5, 140.0, rss_gib=9.0, swap_bytes=1),
@@ -579,8 +583,8 @@ def test_producer_selection_rejects_swap_fallback_digest_drift_and_memory_pressu
 
     selected = select_producer_configuration(results, available_memory_bytes=16 * 1024**3)
 
-    assert selected.selected_workers == 4
-    assert "swap pressure" in selected.rejected_reasons[5]
+    assert selected.selected_workers == 5
+    assert 5 not in selected.rejected_reasons
     assert "memory budget" in selected.rejected_reasons[6]
     assert "semantic digest" in selected.rejected_reasons[6]
 
@@ -730,6 +734,18 @@ def test_parquet_tuning_uses_full_measured_memory_capability() -> None:
         )
         == faster
     )
+
+
+def test_parquet_benchmark_accepts_low_memory_row_group() -> None:
+    benchmark = ParquetBenchmark(
+        row_group_size=16_384,
+        queue_depth=1,
+        persistence_seconds=1.0,
+        aggregate_peak_rss_bytes=1024,
+        semantic_digest="a" * 64,
+    )
+
+    assert benchmark.row_group_size == 16_384
 
 
 def test_capability_contract_fails_fast_on_missing_atomic_filesystem_support() -> None:

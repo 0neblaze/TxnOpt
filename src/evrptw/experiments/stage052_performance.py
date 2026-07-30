@@ -35,7 +35,6 @@ import pyarrow.parquet as pq
 from evrptw.alns import ALNSResult, solve_alns
 from evrptw.artifacts import (
     ARTIFACT_STORAGE_V2,
-    V2_PARQUET_ROW_GROUP_SIZE,
     ArtifactBundleWriter,
     ArtifactIntegrityError,
     ArtifactReader,
@@ -4065,23 +4064,44 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         shard: _Stage052StreamingShard,
         axis_name: str,
         buffer_rows: int = 65_536,
-        neighborhood_buffer_rows: int = 524_288,
+        physical_row_group_rows: int = 65_536,
+        neighborhood_buffer_rows: int | None = None,
         async_persistence: bool = False,
     ) -> None:
         if isinstance(buffer_rows, bool) or not isinstance(buffer_rows, int) or buffer_rows <= 0:
             raise ValueError("trace stream buffer_rows must be a positive integer")
-        if async_persistence and buffer_rows > V2_PARQUET_ROW_GROUP_SIZE:
-            raise ValueError("async trace stream buffer_rows may not exceed one Parquet row group")
         if (
-            isinstance(neighborhood_buffer_rows, bool)
-            or not isinstance(neighborhood_buffer_rows, int)
-            or neighborhood_buffer_rows <= 0
+            isinstance(physical_row_group_rows, bool)
+            or not isinstance(physical_row_group_rows, int)
+            or physical_row_group_rows <= 0
+        ):
+            raise ValueError(
+                "physical_row_group_rows must be a positive integer"
+            )
+        if async_persistence and buffer_rows > physical_row_group_rows:
+            raise ValueError("async trace stream buffer_rows may not exceed one Parquet row group")
+        resolved_neighborhood_buffer_rows = (
+            buffer_rows
+            if neighborhood_buffer_rows is None
+            else neighborhood_buffer_rows
+        )
+        if (
+            isinstance(resolved_neighborhood_buffer_rows, bool)
+            or not isinstance(resolved_neighborhood_buffer_rows, int)
+            or resolved_neighborhood_buffer_rows <= 0
         ):
             raise ValueError("neighborhood_buffer_rows must be a positive integer")
+        if (
+            async_persistence
+            and resolved_neighborhood_buffer_rows > physical_row_group_rows
+        ):
+            raise ValueError(
+                "async neighborhood buffer may not exceed one Parquet row group"
+            )
         self._shard = shard
         self.axis_name = axis_name
         self._buffer_rows = buffer_rows
-        self._neighborhood_buffer_rows = neighborhood_buffer_rows
+        self._neighborhood_buffer_rows = resolved_neighborhood_buffer_rows
         self._event_buffer: list[
             dict[str, object]
             | BufferedScreeningDecision
@@ -5140,6 +5160,8 @@ def _run_and_persist_v2_shard(
             trace_stream = _Stage052TraceStreamSink(
                 shard=shard,
                 axis_name=axis.name,
+                buffer_rows=storage.parquet_row_group_size,
+                physical_row_group_rows=storage.parquet_row_group_size,
                 async_persistence=task.component
                 in {
                     Stage052Component.NATIVE_KERNELS.value,

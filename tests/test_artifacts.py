@@ -126,6 +126,29 @@ def test_v2_parquet_sink_applies_calibrated_row_group_and_async_queue(
     assert pq.read_table(path).column("value").to_pylist() == list(range(150_000))
 
 
+def test_v2_parquet_sink_supports_low_memory_row_groups(tmp_path: Path) -> None:
+    path = tmp_path / "low-memory.parquet"
+    schema = pa.schema((pa.field("value", pa.int64(), nullable=False),))
+    config = ArtifactStorageConfig(
+        storage_policy_version="artifact-storage-v2",
+        parquet_row_group_size=16_384,
+        parquet_queue_depth=1,
+    )
+    sink = artifacts_module._StreamingParquetSink(path, schema, config)
+    values = pa.array(range(40_000), type=pa.int64())
+
+    sink.append_batch(pa.RecordBatch.from_arrays([values], schema=schema))
+    row_count, _ = sink.close()
+
+    parquet = pq.ParquetFile(path)
+    assert row_count == 40_000
+    assert parquet.metadata.num_row_groups == 3
+    assert all(
+        parquet.metadata.row_group(index).num_rows <= 16_384
+        for index in range(parquet.metadata.num_row_groups)
+    )
+
+
 def test_v2_shard_session_appends_axes_before_finalization(tmp_path: Path) -> None:
     run_dir = tmp_path / "results" / "stage05.2_artifact_streaming_attempt02"
     writer = ArtifactBundleWriter(

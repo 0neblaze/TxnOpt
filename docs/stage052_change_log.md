@@ -2200,3 +2200,24 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   `ec5e8eb43562b983ac0b3d733da446f45fa59407b278dff93323ce4d6e6e6253`；
   predecessor RSS 总和仅作失败 provenance，replacement aggregate floor 必须来自
   完整 R205 cgroup measurement，per-worker floor 与固定 6-worker topology 保持。
+
+## 2026-07-30：G Formal memory attempt07/08 与低内存 row-group 候选
+
+- `stage05.2_formal_memory_probe_attempt07` 在 clean commit
+  `d108be9c1d9916a3684fdda857e0b50782730ea3` 上完成 exact `r205_21`、
+  seeds 2014--2019、30/60/300-second axes 与固定 6 workers。签名 v3 report
+  记录 dedicated cgroup physical peak `24,123,187,200` bytes、cgroup swap
+  peak 0、per-worker RSS peak `4,946,546,688` bytes；20% headroom 需要
+  `28,947,824,640` bytes，超过 host capacity `25,196,929,024` bytes，因此
+  attempt07 是完整诊断证据但不满足 Formal resource gate。
+- host-wide `psutil` swap delta 只保留为 telemetry；Formal 硬门槛只使用专用
+  cgroup v2 `memory.swap.peak == 0`。独立回归测试覆盖“host 有 swap 变化但
+  workload cgroup swap 为 0”的情况；fallback 和 resource-limit 仍 fail fast。
+- `stage05.2_formal_memory_probe_attempt08` 尝试 16,384-row diagnostic A/B，
+  但 d108be9 CLI 的显式允许集合仍只有 65,536/262,144，因参数校验以 exit 2
+  fail fast。该 label 与 journal 原样保留且不复用，不产生 readiness geometry。
+- artifact storage、resource contract、calibration candidate matrix 与 CLI
+  现在显式支持 16,384-row low-memory candidate。live trace buffer 使用签名
+  row-group selection；这不是静默 fallback，也不改变 candidate order、
+  objective、exact/cache/deadline 或 evidence schema。下一次内存探针必须使用
+  新 clean commit/wheels/sealed source 与新 label。

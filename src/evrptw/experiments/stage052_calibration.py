@@ -71,6 +71,8 @@ _FORMAL_MEMORY_SEEDS = tuple(range(2014, 2022))
 _PRODUCER_WORKERS = (4, 5, 6)
 _PRODUCER_PROBE_WORKERS = (4, 5, 6, 8)
 _PARQUET_CONFIGURATIONS = (
+    (16_384, 1),
+    (16_384, 2),
     (65_536, 1),
     (65_536, 2),
     (262_144, 1),
@@ -174,7 +176,7 @@ class FormalCampaignMemoryFloor:
             or self.per_worker_peak_rss_bytes <= 0
         ):
             raise ValueError("Formal campaign memory floor RSS values must be positive")
-        if self.row_group_size not in (65_536, 262_144):
+        if self.row_group_size not in (16_384, 65_536, 262_144):
             raise ValueError("Formal campaign memory floor row group size is invalid")
         if self.queue_depth not in (1, 2):
             raise ValueError("Formal campaign memory floor queue depth is invalid")
@@ -869,7 +871,7 @@ def benchmark_formal_memory_candidate(
 
     if workers not in _PRODUCER_PROBE_WORKERS:
         raise ValueError("Formal memory calibration workers must be 4, 5, 6, or 8")
-    if row_group_size not in {65_536, 262_144}:
+    if row_group_size not in {16_384, 65_536, 262_144}:
         raise ValueError("Formal memory calibration row group size is invalid")
     if queue_depth not in {1, 2}:
         raise ValueError("Formal memory calibration queue depth is invalid")
@@ -1160,13 +1162,13 @@ def run_stage052_resource_calibration(
         raise RuntimeError(
             "Formal memory measurement must use a swap-free isolated cgroup v2 service"
         )
-    if (
-        formal_benchmark.swap_peak_bytes > 0
-        or formal_benchmark.fallback_count > 0
-        or formal_benchmark.resource_limit_exceeded
-    ):
+    # ``swap_peak_bytes`` is the host-wide psutil delta retained as telemetry.
+    # Only the dedicated cgroup counter above can attribute swap to this Formal
+    # workload; treating unrelated host activity as a hard gate would make the
+    # signed resource contract non-reproducible.
+    if formal_benchmark.fallback_count > 0 or formal_benchmark.resource_limit_exceeded:
         raise RuntimeError(
-            "Formal memory measurement observed swap, fallback, or a resource limit"
+            "Formal memory measurement observed fallback or a resource limit"
         )
     if (
         formal_campaign_memory_floor is not None
@@ -1442,7 +1444,7 @@ def main() -> int:
     parser.add_argument(
         "--row-group-size",
         type=int,
-        choices=(65_536, 262_144),
+        choices=(16_384, 65_536, 262_144),
         default=65_536,
     )
     parser.add_argument(

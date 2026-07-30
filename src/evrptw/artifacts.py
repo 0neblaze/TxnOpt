@@ -288,8 +288,10 @@ class ArtifactStorageConfig:
             raise ValueError(
                 f"{self.storage_policy_version} does not support {self.screening_schema_version}"
             )
-        if self.parquet_row_group_size not in {65_536, 262_144}:
-            raise ValueError("Parquet row group size must be 65,536 or 262,144")
+        if self.parquet_row_group_size not in {16_384, 65_536, 262_144}:
+            raise ValueError(
+                "Parquet row group size must be 16,384, 65,536, or 262,144"
+            )
         if self.parquet_queue_depth not in {1, 2}:
             raise ValueError("Parquet queue depth must be 1 or 2")
         if self.per_instance_seed_max_bytes <= 0 or self.per_run_max_bytes <= 0:

@@ -42,7 +42,7 @@ _FORMAL_RECALIBRATION_V3_PREDECESSOR_BATCH_ID: Final = "batch0008"
 _FORMAL_RECALIBRATION_V3_RESOURCE_SUMMARY_SHA256: Final = (
     "ec5e8eb43562b983ac0b3d733da446f45fa59407b278dff93323ce4d6e6e6253"
 )
-_ROW_GROUP_SIZES: Final = frozenset({65_536, 262_144})
+_ROW_GROUP_SIZES: Final = frozenset({16_384, 65_536, 262_144})
 _QUEUE_DEPTHS: Final = frozenset({1, 2})
 
 
@@ -282,7 +282,9 @@ class ProducerResourceContract:
         ):
             raise ValueError("producer semantic/calibration digest is invalid")
         if self.row_group_size not in _ROW_GROUP_SIZES:
-            raise ValueError("row_group_size must be 65,536 or 262,144")
+            raise ValueError(
+                "row_group_size must be 16,384, 65,536, or 262,144"
+            )
         if self.queue_depth not in _QUEUE_DEPTHS:
             raise ValueError("queue_depth must be 1 or 2")
         if self.aggregate_memory_limit_bytes < self.selected_aggregate_peak_rss_bytes:
@@ -498,6 +500,7 @@ def load_formal_resource_recalibration_evidence(
         label: str,
         *,
         require_per_worker: bool,
+        require_zero_host_swap: bool,
     ) -> Mapping[str, object]:
         if not isinstance(raw_measurement, Mapping):
             raise RuntimeError(
@@ -508,6 +511,7 @@ def load_formal_resource_recalibration_evidence(
         aggregate_peak = raw_measurement.get("aggregate_peak_rss_bytes")
         semantic_digest = raw_measurement.get("semantic_digest")
         per_worker_peak = raw_measurement.get("per_worker_peak_rss_bytes")
+        host_swap_delta = raw_measurement.get("swap_peak_bytes")
         if (
             isinstance(workers, bool)
             or not isinstance(workers, int)
@@ -521,6 +525,9 @@ def load_formal_resource_recalibration_evidence(
             or aggregate_peak <= 0
             or not isinstance(semantic_digest, str)
             or not _is_sha256(semantic_digest)
+            or isinstance(host_swap_delta, bool)
+            or not isinstance(host_swap_delta, int)
+            or host_swap_delta < 0
             or (
                 require_per_worker
                 and (
@@ -534,7 +541,7 @@ def load_formal_resource_recalibration_evidence(
                 f"Formal resource recalibration {label} measurement is invalid"
             )
         if (
-            not _is_exact_zero_int(raw_measurement.get("swap_peak_bytes"))
+            (require_zero_host_swap and host_swap_delta != 0)
             or not _is_exact_zero_int(raw_measurement.get("fallback_count"))
             or raw_measurement.get("resource_limit_exceeded") is not False
         ):
@@ -550,6 +557,9 @@ def load_formal_resource_recalibration_evidence(
         formal_memory.get("benchmark"),
         "Formal memory",
         require_per_worker=False,
+        require_zero_host_swap=(
+            report_schema == "stage05.2-resource-calibration-report-v2"
+        ),
     )
     formal_per_worker = formal_memory.get("per_worker_peak_rss_bytes")
     if (
@@ -592,6 +602,9 @@ def load_formal_resource_recalibration_evidence(
                 item,
                 field_name,
                 require_per_worker=True,
+                require_zero_host_swap=(
+                    report_schema == "stage05.2-resource-calibration-report-v2"
+                ),
             )
             for item in raw_measurements
         ]
@@ -854,8 +867,6 @@ def select_producer_configuration(
         reasons: list[str] = []
         if result.aggregate_peak_rss_bytes > memory_budget or result.resource_limit_exceeded:
             reasons.append("memory budget or resource limit exceeded")
-        if result.swap_peak_bytes > 0:
-            reasons.append("swap pressure observed")
         if result.fallback_count > 0:
             reasons.append("fallback observed")
         if result.semantic_digest != baseline.semantic_digest:
@@ -899,7 +910,9 @@ class ParquetBenchmark:
 
     def __post_init__(self) -> None:
         if self.row_group_size not in _ROW_GROUP_SIZES:
-            raise ValueError("row_group_size must be 65,536 or 262,144")
+            raise ValueError(
+                "row_group_size must be 16,384, 65,536, or 262,144"
+            )
         if self.queue_depth not in _QUEUE_DEPTHS:
             raise ValueError("queue_depth must be 1 or 2")
         if not math.isfinite(self.persistence_seconds) or self.persistence_seconds <= 0.0:
