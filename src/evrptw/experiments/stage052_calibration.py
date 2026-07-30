@@ -1492,6 +1492,12 @@ def main() -> int:
         default=Path("configs/stage052_performance.toml"),
     )
     arguments = parser.parse_args()
+    resolved_repository = arguments.repository_root.resolve()
+    resolved_config = (
+        arguments.config.resolve()
+        if arguments.config.is_absolute()
+        else (resolved_repository / arguments.config).resolve()
+    )
     if (
         arguments.probe_workers is not None
         and arguments.formal_memory_probe_workers is not None
@@ -1505,8 +1511,8 @@ def main() -> int:
             row_group_size=arguments.row_group_size,
             queue_depth=arguments.queue_depth,
             output_root=arguments.output_root.resolve(),
-            root=arguments.repository_root.resolve(),
-            config_path=arguments.config.resolve(),
+            root=resolved_repository,
+            config_path=resolved_config,
             run_label=arguments.run_label,
         )
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -1518,8 +1524,8 @@ def main() -> int:
             workers=arguments.probe_workers,
             corpus_dir=arguments.corpus_dir.resolve(),
             output_root=arguments.output_root.resolve(),
-            root=arguments.repository_root.resolve(),
-            config_path=arguments.config.resolve(),
+            root=resolved_repository,
+            config_path=resolved_config,
             run_label=arguments.run_label,
         )
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -1542,8 +1548,8 @@ def main() -> int:
         corpus_dir=arguments.corpus_dir.resolve(),
         output_root=arguments.output_root.resolve(),
         contract_path=arguments.contract_path.resolve(),
-        root=arguments.repository_root.resolve(),
-        config_path=arguments.config.resolve(),
+        root=resolved_repository,
+        config_path=resolved_config,
         run_label=arguments.run_label,
         require_clean_source=not arguments.allow_dirty_source,
         formal_campaign_memory_floor=formal_campaign_memory_floor,

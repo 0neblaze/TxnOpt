@@ -544,7 +544,7 @@ def test_calibration_cli_runs_formal_memory_probe_without_corpus(
             "--queue-depth",
             "2",
             "--config",
-            str(tmp_path / "config.toml"),
+            "configs/stage052_performance.toml",
         ],
     )
 
@@ -555,6 +555,9 @@ def test_calibration_cli_runs_formal_memory_probe_without_corpus(
     assert calls[0]["queue_depth"] == 2
     assert calls[0]["output_root"] == (tmp_path / "probe").resolve()
     assert calls[0]["root"] == (tmp_path / "repository").resolve()
+    assert calls[0]["config_path"] == (
+        tmp_path / "repository" / "configs/stage052_performance.toml"
+    ).resolve()
 
 
 def test_calibration_cli_requires_and_loads_failed_formal_memory_floor(

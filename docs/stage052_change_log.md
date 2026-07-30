@@ -2475,3 +2475,8 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   source；缺少 binding 会在 argparse 阶段、启动 evidence 前失败。
 - 该 host-orchestration 修复必须再次形成 clean commit、完整质量门槛、双轴
   code review、新 wheels/venvs/runtime/sealed source，并使用下一未占用 label。
+- 首次双轴复核拦截了一个尚未消费新 label 的残留 cwd 依赖：相对 `--config`
+  仍由 `Path.resolve()` 基于 process cwd 解析。新增红测使用错误 cwd、显式
+  repository root 与相对 config，随后统一把相对 config 解析为
+  `repository_root / config`；绝对 config 保持原 identity。该 finding 修复并重审
+  之前不得启动下一 probe。

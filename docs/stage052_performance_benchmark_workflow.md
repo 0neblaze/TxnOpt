@@ -295,7 +295,8 @@ probe instance 非空。Formal memory probe 在创建 output root 和提交 work
 所有 calibration CLI 必须显式传入 clean ext4 checkout 的
 `--repository-root`；service working directory 不再承担隐式 source binding。
 缺少该参数必须在 argparse 阶段 fail fast，避免从 `/home/oneblaze` 等非 worktree
-目录启动后才消费 evidence label。
+目录启动后才消费 evidence label。相对 `--config` 必须基于该显式 repository root
+解析，禁止基于 service cwd 解析。
 
 producer 的 screening-definition identity state（筛选定义身份状态）固定使用
 `native_bounded_digest`（原生有界摘要）backend，保存完整 SHA-256 collision token

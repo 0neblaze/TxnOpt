@@ -641,7 +641,8 @@ this repository or one of its subdirectories.
   explicitly through `--repository-root`. Service working-directory state is
   not a source-identity input and may not be relied on implicitly. A missing
   repository binding must fail in argument parsing before an evidence label is
-  started.
+  started. Relative `--config` paths resolve against that explicit repository,
+  never against the service working directory.
 - Job-parallel selection compares 1/2/4 workers on the fixed four-instance,
   three-seed scope. Two workers require at least 1.5x speedup and at most 12 GiB
   aggregate RSS; four workers are selected only at 2.5x and at most 12 GiB.
