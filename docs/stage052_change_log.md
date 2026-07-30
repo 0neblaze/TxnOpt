@@ -2480,3 +2480,20 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   repository root 与相对 config，随后统一把相对 config 解析为
   `repository_root / config`；绝对 config 保持原 identity。该 finding 修复并重审
   之前不得启动下一 probe。
+
+## 2026-07-31：G Formal memory attempt17 sealed-source packaging failure
+
+- `stage05.2_formal_memory_probe_attempt17` 使用 clean commit
+  `37ad9ff9a81a688e818c8d137299461583be7546`、wheel SHA-256
+  `832435c2a036048c67c52be5cc8aff6dd303ff42dac25495df5af8fcb666342d`
+  和显式 `--repository-root` 启动，但 host packaging 把 sealed source 做成
+  `git archive`，同时错误地把 active checkout 作为 repository root。active checkout
+  的 `data/schneider/r205_21.txt` 是指向 D: 的 symlink；producer 在约 0.4 秒内由
+  snapshot-local ordinary-file gate fail fast。service status 1、memory peak
+  256 KiB、swap peak 0；solver、worker 与 output root 均未创建，没有 signed v3
+  report 或 readiness geometry。journal 与错误 sealed tree 作为不可变 failure
+  evidence 保留；attempt17 不续跑、不复用、不导入。
+- replacement sealed source 必须由 clean revision 通过
+  `git clone --local --no-hardlinks` 创建，随后把 exact `r205_21` 实体化为 snapshot
+  内 ordinary file。启动前必须独立验证 `.git` 存在、HEAD 精确、status clean、
+  input 非 symlink 且 SHA-256 精确；缺一项不得启动下一 label。
