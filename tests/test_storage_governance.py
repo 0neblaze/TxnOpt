@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -1134,6 +1135,94 @@ def test_duplicate_failure_retains_auditable_projection_and_trigger_shard(
     assert projection["audit_only"] is True
     assert projection["root_cause_id"] == "sqlite-transaction-v1"
     assert len(projection["omitted_files"]) == 1
+
+
+def test_lifecycle_binding_preserves_storage_and_inventory_tree_identities(
+    tmp_path: Path,
+) -> None:
+    locator = _locator(tmp_path)
+    for alias in locator.aliases:
+        locator.resolve(alias).absolute_path.mkdir()
+    state_root = tmp_path / "state"
+    retention_state_root = tmp_path / "retention-state"
+    governance = ExperimentStorageGovernance(
+        policy=GovernancePolicy(),
+        locator=locator,
+        state_root=state_root,
+        retention_state_root=retention_state_root,
+        free_space=lambda _path: 500 * GIB,
+        volume_probe=lambda path: next(
+            root.volume
+            for root in (locator.resolve(alias) for alias in locator.aliases)
+            if root.absolute_path == path
+        ),
+    )
+    run_label = "stage05.2_resource_calibration_attempt98"
+    source = tmp_path / "source" / run_label
+    source.mkdir(parents=True)
+    artifact = source / "manifest.json"
+    artifact.write_bytes(b"sealed calibration")
+    receipt = governance.retain_run(
+        RetentionRequest(
+            run_label=run_label,
+            generation=1,
+            retention_class=RetentionClass.ACCEPTED_FULL,
+            archive_root_alias="e_archive",
+            archive_relative_path=f"runs/{run_label}/generation-0001",
+            segments=(RetentionSegment("run", source, "."),),
+            replay_verifier=_replay_writer(
+                tmp_path,
+                run_label=run_label,
+                generation=1,
+            ),
+        )
+    )
+    artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    lifecycle_digest = hashlib.sha256()
+    lifecycle_digest.update(b"manifest.json\0")
+    lifecycle_digest.update(str(artifact.stat().st_size).encode("ascii"))
+    lifecycle_digest.update(b"\0")
+    lifecycle_digest.update(artifact_sha256.encode("ascii"))
+    lifecycle_digest.update(b"\n")
+    lifecycle_tree_sha256 = lifecycle_digest.hexdigest()
+    inventory_path = tmp_path / "content-inventory.json"
+    storage_governance_module._write_signed_json(
+        inventory_path,
+        {
+            "schema_version": "experiment-content-inventory-v1",
+            "run_label": run_label,
+            "source_tree_sha256": lifecycle_tree_sha256,
+            "files": [
+                {
+                    "relative_path": "manifest.json",
+                    "byte_count": artifact.stat().st_size,
+                    "sha256": artifact_sha256,
+                    "modified_time_ns": artifact.stat().st_mtime_ns,
+                }
+            ],
+        },
+    )
+    permit_path = state_root / "permits" / f"{run_label}.json"
+    permit_sha256 = storage_governance_module._write_signed_json(
+        permit_path,
+        {"run_label": run_label, "status": "reserved"},
+    )
+
+    binding_path = governance.write_lifecycle_retention_binding(
+        receipt,
+        lifecycle_retention_class="current_accepted_full",
+        storage_permit_sha256=permit_sha256,
+        close_performance={"backend": "test"},
+        content_inventory_path=inventory_path,
+    )
+    binding = storage_governance_module._load_signed_json(binding_path)
+
+    assert binding["archive_tree_sha256"] == lifecycle_tree_sha256
+    assert binding["storage_tree_sha256"] == receipt.tree_sha256
+    assert binding["archive_tree_sha256"] != binding["storage_tree_sha256"]
+    assert binding["content_inventory_sha256"] == hashlib.sha256(
+        inventory_path.read_bytes()
+    ).hexdigest()
 
 
 def test_retention_retry_adopts_only_an_identical_published_generation(

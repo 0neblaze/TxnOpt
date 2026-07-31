@@ -2909,6 +2909,82 @@ def compute_tree_identity_parallel(
     return _identities_tree(identities)
 
 
+def _verify_lifecycle_content_inventory(
+    inventory_path: Path,
+    *,
+    run_label: str,
+    archive_path: Path,
+) -> tuple[str, int, int, str]:
+    """Bind a lifecycle inventory tree to an already verified v2 archive."""
+
+    inventory = _load_signed_json(inventory_path)
+    files = inventory.get("files")
+    if (
+        inventory.get("schema_version") != "experiment-content-inventory-v1"
+        or inventory.get("run_label") != run_label
+        or not isinstance(files, list)
+        or not files
+    ):
+        raise StorageGovernanceError("lifecycle content inventory is invalid")
+    if any(not isinstance(item, Mapping) for item in files):
+        raise StorageGovernanceError("lifecycle content inventory entry is invalid")
+    mapping_files = cast(list[Mapping[str, object]], files)
+    expected: dict[str, tuple[int, str]] = {}
+    digest = hashlib.sha256()
+    for raw_item in sorted(
+        mapping_files,
+        key=lambda item: str(item.get("relative_path", "")),
+    ):
+        relative = PurePosixPath(str(raw_item.get("relative_path", "")))
+        byte_count = raw_item.get("byte_count")
+        sha256 = str(raw_item.get("sha256", ""))
+        relative_text = relative.as_posix()
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or ".." in relative.parts
+            or relative_text in expected
+            or isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or byte_count < 0
+            or _SHA256.fullmatch(sha256) is None
+        ):
+            raise StorageGovernanceError("lifecycle content inventory entry is invalid")
+        expected[relative_text] = (byte_count, sha256)
+        digest.update(relative_text.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(byte_count).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(sha256.encode("ascii"))
+        digest.update(b"\n")
+    expected_tree_sha256 = digest.hexdigest()
+    if inventory.get("source_tree_sha256") != expected_tree_sha256:
+        raise StorageGovernanceError("lifecycle content inventory tree differs")
+    observed: dict[str, Path] = {}
+    for path in sorted(archive_path.rglob("*"), key=lambda item: item.as_posix()):
+        if path.is_symlink():
+            raise StorageGovernanceError("lifecycle archive contains a symlink")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise StorageGovernanceError("lifecycle archive entry is unsupported")
+        observed[path.relative_to(archive_path).as_posix()] = path
+    if set(observed) != set(expected):
+        raise StorageGovernanceError("lifecycle archive file set differs")
+    for observed_relative, path in observed.items():
+        byte_count, sha256 = expected[observed_relative]
+        if path.stat().st_size != byte_count or _file_sha256(path) != sha256:
+            raise StorageGovernanceError(
+                f"lifecycle archive content differs: {observed_relative}"
+            )
+    return (
+        expected_tree_sha256,
+        len(expected),
+        sum(byte_count for byte_count, _sha256 in expected.values()),
+        _file_sha256(inventory_path),
+    )
+
+
 def _maintenance_request_for_roots(
     policy: GovernancePolicy,
     roots: tuple[Path, ...],
@@ -3469,6 +3545,7 @@ class ExperimentStorageGovernance:
         lifecycle_retention_class: str,
         storage_permit_sha256: str,
         close_performance: Mapping[str, object],
+        content_inventory_path: Path,
     ) -> Path:
         """Bind a verified v2 archive generation to lifecycle-v3 close input."""
 
@@ -3528,6 +3605,23 @@ class ExperimentStorageGovernance:
             or replay.get("status") != "passed"
         ):
             raise StorageGovernanceError("lifecycle retention replay differs")
+        (
+            lifecycle_tree_sha256,
+            lifecycle_file_count,
+            lifecycle_byte_count,
+            content_inventory_sha256,
+        ) = _verify_lifecycle_content_inventory(
+            content_inventory_path,
+            run_label=receipt.run_label,
+            archive_path=archive_path,
+        )
+        if (
+            lifecycle_file_count != receipt.kept_file_count
+            or lifecycle_byte_count != receipt.kept_bytes
+        ):
+            raise StorageGovernanceError(
+                "lifecycle inventory counts differ from retained generation"
+            )
         permit_path = self.state_root / "permits" / f"{receipt.run_label}.json"
         if (
             not permit_path.is_file()
@@ -3550,9 +3644,11 @@ class ExperimentStorageGovernance:
                 "verification_status": "verified",
                 "archive_root_alias": "e_archive",
                 "archive_relative_path": relative_archive,
-                "archive_tree_sha256": receipt.tree_sha256,
+                "archive_tree_sha256": lifecycle_tree_sha256,
+                "storage_tree_sha256": receipt.tree_sha256,
                 "file_count": receipt.kept_file_count,
                 "byte_count": receipt.kept_bytes,
+                "content_inventory_sha256": content_inventory_sha256,
                 "registry_sha256": receipt.registry_sha256,
                 "replay_receipt_relative_path": replay_relative.as_posix(),
                 "replay_receipt_sha256": receipt.replay_receipt_sha256,

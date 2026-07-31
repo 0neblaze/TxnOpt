@@ -2573,6 +2573,14 @@ compatibility fallback（兼容回退）。
   per-worker RSS floor、零 geometry contribution，以及 contract selection 全部精确一致。
   v2 Attempt99 兼容路径仍要求 floor 与其历史 contract topology 相同。新增回归测试覆盖
   “不同但各自精确”的合法 v3 形状和错误 predecessor topology 的 fail-fast 拒绝。
+- Attempt21 进入 `CLASSIFIED/current_accepted_full` 后，归档前交叉检查又发现 lifecycle
+  content inventory 与 storage-v2 retention receipt 使用不同的 canonical tree encoding：
+  两者文件集、逐文件 size/SHA-256 和总 bytes 完全相同，但 tree SHA-256 必然不同。
+  原 binding writer 把 storage tree 写进 lifecycle `archive_tree_sha256`，使首次 accepted
+  lifecycle-v3 full-retention 永远无法通过 `mark_retained`。修复不改写任何既有 storage
+  registry identity；binding receipt 现在同时保存 `storage_tree_sha256`，并从签名 content
+  inventory 独立重算、逐文件重放后写入 lifecycle `archive_tree_sha256`。回归测试要求两种
+  identity 各自精确、明确不同，且 inventory SHA-256 也进入 binding receipt。
 
 ## 2026-07-31：Stage 0--8 storage governance v2 与 E 盘归档入口
 

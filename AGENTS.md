@@ -32,7 +32,11 @@
   evidence, allocator and batch-release telemetry, and signed producer resource
   contract. CLI terminal manifests must replay both nested control manifests and
   direct `artifact-storage-v2` shard manifests; an unlisted shard artifact is a
-  sealing failure, not a successful calibration.
+  sealing failure, not a successful calibration. Full lifecycle retention binds
+  both immutable identities: the storage-v2 canonical tree remains in the
+  retention registry, while lifecycle close uses its independently signed
+  path/size/SHA-256 content-inventory tree. The binding receipt must preserve and
+  verify both; the two different canonical hash algorithms are not byte-equal.
 - Apache-2.0 applies only to original code and documentation. Benchmark data,
   papers, commercial solvers, and third-party repositories remain under their
   own terms.
