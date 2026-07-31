@@ -1657,6 +1657,42 @@ def build_cli_terminal_manifest(
             raise StorageGovernanceError("terminal manifest identity conflicts")
         identities[relative] = identity
 
+    def replay_artifact_inventory(
+        artifacts: list[object],
+        *,
+        artifact_root: Path,
+    ) -> None:
+        for raw in artifacts:
+            if not isinstance(raw, dict):
+                raise StorageGovernanceError("child artifact identity is invalid")
+            relative = PurePosixPath(str(raw.get("relative_path", "")))
+            checksum = str(raw.get("checksum", ""))
+            byte_size = raw.get("byte_size")
+            if (
+                relative.is_absolute()
+                or not relative.parts
+                or ".." in relative.parts
+                or _SHA256.fullmatch(checksum) is None
+                or isinstance(byte_size, bool)
+                or not isinstance(byte_size, int)
+                or byte_size < 0
+            ):
+                raise StorageGovernanceError("child artifact identity is invalid")
+            artifact_path = artifact_root.joinpath(*relative.parts)
+            stat_before = artifact_path.stat()
+            if not artifact_path.is_file() or stat_before.st_size != byte_size:
+                raise StorageGovernanceError("child artifact size differs")
+            observed_checksum = _file_sha256(artifact_path)
+            stat_after = artifact_path.stat()
+            if (
+                stat_after.st_size != stat_before.st_size
+                or stat_after.st_mtime_ns != stat_before.st_mtime_ns
+            ):
+                raise StorageGovernanceError("child artifact changed while hashing")
+            if observed_checksum != checksum:
+                raise StorageGovernanceError("child artifact checksum differs")
+            add_identity(artifact_path, checksum=observed_checksum)
+
     child_manifests = tuple(
         sorted(
             path
@@ -1686,36 +1722,66 @@ def build_cli_terminal_manifest(
             (str(payload["status"]), str(payload["evidence_completeness"]))
         )
         child_root = manifest_path.parent.parent
-        for raw in artifacts:
-            if not isinstance(raw, dict):
-                raise StorageGovernanceError("child artifact identity is invalid")
-            relative = PurePosixPath(str(raw.get("relative_path", "")))
-            checksum = str(raw.get("checksum", ""))
-            byte_size = raw.get("byte_size")
-            if (
-                relative.is_absolute()
-                or not relative.parts
-                or ".." in relative.parts
-                or _SHA256.fullmatch(checksum) is None
-                or isinstance(byte_size, bool)
-                or not isinstance(byte_size, int)
-                or byte_size < 0
-            ):
-                raise StorageGovernanceError("child artifact identity is invalid")
-            artifact_path = child_root.joinpath(*relative.parts)
-            stat_before = artifact_path.stat()
-            if not artifact_path.is_file() or stat_before.st_size != byte_size:
-                raise StorageGovernanceError("child artifact size differs")
-            observed_checksum = _file_sha256(artifact_path)
-            stat_after = artifact_path.stat()
-            if (
-                stat_after.st_size != stat_before.st_size
-                or stat_after.st_mtime_ns != stat_before.st_mtime_ns
-            ):
-                raise StorageGovernanceError("child artifact changed while hashing")
-            if observed_checksum != checksum:
-                raise StorageGovernanceError("child artifact checksum differs")
-            add_identity(artifact_path, checksum=observed_checksum)
+        replay_artifact_inventory(artifacts, artifact_root=child_root)
+        add_identity(manifest_path)
+        add_identity(sidecar_path)
+    shard_manifests = tuple(
+        sorted(resolved_output.glob("**/*_shard_manifest_*.json"))
+    )
+    for manifest_path in shard_manifests:
+        sidecar_path = manifest_path.with_suffix(".sha256")
+        if not signed_sidecar_matches(manifest_path, sidecar_path):
+            raise StorageGovernanceError("shard artifact manifest signature differs")
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise StorageGovernanceError("shard artifact manifest is invalid") from error
+        artifacts = payload.get("artifacts") if isinstance(payload, dict) else None
+        instance = payload.get("instance") if isinstance(payload, dict) else None
+        seed = payload.get("seed") if isinstance(payload, dict) else None
+        completeness = (
+            payload.get("evidence_completeness") if isinstance(payload, dict) else None
+        )
+        shard_ordinal = (
+            payload.get("shard_ordinal") if isinstance(payload, dict) else None
+        )
+        worker_identity = (
+            payload.get("worker_identity") if isinstance(payload, dict) else None
+        )
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != "artifact-storage-v2"
+            or payload.get("run_label") != run_label
+            or completeness not in {"complete", "partial"}
+            or not isinstance(artifacts, list)
+            or not isinstance(instance, str)
+            or not instance
+            or isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or manifest_path.parent.name != str(seed)
+            or manifest_path.parent.parent.name != instance
+            or isinstance(shard_ordinal, bool)
+            or not isinstance(shard_ordinal, int)
+            or shard_ordinal < 0
+            or not isinstance(worker_identity, str)
+            or not worker_identity
+        ):
+            raise StorageGovernanceError("shard artifact inventory is missing")
+        expected_prefix = (instance, str(seed))
+        if any(
+            not isinstance(raw, dict)
+            or PurePosixPath(str(raw.get("relative_path", ""))).parts[:2]
+            != expected_prefix
+            for raw in artifacts
+        ):
+            raise StorageGovernanceError("shard artifact path identity differs")
+        child_terminal_states.append(
+            ("complete" if completeness == "complete" else "partial", completeness)
+        )
+        replay_artifact_inventory(
+            artifacts,
+            artifact_root=manifest_path.parent.parent.parent,
+        )
         add_identity(manifest_path)
         add_identity(sidecar_path)
     for post_manifest_path in sorted(

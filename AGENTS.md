@@ -30,7 +30,9 @@
   resource gate. A successful calibration is trusted only after independent
   replay of its terminal inventory, v3 report, scoped cgroup measurement/reset
   evidence, allocator and batch-release telemetry, and signed producer resource
-  contract.
+  contract. CLI terminal manifests must replay both nested control manifests and
+  direct `artifact-storage-v2` shard manifests; an unlisted shard artifact is a
+  sealing failure, not a successful calibration.
 - Apache-2.0 applies only to original code and documentation. Benchmark data,
   papers, commercial solvers, and third-party repositories remain under their
   own terms.

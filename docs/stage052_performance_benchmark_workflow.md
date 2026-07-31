@@ -457,6 +457,12 @@ single-pass count 和 cleanup state 必须写入外部 progress log。child summ
 JSON-safe（可安全 JSON 序列化）的有界对象并携带 run/batch/shard/instance/seed 身份；
 parent 必须逐字段核对。失败路径同样必须写 child PID/peak RSS、parent RSS、耗时和
 cleanup state，残留 scratch 在 fail fast 前清除并记录，不得静默重试。
+Calibration 的 CLI terminal manifest 必须同时发现并重放两类 child inventory：
+`**/control/*_manifest.json` terminal child 与直接位于 `instance/seed/` 的
+`artifact-storage-v2` shard manifest。后者必须验证 sidecar、schema、run/instance/seed、
+shard ordinal、worker identity、complete/partial 状态、`instance/seed` path prefix，
+并从 worker/formal root 逐文件重算 byte 与 SHA-256。任何未列入 child inventory 的
+artifact 仍须 fail fast；failure manifest 自动收纳残留的行为不能替代 success closure。
 
 若 sealed raw（已密封原始证据）归档后发生物理 D 盘更换，retrospective review
 （追溯复审）只能通过 signed storage migration attestation（签名存储迁移证明）

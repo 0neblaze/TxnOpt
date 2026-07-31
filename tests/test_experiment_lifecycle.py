@@ -1754,6 +1754,60 @@ def test_terminal_manifest_reuses_signed_child_artifact_identities(
         build_cli_terminal_manifest(output_dir=output, run_label=label)
 
 
+def test_terminal_manifest_replays_direct_v2_shard_manifests(tmp_path: Path) -> None:
+    label = "stage05.2_resource_calibration_attempt01"
+    output = tmp_path / label
+    worker_root = output / "formal-memory-workers6-rg16384-qd1"
+    shard = worker_root / "r205_21" / "2014"
+    raw = shard / f"{label}_events_r205_21_2014.parquet"
+    raw.parent.mkdir(parents=True)
+    raw.write_bytes(b"parquet")
+    shard_manifest = shard / f"{label}_shard_manifest_r205_21_2014.json"
+    atomic_write_signed_json(
+        shard_manifest,
+        {
+            "schema_version": "artifact-storage-v2",
+            "run_label": label,
+            "instance": "r205_21",
+            "seed": 2014,
+            "shard_ordinal": 0,
+            "worker_identity": "worker-0",
+            "evidence_completeness": "complete",
+            "artifacts": [
+                {
+                    "relative_path": f"r205_21/2014/{raw.name}",
+                    "byte_size": raw.stat().st_size,
+                    "checksum": hashlib.sha256(raw.read_bytes()).hexdigest(),
+                }
+            ],
+        },
+    )
+    atomic_write_signed_json(
+        output / "calibration_report.json",
+        {"run_label": label, "status": "complete"},
+    )
+
+    terminal = build_cli_terminal_manifest(output_dir=output, run_label=label)
+    payload = json.loads(terminal.read_text(encoding="utf-8"))
+
+    assert {item["relative_path"] for item in payload["artifacts"]} == {
+        "calibration_report.json",
+        "calibration_report.sha256",
+        f"formal-memory-workers6-rg16384-qd1/r205_21/2014/{raw.name}",
+        (
+            "formal-memory-workers6-rg16384-qd1/r205_21/2014/"
+            f"{shard_manifest.name}"
+        ),
+        (
+            "formal-memory-workers6-rg16384-qd1/r205_21/2014/"
+            f"{shard_manifest.with_suffix('.sha256').name}"
+        ),
+    }
+    raw.write_bytes(b"PARQUET")
+    with pytest.raises(StorageGovernanceError, match="child artifact checksum differs"):
+        build_cli_terminal_manifest(output_dir=output, run_label=label)
+
+
 def test_failed_cli_attempt_persists_partial_inventory_before_sealing(
     tmp_path: Path,
 ) -> None:

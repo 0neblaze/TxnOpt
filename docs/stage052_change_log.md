@@ -2777,3 +2777,21 @@ compatibility fallback（兼容回退）。
   次数和 ordinal 序列，并要求 parent 与 18 个 axis 的 allocator 均为 `malloc`。该变更
   只控制 300 秒 axis 内的可回收 Python page，6 workers、16384/1、swap 0、fallback 0 与
   20% headroom 均保持不变；必须用新 label 重测，不能重标 Attempt18。
+- `stage05.2_resource_calibration_attempt19` 在 pre-admission 阶段因 Scheduled Task 启动的
+  systemd user service 缺少 Windows PowerShell/WSL 路径而拒绝 canonical E: volume
+  identity；它没有 output、permit 或 lifecycle record，但其 systemd journal 保留失败，
+  label 不复用。后续 service 明确绑定最小 Linux、WSL、PowerShell PATH，并在分配新 label
+  前用无实验写入的 systemd diagnostic 重放 historical gate 与 runtime identity。
+- `stage05.2_resource_calibration_attempt20` 首次在固定 6/16384/1、swap 0、20% headroom
+  协议下完成全部计算并通过资源门：cgroup aggregate peak `18,141,900,800` bytes，
+  per-worker formal peak `3,345,002,496` bytes，contract aggregate limit
+  `21,770,280,960` bytes，capacity `25,196,937,216` bytes，fallback 0；allocator 为
+  `malloc`。但 success terminal sealing 随后拒绝全部 direct v2 shard artifacts 为
+  unlisted，因此该 attempt 仍是不可接受的 sealing failure，不能启动 Formal。
+- 根因是通用 CLI terminal builder 只发现 `**/control/*_manifest.json`，而 Calibration
+  的 `artifact-storage-v2` manifests 直接位于 `instance/seed/`；早先 headroom failures
+  只走自动收纳残留的 failure manifest 路径，未触发 success closure。builder 现在独立
+  发现 direct shard manifests，验证签名、schema、run/instance/seed、shard/worker 身份、
+  completeness 与 exact path prefix，并从 worker/formal root 重算每个 artifact 的 byte/
+  SHA-256。新回归测试复现真实 Formal directory shape；Attempt20 不重封或重标，修复必须
+  以新提交和新 calibration label 重跑。
