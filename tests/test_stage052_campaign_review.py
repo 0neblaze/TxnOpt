@@ -72,7 +72,10 @@ from evrptw.stage052_evidence import (
     Stage052PrerequisiteIdentity,
     verify_stage052_review_files,
 )
-from evrptw.stage052_resources import ProducerResourceContract
+from evrptw.stage052_resources import (
+    FormalResourceRecalibrationEvidence,
+    ProducerResourceContract,
+)
 from evrptw.stage052_retention import RetentionRecord, write_retention_registry
 from evrptw.storage_governance import (
     build_cli_failure_manifest,
@@ -187,6 +190,137 @@ def test_lifecycle_failure_capsule_review_rejects_artifact_drift(
             raw_manifest_path=raw_manifest,
             review_manifest_path=run_dir / "review" / "review_manifest.json",
         )
+
+
+def test_resource_calibration_review_replays_terminal_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    label = "stage05.2_resource_calibration_attempt16"
+    run_dir = tmp_path / label
+    control_dir = run_dir / "control"
+    control_dir.mkdir(parents=True)
+    contract = ProducerResourceContract(
+        selected_workers=6,
+        available_memory_bytes=25_196_933_120,
+        selected_aggregate_peak_rss_bytes=18_000_000_000,
+        selected_per_worker_peak_rss_bytes=3_000_000_000,
+        aggregate_memory_limit_bytes=21_600_000_000,
+        per_worker_memory_limit_bytes=3_600_000_000,
+        semantic_digest="a" * 64,
+        calibration_digest="b" * 64,
+        row_group_size=16_384,
+        queue_depth=1,
+    )
+    contract_path = tmp_path / "resource-contract.json"
+    atomic_write_signed_json(contract_path, contract.to_dict())
+    formal = {
+        "cgroup_path": (
+            "/user.slice/user-1001.slice/user@1001.service/app.slice/"
+            "stage052-calibration-attempt16.service"
+        ),
+        "aggregate_peak_rss_bytes": 18_000_000_000,
+    }
+    measurement_path = run_dir / "formal_memory_measurement.json"
+    atomic_write_signed_json(
+        measurement_path,
+        {
+            "schema_version": "stage05.2-formal-memory-measurement-v1",
+            "run_label": label,
+            "status": "measured_pending_contract_validation",
+            "memory_capacity_bytes": contract.available_memory_bytes,
+            "measurement": formal,
+        },
+    )
+    report_path = run_dir / "calibration_report.json"
+    atomic_write_signed_json(
+        report_path,
+        {
+            "schema_version": "stage05.2-resource-calibration-report-v3",
+            "run_label": label,
+            "corpus_role": "read_only_benchmark_differential_only",
+            "formal_memory_measurement_sha256": hashlib.sha256(
+                measurement_path.read_bytes()
+            ).hexdigest(),
+            "formal_memory_measurement": formal,
+        },
+    )
+    reset_path = run_dir / "formal_memory_cgroup_peak_reset.json"
+    atomic_write_signed_json(
+        reset_path,
+        {
+            "schema_version": "stage05.2-cgroup-peak-reset-v1",
+            "run_label": label,
+            "status": "verified",
+            "cgroup_path": formal["cgroup_path"],
+            "memory_current_bytes_after_reset": 100,
+            "memory_peak_bytes_after_reset": 100,
+            "swap_current_bytes_after_reset": 0,
+            "swap_peak_bytes_after_reset": 0,
+        },
+    )
+    artifacts = []
+    for path in sorted(run_dir.glob("*")):
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        artifacts.append(
+            {
+                "relative_path": path.relative_to(run_dir).as_posix(),
+                "byte_size": stat.st_size,
+                "checksum": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "modified_time_ns": stat.st_mtime_ns,
+            }
+        )
+    raw_manifest_path = control_dir / f"{label}_lifecycle_manifest.json"
+    atomic_write_signed_json(
+        raw_manifest_path,
+        {
+            "schema_version": "experiment-cli-terminal-manifest-v1",
+            "run_label": label,
+            "status": "complete",
+            "evidence_completeness": "complete",
+            "artifacts": artifacts,
+        },
+    )
+    evidence = FormalResourceRecalibrationEvidence(
+        report_run_label=label,
+        report_sha256="c" * 64,
+        report_sidecar_sha256="d" * 64,
+        replacement_contract_sha256="e" * 64,
+        predecessor_run_label="stage05.2_benchmark_rerun02",
+        predecessor_batch_id="batch0008",
+        predecessor_resource_summary_sha256="f" * 64,
+        predecessor_aggregate_peak_rss_bytes=1,
+        predecessor_per_worker_peak_rss_bytes=1,
+        formal_memory_semantic_digest="1" * 64,
+        calibration_repository_revision="2" * 40,
+        aggregate_memory_source="cgroup_v2",
+        replacement_aggregate_peak_memory_bytes=18_000_000_000,
+    )
+    monkeypatch.setattr(
+        campaign_review_module,
+        "load_producer_resource_contract",
+        lambda _path: contract,
+    )
+    monkeypatch.setattr(
+        campaign_review_module,
+        "load_formal_resource_recalibration_evidence",
+        lambda _path, _contract: evidence,
+    )
+
+    review_path = run_dir / "review" / "review_manifest.json"
+    review = campaign_review_module.review_resource_calibration(
+        raw_manifest_path=raw_manifest_path,
+        contract_path=contract_path,
+        review_manifest_path=review_path,
+    )
+
+    assert review["status"] == "ACCEPTED"
+    assert review["lifecycle_status"] == "ACCEPTED"
+    assert review["verified_artifact_count"] == 6
+    assert review["gates"]["locked_topology"] == {"passed": True}
+    assert review_path.is_file()
 
 
 def _power_load_payload(maximum_runtime_load1: float) -> dict[str, object]:

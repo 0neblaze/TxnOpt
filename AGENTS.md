@@ -18,6 +18,13 @@
   and none of its shards may be imported. The ABI-v2 candidate-transaction
   implementation requires a new Pilot and Formal label before Stage 5.3;
   Stages 6--8 are roadmap items only.
+- Stage 5.2 resource calibration keeps the frozen 6-worker, 16,384-row-group,
+  queue-depth-1, swap-free protocol and 20% memory headroom. Each completed
+  axis explicitly releases unused PyArrow pool pages and records before/after
+  Arrow allocation and process-RSS telemetry; this memory release must not be
+  represented as a relaxed resource gate. A successful calibration is trusted
+  only after independent replay of its terminal inventory, v3 report, scoped
+  cgroup measurement/reset evidence, and signed producer resource contract.
 - Apache-2.0 applies only to original code and documentation. Benchmark data,
   papers, commercial solvers, and third-party repositories remain under their
   own terms.

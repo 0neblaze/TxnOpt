@@ -2733,3 +2733,18 @@ compatibility fallback（兼容回退）。
   checkout 路径重放。consumer 现在要求历史路径继续存在，且历史与当前 ledger 都匹配
   同一个签名 SHA-256；仅该 ledger 路径允许 relocation，inventory/output/archive/module
   与其余 options 仍保持 path-exact。Attempt14 同样没有 output、permit 或 lifecycle record。
+- `stage05.2_resource_calibration_attempt16` 在 durable Windows Scheduled Task 持有的独立
+  systemd service 中完成 6-worker、16384/1 R205 Formal 测量；其 scoped cgroup peak 为
+  `22,823,022,592` bytes，swap 0、fallback 0，但加 20% headroom 后超过
+  `25,196,941,312` bytes 可用容量。独立 reviewer 复核 300 个 raw artifacts（共
+  `710,413,605` bytes）并报告 `FAILED_KNOWN`；该新根因以
+  `stage052-calibration-workers6-formal-memory-headroom-v1` 全量保留、删除 0 文件并 CLOSED。
+- 六个 Formal child 的 lifetime peak RSS 为约 3.16--4.35 GiB；runner 原先只执行 Python
+  GC，没有让 PyArrow 的 mimalloc pool 在相邻 30/60/300 秒 axis 之间归还空闲页。现在每个
+  axis 终态在 artifact flush 后显式执行 `MemoryPool.release_unused()`，并记录 pool backend、
+  release 前后 Arrow live bytes 和 process RSS。release 异常或 live allocation 增长会
+  fail fast；6 workers、16384/1、swap 0、无 fallback 与 20% headroom 门禁均未改变。
+- calibration 的成功路径新增独立 terminal-manifest replay：reviewer 逐文件复核 byte、mtime
+  和 SHA-256，重放签名 v3 report、formal memory measurement、cgroup peak reset 与外部
+  producer resource contract，并只在固定 6/16384/1 拓扑及全部 binding 一致时输出
+  `ACCEPTED`。producer 自报 complete 不再足以进入 lifecycle classification。

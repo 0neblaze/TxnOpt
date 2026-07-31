@@ -26,7 +26,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from dataclasses import field as dataclass_field
 from multiprocessing import get_context
 from pathlib import Path
@@ -121,6 +121,7 @@ from evrptw.stage052_resources import (
     ProducerResourceContract,
     ReviewMemoryContract,
     load_formal_resource_recalibration_evidence,
+    load_producer_resource_contract,
     load_review_memory_contract,
     verify_filesystem_capabilities,
 )
@@ -6334,8 +6335,206 @@ def review_lifecycle_failure_capsule(
     return manifest
 
 
+def review_resource_calibration(
+    *,
+    raw_manifest_path: Path,
+    contract_path: Path,
+    review_manifest_path: Path,
+) -> dict[str, object]:
+    """Independently replay one complete Stage 5.2 resource calibration."""
+
+    raw_manifest_path = raw_manifest_path.resolve(strict=True)
+    run_dir = raw_manifest_path.parent.parent
+    if (
+        raw_manifest_path.parent.name != "control"
+        or raw_manifest_path.name != f"{run_dir.name}_lifecycle_manifest.json"
+    ):
+        raise ArtifactIntegrityError("calibration lifecycle manifest location is invalid")
+    expected_review_path = run_dir / "review" / "review_manifest.json"
+    if review_manifest_path.resolve() != expected_review_path.resolve():
+        raise ArtifactIntegrityError("calibration review output location is invalid")
+    _verify_manifest_sidecar(raw_manifest_path)
+    raw = _json_object(raw_manifest_path)
+    artifacts = raw.get("artifacts")
+    if (
+        raw.get("schema_version") != "experiment-cli-terminal-manifest-v1"
+        or raw.get("run_label") != run_dir.name
+        or raw.get("status") != "complete"
+        or raw.get("evidence_completeness") != "complete"
+        or not isinstance(artifacts, list)
+        or not artifacts
+    ):
+        raise ArtifactIntegrityError("calibration lifecycle manifest identity is invalid")
+
+    observed_paths: set[str] = set()
+    total_bytes = 0
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping):
+            raise ArtifactIntegrityError("calibration artifact record is invalid")
+        relative = artifact.get("relative_path")
+        byte_size = artifact.get("byte_size")
+        checksum = artifact.get("checksum")
+        modified_time_ns = artifact.get("modified_time_ns")
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+            or relative in observed_paths
+            or isinstance(byte_size, bool)
+            or not isinstance(byte_size, int)
+            or byte_size < 0
+            or not isinstance(checksum, str)
+            or re.fullmatch(r"[0-9a-f]{64}", checksum) is None
+            or isinstance(modified_time_ns, bool)
+            or not isinstance(modified_time_ns, int)
+            or modified_time_ns <= 0
+        ):
+            raise ArtifactIntegrityError("calibration artifact identity is invalid")
+        path = (run_dir / relative).resolve(strict=True)
+        if not path.is_relative_to(run_dir) or not path.is_file():
+            raise ArtifactIntegrityError("calibration artifact escapes the run directory")
+        stat = path.stat()
+        if (
+            stat.st_size != byte_size
+            or stat.st_mtime_ns != modified_time_ns
+            or _sha256(path) != checksum
+        ):
+            raise ArtifactIntegrityError("calibration artifact content differs")
+        observed_paths.add(relative)
+        total_bytes += byte_size
+
+    excluded = {
+        raw_manifest_path.relative_to(run_dir).as_posix(),
+        _sidecar_for(raw_manifest_path).relative_to(run_dir).as_posix(),
+    }
+    physical_paths = {
+        path.relative_to(run_dir).as_posix()
+        for path in run_dir.rglob("*")
+        if path.is_file()
+        and path.relative_to(run_dir).parts[:1] != ("review",)
+        and path.relative_to(run_dir).as_posix() not in excluded
+    }
+    if physical_paths != observed_paths:
+        raise ArtifactIntegrityError("calibration artifact inventory is incomplete")
+
+    report_path = run_dir / "calibration_report.json"
+    measurement_path = run_dir / "formal_memory_measurement.json"
+    reset_path = run_dir / "formal_memory_cgroup_peak_reset.json"
+    required = (report_path, measurement_path, reset_path)
+    if any(path.relative_to(run_dir).as_posix() not in observed_paths for path in required):
+        raise ArtifactIntegrityError("calibration terminal evidence is incomplete")
+    for path in required:
+        _verify_manifest_sidecar(path)
+    contract_path = contract_path.resolve(strict=True)
+    _verify_manifest_sidecar(contract_path)
+    contract = load_producer_resource_contract(contract_path)
+    evidence = load_formal_resource_recalibration_evidence(report_path, contract)
+    report = _json_object(report_path)
+    measurement = _json_object(measurement_path)
+    reset = _json_object(reset_path)
+    measurement_sha256 = _sha256(measurement_path)
+    formal = report.get("formal_memory_measurement")
+    if (
+        report.get("corpus_role") != "read_only_benchmark_differential_only"
+        or report.get("run_label") != run_dir.name
+        or report.get("formal_memory_measurement_sha256") != measurement_sha256
+        or not isinstance(formal, Mapping)
+        or measurement.get("schema_version")
+        != "stage05.2-formal-memory-measurement-v1"
+        or measurement.get("run_label") != run_dir.name
+        or measurement.get("status") != "measured_pending_contract_validation"
+        or measurement.get("memory_capacity_bytes") != contract.available_memory_bytes
+        or measurement.get("measurement") != formal
+        or evidence.report_run_label != run_dir.name
+    ):
+        raise ArtifactIntegrityError("calibration report/measurement binding differs")
+    formal_cgroup = formal.get("cgroup_path")
+    reset_memory_current = reset.get("memory_current_bytes_after_reset")
+    reset_memory_peak = reset.get("memory_peak_bytes_after_reset")
+    if (
+        reset.get("schema_version") != "stage05.2-cgroup-peak-reset-v1"
+        or reset.get("run_label") != run_dir.name
+        or reset.get("status") != "verified"
+        or reset.get("cgroup_path") != formal_cgroup
+        or not is_stage052_dedicated_cgroup_path(formal_cgroup)
+        or isinstance(reset_memory_current, bool)
+        or not isinstance(reset_memory_current, int)
+        or reset_memory_current <= 0
+        or isinstance(reset_memory_peak, bool)
+        or not isinstance(reset_memory_peak, int)
+        or reset_memory_peak < reset_memory_current
+        or reset.get("swap_current_bytes_after_reset") != 0
+        or reset.get("swap_peak_bytes_after_reset") != 0
+    ):
+        raise ArtifactIntegrityError("calibration cgroup reset evidence differs")
+
+    locked_topology_passed = (
+        contract.selected_workers == 6
+        and contract.row_group_size == 16_384
+        and contract.queue_depth == 1
+    )
+    if not locked_topology_passed:
+        raise ArtifactIntegrityError("calibration locked topology differs")
+
+    manifest: dict[str, object] = {
+        "schema_version": "stage05.2-resource-calibration-review-v1",
+        "run_label": run_dir.name,
+        "status": "ACCEPTED",
+        "lifecycle_status": "ACCEPTED",
+        "raw_manifest_sha256": _sha256(raw_manifest_path),
+        "calibration_report_sha256": _sha256(report_path),
+        "formal_memory_measurement_sha256": measurement_sha256,
+        "cgroup_peak_reset_sha256": _sha256(reset_path),
+        "resource_contract_sha256": _sha256(contract_path),
+        "resource_evidence": asdict(evidence),
+        "verified_artifact_count": len(artifacts),
+        "verified_artifact_bytes": total_bytes,
+        "gates": {
+            "terminal_manifest_replay": {"passed": True},
+            "artifact_inventory": {"passed": True},
+            "resource_contract_replay": {"passed": True},
+            "formal_memory_measurement_binding": {"passed": True},
+            "cgroup_peak_reset": {"passed": True},
+            "locked_topology": {
+                "passed": locked_topology_passed,
+            },
+        },
+        "files": {},
+    }
+    review_manifest_path.parent.mkdir(parents=True, exist_ok=False)
+    atomic_write_signed_json(review_manifest_path, manifest)
+    return manifest
+
+
 def main() -> int:
     import argparse
+
+    if "--lifecycle-calibration-manifest" in sys.argv[1:]:
+        calibration_parser = argparse.ArgumentParser(description=__doc__)
+        calibration_parser.add_argument(
+            "--lifecycle-calibration-manifest",
+            type=Path,
+            required=True,
+        )
+        calibration_parser.add_argument(
+            "--calibration-contract",
+            type=Path,
+            required=True,
+        )
+        calibration_parser.add_argument(
+            "--calibration-review-manifest",
+            type=Path,
+            required=True,
+        )
+        calibration_arguments = calibration_parser.parse_args()
+        payload = review_resource_calibration(
+            raw_manifest_path=calibration_arguments.lifecycle_calibration_manifest,
+            contract_path=calibration_arguments.calibration_contract,
+            review_manifest_path=calibration_arguments.calibration_review_manifest,
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
 
     if "--lifecycle-failure-manifest" in sys.argv[1:]:
         failure_parser = argparse.ArgumentParser(description=__doc__)

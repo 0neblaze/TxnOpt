@@ -5945,6 +5945,10 @@ def test_v2_all_artifact_preparation_is_charged_without_gc_or_double_counting(
     assert timing["post_artifact_gc_ns"] == (
         timing["axis_completed_ns"] - timing["artifact_preparation_completed_ns"]
     )
+    assert timing["arrow_memory_pool_backend"] in {"jemalloc", "mimalloc", "system"}
+    assert timing["arrow_bytes_after_release"] <= timing["arrow_bytes_before_release"]
+    assert timing["rss_bytes_before_arrow_release"] > 0
+    assert timing["rss_bytes_after_arrow_release"] > 0
     assert float(rows[0]["end_to_end_seconds"]) == pytest.approx(
         solver_seconds + persistence + recomputed_post_solver - postsolve_persistence
     )
