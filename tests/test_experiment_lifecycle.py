@@ -965,6 +965,31 @@ def test_stage052_historical_semantic_reviewer_is_label_exact(
     assert blocked["status"] == "INVALID"
 
 
+def test_historical_inventory_uses_governance_tree_identity(
+    tmp_path: Path,
+) -> None:
+    generation = tmp_path / "generation"
+    (generation / "segment").mkdir(parents=True)
+    (generation / "segment" / "first.json").write_text(
+        '{"value": 1}\n', encoding="utf-8"
+    )
+    (generation / "second.bin").write_bytes(b"evidence")
+
+    inventory, tree_sha256 = _inventory_generation(
+        run_label="stage05.2_benchmark_attempt33",
+        generation_dir=generation,
+    )
+
+    assert (
+        inventory["file_count"],
+        inventory["byte_count"],
+        tree_sha256,
+    ) == storage_governance.compute_tree_identity(generation)
+    assert inventory["scan_passes"] == 1
+    assert inventory["hash_backend"] == "python_thread_pool"
+    assert inventory["hash_workers"] == 2
+
+
 def test_stage052_hot_path_requires_accepted_lineage_and_successor(
     tmp_path: Path,
 ) -> None:

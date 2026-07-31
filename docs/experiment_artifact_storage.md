@@ -260,6 +260,9 @@ execution 复验后，才可分类为 `superseded_accepted_capsule`；任一绑�
 live `e_archive` volume identity，且只能读取 signed migration ledger 声明的唯一 v2
 registry relative path/SHA；registry SHA 与 generation tree SHA 继续贯穿 inventory、
 execution、binding、final review 和 gate。aggregate gate 还会复核 reviewer module/hash、
+physical inventory 的 tree digest 必须复用 storage-governance v2 的 pretty canonical JSON
+序列化，并以单遍 bounded thread pool（有界线程池）记录每文件 SHA-256；compact JSON
+产生的不同摘要不构成 archive drift（归档漂移）。
 完整命令、输入前后 hash、签名语义输出和 E state-root execution binding，手工拼接
 review JSON 不能替代受控执行。gate consumer 还会重新验证 live locator root，并重放
 signed review、inventory、semantic output、execution receipt 与 execution binding 的完整

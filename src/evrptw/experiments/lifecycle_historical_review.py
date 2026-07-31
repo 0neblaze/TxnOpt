@@ -12,9 +12,11 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from typing import Final, cast
 
@@ -42,7 +44,7 @@ SAFE_RETENTION_CLASSES: Final = frozenset(
 
 
 def _canonical_json(payload: object) -> bytes:
-    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
 def _sha256(path: Path) -> str:
@@ -51,6 +53,36 @@ def _sha256(path: Path) -> str:
         while block := handle.read(8 * 1024 * 1024):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _file_snapshot(path: Path) -> tuple[int, int, int, int, int]:
+    stat = path.stat()
+    return (
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+        stat.st_ino,
+        stat.st_dev,
+    )
+
+
+def _inventory_file(
+    task: tuple[Path, Path],
+) -> dict[str, object]:
+    generation_dir, path = task
+    before = _file_snapshot(path)
+    digest = _sha256(path)
+    if _file_snapshot(path) != before:
+        raise LifecycleError(
+            "historical generation changed during inventory: "
+            f"{path.relative_to(generation_dir).as_posix()}"
+        )
+    return {
+        "relative_path": path.relative_to(generation_dir).as_posix(),
+        "byte_count": before[0],
+        "sha256": digest,
+        "modified_time_ns": before[1],
+    }
 
 
 def _execution_command_prefix(payload: Mapping[str, object]) -> list[object]:
@@ -127,7 +159,7 @@ def _load_v2_record(
 def _inventory_generation(
     *, run_label: str, generation_dir: Path
 ) -> tuple[dict[str, object], str]:
-    files: list[dict[str, object]] = []
+    paths: list[Path] = []
     tree_digest = hashlib.sha256()
     for path in sorted(generation_dir.rglob("*"), key=lambda item: item.as_posix()):
         if path.is_symlink():
@@ -136,14 +168,16 @@ def _inventory_generation(
             continue
         if not path.is_file():
             raise LifecycleError("historical generation contains an unsupported entry")
-        stat = path.stat()
-        item = {
-            "relative_path": path.relative_to(generation_dir).as_posix(),
-            "byte_count": stat.st_size,
-            "sha256": _sha256(path),
-            "modified_time_ns": stat.st_mtime_ns,
-        }
-        files.append(item)
+        paths.append(path)
+    workers = min(32, max(1, os.cpu_count() or 1), max(1, len(paths)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        files = list(
+            executor.map(
+                _inventory_file,
+                ((generation_dir, path) for path in paths),
+            )
+        )
+    for item in files:
         tree_digest.update(
             _canonical_json(
                 {
@@ -160,6 +194,8 @@ def _inventory_generation(
         "byte_count": sum(cast(int, item["byte_count"]) for item in files),
         "tree_sha256": tree_digest.hexdigest(),
         "scan_passes": 1,
+        "hash_backend": "python_thread_pool",
+        "hash_workers": workers,
         "files": files,
     }
     return inventory, tree_digest.hexdigest()
@@ -255,7 +291,13 @@ def review_historical_generation(
         or inventory["byte_count"] != record["byte_count"]
         or tree_sha256 != record["tree_sha256"]
     ):
-        raise LifecycleError("historical archive differs from the v2 registry")
+        raise LifecycleError(
+            "historical archive differs from the v2 registry: "
+            f"expected=(files={record['file_count']},bytes={record['byte_count']},"
+            f"tree={record['tree_sha256']}), "
+            f"observed=(files={inventory['file_count']},"
+            f"bytes={inventory['byte_count']},tree={tree_sha256})"
+        )
     inventory.update(
         {
             "archive_root_alias": "e_archive",

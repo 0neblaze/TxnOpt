@@ -2693,3 +2693,11 @@ compatibility fallback（兼容回退）。
   generation、registry、tree 与 module/command/hash identity；它还重放 semantic
   status/retention class、failure identity/representative、no-dependency/rebuild proof 等
   class-specific gates，手写 gate 或把 `unknown_full` 重标为安全类别均被拒绝。
+- 首次真实 `hot_path_attempt04` physical review 暴露了 reviewer 与 v2 governance 的
+  canonical JSON（规范 JSON）不一致：前者使用 compact serialization，后者及 Windows
+  migration verifier 使用 indent=2、sort_keys 与末尾换行，因此 file/byte 完全相同仍会
+  得到不同 tree SHA-256。这是 reviewer 的确定性算法缺陷，不是归档内容漂移。修复后
+  inventory 复用 v2 序列化合同，并以最多 32 workers 的单遍 thread pool 计算逐文件摘要、
+  前后 stat snapshot 和 tree identity；不匹配异常同时报告 expected/observed
+  file/byte/tree 三元组。回归测试直接将 historical inventory 与
+  `storage_governance.compute_tree_identity` 对账，防止再次分叉。
