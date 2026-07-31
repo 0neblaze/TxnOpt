@@ -2581,6 +2581,10 @@ compatibility fallback（兼容回退）。
   registry identity；binding receipt 现在同时保存 `storage_tree_sha256`，并从签名 content
   inventory 独立重算、逐文件重放后写入 lifecycle `archive_tree_sha256`。回归测试要求两种
   identity 各自精确、明确不同，且 inventory SHA-256 也进入 binding receipt。
+  end-to-end close-path 复核同时修正 lifecycle controller 的下游比较：archive
+  layout 与 close-time content replay 只绑定 lifecycle tree；storage registry 与
+  retention replay 只绑定 receipt 中单独的 `storage_tree_sha256`。缺少任一身份或
+  交叉使用都会 fail fast，不再依赖两种编码偶然相等。
 
 ## 2026-07-31：Stage 0--8 storage governance v2 与 E 盘归档入口
 

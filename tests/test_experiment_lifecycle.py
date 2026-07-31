@@ -377,6 +377,7 @@ def _retention_binding(
     files = inventory["files"]
     assert isinstance(files, list)
     source_bytes = sum(int(item["byte_count"]) for item in files)
+    storage_tree_sha256 = hashlib.sha256(b"storage-v2-tree").hexdigest()
     replay_path = (
         controller.storage_state_root
         / "retention_replays"
@@ -388,7 +389,7 @@ def _retention_binding(
             "schema_version": "experiment-retention-replay-v1",
             "run_label": label,
             "generation": generation,
-            "archive_tree_sha256": inventory["source_tree_sha256"],
+            "archive_tree_sha256": storage_tree_sha256,
             "archive_file_count": len(files),
             "archive_byte_count": source_bytes,
             "verifier_identity_sha256": "2" * 64,
@@ -407,7 +408,7 @@ def _retention_binding(
             "run_label": label,
             "generation": generation,
             "archive_relative_path": relative_archive.as_posix(),
-            "tree_sha256": inventory["source_tree_sha256"],
+            "tree_sha256": storage_tree_sha256,
             "file_count": len(files),
             "byte_count": source_bytes,
             "verification_status": "verified",
@@ -434,6 +435,7 @@ def _retention_binding(
             "storage_permit_sha256": record.storage_permit_sha256,
             "archive_relative_path": relative_archive.as_posix(),
             "archive_tree_sha256": inventory["source_tree_sha256"],
+            "storage_tree_sha256": storage_tree_sha256,
             "verifier_identity_sha256": "2" * 64,
             "file_count": len(files),
             "byte_count": source_bytes,

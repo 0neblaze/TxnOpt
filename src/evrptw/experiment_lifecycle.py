@@ -3028,6 +3028,7 @@ class ExperimentLifecycleController:
             raise LifecycleError("retention receipt class differs")
         hashes = (
             str(receipt.get("archive_tree_sha256", "")),
+            str(receipt.get("storage_tree_sha256", "")),
             str(receipt.get("verifier_identity_sha256", "")),
         )
         counts = (receipt.get("file_count"), receipt.get("byte_count"))
@@ -3101,7 +3102,7 @@ class ExperimentLifecycleController:
         ]
         if not matching_records or any(
             item.get("archive_relative_path") != relative_archive.as_posix()
-            or item.get("tree_sha256") != receipt.get("archive_tree_sha256")
+            or item.get("tree_sha256") != receipt.get("storage_tree_sha256")
             or item.get("file_count") != receipt.get("file_count")
             or item.get("byte_count") != receipt.get("byte_count")
             or item.get("verification_status") != "verified"
@@ -3120,7 +3121,7 @@ class ExperimentLifecycleController:
             or replay.get("run_label") != run_label
             or replay.get("generation") != generation
             or replay.get("archive_tree_sha256")
-            != receipt.get("archive_tree_sha256")
+            != receipt.get("storage_tree_sha256")
             or replay.get("archive_file_count") != receipt.get("file_count")
             or replay.get("archive_byte_count") != receipt.get("byte_count")
             or replay.get("validator_replay_passed") is not True
