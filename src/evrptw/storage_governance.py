@@ -1502,6 +1502,12 @@ def compute_tree_sha256(path: Path) -> str:
     return _tree_identity(path)[2]
 
 
+def compute_tree_identity(path: Path) -> tuple[int, int, str]:
+    """Return canonical file count, byte count, and tree SHA-256."""
+
+    return _tree_identity(path)
+
+
 def _maintenance_request_for_roots(
     policy: GovernancePolicy,
     roots: tuple[Path, ...],
