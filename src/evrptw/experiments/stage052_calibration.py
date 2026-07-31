@@ -55,6 +55,7 @@ from evrptw.stage052_evidence import (
     RunResourceSummary,
     is_stage052_dedicated_cgroup_path,
 )
+from evrptw.stage052_memory import release_stage052_process_memory
 from evrptw.stage052_resources import (
     ParquetBenchmark,
     ProducerBenchmark,
@@ -1174,6 +1175,21 @@ def run_stage052_resource_calibration(
         locked_workers=locked_workers,
         locked_parquet_configuration=locked_parquet_configuration,
     )
+    parent_memory_release_path = output_root / "formal_memory_parent_release.json"
+    parent_memory_release = release_stage052_process_memory()
+    atomic_write_signed_json(
+        parent_memory_release_path,
+        {
+            "schema_version": "stage05.2-process-memory-release-v1",
+            "run_label": run_label,
+            "component": "formal_memory_calibration_parent",
+            "memory_release": parent_memory_release,
+            "status": "verified",
+        },
+    )
+    parent_memory_release_sha256 = hashlib.sha256(
+        parent_memory_release_path.read_bytes()
+    ).hexdigest()
     formal_memory_measurement = formal_memory_runner(
         workers=preliminary_selection.selected_workers,
         row_group_size=selected_parquet.row_group_size,
@@ -1300,6 +1316,8 @@ def run_stage052_resource_calibration(
                 for item in fresh_producer_measurements
             ],
             "attempt73_memory_floor": asdict(memory_floor),
+            "formal_memory_parent_release": parent_memory_release,
+            "formal_memory_parent_release_sha256": parent_memory_release_sha256,
             "formal_memory_measurement": asdict(formal_memory_measurement),
             "formal_memory_measurement_sha256": formal_memory_measurement_sha256,
             "formal_campaign_memory_floor": (

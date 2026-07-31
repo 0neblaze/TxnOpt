@@ -6335,6 +6335,51 @@ def review_lifecycle_failure_capsule(
     return manifest
 
 
+def _verify_stage052_memory_release(payload: object) -> None:
+    if not isinstance(payload, Mapping):
+        raise ArtifactIntegrityError("Stage 5.2 memory release is not an object")
+    nonnegative_integer_fields = (
+        "gc_collected_objects",
+        "arrow_bytes_before_release",
+        "arrow_bytes_after_release",
+    )
+    positive_integer_fields = (
+        "rss_bytes_before_release",
+        "rss_bytes_after_gc",
+        "rss_bytes_before_arrow_release",
+        "rss_bytes_after_arrow_release",
+        "rss_bytes_after_system_allocator_trim",
+    )
+    if any(
+        isinstance(payload.get(field), bool)
+        or not isinstance(payload.get(field), int)
+        or int(payload[field]) < 0
+        for field in nonnegative_integer_fields
+    ) or any(
+        isinstance(payload.get(field), bool)
+        or not isinstance(payload.get(field), int)
+        or int(payload[field]) <= 0
+        for field in positive_integer_fields
+    ):
+        raise ArtifactIntegrityError("Stage 5.2 memory release counters are invalid")
+    if (
+        payload.get("arrow_memory_pool_backend")
+        not in {"jemalloc", "mimalloc", "system"}
+        or not isinstance(payload.get("python_allocator"), str)
+        or not payload.get("python_allocator")
+        or not isinstance(payload.get("python_with_mimalloc"), bool)
+        or payload["arrow_bytes_after_release"]
+        > payload["arrow_bytes_before_release"]
+    ):
+        raise ArtifactIntegrityError("Stage 5.2 memory release identity is invalid")
+    trim_available = payload.get("system_allocator_trim_available")
+    trim_result = payload.get("system_allocator_trim_result")
+    if not isinstance(trim_available, bool) or (
+        trim_result not in {0, 1} if trim_available else trim_result is not None
+    ):
+        raise ArtifactIntegrityError("Stage 5.2 system allocator trim is invalid")
+
+
 def review_resource_calibration(
     *,
     raw_manifest_path: Path,
@@ -6421,7 +6466,8 @@ def review_resource_calibration(
     report_path = run_dir / "calibration_report.json"
     measurement_path = run_dir / "formal_memory_measurement.json"
     reset_path = run_dir / "formal_memory_cgroup_peak_reset.json"
-    required = (report_path, measurement_path, reset_path)
+    parent_release_path = run_dir / "formal_memory_parent_release.json"
+    required = (report_path, measurement_path, reset_path, parent_release_path)
     if any(path.relative_to(run_dir).as_posix() not in observed_paths for path in required):
         raise ArtifactIntegrityError("calibration terminal evidence is incomplete")
     for path in required:
@@ -6433,6 +6479,7 @@ def review_resource_calibration(
     report = _json_object(report_path)
     measurement = _json_object(measurement_path)
     reset = _json_object(reset_path)
+    parent_release = _json_object(parent_release_path)
     measurement_sha256 = _sha256(measurement_path)
     formal = report.get("formal_memory_measurement")
     if (
@@ -6449,6 +6496,49 @@ def review_resource_calibration(
         or evidence.report_run_label != run_dir.name
     ):
         raise ArtifactIntegrityError("calibration report/measurement binding differs")
+    parent_release_sha256 = _sha256(parent_release_path)
+    parent_release_evidence = parent_release.get("memory_release")
+    if (
+        parent_release.get("schema_version")
+        != "stage05.2-process-memory-release-v1"
+        or parent_release.get("run_label") != run_dir.name
+        or parent_release.get("component")
+        != "formal_memory_calibration_parent"
+        or parent_release.get("status") != "verified"
+        or report.get("formal_memory_parent_release_sha256")
+        != parent_release_sha256
+        or report.get("formal_memory_parent_release") != parent_release_evidence
+        or not isinstance(parent_release_evidence, Mapping)
+    ):
+        raise ArtifactIntegrityError("calibration parent memory release differs")
+    _verify_stage052_memory_release(parent_release_evidence)
+
+    expected_axes = {"wall_clock_30", "wall_clock_60", "wall_clock_300"}
+    expected_seeds = set(range(2014, 2020))
+    verified_axis_memory_releases = 0
+    for seed in sorted(expected_seeds):
+        relative_trace = (
+            "formal-memory-workers6-rg16384-qd1/r205_21/"
+            f"{seed}/{run_dir.name}_trace_r205_21_{seed}.json"
+        )
+        if relative_trace not in observed_paths:
+            raise ArtifactIntegrityError("calibration memory trace inventory is incomplete")
+        trace = _json_object(run_dir / relative_trace)
+        axes = trace.get("axes")
+        if (
+            trace.get("run_label") != run_dir.name
+            or trace.get("instance") != "r205_21"
+            or trace.get("seed") != seed
+            or not isinstance(axes, Mapping)
+            or set(axes) != expected_axes
+        ):
+            raise ArtifactIntegrityError("calibration memory trace identity differs")
+        for axis_name in sorted(expected_axes):
+            axis = axes.get(axis_name)
+            if not isinstance(axis, Mapping):
+                raise ArtifactIntegrityError("calibration memory trace axis is invalid")
+            _verify_stage052_memory_release(axis.get("memory_release"))
+            verified_axis_memory_releases += 1
     formal_cgroup = formal.get("cgroup_path")
     reset_memory_current = reset.get("memory_current_bytes_after_reset")
     reset_memory_peak = reset.get("memory_peak_bytes_after_reset")
@@ -6486,16 +6576,22 @@ def review_resource_calibration(
         "calibration_report_sha256": _sha256(report_path),
         "formal_memory_measurement_sha256": measurement_sha256,
         "cgroup_peak_reset_sha256": _sha256(reset_path),
+        "parent_memory_release_sha256": parent_release_sha256,
         "resource_contract_sha256": _sha256(contract_path),
         "resource_evidence": asdict(evidence),
         "verified_artifact_count": len(artifacts),
         "verified_artifact_bytes": total_bytes,
+        "verified_axis_memory_releases": verified_axis_memory_releases,
         "gates": {
             "terminal_manifest_replay": {"passed": True},
             "artifact_inventory": {"passed": True},
             "resource_contract_replay": {"passed": True},
             "formal_memory_measurement_binding": {"passed": True},
             "cgroup_peak_reset": {"passed": True},
+            "parent_memory_release": {"passed": True},
+            "axis_memory_release": {
+                "passed": verified_axis_memory_releases == 18,
+            },
             "locked_topology": {
                 "passed": locked_topology_passed,
             },

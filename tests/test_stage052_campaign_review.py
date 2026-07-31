@@ -232,6 +232,32 @@ def test_resource_calibration_review_replays_terminal_evidence(
             "measurement": formal,
         },
     )
+    parent_release_path = run_dir / "formal_memory_parent_release.json"
+    parent_release_evidence = {
+        "python_allocator": "default",
+        "python_with_mimalloc": True,
+        "gc_collected_objects": 0,
+        "rss_bytes_before_release": 1,
+        "rss_bytes_after_gc": 1,
+        "rss_bytes_before_arrow_release": 1,
+        "arrow_memory_pool_backend": "mimalloc",
+        "arrow_bytes_before_release": 100,
+        "arrow_bytes_after_release": 0,
+        "rss_bytes_after_arrow_release": 1,
+        "system_allocator_trim_available": True,
+        "system_allocator_trim_result": 1,
+        "rss_bytes_after_system_allocator_trim": 1,
+    }
+    atomic_write_signed_json(
+        parent_release_path,
+        {
+            "schema_version": "stage05.2-process-memory-release-v1",
+            "run_label": label,
+            "component": "formal_memory_calibration_parent",
+            "memory_release": parent_release_evidence,
+            "status": "verified",
+        },
+    )
     report_path = run_dir / "calibration_report.json"
     atomic_write_signed_json(
         report_path,
@@ -243,6 +269,10 @@ def test_resource_calibration_review_replays_terminal_evidence(
                 measurement_path.read_bytes()
             ).hexdigest(),
             "formal_memory_measurement": formal,
+            "formal_memory_parent_release_sha256": hashlib.sha256(
+                parent_release_path.read_bytes()
+            ).hexdigest(),
+            "formal_memory_parent_release": parent_release_evidence,
         },
     )
     reset_path = run_dir / "formal_memory_cgroup_peak_reset.json"
@@ -259,8 +289,37 @@ def test_resource_calibration_review_replays_terminal_evidence(
             "swap_peak_bytes_after_reset": 0,
         },
     )
+    for seed in range(2014, 2020):
+        trace_path = (
+            run_dir
+            / "formal-memory-workers6-rg16384-qd1"
+            / "r205_21"
+            / str(seed)
+            / f"{label}_trace_r205_21_{seed}.json"
+        )
+        trace_path.parent.mkdir(parents=True)
+        trace_path.write_text(
+            json.dumps(
+                {
+                    "run_label": label,
+                    "instance": "r205_21",
+                    "seed": seed,
+                    "axes": {
+                        axis: {"memory_release": parent_release_evidence}
+                        for axis in (
+                            "wall_clock_30",
+                            "wall_clock_60",
+                            "wall_clock_300",
+                        )
+                    },
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     artifacts = []
-    for path in sorted(run_dir.glob("*")):
+    for path in sorted(run_dir.rglob("*")):
         if not path.is_file():
             continue
         stat = path.stat()
@@ -318,7 +377,10 @@ def test_resource_calibration_review_replays_terminal_evidence(
 
     assert review["status"] == "ACCEPTED"
     assert review["lifecycle_status"] == "ACCEPTED"
-    assert review["verified_artifact_count"] == 6
+    assert review["verified_artifact_count"] == 14
+    assert review["verified_axis_memory_releases"] == 18
+    assert review["gates"]["axis_memory_release"] == {"passed": True}
+    assert review["gates"]["parent_memory_release"] == {"passed": True}
     assert review["gates"]["locked_topology"] == {"passed": True}
     assert review_path.is_file()
 

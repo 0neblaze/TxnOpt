@@ -29,7 +29,6 @@ from queue import Full, Queue
 from typing import Any, Protocol
 
 import orjson
-import psutil  # type: ignore[import-untyped]
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -145,6 +144,7 @@ from evrptw.stage052_evidence import (
     verify_stage052_runtime_identity,
     verify_stage052_source_snapshot,
 )
+from evrptw.stage052_memory import release_stage052_process_memory
 from evrptw.stage052_platform import peak_rss_bytes
 from evrptw.stage052_remediation import Stage052RemediationResult
 from evrptw.stage052_resources import (
@@ -5526,17 +5526,7 @@ def _run_and_persist_v2_shard(
                 solver_persistence_ns + postsolve_artifact_preparation_ns
             )
             del result, trace, route_dictionary, diagnostic_rows
-            gc.collect()
-            arrow_pool = pa.default_memory_pool()
-            arrow_bytes_before_release = arrow_pool.bytes_allocated()
-            rss_before_arrow_release = psutil.Process().memory_info().rss
-            arrow_pool.release_unused()
-            arrow_bytes_after_release = arrow_pool.bytes_allocated()
-            rss_after_arrow_release = psutil.Process().memory_info().rss
-            if arrow_bytes_after_release > arrow_bytes_before_release:
-                raise RuntimeError(
-                    "PyArrow memory-pool release increased live allocations"
-                )
+            memory_release = release_stage052_process_memory()
             axis_completed_ns = time.perf_counter_ns()
             timing_by_axis[axis.name] = {
                 "axis_started_ns": axis_started_ns,
@@ -5546,12 +5536,9 @@ def _run_and_persist_v2_shard(
                 "axis_completed_ns": axis_completed_ns,
                 "postsolve_artifact_preparation_ns": postsolve_artifact_preparation_ns,
                 "post_artifact_gc_ns": axis_completed_ns - artifact_preparation_completed_ns,
-                "arrow_memory_pool_backend": arrow_pool.backend_name,
-                "arrow_bytes_before_release": arrow_bytes_before_release,
-                "arrow_bytes_after_release": arrow_bytes_after_release,
-                "rss_bytes_before_arrow_release": rss_before_arrow_release,
-                "rss_bytes_after_arrow_release": rss_after_arrow_release,
+                **memory_release,
             }
+            trace_axis["memory_release"] = dict(memory_release)
 
         if task.component == Stage052Component.NATIVE_KERNELS.value:
             fixed_axis = next(axis for axis in axes if axis.name == "fixed_work")

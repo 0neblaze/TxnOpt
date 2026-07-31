@@ -5785,6 +5785,7 @@ def test_v2_all_artifact_preparation_is_charged_without_gc_or_double_counting(
     postprocess_delay_seconds = 0.02
     live_append_delay_seconds = 0.025
     diagnostic_append_delay_seconds = 0.015
+    finalized_trace: dict[str, object] = {}
 
     class FakeShard:
         def append(self, **kwargs: object) -> int:
@@ -5799,8 +5800,10 @@ def test_v2_all_artifact_preparation_is_charged_without_gc_or_double_counting(
         def flush(self) -> None:
             time.sleep(flush_delay_seconds)
 
-        def finalize(self, **_: object) -> None:
-            return None
+        def finalize(self, **kwargs: object) -> None:
+            trace_payload = kwargs["trace_payload"]
+            assert isinstance(trace_payload, dict)
+            finalized_trace.update(trace_payload)
 
         def abort(self, _: BaseException) -> None:
             return None
@@ -5949,6 +5952,13 @@ def test_v2_all_artifact_preparation_is_charged_without_gc_or_double_counting(
     assert timing["arrow_bytes_after_release"] <= timing["arrow_bytes_before_release"]
     assert timing["rss_bytes_before_arrow_release"] > 0
     assert timing["rss_bytes_after_arrow_release"] > 0
+    persisted_axes = finalized_trace["axes"]
+    assert isinstance(persisted_axes, dict)
+    persisted_axis = persisted_axes["fixed_work"]
+    assert isinstance(persisted_axis, dict)
+    assert persisted_axis["memory_release"]["arrow_bytes_after_release"] <= (
+        persisted_axis["memory_release"]["arrow_bytes_before_release"]
+    )
     assert float(rows[0]["end_to_end_seconds"]) == pytest.approx(
         solver_seconds + persistence + recomputed_post_solver - postsolve_persistence
     )

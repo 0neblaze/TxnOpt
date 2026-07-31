@@ -2744,6 +2744,20 @@ compatibility fallback（兼容回退）。
   axis 终态在 artifact flush 后显式执行 `MemoryPool.release_unused()`，并记录 pool backend、
   release 前后 Arrow live bytes 和 process RSS。release 异常或 live allocation 增长会
   fail fast；6 workers、16384/1、swap 0、无 fallback 与 20% headroom 门禁均未改变。
+- `stage05.2_resource_calibration_attempt17` 在相同 6-worker、16384/1、swap-free cgroup
+  协议下复测；显式 Arrow release 把 aggregate peak 从 Attempt16 的
+  `22,823,022,592` 降至 `22,311,612,416` bytes，但仍未满足 20% headroom。独立
+  failure reviewer 复核 300 个 raw artifacts（`717,316,302` bytes）并报告
+  `FAILED_KNOWN`；它与 Attempt16 的 failure identity 相同，按
+  `duplicate_failure_metadata` 签名分类、compaction 与 close 后为 `CLOSED`。本次运行
+  完成 `288,281` 次 exact starts，而旧通过探针 Attempt18 为 `263,816` 次，说明当前
+  wall-clock workload 增加约 9.27%，旧 `18.88 GiB` 峰值不能直接外推。
+- 后续 producer 每个 axis 都把 GC、Arrow pool release、libc `malloc_trim` 可用性/结果及
+  release 前后 RSS 写入不可变 trace；Calibration parent 在 Formal cgroup peak reset
+  之前执行相同释放并签名写入 `formal_memory_parent_release.json`。成功 reviewer 必须
+  重放该文件、calibration report 与 terminal inventory 的 SHA binding，并核验六个
+  R205 seed 的全部 18 个 axis memory-release record；未持久化的内存日志不能成为资源
+  契约依据。
 - calibration 的成功路径新增独立 terminal-manifest replay：reviewer 逐文件复核 byte、mtime
   和 SHA-256，重放签名 v3 report、formal memory measurement、cgroup peak reset 与外部
   producer resource contract，并只在固定 6/16384/1 拓扑及全部 binding 一致时输出
