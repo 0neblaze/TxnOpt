@@ -1297,6 +1297,16 @@ def load_benchmark_execution_lock(
         raise RuntimeError("accepted benchmark review manifest is unreadable") from error
     if not isinstance(review, Mapping):
         raise RuntimeError("accepted benchmark review manifest must be an object")
+    run_label = review.get("run_label")
+    if (
+        not isinstance(run_label, str)
+        or re.fullmatch(
+            r"stage05\.2_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}",
+            run_label,
+        )
+        is None
+    ):
+        raise RuntimeError("accepted benchmark review run label is invalid")
     expected_review_schemas = (
         {
             "stage05.2-campaign-review-v1",
@@ -1337,7 +1347,7 @@ def load_benchmark_execution_lock(
         attribution_path = (
             prerequisite_dir
             / "control"
-            / f"{prerequisite_dir.name}_persistence_attribution.json"
+            / f"{run_label}_persistence_attribution.json"
         )
         attribution_sidecar = attribution_path.with_suffix(".sha256")
         if (
@@ -1357,7 +1367,7 @@ def load_benchmark_execution_lock(
         if (
             campaign.status != "complete"
             or campaign.scope != "pilot"
-            or campaign.run_label != prerequisite_dir.name
+            or campaign.run_label != run_label
             or review.get("raw_campaign_manifest_sha256")
             != _file_sha256(campaign_path)
         ):
@@ -1803,14 +1813,14 @@ def load_pilot_storage_observations(
 ) -> tuple[PilotStorageObservation, ...]:
     """Re-verify archived G01 bytes and derive G02 next-fit estimates."""
 
-    run_label = prerequisite_dir.name
+    manifest = load_campaign_manifest(prerequisite_dir / "campaign_manifest.json")
+    run_label = manifest.run_label
     paths = campaign_control_paths(prerequisite_dir, run_label)
-    manifest = load_campaign_manifest(paths["campaign_manifest"])
     if manifest.scope != "pilot" or manifest.status != "complete":
         raise RuntimeError("G02 requires one complete accepted G01 campaign")
     expected_roots = set(manifest.storage_roots)
-    if expected_roots != set(locator.aliases):
-        raise RuntimeError("G01/G02 storage root alias set differs")
+    if not expected_roots.issubset(locator.aliases):
+        raise RuntimeError("G01/G02 storage root aliases are unavailable")
     for alias in sorted(expected_roots):
         if not locator.resolve(alias).absolute_path.is_dir():
             raise RuntimeError(f"G01/G02 storage root is unavailable: {alias}")
@@ -1829,11 +1839,21 @@ def load_pilot_storage_observations(
     if not isinstance(shards, list) or len(shards) != 36:
         raise RuntimeError("accepted G01 campaign plan shard list is invalid")
     actual_by_shard: dict[str, int] = {}
+    migrated_batch_root = prerequisite_dir.parent / "d_benchmark"
+    segmented_retention = (
+        prerequisite_dir.name == "wsl_active" and migrated_batch_root.is_dir()
+    )
     for batch in manifest.batches:
         if batch.status != "archived" or batch.shard_actual_bytes_by_id is None:
             raise RuntimeError("accepted G01 batch is not archived with shard bytes")
-        archive_root = locator.resolve(batch.root_alias)
-        batch_path = archive_root.absolute_path.joinpath(*Path(batch.logical_path).parts)
+        logical_parts = Path(batch.logical_path).parts
+        if logical_parts != (run_label, batch.batch_id):
+            raise RuntimeError("accepted G01 batch logical path is invalid")
+        if segmented_retention:
+            batch_path = migrated_batch_root / batch.batch_id
+        else:
+            archive_root = locator.resolve(batch.root_alias)
+            batch_path = archive_root.absolute_path.joinpath(*logical_parts)
         if (
             directory_checksum(batch_path) != batch.checksum_sha256
             or directory_byte_count(batch_path) != batch.actual_bytes

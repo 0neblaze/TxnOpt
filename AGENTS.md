@@ -37,6 +37,11 @@
   retention registry, while lifecycle close uses its independently signed
   path/size/SHA-256 content-inventory tree. The binding receipt must preserve and
   verify both; the two different canonical hash algorithms are not byte-equal.
+  A migrated multi-segment benchmark prerequisite is consumed from its verified
+  generation: control/review evidence comes from `wsl_active`, while immutable
+  Pilot batches come from `d_benchmark`. Consumers derive the canonical run
+  label from signed evidence, accept later locator aliases as a superset, and
+  must not recreate deleted D: sources or use compatibility symlinks.
 - Apache-2.0 applies only to original code and documentation. Benchmark data,
   papers, commercial solvers, and third-party repositories remain under their
   own terms.

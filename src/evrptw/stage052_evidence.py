@@ -1621,6 +1621,8 @@ def verify_job_parallel_selection(
 def verify_stage052_review_execution_receipt(
     raw_dir: Path,
     review_manifest_path: Path,
+    *,
+    expected_run_label: str | None = None,
 ) -> dict[str, object]:
     """Verify the finalized systemd receipt bound to one current review manifest."""
 
@@ -1631,9 +1633,10 @@ def verify_stage052_review_execution_receipt(
         raise ArtifactIntegrityError(
             "prerequisite review lacks a finalized service execution receipt"
         ) from error
+    run_label = expected_run_label or raw_dir.name
     if (
         not isinstance(execution, dict)
-        or execution.get("run_label") != raw_dir.name
+        or execution.get("run_label") != run_label
         or execution.get("finalized") is not True
         or execution.get("status") != "completed"
         or execution.get("systemd_service_result") != "success"
@@ -1665,11 +1668,6 @@ def verify_stage052_prerequisite(
     statuses = (expected_status,) if expected_status is not None else tuple(allowed_statuses)
     if not statuses:
         raise ValueError("at least one prerequisite review status is required")
-    if expected_run_label is not None and raw_dir.name != expected_run_label:
-        raise ArtifactIntegrityError(
-            f"prerequisite run label mismatch: expected={expected_run_label} "
-            f"observed={raw_dir.name}"
-        )
     review_manifest_path = raw_dir / "review" / "review_manifest.json"
     try:
         review = json.loads(review_manifest_path.read_text(encoding="utf-8"))
@@ -1677,6 +1675,25 @@ def verify_stage052_prerequisite(
         raise ArtifactIntegrityError(
             f"cannot read prerequisite review manifest: {review_manifest_path}"
         ) from error
+    if not isinstance(review, Mapping):
+        raise ArtifactIntegrityError("prerequisite review manifest is invalid")
+    observed_run_label = review.get("run_label")
+    if (
+        not isinstance(observed_run_label, str)
+        or re.fullmatch(
+            r"stage05\.2_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}",
+            observed_run_label,
+        )
+        is None
+        or (
+            expected_run_label is not None
+            and observed_run_label != expected_run_label
+        )
+    ):
+        raise ArtifactIntegrityError(
+            "prerequisite run label mismatch: "
+            f"expected={expected_run_label} observed={observed_run_label}"
+        )
     campaign_review = expected_component == "benchmark" and expected_scope in {
         "pilot",
         "formal",
@@ -1690,7 +1707,7 @@ def verify_stage052_prerequisite(
         else {STAGE052_REVIEW_SCHEMA_VERSION}
     )
     expected_review = {
-        "run_label": raw_dir.name,
+        "run_label": observed_run_label,
         "component": expected_component,
         "scope": expected_scope,
     }
@@ -1731,7 +1748,11 @@ def verify_stage052_prerequisite(
         raise ArtifactIntegrityError(
             "prerequisite review does not require bounded service execution"
         )
-    verify_stage052_review_execution_receipt(raw_dir, review_manifest_path)
+    verify_stage052_review_execution_receipt(
+        raw_dir,
+        review_manifest_path,
+        expected_run_label=observed_run_label,
+    )
 
     reader = ArtifactReader(raw_dir)
     if reader.manifest.get("evidence_completeness") != "complete":
@@ -1753,7 +1774,7 @@ def verify_stage052_prerequisite(
         raise ArtifactIntegrityError("prerequisite control artifacts are incomplete")
     metadata = reader.read_json(str(metadata_items[0]["relative_path"]))
     if (
-        metadata.get("run_label") != raw_dir.name
+        metadata.get("run_label") != observed_run_label
         or metadata.get("component") != expected_component
         or metadata.get("scope") != expected_scope
         or metadata.get("repository_dirty") is not False
@@ -1761,7 +1782,9 @@ def verify_stage052_prerequisite(
         raise ArtifactIntegrityError("prerequisite producer identity mismatch")
     if metadata.get("persistence_attribution") == "primary_active_writes_v1":
         attribution_path = (
-            raw_dir / "control" / f"{raw_dir.name}_persistence_attribution.json"
+            raw_dir
+            / "control"
+            / f"{observed_run_label}_persistence_attribution.json"
         )
         attribution_sidecar = attribution_path.with_suffix(".sha256")
         if (
@@ -1783,7 +1806,7 @@ def verify_stage052_prerequisite(
     if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision):
         raise ArtifactIntegrityError("prerequisite repository revision is invalid")
     return Stage052PrerequisiteIdentity(
-        run_label=raw_dir.name,
+        run_label=observed_run_label,
         component=expected_component,
         status=observed_status,
         repository_revision=revision,
@@ -1879,7 +1902,11 @@ def verify_stage052_evidence_input(
     observed_runtime = metadata.get("runtime_identity")
     if not isinstance(observed_runtime, Mapping):
         raise ArtifactIntegrityError("current-chain prerequisite has no frozen runtime identity")
-    execution = verify_stage052_review_execution_receipt(raw_dir.resolve(), review_path)
+    execution = verify_stage052_review_execution_receipt(
+        raw_dir.resolve(),
+        review_path,
+        expected_run_label=identity.run_label,
+    )
     if execution.get("producer_repository_revision") != identity.repository_revision:
         raise ArtifactIntegrityError(
             "current-chain prerequisite review receipt revision does not match producer"

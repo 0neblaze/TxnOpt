@@ -608,6 +608,16 @@ def run_stage052(
                 )
             else:
                 resolved_input = ordinary_input
+            segmented_evidence_root = resolved_input / "wsl_active"
+            if segmented_evidence_root.is_dir():
+                if (
+                    requirement.component is Stage052Component.BENCHMARK
+                    and not (resolved_input / "d_benchmark").is_dir()
+                ):
+                    raise ArtifactIntegrityError(
+                        "segmented benchmark prerequisite lacks d_benchmark evidence"
+                    )
+                resolved_input = segmented_evidence_root
             resolved_prerequisite_dirs[requirement.role] = resolved_input
             if storage_migration is not None:
                 review_manifest = json.loads(

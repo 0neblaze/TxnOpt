@@ -2585,6 +2585,13 @@ compatibility fallback（兼容回退）。
   layout 与 close-time content replay 只绑定 lifecycle tree；storage registry 与
   retention replay 只绑定 receipt 中单独的 `storage_tree_sha256`。缺少任一身份或
   交叉使用都会 fail fast，不再依赖两种编码偶然相等。
+- Attempt21 关闭后的 Formal 入口预检发现，v2 resolver 虽能重放迁移 generation，
+  benchmark consumer 仍从目录 basename 和已删除的 D: batch 路径推导 Pilot 身份。
+  修复把签名 review/campaign 内的 canonical run label 作为身份来源，并直接从已验证
+  generation 的 `wsl_active` 读取 control/review、从 `d_benchmark` 读取 Pilot batch；
+  campaign 创建后新增的治理 aliases 允许作为 locator superset。真实 Pilot97 重放验证
+  原 raw/review SHA、execution lock、36 个 storage observations 和 339,561,305 observed
+  bytes 全部保持不变，不创建 D: compatibility symlink，也不恢复已删除源数据。
 
 ## 2026-07-31：Stage 0--8 storage governance v2 与 E 盘归档入口
 

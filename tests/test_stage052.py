@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -3565,6 +3566,16 @@ def test_stage052_producer_prerequisite_binds_raw_and_review_identity(tmp_path: 
     )
     assert identity.run_label == run_label
     assert identity.repository_revision == "a" * 40
+
+    segmented_raw_dir = tmp_path / "generation-0001" / "wsl_active"
+    shutil.copytree(raw_dir, segmented_raw_dir)
+    segmented_identity = verify_stage052_prerequisite(
+        segmented_raw_dir,
+        expected_component="artifact_streaming",
+        expected_status="READY_FOR_STAGE052_JOB_PARALLEL",
+        expected_run_label=run_label,
+    )
+    assert segmented_identity == identity
 
     review_path = review_dir / "review_manifest.json"
     lineage, retry_history = _prior_review_manifest_history(raw_dir)
