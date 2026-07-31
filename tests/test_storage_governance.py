@@ -827,6 +827,70 @@ def test_windows_native_tree_helper_matches_canonical_segment_identities(
     ) == compute_tree_identity(second)
 
 
+def test_windows_native_mapping_helper_reuses_one_worker_pool(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    first = target / "runs" / "attempt01" / "generation-0001"
+    second = target / "runs" / "attempt02" / "generation-0001"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "manifest.json").write_text("first", encoding="utf-8")
+    (second / "raw.bin").write_bytes(b"second")
+    helper = (
+        Path(__file__).resolve().parents[1]
+        / "tools"
+        / "hash_retention_tree_windows.py"
+    )
+    request = {
+        "root": str(target),
+        "workers": 4,
+        "mappings": [
+            {
+                "logical_id": "attempt01",
+                "relative_path": "runs/attempt01/generation-0001",
+            },
+            {
+                "logical_id": "attempt02",
+                "relative_path": "runs/attempt02/generation-0001",
+            },
+            {
+                "logical_id": "empty_attempt",
+                "relative_path": "runs/empty/generation-0001",
+            },
+        ],
+    }
+
+    completed = subprocess.run(
+        (sys.executable, str(helper), "--mapping-stdin"),
+        input=json.dumps(request),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout)
+
+    assert payload["schema_version"] == (
+        "experiment-retention-native-mapping-verification-v1"
+    )
+    assert payload["workers"] == 4
+    assert (
+        payload["mappings"]["attempt01"]["file_count"],
+        payload["mappings"]["attempt01"]["byte_count"],
+        payload["mappings"]["attempt01"]["tree_sha256"],
+    ) == compute_tree_identity(first)
+    assert (
+        payload["mappings"]["attempt02"]["file_count"],
+        payload["mappings"]["attempt02"]["byte_count"],
+        payload["mappings"]["attempt02"]["tree_sha256"],
+    ) == compute_tree_identity(second)
+    assert (
+        payload["mappings"]["empty_attempt"]["file_count"],
+        payload["mappings"]["empty_attempt"]["byte_count"],
+        payload["mappings"]["empty_attempt"]["tree_sha256"],
+    ) == compute_tree_identity(target / "runs" / "empty" / "generation-0001")
+
+
 def test_preflight_rejects_registered_run_label_with_signed_observation(
     tmp_path: Path,
 ) -> None:

@@ -1066,22 +1066,28 @@ def verify_storage_migration_attestation(
             "storage migration attestation has no mappings"
         )
     replay_specs: list[
-        tuple[Mapping[str, object], Path, Path]
+        tuple[str, Mapping[str, object], Path, Path]
     ] = []
+    logical_ids: set[str] = set()
     for raw in raw_mappings:
         if not isinstance(raw, Mapping):
             raise StorageGovernanceError(
                 "storage migration attestation mapping is invalid"
             )
+        logical_id = raw.get("logical_id")
         source_relative = raw.get("source_relative_path")
         destination_relative = raw.get("destination_relative_path")
-        if not isinstance(source_relative, str) or not isinstance(
-            destination_relative,
-            str,
+        if (
+            not isinstance(logical_id, str)
+            or not logical_id
+            or logical_id in logical_ids
+            or not isinstance(source_relative, str)
+            or not isinstance(destination_relative, str)
         ):
             raise StorageGovernanceError(
                 "storage migration attestation paths are invalid"
             )
+        logical_ids.add(logical_id)
         source = _safe_root_relative_path(
             source_root,
             source_relative,
@@ -1092,21 +1098,70 @@ def verify_storage_migration_attestation(
             destination_relative,
             description="storage migration destination",
         )
-        replay_specs.append((raw, source, destination))
-    tree_paths = tuple(
-        path_item
-        for _raw, source, destination in replay_specs
-        for path_item in (source, destination)
+        replay_specs.append((logical_id, raw, source, destination))
+    native_destination_replay = (
+        workers > 1
+        and os.name != "nt"
+        and _windows_path_for_mounted_drive(destination_root) is not None
     )
-    if workers == 1:
-        tree_identities = tuple(_tree_identity(item) for item in tree_paths)
+    if native_destination_replay:
+        destination_mappings = tuple(
+            (logical_id, str(raw["destination_relative_path"]))
+            for logical_id, raw, _source, _destination in replay_specs
+        )
+        with ThreadPoolExecutor(max_workers=1) as native_executor:
+            destination_future = native_executor.submit(
+                _native_verify_tree_mappings,
+                root=destination_root,
+                mappings=destination_mappings,
+                workers=workers,
+            )
+            with ThreadPoolExecutor(max_workers=workers) as source_executor:
+                source_identities = {
+                    logical_id: identity
+                    for (logical_id, _raw, _source, _destination), identity in zip(
+                        replay_specs,
+                        source_executor.map(
+                            _tree_identity,
+                            tuple(
+                                source
+                                for _logical_id, _raw, source, _destination
+                                in replay_specs
+                            ),
+                        ),
+                        strict=True,
+                    )
+                }
+            destination_identities = destination_future.result()
     else:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            tree_identities = tuple(executor.map(_tree_identity, tree_paths))
+        tree_paths = tuple(
+            path_item
+            for _logical_id, _raw, source, destination in replay_specs
+            for path_item in (source, destination)
+        )
+        if workers == 1:
+            tree_identities = tuple(
+                _tree_identity(item) for item in tree_paths
+            )
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                tree_identities = tuple(
+                    executor.map(_tree_identity, tree_paths)
+                )
+        source_identities = {
+            logical_id: tree_identities[index * 2]
+            for index, (logical_id, _raw, _source, _destination)
+            in enumerate(replay_specs)
+        }
+        destination_identities = {
+            logical_id: tree_identities[index * 2 + 1]
+            for index, (logical_id, _raw, _source, _destination)
+            in enumerate(replay_specs)
+        }
     replayed_mappings: list[dict[str, object]] = []
-    for index, (raw, _source, _destination) in enumerate(replay_specs):
-        source_identity = tree_identities[index * 2]
-        destination_identity = tree_identities[index * 2 + 1]
+    for logical_id, raw, _source, _destination in replay_specs:
+        source_identity = source_identities[logical_id]
+        destination_identity = destination_identities[logical_id]
         recorded_identity = (
             raw.get("file_count"),
             raw.get("byte_count"),
@@ -1831,6 +1886,114 @@ def _native_verify_retention_tree(
             "tree_sha256": tree_sha256,
         },
     )
+
+
+def _native_verify_tree_mappings(
+    *,
+    root: Path,
+    mappings: tuple[tuple[str, str], ...],
+    workers: int,
+) -> dict[str, tuple[int, int, str]]:
+    """Rehash many destination generations in one Windows-native process."""
+
+    root_windows = _windows_path_for_mounted_drive(root)
+    helper = (
+        Path(__file__).resolve().parents[2]
+        / "tools"
+        / "hash_retention_tree_windows.py"
+    )
+    helper_windows = _windows_path_for_mounted_drive(helper)
+    python_windows = shutil.which("python.exe")
+    if (
+        os.name == "nt"
+        or root_windows is None
+        or helper_windows is None
+        or python_windows is None
+        or not helper.is_file()
+    ):
+        raise StorageGovernanceError(
+            "Windows-native mapping verification is unavailable"
+        )
+    request = {
+        "root": root_windows,
+        "workers": workers,
+        "mappings": [
+            {
+                "logical_id": logical_id,
+                "relative_path": relative_path,
+            }
+            for logical_id, relative_path in mappings
+        ],
+    }
+    completed = subprocess.run(
+        (python_windows, helper_windows, "--mapping-stdin"),
+        input=json.dumps(request),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise StorageGovernanceError(
+            "Windows-native mapping verification failed: "
+            f"exit={completed.returncode}, stderr={completed.stderr.strip()}, "
+            f"stdout={completed.stdout.strip()}"
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise StorageGovernanceError(
+            "Windows-native mapping verification returned invalid JSON"
+        ) from error
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version")
+        != "experiment-retention-native-mapping-verification-v1"
+        or payload.get("workers") != workers
+    ):
+        raise StorageGovernanceError(
+            "Windows-native mapping verification schema is invalid"
+        )
+    raw_identities = payload.get("mappings")
+    expected_ids = {logical_id for logical_id, _relative_path in mappings}
+    if (
+        not isinstance(raw_identities, dict)
+        or set(raw_identities) != expected_ids
+        or len(expected_ids) != len(mappings)
+    ):
+        raise StorageGovernanceError(
+            "Windows-native mapping identities are invalid"
+        )
+    identities: dict[str, tuple[int, int, str]] = {}
+    for logical_id in expected_ids:
+        raw_identity = raw_identities.get(logical_id)
+        if not isinstance(raw_identity, dict):
+            raise StorageGovernanceError(
+                "Windows-native mapping identity is invalid: "
+                f"{logical_id}"
+            )
+        file_count = raw_identity.get("file_count")
+        byte_count = raw_identity.get("byte_count")
+        tree_sha256 = raw_identity.get("tree_sha256")
+        if (
+            isinstance(file_count, bool)
+            or not isinstance(file_count, int)
+            or file_count < 0
+            or isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or byte_count < 0
+            or not isinstance(tree_sha256, str)
+            or _SHA256.fullmatch(tree_sha256) is None
+        ):
+            raise StorageGovernanceError(
+                "Windows-native mapping identity is invalid: "
+                f"{logical_id}"
+            )
+        identities[logical_id] = (
+            file_count,
+            byte_count,
+            tree_sha256,
+        )
+    return identities
 
 
 def _hash_source_file(
