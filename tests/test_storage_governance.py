@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -768,6 +770,61 @@ def test_auto_native_copy_is_used_and_independently_verified(
         (tmp_path / "state" / "retention_copy_observations").rglob("*.json")
     )
     assert len(observations) == 1
+
+
+def test_windows_native_tree_helper_matches_canonical_segment_identities(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    first = target / "d_benchmark"
+    second = target / "wsl_active"
+    first.mkdir(parents=True)
+    second.mkdir()
+    (first / "first.bin").write_bytes(b"first")
+    (second / "second.bin").write_bytes(b"second")
+    helper = (
+        Path(__file__).resolve().parents[1]
+        / "tools"
+        / "hash_retention_tree_windows.py"
+    )
+
+    completed = subprocess.run(
+        (
+            sys.executable,
+            str(helper),
+            "--root",
+            str(target),
+            "--workers",
+            "4",
+            "--segment",
+            "d_benchmark=d_benchmark",
+            "--segment",
+            "wsl_active=wsl_active",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout)
+
+    assert payload["schema_version"] == (
+        "experiment-retention-native-tree-verification-v1"
+    )
+    assert (
+        payload["file_count"],
+        payload["byte_count"],
+        payload["tree_sha256"],
+    ) == compute_tree_identity(target)
+    assert (
+        payload["segments"]["d_benchmark"]["file_count"],
+        payload["segments"]["d_benchmark"]["byte_count"],
+        payload["segments"]["d_benchmark"]["tree_sha256"],
+    ) == compute_tree_identity(first)
+    assert (
+        payload["segments"]["wsl_active"]["file_count"],
+        payload["segments"]["wsl_active"]["byte_count"],
+        payload["segments"]["wsl_active"]["tree_sha256"],
+    ) == compute_tree_identity(second)
 
 
 def test_preflight_rejects_registered_run_label_with_signed_observation(

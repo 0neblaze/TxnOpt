@@ -1556,6 +1556,15 @@ class _FileSnapshot:
     device: int
 
 
+@dataclass(frozen=True, slots=True)
+class _VerifiedTree:
+    file_count: int
+    byte_count: int
+    tree_sha256: str
+    segment_identities: Mapping[str, tuple[int, int, str]]
+    observation: Mapping[str, object]
+
+
 def _file_snapshot(path: Path) -> _FileSnapshot:
     stat = path.stat()
     return _FileSnapshot(
@@ -1687,6 +1696,141 @@ def _native_copy_segment(
         "elapsed_seconds": elapsed_seconds,
         "exit_code": completed.returncode,
     }
+
+
+def _native_verify_retention_tree(
+    *,
+    root: Path,
+    segments: tuple[RetentionSegment, ...],
+    expected_trees: tuple[ExpectedSegmentTree, ...],
+    workers: int,
+) -> _VerifiedTree:
+    root_windows = _windows_path_for_mounted_drive(root)
+    helper = (
+        Path(__file__).resolve().parents[2]
+        / "tools"
+        / "hash_retention_tree_windows.py"
+    )
+    helper_windows = _windows_path_for_mounted_drive(helper)
+    python_windows = shutil.which("python.exe")
+    if (
+        os.name == "nt"
+        or root_windows is None
+        or helper_windows is None
+        or python_windows is None
+        or not helper.is_file()
+    ):
+        raise StorageGovernanceError(
+            "Windows-native target verification is unavailable"
+        )
+    command = [
+        python_windows,
+        helper_windows,
+        "--root",
+        root_windows,
+        "--workers",
+        str(workers),
+    ]
+    for segment in segments:
+        command.extend(
+            ("--segment", f"{segment.segment_id}={segment.logical_prefix}")
+        )
+    started = time.perf_counter()
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    elapsed_seconds = time.perf_counter() - started
+    if completed.returncode != 0:
+        raise StorageGovernanceError(
+            "Windows-native target verification failed: "
+            f"exit={completed.returncode}, stderr={completed.stderr.strip()}, "
+            f"stdout={completed.stdout.strip()}"
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise StorageGovernanceError(
+            "Windows-native target verification returned invalid JSON"
+        ) from error
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version")
+        != "experiment-retention-native-tree-verification-v1"
+    ):
+        raise StorageGovernanceError(
+            "Windows-native target verification schema is invalid"
+        )
+    raw_segments = payload.get("segments")
+    expected_by_id = {
+        expected.segment_id: expected for expected in expected_trees
+    }
+    if (
+        not isinstance(raw_segments, dict)
+        or set(raw_segments) != set(expected_by_id)
+    ):
+        raise StorageGovernanceError(
+            "Windows-native target segment identities are invalid"
+        )
+    segment_identities: dict[str, tuple[int, int, str]] = {}
+    for segment_id, expected in expected_by_id.items():
+        raw_identity = raw_segments.get(segment_id)
+        if not isinstance(raw_identity, dict):
+            raise StorageGovernanceError(
+                "Windows-native target segment identity is invalid: "
+                f"{segment_id}"
+            )
+        observed = (
+            raw_identity.get("file_count"),
+            raw_identity.get("byte_count"),
+            raw_identity.get("tree_sha256"),
+        )
+        required = (
+            expected.file_count,
+            expected.byte_count,
+            expected.tree_sha256,
+        )
+        if observed != required:
+            raise StorageGovernanceError(
+                "retained segment differs from signed inventory: "
+                f"{segment_id}"
+            )
+        segment_identities[segment_id] = required
+    file_count = payload.get("file_count")
+    byte_count = payload.get("byte_count")
+    tree_sha256 = payload.get("tree_sha256")
+    if (
+        isinstance(file_count, bool)
+        or not isinstance(file_count, int)
+        or file_count < 0
+        or isinstance(byte_count, bool)
+        or not isinstance(byte_count, int)
+        or byte_count < 0
+        or not isinstance(tree_sha256, str)
+        or _SHA256.fullmatch(tree_sha256) is None
+        or file_count != sum(identity[0] for identity in segment_identities.values())
+        or byte_count != sum(identity[1] for identity in segment_identities.values())
+    ):
+        raise StorageGovernanceError(
+            "Windows-native target tree identity is invalid"
+        )
+    return _VerifiedTree(
+        file_count=file_count,
+        byte_count=byte_count,
+        tree_sha256=tree_sha256,
+        segment_identities=segment_identities,
+        observation={
+            "backend": "windows_python_sha256",
+            "workers": workers,
+            "elapsed_seconds": elapsed_seconds,
+            "verifier_pid": payload.get("verifier_pid"),
+            "file_count": file_count,
+            "byte_count": byte_count,
+            "tree_sha256": tree_sha256,
+        },
+    )
 
 
 def _hash_source_file(
@@ -2693,6 +2837,7 @@ class ExperimentStorageGovernance:
             for relative, path in sorted(all_files.items())
         }
         source_identities: dict[str, _FileIdentity] = {}
+        verified_full_tree: _VerifiedTree | None = None
         if request.retention_class == RetentionClass.DUPLICATE_FAILURE_REDUCED:
             source_identities = {
                 relative: _FileIdentity(
@@ -2744,29 +2889,47 @@ class ExperimentStorageGovernance:
             if request.retention_class.is_full:
                 if request.expected_segment_trees:
                     try:
-                        source_identities = _hash_full_destination(
-                            destination,
-                            expected_files=(
-                                None if native_segment_ids else set(all_files)
-                            ),
-                            workers=request.copy_workers,
-                        )
-                        logical_segment_paths = _complete_logical_segment_paths(
-                            segments=request.segments,
-                            identities=source_identities,
-                            known_paths=logical_segment_paths,
-                        )
-                        _verify_expected_segment_trees(
-                            expected_trees=request.expected_segment_trees,
-                            logical_segment_paths=logical_segment_paths,
-                            identities=source_identities,
-                        )
+                        if (
+                            request.copy_backend == "auto_native"
+                            and os.name != "nt"
+                            and _windows_path_for_mounted_drive(destination)
+                            is not None
+                        ):
+                            verified_full_tree = _native_verify_retention_tree(
+                                root=destination,
+                                segments=request.segments,
+                                expected_trees=request.expected_segment_trees,
+                                workers=request.copy_workers,
+                            )
+                        else:
+                            source_identities = _hash_full_destination(
+                                destination,
+                                expected_files=(
+                                    None
+                                    if native_segment_ids
+                                    else set(all_files)
+                                ),
+                                workers=request.copy_workers,
+                            )
+                            logical_segment_paths = (
+                                _complete_logical_segment_paths(
+                                    segments=request.segments,
+                                    identities=source_identities,
+                                    known_paths=logical_segment_paths,
+                                )
+                            )
+                            _verify_expected_segment_trees(
+                                expected_trees=request.expected_segment_trees,
+                                logical_segment_paths=logical_segment_paths,
+                                identities=source_identities,
+                            )
                     except StorageGovernanceError as error:
                         raise StorageGovernanceError(
                             "retention generation already exists but differs: "
                             f"{destination}"
                         ) from error
-                    keep = set(source_identities)
+                    if verified_full_tree is None:
+                        keep = set(source_identities)
                 else:
                     source_tasks = tuple(
                         (
@@ -2853,34 +3016,53 @@ class ExperimentStorageGovernance:
                             workers=request.copy_workers,
                         )
                     }
-                    target_identities = _hash_full_destination(
-                        incoming,
-                        expected_files=(
-                            None if native_segment_ids else set(all_files)
-                        ),
-                        workers=request.copy_workers,
-                    )
-                    if any(
-                        target_identities[relative] != identity
-                        for relative, identity in streamed_identities.items()
+                    if (
+                        request.copy_backend == "auto_native"
+                        and request.expected_segment_trees
+                        and os.name != "nt"
+                        and _windows_path_for_mounted_drive(incoming)
+                        is not None
                     ):
-                        raise StorageGovernanceError(
-                            "retained streamed file verification failed: "
-                            f"{request.run_label}"
+                        verified_full_tree = _native_verify_retention_tree(
+                            root=incoming,
+                            segments=request.segments,
+                            expected_trees=request.expected_segment_trees,
+                            workers=request.copy_workers,
                         )
-                    logical_segment_paths = _complete_logical_segment_paths(
-                        segments=request.segments,
-                        identities=target_identities,
-                        known_paths=logical_segment_paths,
-                    )
-                    _verify_expected_segment_trees(
-                        expected_trees=request.expected_segment_trees,
-                        logical_segment_paths=logical_segment_paths,
-                        identities=target_identities,
-                    )
-                    source_identities = target_identities
-                    keep = set(source_identities)
-                    if native_observations:
+                        source_identities = streamed_identities
+                    else:
+                        target_identities = _hash_full_destination(
+                            incoming,
+                            expected_files=(
+                                None
+                                if native_segment_ids
+                                else set(all_files)
+                            ),
+                            workers=request.copy_workers,
+                        )
+                        if any(
+                            target_identities[relative] != identity
+                            for relative, identity in streamed_identities.items()
+                        ):
+                            raise StorageGovernanceError(
+                                "retained streamed file verification failed: "
+                                f"{request.run_label}"
+                            )
+                        logical_segment_paths = (
+                            _complete_logical_segment_paths(
+                                segments=request.segments,
+                                identities=target_identities,
+                                known_paths=logical_segment_paths,
+                            )
+                        )
+                        _verify_expected_segment_trees(
+                            expected_trees=request.expected_segment_trees,
+                            logical_segment_paths=logical_segment_paths,
+                            identities=target_identities,
+                        )
+                        source_identities = target_identities
+                        keep = set(source_identities)
+                    if native_observations or verified_full_tree is not None:
                         _write_signed_json(
                             self.retention_state_root
                             / "retention_copy_observations"
@@ -2900,7 +3082,11 @@ class ExperimentStorageGovernance:
                                 "streamed_segment_ids": sorted(
                                     stream_segment_ids
                                 ),
-                                "target_verification": "full_sha256_passed",
+                                "target_verification": (
+                                    verified_full_tree.observation
+                                    if verified_full_tree is not None
+                                    else "full_sha256_passed"
+                                ),
                                 "source_deletion_authorized": False,
                             },
                         )
@@ -3004,12 +3190,17 @@ class ExperimentStorageGovernance:
             projected_bytes=0,
         )
         if request.retention_class.is_full:
-            kept_file_count, kept_bytes, tree_sha256 = _identities_tree(
-                {
-                    relative: source_identities[relative]
-                    for relative in keep
-                }
-            )
+            if verified_full_tree is not None:
+                kept_file_count = verified_full_tree.file_count
+                kept_bytes = verified_full_tree.byte_count
+                tree_sha256 = verified_full_tree.tree_sha256
+            else:
+                kept_file_count, kept_bytes, tree_sha256 = _identities_tree(
+                    {
+                        relative: source_identities[relative]
+                        for relative in keep
+                    }
+                )
         else:
             kept_file_count, kept_bytes, tree_sha256 = _tree_identity(destination)
         replay_receipt_sha256 = ""
@@ -3084,8 +3275,16 @@ class ExperimentStorageGovernance:
                 raise StorageGovernanceError(
                     f"independent retention replay failed: {request.run_label}"
                 ) from error
-        original_kept_bytes = sum(source_identities[path].byte_count for path in keep)
-        omitted_bytes = sum(source_identities[path].byte_count for path in omitted)
+        original_kept_bytes = (
+            kept_bytes
+            if request.retention_class.is_full
+            else sum(source_identities[path].byte_count for path in keep)
+        )
+        omitted_bytes = (
+            0
+            if request.retention_class.is_full
+            else sum(source_identities[path].byte_count for path in omitted)
+        )
         registry_sha256 = self._register_retention_generation(
             request=request,
             tree_sha256=tree_sha256,
@@ -3109,7 +3308,11 @@ class ExperimentStorageGovernance:
             retention_class=request.retention_class,
             archive_path=destination,
             tree_sha256=tree_sha256,
-            kept_file_count=len(keep),
+            kept_file_count=(
+                kept_file_count
+                if request.retention_class.is_full
+                else len(keep)
+            ),
             kept_bytes=original_kept_bytes,
             omitted_file_count=len(omitted),
             omitted_bytes=omitted_bytes,
