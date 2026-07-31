@@ -18,6 +18,7 @@ from evrptw.stage052_retention import RetentionRecord, write_retention_registry
 from evrptw.storage_governance import (
     GIB,
     AdjudicationRecord,
+    ExpectedSegmentTree,
     ExperimentStorageGovernance,
     GovernancePolicy,
     RebuildableAsset,
@@ -29,6 +30,7 @@ from evrptw.storage_governance import (
     StorageCapacityError,
     StorageGovernanceError,
     SweepRequest,
+    compute_tree_identity,
     compute_tree_sha256,
     preflight_cli_attempt,
     verify_storage_migration_attestation,
@@ -545,6 +547,229 @@ def test_unknown_retention_is_full_and_resolves_through_verified_generation(
     assert (resolved / "raw" / "shard0001" / "events.parquet").read_bytes() == b"critical"
 
 
+def test_full_retention_limits_content_io_to_one_source_and_one_target_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator = _locator(tmp_path)
+    for alias in locator.aliases:
+        locator.resolve(alias).absolute_path.mkdir()
+    source = tmp_path / "source" / "stage05.2_benchmark_attempt42"
+    source.mkdir(parents=True)
+    payload = b"x" * (2 * 1024 * 1024)
+    (source / "raw.bin").write_bytes(payload)
+    governance = ExperimentStorageGovernance(
+        policy=GovernancePolicy(),
+        locator=locator,
+        state_root=tmp_path / "state",
+        free_space=lambda _path: 500 * GIB,
+        volume_probe=lambda path: next(
+            root.volume
+            for root in (locator.resolve(alias) for alias in locator.aliases)
+            if root.absolute_path == path
+        ),
+    )
+    original_sha256 = storage_governance_module._file_sha256
+    original_copy2 = storage_governance_module.shutil.copy2
+    original_stream_copy = storage_governance_module._copy_file_with_sha256
+    source_bytes_read = 0
+    target_bytes_read = 0
+
+    def counted_sha256(path: Path) -> str:
+        nonlocal source_bytes_read, target_bytes_read
+        if path.is_relative_to(source):
+            source_bytes_read += path.stat().st_size
+        elif path.is_relative_to(locator.resolve("e_archive").absolute_path):
+            target_bytes_read += path.stat().st_size
+        return original_sha256(path)
+
+    def counted_copy2(source_path: Path, target_path: Path) -> None:
+        nonlocal source_bytes_read
+        source_bytes_read += source_path.stat().st_size
+        original_copy2(source_path, target_path)
+
+    def counted_stream_copy(
+        task: tuple[
+            str,
+            Path,
+            Path,
+            storage_governance_module._FileSnapshot,
+        ],
+    ) -> storage_governance_module._FileIdentity:
+        nonlocal source_bytes_read
+        source_bytes_read += task[3].byte_count
+        return original_stream_copy(task)
+
+    monkeypatch.setattr(storage_governance_module, "_file_sha256", counted_sha256)
+    monkeypatch.setattr(storage_governance_module.shutil, "copy2", counted_copy2)
+    monkeypatch.setattr(
+        storage_governance_module,
+        "_copy_file_with_sha256",
+        counted_stream_copy,
+    )
+    governance.retain_run(
+        RetentionRequest(
+            run_label=source.name,
+            generation=1,
+            retention_class=RetentionClass.UNKNOWN_FULL,
+            archive_root_alias="e_archive",
+            archive_relative_path=f"runs/{source.name}/generation-0001",
+            segments=(RetentionSegment("run", source, "."),),
+        )
+    )
+
+    assert source_bytes_read <= len(payload)
+    assert target_bytes_read <= len(payload)
+
+
+def test_full_retention_rejects_target_that_differs_from_signed_segment_tree(
+    tmp_path: Path,
+) -> None:
+    locator = _locator(tmp_path)
+    for alias in locator.aliases:
+        locator.resolve(alias).absolute_path.mkdir()
+    source = tmp_path / "source" / "stage05.2_benchmark_attempt42"
+    source.mkdir(parents=True)
+    (source / "raw.bin").write_bytes(b"signed inventory payload")
+    governance = ExperimentStorageGovernance(
+        policy=GovernancePolicy(),
+        locator=locator,
+        state_root=tmp_path / "state",
+        free_space=lambda _path: 500 * GIB,
+        volume_probe=lambda path: next(
+            root.volume
+            for root in (locator.resolve(alias) for alias in locator.aliases)
+            if root.absolute_path == path
+        ),
+    )
+    destination = (
+        locator.resolve("e_archive").absolute_path
+        / "runs"
+        / source.name
+        / "generation-0001"
+    )
+
+    with pytest.raises(
+        StorageGovernanceError,
+        match="differs from signed inventory",
+    ):
+        governance.retain_run(
+            RetentionRequest(
+                run_label=source.name,
+                generation=1,
+                retention_class=RetentionClass.UNKNOWN_FULL,
+                archive_root_alias="e_archive",
+                archive_relative_path=f"runs/{source.name}/generation-0001",
+                segments=(RetentionSegment("run", source, "run"),),
+                copy_workers=4,
+                expected_segment_trees=(
+                    ExpectedSegmentTree(
+                        segment_id="run",
+                        file_count=1,
+                        byte_count=len(b"signed inventory payload"),
+                        tree_sha256="0" * 64,
+                    ),
+                ),
+            )
+        )
+
+    assert not destination.exists()
+
+
+def test_auto_native_copy_is_used_and_independently_verified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator = _locator(tmp_path)
+    for alias in locator.aliases:
+        locator.resolve(alias).absolute_path.mkdir()
+    source = tmp_path / "source" / "stage05.2_benchmark_attempt42"
+    source.mkdir(parents=True)
+    (source / "raw.bin").write_bytes(b"native copy payload")
+    file_count, byte_count, tree_sha256 = compute_tree_identity(source)
+    governance = ExperimentStorageGovernance(
+        policy=GovernancePolicy(),
+        locator=locator,
+        state_root=tmp_path / "state",
+        free_space=lambda _path: 500 * GIB,
+        volume_probe=lambda path: next(
+            root.volume
+            for root in (locator.resolve(alias) for alias in locator.aliases)
+            if root.absolute_path == path
+        ),
+    )
+    native_calls: list[tuple[Path, Path, int]] = []
+
+    def fake_windows_path(path: Path) -> str:
+        return str(path)
+
+    def fake_native_copy(
+        *,
+        source: Path,
+        destination: Path,
+        workers: int,
+    ) -> dict[str, object]:
+        native_calls.append((source, destination, workers))
+        storage_governance_module.shutil.copytree(
+            source,
+            destination,
+            dirs_exist_ok=True,
+        )
+        return {
+            "backend": "test_native",
+            "source": str(source),
+            "destination": str(destination),
+            "workers": workers,
+            "elapsed_seconds": 0.01,
+            "exit_code": 1,
+        }
+
+    monkeypatch.setattr(
+        storage_governance_module,
+        "_windows_path_for_mounted_drive",
+        fake_windows_path,
+    )
+    monkeypatch.setattr(
+        storage_governance_module,
+        "_native_copy_segment",
+        fake_native_copy,
+    )
+    receipt = governance.retain_run(
+        RetentionRequest(
+            run_label=source.name,
+            generation=1,
+            retention_class=RetentionClass.UNKNOWN_FULL,
+            archive_root_alias="e_archive",
+            archive_relative_path=f"runs/{source.name}/generation-0001",
+            segments=(RetentionSegment("run", source, "run"),),
+            copy_workers=32,
+            copy_backend="auto_native",
+            expected_segment_trees=(
+                ExpectedSegmentTree(
+                    segment_id="run",
+                    file_count=file_count,
+                    byte_count=byte_count,
+                    tree_sha256=tree_sha256,
+                ),
+            ),
+        )
+    )
+
+    assert len(native_calls) == 1
+    native_source, native_destination, native_workers = native_calls[0]
+    assert native_source == source
+    assert native_destination.name == "run"
+    assert native_destination.parent.name.startswith(".generation-0001.incoming-")
+    assert native_workers == 32
+    assert (receipt.archive_path / "run" / "raw.bin").read_bytes() == (
+        b"native copy payload"
+    )
+    observations = tuple(
+        (tmp_path / "state" / "retention_copy_observations").rglob("*.json")
+    )
+    assert len(observations) == 1
+
+
 def test_preflight_rejects_registered_run_label_with_signed_observation(
     tmp_path: Path,
 ) -> None:
@@ -1011,15 +1236,23 @@ def test_retention_rejects_source_change_during_publication(
             if root.absolute_path == path
         ),
     )
-    original_copy2 = storage_governance_module.__dict__["shutil"].copy2
+    original_stream_copy = storage_governance_module._copy_file_with_sha256
 
-    def copy_then_mutate(source_path: Path, target_path: Path) -> None:
-        original_copy2(source_path, target_path)
+    def copy_then_mutate(
+        task: tuple[
+            str,
+            Path,
+            Path,
+            storage_governance_module._FileSnapshot,
+        ],
+    ) -> storage_governance_module._FileIdentity:
+        identity = original_stream_copy(task)
         source_file.write_text("changed after copy", encoding="utf-8")
+        return identity
 
     monkeypatch.setattr(
-        storage_governance_module.__dict__["shutil"],
-        "copy2",
+        storage_governance_module,
+        "_copy_file_with_sha256",
         copy_then_mutate,
     )
 

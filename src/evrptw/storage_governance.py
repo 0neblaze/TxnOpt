@@ -13,10 +13,12 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import time
 import tomllib
 import uuid
 from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -298,6 +300,30 @@ class RetentionSegment:
 
 
 @dataclass(frozen=True, slots=True)
+class ExpectedSegmentTree:
+    """Signed-inventory tree identity required from one copied segment."""
+
+    segment_id: str
+    file_count: int
+    byte_count: int
+    tree_sha256: str
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[a-z][a-z0-9_]*", self.segment_id) is None:
+            raise ValueError("expected segment ID must be canonical")
+        if (
+            isinstance(self.file_count, bool)
+            or not isinstance(self.file_count, int)
+            or self.file_count < 0
+            or isinstance(self.byte_count, bool)
+            or not isinstance(self.byte_count, int)
+            or self.byte_count < 0
+            or _SHA256.fullmatch(self.tree_sha256) is None
+        ):
+            raise ValueError("expected segment tree identity is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class RetentionRequest:
     """One immutable retention-generation transaction."""
 
@@ -312,6 +338,9 @@ class RetentionRequest:
     adjudication_path: Path | None = None
     keep_relative_paths: tuple[str, ...] = ()
     replay_verifier: Callable[[Path], Path] | None = None
+    copy_workers: int = 1
+    copy_backend: str = "python_stream"
+    expected_segment_trees: tuple[ExpectedSegmentTree, ...] = ()
 
     def __post_init__(self) -> None:
         if _RUN_LABEL.fullmatch(self.run_label) is None:
@@ -325,9 +354,27 @@ class RetentionRequest:
             raise ValueError("retention archive path is unsafe")
         if not self.segments:
             raise ValueError("retention request requires at least one source segment")
+        if (
+            isinstance(self.copy_workers, bool)
+            or not isinstance(self.copy_workers, int)
+            or not 1 <= self.copy_workers <= 32
+        ):
+            raise ValueError("retention copy_workers must be between 1 and 32")
+        if self.copy_backend not in {"python_stream", "auto_native"}:
+            raise ValueError("retention copy_backend is unsupported")
         segment_ids = tuple(segment.segment_id for segment in self.segments)
         if len(set(segment_ids)) != len(segment_ids):
             raise ValueError("retention segment IDs must be unique")
+        expected_ids = tuple(
+            expected.segment_id for expected in self.expected_segment_trees
+        )
+        if self.expected_segment_trees and (
+            len(set(expected_ids)) != len(expected_ids)
+            or set(expected_ids) != set(segment_ids)
+        ):
+            raise ValueError(
+                "expected segment trees must bind every source segment exactly once"
+            )
         if self.adjudication is not None and self.adjudication.run_label != self.run_label:
             raise ValueError("adjudication and retention run_label disagree")
         if self.adjudication_path is not None and not self.adjudication_path.is_absolute():
@@ -853,6 +900,106 @@ def write_storage_migration_attestation(
     return _write_signed_json(path, payload)
 
 
+def write_storage_migration_attestation_from_dry_run(
+    path: Path,
+    *,
+    migration_id: str,
+    source_root_alias: str,
+    destination_root_alias: str,
+    source_volume: VolumeIdentity,
+    destination_volume: VolumeIdentity,
+    mappings: tuple[tuple[str, str, str], ...],
+    dry_run_path: Path,
+    dry_run_sha256: str,
+) -> str:
+    """Create an untrusted attestation projection for one later full replay."""
+
+    if (
+        source_root_alias == destination_root_alias
+        or source_volume == destination_volume
+        or _SHA256.fullmatch(dry_run_sha256) is None
+        or not mappings
+    ):
+        raise ValueError("storage migration attestation identity is invalid")
+    if dry_run_path.resolve().parent != path.resolve().parent:
+        raise ValueError(
+            "storage migration dry run and attestation must share one directory"
+        )
+    dry_run = _load_signed_json(dry_run_path)
+    if (
+        _file_sha256(dry_run_path) != dry_run_sha256
+        or dry_run.get("schema_version")
+        != "experiment-storage-migration-dry-run-v1"
+        or dry_run.get("source_deletion_authorized") is not False
+    ):
+        raise StorageGovernanceError(
+            "storage migration dry-run identity is invalid"
+        )
+    raw_planned = dry_run.get("planned_mappings")
+    if not isinstance(raw_planned, list) or any(
+        not isinstance(record, dict) for record in raw_planned
+    ):
+        raise StorageGovernanceError(
+            "storage migration dry-run mappings are invalid"
+        )
+    planned = [dict(record) for record in raw_planned]
+    _verify_migration_dry_run_projection(dry_run, planned)
+    expected_mapping_keys = {
+        (logical_id, source_relative, destination_relative)
+        for logical_id, source_relative, destination_relative in mappings
+    }
+    records: list[dict[str, object]] = []
+    for record in planned:
+        key = (
+            record.get("logical_id"),
+            record.get("source_relative_path"),
+            record.get("destination_relative_path"),
+        )
+        if (
+            key not in expected_mapping_keys
+            or record.get("source_root_alias") != source_root_alias
+            or record.get("destination_root_alias") != destination_root_alias
+        ):
+            raise StorageGovernanceError(
+                "storage migration mappings differ from the signed dry run"
+            )
+        records.append(
+            {
+                field: record[field]
+                for field in (
+                    "logical_id",
+                    "source_relative_path",
+                    "destination_relative_path",
+                    "file_count",
+                    "byte_count",
+                    "tree_sha256",
+                )
+            }
+        )
+    if len(records) != len(expected_mapping_keys):
+        raise StorageGovernanceError(
+            "storage migration mappings differ from the signed dry run"
+        )
+    return _write_signed_json(
+        path,
+        {
+            "schema_version": "experiment-storage-role-migration-v2",
+            "migration_id": migration_id,
+            "created_at_utc": datetime.now(UTC).isoformat(),
+            "source_root_alias": source_root_alias,
+            "destination_root_alias": destination_root_alias,
+            "source_volume_identity": source_volume.to_dict(),
+            "destination_volume_identity": destination_volume.to_dict(),
+            "dry_run_sha256": dry_run_sha256,
+            "dry_run_relative_path": dry_run_path.name,
+            "source_manifests_immutable": True,
+            "source_deletion_authorized": False,
+            "construction_status": "pending_independent_replay",
+            "mappings": records,
+        },
+    )
+
+
 def load_storage_migration_attestation(path: Path) -> dict[str, object]:
     """Load a signed v2 role-migration attestation for production dispatch."""
 
@@ -876,11 +1023,18 @@ def verify_storage_migration_attestation(
     destination_volume: VolumeIdentity,
     dry_run_path: Path,
     volume_probe: Callable[[Path], VolumeIdentity],
+    workers: int = 1,
 ) -> dict[str, object]:
     """Reverify a cross-volume attestation before resolver or cleanup use."""
 
     if _SHA256.fullmatch(expected_sha256) is None:
         raise ValueError("storage migration attestation SHA-256 is invalid")
+    if (
+        isinstance(workers, bool)
+        or not isinstance(workers, int)
+        or not 1 <= workers <= 32
+    ):
+        raise ValueError("attestation workers must be between 1 and 32")
     payload = _load_signed_json(path)
     dry_run = _load_signed_json(dry_run_path)
     dry_run_sha256 = _file_sha256(dry_run_path)
@@ -911,7 +1065,9 @@ def verify_storage_migration_attestation(
         raise StorageGovernanceError(
             "storage migration attestation has no mappings"
         )
-    replayed_mappings: list[dict[str, object]] = []
+    replay_specs: list[
+        tuple[Mapping[str, object], Path, Path]
+    ] = []
     for raw in raw_mappings:
         if not isinstance(raw, Mapping):
             raise StorageGovernanceError(
@@ -936,8 +1092,21 @@ def verify_storage_migration_attestation(
             destination_relative,
             description="storage migration destination",
         )
-        source_identity = _tree_identity(source)
-        destination_identity = _tree_identity(destination)
+        replay_specs.append((raw, source, destination))
+    tree_paths = tuple(
+        path_item
+        for _raw, source, destination in replay_specs
+        for path_item in (source, destination)
+    )
+    if workers == 1:
+        tree_identities = tuple(_tree_identity(item) for item in tree_paths)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            tree_identities = tuple(executor.map(_tree_identity, tree_paths))
+    replayed_mappings: list[dict[str, object]] = []
+    for index, (raw, _source, _destination) in enumerate(replay_specs):
+        source_identity = tree_identities[index * 2]
+        destination_identity = tree_identities[index * 2 + 1]
         recorded_identity = (
             raw.get("file_count"),
             raw.get("byte_count"),
@@ -1378,12 +1547,210 @@ class _FileIdentity:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _FileSnapshot:
+    byte_count: int
+    modified_ns: int
+    changed_ns: int
+    inode: int
+    device: int
+
+
+def _file_snapshot(path: Path) -> _FileSnapshot:
+    stat = path.stat()
+    return _FileSnapshot(
+        byte_count=stat.st_size,
+        modified_ns=stat.st_mtime_ns,
+        changed_ns=stat.st_ctime_ns,
+        inode=stat.st_ino,
+        device=stat.st_dev,
+    )
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _identities_tree(
+    identities: Mapping[str, _FileIdentity],
+) -> tuple[int, int, str]:
+    digest = hashlib.sha256()
+    for relative in sorted(identities):
+        digest.update(_canonical_json(identities[relative].to_dict()))
+    return (
+        len(identities),
+        sum(identity.byte_count for identity in identities.values()),
+        digest.hexdigest(),
+    )
+
+
+def _copy_file_with_sha256(
+    task: tuple[str, Path, Path, _FileSnapshot],
+) -> _FileIdentity:
+    relative, source, target, expected_snapshot = task
+    if _file_snapshot(source) != expected_snapshot:
+        raise StorageGovernanceError(
+            f"retention source changed before copy: {relative}"
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    byte_count = 0
+    with source.open("rb") as source_handle, target.open("xb") as target_handle:
+        while chunk := source_handle.read(8 * 1024 * 1024):
+            target_handle.write(chunk)
+            digest.update(chunk)
+            byte_count += len(chunk)
+    shutil.copystat(source, target)
+    if (
+        byte_count != expected_snapshot.byte_count
+        or _file_snapshot(source) != expected_snapshot
+    ):
+        raise StorageGovernanceError(
+            f"retention source changed during copy: {relative}"
+        )
+    return _FileIdentity(relative, byte_count, digest.hexdigest())
+
+
+def _windows_path_for_mounted_drive(path: Path) -> str | None:
+    resolved = path.resolve()
+    parts = resolved.parts
+    if (
+        len(parts) < 4
+        or parts[0] != "/"
+        or parts[1] != "mnt"
+        or re.fullmatch(r"[a-zA-Z]", parts[2]) is None
+    ):
+        return None
+    suffix = "\\".join(parts[3:])
+    return f"{parts[2].upper()}:\\{suffix}"
+
+
+def _native_copy_segment(
+    *,
+    source: Path,
+    destination: Path,
+    workers: int,
+) -> dict[str, object]:
+    source_windows = _windows_path_for_mounted_drive(source)
+    destination_windows = _windows_path_for_mounted_drive(destination)
+    if source_windows is None or destination_windows is None:
+        raise StorageGovernanceError(
+            "Windows-native copy requires mounted Windows source and destination"
+        )
+    executable = shutil.which("robocopy.exe")
+    if executable is None:
+        raise StorageGovernanceError(
+            "Windows-native copy requires robocopy.exe"
+        )
+    destination.mkdir(parents=True, exist_ok=True)
+    command = (
+        executable,
+        source_windows,
+        destination_windows,
+        "/E",
+        "/COPY:DAT",
+        "/DCOPY:DAT",
+        "/R:1",
+        "/W:1",
+        f"/MT:{workers}",
+        "/J",
+        "/XJ",
+        "/NFL",
+        "/NDL",
+        "/NJH",
+        "/NJS",
+        "/NP",
+    )
+    started = time.perf_counter()
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    elapsed_seconds = time.perf_counter() - started
+    if completed.returncode > 7:
+        raise StorageGovernanceError(
+            "Windows-native copy failed: "
+            f"exit={completed.returncode}, stderr={completed.stderr.strip()}, "
+            f"stdout={completed.stdout.strip()}"
+        )
+    return {
+        "backend": "windows_robocopy",
+        "source": str(source),
+        "destination": str(destination),
+        "workers": workers,
+        "elapsed_seconds": elapsed_seconds,
+        "exit_code": completed.returncode,
+    }
+
+
+def _hash_source_file(
+    task: tuple[str, Path, _FileSnapshot],
+) -> _FileIdentity:
+    relative, source, expected_snapshot = task
+    if _file_snapshot(source) != expected_snapshot:
+        raise StorageGovernanceError(
+            f"retention source changed before verification: {relative}"
+        )
+    identity = _FileIdentity(
+        relative,
+        expected_snapshot.byte_count,
+        _file_sha256(source),
+    )
+    if _file_snapshot(source) != expected_snapshot:
+        raise StorageGovernanceError(
+            f"retention source changed during verification: {relative}"
+        )
+    return identity
+
+
+def _verify_target_file(
+    task: tuple[str, Path, _FileIdentity],
+) -> _FileIdentity:
+    relative, target, expected = task
+    if (
+        not target.is_file()
+        or target.stat().st_size != expected.byte_count
+        or _file_sha256(target) != expected.sha256
+    ):
+        raise StorageGovernanceError(
+            f"retained file verification failed: {relative}"
+        )
+    return expected
+
+
+def _hash_target_file(
+    task: tuple[str, Path],
+) -> _FileIdentity:
+    relative, target = task
+    if not target.is_file():
+        raise StorageGovernanceError(
+            f"retention destination file is missing: {relative}"
+        )
+    snapshot = _file_snapshot(target)
+    identity = _FileIdentity(relative, snapshot.byte_count, _file_sha256(target))
+    if _file_snapshot(target) != snapshot:
+        raise StorageGovernanceError(
+            f"retention destination changed during verification: {relative}"
+        )
+    return identity
+
+
+def _parallel_map[TaskT](
+    function: Callable[[TaskT], _FileIdentity],
+    tasks: tuple[TaskT, ...],
+    *,
+    workers: int,
+) -> tuple[_FileIdentity, ...]:
+    if workers == 1:
+        return tuple(function(task) for task in tasks)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        return tuple(executor.map(function, tasks))
 
 
 def _safe_root_relative_path(
@@ -1457,7 +1824,7 @@ def _is_duplicate_control_evidence(relative_path: str) -> bool:
 
 
 def _tree_identity(path: Path) -> tuple[int, int, str]:
-    files: list[_FileIdentity] = []
+    files: dict[str, _FileIdentity] = {}
     for item in sorted(path.rglob("*"), key=lambda candidate: candidate.as_posix()):
         if item.is_symlink():
             raise StorageGovernanceError(f"retained tree contains a symlink: {item}")
@@ -1466,11 +1833,12 @@ def _tree_identity(path: Path) -> tuple[int, int, str]:
         if not item.is_file():
             raise StorageGovernanceError(f"retained tree entry is unsupported: {item}")
         relative = item.relative_to(path).as_posix()
-        files.append(_FileIdentity(relative, item.stat().st_size, _file_sha256(item)))
-    digest = hashlib.sha256()
-    for record in files:
-        digest.update(_canonical_json(record.to_dict()))
-    return len(files), sum(record.byte_count for record in files), digest.hexdigest()
+        files[relative] = _FileIdentity(
+            relative,
+            item.stat().st_size,
+            _file_sha256(item),
+        )
+    return _identities_tree(files)
 
 
 def _protected_rebuildable_reason(path: Path) -> str | None:
@@ -1507,6 +1875,48 @@ def compute_tree_identity(path: Path) -> tuple[int, int, str]:
     """Return canonical file count, byte count, and tree SHA-256."""
 
     return _tree_identity(path)
+
+
+def compute_tree_identity_parallel(
+    path: Path,
+    *,
+    workers: int,
+) -> tuple[int, int, str]:
+    """Return canonical tree identity with bounded parallel file hashing."""
+
+    if (
+        isinstance(workers, bool)
+        or not isinstance(workers, int)
+        or not 1 <= workers <= 32
+    ):
+        raise ValueError("tree identity workers must be between 1 and 32")
+    source = path.resolve()
+    if not source.is_dir():
+        raise StorageGovernanceError(f"tree identity source is missing: {path}")
+    files: dict[str, Path] = {}
+    for item in sorted(source.rglob("*"), key=lambda candidate: candidate.as_posix()):
+        if item.is_symlink():
+            raise StorageGovernanceError(f"retained tree contains a symlink: {item}")
+        if item.is_dir():
+            continue
+        if not item.is_file():
+            raise StorageGovernanceError(
+                f"retained tree entry is unsupported: {item}"
+            )
+        files[item.relative_to(source).as_posix()] = item
+    tasks = tuple(
+        (relative, item, _file_snapshot(item))
+        for relative, item in files.items()
+    )
+    identities = {
+        identity.relative_path: identity
+        for identity in _parallel_map(
+            _hash_source_file,
+            tasks,
+            workers=workers,
+        )
+    }
+    return _identities_tree(identities)
 
 
 def _maintenance_request_for_roots(
@@ -1579,6 +1989,133 @@ def _published_generation_matches(
         ):
             return False
     return True
+
+
+def _hash_full_destination(
+    destination: Path,
+    *,
+    expected_files: set[str] | None,
+    workers: int,
+) -> dict[str, _FileIdentity]:
+    if not destination.is_dir() or destination.is_symlink():
+        raise StorageGovernanceError(
+            f"retention destination is not a directory: {destination}"
+        )
+    actual_files: set[str] = set()
+    for path in destination.rglob("*"):
+        if path.is_symlink():
+            raise StorageGovernanceError(
+                f"retention destination contains a symlink: {path}"
+            )
+        if path.is_file():
+            actual_files.add(path.relative_to(destination).as_posix())
+        elif not path.is_dir():
+            raise StorageGovernanceError(
+                f"retention destination entry is unsupported: {path}"
+            )
+    if expected_files is not None and actual_files != expected_files:
+        raise StorageGovernanceError(
+            f"retention destination file set differs: {destination}"
+        )
+    tasks = tuple(
+        (
+            relative,
+            destination.joinpath(*PurePosixPath(relative).parts),
+        )
+        for relative in sorted(actual_files)
+    )
+    return {
+        identity.relative_path: identity
+        for identity in _parallel_map(
+            _hash_target_file,
+            tasks,
+            workers=workers,
+        )
+    }
+
+
+def _verify_full_destination(
+    destination: Path,
+    *,
+    source_identities: Mapping[str, _FileIdentity],
+    workers: int,
+) -> None:
+    target_identities = _hash_full_destination(
+        destination,
+        expected_files=set(source_identities),
+        workers=workers,
+    )
+    if target_identities != source_identities:
+        raise StorageGovernanceError(
+            f"retained file verification failed: {destination}"
+        )
+
+
+def _complete_logical_segment_paths(
+    *,
+    segments: tuple[RetentionSegment, ...],
+    identities: Mapping[str, _FileIdentity],
+    known_paths: Mapping[str, tuple[str, str]],
+) -> dict[str, tuple[str, str]]:
+    completed = dict(known_paths)
+    for logical_path in identities:
+        if logical_path in completed:
+            continue
+        logical_parts = PurePosixPath(logical_path).parts
+        matches: list[tuple[str, str]] = []
+        for segment in segments:
+            prefix = PurePosixPath(segment.logical_prefix)
+            prefix_parts = () if str(prefix) == "." else prefix.parts
+            if logical_parts[: len(prefix_parts)] != prefix_parts:
+                continue
+            relative_parts = logical_parts[len(prefix_parts) :]
+            if relative_parts:
+                matches.append(
+                    (segment.segment_id, PurePosixPath(*relative_parts).as_posix())
+                )
+        if len(matches) != 1:
+            raise StorageGovernanceError(
+                "retained file does not map to exactly one segment: "
+                f"{logical_path}"
+            )
+        completed[logical_path] = matches[0]
+    if set(completed) != set(identities):
+        raise StorageGovernanceError(
+            "retention segment mapping differs from retained files"
+        )
+    return completed
+
+
+def _verify_expected_segment_trees(
+    *,
+    expected_trees: tuple[ExpectedSegmentTree, ...],
+    logical_segment_paths: Mapping[str, tuple[str, str]],
+    identities: Mapping[str, _FileIdentity],
+) -> None:
+    if not expected_trees:
+        return
+    by_segment: dict[str, dict[str, _FileIdentity]] = {
+        expected.segment_id: {} for expected in expected_trees
+    }
+    for logical_path, identity in identities.items():
+        segment_id, segment_relative = logical_segment_paths[logical_path]
+        by_segment[segment_id][segment_relative] = _FileIdentity(
+            relative_path=segment_relative,
+            byte_count=identity.byte_count,
+            sha256=identity.sha256,
+        )
+    for expected in expected_trees:
+        observed = _identities_tree(by_segment[expected.segment_id])
+        required = (
+            expected.file_count,
+            expected.byte_count,
+            expected.tree_sha256,
+        )
+        if observed != required:
+            raise StorageGovernanceError(
+                "retained segment differs from signed inventory: "
+                f"{expected.segment_id}"
+            )
 
 
 def _registry_records(payload: Mapping[str, object]) -> list[dict[str, object]]:
@@ -2054,14 +2591,40 @@ class ExperimentStorageGovernance:
         resolved_destination_parent = destination.parent.resolve()
         if not resolved_destination_parent.is_relative_to(resolved_archive):
             raise StorageGovernanceError("retention destination escapes archive root")
+        native_segment_ids = {
+            segment.segment_id
+            for segment in request.segments
+            if (
+                request.retention_class.is_full
+                and request.copy_backend == "auto_native"
+                and bool(request.expected_segment_trees)
+                and _windows_path_for_mounted_drive(segment.source_path)
+                is not None
+                and _windows_path_for_mounted_drive(destination) is not None
+            )
+        }
+        native_source_snapshots: dict[str, _FileSnapshot] = {}
         all_files: dict[str, Path] = {}
+        logical_segment_paths: dict[str, tuple[str, str]] = {}
         for segment in request.segments:
+            if segment.segment_id in native_segment_ids:
+                source = segment.source_path.resolve()
+                if not source.is_dir() or source.is_symlink():
+                    raise StorageGovernanceError(
+                        f"retention source segment is missing: {segment.source_path}"
+                    )
+                native_source_snapshots[segment.segment_id] = _file_snapshot(source)
+                continue
             for source_file, logical_path in _segment_files(segment):
                 if logical_path in all_files:
                     raise StorageGovernanceError(
                         f"retention segments collide at {logical_path}"
                     )
                 all_files[logical_path] = source_file
+                logical_segment_paths[logical_path] = (
+                    segment.segment_id,
+                    source_file.relative_to(segment.source_path.resolve()).as_posix(),
+                )
 
         keep = set(all_files)
         if request.retention_class == RetentionClass.DUPLICATE_FAILURE_REDUCED:
@@ -2125,14 +2688,20 @@ class ExperimentStorageGovernance:
                     "duplicate retention keeps unsupported evidence paths: "
                     f"{unsupported}"
                 )
-        source_identities = {
-            relative: _FileIdentity(
-                relative_path=relative,
-                byte_count=path.stat().st_size,
-                sha256=_file_sha256(path),
-            )
+        source_snapshots = {
+            relative: _file_snapshot(path)
             for relative, path in sorted(all_files.items())
         }
+        source_identities: dict[str, _FileIdentity] = {}
+        if request.retention_class == RetentionClass.DUPLICATE_FAILURE_REDUCED:
+            source_identities = {
+                relative: _FileIdentity(
+                    relative_path=relative,
+                    byte_count=source_snapshots[relative].byte_count,
+                    sha256=_file_sha256(path),
+                )
+                for relative, path in sorted(all_files.items())
+            }
         omitted = sorted(set(all_files).difference(keep))
         projection: dict[str, object] | None = None
         if request.retention_class == RetentionClass.DUPLICATE_FAILURE_REDUCED:
@@ -2161,13 +2730,72 @@ class ExperimentStorageGovernance:
             request=request,
             archive_root=archive_root,
             phase="pre_archive",
-            projected_bytes=sum(
-                identity.byte_count for identity in source_identities.values()
+            projected_bytes=(
+                sum(snapshot.byte_count for snapshot in source_snapshots.values())
+                + sum(
+                    expected.byte_count
+                    for expected in request.expected_segment_trees
+                    if expected.segment_id in native_segment_ids
+                )
             ),
         )
         incoming = destination.parent / f".{destination.name}.incoming-{uuid.uuid4().hex}"
         if destination.exists():
-            if not _published_generation_matches(
+            if request.retention_class.is_full:
+                if request.expected_segment_trees:
+                    try:
+                        source_identities = _hash_full_destination(
+                            destination,
+                            expected_files=(
+                                None if native_segment_ids else set(all_files)
+                            ),
+                            workers=request.copy_workers,
+                        )
+                        logical_segment_paths = _complete_logical_segment_paths(
+                            segments=request.segments,
+                            identities=source_identities,
+                            known_paths=logical_segment_paths,
+                        )
+                        _verify_expected_segment_trees(
+                            expected_trees=request.expected_segment_trees,
+                            logical_segment_paths=logical_segment_paths,
+                            identities=source_identities,
+                        )
+                    except StorageGovernanceError as error:
+                        raise StorageGovernanceError(
+                            "retention generation already exists but differs: "
+                            f"{destination}"
+                        ) from error
+                    keep = set(source_identities)
+                else:
+                    source_tasks = tuple(
+                        (
+                            relative,
+                            all_files[relative],
+                            source_snapshots[relative],
+                        )
+                        for relative in sorted(all_files)
+                    )
+                    source_identities = {
+                        identity.relative_path: identity
+                        for identity in _parallel_map(
+                            _hash_source_file,
+                            source_tasks,
+                            workers=request.copy_workers,
+                        )
+                    }
+                    try:
+                        _verify_full_destination(
+                            destination,
+                            source_identities=source_identities,
+                            workers=request.copy_workers,
+                        )
+                    except StorageGovernanceError as error:
+                        raise StorageGovernanceError(
+                            "retention generation already exists but differs: "
+                            f"{destination}"
+                        ) from error
+            elif not _published_generation_matches(
                 destination,
                 source_identities=source_identities,
                 keep=keep,
@@ -2179,36 +2807,154 @@ class ExperimentStorageGovernance:
         else:
             incoming.mkdir(parents=True)
             try:
-                for relative in sorted(keep):
-                    target = incoming.joinpath(*PurePosixPath(relative).parts)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(all_files[relative], target)
-                    identity = source_identities[relative]
-                    if (
-                        target.stat().st_size != identity.byte_count
-                        or _file_sha256(target) != identity.sha256
+                if request.retention_class.is_full:
+                    native_segments = [
+                        segment
+                        for segment in request.segments
+                        if segment.segment_id in native_segment_ids
+                    ]
+                    stream_segment_ids = {
+                        segment.segment_id
+                        for segment in request.segments
+                        if segment.segment_id not in native_segment_ids
+                    }
+                    native_observations = [
+                        _native_copy_segment(
+                            source=segment.source_path,
+                            destination=(
+                                incoming
+                                if segment.logical_prefix == "."
+                                else incoming.joinpath(
+                                    *PurePosixPath(
+                                        segment.logical_prefix
+                                    ).parts
+                                )
+                            ),
+                            workers=request.copy_workers,
+                        )
+                        for segment in native_segments
+                    ]
+                    copy_tasks = tuple(
+                        (
+                            relative,
+                            all_files[relative],
+                            incoming.joinpath(*PurePosixPath(relative).parts),
+                            source_snapshots[relative],
+                        )
+                        for relative in sorted(keep)
+                        if logical_segment_paths[relative][0]
+                        in stream_segment_ids
+                    )
+                    streamed_identities = {
+                        identity.relative_path: identity
+                        for identity in _parallel_map(
+                            _copy_file_with_sha256,
+                            copy_tasks,
+                            workers=request.copy_workers,
+                        )
+                    }
+                    target_identities = _hash_full_destination(
+                        incoming,
+                        expected_files=(
+                            None if native_segment_ids else set(all_files)
+                        ),
+                        workers=request.copy_workers,
+                    )
+                    if any(
+                        target_identities[relative] != identity
+                        for relative, identity in streamed_identities.items()
                     ):
                         raise StorageGovernanceError(
-                            f"retained file verification failed: {relative}"
+                            "retained streamed file verification failed: "
+                            f"{request.run_label}"
                         )
+                    logical_segment_paths = _complete_logical_segment_paths(
+                        segments=request.segments,
+                        identities=target_identities,
+                        known_paths=logical_segment_paths,
+                    )
+                    _verify_expected_segment_trees(
+                        expected_trees=request.expected_segment_trees,
+                        logical_segment_paths=logical_segment_paths,
+                        identities=target_identities,
+                    )
+                    source_identities = target_identities
+                    keep = set(source_identities)
+                    if native_observations:
+                        _write_signed_json(
+                            self.retention_state_root
+                            / "retention_copy_observations"
+                            / request.run_label
+                            / f"generation-{request.generation:04d}"
+                            / f"{incoming.name}.json",
+                            {
+                                "schema_version": (
+                                    "experiment-retention-copy-observation-v1"
+                                ),
+                                "created_at_utc": datetime.now(UTC).isoformat(),
+                                "run_label": request.run_label,
+                                "generation": request.generation,
+                                "copy_backend": request.copy_backend,
+                                "copy_workers": request.copy_workers,
+                                "native_segments": native_observations,
+                                "streamed_segment_ids": sorted(
+                                    stream_segment_ids
+                                ),
+                                "target_verification": "full_sha256_passed",
+                                "source_deletion_authorized": False,
+                            },
+                        )
+                else:
+                    for relative in sorted(keep):
+                        target = incoming.joinpath(*PurePosixPath(relative).parts)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(all_files[relative], target)
+                        identity = source_identities[relative]
+                        if (
+                            target.stat().st_size != identity.byte_count
+                            or _file_sha256(target) != identity.sha256
+                        ):
+                            raise StorageGovernanceError(
+                                f"retained file verification failed: {relative}"
+                            )
                 if projection is not None:
                     _write_signed_json(
                         incoming / "retention_projection_manifest.json",
                         projection,
                     )
-                prepublication_source_identities = {
-                    relative: _FileIdentity(
-                        relative_path=relative,
-                        byte_count=path.stat().st_size,
-                        sha256=_file_sha256(path),
-                    )
-                    for relative, path in sorted(all_files.items())
-                }
-                if prepublication_source_identities != source_identities:
-                    raise StorageGovernanceError(
-                        "retention source changed before atomic publication: "
-                        f"{request.run_label}"
-                    )
+                if request.retention_class.is_full:
+                    if any(
+                        _file_snapshot(path) != source_snapshots[relative]
+                        for relative, path in all_files.items()
+                    ) or any(
+                        _file_snapshot(
+                            next(
+                                segment.source_path.resolve()
+                                for segment in request.segments
+                                if segment.segment_id == segment_id
+                            )
+                        )
+                        != snapshot
+                        for segment_id, snapshot in native_source_snapshots.items()
+                    ):
+                        raise StorageGovernanceError(
+                            "retention source changed before atomic publication: "
+                            f"{request.run_label}"
+                        )
+                else:
+                    prepublication_source_identities = {
+                        relative: _FileIdentity(
+                            relative_path=relative,
+                            byte_count=path.stat().st_size,
+                            sha256=_file_sha256(path),
+                        )
+                        for relative, path in sorted(all_files.items())
+                    }
+                    if prepublication_source_identities != source_identities:
+                        raise StorageGovernanceError(
+                            "retention source changed before atomic publication: "
+                            f"{request.run_label}"
+                        )
                 incoming.parent.mkdir(parents=True, exist_ok=True)
                 self._publish_incoming_generation(
                     request=request,
@@ -2220,25 +2966,52 @@ class ExperimentStorageGovernance:
                     shutil.rmtree(incoming)
                 raise
 
-        observed_source_identities = {
-            relative: _FileIdentity(
-                relative_path=relative,
-                byte_count=path.stat().st_size,
-                sha256=_file_sha256(path),
-            )
-            for relative, path in sorted(all_files.items())
-        }
-        if observed_source_identities != source_identities:
-            raise StorageGovernanceError(
-                f"retention source changed during publication: {request.run_label}"
-            )
+        if request.retention_class.is_full:
+            if any(
+                _file_snapshot(path) != source_snapshots[relative]
+                for relative, path in all_files.items()
+            ) or any(
+                _file_snapshot(
+                    next(
+                        segment.source_path.resolve()
+                        for segment in request.segments
+                        if segment.segment_id == segment_id
+                    )
+                )
+                != snapshot
+                for segment_id, snapshot in native_source_snapshots.items()
+            ):
+                raise StorageGovernanceError(
+                    f"retention source changed during publication: {request.run_label}"
+                )
+        else:
+            observed_source_identities = {
+                relative: _FileIdentity(
+                    relative_path=relative,
+                    byte_count=path.stat().st_size,
+                    sha256=_file_sha256(path),
+                )
+                for relative, path in sorted(all_files.items())
+            }
+            if observed_source_identities != source_identities:
+                raise StorageGovernanceError(
+                    f"retention source changed during publication: {request.run_label}"
+                )
         self._observe_archive_capacity(
             request=request,
             archive_root=archive_root,
             phase="post_archive",
             projected_bytes=0,
         )
-        kept_file_count, kept_bytes, tree_sha256 = _tree_identity(destination)
+        if request.retention_class.is_full:
+            kept_file_count, kept_bytes, tree_sha256 = _identities_tree(
+                {
+                    relative: source_identities[relative]
+                    for relative in keep
+                }
+            )
+        else:
+            kept_file_count, kept_bytes, tree_sha256 = _tree_identity(destination)
         replay_receipt_sha256 = ""
         replay_receipt_relative_path = ""
         if request.replay_verifier is not None:

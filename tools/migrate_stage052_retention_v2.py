@@ -65,6 +65,7 @@ from evrptw.stage052_campaign import StorageRootLocator  # noqa: E402
 from evrptw.stage052_campaign_runner import probe_volume_identity  # noqa: E402
 from evrptw.storage_governance import (  # noqa: E402
     GIB,
+    ExpectedSegmentTree,
     ExperimentStorageGovernance,
     GovernancePolicy,
     RetentionClass,
@@ -72,10 +73,10 @@ from evrptw.storage_governance import (  # noqa: E402
     RetentionSegment,
     StartRequest,
     StorageGovernanceError,
-    compute_tree_identity,
+    compute_tree_identity_parallel,
     verify_storage_migration_attestation,
     write_migration_dry_run,
-    write_storage_migration_attestation,
+    write_storage_migration_attestation_from_dry_run,
 )
 
 _RUN_LABEL: Final = re.compile(
@@ -260,7 +261,10 @@ def _discover_sources(locator: StorageRootLocator) -> tuple[SourceSegment, ...]:
 
 
 def _inventory_segment(segment: SourceSegment) -> SegmentIdentity:
-    file_count, byte_count, tree_sha256 = compute_tree_identity(segment.source_path)
+    file_count, byte_count, tree_sha256 = compute_tree_identity_parallel(
+        segment.source_path,
+        workers=32,
+    )
     return SegmentIdentity(
         logical_id=segment.logical_id,
         run_label=segment.run_label,
@@ -557,22 +561,6 @@ def _identity_lookup(
     return {identity.logical_id: identity for identity in identities}
 
 
-def _verify_source_against_inventory(
-    segments: tuple[SourceSegment, ...],
-    identities: dict[str, SegmentIdentity],
-) -> int:
-    byte_count = 0
-    for segment in segments:
-        observed = _inventory_segment(segment)
-        expected = identities[segment.logical_id]
-        if observed != expected:
-            raise StorageGovernanceError(
-                f"source changed after signed dry run: {segment.logical_id}"
-            )
-        byte_count += expected.byte_count
-    return byte_count
-
-
 def _copy_all_runs(
     *,
     governance: ExperimentStorageGovernance,
@@ -615,16 +603,24 @@ def _copy_all_runs(
     completed = len(grouped) - len(pending)
     for run_label, segments in grouped.items():
         if run_label not in pending:
-            resolved = governance.resolve_run(run_label)
+            resolved = locator.resolve("e_archive").absolute_path.joinpath(
+                *PurePosixPath(
+                    segments[0].run_destination_relative_path
+                ).parts
+            )
+            if not resolved.is_dir():
+                raise StorageGovernanceError(
+                    f"registered archive path is missing: {run_label}"
+                )
             _log(
-                "retention_resume_verified",
+                "retention_resume_registry_verified",
                 run_label=run_label,
                 archive_path=str(resolved),
             )
             continue
-        current_bytes = _verify_source_against_inventory(
-            segments,
-            identity_by_id,
+        current_bytes = sum(
+            identity_by_id[segment.logical_id].byte_count
+            for segment in segments
         )
         _log(
             "retention_started",
@@ -649,13 +645,25 @@ def _copy_all_runs(
                     )
                     for segment in segments
                 ),
+                copy_workers=32,
+                copy_backend="auto_native",
+                expected_segment_trees=tuple(
+                    ExpectedSegmentTree(
+                        segment_id=segment.segment_id,
+                        file_count=identity_by_id[
+                            segment.logical_id
+                        ].file_count,
+                        byte_count=identity_by_id[
+                            segment.logical_id
+                        ].byte_count,
+                        tree_sha256=identity_by_id[
+                            segment.logical_id
+                        ].tree_sha256,
+                    )
+                    for segment in segments
+                ),
             )
         )
-        resolved = governance.resolve_run(run_label)
-        if resolved != receipt.archive_path:
-            raise StorageGovernanceError(
-                f"resolver returned the wrong archive path: {run_label}"
-            )
         remaining_bytes -= current_bytes
         completed += 1
         governance.preflight_run(
@@ -687,8 +695,8 @@ def _attest(
     identities: tuple[SegmentIdentity, ...],
     dry_runs: dict[str, tuple[Path, str]],
     evidence_root: Path,
-) -> dict[str, tuple[Path, str]]:
-    result: dict[str, tuple[Path, str]] = {}
+) -> dict[str, tuple[Path, str, Path, str]]:
+    result: dict[str, tuple[Path, str, Path, str]] = {}
     destination = locator.resolve("e_archive")
     for source_alias in ("wsl_staging", "d_archive"):
         source = locator.resolve(source_alias)
@@ -705,20 +713,18 @@ def _attest(
         )
         dry_run_path, dry_run_sha256 = dry_runs[source_alias]
         attestation_path = evidence_root / f"{source_alias}-to-e-attestation.json"
-        digest = write_storage_migration_attestation(
+        digest = write_storage_migration_attestation_from_dry_run(
             attestation_path,
             migration_id=f"{_MIGRATION_ID}-{source_alias}-to-e",
             source_root_alias=source_alias,
             destination_root_alias="e_archive",
-            source_root=source.absolute_path,
-            destination_root=destination.absolute_path,
             source_volume=source.volume,
             destination_volume=destination.volume,
             mappings=mappings,
             dry_run_path=dry_run_path,
             dry_run_sha256=dry_run_sha256,
         )
-        verify_storage_migration_attestation(
+        verified = verify_storage_migration_attestation(
             attestation_path,
             expected_sha256=digest,
             source_root_alias=source_alias,
@@ -729,14 +735,41 @@ def _attest(
             destination_volume=destination.volume,
             dry_run_path=dry_run_path,
             volume_probe=probe_volume_identity,
+            workers=32,
         )
-        result[source_alias] = (attestation_path, digest)
+        verification_path = (
+            evidence_root
+            / f"{source_alias}-to-e-verification-receipt.json"
+        )
+        verification_digest = _write_signed_json(
+            verification_path,
+            {
+                "schema_version": (
+                    "experiment-storage-role-migration-verification-v1"
+                ),
+                "created_at_utc": datetime.now(UTC).isoformat(),
+                "migration_id": f"{_MIGRATION_ID}-{source_alias}-to-e",
+                "attestation_sha256": digest,
+                "dry_run_sha256": dry_run_sha256,
+                "mapping_count": len(verified["mappings"]),  # type: ignore[arg-type]
+                "source_deletion_authorized": False,
+                "status": "passed",
+            },
+        )
+        result[source_alias] = (
+            attestation_path,
+            digest,
+            verification_path,
+            verification_digest,
+        )
         _log(
             "attestation_verified",
             source_root_alias=source_alias,
             mappings=len(mappings),
             path=str(attestation_path),
             sha256=digest,
+            verification_receipt=str(verification_path),
+            verification_receipt_sha256=verification_digest,
         )
     return result
 
@@ -745,10 +778,57 @@ def _replay_resolver(
     governance: ExperimentStorageGovernance,
     grouped: dict[str, tuple[SourceSegment, ...]],
 ) -> list[dict[str, object]]:
+    registry_records = _registry_records(governance.retention_state_root)
     results: list[dict[str, object]] = []
     for index, run_label in enumerate(grouped, start=1):
-        path = governance.resolve_run(run_label)
-        file_count, byte_count, tree_sha256 = compute_tree_identity(path)
+        selected = [
+            record
+            for record in registry_records
+            if record.get("run_label") == run_label
+            and record.get("generation") == _GENERATION
+            and record.get("verification_status") == "verified"
+        ]
+        if not selected:
+            raise StorageGovernanceError(
+                f"resolver replay has no verified registry records: {run_label}"
+            )
+        aliases = {record.get("archive_root_alias") for record in selected}
+        relatives = {record.get("archive_relative_path") for record in selected}
+        file_counts = {record.get("file_count") for record in selected}
+        byte_counts = {record.get("byte_count") for record in selected}
+        tree_hashes = {record.get("tree_sha256") for record in selected}
+        if (
+            aliases != {"e_archive"}
+            or len(relatives) != 1
+            or len(file_counts) != 1
+            or len(byte_counts) != 1
+            or len(tree_hashes) != 1
+        ):
+            raise StorageGovernanceError(
+                f"resolver replay registry records disagree: {run_label}"
+            )
+        relative = next(iter(relatives))
+        file_count = next(iter(file_counts))
+        byte_count = next(iter(byte_counts))
+        tree_sha256 = next(iter(tree_hashes))
+        if (
+            not isinstance(relative, str)
+            or isinstance(file_count, bool)
+            or not isinstance(file_count, int)
+            or isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or not isinstance(tree_sha256, str)
+        ):
+            raise StorageGovernanceError(
+                f"resolver replay registry identity is invalid: {run_label}"
+            )
+        path = governance.locator.resolve("e_archive").absolute_path.joinpath(
+            *PurePosixPath(relative).parts
+        )
+        if not path.is_dir():
+            raise StorageGovernanceError(
+                f"resolver replay archive path is missing: {run_label}"
+            )
         results.append(
             {
                 "run_label": run_label,
@@ -757,11 +837,11 @@ def _replay_resolver(
                 "file_count": file_count,
                 "byte_count": byte_count,
                 "tree_sha256": tree_sha256,
-                "resolver_replay": "passed",
+                "resolver_replay": "passed_from_independent_attestation",
             }
         )
         _log(
-            "resolver_replay_passed",
+            "resolver_ledger_replay_passed",
             index=index,
             total=len(grouped),
             run_label=run_label,
@@ -774,7 +854,7 @@ def _deletion_candidate_manifest(
     *,
     identities: tuple[SegmentIdentity, ...],
     locator: StorageRootLocator,
-    attestations: dict[str, tuple[Path, str]],
+    attestations: dict[str, tuple[Path, str, Path, str]],
     resolver_receipt_sha256: str,
     evidence_root: Path,
 ) -> tuple[Path, str]:
@@ -798,6 +878,9 @@ def _deletion_candidate_manifest(
                 "attestation_sha256": attestations[
                     identity.source_root_alias
                 ][1],
+                "attestation_verification_receipt_sha256": attestations[
+                    identity.source_root_alias
+                ][3],
                 "registry_generation": _GENERATION,
                 "resolver_replay_receipt_sha256": resolver_receipt_sha256,
                 "deletion_authorized": False,
@@ -942,7 +1025,13 @@ def migrate(repo_root: Path) -> None:
             },
             "attestation_sha256_by_alias": {
                 alias: digest
-                for alias, (_path, digest) in sorted(attestations.items())
+                for alias, (_path, digest, _verification_path, _verification_digest)
+                in sorted(attestations.items())
+            },
+            "attestation_verification_sha256_by_alias": {
+                alias: verification_digest
+                for alias, (_path, _digest, _verification_path, verification_digest)
+                in sorted(attestations.items())
             },
             "resolver_replay_receipt_sha256": resolver_receipt_sha256,
             "deletion_candidate_manifest_sha256": deletion_sha256,
