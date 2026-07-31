@@ -180,6 +180,23 @@ Stage 0 frozen baseline、Stage 2/3 历史证据和已发布 v1 bundle 不做物
   attempt 中为维持 Stage 5.2 active-workspace cap（活动工作区上限）而明确配置的
   same-attempt rolling-batch handoff（同一 attempt 滚动批次移交）。
 
+### Stage 5.2 historical migration status
+
+`stage052-retention-v2-20260731` 已于 2026-07-31 完成：307 个 run、356 个 segment、
+712,267,368,027 bytes 全部发布到绑定的 `e_archive`，两卷 migration attestation、
+307/307 resolver ledger replay 与所有签名 sidecar 均通过。精确删除 manifest 的
+SHA-256 为
+`0b75becf3478b2183728da082ffeddb016a56ff7f829e8394420127fb7b248c8`。
+用户在查看完整 source/target/bytes/tree-SHA 清单和单介质风险后再次字面确认；执行器在
+删除前重新完整复验全部源，随后删除 356/356 个清单路径并复核全部不存在。删除执行回执
+SHA-256 为
+`6192df5608288b9a0692afd512965469e2cc9aed3e5fea43d33d67ad15af3b36`。
+
+本次迁移后 E 盘是这些 raw evidence 的唯一长期介质副本，不得把 content verification
+表述为 backup。维护 allowlist 的归档后 dry run 为零候选；Ubuntu VHDX 在 TRIM 后通过
+离线 `Optimize-VHD -Mode Full` 从 456,645,410,816 bytes 压缩至约
+336,704,045,056 bytes。未来迁移仍必须重新执行上述逐次确认流程，不能复用本次确认。
+
 ## Stage 0--8 capacity stop gate
 
 每个新 attempt/rerun 在创建 run directory（运行目录）或启动 worker 前必须提交可重放

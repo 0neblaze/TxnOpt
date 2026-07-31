@@ -978,6 +978,28 @@ The executable workflow and gate table are maintained in
   consistency. Tracked summaries and registry publication are downstream of
   that review.
 
+## Stage 0--8 Storage Governance and Completed Stage 5.2 Migration
+
+- Every new Stage 0--8 attempt must obtain a storage-governance start permit
+  before creating its run directory or starting workers. The dynamic stop gate
+  reserves the complete planned archive bytes plus 200 GiB on E, projected WSL
+  growth plus 200 GiB on D, and active workspace plus 50 GiB on ext4; Stage 5.2
+  active workspace is at least 32 GiB.
+- The verified Stage 5.2 historical migration
+  `stage052-retention-v2-20260731` published 307 runs / 356 segments /
+  712,267,368,027 source bytes to the bound NTFS USB `e_archive`. The v2
+  registry, migration attestations, resolver replay receipt, deletion manifest,
+  and deletion execution receipt under the E archive are the immutable storage
+  evidence for that migration.
+- After literal operator confirmation, the 356 manifest-listed D/WSL source
+  directories were deleted and independently verified absent. Those historical
+  source paths must not be reconstructed as parallel archives or treated as
+  current evidence roots. New active work still stages on ext4 and publishes a
+  new immutable E generation through `evrptw.storage_governance`.
+- E is the sole long-term media copy for the migrated raw evidence. SHA-256,
+  attestation replay, and resolver verification establish content identity;
+  they do not constitute a backup or provide recovery from E-device failure.
+
 ## Literature Recommendation Policy
 
 - Codex recommends literature but does not obtain it. Do not access the user's

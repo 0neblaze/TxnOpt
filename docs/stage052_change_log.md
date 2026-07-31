@@ -1212,3 +1212,30 @@ compatibility fallback（兼容回退）。
 - 本条只发布代码、配置和只读迁移入口；尚未复制或删除 Stage 5.2 raw，也未 compact
   VHDX。任何物理迁移后的源删除仍需逐目录报告 source/target/bytes/hash/可释放空间和
   单份介质风险，并等待用户字面确认 `确认`。
+
+## 2026-07-31：Stage 5.2 E 盘迁移、源删除与 VHDX compact 完成
+
+- `stage052-retention-v2-20260731` 最终发现并迁移 307 个 run、356 个 segment，
+  总 source payload 为 712,267,368,027 bytes。全部 generation 在
+  `E:\Reproducible-EVRPTW-archive` 原子发布并登记；WSL→E 的 133 个 mapping 与
+  D→E 的 223 个 mapping 均完成独立 source/destination tree SHA-256 replay。
+  307/307 个 run 通过 v2 resolver ledger replay，migration receipt 状态为
+  `verified_not_deleted` 后才生成删除候选清单。
+- 为消除 WSL/DrvFS I/O amplification（输入输出放大），归档复制使用
+  `robocopy /MT:32 /J` 或 32 路 stream copy；E 目标和 D 源的最终 attestation 改为
+  Windows-native 单进程/单遍 32 路 SHA-256。正式双原生复验实测 D 峰值约
+  1.87 GiB/s、E 峰值约 963 MiB/s，校验语义、逐文件账本和 canonical tree identity
+  均未降低。
+- 签名删除候选 manifest 精确列出 356 个互不重复、无嵌套的源目录，SHA-256 为
+  `0b75becf3478b2183728da082ffeddb016a56ff7f829e8394420127fb7b248c8`。
+  用户在看到精确路径、663.35 GiB 总量、全部校验结果和“E 为单份介质、删除后无介质
+  回滚”风险后再次回复 `确认`。删除执行器先重新读取并验证全部 712,267,368,027 bytes，
+  再删除 356/356 个路径；重启 Ubuntu 后独立检查仍为 0 个存在。执行收据 SHA-256 为
+  `6192df5608288b9a0692afd512965469e2cc9aed3e5fea43d33d67ad15af3b36`。
+- 精确 rebuildable allowlist 的归档后 maintenance dry run 为 0 candidates / 0 bytes；
+  producer logs、storage-governance ledger、manifest、registry 与 review 未进入清理。
+  ext4 `fstrim` 报告 746,023,903,232 bytes 可回收；Ubuntu 停止后
+  `Optimize-VHD -Mode Full` 把 `D:\WSL\Ubuntu\ext4.vhdx` 从
+  456,645,410,816 bytes 压缩至 336,704,045,056 bytes。重启后 Ubuntu 正常，
+  最终空闲空间为 D 1252.32 GiB、E 267.40 GiB、WSL ext4 约 644.24 GiB，全部超过
+  storage stop gate。
