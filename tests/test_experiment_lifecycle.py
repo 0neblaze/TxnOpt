@@ -1067,12 +1067,13 @@ def test_stage052_hot_path_requires_accepted_lineage_and_successor(
             "gates": gates,
             "raw_manifest_sha256": raw_sha256,
             "review_manifest_lineage_sha256": [],
-            "review_retry_history_sha256": retry_history or [],
             "run_label": label,
             "schema_version": "stage05.2-review-v1",
             "scope": "performance",
             "status": status,
         }
+        if retry_history is not None:
+            manifest["review_retry_history_sha256"] = retry_history
         manifest_path = placeholder / "review_manifest.json"
         digest = write_json(manifest_path, manifest)
         final = placeholder.with_name(digest)

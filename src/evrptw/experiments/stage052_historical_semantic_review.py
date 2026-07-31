@@ -636,7 +636,7 @@ def _hot_path_supersession_proof(
             raise LifecycleError("hot-path failed-review history is invalid")
         if (
             retry_review.get("review_manifest_lineage_sha256") != []
-            or retry_review.get("review_retry_history_sha256")
+            or retry_review.get("review_retry_history_sha256", [])
             != retry_hashes[:index]
         ):
             raise LifecycleError("hot-path failed-review lineage is invalid")
