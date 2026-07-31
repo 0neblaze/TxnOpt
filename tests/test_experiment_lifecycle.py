@@ -829,10 +829,22 @@ def test_historical_semantic_adjudication_closes_gate_only_when_complete(
         output_root=output_root,
     )
 
+    relocated_migration_path = (
+        tmp_path
+        / "sealed-source"
+        / "experiments"
+        / "registries"
+        / migration_path.name
+    )
+    relocated_migration_path.parent.mkdir(parents=True)
+    relocated_migration_path.write_bytes(migration_path.read_bytes())
+    relocated_migration_path.with_suffix(".json.sha256").write_bytes(
+        migration_path.with_suffix(".json.sha256").read_bytes()
+    )
     monkeypatch.setattr(sys, "executable", str(historical_reviewer_python.resolve()))
     assert load_historical_migration_gate(
         gate_path,
-        migration_ledger_path=migration_path,
+        migration_ledger_path=relocated_migration_path,
         repository=ROOT,
     )["status"] == "complete"
 

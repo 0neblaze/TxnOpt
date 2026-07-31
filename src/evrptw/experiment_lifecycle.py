@@ -640,8 +640,17 @@ def load_historical_migration_gate(
             raise LifecycleError("historical semantic review path is unsafe")
         semantic_path = evidence_dir.joinpath(*semantic_relative.parts)
         semantic = _load_signed_json(semantic_path)
+        try:
+            historical_migration_path = Path(
+                options["--migration-ledger"]
+            ).resolve(strict=True)
+        except OSError as error:
+            raise LifecycleError(
+                "historical semantic migration ledger is unavailable"
+            ) from error
+        if _sha256_file(historical_migration_path) != migration_sha256:
+            raise LifecycleError("historical semantic migration ledger differs")
         expected_options = {
-            "--migration-ledger": str(migration_ledger_path.resolve(strict=True)),
             "--content-inventory": str(inventory_path.resolve(strict=True)),
             "--run-label": label,
             "--output": str(semantic_path.resolve(strict=True)),
@@ -762,7 +771,8 @@ def load_historical_migration_gate(
             "legacy_tree_sha256",
         )
         if (
-            options != expected_options
+            {key: value for key, value in options.items() if key != "--migration-ledger"}
+            != expected_options
             or semantic_reviewer
             != "evrptw.experiments.stage052_historical_semantic_review"
             or execution.get("run_label") != label

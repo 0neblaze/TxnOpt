@@ -1192,7 +1192,11 @@ The executable workflow and gate table are maintained in
   Python executable, `-m` invocation, allowlisted reviewer module, complete
   option set, and downstream hashes. It must not require the historical
   reviewer executable to equal the current producer's `sys.executable`, because
-  producer and reviewer runtimes are independently frozen.
+  producer and reviewer runtimes are independently frozen. Likewise, a sealed
+  source relocation may change the migration-ledger absolute path only when the
+  historical path still exists and both paths have the exact signed SHA-256;
+  inventory, output, archive, module, and all other command bindings remain
+  path-exact.
   `hot_path_attempt04` may be classified as `superseded_accepted_capsule` only
   when the stage-specific reviewer replays its unchanged raw-manifest identity,
   the complete accepted-review lineage and failed-review retry set, the terminal

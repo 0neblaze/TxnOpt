@@ -2728,3 +2728,8 @@ compatibility fallback（兼容回退）。
   reviewer 的 Python 绝对路径错误地要求等于当前 producer `sys.executable`，与独立冻结
   producer/reviewer runtime 的协议冲突。修复后仍验证签名 command 的现存绝对 Python、
   `-m`、module、完整 options 及全部下游 hash，只移除跨运行时相等这一错误约束。
+- Attempt14 随后在同一 pre-admission 边界暴露第二个 relocation 缺陷：历史命令绑定
+  active checkout 的 migration-ledger 绝对路径，而封存 producer 以相同字节的 sealed
+  checkout 路径重放。consumer 现在要求历史路径继续存在，且历史与当前 ledger 都匹配
+  同一个签名 SHA-256；仅该 ledger 路径允许 relocation，inventory/output/archive/module
+  与其余 options 仍保持 path-exact。Attempt14 同样没有 output、permit 或 lifecycle record。
