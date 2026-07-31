@@ -686,6 +686,9 @@ def test_historical_semantic_adjudication_closes_gate_only_when_complete(
         ROOT / "src/evrptw/experiments/stage052_historical_semantic_review.py"
     )
     reviewer_sha256 = hashlib.sha256(reviewer_path.read_bytes()).hexdigest()
+    historical_reviewer_python = tmp_path / "reviewer-venv" / "bin" / "python"
+    historical_reviewer_python.parent.mkdir(parents=True)
+    historical_reviewer_python.write_bytes(b"historical reviewer runtime\n")
 
     def adjudicate(label: str, inventory_path: Path) -> None:
         inventory_sha256 = hashlib.sha256(inventory_path.read_bytes()).hexdigest()
@@ -826,6 +829,7 @@ def test_historical_semantic_adjudication_closes_gate_only_when_complete(
         output_root=output_root,
     )
 
+    monkeypatch.setattr(sys, "executable", str(historical_reviewer_python.resolve()))
     assert load_historical_migration_gate(
         gate_path,
         migration_ledger_path=migration_path,

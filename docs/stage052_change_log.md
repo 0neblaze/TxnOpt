@@ -2723,3 +2723,8 @@ compatibility fallback（兼容回退）。
 - Formal sampler 一旦返回就先签名写入 `formal_memory_measurement.json`，再执行
   contract/headroom 门禁；因此即使门禁随后 fail fast，也会保留本次 cgroup 峰值、
   per-worker 峰值与 swap 证据。成功的 calibration report 还必须绑定该文件 SHA-256。
+- `stage05.2_resource_calibration_attempt13` 在 pre-admission 阶段、创建 output/permit/
+  lifecycle record 之前被 historical gate replay 拒绝。根因是 consumer 把历史 semantic
+  reviewer 的 Python 绝对路径错误地要求等于当前 producer `sys.executable`，与独立冻结
+  producer/reviewer runtime 的协议冲突。修复后仍验证签名 command 的现存绝对 Python、
+  `-m`、module、完整 options 及全部下游 hash，只移除跨运行时相等这一错误约束。

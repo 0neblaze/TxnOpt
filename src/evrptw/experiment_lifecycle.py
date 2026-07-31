@@ -503,7 +503,14 @@ def load_historical_migration_gate(
         if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
             raise LifecycleError("historical semantic command is invalid")
         command = cast(list[str], raw)
-        if len(command) < 3 or command[:2] != [sys.executable, "-m"]:
+        reviewer_python = Path(command[0]) if command else Path()
+        if (
+            len(command) < 3
+            or not reviewer_python.is_absolute()
+            or not reviewer_python.is_file()
+            or not reviewer_python.name.startswith("python")
+            or command[1] != "-m"
+        ):
             raise LifecycleError("historical semantic command prefix differs")
         tail = command[3:]
         allowed = {

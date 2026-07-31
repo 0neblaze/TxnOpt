@@ -1188,6 +1188,11 @@ The executable workflow and gate table are maintained in
   retention class, failure identity, canonical representative, no-dependency
   proof and rebuild proof must satisfy the same class-specific rules as the
   original adjudication.
+- Historical command replay validates the signed command's existing absolute
+  Python executable, `-m` invocation, allowlisted reviewer module, complete
+  option set, and downstream hashes. It must not require the historical
+  reviewer executable to equal the current producer's `sys.executable`, because
+  producer and reviewer runtimes are independently frozen.
   `hot_path_attempt04` may be classified as `superseded_accepted_capsule` only
   when the stage-specific reviewer replays its unchanged raw-manifest identity,
   the complete accepted-review lineage and failed-review retry set, the terminal
