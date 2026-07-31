@@ -908,6 +908,11 @@ this repository or one of its subdirectories.
   `memory.peak` and `memory.swap.peak` immediately before the R205 measurement
   and retain a signed reset receipt; earlier worker/Parquet calibration phases
   must not contribute lifetime cgroup high-water marks to that scoped result.
+  Once the Formal sampler returns, calibration must immediately seal
+  `formal_memory_measurement.json` before contract/headroom validation, so a
+  post-measurement failure still preserves the exact cgroup, per-worker, and
+  swap evidence. A successful calibration report binds that artifact by
+  SHA-256.
 - On the Windows/WSL2 formal host, long-running Stage 5.2 reviewers must run as
   transient `systemd --user` services rather than Codex desktop child
   processes. Review workers, `MemoryHigh`, `MemoryMax`, `MemorySwapMax=0`, and

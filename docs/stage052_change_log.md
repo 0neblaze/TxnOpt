@@ -2720,3 +2720,6 @@ compatibility fallback（兼容回退）。
   counter 一致性。Calibration 同时写入签名
   `formal_memory_cgroup_peak_reset.json`；后续尝试继续固定 6 workers、16384/1、
   swap 0、20% headroom 和无 fallback，不复用或覆盖上述失败标签。
+- Formal sampler 一旦返回就先签名写入 `formal_memory_measurement.json`，再执行
+  contract/headroom 门禁；因此即使门禁随后 fail fast，也会保留本次 cgroup 峰值、
+  per-worker 峰值与 swap 证据。成功的 calibration report 还必须绑定该文件 SHA-256。

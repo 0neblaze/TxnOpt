@@ -135,6 +135,13 @@ def test_calibration_runs_every_candidate_and_seals_selected_contract(
     assert contract.queue_depth == 1
     assert load_producer_resource_contract(contract_path) == contract
     assert (tmp_path / "calibration" / "calibration_report.sha256").is_file()
+    formal_measurement_path = (
+        tmp_path / "calibration" / "formal_memory_measurement.json"
+    )
+    assert signed_sidecar_matches(
+        formal_measurement_path,
+        formal_measurement_path.with_suffix(".sha256"),
+    )
     report = json.loads(
         (tmp_path / "calibration" / "calibration_report.json").read_text(
             encoding="utf-8"
@@ -145,6 +152,92 @@ def test_calibration_runs_every_candidate_and_seals_selected_contract(
     assert (
         report["formal_memory_measurement"]["benchmark"]["swap_peak_bytes"]
         == 12_345
+    )
+    assert report["formal_memory_measurement_sha256"] == hashlib.sha256(
+        formal_measurement_path.read_bytes()
+    ).hexdigest()
+
+
+def test_calibration_seals_formal_measurement_before_headroom_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def producer_runner(**kwargs) -> MeasuredProducerCandidate:
+        workers = int(kwargs["workers"])
+        return MeasuredProducerCandidate(
+            benchmark=ProducerBenchmark(
+                workers=workers,
+                throughput=float(workers),
+                aggregate_peak_rss_bytes=workers * 1024**3,
+                semantic_digest="a" * 64,
+                swap_peak_bytes=0,
+                fallback_count=0,
+                resource_limit_exceeded=False,
+            ),
+            per_worker_peak_rss_bytes=1024**3,
+        )
+
+    def parquet_runner(**kwargs) -> ParquetBenchmark:
+        return ParquetBenchmark(
+            row_group_size=int(kwargs["row_group_size"]),
+            queue_depth=int(kwargs["queue_depth"]),
+            persistence_seconds=1.0,
+            aggregate_peak_rss_bytes=1024**3,
+            semantic_digest="b" * 64,
+        )
+
+    def formal_memory_runner(**kwargs) -> MeasuredProducerCandidate:
+        return MeasuredProducerCandidate(
+            benchmark=ProducerBenchmark(
+                workers=int(kwargs["workers"]),
+                throughput=1.0,
+                aggregate_peak_rss_bytes=15 * 1024**3,
+                semantic_digest="c" * 64,
+                swap_peak_bytes=0,
+                fallback_count=0,
+                resource_limit_exceeded=False,
+            ),
+            per_worker_peak_rss_bytes=3 * 1024**3,
+            aggregate_memory_source="cgroup_v2",
+            cgroup_path="/stage052-calibration.service",
+            cgroup_swap_peak_bytes=0,
+        )
+
+    monkeypatch.setattr(
+        stage052_calibration.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(available=16 * 1024**3, total=16 * 1024**3),
+    )
+    output_root = tmp_path / "calibration"
+    with pytest.raises(RuntimeError, match="operating headroom"):
+        run_stage052_resource_calibration(
+            corpus_dir=tmp_path / "corpus",
+            output_root=output_root,
+            contract_path=tmp_path / "contract.json",
+            root=tmp_path,
+            config_path=tmp_path / "config.toml",
+            producer_runner=producer_runner,
+            parquet_runner=parquet_runner,
+            formal_memory_runner=formal_memory_runner,
+            memory_floor=ProducerMemoryFloor(
+                four_worker_aggregate_peak_rss_bytes=1024,
+                per_worker_peak_rss_bytes=1024,
+                source_sha256_by_batch={
+                    "batch0001": "d" * 64,
+                    "batch0002": "e" * 64,
+                },
+            ),
+        )
+
+    measurement_path = output_root / "formal_memory_measurement.json"
+    payload = json.loads(measurement_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "measured_pending_contract_validation"
+    assert payload["measurement"]["benchmark"]["aggregate_peak_rss_bytes"] == (
+        15 * 1024**3
+    )
+    assert signed_sidecar_matches(
+        measurement_path,
+        measurement_path.with_suffix(".sha256"),
     )
 
 

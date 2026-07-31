@@ -1184,6 +1184,21 @@ def run_stage052_resource_calibration(
         run_label=run_label,
         aggregate_memory_limit_bytes=memory_capacity,
     )
+    formal_memory_measurement_path = output_root / "formal_memory_measurement.json"
+    atomic_write_signed_json(
+        formal_memory_measurement_path,
+        {
+            "schema_version": "stage05.2-formal-memory-measurement-v1",
+            "run_label": run_label,
+            "component": "formal_memory_calibration",
+            "memory_capacity_bytes": memory_capacity,
+            "measurement": asdict(formal_memory_measurement),
+            "status": "measured_pending_contract_validation",
+        },
+    )
+    formal_memory_measurement_sha256 = hashlib.sha256(
+        formal_memory_measurement_path.read_bytes()
+    ).hexdigest()
     formal_benchmark = formal_memory_measurement.benchmark
     if formal_benchmark.workers != preliminary_selection.selected_workers:
         raise RuntimeError("Formal memory measurement used the wrong producer worker count")
@@ -1286,6 +1301,7 @@ def run_stage052_resource_calibration(
             ],
             "attempt73_memory_floor": asdict(memory_floor),
             "formal_memory_measurement": asdict(formal_memory_measurement),
+            "formal_memory_measurement_sha256": formal_memory_measurement_sha256,
             "formal_campaign_memory_floor": (
                 asdict(formal_campaign_memory_floor)
                 if formal_campaign_memory_floor is not None
