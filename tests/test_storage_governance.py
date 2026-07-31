@@ -824,6 +824,130 @@ def test_retention_retry_adopts_only_an_identical_published_generation(
         )
 
 
+def test_retention_atomic_publish_recovers_from_transient_ntfs_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator = _locator(tmp_path)
+    for alias in locator.aliases:
+        locator.resolve(alias).absolute_path.mkdir()
+    source = tmp_path / "source" / "stage05.2_benchmark_attempt07"
+    source.mkdir(parents=True)
+    (source / "manifest.json").write_text("sealed", encoding="utf-8")
+    governance = ExperimentStorageGovernance(
+        policy=GovernancePolicy(),
+        locator=locator,
+        state_root=tmp_path / "state",
+        free_space=lambda _path: 500 * GIB,
+        volume_probe=lambda path: next(
+            root.volume
+            for root in (locator.resolve(alias) for alias in locator.aliases)
+            if root.absolute_path == path
+        ),
+    )
+    original_replace = Path.replace
+    publish_calls = 0
+
+    def transient_replace(self: Path, target: Path) -> Path:
+        nonlocal publish_calls
+        if ".incoming-" in self.name and target.name == "generation-0001":
+            publish_calls += 1
+            if publish_calls <= 2:
+                raise PermissionError("simulated transient NTFS directory lock")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", transient_replace)
+    monkeypatch.setattr(storage_governance_module.time, "sleep", lambda _delay: None)
+    receipt = governance.retain_run(
+        RetentionRequest(
+            run_label=source.name,
+            generation=1,
+            retention_class=RetentionClass.UNKNOWN_FULL,
+            archive_root_alias="e_archive",
+            archive_relative_path=f"runs/{source.name}/generation-0001",
+            segments=(RetentionSegment("run", source, "."),),
+        )
+    )
+
+    assert publish_calls == 3
+    assert receipt.archive_path.is_dir()
+    observation = json.loads(
+        (
+            tmp_path
+            / "state"
+            / "retention_publish_observations"
+            / f"{source.name}-generation-0001.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert observation["status"] == "recovered"
+    assert observation["successful_attempt"] == 3
+    assert len(observation["attempts"]) == 2
+
+
+def test_retention_atomic_publish_exhaustion_remains_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator = _locator(tmp_path)
+    for alias in locator.aliases:
+        locator.resolve(alias).absolute_path.mkdir()
+    source = tmp_path / "source" / "stage05.2_benchmark_attempt08"
+    source.mkdir(parents=True)
+    (source / "manifest.json").write_text("sealed", encoding="utf-8")
+    governance = ExperimentStorageGovernance(
+        policy=GovernancePolicy(),
+        locator=locator,
+        state_root=tmp_path / "state",
+        free_space=lambda _path: 500 * GIB,
+        volume_probe=lambda path: next(
+            root.volume
+            for root in (locator.resolve(alias) for alias in locator.aliases)
+            if root.absolute_path == path
+        ),
+    )
+    original_replace = Path.replace
+    publish_calls = 0
+
+    def locked_replace(self: Path, target: Path) -> Path:
+        nonlocal publish_calls
+        if ".incoming-" in self.name and target.name == "generation-0001":
+            publish_calls += 1
+            raise PermissionError("simulated persistent NTFS directory lock")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", locked_replace)
+    monkeypatch.setattr(storage_governance_module.time, "sleep", lambda _delay: None)
+    with pytest.raises(PermissionError, match="persistent NTFS"):
+        governance.retain_run(
+            RetentionRequest(
+                run_label=source.name,
+                generation=1,
+                retention_class=RetentionClass.UNKNOWN_FULL,
+                archive_root_alias="e_archive",
+                archive_relative_path=f"runs/{source.name}/generation-0001",
+                segments=(RetentionSegment("run", source, "."),),
+            )
+        )
+
+    assert publish_calls == 7
+    assert (source / "manifest.json").is_file()
+    destination_parent = (
+        tmp_path / "e-archive" / "runs" / source.name
+    )
+    assert not (destination_parent / "generation-0001").exists()
+    assert not tuple(destination_parent.glob(".generation-0001.incoming-*"))
+    observation = json.loads(
+        (
+            tmp_path
+            / "state"
+            / "retention_publish_observations"
+            / f"{source.name}-generation-0001.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert observation["status"] == "failed"
+    assert len(observation["attempts"]) == 7
+
+
 def test_full_retention_replay_failure_keeps_source_and_blocks_registry(
     tmp_path: Path,
 ) -> None:

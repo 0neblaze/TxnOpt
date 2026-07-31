@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import time
 import tomllib
 import uuid
 from collections.abc import Callable, Iterator, Mapping
@@ -1941,6 +1942,74 @@ class ExperimentStorageGovernance:
         if not passed:
             raise StorageCapacityError(observation=observation)
 
+    def _publish_incoming_generation(
+        self,
+        *,
+        request: RetentionRequest,
+        incoming: Path,
+        destination: Path,
+    ) -> None:
+        """Atomically publish after bounded retries for transient NTFS locks."""
+
+        retry_delays = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+        observation_path = (
+            self.state_root
+            / "retention_publish_observations"
+            / (
+                f"{request.run_label}-generation-"
+                f"{request.generation:04d}.json"
+            )
+        )
+        errors: list[dict[str, object]] = []
+        for attempt in range(1, len(retry_delays) + 2):
+            try:
+                incoming.replace(destination)
+            except PermissionError as error:
+                errors.append(
+                    {
+                        "attempt": attempt,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "observed_at_utc": datetime.now(UTC).isoformat(),
+                    }
+                )
+                exhausted = attempt > len(retry_delays)
+                _write_signed_json(
+                    observation_path,
+                    {
+                        "schema_version": (
+                            "experiment-retention-atomic-publish-v1"
+                        ),
+                        "run_label": request.run_label,
+                        "generation": request.generation,
+                        "incoming_path": str(incoming),
+                        "destination_path": str(destination),
+                        "attempts": errors,
+                        "status": "failed" if exhausted else "retrying",
+                    },
+                )
+                if exhausted:
+                    raise
+                time.sleep(retry_delays[attempt - 1])
+            else:
+                if errors:
+                    _write_signed_json(
+                        observation_path,
+                        {
+                            "schema_version": (
+                                "experiment-retention-atomic-publish-v1"
+                            ),
+                            "run_label": request.run_label,
+                            "generation": request.generation,
+                            "incoming_path": str(incoming),
+                            "destination_path": str(destination),
+                            "attempts": errors,
+                            "successful_attempt": attempt,
+                            "status": "recovered",
+                        },
+                    )
+                return
+
     def retain_run(self, request: RetentionRequest) -> RetentionReceipt:
         """Publish one verified immutable full or reduced retention generation."""
 
@@ -2141,7 +2210,11 @@ class ExperimentStorageGovernance:
                         f"{request.run_label}"
                     )
                 incoming.parent.mkdir(parents=True, exist_ok=True)
-                incoming.replace(destination)
+                self._publish_incoming_generation(
+                    request=request,
+                    incoming=incoming,
+                    destination=destination,
+                )
             except BaseException:
                 if incoming.exists():
                     shutil.rmtree(incoming)
