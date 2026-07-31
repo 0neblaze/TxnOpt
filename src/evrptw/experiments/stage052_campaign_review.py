@@ -47,6 +47,7 @@ from evrptw.artifacts import (
     ArtifactIntegrityError,
     ArtifactReader,
     artifact_schema_fingerprint,
+    atomic_write_signed_json,
     screening_definition_store_contract,
     signed_sidecar_matches,
 )
@@ -6324,11 +6325,7 @@ def review_lifecycle_failure_capsule(
         "files": {},
     }
     review_manifest_path.parent.mkdir(parents=True, exist_ok=False)
-    _write_fsync(
-        review_manifest_path,
-        json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n",
-    )
-    _fsync_directory(review_manifest_path.parent)
+    atomic_write_signed_json(review_manifest_path, manifest)
     return manifest
 
 
