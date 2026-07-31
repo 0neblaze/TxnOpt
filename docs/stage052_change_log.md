@@ -2701,3 +2701,22 @@ compatibility fallback（兼容回退）。
   前后 stat snapshot 和 tree identity；不匹配异常同时报告 expected/observed
   file/byte/tree 三元组。回归测试直接将 historical inventory 与
   `storage_governance.compute_tree_identity` 对账，防止再次分叉。
+
+## 2026-07-31：Calibration lifecycle 与 cgroup scoped-peak 修复
+
+- `stage05.2_resource_calibration_attempt09` 在普通 WSL 会话中启动，正式内存门禁因
+  不属于独立 `systemd --user` service cgroup 而 fail fast。独立 failure-capsule
+  reviewer 重算其 218 项 manifest inventory，并把精确错误裁定为
+  `FAILED_KNOWN`；lifecycle 以 `unique_failure_capsule` 保留全部 224 个终态文件、
+  删除 0 文件并完成 `CLOSED`。
+- 隔离 service 启动后的 `stage05.2_resource_calibration_attempt11` 完成 16384/1、
+  6-worker Formal 测量，但 contract derivation 因读取 service-lifetime
+  `memory.peak` 而错误地把先前 worker/Parquet 阶段高水位算入 scoped R205 峰值，
+  最终触发 20% headroom 门禁。独立 `stage05.2_formal_memory_probe_attempt18` 已在
+  相同物理参数下记录 R205 cgroup peak `18,879,209,472` bytes，证明该失败不是
+  放宽 headroom 的理由。
+- `CgroupV2MemorySource.reset_peaks()` 现在在 Formal sampler 启动前把独立 service
+  的 `memory.peak` 与 `memory.swap.peak` 重置为当前 scoped baseline，并验证 swap
+  counter 一致性。Calibration 同时写入签名
+  `formal_memory_cgroup_peak_reset.json`；后续尝试继续固定 6 workers、16384/1、
+  swap 0、20% headroom 和无 fallback，不复用或覆盖上述失败标签。

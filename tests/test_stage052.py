@@ -3938,6 +3938,25 @@ def test_process_tree_resource_sampler_uses_cgroup_memory_for_aggregate_gate(
     assert task_started is False
 
 
+def test_cgroup_memory_source_resets_lifetime_peaks(tmp_path: Path) -> None:
+    cgroup = tmp_path / "stage052-formal.service"
+    cgroup.mkdir()
+    (cgroup / "memory.current").write_text("800\n", encoding="ascii")
+    (cgroup / "memory.peak").write_text("1500\n", encoding="ascii")
+    (cgroup / "memory.swap.current").write_text("0\n", encoding="ascii")
+    (cgroup / "memory.swap.peak").write_text("200\n", encoding="ascii")
+    memory_source = CgroupV2MemorySource(
+        cgroup_path=cgroup,
+        relative_path="/stage052-formal.service",
+    )
+
+    reset = memory_source.reset_peaks()
+
+    assert reset == (800, 800, 0, 0)
+    assert (cgroup / "memory.peak").read_text(encoding="ascii") == "0"
+    assert (cgroup / "memory.swap.peak").read_text(encoding="ascii") == "0"
+
+
 def test_cgroup_memory_source_discovery_rejects_shared_init_scope(
     tmp_path: Path,
 ) -> None:

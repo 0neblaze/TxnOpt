@@ -103,8 +103,23 @@ _SOURCE_SNAPSHOT = {
 }
 
 
+@pytest.mark.parametrize(
+    ("error_message", "expected_check"),
+    (
+        (
+            "Stage 5.2 aggregate memory gate requires an isolated systemd service cgroup",
+            "isolated_service_cgroup_required",
+        ),
+        (
+            "selected producer peak plus operating headroom exceeds available memory",
+            "producer_operating_headroom_exceeds_available_memory",
+        ),
+    ),
+)
 def test_lifecycle_failure_capsule_review_recomputes_known_failure(
     tmp_path: Path,
+    error_message: str,
+    expected_check: str,
 ) -> None:
     label = "stage05.2_resource_calibration_attempt09"
     run_dir = tmp_path / label
@@ -118,10 +133,7 @@ def test_lifecycle_failure_capsule_review_recomputes_known_failure(
             "status": "failed",
             "failure_code": "runner_failure",
             "error_type": "RuntimeError",
-            "error_message": (
-                "Stage 5.2 aggregate memory gate requires an isolated "
-                "systemd service cgroup"
-            ),
+            "error_message": error_message,
         },
     )
     raw_manifest = build_cli_failure_manifest(
@@ -138,7 +150,7 @@ def test_lifecycle_failure_capsule_review_recomputes_known_failure(
     assert review["lifecycle_status"] == "FAILED_KNOWN"
     assert review["failure_identity"] == {
         "component": "stage052_calibration",
-        "invariant_or_check": "isolated_service_cgroup_required",
+        "invariant_or_check": expected_check,
         "location": "failure_summary.json",
     }
     assert review["verified_artifact_count"] == 3

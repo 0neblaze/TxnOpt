@@ -50,6 +50,7 @@ from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
 from evrptw.stage052 import Stage052Component
 from evrptw.stage052_evidence import (
+    CgroupV2MemorySource,
     ProcessTreeResourceSampler,
     RunResourceSummary,
     is_stage052_dedicated_cgroup_path,
@@ -893,6 +894,27 @@ def benchmark_formal_memory_candidate(
         f"formal-memory-workers{workers}-rg{row_group_size}-qd{queue_depth}"
     )
     candidate_dir.mkdir(parents=True, exist_ok=False)
+    aggregate_memory_source = CgroupV2MemorySource.discover()
+    (
+        reset_memory_current,
+        reset_memory_peak,
+        reset_swap_current,
+        reset_swap_peak,
+    ) = aggregate_memory_source.reset_peaks()
+    atomic_write_signed_json(
+        output_root / "formal_memory_cgroup_peak_reset.json",
+        {
+            "schema_version": "stage05.2-cgroup-peak-reset-v1",
+            "run_label": run_label,
+            "component": "formal_memory_calibration",
+            "cgroup_path": aggregate_memory_source.relative_path,
+            "memory_current_bytes_after_reset": reset_memory_current,
+            "memory_peak_bytes_after_reset": reset_memory_peak,
+            "swap_current_bytes_after_reset": reset_swap_current,
+            "swap_peak_bytes_after_reset": reset_swap_peak,
+            "status": "verified",
+        },
+    )
     tasks = _build_tasks(
         root=root,
         config_path=config_path,
@@ -911,6 +933,7 @@ def benchmark_formal_memory_candidate(
         configured_worker_count=workers,
         interval_seconds=0.02,
         aggregate_memory_limit_bytes=aggregate_memory_limit_bytes,
+        aggregate_memory_source=aggregate_memory_source,
     )
     swap_baseline = int(psutil.swap_memory().used)
     swap_peak = swap_baseline

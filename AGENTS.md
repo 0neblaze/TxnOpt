@@ -903,7 +903,11 @@ this repository or one of its subdirectories.
   `stage05.2_benchmark_rerun02/batch0008`, treats that run's summed RSS only as
   failure provenance, and derives the replacement aggregate limit from the
   complete R205 cgroup measurement with 20% headroom. It retains the failed
-  batch's per-worker RSS floor and the locked six-worker topology.
+  batch's per-worker RSS floor and the locked six-worker topology. Full
+  calibration must reset and verify the dedicated service cgroup's
+  `memory.peak` and `memory.swap.peak` immediately before the R205 measurement
+  and retain a signed reset receipt; earlier worker/Parquet calibration phases
+  must not contribute lifetime cgroup high-water marks to that scoped result.
 - On the Windows/WSL2 formal host, long-running Stage 5.2 reviewers must run as
   transient `systemd --user` services rather than Codex desktop child
   processes. Review workers, `MemoryHigh`, `MemoryMax`, `MemorySwapMax=0`, and

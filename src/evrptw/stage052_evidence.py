@@ -2013,6 +2013,24 @@ class CgroupV2MemorySource:
         current, peak, swap_peak = values
         return current, max(current, peak), swap_peak
 
+    def reset_peaks(self) -> tuple[int, int, int, int]:
+        """Reset lifetime counters before one independently scoped measurement."""
+
+        try:
+            (self.cgroup_path / "memory.peak").write_text("0", encoding="ascii")
+            (self.cgroup_path / "memory.swap.peak").write_text("0", encoding="ascii")
+            swap_current = int(
+                (self.cgroup_path / "memory.swap.current")
+                .read_text(encoding="ascii")
+                .strip()
+            )
+            memory_current, memory_peak, swap_peak = self.sample()
+        except (OSError, ValueError) as error:
+            raise RuntimeError("cannot reset cgroup v2 memory peaks") from error
+        if swap_current < 0 or swap_peak < swap_current:
+            raise RuntimeError("cgroup v2 swap peak reset is inconsistent")
+        return memory_current, memory_peak, swap_current, swap_peak
+
 
 @dataclass(frozen=True, slots=True)
 class RunResourceSummary:

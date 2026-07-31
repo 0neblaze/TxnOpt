@@ -143,9 +143,14 @@ NOT_READY = "NOT_READY"
 PILOT_READY = "READY_FOR_STAGE052_FORMAL_BENCHMARK"
 FORMAL_READY = "READY_FOR_STAGE05_3"
 FORMAL_REPLAY_BACKEND: Literal["native_arrow"] = "native_arrow"
-_ISOLATED_SERVICE_CGROUP_ERROR = (
-    "Stage 5.2 aggregate memory gate requires an isolated systemd service cgroup"
-)
+_KNOWN_CALIBRATION_FAILURE_CHECKS = {
+    "Stage 5.2 aggregate memory gate requires an isolated systemd service cgroup": (
+        "isolated_service_cgroup_required"
+    ),
+    "selected producer peak plus operating headroom exceeds available memory": (
+        "producer_operating_headroom_exceeds_available_memory"
+    ),
+}
 
 
 def _verify_review_storage_migration(
@@ -6294,11 +6299,11 @@ def review_lifecycle_failure_capsule(
 
     known = (
         summary["error_type"] == "RuntimeError"
-        and summary["error_message"] == _ISOLATED_SERVICE_CGROUP_ERROR
+        and summary["error_message"] in _KNOWN_CALIBRATION_FAILURE_CHECKS
     )
     lifecycle_status = "FAILED_KNOWN" if known else "FAILED_UNKNOWN"
     failure_check = (
-        "isolated_service_cgroup_required"
+        _KNOWN_CALIBRATION_FAILURE_CHECKS[str(summary["error_message"])]
         if known
         else "unclassified_cli_runner_failure"
     )
