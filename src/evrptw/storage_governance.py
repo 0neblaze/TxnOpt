@@ -1099,16 +1099,41 @@ def verify_storage_migration_attestation(
             description="storage migration destination",
         )
         replay_specs.append((logical_id, raw, source, destination))
+    native_source_replay = (
+        workers > 1
+        and os.name != "nt"
+        and _windows_path_for_mounted_drive(source_root) is not None
+    )
     native_destination_replay = (
         workers > 1
         and os.name != "nt"
         and _windows_path_for_mounted_drive(destination_root) is not None
     )
-    if native_destination_replay:
-        destination_mappings = tuple(
-            (logical_id, str(raw["destination_relative_path"]))
-            for logical_id, raw, _source, _destination in replay_specs
-        )
+    source_mappings = tuple(
+        (logical_id, str(raw["source_relative_path"]))
+        for logical_id, raw, _source, _destination in replay_specs
+    )
+    destination_mappings = tuple(
+        (logical_id, str(raw["destination_relative_path"]))
+        for logical_id, raw, _source, _destination in replay_specs
+    )
+    if native_source_replay and native_destination_replay:
+        with ThreadPoolExecutor(max_workers=2) as native_executor:
+            source_future = native_executor.submit(
+                _native_verify_tree_mappings,
+                root=source_root,
+                mappings=source_mappings,
+                workers=workers,
+            )
+            destination_future = native_executor.submit(
+                _native_verify_tree_mappings,
+                root=destination_root,
+                mappings=destination_mappings,
+                workers=workers,
+            )
+            source_identities = source_future.result()
+            destination_identities = destination_future.result()
+    elif native_destination_replay:
         with ThreadPoolExecutor(max_workers=1) as native_executor:
             destination_future = native_executor.submit(
                 _native_verify_tree_mappings,
@@ -1133,6 +1158,31 @@ def verify_storage_migration_attestation(
                     )
                 }
             destination_identities = destination_future.result()
+    elif native_source_replay:
+        with ThreadPoolExecutor(max_workers=1) as native_executor:
+            source_future = native_executor.submit(
+                _native_verify_tree_mappings,
+                root=source_root,
+                mappings=source_mappings,
+                workers=workers,
+            )
+            with ThreadPoolExecutor(max_workers=workers) as destination_executor:
+                destination_identities = {
+                    logical_id: identity
+                    for (logical_id, _raw, _source, _destination), identity in zip(
+                        replay_specs,
+                        destination_executor.map(
+                            _tree_identity,
+                            tuple(
+                                destination
+                                for _logical_id, _raw, _source, destination
+                                in replay_specs
+                            ),
+                        ),
+                        strict=True,
+                    )
+                }
+            source_identities = source_future.result()
     else:
         tree_paths = tuple(
             path_item
