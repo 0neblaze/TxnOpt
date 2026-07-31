@@ -713,6 +713,35 @@ def load_historical_migration_gate(
             ):
                 raise LifecycleError("historical duplicate representative differs")
         if (
+            semantic_retention_class
+            == RetentionClassV3.SUPERSEDED_ACCEPTED_CAPSULE.value
+        ):
+            supersession_proof = semantic.get("supersession_proof")
+            required_hashes = (
+                "accepted_review_manifest_sha256",
+                "accepted_raw_manifest_sha256",
+                "terminal_review_manifest_sha256",
+                "terminal_review_execution_sha256",
+                "successor_archive_tree_sha256",
+                "successor_raw_manifest_sha256",
+                "successor_review_manifest_sha256",
+                "successor_review_execution_sha256",
+            )
+            if (
+                not isinstance(supersession_proof, dict)
+                or supersession_proof != review.get("supersession_proof")
+                or not str(supersession_proof.get("failure_code", ""))
+                or not str(supersession_proof.get("successor_run_label", ""))
+                or any(
+                    _SHA256.fullmatch(str(supersession_proof.get(field, "")))
+                    is None
+                    for field in required_hashes
+                )
+            ):
+                raise LifecycleError(
+                    "historical superseded accepted proof differs"
+                )
+        if (
             semantic_retention_class == RetentionClassV3.REBUILDABLE.value
             and _SHA256.fullmatch(str(semantic.get("rebuild_proof_sha256", "")))
             is None

@@ -251,7 +251,11 @@ SHA-bound campaign/control/review/batch manifest closure 重新完成零引用�
 `no_dependency_proof`；调用方不能替换 keeper 路径或提交手写 proof。
 完整 semantic command、content inventory、execution receipt、binding 和 aggregate gate
 还必须携带 physical historical review 所绑定的同一个 canonical `e_archive` root 与
-generation identity；临时 mirror 不能替代该根。`hot_path_attempt04` 继续保持
+generation identity；临时 mirror 不能替代该根。`hot_path_attempt04` 只有在重放同一
+raw manifest、完整 accepted-review lineage（已接受审查谱系）与 failed-review retry set
+（失败审查重试集合）、terminal review execution（最终审查执行）及其精确失败门，并对
+v2 registry 绑定的后继 `hot_path_attempt06` 完成全树、accepted review 和 finalized
+execution 复验后，才可分类为 `superseded_accepted_capsule`；任一绑定不成立仍保持
 `unknown_full`。physical review 自身必须通过仓库 local storage-root locator 解析并验证
 live `e_archive` volume identity，且只能读取 signed migration ledger 声明的唯一 v2
 registry relative path/SHA；registry SHA 与 generation tree SHA 继续贯穿 inventory、

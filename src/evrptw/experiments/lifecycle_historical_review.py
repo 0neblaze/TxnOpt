@@ -431,6 +431,35 @@ def apply_semantic_adjudication(
             and not semantic.get("canonical_representative")
         ):
             raise LifecycleError("duplicate historical failure has no representative")
+    supersession_proof = semantic.get("supersession_proof")
+    if retention_class == "superseded_accepted_capsule":
+        required_hashes = (
+            "accepted_review_manifest_sha256",
+            "accepted_raw_manifest_sha256",
+            "terminal_review_manifest_sha256",
+            "terminal_review_execution_sha256",
+            "successor_archive_tree_sha256",
+            "successor_raw_manifest_sha256",
+            "successor_review_manifest_sha256",
+            "successor_review_execution_sha256",
+        )
+        if (
+            not isinstance(supersession_proof, dict)
+            or not str(supersession_proof.get("failure_code", ""))
+            or not str(supersession_proof.get("successor_run_label", ""))
+            or any(
+                not isinstance(supersession_proof.get(field), str)
+                or len(str(supersession_proof[field])) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in str(supersession_proof[field])
+                )
+                for field in required_hashes
+            )
+        ):
+            raise LifecycleError(
+                "historical superseded accepted disposition lacks proof"
+            )
     if (
         retention_class == "superseded_metadata"
         and semantic.get("no_dependency_proof") is not True
@@ -459,6 +488,7 @@ def apply_semantic_adjudication(
         "legacy_tree_sha256": execution["legacy_tree_sha256"],
         "failure_identity": failure_identity or {},
         "canonical_representative": semantic.get("canonical_representative", ""),
+        "supersession_proof": supersession_proof or {},
     }
     review_path = evidence_dir / "review_manifest.json"
     _write_signed_json(review_path, review)

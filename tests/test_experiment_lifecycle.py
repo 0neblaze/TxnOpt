@@ -33,6 +33,7 @@ from evrptw.experiment_lifecycle import (
     main as lifecycle_main,
 )
 from evrptw.experiments.lifecycle_historical_review import (
+    _inventory_generation,
     aggregate_historical_gate,
     apply_semantic_adjudication,
     execute_semantic_reviewer,
@@ -962,6 +963,315 @@ def test_stage052_historical_semantic_reviewer_is_label_exact(
     )
     assert blocked["retention_class"] == "unknown_full"
     assert blocked["status"] == "INVALID"
+
+
+def test_stage052_hot_path_requires_accepted_lineage_and_successor(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    current_label = "stage05.2_hot_path_attempt04"
+    successor_label = "stage05.2_hot_path_attempt06"
+    gate_names = {
+        "exact_scope",
+        "optimization_profile",
+        "performance_promotion",
+        "persistence_attribution",
+        "prerequisite_performance_baseline",
+        "replay_consistency",
+        "runtime_identity",
+        "source_snapshot",
+        "staging_root_identity",
+    }
+
+    def gates(
+        *failed: str, details: dict[str, str] | None = None
+    ) -> dict[str, dict[str, object]]:
+        detail_by_name = details or {}
+        return {
+            name: {
+                "detail": detail_by_name.get(name, name),
+                "passed": name not in failed,
+            }
+            for name in sorted(gate_names)
+        }
+
+    def write_json(path: Path, payload: object) -> str:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def raw_manifest(generation: Path, segment: str, label: str) -> str:
+        path = generation / segment / "control" / f"{label}_manifest.json"
+        digest = write_json(
+            path,
+            {"component": "hot_path", "run_label": label},
+        )
+        path.with_suffix(".sha256").write_text(digest + "\n", encoding="utf-8")
+        return digest
+
+    def review_generation(
+        generation: Path,
+        relative_root: Path,
+        generation_id: str,
+    ) -> dict[str, str]:
+        review_dir = generation / relative_root / "generations" / generation_id
+        report = review_dir / "review_report.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("review\n", encoding="utf-8")
+        relative = f"generations/{generation_id}/review_report.md"
+        return {relative: hashlib.sha256(report.read_bytes()).hexdigest()}
+
+    def archived_review(
+        generation: Path,
+        *,
+        label: str,
+        raw_sha256: str,
+        status: str,
+        gates: dict[str, dict[str, object]],
+        generation_id: str,
+        retry_history: list[str] | None = None,
+    ) -> str:
+        placeholder = generation / "d_history" / "review" / "history" / generation_id
+        files = review_generation(generation, placeholder.relative_to(generation), "output")
+        manifest = {
+            "component": "hot_path",
+            "files": files,
+            "gates": gates,
+            "raw_manifest_sha256": raw_sha256,
+            "review_manifest_lineage_sha256": [],
+            "review_retry_history_sha256": retry_history or [],
+            "run_label": label,
+            "schema_version": "stage05.2-review-v1",
+            "scope": "performance",
+            "status": status,
+        }
+        manifest_path = placeholder / "review_manifest.json"
+        digest = write_json(manifest_path, manifest)
+        final = placeholder.with_name(digest)
+        placeholder.rename(final)
+        return digest
+
+    current_relative = f"stage05.2/runs/{current_label}/generation-0001"
+    current_generation = archive_root / current_relative
+    current_raw = raw_manifest(current_generation, "d_history", current_label)
+    retry_one = archived_review(
+        current_generation,
+        label=current_label,
+        raw_sha256=current_raw,
+        status="NOT_READY",
+        gates=gates("runtime_identity"),
+        generation_id="retry-one",
+    )
+    retry_two = archived_review(
+        current_generation,
+        label=current_label,
+        raw_sha256=current_raw,
+        status="NOT_READY",
+        gates=gates("prerequisite_performance_baseline"),
+        generation_id="retry-two",
+        retry_history=[retry_one],
+    )
+    accepted = archived_review(
+        current_generation,
+        label=current_label,
+        raw_sha256=current_raw,
+        status="READY_FOR_STAGE052_ARTIFACT_STREAMING",
+        gates=gates(),
+        generation_id="accepted",
+        retry_history=[retry_one, retry_two],
+    )
+    current_review_root = current_generation / "d_history" / "review"
+    current_files = review_generation(
+        current_generation,
+        Path("d_history/review"),
+        "terminal",
+    )
+    current_review = {
+        "component": "hot_path",
+        "files": current_files,
+        "gates": gates(
+            "prerequisite_performance_baseline",
+            "source_snapshot",
+            details={
+                "prerequisite_performance_baseline": (
+                    "producer metadata is not bound to the reviewed prerequisite role"
+                ),
+                "source_snapshot": (
+                    "raw source snapshot identity does not match independent live replay"
+                ),
+            },
+        ),
+        "raw_manifest_sha256": current_raw,
+        "review_manifest_lineage_sha256": [accepted],
+        "review_retry_history_sha256": [retry_one, retry_two],
+        "run_label": current_label,
+        "schema_version": "stage05.2-review-v1",
+        "scope": "performance",
+        "status": "NOT_READY",
+    }
+    current_review_sha256 = write_json(
+        current_review_root / "review_manifest.json", current_review
+    )
+    write_json(
+        current_review_root / "review_execution.json",
+        {
+            "exit_code": 0,
+            "finalized": True,
+            "raw_manifest_sha256_after": current_raw,
+            "raw_manifest_sha256_before": current_raw,
+            "raw_manifest_unchanged": True,
+            "review_manifest_sha256": current_review_sha256,
+            "reviewer_module_name": (
+                "evrptw.experiments.stage052_performance_review"
+            ),
+            "run_label": current_label,
+            "schema_version": "stage05.2-review-execution-v1",
+            "status": "completed",
+        },
+    )
+
+    successor_relative = f"stage05.2/runs/{successor_label}/generation-0001"
+    successor_generation = archive_root / successor_relative
+    successor_raw = raw_manifest(successor_generation, "wsl_active", successor_label)
+    successor_review_root = successor_generation / "wsl_active" / "review"
+    successor_files = review_generation(
+        successor_generation,
+        Path("wsl_active/review"),
+        "accepted",
+    )
+    successor_review = {
+        "component": "hot_path",
+        "files": successor_files,
+        "gates": gates(),
+        "raw_manifest_sha256": successor_raw,
+        "review_manifest_lineage_sha256": [],
+        "review_retry_history_sha256": [],
+        "run_label": successor_label,
+        "schema_version": "stage05.2-review-v1",
+        "scope": "performance",
+        "status": "READY_FOR_STAGE052_ARTIFACT_STREAMING",
+    }
+    successor_review_sha256 = write_json(
+        successor_review_root / "review_manifest.json", successor_review
+    )
+    write_json(
+        successor_review_root / "review_execution.json",
+        {
+            "exit_code": 0,
+            "finalized": True,
+            "raw_manifest_sha256_after": successor_raw,
+            "raw_manifest_sha256_before": successor_raw,
+            "raw_manifest_unchanged": True,
+            "review_manifest_sha256": successor_review_sha256,
+            "reviewer_module_name": (
+                "evrptw.experiments.stage052_performance_review"
+            ),
+            "run_label": successor_label,
+            "schema_version": "stage05.2-review-execution-v1",
+            "status": "completed",
+        },
+    )
+
+    current_inventory, current_tree = _inventory_generation(
+        run_label=current_label,
+        generation_dir=current_generation,
+    )
+    successor_inventory, successor_tree = _inventory_generation(
+        run_label=successor_label,
+        generation_dir=successor_generation,
+    )
+    registry_path = archive_root / ".storage-governance/retention_registry_v2.json"
+    _write_signed_json(
+        registry_path,
+        {
+            "schema_version": "experiment-retention-registry-v2",
+            "records": [
+                {
+                    "archive_relative_path": current_relative,
+                    "archive_root_alias": "e_archive",
+                    "byte_count": current_inventory["byte_count"],
+                    "file_count": current_inventory["file_count"],
+                    "generation": 1,
+                    "retention_class": "unknown_full",
+                    "run_label": current_label,
+                    "tree_sha256": current_tree,
+                    "verification_status": "verified",
+                },
+                {
+                    "archive_relative_path": successor_relative,
+                    "archive_root_alias": "e_archive",
+                    "byte_count": successor_inventory["byte_count"],
+                    "file_count": successor_inventory["file_count"],
+                    "generation": 1,
+                    "retention_class": "unknown_full",
+                    "run_label": successor_label,
+                    "tree_sha256": successor_tree,
+                    "verification_status": "verified",
+                },
+            ],
+        },
+    )
+    migration_path = tmp_path / "migration.json"
+    _write_signed_json(
+        migration_path,
+        {
+            "schema_version": "experiment-lifecycle-migration-v3",
+            "pending_historical_classification": [current_label],
+            "protected_run_labels": ["stage05.2_benchmark_attempt97"],
+            "legacy_sources": [
+                {
+                    "registry_sha256": hashlib.sha256(
+                        registry_path.read_bytes()
+                    ).hexdigest(),
+                    "relative_path": (
+                        ".storage-governance/retention_registry_v2.json"
+                    ),
+                    "role": "read_only_primary_legacy",
+                    "root_alias": "e_archive",
+                    "schema_version": "experiment-retention-registry-v2",
+                }
+            ],
+        },
+    )
+    current_inventory.update(
+        {
+            "archive_root_alias": "e_archive",
+            "archive_root_resolved_path": str(archive_root.resolve()),
+            "archive_generation_relative_path": current_relative,
+            "legacy_registry_sha256": hashlib.sha256(
+                registry_path.read_bytes()
+            ).hexdigest(),
+            "legacy_tree_sha256": current_tree,
+        }
+    )
+    inventory_path = tmp_path / "content_inventory.json"
+    _write_signed_json(inventory_path, current_inventory)
+
+    result = review_historical_stage052(
+        migration_ledger_path=migration_path,
+        content_inventory_path=inventory_path,
+        run_label=current_label,
+        archive_root=archive_root,
+    )
+    assert result["status"] == "PARTIAL"
+    assert result["retention_class"] == "superseded_accepted_capsule"
+    proof = result["supersession_proof"]
+    assert isinstance(proof, dict)
+    assert proof["accepted_review_manifest_sha256"] == accepted
+    assert proof["successor_run_label"] == successor_label
+
+    successor_review["status"] = "NOT_READY"
+    write_json(successor_review_root / "review_manifest.json", successor_review)
+    with pytest.raises(LifecycleError, match="successor differs"):
+        review_historical_stage052(
+            migration_ledger_path=migration_path,
+            content_inventory_path=inventory_path,
+            run_label=current_label,
+            archive_root=archive_root,
+        )
 
 
 def test_historical_semantic_execution_rejects_archive_root_substitution(

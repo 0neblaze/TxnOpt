@@ -1179,8 +1179,14 @@ The executable workflow and gate table are maintained in
   retention class, failure identity, canonical representative, no-dependency
   proof and rebuild proof must satisfy the same class-specific rules as the
   original adjudication.
-  `hot_path_attempt04` remains `INVALID`/`unknown_full` until its own semantic
-  evidence exists.
+  `hot_path_attempt04` may be classified as `superseded_accepted_capsule` only
+  when the stage-specific reviewer replays its unchanged raw-manifest identity,
+  the complete accepted-review lineage and failed-review retry set, the terminal
+  review execution and exact failed gates, plus the v2-registry-bound full tree,
+  accepted review, and finalized review execution of successor
+  `hot_path_attempt06`. The resulting supersession proof must remain bound
+  through semantic execution, physical review, aggregate gate, and gate
+  consumption; otherwise the run remains `INVALID`/`unknown_full`.
 - Every catalogued producer's successful CLI path must release its writer lease
   and call the shared lifecycle seal. Stage 5.2 benchmark uses the final
   `stage05.2-campaign-manifest-v3` as its sealed manifest; calibration tools

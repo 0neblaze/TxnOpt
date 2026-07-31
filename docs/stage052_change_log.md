@@ -2678,8 +2678,16 @@ compatibility fallback（兼容回退）。
   storage-root locator 验证 live volume identity，并使用 signed migration ledger 唯一声明
   的 v2 registry path/SHA；registry SHA 与 generation tree SHA 贯穿后续全部签名证据。
   aggregate gate 逐项复核执行命令、module SHA-256、migration/inventory 前后 identity、
-  签名 semantic output 和 E state-root binding。`stage05.2_hot_path_attempt04` 未获根因证明，仍保持
-  `INVALID`/`unknown_full` 并阻塞真实历史 gate。
+  签名 semantic output 和 E state-root binding。后续根因审计确认
+  `stage05.2_hot_path_attempt04` 的 raw manifest 在全部 review generation 中不变，历史
+  READY review 被当前 manifest 明确列入 accepted lineage，后续终态 NOT_READY 只命中
+  `source_snapshot` 与 `prerequisite_performance_baseline` 两个 live/current-chain gate；
+  `stage05.2_hot_path_attempt06` 又以独立 finalized review 接替并通过同一 hot-path 状态。
+  reviewer 因此新增精确 supersession replay：它从 ledger-bound v2 registry 复验 attempt04
+  的完整 lineage/retry/files/execution 绑定，并重新通读 attempt06 全树、raw/review/execution
+  identity。只有这些证据全部成立才输出 `PARTIAL`/`superseded_accepted_capsule`；否则仍为
+  `INVALID`/`unknown_full`。真实 historical gate 与后续 Calibration 仍须在该实现提交后
+  另行受控执行，不因代码路径存在而自动解锁。
 - historical gate consumer 现在再次验证 live locator `e_archive`、migration-ledger v2
   registry SHA，并交叉重放 gate/review/inventory/semantic execution/binding 的 root、
   generation、registry、tree 与 module/command/hash identity；它还重放 semantic
