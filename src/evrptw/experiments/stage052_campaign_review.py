@@ -142,6 +142,9 @@ NOT_READY = "NOT_READY"
 PILOT_READY = "READY_FOR_STAGE052_FORMAL_BENCHMARK"
 FORMAL_READY = "READY_FOR_STAGE05_3"
 FORMAL_REPLAY_BACKEND: Literal["native_arrow"] = "native_arrow"
+_ISOLATED_SERVICE_CGROUP_ERROR = (
+    "Stage 5.2 aggregate memory gate requires an isolated systemd service cgroup"
+)
 
 
 def _verify_review_storage_migration(
@@ -6189,8 +6192,168 @@ def review_stage052_campaign(
     )
 
 
+def review_lifecycle_failure_capsule(
+    *,
+    raw_manifest_path: Path,
+    review_manifest_path: Path,
+) -> dict[str, object]:
+    """Independently classify a sealed CLI failure without trusting its summary."""
+
+    raw_manifest_path = raw_manifest_path.resolve(strict=True)
+    run_dir = raw_manifest_path.parent.parent
+    if (
+        raw_manifest_path.parent.name != "control"
+        or raw_manifest_path.name
+        != f"{run_dir.name}_failure_lifecycle_manifest.json"
+    ):
+        raise ArtifactIntegrityError("CLI failure manifest location is invalid")
+    expected_review_path = run_dir / "review" / "review_manifest.json"
+    if review_manifest_path.resolve() != expected_review_path.resolve():
+        raise ArtifactIntegrityError("CLI failure review output location is invalid")
+    _verify_manifest_sidecar(raw_manifest_path)
+    raw = _json_object(raw_manifest_path)
+    artifacts = raw.get("artifacts")
+    if (
+        raw.get("schema_version") != "experiment-cli-failure-manifest-v1"
+        or raw.get("run_label") != run_dir.name
+        or raw.get("status") != "failed"
+        or raw.get("evidence_completeness") != "partial"
+        or raw.get("artifact_trust") != "untrusted_failure_capsule"
+        or not isinstance(artifacts, list)
+        or not artifacts
+    ):
+        raise ArtifactIntegrityError("CLI failure manifest identity is invalid")
+
+    observed_paths: set[str] = set()
+    total_bytes = 0
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping):
+            raise ArtifactIntegrityError("CLI failure artifact record is invalid")
+        relative = artifact.get("relative_path")
+        byte_size = artifact.get("byte_size")
+        checksum = artifact.get("checksum")
+        modified_time_ns = artifact.get("modified_time_ns")
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+            or relative in observed_paths
+            or isinstance(byte_size, bool)
+            or not isinstance(byte_size, int)
+            or byte_size < 0
+            or not isinstance(checksum, str)
+            or re.fullmatch(r"[0-9a-f]{64}", checksum) is None
+            or isinstance(modified_time_ns, bool)
+            or not isinstance(modified_time_ns, int)
+            or modified_time_ns <= 0
+        ):
+            raise ArtifactIntegrityError("CLI failure artifact identity is invalid")
+        path = (run_dir / relative).resolve(strict=True)
+        if not path.is_relative_to(run_dir) or not path.is_file():
+            raise ArtifactIntegrityError("CLI failure artifact escapes the run directory")
+        stat = path.stat()
+        if (
+            stat.st_size != byte_size
+            or stat.st_mtime_ns != modified_time_ns
+            or _sha256(path) != checksum
+        ):
+            raise ArtifactIntegrityError("CLI failure artifact content differs")
+        observed_paths.add(relative)
+        total_bytes += byte_size
+
+    excluded = {
+        raw_manifest_path.relative_to(run_dir).as_posix(),
+        _sidecar_for(raw_manifest_path).relative_to(run_dir).as_posix(),
+    }
+    physical_paths = {
+        path.relative_to(run_dir).as_posix()
+        for path in run_dir.rglob("*")
+        if path.is_file()
+        and path.relative_to(run_dir).parts[:1] != ("review",)
+        and path.relative_to(run_dir).as_posix() not in excluded
+    }
+    if physical_paths != observed_paths:
+        raise ArtifactIntegrityError("CLI failure artifact inventory is incomplete")
+
+    summary_path = run_dir / "failure_summary.json"
+    if "failure_summary.json" not in observed_paths:
+        raise ArtifactIntegrityError("CLI failure summary is absent from the inventory")
+    _verify_manifest_sidecar(summary_path)
+    summary = _json_object(summary_path)
+    if (
+        summary.get("schema_version") != "experiment-cli-failure-summary-v1"
+        or summary.get("run_label") != run_dir.name
+        or summary.get("status") != "failed"
+        or summary.get("failure_code") != "runner_failure"
+        or not isinstance(summary.get("error_type"), str)
+        or not isinstance(summary.get("error_message"), str)
+    ):
+        raise ArtifactIntegrityError("CLI failure summary identity is invalid")
+
+    known = (
+        summary["error_type"] == "RuntimeError"
+        and summary["error_message"] == _ISOLATED_SERVICE_CGROUP_ERROR
+    )
+    lifecycle_status = "FAILED_KNOWN" if known else "FAILED_UNKNOWN"
+    failure_check = (
+        "isolated_service_cgroup_required"
+        if known
+        else "unclassified_cli_runner_failure"
+    )
+    manifest: dict[str, object] = {
+        "schema_version": "experiment-lifecycle-failure-review-v1",
+        "run_label": run_dir.name,
+        "status": lifecycle_status,
+        "lifecycle_status": lifecycle_status,
+        "failure_identity": {
+            "component": "stage052_calibration",
+            "invariant_or_check": failure_check,
+            "location": "failure_summary.json",
+        },
+        "raw_manifest_sha256": _sha256(raw_manifest_path),
+        "failure_summary_sha256": _sha256(summary_path),
+        "verified_artifact_count": len(artifacts),
+        "verified_artifact_bytes": total_bytes,
+        "gates": {
+            "failure_manifest_sidecar": {"passed": True},
+            "failure_artifact_inventory": {"passed": True},
+            "failure_summary_sidecar": {"passed": True},
+            "known_root_cause": {"passed": known},
+        },
+        "files": {},
+    }
+    review_manifest_path.parent.mkdir(parents=True, exist_ok=False)
+    _write_fsync(
+        review_manifest_path,
+        json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n",
+    )
+    _fsync_directory(review_manifest_path.parent)
+    return manifest
+
+
 def main() -> int:
     import argparse
+
+    if "--lifecycle-failure-manifest" in sys.argv[1:]:
+        failure_parser = argparse.ArgumentParser(description=__doc__)
+        failure_parser.add_argument(
+            "--lifecycle-failure-manifest",
+            type=Path,
+            required=True,
+        )
+        failure_parser.add_argument(
+            "--failure-review-manifest",
+            type=Path,
+            required=True,
+        )
+        failure_arguments = failure_parser.parse_args()
+        payload = review_lifecycle_failure_capsule(
+            raw_manifest_path=failure_arguments.lifecycle_failure_manifest,
+            review_manifest_path=failure_arguments.failure_review_manifest,
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--campaign-dir", type=Path, required=True)

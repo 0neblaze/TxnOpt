@@ -23,6 +23,7 @@ from evrptw.artifacts import (
     ArtifactRunContext,
     ArtifactStorageConfig,
     _schema_fingerprint,
+    atomic_write_signed_json,
     screening_definition_store_contract,
 )
 from evrptw.best_known import BEST_KNOWN_VALUES
@@ -37,6 +38,7 @@ from evrptw.experiments.stage052_campaign_review import (
     audit_campaign_planning,
     audit_streamed_events,
     replay_streamed_shard_events,
+    review_lifecycle_failure_capsule,
     review_stage052_campaign,
     review_status_for_scope,
     summarize_streamed_global_bests,
@@ -73,6 +75,7 @@ from evrptw.stage052_evidence import (
 from evrptw.stage052_resources import ProducerResourceContract
 from evrptw.stage052_retention import RetentionRecord, write_retention_registry
 from evrptw.storage_governance import (
+    build_cli_failure_manifest,
     compute_tree_sha256,
     write_migration_dry_run,
     write_storage_migration_attestation,
@@ -98,6 +101,80 @@ _SOURCE_SNAPSHOT = {
     "allowed_untracked_sha256": {},
     "read_only": True,
 }
+
+
+def test_lifecycle_failure_capsule_review_recomputes_known_failure(
+    tmp_path: Path,
+) -> None:
+    label = "stage05.2_resource_calibration_attempt09"
+    run_dir = tmp_path / label
+    run_dir.mkdir()
+    (run_dir / "partial.log").write_text("started\n", encoding="utf-8")
+    atomic_write_signed_json(
+        run_dir / "failure_summary.json",
+        {
+            "schema_version": "experiment-cli-failure-summary-v1",
+            "run_label": label,
+            "status": "failed",
+            "failure_code": "runner_failure",
+            "error_type": "RuntimeError",
+            "error_message": (
+                "Stage 5.2 aggregate memory gate requires an isolated "
+                "systemd service cgroup"
+            ),
+        },
+    )
+    raw_manifest = build_cli_failure_manifest(
+        output_dir=run_dir,
+        run_label=label,
+    )
+    review_manifest = run_dir / "review" / "review_manifest.json"
+
+    review = review_lifecycle_failure_capsule(
+        raw_manifest_path=raw_manifest,
+        review_manifest_path=review_manifest,
+    )
+
+    assert review["lifecycle_status"] == "FAILED_KNOWN"
+    assert review["failure_identity"] == {
+        "component": "stage052_calibration",
+        "invariant_or_check": "isolated_service_cgroup_required",
+        "location": "failure_summary.json",
+    }
+    assert review["verified_artifact_count"] == 3
+    assert review_manifest.is_file()
+
+
+def test_lifecycle_failure_capsule_review_rejects_artifact_drift(
+    tmp_path: Path,
+) -> None:
+    label = "stage05.2_resource_calibration_attempt09"
+    run_dir = tmp_path / label
+    run_dir.mkdir()
+    partial = run_dir / "partial.log"
+    partial.write_text("started\n", encoding="utf-8")
+    atomic_write_signed_json(
+        run_dir / "failure_summary.json",
+        {
+            "schema_version": "experiment-cli-failure-summary-v1",
+            "run_label": label,
+            "status": "failed",
+            "failure_code": "runner_failure",
+            "error_type": "RuntimeError",
+            "error_message": "unclassified",
+        },
+    )
+    raw_manifest = build_cli_failure_manifest(
+        output_dir=run_dir,
+        run_label=label,
+    )
+    partial.write_text("changed\n", encoding="utf-8")
+
+    with pytest.raises(ArtifactIntegrityError, match="content differs"):
+        review_lifecycle_failure_capsule(
+            raw_manifest_path=raw_manifest,
+            review_manifest_path=run_dir / "review" / "review_manifest.json",
+        )
 
 
 def _power_load_payload(maximum_runtime_load1: float) -> dict[str, object]:
