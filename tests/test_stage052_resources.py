@@ -638,13 +638,19 @@ def test_producer_resource_contract_is_calibration_derived_and_round_trips() -> 
         available_memory_bytes=16 * 1024**3,
         row_group_size=65_536,
         queue_depth=1,
+        python_allocator="malloc",
     )
 
     assert contract.selected_workers == 5
     assert contract.aggregate_memory_limit_bytes == math.ceil(9 * 1024**3 * 1.2)
     assert contract.per_worker_memory_limit_bytes == math.ceil(3 * 1024**3 * 1.2)
     assert contract.aggregate_memory_limit_bytes <= 16 * 1024**3
+    assert contract.python_allocator == "malloc"
     assert ProducerResourceContract.from_dict(contract.to_dict()) == contract
+
+    legacy_payload = contract.to_dict()
+    del legacy_payload["python_allocator"]
+    assert ProducerResourceContract.from_dict(legacy_payload).python_allocator == "default"
 
 
 def test_producer_resource_contract_keeps_full_headroom_above_seventy_five_percent() -> None:

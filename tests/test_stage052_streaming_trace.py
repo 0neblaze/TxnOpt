@@ -2819,3 +2819,70 @@ def test_stage052_solver_installs_runtime_trace_sink(
     measurement = captured["measurement_config"]
     assert isinstance(measurement, MeasurementConfig)
     assert measurement.stream_sink is expected
+
+
+def test_async_pipeline_periodically_trims_malloc_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYTHONMALLOC", "malloc")
+    trim_calls = 0
+
+    def trim() -> dict[str, object]:
+        nonlocal trim_calls
+        trim_calls += 1
+        return {
+            "python_allocator": "malloc",
+            "system_allocator_trim_available": True,
+            "system_allocator_trim_result": 1,
+            "rss_bytes_before_system_allocator_trim": 2,
+            "rss_bytes_after_system_allocator_trim": 1,
+        }
+
+    monkeypatch.setattr(stage052_performance, "trim_stage052_system_allocator", trim)
+    writer = ArtifactBundleWriter(
+        tmp_path / "stage05.2_artifact_streaming_attempt99",
+        ArtifactRunContext(
+            "stage05.2",
+            "artifact_streaming",
+            "stage05.2_artifact_streaming_attempt99",
+        ),
+        ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+    shard = writer.open_v2_shard(
+        instance="toy",
+        seed=2014,
+        shard_ordinal=0,
+        worker_identity="worker-0",
+    )
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,
+        axis_name="fixed_work",
+        buffer_rows=1,
+        async_persistence=True,
+    )
+    for iteration in range(8):
+        sink.append_event(
+            {
+                "event_type": "operator_call",
+                "lane": "legacy",
+                "iteration": iteration,
+                "operator": "repair",
+            }
+        )
+    sink.finish()
+    sink.close()
+
+    release = sink.batch_memory_release
+    assert trim_calls == 1
+    assert release["release_count"] == 1
+    assert release["releases"] == [
+        {
+            "after_batch_ordinal": 7,
+            "python_allocator": "malloc",
+            "system_allocator_trim_available": True,
+            "system_allocator_trim_result": 1,
+            "rss_bytes_before_system_allocator_trim": 2,
+            "rss_bytes_after_system_allocator_trim": 1,
+        }
+    ]

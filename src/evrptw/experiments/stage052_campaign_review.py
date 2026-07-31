@@ -6380,6 +6380,74 @@ def _verify_stage052_memory_release(payload: object) -> None:
         raise ArtifactIntegrityError("Stage 5.2 system allocator trim is invalid")
 
 
+def _verify_stage052_batch_memory_release(
+    payload: object,
+    *,
+    persistence_pipeline: object,
+) -> int:
+    if not isinstance(payload, Mapping) or not isinstance(
+        persistence_pipeline, Mapping
+    ):
+        raise ArtifactIntegrityError("Stage 5.2 batch memory release is missing")
+    releases = payload.get("releases")
+    release_count = payload.get("release_count")
+    submitted_batches = persistence_pipeline.get("submitted_batches")
+    if (
+        set(payload)
+        != {
+            "schema_version",
+            "enabled",
+            "python_allocator",
+            "batch_interval",
+            "release_count",
+            "releases",
+        }
+        or payload.get("schema_version")
+        != "stage05.2-batch-memory-release-v1"
+        or payload.get("enabled") is not True
+        or payload.get("python_allocator") != "malloc"
+        or payload.get("batch_interval") != 8
+        or isinstance(release_count, bool)
+        or not isinstance(release_count, int)
+        or release_count <= 0
+        or not isinstance(releases, list)
+        or len(releases) != release_count
+        or isinstance(submitted_batches, bool)
+        or not isinstance(submitted_batches, int)
+        or release_count != submitted_batches // 8
+    ):
+        raise ArtifactIntegrityError("Stage 5.2 batch memory release identity differs")
+    for index, release in enumerate(releases):
+        if (
+            not isinstance(release, Mapping)
+            or set(release)
+            != {
+                "after_batch_ordinal",
+                "python_allocator",
+                "system_allocator_trim_available",
+                "system_allocator_trim_result",
+                "rss_bytes_before_system_allocator_trim",
+                "rss_bytes_after_system_allocator_trim",
+            }
+            or release.get("after_batch_ordinal") != (index + 1) * 8 - 1
+            or release.get("python_allocator") != "malloc"
+            or release.get("system_allocator_trim_available") is not True
+            or release.get("system_allocator_trim_result") not in {0, 1}
+            or isinstance(release.get("rss_bytes_before_system_allocator_trim"), bool)
+            or not isinstance(
+                release.get("rss_bytes_before_system_allocator_trim"), int
+            )
+            or int(release["rss_bytes_before_system_allocator_trim"]) <= 0
+            or isinstance(release.get("rss_bytes_after_system_allocator_trim"), bool)
+            or not isinstance(
+                release.get("rss_bytes_after_system_allocator_trim"), int
+            )
+            or int(release["rss_bytes_after_system_allocator_trim"]) <= 0
+        ):
+            raise ArtifactIntegrityError("Stage 5.2 batch memory release record differs")
+    return release_count
+
+
 def review_resource_calibration(
     *,
     raw_manifest_path: Path,
@@ -6512,10 +6580,13 @@ def review_resource_calibration(
     ):
         raise ArtifactIntegrityError("calibration parent memory release differs")
     _verify_stage052_memory_release(parent_release_evidence)
+    if parent_release_evidence.get("python_allocator") != "malloc":
+        raise ArtifactIntegrityError("calibration parent allocator is not malloc")
 
     expected_axes = {"wall_clock_30", "wall_clock_60", "wall_clock_300"}
     expected_seeds = set(range(2014, 2020))
     verified_axis_memory_releases = 0
+    verified_batch_memory_releases = 0
     for seed in sorted(expected_seeds):
         relative_trace = (
             "formal-memory-workers6-rg16384-qd1/r205_21/"
@@ -6538,6 +6609,12 @@ def review_resource_calibration(
             if not isinstance(axis, Mapping):
                 raise ArtifactIntegrityError("calibration memory trace axis is invalid")
             _verify_stage052_memory_release(axis.get("memory_release"))
+            if axis["memory_release"].get("python_allocator") != "malloc":
+                raise ArtifactIntegrityError("calibration axis allocator is not malloc")
+            verified_batch_memory_releases += _verify_stage052_batch_memory_release(
+                axis.get("batch_memory_release"),
+                persistence_pipeline=axis.get("persistence_pipeline"),
+            )
             verified_axis_memory_releases += 1
     formal_cgroup = formal.get("cgroup_path")
     reset_memory_current = reset.get("memory_current_bytes_after_reset")
@@ -6563,6 +6640,7 @@ def review_resource_calibration(
         contract.selected_workers == 6
         and contract.row_group_size == 16_384
         and contract.queue_depth == 1
+        and contract.python_allocator == "malloc"
     )
     if not locked_topology_passed:
         raise ArtifactIntegrityError("calibration locked topology differs")
@@ -6582,6 +6660,7 @@ def review_resource_calibration(
         "verified_artifact_count": len(artifacts),
         "verified_artifact_bytes": total_bytes,
         "verified_axis_memory_releases": verified_axis_memory_releases,
+        "verified_batch_memory_releases": verified_batch_memory_releases,
         "gates": {
             "terminal_manifest_replay": {"passed": True},
             "artifact_inventory": {"passed": True},
@@ -6591,6 +6670,9 @@ def review_resource_calibration(
             "parent_memory_release": {"passed": True},
             "axis_memory_release": {
                 "passed": verified_axis_memory_releases == 18,
+            },
+            "batch_memory_release": {
+                "passed": verified_batch_memory_releases > 0,
             },
             "locked_topology": {
                 "passed": locked_topology_passed,

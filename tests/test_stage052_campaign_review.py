@@ -211,6 +211,7 @@ def test_resource_calibration_review_replays_terminal_evidence(
         calibration_digest="b" * 64,
         row_group_size=16_384,
         queue_depth=1,
+        python_allocator="malloc",
     )
     contract_path = tmp_path / "resource-contract.json"
     atomic_write_signed_json(contract_path, contract.to_dict())
@@ -234,7 +235,7 @@ def test_resource_calibration_review_replays_terminal_evidence(
     )
     parent_release_path = run_dir / "formal_memory_parent_release.json"
     parent_release_evidence = {
-        "python_allocator": "default",
+        "python_allocator": "malloc",
         "python_with_mimalloc": True,
         "gc_collected_objects": 0,
         "rss_bytes_before_release": 1,
@@ -305,7 +306,29 @@ def test_resource_calibration_review_replays_terminal_evidence(
                     "instance": "r205_21",
                     "seed": seed,
                     "axes": {
-                        axis: {"memory_release": parent_release_evidence}
+                        axis: {
+                            "memory_release": parent_release_evidence,
+                            "persistence_pipeline": {"submitted_batches": 8},
+                            "batch_memory_release": {
+                                "schema_version": (
+                                    "stage05.2-batch-memory-release-v1"
+                                ),
+                                "enabled": True,
+                                "python_allocator": "malloc",
+                                "batch_interval": 8,
+                                "release_count": 1,
+                                "releases": [
+                                    {
+                                        "after_batch_ordinal": 7,
+                                        "python_allocator": "malloc",
+                                        "system_allocator_trim_available": True,
+                                        "system_allocator_trim_result": 1,
+                                        "rss_bytes_before_system_allocator_trim": 2,
+                                        "rss_bytes_after_system_allocator_trim": 1,
+                                    }
+                                ],
+                            },
+                        }
                         for axis in (
                             "wall_clock_30",
                             "wall_clock_60",
@@ -379,6 +402,7 @@ def test_resource_calibration_review_replays_terminal_evidence(
     assert review["lifecycle_status"] == "ACCEPTED"
     assert review["verified_artifact_count"] == 14
     assert review["verified_axis_memory_releases"] == 18
+    assert review["verified_batch_memory_releases"] == 18
     assert review["gates"]["axis_memory_release"] == {"passed": True}
     assert review["gates"]["parent_memory_release"] == {"passed": True}
     assert review["gates"]["locked_topology"] == {"passed": True}

@@ -265,6 +265,7 @@ class ProducerResourceContract:
     calibration_digest: str
     row_group_size: int
     queue_depth: int
+    python_allocator: str = "default"
 
     def __post_init__(self) -> None:
         if self.selected_workers not in _PRODUCER_WORKERS:
@@ -287,6 +288,8 @@ class ProducerResourceContract:
             )
         if self.queue_depth not in _QUEUE_DEPTHS:
             raise ValueError("queue_depth must be 1 or 2")
+        if self.python_allocator not in {"default", "malloc"}:
+            raise ValueError("python_allocator must be default or malloc")
         if self.aggregate_memory_limit_bytes < self.selected_aggregate_peak_rss_bytes:
             raise ValueError("aggregate memory limit is below the calibrated peak")
         if self.per_worker_memory_limit_bytes < self.selected_per_worker_peak_rss_bytes:
@@ -307,6 +310,7 @@ class ProducerResourceContract:
             "calibration_digest": self.calibration_digest,
             "row_group_size": self.row_group_size,
             "queue_depth": self.queue_depth,
+            "python_allocator": self.python_allocator,
         }
 
     @classmethod
@@ -324,7 +328,12 @@ class ProducerResourceContract:
             "row_group_size",
             "queue_depth",
         }
-        if set(payload) != expected:
+        legacy_expected = set(expected)
+        expected.add("python_allocator")
+        if frozenset(payload) not in {
+            frozenset(legacy_expected),
+            frozenset(expected),
+        }:
             raise ValueError("producer resource contract fields do not match the schema")
         if payload.get("schema_version") != "stage05.2-producer-resource-contract-v1":
             raise ValueError("producer resource contract schema is unsupported")
@@ -336,9 +345,10 @@ class ProducerResourceContract:
 
         semantic_digest = payload.get("semantic_digest")
         calibration_digest = payload.get("calibration_digest")
+        python_allocator = payload.get("python_allocator", "default")
         if not isinstance(semantic_digest, str) or not isinstance(
             calibration_digest, str
-        ):
+        ) or not isinstance(python_allocator, str):
             raise ValueError("producer resource contract digests must be strings")
         return cls(
             selected_workers=integer("selected_workers"),
@@ -355,6 +365,7 @@ class ProducerResourceContract:
             calibration_digest=calibration_digest,
             row_group_size=integer("row_group_size"),
             queue_depth=integer("queue_depth"),
+            python_allocator=python_allocator,
         )
 
 
@@ -752,6 +763,7 @@ def derive_producer_resource_contract(
     available_memory_bytes: int,
     row_group_size: int,
     queue_depth: int,
+    python_allocator: str = "default",
 ) -> ProducerResourceContract:
     """Freeze selected producer peaks with 20% headroom within host capability."""
 
@@ -795,6 +807,7 @@ def derive_producer_resource_contract(
         "selected_per_worker_peak_rss_bytes": selected_per_worker_peak_rss_bytes,
         "row_group_size": row_group_size,
         "queue_depth": queue_depth,
+        "python_allocator": python_allocator,
     }
     calibration_digest = hashlib.sha256(
         json.dumps(
@@ -815,6 +828,7 @@ def derive_producer_resource_contract(
         calibration_digest=calibration_digest,
         row_group_size=row_group_size,
         queue_depth=queue_depth,
+        python_allocator=python_allocator,
     )
 
 

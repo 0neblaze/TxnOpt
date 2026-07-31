@@ -144,7 +144,11 @@ from evrptw.stage052_evidence import (
     verify_stage052_runtime_identity,
     verify_stage052_source_snapshot,
 )
-from evrptw.stage052_memory import release_stage052_process_memory
+from evrptw.stage052_memory import (
+    release_stage052_process_memory,
+    stage052_python_allocator,
+    trim_stage052_system_allocator,
+)
 from evrptw.stage052_platform import peak_rss_bytes
 from evrptw.stage052_remediation import Stage052RemediationResult
 from evrptw.stage052_resources import (
@@ -166,6 +170,7 @@ from evrptw.storage_governance import (
 from evrptw.validation import validate_routes
 
 STAGE052_WRITER_THREAD_SWITCH_INTERVAL_SECONDS = 0.5
+STAGE052_MEMORY_RELEASE_BATCH_INTERVAL = 8
 STAGE052_SCHEMA_VERSION = "stage05.2-performance-v1"
 NATIVE_ABLATION_AXIS_SCHEMA_VERSION = "stage05.2-native-ablation-axis-v4"
 NATIVE_ABLATION_TIMING_ENVELOPE = "in_memory_measurement_trace_no_stream_sink_v1"
@@ -1160,6 +1165,10 @@ def _run_benchmark_campaign_impl(
     producer_resource_contract = load_producer_resource_contract(
         _resolve(root, config.resource_calibration_contract)
     )
+    if stage052_python_allocator() != producer_resource_contract.python_allocator:
+        raise RuntimeError(
+            "benchmark Python allocator differs from the calibrated resource contract"
+        )
     recalibration_report = (
         root / "configs" / "stage052_resource_calibration.local.report.json"
     )
@@ -4013,6 +4022,7 @@ class _BoundedShardAppender:
         self._writer_cpu_nanoseconds = 0
         self._peak_queued_batches = 0
         self._batch_ledger: list[dict[str, object]] = []
+        self._memory_release_ledger: list[dict[str, object]] = []
         self._thread = threading.Thread(
             target=self._run,
             name="stage052-artifact-writer",
@@ -4042,6 +4052,17 @@ class _BoundedShardAppender:
     @property
     def writer_cpu_nanoseconds(self) -> int:
         return self._writer_cpu_nanoseconds
+
+    @property
+    def memory_release_summary(self) -> dict[str, object]:
+        return {
+            "schema_version": "stage05.2-batch-memory-release-v1",
+            "enabled": stage052_python_allocator() == "malloc",
+            "python_allocator": stage052_python_allocator(),
+            "batch_interval": STAGE052_MEMORY_RELEASE_BATCH_INTERVAL,
+            "release_count": len(self._memory_release_ledger),
+            "releases": [dict(item) for item in self._memory_release_ledger],
+        }
 
     @property
     def producer_turn_submitted_batch(self) -> bool:
@@ -4183,6 +4204,34 @@ class _BoundedShardAppender:
                             critical_events=batch,
                             cache_lookups_coalesced=True,
                         )
+                        if persisted != len(batch):
+                            raise RuntimeError(
+                                "Stage 5.2 trace sink did not persist its complete "
+                                "logical event batch"
+                            )
+                        self._completed_batches += 1
+                        self._batch_ledger.append(
+                            {
+                                "ordinal": queued.ordinal,
+                                "row_count": len(batch),
+                                "event_token_sha256": queued.event_token_sha256,
+                            }
+                        )
+                        if (
+                            self._completed_batches
+                            % STAGE052_MEMORY_RELEASE_BATCH_INTERVAL
+                            == 0
+                            and stage052_python_allocator() == "malloc"
+                        ):
+                            completed_ordinal = queued.ordinal
+                            item = self._sentinel
+                            del batch, queued
+                            self._memory_release_ledger.append(
+                                {
+                                    "after_batch_ordinal": completed_ordinal,
+                                    **trim_stage052_system_allocator(),
+                                }
+                            )
                     finally:
                         writer_cpu_elapsed_ns = time.thread_time_ns() - writer_cpu_started_ns
                         writer_wall_elapsed_ns = time.perf_counter_ns() - writer_wall_started_ns
@@ -4196,18 +4245,6 @@ class _BoundedShardAppender:
                         )
                         sys.setswitchinterval(previous_switch_interval)
                         self._meter.exit(activity)
-                if persisted != len(batch):
-                    raise RuntimeError(
-                        "Stage 5.2 trace sink did not persist its complete logical event batch"
-                    )
-                self._completed_batches += 1
-                self._batch_ledger.append(
-                    {
-                        "ordinal": queued.ordinal,
-                        "row_count": len(batch),
-                        "event_token_sha256": queued.event_token_sha256,
-                    }
-                )
             except BaseException as error:
                 with self._error_lock:
                     if self._error is None:
@@ -4881,6 +4918,19 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         if errors:
             raise BaseExceptionGroup("failed to close Stage 5.2 trace stream", errors)
 
+    @property
+    def batch_memory_release(self) -> dict[str, object]:
+        if self._async_appender is None:
+            return {
+                "schema_version": "stage05.2-batch-memory-release-v1",
+                "enabled": False,
+                "python_allocator": stage052_python_allocator(),
+                "batch_interval": STAGE052_MEMORY_RELEASE_BATCH_INTERVAL,
+                "release_count": 0,
+                "releases": [],
+            }
+        return self._async_appender.memory_release_summary
+
     def discard_pending(self) -> None:
         """Discard an uncommitted callback batch after a shard append failure."""
 
@@ -5516,6 +5566,7 @@ def _run_and_persist_v2_shard(
             )
             trace_stream.close()
             trace_axis["persistence_pipeline"] = trace_stream.persistence_pipeline
+            trace_axis["batch_memory_release"] = trace_stream.batch_memory_release
             trace_axes[axis.name] = trace_axis
             active_trace_stream = None
             artifact_preparation_completed_ns = time.perf_counter_ns()

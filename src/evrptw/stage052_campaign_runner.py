@@ -150,7 +150,7 @@ _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
         "cd8cbcf415b30c3d29d53aca8fecd22bd3ded62099de621b9cbf8c011d827de1"
     ),
     "tests/test_stage052_streaming_trace.py": (
-        "a1a408779f438d26af7258608e80dc20290b76219f0c3ddfa2650c1ac57b2248"
+        "92f4a0a42131592ca62090c04b74e7faf642f79450a5906e72ce019071cd3c53"
     ),
 }
 

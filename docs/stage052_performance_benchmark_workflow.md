@@ -297,6 +297,16 @@ report、checksum 不一致、worker identity
 缺失或重复、拓扑变化、memory floor 降低或非零 geometry 都继续拒绝，失败 label
 不续跑、不导入 shard。
 
+Formal calibration 与 benchmark producer 的 interpreter 必须以
+`PYTHONMALLOC=malloc` 启动。allocator identity（分配器身份）写入 signed producer
+resource contract，并在 benchmark admission 重放；缺少该字段的 legacy contract 只能
+解析为 `default`，不能通过新的 Formal calibration gate。async Parquet writer 每完成
+8 个 batches，就在仍持有 measured writer turn 时丢弃刚持久化 batch 的引用并执行 libc
+`malloc_trim`。每个 axis 固定记录 release ordinal、allocator、trim 可用性/结果及前后
+RSS。independent calibration reviewer 从 `submitted_batches` 重算 release 数量与 exact
+ordinal sequence，拒绝缺失或伪造的 release telemetry。该协议只约束可回收 Python
+pages；6 workers、16,384/1、swap 0、fallback 0 与 20% headroom 不变。
+
 sealed source snapshot 不能只做 Git clone：Schneider benchmark 是 ignored input，
 必须在启动前以 snapshot-local ordinary files（快照内普通文件）实体化，并核对 exact
 probe instance 非空。Formal memory probe 在创建 output root 和提交 worker work

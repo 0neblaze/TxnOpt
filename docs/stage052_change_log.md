@@ -2762,3 +2762,18 @@ compatibility fallback（兼容回退）。
   和 SHA-256，重放签名 v3 report、formal memory measurement、cgroup peak reset 与外部
   producer resource contract，并只在固定 6/16384/1 拓扑及全部 binding 一致时输出
   `ACCEPTED`。producer 自报 complete 不再足以进入 lifecycle classification。
+- `stage05.2_resource_calibration_attempt18` 在上述 parent/axis release 协议下仍记录
+  cgroup peak `23,090,085,888` bytes（容量 `25,196,937,216` bytes）、swap 0、fallback 0，
+  因 20% headroom 失败。独立 reviewer 复核 302 个 artifacts（`740,559,325` bytes）并
+  报告 `FAILED_KNOWN`；failure identity 继续归并到 Attempt16，按
+  `duplicate_failure_metadata` compaction 后 CLOSED。18 个 axis 的 Arrow live allocation
+  仅约 14.6--15.7 MiB，而 300 秒 axis 结束回收后的 worker RSS 仍约 2.89--3.98 GiB；
+  证据因此把剩余问题定位到 CPython mimalloc 长轴内的 retained/fragmented pages，而非
+  PyArrow live buffers，也不构成放宽资源门禁的依据。
+- 后续 Formal calibration/benchmark 把 `PYTHONMALLOC=malloc` 纳入签名 producer resource
+  contract。async writer 每完成 8 个 Parquet batches，就在持有 writer turn 时丢弃刚完成
+  batch 引用并执行 libc `malloc_trim`；trace 固定记录 release ordinal、allocator、trim
+  结果与前后 RSS。成功 reviewer 从 `submitted_batches` 独立重算每个 axis 的 release
+  次数和 ordinal 序列，并要求 parent 与 18 个 axis 的 allocator 均为 `malloc`。该变更
+  只控制 300 秒 axis 内的可回收 Python page，6 workers、16384/1、swap 0、fallback 0 与
+  20% headroom 均保持不变；必须用新 label 重测，不能重标 Attempt18。

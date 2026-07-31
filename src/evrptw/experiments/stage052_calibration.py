@@ -55,7 +55,10 @@ from evrptw.stage052_evidence import (
     RunResourceSummary,
     is_stage052_dedicated_cgroup_path,
 )
-from evrptw.stage052_memory import release_stage052_process_memory
+from evrptw.stage052_memory import (
+    release_stage052_process_memory,
+    stage052_python_allocator,
+)
 from evrptw.stage052_resources import (
     ParquetBenchmark,
     ProducerBenchmark,
@@ -1056,6 +1059,7 @@ def create_resource_contract(
     available_memory_bytes: int,
     locked_workers: int | None = None,
     locked_parquet_configuration: tuple[int, int] | None = None,
+    python_allocator: str = "default",
 ) -> tuple[ProducerResourceContract, ProducerSelection, ParquetBenchmark]:
     """Apply all deterministic selection gates to measured observations."""
 
@@ -1098,6 +1102,7 @@ def create_resource_contract(
         available_memory_bytes=available_memory_bytes,
         row_group_size=selected_parquet.row_group_size,
         queue_depth=selected_parquet.queue_depth,
+        python_allocator=python_allocator,
     )
     return contract, selection, selected_parquet
 
@@ -1130,6 +1135,12 @@ def run_stage052_resource_calibration(
         else config_path.resolve()
     )
     source_state = _source_state(repository)
+    python_allocator = stage052_python_allocator()
+    if require_clean_source and python_allocator != "malloc":
+        raise RuntimeError(
+            "resource calibration requires PYTHONMALLOC=malloc for bounded "
+            "axis-internal reclamation"
+        )
     if require_clean_source and (
         source_state.get("repository_revision") is None
         or source_state.get("repository_dirty") is not False
@@ -1174,6 +1185,7 @@ def run_stage052_resource_calibration(
         available_memory_bytes=memory_capacity,
         locked_workers=locked_workers,
         locked_parquet_configuration=locked_parquet_configuration,
+        python_allocator=python_allocator,
     )
     parent_memory_release_path = output_root / "formal_memory_parent_release.json"
     parent_memory_release = release_stage052_process_memory()
@@ -1277,6 +1289,7 @@ def run_stage052_resource_calibration(
         available_memory_bytes=memory_capacity,
         locked_workers=locked_workers,
         locked_parquet_configuration=locked_parquet_configuration,
+        python_allocator=python_allocator,
     )
     if selection.selected_workers != preliminary_selection.selected_workers:
         raise RuntimeError(
