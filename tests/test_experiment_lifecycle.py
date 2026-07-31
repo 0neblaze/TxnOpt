@@ -43,6 +43,9 @@ from evrptw.experiments.stage052_historical_semantic_review import (
     build_no_dependency_proof,
     review_historical_stage052,
 )
+from evrptw.experiments.stage052_historical_semantic_review import (
+    main as historical_semantic_main,
+)
 from evrptw.stage052_campaign import (
     StorageRoot,
     StorageRootLocator,
@@ -988,6 +991,50 @@ def test_historical_inventory_uses_governance_tree_identity(
     assert inventory["scan_passes"] == 1
     assert inventory["hash_backend"] == "python_thread_pool"
     assert inventory["hash_workers"] == 2
+
+
+def test_historical_semantic_cli_writes_lifecycle_canonical_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    label = "stage05.2_hot_path_attempt04"
+    migration_path = tmp_path / "migration.json"
+    inventory_path = tmp_path / "inventory.json"
+    output_path = tmp_path / "semantic.json"
+    _write_signed_json(
+        migration_path,
+        {
+            "schema_version": "experiment-lifecycle-migration-v3",
+            "pending_historical_classification": [label],
+            "protected_run_labels": ["stage05.2_benchmark_attempt97"],
+        },
+    )
+    _write_signed_json(
+        inventory_path,
+        {
+            "schema_version": "experiment-content-inventory-v1",
+            "run_label": label,
+            "files": [{"relative_path": "control/manifest.json"}],
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage052_historical_semantic_review",
+            "--migration-ledger",
+            str(migration_path),
+            "--content-inventory",
+            str(inventory_path),
+            "--run-label",
+            label,
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    assert historical_semantic_main() == 0
+    assert lifecycle_module._load_signed_json(output_path)["status"] == "INVALID"
 
 
 def test_stage052_hot_path_requires_accepted_lineage_and_successor(

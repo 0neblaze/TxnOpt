@@ -920,11 +920,7 @@ def main() -> int:
     output = arguments.output.resolve()
     if output.exists():
         raise LifecycleError("historical semantic output already exists")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    _write_signed_json(output, payload)
     print(output)
     return 0
 
