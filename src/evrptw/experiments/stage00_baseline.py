@@ -29,6 +29,7 @@ from evrptw.environment import collect_environment
 from evrptw.models import Instance
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
+from evrptw.storage_governance import preflight_cli_attempt
 from evrptw.validation import SolutionReport, validate_routes
 
 SCHEMA_VERSION = "1"
@@ -1283,6 +1284,10 @@ def main() -> int:
     arguments = parser.parse_args()
     config = load_config(arguments.config)
     if arguments.command == "run":
+        preflight_cli_attempt(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+        )
         outputs = run_stage00(
             config,
             arguments.config,

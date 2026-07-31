@@ -60,6 +60,7 @@ from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
 from evrptw.stage04 import Stage04Config, with_fixed_weights
 from evrptw.stage052_platform import peak_rss_bytes
+from evrptw.storage_governance import preflight_cli_attempt
 
 STAGE04_SCHEMA_VERSION = "stage04-adaptive-weights-v6"
 STAGE04_RUN_LABEL = re.compile(
@@ -866,6 +867,11 @@ def main() -> int:
     parser.add_argument("--scope", choices=("smoke", "formal"), required=True)
     parser.add_argument("--run-label", required=True)
     arguments = parser.parse_args()
+    preflight_cli_attempt(
+        config_path=arguments.config,
+        output_dir=arguments.output_dir,
+        run_label=arguments.run_label,
+    )
     outputs = run_stage04_weights(
         config_path=arguments.config,
         output_dir=arguments.output_dir,

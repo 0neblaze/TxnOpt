@@ -1044,6 +1044,11 @@ filesystem = "{filesystem}"
 absolute_path = "{archive}"
 device_uuid = "d-nvme"
 filesystem = "9p"
+
+[roots.e_archive]
+absolute_path = "{archive / 'e'}"
+device_uuid = "e-usb"
+filesystem = "9p"
 {extra_root}
 """.strip()
             + "\n",

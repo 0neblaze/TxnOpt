@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Final, cast
 
 if TYPE_CHECKING:
     from evrptw.stage052_campaign import StorageRootLocator
+    from evrptw.stage052_campaign_runner import probe_volume_identity
 
 INVENTORY_SCHEMA_VERSION: Final = "stage05.2-retention-inventory-v1"
 REGISTRY_SCHEMA_VERSION: Final = "stage05.2-retention-registry-v1"
@@ -1799,6 +1800,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     locator = StorageRootLocator.from_toml(arguments.storage_root_locator)
     alias = approved.policy.archive_root_alias
+    if alias == "e_archive":
+        raise RetentionIntegrityError(
+            "legacy Stage 5.2 retention v1 cannot publish to e_archive; "
+            "use experiment retention v2 so historical source deletion remains "
+            "a separately confirmed action"
+        )
+    locator.verify_all(probe_volume_identity, (alias,))
     records = archive_stage052_inventory_to_registry(
         arguments.inventory,
         inventory_sha256=arguments.inventory_sha256,

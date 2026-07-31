@@ -5,8 +5,10 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
 不得为整理历史而改写旧条目。
 
 每条记录至少包含：原因、修改范围、行为变化、证据影响、失效或迁移的运行身份、验证
-结果及后续运行要求。大型 raw evidence（原始证据）的物理位置由
-`experiments/registries/stage05.2_retention_registry.csv` 记录。
+结果及后续运行要求。大型 raw evidence（原始证据）的当前物理位置由 `e_archive`
+中的签名 v2 registry generation（注册表代次）记录；tracked
+`experiments/registries/stage05.2_retention_registry.csv` 保持为不可变 v1
+compatibility fallback（兼容回退）。
 
 ## 2026-07-26：G56 24-thread saturation runtime guard 修复
 
@@ -2550,3 +2552,66 @@ gate（门槛），`attemptNN`/`rerunNN` 是实验运行身份，不是代码版
   `parquet_policy=user_locked`，Formal memory measurement 与最终 contract 必须复用
   同一 exact pair。replacement calibration 必须使用新 clean commit/runtime/sealed
   source 与下一未占用 label。
+## 2026-07-31：Stage 0--8 storage governance v2 与 E 盘归档入口
+
+- 原因：Stage 5.2 active/history/benchmark raw 的现有投影已超过 600 GiB，旧的
+  “所有失败永久完整保留 + D 盘 50 GiB reserve”合同不能继续作为未来 Stage 的容量
+  边界。E 盘已作为新的单份长期 archive（归档）介质接入，但 SHA-256 内容一致性不等于
+  backup（备份）；删除已验证源之后不存在介质故障回滚。
+- 新增 `evrptw.storage_governance` deep module（深模块）：
+  `preflight_run` 在 run directory/worker 创建前验证 experiment plan、三卷 identity、
+  动态容量和唯一 run label，并通过带锁 ledger 预留容量；失败 observation 带 SHA-256
+  sidecar 持久化，permit 未经审计不自动释放。
+- 动态 stop gate 固定为 E `planned archive + 200 GiB`、D
+  `projected WSL growth + 200 GiB`、WSL ext4
+  `active workspace + 50 GiB`；Stage 5.2 active workspace 至少 32 GiB。benchmark
+  producer 已在 output directory 创建前取得 permit，并把 plan/observation identity
+  写入 control metadata。Stage 0--5.1 及 Stage 5.2 非 benchmark producer CLI 也在
+  调用各自 runner 前经过同一 preflight；后续 Stage 6--8 producer 必须复用该入口。
+  benchmark 每次 batch dispatch/archive 前重新使用同一 permit identity 复测三卷容量。
+- retention v2 将 evidence 分为 `accepted_full`、`unique_failure_full`、
+  `duplicate_failure_reduced`、`rebuildable` 与 `unknown_full`。duplicate reduction
+  必须加载并复验签名 adjudication、匹配已完整保存的 canonical root-cause
+  representative，并生成 immutable projection manifest；reduced generation 明确为
+  audit-only。v2 resolver 优先选择最新 verified generation，并回退读取既有 Stage 5.2
+  v1 registry。accepted/unique full generation 还必须登记签名 independent replay
+  receipt，绑定 archive tree、verifier identity、validator/objective/raw-review replay；
+  resolver 每次重新验证该回执。
+- archive role 从硬编码 `d_archive` 改为 `e_archive`。共享 volume probe 允许绑定
+  model/serial/BusType 的 NTFS USB physical disk，同时拒绝 FAT/ExFAT、虚拟/未知设备、
+  序列号或盘符漂移。`d_archive` 保留为 legacy resolver 和 WSL VHDX host-capacity role。
+- rebuildable maintenance 默认 dry run，只允许精确 allowlist、无 active lock、超过
+  retention period、keeper 零引用且 tree identity 一致的 cache/spool；venv/build
+  还必须具有签名 isolated rebuild + hash/smoke-test proof。缺少任何证据均 fail closed。
+  实际 apply 必须绑定内容完全一致的签名 dry-run receipt；开始、失败和完成状态分别保留
+  签名回执，避免清理清单在审计后漂移。
+- 本条只发布代码、配置和只读迁移入口；尚未复制或删除 Stage 5.2 raw，也未 compact
+  VHDX。任何物理迁移后的源删除仍需逐目录报告 source/target/bytes/hash/可释放空间和
+  单份介质风险，并等待用户字面确认 `确认`。
+
+## 2026-07-31：Stage 5.2 E 盘迁移、源删除与 VHDX compact 完成
+
+- `stage052-retention-v2-20260731` 最终发现并迁移 307 个 run、356 个 segment，
+  总 source payload 为 712,267,368,027 bytes。全部 generation 在
+  `E:\Reproducible-EVRPTW-archive` 原子发布并登记；WSL→E 的 133 个 mapping 与
+  D→E 的 223 个 mapping 均完成独立 source/destination tree SHA-256 replay。
+  307/307 个 run 通过 v2 resolver ledger replay，migration receipt 状态为
+  `verified_not_deleted` 后才生成删除候选清单。
+- 为消除 WSL/DrvFS I/O amplification（输入输出放大），归档复制使用
+  `robocopy /MT:32 /J` 或 32 路 stream copy；E 目标和 D 源的最终 attestation 改为
+  Windows-native 单进程/单遍 32 路 SHA-256。正式双原生复验实测 D 峰值约
+  1.87 GiB/s、E 峰值约 963 MiB/s，校验语义、逐文件账本和 canonical tree identity
+  均未降低。
+- 签名删除候选 manifest 精确列出 356 个互不重复、无嵌套的源目录，SHA-256 为
+  `0b75becf3478b2183728da082ffeddb016a56ff7f829e8394420127fb7b248c8`。
+  用户在看到精确路径、663.35 GiB 总量、全部校验结果和“E 为单份介质、删除后无介质
+  回滚”风险后再次回复 `确认`。删除执行器先重新读取并验证全部 712,267,368,027 bytes，
+  再删除 356/356 个路径；重启 Ubuntu 后独立检查仍为 0 个存在。执行收据 SHA-256 为
+  `6192df5608288b9a0692afd512965469e2cc9aed3e5fea43d33d67ad15af3b36`。
+- 精确 rebuildable allowlist 的归档后 maintenance dry run 为 0 candidates / 0 bytes；
+  producer logs、storage-governance ledger、manifest、registry 与 review 未进入清理。
+  ext4 `fstrim` 报告 746,023,903,232 bytes 可回收；Ubuntu 停止后
+  `Optimize-VHD -Mode Full` 把 `D:\WSL\Ubuntu\ext4.vhdx` 从
+  456,645,410,816 bytes 压缩至 336,704,045,056 bytes。重启后 Ubuntu 正常，
+  最终空闲空间为 D 1252.32 GiB、E 267.40 GiB、WSL ext4 约 644.24 GiB，全部超过
+  storage stop gate。

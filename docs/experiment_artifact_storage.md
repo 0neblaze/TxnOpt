@@ -133,24 +133,96 @@ Stage 0 frozen baseline、Stage 2/3 历史证据和已发布 v1 bundle 不做物
 
 ## Stage 5.2 retention policy
 
-- `Stage052RetentionPolicy` 固定 `workspace_full_evidence=active_only`，complete 与 failed
-  run 均执行 `archive`。
+- Retention policy v2（留存政策第二版）分为 `accepted_full`、
+  `unique_failure_full`、`duplicate_failure_reduced`、`rebuildable` 和
+  fail-closed（关闭式失败）的 `unknown_full`。accepted/current-chain 与独特根因失败保留
+  完整 raw；重复根因只有在签名 adjudication record（裁定记录）绑定稳定
+  `root_cause_id`、完整 canonical representative（规范代表）和证据引用后才可减量。
+- reduced generation（减量代次）是 audit-only（仅审计），保留 control manifests、
+  review generations、日志、checksums、failure evidence 和触发失败的代表 shard；它不得
+  作为 scientific comparison（科学比较）或 prerequisite（先决证据）。原 manifest 不
+  改写，projection manifest 同时记录所有保留和省略文件的原始 SHA-256。
 - audit inventory 记录 run label、component、状态、completeness、source commit、
   prerequisite identities、文件数、总字节数和 tree SHA-256，并使用独立 sidecar 签名。
 - archive 必须显式绑定 inventory SHA-256，并由 ignored storage-root locator 验证 alias
-  与 volume identity。同 volume 使用校验后的原子移动；跨 volume 先复制到目标卷隐藏
-  临时目录，完整复验后在目标卷原子落位，最后才清理源。源目录在 audit 后发生变化、
-  目标内容不同或迁移后复验失败时均 fail fast，且不得删除源数据。
+  与 volume identity。新归档使用 `e_archive`；`d_archive` 只解析 legacy evidence
+  （历史证据）并承担 host/VHDX capacity gate（主机容量门槛）。跨卷先复制到目标卷隐藏
+  incoming generation，完整复验后原子发布并登记。源目录在 audit 后变化、目标碰撞、
+  校验失败或 registry 写入失败时均保留；已发布但未登记的同一代次可在内容完全一致时
+  安全重试。
+- cross-role storage migration attestation（跨角色存储迁移证明）必须与详细签名 dry run
+  位于同一 governance generation，逐项绑定 source/destination alias、相对路径、logical
+  ID、file count、byte count、tree SHA-256、两端 volume identity 与全量 retained
+  projection 上限。Stage 5.2 campaign reviewer 必须通过同一通用 verifier 消费 v2
+  attestation；仅有一份合法但不含相同 mappings 的 dry run 不构成迁移证明。
 - active/unsealed run 默认不能进入 inventory；仅改造前历史迁移可显式 override，并同时
   绑定预期目录数和总字节数。registry 更新必须按 run label 原子合并，禁止覆盖历史行。
-- 轻量 `stage05.2_retention_registry.csv` 只记录 archive alias 和相对路径，不记录本机
-  绝对路径。详细实现变更追加到 `docs/stage052_change_log.md`。
+- v2 registry identity（注册表身份）为
+  `(run_label, segment_id, generation)`；resolver（解析器）优先选择最新 verified v2
+  generation。v2 registry 与 full-replay receipts 存放在 `e_archive` 自身的签名
+  `.storage-governance` 状态中；既有 tracked
+  `stage05.2_retention_registry.csv` 仅作为不可变 v1 fallback（回退），不是并行的 v2
+  truth source（事实源）。registry 只记录 archive alias 和相对路径，不记录本机绝对路径。
+- `accepted_full` 与 `unique_failure_full` 在登记前必须生成签名 independent replay
+  receipt（独立重放回执），绑定 archive tree SHA-256、文件数、字节数、verifier
+  identity，以及 validator、objective 和 raw-review replay 三项通过状态。resolver
+  每次返回 full-retention generation 前重新验证该回执；只有调用回调而没有可复验回执
+  不构成完整 replay。
 - prerequisite/review 以 run label 调用 `resolve_retained_run`，由 registry 和本地
   storage-root locator 解析 archive alias；返回现有 runner/reviewer 前再次核对文件数、
   字节数和 tree SHA-256。调用方不得自行拼接或在 tracked 文件中保存绝对归档路径。
 - 归档目录只能作为只读 comparison/prerequisite/replay 输入；reviewer 不得把新的 review
   generation 写回已登记的归档 tree，否则会破坏 registry checksum。需发布新 generation
   的 raw 必须留在 active root，发布并封存后再归档。
+- 本轮 historical D/WSL migration（历史 D/WSL 迁移）的归档成功不授权删除源。实际
+  删除前必须列出精确源、E 盘目标、字节数、校验结果、预计释放空间和“E 盘为单份长期
+  副本、删除后无介质故障回滚”的风险，并等待字面确认 `确认`。该确认边界不替代未来
+  attempt 中为维持 Stage 5.2 active-workspace cap（活动工作区上限）而明确配置的
+  same-attempt rolling-batch handoff（同一 attempt 滚动批次移交）。
+
+### Stage 5.2 historical migration status
+
+`stage052-retention-v2-20260731` 已于 2026-07-31 完成：307 个 run、356 个 segment、
+712,267,368,027 bytes 全部发布到绑定的 `e_archive`，两卷 migration attestation、
+307/307 resolver ledger replay 与所有签名 sidecar 均通过。精确删除 manifest 的
+SHA-256 为
+`0b75becf3478b2183728da082ffeddb016a56ff7f829e8394420127fb7b248c8`。
+用户在查看完整 source/target/bytes/tree-SHA 清单和单介质风险后再次字面确认；执行器在
+删除前重新完整复验全部源，随后删除 356/356 个清单路径并复核全部不存在。删除执行回执
+SHA-256 为
+`6192df5608288b9a0692afd512965469e2cc9aed3e5fea43d33d67ad15af3b36`。
+
+本次迁移后 E 盘是这些 raw evidence 的唯一长期介质副本，不得把 content verification
+表述为 backup。维护 allowlist 的归档后 dry run 为零候选；Ubuntu VHDX 在 TRIM 后通过
+离线 `Optimize-VHD -Mode Full` 从 456,645,410,816 bytes 压缩至约
+336,704,045,056 bytes。未来迁移仍必须重新执行上述逐次确认流程，不能复用本次确认。
+
+## Stage 0--8 capacity stop gate
+
+每个新 attempt/rerun 在创建 run directory（运行目录）或启动 worker 前必须提交可重放
+experiment plan，包含预计 archive bytes、最大 active workspace，以及 shard/run/batch
+hard caps。`preflight_run` 对 E/D/WSL 重新探测同一套 volume identity（卷身份）并采用
+动态门槛：E 至少保留 `planned_archive + 200 GiB`，D 至少保留
+`projected_WSL_growth + 200 GiB`，WSL ext4 至少保留
+`active_workspace + 50 GiB`；Stage 5.2 的 active workspace 不得小于 32 GiB。缺失计划、
+身份漂移、空间不足或未核销 permit（许可）均在写入前 fail fast，并持久化完整 capacity
+observation（容量观测）。
+
+## Rebuildable asset maintenance
+
+cache、venv、build 和 temporary spool 只在精确 allowlist（允许清单）中接受审计。
+maintenance audit（维护审计）必须独立扫描 keeper references（保留者引用），检查活动锁、
+保留期、tree SHA-256 和 manifest 引用；venv/build 还必须验证签名 isolated rebuild
+proof（隔离重建证明）、sealed wheel/lockfile/Python/native identity 与 smoke test。任何
+输入缺失或结果不一致都保留资产。实际清理必须重新计算同一清单，并绑定前一步签名
+dry-run receipt（试运行回执）；清单、身份、引用或字节数漂移时拒绝执行并保留资产。
+执行开始、失败或完成均生成独立签名回执。活动 Git repository、sealed source snapshot、
+registry、manifest、review、checksum、active/unsealed run 永不进入自动清理。
+Stage start 与 retention 完成后的 production hook（生产钩子）必须扫描 policy TOML
+声明的精确相对 allowlist；不存在的路径如实跳过，存在的 cache/venv/build/spool 必须进入
+签名 audit decision。未通过 keeper/rebuild proof 的资产只会以 retained reason（保留
+原因）登记，不得把“无法验证”当作空审计或删除许可。真正 apply 还必须绑定完全相同的
+dry run、删除前二次复验和字面确认 `确认`。
 
 ## 正式运行前 preflight
 

@@ -100,13 +100,13 @@ from evrptw.stage052_remediation import (
     E03_SHARD_COUNT,
     E03_SOLVER_ROW_COUNT,
 )
-from evrptw.stage052_retention import (
-    load_retention_registry,
-    resolve_retained_run_from_locator,
-)
 from evrptw.stage052_review_service import (
     ReviewProcessMemoryGuard,
     ReviewProgressLog,
+)
+from evrptw.storage_governance import (
+    is_retained_path_from_locator,
+    resolve_run_from_locator,
 )
 from evrptw.validation import validate_routes
 
@@ -5720,7 +5720,11 @@ def _validate_stage052_staging_root_identity(
         if raw_dir.resolve().parent != staging_path:
             return False, "raw evidence directory is outside the configured staging root"
         if expected_alias == "wsl_staging":
-            if locator.aliases != ("d_archive", "wsl_staging"):
+            if locator.aliases != (
+                "d_archive",
+                "e_archive",
+                "wsl_staging",
+            ):
                 return False, "current storage locator aliases are not exact"
             if staging.volume.filesystem.casefold() != "ext4":
                 return False, "current wsl_staging filesystem is not ext4"
@@ -7117,10 +7121,18 @@ def main() -> int:
             r"stage05\.2_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}",
             path.as_posix(),
         ):
-            return resolve_retained_run_from_locator(
+            return resolve_run_from_locator(
                 path.as_posix(),
-                registry_path=(repository / arguments.retention_registry).resolve(),
+                policy_path=(
+                    repository
+                    / "configs"
+                    / "experiment_storage_governance.toml"
+                ).resolve(),
                 storage_root_locator_path=(repository / arguments.storage_root_locator).resolve(),
+                legacy_registry_path=(
+                    repository / arguments.retention_registry
+                ).resolve(),
+                volume_probe=probe_volume_identity,
             )
         return ordinary.resolve()
 
@@ -7137,18 +7149,19 @@ def main() -> int:
     locator_path = (repository / arguments.storage_root_locator).resolve()
     if not registry_path.is_file() or not locator_path.is_file():
         parser.error("retention registry and storage-root locator are required")
-    locator = StorageRootLocator.from_toml(locator_path)
-    for record in load_retention_registry(registry_path):
-        if record.run_label != raw_root.name:
-            continue
-        registered_path = locator.resolve(record.archive_root_alias).absolute_path.joinpath(
-            *Path(record.archive_relative_path).parts
+    if is_retained_path_from_locator(
+        raw_root,
+        policy_path=(
+            repository / "configs" / "experiment_storage_governance.toml"
+        ).resolve(),
+        storage_root_locator_path=locator_path,
+        legacy_registry_path=registry_path,
+        volume_probe=probe_volume_identity,
+    ):
+        parser.error(
+            "--raw-dir cannot be immutable archived evidence; use it only as a "
+            "comparison or prerequisite"
         )
-        if registered_path.resolve() == raw_root:
-            parser.error(
-                "--raw-dir cannot be immutable archived evidence; use it only as a "
-                "comparison or prerequisite"
-            )
     comparison_dirs = [resolve_input(path) for path in arguments.comparison_dir]
     prerequisite_dir = (
         resolve_input(arguments.prerequisite_dir)

@@ -1415,19 +1415,22 @@ def probe_volume_identity(path: Path) -> VolumeIdentity:
     if drive_match is None:
         raise RuntimeError(f"mounted volume identity is incomplete for {path}: {source}")
     return VolumeIdentity(
-        device_uuid=_windows_nvme_identity(drive_match.group(1)),
+        device_uuid=_windows_disk_identity(drive_match.group(1)),
         filesystem=filesystem,
     )
 
 
-def _windows_nvme_identity(drive_letter: str) -> str:
+def _windows_disk_identity(drive_letter: str) -> str:
     powershell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
     if powershell is None:
         raise RuntimeError("Windows drive identity requires PowerShell")
     script = (
-        f"$disk = Get-Partition -DriveLetter '{drive_letter}' | Get-Disk; "
+        f"$partition = Get-Partition -DriveLetter '{drive_letter}'; "
+        "$disk = $partition | Get-Disk; "
+        f"$volume = Get-Volume -DriveLetter '{drive_letter}'; "
         "[pscustomobject]@{FriendlyName=$disk.FriendlyName;"
-        "SerialNumber=$disk.SerialNumber;BusType=[string]$disk.BusType} "
+        "SerialNumber=$disk.SerialNumber;BusType=[string]$disk.BusType;"
+        "FileSystem=[string]$volume.FileSystem} "
         "| ConvertTo-Json -Compress"
     )
     completed = subprocess.run(
@@ -1438,20 +1441,37 @@ def _windows_nvme_identity(drive_letter: str) -> str:
     )
     try:
         payload = json.loads(completed.stdout)
-        friendly_name = str(payload["FriendlyName"])
-        serial_number = str(payload["SerialNumber"])
-        bus_type = str(payload["BusType"])
+        raw_friendly_name = payload["FriendlyName"]
+        raw_serial_number = payload["SerialNumber"]
+        raw_bus_type = payload["BusType"]
+        raw_filesystem = payload["FileSystem"]
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise RuntimeError("PowerShell returned invalid Windows disk identity") from error
-    if bus_type.casefold() != "nvme" or not friendly_name or not serial_number:
-        raise RuntimeError("D archive must resolve to an identified NVMe disk")
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (
+            raw_friendly_name,
+            raw_serial_number,
+            raw_bus_type,
+            raw_filesystem,
+        )
+    ):
+        raise RuntimeError("Windows archive must resolve to an identified physical disk")
+    friendly_name = raw_friendly_name.strip()
+    serial_number = raw_serial_number.strip()
+    bus_type = raw_bus_type.strip()
+    filesystem = raw_filesystem.strip()
+    if bus_type.casefold() in {"unknown", "file backed virtual", "virtual"}:
+        raise RuntimeError("Windows archive must use an identified physical disk")
+    if filesystem.casefold() != "ntfs":
+        raise RuntimeError("Windows archive backing filesystem must be NTFS")
     identity = re.sub(
         r"[^a-z0-9]+",
         "-",
         f"{bus_type}-{friendly_name}-{serial_number}".casefold(),
     ).strip("-")
     if not identity:
-        raise RuntimeError("Windows NVMe identity is empty")
+        raise RuntimeError("Windows physical-disk identity is empty")
     return identity
 
 
@@ -1494,26 +1514,41 @@ def verify_campaign_root_locations(
     *,
     repository_root: Path,
     locator: StorageRootLocator,
+    staging_root_alias: str = "wsl_staging",
+    archive_root_aliases: tuple[str, ...] | None = None,
 ) -> None:
     """Reject local locator drift before creating or writing any campaign root."""
 
     del repository_root
-    if locator.aliases != ("d_archive", "wsl_staging"):
-        raise RuntimeError("Stage 5.2 storage locator must contain only d_archive/wsl_staging")
-    staging = locator.resolve("wsl_staging")
-    archive = locator.resolve("d_archive")
+    selected_archives = (
+        tuple(
+            alias
+            for alias in locator.aliases
+            if alias != staging_root_alias and alias.endswith("_archive")
+        )
+        if archive_root_aliases is None
+        else archive_root_aliases
+    )
+    if not selected_archives or len(set(selected_archives)) != len(selected_archives):
+        raise RuntimeError("Stage 5.2 requires unique archive root aliases")
+    staging = locator.resolve(staging_root_alias)
     staging_path = staging.absolute_path.resolve()
-    archive_path = archive.absolute_path.resolve()
     if staging.volume.filesystem.casefold() != "ext4" or staging_path.is_relative_to(
         Path("/mnt")
     ):
         raise RuntimeError("Stage 5.2 wsl_staging must be on WSL2 native ext4")
-    if not archive_path.is_relative_to(Path("/mnt/d")):
-        raise RuntimeError("Stage 5.2 archive path is forbidden outside the D drive")
-    if archive.volume.filesystem.casefold() in {"exfat", "vfat", "fat", "fat32"}:
-        raise RuntimeError("Stage 5.2 D archive cannot use ExFAT or removable FAT storage")
-    if "usb" in archive.volume.device_uuid.casefold():
-        raise RuntimeError("Stage 5.2 D archive cannot use USB storage")
+    for alias in selected_archives:
+        archive = locator.resolve(alias)
+        archive_path = archive.absolute_path.resolve()
+        filesystem = archive.volume.filesystem.casefold()
+        if filesystem in {"exfat", "vfat", "fat", "fat32"}:
+            raise RuntimeError("Stage 5.2 archive cannot use ExFAT or FAT storage")
+        if filesystem not in {"9p", "ntfs"}:
+            raise RuntimeError("Stage 5.2 archive must resolve to NTFS through WSL")
+        if archive.volume == staging.volume or archive_path == staging_path:
+            raise RuntimeError("Stage 5.2 staging and archive roots must be distinct")
+        if os.name != "nt" and not archive_path.is_relative_to(Path("/mnt")):
+            raise RuntimeError("Stage 5.2 WSL archive must resolve below /mnt")
 
 
 def verify_rolling_campaign_capacity(

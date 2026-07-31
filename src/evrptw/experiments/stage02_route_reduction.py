@@ -41,6 +41,7 @@ from evrptw.objective import (
 )
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
+from evrptw.storage_governance import preflight_cli_attempt
 from evrptw.validation import SolutionReport, validate_routes
 
 SCHEMA_VERSION = "1"
@@ -2456,6 +2457,11 @@ def main() -> int:
         help="first complete Stage 2 output directory or gate report to compare",
     )
     arguments = parser.parse_args()
+    preflight_cli_attempt(
+        config_path=arguments.config,
+        output_dir=arguments.output_dir,
+        run_label=arguments.run_label,
+    )
     outputs = run_stage02(
         config_path=arguments.config,
         output_dir=arguments.output_dir,

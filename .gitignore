@@ -120,6 +120,7 @@ secrets.*
 
 # Machine-specific Stage 5.2 storage roots
 /configs/stage052_storage_roots.local.toml
+/.storage-governance/
 /configs/stage052_runtime_identity.local.json
 /configs/stage052_campaign_lock.local.json
 /configs/stage052_campaign_lock.local.sha256

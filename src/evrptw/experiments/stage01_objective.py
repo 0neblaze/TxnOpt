@@ -36,6 +36,7 @@ from evrptw.objective import (
     count_charging_visits,
 )
 from evrptw.parser import parse_schneider
+from evrptw.storage_governance import preflight_cli_attempt
 from evrptw.validation import SolutionReport, validate_routes
 
 OBJECTIVE_SCHEMA = "vehicles,distance,charging_time,charging_count"
@@ -777,6 +778,10 @@ def main() -> int:
     )
     parser.add_argument("--summary-dir", type=Path, default=Path("experiments/summaries"))
     arguments = parser.parse_args()
+    preflight_cli_attempt(
+        config_path=arguments.config,
+        output_dir=arguments.output_dir,
+    )
     outputs = run_stage01_objective(
         config_path=arguments.config,
         baseline_dir=arguments.baseline_dir,
