@@ -2552,6 +2552,28 @@ compatibility fallback（兼容回退）。
   `parquet_policy=user_locked`，Formal memory measurement 与最终 contract 必须复用
   同一 exact pair。replacement calibration 必须使用新 clean commit/runtime/sealed
   source 与下一未占用 label。
+## 2026-08-01：Resource calibration attempt21 reviewer predecessor-topology 修复
+
+- `stage05.2_resource_calibration_attempt21` 在 clean commit
+  `aad33e2158b5e42309e0594a6caa450ce44223a0` 上完成冻结的 6-worker、16,384-row、
+  queue-depth-1、`PYTHONMALLOC=malloc` 校准。producer terminal inventory 正确重放
+  direct `artifact-storage-v2` shard manifests 并进入 `SEALED`；systemd service exit 0、
+  service lifetime peak 显示为 `16.7G`、swap peak 0。signed v3 report 记录 scoped
+  aggregate cgroup peak `18,160,549,888` bytes，合同 aggregate limit 为
+  `21,792,659,866` bytes，均低于 host capacity `25,196,937,216` bytes。
+- 独立 reviewer 随即 fail fast：它错误地要求 immutable predecessor
+  `stage05.2_benchmark_rerun02/batch0008` 的物理 topology
+  (6 workers, 262,144-row groups, queue depth 2) 等于新合同冻结的
+  (6 workers, 16,384-row groups, queue depth 1)。producer 和既有 calibration
+  tests 已明确允许两者不同：前者只提供 signed failure provenance 与 per-worker RSS
+  floor，后者才是 replacement calibration 的执行 topology。该要求使冻结协议不可验收，
+  属于 reviewer gate contradiction，不是 raw evidence 漂移。
+- 修复后 v3 reviewer 分别绑定 predecessor 的 exact immutable topology 与 contract 的
+  exact locked topology；仍要求 predecessor run/batch/resource-summary SHA-256、6-worker、
+  per-worker RSS floor、零 geometry contribution，以及 contract selection 全部精确一致。
+  v2 Attempt99 兼容路径仍要求 floor 与其历史 contract topology 相同。新增回归测试覆盖
+  “不同但各自精确”的合法 v3 形状和错误 predecessor topology 的 fail-fast 拒绝。
+
 ## 2026-07-31：Stage 0--8 storage governance v2 与 E 盘归档入口
 
 - 原因：Stage 5.2 active/history/benchmark raw 的现有投影已超过 600 GiB，旧的

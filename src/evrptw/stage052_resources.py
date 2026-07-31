@@ -42,6 +42,9 @@ _FORMAL_RECALIBRATION_V3_PREDECESSOR_BATCH_ID: Final = "batch0008"
 _FORMAL_RECALIBRATION_V3_RESOURCE_SUMMARY_SHA256: Final = (
     "ec5e8eb43562b983ac0b3d733da446f45fa59407b278dff93323ce4d6e6e6253"
 )
+_FORMAL_RECALIBRATION_V3_PREDECESSOR_WORKERS: Final = 6
+_FORMAL_RECALIBRATION_V3_PREDECESSOR_ROW_GROUP_SIZE: Final = 262_144
+_FORMAL_RECALIBRATION_V3_PREDECESSOR_QUEUE_DEPTH: Final = 2
 _ROW_GROUP_SIZES: Final = frozenset({16_384, 65_536, 262_144})
 _QUEUE_DEPTHS: Final = frozenset({1, 2})
 
@@ -687,10 +690,27 @@ def load_formal_resource_recalibration_evidence(
         )
     if not _is_exact_zero_int(floor.get("campaign_geometry_contribution")):
         raise RuntimeError("Formal memory floor must contribute zero readiness geometry")
+    expected_floor_topology = (
+        (
+            _FORMAL_RECALIBRATION_V3_PREDECESSOR_WORKERS,
+            _FORMAL_RECALIBRATION_V3_PREDECESSOR_ROW_GROUP_SIZE,
+            _FORMAL_RECALIBRATION_V3_PREDECESSOR_QUEUE_DEPTH,
+        )
+        if report_schema == "stage05.2-resource-calibration-report-v3"
+        else (
+            contract.selected_workers,
+            contract.row_group_size,
+            contract.queue_depth,
+        )
+    )
+    observed_floor_topology = (
+        floor.get("workers"),
+        floor.get("row_group_size"),
+        floor.get("queue_depth"),
+    )
     if (
-        floor.get("workers") != contract.selected_workers
-        or floor.get("row_group_size") != contract.row_group_size
-        or floor.get("queue_depth") != contract.queue_depth
+        observed_floor_topology != expected_floor_topology
+        or floor.get("workers") != contract.selected_workers
         or floor.get("per_worker_peak_rss_bytes")
         != contract.selected_per_worker_peak_rss_bytes
     ):

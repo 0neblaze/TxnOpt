@@ -203,6 +203,8 @@ def test_formal_resource_recalibration_v3_binds_cgroup_memory_and_rerun02(
             "run_label": "stage05.2_benchmark_rerun02",
             "batch_id": "batch0008",
             "aggregate_peak_rss_bytes": 24_099_033_088,
+            "row_group_size": 262_144,
+            "queue_depth": 2,
             "resource_summary_sha256": (
                 "ec5e8eb43562b983ac0b3d733da446f45fa59407b278dff93323ce4d6e6e6253"
             ),
@@ -222,6 +224,55 @@ def test_formal_resource_recalibration_v3_binds_cgroup_memory_and_rerun02(
     assert evidence.predecessor_aggregate_peak_rss_bytes == 24_099_033_088
     assert evidence.aggregate_memory_source == "cgroup_v2"
     assert evidence.replacement_aggregate_peak_memory_bytes == 3_000_000_000
+
+
+def test_formal_resource_recalibration_v3_rejects_wrong_predecessor_topology(
+    tmp_path: Path,
+) -> None:
+    contract = ProducerResourceContract(
+        selected_workers=6,
+        available_memory_bytes=30_000_000_000,
+        selected_aggregate_peak_rss_bytes=3_000_000_000,
+        selected_per_worker_peak_rss_bytes=4_700_000_000,
+        aggregate_memory_limit_bytes=3_600_000_000,
+        per_worker_memory_limit_bytes=5_640_000_000,
+        semantic_digest="a" * 64,
+        calibration_digest="b" * 64,
+        row_group_size=16_384,
+        queue_depth=1,
+    )
+    report_path = tmp_path / "stage052_resource_calibration.local.report.json"
+    _write_formal_recalibration_report(report_path, contract)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = "stage05.2-resource-calibration-report-v3"
+    payload["formal_memory_measurement"].update(
+        {
+            "aggregate_memory_source": "cgroup_v2",
+            "cgroup_path": "/stage052-calibration.service",
+            "cgroup_swap_peak_bytes": 0,
+        }
+    )
+    payload["formal_campaign_memory_floor"].update(
+        {
+            "run_label": "stage05.2_benchmark_rerun02",
+            "batch_id": "batch0008",
+            "aggregate_peak_rss_bytes": 24_099_033_088,
+            "row_group_size": 65_536,
+            "queue_depth": 1,
+            "resource_summary_sha256": (
+                "ec5e8eb43562b983ac0b3d733da446f45fa59407b278dff93323ce4d6e6e6253"
+            ),
+        }
+    )
+    raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    report_path.write_bytes(raw)
+    report_path.with_suffix(".sha256").write_text(
+        hashlib.sha256(raw).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="memory floor/contract mismatch"):
+        load_formal_resource_recalibration_evidence(report_path, contract)
 
 
 def test_formal_resource_recalibration_v3_rejects_shared_user_manager(

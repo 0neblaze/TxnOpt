@@ -918,8 +918,12 @@ this repository or one of its subdirectories.
   `stage05.2_benchmark_rerun02/batch0008`, treats that run's summed RSS only as
   failure provenance, and derives the replacement aggregate limit from the
   complete R205 cgroup measurement with 20% headroom. It retains the failed
-  batch's per-worker RSS floor and the locked six-worker topology. Full
-  calibration must reset and verify the dedicated service cgroup's
+  batch's per-worker RSS floor and exact predecessor physical topology
+  (6 workers, 262,144-row groups, queue depth 2) as provenance. That historical
+  topology is distinct from the new calibration contract's frozen 6-worker,
+  16,384-row-group, queue-depth-1 topology; reviewer code must bind each to its
+  own source and must not require those two physical configurations to be equal.
+  Full calibration must reset and verify the dedicated service cgroup's
   `memory.peak` and `memory.swap.peak` immediately before the R205 measurement
   and retain a signed reset receipt; earlier worker/Parquet calibration phases
   must not contribute lifetime cgroup high-water marks to that scoped result.
