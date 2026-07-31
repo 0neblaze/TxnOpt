@@ -4,8 +4,8 @@
 schema_version = "experiment-storage-governance-v1"
 
 [capacity]
-archive_reserve_bytes = 214748364800
-host_reserve_bytes = 214748364800
+archive_reserve_bytes = 0
+host_reserve_bytes = 0
 staging_safety_reserve_bytes = 53687091200
 stage052_active_workspace_floor_bytes = 34359738368
 capacity_mode = "dynamic_plan"

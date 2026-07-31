@@ -1526,6 +1526,7 @@ class CampaignManifest:
     batch_persistence_envelope_sha256_by_id: Mapping[str, str] = field(
         default_factory=dict
     )
+    artifacts: tuple[Mapping[str, object], ...] = ()
     failure_reason: str | None = None
 
     def __post_init__(self) -> None:
@@ -1588,6 +1589,23 @@ class CampaignManifest:
             "batch_persistence_envelope_sha256_by_id",
             MappingProxyType(envelope_hashes),
         )
+        artifact_rows = tuple(MappingProxyType(dict(item)) for item in self.artifacts)
+        artifact_paths = [str(item.get("relative_path", "")) for item in artifact_rows]
+        if artifact_rows and (
+            len(set(artifact_paths)) != len(artifact_paths)
+            or any(
+                not path
+                or PurePosixPath(path).is_absolute()
+                or ".." in PurePosixPath(path).parts
+                or not _is_sha256(str(item.get("checksum", "")))
+                or isinstance(item.get("byte_size"), bool)
+                or not isinstance(item.get("byte_size"), int)
+                or cast(int, item["byte_size"]) < 0
+                for path, item in zip(artifact_paths, artifact_rows, strict=True)
+            )
+        ):
+            raise ValueError("campaign artifact inventory is invalid")
+        object.__setattr__(self, "artifacts", artifact_rows)
         if any(
             batch.root_alias not in self.storage_roots
             or batch.archive_root_alias not in self.storage_roots
@@ -1711,6 +1729,15 @@ class CampaignManifest:
             raise RuntimeError("all batches must be archived before campaign completion")
         return replace(self, status="complete")
 
+    def with_artifacts(
+        self, artifacts: Sequence[Mapping[str, object]]
+    ) -> CampaignManifest:
+        if self.status != "complete" or not artifacts:
+            raise RuntimeError("only a complete campaign can bind final artifacts")
+        if self.artifacts:
+            raise RuntimeError("campaign artifact inventory is immutable")
+        return replace(self, artifacts=tuple(dict(item) for item in artifacts))
+
     def mark_failed(self, reason: str) -> CampaignManifest:
         if self.status == "complete":
             raise RuntimeError("a complete campaign cannot become failed")
@@ -1719,12 +1746,17 @@ class CampaignManifest:
         return replace(self, status="failed", failure_reason=reason)
 
     def to_dict(self) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "schema_version": (
+        schema_version = (
+            "stage05.2-campaign-manifest-v3"
+            if self.artifacts
+            else (
                 "stage05.2-campaign-manifest-v2"
                 if self.producer_resource_contract is not None
                 else "stage05.2-campaign-manifest-v1"
-            ),
+            )
+        )
+        payload: dict[str, object] = {
+            "schema_version": schema_version,
             "run_label": self.run_label,
             "status": self.status,
             "scope": self.scope,
@@ -1756,6 +1788,9 @@ class CampaignManifest:
             payload["producer_resource_contract"] = (
                 self.producer_resource_contract.to_dict()
             )
+        if self.artifacts:
+            payload["evidence_completeness"] = "complete"
+            payload["artifacts"] = [dict(item) for item in self.artifacts]
         return payload
 
     @classmethod
@@ -1786,14 +1821,24 @@ class CampaignManifest:
             "failure_reason",
         }
         schema_version = payload.get("schema_version")
-        if schema_version == "stage05.2-campaign-manifest-v2":
+        if schema_version in {
+            "stage05.2-campaign-manifest-v2",
+            "stage05.2-campaign-manifest-v3",
+        }:
             expected_fields.add("producer_resource_contract")
+        if schema_version == "stage05.2-campaign-manifest-v3":
+            expected_fields.update({"evidence_completeness", "artifacts"})
         _exact_fields(payload, expected_fields, "campaign manifest")
         if schema_version not in {
             "stage05.2-campaign-manifest-v1",
             "stage05.2-campaign-manifest-v2",
+            "stage05.2-campaign-manifest-v3",
         }:
             raise ValueError("campaign manifest schema_version is unsupported")
+        if schema_version == "stage05.2-campaign-manifest-v3" and not isinstance(
+            payload.get("artifacts"), list
+        ):
+            raise ValueError("campaign artifact inventory must be an array")
         roots_payload = _object_mapping(payload.get("storage_roots"), "storage_roots")
         storage_roots = {
             alias: VolumeIdentity.from_dict(_object_mapping(value, f"storage_roots.{alias}"))
@@ -1831,7 +1876,10 @@ class CampaignManifest:
                         "producer_resource_contract",
                     )
                 )
-                if schema_version == "stage05.2-campaign-manifest-v2"
+                if schema_version in {
+                    "stage05.2-campaign-manifest-v2",
+                    "stage05.2-campaign-manifest-v3",
+                }
                 else None
             ),
             batch_persistence_envelope_sha256_by_id=_optional_string_mapping(
@@ -1839,8 +1887,24 @@ class CampaignManifest:
                 "batch_persistence_envelope_sha256_by_id",
             )
             or {},
+            artifacts=(
+                tuple(
+                    _object_mapping(item, f"artifacts[{index}]")
+                    for index, item in enumerate(
+                        cast(list[object], payload.get("artifacts", []))
+                    )
+                )
+                if schema_version == "stage05.2-campaign-manifest-v3"
+                and isinstance(payload.get("artifacts"), list)
+                else ()
+            ),
             failure_reason=_optional_str(payload, "failure_reason"),
         )
+        if (
+            schema_version == "stage05.2-campaign-manifest-v3"
+            and payload.get("evidence_completeness") != "complete"
+        ):
+            raise ValueError("campaign lifecycle evidence completeness is invalid")
         declared_transfer_seconds = _required_number(payload, "archive_transfer_seconds")
         observed_transfer_seconds = sum(
             batch.archive_transfer_seconds or 0.0 for batch in result.batches
@@ -2254,7 +2318,7 @@ class BenchmarkCampaignConfig:
     shard_hard_cap_bytes: int = 2 * GIB
     external_safety_reserve_bytes: int = 50 * GIB
     external_active_workspace_bytes: int = 32 * GIB
-    internal_safety_reserve_bytes: int = 50 * GIB
+    internal_safety_reserve_bytes: int = 0
     producer_resource_contract: ProducerResourceContract | None = None
     required_power_source: str | None = None
     preflight_window_count: int = 2
@@ -2310,22 +2374,22 @@ class BenchmarkCampaignConfig:
             or self.shard_hard_cap_bytes != 2 * GIB
             or self.external_safety_reserve_bytes != 50 * GIB
             or self.external_active_workspace_bytes != 32 * GIB
-            or self.internal_safety_reserve_bytes != 50 * GIB
+            or self.internal_safety_reserve_bytes != 0
         ):
             raise ValueError("Stage 5.2 storage byte limits are fixed")
         if not (
             0 < self.shard_hard_cap_bytes <= self.batch_target_bytes <= self.batch_hard_cap_bytes
         ):
             raise ValueError("shard/target/hard-cap byte limits are inconsistent")
-        if any(
-            value <= 0
-            for value in (
-                self.external_safety_reserve_bytes,
-                self.external_active_workspace_bytes,
-                self.internal_safety_reserve_bytes,
-            )
+        if (
+            self.external_safety_reserve_bytes <= 0
+            or self.external_active_workspace_bytes <= 0
+            or self.internal_safety_reserve_bytes < 0
         ):
-            raise ValueError("capacity reserves must be positive")
+            raise ValueError(
+                "external capacity reserves must be positive and the internal reserve "
+                "must be non-negative"
+            )
         if (
             self.required_power_source is not None
             or self.preflight_window_count != 2
@@ -2406,7 +2470,7 @@ class BenchmarkCampaignConfig:
         shard_hard_cap_bytes: int = 2 * GIB,
         external_safety_reserve_bytes: int = 50 * GIB,
         external_active_workspace_bytes: int = 32 * GIB,
-        internal_safety_reserve_bytes: int = 50 * GIB,
+        internal_safety_reserve_bytes: int = 0,
         producer_resource_contract: ProducerResourceContract | None = None,
     ) -> BenchmarkCampaignConfig:
         """Build the canonical 92 x 10 configuration."""
@@ -2446,7 +2510,7 @@ class BenchmarkCampaignConfig:
         shard_hard_cap_bytes: int = 2 * GIB,
         external_safety_reserve_bytes: int = 50 * GIB,
         external_active_workspace_bytes: int = 32 * GIB,
-        internal_safety_reserve_bytes: int = 50 * GIB,
+        internal_safety_reserve_bytes: int = 0,
         producer_resource_contract: ProducerResourceContract | None = None,
     ) -> BenchmarkCampaignConfig:
         """Build the fixed Stage 0 12-instance x three-seed G01 scope."""

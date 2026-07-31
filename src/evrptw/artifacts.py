@@ -4384,6 +4384,7 @@ def _verify_post_manifest_persistence_envelopes(
             not in {
                 "stage05.2-campaign-manifest-v1",
                 "stage05.2-campaign-manifest-v2",
+                "stage05.2-campaign-manifest-v3",
             }
             or campaign_state.get("run_label") != run_label
             or campaign_state.get("status") not in {"planned", "complete", "failed"}

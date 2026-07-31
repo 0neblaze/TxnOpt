@@ -7,7 +7,11 @@ from evrptw.experiments.stage03_measurement import (
     load_config,
     run_stage03,
 )
-from evrptw.storage_governance import preflight_cli_attempt
+from evrptw.storage_governance import (
+    preflight_cli_attempt,
+    seal_cli_attempt,
+    seal_failed_cli_attempt,
+)
 
 
 def run_stage031(
@@ -52,14 +56,29 @@ def main() -> int:
         output_dir=arguments.output_dir,
         run_label=arguments.run_label,
     )
-    outputs = run_stage031(
-        config_path=arguments.config,
-        output_dir=arguments.output_dir,
-        scope=arguments.scope,
-        run_label=arguments.run_label,
-        summary_dir=arguments.summary_dir,
-        smoke_review_dir=arguments.smoke_review_dir,
-    )
+    try:
+        outputs = run_stage031(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            scope=arguments.scope,
+            run_label=arguments.run_label,
+            summary_dir=arguments.summary_dir,
+            smoke_review_dir=arguments.smoke_review_dir,
+        )
+        seal_cli_attempt(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            run_label=arguments.run_label,
+            manifest_path=outputs["manifest"],
+        )
+    except BaseException as error:
+        seal_failed_cli_attempt(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            run_label=arguments.run_label,
+            error=error,
+        )
+        raise
     for name, path in outputs.items():
         print(f"{name}: {path}")
     return 0

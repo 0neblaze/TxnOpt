@@ -570,6 +570,16 @@ def test_calibration_cli_runs_formal_memory_probe_without_corpus(
         run_probe,
     )
     monkeypatch.setattr(
+        stage052_calibration,
+        "preflight_cli_attempt",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        stage052_calibration,
+        "seal_cli_attempt",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
         stage052_calibration.sys,
         "argv",
         [
@@ -637,6 +647,16 @@ def test_calibration_cli_requires_and_loads_failed_formal_memory_floor(
         stage052_calibration,
         "run_stage052_resource_calibration",
         run_calibration,
+    )
+    monkeypatch.setattr(
+        stage052_calibration,
+        "preflight_cli_attempt",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        stage052_calibration,
+        "seal_cli_attempt",
+        lambda **_kwargs: None,
     )
     monkeypatch.setattr(
         stage052_calibration.sys,

@@ -1131,6 +1131,52 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _write_review_execution_receipt(
+    *,
+    path: Path,
+    run_label: str,
+    raw_manifest_sha256_before: str,
+    raw_manifest_sha256_after: str,
+    review_manifest_path: Path,
+) -> None:
+    reviewer_digest = _sha256(Path(__file__).resolve())
+    payload = {
+        "schema_version": "experiment-review-execution-v1",
+        "run_label": run_label,
+        "status": "completed",
+        "finalized": True,
+        "exit_code": 0,
+        "reviewer_module_name": "evrptw.experiments.stage052_campaign_review",
+        "reviewer_installed_distribution_digest": reviewer_digest,
+        "raw_manifest_sha256_before": raw_manifest_sha256_before,
+        "raw_manifest_sha256_after": raw_manifest_sha256_after,
+        "raw_manifest_unchanged": (
+            raw_manifest_sha256_before == raw_manifest_sha256_after
+        ),
+        "review_manifest_sha256": _sha256(review_manifest_path),
+    }
+    data = (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    digest = hashlib.sha256(data).hexdigest()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    sidecar = path.with_suffix(path.suffix + ".sha256")
+    temporary_sidecar = sidecar.with_name(f".{sidecar.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        _write_fsync(temporary, data)
+        _write_fsync(
+            temporary_sidecar,
+            f"{digest}  {path.name}\n".encode("ascii"),
+        )
+        os.replace(temporary, path)
+        os.replace(temporary_sidecar, sidecar)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+        temporary_sidecar.unlink(missing_ok=True)
+
+
 def _strict_int(value: object, field: str) -> int:
     if _is_int(value):
         return value
@@ -4480,7 +4526,7 @@ def _independent_capacity_plan(
                 raise ArtifactIntegrityError(
                     "campaign archive filesystem capability telemetry is missing"
                 )
-            reserve = 50 * GIB
+            reserve = 0
         usable[device] = max(0, free_by_device[device] - reserve)
     if sum(usable.values()) < plan.estimated_bytes:
         raise ArtifactIntegrityError("campaign capacity is insufficient after fixed reserves")
@@ -5862,12 +5908,23 @@ def _publish_review(
         manifest_payload["review_execution_required"] = True
     manifest_bytes = (json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     temporary_manifest = review_dir / f".review_manifest.{uuid.uuid4().hex}.tmp"
+    temporary_sidecar: Path | None = None
     try:
         _write_fsync(temporary_manifest, manifest_bytes)
         os.replace(temporary_manifest, manifest_path)
+        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+        sidecar_path = manifest_path.with_suffix(manifest_path.suffix + ".sha256")
+        temporary_sidecar = review_dir / f".{sidecar_path.name}.{uuid.uuid4().hex}.tmp"
+        _write_fsync(
+            temporary_sidecar,
+            f"{manifest_sha256}  {manifest_path.name}\n".encode("ascii"),
+        )
+        os.replace(temporary_sidecar, sidecar_path)
         _fsync_directory(review_dir)
     finally:
         temporary_manifest.unlink(missing_ok=True)
+        if temporary_sidecar is not None:
+            temporary_sidecar.unlink(missing_ok=True)
     outputs = {key: generation / _REVIEW_FILENAMES[key] for key in payloads}
     outputs["review_manifest"] = manifest_path
     return outputs
@@ -6075,12 +6132,26 @@ def review_stage052_campaign(
         }
     passed = bool(gates) and all(gate.get("passed") is True for gate in gates.values())
     status = review_status_for_scope(scope, passed=passed)
+    failing_gate = next(
+        (name for name, gate in sorted(gates.items()) if gate.get("passed") is not True),
+        "",
+    )
     manifest: dict[str, object] = {
         "schema_version": CAMPAIGN_REVIEW_SCHEMA,
         "run_label": run_label,
         "component": Stage052Component.BENCHMARK.value,
         "scope": scope,
         "status": status,
+        "lifecycle_status": "ACCEPTED" if passed else "FAILED_UNKNOWN",
+        "failure_identity": (
+            {}
+            if passed
+            else {
+                "component": "stage052_campaign_review",
+                "invariant_or_check": failing_gate,
+                "location": "review/review_manifest.json",
+            }
+        ),
         "raw_manifest_sha256": evidence.standard_raw_manifest_sha256,
         "raw_campaign_manifest_sha256": raw_hash,
         "persistence_attribution_sha256": (evidence.campaign_persistence_attribution_sha256),
@@ -6177,6 +6248,18 @@ def main() -> int:
         if arguments.campaign_dir.is_absolute()
         else root / arguments.campaign_dir
     ).resolve()
+    review_execution_path = arguments.review_execution_receipt.resolve()
+    expected_execution_path = campaign_dir / "review" / "review_execution.json"
+    if review_execution_path != expected_execution_path:
+        parser.error(
+            "--review-execution-receipt must be the governed "
+            "campaign review/review_execution.json path"
+        )
+    raw_manifest_path = campaign_dir / "campaign_manifest.json"
+    if not raw_manifest_path.is_file():
+        parser.error("--campaign-dir has no campaign_manifest.json")
+    campaign_identity = load_campaign_manifest(raw_manifest_path)
+    raw_manifest_sha256_before = _sha256(raw_manifest_path)
     registry_path = (root / arguments.retention_registry).resolve()
     locator_path = (root / arguments.storage_roots).resolve()
     if not registry_path.is_file() or not locator_path.is_file():
@@ -6249,7 +6332,7 @@ def main() -> int:
     previous_progress = os.environ.get("STAGE052_REVIEW_PROGRESS_LOG")
     previous_receipt = os.environ.get(_REVIEW_EXECUTION_ENV)
     os.environ["STAGE052_REVIEW_PROGRESS_LOG"] = str(progress_path)
-    os.environ[_REVIEW_EXECUTION_ENV] = str(arguments.review_execution_receipt.resolve())
+    os.environ[_REVIEW_EXECUTION_ENV] = str(review_execution_path)
     progress.emit(
         "campaign_review_start",
         campaign_dir=str(campaign_dir),
@@ -6288,6 +6371,16 @@ def main() -> int:
             os.environ.pop(_REVIEW_EXECUTION_ENV, None)
         else:
             os.environ[_REVIEW_EXECUTION_ENV] = previous_receipt
+    raw_manifest_sha256_after = _sha256(raw_manifest_path)
+    if raw_manifest_sha256_after != raw_manifest_sha256_before:
+        raise ArtifactIntegrityError("raw campaign manifest changed during review")
+    _write_review_execution_receipt(
+        path=review_execution_path,
+        run_label=campaign_identity.run_label,
+        raw_manifest_sha256_before=raw_manifest_sha256_before,
+        raw_manifest_sha256_after=raw_manifest_sha256_after,
+        review_manifest_path=outputs["review_manifest"],
+    )
     progress.emit(
         "campaign_review_complete",
         outputs={key: str(path) for key, path in outputs.items()},

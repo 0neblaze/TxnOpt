@@ -22,6 +22,11 @@ jobs:
       - run: uv sync --frozen --all-groups
       - run: uv run ruff check .
       - run: uv run mypy
+      - run: >-
+          uv run experiment-lifecycle
+          --catalog configs/experiment_catalog.toml
+          --state-root .experiment-lifecycle-ci
+          audit --repository .
       - run: uv run pytest -m "not external_data and not formal_environment" -q
 
   windows-smoke:

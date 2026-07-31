@@ -38,7 +38,11 @@ from evrptw.models import Instance, NodeType
 from evrptw.neighborhoods import VehicleOperatorConfig
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
-from evrptw.storage_governance import preflight_cli_attempt
+from evrptw.storage_governance import (
+    preflight_cli_attempt,
+    seal_cli_attempt,
+    seal_failed_cli_attempt,
+)
 
 STAGE034_SCHEMA_VERSION = "stage034-control-parallel-v1"
 STAGE034_RUN_LABEL = re.compile(r"stage03\.4_control_parallel_(?:attempt|rerun)[0-9]{2}")
@@ -460,14 +464,32 @@ def main() -> int:
         config_path=arguments.config,
         output_dir=arguments.output_dir,
         run_label=arguments.run_label,
+        workers=4,
+        threads=4,
+        processes=4,
     )
-    outputs = run_stage034(
-        config_path=arguments.config,
-        output_dir=arguments.output_dir,
-        scope=arguments.scope,
-        run_label=arguments.run_label,
-        smoke_review_dir=arguments.smoke_review_dir,
-    )
+    try:
+        outputs = run_stage034(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            scope=arguments.scope,
+            run_label=arguments.run_label,
+            smoke_review_dir=arguments.smoke_review_dir,
+        )
+        seal_cli_attempt(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            run_label=arguments.run_label,
+            manifest_path=outputs["manifest"],
+        )
+    except BaseException as error:
+        seal_failed_cli_attempt(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            run_label=arguments.run_label,
+            error=error,
+        )
+        raise
     for name, path in outputs.items():
         print(f"{name}: {path}")
     return 0

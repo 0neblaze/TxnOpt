@@ -56,6 +56,14 @@ from evrptw.best_known import BEST_KNOWN_VALUES
 from evrptw.candidate_transaction import NativeCandidateTransactionConfig
 from evrptw.environment import collect_environment
 from evrptw.exact_deadline import ExactDeadlineConfig
+from evrptw.experiment_lifecycle import (
+    ExperimentCatalog,
+    ExperimentLifecycleController,
+    LifecycleError,
+    build_repository_plan,
+    load_historical_migration_gate,
+    register_lifecycle_writer,
+)
 from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES
 from evrptw.experiments.stage02_route_reduction import (
     load_config as load_stage02_config,
@@ -148,8 +156,11 @@ from evrptw.storage_governance import (
     GovernancePolicy,
     StartRequest,
     load_capacity_observation,
+    persist_cli_plan_rejection,
     preflight_cli_attempt,
     resolve_run_from_locator,
+    seal_cli_attempt,
+    seal_failed_cli_attempt,
 )
 from evrptw.validation import validate_routes
 
@@ -1295,21 +1306,95 @@ def _run_benchmark_campaign_impl(
         volume_probe=probe_volume_identity,
         legacy_registry_path=root / _RETENTION_REGISTRY,
     )
+    historical_gate_path = (
+        locator.resolve(config.archive_root_aliases[0]).absolute_path
+        / ".experiment-lifecycle"
+        / "historical-migration"
+        / "gate.json"
+    )
+    load_historical_migration_gate(
+        historical_gate_path,
+        migration_ledger_path=(
+            root
+            / "experiments"
+            / "registries"
+            / "experiment_lifecycle_v3_migration.json"
+        ),
+        repository=root,
+    )
+    lifecycle_plan = build_repository_plan(
+        repository=root,
+        config_path=config_path,
+        run_label=run_label,
+        run_dir=output_dir,
+        planned_archive_bytes=plan.estimated_bytes,
+        max_batch_bytes=campaign_config.batch_hard_cap_bytes,
+        max_run_bytes=plan.estimated_bytes,
+        max_workspace_bytes=campaign_config.external_active_workspace_bytes,
+        workers=worker_count,
+        threads=worker_count,
+        processes=worker_count,
+        io_backend="windows_native_calibrated",
+        io_workers=worker_count,
+        batch_size=config.batch_size,
+        queue_depth=producer_resource_contract.queue_depth,
+        row_group_size=producer_resource_contract.row_group_size,
+        prerequisite_sha256_by_contract={
+            "campaign_geometry": governance_plan_sha256,
+            "historical_migration": _sha256(historical_gate_path),
+            "stage051_readiness": _sha256(root / config.stage051_manifest),
+        },
+    )
+    lifecycle = ExperimentLifecycleController(
+        catalog=ExperimentCatalog.from_toml(
+            root / "configs" / "experiment_catalog.toml"
+        ),
+        state_root=(
+            locator.resolve(config.archive_root_aliases[0]).absolute_path
+            / ".experiment-lifecycle"
+        ),
+        storage_state_root=(
+            locator.resolve(config.archive_root_aliases[0]).absolute_path
+            / ".storage-governance"
+        ),
+        capacity_state_root=staging.absolute_path / ".storage-governance",
+        archive_root=locator.resolve(config.archive_root_aliases[0]).absolute_path,
+    )
     governance_start_request = StartRequest(
         stage_id="stage05.2",
         run_label=run_label,
         run_dir=output_dir,
         staging_root_alias=config.staging_root_alias,
-        host_root_alias="d_archive",
+        host_root_alias="d_host",
         archive_root_alias=config.archive_root_aliases[0],
         planned_archive_bytes=plan.estimated_bytes,
         max_active_workspace_bytes=campaign_config.external_active_workspace_bytes,
         projected_host_growth_bytes=(
             campaign_config.external_active_workspace_bytes
         ),
-        stage_plan_sha256=governance_plan_sha256,
+        stage_plan_sha256=lifecycle_plan.plan_sha256,
     )
     start_permit = governance.preflight_run(governance_start_request)
+    try:
+        lifecycle.plan(lifecycle_plan)
+    except LifecycleError as error:
+        rejection = persist_cli_plan_rejection(
+            config_path=config_path,
+            output_dir=output_dir,
+            run_label=run_label,
+            reason=f"lifecycle admission failed: {error}",
+        )
+        governance.reconcile_permit(
+            run_label,
+            outcome="aborted_audited",
+            evidence_sha256=_sha256(rejection),
+        )
+        raise RuntimeError(
+            "lifecycle admission failed after capacity reservation"
+        ) from error
+    lifecycle.permit(run_label, storage_permit_path=start_permit.permit_path)
+    lifecycle.start(run_label, runtime_plan=lifecycle_plan)
+    register_lifecycle_writer(state_root=lifecycle.state_root, run_label=run_label)
     verify_campaign_root_locations(
         repository_root=root,
         locator=locator,
@@ -1956,12 +2041,28 @@ def _run_benchmark_campaign_impl(
     # The canonical campaign status is the final success commit.  Before this
     # point the signed attribution and its hard ratio gate cannot be bypassed.
     campaign = campaign.mark_complete()
+    lifecycle_artifacts = [item.to_dict() for item in bundle.artifacts]
+    for path in (
+        bundle.manifest_path,
+        bundle.manifest_sidecar_path,
+        campaign_attribution_path,
+        campaign_attribution_sidecar,
+    ):
+        lifecycle_artifacts.append(
+            {
+                "relative_path": path.relative_to(output_dir).as_posix(),
+                "byte_size": path.stat().st_size,
+                "checksum": _sha256(path),
+            }
+        )
+    campaign = campaign.with_artifacts(lifecycle_artifacts)
     campaign_manifest_path = persist_campaign_manifest(output_dir, campaign)
     return {
         "run_dir": bundle.run_dir,
         "per_run_results": per_run_path,
         "anytime_checkpoints": checkpoint_path,
         "campaign_manifest": campaign_manifest_path,
+        "lifecycle_manifest": campaign_manifest_path,
         "rolling_capacity": rolling_capacity_path,
         "manifest": bundle.manifest_path,
         "manifest_sidecar": bundle.manifest_sidecar_path,
@@ -6344,19 +6445,46 @@ def main() -> int:
             config_path=arguments.config,
             output_dir=arguments.output_dir,
             run_label=arguments.run_label,
+            workers=arguments.workers,
+            threads=arguments.workers,
+            processes=arguments.workers,
         )
-    outputs = run_stage052(
-        config_path=arguments.config,
-        output_dir=arguments.output_dir,
-        run_label=arguments.run_label,
-        component=arguments.component,
-        scope=arguments.scope,
-        worker_count=arguments.workers,
-        prerequisite_dir=arguments.prerequisite_dir,
-        prerequisite_dirs=named_prerequisites,
-        storage_migration_path=arguments.storage_migration,
-        storage_migration_evidence_dir=arguments.storage_migration_evidence_dir,
-    )
+    try:
+        outputs = run_stage052(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            run_label=arguments.run_label,
+            component=arguments.component,
+            scope=arguments.scope,
+            worker_count=arguments.workers,
+            prerequisite_dir=arguments.prerequisite_dir,
+            prerequisite_dirs=named_prerequisites,
+            storage_migration_path=arguments.storage_migration,
+            storage_migration_evidence_dir=arguments.storage_migration_evidence_dir,
+        )
+        lifecycle_manifest = outputs.get("lifecycle_manifest")
+        if lifecycle_manifest is None:
+            lifecycle_manifest = seal_cli_attempt(
+                config_path=arguments.config,
+                output_dir=arguments.output_dir,
+                run_label=arguments.run_label,
+                manifest_path=None,
+            )
+        else:
+            seal_cli_attempt(
+                config_path=arguments.config,
+                output_dir=arguments.output_dir,
+                run_label=arguments.run_label,
+                manifest_path=lifecycle_manifest,
+            )
+    except BaseException as error:
+        seal_failed_cli_attempt(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            run_label=arguments.run_label,
+            error=error,
+        )
+        raise
     for name, path in outputs.items():
         print(f"{name}: {path}")
     return 0

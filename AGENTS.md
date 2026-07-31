@@ -772,8 +772,8 @@ this repository or one of its subdirectories.
   identity-matched `BenchmarkCampaignConfig`: WSL active/future staging uses
   50 GiB safety plus at least 32 GiB active workspace. Every Stage 0--8 attempt
   must submit a replayable plan before its run directory or workers exist.
-  Dynamic stop gates require E free bytes of planned archive plus 200 GiB, D
-  free bytes of projected WSL growth plus 200 GiB, and WSL free bytes of active
+  Dynamic stop gates require E free bytes of planned archive plus 0 GiB, D
+  free bytes of projected WSL growth plus 0 GiB, and WSL free bytes of active
   workspace plus 50 GiB. A locked permit ledger prevents concurrent
   over-reservation; permits do not expire without audit. Reviewer-local reserve
   constants or lower thresholds are forbidden contract drift.
@@ -1114,13 +1114,83 @@ The executable workflow and gate table are maintained in
   consistency. Tracked summaries and registry publication are downstream of
   that review.
 
-## Stage 0--8 Storage Governance and Completed Stage 5.2 Migration
+## Stage 0--8 Experiment Lifecycle, Retention v3, and Storage Governance
 
-- Every new Stage 0--8 attempt must obtain a storage-governance start permit
-  before creating its run directory or starting workers. The dynamic stop gate
-  reserves the complete planned archive bytes plus 200 GiB on E, projected WSL
-  growth plus 200 GiB on D, and active workspace plus 50 GiB on ext4; Stage 5.2
-  active workspace is at least 32 GiB.
+- Every new Stage 0--8 top-level attempt must be registered in
+  `configs/experiment_catalog.toml` and run through
+  `ExperimentLifecycleController`. Its mandatory states are
+  `PLANNED -> PERMITTED -> RUNNING -> SEALED -> REVIEWED -> CLASSIFIED ->
+  RETAINED/COMPACTED -> CLOSED`. No later top-level run may be planned while
+  an earlier record is not `CLOSED`; child shards, batches, and axes inherit
+  their top-level identity and may run in parallel.
+- A runner must obtain both the lifecycle-bound storage permit and `RUNNING`
+  transition before creating its run directory or workers. Fixed reserves are
+  E archive 0, D host 0, WSL staging safety 50 GiB, and Stage 5.2 active
+  workspace floor 32 GiB. `e_archive` is the only new long-term archive target;
+  `d_archive` is legacy-read-only and `d_host` measures host capacity only.
+- Retention v3 is rule-engine-only. Reviewer status, controlled failure code,
+  exact failure identity, and signed adjudication determine the retention
+  class. Unknown root cause or reference becomes `unknown_full` and
+  `BLOCKED_RETENTION`; an agent or runner may not choose a deletion list or
+  retention class directly.
+- In-place compaction accepts only the controller-produced signed plan and its
+  exact SHA-256. It records PREPARED/APPLYING/COMMITTED state, preserves the
+  original manifest, appends deleted-file identities to the ledger, and allows
+  at most one producer-side content-hash pass and one apply traversal. The
+  signed incremental content inventory is immutable input: added files,
+  symlinks, missing files, or stat/content drift abort the transaction. An
+  explicit lifecycle close plus its signed matching plan is execution
+  authorization; no second manual deletion confirmation is required.
+- A full-retention receipt must exactly match the signed content inventory's
+  tree hash, file count, and byte count. Closing a new
+  `current_accepted_full` record atomically supersedes and compacts the prior
+  current run for the same experiment. The predecessor's original `CLOSED`
+  record is immutable; a signed append-only supersession transaction records
+  the effective `superseded_accepted_capsule` projection and `superseded_by`
+  identity. Interrupted supersession resumes from that signed checkpoint.
+- Runtime source/config/environment and worker/thread/process values must match
+  the immutable lifecycle plan again immediately before execution. An
+  idempotent retry with any runtime-plan drift is a hard failure rather than a
+  new implicit experiment identity.
+- `experiments/registries/experiment_lifecycle_v3_migration.json` is the signed
+  compatibility anchor: v1/v2 registries remain read-only inputs and lifecycle
+  v3 is the sole schema for new governance facts.
+- Review promotion requires a signed `review_execution.json` from the catalogued
+  reviewer module, binding the raw manifest before/after digest and the emitted
+  review manifest. Historical v2 runs additionally require a one-pass per-file
+  content inventory and a signed stage-specific semantic disposition; inventory
+  generation alone remains `INVALID`/`unknown_full` and blocks Stage 5.2.
+- Historical semantic review may execute only the reviewer module allowlisted in
+  the catalog and must bind its module hash, exact command, raw input hashes,
+  signed output, and execution receipt. A `superseded_metadata` disposition also
+  requires a signed no-dependency proof recomputed from the migration-ledger-
+  bound v2 retention registry and the SHA-bound dependency-document closure for
+  every canonical protected keeper generation; caller-supplied keeper paths or
+  hand-written proof payloads are not trusted. The complete semantic command,
+  inventory, execution receipt, binding and aggregate gate must all carry the
+  same physical-review-bound canonical `e_archive` root and generation identity.
+  The physical review itself must resolve `e_archive` through the repository's
+  local storage-root locator, verify the live volume identity, and use the unique
+  v2 registry relative path and SHA declared by the signed migration ledger;
+  registry SHA and generation tree SHA remain bound through the final gate. A
+  gate consumer must re-verify the live locator root and the signed review,
+  inventory, semantic output, execution receipt and execution binding; a
+  hand-written gate bundle is never sufficient. The consumed semantic status,
+  retention class, failure identity, canonical representative, no-dependency
+  proof and rebuild proof must satisfy the same class-specific rules as the
+  original adjudication.
+  `hot_path_attempt04` remains `INVALID`/`unknown_full` until its own semantic
+  evidence exists.
+- Every catalogued producer's successful CLI path must release its writer lease
+  and call the shared lifecycle seal. Stage 5.2 benchmark uses the final
+  `stage05.2-campaign-manifest-v3` as its sealed manifest; calibration tools
+  aggregate signed child inventories without rehashing raw artifacts. Successful
+  and failed sealing, terminal child verification, and archive close each hold
+  the run's exclusive writer lease through the state commit; failures before a
+  producer creates its directory use the exact signed plan path and seal an
+  explicitly untrusted failure capsule. Internal lifecycle state uses
+  `.json.sha256`, while external artifact/reviewer evidence may use the existing
+  `.sha256` convention and is validated separately.
 - The verified Stage 5.2 historical migration
   `stage052-retention-v2-20260731` published 307 runs / 356 segments /
   712,267,368,027 source bytes to the bound NTFS USB `e_archive`. The v2

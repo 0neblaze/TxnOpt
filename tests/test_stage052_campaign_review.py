@@ -450,7 +450,7 @@ def test_rolling_capacity_replay_uses_canonical_campaign_reserves() -> None:
         staging_root_alias="staging",
         archive_root_aliases=("archive",),
     ) == {
-        "archive-9p": 52 * gib,
+        "archive-9p": 2 * gib,
         "staging-ext4": 82 * gib,
     }
     assert campaign_review_module._expected_rolling_capacity_required(
@@ -461,7 +461,7 @@ def test_rolling_capacity_replay_uses_canonical_campaign_reserves() -> None:
         staging_root_alias="staging",
         archive_root_aliases=("archive",),
     ) == {
-        "archive-9p": 53 * gib,
+        "archive-9p": 3 * gib,
         "staging-ext4": 50 * gib,
     }
     assert campaign_review_module._expected_rolling_capacity_required(
@@ -472,7 +472,7 @@ def test_rolling_capacity_replay_uses_canonical_campaign_reserves() -> None:
         staging_root_alias="staging",
         archive_root_aliases=("archive",),
     ) == {
-        "archive-9p": 50 * gib,
+        "archive-9p": 0,
         "staging-ext4": 50 * gib,
     }
 

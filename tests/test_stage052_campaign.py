@@ -358,7 +358,7 @@ def test_campaign_capacity_preserves_external_workspace_and_internal_reserve(
     )
     plan = config.build_plan(_pilot_observations())
     external_floor = 82 * 1024**3
-    internal_free = 50 * 1024**3 + plan.estimated_bytes
+    internal_free = plan.estimated_bytes
 
     capacity = config.plan_archive_roots(
         plan,

@@ -29,7 +29,11 @@ from evrptw.environment import collect_environment
 from evrptw.models import Instance
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
-from evrptw.storage_governance import preflight_cli_attempt
+from evrptw.storage_governance import (
+    preflight_cli_attempt,
+    seal_cli_attempt,
+    seal_failed_cli_attempt,
+)
 from evrptw.validation import SolutionReport, validate_routes
 
 SCHEMA_VERSION = "1"
@@ -1288,12 +1292,26 @@ def main() -> int:
             config_path=arguments.config,
             output_dir=arguments.output_dir,
         )
-        outputs = run_stage00(
-            config,
-            arguments.config,
-            arguments.output_dir,
-            baseline_dir=arguments.baseline_dir,
-        )
+        try:
+            outputs = run_stage00(
+                config,
+                arguments.config,
+                arguments.output_dir,
+                baseline_dir=arguments.baseline_dir,
+            )
+            seal_cli_attempt(
+                config_path=arguments.config,
+                output_dir=arguments.output_dir,
+                manifest_path=outputs["manifest"],
+            )
+        except BaseException as error:
+            seal_failed_cli_attempt(
+                config_path=arguments.config,
+                output_dir=arguments.output_dir,
+                run_label=arguments.output_dir.resolve().name,
+                error=error,
+            )
+            raise
         for name, path in outputs.items():
             print(f"{name}: {path}")
     elif arguments.command == "verify":

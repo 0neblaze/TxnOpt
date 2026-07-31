@@ -36,7 +36,11 @@ from evrptw.objective import (
     count_charging_visits,
 )
 from evrptw.parser import parse_schneider
-from evrptw.storage_governance import preflight_cli_attempt
+from evrptw.storage_governance import (
+    preflight_cli_attempt,
+    seal_cli_attempt,
+    seal_failed_cli_attempt,
+)
 from evrptw.validation import SolutionReport, validate_routes
 
 OBJECTIVE_SCHEMA = "vehicles,distance,charging_time,charging_count"
@@ -782,12 +786,26 @@ def main() -> int:
         config_path=arguments.config,
         output_dir=arguments.output_dir,
     )
-    outputs = run_stage01_objective(
-        config_path=arguments.config,
-        baseline_dir=arguments.baseline_dir,
-        output_dir=arguments.output_dir,
-        summary_dir=arguments.summary_dir,
-    )
+    try:
+        outputs = run_stage01_objective(
+            config_path=arguments.config,
+            baseline_dir=arguments.baseline_dir,
+            output_dir=arguments.output_dir,
+            summary_dir=arguments.summary_dir,
+        )
+        seal_cli_attempt(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            manifest_path=outputs["manifest"],
+        )
+    except BaseException as error:
+        seal_failed_cli_attempt(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            run_label=arguments.output_dir.resolve().name,
+            error=error,
+        )
+        raise
     for name, path in outputs.items():
         print(f"{name}: {path}")
     return 0

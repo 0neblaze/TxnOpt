@@ -63,6 +63,11 @@ from evrptw.stage052_resources import (
     select_parquet_configuration,
     select_producer_configuration,
 )
+from evrptw.storage_governance import (
+    preflight_cli_attempt,
+    seal_cli_attempt,
+    seal_failed_cli_attempt,
+)
 
 _CALIBRATION_INSTANCES = ("c101_21", "r101_21", "rc101_21")
 _CALIBRATION_SEEDS = (2014, 2015)
@@ -1518,29 +1523,78 @@ def main() -> int:
         65_536 if arguments.row_group_size is None else arguments.row_group_size
     )
     queue_depth = 2 if arguments.queue_depth is None else arguments.queue_depth
-    if arguments.formal_memory_probe_workers is not None:
-        payload = run_stage052_formal_memory_probe(
-            workers=arguments.formal_memory_probe_workers,
-            row_group_size=row_group_size,
-            queue_depth=queue_depth,
-            output_root=arguments.output_root.resolve(),
-            root=resolved_repository,
+
+    def seal_output() -> None:
+        seal_cli_attempt(
             config_path=resolved_config,
+            output_dir=arguments.output_root.resolve(),
             run_label=arguments.run_label,
+            manifest_path=None,
         )
+
+    if arguments.formal_memory_probe_workers is not None:
+        preflight_cli_attempt(
+            config_path=resolved_config,
+            output_dir=arguments.output_root.resolve(),
+            run_label=arguments.run_label,
+            workers=arguments.formal_memory_probe_workers,
+            threads=arguments.formal_memory_probe_workers,
+            processes=arguments.formal_memory_probe_workers,
+            queue_depth=queue_depth,
+            row_group_size=row_group_size,
+        )
+        try:
+            payload = run_stage052_formal_memory_probe(
+                workers=arguments.formal_memory_probe_workers,
+                row_group_size=row_group_size,
+                queue_depth=queue_depth,
+                output_root=arguments.output_root.resolve(),
+                root=resolved_repository,
+                config_path=resolved_config,
+                run_label=arguments.run_label,
+            )
+            seal_output()
+        except BaseException as error:
+            seal_failed_cli_attempt(
+                config_path=resolved_config,
+                output_dir=arguments.output_root.resolve(),
+                run_label=arguments.run_label,
+                error=error,
+            )
+            raise
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     if arguments.probe_workers is not None:
         if arguments.corpus_dir is None:
             parser.error("--corpus-dir is required with --probe-workers")
-        payload = run_stage052_producer_probe(
-            workers=arguments.probe_workers,
-            corpus_dir=arguments.corpus_dir.resolve(),
-            output_root=arguments.output_root.resolve(),
-            root=resolved_repository,
+        preflight_cli_attempt(
             config_path=resolved_config,
+            output_dir=arguments.output_root.resolve(),
             run_label=arguments.run_label,
+            workers=arguments.probe_workers,
+            threads=arguments.probe_workers,
+            processes=arguments.probe_workers,
+            queue_depth=queue_depth,
+            row_group_size=row_group_size,
         )
+        try:
+            payload = run_stage052_producer_probe(
+                workers=arguments.probe_workers,
+                corpus_dir=arguments.corpus_dir.resolve(),
+                output_root=arguments.output_root.resolve(),
+                root=resolved_repository,
+                config_path=resolved_config,
+                run_label=arguments.run_label,
+            )
+            seal_output()
+        except BaseException as error:
+            seal_failed_cli_attempt(
+                config_path=resolved_config,
+                output_dir=arguments.output_root.resolve(),
+                run_label=arguments.run_label,
+                error=error,
+            )
+            raise
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     if arguments.corpus_dir is None:
@@ -1567,17 +1621,37 @@ def main() -> int:
         arguments.formal_memory_floor_dir.resolve(),
         batch_id=arguments.formal_memory_floor_batch_id,
     )
-    contract = run_stage052_resource_calibration(
-        corpus_dir=arguments.corpus_dir.resolve(),
-        output_root=arguments.output_root.resolve(),
-        contract_path=arguments.contract_path.resolve(),
-        root=resolved_repository,
+    preflight_cli_attempt(
         config_path=resolved_config,
+        output_dir=arguments.output_root.resolve(),
         run_label=arguments.run_label,
-        require_clean_source=not arguments.allow_dirty_source,
-        formal_campaign_memory_floor=formal_campaign_memory_floor,
-        locked_parquet_configuration=locked_parquet_configuration,
+        workers=6,
+        threads=6,
+        processes=6,
+        queue_depth=queue_depth,
+        row_group_size=row_group_size,
     )
+    try:
+        contract = run_stage052_resource_calibration(
+            corpus_dir=arguments.corpus_dir.resolve(),
+            output_root=arguments.output_root.resolve(),
+            contract_path=arguments.contract_path.resolve(),
+            root=resolved_repository,
+            config_path=resolved_config,
+            run_label=arguments.run_label,
+            require_clean_source=not arguments.allow_dirty_source,
+            formal_campaign_memory_floor=formal_campaign_memory_floor,
+            locked_parquet_configuration=locked_parquet_configuration,
+        )
+        seal_output()
+    except BaseException as error:
+        seal_failed_cli_attempt(
+            config_path=resolved_config,
+            output_dir=arguments.output_root.resolve(),
+            run_label=arguments.run_label,
+            error=error,
+        )
+        raise
     print(json.dumps(contract.to_dict(), indent=2, sort_keys=True))
     return 0
 

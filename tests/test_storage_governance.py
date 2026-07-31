@@ -94,8 +94,8 @@ def test_repository_governance_policy_declares_balanced_reserves() -> None:
         Path("configs/experiment_storage_governance.toml")
     )
 
-    assert policy.archive_reserve_bytes == 200 * GIB
-    assert policy.host_reserve_bytes == 200 * GIB
+    assert policy.archive_reserve_bytes == 0
+    assert policy.host_reserve_bytes == 0
     assert policy.staging_safety_reserve_bytes == 50 * GIB
     assert policy.stage052_active_workspace_floor_bytes == 32 * GIB
     assert policy.maintenance_allowlist == (
@@ -166,7 +166,7 @@ def test_preflight_capacity_failure_is_observable_without_creating_run(
     free = {
         locator.resolve("wsl_staging").absolute_path: 200 * GIB,
         locator.resolve("d_host").absolute_path: 500 * GIB,
-        locator.resolve("e_archive").absolute_path: 250 * GIB,
+        locator.resolve("e_archive").absolute_path: 50 * GIB,
     }
     governance = ExperimentStorageGovernance(
         policy=GovernancePolicy(),
@@ -205,6 +205,52 @@ def test_preflight_capacity_failure_is_observable_without_creating_run(
     assert receipts[0].with_suffix(".json.sha256").is_file()
 
 
+def test_preflight_rejects_d_role_as_new_archive(tmp_path: Path) -> None:
+    base = _locator(tmp_path)
+    locator = StorageRootLocator(
+        {
+            **{alias: base.resolve(alias) for alias in base.aliases},
+            "d_archive": StorageRoot(
+                "d_archive",
+                tmp_path / "d-archive",
+                VolumeIdentity("d-nvme", "ntfs"),
+            ),
+        }
+    )
+    for alias in locator.aliases:
+        locator.resolve(alias).absolute_path.mkdir()
+    governance = ExperimentStorageGovernance(
+        policy=GovernancePolicy(),
+        locator=locator,
+        state_root=tmp_path / "state",
+        free_space=lambda _path: 500 * GIB,
+        volume_probe=lambda path: next(
+            root.volume
+            for root in (locator.resolve(alias) for alias in locator.aliases)
+            if root.absolute_path == path
+        ),
+    )
+    run_dir = locator.resolve("wsl_staging").absolute_path / "stage05.2_benchmark_attempt01"
+
+    with pytest.raises(StorageCapacityError, match="new experiment archives"):
+        governance.preflight_run(
+            StartRequest(
+                stage_id="stage05.2",
+                run_label=run_dir.name,
+                run_dir=run_dir,
+                staging_root_alias="wsl_staging",
+                host_root_alias="d_host",
+                archive_root_alias="d_archive",
+                planned_archive_bytes=1 * GIB,
+                max_active_workspace_bytes=32 * GIB,
+                projected_host_growth_bytes=32 * GIB,
+                stage_plan_sha256="1" * 64,
+            )
+        )
+
+    assert not run_dir.exists()
+
+
 def test_preflight_reserves_capacity_across_concurrent_run_labels(tmp_path: Path) -> None:
     locator = _locator(tmp_path)
     for alias in locator.aliases:
@@ -212,7 +258,7 @@ def test_preflight_reserves_capacity_across_concurrent_run_labels(tmp_path: Path
     free = {
         locator.resolve("wsl_staging").absolute_path: 200 * GIB,
         locator.resolve("d_host").absolute_path: 500 * GIB,
-        locator.resolve("e_archive").absolute_path: 350 * GIB,
+        locator.resolve("e_archive").absolute_path: 150 * GIB,
     }
     governance = ExperimentStorageGovernance(
         policy=GovernancePolicy(),
@@ -335,7 +381,7 @@ def test_preflight_allows_only_monotonic_remaining_archive_projection(
     final_observation = json.loads(
         final_permit.observation_path.read_text(encoding="utf-8")
     )
-    assert final_observation["required_bytes_by_alias"]["e_archive"] == 200 * GIB
+    assert final_observation["required_bytes_by_alias"]["e_archive"] == 0
     with pytest.raises(StorageCapacityError, match="conflicts"):
         governance.preflight_run(
             replace(request, planned_archive_bytes=1 * GIB)
@@ -401,7 +447,7 @@ def test_existing_permit_remeasures_capacity_before_batch_dispatch(
     free = {
         locator.resolve("wsl_staging").absolute_path: 200 * GIB,
         locator.resolve("d_host").absolute_path: 500 * GIB,
-        locator.resolve("e_archive").absolute_path: 350 * GIB,
+        locator.resolve("e_archive").absolute_path: 150 * GIB,
     }
     governance = ExperimentStorageGovernance(
         policy=GovernancePolicy(),
@@ -432,7 +478,7 @@ def test_existing_permit_remeasures_capacity_before_batch_dispatch(
 
     governance.preflight_run(request)
     request.run_dir.mkdir()
-    free[locator.resolve("e_archive").absolute_path] = 250 * GIB
+    free[locator.resolve("e_archive").absolute_path] = 50 * GIB
 
     with pytest.raises(StorageCapacityError) as raised:
         governance.preflight_run(request)

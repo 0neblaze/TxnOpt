@@ -4,7 +4,11 @@ import argparse
 from pathlib import Path
 
 from evrptw.experiments.stage02_route_reduction import run_stage02
-from evrptw.storage_governance import preflight_cli_attempt
+from evrptw.storage_governance import (
+    preflight_cli_attempt,
+    seal_cli_attempt,
+    seal_failed_cli_attempt,
+)
 
 
 def main() -> int:
@@ -19,7 +23,7 @@ def main() -> int:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("results/stage02.3_constraint_guided_attempt01"),
+        default=Path("results/stage02_constraint_guided_attempt01"),
     )
     parser.add_argument(
         "--summary-dir",
@@ -28,7 +32,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--run-label",
-        default="stage02.3_constraint_guided_attempt01",
+        default="stage02_constraint_guided_attempt01",
     )
     parser.add_argument(
         "--repeat-of",
@@ -41,13 +45,28 @@ def main() -> int:
         output_dir=arguments.output_dir,
         run_label=arguments.run_label,
     )
-    outputs = run_stage02(
-        config_path=arguments.config,
-        output_dir=arguments.output_dir,
-        summary_dir=arguments.summary_dir,
-        run_label=arguments.run_label,
-        repeat_of=arguments.repeat_of,
-    )
+    try:
+        outputs = run_stage02(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            summary_dir=arguments.summary_dir,
+            run_label=arguments.run_label,
+            repeat_of=arguments.repeat_of,
+        )
+        seal_cli_attempt(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            run_label=arguments.run_label,
+            manifest_path=outputs["manifest"],
+        )
+    except BaseException as error:
+        seal_failed_cli_attempt(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            run_label=arguments.run_label,
+            error=error,
+        )
+        raise
     for name, path in outputs.items():
         print(f"{name}: {path}")
     return 0

@@ -1,4 +1,4 @@
-# 实验产物存储规则：v2 policy、v3 physical schema 与历史兼容
+# 实验产物存储规则：lifecycle v3、retention v3 与历史兼容
 
 本规则适用于 Stage 0–8 的实验产物。它只约束 artifact persistence（产物持久化），不改变 ALNS、`evrptw.objective`、统一 validator（验证器）、vehicle-first acceptance（车辆数优先接受规则）或 exact charging（精确充电子问题）的算法语义。
 
@@ -13,6 +13,20 @@ manifest、retention registry（保留登记表）和 change log，不硬编码�
 所有 gate 必须绑定经过审查的直接 predecessor、clean commit（干净提交）和 frozen
 wheel runtime（冻结 wheel 运行时）；actual selected workers/backend 只能由当前 raw
 review 决定。`attemptNN`/`rerunNN` 是唯一运行身份，不是代码版本。
+
+## Lifecycle v3 强制入口
+
+所有顶层实验必须先登记在 `configs/experiment_catalog.toml`，并通过
+`experiment-lifecycle` 完成 `PLANNED -> PERMITTED -> RUNNING -> SEALED -> REVIEWED ->
+CLASSIFIED -> RETAINED/COMPACTED -> CLOSED`。上一项顶层实验未 `CLOSED`、存在
+`BLOCKED_RETENTION`、catalog/prerequisite/source/config/lock/environment identity
+不一致，或资源计划超过登记上限时，程序在创建 run directory 前拒绝启动。
+
+retention class（保留类别）只能由独立 reviewer 的受控状态、failure code、完整失败
+身份和签名 root-cause adjudication 通过规则引擎产生。未知根因固定为 `unknown_full` 并
+阻塞后续实验。v1/v2 registry 只读兼容；
+`experiments/registries/experiment_lifecycle_v3_migration.json` 固定其身份，v3 是唯一
+允许新增治理事实的 schema。
 
 v1/v2 的固定策略为：
 
@@ -63,7 +77,7 @@ count 与 checksum；batch 不得伪装成新 attempt。`failure` 不适用时�
 manifest 必须记录 `artifact_status.failure=not_applicable`。所有 raw evidence（原始
 证据）先写入 Git-ignored active staging root；运行封存后由 retention interface
 校验完整 tree SHA-256 和字节数，并移入
-`d_archive/stage05.2/history/<run_label>/`。tracked summary（受 Git 跟踪的汇总）只能
+`e_archive/stage05.2/history/<run_label>/`。tracked summary（受 Git 跟踪的汇总）只能
 由独立 reviewer 在 raw replay（原始证据回放）通过后发布。
 
 ## Critical evidence 与索引
@@ -133,7 +147,7 @@ Stage 0 frozen baseline、Stage 2/3 历史证据和已发布 v1 bundle 不做物
 
 ## Stage 5.2 retention policy
 
-- Retention policy v2（留存政策第二版）分为 `accepted_full`、
+- Retention policy v2（留存政策第二版）仅用于读取历史事实，分为 `accepted_full`、
   `unique_failure_full`、`duplicate_failure_reduced`、`rebuildable` 和
   fail-closed（关闭式失败）的 `unknown_full`。accepted/current-chain 与独特根因失败保留
   完整 raw；重复根因只有在签名 adjudication record（裁定记录）绑定稳定
@@ -163,6 +177,23 @@ Stage 0 frozen baseline、Stage 2/3 历史证据和已发布 v1 bundle 不做物
   `.storage-governance` 状态中；既有 tracked
   `stage05.2_retention_registry.csv` 仅作为不可变 v1 fallback（回退），不是并行的 v2
   truth source（事实源）。registry 只记录 archive alias 和相对路径，不记录本机绝对路径。
+- 新写 retention v3 分为 `published_full`、`current_accepted_full`、
+  `superseded_accepted_capsule`、`unique_failure_capsule`、
+  `duplicate_failure_metadata`、`superseded_metadata`、`rebuildable` 和
+  `unknown_full`。原位精简严格执行 PREPARED/APPLYING/COMMITTED，输入只能是 controller
+  生成的签名 keep/delete 清单及精确计划 SHA-256；原始 manifest 不修改，删除身份追加到
+  ledger。close 最多一次内容哈希通读和一次删除遍历，未校准 native backend、隐式
+  fallback、重复哈希或全 E 盘扫描均使 performance gate 失败。
+- full-retention receipt 必须逐项等于增量 content inventory 的 tree SHA-256、文件数和
+  字节数；controller 在 E 盘治理状态中保存该 inventory identity，供未来 supersession
+  transaction（取代事务）复用。新 `current_accepted_full` 关闭时，同一 experiment 的旧
+  current 通过追加式 supersession projection（取代投影）获得
+  `superseded_accepted_capsule` 的有效分类；旧 `CLOSED` record 本身不重开、不改写。
+  中断后从 PREPARED/APPLYING checkpoint 重入，不能留下两个有效 current。
+- PERMITTED -> RUNNING 会重新绑定同一 immutable plan。worker/thread/process、source、
+  config、lock、environment、prerequisite、I/O backend 任一漂移均拒绝；已经 RUNNING 的
+  幂等重试也执行同一检查。compaction apply 对 inventory 后新增文件、symlink、缺失文件、
+  stat 漂移和内容漂移全部 fail closed。
 - `accepted_full` 与 `unique_failure_full` 在登记前必须生成签名 independent replay
   receipt（独立重放回执），绑定 archive tree SHA-256、文件数、字节数、verifier
   identity，以及 validator、objective 和 raw-review replay 三项通过状态。resolver
@@ -174,11 +205,10 @@ Stage 0 frozen baseline、Stage 2/3 历史证据和已发布 v1 bundle 不做物
 - 归档目录只能作为只读 comparison/prerequisite/replay 输入；reviewer 不得把新的 review
   generation 写回已登记的归档 tree，否则会破坏 registry checksum。需发布新 generation
   的 raw 必须留在 active root，发布并封存后再归档。
-- 本轮 historical D/WSL migration（历史 D/WSL 迁移）的归档成功不授权删除源。实际
-  删除前必须列出精确源、E 盘目标、字节数、校验结果、预计释放空间和“E 盘为单份长期
-  副本、删除后无介质故障回滚”的风险，并等待字面确认 `确认`。该确认边界不替代未来
-  attempt 中为维持 Stage 5.2 active-workspace cap（活动工作区上限）而明确配置的
-  same-attempt rolling-batch handoff（同一 attempt 滚动批次移交）。
+- 历史 `stage052-retention-v2-20260731` 的人工确认边界保持为不可变事实。未来处置不复用
+  该确认，也不要求第二次人工确认；显式 lifecycle close、controller 签名计划和匹配
+  SHA-256 共同构成执行授权。same-attempt rolling-batch handoff（同一 attempt 滚动批次
+  移交）仍受其顶层 lifecycle identity 约束。
 
 ### Stage 5.2 historical migration status
 
@@ -195,15 +225,52 @@ SHA-256 为
 本次迁移后 E 盘是这些 raw evidence 的唯一长期介质副本，不得把 content verification
 表述为 backup。维护 allowlist 的归档后 dry run 为零候选；Ubuntu VHDX 在 TRIM 后通过
 离线 `Optimize-VHD -Mode Full` 从 456,645,410,816 bytes 压缩至约
-336,704,045,056 bytes。未来迁移仍必须重新执行上述逐次确认流程，不能复用本次确认。
+336,704,045,056 bytes。未来处置必须使用新的签名 lifecycle transaction，不复用本次
+人工确认。
+
+上述完成状态只表示 v2 物理迁移完成，不表示 v3 历史语义裁定完成。migration ledger
+中的 13 个 pending run 必须各自产生一次 content inventory（内容清单）和独立语义
+review；仅生成 inventory 会得到 `INVALID`/`unknown_full`，不会生成可通过的
+`historical-migration/gate.json`，并继续阻塞 Stage 5.2 Calibration。完整 gate 必须绑定
+每个 review、inventory 及 migration ledger 的精确 SHA-256。
+
+Producer 正常完成后必须调用共享 `seal_cli_attempt` 停止 writer lease 并进入
+`SEALED`。Stage 5.2 benchmark 使用 `stage05.2-campaign-manifest-v3` 作为顶层 sealed
+manifest；其 `artifacts` 复用写入时已生成的 checksum。资源 calibration 等多 child
+manifest producer 使用 terminal manifest 聚合这些签名 identity，只读取小型
+manifest/report，并在排他 writer lease 内对当前 run 做一次最终内容验证；child 状态、
+checksum、完整文件集或 metadata 有任何漂移都会拒绝。损坏 producer manifest 不会被
+重新解释为可信 child，而是进入显式 `untrusted_failure_capsule`。内部 lifecycle state 使用
+`.json.sha256`，外部 artifact/reviewer 证据同时支持仓库既有 `.sha256` 约定，两类验证
+逻辑保持隔离。
+
+历史语义处置只允许 catalog 登记的
+`stage052_historical_semantic_review`。12 个 benchmark 候选只有从 migration ledger
+绑定的 v2 retention registry 解析 canonical protected keeper generation，并对账本中
+SHA-bound campaign/control/review/batch manifest closure 重新完成零引用扫描时，才可生成
+`no_dependency_proof`；调用方不能替换 keeper 路径或提交手写 proof。
+完整 semantic command、content inventory、execution receipt、binding 和 aggregate gate
+还必须携带 physical historical review 所绑定的同一个 canonical `e_archive` root 与
+generation identity；临时 mirror 不能替代该根。`hot_path_attempt04` 继续保持
+`unknown_full`。physical review 自身必须通过仓库 local storage-root locator 解析并验证
+live `e_archive` volume identity，且只能读取 signed migration ledger 声明的唯一 v2
+registry relative path/SHA；registry SHA 与 generation tree SHA 继续贯穿 inventory、
+execution、binding、final review 和 gate。aggregate gate 还会复核 reviewer module/hash、
+完整命令、输入前后 hash、签名语义输出和 E state-root execution binding，手工拼接
+review JSON 不能替代受控执行。gate consumer 还会重新验证 live locator root，并重放
+signed review、inventory、semantic output、execution receipt 与 execution binding 的完整
+交叉绑定，并重新执行 retention-class-specific gates：semantic status/class 必须与
+review/gate 一致，failure identity/canonical representative、no-dependency proof 或
+rebuild proof 必须按类别成立。因此手写 gate bundle 或把 `unknown_full` 重标成安全类别
+都不能作为 Stage 5.2 prerequisite。
 
 ## Stage 0--8 capacity stop gate
 
 每个新 attempt/rerun 在创建 run directory（运行目录）或启动 worker 前必须提交可重放
 experiment plan，包含预计 archive bytes、最大 active workspace，以及 shard/run/batch
 hard caps。`preflight_run` 对 E/D/WSL 重新探测同一套 volume identity（卷身份）并采用
-动态门槛：E 至少保留 `planned_archive + 200 GiB`，D 至少保留
-`projected_WSL_growth + 200 GiB`，WSL ext4 至少保留
+动态门槛：E 至少保留 `planned_archive + 0 GiB`，D 至少保留
+`projected_WSL_growth + 0 GiB`，WSL ext4 至少保留
 `active_workspace + 50 GiB`；Stage 5.2 的 active workspace 不得小于 32 GiB。缺失计划、
 身份漂移、空间不足或未核销 permit（许可）均在写入前 fail fast，并持久化完整 capacity
 observation（容量观测）。
@@ -222,7 +289,8 @@ Stage start 与 retention 完成后的 production hook（生产钩子）必须�
 声明的精确相对 allowlist；不存在的路径如实跳过，存在的 cache/venv/build/spool 必须进入
 签名 audit decision。未通过 keeper/rebuild proof 的资产只会以 retained reason（保留
 原因）登记，不得把“无法验证”当作空审计或删除许可。真正 apply 还必须绑定完全相同的
-dry run、删除前二次复验和字面确认 `确认`。
+dry run、controller 生成的精确计划 SHA-256 和显式 lifecycle close；不另设第二次人工
+确认。
 
 ## 正式运行前 preflight
 

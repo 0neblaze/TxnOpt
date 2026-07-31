@@ -34,7 +34,11 @@ from evrptw.best_known import (
     TOTAL_INSTANCES,
 )
 from evrptw.environment import collect_environment
-from evrptw.storage_governance import preflight_cli_attempt
+from evrptw.storage_governance import (
+    preflight_cli_attempt,
+    seal_cli_attempt,
+    seal_failed_cli_attempt,
+)
 
 STAGE051_SCHEMA_VERSION = "stage05.1-best-known-v6"
 STAGE051_RUN_LABEL = re.compile(r"^stage05\.1_best_known_(?:attempt|rerun)[0-9]{2}$")
@@ -534,11 +538,26 @@ def main() -> int:
         output_dir=arguments.output_dir,
         run_label=arguments.run_label,
     )
-    outputs = run_stage051_best_known(
-        config_path=arguments.config,
-        output_dir=arguments.output_dir,
-        run_label=arguments.run_label,
-    )
+    try:
+        outputs = run_stage051_best_known(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            run_label=arguments.run_label,
+        )
+        seal_cli_attempt(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            run_label=arguments.run_label,
+            manifest_path=outputs["manifest"],
+        )
+    except BaseException as error:
+        seal_failed_cli_attempt(
+            config_path=arguments.config,
+            output_dir=arguments.output_dir,
+            run_label=arguments.run_label,
+            error=error,
+        )
+        raise
     for name, path in outputs.items():
         print(f"{name}: {path}")
     return 0

@@ -2386,6 +2386,7 @@ def _dispatcher_locator(tmp_path: Path) -> StorageRootLocator:
         {
             "wsl_staging": StorageRoot("wsl_staging", tmp_path / "wsl-active", internal),
             "d_archive": StorageRoot("d_archive", tmp_path / "archive-d", d_drive),
+            "d_host": StorageRoot("d_host", tmp_path / "host-d", d_drive),
             "e_archive": StorageRoot(
                 "e_archive",
                 tmp_path / "archive-e",
@@ -2482,6 +2483,24 @@ def _patch_dispatcher_dependencies(
     *,
     locator: StorageRootLocator,
 ) -> list[str]:
+    historical_gate = (
+        locator.resolve("e_archive").absolute_path
+        / ".experiment-lifecycle"
+        / "historical-migration"
+        / "gate.json"
+    )
+    historical_gate.parent.mkdir(parents=True, exist_ok=True)
+    historical_gate.write_text('{"status":"complete"}\n', encoding="utf-8")
+    monkeypatch.setattr(
+        stage052_performance,
+        "load_historical_migration_gate",
+        lambda *_args, **_kwargs: {"status": "complete"},
+    )
+    monkeypatch.setattr(
+        stage052_performance,
+        "register_lifecycle_writer",
+        lambda **_kwargs: None,
+    )
     producer_contract = ProducerResourceContract(
         selected_workers=4,
         available_memory_bytes=32 * 1024**3,
@@ -2685,10 +2704,39 @@ def _run_patched_pilot(
     fail_campaign_attribution: bool = False,
     attribution_precommit_status: list[str] | None = None,
 ) -> tuple[Path, list[str], list[str]]:
+    stage051_manifest = (
+        tmp_path
+        / "experiments"
+        / "manifests"
+        / "stage05.1_best_known_artifact_manifest.json"
+    )
+    stage051_manifest.parent.mkdir(parents=True)
+    stage051_manifest.write_text("{}\n", encoding="utf-8")
     locator = _dispatcher_locator(tmp_path)
     preflight_calls = _patch_dispatcher_dependencies(monkeypatch, locator=locator)
     config_path = Path("configs/stage052_performance.toml").resolve()
     config = load_stage052_config(config_path)
+    lifecycle_plan = SimpleNamespace(plan_sha256="d" * 64)
+    monkeypatch.setattr(
+        stage052_performance,
+        "build_repository_plan",
+        lambda **_kwargs: lifecycle_plan,
+    )
+    monkeypatch.setattr(
+        stage052_performance.ExperimentCatalog,
+        "from_toml",
+        classmethod(lambda _cls, _path: object()),
+    )
+    monkeypatch.setattr(
+        stage052_performance,
+        "ExperimentLifecycleController",
+        lambda **_kwargs: SimpleNamespace(
+            state_root=tmp_path / "archive-e" / ".experiment-lifecycle",
+            plan=lambda _plan: None,
+            permit=lambda _run_label, **_permit: None,
+            start=lambda _run_label, **_runtime: None,
+        ),
+    )
     prerequisite_dir = tmp_path / "stage05.2_accelerator_pilot_attempt02"
     review_dir = prerequisite_dir / "review"
     review_dir.mkdir(parents=True)

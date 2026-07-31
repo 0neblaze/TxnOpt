@@ -34,6 +34,9 @@ commercial-solvers = [
 
 [project.scripts]
 evrptw-env = "evrptw.environment:main"
+experiment-lifecycle = "evrptw.experiment_lifecycle:main"
+experiment-historical-review = "evrptw.experiments.lifecycle_historical_review:main"
+experiment-legacy-review = "evrptw.experiments.lifecycle_legacy_review:main"
 
 [dependency-groups]
 dev = [

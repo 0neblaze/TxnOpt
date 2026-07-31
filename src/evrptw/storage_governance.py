@@ -77,8 +77,8 @@ class GovernancePolicy:
     """Hard reserves shared by every new Stage 0--8 experiment."""
 
     schema_version: str = POLICY_SCHEMA_VERSION
-    archive_reserve_bytes: int = 200 * GIB
-    host_reserve_bytes: int = 200 * GIB
+    archive_reserve_bytes: int = 0
+    host_reserve_bytes: int = 0
     staging_safety_reserve_bytes: int = 50 * GIB
     stage052_active_workspace_floor_bytes: int = 32 * GIB
     maintenance_allowlist: tuple[tuple[str, str], ...] = (
@@ -91,17 +91,25 @@ class GovernancePolicy:
     def __post_init__(self) -> None:
         if self.schema_version != POLICY_SCHEMA_VERSION:
             raise ValueError(f"unsupported storage governance policy: {self.schema_version}")
-        values = (
+        nonnegative_values = (
             self.archive_reserve_bytes,
             self.host_reserve_bytes,
+        )
+        positive_values = (
             self.staging_safety_reserve_bytes,
             self.stage052_active_workspace_floor_bytes,
         )
         if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in nonnegative_values
+        ) or any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
-            for value in values
+            for value in positive_values
         ):
-            raise ValueError("storage governance reserves must be positive integers")
+            raise ValueError(
+                "archive and host reserves must be non-negative integers; "
+                "staging safety and active workspace reserves must be positive integers"
+            )
         allowed_kinds = {"cache", "venv", "build", "temporary_spool"}
         for relative_path, kind in self.maintenance_allowlist:
             relative = PurePosixPath(relative_path)
@@ -1298,8 +1306,23 @@ def preflight_cli_attempt(
     config_path: Path,
     output_dir: Path,
     run_label: str | None = None,
+    workers: int = 1,
+    threads: int = 1,
+    processes: int = 1,
+    batch_size: int = 1,
+    queue_depth: int = 1,
+    row_group_size: int = 1,
 ) -> StartPermit:
     """Apply the shared Stage 0--8 stop gate at every producer CLI boundary."""
+
+    from evrptw.experiment_lifecycle import (
+        ExperimentCatalog,
+        ExperimentLifecycleController,
+        LifecycleError,
+        build_repository_plan,
+        load_historical_migration_gate,
+        register_lifecycle_writer,
+    )
 
     resolved_output = output_dir.resolve()
     selected_label = run_label or resolved_output.name
@@ -1366,22 +1389,88 @@ def preflight_cli_attempt(
             raise StorageGovernanceError(reason)
         per_run_caps.append(value)
     planned_archive_bytes = max(per_run_caps)
-    plan_sha256 = hashlib.sha256(
-        _canonical_json(
-            {
-                "schema_version": "experiment-cli-plan-v1",
-                "stage_id": stage_id,
-                "run_label": selected_label,
-                "configuration_sha256": _file_sha256(resolved_config),
-                "planned_archive_bytes": planned_archive_bytes,
-                "max_active_workspace_bytes": planned_archive_bytes,
-                "projected_host_growth_bytes": planned_archive_bytes,
-            }
+    prerequisite_sha256_by_contract: dict[str, str] = {}
+    if stage_id == "stage05.2":
+        stage052 = config_payload.get("stage05_2")
+        if not isinstance(stage052, dict) or not isinstance(
+            stage052.get("stage051_manifest"), str
+        ):
+            raise StorageGovernanceError(
+                "Stage 5.2 lifecycle plan requires the Stage 5.1 prerequisite"
+            )
+        prerequisite_path = resolved_config.parent.parent / str(
+            stage052["stage051_manifest"]
         )
-    ).hexdigest()
+        try:
+            prerequisite_sha256_by_contract["stage051_readiness"] = hashlib.sha256(
+                prerequisite_path.read_bytes()
+            ).hexdigest()
+        except OSError as error:
+            raise StorageGovernanceError(
+                "Stage 5.2 lifecycle prerequisite cannot be read"
+            ) from error
     locator_path = resolved_config.parent / "stage052_storage_roots.local.toml"
     policy_path = resolved_config.parent / "experiment_storage_governance.toml"
+    catalog_path = resolved_config.parent / "experiment_catalog.toml"
+    if not catalog_path.is_file():
+        reason = "experiment catalog is missing at the producer boundary"
+        _persist_cli_plan_rejection(
+            config_path=resolved_config,
+            output_dir=resolved_output,
+            run_label=selected_label,
+            reason=reason,
+        )
+        raise StorageGovernanceError(reason)
+    catalog = ExperimentCatalog.from_toml(catalog_path)
+    spec = catalog.for_run_label(selected_label)
+    repository = resolved_config.parent.parent
+    for contract, relative_path in spec.prerequisite_paths.items():
+        prerequisite_path = repository.joinpath(*PurePosixPath(relative_path).parts)
+        try:
+            prerequisite_sha256 = _file_sha256(prerequisite_path)
+        except OSError as error:
+            raise StorageGovernanceError(
+                f"catalog prerequisite cannot be read: {contract}"
+            ) from error
+        existing_prerequisite = prerequisite_sha256_by_contract.get(contract)
+        if (
+            existing_prerequisite is not None
+            and existing_prerequisite != prerequisite_sha256
+        ):
+            raise StorageGovernanceError(
+                f"config and catalog prerequisite identities differ: {contract}"
+            )
+        prerequisite_sha256_by_contract[contract] = prerequisite_sha256
     locator = StorageRootLocator.from_toml(locator_path)
+    if stage_id == "stage05.2":
+        historical_gate_path = (
+            locator.resolve("e_archive").absolute_path
+            / ".experiment-lifecycle"
+            / "historical-migration"
+            / "gate.json"
+        )
+        load_historical_migration_gate(
+            historical_gate_path,
+            migration_ledger_path=(
+                repository
+                / "experiments"
+                / "registries"
+                / "experiment_lifecycle_v3_migration.json"
+            ),
+            repository=repository,
+        )
+        prerequisite_sha256_by_contract["historical_migration"] = _file_sha256(
+            historical_gate_path
+        )
+        prerequisite_sha256_by_contract["campaign_geometry"] = hashlib.sha256(
+            _canonical_json(
+                {
+                    "run_label": selected_label,
+                    "stage_id": stage_id,
+                    "configuration_sha256": _file_sha256(resolved_config),
+                }
+            )
+        ).hexdigest()
     from evrptw.stage052_campaign_runner import free_bytes, probe_volume_identity
 
     staging = locator.resolve("wsl_staging")
@@ -1404,20 +1493,473 @@ def preflight_cli_attempt(
             legacy_registry_path if legacy_registry_path.is_file() else None
         ),
     )
-    return governance.preflight_run(
+    lifecycle_plan = build_repository_plan(
+        repository=resolved_config.parent.parent,
+        config_path=resolved_config,
+        run_label=selected_label,
+        run_dir=resolved_output,
+        planned_archive_bytes=planned_archive_bytes,
+        max_workspace_bytes=planned_archive_bytes,
+        workers=workers,
+        threads=threads,
+        processes=processes,
+        batch_size=batch_size,
+        queue_depth=queue_depth,
+        row_group_size=row_group_size,
+        prerequisite_sha256_by_contract=prerequisite_sha256_by_contract,
+    )
+    lifecycle = ExperimentLifecycleController(
+        catalog=catalog,
+        state_root=locator.resolve("e_archive").absolute_path / ".experiment-lifecycle",
+        storage_state_root=(
+            locator.resolve("e_archive").absolute_path / ".storage-governance"
+        ),
+        capacity_state_root=staging.absolute_path / ".storage-governance",
+        archive_root=locator.resolve("e_archive").absolute_path,
+    )
+    permit = governance.preflight_run(
         StartRequest(
             stage_id=stage_id,
             run_label=selected_label,
             run_dir=resolved_output,
             staging_root_alias="wsl_staging",
-            host_root_alias="d_archive",
+            host_root_alias="d_host",
             archive_root_alias="e_archive",
             planned_archive_bytes=planned_archive_bytes,
             max_active_workspace_bytes=planned_archive_bytes,
             projected_host_growth_bytes=planned_archive_bytes,
-            stage_plan_sha256=plan_sha256,
+            stage_plan_sha256=lifecycle_plan.plan_sha256,
         )
     )
+    try:
+        lifecycle.plan(lifecycle_plan)
+    except LifecycleError as error:
+        rejection_path = _persist_cli_plan_rejection(
+            config_path=resolved_config,
+            output_dir=resolved_output,
+            run_label=selected_label,
+            reason=f"lifecycle admission failed: {error}",
+        )
+        governance.reconcile_permit(
+            selected_label,
+            outcome="aborted_audited",
+            evidence_sha256=_file_sha256(rejection_path),
+        )
+        raise StorageGovernanceError(
+            "lifecycle admission failed after capacity reservation"
+        ) from error
+    lifecycle.permit(selected_label, storage_permit_path=permit.permit_path)
+    lifecycle.start(selected_label, runtime_plan=lifecycle_plan)
+    register_lifecycle_writer(
+        state_root=lifecycle.state_root,
+        run_label=selected_label,
+    )
+    return permit
+
+
+def seal_cli_attempt(
+    *,
+    config_path: Path,
+    output_dir: Path,
+    manifest_path: Path | None,
+    run_label: str | None = None,
+    failure_code: str = "",
+) -> Path:
+    """Stop the governed writer and atomically advance a finished CLI run to SEALED."""
+
+    from evrptw.experiment_lifecycle import (
+        ExperimentCatalog,
+        ExperimentLifecycleController,
+        release_lifecycle_writer,
+    )
+
+    resolved_config = config_path.resolve(strict=True)
+    resolved_output = output_dir.resolve(strict=True)
+    selected_label = run_label or resolved_output.name
+    if resolved_output.name != selected_label:
+        raise StorageGovernanceError("sealed CLI output identity differs")
+    locator = StorageRootLocator.from_toml(
+        resolved_config.parent / "stage052_storage_roots.local.toml"
+    )
+    archive_root = locator.resolve("e_archive").absolute_path
+    lifecycle = ExperimentLifecycleController(
+        catalog=ExperimentCatalog.from_toml(
+            resolved_config.parent / "experiment_catalog.toml"
+        ),
+        state_root=archive_root / ".experiment-lifecycle",
+        storage_state_root=archive_root / ".storage-governance",
+        capacity_state_root=(
+            locator.resolve("wsl_staging").absolute_path / ".storage-governance"
+        ),
+        archive_root=archive_root,
+    )
+    release_lifecycle_writer(
+        state_root=lifecycle.state_root,
+        run_label=selected_label,
+    )
+    with _state_lock(
+        lifecycle.state_root / "writer-locks" / f"{selected_label}.lock"
+    ):
+        selected_manifest = (
+            build_cli_terminal_manifest(
+                output_dir=resolved_output,
+                run_label=selected_label,
+            )
+            if manifest_path is None
+            else manifest_path.resolve(strict=True)
+        )
+        lifecycle.seal(
+            selected_label,
+            manifest_path=selected_manifest,
+            failure_code=failure_code,
+        )
+    return selected_manifest
+
+
+def build_cli_terminal_manifest(
+    *,
+    output_dir: Path,
+    run_label: str,
+    status: str = "complete",
+    evidence_completeness: str = "complete",
+) -> Path:
+    """Build an exact terminal inventory and verify every child artifact."""
+
+    from evrptw.artifacts import atomic_write_signed_json, signed_sidecar_matches
+
+    resolved_output = output_dir.resolve(strict=True)
+    identities: dict[str, dict[str, object]] = {}
+    child_terminal_states: list[tuple[str, str]] = []
+
+    def add_identity(path: Path, *, checksum: str | None = None) -> None:
+        resolved = path.resolve(strict=True)
+        if not resolved.is_relative_to(resolved_output) or not resolved.is_file():
+            raise StorageGovernanceError("terminal manifest path is outside its run")
+        relative = resolved.relative_to(resolved_output).as_posix()
+        stat_before = resolved.stat()
+        digest = _file_sha256(resolved) if checksum is None else checksum
+        stat_after = resolved.stat()
+        if (
+            stat_after.st_size != stat_before.st_size
+            or stat_after.st_mtime_ns != stat_before.st_mtime_ns
+        ):
+            raise StorageGovernanceError(
+                "terminal manifest artifact changed while hashing"
+            )
+        identity = {
+            "relative_path": relative,
+            "byte_size": stat_before.st_size,
+            "checksum": digest,
+            "modified_time_ns": stat_before.st_mtime_ns,
+        }
+        existing = identities.get(relative)
+        if existing is not None and existing != identity:
+            raise StorageGovernanceError("terminal manifest identity conflicts")
+        identities[relative] = identity
+
+    child_manifests = tuple(
+        sorted(
+            path
+            for path in resolved_output.glob("**/control/*_manifest.json")
+            if not path.name.endswith("_lifecycle_manifest.json")
+        )
+    )
+    for manifest_path in child_manifests:
+        sidecar_path = manifest_path.with_suffix(".sha256")
+        if not signed_sidecar_matches(manifest_path, sidecar_path):
+            raise StorageGovernanceError("child artifact manifest signature differs")
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise StorageGovernanceError("child artifact manifest is invalid") from error
+        artifacts = payload.get("artifacts") if isinstance(payload, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("run_label") != run_label
+            or payload.get("status") not in {"complete", "partial", "failed"}
+            or payload.get("evidence_completeness")
+            not in {"complete", "partial", "legacy_unknown"}
+            or not isinstance(artifacts, list)
+        ):
+            raise StorageGovernanceError("child artifact inventory is missing")
+        child_terminal_states.append(
+            (str(payload["status"]), str(payload["evidence_completeness"]))
+        )
+        child_root = manifest_path.parent.parent
+        for raw in artifacts:
+            if not isinstance(raw, dict):
+                raise StorageGovernanceError("child artifact identity is invalid")
+            relative = PurePosixPath(str(raw.get("relative_path", "")))
+            checksum = str(raw.get("checksum", ""))
+            byte_size = raw.get("byte_size")
+            if (
+                relative.is_absolute()
+                or not relative.parts
+                or ".." in relative.parts
+                or _SHA256.fullmatch(checksum) is None
+                or isinstance(byte_size, bool)
+                or not isinstance(byte_size, int)
+                or byte_size < 0
+            ):
+                raise StorageGovernanceError("child artifact identity is invalid")
+            artifact_path = child_root.joinpath(*relative.parts)
+            stat_before = artifact_path.stat()
+            if not artifact_path.is_file() or stat_before.st_size != byte_size:
+                raise StorageGovernanceError("child artifact size differs")
+            observed_checksum = _file_sha256(artifact_path)
+            stat_after = artifact_path.stat()
+            if (
+                stat_after.st_size != stat_before.st_size
+                or stat_after.st_mtime_ns != stat_before.st_mtime_ns
+            ):
+                raise StorageGovernanceError("child artifact changed while hashing")
+            if observed_checksum != checksum:
+                raise StorageGovernanceError("child artifact checksum differs")
+            add_identity(artifact_path, checksum=observed_checksum)
+        add_identity(manifest_path)
+        add_identity(sidecar_path)
+    for post_manifest_path in sorted(
+        resolved_output.glob("**/control/*_persistence_attribution.json")
+    ):
+        post_sidecar = post_manifest_path.with_suffix(".sha256")
+        if not signed_sidecar_matches(post_manifest_path, post_sidecar):
+            raise StorageGovernanceError(
+                "post-manifest persistence attribution signature differs"
+            )
+        add_identity(post_manifest_path)
+        add_identity(post_sidecar)
+    root_control = resolved_output / "control"
+    if root_control.is_dir():
+        for control_path in sorted(root_control.glob("*.json")):
+            if control_path.name.endswith("_lifecycle_manifest.json"):
+                continue
+            control_sidecar = control_path.with_suffix(".sha256")
+            if not signed_sidecar_matches(control_path, control_sidecar):
+                raise StorageGovernanceError("root control signature differs")
+            add_identity(control_path)
+            add_identity(control_sidecar)
+    for root_file in sorted(item for item in resolved_output.iterdir() if item.is_file()):
+        add_identity(root_file)
+    if not identities:
+        raise StorageGovernanceError("terminal manifest has no governed artifacts")
+    if status == "complete" and (
+        evidence_completeness != "complete"
+        or any(
+            child_status != "complete" or child_completeness != "complete"
+            for child_status, child_completeness in child_terminal_states
+        )
+    ):
+        raise StorageGovernanceError(
+            "incomplete child evidence cannot become a complete terminal manifest"
+        )
+    manifest_path = (
+        resolved_output / "control" / f"{run_label}_lifecycle_manifest.json"
+    )
+    terminal_sidecar = manifest_path.with_suffix(".sha256")
+    observed: set[str] = set()
+    for directory, directories, files in os.walk(resolved_output):
+        directories.sort()
+        files.sort()
+        directory_path = Path(directory)
+        if any((directory_path / name).is_symlink() for name in directories):
+            raise StorageGovernanceError("terminal run contains a directory symlink")
+        for name in files:
+            path = directory_path / name
+            if path in {manifest_path, terminal_sidecar}:
+                continue
+            if path.is_symlink() or not path.is_file():
+                raise StorageGovernanceError("terminal run contains a non-regular file")
+            observed.add(path.relative_to(resolved_output).as_posix())
+    missing = set(identities) - observed
+    unlisted = observed - set(identities)
+    if missing:
+        raise StorageGovernanceError(
+            f"terminal manifest is missing declared files: {sorted(missing)[:5]}"
+        )
+    if unlisted and status != "complete":
+        for unlisted_path in sorted(unlisted):
+            add_identity(
+                resolved_output.joinpath(*PurePosixPath(unlisted_path).parts)
+            )
+        unlisted = set()
+    if unlisted:
+        raise StorageGovernanceError(
+            "terminal manifest file set differs: "
+            f"unlisted={sorted(unlisted)[:5]}, missing=[]"
+        )
+    for terminal_relative, identity in identities.items():
+        path = resolved_output.joinpath(*PurePosixPath(terminal_relative).parts)
+        stat = path.stat()
+        if (
+            stat.st_size != identity["byte_size"]
+            or stat.st_mtime_ns != identity["modified_time_ns"]
+        ):
+            raise StorageGovernanceError(
+                "terminal manifest artifact changed after hashing"
+            )
+    atomic_write_signed_json(
+        manifest_path,
+        {
+            "schema_version": "experiment-cli-terminal-manifest-v1",
+            "run_label": run_label,
+            "status": status,
+            "evidence_completeness": evidence_completeness,
+            "artifacts": [identities[key] for key in sorted(identities)],
+        },
+    )
+    return manifest_path
+
+
+def build_cli_failure_manifest(*, output_dir: Path, run_label: str) -> Path:
+    """Inventory an untrusted failed run without interpreting broken child state."""
+
+    from evrptw.artifacts import atomic_write_signed_json
+
+    resolved_output = output_dir.resolve(strict=True)
+    if not resolved_output.is_dir():
+        raise StorageGovernanceError("failed CLI run directory is missing")
+    manifest_path = (
+        resolved_output / "control" / f"{run_label}_failure_lifecycle_manifest.json"
+    )
+    sidecar_path = manifest_path.with_suffix(".sha256")
+    identities: list[dict[str, object]] = []
+    for directory, directories, files in os.walk(resolved_output):
+        directories.sort()
+        files.sort()
+        directory_path = Path(directory)
+        if any((directory_path / name).is_symlink() for name in directories):
+            raise StorageGovernanceError("failed CLI run contains a directory symlink")
+        for name in files:
+            path = directory_path / name
+            if path in {manifest_path, sidecar_path}:
+                continue
+            if path.is_symlink() or not path.is_file():
+                raise StorageGovernanceError("failed CLI run contains a non-regular file")
+            stat = path.stat()
+            identities.append(
+                {
+                    "relative_path": path.relative_to(resolved_output).as_posix(),
+                    "byte_size": stat.st_size,
+                    "checksum": _file_sha256(path),
+                    "modified_time_ns": stat.st_mtime_ns,
+                }
+            )
+    if not identities:
+        raise StorageGovernanceError("failed CLI run has no failure evidence")
+    for identity in identities:
+        path = resolved_output.joinpath(
+            *PurePosixPath(str(identity["relative_path"])).parts
+        )
+        stat = path.stat()
+        if (
+            stat.st_size != identity["byte_size"]
+            or stat.st_mtime_ns != identity["modified_time_ns"]
+        ):
+            raise StorageGovernanceError("failed CLI artifact changed after hashing")
+    atomic_write_signed_json(
+        manifest_path,
+        {
+            "schema_version": "experiment-cli-failure-manifest-v1",
+            "run_label": run_label,
+            "status": "failed",
+            "evidence_completeness": "partial",
+            "artifact_trust": "untrusted_failure_capsule",
+            "artifacts": sorted(
+                identities,
+                key=lambda item: str(item["relative_path"]),
+            ),
+        },
+    )
+    return manifest_path
+
+
+def seal_failed_cli_attempt(
+    *,
+    config_path: Path,
+    output_dir: Path,
+    run_label: str,
+    error: BaseException,
+) -> bool:
+    """Persist a controlled failure inventory and advance RUNNING to SEALED."""
+
+    from evrptw.artifacts import atomic_write_signed_json
+    from evrptw.experiment_lifecycle import (
+        ExperimentCatalog,
+        ExperimentLifecycleController,
+        ExperimentPlan,
+        LifecycleState,
+        _load_signed_json,
+        release_lifecycle_writer,
+    )
+
+    resolved_config = config_path.resolve(strict=True)
+    locator = StorageRootLocator.from_toml(
+        resolved_config.parent / "stage052_storage_roots.local.toml"
+    )
+    archive_root = locator.resolve("e_archive").absolute_path
+    lifecycle = ExperimentLifecycleController(
+        catalog=ExperimentCatalog.from_toml(
+            resolved_config.parent / "experiment_catalog.toml"
+        ),
+        state_root=archive_root / ".experiment-lifecycle",
+        storage_state_root=archive_root / ".storage-governance",
+        capacity_state_root=(
+            locator.resolve("wsl_staging").absolute_path / ".storage-governance"
+        ),
+        archive_root=archive_root,
+    )
+    active = tuple(
+        record
+        for record in lifecycle.records()
+        if record.run_label == run_label and record.state == LifecycleState.RUNNING
+    )
+    if not active:
+        return False
+    if len(active) != 1:
+        raise StorageGovernanceError("CLI lifecycle run identity is ambiguous")
+    plan_payload = _load_signed_json(
+        lifecycle.state_root / "plans" / f"{run_label}.json"
+    )
+    raw_plan = plan_payload.get("plan")
+    if not isinstance(raw_plan, dict):
+        raise StorageGovernanceError("failed CLI lifecycle plan is invalid")
+    plan = ExperimentPlan.from_dict(raw_plan)
+    resolved_output = output_dir.resolve()
+    if (
+        plan.run_dir != resolved_output
+        or plan.plan_sha256 != active[0].plan_sha256
+        or resolved_output.name != run_label
+    ):
+        raise StorageGovernanceError("failed CLI output differs from lifecycle plan")
+    if resolved_output.exists() and not resolved_output.is_dir():
+        raise StorageGovernanceError("failed CLI output is not a directory")
+    resolved_output.mkdir(parents=True, exist_ok=True)
+    release_lifecycle_writer(
+        state_root=lifecycle.state_root,
+        run_label=run_label,
+    )
+    with _state_lock(lifecycle.state_root / "writer-locks" / f"{run_label}.lock"):
+        atomic_write_signed_json(
+            resolved_output / "failure_summary.json",
+            {
+                "schema_version": "experiment-cli-failure-summary-v1",
+                "run_label": run_label,
+                "status": "failed",
+                "failure_code": "runner_failure",
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+            },
+        )
+        manifest = build_cli_failure_manifest(
+            output_dir=resolved_output,
+            run_label=run_label,
+        )
+        lifecycle.seal(
+            run_label,
+            manifest_path=manifest,
+            failure_code="runner_failure",
+        )
+    return True
 
 
 def _persist_cli_plan_rejection(
@@ -1462,6 +2004,23 @@ def _persist_cli_plan_rejection(
         },
     )
     return observation_path
+
+
+def persist_cli_plan_rejection(
+    *,
+    config_path: Path,
+    output_dir: Path,
+    run_label: str,
+    reason: str,
+) -> Path:
+    """Public fail-fast writer for a signed pre-admission rejection."""
+
+    return _persist_cli_plan_rejection(
+        config_path=config_path,
+        output_dir=output_dir,
+        run_label=run_label,
+        reason=reason,
+    )
 
 
 def load_adjudication_record(
@@ -2586,6 +3145,20 @@ class ExperimentStorageGovernance:
             }
             permit_path = self.state_root / "permits" / f"{request.run_label}.json"
             identity_errors: list[str] = []
+            if request.archive_root_alias != "e_archive":
+                identity_errors.append(
+                    "new experiment archives must use e_archive; D roles are read-only"
+                )
+            unreconciled = sorted(
+                label
+                for label, reservation in reservations.items()
+                if label != request.run_label and reservation.get("status") == "reserved"
+            )
+            if unreconciled:
+                identity_errors.append(
+                    "previous top-level storage permits are not reconciled: "
+                    + ", ".join(unreconciled)
+                )
             if existing is not None:
                 if existing != request_identity and not _reservation_can_shrink(
                     existing,
@@ -2765,26 +3338,54 @@ class ExperimentStorageGovernance:
         ledger_path = self.state_root / "capacity_ledger.json"
         lock_path = self.state_root / "capacity_ledger.lock"
         receipt_path = self.state_root / "permit_reconciliations" / f"{run_label}.json"
+        permit_path = self.state_root / "permits" / f"{run_label}.json"
+        if not permit_path.is_file():
+            raise StorageGovernanceError("capacity permit receipt does not exist")
+        permit_sha256 = _file_sha256(permit_path)
         with _state_lock(lock_path):
             if not ledger_path.exists():
                 raise StorageGovernanceError("capacity ledger does not exist")
             reservations = _reservation_mapping(_load_signed_json(ledger_path))
             reservation = reservations.get(run_label)
-            if reservation is None or reservation.get("status") != "reserved":
+            if reservation is None:
+                raise StorageGovernanceError("capacity permit does not exist")
+            if reservation.get("status") == "reconciled":
+                if (
+                    reservation.get("outcome") != outcome
+                    or reservation.get("evidence_sha256") != evidence_sha256
+                    or reservation.get("storage_permit_sha256") != permit_sha256
+                ):
+                    raise StorageGovernanceError(
+                        "capacity permit reconciliation identity differs"
+                    )
+                _write_signed_json(
+                    receipt_path,
+                    {
+                        "schema_version": "experiment-capacity-reconciliation-v1",
+                        "run_label": run_label,
+                        "outcome": outcome,
+                        "evidence_sha256": evidence_sha256,
+                        "storage_permit_sha256": permit_sha256,
+                        "reconciled_at_utc": datetime.now(UTC).isoformat(),
+                    },
+                )
+                return receipt_path
+            if reservation.get("status") != "reserved":
                 raise StorageGovernanceError("capacity permit is not reserved")
             reconciled = dict(reservation)
             reconciled["status"] = "reconciled"
             reconciled["outcome"] = outcome
             reconciled["evidence_sha256"] = evidence_sha256
+            reconciled["storage_permit_sha256"] = permit_sha256
             reservations[run_label] = reconciled
             receipt = {
                 "schema_version": "experiment-capacity-reconciliation-v1",
                 "run_label": run_label,
                 "outcome": outcome,
                 "evidence_sha256": evidence_sha256,
+                "storage_permit_sha256": permit_sha256,
                 "reconciled_at_utc": datetime.now(UTC).isoformat(),
             }
-            _write_signed_json(receipt_path, receipt)
             _write_signed_json(
                 ledger_path,
                 {
@@ -2792,7 +3393,119 @@ class ExperimentStorageGovernance:
                     "reservations": dict(sorted(reservations.items())),
                 },
             )
+            _write_signed_json(receipt_path, receipt)
         return receipt_path
+
+    def write_lifecycle_retention_binding(
+        self,
+        receipt: RetentionReceipt,
+        *,
+        lifecycle_retention_class: str,
+        storage_permit_sha256: str,
+        close_performance: Mapping[str, object],
+    ) -> Path:
+        """Bind a verified v2 archive generation to lifecycle-v3 close input."""
+
+        if lifecycle_retention_class not in {
+            "published_full",
+            "current_accepted_full",
+        }:
+            raise StorageGovernanceError(
+                "only full accepted retention can use a lifecycle binding receipt"
+            )
+        if (
+            receipt.retention_class != RetentionClass.ACCEPTED_FULL
+            or _SHA256.fullmatch(storage_permit_sha256) is None
+            or not isinstance(close_performance, Mapping)
+        ):
+            raise StorageGovernanceError("lifecycle retention binding is invalid")
+        archive_root = self.locator.resolve("e_archive").absolute_path.resolve()
+        archive_path = receipt.archive_path.resolve()
+        if not archive_path.is_relative_to(archive_root) or archive_path == archive_root:
+            raise StorageGovernanceError("lifecycle archive is outside e_archive")
+        registry_path = self.retention_state_root / "retention_registry_v2.json"
+        if _file_sha256(registry_path) != receipt.registry_sha256:
+            raise StorageGovernanceError("lifecycle retention registry differs")
+        records = self._load_registry()
+        matching = [
+            record
+            for record in records
+            if record.get("run_label") == receipt.run_label
+            and record.get("generation") == receipt.generation
+        ]
+        if not matching:
+            raise StorageGovernanceError("lifecycle retention generation is absent")
+        relative_archive = archive_path.relative_to(archive_root).as_posix()
+        if any(
+            record.get("archive_root_alias") != "e_archive"
+            or record.get("archive_relative_path") != relative_archive
+            or record.get("tree_sha256") != receipt.tree_sha256
+            or record.get("file_count") != receipt.kept_file_count
+            or record.get("byte_count") != receipt.kept_bytes
+            or record.get("verification_status") != "verified"
+            for record in matching
+        ):
+            raise StorageGovernanceError("lifecycle retention generation differs")
+        replay_relatives = {
+            str(record.get("replay_receipt_relative_path", ""))
+            for record in matching
+        }
+        if len(replay_relatives) != 1 or not next(iter(replay_relatives)):
+            raise StorageGovernanceError("lifecycle retention replay is missing")
+        replay_relative = PurePosixPath(next(iter(replay_relatives)))
+        if replay_relative.is_absolute() or ".." in replay_relative.parts:
+            raise StorageGovernanceError("lifecycle retention replay path is unsafe")
+        replay_path = self.retention_state_root.joinpath(*replay_relative.parts)
+        replay = _load_signed_json(replay_path)
+        if (
+            _file_sha256(replay_path) != receipt.replay_receipt_sha256
+            or replay.get("status") != "passed"
+        ):
+            raise StorageGovernanceError("lifecycle retention replay differs")
+        permit_path = self.state_root / "permits" / f"{receipt.run_label}.json"
+        if (
+            not permit_path.is_file()
+            or _file_sha256(permit_path) != storage_permit_sha256
+        ):
+            raise StorageGovernanceError("lifecycle storage permit differs")
+        path = (
+            self.retention_state_root
+            / "lifecycle_retention_receipts"
+            / f"{receipt.run_label}.json"
+        )
+        _write_signed_json(
+            path,
+            {
+                "schema_version": "experiment-lifecycle-retention-binding-v1",
+                "run_label": receipt.run_label,
+                "generation": receipt.generation,
+                "retention_class": lifecycle_retention_class,
+                "storage_permit_sha256": storage_permit_sha256,
+                "verification_status": "verified",
+                "archive_root_alias": "e_archive",
+                "archive_relative_path": relative_archive,
+                "archive_tree_sha256": receipt.tree_sha256,
+                "file_count": receipt.kept_file_count,
+                "byte_count": receipt.kept_bytes,
+                "registry_sha256": receipt.registry_sha256,
+                "replay_receipt_relative_path": replay_relative.as_posix(),
+                "replay_receipt_sha256": receipt.replay_receipt_sha256,
+                "verifier_identity_sha256": replay.get(
+                    "verifier_identity_sha256"
+                ),
+                "validator_replay_passed": replay.get(
+                    "validator_replay_passed"
+                ),
+                "objective_replay_passed": replay.get(
+                    "objective_replay_passed"
+                ),
+                "raw_review_replay_passed": replay.get(
+                    "raw_review_replay_passed"
+                ),
+                "close_performance": dict(close_performance),
+            },
+        )
+        return path
 
     def _observe_archive_capacity(
         self,

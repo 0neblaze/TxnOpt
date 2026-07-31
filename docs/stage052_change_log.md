@@ -2615,3 +2615,73 @@ compatibility fallback（兼容回退）。
   456,645,410,816 bytes 压缩至 336,704,045,056 bytes。重启后 Ubuntu 正常，
   最终空闲空间为 D 1252.32 GiB、E 267.40 GiB、WSL ext4 约 644.24 GiB，全部超过
   storage stop gate。
+
+## 2026-07-31：全仓库 experiment lifecycle v3 落地
+
+- 新增 `evrptw.experiment_lifecycle` deep module（深模块）与统一
+  `experiment-lifecycle` CLI，强制顶层实验依次完成 PLANNED、PERMITTED、RUNNING、
+  SEALED、REVIEWED、CLASSIFIED、RETAINED/COMPACTED、CLOSED；未关闭或
+  `BLOCKED_RETENTION` 记录会在新 run directory 创建前阻塞下一实验。
+- `configs/experiment_catalog.toml` 登记现有 13 个 Stage 0--5.2 producer；CI 静态审计
+  runner 入口、共享 lifecycle preflight 和 v1/v2 migration ledger。新写治理事实只使用
+  v3；既有 v2 E registry 与 tracked v1 registry 保持只读兼容。
+- retention v3 的分类由 reviewer status、受控 failure code、完整 failure identity 和
+  签名 root-cause adjudication 决定。未知根因固定为 `unknown_full` 并阻塞；原位精简只
+  接受 controller 签名 keep/delete 计划和精确 SHA-256，并记录释放字节、最终 tree
+  SHA-256、哈希/扫描/删除遍历次数和 native I/O backend。
+- 容量合同更新为 E archive reserve 0、D host reserve 0、WSL safety 50 GiB、Stage 5.2
+  active floor 32 GiB。`e_archive` 是唯一新归档角色；`d_archive` 只读解析历史，`d_host`
+  只承担 VHDX host-capacity measurement（宿主容量测量）。
+- 后续双轴审查加固了事实边界：reviewer status 与 classification 只从签名 manifest 推导；
+  unknown failure 必须经签名 adjudication 才能解锁；full-retention receipt 必须与增量
+  content inventory 的 tree/file/byte identity 完全一致。新 current 的 close transaction
+  自动胶囊化旧 current，并保留可重入 supersession checkpoint。
+- permit reconciliation 改为 ledger-first、receipt-second 的可恢复提交；CLOSED receipt
+  先于最终 record 写入且必须逐字段匹配。运行时会再次绑定 source/config/environment 和
+  worker/thread/process 参数；Stage 3.4、Stage 4 与 Stage 5.2 的真实并发度已显式进入
+  immutable plan。CI 使用 AST call inspection，不再以字符串出现作为接入证明。
+- compaction 不再在 close 阶段重扫或重哈希 E 盘：只消费 producer 增量生成的签名
+  inventory，apply 单次遍历当前 run 并拒绝任何新增文件、symlink、缺失或 stat 漂移；
+  keep/delete ledger 仅追加，重复执行与 APPLYING 中断均可安全恢复。
+- 双轴审查后的 v3 加固将 lifecycle transition 改为 append-first event + per-run CAS，
+  producer 持有共享 writer lease，seal/compaction 取得互斥租约；compaction apply 会重新
+  校验每个文件的内容 SHA-256，因此同大小、同 mtime 篡改也会失败。旧 current 的原始
+  `CLOSED` record 不再重开，effective retention class 只写入追加式 supersession receipt。
+- retention 与 close 不再接受任意路径上的自报 JSON：它们分别绑定 E 盘 canonical
+  v3 retention receipt、实时 v2 registry/replay identity，以及 WSL capacity ledger 中的
+  原始 permit/reconciliation。独立 review 必须另有签名 `review_execution.json`，绑定
+  reviewer module、raw manifest 前后哈希和 review manifest。
+- migration ledger 中的 13 个历史 pending run 新增独立硬门。只读 historical reviewer
+  可以单遍生成逐文件 inventory 并复核 v2 tree/file/byte identity，但在没有 stage-specific
+  semantic disposition（阶段专用语义裁定）时固定输出 `INVALID`/`unknown_full`；因此当前
+  不会伪造 `historical-migration/gate.json`，Calibration Attempt09 仍被程序化阻塞。
+- 第三轮 fail-closed 加固把所有 catalog producer 的正常完成路径接到共享
+  `seal_cli_attempt`；CI 同时检查 preflight 与 seal 调用。Stage 5.2 calibration 通过已签名
+  child manifest 聚合 terminal inventory，不重新读取大型 raw 内容；benchmark 的最终
+  campaign manifest 升级为 v3，直接绑定 primary manifest、persistence attribution 和
+  全部增量 artifact identity，可作为 canonical sealed manifest。
+- lifecycle 对内部 state 继续强制 `.json.sha256` 双文件格式；producer/reviewer 外部证据
+  单独兼容项目既有 `.sha256` sidecar，并要求同时存在的 sidecar 都与同一 payload 一致。
+  compaction plan 改为按 SHA-256 寻址，supersession status 通过追加 receipt 投影 effective
+  retention class；full-retention close 会对真实 archive generation 做一次精确内容复验。
+- 第六轮可靠性加固把 terminal build、failure capsule、seal 与 close 放入同一 run 的排他
+  writer lease。producer 在首次 `mkdir` 前失败时，只能从已签名 lifecycle plan 创建精确
+  output directory；无 RUNNING record 的 pre-admission 错误不会被二次 seal 异常覆盖。
+  reviewer 完成后对 sealed raw 做一次内容校验，并在 execution receipt/state binding 写入后
+  再核对 metadata snapshot；current record 首次写入中断可从 append-first event 恢复。
+- historical semantic reviewer 已列入中央 catalog allowlist。benchmark 历史候选必须从
+  migration-ledger-bound v2 registry 解析 canonical protected keeper generation，重新验证
+  账本中 SHA-bound campaign/control/review/batch manifest closure 的签名零引用证明；调用
+  方 keeper 路径和手写 proof 均被拒绝。完整 semantic command、inventory、execution、
+  binding 与 aggregate gate 必须一致绑定 physical review 的 canonical `e_archive` root
+  和 generation identity，临时 mirror 不能替代。physical review 又必须通过仓库 local
+  storage-root locator 验证 live volume identity，并使用 signed migration ledger 唯一声明
+  的 v2 registry path/SHA；registry SHA 与 generation tree SHA 贯穿后续全部签名证据。
+  aggregate gate 逐项复核执行命令、module SHA-256、migration/inventory 前后 identity、
+  签名 semantic output 和 E state-root binding。`stage05.2_hot_path_attempt04` 未获根因证明，仍保持
+  `INVALID`/`unknown_full` 并阻塞真实历史 gate。
+- historical gate consumer 现在再次验证 live locator `e_archive`、migration-ledger v2
+  registry SHA，并交叉重放 gate/review/inventory/semantic execution/binding 的 root、
+  generation、registry、tree 与 module/command/hash identity；它还重放 semantic
+  status/retention class、failure identity/representative、no-dependency/rebuild proof 等
+  class-specific gates，手写 gate 或把 `unknown_full` 重标为安全类别均被拒绝。
