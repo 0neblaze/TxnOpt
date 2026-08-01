@@ -2612,6 +2612,12 @@ compatibility fallback（兼容回退）。
   configuration selection hash，并将 E alias 加入 planned-root migration coverage。未验证的
   alias drift、staging drift 和任何 scientific/resource 字段变化仍 fail fast；新测试要求
   无 retained-migration proof 时相同 D→E 差异必须被拒绝。
+- successor-revision 重放继续显示 Pilot97 之后的 Stage 0--8 lifecycle/storage-governance
+  接线路径尚未进入 G-governance allowlist。当前提交只追加精确的 lifecycle catalog/
+  policy/registry、storage governance deep module、各历史 runner 的共享 preflight 入口、
+  CI/tests 和签名迁移/删除工具；`objective.py`、ALNS 搜索、neighborhoods 与其他
+  scientific core 仍不在 allowlist。回归测试允许 `storage_governance.py` successor，
+  并继续明确拒绝 `objective.py` drift。
 
 ## 2026-07-31：Stage 0--8 storage governance v2 与 E 盘归档入口
 

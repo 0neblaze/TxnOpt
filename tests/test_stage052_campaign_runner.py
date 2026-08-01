@@ -1148,6 +1148,8 @@ def test_campaign_successor_revision_allows_only_g_governance_paths(
     allowed_config_test = repository / "tests" / "test_stage052_campaign.py"
     allowed_config_test.parent.mkdir(parents=True)
     allowed_config_test.write_text("v1\n", encoding="utf-8")
+    allowed_governance = repository / "src" / "evrptw" / "storage_governance.py"
+    allowed_governance.write_text("v1\n", encoding="utf-8")
     subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
     subprocess.run(
         ("git", "-C", str(repository), "commit", "-qm", "base"),
@@ -1161,6 +1163,7 @@ def test_campaign_successor_revision_allows_only_g_governance_paths(
     ).stdout.strip()
     allowed.write_text("v2\n", encoding="utf-8")
     allowed_config_test.write_text("v2\n", encoding="utf-8")
+    allowed_governance.write_text("v2\n", encoding="utf-8")
     subprocess.run(("git", "-C", str(repository), "commit", "-qam", "G fix"), check=True)
     successor = subprocess.run(
         ("git", "-C", str(repository), "rev-parse", "HEAD"),
@@ -1175,6 +1178,7 @@ def test_campaign_successor_revision_allows_only_g_governance_paths(
         current_revision=successor,
     ) == (
         "src/evrptw/stage052_campaign_runner.py",
+        "src/evrptw/storage_governance.py",
         "tests/test_stage052_campaign.py",
     )
 
