@@ -2618,6 +2618,15 @@ compatibility fallback（兼容回退）。
   CI/tests 和签名迁移/删除工具；`objective.py`、ALNS 搜索、neighborhoods 与其他
   scientific core 仍不在 allowlist。回归测试允许 `storage_governance.py` successor，
   并继续明确拒绝 `objective.py` drift。
+- `c31ee32` sealed producer 完整通过离线 pre-admission replay 后，Formal 仍在
+  output/permit/lifecycle 创建前被 lifecycle clean-tree gate 拒绝：v3 recalibration
+  report 及 sidecar 已由 source-snapshot allowlist 和签名 loader 明确要求，却未列入
+  `.gitignore`，因此同一 producer 一方面必须携带二者，另一方面又必然被
+  `git status --untracked-files=all` 判 dirty。修复只把这两个精确 local evidence path
+  加入 ignore；source snapshot 仍遍历并哈希其实际字节，formal loader 仍验证 sidecar
+  与 replacement contract binding，其他未登记文件继续 fail fast。回归测试用
+  `git check-ignore` 固定这两个路径的 lifecycle cleanliness 语义。本次失败没有
+  output、permit 或 lifecycle record，`rerun03` 标签仍未消费。
 
 ## 2026-07-31：Stage 0--8 storage governance v2 与 E 盘归档入口
 

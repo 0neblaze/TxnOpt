@@ -221,6 +221,26 @@ def test_source_snapshot_requires_clean_ext4_and_read_only_tree(
         verify_stage052_source_snapshot(source)
 
 
+@pytest.mark.parametrize(
+    "report_path",
+    (
+        "configs/stage052_resource_calibration.local.report.json",
+        "configs/stage052_resource_calibration.local.report.sha256",
+    ),
+)
+def test_formal_resource_recalibration_report_is_git_ignored(
+    report_path: str,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        ("git", "check-ignore", "--quiet", "--", report_path),
+        cwd=repository,
+        check=False,
+    )
+
+    assert result.returncode == 0
+
+
 def test_source_snapshot_contract_ignores_device_and_path_telemetry() -> None:
     frozen = {
         "repository_revision": "a" * 40,
