@@ -433,7 +433,10 @@ def _verify_performance_staging_root(
     locator = StorageRootLocator.from_toml(locator_path)
     staging = locator.resolve(staging_alias)
     del root
-    if staging_alias != "wsl_staging" or locator.aliases != ("d_archive", "wsl_staging"):
+    required_aliases = {"d_archive", "wsl_staging"}
+    if staging_alias != "wsl_staging" or not required_aliases.issubset(
+        locator.aliases
+    ):
         raise ValueError("Stage 5.2 performance storage aliases are not the WSL2 contract")
     if output_dir.resolve().parent != staging.absolute_path.resolve():
         raise ValueError("Stage 5.2 performance output is outside the staging root")

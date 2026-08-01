@@ -2592,6 +2592,12 @@ compatibility fallback（兼容回退）。
   campaign 创建后新增的治理 aliases 允许作为 locator superset。真实 Pilot97 重放验证
   原 raw/review SHA、execution lock、36 个 storage observations 和 339,561,305 observed
   bytes 全部保持不变，不创建 D: compatibility symlink，也不恢复已删除源数据。
+- Formal Rerun03 首次启动在 output/permit/lifecycle record 创建前又暴露同类遗留断言：
+  performance staging 预检仍要求 locator aliases 精确等于
+  `d_archive + wsl_staging`，而已验证的当前 locator 还必须包含 lifecycle 使用的
+  `d_host + e_archive`。修复改为必要 aliases 的 subset 验证，额外治理 aliases
+  仍由各自的下游 root/volume gate 独立验证；回归测试直接使用四 alias 生产形状。
+  该 pre-admission failure 没有 output、permit 或 lifecycle record，`rerun03` 标签未被消费。
 
 ## 2026-07-31：Stage 0--8 storage governance v2 与 E 盘归档入口
 

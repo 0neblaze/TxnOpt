@@ -904,6 +904,14 @@ filesystem = "ext4"
 absolute_path = "{tmp_path / "archive"}"
 device_uuid = "d-nvme"
 filesystem = "9p"
+[roots.d_host]
+absolute_path = "{tmp_path / "host"}"
+device_uuid = "d-nvme"
+filesystem = "9p"
+[roots.e_archive]
+absolute_path = "{tmp_path / "e-archive"}"
+device_uuid = "e-usb"
+filesystem = "9p"
 """.strip()
         + "\n",
         encoding="utf-8",
