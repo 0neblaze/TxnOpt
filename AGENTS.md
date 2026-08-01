@@ -799,8 +799,12 @@ this repository or one of its subdirectories.
   Dynamic stop gates require E free bytes of planned archive plus 0 GiB, D
   free bytes of projected WSL growth plus 0 GiB, and WSL free bytes of active
   workspace plus 50 GiB. A locked permit ledger prevents concurrent
-  over-reservation; permits do not expire without audit. Reviewer-local reserve
-  constants or lower thresholds are forbidden contract drift.
+  over-reservation; permits do not expire without audit. The first successful
+  preflight creates the immutable lifecycle-bound start permit. Rolling-capacity
+  checks may append observations and monotonically shrink the ledger reservation,
+  but they must never rewrite that permit file or change its SHA-256; close and
+  reconciliation continue to bind the original permit identity. Reviewer-local
+  reserve constants or lower thresholds are forbidden contract drift.
 - Rebuildable cache, venv, build, or temporary spool cleanup is allowed only
   from an exact allowlist after an independent keeper-reference scan. Every
   execution must match a signed dry-run identity. Venv/build cleanup also
@@ -1165,6 +1169,9 @@ The executable workflow and gate table are maintained in
   E archive 0, D host 0, WSL staging safety 50 GiB, and Stage 5.2 active
   workspace floor 32 GiB. `e_archive` is the only new long-term archive target;
   `d_archive` is legacy-read-only and `d_host` measures host capacity only.
+  The start permit is immutable after `PERMITTED`; later rolling-capacity
+  observations update only the monotonic reservation projection and cannot
+  replace the lifecycle-bound permit receipt.
 - Retention v3 is rule-engine-only. Reviewer status, controlled failure code,
   exact failure identity, and signed adjudication determine the retention
   class. Unknown root cause or reference becomes `unknown_full` and

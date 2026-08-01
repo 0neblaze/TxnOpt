@@ -3309,6 +3309,29 @@ class ExperimentStorageGovernance:
                     identity_errors.append(
                         f"capacity reservation conflicts for {request.run_label}"
                     )
+                if not permit_path.is_file():
+                    identity_errors.append(
+                        "existing capacity reservation has no immutable start permit"
+                    )
+                else:
+                    try:
+                        existing_permit = _load_signed_json(permit_path)
+                    except StorageGovernanceError as error:
+                        identity_errors.append(
+                            f"existing start permit verification failed: {error}"
+                        )
+                    else:
+                        if (
+                            existing_permit.get("schema_version")
+                            != POLICY_SCHEMA_VERSION
+                            or existing_permit.get("run_label") != request.run_label
+                            or existing_permit.get("stage_plan_sha256")
+                            != request.stage_plan_sha256
+                            or existing_permit.get("status") != "reserved"
+                        ):
+                            identity_errors.append(
+                                "existing immutable start permit identity differs"
+                            )
             elif request.run_dir.exists():
                 identity_errors.append(
                     f"governed run path already exists without a permit: {request.run_dir}"
@@ -3436,20 +3459,21 @@ class ExperimentStorageGovernance:
                 "reservations": dict(sorted(reservations.items())),
             }
             _write_signed_json(ledger_path, ledger_payload)
-            permit_payload = {
-                "schema_version": POLICY_SCHEMA_VERSION,
-                "run_label": request.run_label,
-                "stage_plan_sha256": request.stage_plan_sha256,
-                "observation_sha256": observation_sha256,
-                "maintenance_audit_sha256": (
-                    maintenance_audit.receipt_sha256
-                ),
-                "maintenance_audit_path": str(
-                    maintenance_audit.receipt_path
-                ),
-                "status": "reserved",
-            }
-            _write_signed_json(permit_path, permit_payload)
+            if existing is None:
+                permit_payload = {
+                    "schema_version": POLICY_SCHEMA_VERSION,
+                    "run_label": request.run_label,
+                    "stage_plan_sha256": request.stage_plan_sha256,
+                    "observation_sha256": observation_sha256,
+                    "maintenance_audit_sha256": (
+                        maintenance_audit.receipt_sha256
+                    ),
+                    "maintenance_audit_path": str(
+                        maintenance_audit.receipt_path
+                    ),
+                    "status": "reserved",
+                }
+                _write_signed_json(permit_path, permit_payload)
             return StartPermit(
                 run_label=request.run_label,
                 stage_plan_sha256=request.stage_plan_sha256,

@@ -290,7 +290,11 @@ hard caps。`preflight_run` 对 E/D/WSL 重新探测同一套 volume identity（
 `projected_WSL_growth + 0 GiB`，WSL ext4 至少保留
 `active_workspace + 50 GiB`；Stage 5.2 的 active workspace 不得小于 32 GiB。缺失计划、
 身份漂移、空间不足或未核销 permit（许可）均在写入前 fail fast，并持久化完整 capacity
-observation（容量观测）。
+observation（容量观测）。首次通过 preflight 时生成的 start permit 是 lifecycle 绑定的
+immutable identity（不可变身份）；后续 rolling-capacity check（滚动容量检查）可以追加
+新的 observation 并单调缩小 ledger reservation，但不得覆写 permit 文件或改变其
+SHA-256。最终 reconciliation 与 lifecycle close 始终绑定首次 permit，避免滚动观测把
+已签名 `PERMITTED` 状态变成不可关闭的漂移状态。
 
 ## Rebuildable asset maintenance
 

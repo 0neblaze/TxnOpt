@@ -375,7 +375,13 @@ def test_preflight_allows_only_monotonic_remaining_archive_projection(
         stage_plan_sha256="7" * 64,
     )
 
-    governance.preflight_run(request)
+    initial_permit = governance.preflight_run(request)
+    initial_permit_sha256 = hashlib.sha256(
+        initial_permit.permit_path.read_bytes()
+    ).hexdigest()
+    initial_permit_payload = json.loads(
+        initial_permit.permit_path.read_text(encoding="utf-8")
+    )
     final_permit = governance.preflight_run(
         replace(request, planned_archive_bytes=0)
     )
@@ -383,6 +389,26 @@ def test_preflight_allows_only_monotonic_remaining_archive_projection(
         final_permit.observation_path.read_text(encoding="utf-8")
     )
     assert final_observation["required_bytes_by_alias"]["e_archive"] == 0
+    assert final_permit.permit_path == initial_permit.permit_path
+    assert (
+        hashlib.sha256(final_permit.permit_path.read_bytes()).hexdigest()
+        == initial_permit_sha256
+    )
+    assert (
+        json.loads(final_permit.permit_path.read_text(encoding="utf-8"))
+        == initial_permit_payload
+    )
+    ledger = json.loads(
+        (tmp_path / "state" / "capacity_ledger.json").read_text(encoding="utf-8")
+    )
+    assert ledger["reservations"][request.run_label]["planned_archive_bytes"] == 0
+    reconciliation = governance.reconcile_permit(
+        request.run_label,
+        outcome="retained",
+        evidence_sha256="8" * 64,
+    )
+    reconciliation_payload = json.loads(reconciliation.read_text(encoding="utf-8"))
+    assert reconciliation_payload["storage_permit_sha256"] == initial_permit_sha256
     with pytest.raises(StorageCapacityError, match="conflicts"):
         governance.preflight_run(
             replace(request, planned_archive_bytes=1 * GIB)

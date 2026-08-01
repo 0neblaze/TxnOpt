@@ -2881,3 +2881,16 @@ compatibility fallback（兼容回退）。
   completeness 与 exact path prefix，并从 worker/formal root 重算每个 artifact 的 byte/
   SHA-256。新回归测试复现真实 Formal directory shape；Attempt20 不重封或重标，修复必须
   以新提交和新 calibration label 重跑。
+- `stage05.2_benchmark_rerun03` 通过全部 admission/capacity gates 后，由可见 Windows
+  Scheduled Task console 被人工关闭而收到 `0xC000013A`；systemd 同时记录外部 stop，
+  producer 无算法、容量、内存或 swap failure。该 label 按 partial failure inventory
+  封存，独立 reviewer 复核 2,639 个 artifacts（281,046,376 bytes）且 raw manifest
+  前后 SHA-256 不变，再以签名 adjudication 归类为唯一 external-control interruption；
+  同 label、partial shard 均禁止复用。
+- 本次中断同时暴露 rolling-capacity preflight 会覆写最初 lifecycle-bound permit 的根因：
+  `PERMITTED` record 保存首次 permit SHA-256，而 batch pre-dispatch 又以同一 run label
+  写入新 observation 和 permit，导致最终 reconciliation/close 必然漂移。修复后首次
+  permit 文件不可变；滚动检查只追加 observation 并单调缩小 ledger reservation。
+  回归测试验证连续 preflight 后 permit bytes/SHA-256 不变、最新 E reserve 生效、ledger
+  收缩且 reconciliation 仍绑定首次 permit。后续 Formal 必须用新 commit、新 sealed
+  runtime 和新 label，并通过隐藏且与可见 console 解耦的启动控制面从零运行。
