@@ -718,6 +718,11 @@ def test_execution_lock_freezes_accepted_g01_storage_root_alias_set() -> None:
         staging_root_alias="transfer_staging",
         planned_archive_root_aliases=("internal_archive",),
     )
+    lock.verify_planned_storage_roots(
+        staging_root_alias="transfer_staging",
+        planned_archive_root_aliases=("e_archive",),
+        migrated_archive_root_aliases=("e_archive",),
+    )
 
 
 @pytest.mark.parametrize(
@@ -876,6 +881,40 @@ def test_execution_lock_rejects_current_runtime_or_worker_drift() -> None:
             input_provenance=metadata["performance_provenance"],
             native_kernel_config=metadata["native_kernel_config"],
         )
+
+
+def test_execution_lock_accepts_only_verified_archive_configuration_relocation() -> None:
+    metadata, review, raw_manifest_sha = _accepted_f02_payloads()
+    lock = BenchmarkExecutionLock.from_accepted_evidence(
+        metadata=metadata,
+        review_manifest=review,
+        raw_manifest_sha256=raw_manifest_sha,
+        expected_scope="performance",
+        expected_status="READY_FOR_STAGE052_BENCHMARK",
+    )
+    current_selection = "f" * 64
+    arguments = {
+        "selected_backend": lock.selected_backend,
+        "selected_exact_backend": lock.selected_exact_backend,
+        "selected_workers": lock.selected_workers,
+        "repository_revision": lock.repository_revision,
+        "configuration_sha256": current_selection,
+        "configuration_selection_sha256": current_selection,
+        "predecessor_configuration_selection_sha256": (
+            lock.configuration_selection_sha256
+        ),
+        "runtime_identity": metadata["runtime_identity"],
+        "input_provenance": metadata["performance_provenance"],
+        "native_kernel_config": metadata["native_kernel_config"],
+    }
+
+    with pytest.raises(RuntimeError, match="configuration"):
+        lock.verify_current_execution(**arguments)
+
+    lock.verify_current_execution(
+        **arguments,
+        migrated_archive_roots_verified=True,
+    )
 
 
 def test_execution_lock_ignores_only_same_revision_runtime_telemetry_and_paths() -> None:
@@ -1313,6 +1352,24 @@ parquet_queue_depth = 2
     assert campaign_configuration_selection_sha256(changed_science) != (
         campaign_configuration_selection_sha256(calibrated)
     )
+
+    pilot_archive = b"""
+[campaign]
+storage_root_locator = "roots.toml"
+staging_root_alias = "wsl_staging"
+archive_root_aliases = ["d_archive"]
+
+[retention]
+archive_root_alias = "d_archive"
+"""
+    migrated_archive = pilot_archive.replace(b"d_archive", b"e_archive")
+    assert campaign_configuration_selection_sha256(migrated_archive) != (
+        campaign_configuration_selection_sha256(pilot_archive)
+    )
+    assert campaign_configuration_selection_sha256(
+        migrated_archive,
+        archive_root_aliases_override=("d_archive",),
+    ) == campaign_configuration_selection_sha256(pilot_archive)
 
 
 def test_campaign_runtime_selection_hash_normalizes_attested_archive_disk() -> None:

@@ -217,7 +217,11 @@ def campaign_runtime_selection_sha256(
     return _canonical_sha256(selection)
 
 
-def campaign_configuration_selection_sha256(content: bytes) -> str:
+def campaign_configuration_selection_sha256(
+    content: bytes,
+    *,
+    archive_root_aliases_override: tuple[str, ...] | None = None,
+) -> str:
     """Hash scientific inputs while resource tuning remains separately signed."""
 
     try:
@@ -227,6 +231,17 @@ def campaign_configuration_selection_sha256(content: bytes) -> str:
     campaign = payload.get("campaign")
     if isinstance(campaign, dict):
         campaign.pop("resource_calibration_contract", None)
+        if archive_root_aliases_override is not None:
+            if (
+                len(archive_root_aliases_override) != 1
+                or not archive_root_aliases_override[0]
+            ):
+                raise RuntimeError("archive root alias override must contain one alias")
+            campaign["archive_root_aliases"] = list(archive_root_aliases_override)
+            retention = payload.get("retention")
+            if not isinstance(retention, dict):
+                raise RuntimeError("benchmark retention configuration is missing")
+            retention["archive_root_alias"] = archive_root_aliases_override[0]
     artifacts = payload.get("artifact_storage_v2")
     if isinstance(artifacts, dict):
         artifacts.pop("parquet_row_group_size", None)
@@ -1139,6 +1154,7 @@ class BenchmarkExecutionLock:
         *,
         staging_root_alias: str,
         planned_archive_root_aliases: tuple[str, ...],
+        migrated_archive_root_aliases: tuple[str, ...] = (),
     ) -> None:
         """Reject Formal storage-root drift before any batch is dispatched."""
 
@@ -1160,11 +1176,17 @@ class BenchmarkExecutionLock:
             or staging_root_alias in planned_archive_root_aliases
         ):
             raise RuntimeError("Formal planned archive root alias set is invalid")
-        if not set(planned_archive_root_aliases).issubset(
-            self.archive_root_aliases_exercised
+        migration_coverage = set(migrated_archive_root_aliases)
+        if (
+            any(not isinstance(alias, str) or not alias for alias in migration_coverage)
+            or staging_root_alias in migration_coverage
         ):
+            raise RuntimeError("Formal migrated archive root alias set is invalid")
+        covered_aliases = set(self.archive_root_aliases_exercised) | migration_coverage
+        if not set(planned_archive_root_aliases).issubset(covered_aliases):
             raise RuntimeError(
-                "Formal planned archive root aliases exceed accepted G01 drill coverage"
+                "Formal planned archive root aliases exceed accepted G01 drill "
+                "coverage or verified migration coverage"
             )
 
     def verify_current_execution(
@@ -1176,6 +1198,8 @@ class BenchmarkExecutionLock:
         repository_revision: str,
         configuration_sha256: str,
         configuration_selection_sha256: str | None = None,
+        predecessor_configuration_selection_sha256: str | None = None,
+        migrated_archive_roots_verified: bool = False,
         runtime_identity: object,
         input_provenance: object,
         native_kernel_config: object,
@@ -1211,7 +1235,15 @@ class BenchmarkExecutionLock:
             if configuration_selection_sha256 is None
             else configuration_selection_sha256
         )
-        if observed_configuration_selection != self.configuration_selection_sha256:
+        configuration_matches = (
+            observed_configuration_selection == self.configuration_selection_sha256
+            or (
+                migrated_archive_roots_verified
+                and predecessor_configuration_selection_sha256
+                == self.configuration_selection_sha256
+            )
+        )
+        if not configuration_matches:
             raise RuntimeError("benchmark configuration differs from accepted selection")
         current_runtime = _mapping(runtime_identity, "runtime identity")
         if repository_revision == self.repository_revision:

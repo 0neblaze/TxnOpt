@@ -2605,6 +2605,13 @@ compatibility fallback（兼容回退）。
   effective-lock 现在仅对 `cgroup_v2` v3 recalibration 接受该已签名 topology replacement；
   历史 process-tree v2 仍要求 topology 不变，workers、memory floors、20% headroom、
   replacement contract SHA 和 zero geometry 所有门禁保持。回归测试使用 Attempt21 的真实拓扑差异。
+- Formal 随后进入 configuration selection gate，只发现 Pilot97 的 `d_archive`
+  与当前 storage-governance-v2 的 `e_archive` 两处物理存储别名差异，其余 TOML 字节一致。
+  consumer 现在必须用 `is_retained_path_from_locator` 重新验证 prerequisite 确实位于
+  当前 E retention root，才可仅将 archive alias 规范化回 predecessor 值复核旧
+  configuration selection hash，并将 E alias 加入 planned-root migration coverage。未验证的
+  alias drift、staging drift 和任何 scientific/resource 字段变化仍 fail fast；新测试要求
+  无 retained-migration proof 时相同 D→E 差异必须被拒绝。
 
 ## 2026-07-31：Stage 0--8 storage governance v2 与 E 盘归档入口
 

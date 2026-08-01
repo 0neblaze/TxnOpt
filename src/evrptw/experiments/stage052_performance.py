@@ -160,6 +160,7 @@ from evrptw.storage_governance import (
     ExperimentStorageGovernance,
     GovernancePolicy,
     StartRequest,
+    is_retained_path_from_locator,
     load_capacity_observation,
     persist_cli_plan_rejection,
     preflight_cli_attempt,
@@ -1193,6 +1194,32 @@ def _run_benchmark_campaign_impl(
         if scope == "formal" and recalibration_report.is_file()
         else None
     )
+    locator_path = _resolve(root, config.storage_root_locator)
+    locator = StorageRootLocator.from_toml(locator_path)
+    retention_root_alias = config.archive_root_aliases[0]
+    retention_root = locator.resolve(retention_root_alias).absolute_path.resolve()
+    migrated_archive_root_aliases: tuple[str, ...] = ()
+    if scope == "formal" and prerequisite_dir.resolve().is_relative_to(retention_root):
+        retained_prerequisite = prerequisite_dir
+        if (
+            prerequisite_dir.name == "wsl_active"
+            and re.fullmatch(r"generation-[0-9]{4}", prerequisite_dir.parent.name)
+            is not None
+        ):
+            retained_prerequisite = prerequisite_dir.parent
+        if not is_retained_path_from_locator(
+            retained_prerequisite,
+            policy_path=config_path.parent / "experiment_storage_governance.toml",
+            storage_root_locator_path=locator_path,
+            legacy_registry_path=root / _RETENTION_REGISTRY,
+            volume_probe=probe_volume_identity,
+            staging_root_alias=config.staging_root_alias,
+            retention_root_alias=retention_root_alias,
+        ):
+            raise RuntimeError(
+                "Formal prerequisite archive relocation is not independently retained"
+            )
+        migrated_archive_root_aliases = config.archive_root_aliases
     storage = replace(
         storage,
         parquet_row_group_size=producer_resource_contract.row_group_size,
@@ -1228,6 +1255,7 @@ def _run_benchmark_campaign_impl(
         batch_size=config.batch_size,
         runtime_environment=environment,
     )
+    configuration_bytes = config_path.read_bytes()
     selection_lock.verify_current_execution(
         selected_backend=selection_lock.selected_backend,
         selected_exact_backend="cpu_batch",
@@ -1235,8 +1263,19 @@ def _run_benchmark_campaign_impl(
         repository_revision=revision,
         configuration_sha256=_sha256(config_path),
         configuration_selection_sha256=campaign_configuration_selection_sha256(
-            config_path.read_bytes()
+            configuration_bytes
         ),
+        predecessor_configuration_selection_sha256=(
+            campaign_configuration_selection_sha256(
+                configuration_bytes,
+                archive_root_aliases_override=(
+                    selection_lock.archive_root_aliases_exercised
+                ),
+            )
+            if migrated_archive_root_aliases
+            else None
+        ),
+        migrated_archive_roots_verified=bool(migrated_archive_root_aliases),
         runtime_identity=runtime_identity,
         input_provenance=performance_provenance,
         native_kernel_config=config.native_kernels.to_dict(),
@@ -1250,8 +1289,6 @@ def _run_benchmark_campaign_impl(
             "accepted F02 selected CUDA, but no Stage 5.2 campaign CUDA execution "
             "adapter is registered; native CPU fallback is forbidden"
         )
-    locator_path = _resolve(root, config.storage_root_locator)
-    locator = StorageRootLocator.from_toml(locator_path)
     verify_campaign_root_locations(repository_root=root, locator=locator)
     for alias in (config.staging_root_alias, *config.archive_root_aliases):
         storage_path = locator.resolve(alias).absolute_path
@@ -1443,6 +1480,7 @@ def _run_benchmark_campaign_impl(
             planned_archive_root_aliases=tuple(
                 dict.fromkeys(assignment.root_alias for assignment in capacity.assignments)
             ),
+            migrated_archive_root_aliases=migrated_archive_root_aliases,
         )
     snapshot_source = WindowsWslMachineSnapshotSource()
     snapshot_source.refresh_native_status()
