@@ -139,6 +139,7 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
         "src/evrptw/storage_governance.py",
         "tests/test_artifacts.py",
         "tests/test_experiment_lifecycle.py",
+        "tests/test_publication_metadata.py",
         "tests/test_stage052.py",
         "tests/test_stage052_calibration.py",
         "tests/test_stage052_campaign_review.py",
