@@ -271,6 +271,16 @@ review/gate 一致，failure identity/canonical representative、no-dependency p
 rebuild proof 必须按类别成立。因此手写 gate bundle 或把 `unknown_full` 重标成安全类别
 都不能作为 Stage 5.2 prerequisite。
 
+历史 generation 的物理精简使用独立 controller transaction。prepare 只能消费 `complete`
+aggregate gate 中唯一匹配的记录、canonical `e_archive` generation、签名 inventory 与
+review，并重算 historical pretty-canonical tree digest；它只写签名 `PREPARED` plan，不创建
+lifecycle run record，也不删除文件。apply 必须提交 canonical plan path 与精确 plan
+SHA-256，重新重放全部 gate binding，拒绝 active writer、额外文件、symlink、stat 或内容
+漂移，然后导入单一 `CLASSIFIED` 历史记录并复用通用 compaction engine。只有
+`superseded_metadata` 和 `superseded_accepted_capsule` 可进入该路径；成功事务必须留下
+import、APPLYING/COMMITTED、deleted-file ledger、completion 和 close receipts，并以
+`CLOSED` 结束。v2 registry 保持不可变历史输入，v3 append-only receipts 记录有效精简投影。
+
 ## Stage 0--8 capacity stop gate
 
 每个新 attempt/rerun 在创建 run directory（运行目录）或启动 worker 前必须提交可重放

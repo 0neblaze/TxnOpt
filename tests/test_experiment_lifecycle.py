@@ -2739,5 +2739,191 @@ def test_compaction_apply_deletes_only_controller_plan(tmp_path: Path) -> None:
     assert closed.state == LifecycleState.CLOSED
 
 
+def test_historical_compaction_requires_gate_plan_and_closes_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = (tmp_path / "archive").resolve()
+    state_root = archive / ".experiment-lifecycle"
+    controller = ExperimentLifecycleController(
+        catalog=_catalog(),
+        state_root=state_root,
+        storage_state_root=archive / ".storage-governance",
+        capacity_state_root=tmp_path / "capacity",
+        archive_root=archive,
+    )
+    label = "stage05.2_benchmark_attempt48"
+    generation_relative = (
+        f"stage05.2/runs/{label}/generation-0001"
+    )
+    generation = archive / generation_relative
+    manifest = generation / "control" / "manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text('{"status":"partial"}\n', encoding="utf-8")
+    raw = generation / "instance" / "events.parquet"
+    raw.parent.mkdir()
+    raw.write_bytes(b"superseded-raw-events")
+    identities = tuple(
+        sorted(
+            (
+                lifecycle_module.FileIdentity(
+                    path.relative_to(generation).as_posix(),
+                    path.stat().st_size,
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                    path.stat().st_mtime_ns,
+                )
+                for path in (manifest, raw)
+            ),
+            key=lambda item: item.relative_path,
+        )
+    )
+    gate_root = state_root / "historical-migration"
+    evidence = gate_root / "evidence" / label
+    inventory_path = evidence / "content_inventory.json"
+    tree_digest = hashlib.sha256()
+    for item in identities:
+        tree_digest.update(
+            (
+                json.dumps(
+                    {
+                        "relative_path": item.relative_path,
+                        "byte_count": item.byte_count,
+                        "sha256": item.sha256,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+    tree_sha256 = tree_digest.hexdigest()
+    legacy_registry_sha256 = "1" * 64
+    _write_signed_json(
+        inventory_path,
+        {
+            "schema_version": "experiment-content-inventory-v1",
+            "run_label": label,
+            "archive_root_alias": "e_archive",
+            "archive_root_resolved_path": str(archive),
+            "archive_generation_relative_path": generation_relative,
+            "legacy_registry_sha256": legacy_registry_sha256,
+            "legacy_tree_sha256": tree_sha256,
+            "tree_sha256": tree_sha256,
+            "scan_passes": 1,
+            "hash_backend": "python_thread_pool",
+            "hash_workers": 2,
+            "file_count": len(identities),
+            "byte_count": sum(item.byte_count for item in identities),
+            "files": [item.to_dict() for item in identities],
+        },
+    )
+    review_path = evidence / "review_manifest.json"
+    _write_signed_json(
+        review_path,
+        {
+            "run_label": label,
+            "status": "PARTIAL",
+            "retention_class": "superseded_metadata",
+            "content_inventory_sha256": hashlib.sha256(
+                inventory_path.read_bytes()
+            ).hexdigest(),
+            "failure_identity": {},
+        },
+    )
+    gate_record = {
+        "run_label": label,
+        "review_status": "PARTIAL",
+        "retention_class": "superseded_metadata",
+        "review_manifest_relative_path": review_path.relative_to(
+            gate_root
+        ).as_posix(),
+        "review_manifest_sha256": hashlib.sha256(review_path.read_bytes()).hexdigest(),
+        "content_inventory_relative_path": inventory_path.relative_to(
+            gate_root
+        ).as_posix(),
+        "content_inventory_sha256": hashlib.sha256(
+            inventory_path.read_bytes()
+        ).hexdigest(),
+        "archive_root_alias": "e_archive",
+        "archive_root_resolved_path": str(archive),
+        "archive_generation_relative_path": generation_relative,
+        "legacy_registry_sha256": legacy_registry_sha256,
+        "legacy_tree_sha256": tree_sha256,
+    }
+    gate = {
+        "schema_version": "experiment-lifecycle-historical-gate-v1",
+        "migration_ledger_sha256": "2" * 64,
+        "status": "complete",
+        "records": [gate_record],
+    }
+    gate_path = gate_root / "gate.json"
+    _write_signed_json(gate_path, gate)
+    migration_ledger = tmp_path / "migration.json"
+    _write_signed_json(migration_ledger, {"status": "test"})
+    monkeypatch.setattr(
+        lifecycle_module,
+        "load_historical_migration_gate",
+        lambda *_args, **_kwargs: gate,
+    )
+
+    compaction, plan_path, prepared_path = (
+        controller.prepare_historical_compaction(
+            label,
+            repository=tmp_path,
+            migration_ledger_path=migration_ledger,
+            historical_gate_path=gate_path,
+        )
+    )
+
+    assert not controller._record_path(label).exists()
+    assert plan_path.is_file()
+    assert prepared_path.is_file()
+    assert {item.relative_path for item in compaction.keep} == {
+        "control/manifest.json"
+    }
+    assert {item.relative_path for item in compaction.delete} == {
+        "instance/events.parquet"
+    }
+    with pytest.raises(LifecycleError, match="active writer"):
+        controller.apply_historical_compaction(
+            label,
+            repository=tmp_path,
+            migration_ledger_path=migration_ledger,
+            historical_gate_path=gate_path,
+            plan_path=plan_path,
+            expected_plan_sha256=compaction.plan_sha256,
+            writer_is_active=lambda _path: True,
+        )
+    assert raw.is_file()
+    assert controller._load(label).state == LifecycleState.CLASSIFIED
+
+    receipt = controller.apply_historical_compaction(
+        label,
+        repository=tmp_path,
+        migration_ledger_path=migration_ledger,
+        historical_gate_path=gate_path,
+        plan_path=plan_path,
+        expected_plan_sha256=compaction.plan_sha256,
+        writer_is_active=lambda _path: False,
+    )
+
+    assert receipt["status"] == "COMMITTED"
+    assert receipt["released_bytes"] == len(b"superseded-raw-events")
+    assert not raw.exists()
+    assert manifest.is_file()
+    assert controller._load(label).state == LifecycleState.CLOSED
+    assert controller.audit()["passed"] is True
+    assert lifecycle_module._load_signed_json(prepared_path)["state"] == "COMMITTED"
+    assert controller.apply_historical_compaction(
+        label,
+        repository=tmp_path,
+        migration_ledger_path=migration_ledger,
+        historical_gate_path=gate_path,
+        plan_path=plan_path,
+        expected_plan_sha256=compaction.plan_sha256,
+        writer_is_active=lambda _path: False,
+    ) == receipt
+
+
 def test_ci_audit_accepts_the_catalogued_runner_surface() -> None:
     audit_runner_entrypoints(ROOT, _catalog())

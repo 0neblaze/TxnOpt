@@ -36,6 +36,9 @@ CATALOG_SCHEMA_VERSION: Final = "experiment-catalog-v1"
 COMPACTION_SCHEMA_VERSION: Final = "experiment-compaction-v1"
 MIGRATION_SCHEMA_VERSION: Final = "experiment-lifecycle-migration-v3"
 HISTORICAL_GATE_SCHEMA_VERSION: Final = "experiment-lifecycle-historical-gate-v1"
+HISTORICAL_COMPACTION_SCHEMA_VERSION: Final = (
+    "experiment-historical-compaction-transaction-v1"
+)
 _SHA256: Final = re.compile(r"[0-9a-f]{64}")
 _RUN_LABEL: Final = re.compile(
     r"stage0[0-8](?:\.[0-9]+)?_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}"
@@ -1957,6 +1960,181 @@ def _failure_shard_prefix(location: str) -> PurePosixPath | None:
     return PurePosixPath(*path.parts[:length])
 
 
+def _historical_compaction_inputs(
+    *,
+    repository: Path,
+    migration_ledger_path: Path,
+    historical_gate_path: Path,
+    archive_root: Path,
+    run_label: str,
+) -> tuple[CompactionPlan, dict[str, object], Path, Path]:
+    """Rebuild one historical compaction plan from the signed migration gate."""
+
+    gate = load_historical_migration_gate(
+        historical_gate_path,
+        migration_ledger_path=migration_ledger_path,
+        repository=repository,
+    )
+    raw_records = gate.get("records")
+    if not isinstance(raw_records, list):
+        raise LifecycleError("historical migration gate records are invalid")
+    matches = [
+        cast(dict[str, object], item)
+        for item in raw_records
+        if isinstance(item, dict) and item.get("run_label") == run_label
+    ]
+    if len(matches) != 1:
+        raise LifecycleError("historical compaction run is not uniquely gated")
+    gate_record = matches[0]
+    try:
+        retention_class = RetentionClassV3(str(gate_record["retention_class"]))
+    except (KeyError, ValueError) as error:
+        raise LifecycleError("historical compaction retention class is invalid") from error
+    if retention_class not in {
+        RetentionClassV3.SUPERSEDED_METADATA,
+        RetentionClassV3.SUPERSEDED_ACCEPTED_CAPSULE,
+    }:
+        raise LifecycleError("historical compaction class does not permit reduction")
+    resolved_archive = archive_root.resolve()
+    if (
+        gate_record.get("archive_root_alias") != "e_archive"
+        or Path(str(gate_record.get("archive_root_resolved_path", ""))).resolve()
+        != resolved_archive
+    ):
+        raise LifecycleError("historical compaction archive root differs")
+    generation_relative = PurePosixPath(
+        str(gate_record.get("archive_generation_relative_path", ""))
+    )
+    if (
+        generation_relative.is_absolute()
+        or ".." in generation_relative.parts
+        or run_label not in generation_relative.parts
+        or re.fullmatch(r"generation-[0-9]{4}", generation_relative.name) is None
+    ):
+        raise LifecycleError("historical compaction generation path is invalid")
+    source_root = resolved_archive.joinpath(*generation_relative.parts).resolve()
+    if (
+        not source_root.is_dir()
+        or source_root.is_symlink()
+        or not source_root.is_relative_to(resolved_archive)
+    ):
+        raise LifecycleError("historical compaction source generation is invalid")
+    evidence_root = historical_gate_path.resolve(strict=True).parent
+
+    def evidence_path(field: str) -> Path:
+        relative = PurePosixPath(str(gate_record.get(field, "")))
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            raise LifecycleError("historical compaction evidence path is unsafe")
+        path = evidence_root.joinpath(*relative.parts).resolve(strict=True)
+        if not path.is_relative_to(evidence_root):
+            raise LifecycleError("historical compaction evidence escapes its root")
+        return path
+
+    inventory_path = evidence_path("content_inventory_relative_path")
+    review_path = evidence_path("review_manifest_relative_path")
+    if (
+        _sha256_file(inventory_path)
+        != gate_record.get("content_inventory_sha256")
+        or _sha256_file(review_path) != gate_record.get("review_manifest_sha256")
+    ):
+        raise LifecycleError("historical compaction evidence identity differs")
+    inventory = _load_signed_json(inventory_path)
+    review = _load_signed_json(review_path)
+    if (
+        inventory.get("schema_version") != "experiment-content-inventory-v1"
+        or inventory.get("run_label") != run_label
+        or inventory.get("archive_root_alias") != "e_archive"
+        or inventory.get("archive_root_resolved_path") != str(resolved_archive)
+        or inventory.get("archive_generation_relative_path")
+        != generation_relative.as_posix()
+        or inventory.get("legacy_registry_sha256")
+        != gate_record.get("legacy_registry_sha256")
+        or inventory.get("legacy_tree_sha256")
+        != gate_record.get("legacy_tree_sha256")
+        or inventory.get("tree_sha256") != gate_record.get("legacy_tree_sha256")
+        or inventory.get("scan_passes") != 1
+        or review.get("run_label") != run_label
+        or review.get("retention_class") != retention_class.value
+        or review.get("content_inventory_sha256") != _sha256_file(inventory_path)
+    ):
+        raise LifecycleError("historical compaction inventory binding differs")
+    raw_files = inventory.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise LifecycleError("historical compaction inventory files are invalid")
+    try:
+        identities = tuple(
+            FileIdentity(
+                relative_path=str(item["relative_path"]),
+                byte_count=int(str(item["byte_count"])),
+                sha256=str(item["sha256"]),
+                modified_time_ns=int(str(item["modified_time_ns"])),
+            )
+            for item in raw_files
+            if isinstance(item, dict)
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise LifecycleError(
+            "historical compaction file identity is invalid"
+        ) from error
+    historical_tree_digest = hashlib.sha256()
+    for item in identities:
+        historical_tree_digest.update(
+            (
+                json.dumps(
+                    {
+                        "relative_path": item.relative_path,
+                        "byte_count": item.byte_count,
+                        "sha256": item.sha256,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+    if (
+        len(identities) != len(raw_files)
+        or len({item.relative_path for item in identities}) != len(identities)
+        or historical_tree_digest.hexdigest() != inventory.get("tree_sha256")
+        or inventory.get("file_count") != len(identities)
+        or inventory.get("byte_count")
+        != sum(item.byte_count for item in identities)
+    ):
+        raise LifecycleError("historical compaction inventory tree differs")
+    keep = tuple(
+        item
+        for item in identities
+        if _capsule_keep(item.relative_path, retention_class)
+    )
+    delete = tuple(item for item in identities if item not in keep)
+    hash_backend = str(inventory.get("hash_backend", ""))
+    hash_workers = inventory.get("hash_workers")
+    if (
+        not keep
+        or not delete
+        or not hash_backend
+        or isinstance(hash_workers, bool)
+        or not isinstance(hash_workers, int)
+        or hash_workers <= 0
+    ):
+        raise LifecycleError("historical compaction reduction plan is invalid")
+    plan = CompactionPlan(
+        run_label=run_label,
+        source_root=source_root,
+        source_tree_sha256=str(inventory["tree_sha256"]),
+        retention_class=retention_class,
+        keep=keep,
+        delete=delete,
+        scanned_bytes=sum(item.byte_count for item in identities),
+        hashed_bytes=sum(item.byte_count for item in identities),
+        scan_passes=1,
+        hash_passes=1,
+        io_backend=hash_backend,
+        io_workers=hash_workers,
+    )
+    return plan, gate_record, inventory_path, review_path
+
+
 class ExperimentLifecycleController:
     """Single-writer controller for one repository's top-level experiments."""
 
@@ -1990,6 +2168,309 @@ class ExperimentLifecycleController:
             or not self.archive_root.is_absolute()
         ):
             raise ValueError("lifecycle storage bindings must be absolute")
+
+    def prepare_historical_compaction(
+        self,
+        run_label: str,
+        *,
+        repository: Path,
+        migration_ledger_path: Path,
+        historical_gate_path: Path,
+    ) -> tuple[CompactionPlan, Path, Path]:
+        """Persist an exact plan without importing or mutating the historical run."""
+
+        if self._record_path(run_label).exists():
+            raise LifecycleError("historical compaction run is already lifecycle-managed")
+        plan, gate_record, inventory_path, review_path = _historical_compaction_inputs(
+            repository=repository,
+            migration_ledger_path=migration_ledger_path,
+            historical_gate_path=historical_gate_path,
+            archive_root=self.archive_root,
+            run_label=run_label,
+        )
+        plan_path = (
+            self.state_root
+            / "historical-compaction"
+            / "plans"
+            / run_label
+            / f"{plan.plan_sha256}.json"
+        )
+        prepared_path = (
+            self.state_root
+            / "historical-compaction"
+            / "prepared"
+            / f"{run_label}.json"
+        )
+        expected = {
+            "schema_version": HISTORICAL_COMPACTION_SCHEMA_VERSION,
+            "run_label": run_label,
+            "state": "PREPARED",
+            "compaction_plan_sha256": plan.plan_sha256,
+            "historical_gate_sha256": _sha256_file(historical_gate_path),
+            "migration_ledger_sha256": _sha256_file(migration_ledger_path),
+            "content_inventory_sha256": _sha256_file(inventory_path),
+            "review_manifest_sha256": _sha256_file(review_path),
+            "legacy_registry_sha256": gate_record["legacy_registry_sha256"],
+            "source_tree_sha256": plan.source_tree_sha256,
+            "retention_class": plan.retention_class.value,
+            "source_root": str(plan.source_root),
+            "keep_file_count": len(plan.keep),
+            "keep_bytes": sum(item.byte_count for item in plan.keep),
+            "delete_file_count": len(plan.delete),
+            "delete_bytes": sum(item.byte_count for item in plan.delete),
+        }
+        with _exclusive_lock(
+            self.state_root / "historical-compaction" / "transaction.lock"
+        ):
+            if plan_path.is_file():
+                if CompactionPlan.from_dict(_load_signed_json(plan_path)) != plan:
+                    raise LifecycleError("historical compaction plan identity differs")
+            else:
+                _write_signed_json(plan_path, plan.to_dict())
+            if prepared_path.is_file():
+                prepared = _load_signed_json(prepared_path)
+                if any(prepared.get(key) != value for key, value in expected.items()):
+                    raise LifecycleError(
+                        "historical compaction prepared transaction differs"
+                    )
+            else:
+                _write_signed_json(
+                    prepared_path,
+                    {**expected, "created_at_utc": datetime.now(UTC).isoformat()},
+                )
+        return plan, plan_path, prepared_path
+
+    def apply_historical_compaction(
+        self,
+        run_label: str,
+        *,
+        repository: Path,
+        migration_ledger_path: Path,
+        historical_gate_path: Path,
+        plan_path: Path,
+        expected_plan_sha256: str,
+        writer_is_active: Callable[[Path], bool],
+    ) -> dict[str, object]:
+        """Import, compact, and close one pre-lifecycle run as one transaction."""
+
+        expected_plan_path = (
+            self.state_root
+            / "historical-compaction"
+            / "plans"
+            / run_label
+            / f"{expected_plan_sha256}.json"
+        ).resolve()
+        if plan_path.resolve(strict=True) != expected_plan_path:
+            raise LifecycleError("historical compaction plan path is not canonical")
+        prepared_path = (
+            self.state_root
+            / "historical-compaction"
+            / "prepared"
+            / f"{run_label}.json"
+        )
+        prepared = _load_signed_json(prepared_path)
+        if (
+            prepared.get("schema_version")
+            != HISTORICAL_COMPACTION_SCHEMA_VERSION
+            or prepared.get("run_label") != run_label
+            or prepared.get("state") not in {"PREPARED", "COMMITTED"}
+            or prepared.get("compaction_plan_sha256") != expected_plan_sha256
+        ):
+            raise LifecycleError("historical compaction transaction is not prepared")
+        recorded_plan = CompactionPlan.from_dict(_load_signed_json(plan_path))
+        current_plan, gate_record, inventory_path, review_path = (
+            _historical_compaction_inputs(
+                repository=repository,
+                migration_ledger_path=migration_ledger_path,
+                historical_gate_path=historical_gate_path,
+                archive_root=self.archive_root,
+                run_label=run_label,
+            )
+        )
+        if (
+            recorded_plan != current_plan
+            or recorded_plan.plan_sha256 != expected_plan_sha256
+            or prepared.get("historical_gate_sha256")
+            != _sha256_file(historical_gate_path)
+            or prepared.get("migration_ledger_sha256")
+            != _sha256_file(migration_ledger_path)
+            or prepared.get("content_inventory_sha256")
+            != _sha256_file(inventory_path)
+            or prepared.get("review_manifest_sha256") != _sha256_file(review_path)
+        ):
+            raise LifecycleError("historical compaction authorization differs")
+        completion_path = (
+            self.state_root
+            / "historical-compaction"
+            / "receipts"
+            / f"{run_label}.json"
+        )
+        unfinished = tuple(
+            record
+            for record in self.records()
+            if record.run_label != run_label and not self._close_receipt_valid(record)
+        )
+        if unfinished:
+            raise LifecycleError(
+                "another lifecycle record is unfinished during historical compaction: "
+                + ", ".join(item.run_label for item in unfinished)
+            )
+        if self._record_path(run_label).is_file():
+            existing = self._load(run_label)
+            if existing.state == LifecycleState.CLOSED:
+                if not self._close_receipt_valid(existing):
+                    raise LifecycleError("historical compaction close receipt is invalid")
+                completion = _load_signed_json(completion_path)
+                if (
+                    completion.get("compaction_plan_sha256")
+                    != expected_plan_sha256
+                    or completion.get("status") != "COMMITTED"
+                ):
+                    raise LifecycleError(
+                        "historical compaction completion identity differs"
+                    )
+                if prepared.get("state") != "COMMITTED":
+                    repaired = dict(prepared)
+                    repaired.update(
+                        state="COMMITTED",
+                        completion_receipt_sha256=_sha256_file(completion_path),
+                        committed_at_utc=completion.get("committed_at_utc"),
+                    )
+                    _write_signed_json(prepared_path, repaired)
+                return completion
+            if prepared.get("state") == "COMMITTED":
+                raise LifecycleError(
+                    "historical compaction transaction is committed without CLOSED state"
+                )
+            if (
+                existing.plan_sha256 != expected_plan_sha256
+                or existing.compaction_plan_sha256 != expected_plan_sha256
+                or existing.content_inventory_sha256
+                != _sha256_file(inventory_path)
+                or existing.retention_class != recorded_plan.retention_class
+                or existing.state
+                not in {LifecycleState.CLASSIFIED, LifecycleState.COMPACTED}
+            ):
+                raise LifecycleError("historical lifecycle import differs")
+        else:
+            review = _load_signed_json(review_path)
+            failure = review.get("failure_identity")
+            failure_mapping = failure if isinstance(failure, dict) else {}
+            created_at = prepared.get("created_at_utc")
+            if not isinstance(created_at, str) or not created_at:
+                raise LifecycleError(
+                    "historical compaction prepared timestamp is invalid"
+                )
+            now = created_at
+            spec = self.catalog.for_run_label(run_label)
+            imported = RunLifecycleRecord(
+                run_label=run_label,
+                experiment_id=spec.experiment_id,
+                state=LifecycleState.CLASSIFIED,
+                plan_sha256=expected_plan_sha256,
+                catalog_sha256=self.catalog.catalog_sha256,
+                transition_ordinal=0,
+                created_at_utc=now,
+                updated_at_utc=now,
+                reviewer_status=ReviewerStatus(str(gate_record["review_status"])),
+                review_manifest_sha256=_sha256_file(review_path),
+                failure_code=str(failure_mapping.get("failure_code", "")),
+                failure_component=str(failure_mapping.get("component", "")),
+                failure_check=str(failure_mapping.get("invariant_or_check", "")),
+                failure_location=str(failure_mapping.get("location", "")),
+                retention_class=recorded_plan.retention_class,
+                content_inventory_sha256=_sha256_file(inventory_path),
+                compaction_plan_sha256=expected_plan_sha256,
+            )
+            import_path = (
+                self.state_root
+                / "historical-compaction"
+                / "imports"
+                / f"{run_label}.json"
+            )
+            _write_signed_json(
+                import_path,
+                {
+                    "schema_version": HISTORICAL_COMPACTION_SCHEMA_VERSION,
+                    "run_label": run_label,
+                    "state": "CLASSIFIED",
+                    "historical_gate_sha256": _sha256_file(historical_gate_path),
+                    "content_inventory_sha256": _sha256_file(inventory_path),
+                    "review_manifest_sha256": _sha256_file(review_path),
+                    "compaction_plan_sha256": expected_plan_sha256,
+                    "record": imported.to_dict(),
+                },
+            )
+            self._write(imported)
+        current = self._load(run_label)
+        if current.state == LifecycleState.CLASSIFIED:
+            receipt = self.apply_compaction(
+                recorded_plan,
+                expected_plan_sha256=expected_plan_sha256,
+                writer_is_active=writer_is_active,
+            )
+        else:
+            receipt_payload = _load_signed_json(
+                self.state_root / "compaction" / "receipts" / f"{run_label}.json"
+            )
+            receipt = CompactionReceipt(
+                run_label=run_label,
+                released_bytes=int(str(receipt_payload["released_bytes"])),
+                deleted_file_count=int(str(receipt_payload["deleted_file_count"])),
+                final_tree_sha256=str(receipt_payload["final_tree_sha256"]),
+                delete_traversals=int(str(receipt_payload["delete_traversals"])),
+                compaction_plan_sha256=expected_plan_sha256,
+                receipt_sha256=_sha256_file(
+                    self.state_root
+                    / "compaction"
+                    / "receipts"
+                    / f"{run_label}.json"
+                ),
+            )
+        completion = {
+            "schema_version": HISTORICAL_COMPACTION_SCHEMA_VERSION,
+            "run_label": run_label,
+            "status": "COMMITTED",
+            "historical_gate_sha256": _sha256_file(historical_gate_path),
+            "content_inventory_sha256": _sha256_file(inventory_path),
+            "review_manifest_sha256": _sha256_file(review_path),
+            "compaction_plan_sha256": expected_plan_sha256,
+            "compaction_receipt_sha256": receipt.receipt_sha256,
+            "released_bytes": receipt.released_bytes,
+            "deleted_file_count": receipt.deleted_file_count,
+            "final_tree_sha256": receipt.final_tree_sha256,
+            "committed_at_utc": datetime.now(UTC).isoformat(),
+        }
+        completion_sha256 = _write_signed_json(completion_path, completion)
+        record = self._load(run_label)
+        if record.state != LifecycleState.COMPACTED:
+            raise LifecycleError("historical compaction did not reach COMPACTED")
+        closed_payload = record.to_dict()
+        closed_payload.update(
+            state=LifecycleState.CLOSED.value,
+            transition_ordinal=record.transition_ordinal + 1,
+            updated_at_utc=datetime.now(UTC).isoformat(),
+        )
+        closed = RunLifecycleRecord.from_dict(closed_payload)
+        _write_signed_json(
+            self.state_root / "close" / f"{run_label}.json",
+            {
+                "schema_version": LIFECYCLE_SCHEMA_VERSION,
+                "run_label": run_label,
+                "status": "CLOSED",
+                "record": closed.to_dict(),
+                "historical_compaction_receipt_sha256": completion_sha256,
+            },
+        )
+        self._write(closed)
+        committed_prepared = dict(prepared)
+        committed_prepared.update(
+            state="COMMITTED",
+            completion_receipt_sha256=completion_sha256,
+            committed_at_utc=datetime.now(UTC).isoformat(),
+        )
+        _write_signed_json(prepared_path, committed_prepared)
+        return completion
 
     def _record_path(self, run_label: str) -> Path:
         return self.state_root / "runs" / f"{run_label}.json"
@@ -4087,6 +4568,18 @@ def _cli() -> argparse.ArgumentParser:
     adjudicate.add_argument("--adjudication", type=Path, required=True)
     adjudicate.add_argument("--root-cause-id", required=True)
     adjudicate.add_argument("--canonical-representative", required=True)
+    prepare_historical = subparsers.add_parser("prepare-historical-compaction")
+    prepare_historical.add_argument("--run-label", required=True)
+    prepare_historical.add_argument("--repository", type=Path, required=True)
+    prepare_historical.add_argument("--migration-ledger", type=Path, required=True)
+    prepare_historical.add_argument("--historical-gate", type=Path, required=True)
+    apply_historical = subparsers.add_parser("apply-historical-compaction")
+    apply_historical.add_argument("--run-label", required=True)
+    apply_historical.add_argument("--repository", type=Path, required=True)
+    apply_historical.add_argument("--migration-ledger", type=Path, required=True)
+    apply_historical.add_argument("--historical-gate", type=Path, required=True)
+    apply_historical.add_argument("--plan", type=Path, required=True)
+    apply_historical.add_argument("--expected-plan-sha256", required=True)
     close = subparsers.add_parser("close")
     close.add_argument("--run-label", required=True)
     close.add_argument("--run-dir", type=Path, required=True)
@@ -4246,6 +4739,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             canonical_representative=arguments.canonical_representative,
             adjudication_path=arguments.adjudication,
         ).to_dict()
+    elif arguments.command == "prepare-historical-compaction":
+        compaction, plan_path, prepared_path = controller.prepare_historical_compaction(
+            arguments.run_label,
+            repository=arguments.repository.resolve(),
+            migration_ledger_path=arguments.migration_ledger.resolve(strict=True),
+            historical_gate_path=arguments.historical_gate.resolve(strict=True),
+        )
+        payload = {
+            "run_label": arguments.run_label,
+            "state": "PREPARED",
+            "compaction_plan_sha256": compaction.plan_sha256,
+            "plan_path": str(plan_path),
+            "prepared_path": str(prepared_path),
+            "keep_file_count": len(compaction.keep),
+            "keep_bytes": sum(item.byte_count for item in compaction.keep),
+            "delete_file_count": len(compaction.delete),
+            "delete_bytes": sum(item.byte_count for item in compaction.delete),
+        }
+    elif arguments.command == "apply-historical-compaction":
+        payload = controller.apply_historical_compaction(
+            arguments.run_label,
+            repository=arguments.repository.resolve(),
+            migration_ledger_path=arguments.migration_ledger.resolve(strict=True),
+            historical_gate_path=arguments.historical_gate.resolve(strict=True),
+            plan_path=arguments.plan.resolve(strict=True),
+            expected_plan_sha256=arguments.expected_plan_sha256,
+            writer_is_active=_writer_is_active,
+        )
     elif arguments.command == "close":
         decision = controller.classify(
             arguments.run_label,

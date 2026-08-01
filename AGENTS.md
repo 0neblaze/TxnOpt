@@ -1216,6 +1216,17 @@ The executable workflow and gate table are maintained in
   retention class, failure identity, canonical representative, no-dependency
   proof and rebuild proof must satisfy the same class-specific rules as the
   original adjudication.
+- Pre-lifecycle historical compaction is a separate controller transaction. It
+  may prepare a plan only from a `complete` aggregate historical gate, the
+  gate-bound canonical `e_archive` generation, and the exact signed inventory
+  and review identities. `PREPARED` creates no lifecycle run record and deletes
+  nothing. Apply requires the canonical plan path plus its exact SHA-256,
+  replays the gate and legacy pretty-canonical tree digest, rejects any active
+  writer or file/stat/content drift, imports one `CLASSIFIED` record, reuses the
+  single-pass compaction engine, and must finish with signed compaction/import/
+  close receipts and `CLOSED`. Only `superseded_metadata` and
+  `superseded_accepted_capsule` are eligible; the v2 registry remains immutable
+  historical input and the append-only v3 ledger records every removed file.
 - Historical command replay validates the signed command's existing absolute
   Python executable, `-m` invocation, allowlisted reviewer module, complete
   option set, and downstream hashes. It must not require the historical

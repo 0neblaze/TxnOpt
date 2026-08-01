@@ -2627,6 +2627,16 @@ compatibility fallback（兼容回退）。
   与 replacement contract binding，其他未登记文件继续 fail fast。回归测试用
   `git check-ignore` 固定这两个路径的 lifecycle cleanliness 语义。本次失败没有
   output、permit 或 lifecycle record，`rerun03` 标签仍未消费。
+- `f1d577b` producer 随后完整通过 920-shard/2040-axis pre-admission 与 lifecycle plan
+  重放，但 E 盘 free bytes 比签名 Formal archive estimate 少 `13,240,344,460` bytes。
+  为避免手写删除清单或篡改 v2 registry，lifecycle controller 新增 historical
+  compaction transaction：只从 complete aggregate gate 的唯一 record、canonical E
+  generation、签名 physical inventory 和 review 生成 plan；PREPARED 不导入 run record、
+  不删除文件。apply 重新验证 gate/plan/inventory/review、legacy pretty-canonical tree、
+  完整文件集、mtime/size/SHA-256 与 writer absence，随后才导入 CLASSIFIED、复用现有
+  APPLYING/COMMITTED 单遍删除引擎并写 CLOSED receipt。仅
+  `superseded_metadata`/`superseded_accepted_capsule` 可用；回归测试覆盖 active-writer
+  拒绝、精确 keep/delete、幂等重入和最终 lifecycle audit。
 
 ## 2026-07-31：Stage 0--8 storage governance v2 与 E 盘归档入口
 
