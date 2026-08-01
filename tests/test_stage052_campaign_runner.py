@@ -153,9 +153,20 @@ def test_formal_execution_lock_requires_signed_recalibration_for_memory_drift() 
             replace(recalibrated, semantic_digest="c" * 64),
             formal_recalibration=evidence,
         )
+    changed_topology = replace(recalibrated, row_group_size=16_384)
+    with pytest.raises(RuntimeError, match="exact zero-geometry evidence"):
+        execution_lock.with_producer_resource_contract(
+            changed_topology,
+            formal_recalibration=replace(
+                evidence,
+                replacement_contract_sha256=_sha256_json(
+                    changed_topology.to_dict()
+                ),
+            ),
+        )
 
 
-def test_formal_execution_lock_accepts_cgroup_peak_below_predecessor_rss() -> None:
+def test_formal_execution_lock_accepts_cgroup_peak_and_replacement_topology() -> None:
     locked = ProducerResourceContract(
         selected_workers=6,
         available_memory_bytes=30_000_000_000,
@@ -165,8 +176,8 @@ def test_formal_execution_lock_accepts_cgroup_peak_below_predecessor_rss() -> No
         per_worker_memory_limit_bytes=4_800_000_000,
         semantic_digest="a" * 64,
         calibration_digest="b" * 64,
-        row_group_size=65_536,
-        queue_depth=1,
+        row_group_size=262_144,
+        queue_depth=2,
     )
     cgroup_contract = ProducerResourceContract(
         selected_workers=6,
@@ -177,7 +188,7 @@ def test_formal_execution_lock_accepts_cgroup_peak_below_predecessor_rss() -> No
         per_worker_memory_limit_bytes=5_640_000_000,
         semantic_digest="a" * 64,
         calibration_digest="d" * 64,
-        row_group_size=65_536,
+        row_group_size=16_384,
         queue_depth=1,
     )
     execution_lock = BenchmarkExecutionLock(

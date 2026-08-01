@@ -2598,6 +2598,13 @@ compatibility fallback（兼容回退）。
   `d_host + e_archive`。修复改为必要 aliases 的 subset 验证，额外治理 aliases
   仍由各自的下游 root/volume gate 独立验证；回归测试直接使用四 alias 生产形状。
   该 pre-admission failure 没有 output、permit 或 lifecycle record，`rerun03` 标签未被消费。
+- 新 sealed producer 补入 Attempt21 已归档且 sidecar 验证的 v3 recalibration report 后，
+  Formal 继续在同一 pre-admission 边界暴露 producer effective-lock 的旧逻辑：它仍要求
+  Pilot predecessor 的 262,144/2 topology 与 replacement contract 的 16,384/1 相同，
+  与 v3 loader/reviewer 已验证的“predecessor 和 replacement 各自精确绑定”协议冲突。
+  effective-lock 现在仅对 `cgroup_v2` v3 recalibration 接受该已签名 topology replacement；
+  历史 process-tree v2 仍要求 topology 不变，workers、memory floors、20% headroom、
+  replacement contract SHA 和 zero geometry 所有门禁保持。回归测试使用 Attempt21 的真实拓扑差异。
 
 ## 2026-07-31：Stage 0--8 storage governance v2 与 E 盘归档入口
 

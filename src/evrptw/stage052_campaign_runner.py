@@ -1094,11 +1094,17 @@ class BenchmarkExecutionLock:
                         or formal_recalibration.predecessor_aggregate_peak_rss_bytes
                         != contract.selected_aggregate_peak_rss_bytes
                     )
+                topology_invalid = (
+                    formal_recalibration.aggregate_memory_source != "cgroup_v2"
+                    and (
+                        predecessor.row_group_size != contract.row_group_size
+                        or predecessor.queue_depth != contract.queue_depth
+                    )
+                )
                 if (
                     predecessor.selected_workers != contract.selected_workers
                     or predecessor.selected_workers != self.selected_workers
-                    or predecessor.row_group_size != contract.row_group_size
-                    or predecessor.queue_depth != contract.queue_depth
+                    or topology_invalid
                     or aggregate_memory_invalid
                     or contract.selected_per_worker_peak_rss_bytes
                     < predecessor.selected_per_worker_peak_rss_bytes
