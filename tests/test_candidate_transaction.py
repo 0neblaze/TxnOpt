@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -575,6 +576,81 @@ def test_route_cache_commit_restores_exact_and_negative_state_on_store_failure(
     evaluator._discard_pending_candidate_cache("test_cleanup")
     assert evaluator.pending_candidate_cache == {}
     assert evaluator.pending_negative_screening_sequences == {}
+
+
+def test_route_cache_commit_reconciles_equivalent_late_shared_cache_entry() -> None:
+    instance = _fixture_instance("candidate_transaction_equivalent_late_cache_fixture")
+    route_cache = RouteEvaluationCache(
+        instance,
+        CacheIncrementalConfig(enabled=True, max_entries=2),
+    )
+    result = _feasible_result()
+    route_cache.store(("C1",), result)
+    before_statistics = route_cache.statistics_dict()
+    trace = Stage03Trace()
+    evaluator = _Evaluator(
+        instance,
+        deadline=time.perf_counter() + 10.0,
+        measurement_trace=trace,
+        route_cache=route_cache,
+    )
+    evaluator.pending_candidate_cache[("C1",)] = replace(
+        result,
+        runtime_seconds=result.runtime_seconds + 1.0,
+    )
+
+    evaluator._commit_pending_candidate_cache()
+
+    assert route_cache.statistics_dict() == before_statistics
+    assert evaluator.pending_candidate_cache == {}
+    reconciliation = [
+        event
+        for event in trace.events
+        if event.get("event_type") == "cache_event"
+        and event.get("operation") == "reconcile"
+    ]
+    assert len(reconciliation) == 1
+    assert reconciliation[0]["reason"] == "equivalent_existing"
+    assert reconciliation[0]["pending_result_digest"] == reconciliation[0][
+        "existing_result_digest"
+    ]
+    commit = [
+        event
+        for event in trace.events
+        if event.get("event_type") == "candidate_cache_commit"
+    ]
+    assert len(commit) == 1
+    assert commit[0]["stored_entries"] == 0
+    assert commit[0]["reconciled_existing_entries"] == 1
+
+
+def test_route_cache_conflict_preserves_original_error_with_bounded_negative_cache() -> None:
+    instance = _fixture_instance("candidate_transaction_bounded_rollback_fixture")
+    route_cache = RouteEvaluationCache(
+        instance,
+        CacheIncrementalConfig(enabled=True, max_entries=2),
+    )
+    result = _feasible_result()
+    route_cache.store(("C1",), result)
+    before_statistics = route_cache.statistics_dict()
+    negative_cache = BoundedNegativeSequenceCache(capacity=2)
+    evaluator = _Evaluator(
+        instance,
+        deadline=time.perf_counter() + 10.0,
+        route_cache=route_cache,
+        negative_screening_sequences=negative_cache,
+    )
+    evaluator.pending_candidate_cache[("C1",)] = replace(result, distance=3.0)
+    evaluator.pending_negative_screening_sequences[("reject",)] = "capacity_prefilter"
+
+    with pytest.raises(RuntimeError, match="semantic conflict") as caught:
+        evaluator._commit_pending_candidate_cache()
+
+    assert "pending_digest=" in str(caught.value)
+    assert "existing_digest=" in str(caught.value)
+    assert route_cache.statistics_dict() == before_statistics
+    assert dict(negative_cache.items()) == {}
+    evaluator._discard_pending_candidate_cache("test_cleanup")
 
 
 def test_route_cache_commit_rolls_back_exact_entries_when_negative_commit_fails(

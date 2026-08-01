@@ -962,6 +962,20 @@ class _StreamedEventAuditAccumulator:
                     self._failures.append(f"cache store precedes exact completion on {axis}")
                 self._completed_exact_keys[axis].discard(digest)
                 self._cache_keys[axis].add(digest)
+            elif operation == "reconcile":
+                pending_digest = event.get("pending_result_digest")
+                existing_digest = event.get("existing_result_digest")
+                if digest not in self._cache_keys[axis]:
+                    self._failures.append(
+                        f"cache reconciliation refers to an absent key on {axis}"
+                    )
+                if (
+                    not _is_sha256(pending_digest)
+                    or pending_digest != existing_digest
+                ):
+                    self._failures.append(
+                        f"cache reconciliation result digest mismatch on {axis}"
+                    )
             elif operation == "evict":
                 if digest not in self._cache_keys[axis]:
                     self._failures.append(f"cache eviction refers to an absent key on {axis}")

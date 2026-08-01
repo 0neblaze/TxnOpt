@@ -5,12 +5,14 @@ import hashlib
 import json
 import math
 import os
+import queue
 import shutil
 import statistics
 import subprocess
 import sys
 import time
 from dataclasses import replace
+from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,6 +38,7 @@ from evrptw.experiments.stage052_performance import (
     PERFORMANCE_INSTANCES,
     PERFORMANCE_SEEDS,
     Stage052Axis,
+    Stage052ShardExecutionError,
     _accelerator_decision_inputs,
     _ensure_partial_shard_failure,
     _launch_occupancy_summary,
@@ -121,6 +124,23 @@ from evrptw.stage052_evidence import (
     verify_stage052_source_snapshot,
     verify_stage052_storage_root_binding,
 )
+
+
+def _fail_stage052_worker_with_unpickleable_state(
+    _task: _ShardTask,
+) -> list[dict[str, object]]:
+    error = RuntimeError("atomic candidate cache semantic conflict")
+    error.unpickleable_state = queue.SimpleQueue()  # type: ignore[attr-defined]
+    raise error
+
+
+def _run_wrapped_unpickleable_stage052_worker(
+    task: _ShardTask,
+) -> list[dict[str, object]]:
+    return _run_v2_shard_task(
+        task,
+        _worker=_fail_stage052_worker_with_unpickleable_state,
+    )
 
 
 def _bind_successful_review_execution(review_manifest: Path) -> None:
@@ -6022,7 +6042,7 @@ def test_v2_pre_open_failure_publishes_partial_shard_evidence(
         storage=ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
     )
 
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(Stage052ShardExecutionError, match="FileNotFoundError"):
         _run_v2_shard_task(task)
 
     prefix = task.run_dir / "c101_21" / "2014" / run_label
@@ -6033,6 +6053,71 @@ def test_v2_pre_open_failure_publishes_partial_shard_evidence(
     assert sidecar.is_file()
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     assert payload["evidence_completeness"] == "partial"
+
+
+def test_v2_shard_worker_converts_unpickleable_exception_to_rooted_wire_error(
+    tmp_path: Path,
+) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt94"
+    task = _ShardTask(
+        root=tmp_path,
+        config_path=tmp_path / "missing.toml",
+        run_dir=tmp_path / "results" / run_label,
+        run_label=run_label,
+        component="artifact_streaming",
+        scope="performance",
+        instance_name="c101_21",
+        customer_count=100,
+        seed=2014,
+        shard_ordinal=0,
+        worker_count=1,
+        storage=ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+
+    with pytest.raises(Stage052ShardExecutionError) as caught:
+        _run_v2_shard_task(task, _worker=_fail_stage052_worker_with_unpickleable_state)
+
+    assert "RuntimeError" in str(caught.value)
+    assert "atomic candidate cache semantic conflict" in str(caught.value)
+    ForkingPickler.dumps(caught.value)
+    failure = (
+        task.run_dir
+        / task.instance_name
+        / str(task.seed)
+        / f"{run_label}_failure_{task.instance_name}_{task.seed}.json"
+    )
+    failure_payload = json.loads(failure.read_text(encoding="utf-8"))
+    assert failure_payload["failure_reason"] == "atomic candidate cache semantic conflict"
+
+
+def test_v2_process_pool_preserves_root_message_for_unpickleable_worker_error(
+    tmp_path: Path,
+) -> None:
+    run_label = "stage05.2_artifact_streaming_attempt95"
+    task = _ShardTask(
+        root=tmp_path,
+        config_path=tmp_path / "missing.toml",
+        run_dir=tmp_path / "results" / run_label,
+        run_label=run_label,
+        component="artifact_streaming",
+        scope="performance",
+        instance_name="c101_21",
+        customer_count=100,
+        seed=2014,
+        shard_ordinal=0,
+        worker_count=1,
+        storage=ArtifactStorageConfig(storage_policy_version="artifact-storage-v2"),
+    )
+
+    with pytest.raises(Stage052ShardExecutionError) as caught:
+        _run_v2_tasks(
+            (task,),
+            worker_count=1,
+            _task_runner=_run_wrapped_unpickleable_stage052_worker,
+        )
+
+    assert "RuntimeError" in str(caught.value)
+    assert "atomic candidate cache semantic conflict" in str(caught.value)
 
 
 def test_v2_recovery_replaces_invalid_manifest_and_preserves_it(

@@ -147,6 +147,7 @@ class RouteCacheWriteBatch:
     """O(changes) journal for a cache batch awaiting transaction commit."""
 
     stores: tuple[CacheStore, ...]
+    reconciled_existing: tuple[CacheReconciliation, ...]
     inserted_keys: tuple[RouteCacheKey, ...]
     evicted_entries: tuple[
         tuple[RouteCacheKey, tuple[ChargingSubproblemResult, int]], ...
@@ -155,12 +156,46 @@ class RouteCacheWriteBatch:
     active: bool = True
 
 
-def estimate_cache_entry_bytes(result: ChargingSubproblemResult) -> int:
-    """Estimate memory using a stable serialized payload plus object overhead."""
+@dataclass(frozen=True, slots=True)
+class CacheReconciliation:
+    """A staged miss that another lane committed before this transaction."""
+
+    key: RouteCacheKey
+    pending_result_digest: str
+    existing_result_digest: str
+    current_entries: int
+    current_bytes: int
+
+
+def charging_result_semantic_payload(
+    result: ChargingSubproblemResult,
+) -> dict[str, object]:
+    """Return deterministic result fields, excluding measured runtime."""
 
     stable_result = asdict(result)
     stable_result.pop("runtime_seconds")
-    payload = json.dumps(stable_result, sort_keys=True, separators=(",", ":"))
+    return stable_result
+
+
+def charging_result_semantic_digest(result: ChargingSubproblemResult) -> str:
+    """Hash the deterministic exact-charging result fields."""
+
+    payload = json.dumps(
+        charging_result_semantic_payload(result),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def estimate_cache_entry_bytes(result: ChargingSubproblemResult) -> int:
+    """Estimate memory using a stable serialized payload plus object overhead."""
+
+    payload = json.dumps(
+        charging_result_semantic_payload(result),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return 128 + len(payload.encode("utf-8"))
 
 
@@ -245,10 +280,32 @@ class RouteEvaluationCache:
         evicted_entries: list[tuple[RouteCacheKey, tuple[ChargingSubproblemResult, int]]] = []
         try:
             stores: list[CacheStore] = []
+            reconciled_existing: list[CacheReconciliation] = []
             for sequence, result in entries:
                 key = self.make_key(sequence)
-                if key in self._entries:
-                    raise RuntimeError("atomic candidate cache batch contains a non-miss key")
+                existing = self._entries.get(key)
+                if existing is not None:
+                    existing_result, _existing_bytes = existing
+                    pending_payload = charging_result_semantic_payload(result)
+                    existing_payload = charging_result_semantic_payload(existing_result)
+                    pending_digest = charging_result_semantic_digest(result)
+                    existing_digest = charging_result_semantic_digest(existing_result)
+                    if pending_payload != existing_payload:
+                        raise RuntimeError(
+                            "atomic candidate cache semantic conflict for route "
+                            f"{key.route_key}: pending_digest={pending_digest} "
+                            f"existing_digest={existing_digest}"
+                        )
+                    reconciled_existing.append(
+                        CacheReconciliation(
+                            key=key,
+                            pending_result_digest=pending_digest,
+                            existing_result_digest=existing_digest,
+                            current_entries=self.statistics.entries_current,
+                            current_bytes=self.statistics.bytes_current,
+                        )
+                    )
+                    continue
                 entry_bytes = estimate_cache_entry_bytes(result)
                 predicted_evictions: list[
                     tuple[RouteCacheKey, tuple[ChargingSubproblemResult, int]]
@@ -276,6 +333,7 @@ class RouteEvaluationCache:
                 stores.append(store)
             return RouteCacheWriteBatch(
                 stores=tuple(stores),
+                reconciled_existing=tuple(reconciled_existing),
                 inserted_keys=tuple(possible_insertions),
                 evicted_entries=tuple(evicted_entries),
                 statistics_before=statistics_before,

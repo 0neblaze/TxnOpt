@@ -5613,8 +5613,19 @@ class ArtifactV2ShardSession:
         if event.marker != "cache_event":
             raise ArtifactIntegrityError("deferred cache-event marker is invalid")
         values = event.values
-        if len(values) != 18:
-            raise ArtifactIntegrityError("deferred cache event must contain eighteen fields")
+        if len(values) not in {18, 20}:
+            raise ArtifactIntegrityError(
+                "deferred cache event must contain eighteen legacy or twenty current fields"
+            )
+        common = values[:17]
+        if len(values) == 18:
+            pending_result_digest = None
+            existing_result_digest = None
+            extras_presence = values[17]
+        else:
+            pending_result_digest = values[17]
+            existing_result_digest = values[18]
+            extras_presence = values[19]
         (
             route_key,
             lane,
@@ -5633,8 +5644,7 @@ class ArtifactV2ShardSession:
             lookup_current_bytes,
             lookup_current_entries,
             lookup_result,
-            extras_presence,
-        ) = values
+        ) = common
         if (
             not isinstance(route_key, str)
             or not isinstance(lane, str)
@@ -5668,6 +5678,8 @@ class ArtifactV2ShardSession:
             ("lookup_current_bytes", lookup_current_bytes),
             ("lookup_current_entries", lookup_current_entries),
             ("lookup_result", lookup_result),
+            ("pending_result_digest", pending_result_digest),
+            ("existing_result_digest", existing_result_digest),
         )
         extras_key = (
             event.axis_name,

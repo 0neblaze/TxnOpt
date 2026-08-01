@@ -936,6 +936,7 @@ def _cache_incremental_trace_ok(
         "hit",
         "miss",
         "store",
+        "reconcile",
         "evict",
         "oversize_not_cached",
     }
@@ -1039,8 +1040,35 @@ def _cache_incremental_trace_ok(
             expected_bytes = sum(entry[1] for entry in cache_state.values())
             if _int_value(event.get("current_bytes", -1)) != expected_bytes:
                 return False
+        elif operation == "reconcile":
+            if digest not in cache_state:
+                return False
+            pending_digest = str(event.get("pending_result_digest", ""))
+            existing_digest = str(event.get("existing_result_digest", ""))
+            if (
+                len(pending_digest) != 64
+                or pending_digest != existing_digest
+                or any(character not in "0123456789abcdef" for character in pending_digest)
+            ):
+                return False
+            candidates = exact_by_digest[digest]
+            cursor = exact_cursor[digest]
+            if cursor >= len(candidates):
+                return False
+            if _cache_result_fingerprint(candidates[cursor]) != _cache_result_fingerprint(
+                cache_state[digest][0]
+            ):
+                return False
+            exact_cursor[digest] += 1
+            if _int_value(event.get("current_entries", -1)) != len(cache_state):
+                return False
+            expected_bytes = sum(entry[1] for entry in cache_state.values())
+            if _int_value(event.get("current_bytes", -1)) != expected_bytes:
+                return False
     if sum(exact_cursor.values()) != sum(
-        1 for event in cache_events if event.get("operation") == "store"
+        1
+        for event in cache_events
+        if event.get("operation") in {"store", "reconcile"}
     ):
         return False
     observed_hit_fingerprints = {

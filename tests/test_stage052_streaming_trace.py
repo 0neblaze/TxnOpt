@@ -444,6 +444,41 @@ def test_stage052_stream_counts_follow_coalesced_physical_events() -> None:
     }
 
 
+def test_stage052_stream_retains_cache_reconciliation_digests() -> None:
+    shard = _BufferedScreeningRecordingShard()
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=shard,  # type: ignore[arg-type]
+        axis_name="fixed_work",
+    )
+    digest = "a" * 64
+
+    sink.append_event(
+        {
+            "event_type": "cache_event",
+            "lane": "legacy",
+            "iteration": 1,
+            "operator": "repair",
+            "route_key": "route:2:C1",
+            "cache_key_digest": "b" * 64,
+            "operation": "reconcile",
+            "reason": "equivalent_existing",
+            "current_entries": 1,
+            "current_bytes": 512,
+            "pending_result_digest": digest,
+            "existing_result_digest": digest,
+        }
+    )
+    sink.finish()
+
+    assert len(shard.rows) == 1
+    row = shard.rows[0]
+    assert isinstance(row, DeferredCacheEvent)
+    assert len(row.values) == 20
+    assert row.values[17:19] == (digest, digest)
+    assert row.values[19] & (1 << 6)
+    assert row.values[19] & (1 << 7)
+
+
 def test_neighborhood_rejections_and_failures_are_retained_in_order() -> None:
     shard = _RecordingShard()
     sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
@@ -1327,10 +1362,36 @@ def test_v3_native_sparse_events_preserve_mixed_event_order(tmp_path: Path) -> N
                         63,
                     ),
                 ),
+                DeferredCacheEvent(
+                    "cache_event",
+                    "fixed_work",
+                    (
+                        route_key,
+                        "fixed_work:legacy",
+                        1,
+                        "repair",
+                        0.3,
+                        0.3,
+                        0.3,
+                        0.0,
+                        "",
+                        "reconcile",
+                        "digest",
+                        10,
+                        2,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "a" * 64,
+                        "a" * 64,
+                        195,
+                    ),
+                ),
             ),
             cache_lookups_coalesced=True,
         )
-        == 3
+        == 4
     )
     shard.finalize(
         raw_payload={},
@@ -1345,16 +1406,20 @@ def test_v3_native_sparse_events_preserve_mixed_event_order(tmp_path: Path) -> N
             f"toy/2014/{run_label}_events_toy_2014.parquet"
         )
     )
-    assert [row["event_id"] for row in rows] == [1, 2, 3]
+    assert [row["event_id"] for row in rows] == [1, 2, 3, 4]
     assert [row["event_type"] for row in rows] == [
         "route_evaluation",
         "operator_call",
+        "cache_event",
         "cache_event",
     ]
     assert rows[0]["lane"] == "fixed_work:legacy"
     assert rows[0]["evaluation_id"] == 1
     assert rows[2]["operation"] == "lookup_result"
     assert rows[2]["lookup_result"] == "miss"
+    assert rows[3]["operation"] == "reconcile"
+    assert rows[3]["pending_result_digest"] == "a" * 64
+    assert rows[3]["existing_result_digest"] == "a" * 64
 
 
 def test_v2_screening_bridge_retains_the_complete_legacy_payload() -> None:

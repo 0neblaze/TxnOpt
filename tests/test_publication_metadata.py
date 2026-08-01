@@ -5,6 +5,7 @@ import hashlib
 import json
 import subprocess
 import tomllib
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +48,22 @@ def test_source_disposition_accounts_for_every_target_byte() -> None:
         target = ROOT / row["target_path"]
         assert target.is_file()
         assert hashlib.sha256(target.read_bytes()).hexdigest() == row["target_sha256"]
+
+
+def test_source_disposition_summary_counts_replay_from_csv() -> None:
+    with (ROOT / "docs/provenance/source-file-disposition.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+    summary = json.loads(
+        (ROOT / "docs/provenance/source-file-disposition-summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert summary["source_file_count"] == len(rows)
+    assert summary["counts"] == dict(Counter(row["disposition"] for row in rows))
+    assert sum(summary["counts"].values()) == summary["source_file_count"]
 
 
 def test_artifact_index_does_not_promote_partial_formal_evidence() -> None:

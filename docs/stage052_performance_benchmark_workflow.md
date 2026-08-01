@@ -363,6 +363,20 @@ deferred native occurrence identity 也必须使用 `(marker, complete signature
 raw result/transaction statistics 必须签入 capacity、current/peak、stores、evictions
 与 rollovers，independent reviewer 对缺失、无界或内部不一致证据 fail fast。
 
+Candidate-scoped exact result（候选级精确结果）在 shared route cache（共享路线缓存）中
+先观察 miss、但提交时发现同一 key 已由另一 lane 写入，只能按以下协议处理：除
+`runtime_seconds` 外，`ChargingSubproblemResult` 的全部确定性字段必须 exact equality；
+相同则保留既有 cache/LRU/statistics，不重复 store，并写入
+`cache_event(operation="reconcile", reason="equivalent_existing")` 及相同的 pending/
+existing result SHA-256；不同则同时报告两份摘要并 fail fast。current compact cache event
+使用 20 字段并将两份摘要写入 `extras_json`，native sparse packer 与 Python writer 同时
+兼容旧 18 字段证据。independent reviewer 必须验证 key 已存在、两份摘要均为合法
+SHA-256 且完全相同。若 route-cache commit 在 bounded negative-cache batch 建立前失败，
+回滚不得假定 bounded cache 是 `dict`，也不得用二次 `AssertionError` 掩盖原始错误。
+worker 写完 partial-shard evidence 后，只允许跨 ProcessPool 边界抛出包含原始类型与消息
+的 string-backed pickle-safe error；带 trace、async writer 或 `SimpleQueue` 的异常对象
+不得跨进程传递。
+
 producer、retention、performance reviewer 与 campaign reviewer 必须调用同一个
 cross-platform `probe_volume_identity`：WSL 用 `findmnt`，DrvFS 额外绑定 Windows
 physical-disk identity（物理磁盘身份），macOS 才使用 `diskutil`。reviewer 不得复制或

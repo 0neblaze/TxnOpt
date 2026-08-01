@@ -2894,3 +2894,34 @@ compatibility fallback（兼容回退）。
   回归测试验证连续 preflight 后 permit bytes/SHA-256 不变、最新 E reserve 生效、ledger
   收缩且 reconciliation 仍绑定首次 permit。后续 Formal 必须用新 commit、新 sealed
   runtime 和新 label，并通过隐藏且与可见 console 解耦的启动控制面从零运行。
+
+## 2026-08-01：Formal Rerun05 candidate-cache commit 与 worker error 根因修复
+
+- `stage05.2_benchmark_rerun05` 在隐藏 Scheduled Task 与独立 user service 中从零启动；
+  batch0001--batch0004 完成并复验归档。batch0005 的 51 个预分配 shard manifests 中仅
+  36 个达到 `evidence_completeness=complete`，其余 15 个为 partial；按文件存在数量监控
+  会错误报告进度，因此 complete/partial 必须读取 manifest 语义字段。该 label 已
+  `SEALED`，不得续跑、覆盖或向后续 Formal 导入任何 shard。
+- systemd journal 保留的首个真实异常是 shared `RouteEvaluationCache` 在 candidate commit
+  收到已存在 key：`atomic candidate cache batch contains a non-miss key`。随后 bounded
+  `BoundedNegativeSequenceCache` 尚未建立 batch，异常路径却断言它必须是 `dict`，以
+  `AssertionError` 掩盖首因；`Stage03ExecutionError` 又携带 async persistence trace，
+  ProcessPool 序列化时最终把两层错误掩盖为 `TypeError: cannot pickle
+  '_queue.SimpleQueue' object`。全部 51 个 task 输入经 `pickle` 与 `ForkingPickler`
+  单独验证可序列化，排除了 task payload 与 Windows console 作为首因。
+- route-cache atomic commit 现在对迟到的已存在 key 重算除 `runtime_seconds` 外的完整
+  deterministic result payload。exact equality 时不重写 LRU 或 statistics，而写入包含
+  pending/existing SHA-256 的 `equivalent_existing` reconciliation event；任一字段不同则
+  报告两份摘要并 fail fast。current compact cache event 扩展为 20 字段，Python writer
+  与 native sparse packer 继续读取旧 18 字段；campaign 与 performance reviewers 对
+  已存在 key 和摘要相等性进行独立审计。
+- bounded negative-cache rollback 只在 batch 已建立时回滚；若失败发生在此前且没有
+  dictionary insertion，则不执行错误类型断言。worker 在先写入 partial-shard evidence
+  后，把任意原异常转换为只含字符串的 `Stage052ShardExecutionError`，保留原始类型与
+  消息并安全通过 `spawn` ProcessPool；trace、executor 与 `SimpleQueue` 不再跨进程边界。
+- 回归测试覆盖 equivalent late commit、semantic conflict、bounded rollback、20/18 字段
+  native round-trip、reviewer 拒绝错误摘要，以及真实 `spawn` pool 中携带
+  `SimpleQueue` 的异常。完整验证为 1,065 passed，Ruff、strict mypy（77 source files）
+  与 `git diff --check` 通过。Rerun05 仍须按独立 failure review、adjudication、签名
+  retention plan、compaction 与 lifecycle close 完成闭环；修复后只能以新 clean revision
+  和 `stage05.2_benchmark_rerun06` 从零运行。

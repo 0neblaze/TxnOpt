@@ -1082,6 +1082,19 @@ The executable workflow and gate table are maintained in
   constant; a reviewer-only hard-coded interval is forbidden contract drift.
   V3 route-evaluation and cache-event batches likewise use native schema-ordered sparse columns;
   mixed ordinary events are filled at their original positions and may not be reordered or dropped.
+- A candidate-scoped exact result may observe a shared route-cache miss and then find that another
+  lane committed the same key before candidate commit. This is valid only when every deterministic
+  `ChargingSubproblemResult` field matches exactly after excluding `runtime_seconds`; the producer
+  emits a `cache_event(operation="reconcile", reason="equivalent_existing")` with equal pending and
+  existing result SHA-256 values and does not mutate cache statistics or LRU state. Any semantic
+  difference is a hard conflict that reports both digests. The compact artifact writer and native
+  sparse packer preserve the two digests in the current 20-field cache-event form while continuing
+  to read the historical 18-field form, and independent replay verifies the existing cache key and
+  digest equality. A failure before a bounded negative-cache batch begins must not attempt bounded
+  rollback or mask the original route-cache error. After partial-shard evidence is persisted, the
+  process-worker boundary raises only a string-backed pickle-safe error containing the original
+  exception type and message; measured traces and asynchronous writer objects never cross that
+  boundary.
 - Producer screening-definition collision state uses the native
   `native_bounded_digest` store: it retains the full SHA-256 digest without a
   duplicate JSON payload, has a hard 2,097,152-entry limit, validates each batch

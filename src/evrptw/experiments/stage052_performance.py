@@ -349,6 +349,10 @@ class _ShardTask:
     storage: ArtifactStorageConfig
 
 
+class Stage052ShardExecutionError(RuntimeError):
+    """Pickle-safe worker-boundary error retaining the original root message."""
+
+
 def load_stage052_config(path: Path) -> Stage052Config:
     with path.open("rb") as handle:
         payload = tomllib.load(handle)
@@ -2755,8 +2759,8 @@ def _exercise_campaign_failure_state_machine(
     try:
         with recorder.record("failure_state_drill_worker_failure_recovery"):
             _run_v2_shard_task(worker_task, _worker=inject_worker_failure)
-    except RuntimeError as error:
-        if str(error) != "injected worker failure drill":
+    except Stage052ShardExecutionError as error:
+        if "RuntimeError: injected worker failure drill" not in str(error):
             raise
     worker_shard_dir = worker_root / worker_task.instance_name / str(worker_task.seed)
     worker_failure_path = worker_shard_dir / (
@@ -3614,7 +3618,11 @@ def _run_v2_shard_task(
         return worker(task)
     except BaseException as error:
         _ensure_partial_shard_failure(task, error)
-        raise
+        raise Stage052ShardExecutionError(
+            "Stage 5.2 shard "
+            f"{task.instance_name}/{task.seed} failed with "
+            f"{type(error).__name__}: {error}"
+        ) from None
 
 
 def _ensure_partial_shard_failure(task: _ShardTask, error: BaseException | str) -> None:
@@ -5323,6 +5331,8 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                     "lookup_current_bytes",
                     "lookup_current_entries",
                     "lookup_result",
+                    "pending_result_digest",
+                    "existing_result_digest",
                 )
                 extras_presence = sum(
                     1 << index for index, field in enumerate(optional_fields) if field in event

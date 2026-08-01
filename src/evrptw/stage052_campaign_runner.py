@@ -161,11 +161,17 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
 )
 _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
     "cpp/evrptw_core.cpp": (
-        "97005f14a9c1d5356e193aa4d4e446939613b51562b4b57be9d64d2a615a27cf"
+        "3ba747c01075da990d0526a2e10efafbf2b79d50db6c0bc88fa8325e00445817"
     ),
-    "src/evrptw/alns.py": "e5a3c1bf27cfda6d36ee24a3cdba24880379209b7eb0e2e58ed9b115bbfbf38b",
+    "src/evrptw/alns.py": "388ab7d663c69e769612f86c5d79a8f37579c578f35ab9fe3f3b28c4574b4f54",
+    "src/evrptw/cache_incremental.py": (
+        "babe9c2f6315c73a81fbb4c7cbb6d673035cc62c903aa19ee3d430c94e09bdaa"
+    ),
     "src/evrptw/candidate_transaction.py": (
         "1d510f58b5ca6e68962716e8eabb676d8a4e4e96cea1beac690b82172e987e72"
+    ),
+    "src/evrptw/experiments/stage03_measurement_review.py": (
+        "7299f13a15571ecd6a1617299b8d769baba6a8c3773947304231cdce11438fb8"
     ),
     "src/evrptw/measurement.py": (
         "3e6b5cbfa63a881834d03e14167c0f940b505e5d81400296cd56930bc401917f"
@@ -177,13 +183,13 @@ _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
         "226ca2e494d1a4fe9be27ba6eb4b3ef7fa47d4e0ef4803de14e8f34694e078a5"
     ),
     "tests/test_candidate_transaction.py": (
-        "88366a8283de49512b06554b2a1293c6558d8eb5360ee91b6479848001d574b0"
+        "71581efa9f8e447ac89cb5ae030cc08fdeec362fb28dafcb4cedd228883d8106"
     ),
     "tests/test_stage033_exact_deadline.py": (
         "cd8cbcf415b30c3d29d53aca8fecd22bd3ded62099de621b9cbf8c011d827de1"
     ),
     "tests/test_stage052_streaming_trace.py": (
-        "92f4a0a42131592ca62090c04b74e7faf642f79450a5906e72ce019071cd3c53"
+        "a607b72a78c32bbedc36a948d49c8904d07b311118e5f72e87738da9a637f73e"
     ),
 }
 

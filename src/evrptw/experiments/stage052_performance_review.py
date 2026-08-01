@@ -4240,6 +4240,20 @@ def _audit_native_ablation_records(
                 continue
             deadline_boundary_lanes.add(lane)
             continue
+        if event_type == "cache_event" and event.get("operation") == "reconcile":
+            pending_digest = event.get("pending_result_digest")
+            existing_digest = event.get("existing_result_digest")
+            if (
+                not isinstance(pending_digest, str)
+                or len(pending_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in pending_digest
+                )
+                or pending_digest != existing_digest
+            ):
+                failures.append("cache reconciliation result digest mismatch")
+                break
         lane_terminated = (
             exact_budget_boundary_seen or event.get("lane") in deadline_boundary_lanes
         )

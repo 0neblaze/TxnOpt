@@ -16,6 +16,7 @@ import numpy as np
 
 from evrptw.cache_incremental import (
     CacheIncrementalConfig,
+    CacheReconciliation,
     CacheStore,
     RouteCacheWriteBatch,
     RouteEvaluationCache,
@@ -530,6 +531,7 @@ class _Evaluator:
         route_cache_batch: RouteCacheWriteBatch | None = None
         native_negative_commit: NegativeCacheCommit | None = None
         stores: tuple[CacheStore, ...] = ()
+        reconciled_existing: tuple[CacheReconciliation, ...] = ()
         try:
             if self.route_cache is None:
                 if self.local_cache_enabled:
@@ -543,6 +545,7 @@ class _Evaluator:
             else:
                 route_cache_batch = self.route_cache.begin_store_many_atomic(pending)
                 stores = route_cache_batch.stores
+                reconciled_existing = route_cache_batch.reconciled_existing
             if isinstance(
                 self.negative_screening_sequences,
                 BoundedNegativeSequenceCache,
@@ -612,11 +615,28 @@ class _Evaluator:
                     current_bytes=store.current_bytes,
                 )
             if self.measurement_trace is not None:
+                for reconciliation in reconciled_existing:
+                    self.measurement_trace.record_cache_event(
+                        operation="reconcile",
+                        route_key=reconciliation.key.route_key,
+                        cache_key_digest=reconciliation.key.digest,
+                        lane=self.lane,
+                        iteration=self.iteration,
+                        operator=self.operator,
+                        reason="equivalent_existing",
+                        pending_result_digest=reconciliation.pending_result_digest,
+                        existing_result_digest=reconciliation.existing_result_digest,
+                        current_entries=reconciliation.current_entries,
+                        current_bytes=reconciliation.current_bytes,
+                    )
+            if self.measurement_trace is not None:
                 self.measurement_trace.events.append(
                     {
                         "event_type": "candidate_cache_commit",
                         "status": "committed",
                         "committed_entries": len(pending),
+                        "stored_entries": sum(store.stored for store in stores),
+                        "reconciled_existing_entries": len(reconciled_existing),
                         "committed_negative_entries": len(pending_negative),
                         "timestamp_seconds": self.measurement_trace._offset(),
                         "lane": self.lane,
@@ -659,7 +679,7 @@ class _Evaluator:
                 self.negative_screening_sequences.rollback_store_batch(
                     negative_sequence_batch
                 )
-            else:
+            elif negative_insertions:
                 assert isinstance(self.negative_screening_sequences, dict)
                 for sequence in negative_insertions:
                     self.negative_screening_sequences.pop(sequence, None)

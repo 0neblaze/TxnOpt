@@ -1267,6 +1267,112 @@ def test_streaming_event_audit_accepts_ordered_cache_exact_candidate_flow() -> N
     assert audit.accepted_candidates == audit.global_bests == 1
 
 
+def test_streaming_event_audit_accepts_equivalent_cache_reconciliation() -> None:
+    result_digest = "a" * 64
+    events = (
+        {
+            "event_id": 1,
+            "benchmark_axis": "wall_clock_30",
+            "event_type": "cache_event",
+            "operation": "lookup_result",
+            "lookup_result": "miss",
+            "cache_key_digest": "route-a",
+        },
+        {
+            "event_id": 2,
+            "benchmark_axis": "wall_clock_30",
+            "event_type": "route_evaluation",
+            "kind": "exact_call",
+            "evaluation_id": 1,
+            "exact_started": True,
+            "exact_completed": True,
+            "started_at": 0.1,
+            "completed_at": 0.2,
+            "cache_key_digest": "route-a",
+            "status": "completed_feasible",
+        },
+        {
+            "event_id": 3,
+            "benchmark_axis": "wall_clock_30",
+            "event_type": "cache_event",
+            "operation": "store",
+            "cache_key_digest": "route-a",
+        },
+        {
+            "event_id": 4,
+            "benchmark_axis": "wall_clock_30",
+            "event_type": "cache_event",
+            "operation": "reconcile",
+            "cache_key_digest": "route-a",
+            "pending_result_digest": result_digest,
+            "existing_result_digest": result_digest,
+        },
+    )
+
+    audit = audit_streamed_events(events, {"wall_clock_30": 30})
+
+    assert audit.passed is True, audit.detail
+
+
+@pytest.mark.parametrize(
+    ("cache_key_digest", "pending_digest", "existing_digest", "expected"),
+    (
+        ("route-b", "a" * 64, "a" * 64, "absent key"),
+        ("route-a", "a" * 64, "b" * 64, "digest mismatch"),
+    ),
+)
+def test_streaming_event_audit_rejects_invalid_cache_reconciliation(
+    cache_key_digest: str,
+    pending_digest: str,
+    existing_digest: str,
+    expected: str,
+) -> None:
+    events = (
+        {
+            "event_id": 1,
+            "benchmark_axis": "wall_clock_30",
+            "event_type": "cache_event",
+            "operation": "lookup_result",
+            "lookup_result": "miss",
+            "cache_key_digest": "route-a",
+        },
+        {
+            "event_id": 2,
+            "benchmark_axis": "wall_clock_30",
+            "event_type": "route_evaluation",
+            "kind": "exact_call",
+            "evaluation_id": 1,
+            "exact_started": True,
+            "exact_completed": True,
+            "started_at": 0.1,
+            "completed_at": 0.2,
+            "cache_key_digest": "route-a",
+            "status": "completed_feasible",
+        },
+        {
+            "event_id": 3,
+            "benchmark_axis": "wall_clock_30",
+            "event_type": "cache_event",
+            "operation": "store",
+            "cache_key_digest": "route-a",
+        },
+        {
+            "event_id": 4,
+            "benchmark_axis": "wall_clock_30",
+            "event_type": "cache_event",
+            "operation": "reconcile",
+            "cache_key_digest": cache_key_digest,
+            "pending_result_digest": pending_digest,
+            "existing_result_digest": existing_digest,
+        },
+    )
+
+    audit = audit_streamed_events(events, {"wall_clock_30": 30})
+
+    assert audit.passed is False
+    assert expected in audit.detail
+
+
 def test_streaming_event_audit_tracks_all_route_evaluation_ids_with_cache_hits() -> None:
     events = (
         {

@@ -2440,8 +2440,9 @@ py::tuple pack_stage052_deferred_sparse_events(
             remaining.append(py::make_tuple(event_index, position));
             continue;
         }
-        if ((is_route_evaluation && py::len(values) != 20)
-            || (is_cache_event && py::len(values) != 18)) {
+        const auto value_count = py::len(values);
+        if ((is_route_evaluation && value_count != 20)
+            || (is_cache_event && value_count != 18 && value_count != 20)) {
             throw std::invalid_argument(
                 "Stage 5.2 deferred sparse event has an invalid field count");
         }
@@ -2509,33 +2510,40 @@ py::tuple pack_stage052_deferred_sparse_events(
             continue;
         }
 
-        if (PyBool_Check(values[17].ptr()) || !PyLong_Check(values[17].ptr())) {
+        const auto extras_presence_index = value_count - 1;
+        if (PyBool_Check(values[extras_presence_index].ptr())
+            || !PyLong_Check(values[extras_presence_index].ptr())) {
             throw std::invalid_argument(
                 "Stage 5.2 deferred cache extras presence must be an integer");
         }
-        const auto extras_presence = PyLong_AsLongLong(values[17].ptr());
+        const auto extras_presence =
+            PyLong_AsLongLong(values[extras_presence_index].ptr());
         if (extras_presence == -1 && PyErr_Occurred()) {
             throw py::error_already_set();
         }
-        py::tuple extras_key(8);
+        const auto extra_count = extras_presence_index - 11;
+        py::tuple extras_key(2 + extra_count);
         extras_key[0] = axis_name;
-        extras_key[1] = values[17];
-        for (py::ssize_t index = 0; index < 6; ++index) {
+        extras_key[1] = values[extras_presence_index];
+        for (py::ssize_t index = 0; index < extra_count; ++index) {
             extras_key[2 + index] = values[11 + index];
         }
         py::dict extras;
         extras["benchmark_axis"] = axis_name;
-        const std::array<const char*, 6> extra_names = {
+        const std::array<const char*, 8> extra_names = {
             "current_bytes",
             "current_entries",
             "entry_bytes",
             "lookup_current_bytes",
             "lookup_current_entries",
             "lookup_result",
+            "pending_result_digest",
+            "existing_result_digest",
         };
-        for (std::size_t index = 0; index < extra_names.size(); ++index) {
+        for (py::ssize_t index = 0; index < extra_count; ++index) {
             if ((extras_presence & (std::int64_t{1} << index)) != 0) {
-                extras[py::str(extra_names[index])] = values[11 + index];
+                extras[py::str(extra_names[static_cast<std::size_t>(index)])] =
+                    values[11 + index];
             }
         }
         const py::object extras_json = cached_json(
