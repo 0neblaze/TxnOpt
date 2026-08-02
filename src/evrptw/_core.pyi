@@ -159,6 +159,7 @@ class NativeRouteCacheV2:
     def begin_protocol_transaction(self) -> None: ...
     def commit_protocol_transaction(self) -> npt.NDArray[np.int64]: ...
     def rollback_protocol_transaction(self) -> npt.NDArray[np.int64]: ...
+    def inject_protocol_journal_failure_once(self) -> None: ...
     def begin_store_many_atomic(
         self,
         route_offsets: npt.NDArray[np.int64],
@@ -308,8 +309,51 @@ class NativeSearchEngineV2:
         npt.NDArray[np.int64],
         str,
     ]: ...
+    def constraint_probe(
+        self,
+        operation: int,
+        requested_count: int,
+        seed: int,
+        context_ids: npt.NDArray[np.int64],
+        deadline_remaining: npt.NDArray[np.float64],
+        batch_size: npt.NDArray[np.int64],
+        route_change_limit: int,
+    ) -> tuple[
+        tuple[
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.float64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+        ],
+        tuple[
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+        ]
+        | None,
+        tuple[
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.float64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            str,
+        ]
+        | None,
+    ]: ...
     def initialized(self) -> bool: ...
     def inject_commit_failure_once(self, step: int) -> None: ...
+    def inject_constraint_probe_envelope_failure_once(self) -> None: ...
     def state(
         self,
     ) -> tuple[

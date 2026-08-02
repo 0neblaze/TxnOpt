@@ -2587,6 +2587,169 @@ def test_native_search_engine_owns_problem_and_warm_start_arrays() -> None:
     assert result[1].tolist() == [5]
 
 
+def test_native_search_engine_constraint_probe_composes_all_native_layers() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+
+    removal, repair, transaction = engine.constraint_probe(
+        0,
+        1,
+        0x5EED,
+        np.asarray([5, 0, 7], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+
+    assert removal[0].tolist() == [0, 1]
+    assert removal[1].tolist() == [1]
+    assert removal[2].tolist() == [2]
+    assert repair is not None
+    assert repair[0].tolist() == [0, 2]
+    assert repair[1].tolist() == [2, 1]
+    assert repair[2].tolist() == [0, 0, 1, 2, 2, 0, 0]
+    assert transaction is not None
+    assert transaction[0].tolist() == [0]
+    assert transaction[1].tolist() == [5]
+    assert transaction[2].tolist() == [[1, 0]]
+    np.testing.assert_allclose(transaction[3], np.asarray([[4.0, 0.0]]))
+    assert transaction[5].tolist() == [0]
+    assert transaction[10].tolist()[5:8] == [2, 2, 0]
+
+
+def test_native_search_engine_constraint_probe_uses_one_end_to_end_deadline() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    before = engine.state()
+
+    with pytest.raises(RuntimeError, match="constraint probe reached its deadline"):
+        engine.constraint_probe(
+            0,
+            1,
+            0x5EED,
+            np.asarray([5, 0, 7], dtype=np.int64),
+            np.asarray([np.nextafter(0.0, 1.0)], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        )
+
+    after = engine.state()
+    assert after[0].tolist() == before[0].tolist()
+    assert after[1].tolist() == before[1].tolist()
+    assert after[2] == before[2]
+    assert after[3].tolist() == before[3].tolist()
+
+
+def test_native_search_engine_constraint_probe_envelope_failure_rolls_back() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 1, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    before = engine.state()
+    engine.inject_constraint_probe_envelope_failure_once()
+
+    with pytest.raises(RuntimeError, match="constraint-probe envelope failure"):
+        engine.constraint_probe(
+            0,
+            1,
+            0x5EED,
+            np.asarray([5, 0, 7], dtype=np.int64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        )
+
+    failed = engine.state()
+    assert failed[0].tolist() == before[0].tolist()
+    assert failed[2] == before[2]
+    assert failed[3].tolist() == before[3].tolist()
+    assert failed[1].tolist()[5:8] == [2, 2, 0]
+
+    _removal, _repair, recovered = engine.constraint_probe(
+        0,
+        1,
+        0x5EED,
+        np.asarray([5, 0, 7], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+    assert recovered is not None
+    assert recovered[1].tolist() == [3]
+    assert recovered[10].tolist()[5:8] == [2, 2, 0]
+
+    _removal, _repair, next_round = engine.constraint_probe(
+        0,
+        1,
+        0x5EED,
+        np.asarray([5, 1, 7], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+    assert next_round is not None
+    assert next_round[1].tolist() == [5]
+    assert next_round[10].tolist()[5:8] == [3, 3, 0]
+
+
 def test_native_route_cache_atomic_lru_matches_python_cache() -> None:
     from evrptw import _core as native_core
 
@@ -2871,6 +3034,25 @@ def test_native_route_cache_restores_typed_exact_payload_on_hit() -> None:
             semantic_hashes,
             entry_bytes,
         )
+
+
+def test_native_route_cache_seen_journal_failure_precedes_seen_mutation() -> None:
+    from evrptw import _core as native_core
+
+    cache = native_core.NativeRouteCacheV2(2, 1_000_000)
+    before = cache.snapshot()
+    cache.begin_protocol_transaction()
+    cache.inject_protocol_journal_failure_once()
+
+    with pytest.raises(RuntimeError, match="protocol journal failure"):
+        cache.lookup_exact_many(
+            np.asarray([0, 1], dtype=np.int64),
+            np.asarray([1], dtype=np.int64),
+        )
+
+    cache.rollback_protocol_transaction()
+    after = cache.snapshot()
+    assert [item.tolist() for item in after] == [item.tolist() for item in before]
 
 
 def test_native_negative_route_cache_generation_matches_python() -> None:

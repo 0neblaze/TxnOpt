@@ -1853,9 +1853,14 @@ public:
         for (std::size_t index = 0; index < routes.size(); ++index) {
             ++statistics_[0];
             const auto key = route_key(routes[index]);
-            const auto [_, newly_seen] = seen_keys_.insert(key);
+            const auto newly_seen = !seen_keys_.contains(key);
             if (newly_seen) {
                 record_protocol_seen(key);
+                const auto [_, inserted] = seen_keys_.insert(key);
+                if (!inserted) {
+                    throw std::logic_error(
+                        "native route-cache seen identity changed during lookup");
+                }
             }
             statistics_[10] = static_cast<std::int64_t>(seen_keys_.size());
             const auto found = find_entry(key);
@@ -1936,7 +1941,12 @@ public:
                     auto evicted = entries_.begin();
                     const auto evicted_key = evicted->key;
                     const auto evicted_bytes = evicted->entry_bytes;
-                    record_protocol_eviction(*evicted, next_key(evicted));
+                    const auto retain_eviction = !inserted.contains(evicted_key);
+                    if (retain_eviction) {
+                        record_protocol_eviction(evicted_key, next_key(evicted));
+                    } else {
+                        cancel_protocol_insertion(evicted_key);
+                    }
                     auto index_node = index_.extract(evicted_key);
                     if (index_node.empty()) {
                         throw std::logic_error(
@@ -1946,7 +1956,7 @@ public:
                     statistics_[8] -= evicted_bytes;
                     ++statistics_[4];
                     ++eviction_counts[index];
-                    if (!inserted.contains(evicted_key)) {
+                    if (retain_eviction) {
                         journal.evicted_index_nodes.push_back(
                             std::move(index_node));
                         journal.evicted_entries.splice(
@@ -2116,9 +2126,14 @@ public:
         for (std::size_t index = 0; index < routes.size(); ++index) {
             ++statistics_[0];
             const auto key = route_key(routes[index]);
-            const auto [_, newly_seen] = seen_keys_.insert(key);
+            const auto newly_seen = !seen_keys_.contains(key);
             if (newly_seen) {
                 record_protocol_seen(key);
+                const auto [_, inserted] = seen_keys_.insert(key);
+                if (!inserted) {
+                    throw std::logic_error(
+                        "native route-cache seen identity changed during exact lookup");
+                }
             }
             statistics_[10] = static_cast<std::int64_t>(seen_keys_.size());
             const auto found = find_entry(key);
@@ -2173,7 +2188,9 @@ public:
             throw std::runtime_error(
                 "native route-cache protocol transaction is already active");
         }
-        protocol_snapshot_ = ProtocolSnapshot{statistics_, {}};
+        ProtocolSnapshot snapshot;
+        snapshot.statistics = statistics_;
+        protocol_snapshot_ = std::move(snapshot);
     }
 
     py::array_t<std::int64_t> commit_protocol_transaction() {
@@ -2186,15 +2203,20 @@ public:
     py::array_t<std::int64_t> rollback_protocol_transaction() {
         require_no_active_batch("rollback_protocol_transaction");
         require_protocol_snapshot("rollback_protocol_transaction");
-        rollback_protocol_operations(protocol_snapshot_->operations);
-        statistics_ = protocol_snapshot_->statistics;
-        protocol_snapshot_.reset();
+        prepare_protocol_rollback();
+        rollback_protocol_transaction_noexcept();
         return statistics_array();
+    }
+
+    void inject_protocol_journal_failure_once() {
+        require_protocol_snapshot("inject_protocol_journal_failure_once");
+        protocol_journal_failure_injection_ = true;
     }
 
     py::array_t<std::int64_t> commit_store_batch() {
         require_active_batch("commit_store_batch");
-        active_batch_.reset();
+        prepare_store_commit();
+        commit_store_batch_noexcept();
         return statistics_array();
     }
 
@@ -2270,11 +2292,15 @@ private:
         ProtocolOperationKind kind;
         std::string key;
         std::optional<std::string> next_key;
-        std::optional<Entry> entry;
     };
     struct ProtocolSnapshot {
-        std::array<std::int64_t, 11> statistics;
+        std::array<std::int64_t, 11> statistics{};
         std::vector<ProtocolOperation> operations;
+        std::list<Entry> retained_entries;
+        std::vector<
+            std::unordered_map<
+                std::string,
+                std::list<Entry>::iterator>::node_type> retained_index_nodes;
     };
 
     std::int64_t max_entries_;
@@ -2285,6 +2311,7 @@ private:
     std::array<std::int64_t, 11> statistics_{};
     std::optional<BatchJournal> active_batch_;
     std::optional<ProtocolSnapshot> protocol_snapshot_;
+    bool protocol_journal_failure_injection_ = false;
 
     static std::string route_key(const std::vector<std::int64_t>& route) {
         std::string key;
@@ -2349,8 +2376,13 @@ private:
 
     void record_protocol_seen(const std::string& key) {
         if (protocol_snapshot_.has_value()) {
+            if (protocol_journal_failure_injection_) {
+                protocol_journal_failure_injection_ = false;
+                throw std::runtime_error(
+                    "injected native route-cache protocol journal failure");
+            }
             protocol_snapshot_->operations.push_back(ProtocolOperation{
-                ProtocolOperationKind::seen, key, std::nullopt, std::nullopt});
+                ProtocolOperationKind::seen, key, std::nullopt});
         }
     }
 
@@ -2360,7 +2392,6 @@ private:
                 ProtocolOperationKind::move,
                 entry->key,
                 next_key(entry),
-                std::nullopt,
             });
         }
     }
@@ -2368,26 +2399,69 @@ private:
     void record_protocol_insertion(const std::string& key) {
         if (protocol_snapshot_.has_value()) {
             protocol_snapshot_->operations.push_back(ProtocolOperation{
-                ProtocolOperationKind::insertion, key, std::nullopt, std::nullopt});
+                ProtocolOperationKind::insertion, key, std::nullopt});
         }
     }
 
     void record_protocol_eviction(
-        const Entry& entry,
+        const std::string& key,
         std::optional<std::string> following_key) {
         if (protocol_snapshot_.has_value()) {
             protocol_snapshot_->operations.push_back(ProtocolOperation{
                 ProtocolOperationKind::eviction,
-                entry.key,
+                key,
                 std::move(following_key),
-                entry,
             });
         }
     }
 
-    void rollback_protocol_operations(
-        const std::vector<ProtocolOperation>& operations) {
-        for (auto operation = operations.rbegin(); operation != operations.rend(); ++operation) {
+    void cancel_protocol_insertion(const std::string& key) {
+        if (!protocol_snapshot_.has_value()) {
+            return;
+        }
+        auto& operations = protocol_snapshot_->operations;
+        const auto found = std::find_if(
+            operations.rbegin(), operations.rend(),
+            [&](const ProtocolOperation& operation) {
+                return operation.kind == ProtocolOperationKind::insertion
+                    && operation.key == key;
+            });
+        if (found == operations.rend()) {
+            throw std::logic_error(
+                "native route-cache transient eviction lost its insertion journal");
+        }
+        operations.erase(std::next(found).base());
+    }
+
+    void prepare_protocol_rollback() const {
+        require_no_active_batch("prepare_protocol_rollback");
+        require_protocol_snapshot("prepare_protocol_rollback");
+        for (const auto& operation : protocol_snapshot_->operations) {
+            if (operation.kind != ProtocolOperationKind::eviction) {
+                continue;
+            }
+            const auto retained_entry = std::find_if(
+                protocol_snapshot_->retained_entries.begin(),
+                protocol_snapshot_->retained_entries.end(),
+                [&](const Entry& entry) { return entry.key == operation.key; });
+            const auto retained_node = std::find_if(
+                protocol_snapshot_->retained_index_nodes.begin(),
+                protocol_snapshot_->retained_index_nodes.end(),
+                [&](const auto& node) {
+                    return !node.empty() && node.key() == operation.key;
+                });
+            if (retained_entry == protocol_snapshot_->retained_entries.end()
+                || retained_node == protocol_snapshot_->retained_index_nodes.end()) {
+                throw std::logic_error(
+                    "native route-cache protocol rollback journal is incomplete");
+            }
+        }
+    }
+
+    void rollback_protocol_operations_noexcept(
+        ProtocolSnapshot& snapshot) noexcept {
+        for (auto operation = snapshot.operations.rbegin();
+             operation != snapshot.operations.rend(); ++operation) {
             if (operation->kind == ProtocolOperationKind::seen) {
                 seen_keys_.erase(operation->key);
                 continue;
@@ -2395,42 +2469,54 @@ private:
             if (operation->kind == ProtocolOperationKind::insertion) {
                 const auto found = find_entry(operation->key);
                 if (found == entries_.end()) {
-                    throw std::runtime_error(
-                        "native route-cache protocol rollback lost an insertion");
+                    std::terminate();
                 }
                 index_.erase(operation->key);
                 entries_.erase(found);
                 continue;
             }
             if (operation->kind == ProtocolOperationKind::eviction) {
-                if (!operation->entry.has_value() || index_.contains(operation->key)) {
-                    throw std::runtime_error(
-                        "native route-cache protocol eviction journal is invalid");
+                if (index_.contains(operation->key)) {
+                    std::terminate();
                 }
                 auto position = entries_.end();
                 if (operation->next_key.has_value()) {
                     const auto following = index_.find(*operation->next_key);
                     if (following == index_.end()) {
-                        throw std::runtime_error(
-                            "native route-cache protocol rollback lost an eviction anchor");
+                        std::terminate();
                     }
                     position = following->second;
                 }
-                auto restored = entries_.insert(position, *operation->entry);
-                index_.emplace(restored->key, restored);
+                const auto retained_entry = std::find_if(
+                    snapshot.retained_entries.begin(),
+                    snapshot.retained_entries.end(),
+                    [&](const Entry& entry) { return entry.key == operation->key; });
+                const auto retained_node = std::find_if(
+                    snapshot.retained_index_nodes.begin(),
+                    snapshot.retained_index_nodes.end(),
+                    [&](const auto& node) {
+                        return !node.empty() && node.key() == operation->key;
+                    });
+                if (retained_entry == snapshot.retained_entries.end()
+                    || retained_node == snapshot.retained_index_nodes.end()) {
+                    std::terminate();
+                }
+                entries_.splice(position, snapshot.retained_entries, retained_entry);
+                const auto restored = index_.insert(std::move(*retained_node));
+                if (!restored.inserted) {
+                    std::terminate();
+                }
                 continue;
             }
             const auto found = find_entry(operation->key);
             if (found == entries_.end()) {
-                throw std::runtime_error(
-                    "native route-cache protocol rollback lost an LRU entry");
+                std::terminate();
             }
             auto position = entries_.end();
             if (operation->next_key.has_value()) {
                 const auto following = index_.find(*operation->next_key);
                 if (following == index_.end()) {
-                    throw std::runtime_error(
-                        "native route-cache protocol rollback lost an LRU anchor");
+                    std::terminate();
                 }
                 position = following->second;
             }
@@ -2494,6 +2580,33 @@ private:
 
     void commit_protocol_transaction_noexcept() noexcept {
         protocol_snapshot_.reset();
+    }
+
+    void rollback_protocol_transaction_noexcept() noexcept {
+        rollback_protocol_operations_noexcept(*protocol_snapshot_);
+        statistics_ = protocol_snapshot_->statistics;
+        protocol_snapshot_.reset();
+    }
+
+    void prepare_store_commit() {
+        require_active_batch("prepare_store_commit");
+        if (protocol_snapshot_.has_value()) {
+            protocol_snapshot_->retained_index_nodes.reserve(
+                protocol_snapshot_->retained_index_nodes.size()
+                + active_batch_->evicted_index_nodes.size());
+        }
+    }
+
+    void commit_store_batch_noexcept() noexcept {
+        if (protocol_snapshot_.has_value()) {
+            protocol_snapshot_->retained_entries.splice(
+                protocol_snapshot_->retained_entries.end(),
+                active_batch_->evicted_entries);
+            for (auto& node : active_batch_->evicted_index_nodes) {
+                protocol_snapshot_->retained_index_nodes.push_back(std::move(node));
+            }
+        }
+        active_batch_.reset();
     }
 
     void prepare_protocol_commit() const {
@@ -2765,6 +2878,20 @@ private:
         active_batch_.reset();
     }
 
+    void rollback_store_batch_noexcept() noexcept {
+        if (active_batch_->rollover) {
+            entries_ = std::move(active_batch_->previous_entries);
+        } else {
+            const auto& added = active_batch_->added_keys;
+            std::erase_if(entries_, [&](const Entry& entry) {
+                return std::find(added.begin(), added.end(), entry.key)
+                    != added.end();
+            });
+        }
+        statistics_[3] = static_cast<std::int64_t>(entries_.size());
+        active_batch_.reset();
+    }
+
     void prepare_store_commit() const {
         require_active_batch("prepare_store_commit");
     }
@@ -2918,6 +3045,15 @@ public:
 
 private:
     friend class NativeSearchEngineV2;
+    struct NativeSnapshot {
+        bool round_active = false;
+        std::int64_t lane_id = -1;
+        std::int64_t iteration = -1;
+        std::int64_t round_used = 0;
+        std::int64_t started = 0;
+        std::int64_t completed = 0;
+        std::int64_t interrupted = 0;
+    };
     std::int64_t exact_budget_;
     std::int64_t round_budget_;
     bool round_active_ = false;
@@ -2931,6 +3067,32 @@ private:
     [[nodiscard]] std::int64_t round_remaining() const {
         return round_active_ ? std::max<std::int64_t>(0, round_budget_ - round_used_)
                              : round_budget_;
+    }
+
+    [[nodiscard]] NativeSnapshot native_snapshot() const noexcept {
+        return NativeSnapshot{
+            round_active_, lane_id_, iteration_, round_used_,
+            started_, completed_, interrupted_};
+    }
+
+    void rollback_preserving_exact_noexcept(
+        const NativeSnapshot& snapshot) noexcept {
+        const auto started_delta = started_ - snapshot.started;
+        const auto completed_delta = completed_ - snapshot.completed;
+        const auto interrupted_delta = interrupted_ - snapshot.interrupted;
+        if (started_delta < 0 || completed_delta < 0 || interrupted_delta < 0
+            || completed_delta + interrupted_delta != started_delta) {
+            std::terminate();
+        }
+        if (started_delta == 0) {
+            round_active_ = snapshot.round_active;
+            lane_id_ = snapshot.lane_id;
+            iteration_ = snapshot.iteration;
+            round_used_ = snapshot.round_used;
+        }
+        started_ = snapshot.started + started_delta;
+        completed_ = snapshot.completed + completed_delta;
+        interrupted_ = snapshot.interrupted + interrupted_delta;
     }
 };
 
@@ -3015,6 +3177,13 @@ private:
     std::optional<std::vector<std::string>> active_additions_;
 
     void commit_mark_batch_noexcept() noexcept {
+        active_additions_.reset();
+    }
+
+    void rollback_mark_batch_noexcept() noexcept {
+        for (const auto& key : *active_additions_) {
+            attempted_.erase(key);
+        }
         active_additions_.reset();
     }
 
@@ -9307,7 +9476,7 @@ public:
             canonical_expected.begin(), canonical_expected.end(),
             checked_data(canonical_expected_array));
 
-        auto round_budget_snapshot = budget_.snapshot();
+        auto round_budget_snapshot = budget_.native_snapshot();
         budget_.begin_round(context[0], context[1]);
         bool round_protocol_active = false;
         bool negative_store_active = false;
@@ -9906,6 +10075,7 @@ public:
             std::move(feasible_order_array),
             native_sha256_hex(evidence));
         route_cache_.prepare_protocol_commit();
+        route_cache_.prepare_protocol_rollback();
         if (commit_failure_injection_ == 1) {
             commit_failure_injection_ = 0;
             throw std::runtime_error(
@@ -9927,6 +10097,21 @@ public:
             throw std::runtime_error(
                 "injected full native attempted-plan commit preparation failure");
         }
+        if (defer_composite_commit_) {
+            if (pending_composite_active_) {
+                throw std::logic_error(
+                    "full native composite transaction is already pending");
+            }
+            pending_round_protocol_ = round_protocol_active;
+            pending_negative_store_ = negative_store_active;
+            pending_attempted_mark_ = attempted_mark_active;
+            pending_budget_snapshot_.emplace(round_budget_snapshot);
+            pending_composite_active_ = true;
+            round_protocol_active = false;
+            negative_store_active = false;
+            attempted_mark_active = false;
+            return result;
+        }
         route_cache_.commit_protocol_transaction_noexcept();
         round_protocol_active = false;
         if (negative_store_active) {
@@ -9940,17 +10125,176 @@ public:
         return result;
         } catch (...) {
             if (attempted_mark_active) {
-                attempted_plans_.rollback_mark_batch();
+                attempted_plans_.rollback_mark_batch_noexcept();
             }
             if (negative_store_active) {
-                negative_cache_.rollback_store_batch();
+                negative_cache_.rollback_store_batch_noexcept();
             }
             if (round_protocol_active) {
-                route_cache_.rollback_protocol_transaction();
+                route_cache_.rollback_protocol_transaction_noexcept();
             }
             rollback_round_budget_preserving_exact(round_budget_snapshot);
             throw;
         }
+    }
+
+    py::tuple constraint_probe(
+        std::int64_t operation,
+        std::int64_t requested_count,
+        std::uint64_t seed,
+        py::handle context_ids,
+        py::handle deadline_remaining,
+        py::handle batch_size,
+        std::int64_t route_change_limit) {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (!initialized_) {
+            throw std::runtime_error(
+                "full native search engine must be initialized before a constraint probe");
+        }
+        const auto probe_started = std::chrono::steady_clock::now();
+        auto context_array = owned_array_copy<std::int64_t>(
+            context_ids, "context_ids", 1);
+        auto deadline_array = owned_array_copy<double>(
+            deadline_remaining, "deadline_remaining", 1);
+        auto batch_array = owned_array_copy<std::int64_t>(
+            batch_size, "batch_size", 1);
+        if (context_array.size() != 3 || deadline_array.size() != 1
+            || batch_array.size() != 1
+            || checked_data<std::int64_t>(batch_array)[0] <= 0) {
+            throw std::invalid_argument(
+                "full native constraint probe scalar-array shape is invalid");
+        }
+        const auto* context = checked_data<std::int64_t>(context_array);
+        if (context[0] < 0 || context[1] < 0 || context[2] < 0) {
+            throw std::invalid_argument(
+                "full native constraint probe context IDs must be non-negative");
+        }
+        const auto deadline_seconds = checked_data<double>(deadline_array)[0];
+        if (!std::isfinite(deadline_seconds) || deadline_seconds <= 0.0) {
+            throw std::invalid_argument(
+                "full native constraint probe deadline must be finite and positive");
+        }
+        if (operation < 0 || operation > 3 || requested_count <= 0
+            || route_change_limit == 0 || route_change_limit < -1) {
+            throw std::invalid_argument(
+                "full native constraint probe configuration is invalid");
+        }
+        const auto remaining_at_boundary = [&]() {
+            return deadline_seconds - std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - probe_started).count();
+        };
+        const auto require_deadline = [&]() {
+            if (remaining_at_boundary() <= 0.0) {
+                throw std::runtime_error(
+                    "full native constraint probe reached its deadline");
+            }
+        };
+        auto removal = constraint_removal_v2(
+            operation,
+            node_kind_,
+            demand_,
+            ready_time_,
+            due_date_,
+            service_time_,
+            distance_,
+            reachable_,
+            vehicle_,
+            lexical_rank_,
+            current_offsets_,
+            current_indices_,
+            current_exact_payload_[0],
+            current_exact_payload_[1],
+            current_exact_payload_[4],
+            requested_count,
+            seed);
+        auto removal_metadata = py::cast<py::array_t<std::int64_t>>(removal[6]);
+        if (checked_data<std::int64_t>(removal_metadata)[0] != 0) {
+            auto result = py::make_tuple(
+                std::move(removal), py::none(), py::none());
+            require_deadline();
+            return result;
+        }
+        auto repair = candidate_control_repair_v2(
+            node_kind_,
+            demand_,
+            ready_time_,
+            due_date_,
+            service_time_,
+            distance_,
+            reachable_,
+            vehicle_,
+            lexical_rank_,
+            removal[0],
+            removal[1],
+            removal[2],
+            screening_epsilon_,
+            route_change_limit,
+            false);
+        auto repair_metadata = py::cast<py::array_t<std::int64_t>>(repair[2]);
+        if (checked_data<std::int64_t>(repair_metadata)[0] != 0) {
+            auto result = py::make_tuple(
+                std::move(removal), std::move(repair), py::none());
+            require_deadline();
+            return result;
+        }
+        auto repaired_offsets = py::cast<py::array_t<std::int64_t>>(repair[0]);
+        py::array_t<std::int64_t> plan_offsets(2);
+        checked_data(plan_offsets)[0] = 0;
+        checked_data(plan_offsets)[1] = repaired_offsets.size() - 1;
+        std::vector<std::int64_t> expected(
+            all_customers_.begin(), all_customers_.end());
+        std::stable_sort(
+            expected.begin(), expected.end(),
+            [&](std::int64_t left, std::int64_t right) {
+                return checked_data<std::int64_t>(lexical_rank_)[left]
+                    < checked_data<std::int64_t>(lexical_rank_)[right];
+            });
+        py::array_t<std::int64_t> expected_array(expected.size());
+        std::copy(expected.begin(), expected.end(), checked_data(expected_array));
+        require_deadline();
+        py::array_t<double> adjusted_deadline(1);
+        checked_data(adjusted_deadline)[0] = remaining_at_boundary();
+        defer_composite_commit_ = true;
+        try {
+            auto transaction = evaluate_plans(
+                plan_offsets,
+                repair[0],
+                repair[1],
+                context_array,
+                adjusted_deadline,
+                batch_array,
+                expected_array);
+            defer_composite_commit_ = false;
+            auto result = py::make_tuple(
+                std::move(removal), std::move(repair), std::move(transaction));
+            require_deadline();
+            if (probe_envelope_failure_injection_) {
+                probe_envelope_failure_injection_ = false;
+                throw std::runtime_error(
+                    "injected full native constraint-probe envelope failure");
+            }
+            commit_pending_composite_noexcept();
+            return result;
+        } catch (...) {
+            defer_composite_commit_ = false;
+            if (pending_composite_active_) {
+                rollback_pending_composite();
+            }
+            throw;
+        }
+    }
+
+    void inject_constraint_probe_envelope_failure_once() {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        probe_envelope_failure_injection_ = true;
     }
 
     void inject_commit_failure_once(std::int64_t step) {
@@ -9991,7 +10335,7 @@ public:
     }
 
 private:
-    mutable std::mutex state_mutex_;
+    mutable std::recursive_mutex state_mutex_;
     NativeRouteCacheV2 route_cache_;
     NativeNegativeRouteCacheV2 negative_cache_;
     NativeBudgetStateV2 budget_;
@@ -10001,6 +10345,13 @@ private:
     std::int64_t worker_count_;
     std::int64_t batch_size_ = 0;
     std::int64_t commit_failure_injection_ = 0;
+    bool probe_envelope_failure_injection_ = false;
+    bool defer_composite_commit_ = false;
+    bool pending_composite_active_ = false;
+    bool pending_round_protocol_ = false;
+    bool pending_negative_store_ = false;
+    bool pending_attempted_mark_ = false;
+    std::optional<NativeBudgetStateV2::NativeSnapshot> pending_budget_snapshot_;
     std::int64_t depot_ = -1;
     std::vector<std::int64_t> recharge_nodes_;
     std::unordered_set<std::int64_t> all_customers_;
@@ -10020,38 +10371,51 @@ private:
     py::array_t<std::int64_t> current_objective_integer_;
     py::array_t<double> current_objective_float_;
 
-    void rollback_round_budget_preserving_exact(
-        const py::array_t<std::int64_t>& snapshot) {
-        auto failed_state = budget_.state();
-        const auto* before = checked_data<std::int64_t>(snapshot);
-        const auto* failed = checked_data<std::int64_t>(failed_state);
-        const auto started_delta = failed[5] - before[5];
-        const auto completed_delta = failed[6] - before[6];
-        const auto interrupted_delta = failed[7] - before[7];
-        if (started_delta < 0 || completed_delta < 0 || interrupted_delta < 0
-            || completed_delta + interrupted_delta != started_delta) {
-            throw std::logic_error(
-                "full native exact accounting cannot be reconciled during rollback");
-        }
-        py::array_t<std::int64_t> logical_state(snapshot.size());
-        std::copy(
-            before, before + snapshot.size(), checked_data(logical_state));
-        if (started_delta > 0) {
-            for (std::size_t index = 0; index < 4; ++index) {
-                checked_data(logical_state)[index] = failed[index];
-            }
-        }
-        budget_.restore(logical_state);
-        if (started_delta == 0) {
+    void clear_pending_composite_noexcept() noexcept {
+        pending_round_protocol_ = false;
+        pending_negative_store_ = false;
+        pending_attempted_mark_ = false;
+        pending_budget_snapshot_.reset();
+        pending_composite_active_ = false;
+    }
+
+    void commit_pending_composite_noexcept() noexcept {
+        if (!pending_composite_active_) {
             return;
         }
-        const auto reservation = budget_.reserve_exact(started_delta);
-        if (checked_data<std::int64_t>(reservation)[1] != started_delta) {
-            throw std::logic_error(
-                "full native exact accounting could not be restored after rollback");
+        if (pending_round_protocol_) {
+            route_cache_.commit_protocol_transaction_noexcept();
         }
-        budget_.complete_exact(completed_delta);
-        budget_.interrupt_exact(interrupted_delta);
+        if (pending_negative_store_) {
+            negative_cache_.commit_store_batch_noexcept();
+        }
+        if (pending_attempted_mark_) {
+            attempted_plans_.commit_mark_batch_noexcept();
+        }
+        clear_pending_composite_noexcept();
+    }
+
+    void rollback_pending_composite() noexcept {
+        if (!pending_composite_active_ || !pending_budget_snapshot_.has_value()) {
+            std::terminate();
+        }
+        if (pending_attempted_mark_) {
+            attempted_plans_.rollback_mark_batch_noexcept();
+        }
+        if (pending_negative_store_) {
+            negative_cache_.rollback_store_batch_noexcept();
+        }
+        if (pending_round_protocol_) {
+            route_cache_.rollback_protocol_transaction_noexcept();
+        }
+        const auto budget_snapshot = *pending_budget_snapshot_;
+        clear_pending_composite_noexcept();
+        rollback_round_budget_preserving_exact(budget_snapshot);
+    }
+
+    void rollback_round_budget_preserving_exact(
+        const NativeBudgetStateV2::NativeSnapshot& snapshot) noexcept {
+        budget_.rollback_preserving_exact_noexcept(snapshot);
     }
 
     py::array_t<std::uint8_t> exact_semantic_hashes(
@@ -10772,6 +11136,9 @@ PYBIND11_MODULE(_core, module) {
         .def(
             "rollback_protocol_transaction",
             &NativeRouteCacheV2::rollback_protocol_transaction)
+        .def(
+            "inject_protocol_journal_failure_once",
+            &NativeRouteCacheV2::inject_protocol_journal_failure_once)
         .def("commit_store_batch", &NativeRouteCacheV2::commit_store_batch)
         .def("rollback_store_batch", &NativeRouteCacheV2::rollback_store_batch)
         .def("snapshot", &NativeRouteCacheV2::snapshot);
@@ -10858,11 +11225,20 @@ PYBIND11_MODULE(_core, module) {
             py::arg("route_indices"), py::arg("context_ids"),
             py::arg("deadline_remaining"), py::arg("batch_size"),
             py::arg("expected_customer_indices"))
+        .def(
+            "constraint_probe", &NativeSearchEngineV2::constraint_probe,
+            py::arg("operation"), py::arg("requested_count"),
+            py::arg("seed"), py::arg("context_ids"),
+            py::arg("deadline_remaining"), py::arg("batch_size"),
+            py::arg("route_change_limit"))
         .def("initialized", &NativeSearchEngineV2::initialized)
         .def(
             "inject_commit_failure_once",
             &NativeSearchEngineV2::inject_commit_failure_once,
             py::arg("step"))
+        .def(
+            "inject_constraint_probe_envelope_failure_once",
+            &NativeSearchEngineV2::inject_constraint_probe_envelope_failure_once)
         .def("state", &NativeSearchEngineV2::state);
     py::class_<Stage052ReplayState>(module, "Stage052ReplayState")
         .def(
