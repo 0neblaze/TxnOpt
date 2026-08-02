@@ -473,6 +473,155 @@ py::tuple python_random_golden_v1(
         std::move(shuffled_values));
 }
 
+py::tuple legacy_destroy_v2(
+    std::uint64_t seed,
+    std::int64_t operation,
+    std::int64_t remove_count,
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle distance,
+    py::handle lexical_rank,
+    std::int64_t depot) {
+    auto offsets_array = checked_array<std::int64_t>(
+        route_offsets, "route_offsets", 1);
+    auto indices_array = checked_array<std::int64_t>(
+        route_indices, "route_indices", 1);
+    auto distance_array = checked_array<double>(distance, "distance", 2);
+    auto lexical_array = checked_array<std::int64_t>(
+        lexical_rank, "lexical_rank", 1);
+    if (operation < 0 || operation > 2 || remove_count <= 0
+        || offsets_array.size() < 2 || distance_array.shape(0) == 0
+        || distance_array.shape(0) != distance_array.shape(1)
+        || lexical_array.size() != distance_array.shape(0)
+        || depot < 0 || depot >= distance_array.shape(0)) {
+        throw std::invalid_argument("legacy destroy input/config is invalid");
+    }
+    const auto route_count = static_cast<std::size_t>(offsets_array.size() - 1);
+    const auto* offsets = checked_data<std::int64_t>(offsets_array);
+    const auto* indices = checked_data<std::int64_t>(indices_array);
+    const auto* distances = checked_data<double>(distance_array);
+    const auto* lexical = checked_data<std::int64_t>(lexical_array);
+    const auto node_count = static_cast<std::size_t>(distance_array.shape(0));
+    if (offsets[0] != 0 || offsets[route_count] != indices_array.size()) {
+        throw std::invalid_argument("legacy destroy route offsets are invalid");
+    }
+    std::vector<std::vector<std::int64_t>> routes;
+    std::vector<std::int64_t> customers;
+    std::vector<bool> seen(node_count, false);
+    for (std::size_t route = 0; route < route_count; ++route) {
+        if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]) {
+            throw std::invalid_argument("legacy destroy routes must be non-empty");
+        }
+        routes.emplace_back(
+            indices + offsets[route], indices + offsets[route + 1]);
+        for (const auto customer : routes.back()) {
+            if (customer < 0 || static_cast<std::size_t>(customer) >= node_count
+                || customer == depot || seen[static_cast<std::size_t>(customer)]) {
+                throw std::invalid_argument(
+                    "legacy destroy routes must contain unique non-depot nodes");
+            }
+            seen[static_cast<std::size_t>(customer)] = true;
+            customers.push_back(customer);
+        }
+    }
+    const auto count = std::min<std::size_t>(
+        static_cast<std::size_t>(remove_count), customers.size());
+    PythonRandom random(seed);
+    std::vector<std::int64_t> removed;
+    removed.reserve(count);
+    if (operation == 0) {
+        const auto sampled = random.sample_indices(
+            static_cast<std::int64_t>(customers.size()),
+            static_cast<std::int64_t>(count));
+        for (const auto index : sampled) {
+            removed.push_back(customers[static_cast<std::size_t>(index)]);
+        }
+    } else if (operation == 1) {
+        std::vector<std::pair<double, std::int64_t>> contributions;
+        contributions.reserve(customers.size());
+        for (const auto& route : routes) {
+            for (std::size_t position = 0; position < route.size(); ++position) {
+                const auto before = position == 0 ? depot : route[position - 1];
+                const auto customer = route[position];
+                const auto after = position + 1 == route.size()
+                    ? depot
+                    : route[position + 1];
+                const auto saving = distances[
+                    static_cast<std::size_t>(before) * node_count
+                    + static_cast<std::size_t>(customer)]
+                    + distances[static_cast<std::size_t>(customer) * node_count
+                                + static_cast<std::size_t>(after)]
+                    - distances[static_cast<std::size_t>(before) * node_count
+                                + static_cast<std::size_t>(after)];
+                contributions.emplace_back(saving, customer);
+            }
+        }
+        std::stable_sort(
+            contributions.begin(), contributions.end(),
+            [&](const auto& left, const auto& right) {
+                if (left.first != right.first) {
+                    return left.first > right.first;
+                }
+                return lexical[left.second] > lexical[right.second];
+            });
+        for (std::size_t index = 0; index < count; ++index) {
+            removed.push_back(contributions[index].second);
+        }
+    } else {
+        const auto anchor = customers[static_cast<std::size_t>(
+            random.randbelow(customers.size()))];
+        std::vector<std::pair<double, std::int64_t>> related;
+        related.reserve(customers.size());
+        for (const auto customer : customers) {
+            related.emplace_back(
+                distances[static_cast<std::size_t>(anchor) * node_count
+                          + static_cast<std::size_t>(customer)],
+                customer);
+        }
+        std::stable_sort(
+            related.begin(), related.end(),
+            [&](const auto& left, const auto& right) {
+                if (left.first != right.first) {
+                    return left.first < right.first;
+                }
+                return lexical[left.second] < lexical[right.second];
+            });
+        for (std::size_t index = 0; index < count; ++index) {
+            removed.push_back(related[index].second);
+        }
+    }
+    const std::unordered_set<std::int64_t> removed_set(
+        removed.begin(), removed.end());
+    std::vector<std::int64_t> partial_offsets{0};
+    std::vector<std::int64_t> partial_indices;
+    for (const auto& route : routes) {
+        const auto before = partial_indices.size();
+        for (const auto customer : route) {
+            if (!removed_set.contains(customer)) {
+                partial_indices.push_back(customer);
+            }
+        }
+        if (partial_indices.size() != before) {
+            partial_offsets.push_back(
+                static_cast<std::int64_t>(partial_indices.size()));
+        }
+    }
+    py::array_t<std::int64_t> partial_offsets_array(partial_offsets.size());
+    py::array_t<std::int64_t> partial_indices_array(partial_indices.size());
+    py::array_t<std::int64_t> removed_array(removed.size());
+    std::copy(
+        partial_offsets.begin(), partial_offsets.end(),
+        checked_data(partial_offsets_array));
+    std::copy(
+        partial_indices.begin(), partial_indices.end(),
+        checked_data(partial_indices_array));
+    std::copy(removed.begin(), removed.end(), checked_data(removed_array));
+    return py::make_tuple(
+        std::move(partial_offsets_array),
+        std::move(partial_indices_array),
+        std::move(removed_array));
+}
+
 py::array_t<std::int64_t> native_objective_acceptance_v1(
     py::handle current_integer,
     py::handle current_float,
@@ -774,6 +923,115 @@ py::tuple changed_candidate_pool_v1(
         std::move(change_indices_array),
         std::move(removed_offsets_array),
         std::move(removed_indices_array));
+}
+
+py::tuple insertion_candidate_plans_v2(
+    py::handle current_route_offsets,
+    py::handle current_route_indices,
+    std::int64_t customer,
+    py::handle demand,
+    double load_capacity,
+    double epsilon) {
+    auto offsets_array = checked_array<std::int64_t>(
+        current_route_offsets, "current_route_offsets", 1);
+    auto indices_array = checked_array<std::int64_t>(
+        current_route_indices, "current_route_indices", 1);
+    auto demand_array = checked_array<double>(demand, "demand", 1);
+    if (offsets_array.size() < 1 || customer < 0
+        || customer >= demand_array.size() || !std::isfinite(load_capacity)
+        || load_capacity < 0.0 || !std::isfinite(epsilon) || epsilon < 0.0) {
+        throw std::invalid_argument("insertion candidate-plan input/config is invalid");
+    }
+    const auto route_count = static_cast<std::size_t>(offsets_array.size() - 1);
+    const auto* offsets = checked_data<std::int64_t>(offsets_array);
+    const auto* indices = checked_data<std::int64_t>(indices_array);
+    const auto* demands = checked_data<double>(demand_array);
+    if (offsets[0] != 0 || offsets[route_count] != indices_array.size()) {
+        throw std::invalid_argument("insertion current routes do not span indices");
+    }
+    std::vector<std::vector<std::int64_t>> routes;
+    routes.reserve(route_count);
+    for (std::size_t route = 0; route < route_count; ++route) {
+        if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]) {
+            throw std::invalid_argument("insertion current routes must be non-empty");
+        }
+        routes.emplace_back(
+            indices + offsets[route], indices + offsets[route + 1]);
+        for (const auto node : routes.back()) {
+            if (node < 0 || node >= demand_array.size() || node == customer) {
+                throw std::invalid_argument(
+                    "insertion routes contain an invalid or already-present customer");
+            }
+        }
+    }
+    std::vector<std::int64_t> plan_offsets{0};
+    std::vector<std::int64_t> route_offsets{0};
+    std::vector<std::int64_t> route_indices;
+    std::vector<std::int64_t> metadata;
+    for (std::size_t target = 0; target <= route_count; ++target) {
+        const std::vector<std::int64_t> empty;
+        const auto& base = target < route_count ? routes[target] : empty;
+        double demand_total = 0.0;
+        double demand_compensation = 0.0;
+        const auto add_demand = [&](double value) {
+            const auto next = demand_total + value;
+            demand_compensation += std::fabs(demand_total) >= std::fabs(value)
+                ? (demand_total - next) + value
+                : (value - next) + demand_total;
+            demand_total = next;
+        };
+        add_demand(demands[customer]);
+        for (const auto node : base) {
+            add_demand(demands[node]);
+        }
+        const auto total_demand = demand_compensation != 0.0
+                && std::isfinite(demand_compensation)
+            ? demand_total + demand_compensation
+            : demand_total;
+        if (total_demand > load_capacity + epsilon) {
+            continue;
+        }
+        for (std::size_t position = 0; position <= base.size(); ++position) {
+            auto candidate = base;
+            candidate.insert(
+                candidate.begin() + static_cast<std::ptrdiff_t>(position), customer);
+            for (std::size_t route = 0; route < route_count; ++route) {
+                const auto& selected = route == target ? candidate : routes[route];
+                route_indices.insert(
+                    route_indices.end(), selected.begin(), selected.end());
+                route_offsets.push_back(
+                    static_cast<std::int64_t>(route_indices.size()));
+            }
+            if (target == route_count) {
+                route_indices.insert(
+                    route_indices.end(), candidate.begin(), candidate.end());
+                route_offsets.push_back(
+                    static_cast<std::int64_t>(route_indices.size()));
+            }
+            plan_offsets.push_back(
+                static_cast<std::int64_t>(route_offsets.size() - 1));
+            metadata.push_back(static_cast<std::int64_t>(target));
+            metadata.push_back(static_cast<std::int64_t>(position));
+        }
+    }
+    py::array_t<std::int64_t> plan_offsets_array(plan_offsets.size());
+    py::array_t<std::int64_t> route_offsets_array(route_offsets.size());
+    py::array_t<std::int64_t> route_indices_array(route_indices.size());
+    py::array_t<std::int64_t> metadata_array(
+        std::vector<py::ssize_t>{
+            static_cast<py::ssize_t>(metadata.size() / 2), 2});
+    std::copy(
+        plan_offsets.begin(), plan_offsets.end(), checked_data(plan_offsets_array));
+    std::copy(
+        route_offsets.begin(), route_offsets.end(), checked_data(route_offsets_array));
+    std::copy(
+        route_indices.begin(), route_indices.end(), checked_data(route_indices_array));
+    std::copy(metadata.begin(), metadata.end(), checked_data(metadata_array));
+    return py::make_tuple(
+        std::move(plan_offsets_array),
+        std::move(route_offsets_array),
+        std::move(route_indices_array),
+        std::move(metadata_array));
 }
 
 py::tuple assemble_changed_candidate_plans_v1(
@@ -8100,6 +8358,17 @@ PYBIND11_MODULE(_core, module) {
         py::arg("sample_size"),
         py::arg("weights"),
         py::arg("shuffle_size"));
+    module.def(
+        "legacy_destroy_v2",
+        &legacy_destroy_v2,
+        py::arg("seed"),
+        py::arg("operation"),
+        py::arg("remove_count"),
+        py::arg("route_offsets"),
+        py::arg("route_indices"),
+        py::arg("distance"),
+        py::arg("lexical_rank"),
+        py::arg("depot"));
     module.def("native_sha256_v1", &native_sha256_v1, py::arg("payload"));
     module.def(
         "native_objective_acceptance_v1",
@@ -8123,6 +8392,15 @@ PYBIND11_MODULE(_core, module) {
         py::arg("operation"),
         py::arg("route_offsets"),
         py::arg("route_indices"));
+    module.def(
+        "insertion_candidate_plans_v2",
+        &insertion_candidate_plans_v2,
+        py::arg("current_route_offsets"),
+        py::arg("current_route_indices"),
+        py::arg("customer"),
+        py::arg("demand"),
+        py::arg("load_capacity"),
+        py::arg("epsilon"));
     module.def(
         "assemble_changed_candidate_plans_v1",
         &assemble_changed_candidate_plans_v1,

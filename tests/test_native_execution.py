@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from evrptw.alns import _Evaluator, solve_alns
+from evrptw.alns import _destroy, _Evaluator, solve_alns
 from evrptw.cache_incremental import (
     CacheIncrementalConfig,
     RouteEvaluationCache,
@@ -790,6 +790,110 @@ def test_native_python_random_matches_python313_call_sequence(seed: int) -> None
     assert native[2].tolist() == expected_sample
     assert native[3] == expected_weighted
     assert native[4].tolist() == expected_shuffle
+
+
+@pytest.mark.parametrize(
+    ("operation", "destroy_name"),
+    ((0, "random"), (1, "worst"), (2, "related")),
+)
+@pytest.mark.parametrize("seed", (2014, 2015, 2016))
+def test_native_legacy_destroy_matches_python(
+    operation: int,
+    destroy_name: str,
+    seed: int,
+) -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    sequences = (("C1", "C2"),)
+    expected_partial, expected_removed = _destroy(
+        instance,
+        sequences,
+        1,
+        destroy_name,
+        random.Random(seed),
+    )
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    offsets = np.asarray([0, 2], dtype=np.int64)
+    indices = np.asarray(
+        [context.name_to_index[name] for name in sequences[0]],
+        dtype=np.int64,
+    )
+    ordered_names = sorted(context.node_names)
+    rank_by_name = {name: rank for rank, name in enumerate(ordered_names)}
+    lexical_rank = np.asarray(
+        [rank_by_name[name] for name in context.node_names],
+        dtype=np.int64,
+    )
+    partial_offsets, partial_indices, removed_indices = native_core.legacy_destroy_v2(
+        seed,
+        operation,
+        1,
+        offsets,
+        indices,
+        context.distance,
+        lexical_rank,
+        context.name_to_index[instance.depot.name],
+    )
+    actual_partial = tuple(
+        tuple(
+            context.node_names[int(index)]
+            for index in partial_indices[
+                int(partial_offsets[route]) : int(partial_offsets[route + 1])
+            ]
+        )
+        for route in range(len(partial_offsets) - 1)
+    )
+    actual_removed = tuple(context.node_names[int(index)] for index in removed_indices)
+
+    assert actual_partial == expected_partial
+    assert actual_removed == expected_removed
+
+
+def test_native_insertion_candidate_plans_match_controlled_python_enumeration() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    customer = "C2"
+    current_offsets = np.asarray([0, 1], dtype=np.int64)
+    current_indices = np.asarray(
+        [context.name_to_index["C1"]],
+        dtype=np.int64,
+    )
+    plan_offsets, route_offsets, route_indices, metadata = (
+        native_core.insertion_candidate_plans_v2(
+            current_offsets,
+            current_indices,
+            context.name_to_index[customer],
+            context.demand,
+            instance.vehicle.load_capacity,
+            1e-9,
+        )
+    )
+    actual = tuple(
+        tuple(
+            tuple(
+                context.node_names[int(index)]
+                for index in route_indices[
+                    int(route_offsets[route]) : int(route_offsets[route + 1])
+                ]
+            )
+            for route in range(
+                int(plan_offsets[plan]),
+                int(plan_offsets[plan + 1]),
+            )
+        )
+        for plan in range(len(plan_offsets) - 1)
+    )
+    expected = (
+        (("C2", "C1"),),
+        (("C1", "C2"),),
+        (("C1",), ("C2",)),
+    )
+
+    assert actual == expected
+    assert metadata.tolist() == [[0, 0], [0, 1], [1, 0]]
 
 
 def test_full_native_initialization_matches_python_exact_objective_and_budget() -> None:
