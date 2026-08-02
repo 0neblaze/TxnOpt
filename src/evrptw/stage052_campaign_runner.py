@@ -7,6 +7,7 @@ evidence and to the local machine boundaries used by the experiment runner.
 
 from __future__ import annotations
 
+import ast
 import csv
 import hashlib
 import io
@@ -193,6 +194,215 @@ _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
         "c9c01a14fc1e77dc3f9b475c68cadd03a22734df84d2c281eb7b5be3be2d32b9"
     ),
 }
+
+_CALIBRATION_SUCCESSOR_PREDECESSOR = (
+    "58c325ac4263b623449d465a803adc5953d32644"
+)
+_CALIBRATION_SUCCESSOR_RUN_LABEL = "stage05.2_resource_calibration_attempt23"
+_CALIBRATION_SUCCESSOR_ALLOWED_PATHS = frozenset(
+    {
+        ".gitignore",
+        "AGENTS.md",
+        "docs/provenance/migration-manifest.json",
+        "docs/provenance/source-file-disposition.csv",
+        "docs/stage052_change_log.md",
+        "docs/stage052_performance_benchmark_workflow.md",
+        "src/evrptw/experiment_lifecycle.py",
+        "src/evrptw/experiments/stage052_campaign_review.py",
+        "src/evrptw/experiments/stage052_performance.py",
+        "src/evrptw/stage052_campaign.py",
+        "src/evrptw/stage052_campaign_runner.py",
+        "src/evrptw/stage052_evidence.py",
+        "tests/test_experiment_lifecycle.py",
+        "tests/test_stage052_campaign.py",
+        "tests/test_stage052_campaign_review.py",
+        "tests/test_stage052_campaign_runner.py",
+        "tools/create_stage052_calibration_successor_attestation.py",
+    }
+)
+_CALIBRATION_REQUIRED_REVIEW_GATES = frozenset(
+    {
+        "terminal_manifest_replay",
+        "artifact_inventory",
+        "resource_contract_replay",
+        "formal_memory_measurement_binding",
+        "cgroup_peak_reset",
+        "parent_memory_release",
+        "axis_memory_release",
+        "batch_memory_release",
+        "locked_topology",
+    }
+)
+_CALIBRATION_SCIENTIFIC_PATHS = (
+    "configs/stage02_constraint_guided.toml",
+    "configs/stage04_weights.toml",
+    "configs/stage052_performance.toml",
+    "cpp/evrptw_core.cpp",
+    "src/evrptw/alns.py",
+    "src/evrptw/artifacts.py",
+    "src/evrptw/candidate_control.py",
+    "src/evrptw/candidate_transaction.py",
+    "src/evrptw/charging.py",
+    "src/evrptw/exact_deadline.py",
+    "src/evrptw/models.py",
+    "src/evrptw/native_kernels.py",
+    "src/evrptw/objective.py",
+    "src/evrptw/validation.py",
+)
+_CALIBRATION_PINNED_RECOVERY_BLOBS = {
+    "src/evrptw/experiments/stage052_performance.py": (
+        "def7b941ed4e824f6eaa6b899924ba1ff01332cce41e5734437c88764b55f56d"
+    ),
+    "src/evrptw/stage052_campaign.py": (
+        "5a2ef5e115cf1f9d144b2861cc6f9d40cc7d7a06c33f819eafb8d63ecd91a75c"
+    ),
+    "src/evrptw/stage052_evidence.py": (
+        "7e3a9b126b5076688efbfdd4d48fc960f1c5ff9f79a6c139c73f04c18a45caaf"
+    ),
+}
+_CALIBRATION_ATTESTATION_NODES = frozenset(
+    {
+        "_CALIBRATION_SUCCESSOR_PREDECESSOR",
+        "_CALIBRATION_SUCCESSOR_RUN_LABEL",
+        "_CALIBRATION_SUCCESSOR_ALLOWED_PATHS",
+        "_CALIBRATION_REQUIRED_REVIEW_GATES",
+        "_CALIBRATION_SCIENTIFIC_PATHS",
+        "_CALIBRATION_PINNED_RECOVERY_BLOBS",
+        "_CALIBRATION_ATTESTATION_NODES",
+        "CalibrationSuccessorAttestation",
+        "_calibration_successor_blob_hashes",
+        "_git_revision_bytes",
+        "_calibration_scientific_surface_sha256",
+        "_verified_calibration_successor_inputs",
+        "create_calibration_successor_attestation",
+        "verify_calibration_successor_attestation",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationSuccessorAttestation:
+    """Narrow proof that only the reviewed resource contract crosses revision."""
+
+    predecessor_revision: str
+    successor_revision: str
+    calibration_run_label: str
+    calibration_report_sha256: str
+    calibration_review_manifest_sha256: str
+    resource_contract_sha256: str
+    predecessor_scientific_surface_sha256: str
+    successor_scientific_surface_sha256: str
+    changed_blob_sha256_by_path: Mapping[str, str]
+    inheritance_scope: str = "resource_contract_only"
+    formal_batch_geometry_contribution: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            self.predecessor_revision != _CALIBRATION_SUCCESSOR_PREDECESSOR
+            or re.fullmatch(r"[0-9a-f]{40}", self.successor_revision) is None
+            or self.calibration_run_label != _CALIBRATION_SUCCESSOR_RUN_LABEL
+            or self.inheritance_scope != "resource_contract_only"
+            or self.formal_batch_geometry_contribution != 0
+        ):
+            raise ValueError("calibration successor identity/scope is invalid")
+        digests = (
+            self.calibration_report_sha256,
+            self.calibration_review_manifest_sha256,
+            self.resource_contract_sha256,
+            self.predecessor_scientific_surface_sha256,
+            self.successor_scientific_surface_sha256,
+        )
+        changed = dict(self.changed_blob_sha256_by_path)
+        if (
+            any(re.fullmatch(r"[0-9a-f]{64}", digest) is None for digest in digests)
+            or not changed
+            or not set(changed).issubset(_CALIBRATION_SUCCESSOR_ALLOWED_PATHS)
+            or any(
+                re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                for digest in changed.values()
+            )
+        ):
+            raise ValueError("calibration successor digest/path inventory is invalid")
+        object.__setattr__(self, "changed_blob_sha256_by_path", changed)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": "stage05.2-calibration-successor-attestation-v1",
+            "predecessor_revision": self.predecessor_revision,
+            "successor_revision": self.successor_revision,
+            "calibration_run_label": self.calibration_run_label,
+            "calibration_report_sha256": self.calibration_report_sha256,
+            "calibration_review_manifest_sha256": (
+                self.calibration_review_manifest_sha256
+            ),
+            "resource_contract_sha256": self.resource_contract_sha256,
+            "predecessor_scientific_surface_sha256": (
+                self.predecessor_scientific_surface_sha256
+            ),
+            "successor_scientific_surface_sha256": (
+                self.successor_scientific_surface_sha256
+            ),
+            "changed_blob_sha256_by_path": dict(
+                sorted(self.changed_blob_sha256_by_path.items())
+            ),
+            "inheritance_scope": self.inheritance_scope,
+            "formal_batch_geometry_contribution": (
+                self.formal_batch_geometry_contribution
+            ),
+        }
+
+    @classmethod
+    def from_dict(
+        cls, payload: Mapping[str, object]
+    ) -> CalibrationSuccessorAttestation:
+        fields = {
+            "schema_version",
+            "predecessor_revision",
+            "successor_revision",
+            "calibration_run_label",
+            "calibration_report_sha256",
+            "calibration_review_manifest_sha256",
+            "resource_contract_sha256",
+            "predecessor_scientific_surface_sha256",
+            "successor_scientific_surface_sha256",
+            "changed_blob_sha256_by_path",
+            "inheritance_scope",
+            "formal_batch_geometry_contribution",
+        }
+        if set(payload) != fields or payload.get("schema_version") != (
+            "stage05.2-calibration-successor-attestation-v1"
+        ):
+            raise ValueError("calibration successor attestation schema differs")
+        changed = payload.get("changed_blob_sha256_by_path")
+        if not isinstance(changed, Mapping) or any(
+            not isinstance(path, str) or not isinstance(digest, str)
+            for path, digest in changed.items()
+        ):
+            raise ValueError("calibration successor changed-blob map is invalid")
+        contribution = payload.get("formal_batch_geometry_contribution")
+        if isinstance(contribution, bool) or not isinstance(contribution, int):
+            raise ValueError("calibration successor geometry contribution is invalid")
+        return cls(
+            predecessor_revision=str(payload["predecessor_revision"]),
+            successor_revision=str(payload["successor_revision"]),
+            calibration_run_label=str(payload["calibration_run_label"]),
+            calibration_report_sha256=str(payload["calibration_report_sha256"]),
+            calibration_review_manifest_sha256=str(
+                payload["calibration_review_manifest_sha256"]
+            ),
+            resource_contract_sha256=str(payload["resource_contract_sha256"]),
+            predecessor_scientific_surface_sha256=str(
+                payload["predecessor_scientific_surface_sha256"]
+            ),
+            successor_scientific_surface_sha256=str(
+                payload["successor_scientific_surface_sha256"]
+            ),
+            changed_blob_sha256_by_path={
+                str(path): str(digest) for path, digest in changed.items()
+            },
+            inheritance_scope=str(payload["inheritance_scope"]),
+            formal_batch_geometry_contribution=contribution,
+        )
 
 
 def _canonical_sha256(value: object) -> str:
@@ -485,6 +695,283 @@ def verify_campaign_successor_revision(
                 f"campaign successor revision changes pinned producer-fix content: {path}"
             )
     return changed_paths
+
+
+def _calibration_successor_blob_hashes(
+    repository: Path,
+    *,
+    predecessor_revision: str,
+    successor_revision: str,
+) -> dict[str, str]:
+    result = subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository.resolve()),
+            "diff",
+            "--name-only",
+            "-z",
+            predecessor_revision,
+            successor_revision,
+        ),
+        check=True,
+        capture_output=True,
+        timeout=10.0,
+    )
+    paths = tuple(
+        sorted(
+            path.decode("utf-8")
+            for path in result.stdout.split(b"\0")
+            if path
+        )
+    )
+    forbidden = set(paths).difference(_CALIBRATION_SUCCESSOR_ALLOWED_PATHS)
+    if not paths or forbidden:
+        raise RuntimeError(
+            "calibration successor changes forbidden scientific/runtime paths: "
+            + ", ".join(sorted(forbidden))
+        )
+    blobs: dict[str, str] = {}
+    for path in paths:
+        try:
+            content = subprocess.run(
+                (
+                    "git",
+                    "-C",
+                    str(repository.resolve()),
+                    "show",
+                    f"{successor_revision}:{path}",
+                ),
+                check=True,
+                capture_output=True,
+                timeout=10.0,
+            ).stdout
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(
+                f"calibration successor path is deleted or unreadable: {path}"
+            ) from error
+        blobs[path] = hashlib.sha256(content).hexdigest()
+    if set(_CALIBRATION_PINNED_RECOVERY_BLOBS).difference(blobs):
+        raise RuntimeError("calibration successor lacks pinned recovery-only blobs")
+    if any(
+        blobs[path] != expected
+        for path, expected in _CALIBRATION_PINNED_RECOVERY_BLOBS.items()
+    ):
+        raise RuntimeError(
+            "calibration successor changes an audited recovery-only mixed module"
+        )
+    return blobs
+
+
+def _git_revision_bytes(repository: Path, revision: str, path: str) -> bytes:
+    try:
+        return subprocess.run(
+            ("git", "-C", str(repository.resolve()), "show", f"{revision}:{path}"),
+            check=True,
+            capture_output=True,
+            timeout=10.0,
+        ).stdout
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(
+            f"calibration scientific surface path is unreadable: {path}"
+        ) from error
+
+
+def _calibration_scientific_surface_sha256(
+    repository: Path,
+    revision: str,
+) -> str:
+    """Hash solver/config/artifact code plus protected producer top-level nodes."""
+
+    digest = hashlib.sha256(b"stage05.2-calibration-scientific-surface-v1\0")
+    for path in _CALIBRATION_SCIENTIFIC_PATHS:
+        content = _git_revision_bytes(repository, revision, path)
+        digest.update(path.encode("utf-8") + b"\0")
+        digest.update(hashlib.sha256(content).digest())
+    runner_path = "src/evrptw/stage052_campaign_runner.py"
+    source = _git_revision_bytes(repository, revision, runner_path).decode(
+        "utf-8"
+    )
+    module = ast.parse(source, filename=runner_path)
+    protected_nodes: list[ast.stmt] = []
+    for node in module.body:
+        if isinstance(node, ast.Import) and any(
+            alias.name == "ast" for alias in node.names
+        ):
+            continue
+        name = getattr(node, "name", None)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names = {
+                target.id for target in targets if isinstance(target, ast.Name)
+            }
+            if names.intersection(_CALIBRATION_ATTESTATION_NODES):
+                continue
+        elif isinstance(name, str) and name in _CALIBRATION_ATTESTATION_NODES:
+            continue
+        protected_nodes.append(node)
+    protected_module = ast.Module(body=protected_nodes, type_ignores=[])
+    digest.update(runner_path.encode("utf-8") + b"\0")
+    digest.update(ast.dump(protected_module, include_attributes=False).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _verified_calibration_successor_inputs(
+    *,
+    calibration_report_path: Path,
+    calibration_review_manifest_path: Path,
+    resource_contract_path: Path,
+) -> tuple[str, str, str]:
+    for path, sidecar in (
+        (
+            calibration_report_path,
+            calibration_report_path.with_suffix(".sha256"),
+        ),
+        (
+            calibration_review_manifest_path,
+            calibration_review_manifest_path.with_suffix(
+                calibration_review_manifest_path.suffix + ".sha256"
+            ),
+        ),
+        (resource_contract_path, resource_contract_path.with_suffix(".sha256")),
+    ):
+        if not signed_sidecar_matches(path, sidecar):
+            raise RuntimeError(f"calibration successor input is not signed: {path}")
+    try:
+        report = json.loads(calibration_report_path.read_text(encoding="utf-8"))
+        review = json.loads(
+            calibration_review_manifest_path.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("calibration successor input JSON is invalid") from error
+    if (
+        not isinstance(report, Mapping)
+        or report.get("run_label") != _CALIBRATION_SUCCESSOR_RUN_LABEL
+        or not isinstance(review, Mapping)
+        or review.get("schema_version")
+        != "stage05.2-resource-calibration-review-v1"
+        or review.get("run_label") != _CALIBRATION_SUCCESSOR_RUN_LABEL
+        or review.get("status") != "ACCEPTED"
+        or review.get("calibration_report_sha256")
+        != _file_sha256(calibration_report_path)
+        or review.get("resource_contract_sha256")
+        != _file_sha256(resource_contract_path)
+        or not isinstance(review.get("gates"), Mapping)
+        or set(cast(Mapping[str, object], review["gates"]))
+        != _CALIBRATION_REQUIRED_REVIEW_GATES
+        or any(
+            not isinstance(gate, Mapping) or gate.get("passed") is not True
+            for gate in cast(Mapping[str, object], review["gates"]).values()
+        )
+    ):
+        raise RuntimeError("calibration successor inputs are not independently accepted")
+    return (
+        _file_sha256(calibration_report_path),
+        _file_sha256(calibration_review_manifest_path),
+        _file_sha256(resource_contract_path),
+    )
+
+
+def create_calibration_successor_attestation(
+    *,
+    repository: Path,
+    successor_revision: str,
+    calibration_report_path: Path,
+    calibration_review_manifest_path: Path,
+    resource_contract_path: Path,
+    output_path: Path,
+) -> Path:
+    """Create the signed Attempt23 resource-contract-only successor proof."""
+
+    report_sha, review_sha, contract_sha = _verified_calibration_successor_inputs(
+        calibration_report_path=calibration_report_path,
+        calibration_review_manifest_path=calibration_review_manifest_path,
+        resource_contract_path=resource_contract_path,
+    )
+    blobs = _calibration_successor_blob_hashes(
+        repository,
+        predecessor_revision=_CALIBRATION_SUCCESSOR_PREDECESSOR,
+        successor_revision=successor_revision,
+    )
+    predecessor_surface = _calibration_scientific_surface_sha256(
+        repository, _CALIBRATION_SUCCESSOR_PREDECESSOR
+    )
+    successor_surface = _calibration_scientific_surface_sha256(
+        repository, successor_revision
+    )
+    if predecessor_surface != successor_surface:
+        raise RuntimeError(
+            "calibration successor changes solver, artifact, or scientific config surface"
+        )
+    attestation = CalibrationSuccessorAttestation(
+        predecessor_revision=_CALIBRATION_SUCCESSOR_PREDECESSOR,
+        successor_revision=successor_revision,
+        calibration_run_label=_CALIBRATION_SUCCESSOR_RUN_LABEL,
+        calibration_report_sha256=report_sha,
+        calibration_review_manifest_sha256=review_sha,
+        resource_contract_sha256=contract_sha,
+        predecessor_scientific_surface_sha256=predecessor_surface,
+        successor_scientific_surface_sha256=successor_surface,
+        changed_blob_sha256_by_path=blobs,
+    )
+    path, _sidecar = atomic_write_signed_json(output_path, attestation.to_dict())
+    return path
+
+
+def verify_calibration_successor_attestation(
+    *,
+    repository: Path,
+    current_revision: str,
+    attestation_path: Path,
+    calibration_report_path: Path,
+    calibration_review_manifest_path: Path,
+    resource_contract_path: Path,
+) -> CalibrationSuccessorAttestation:
+    """Recompute Git and evidence bindings before inheriting Attempt23 limits."""
+
+    if not signed_sidecar_matches(
+        attestation_path, attestation_path.with_suffix(".sha256")
+    ):
+        raise RuntimeError("calibration successor attestation is not signed")
+    try:
+        payload = json.loads(attestation_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("calibration successor attestation is invalid") from error
+    if not isinstance(payload, Mapping):
+        raise RuntimeError("calibration successor attestation must be an object")
+    try:
+        attestation = CalibrationSuccessorAttestation.from_dict(payload)
+    except ValueError as error:
+        raise RuntimeError("calibration successor attestation contract differs") from error
+    report_sha, review_sha, contract_sha = _verified_calibration_successor_inputs(
+        calibration_report_path=calibration_report_path,
+        calibration_review_manifest_path=calibration_review_manifest_path,
+        resource_contract_path=resource_contract_path,
+    )
+    observed_blobs = _calibration_successor_blob_hashes(
+        repository,
+        predecessor_revision=attestation.predecessor_revision,
+        successor_revision=current_revision,
+    )
+    predecessor_surface = _calibration_scientific_surface_sha256(
+        repository, attestation.predecessor_revision
+    )
+    successor_surface = _calibration_scientific_surface_sha256(
+        repository, current_revision
+    )
+    if (
+        attestation.successor_revision != current_revision
+        or attestation.calibration_report_sha256 != report_sha
+        or attestation.calibration_review_manifest_sha256 != review_sha
+        or attestation.resource_contract_sha256 != contract_sha
+        or dict(attestation.changed_blob_sha256_by_path) != observed_blobs
+        or attestation.predecessor_scientific_surface_sha256
+        != predecessor_surface
+        or attestation.successor_scientific_surface_sha256 != successor_surface
+        or predecessor_surface != successor_surface
+    ):
+        raise RuntimeError("calibration successor attestation replay differs")
+    return attestation
 
 
 def _input_lock_payload(value: Mapping[str, object]) -> dict[str, object]:

@@ -596,14 +596,28 @@ this repository or one of its subdirectories.
   `job_parallel`, `native_kernels`, optional `accelerator_pilot`, then
   `benchmark`; they are not separately maintained software versions.
 - `stage05.2_<component>_attemptNN` and `rerunNN` are unique run identities,
-  not version names. A failed or interrupted run consumes its label and shards
-  may never be imported into another run, but bulky evidence need not remain in
-  the repository workspace. Current-chain truth comes from signed manifests,
+  not version names. Cross-run and cross-revision shard import is forbidden.
+  A Formal campaign may reopen its existing output only while its lifecycle is
+  still `RUNNING`, with no active writer or terminal manifest, and only through
+  a one-use signed resume permit bound to the original campaign identity. The
+  append-only recovery epoch chain may reuse independently revalidated archived
+  batches from that same identity; an incomplete batch contributes no shard and
+  is discarded as one signed retention transaction before whole-batch rerun.
+  Current-chain truth comes from signed manifests,
   prerequisite references, and the newest verified v2 registry generation
   stored with the bound `e_archive` governance state. The tracked
   `stage05.2_retention_registry.csv` is the immutable v1 compatibility source,
   never a competing current v2 truth source; neither may be replaced by a
   hard-coded attempt number in policy documentation.
+- Recoverable interruption causes are exactly `unexpected_host_loss` and
+  `operator_stop`. Operator stop requires a signed stop intent written before
+  service shutdown plus a signed inactive-service receipt. Algorithm,
+  validator/objective, manifest-integrity, scientific-configuration, resource-
+  gate, or unknown failures terminate the label. Any code, tree, wheel, native
+  extension, dependency, configuration, prerequisite, resource contract,
+  campaign plan, lifecycle plan, or immutable start-permit change requires a
+  new label; completed batches cannot cross that boundary. Recovery never adds
+  a `PAUSED` lifecycle state.
 - Every sealed Stage 5.2 source snapshot must materialize the required ignored
   benchmark inputs as ordinary snapshot-local files; a Git clone alone is not a
   complete producer source. Formal memory probing verifies the exact non-empty
@@ -662,6 +676,13 @@ this repository or one of its subdirectories.
   retains its own valid semantic digest and must fit below the replacement
   contract's selected aggregate and per-worker peaks. Missing or mismatched
   evidence, lower floors, topology changes, or shard reuse fail fast.
+- Calibration Attempt23 may cross the `58c325a` revision boundary only through
+  a signed `resource_contract_only` successor attestation after its sealed
+  independent review reports `ACCEPTED`. Producer and reviewer independently
+  recompute the exact Git changed-path/blob inventory and the report, review,
+  and contract hashes. Solver, objective, native-kernel, shard/artifact schema,
+  or scientific-configuration changes reject inheritance; this exception never
+  authorizes Formal batch reuse across revisions.
 - Every Stage 5.2 calibration CLI invocation must pass the clean ext4 checkout
   explicitly through `--repository-root`. Service working-directory state is
   not a source-identity input and may not be relied on implicitly. A missing

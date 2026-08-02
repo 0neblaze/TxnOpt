@@ -60,6 +60,7 @@ from evrptw.stage052_campaign import (
     VolumeIdentity,
     directory_byte_count,
     directory_checksum,
+    load_campaign_manifest,
 )
 from evrptw.stage052_evidence import (
     CAMPAIGN_FORMAL_GATES,
@@ -4036,6 +4037,40 @@ def test_campaign_reviewer_publishes_not_ready_for_missing_raw_campaign(
     assert review["gates"]["campaign_replay"]["passed"] is False
 
 
+def test_campaign_recovery_gate_preserves_legacy_and_fails_closed_on_bad_identity(
+    tmp_path: Path,
+) -> None:
+    campaign_dir, locator, _volume = _build_complete_pilot_campaign(tmp_path)
+    campaign = load_campaign_manifest(campaign_dir / "campaign_manifest.json")
+    reader = ArtifactReader(campaign_dir)
+
+    passed, detail = campaign_review_module._audit_campaign_recovery(
+        campaign_dir=campaign_dir,
+        campaign=campaign,
+        locator=locator,
+        reader=reader,
+    )
+    assert passed is True
+    assert "legacy" in detail
+
+    atomic_write_signed_json(
+        campaign_dir / "control" / "campaign_identity.json",
+        {
+            "schema_version": "stage05.2-campaign-identity-v1",
+            "run_label": campaign.run_label,
+            "campaign_identity_sha256": "invalid",
+        },
+    )
+    passed, detail = campaign_review_module._audit_campaign_recovery(
+        campaign_dir=campaign_dir,
+        campaign=campaign,
+        locator=locator,
+        reader=reader,
+    )
+    assert passed is False
+    assert "campaign identity" in detail
+
+
 def test_campaign_review_pointer_archives_prior_manifest_with_lineage(
     tmp_path: Path,
 ) -> None:
@@ -4234,3 +4269,86 @@ def test_noncanonical_single_batch_pilot_cannot_receive_ready_review(
     assert all(row["child_peak_rss_bytes"] > 0 for row in completed)
     parent_rss = [int(row["parent_rss_bytes"]) for row in completed]
     assert max(parent_rss) - min(parent_rss) < 256 * 1024 * 1024
+
+
+@pytest.mark.external_data
+def test_actual_reviewer_outputs_match_for_control_and_recovered_semantics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = (tmp_path / "control", tmp_path / "recovered")
+    for root in roots:
+        root.mkdir()
+    built = [_build_complete_pilot_campaign(root) for root in roots]
+    identities: dict[Path, Stage052PrerequisiteIdentity] = {}
+    for root in roots:
+        prerequisite = root / "stage05.2_accelerator_pilot_attempt02"
+        reader = ArtifactReader(prerequisite)
+        review_path = prerequisite / "review/review_manifest.json"
+        metadata = reader.read_json(
+            next(
+                str(item["relative_path"])
+                for item in reader.manifest["artifacts"]
+                if item["artifact_type"] == "manifest_metadata"
+            )
+        )
+        identities[prerequisite.resolve()] = Stage052PrerequisiteIdentity(
+            run_label=prerequisite.name,
+            component="accelerator_pilot",
+            status="READY_FOR_STAGE052_BENCHMARK",
+            repository_revision=str(metadata["repository_revision"]),
+            configuration_sha256=str(metadata["configuration_sha256"]),
+            raw_manifest_sha256=hashlib.sha256(
+                reader.result.manifest_path.read_bytes()
+            ).hexdigest(),
+            review_manifest_sha256=hashlib.sha256(
+                review_path.read_bytes()
+            ).hexdigest(),
+            scope="performance",
+        )
+    monkeypatch.setattr(
+        "evrptw.experiments.stage052_campaign_review.verify_stage052_evidence_input",
+        lambda raw_dir, _requirement: identities[raw_dir.resolve()],
+    )
+    reviewed: list[dict[str, Path]] = []
+    for root, (campaign, locator, volume) in zip(roots, built, strict=True):
+        reviewed.append(
+            review_stage052_campaign(
+                campaign_dir=campaign,
+                benchmark_dir=Path("data/schneider"),
+                bks_path=Path("experiments/baselines/schneider_best_known.csv"),
+                scope="pilot",
+                prerequisite_dir=root / "stage05.2_accelerator_pilot_attempt02",
+                locator=locator,
+                volume_probe=lambda _path, expected=volume: expected,
+            )
+        )
+    assert set(reviewed[0]) == set(reviewed[1])
+    for key in reviewed[0]:
+        if key == "review_manifest":
+            left = json.loads(reviewed[0][key].read_text(encoding="utf-8"))
+            right = json.loads(reviewed[1][key].read_text(encoding="utf-8"))
+            for payload in (left, right):
+                payload.pop("raw_manifest_sha256", None)
+                payload.pop("review_generation", None)
+                payload.pop("review_history", None)
+                payload["review_shard_metrics"] = [
+                    {
+                        field: metric[field]
+                        for field in (
+                            "batch_id",
+                            "shard_id",
+                            "canonical_merge_ordinal",
+                        )
+                    }
+                    for metric in payload["review_shard_metrics"]
+                ]
+            assert left == right
+            continue
+        left_text = reviewed[0][key].read_text(encoding="utf-8").replace(
+            str(roots[0]), "<ROOT>"
+        )
+        right_text = reviewed[1][key].read_text(encoding="utf-8").replace(
+            str(roots[1]), "<ROOT>"
+        )
+        assert left_text == right_text, key

@@ -100,7 +100,9 @@ from evrptw.stage052_campaign import (
     AnytimeCheckpoint,
     BatchManifest,
     BenchmarkCampaignConfig,
+    CampaignIdentity,
     CampaignManifest,
+    CampaignRecoveryController,
     ObjectiveKey,
     StorageRoot,
     StorageRootLocator,
@@ -128,6 +130,7 @@ from evrptw.stage052_campaign_runner import (
     persist_campaign_manifest,
     probe_volume_identity,
     validate_batch_measurements,
+    verify_calibration_successor_attestation,
     verify_campaign_root_locations,
     verify_rolling_campaign_capacity,
 )
@@ -269,6 +272,7 @@ class _VerifiedBatchExecution:
     base_attribution: Stage052PersistenceAttribution
     verified_manifest_sha256: str
     verified_manifest_write_interval: PersistenceInterval
+    verified_receipt_path: Path | None = None
 
 
 def _write_persistence_attribution(
@@ -522,6 +526,7 @@ def run_stage052(
     retention_registry_path: Path = _RETENTION_REGISTRY,
     storage_migration_path: Path | None = None,
     storage_migration_evidence_dir: Path | None = None,
+    resume_permit_path: Path | None = None,
 ) -> dict[str, Path]:
     """Execute one canonical Stage 5.2 component attempt."""
 
@@ -543,8 +548,17 @@ def run_stage052(
     resolved_output = _resolve(root, output_dir)
     if resolved_output.name != run_label:
         raise ValueError("Stage 5.2 output directory must end with the canonical run label")
-    if resolved_output.exists():
+    resolved_resume_permit = (
+        _resolve(root, resume_permit_path) if resume_permit_path is not None else None
+    )
+    if resolved_output.exists() and resolved_resume_permit is None:
         raise FileExistsError(resolved_output)
+    if not resolved_output.exists() and resolved_resume_permit is not None:
+        raise FileNotFoundError("resume permit requires an existing campaign output")
+    if resolved_resume_permit is not None and (
+        selected is not Stage052Component.BENCHMARK or scope != "formal"
+    ):
+        raise ValueError("same-identity recovery is available only to Formal benchmark")
     _require_clean_stage052_repository(root)
     source_snapshot = verify_stage052_source_snapshot(root)
     staging_root_binding = _verify_performance_staging_root(
@@ -737,6 +751,7 @@ def run_stage052(
             resolved_prerequisite_dirs=resolved_prerequisite_dirs,
             storage=storage,
             storage_migration=storage_migration,
+            resume_permit_path=resolved_resume_permit,
         )
 
     resolved_output.mkdir(parents=True)
@@ -1114,6 +1129,7 @@ def _run_benchmark_campaign(
     resolved_prerequisite_dirs: Mapping[str, Path],
     storage: ArtifactStorageConfig,
     storage_migration: Mapping[str, object] | None = None,
+    resume_permit_path: Path | None = None,
 ) -> dict[str, Path]:
     try:
         return _run_benchmark_campaign_impl(
@@ -1129,6 +1145,7 @@ def _run_benchmark_campaign(
             resolved_prerequisite_dirs=resolved_prerequisite_dirs,
             storage=storage,
             storage_migration=storage_migration,
+            resume_permit_path=resume_permit_path,
         )
     except BaseException as error:
         if output_dir.is_dir():
@@ -1160,6 +1177,165 @@ def _benchmark_prerequisite_binding(scope: str) -> tuple[str, str, str]:
     raise ValueError(f"unsupported benchmark scope: {scope}")
 
 
+_PER_RUN_INTEGER_FIELDS = frozenset(
+    {
+        "seed",
+        "customer_count",
+        "worker_count",
+        "native_invocations",
+        "native_fallbacks",
+        "native_screening_invocations",
+        "native_screening_batch_invocations",
+        "native_screening_batch_candidates",
+        "native_propagation_invocations",
+        "native_protocol_fallbacks",
+        "native_candidate_transactions",
+        "native_candidate_transaction_fallbacks",
+        "exact_started_calls",
+        "exact_completed_calls",
+        "effective_iterations",
+        "batch_launches",
+        "peak_rss_bytes",
+        "vehicle_count",
+        "charging_count",
+    }
+)
+_PER_RUN_FLOAT_FIELDS = frozenset(
+    {
+        "solver_seconds",
+        "artifact_persistence_seconds",
+        "end_to_end_seconds",
+        "screening_seconds",
+        "exact_seconds",
+        "packing_seconds",
+        "unpacking_seconds",
+        "native_kernel_seconds",
+        "native_screening_seconds",
+        "native_screening_median_occupancy",
+        "native_propagation_seconds",
+        "median_batch_occupancy",
+        "total_distance",
+        "total_charging_time",
+    }
+)
+
+
+def _load_completed_campaign_aggregates(
+    *,
+    campaign: CampaignManifest,
+    locator: StorageRootLocator,
+    run_label: str,
+) -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[BatchPersistenceEnvelope],
+]:
+    """Rebuild parent aggregates only from immutable archived batch controls."""
+
+    rows: list[dict[str, object]] = []
+    checkpoints: list[dict[str, object]] = []
+    envelopes: list[BatchPersistenceEnvelope] = []
+    for batch in campaign.batches:
+        if batch.status != "archived":
+            continue
+        batch_dir = locator.resolve(batch.root_alias).absolute_path.joinpath(
+            *Path(batch.logical_path).parts
+        )
+        per_run_path = (
+            batch_dir
+            / "control"
+            / f"{run_label}_{batch.batch_id}_per_run_results.csv"
+        )
+        with per_run_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if tuple(reader.fieldnames or ()) != PER_RUN_FIELDS:
+                raise RuntimeError(
+                    f"archived batch per-run schema differs: {batch.batch_id}"
+                )
+            for raw in reader:
+                row: dict[str, object] = dict(raw)
+                for field in _PER_RUN_INTEGER_FIELDS:
+                    row[field] = int(raw[field])
+                for field in _PER_RUN_FLOAT_FIELDS:
+                    row[field] = float(raw[field])
+                if raw["validator_passed"] not in {"True", "False"}:
+                    raise RuntimeError("archived batch validator flag is invalid")
+                row["validator_passed"] = raw["validator_passed"] == "True"
+                rows.append(row)
+        checkpoint_path = (
+            batch_dir
+            / "control"
+            / f"{run_label}_{batch.batch_id}_anytime_checkpoints.json"
+        )
+        if not signed_sidecar_matches(
+            checkpoint_path, checkpoint_path.with_suffix(".sha256")
+        ):
+            raise RuntimeError(
+                f"archived batch checkpoint sidecar differs: {batch.batch_id}"
+            )
+        checkpoint_payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(checkpoint_payload, Mapping)
+            or checkpoint_payload.get("run_label") != run_label
+            or checkpoint_payload.get("batch_id") != batch.batch_id
+            or not isinstance(checkpoint_payload.get("rows"), list)
+            or checkpoint_payload.get("row_count")
+            != len(checkpoint_payload["rows"])
+        ):
+            raise RuntimeError(
+                f"archived batch checkpoint identity differs: {batch.batch_id}"
+            )
+        batch_checkpoints = [
+            dict(item)
+            for item in checkpoint_payload["rows"]
+            if isinstance(item, Mapping)
+        ]
+        if len(batch_checkpoints) != int(checkpoint_payload["row_count"]):
+            raise RuntimeError("archived batch checkpoint member is invalid")
+        checkpoints.extend(batch_checkpoints)
+        envelope_path = batch_dir / "batch_persistence_envelope.json"
+        expected_envelope_sha = campaign.batch_persistence_envelope_sha256_by_id.get(
+            batch.batch_id
+        )
+        if (
+            expected_envelope_sha is None
+            or not signed_sidecar_matches(
+                envelope_path, envelope_path.with_suffix(".sha256")
+            )
+            or _sha256(envelope_path) != expected_envelope_sha
+        ):
+            raise RuntimeError(
+                f"archived batch persistence envelope differs: {batch.batch_id}"
+            )
+        envelope_payload = json.loads(envelope_path.read_text(encoding="utf-8"))
+        if not isinstance(envelope_payload, Mapping):
+            raise RuntimeError("archived batch persistence envelope is invalid")
+        envelope = BatchPersistenceEnvelope.from_dict(envelope_payload)
+        if envelope.run_label != run_label or envelope.batch_id != batch.batch_id:
+            raise RuntimeError("archived batch persistence identity differs")
+        envelopes.append(envelope)
+    return rows, checkpoints, envelopes
+
+
+def _load_rolling_capacity_observations(
+    output_dir: Path,
+) -> list[dict[str, object]]:
+    observations: list[dict[str, object]] = []
+    journal_root = output_dir / "control" / "rolling_capacity_observations"
+    if not journal_root.is_dir():
+        return observations
+    for expected, path in enumerate(sorted(journal_root.glob("*.json")), start=1):
+        if path.name[:4] != f"{expected:04d}" or not signed_sidecar_matches(
+            path, path.with_suffix(".sha256")
+        ):
+            raise RuntimeError("rolling capacity recovery journal is not contiguous")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise RuntimeError("rolling capacity recovery journal is invalid")
+        observations.append(payload)
+    return observations
+
+
 def _run_benchmark_campaign_impl(
     *,
     root: Path,
@@ -1174,6 +1350,7 @@ def _run_benchmark_campaign_impl(
     resolved_prerequisite_dirs: Mapping[str, Path],
     storage: ArtifactStorageConfig,
     storage_migration: Mapping[str, object] | None = None,
+    resume_permit_path: Path | None = None,
 ) -> dict[str, Path]:
     """Execute G01/G02 as immutable, archived batches rather than one task fan-out."""
 
@@ -1245,6 +1422,27 @@ def _run_benchmark_campaign_impl(
     if scope == "formal" and worker_count != selection_lock.selected_workers:
         raise ValueError("Formal benchmark worker_count differs from the accepted Pilot selection")
     revision = _git(root, "rev-parse", "HEAD")
+    if (
+        scope == "formal"
+        and formal_recalibration is not None
+        and formal_recalibration.calibration_repository_revision != revision
+    ):
+        verify_calibration_successor_attestation(
+            repository=root,
+            current_revision=revision,
+            attestation_path=(
+                root / "configs" / "stage052_calibration_successor.local.json"
+            ),
+            calibration_report_path=recalibration_report,
+            calibration_review_manifest_path=(
+                root
+                / "configs"
+                / "stage052_resource_calibration.local.review.json"
+            ),
+            resource_contract_path=_resolve(
+                root, config.resource_calibration_contract
+            ),
+        )
     source_snapshot = verify_stage052_source_snapshot(root)
     runtime_identity = verify_stage052_runtime_identity(
         _resolve(root, config.runtime_identity_manifest),
@@ -1496,10 +1694,50 @@ def _run_benchmark_campaign_impl(
         campaign_config,
         snapshot=snapshot_source,
     )
-    output_dir.mkdir(parents=True)
     campaign_config_sha256 = _canonical_mapping_sha256(campaign_config.to_dict())
     prerequisite_review_path = prerequisite_dir / "review" / "review_manifest.json"
     prerequisite_review_sha256 = _sha256(prerequisite_review_path)
+    fresh_campaign = CampaignManifest.planned(
+        config=campaign_config,
+        plan=plan,
+        capacity=capacity,
+        locator=locator,
+        configuration_sha256=campaign_config_sha256,
+        prerequisite_review_sha256=prerequisite_review_sha256,
+    )
+    wheel_sha256 = runtime_identity.get("wheel_sha256")
+    if not isinstance(wheel_sha256, str) and scope == "formal":
+        raise RuntimeError("campaign runtime identity has no wheel SHA-256")
+    if not isinstance(wheel_sha256, str):
+        wheel_sha256 = _canonical_mapping_sha256(runtime_identity)
+    campaign_identity = CampaignIdentity(
+        run_label=run_label,
+        repository_revision=revision,
+        repository_tree=_git(root, "rev-parse", "HEAD^{tree}"),
+        wheel_sha256=wheel_sha256,
+        runtime_identity_sha256=_canonical_mapping_sha256(runtime_identity),
+        configuration_sha256=_sha256(config_path),
+        prerequisite_review_sha256=prerequisite_review_sha256,
+        producer_resource_contract_sha256=_canonical_mapping_sha256(
+            producer_resource_contract.to_dict()
+        ),
+        campaign_plan_sha256=_canonical_mapping_sha256(plan.to_dict()),
+        lifecycle_plan_sha256=lifecycle_plan.plan_sha256,
+        start_permit_sha256=_sha256(start_permit.permit_path),
+    )
+    recovery = CampaignRecoveryController(run_dir=output_dir, locator=locator)
+    execution_session = recovery.open(
+        expected_identity=campaign_identity,
+        fresh_campaign=fresh_campaign,
+        resume_permit_path=resume_permit_path,
+    )
+    recovery.record_start_evidence(
+        lifecycle_plan=lifecycle_plan.to_dict(),
+        start_permit_path=start_permit.permit_path,
+        start_observation_path=start_permit.observation_path,
+        maintenance_audit_path=start_permit.maintenance_audit_path,
+    )
+    campaign = execution_session.campaign
     exercised_aliases = (
         config.archive_root_aliases
         if scope == "pilot"
@@ -1520,10 +1758,15 @@ def _run_benchmark_campaign_impl(
         "native_kernel_config": config.native_kernels.to_dict(),
         "candidate_transaction_config": config.candidate_transaction.to_dict(),
         "repository_revision": revision,
+        "repository_tree": campaign_identity.repository_tree,
         "repository_dirty": False,
         "configuration_sha256": _sha256(config_path),
         "campaign_configuration_sha256": campaign_config_sha256,
+        "campaign_config": campaign_config.to_dict(),
         "campaign_prerequisite_review_sha256": prerequisite_review_sha256,
+        "campaign_identity_sha256": campaign_identity.identity_sha256,
+        "recovery_protocol_schema": "stage05.2-campaign-recovery-v1",
+        "execution_epoch": execution_session.epoch,
         "runtime_identity": runtime_identity,
         "source_snapshot": source_snapshot,
         "performance_provenance": performance_provenance,
@@ -1554,39 +1797,56 @@ def _run_benchmark_campaign_impl(
     campaign_persistence_recorder = _PersistenceRecorder()
     context = ArtifactRunContext("stage05.2", Stage052Component.BENCHMARK.value, run_label)
     parent_writer = ArtifactBundleWriter(output_dir, context, storage)
-    with campaign_persistence_recorder.record("campaign_parent_write_control"):
-        parent_writer.write_control(metadata=metadata, configuration_path=config_path)
     control_paths = campaign_control_paths(output_dir, run_label)
-    with campaign_persistence_recorder.record("campaign_plan_write"):
-        plan_path, plan_sidecar = atomic_write_signed_json(
-            control_paths["campaign_plan"], plan.to_dict()
-        )
-    with campaign_persistence_recorder.record("campaign_preflight_write"):
-        preflight_path, preflight_sidecar = atomic_write_signed_json(
-            control_paths["preflight"],
-            {
-                "schema_version": "stage05.2-campaign-preflight-v1",
-                "run_label": run_label,
-                "scope": scope,
-                "power_source": preflight.power_source,
-                "low_power_mode_enabled": preflight.low_power_mode_enabled,
-                "windows": [window.to_dict() for window in preflight.windows],
-                "volume_identities": locator.tracked_payload(
-                    (config.staging_root_alias, *config.archive_root_aliases)
-                ),
-                "free_bytes_by_alias": dict(sorted(free_by_alias.items())),
-            },
-        )
-    campaign = CampaignManifest.planned(
-        config=campaign_config,
-        plan=plan,
-        capacity=capacity,
-        locator=locator,
-        configuration_sha256=campaign_config_sha256,
-        prerequisite_review_sha256=prerequisite_review_sha256,
-    )
-    with campaign_persistence_recorder.record("campaign_manifest_initial_write"):
-        campaign_manifest_path = persist_campaign_manifest(output_dir, campaign)
+    if execution_session.resumed:
+        metadata_path = output_dir / "control" / f"{run_label}_run_metadata.json"
+        config_snapshot_path = output_dir / "control" / f"{run_label}_config.toml"
+        for path, artifact_type, storage_format in (
+            (metadata_path, "manifest_metadata", "json_control"),
+            (config_snapshot_path, "config", "toml_control"),
+        ):
+            parent_writer.record_existing_file(
+                path,
+                artifact_type=artifact_type,
+                retention_class="control",
+                storage_format=storage_format,
+            )
+        plan_path = control_paths["campaign_plan"]
+        plan_sidecar = plan_path.with_suffix(".sha256")
+        preflight_path = control_paths["preflight"]
+        preflight_sidecar = preflight_path.with_suffix(".sha256")
+        if (
+            not signed_sidecar_matches(plan_path, plan_sidecar)
+            or json.loads(plan_path.read_text(encoding="utf-8")) != plan.to_dict()
+            or not signed_sidecar_matches(preflight_path, preflight_sidecar)
+        ):
+            raise RuntimeError("campaign resume control identity differs")
+        campaign_manifest_path = output_dir / "campaign_manifest.json"
+    else:
+        with campaign_persistence_recorder.record("campaign_parent_write_control"):
+            parent_writer.write_control(metadata=metadata, configuration_path=config_path)
+        with campaign_persistence_recorder.record("campaign_plan_write"):
+            plan_path, plan_sidecar = atomic_write_signed_json(
+                control_paths["campaign_plan"], plan.to_dict()
+            )
+        with campaign_persistence_recorder.record("campaign_preflight_write"):
+            preflight_path, preflight_sidecar = atomic_write_signed_json(
+                control_paths["preflight"],
+                {
+                    "schema_version": "stage05.2-campaign-preflight-v1",
+                    "run_label": run_label,
+                    "scope": scope,
+                    "power_source": preflight.power_source,
+                    "low_power_mode_enabled": preflight.low_power_mode_enabled,
+                    "windows": [window.to_dict() for window in preflight.windows],
+                    "volume_identities": locator.tracked_payload(
+                        (config.staging_root_alias, *config.archive_root_aliases)
+                    ),
+                    "free_bytes_by_alias": dict(sorted(free_by_alias.items())),
+                },
+            )
+        with campaign_persistence_recorder.record("campaign_manifest_initial_write"):
+            campaign_manifest_path = persist_campaign_manifest(output_dir, campaign)
     failure_drill_paths: tuple[Path, ...] | None = None
     if scope == "pilot":
         failure_drill_paths = _exercise_campaign_failure_state_machine(
@@ -1595,10 +1855,16 @@ def _run_benchmark_campaign_impl(
             recorder=campaign_persistence_recorder,
             storage=storage,
         )
-    all_rows: list[dict[str, object]] = []
-    all_checkpoints: list[dict[str, object]] = []
-    batch_persistence_envelopes: list[BatchPersistenceEnvelope] = []
-    rolling_capacity_observations: list[dict[str, object]] = []
+    (
+        all_rows,
+        all_checkpoints,
+        batch_persistence_envelopes,
+    ) = _load_completed_campaign_aggregates(
+        campaign=campaign,
+        locator=locator,
+        run_label=run_label,
+    )
+    rolling_capacity_observations = _load_rolling_capacity_observations(output_dir)
     rolling_capacity_path: Path | None = None
     rolling_capacity_sidecar: Path | None = None
     rolling_observation_paths: list[tuple[Path, Path]] = []
@@ -1695,6 +1961,13 @@ def _run_benchmark_campaign_impl(
 
     try:
         for batch_plan, planned_batch in zip(plan.batches, campaign.batches, strict=True):
+            if planned_batch.status == "archived":
+                continue
+            if planned_batch.status != "planned":
+                raise RuntimeError(
+                    "campaign recovery left a non-runnable batch state: "
+                    f"{planned_batch.batch_id}/{planned_batch.status}"
+                )
             try:
                 verify_and_record_capacity(
                     batch_id=planned_batch.batch_id,
@@ -1717,6 +1990,8 @@ def _run_benchmark_campaign_impl(
                     locator=locator,
                     storage=storage,
                     snapshot_source=snapshot_source,
+                    campaign_identity_sha256=campaign_identity.identity_sha256,
+                    execution_epoch=execution_session.epoch,
                 )
                 campaign = campaign.with_batch(execution.batch)
                 with campaign_persistence_recorder.record(
@@ -1945,6 +2220,7 @@ def _run_benchmark_campaign_impl(
                     retention_class="diagnostic",
                     storage_format=storage_format,
                 )
+        _record_campaign_recovery_controls(parent_writer, output_dir)
         parent_writer.finalize(status="partial", evidence_completeness="partial")
         raise
     all_rows.sort(
@@ -2082,6 +2358,11 @@ def _run_benchmark_campaign_impl(
             raw_replay_drill_sidecar,
             "raw_replay_drill_sidecar",
         )
+    recovery.record_epoch_result(
+        campaign,
+        status="batch_execution_completed",
+    )
+    _record_campaign_recovery_controls(parent_writer, output_dir)
     with campaign_persistence_recorder.record("campaign_primary_manifest_finalize"):
         bundle = parent_writer.finalize()
     campaign_attribution = Stage052PersistenceAttribution(
@@ -2183,6 +2464,8 @@ def _run_benchmark_batch(
     locator: StorageRootLocator,
     storage: ArtifactStorageConfig,
     snapshot_source: WindowsWslMachineSnapshotSource,
+    campaign_identity_sha256: str,
+    execution_epoch: int,
 ) -> _VerifiedBatchExecution:
     """Run, verify, and seal one indivisible next-fit campaign batch."""
 
@@ -2218,6 +2501,8 @@ def _run_benchmark_batch(
         "configuration_sha256": _sha256(config_path),
         "campaign_configuration_sha256": campaign_configuration_sha256,
         "campaign_prerequisite_review_sha256": campaign_prerequisite_review_sha256,
+        "campaign_identity_sha256": campaign_identity_sha256,
+        "execution_epoch": execution_epoch,
         "runtime_identity": dict(runtime_identity),
         "source_snapshot": dict(source_snapshot),
         "performance_provenance": dict(performance_provenance),
@@ -2420,6 +2705,34 @@ def _run_benchmark_batch(
         checkpoints = _collect_batch_checkpoints(batch_dir, tasks)
         if len(checkpoints) != sum(shard.checkpoint_count for shard in plan.shards):
             raise RuntimeError(f"{plan.batch_id} checkpoint count does not match its plan")
+        with persistence_recorder.record("batch_anytime_checkpoint_control"):
+            checkpoint_path, checkpoint_sidecar = atomic_write_signed_json(
+                batch_dir
+                / "control"
+                / f"{campaign_config.run_label}_{plan.batch_id}_anytime_checkpoints.json",
+                {
+                    "schema_version": "stage05.2-batch-anytime-checkpoints-v1",
+                    "run_label": campaign_config.run_label,
+                    "batch_id": plan.batch_id,
+                    "row_count": len(checkpoints),
+                    "rows": checkpoints,
+                },
+            )
+            writer.record_existing_file(
+                checkpoint_path,
+                artifact_type="batch_anytime_checkpoints",
+                artifact_subtype=plan.batch_id,
+                retention_class="control",
+                storage_format="json_control",
+                row_count=len(checkpoints),
+            )
+            writer.record_existing_file(
+                checkpoint_sidecar,
+                artifact_type="batch_anytime_checkpoints_sidecar",
+                artifact_subtype=plan.batch_id,
+                retention_class="control",
+                storage_format="sha256_control",
+            )
         with persistence_recorder.record("batch_primary_manifest_finalize"):
             bundle = writer.finalize()
         attribution, persistence_attribution_path, _ = _write_persistence_attribution(
@@ -2552,17 +2865,32 @@ def _seal_verified_benchmark_batch(
         verified.to_dict(),
     )
     verified_write_completed_ns = time.monotonic_ns()
+    verified_interval = PersistenceInterval(
+        label="verified_batch_manifest_write",
+        started_ns=verified_write_started_ns,
+        completed_ns=verified_write_completed_ns,
+    )
+    verified_receipt_path, _ = atomic_write_signed_json(
+        batch_dir / "batch_verified_receipt.json",
+        {
+            "schema_version": "stage05.2-batch-verified-receipt-v1",
+            "run_label": run_label,
+            "batch_id": plan.batch_id,
+            "verified_manifest_sha256": _sha256(verified_manifest_path),
+            "base_attribution_sha256": _sha256(persistence_attribution_path),
+            "solver_seconds": attribution.solver_seconds,
+            "base_persistence_seconds": attribution.total_persistence_seconds,
+            "verified_manifest_write_interval": verified_interval.to_dict(),
+        },
+    )
     return _VerifiedBatchExecution(
         rows=rows,
         checkpoints=checkpoints,
         batch=verified,
         base_attribution=attribution,
         verified_manifest_sha256=_sha256(verified_manifest_path),
-        verified_manifest_write_interval=PersistenceInterval(
-            label="verified_batch_manifest_write",
-            started_ns=verified_write_started_ns,
-            completed_ns=verified_write_completed_ns,
-        ),
+        verified_manifest_write_interval=verified_interval,
+        verified_receipt_path=verified_receipt_path,
     )
 
 
@@ -2659,6 +2987,38 @@ def _record_campaign_control(
         retention_class="control",
         storage_format=("sha256_control" if path.suffix == ".sha256" else "json_control"),
     )
+
+
+def _record_campaign_recovery_controls(
+    writer: ArtifactBundleWriter,
+    output_dir: Path,
+) -> None:
+    paths = [
+        output_dir / "control" / "campaign_identity.json",
+        output_dir / "control" / "campaign_identity.sha256",
+    ]
+    recovery_root = output_dir / "control" / "recovery"
+    if recovery_root.is_dir():
+        paths.extend(
+            path
+            for path in sorted(recovery_root.rglob("*"))
+            if path.is_file() and not path.name.startswith(".")
+        )
+    for path in paths:
+        writer.record_existing_file(
+            path,
+            artifact_type=(
+                "campaign_identity"
+                if path.name == "campaign_identity.json"
+                else "campaign_identity_sidecar"
+                if path.name == "campaign_identity.sha256"
+                else "campaign_recovery_control"
+            ),
+            retention_class="control",
+            storage_format=(
+                "sha256_control" if path.suffix == ".sha256" else "json_control"
+            ),
+        )
 
 
 def _exercise_campaign_failure_state_machine(
@@ -6612,6 +6972,7 @@ def main() -> int:
     parser.add_argument("--prerequisite", action="append", default=[])
     parser.add_argument("--storage-migration", type=Path)
     parser.add_argument("--storage-migration-evidence-dir", type=Path)
+    parser.add_argument("--resume-permit", type=Path)
     arguments = parser.parse_args()
     named_prerequisites = _parse_prerequisite_bindings(arguments.prerequisite)
     if arguments.component != Stage052Component.BENCHMARK.value:
@@ -6635,6 +6996,7 @@ def main() -> int:
             prerequisite_dirs=named_prerequisites,
             storage_migration_path=arguments.storage_migration,
             storage_migration_evidence_dir=arguments.storage_migration_evidence_dir,
+            resume_permit_path=arguments.resume_permit,
         )
         lifecycle_manifest = outputs.get("lifecycle_manifest")
         if lifecycle_manifest is None:

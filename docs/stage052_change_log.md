@@ -2981,3 +2981,28 @@ compatibility fallback（兼容回退）。
   predecessor 原 `CLOSED` record，并使 lifecycle audit 通过。该 controller 修复改变
   source revision，因此后续 Formal 必须在新 clean commit 上重新执行 resource
   calibration，并继续使用全新、未创建的 Formal label。
+
+## 2026-08-02：同身份按批次恢复协议
+
+- 新增 `CampaignRecoveryController` deep module（深模块），统一首次执行和恢复打开路径。
+  首次运行写入不可变 `campaign_identity.json` 和 epoch0001；后续只能使用 lifecycle 在
+  `RUNNING`、writer 已退出且无终态清单时签发的一次性 `ResumePermit`。恢复原因限于
+  `unexpected_host_loss` 和有 signed pre-stop intent 的 `operator_stop`，不新增
+  `PAUSED` 状态。
+- 已归档 batch 在恢复时重新验证 manifest/sidecar、tree hash、bytes 与 persistence
+  envelope，原 SHA-256 保持不变；verified/archive transaction 中断幂等完成。未完成
+  batch 形成签名 inventory、control-only interruption capsule 和 deletion receipt 后整批
+  重算，旧 shard 不得进入最终 geometry。run label、Git tree/revision、wheel/runtime、
+  config、prerequisite、resource contract、plan 或 start permit 漂移均 fail closed。
+- runner 从所有已验证 archived batches 重建 per-run rows、signed per-batch checkpoints、
+  rolling-capacity journal 与 persistence attribution，不依赖前一进程内存。campaign
+  reviewer 新增 recovery gate，独立重放 identity/epoch/permit/consumption/capsule 链和
+  batch execution epoch，并继续从 raw evidence 重算 geometry、validator/objective 与
+  checkpoint 汇总。
+- Calibration Attempt23 的跨 revision 继承改为签名 successor attestation：精确绑定
+  `58c325a`、新 commit、全部 changed paths/blob hashes、Attempt23 accepted report/review
+  和 resource contract。该证明仅允许 `resource_contract_only` 继承，Formal shard 不能
+  跨 revision 复用；scientific、solver、objective、native-kernel 或 shard-schema 路径
+  变化直接拒绝。
+- 本变更只实现和验证协议；未启动 Formal Rerun16，未启用 Scheduled Task，未删除历史
+  evidence，也不声明 `READY_FOR_STAGE05_3`。

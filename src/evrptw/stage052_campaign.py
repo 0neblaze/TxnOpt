@@ -22,10 +22,11 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Final, Protocol, cast
 
-from evrptw.artifacts import signed_sidecar_matches
+from evrptw.artifacts import atomic_write_signed_json, signed_sidecar_matches
 from evrptw.best_known import BEST_KNOWN_VALUES
 from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
 from evrptw.stage052 import STAGE052_MAXIMUM_PERSISTENCE_RATIO
+from evrptw.stage052_evidence import BatchPersistenceEnvelope, PersistenceInterval
 from evrptw.stage052_resources import ProducerResourceContract
 
 GIB: Final = 1024**3
@@ -1503,7 +1504,7 @@ class BatchManifest:
 
 @dataclass(frozen=True, slots=True)
 class CampaignManifest:
-    """Top-level state machine for a single non-resumable Formal attempt."""
+    """Top-level state machine for one immutable campaign identity."""
 
     run_label: str
     status: str
@@ -1956,6 +1957,1235 @@ def load_campaign_manifest(path: Path) -> CampaignManifest:
         raise ManifestIntegrityError("campaign manifest contract is invalid") from error
 
 
+_RECOVERY_CAUSES: Final = frozenset({"unexpected_host_loss", "operator_stop"})
+
+
+def _canonical_object_sha256(payload: Mapping[str, object]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _canonical_signed_json_sha256(payload: Mapping[str, object]) -> str:
+    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignIdentity:
+    """Immutable scientific and runtime identity shared by every recovery epoch."""
+
+    run_label: str
+    repository_revision: str
+    repository_tree: str
+    wheel_sha256: str
+    runtime_identity_sha256: str
+    configuration_sha256: str
+    prerequisite_review_sha256: str
+    producer_resource_contract_sha256: str
+    campaign_plan_sha256: str
+    lifecycle_plan_sha256: str
+    start_permit_sha256: str
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(
+            r"stage05\.2_benchmark_(?:attempt|rerun)[0-9]{2}", self.run_label
+        ) is None:
+            raise ValueError("campaign recovery run_label is not canonical")
+        if re.fullmatch(r"[0-9a-f]{40}", self.repository_revision) is None:
+            raise ValueError("campaign recovery repository revision is invalid")
+        if re.fullmatch(r"[0-9a-f]{40}", self.repository_tree) is None:
+            raise ValueError("campaign recovery repository tree is invalid")
+        digests = (
+            self.wheel_sha256,
+            self.runtime_identity_sha256,
+            self.configuration_sha256,
+            self.prerequisite_review_sha256,
+            self.producer_resource_contract_sha256,
+            self.campaign_plan_sha256,
+            self.lifecycle_plan_sha256,
+            self.start_permit_sha256,
+        )
+        if any(not _is_sha256(value) for value in digests):
+            raise ValueError("campaign recovery identity digest is invalid")
+
+    @property
+    def identity_sha256(self) -> str:
+        return _canonical_object_sha256(self.to_dict(include_digest=False))
+
+    def to_dict(self, *, include_digest: bool = True) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "schema_version": "stage05.2-campaign-identity-v1",
+            "run_label": self.run_label,
+            "repository_revision": self.repository_revision,
+            "repository_tree": self.repository_tree,
+            "wheel_sha256": self.wheel_sha256,
+            "runtime_identity_sha256": self.runtime_identity_sha256,
+            "configuration_sha256": self.configuration_sha256,
+            "prerequisite_review_sha256": self.prerequisite_review_sha256,
+            "producer_resource_contract_sha256": (
+                self.producer_resource_contract_sha256
+            ),
+            "campaign_plan_sha256": self.campaign_plan_sha256,
+            "lifecycle_plan_sha256": self.lifecycle_plan_sha256,
+            "start_permit_sha256": self.start_permit_sha256,
+        }
+        if include_digest:
+            payload["campaign_identity_sha256"] = self.identity_sha256
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> CampaignIdentity:
+        expected = {
+            "schema_version",
+            "run_label",
+            "repository_revision",
+            "repository_tree",
+            "wheel_sha256",
+            "runtime_identity_sha256",
+            "configuration_sha256",
+            "prerequisite_review_sha256",
+            "producer_resource_contract_sha256",
+            "campaign_plan_sha256",
+            "lifecycle_plan_sha256",
+            "start_permit_sha256",
+            "campaign_identity_sha256",
+        }
+        _exact_fields(payload, expected, "campaign identity")
+        if payload.get("schema_version") != "stage05.2-campaign-identity-v1":
+            raise ValueError("campaign identity schema is unsupported")
+        identity = cls(
+            run_label=_required_str(payload, "run_label"),
+            repository_revision=_required_str(payload, "repository_revision"),
+            repository_tree=_required_str(payload, "repository_tree"),
+            wheel_sha256=_required_str(payload, "wheel_sha256"),
+            runtime_identity_sha256=_required_str(payload, "runtime_identity_sha256"),
+            configuration_sha256=_required_str(payload, "configuration_sha256"),
+            prerequisite_review_sha256=_required_str(
+                payload, "prerequisite_review_sha256"
+            ),
+            producer_resource_contract_sha256=_required_str(
+                payload, "producer_resource_contract_sha256"
+            ),
+            campaign_plan_sha256=_required_str(payload, "campaign_plan_sha256"),
+            lifecycle_plan_sha256=_required_str(payload, "lifecycle_plan_sha256"),
+            start_permit_sha256=_required_str(payload, "start_permit_sha256"),
+        )
+        if payload.get("campaign_identity_sha256") != identity.identity_sha256:
+            raise ValueError("campaign identity self-digest differs")
+        return identity
+
+
+@dataclass(frozen=True, slots=True)
+class ResumePermit:
+    """One-use authorization to reopen an existing RUNNING campaign."""
+
+    run_label: str
+    epoch: int
+    cause: str
+    campaign_identity_sha256: str
+    lifecycle_plan_sha256: str
+    start_permit_sha256: str
+    previous_campaign_manifest_sha256: str
+    previous_epoch_sha256: str
+    stop_evidence_sha256: str
+    completed_batch_manifest_sha256_by_id: Mapping[str, str]
+    interrupted_batch_id: str | None
+    nonce: str
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(
+            r"stage05\.2_benchmark_(?:attempt|rerun)[0-9]{2}", self.run_label
+        ) is None:
+            raise ValueError("resume permit run_label is not canonical")
+        if not _is_plain_int(self.epoch) or self.epoch < 2:
+            raise ValueError("resume permit epoch must be at least two")
+        if self.cause not in _RECOVERY_CAUSES:
+            raise ValueError("resume permit cause is not recoverable")
+        digest_values = (
+            self.campaign_identity_sha256,
+            self.lifecycle_plan_sha256,
+            self.start_permit_sha256,
+            self.previous_campaign_manifest_sha256,
+            self.stop_evidence_sha256,
+        )
+        if any(not _is_sha256(value) for value in digest_values):
+            raise ValueError("resume permit digest is invalid")
+        if self.previous_epoch_sha256 and not _is_sha256(
+            self.previous_epoch_sha256
+        ):
+            raise ValueError("resume permit previous epoch digest is invalid")
+        completed = dict(self.completed_batch_manifest_sha256_by_id)
+        if any(
+            re.fullmatch(r"batch[0-9]{4}", batch_id) is None
+            or not _is_sha256(digest)
+            for batch_id, digest in completed.items()
+        ):
+            raise ValueError("resume permit completed batch identities are invalid")
+        object.__setattr__(
+            self,
+            "completed_batch_manifest_sha256_by_id",
+            MappingProxyType(completed),
+        )
+        if self.interrupted_batch_id is not None and re.fullmatch(
+            r"batch[0-9]{4}", self.interrupted_batch_id
+        ) is None:
+            raise ValueError("resume permit interrupted batch identity is invalid")
+        if re.fullmatch(r"[0-9a-f]{32}", self.nonce) is None:
+            raise ValueError("resume permit nonce is invalid")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": "stage05.2-resume-permit-v1",
+            "run_label": self.run_label,
+            "epoch": self.epoch,
+            "cause": self.cause,
+            "campaign_identity_sha256": self.campaign_identity_sha256,
+            "lifecycle_plan_sha256": self.lifecycle_plan_sha256,
+            "start_permit_sha256": self.start_permit_sha256,
+            "previous_campaign_manifest_sha256": (
+                self.previous_campaign_manifest_sha256
+            ),
+            "previous_epoch_sha256": self.previous_epoch_sha256,
+            "stop_evidence_sha256": self.stop_evidence_sha256,
+            "completed_batch_manifest_sha256_by_id": dict(
+                sorted(self.completed_batch_manifest_sha256_by_id.items())
+            ),
+            "interrupted_batch_id": self.interrupted_batch_id,
+            "nonce": self.nonce,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> ResumePermit:
+        expected = {
+            "schema_version",
+            "run_label",
+            "epoch",
+            "cause",
+            "campaign_identity_sha256",
+            "lifecycle_plan_sha256",
+            "start_permit_sha256",
+            "previous_campaign_manifest_sha256",
+            "previous_epoch_sha256",
+            "stop_evidence_sha256",
+            "completed_batch_manifest_sha256_by_id",
+            "interrupted_batch_id",
+            "nonce",
+        }
+        _exact_fields(payload, expected, "resume permit")
+        if payload.get("schema_version") != "stage05.2-resume-permit-v1":
+            raise ValueError("resume permit schema is unsupported")
+        return cls(
+            run_label=_required_str(payload, "run_label"),
+            epoch=_required_int(payload, "epoch"),
+            cause=_required_str(payload, "cause"),
+            campaign_identity_sha256=_required_str(
+                payload, "campaign_identity_sha256"
+            ),
+            lifecycle_plan_sha256=_required_str(payload, "lifecycle_plan_sha256"),
+            start_permit_sha256=_required_str(payload, "start_permit_sha256"),
+            previous_campaign_manifest_sha256=_required_str(
+                payload, "previous_campaign_manifest_sha256"
+            ),
+            previous_epoch_sha256=_required_str(payload, "previous_epoch_sha256"),
+            stop_evidence_sha256=_required_str(payload, "stop_evidence_sha256"),
+            completed_batch_manifest_sha256_by_id=(
+                _optional_string_mapping(
+                    payload, "completed_batch_manifest_sha256_by_id"
+                )
+                or {}
+            ),
+            interrupted_batch_id=_optional_str(payload, "interrupted_batch_id"),
+            nonce=_required_str(payload, "nonce"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignExecutionSession:
+    """Restart-safe state returned through the campaign recovery interface."""
+
+    identity: CampaignIdentity
+    campaign: CampaignManifest
+    epoch: int
+    resumed: bool
+    completed_batch_ids: tuple[str, ...]
+    pending_batch_ids: tuple[str, ...]
+    epoch_manifest_path: Path
+
+
+class CampaignRecoveryError(RuntimeError):
+    """The campaign cannot be recovered without weakening evidence identity."""
+
+
+class CampaignRecoveryController:
+    """Deep module for fresh/open recovery and batch-boundary reconciliation."""
+
+    def __init__(self, *, run_dir: Path, locator: StorageRootLocator) -> None:
+        self.run_dir = run_dir
+        self.locator = locator
+
+    @property
+    def identity_path(self) -> Path:
+        return self.run_dir / "control" / "campaign_identity.json"
+
+    @property
+    def recovery_root(self) -> Path:
+        return self.run_dir / "control" / "recovery"
+
+    def open(
+        self,
+        *,
+        expected_identity: CampaignIdentity,
+        fresh_campaign: CampaignManifest,
+        resume_permit_path: Path | None,
+    ) -> CampaignExecutionSession:
+        if resume_permit_path is None:
+            return self._open_fresh(expected_identity, fresh_campaign)
+        return self._open_resumed(
+            expected_identity,
+            fresh_campaign,
+            resume_permit_path,
+        )
+
+    def record_epoch_result(
+        self,
+        campaign: CampaignManifest,
+        *,
+        status: str,
+    ) -> Path:
+        """Seal the current epoch result before the top-level artifact manifest."""
+
+        if status != "batch_execution_completed":
+            raise ValueError("unsupported campaign recovery epoch result status")
+        epoch_paths = sorted(
+            (self.recovery_root / "epochs").glob(
+                "epoch[0-9][0-9][0-9][0-9].json"
+            )
+        )
+        if not epoch_paths:
+            raise CampaignRecoveryError("campaign recovery epoch is missing")
+        return _write_recovery_epoch_result(
+            run_dir=self.run_dir,
+            campaign=campaign,
+            epoch=len(epoch_paths),
+            status=status,
+            cause=None,
+        )
+
+    def record_start_evidence(
+        self,
+        *,
+        lifecycle_plan: Mapping[str, object],
+        start_permit_path: Path,
+        start_observation_path: Path,
+        maintenance_audit_path: Path,
+    ) -> None:
+        """Persist and verify the immutable controls bound into the identity."""
+
+        try:
+            identity = CampaignIdentity.from_dict(
+                _load_verified_manifest_object(self.identity_path)
+            )
+            permit_raw = start_permit_path.read_bytes()
+            permit_text = permit_raw.decode("utf-8")
+            permit_payload = json.loads(permit_text)
+            observation_raw = start_observation_path.read_bytes()
+            maintenance_raw = maintenance_audit_path.read_bytes()
+        except (
+            ManifestIntegrityError,
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as error:
+            raise CampaignRecoveryError("campaign start evidence is invalid") from error
+        if not isinstance(permit_payload, Mapping):
+            raise CampaignRecoveryError("campaign start permit must be a JSON object")
+        if _canonical_object_sha256(lifecycle_plan) != identity.lifecycle_plan_sha256:
+            raise CampaignRecoveryError("campaign lifecycle plan identity differs")
+        if hashlib.sha256(permit_raw).hexdigest() != identity.start_permit_sha256:
+            raise CampaignRecoveryError("campaign start permit identity differs")
+        observation_sha256 = hashlib.sha256(observation_raw).hexdigest()
+        maintenance_sha256 = hashlib.sha256(maintenance_raw).hexdigest()
+        if (
+            permit_payload.get("run_label") != identity.run_label
+            or permit_payload.get("stage_plan_sha256")
+            != identity.lifecycle_plan_sha256
+            or permit_payload.get("observation_sha256") != observation_sha256
+            or permit_payload.get("maintenance_audit_sha256")
+            != maintenance_sha256
+        ):
+            raise CampaignRecoveryError("campaign start permit bindings differ")
+        controls: dict[Path, Mapping[str, object]] = {
+            self.recovery_root / "start" / "lifecycle_plan.json": {
+                "schema_version": "stage05.2-lifecycle-plan-binding-v1",
+                "run_label": identity.run_label,
+                "lifecycle_plan_sha256": identity.lifecycle_plan_sha256,
+                "lifecycle_plan": dict(lifecycle_plan),
+            },
+            self.recovery_root / "start" / "start_permit.json": {
+                "schema_version": "stage05.2-start-permit-binding-v1",
+                "run_label": identity.run_label,
+                "start_permit_sha256": identity.start_permit_sha256,
+                "start_permit_raw_utf8": permit_text,
+            },
+            self.recovery_root / "start" / "start_observation.json": {
+                "schema_version": "stage05.2-start-observation-binding-v1",
+                "run_label": identity.run_label,
+                "start_observation_sha256": observation_sha256,
+                "start_observation_raw_utf8": observation_raw.decode("utf-8"),
+            },
+            self.recovery_root / "start" / "maintenance_audit.json": {
+                "schema_version": "stage05.2-maintenance-audit-binding-v1",
+                "run_label": identity.run_label,
+                "maintenance_audit_sha256": maintenance_sha256,
+                "maintenance_audit_raw_utf8": maintenance_raw.decode("utf-8"),
+            },
+        }
+        for path, payload in controls.items():
+            if path.exists() or path.with_suffix(".sha256").exists():
+                if _load_verified_manifest_object(path) != payload:
+                    raise CampaignRecoveryError(
+                        f"campaign immutable start control differs: {path.name}"
+                    )
+            else:
+                atomic_write_signed_json(path, payload)
+
+    def _open_fresh(
+        self,
+        identity: CampaignIdentity,
+        campaign: CampaignManifest,
+    ) -> CampaignExecutionSession:
+        if self.run_dir.name != identity.run_label:
+            raise CampaignRecoveryError("campaign output run label differs")
+        if self.run_dir.exists():
+            raise CampaignRecoveryError(
+                "existing campaign output requires a signed resume permit"
+            )
+        if identity.run_label != campaign.run_label:
+            raise CampaignRecoveryError("fresh campaign identity differs")
+        self.run_dir.mkdir(parents=True)
+        atomic_write_signed_json(self.identity_path, identity.to_dict())
+        epoch_path, _ = atomic_write_signed_json(
+            self.recovery_root / "epochs" / "epoch0001.json",
+            {
+                "schema_version": "stage05.2-recovery-epoch-v1",
+                "run_label": identity.run_label,
+                "epoch": 1,
+                "status": "started",
+                "cause": "initial_execution",
+                "campaign_identity_sha256": identity.identity_sha256,
+                "previous_epoch_sha256": "",
+                "resume_permit_sha256": "",
+                "completed_batch_manifest_sha256_by_id": {},
+                "interrupted_batch_id": None,
+                "interrupted_batch_action": None,
+            },
+        )
+        return CampaignExecutionSession(
+            identity=identity,
+            campaign=campaign,
+            epoch=1,
+            resumed=False,
+            completed_batch_ids=(),
+            pending_batch_ids=tuple(batch.batch_id for batch in campaign.batches),
+            epoch_manifest_path=epoch_path,
+        )
+
+    def _open_resumed(
+        self,
+        expected_identity: CampaignIdentity,
+        fresh_campaign: CampaignManifest,
+        resume_permit_path: Path,
+    ) -> CampaignExecutionSession:
+        if self.run_dir.name != expected_identity.run_label:
+            raise CampaignRecoveryError("campaign output run label differs")
+        if not self.run_dir.is_dir():
+            raise CampaignRecoveryError("resume campaign output is missing")
+        try:
+            permit_parent = resume_permit_path.resolve(strict=True).parent
+        except OSError as error:
+            raise CampaignRecoveryError("resume permit is missing") from error
+        if permit_parent != (self.recovery_root / "permits").resolve():
+            raise CampaignRecoveryError("resume permit is outside the campaign")
+        try:
+            identity = CampaignIdentity.from_dict(
+                _load_verified_manifest_object(self.identity_path)
+            )
+            permit = ResumePermit.from_dict(
+                _load_verified_manifest_object(resume_permit_path)
+            )
+            campaign_path = self.run_dir / "campaign_manifest.json"
+            campaign = load_campaign_manifest(campaign_path)
+            permit_campaign_path = (
+                self.recovery_root
+                / "campaign-manifests"
+                / f"epoch{permit.epoch:04d}-pre.json"
+            )
+            permit_campaign = load_campaign_manifest(permit_campaign_path)
+        except (ManifestIntegrityError, ValueError) as error:
+            raise CampaignRecoveryError(
+                "campaign recovery control evidence is invalid"
+            ) from error
+        if identity != expected_identity or identity.run_label != fresh_campaign.run_label:
+            raise CampaignRecoveryError("campaign frozen identity drifted")
+        if campaign.status != "planned":
+            raise CampaignRecoveryError("only a RUNNING planned campaign can resume")
+        if (
+            permit.run_label != identity.run_label
+            or permit.campaign_identity_sha256 != identity.identity_sha256
+            or permit.lifecycle_plan_sha256 != identity.lifecycle_plan_sha256
+            or permit.start_permit_sha256 != identity.start_permit_sha256
+            or permit.previous_campaign_manifest_sha256
+            != _sha256_file(permit_campaign_path)
+        ):
+            raise CampaignRecoveryError("resume permit does not bind current campaign")
+        expected_campaign = replace(
+            fresh_campaign,
+            batches=permit_campaign.batches,
+            batch_persistence_envelope_sha256_by_id=(
+                permit_campaign.batch_persistence_envelope_sha256_by_id
+            ),
+        )
+        if permit_campaign != expected_campaign:
+            raise CampaignRecoveryError("campaign plan or execution contract drifted")
+        consumed_path = self.recovery_root / "consumed" / f"{permit.nonce}.json"
+        epoch_paths = sorted((self.recovery_root / "epochs").glob("epoch[0-9][0-9][0-9][0-9].json"))
+        if len(epoch_paths) + 1 != permit.epoch:
+            raise CampaignRecoveryError("resume permit epoch is not the next epoch")
+        previous_epoch_sha256 = _sha256_file(epoch_paths[-1]) if epoch_paths else ""
+        if permit.previous_epoch_sha256 != previous_epoch_sha256:
+            raise CampaignRecoveryError("resume permit recovery chain differs")
+        completed = self._verify_completed_batches(permit_campaign, permit)
+        campaign, interrupted, interrupted_action = self._prepare_interrupted_batch(
+            campaign, permit
+        )
+        expected_after_recovery = permit_campaign
+        if interrupted_action == "archive_completed":
+            recovered_batch = next(
+                batch
+                for batch in campaign.batches
+                if batch.batch_id == permit.interrupted_batch_id
+            )
+            expected_after_recovery = expected_after_recovery.with_batch(
+                recovered_batch
+            )
+            recovered_envelope = (
+                campaign.batch_persistence_envelope_sha256_by_id.get(
+                    recovered_batch.batch_id
+                )
+            )
+            if recovered_envelope is None:
+                raise CampaignRecoveryError(
+                    "recovered archived batch lacks persistence evidence"
+                )
+            expected_after_recovery = (
+                expected_after_recovery.with_batch_persistence_envelope(
+                    recovered_batch.batch_id, recovered_envelope
+                )
+            )
+        if campaign != expected_after_recovery:
+            raise CampaignRecoveryError("campaign recovery progress differs")
+        for batch in campaign.batches:
+            if batch.status == "archived" and batch.batch_id not in completed:
+                manifest_path = self.locator.resolve(batch.root_alias).absolute_path.joinpath(
+                    *PurePosixPath(batch.logical_path).parts,
+                    "batch_manifest.json",
+                )
+                completed[batch.batch_id] = _sha256_file(manifest_path)
+        consumption_payload = {
+            "schema_version": "stage05.2-resume-permit-consumption-v1",
+            "run_label": identity.run_label,
+            "epoch": permit.epoch,
+            "resume_permit_sha256": _sha256_file(resume_permit_path),
+            "nonce": permit.nonce,
+            "status": "consumed",
+        }
+        if consumed_path.exists() or consumed_path.with_suffix(".sha256").exists():
+            if _load_verified_manifest_object(consumed_path) != consumption_payload:
+                raise CampaignRecoveryError("resume permit consumption differs")
+        else:
+            atomic_write_signed_json(consumed_path, consumption_payload)
+        epoch_path, _ = atomic_write_signed_json(
+            self.recovery_root / "epochs" / f"epoch{permit.epoch:04d}.json",
+            {
+                "schema_version": "stage05.2-recovery-epoch-v1",
+                "run_label": identity.run_label,
+                "epoch": permit.epoch,
+                "status": "started",
+                "cause": permit.cause,
+                "campaign_identity_sha256": identity.identity_sha256,
+                "previous_epoch_sha256": previous_epoch_sha256,
+                "resume_permit_sha256": _sha256_file(resume_permit_path),
+                "completed_batch_manifest_sha256_by_id": dict(sorted(completed.items())),
+                "interrupted_batch_id": interrupted,
+                "interrupted_batch_action": interrupted_action,
+            },
+        )
+        pending = tuple(
+            batch.batch_id for batch in campaign.batches if batch.status != "archived"
+        )
+        return CampaignExecutionSession(
+            identity=identity,
+            campaign=campaign,
+            epoch=permit.epoch,
+            resumed=True,
+            completed_batch_ids=tuple(sorted(completed)),
+            pending_batch_ids=pending,
+            epoch_manifest_path=epoch_path,
+        )
+
+    def _verify_completed_batches(
+        self,
+        campaign: CampaignManifest,
+        permit: ResumePermit,
+    ) -> dict[str, str]:
+        observed: dict[str, str] = {}
+        for batch in campaign.batches:
+            if batch.status != "archived":
+                continue
+            root = self.locator.resolve(batch.root_alias)
+            batch_dir = root.absolute_path.joinpath(
+                *PurePosixPath(batch.logical_path).parts
+            )
+            manifest_path = batch_dir / "batch_manifest.json"
+            loaded = load_batch_manifest(manifest_path)
+            envelope_path = batch_dir / "batch_persistence_envelope.json"
+            expected_envelope = campaign.batch_persistence_envelope_sha256_by_id.get(
+                batch.batch_id
+            )
+            if (
+                loaded != batch
+                or directory_checksum(batch_dir) != batch.checksum_sha256
+                or directory_byte_count(batch_dir) != batch.actual_bytes
+                or expected_envelope is None
+                or not signed_sidecar_matches(
+                    envelope_path, envelope_path.with_suffix(".sha256")
+                )
+                or _sha256_file(envelope_path) != expected_envelope
+            ):
+                raise CampaignRecoveryError(
+                    f"completed batch changed before resume: {batch.batch_id}"
+                )
+            observed[batch.batch_id] = _sha256_file(manifest_path)
+        if observed != dict(permit.completed_batch_manifest_sha256_by_id):
+            raise CampaignRecoveryError("resume permit completed batch set differs")
+        return observed
+
+    def _prepare_interrupted_batch(
+        self,
+        campaign: CampaignManifest,
+        permit: ResumePermit,
+    ) -> tuple[CampaignManifest, str | None, str | None]:
+        non_archived = tuple(
+            batch for batch in campaign.batches if batch.status != "archived"
+        )
+        if any(batch.status == "failed" for batch in non_archived):
+            raise CampaignRecoveryError("a failed batch cannot resume")
+        existing: list[tuple[BatchManifest, Path]] = []
+        for batch in non_archived:
+            source = self.locator.resolve(batch.root_alias).absolute_path.joinpath(
+                *PurePosixPath(batch.logical_path).parts
+            )
+            destination = self.locator.resolve(
+                batch.archive_root_alias
+            ).absolute_path.joinpath(*PurePosixPath(batch.logical_path).parts)
+            if source.exists() or destination.exists():
+                existing.append((batch, source if source.exists() else destination))
+        if len(existing) > 1:
+            raise CampaignRecoveryError("multiple interrupted batches are present")
+        interrupted_id = existing[0][0].batch_id if existing else None
+        if interrupted_id is None and permit.interrupted_batch_id is not None:
+            prior = next(
+                batch
+                for batch in campaign.batches
+                if batch.batch_id == permit.interrupted_batch_id
+            )
+            if prior.status == "archived":
+                return campaign, prior.batch_id, "archive_completed"
+            capsule = (
+                self.locator.resolve(prior.archive_root_alias).absolute_path
+                / ".campaign-recovery"
+                / prior.run_label
+                / f"epoch{permit.epoch:04d}"
+                / prior.batch_id
+            )
+            if capsule.exists():
+                self._compact_interrupted_batch(
+                    path=self.locator.resolve(prior.root_alias).absolute_path.joinpath(
+                        *PurePosixPath(prior.logical_path).parts
+                    ),
+                    batch=prior,
+                    permit=permit,
+                )
+                return campaign, prior.batch_id, "discarded_and_recomputed"
+        if permit.interrupted_batch_id != interrupted_id:
+            raise CampaignRecoveryError("resume permit interrupted batch differs")
+        if not existing:
+            return campaign, None, None
+        batch, path = existing[0]
+        manifest_path = path / "batch_manifest.json"
+        verified = None
+        if manifest_path.is_file() and manifest_path.with_suffix(".sha256").is_file():
+            candidate = load_batch_manifest(manifest_path)
+            if candidate.status == "verified":
+                verified = candidate
+            elif candidate.status == "archived":
+                verified = replace(
+                    candidate,
+                    status="verified",
+                    root_alias="wsl_staging",
+                    volume=campaign.storage_roots["wsl_staging"],
+                    transfer_mode=None,
+                    archive_transfer_seconds=None,
+                )
+        if batch.status == "verified" or verified is not None:
+            expected = batch if batch.status == "verified" else verified
+            assert expected is not None
+            if (
+                expected.run_label != batch.run_label
+                or expected.batch_id != batch.batch_id
+                or expected.shard_ids != batch.shard_ids
+            ):
+                raise CampaignRecoveryError("verified recovery batch identity differs")
+            campaign = self._finish_verified_batch(campaign, expected)
+            return campaign, batch.batch_id, "archive_completed"
+        self._compact_interrupted_batch(path=path, batch=batch, permit=permit)
+        return campaign, batch.batch_id, "discarded_and_recomputed"
+
+    def _finish_verified_batch(
+        self,
+        campaign: CampaignManifest,
+        verified: BatchManifest,
+    ) -> CampaignManifest:
+        source = self.locator.resolve(verified.root_alias).absolute_path.joinpath(
+            *PurePosixPath(verified.logical_path).parts
+        )
+        destination_root = self.locator.resolve(verified.archive_root_alias)
+        destination = destination_root.absolute_path.joinpath(
+            *PurePosixPath(verified.logical_path).parts
+        )
+        incoming = destination.with_name(f"{destination.name}.incoming")
+        archived_write_interval: PersistenceInterval | None = None
+        if incoming.exists():
+            if (
+                not source.is_dir()
+                or directory_checksum(incoming) != verified.checksum_sha256
+                or directory_byte_count(incoming) != verified.actual_bytes
+            ):
+                raise CampaignRecoveryError("archive incoming recovery state differs")
+            shutil.rmtree(incoming)
+        if destination.is_dir():
+            destination_manifest = load_batch_manifest(
+                destination / "batch_manifest.json"
+            )
+            if destination_manifest.status == "archived":
+                archived = destination_manifest
+                if (
+                    archived.run_label != verified.run_label
+                    or archived.batch_id != verified.batch_id
+                    or archived.shard_ids != verified.shard_ids
+                    or archived.checksum_sha256 != verified.checksum_sha256
+                    or archived.actual_bytes != verified.actual_bytes
+                    or archived.root_alias != destination_root.alias
+                    or archived.volume != destination_root.volume
+                    or directory_checksum(destination) != verified.checksum_sha256
+                    or directory_byte_count(destination) != verified.actual_bytes
+                ):
+                    raise CampaignRecoveryError(
+                        "archived destination payload differs from verified batch"
+                    )
+            elif destination_manifest == verified:
+                started_ns = time.monotonic_ns()
+                archived = verified.mark_archived(
+                    root_alias=destination_root.alias,
+                    volume=destination_root.volume,
+                    transfer_mode="cross_volume_verified_copy",
+                    archive_transfer_seconds=0.0,
+                )
+                atomic_write_signed_json(
+                    destination / "batch_manifest.json", archived.to_dict()
+                )
+                archived_write_interval = PersistenceInterval(
+                    label="archived_batch_manifest_write",
+                    started_ns=started_ns,
+                    completed_ns=time.monotonic_ns(),
+                )
+            else:
+                raise CampaignRecoveryError("archive destination recovery state differs")
+            if source.exists():
+                if (
+                    directory_checksum(source) != verified.checksum_sha256
+                    or directory_byte_count(source) != verified.actual_bytes
+                ):
+                    raise CampaignRecoveryError("archive source/destination forked")
+                shutil.rmtree(source)
+        else:
+            started_ns = time.monotonic_ns()
+            archived = BatchArchiver(self.locator).archive(verified)
+            atomic_write_signed_json(destination / "batch_manifest.json", archived.to_dict())
+            archived_write_interval = PersistenceInterval(
+                label="archived_batch_manifest_write",
+                started_ns=started_ns,
+                completed_ns=time.monotonic_ns(),
+            )
+        receipt_path = destination / "batch_verified_receipt.json"
+        if not signed_sidecar_matches(
+            receipt_path, receipt_path.with_suffix(".sha256")
+        ):
+            raise CampaignRecoveryError("verified batch recovery receipt is missing")
+        receipt = _load_verified_manifest_object(receipt_path)
+        if (
+            receipt.get("schema_version")
+            != "stage05.2-batch-verified-receipt-v1"
+            or receipt.get("run_label") != verified.run_label
+            or receipt.get("batch_id") != verified.batch_id
+            or receipt.get("verified_manifest_sha256")
+            != _canonical_signed_json_sha256(verified.to_dict())
+        ):
+            raise CampaignRecoveryError("verified batch recovery receipt differs")
+        envelope_path = destination / "batch_persistence_envelope.json"
+        if signed_sidecar_matches(
+            envelope_path, envelope_path.with_suffix(".sha256")
+        ):
+            try:
+                existing_envelope = BatchPersistenceEnvelope.from_dict(
+                    _load_verified_manifest_object(envelope_path)
+                )
+            except (ManifestIntegrityError, ValueError) as error:
+                raise CampaignRecoveryError(
+                    "archived batch persistence envelope is invalid"
+                ) from error
+            if (
+                existing_envelope.run_label != archived.run_label
+                or existing_envelope.batch_id != archived.batch_id
+                or existing_envelope.archived_manifest_sha256
+                != _sha256_file(destination / "batch_manifest.json")
+            ):
+                raise CampaignRecoveryError(
+                    "archived batch persistence envelope differs"
+                )
+            campaign = campaign.with_batch(archived)
+            campaign = campaign.with_batch_persistence_envelope(
+                archived.batch_id, _sha256_file(envelope_path)
+            )
+            atomic_write_signed_json(
+                self.run_dir / "campaign_manifest.json", campaign.to_dict()
+            )
+            return campaign
+        raw_interval = receipt.get("verified_manifest_write_interval")
+        if not isinstance(raw_interval, Mapping):
+            raise CampaignRecoveryError("verified batch recovery interval is invalid")
+        if archived_write_interval is None:
+            now_ns = time.monotonic_ns()
+            archived_write_interval = PersistenceInterval(
+                label="archived_batch_manifest_write",
+                started_ns=now_ns,
+                completed_ns=now_ns,
+            )
+        envelope = BatchPersistenceEnvelope(
+            run_label=verified.run_label,
+            batch_id=verified.batch_id,
+            base_attribution_sha256=str(receipt["base_attribution_sha256"]),
+            verified_manifest_sha256=str(receipt["verified_manifest_sha256"]),
+            archived_manifest_sha256=_sha256_file(
+                destination / "batch_manifest.json"
+            ),
+            solver_seconds=_required_number(receipt, "solver_seconds"),
+            base_persistence_seconds=_required_number(
+                receipt, "base_persistence_seconds"
+            ),
+            state_intervals=(
+                PersistenceInterval.from_dict(raw_interval),
+                archived_write_interval,
+            ),
+        )
+        envelope_path, _ = atomic_write_signed_json(
+            destination / "batch_persistence_envelope.json",
+            envelope.to_dict(),
+        )
+        campaign = campaign.with_batch(archived)
+        campaign = campaign.with_batch_persistence_envelope(
+            archived.batch_id, _sha256_file(envelope_path)
+        )
+        atomic_write_signed_json(
+            self.run_dir / "campaign_manifest.json", campaign.to_dict()
+        )
+        return campaign
+
+    def _compact_interrupted_batch(
+        self,
+        *,
+        path: Path,
+        batch: BatchManifest,
+        permit: ResumePermit,
+    ) -> None:
+        archive = self.locator.resolve(batch.archive_root_alias).absolute_path
+        capsule = (
+            archive
+            / ".campaign-recovery"
+            / batch.run_label
+            / f"epoch{permit.epoch:04d}"
+            / batch.batch_id
+        )
+        capsule.mkdir(parents=True, exist_ok=True)
+        inventory_path = capsule / "interrupted_inventory.json"
+        receipt_path = capsule / "deletion_receipt.json"
+        inventory_payload: dict[str, object] | None = None
+        if path.is_dir():
+            inventory: list[dict[str, object]] = []
+            inventory_bytes = 0
+            for item in _tree_files(path):
+                stat = item.stat()
+                inventory_bytes += stat.st_size
+                inventory.append(
+                    {
+                        "relative_path": item.relative_to(path).as_posix(),
+                        "byte_size": stat.st_size,
+                        "sha256": _sha256_file(item),
+                    }
+                )
+            inventory_payload = {
+                "schema_version": "stage05.2-interrupted-batch-inventory-v1",
+                "run_label": batch.run_label,
+                "batch_id": batch.batch_id,
+                "epoch": permit.epoch,
+                "cause": permit.cause,
+                "campaign_identity_sha256": permit.campaign_identity_sha256,
+                "file_count": len(inventory),
+                "byte_count": inventory_bytes,
+                "files": inventory,
+            }
+        if inventory_path.exists() or inventory_path.with_suffix(".sha256").exists():
+            if inventory_payload is not None and (
+                _load_verified_manifest_object(inventory_path) != inventory_payload
+            ):
+                raise CampaignRecoveryError(
+                    "interrupted batch changed after inventory was signed"
+                )
+            stored_inventory = _load_verified_manifest_object(inventory_path)
+            if (
+                stored_inventory.get("run_label") != batch.run_label
+                or stored_inventory.get("batch_id") != batch.batch_id
+                or stored_inventory.get("epoch") != permit.epoch
+                or stored_inventory.get("campaign_identity_sha256")
+                != permit.campaign_identity_sha256
+            ):
+                raise CampaignRecoveryError("interrupted batch inventory differs")
+        elif inventory_payload is None:
+            raise CampaignRecoveryError(
+                "interrupted batch vanished before a signed inventory was durable"
+            )
+        else:
+            inventory_path, _ = atomic_write_signed_json(
+                inventory_path, inventory_payload
+            )
+        if path.is_dir():
+            control_source = path / "control"
+            control_capsule = capsule / "control"
+            if control_source.is_dir():
+                if control_capsule.exists():
+                    shutil.rmtree(control_capsule)
+                shutil.copytree(control_source, control_capsule)
+            if receipt_path.exists() or receipt_path.with_suffix(".sha256").exists():
+                raise CampaignRecoveryError(
+                    "interrupted batch source exists after deletion receipt"
+                )
+            shutil.rmtree(path)
+        if path.exists():
+            raise CampaignRecoveryError("interrupted batch cleanup did not finish")
+        receipt_payload = {
+                "schema_version": "stage05.2-interrupted-batch-deletion-v1",
+                "run_label": batch.run_label,
+                "batch_id": batch.batch_id,
+                "epoch": permit.epoch,
+                "source_absent": True,
+                "inventory_sha256": _sha256_file(inventory_path),
+                "retention_class": "duplicate_failure_metadata",
+            }
+        if receipt_path.exists() or receipt_path.with_suffix(".sha256").exists():
+            if _load_verified_manifest_object(receipt_path) != receipt_payload:
+                raise CampaignRecoveryError(
+                    "interrupted batch deletion receipt differs"
+                )
+        else:
+            atomic_write_signed_json(receipt_path, receipt_payload)
+
+
+def _write_recovery_epoch_result(
+    *,
+    run_dir: Path,
+    campaign: CampaignManifest,
+    epoch: int,
+    status: str,
+    cause: str | None,
+) -> Path:
+    if status not in {"interrupted", "batch_execution_completed"}:
+        raise ValueError("campaign recovery epoch result status is invalid")
+    campaign_path = run_dir / "campaign_manifest.json"
+    completed: dict[str, str] = {}
+    for batch in campaign.batches:
+        if batch.status != "archived":
+            continue
+        # The payload checksum is immutable in the archived campaign state;
+        # the caller separately replays the live manifest before resume.
+        completed[batch.batch_id] = batch.checksum_sha256 or ""
+    result_path = (
+        run_dir
+        / "control"
+        / "recovery"
+        / "results"
+        / f"epoch{epoch:04d}.json"
+    )
+    payload: dict[str, object] = {
+        "schema_version": "stage05.2-recovery-epoch-result-v1",
+        "run_label": campaign.run_label,
+        "epoch": epoch,
+        "status": status,
+        "cause": cause,
+        "campaign_manifest_sha256": _sha256_file(campaign_path),
+        "completed_batch_payload_sha256_by_id": dict(sorted(completed.items())),
+        "pending_batch_ids": [
+            batch.batch_id for batch in campaign.batches if batch.status != "archived"
+        ],
+    }
+    if result_path.exists():
+        existing = _load_verified_manifest_object(result_path)
+        if existing != payload:
+            raise CampaignRecoveryError("campaign recovery epoch result differs")
+        return result_path
+    path, _ = atomic_write_signed_json(result_path, payload)
+    return path
+
+
+def authorize_resume(
+    *,
+    run_dir: Path,
+    identity: CampaignIdentity,
+    locator: StorageRootLocator,
+    cause: str,
+    stop_evidence_path: Path,
+    lifecycle_state: str,
+    writer_active: bool,
+) -> tuple[ResumePermit, Path]:
+    """Issue one signed permit after fail-closed lifecycle and identity checks."""
+
+    if cause not in _RECOVERY_CAUSES:
+        raise CampaignRecoveryError("resume cause is not recoverable")
+    if lifecycle_state != "RUNNING":
+        raise CampaignRecoveryError("resume requires a RUNNING lifecycle")
+    if writer_active:
+        raise CampaignRecoveryError("resume requires no active campaign writer")
+    if not run_dir.is_dir():
+        raise CampaignRecoveryError("resume campaign directory is missing")
+    if run_dir.name != identity.run_label:
+        raise CampaignRecoveryError("resume output run label differs")
+    identity_path = run_dir / "control" / "campaign_identity.json"
+    persisted = CampaignIdentity.from_dict(_load_verified_manifest_object(identity_path))
+    if persisted != identity:
+        raise CampaignRecoveryError("resume frozen identity differs")
+    try:
+        stop_evidence_path.resolve(strict=True).relative_to(
+            run_dir / "control" / "recovery"
+        )
+    except (OSError, ValueError) as error:
+        raise CampaignRecoveryError(
+            "resume cause evidence is outside the campaign recovery root"
+        ) from error
+    _verify_recovery_cause_evidence(
+        run_dir=run_dir,
+        identity=identity,
+        cause=cause,
+        evidence_path=stop_evidence_path,
+    )
+    terminal_candidates = (
+        run_dir / "control" / f"{identity.run_label}_terminal_manifest.json",
+        run_dir / "failure_manifest.json",
+        run_dir / "failure_summary.json",
+    )
+    if any(path.exists() for path in terminal_candidates):
+        raise CampaignRecoveryError("terminal campaign evidence forbids resume")
+    campaign_path = run_dir / "campaign_manifest.json"
+    campaign = load_campaign_manifest(campaign_path)
+    if campaign.status != "planned":
+        raise CampaignRecoveryError("only a planned campaign can be resumed")
+    epoch_paths = sorted(
+        (run_dir / "control" / "recovery" / "epochs").glob(
+            "epoch[0-9][0-9][0-9][0-9].json"
+        )
+    )
+    next_epoch = len(epoch_paths) + 1
+    outstanding = tuple(
+        (run_dir / "control" / "recovery" / "permits").glob(
+            f"epoch{next_epoch:04d}-*.json"
+        )
+    )
+    if outstanding:
+        raise CampaignRecoveryError("a resume permit already exists for the next epoch")
+    previous_epoch_sha256 = _sha256_file(epoch_paths[-1]) if epoch_paths else ""
+    completed: dict[str, str] = {}
+    interrupted: str | None = None
+    for batch in campaign.batches:
+        if batch.status == "archived":
+            manifest_path = locator.resolve(batch.root_alias).absolute_path.joinpath(
+                *PurePosixPath(batch.logical_path).parts,
+                "batch_manifest.json",
+            )
+            completed[batch.batch_id] = _sha256_file(manifest_path)
+        else:
+            source_candidate = locator.resolve(
+                batch.root_alias
+            ).absolute_path.joinpath(
+                *PurePosixPath(batch.logical_path).parts
+            )
+            archive_candidate = locator.resolve(
+                batch.archive_root_alias
+            ).absolute_path.joinpath(*PurePosixPath(batch.logical_path).parts)
+            if source_candidate.exists() or archive_candidate.exists():
+                if interrupted is not None:
+                    raise CampaignRecoveryError("multiple interrupted batches are present")
+                interrupted = batch.batch_id
+    previous_result_path = (
+        run_dir
+        / "control"
+        / "recovery"
+        / "results"
+        / f"epoch{len(epoch_paths):04d}.json"
+    )
+    if previous_result_path.exists():
+        previous_result = _load_verified_manifest_object(previous_result_path)
+        if (
+            previous_result.get("run_label") != identity.run_label
+            or previous_result.get("epoch") != len(epoch_paths)
+            or previous_result.get("status")
+            not in {"interrupted", "batch_execution_completed"}
+        ):
+            raise CampaignRecoveryError("previous recovery epoch result differs")
+    else:
+        _write_recovery_epoch_result(
+            run_dir=run_dir,
+            campaign=campaign,
+            epoch=len(epoch_paths),
+            status="interrupted",
+            cause=cause,
+        )
+    snapshot_path, _ = atomic_write_signed_json(
+        run_dir
+        / "control"
+        / "recovery"
+        / "campaign-manifests"
+        / f"epoch{next_epoch:04d}-pre.json",
+        campaign.to_dict(),
+    )
+    if _sha256_file(snapshot_path) != _sha256_file(campaign_path):
+        raise CampaignRecoveryError("recovery campaign snapshot differs")
+    permit = ResumePermit(
+        run_label=identity.run_label,
+        epoch=next_epoch,
+        cause=cause,
+        campaign_identity_sha256=identity.identity_sha256,
+        lifecycle_plan_sha256=identity.lifecycle_plan_sha256,
+        start_permit_sha256=identity.start_permit_sha256,
+        previous_campaign_manifest_sha256=_sha256_file(campaign_path),
+        previous_epoch_sha256=previous_epoch_sha256,
+        stop_evidence_sha256=_sha256_file(stop_evidence_path),
+        completed_batch_manifest_sha256_by_id=completed,
+        interrupted_batch_id=interrupted,
+        nonce=os.urandom(16).hex(),
+    )
+    permit_path, _ = atomic_write_signed_json(
+        run_dir
+        / "control"
+        / "recovery"
+        / "permits"
+        / f"epoch{permit.epoch:04d}-{permit.nonce}.json",
+        permit.to_dict(),
+    )
+    return permit, permit_path
+
+
+def _verify_recovery_cause_evidence(
+    *,
+    run_dir: Path,
+    identity: CampaignIdentity,
+    cause: str,
+    evidence_path: Path,
+) -> None:
+    """Verify that a recoverable interruption has an auditable host receipt."""
+
+    try:
+        evidence = _load_verified_manifest_object(evidence_path)
+    except ManifestIntegrityError as error:
+        raise CampaignRecoveryError("resume cause evidence is not signed") from error
+    common = {
+        "schema_version",
+        "run_label",
+        "cause",
+        "campaign_identity_sha256",
+        "writer_absent",
+        "service_state",
+    }
+    if cause == "unexpected_host_loss":
+        _exact_fields(evidence, common, "unexpected host-loss receipt")
+        valid_schema = "stage05.2-unexpected-host-loss-receipt-v1"
+    else:
+        _exact_fields(
+            evidence,
+            common | {"stop_intent_relative_path", "stop_intent_sha256"},
+            "operator-stop receipt",
+        )
+        valid_schema = "stage05.2-operator-stop-receipt-v1"
+    if (
+        evidence.get("schema_version") != valid_schema
+        or evidence.get("run_label") != identity.run_label
+        or evidence.get("cause") != cause
+        or evidence.get("campaign_identity_sha256") != identity.identity_sha256
+        or evidence.get("writer_absent") is not True
+        or evidence.get("service_state") not in {"inactive", "failed", "not_found"}
+    ):
+        raise CampaignRecoveryError("resume cause evidence identity/state differs")
+    if cause != "operator_stop":
+        return
+    relative = PurePosixPath(
+        _required_str(evidence, "stop_intent_relative_path")
+    )
+    if relative.is_absolute() or ".." in relative.parts:
+        raise CampaignRecoveryError("operator stop-intent path is invalid")
+    intent_path = run_dir.joinpath(*relative.parts)
+    try:
+        intent = _load_verified_manifest_object(intent_path)
+    except ManifestIntegrityError as error:
+        raise CampaignRecoveryError("operator stop intent is not signed") from error
+    _exact_fields(
+        intent,
+        {
+            "schema_version",
+            "run_label",
+            "campaign_identity_sha256",
+            "requested_action",
+            "status",
+        },
+        "operator stop intent",
+    )
+    if (
+        evidence.get("stop_intent_sha256") != _sha256_file(intent_path)
+        or intent.get("schema_version") != "stage05.2-stop-intent-v1"
+        or intent.get("run_label") != identity.run_label
+        or intent.get("campaign_identity_sha256") != identity.identity_sha256
+        or intent.get("requested_action") != "stop_for_recovery"
+        or intent.get("status") != "requested_before_service_stop"
+    ):
+        raise CampaignRecoveryError("operator stop-intent binding differs")
+
+
 class ArchiveTransferError(RuntimeError):
     """A batch archive transaction did not reach verified completion."""
 
@@ -1994,6 +3224,8 @@ _BATCH_ENVELOPE_FILENAMES: Final = frozenset(
     {
         "batch_manifest.json",
         "batch_manifest.sha256",
+        "batch_verified_receipt.json",
+        "batch_verified_receipt.sha256",
         "batch_persistence_envelope.json",
         "batch_persistence_envelope.sha256",
     }

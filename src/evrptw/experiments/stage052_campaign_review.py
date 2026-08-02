@@ -78,10 +78,12 @@ from evrptw.stage052_campaign import (
     AnytimeCheckpoint,
     BatchManifest,
     BenchmarkCampaignConfig,
+    CampaignIdentity,
     CampaignManifest,
     CampaignPlan,
     PilotStorageObservation,
     ProcessCpuCounterSample,
+    ResumePermit,
     StorageRoot,
     StorageRootLocator,
     VolumeIdentity,
@@ -101,6 +103,7 @@ from evrptw.stage052_campaign_runner import (
     campaign_runtime_selection_sha256,
     load_benchmark_execution_lock,
     probe_volume_identity,
+    verify_calibration_successor_attestation,
     verify_campaign_successor_revision,
 )
 from evrptw.stage052_evidence import (
@@ -131,6 +134,7 @@ from evrptw.stage052_storage_migration import (
     verify_successor_storage_migration_evidence,
 )
 from evrptw.storage_governance import (
+    POLICY_SCHEMA_VERSION,
     GovernancePolicy,
     StorageGovernanceError,
     is_retained_path_from_locator,
@@ -3976,6 +3980,592 @@ def _audit_campaign_controls(
         return False, str(error)
 
 
+def _signed_recovery_object(path: Path) -> dict[str, object]:
+    if not signed_sidecar_matches(path, path.with_suffix(".sha256")):
+        raise ArtifactIntegrityError(f"recovery control sidecar differs: {path.name}")
+    return _json_object(path)
+
+
+def _audit_campaign_recovery(
+    *,
+    campaign_dir: Path,
+    campaign: CampaignManifest,
+    locator: StorageRootLocator,
+    reader: ArtifactReader,
+) -> tuple[bool, str]:
+    """Replay the immutable identity and complete append-only recovery chain."""
+
+    identity_path = campaign_dir / "control" / "campaign_identity.json"
+    try:
+        metadata_ref = _one_artifact(reader, "manifest_metadata")
+        metadata = reader.read_json(str(metadata_ref["relative_path"]))
+        if not identity_path.exists():
+            if metadata.get("recovery_protocol_schema") is not None:
+                raise ArtifactIntegrityError(
+                    "declared recovery protocol is missing campaign identity"
+                )
+            return True, "legacy campaign is immutable and carries no resumable identity"
+        identity = CampaignIdentity.from_dict(_signed_recovery_object(identity_path))
+        plan_ref = _one_artifact(reader, "campaign_plan")
+        plan_payload = reader.read_json(str(plan_ref["relative_path"]))
+        config_ref = _one_artifact(reader, "config")
+        config_path = campaign_dir / str(config_ref["relative_path"])
+        runtime_identity = metadata.get("runtime_identity")
+        if (
+            identity.run_label != campaign.run_label
+            or identity.prerequisite_review_sha256
+            != campaign.prerequisite_review_sha256
+            or identity.campaign_plan_sha256 != _canonical_sha256(plan_payload)
+            or identity.configuration_sha256 != _sha256(config_path)
+            or not isinstance(runtime_identity, Mapping)
+            or identity.runtime_identity_sha256
+            != _canonical_sha256(runtime_identity)
+            or (
+                campaign.scope == "formal"
+                and runtime_identity.get("wheel_sha256")
+                != identity.wheel_sha256
+            )
+            or metadata.get("repository_revision") != identity.repository_revision
+            or metadata.get("repository_tree") != identity.repository_tree
+            or metadata.get("campaign_identity_sha256")
+            != identity.identity_sha256
+            or metadata.get("recovery_protocol_schema")
+            != "stage05.2-campaign-recovery-v1"
+            or identity.producer_resource_contract_sha256
+            != _canonical_sha256(
+                campaign.producer_resource_contract.to_dict()
+                if campaign.producer_resource_contract is not None
+                else {}
+            )
+        ):
+            raise ArtifactIntegrityError("campaign recovery identity binding differs")
+        recovery_root = campaign_dir / "control" / "recovery"
+        lifecycle_binding = _signed_recovery_object(
+            recovery_root / "start" / "lifecycle_plan.json"
+        )
+        start_permit_binding = _signed_recovery_object(
+            recovery_root / "start" / "start_permit.json"
+        )
+        observation_binding = _signed_recovery_object(
+            recovery_root / "start" / "start_observation.json"
+        )
+        maintenance_binding = _signed_recovery_object(
+            recovery_root / "start" / "maintenance_audit.json"
+        )
+        lifecycle_payload = lifecycle_binding.get("lifecycle_plan")
+        permit_raw = start_permit_binding.get("start_permit_raw_utf8")
+        observation_raw = observation_binding.get("start_observation_raw_utf8")
+        maintenance_raw = maintenance_binding.get("maintenance_audit_raw_utf8")
+        repository_tree = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(repository_root()),
+                "rev-parse",
+                f"{identity.repository_revision}^{{tree}}",
+            ),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        ).stdout.strip()
+        if (
+            lifecycle_binding.get("schema_version")
+            != "stage05.2-lifecycle-plan-binding-v1"
+            or lifecycle_binding.get("run_label") != campaign.run_label
+            or lifecycle_binding.get("lifecycle_plan_sha256")
+            != identity.lifecycle_plan_sha256
+            or not isinstance(lifecycle_payload, Mapping)
+            or _canonical_sha256(lifecycle_payload)
+            != identity.lifecycle_plan_sha256
+            or start_permit_binding.get("schema_version")
+            != "stage05.2-start-permit-binding-v1"
+            or start_permit_binding.get("run_label") != campaign.run_label
+            or start_permit_binding.get("start_permit_sha256")
+            != identity.start_permit_sha256
+            or not isinstance(permit_raw, str)
+            or hashlib.sha256(permit_raw.encode("utf-8")).hexdigest()
+            != identity.start_permit_sha256
+            or observation_binding.get("schema_version")
+            != "stage05.2-start-observation-binding-v1"
+            or observation_binding.get("run_label") != campaign.run_label
+            or not isinstance(observation_raw, str)
+            or observation_binding.get("start_observation_sha256")
+            != hashlib.sha256(observation_raw.encode("utf-8")).hexdigest()
+            or maintenance_binding.get("schema_version")
+            != "stage05.2-maintenance-audit-binding-v1"
+            or maintenance_binding.get("run_label") != campaign.run_label
+            or not isinstance(maintenance_raw, str)
+            or maintenance_binding.get("maintenance_audit_sha256")
+            != hashlib.sha256(maintenance_raw.encode("utf-8")).hexdigest()
+            or repository_tree != identity.repository_tree
+        ):
+            raise ArtifactIntegrityError("campaign immutable start controls differ")
+        permit_payload = json.loads(permit_raw)
+        observation_payload = json.loads(observation_raw)
+        maintenance_payload = json.loads(maintenance_raw)
+        observation_volumes = (
+            observation_payload.get("volume_identities_by_alias")
+            if isinstance(observation_payload, Mapping)
+            else None
+        )
+        free_bytes = (
+            observation_payload.get("free_bytes_by_alias")
+            if isinstance(observation_payload, Mapping)
+            else None
+        )
+        required_bytes = (
+            observation_payload.get("required_bytes_by_alias")
+            if isinstance(observation_payload, Mapping)
+            else None
+        )
+        lifecycle_prerequisites = lifecycle_payload.get(
+            "prerequisite_sha256_by_contract"
+        )
+        metadata_campaign_config = metadata.get("campaign_config")
+        expected_lifecycle_prerequisites = {
+            "campaign_geometry": _canonical_sha256(
+                {
+                    "campaign_config": metadata_campaign_config,
+                    "campaign_plan": plan_payload,
+                }
+            ),
+            "historical_migration": _sha256(
+                locator.resolve("e_archive").absolute_path
+                / ".experiment-lifecycle"
+                / "historical-migration"
+                / "gate.json"
+            ),
+            "stage051_readiness": _sha256(
+                repository_root()
+                / "experiments"
+                / "manifests"
+                / "stage05.1_best_known_artifact_manifest.json"
+            ),
+        }
+        maintenance_request = (
+            maintenance_payload.get("request_identity")
+            if isinstance(maintenance_payload, Mapping)
+            else None
+        )
+        if (
+            not isinstance(permit_payload, Mapping)
+            or set(permit_payload)
+            != {
+                "schema_version",
+                "run_label",
+                "stage_plan_sha256",
+                "observation_sha256",
+                "maintenance_audit_sha256",
+                "maintenance_audit_path",
+                "status",
+            }
+            or permit_payload.get("schema_version") != POLICY_SCHEMA_VERSION
+            or permit_payload.get("run_label") != campaign.run_label
+            or permit_payload.get("stage_plan_sha256")
+            != identity.lifecycle_plan_sha256
+            or permit_payload.get("observation_sha256")
+            != observation_binding.get("start_observation_sha256")
+            or permit_payload.get("maintenance_audit_sha256")
+            != maintenance_binding.get("maintenance_audit_sha256")
+            or permit_payload.get("status") != "reserved"
+            or not isinstance(observation_payload, Mapping)
+            or not isinstance(maintenance_payload, Mapping)
+            or lifecycle_payload.get("run_label") != campaign.run_label
+            or lifecycle_payload.get("run_dir") != str(campaign_dir)
+            or lifecycle_payload.get("configuration_sha256")
+            != identity.configuration_sha256
+            or lifecycle_payload.get("fallback_allowed") is not False
+            or lifecycle_payload.get("workers") != metadata.get("worker_count")
+            or lifecycle_payload.get("threads") != metadata.get("worker_count")
+            or lifecycle_payload.get("processes") != metadata.get("worker_count")
+            or not isinstance(lifecycle_prerequisites, Mapping)
+            or lifecycle_prerequisites != expected_lifecycle_prerequisites
+            or observation_payload.get("schema_version") != POLICY_SCHEMA_VERSION
+            or observation_payload.get("stage_id") != "stage05.2"
+            or observation_payload.get("run_label") != campaign.run_label
+            or observation_payload.get("run_dir") != str(campaign_dir)
+            or observation_payload.get("stage_plan_sha256")
+            != identity.lifecycle_plan_sha256
+            or observation_payload.get("maintenance_audit_sha256")
+            != maintenance_binding.get("maintenance_audit_sha256")
+            or observation_payload.get("passed") is not True
+            or observation_payload.get("deficits_by_alias") != {}
+            or observation_payload.get("measurement_errors_by_alias") != {}
+            or observation_payload.get("identity_errors") != []
+            or not isinstance(observation_volumes, Mapping)
+            or set(observation_volumes)
+            != {"wsl_staging", "d_host", "e_archive"}
+            or not set(campaign.storage_roots).issubset(observation_volumes)
+            or any(
+                observation_volumes.get(alias) != volume.to_dict()
+                for alias, volume in campaign.storage_roots.items()
+            )
+            or not isinstance(free_bytes, Mapping)
+            or not isinstance(required_bytes, Mapping)
+            or set(free_bytes)
+            != set(required_bytes)
+            or set(free_bytes) != set(observation_volumes)
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or isinstance(required_bytes.get(alias), bool)
+                or not isinstance(required_bytes.get(alias), int)
+                or value < cast(int, required_bytes[alias])
+                for alias, value in free_bytes.items()
+            )
+            or maintenance_payload.get("schema_version")
+            != "experiment-rebuildable-audit-v1"
+            or maintenance_payload.get("applied") is not False
+            or not isinstance(maintenance_request, Mapping)
+            or maintenance_request.get("schema_version")
+            != "experiment-rebuildable-request-v1"
+            or maintenance_payload.get("request_identity_sha256")
+            != _canonical_sha256(maintenance_request)
+            or not isinstance(maintenance_payload.get("candidate_paths"), list)
+            or not isinstance(maintenance_payload.get("retained"), list)
+            or isinstance(maintenance_payload.get("candidate_bytes"), bool)
+            or not isinstance(maintenance_payload.get("candidate_bytes"), int)
+            or cast(int, maintenance_payload["candidate_bytes"]) < 0
+        ):
+            raise ArtifactIntegrityError("campaign immutable start permit is invalid")
+        epoch_paths = sorted(
+            (recovery_root / "epochs").glob("epoch[0-9][0-9][0-9][0-9].json")
+        )
+        if not epoch_paths:
+            raise ArtifactIntegrityError("campaign recovery epoch chain is missing")
+        interrupted_rules: list[tuple[int, str, str]] = []
+        used_permit_paths: set[Path] = set()
+        previous_campaign_sha256_by_epoch: dict[int, str] = {}
+        previous_sha256 = ""
+        for expected_epoch, epoch_path in enumerate(epoch_paths, start=1):
+            epoch = _signed_recovery_object(epoch_path)
+            expected_fields = {
+                "schema_version",
+                "run_label",
+                "epoch",
+                "status",
+                "cause",
+                "campaign_identity_sha256",
+                "previous_epoch_sha256",
+                "resume_permit_sha256",
+                "completed_batch_manifest_sha256_by_id",
+                "interrupted_batch_id",
+                "interrupted_batch_action",
+            }
+            if set(epoch) != expected_fields:
+                raise ArtifactIntegrityError("recovery epoch fields differ")
+            if (
+                epoch.get("schema_version") != "stage05.2-recovery-epoch-v1"
+                or epoch.get("run_label") != campaign.run_label
+                or epoch.get("epoch") != expected_epoch
+                or epoch.get("status") != "started"
+                or epoch.get("campaign_identity_sha256")
+                != identity.identity_sha256
+                or epoch.get("previous_epoch_sha256") != previous_sha256
+            ):
+                raise ArtifactIntegrityError("recovery epoch hash chain differs")
+            completed = epoch.get("completed_batch_manifest_sha256_by_id")
+            if not isinstance(completed, Mapping):
+                raise ArtifactIntegrityError("recovery completed-batch map is invalid")
+            for batch_id, digest in completed.items():
+                batch = next(
+                    (item for item in campaign.batches if item.batch_id == batch_id),
+                    None,
+                )
+                if batch is None or not _is_sha256(digest):
+                    raise ArtifactIntegrityError("recovery completed-batch identity differs")
+                batch_path = locator.resolve(batch.root_alias).absolute_path.joinpath(
+                    *Path(batch.logical_path).parts,
+                    "batch_manifest.json",
+                )
+                if _sha256(batch_path) != digest:
+                    raise ArtifactIntegrityError("reused batch manifest changed after recovery")
+            interrupted_id = epoch.get("interrupted_batch_id")
+            interrupted_action = epoch.get("interrupted_batch_action")
+            if expected_epoch == 1:
+                if (
+                    epoch.get("cause") != "initial_execution"
+                    or epoch.get("resume_permit_sha256") != ""
+                    or completed
+                    or interrupted_id is not None
+                    or interrupted_action is not None
+                ):
+                    raise ArtifactIntegrityError("initial recovery epoch is invalid")
+            else:
+                if epoch.get("cause") not in {
+                    "unexpected_host_loss",
+                    "operator_stop",
+                }:
+                    raise ArtifactIntegrityError("recovery cause is not authorized")
+                permit_digest = epoch.get("resume_permit_sha256")
+                permit_paths = [
+                    path
+                    for path in (recovery_root / "permits").glob(
+                        f"epoch{expected_epoch:04d}-*.json"
+                    )
+                    if _sha256(path) == permit_digest
+                ]
+                if len(permit_paths) != 1:
+                    raise ArtifactIntegrityError("recovery resume permit is missing or ambiguous")
+                permit = ResumePermit.from_dict(
+                    _signed_recovery_object(permit_paths[0])
+                )
+                used_permit_paths.add(permit_paths[0])
+                previous_campaign_sha256_by_epoch[expected_epoch] = (
+                    permit.previous_campaign_manifest_sha256
+                )
+                campaign_snapshot_path = (
+                    recovery_root
+                    / "campaign-manifests"
+                    / f"epoch{expected_epoch:04d}-pre.json"
+                )
+                campaign_snapshot = load_campaign_manifest(
+                    campaign_snapshot_path
+                )
+                if (
+                    _sha256(campaign_snapshot_path)
+                    != permit.previous_campaign_manifest_sha256
+                    or campaign_snapshot.run_label != campaign.run_label
+                    or campaign_snapshot.status != "planned"
+                    or set(permit.completed_batch_manifest_sha256_by_id)
+                    != {
+                        batch.batch_id
+                        for batch in campaign_snapshot.batches
+                        if batch.status == "archived"
+                    }
+                ):
+                    raise ArtifactIntegrityError(
+                        "resume permit campaign snapshot differs"
+                    )
+                cause_paths = [
+                    path
+                    for path in recovery_root.rglob("*.json")
+                    if _sha256(path) == permit.stop_evidence_sha256
+                ]
+                if len(cause_paths) != 1:
+                    raise ArtifactIntegrityError(
+                        "recovery cause evidence is missing or ambiguous"
+                    )
+                cause_evidence = _signed_recovery_object(cause_paths[0])
+                if (
+                    cause_evidence.get("run_label") != campaign.run_label
+                    or cause_evidence.get("cause") != permit.cause
+                    or cause_evidence.get("campaign_identity_sha256")
+                    != identity.identity_sha256
+                    or cause_evidence.get("writer_absent") is not True
+                    or cause_evidence.get("service_state")
+                    not in {"inactive", "failed", "not_found"}
+                ):
+                    raise ArtifactIntegrityError("recovery cause receipt differs")
+                if permit.cause == "operator_stop":
+                    intent_relative = cause_evidence.get(
+                        "stop_intent_relative_path"
+                    )
+                    if not isinstance(intent_relative, str):
+                        raise ArtifactIntegrityError(
+                            "operator recovery stop intent is missing"
+                        )
+                    relative_path = Path(intent_relative)
+                    if relative_path.is_absolute() or ".." in relative_path.parts:
+                        raise ArtifactIntegrityError(
+                            "operator recovery stop-intent path is invalid"
+                        )
+                    intent_path = campaign_dir.joinpath(*relative_path.parts)
+                    intent = _signed_recovery_object(intent_path)
+                    if (
+                        cause_evidence.get("schema_version")
+                        != "stage05.2-operator-stop-receipt-v1"
+                        or cause_evidence.get("stop_intent_sha256")
+                        != _sha256(intent_path)
+                        or intent.get("schema_version")
+                        != "stage05.2-stop-intent-v1"
+                        or intent.get("status")
+                        != "requested_before_service_stop"
+                    ):
+                        raise ArtifactIntegrityError(
+                            "operator recovery stop-intent binding differs"
+                        )
+                elif cause_evidence.get("schema_version") != (
+                    "stage05.2-unexpected-host-loss-receipt-v1"
+                ):
+                    raise ArtifactIntegrityError(
+                        "unexpected host-loss receipt schema differs"
+                    )
+                consumption_path = recovery_root / "consumed" / f"{permit.nonce}.json"
+                consumption = _signed_recovery_object(consumption_path)
+                if (
+                    permit.run_label != campaign.run_label
+                    or permit.epoch != expected_epoch
+                    or permit.cause != epoch.get("cause")
+                    or permit.campaign_identity_sha256 != identity.identity_sha256
+                    or permit.previous_epoch_sha256 != previous_sha256
+                    or permit.interrupted_batch_id != interrupted_id
+                    or consumption
+                    != {
+                        "schema_version": "stage05.2-resume-permit-consumption-v1",
+                        "run_label": campaign.run_label,
+                        "epoch": expected_epoch,
+                        "resume_permit_sha256": permit_digest,
+                        "nonce": permit.nonce,
+                        "status": "consumed",
+                    }
+                ):
+                    raise ArtifactIntegrityError("resume permit replay differs")
+                permitted_completed = dict(
+                    permit.completed_batch_manifest_sha256_by_id
+                )
+                observed_completed = dict(completed)
+                if any(
+                    observed_completed.get(batch_id) != digest
+                    for batch_id, digest in permitted_completed.items()
+                ) or set(observed_completed).difference(permitted_completed) not in (
+                    set(),
+                    {str(interrupted_id)},
+                ):
+                    raise ArtifactIntegrityError("recovery completed-batch set differs")
+                if interrupted_id is None:
+                    if interrupted_action is not None:
+                        raise ArtifactIntegrityError("recovery interruption action is orphaned")
+                elif interrupted_action not in {
+                    "archive_completed",
+                    "discarded_and_recomputed",
+                }:
+                    raise ArtifactIntegrityError("recovery interruption action is invalid")
+                else:
+                    interrupted_rules.append(
+                        (expected_epoch, str(interrupted_id), str(interrupted_action))
+                    )
+            previous_sha256 = _sha256(epoch_path)
+
+        all_permit_paths = set((recovery_root / "permits").glob("epoch*-*.json"))
+        if all_permit_paths != used_permit_paths:
+            raise ArtifactIntegrityError("unused or unchained resume permit exists")
+        planned_final = replace(campaign, status="planned", artifacts=())
+        planned_final_sha256 = hashlib.sha256(
+            (
+                json.dumps(planned_final.to_dict(), indent=2, sort_keys=True)
+                + "\n"
+            ).encode("utf-8")
+        ).hexdigest()
+        for epoch_number in range(1, len(epoch_paths) + 1):
+            result_path = (
+                recovery_root / "results" / f"epoch{epoch_number:04d}.json"
+            )
+            result = _signed_recovery_object(result_path)
+            completed_payloads = result.get(
+                "completed_batch_payload_sha256_by_id"
+            )
+            pending_batches = result.get("pending_batch_ids")
+            if (
+                result.get("schema_version")
+                != "stage05.2-recovery-epoch-result-v1"
+                or result.get("run_label") != campaign.run_label
+                or result.get("epoch") != epoch_number
+                or result.get("status")
+                not in {"interrupted", "batch_execution_completed"}
+                or not isinstance(completed_payloads, Mapping)
+                or not isinstance(pending_batches, list)
+                or set(completed_payloads).intersection(map(str, pending_batches))
+            ):
+                raise ArtifactIntegrityError("recovery epoch result is invalid")
+            for batch_id, digest in completed_payloads.items():
+                batch = next(
+                    (item for item in campaign.batches if item.batch_id == batch_id),
+                    None,
+                )
+                if batch is None or digest != batch.checksum_sha256:
+                    raise ArtifactIntegrityError(
+                        "recovery epoch completed-batch result differs"
+                    )
+            expected_result_campaign_sha = (
+                previous_campaign_sha256_by_epoch[epoch_number + 1]
+                if epoch_number < len(epoch_paths)
+                else planned_final_sha256
+            )
+            if result.get("campaign_manifest_sha256") != expected_result_campaign_sha:
+                raise ArtifactIntegrityError(
+                    "recovery epoch result campaign binding differs"
+                )
+        final_result = _signed_recovery_object(
+            recovery_root / "results" / f"epoch{len(epoch_paths):04d}.json"
+        )
+        if final_result.get("status") != "batch_execution_completed":
+            raise ArtifactIntegrityError("final recovery epoch did not complete")
+
+        batch_epochs: dict[str, int] = {}
+        for batch in campaign.batches:
+            batch_dir = locator.resolve(batch.root_alias).absolute_path.joinpath(
+                *Path(batch.logical_path).parts
+            )
+            reader = _batch_reader(batch_dir, run_label=campaign.run_label)
+            _metadata_ref, metadata_path = _batch_control_artifact(
+                reader, "manifest_metadata"
+            )
+            metadata = _json_object(metadata_path)
+            batch_epoch = _strict_int(
+                metadata.get("execution_epoch"), "execution_epoch"
+            )
+            if (
+                metadata.get("campaign_identity_sha256")
+                != identity.identity_sha256
+                or batch_epoch < 1
+                or batch_epoch > len(epoch_paths)
+            ):
+                raise ArtifactIntegrityError("batch recovery identity/epoch differs")
+            batch_epochs[batch.batch_id] = batch_epoch
+
+        for recovery_epoch, batch_id, action in interrupted_rules:
+            batch = next(item for item in campaign.batches if item.batch_id == batch_id)
+            produced_epoch = batch_epochs[batch_id]
+            if action == "archive_completed":
+                if produced_epoch >= recovery_epoch:
+                    raise ArtifactIntegrityError("completed interrupted batch was recomputed")
+                continue
+            if produced_epoch < recovery_epoch:
+                raise ArtifactIntegrityError("discarded interrupted batch contributed shards")
+            capsule = locator.resolve(batch.root_alias).absolute_path / (
+                ".campaign-recovery"
+            ) / campaign.run_label / f"epoch{recovery_epoch:04d}" / batch_id
+            inventory_path = capsule / "interrupted_inventory.json"
+            receipt_path = capsule / "deletion_receipt.json"
+            inventory = _signed_recovery_object(inventory_path)
+            receipt = _signed_recovery_object(receipt_path)
+            if (
+                inventory.get("schema_version")
+                != "stage05.2-interrupted-batch-inventory-v1"
+                or inventory.get("run_label") != campaign.run_label
+                or inventory.get("batch_id") != batch_id
+                or inventory.get("epoch") != recovery_epoch
+                or inventory.get("campaign_identity_sha256")
+                != identity.identity_sha256
+                or receipt.get("schema_version")
+                != "stage05.2-interrupted-batch-deletion-v1"
+                or receipt.get("run_label") != campaign.run_label
+                or receipt.get("batch_id") != batch_id
+                or receipt.get("epoch") != recovery_epoch
+                or receipt.get("source_absent") is not True
+                or receipt.get("inventory_sha256") != _sha256(inventory_path)
+                or receipt.get("retention_class")
+                != "duplicate_failure_metadata"
+            ):
+                raise ArtifactIntegrityError("interrupted batch deletion evidence differs")
+        return (
+            True,
+            f"replayed {len(epoch_paths)} recovery epochs; "
+            f"{len(interrupted_rules)} interrupted batch transactions passed",
+        )
+    except (
+        ArtifactIntegrityError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        return False, str(error)
+
+
 def _verify_shared_governance_observation(
     *,
     observation: Mapping[str, object],
@@ -4759,6 +5349,16 @@ def _audit_campaign(
         if campaign_identity
         else "campaign identity/status/backend/native profile mismatch",
     }
+    recovery_passed, recovery_detail = _audit_campaign_recovery(
+        campaign_dir=campaign_dir,
+        campaign=campaign,
+        locator=locator,
+        reader=standard_reader,
+    )
+    gates["campaign_recovery"] = {
+        "passed": recovery_passed,
+        "detail": recovery_detail,
+    }
     migration_payload: dict[str, object] | None = None
     migration_error = ""
     if storage_migration_path is not None:
@@ -4833,6 +5433,33 @@ def _audit_campaign(
                 if recalibration_path.is_file()
                 else None
             )
+            if (
+                recalibration is not None
+                and recalibration.calibration_repository_revision
+                != current_source_snapshot.get("repository_revision")
+            ):
+                verify_calibration_successor_attestation(
+                    repository=source_root,
+                    current_revision=str(
+                        current_source_snapshot.get("repository_revision", "")
+                    ),
+                    attestation_path=(
+                        source_root
+                        / "configs"
+                        / "stage052_calibration_successor.local.json"
+                    ),
+                    calibration_report_path=recalibration_path,
+                    calibration_review_manifest_path=(
+                        source_root
+                        / "configs"
+                        / "stage052_resource_calibration.local.review.json"
+                    ),
+                    resource_contract_path=(
+                        source_root
+                        / "configs"
+                        / "stage052_resource_calibration.local.json"
+                    ),
+                )
             selection_lock.update(
                 accepted.with_producer_resource_contract(
                     campaign.producer_resource_contract,
@@ -5376,6 +6003,27 @@ def _audit_campaign(
                 if item.batch_id == embedded_batch.batch_id
             ):
                 raise ArtifactIntegrityError("batch checkpoint count mismatch")
+            checkpoint_ref, checkpoint_path = _batch_control_artifact(
+                reader, "batch_anytime_checkpoints"
+            )
+            checkpoint_control = _json_object(checkpoint_path)
+            checkpoint_rows = checkpoint_control.get("rows")
+            replayed_checkpoint_rows = evidence.checkpoint_rows[
+                checkpoint_count_before:
+            ]
+            if (
+                checkpoint_control.get("schema_version")
+                != "stage05.2-batch-anytime-checkpoints-v1"
+                or checkpoint_control.get("run_label") != campaign.run_label
+                or checkpoint_control.get("batch_id") != embedded_batch.batch_id
+                or not isinstance(checkpoint_rows, list)
+                or checkpoint_control.get("row_count") != len(checkpoint_rows)
+                or checkpoint_ref.get("row_count") != len(checkpoint_rows)
+                or checkpoint_rows != replayed_checkpoint_rows
+            ):
+                raise ArtifactIntegrityError(
+                    "signed per-batch checkpoint reconstruction differs from raw replay"
+                )
         except (
             ArtifactIntegrityError,
             KeyError,

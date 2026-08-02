@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
+import os
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import evrptw.stage052_campaign as stage052_campaign
+from evrptw.artifacts import atomic_write_signed_json
 from evrptw.stage052_campaign import (
     PILOT_INSTANCE_NAMES,
     PILOT_SEEDS,
@@ -19,7 +24,10 @@ from evrptw.stage052_campaign import (
     BatchPlan,
     BenchmarkCampaignConfig,
     BenchmarkPreflightObservation,
+    CampaignIdentity,
     CampaignManifest,
+    CampaignRecoveryController,
+    CampaignRecoveryError,
     FileSystemArchiveIO,
     ManifestIntegrityError,
     PilotStorageObservation,
@@ -28,11 +36,13 @@ from evrptw.stage052_campaign import (
     StorageRootLocator,
     SystemLoadWindow,
     VolumeIdentity,
+    authorize_resume,
     directory_byte_count,
     directory_checksum,
     directory_file_count,
     load_campaign_manifest,
 )
+from evrptw.stage052_evidence import BatchPersistenceEnvelope, PersistenceInterval
 
 
 def _pilot_observations(
@@ -56,6 +66,840 @@ def _pilot_observations(
         )
         for family in ("C", "R", "RC")
     )
+
+
+def _recovery_campaign(
+    tmp_path: Path,
+) -> tuple[
+    Path,
+    StorageRootLocator,
+    CampaignManifest,
+    CampaignIdentity,
+    CampaignRecoveryController,
+]:
+    staging = tmp_path / "wsl-staging"
+    archive = tmp_path / "e-archive"
+    staging.mkdir()
+    archive.mkdir()
+    locator = StorageRootLocator(
+        {
+            "wsl_staging": StorageRoot(
+                "wsl_staging", staging, VolumeIdentity("wsl-device", "ext4")
+            ),
+            "e_archive": StorageRoot(
+                "e_archive", archive, VolumeIdentity("e-device", "ntfs")
+            ),
+        }
+    )
+    config = BenchmarkCampaignConfig.formal(
+        run_label="stage05.2_benchmark_rerun16",
+        staging_root_alias="wsl_staging",
+        archive_root_aliases=("e_archive",),
+        selected_backend="native_cpu",
+        selected_exact_backend="cpu_batch",
+        selected_workers=6,
+        native_profile="stage05.2-native-kernels-v1",
+    )
+    plan = config.build_plan(_pilot_observations())
+    capacity = config.plan_archive_roots(
+        plan,
+        locator,
+        free_bytes_by_alias={
+            "wsl_staging": 2 * 1024**4,
+            "e_archive": 2 * 1024**4,
+        },
+    )
+    campaign = CampaignManifest.planned(
+        config=config,
+        plan=plan,
+        capacity=capacity,
+        locator=locator,
+        configuration_sha256="1" * 64,
+        prerequisite_review_sha256="2" * 64,
+    )
+    identity = CampaignIdentity(
+        run_label=campaign.run_label,
+        repository_revision="a" * 40,
+        repository_tree="b" * 40,
+        wheel_sha256="3" * 64,
+        runtime_identity_sha256="4" * 64,
+        configuration_sha256="5" * 64,
+        prerequisite_review_sha256=campaign.prerequisite_review_sha256,
+        producer_resource_contract_sha256="6" * 64,
+        campaign_plan_sha256="7" * 64,
+        lifecycle_plan_sha256="8" * 64,
+        start_permit_sha256="9" * 64,
+    )
+    run_dir = staging / campaign.run_label
+    controller = CampaignRecoveryController(run_dir=run_dir, locator=locator)
+    controller.open(
+        expected_identity=identity,
+        fresh_campaign=campaign,
+        resume_permit_path=None,
+    )
+    atomic_write_signed_json(run_dir / "campaign_manifest.json", campaign.to_dict())
+    return run_dir, locator, campaign, identity, controller
+
+
+def _host_loss_receipt(
+    run_dir: Path, identity: CampaignIdentity
+) -> Path:
+    path, _ = atomic_write_signed_json(
+        run_dir / "control" / "recovery" / "host-loss.json",
+        {
+            "schema_version": "stage05.2-unexpected-host-loss-receipt-v1",
+            "run_label": identity.run_label,
+            "cause": "unexpected_host_loss",
+            "campaign_identity_sha256": identity.identity_sha256,
+            "writer_absent": True,
+            "service_state": "failed",
+        },
+    )
+    return path
+
+
+def _archive_first_recovery_batch(
+    *,
+    run_dir: Path,
+    locator: StorageRootLocator,
+    campaign: CampaignManifest,
+) -> tuple[CampaignManifest, Path, str]:
+    planned = campaign.batches[0]
+    destination = locator.resolve("e_archive").absolute_path / planned.logical_path
+    destination.mkdir(parents=True)
+    shard_hashes, shard_bytes, axis_count = _write_synthetic_recovery_shards(
+        destination, planned.shard_ids
+    )
+    verified = planned.mark_verified(
+        checksum_sha256=directory_checksum(destination),
+        actual_bytes=directory_byte_count(destination),
+        row_count=axis_count,
+        physical_schema="screening_decisions_v3",
+        resource_summary_sha256="a" * 64,
+        persistence_attribution_sha256="b" * 64,
+        control_persistence_seconds=0.0,
+        persistence_ratio=0.0,
+        shard_manifest_sha256_by_id=shard_hashes,
+        shard_actual_bytes_by_id=shard_bytes,
+    )
+    archived = verified.mark_archived(
+        root_alias="e_archive",
+        volume=locator.resolve("e_archive").volume,
+        transfer_mode="cross_volume_verified_copy",
+        archive_transfer_seconds=0.0,
+    )
+    verified_manifest_sha = hashlib.sha256(
+        (json.dumps(verified.to_dict(), indent=2, sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    atomic_write_signed_json(
+        destination / "batch_verified_receipt.json",
+        {
+            "schema_version": "stage05.2-batch-verified-receipt-v1",
+            "run_label": campaign.run_label,
+            "batch_id": verified.batch_id,
+            "verified_manifest_sha256": verified_manifest_sha,
+            "base_attribution_sha256": "d" * 64,
+            "solver_seconds": 1.0,
+            "base_persistence_seconds": 0.0,
+            "verified_manifest_write_interval": {
+                "label": "verified_batch_manifest_write",
+                "started_ns": 1,
+                "completed_ns": 2,
+                "duration_seconds": 1e-9,
+            },
+        },
+    )
+    manifest_path, _ = atomic_write_signed_json(
+        destination / "batch_manifest.json", archived.to_dict()
+    )
+    manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    envelope = BatchPersistenceEnvelope(
+        run_label=campaign.run_label,
+        batch_id=archived.batch_id,
+        base_attribution_sha256="d" * 64,
+        verified_manifest_sha256=verified_manifest_sha,
+        archived_manifest_sha256=manifest_sha,
+        solver_seconds=1.0,
+        base_persistence_seconds=0.0,
+        state_intervals=(
+            PersistenceInterval(
+                label="verified_batch_manifest_write",
+                started_ns=1,
+                completed_ns=2,
+            ),
+            PersistenceInterval(
+                label="archived_batch_manifest_write",
+                started_ns=3,
+                completed_ns=4,
+            ),
+        ),
+    )
+    envelope_path, _ = atomic_write_signed_json(
+        destination / "batch_persistence_envelope.json", envelope.to_dict()
+    )
+    updated = campaign.with_batch(archived).with_batch_persistence_envelope(
+        archived.batch_id,
+        hashlib.sha256(envelope_path.read_bytes()).hexdigest(),
+    )
+    atomic_write_signed_json(run_dir / "campaign_manifest.json", updated.to_dict())
+    return updated, manifest_path, manifest_sha
+
+
+def _write_verified_recovery_batch(
+    *,
+    run_dir: Path,
+    locator: StorageRootLocator,
+    campaign: CampaignManifest,
+) -> tuple[CampaignManifest, BatchManifest, Path]:
+    planned = campaign.batches[0]
+    source = locator.resolve("wsl_staging").absolute_path / planned.logical_path
+    source.mkdir(parents=True)
+    shard_hashes, shard_bytes, axis_count = _write_synthetic_recovery_shards(
+        source, planned.shard_ids
+    )
+    verified = planned.mark_verified(
+        checksum_sha256=directory_checksum(source),
+        actual_bytes=directory_byte_count(source),
+        row_count=axis_count,
+        physical_schema="screening_decisions_v3",
+        resource_summary_sha256="a" * 64,
+        persistence_attribution_sha256="b" * 64,
+        control_persistence_seconds=0.0,
+        persistence_ratio=0.0,
+        shard_manifest_sha256_by_id=shard_hashes,
+        shard_actual_bytes_by_id=shard_bytes,
+    )
+    verified_sha = hashlib.sha256(
+        (json.dumps(verified.to_dict(), indent=2, sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    atomic_write_signed_json(source / "batch_manifest.json", verified.to_dict())
+    atomic_write_signed_json(
+        source / "batch_verified_receipt.json",
+        {
+            "schema_version": "stage05.2-batch-verified-receipt-v1",
+            "run_label": campaign.run_label,
+            "batch_id": verified.batch_id,
+            "verified_manifest_sha256": verified_sha,
+            "base_attribution_sha256": "d" * 64,
+            "solver_seconds": 1.0,
+            "base_persistence_seconds": 0.0,
+            "verified_manifest_write_interval": PersistenceInterval(
+                label="verified_batch_manifest_write",
+                started_ns=1,
+                completed_ns=2,
+            ).to_dict(),
+        },
+    )
+    updated = campaign.with_batch(verified)
+    atomic_write_signed_json(run_dir / "campaign_manifest.json", updated.to_dict())
+    return updated, verified, source
+
+
+def _crash_recovery_worker(
+    fault_point: str,
+    run_dir: Path,
+    staging: Path,
+    archive: Path,
+) -> None:
+    locator = StorageRootLocator(
+        {
+            "wsl_staging": StorageRoot(
+                "wsl_staging", staging, VolumeIdentity("wsl-device", "ext4")
+            ),
+            "e_archive": StorageRoot(
+                "e_archive", archive, VolumeIdentity("e-device", "ntfs")
+            ),
+        }
+    )
+    campaign = load_campaign_manifest(run_dir / "campaign_manifest.json")
+    controller = CampaignRecoveryController(run_dir=run_dir, locator=locator)
+    if fault_point == "during_batch_compute":
+        partial = run_dir / "batch0001"
+        partial.mkdir()
+        (partial / "partial.parquet").write_bytes(b"partial")
+    elif fault_point in {
+        "verified_before_archive",
+        "archive_publish_before_state",
+        "envelope_publish_before_state",
+    }:
+        verified_campaign, verified, source = _write_verified_recovery_batch(
+            run_dir=run_dir,
+            locator=locator,
+            campaign=campaign,
+        )
+        if fault_point == "archive_publish_before_state":
+            destination = (
+                locator.resolve("e_archive").absolute_path / verified.logical_path
+            )
+            shutil.copytree(source, destination)
+            archived = verified.mark_archived(
+                root_alias="e_archive",
+                volume=locator.resolve("e_archive").volume,
+                transfer_mode="cross_volume_verified_copy",
+                archive_transfer_seconds=0.0,
+            )
+            atomic_write_signed_json(
+                destination / "batch_manifest.json", archived.to_dict()
+            )
+        elif fault_point == "envelope_publish_before_state":
+            controller._finish_verified_batch(verified_campaign, verified)
+            atomic_write_signed_json(
+                run_dir / "campaign_manifest.json",
+                verified_campaign.to_dict(),
+            )
+    elif fault_point == "final_batch_before_finalize":
+        _archive_first_recovery_batch(
+            run_dir=run_dir,
+            locator=locator,
+            campaign=campaign,
+        )
+    os._exit(86)
+
+
+def _write_synthetic_recovery_shards(
+    batch_dir: Path,
+    shard_ids: tuple[str, ...],
+) -> tuple[dict[str, str], dict[str, int], int]:
+    shard_root = batch_dir / "shards"
+    shard_root.mkdir()
+    hashes: dict[str, str] = {}
+    byte_sizes: dict[str, int] = {}
+    axis_total = 0
+    for ordinal, shard_id in enumerate(shard_ids, start=1):
+        axis_count = 3 if ordinal <= 200 else 2
+        checkpoint_count = 12 if ordinal <= 280 else 11
+        payload = {
+            "shard_id": shard_id,
+            "validator_passed": True,
+            "objective_rows": [
+                [1, float(ordinal), 0.0, 0] for _axis in range(axis_count)
+            ],
+            "checkpoints": list(range(checkpoint_count)),
+        }
+        path = shard_root / f"{shard_id}.json"
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        hashes[shard_id] = hashlib.sha256(path.read_bytes()).hexdigest()
+        byte_sizes[shard_id] = path.stat().st_size
+        axis_total += axis_count
+    return hashes, byte_sizes, axis_total
+
+
+def _synthetic_recovery_review(
+    campaign: CampaignManifest,
+    locator: StorageRootLocator,
+) -> dict[str, object]:
+    """Replay synthetic raw shards like the recovery gate's scientific core."""
+
+    shard_ids: list[str] = []
+    objective_rows: list[list[float | int]] = []
+    checkpoint_count = 0
+    validator_passed = True
+    for batch in campaign.batches:
+        assert batch.status == "archived"
+        batch_dir = locator.resolve(batch.root_alias).absolute_path / batch.logical_path
+        for shard_id in batch.shard_ids:
+            path = batch_dir / "shards" / f"{shard_id}.json"
+            assert hashlib.sha256(path.read_bytes()).hexdigest() == (
+                batch.shard_manifest_sha256_by_id or {}
+            )[shard_id]
+            assert path.stat().st_size == (batch.shard_actual_bytes_by_id or {})[
+                shard_id
+            ]
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            assert payload["shard_id"] == shard_id
+            shard_ids.append(shard_id)
+            objective_rows.extend(payload["objective_rows"])
+            checkpoint_count += len(payload["checkpoints"])
+            validator_passed = validator_passed and payload["validator_passed"]
+    return {
+        "run_label": campaign.run_label,
+        "scope": campaign.scope,
+        "shard_ids": shard_ids,
+        "shard_count": len(shard_ids),
+        "axis_count": len(objective_rows),
+        "checkpoint_count": checkpoint_count,
+        "validator_passed": validator_passed,
+        "objective_rows": objective_rows,
+        "batches": [
+            {
+                "batch_id": batch.batch_id,
+                "status": batch.status,
+                "shard_ids": list(batch.shard_ids),
+                "checksum_sha256": batch.checksum_sha256,
+                "actual_bytes": batch.actual_bytes,
+                "row_count": batch.row_count,
+                "physical_schema": batch.physical_schema,
+                "shard_manifest_sha256_by_id": dict(
+                    batch.shard_manifest_sha256_by_id or {}
+                ),
+                "shard_actual_bytes_by_id": dict(
+                    batch.shard_actual_bytes_by_id or {}
+                ),
+            }
+            for batch in campaign.batches
+        ],
+    }
+
+
+def test_recovery_fresh_open_rejects_an_existing_output_without_permit(
+    tmp_path: Path,
+) -> None:
+    _run_dir, _locator, campaign, identity, controller = _recovery_campaign(tmp_path)
+
+    with pytest.raises(CampaignRecoveryError, match="signed resume permit"):
+        controller.open(
+            expected_identity=identity,
+            fresh_campaign=campaign,
+            resume_permit_path=None,
+        )
+
+
+def test_recovery_discards_an_interrupted_batch_and_consumes_permit_once(
+    tmp_path: Path,
+) -> None:
+    run_dir, locator, campaign, identity, controller = _recovery_campaign(tmp_path)
+    partial = run_dir / "batch0001"
+    (partial / "shard0001").mkdir(parents=True)
+    (partial / "shard0001" / "partial.parquet").write_bytes(b"not-complete")
+    receipt = _host_loss_receipt(run_dir, identity)
+    permit, permit_path = authorize_resume(
+        run_dir=run_dir,
+        identity=identity,
+        locator=locator,
+        cause="unexpected_host_loss",
+        stop_evidence_path=receipt,
+        lifecycle_state="RUNNING",
+        writer_active=False,
+    )
+
+    session = controller.open(
+        expected_identity=identity,
+        fresh_campaign=campaign,
+        resume_permit_path=permit_path,
+    )
+
+    assert session.resumed is True
+    assert session.epoch == 2
+    assert session.completed_batch_ids == ()
+    assert session.pending_batch_ids == tuple(
+        batch.batch_id for batch in campaign.batches
+    )
+    assert not partial.exists()
+    capsule = (
+        locator.resolve("e_archive").absolute_path
+        / ".campaign-recovery"
+        / campaign.run_label
+        / "epoch0002"
+        / "batch0001"
+    )
+    assert (capsule / "interrupted_inventory.json").is_file()
+    assert (capsule / "deletion_receipt.json").is_file()
+    assert (
+        run_dir / "control" / "recovery" / "consumed" / f"{permit.nonce}.json"
+    ).is_file()
+    with pytest.raises(CampaignRecoveryError):
+        controller.open(
+            expected_identity=identity,
+            fresh_campaign=campaign,
+            resume_permit_path=permit_path,
+        )
+
+
+def test_interrupted_batch_compaction_retries_after_inventory_before_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir, locator, campaign, identity, controller = _recovery_campaign(tmp_path)
+    partial = run_dir / "batch0001"
+    partial.mkdir()
+    (partial / "partial.bin").write_bytes(b"partial")
+    permit, _permit_path = authorize_resume(
+        run_dir=run_dir,
+        identity=identity,
+        locator=locator,
+        cause="unexpected_host_loss",
+        stop_evidence_path=_host_loss_receipt(run_dir, identity),
+        lifecycle_state="RUNNING",
+        writer_active=False,
+    )
+    real_rmtree = stage052_campaign.shutil.rmtree
+    failed = False
+
+    def fail_source_delete(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal failed
+        if Path(path) == partial and not failed:
+            failed = True
+            raise OSError("injected after inventory")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(stage052_campaign.shutil, "rmtree", fail_source_delete)
+    with pytest.raises(OSError, match="injected after inventory"):
+        controller._compact_interrupted_batch(
+            path=partial, batch=campaign.batches[0], permit=permit
+        )
+    monkeypatch.setattr(stage052_campaign.shutil, "rmtree", real_rmtree)
+    controller._compact_interrupted_batch(
+        path=partial, batch=campaign.batches[0], permit=permit
+    )
+    capsule = (
+        locator.resolve("e_archive").absolute_path
+        / ".campaign-recovery"
+        / campaign.run_label
+        / "epoch0002"
+        / "batch0001"
+    )
+    assert not partial.exists()
+    assert (capsule / "deletion_receipt.json").is_file()
+
+
+def test_interrupted_batch_compaction_retries_after_delete_before_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir, locator, campaign, identity, controller = _recovery_campaign(tmp_path)
+    partial = run_dir / "batch0001"
+    partial.mkdir()
+    (partial / "partial.bin").write_bytes(b"partial")
+    permit, _permit_path = authorize_resume(
+        run_dir=run_dir,
+        identity=identity,
+        locator=locator,
+        cause="unexpected_host_loss",
+        stop_evidence_path=_host_loss_receipt(run_dir, identity),
+        lifecycle_state="RUNNING",
+        writer_active=False,
+    )
+    real_write = stage052_campaign.atomic_write_signed_json
+
+    def fail_receipt(path: Path, payload: object) -> tuple[Path, Path]:
+        if path.name == "deletion_receipt.json":
+            raise OSError("injected before receipt")
+        return real_write(path, payload)
+
+    monkeypatch.setattr(stage052_campaign, "atomic_write_signed_json", fail_receipt)
+    with pytest.raises(OSError, match="injected before receipt"):
+        controller._compact_interrupted_batch(
+            path=partial, batch=campaign.batches[0], permit=permit
+        )
+    monkeypatch.setattr(stage052_campaign, "atomic_write_signed_json", real_write)
+    controller._compact_interrupted_batch(
+        path=partial, batch=campaign.batches[0], permit=permit
+    )
+    assert not partial.exists()
+
+
+def test_verified_recovery_rejects_divergent_archived_destination(
+    tmp_path: Path,
+) -> None:
+    run_dir, locator, campaign, _identity, controller = _recovery_campaign(tmp_path)
+    archived_campaign, _manifest_path, _manifest_sha = _archive_first_recovery_batch(
+        run_dir=run_dir,
+        locator=locator,
+        campaign=campaign,
+    )
+    archived = archived_campaign.batches[0]
+    verified = replace(
+        archived,
+        status="verified",
+        root_alias="wsl_staging",
+        volume=locator.resolve("wsl_staging").volume,
+        transfer_mode=None,
+        archive_transfer_seconds=None,
+    )
+    destination = locator.resolve("e_archive").absolute_path / archived.logical_path
+    (destination / "payload.bin").write_bytes(b"diverged")
+
+    with pytest.raises(CampaignRecoveryError, match="payload differs"):
+        controller._finish_verified_batch(campaign, verified)
+
+
+@pytest.mark.parametrize(
+    ("fault_point", "expected_completed"),
+    (
+        ("before_batch_create", False),
+        ("during_batch_compute", False),
+        ("verified_before_archive", True),
+        ("archive_publish_before_state", True),
+        ("envelope_publish_before_state", True),
+        ("final_batch_before_finalize", True),
+    ),
+)
+def test_process_fault_injection_recovers_six_batch_boundaries(
+    tmp_path: Path,
+    fault_point: str,
+    expected_completed: bool,
+) -> None:
+    run_dir, locator, campaign, identity, controller = _recovery_campaign(tmp_path)
+
+    process = multiprocessing.get_context("spawn").Process(
+        target=_crash_recovery_worker,
+        args=(
+            fault_point,
+            run_dir,
+            locator.resolve("wsl_staging").absolute_path,
+            locator.resolve("e_archive").absolute_path,
+        ),
+    )
+    process.start()
+    process.join(10)
+    assert process.exitcode == 86
+    permit, permit_path = authorize_resume(
+        run_dir=run_dir,
+        identity=identity,
+        locator=locator,
+        cause="unexpected_host_loss",
+        stop_evidence_path=_host_loss_receipt(run_dir, identity),
+        lifecycle_state="RUNNING",
+        writer_active=False,
+    )
+    session = controller.open(
+        expected_identity=identity,
+        fresh_campaign=campaign,
+        resume_permit_path=permit_path,
+    )
+    semantic_state = (
+        session.identity.identity_sha256,
+        session.epoch,
+        session.completed_batch_ids,
+        session.pending_batch_ids,
+    )
+    expected_completed_ids = ("batch0001",) if expected_completed else ()
+    expected_pending_ids = (
+        ()
+        if expected_completed
+        else tuple(batch.batch_id for batch in campaign.batches)
+    )
+    assert semantic_state == (
+        identity.identity_sha256,
+        2,
+        expected_completed_ids,
+        expected_pending_ids,
+    )
+    assert (
+        run_dir / "control" / "recovery" / "consumed" / f"{permit.nonce}.json"
+    ).is_file()
+    recovered_final = session.campaign
+    if not expected_completed:
+        recovered_final, _manifest_path, _manifest_sha = (
+            _archive_first_recovery_batch(
+                run_dir=run_dir,
+                locator=locator,
+                campaign=recovered_final,
+            )
+        )
+    control_root = tmp_path / "uninterrupted-control"
+    control_root.mkdir()
+    control_run, control_locator, control_campaign, _identity, _controller = (
+        _recovery_campaign(control_root)
+    )
+    control_final, _manifest_path, _manifest_sha = _archive_first_recovery_batch(
+        run_dir=control_run,
+        locator=control_locator,
+        campaign=control_campaign,
+    )
+    recovered_review = _synthetic_recovery_review(recovered_final, locator)
+    control_review = _synthetic_recovery_review(control_final, control_locator)
+    assert recovered_review == control_review
+    assert recovered_review["shard_count"] == 920
+    assert recovered_review["axis_count"] == 2_040
+    assert recovered_review["checkpoint_count"] == 10_400
+
+
+def test_recovery_revalidates_completed_batch_without_changing_its_hash(
+    tmp_path: Path,
+) -> None:
+    run_dir, locator, campaign, identity, controller = _recovery_campaign(tmp_path)
+    campaign, manifest_path, before_sha = _archive_first_recovery_batch(
+        run_dir=run_dir,
+        locator=locator,
+        campaign=campaign,
+    )
+    receipt = _host_loss_receipt(run_dir, identity)
+    _permit, permit_path = authorize_resume(
+        run_dir=run_dir,
+        identity=identity,
+        locator=locator,
+        cause="unexpected_host_loss",
+        stop_evidence_path=receipt,
+        lifecycle_state="RUNNING",
+        writer_active=False,
+    )
+
+    session = controller.open(
+        expected_identity=identity,
+        fresh_campaign=campaign,
+        resume_permit_path=permit_path,
+    )
+
+    assert session.completed_batch_ids == ("batch0001",)
+    assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == before_sha
+
+
+def test_recovery_completes_after_permit_consumption_precedes_epoch_commit(
+    tmp_path: Path,
+) -> None:
+    run_dir, locator, campaign, identity, controller = _recovery_campaign(tmp_path)
+    receipt = _host_loss_receipt(run_dir, identity)
+    permit, permit_path = authorize_resume(
+        run_dir=run_dir,
+        identity=identity,
+        locator=locator,
+        cause="unexpected_host_loss",
+        stop_evidence_path=receipt,
+        lifecycle_state="RUNNING",
+        writer_active=False,
+    )
+    atomic_write_signed_json(
+        run_dir / "control" / "recovery" / "consumed" / f"{permit.nonce}.json",
+        {
+            "schema_version": "stage05.2-resume-permit-consumption-v1",
+            "run_label": identity.run_label,
+            "epoch": permit.epoch,
+            "resume_permit_sha256": hashlib.sha256(
+                permit_path.read_bytes()
+            ).hexdigest(),
+            "nonce": permit.nonce,
+            "status": "consumed",
+        },
+    )
+
+    session = controller.open(
+        expected_identity=identity,
+        fresh_campaign=campaign,
+        resume_permit_path=permit_path,
+    )
+
+    assert session.epoch == 2
+    assert session.epoch_manifest_path.is_file()
+
+
+def test_operator_stop_requires_a_separately_signed_pre_stop_intent(
+    tmp_path: Path,
+) -> None:
+    run_dir, locator, _campaign, identity, _controller = _recovery_campaign(tmp_path)
+    receipt, _ = atomic_write_signed_json(
+        run_dir / "control" / "recovery" / "operator-stop.json",
+        {
+            "schema_version": "stage05.2-operator-stop-receipt-v1",
+            "run_label": identity.run_label,
+            "cause": "operator_stop",
+            "campaign_identity_sha256": identity.identity_sha256,
+            "writer_absent": True,
+            "service_state": "inactive",
+            "stop_intent_relative_path": "control/recovery/stop-intent.json",
+            "stop_intent_sha256": "f" * 64,
+        },
+    )
+
+    with pytest.raises(CampaignRecoveryError, match="stop intent"):
+        authorize_resume(
+            run_dir=run_dir,
+            identity=identity,
+            locator=locator,
+            cause="operator_stop",
+            stop_evidence_path=receipt,
+            lifecycle_state="RUNNING",
+            writer_active=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("lifecycle_state", "writer_active", "match"),
+    (("SEALED", False, "RUNNING"), ("RUNNING", True, "active")),
+)
+def test_recovery_rejects_terminal_lifecycle_or_active_writer(
+    tmp_path: Path,
+    lifecycle_state: str,
+    writer_active: bool,
+    match: str,
+) -> None:
+    run_dir, locator, _campaign, identity, _controller = _recovery_campaign(tmp_path)
+    receipt = _host_loss_receipt(run_dir, identity)
+
+    with pytest.raises(CampaignRecoveryError, match=match):
+        authorize_resume(
+            run_dir=run_dir,
+            identity=identity,
+            locator=locator,
+            cause="unexpected_host_loss",
+            stop_evidence_path=receipt,
+            lifecycle_state=lifecycle_state,
+            writer_active=writer_active,
+        )
+
+
+def test_recovery_rejects_identity_drift_and_unknown_reason(
+    tmp_path: Path,
+) -> None:
+    run_dir, locator, _campaign, identity, _controller = _recovery_campaign(tmp_path)
+    receipt = _host_loss_receipt(run_dir, identity)
+
+    with pytest.raises(CampaignRecoveryError, match="cause"):
+        authorize_resume(
+            run_dir=run_dir,
+            identity=identity,
+            locator=locator,
+            cause="resource_gate",
+            stop_evidence_path=receipt,
+            lifecycle_state="RUNNING",
+            writer_active=False,
+        )
+    with pytest.raises(CampaignRecoveryError, match="identity"):
+        authorize_resume(
+            run_dir=run_dir,
+            identity=replace(identity, wheel_sha256="0" * 64),
+            locator=locator,
+            cause="unexpected_host_loss",
+            stop_evidence_path=receipt,
+            lifecycle_state="RUNNING",
+            writer_active=False,
+        )
+
+
+def test_recovery_rejects_a_tampered_permit_sidecar(
+    tmp_path: Path,
+) -> None:
+    run_dir, locator, campaign, identity, controller = _recovery_campaign(tmp_path)
+    receipt = _host_loss_receipt(run_dir, identity)
+    _permit, permit_path = authorize_resume(
+        run_dir=run_dir,
+        identity=identity,
+        locator=locator,
+        cause="unexpected_host_loss",
+        stop_evidence_path=receipt,
+        lifecycle_state="RUNNING",
+        writer_active=False,
+    )
+    permit_path.write_bytes(permit_path.read_bytes() + b" ")
+
+    with pytest.raises(CampaignRecoveryError, match="control evidence"):
+        controller.open(
+            expected_identity=identity,
+            fresh_campaign=campaign,
+            resume_permit_path=permit_path,
+        )
+
+
+def test_recovery_rejects_a_cross_label_output_directory(tmp_path: Path) -> None:
+    _run_dir, locator, campaign, identity, _controller = _recovery_campaign(tmp_path)
+    wrong = CampaignRecoveryController(
+        run_dir=tmp_path / "stage05.2_benchmark_rerun17",
+        locator=locator,
+    )
+
+    with pytest.raises(CampaignRecoveryError, match="run label"):
+        wrong.open(
+            expected_identity=identity,
+            fresh_campaign=campaign,
+            resume_permit_path=None,
+        )
 
 
 def test_campaign_objective_keys_require_shared_canonical_precision() -> None:

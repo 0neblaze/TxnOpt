@@ -2862,6 +2862,65 @@ class ExperimentLifecycleController:
             return record
         return self._transition(record, LifecycleState.RUNNING)
 
+    def authorize_resume(
+        self,
+        run_label: str,
+        *,
+        identity_path: Path,
+        cause: str,
+        stop_evidence_path: Path,
+        storage_root_locator_path: Path,
+    ) -> Path:
+        """Authorize one same-identity recovery epoch without changing lifecycle state."""
+
+        from evrptw.stage052_campaign import (
+            CampaignIdentity,
+            StorageRootLocator,
+            _load_verified_manifest_object,
+            authorize_resume,
+        )
+
+        record = self._load(run_label)
+        if record.state != LifecycleState.RUNNING:
+            raise LifecycleError("resume authorization requires a RUNNING lifecycle")
+        plan_payload = _load_signed_json(
+            self.state_root / "plans" / f"{run_label}.json"
+        )
+        raw_plan = plan_payload.get("plan")
+        if not isinstance(raw_plan, dict):
+            raise LifecycleError("resume lifecycle plan is invalid")
+        persisted_plan = ExperimentPlan.from_dict(raw_plan)
+        try:
+            identity = CampaignIdentity.from_dict(
+                _load_verified_manifest_object(identity_path.resolve(strict=True))
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            raise LifecycleError("resume campaign identity is invalid") from error
+        if (
+            identity.run_label != run_label
+            or identity.lifecycle_plan_sha256 != record.plan_sha256
+            or identity.start_permit_sha256 != record.storage_permit_sha256
+            or identity_path.resolve().parent.resolve()
+            != persisted_plan.run_dir / "control"
+        ):
+            raise LifecycleError("resume identity differs from the lifecycle plan")
+        locator = StorageRootLocator.from_toml(
+            storage_root_locator_path.resolve(strict=True)
+        )
+        try:
+            _permit, permit_path = authorize_resume(
+                run_dir=persisted_plan.run_dir,
+                identity=identity,
+                locator=locator,
+                cause=cause,
+                stop_evidence_path=stop_evidence_path.resolve(strict=True),
+                lifecycle_state=record.state.value,
+                writer_active=self._writer_is_active(run_label, persisted_plan.run_dir),
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            raise LifecycleError("resume authorization failed") from error
+        return permit_path
+
     def seal(
         self,
         run_label: str,
@@ -4645,6 +4704,15 @@ def _cli() -> argparse.ArgumentParser:
     start.add_argument("--run-label", required=True)
     start.add_argument("--storage-permit", type=Path, required=True)
     start.add_argument("--runtime-plan", type=Path, required=True)
+    resume = subparsers.add_parser("authorize-resume")
+    resume.add_argument("--run-label", required=True)
+    resume.add_argument("--identity", type=Path, required=True)
+    resume.add_argument(
+        "--cause",
+        choices=("unexpected_host_loss", "operator_stop"),
+        required=True,
+    )
+    resume.add_argument("--stop-evidence", type=Path, required=True)
     seal = subparsers.add_parser("seal")
     seal.add_argument("--run-label", required=True)
     seal.add_argument("--manifest", type=Path, required=True)
@@ -4800,6 +4868,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.run_label,
             runtime_plan=ExperimentPlan.from_dict(raw_runtime_plan),
         ).to_dict()
+    elif arguments.command == "authorize-resume":
+        permit_path = controller.authorize_resume(
+            arguments.run_label,
+            identity_path=arguments.identity,
+            cause=arguments.cause,
+            stop_evidence_path=arguments.stop_evidence,
+            storage_root_locator_path=cast(Path, arguments.storage_root_locator),
+        )
+        payload = {
+            "run_label": arguments.run_label,
+            "resume_permit": str(permit_path),
+            "resume_permit_sha256": _sha256_file(permit_path),
+        }
     elif arguments.command == "seal":
         payload = controller.seal(
             arguments.run_label,

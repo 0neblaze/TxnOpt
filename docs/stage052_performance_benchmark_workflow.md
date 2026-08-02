@@ -410,6 +410,19 @@ anytime checkpoints 为预算范围内的 `1/5/10/30/60/120/300 s`。small insta
 - future benchmark attempt 的 verified batch 可按预先配置执行 same-attempt rolling
   handoff：目标卷完整校验、原子发布后清理该 batch 的 staging source，以维持 32 GiB
   active-workspace cap。该路径不授权清理本轮历史迁移源。
+- 同一 frozen identity（冻结身份）的 Formal campaign 可从下一未完成 batch 恢复，
+  但 lifecycle 始终保持 `RUNNING`。首次计算前写入签名
+  `control/campaign_identity.json`；后续只能使用 lifecycle 签发的一次性
+  `ResumePermit`，并在 `control/recovery/epochs` 追加哈希链。身份绑定 run label、Git
+  commit/tree、wheel、native extension/dependencies、科学配置、prerequisite、resource
+  contract、campaign plan、lifecycle plan 和 immutable start permit。任一字段变化都
+  必须终止原 label 并创建新 label，禁止跨 label/revision 导入 shard。
+- 恢复只接受 `unexpected_host_loss` 和带 pre-stop signed intent（停机前签名意图）的
+  `operator_stop`。已归档 batch 必须重放 manifest/sidecar、tree SHA-256、bytes、shard
+  set 和 persistence envelope；verified-but-unarchived 或 archive publish 中断由同一事务
+  幂等完成。计算未完成的 batch 先生成签名 inventory 与 deletion receipt，仅保留中断
+  control capsule，再整批重算，旧 shard 不进入最终 geometry。算法、objective/validator、
+  manifest integrity、科学配置、资源门禁和未知故障均不可恢复。
 - 新完整 raw generation 保存在
   `e_archive/stage05.2/generations/<run_label>/<generation>/`；既有
   `d_archive/stage05.2/history/<run_label>/` 由 v1 resolver 保持只读可解析。reduced
@@ -421,6 +434,12 @@ anytime checkpoints 为预算范围内的 `1/5/10/30/60/120/300 s`。small insta
 ## Review 与发布
 
 independent reviewer 必须从 raw shards 重算：exact scope identity、validator/objective、event/cache/exact-call、deadline/budget、worker/shard completeness、resource limits、严格性能 gate、anytime 汇总和模型兼容性。BKS compatibility 仍为 `False`，因此不创建 gap 列。
+
+含 recovery control 的 campaign 还必须通过独立 `campaign_recovery` gate：重放 identity、
+start/resume permits、permit consumption、连续 recovery epoch 哈希链、archive transaction
+与 interrupted-batch deletion receipt；验证全部 920 shard 恰好一次、同属一个 identity，
+并从各 batch 的签名 checkpoint control 重建 2,040 axes 和 10,400 checkpoints。缺链、
+身份漂移、permit 重放、跨标签导入、重复 shard 或未签名删除一律 `NOT_READY`。
 
 `deadline_boundary` 按 lane（搜索通道）生效：同一 lane 在 boundary 后不得再启动
 exact work、写 cache 或接受 candidate；同时所有 exact completion 和 accepted
