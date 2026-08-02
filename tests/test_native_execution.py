@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import socket
+import struct
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -627,3 +629,28 @@ def test_host_scheduler_exit_fails_fast_without_local_fallback(tmp_path: Path) -
                 scheduler_socket_path=str(endpoint),
             ),
         )
+
+
+def test_host_scheduler_partial_ipc_rolls_back_and_keeps_service_usable(
+    tmp_path: Path,
+) -> None:
+    endpoint = tmp_path / "native-scheduler.sock"
+    with NativeHostScheduler(endpoint):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.connect(str(endpoint))
+            connection.sendall(struct.pack("!Q", 100) + b"{}")
+
+        result = solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            screening_config=CheapScreeningConfig(),
+            native_execution_config=replace(
+                _native_config("host_scheduler"),
+                scheduler_socket_path=str(endpoint),
+            ),
+        )
+
+    assert result.feasible
+    assert result.native_execution_statistics["fallback_count"] == 0

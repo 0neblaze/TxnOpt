@@ -2,6 +2,7 @@
 #include <array>
 #include <chrono>
 #include <cctype>
+#include <condition_variable>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -9,6 +10,7 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <queue>
 #include <sstream>
@@ -21,6 +23,13 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#ifdef __linux__
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/un.h>
+#include <unistd.h>
+#endif
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -4849,17 +4858,35 @@ py::tuple full_native_alns_v1(
     std::int64_t completed_iterations = 0;
     std::vector<std::int64_t> trajectory;
     trajectory.reserve(static_cast<std::size_t>(control_values[1]) * 7);
-    const auto total_distance = [](const py::tuple& payload) {
+    const auto objective_key = [&](const py::tuple& payload, std::size_t vehicle_count) {
         const auto metrics = py::cast<py::array_t<double>>(payload[4]);
         const auto info = metrics.request();
         const auto* values = checked_data<double>(metrics);
-        PythonFloatSum total;
+        PythonFloatSum distance_total;
+        PythonFloatSum charging_time_total;
         for (py::ssize_t route = 0; route < info.shape[0]; ++route) {
-            total.add(values[static_cast<std::size_t>(route) * 4]);
+            distance_total.add(values[static_cast<std::size_t>(route) * 4]);
+            charging_time_total.add(values[static_cast<std::size_t>(route) * 4 + 3]);
         }
-        return total.value();
+        const auto path_indices = py::cast<py::array_t<std::int64_t>>(payload[1]);
+        const auto* path_values = checked_data<std::int64_t>(path_indices);
+        std::int64_t charging_count = 0;
+        for (py::ssize_t index = 0; index < path_indices.request().shape[0]; ++index) {
+            if (kinds[path_values[index]] == station_kind) {
+                ++charging_count;
+            }
+        }
+        const auto rounded = [](double value) {
+            constexpr double scale = 1'000'000'000.0;
+            return std::round(value * scale) / scale;
+        };
+        return std::tuple{
+            static_cast<std::int64_t>(vehicle_count),
+            rounded(distance_total.value()),
+            rounded(charging_time_total.value()),
+            charging_count};
     };
-    double current_distance = total_distance(exact_payload);
+    auto current_objective = objective_key(exact_payload, routes.size());
     std::size_t pair_cursor = static_cast<std::size_t>(
         static_cast<std::uint64_t>(control_values[0]) % std::max<std::size_t>(1, routes.size()));
     std::uint64_t random_state = static_cast<std::uint64_t>(control_values[0])
@@ -5022,11 +5049,10 @@ py::tuple full_native_alns_v1(
             }
             continue;
         }
-        const auto candidate_distance = total_distance(candidate_payload);
+        const auto candidate_objective = objective_key(
+            candidate_payload, candidate_routes.size());
         const bool vehicle_improvement = candidate_routes.size() < routes.size();
-        const bool distance_improvement = candidate_routes.size() == routes.size()
-            && candidate_distance + 1e-9 < current_distance;
-        if (!vehicle_improvement && !distance_improvement) {
+        if (!(candidate_objective < current_objective)) {
             ++rejected_moves;
             status_code = 4;
             trajectory.insert(
@@ -5039,7 +5065,7 @@ py::tuple full_native_alns_v1(
         customer_offsets = std::move(candidate_offsets);
         customer_indices = std::move(candidate_indices);
         exact_payload = std::move(candidate_payload);
-        current_distance = candidate_distance;
+        current_objective = candidate_objective;
         ++accepted_moves;
         ++improving_moves;
         status_code = 3;
@@ -5093,6 +5119,274 @@ py::tuple full_native_alns_v1(
         std::move(timings),
         std::move(trajectory_array),
         digest);
+}
+
+#ifdef __linux__
+namespace {
+
+constexpr std::uint64_t scheduler_max_control_bytes = 1ULL << 20;
+
+bool scheduler_read_exact(int descriptor, char* destination, std::size_t size) {
+    std::size_t offset = 0;
+    while (offset < size) {
+        const auto received = ::recv(
+            descriptor, destination + offset, size - offset, 0);
+        if (received <= 0) {
+            return false;
+        }
+        offset += static_cast<std::size_t>(received);
+    }
+    return true;
+}
+
+void scheduler_send_all(int descriptor, const char* source, std::size_t size) {
+    std::size_t offset = 0;
+    while (offset < size) {
+        const auto sent = ::send(
+            descriptor, source + offset, size - offset, MSG_NOSIGNAL);
+        if (sent <= 0) {
+            throw std::runtime_error("host scheduler could not send a complete IPC frame");
+        }
+        offset += static_cast<std::size_t>(sent);
+    }
+}
+
+std::string scheduler_read_frame(int descriptor) {
+    std::array<unsigned char, 8> header{};
+    if (!scheduler_read_exact(
+            descriptor,
+            reinterpret_cast<char*>(header.data()),
+            header.size())) {
+        throw std::runtime_error("host scheduler received a partial IPC frame");
+    }
+    std::uint64_t size = 0;
+    for (const auto byte : header) {
+        size = (size << 8) | static_cast<std::uint64_t>(byte);
+    }
+    if (size == 0 || size > scheduler_max_control_bytes) {
+        throw std::runtime_error("host scheduler control frame size is invalid");
+    }
+    std::string payload(static_cast<std::size_t>(size), '\0');
+    if (!scheduler_read_exact(descriptor, payload.data(), payload.size())) {
+        throw std::runtime_error("host scheduler received a partial IPC frame");
+    }
+    return payload;
+}
+
+void scheduler_send_frame(int descriptor, const std::string& payload) {
+    std::array<unsigned char, 8> header{};
+    auto size = static_cast<std::uint64_t>(payload.size());
+    for (std::size_t index = header.size(); index-- > 0;) {
+        header[index] = static_cast<unsigned char>(size & 0xffU);
+        size >>= 8;
+    }
+    scheduler_send_all(
+        descriptor,
+        reinterpret_cast<const char*>(header.data()),
+        header.size());
+    scheduler_send_all(descriptor, payload.data(), payload.size());
+}
+
+void scheduler_handle_connection(int descriptor) {
+    std::string output_name;
+    try {
+        const auto request_text = scheduler_read_frame(descriptor);
+        py::gil_scoped_acquire acquire;
+        const auto json = py::module_::import("json");
+        const auto shared_memory = py::module_::import("multiprocessing.shared_memory");
+        const auto numpy = py::module_::import("numpy");
+        const auto pickle = py::module_::import("pickle");
+        const auto request = py::cast<py::dict>(
+            json.attr("loads")(request_text));
+        if (!request.contains("operation")
+            || py::cast<std::string>(request["operation"]) != "full_native_alns_v1") {
+            throw std::runtime_error("host scheduler received an unknown operation");
+        }
+        const auto descriptors = py::cast<py::list>(request["arrays"]);
+        if (descriptors.size() != 12) {
+            throw std::runtime_error(
+                "host scheduler received an invalid SoA descriptor set");
+        }
+        py::list segments;
+        py::list arrays;
+        for (const auto item : descriptors) {
+            const auto raw = py::cast<py::dict>(item);
+            const auto segment = shared_memory.attr("SharedMemory")(
+                py::arg("name") = raw["name"]);
+            segments.append(segment);
+            const auto array = numpy.attr("ndarray")(
+                raw["shape"],
+                py::arg("dtype") = raw["dtype"],
+                py::arg("buffer") = segment.attr("buf"));
+            if (!py::cast<bool>(array.attr("flags").attr("c_contiguous"))) {
+                throw std::runtime_error(
+                    "host scheduler shared-memory array is not contiguous");
+            }
+            if (py::cast<py::ssize_t>(array.attr("nbytes"))
+                != py::cast<py::ssize_t>(raw["nbytes"])) {
+                throw std::runtime_error(
+                    "host scheduler shared-memory array does not reconcile");
+            }
+            arrays.append(array);
+        }
+        const auto result = full_native_alns_v1(
+            arrays[0], arrays[1], arrays[2], arrays[3], arrays[4], arrays[5],
+            arrays[6], arrays[7], arrays[8], arrays[9], arrays[10], arrays[11]);
+        const auto encoded_object = pickle.attr("dumps")(
+            result, py::arg("protocol") = 5);
+        const auto encoded = py::cast<std::string>(encoded_object);
+        const auto output = shared_memory.attr("SharedMemory")(
+            py::arg("create") = true,
+            py::arg("size") = std::max<std::size_t>(1, encoded.size()));
+        output.attr("buf").attr("__setitem__")(
+            py::slice(0, static_cast<py::ssize_t>(encoded.size()), 1),
+            py::bytes(encoded));
+        py::dict response;
+        response["ok"] = true;
+        output_name = py::cast<std::string>(output.attr("name"));
+        response["output_name"] = output_name;
+        response["output_size"] = encoded.size();
+        const auto response_text = py::cast<std::string>(json.attr("dumps")(
+            response,
+            py::arg("sort_keys") = true,
+            py::arg("separators") = py::make_tuple(",", ":")));
+        for (const auto segment : segments) {
+            py::reinterpret_borrow<py::object>(segment).attr("close")();
+        }
+        scheduler_send_frame(descriptor, response_text);
+        output.attr("close")();
+    } catch (const std::exception& error) {
+        try {
+            py::gil_scoped_acquire acquire;
+            const auto json = py::module_::import("json");
+            if (!output_name.empty()) {
+                const auto shared_memory = py::module_::import(
+                    "multiprocessing.shared_memory");
+                const auto orphan = shared_memory.attr("SharedMemory")(
+                    py::arg("name") = output_name);
+                orphan.attr("close")();
+                orphan.attr("unlink")();
+            }
+            py::dict response;
+            response["ok"] = false;
+            response["error_type"] = "RuntimeError";
+            response["error"] = error.what();
+            const auto response_text = py::cast<std::string>(json.attr("dumps")(
+                response,
+                py::arg("sort_keys") = true,
+                py::arg("separators") = py::make_tuple(",", ":")));
+            scheduler_send_frame(descriptor, response_text);
+        } catch (...) {
+        }
+    }
+    ::close(descriptor);
+}
+
+}  // namespace
+#endif
+
+void run_host_scheduler_service_v1(
+    const std::string& socket_path,
+    std::int64_t worker_threads) {
+#ifndef __linux__
+    static_cast<void>(socket_path);
+    static_cast<void>(worker_threads);
+    throw std::runtime_error("host scheduler service requires Linux Unix-domain sockets");
+#else
+    if (socket_path.empty() || socket_path.size() >= sizeof(sockaddr_un::sun_path)) {
+        throw std::invalid_argument("host scheduler socket path is invalid");
+    }
+    if (worker_threads != 24) {
+        throw std::invalid_argument("host scheduler requires exactly 24 worker threads");
+    }
+    ::unlink(socket_path.c_str());
+    const auto server = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server < 0) {
+        throw std::runtime_error("host scheduler could not create its Unix-domain socket");
+    }
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, socket_path.c_str(), socket_path.size() + 1);
+    if (::bind(
+            server,
+            reinterpret_cast<const sockaddr*>(&address),
+            sizeof(address)) != 0
+        || ::listen(server, 64) != 0) {
+        ::close(server);
+        ::unlink(socket_path.c_str());
+        throw std::runtime_error("host scheduler could not bind/listen on its control socket");
+    }
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::deque<int> connections;
+    bool stopping = false;
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<std::size_t>(worker_threads));
+    {
+        py::gil_scoped_release release;
+        for (std::int64_t index = 0; index < worker_threads; ++index) {
+            workers.emplace_back([&]() {
+                while (true) {
+                    int connection = -1;
+                    {
+                        std::unique_lock lock(mutex);
+                        condition.wait(lock, [&]() {
+                            return stopping || !connections.empty();
+                        });
+                        if (connections.empty()) {
+                            if (stopping) {
+                                return;
+                            }
+                            continue;
+                        }
+                        connection = connections.front();
+                        connections.pop_front();
+                    }
+                    scheduler_handle_connection(connection);
+                }
+            });
+        }
+        while (true) {
+            const auto connection = ::accept(server, nullptr, nullptr);
+            if (connection < 0) {
+                continue;
+            }
+            char control = '\0';
+            const auto peeked = ::recv(connection, &control, 1, MSG_PEEK);
+            if (peeked == 1 && control == 'X') {
+                ::recv(connection, &control, 1, 0);
+                ::close(connection);
+                break;
+            }
+            timeval timeout{};
+            timeout.tv_sec = 5;
+            if (::setsockopt(
+                    connection, SOL_SOCKET, SO_RCVTIMEO,
+                    &timeout, sizeof(timeout)) != 0
+                || ::setsockopt(
+                    connection, SOL_SOCKET, SO_SNDTIMEO,
+                    &timeout, sizeof(timeout)) != 0) {
+                ::close(connection);
+                continue;
+            }
+            {
+                std::lock_guard lock(mutex);
+                connections.push_back(connection);
+            }
+            condition.notify_one();
+        }
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        condition.notify_all();
+        for (auto& worker : workers) {
+            worker.join();
+        }
+    }
+    ::close(server);
+    ::unlink(socket_path.c_str());
+#endif
 }
 
 py::tuple propagate_routes_numeric(
@@ -5367,6 +5661,11 @@ PYBIND11_MODULE(_core, module) {
         py::arg("initial_route_indices"),
         py::arg("control"),
         py::arg("deadline_remaining"));
+    module.def(
+        "run_host_scheduler_service_v1",
+        &run_host_scheduler_service_v1,
+        py::arg("socket_path"),
+        py::arg("worker_threads"));
     module.def(
         "propagate_routes_numeric",
         &propagate_routes_numeric,

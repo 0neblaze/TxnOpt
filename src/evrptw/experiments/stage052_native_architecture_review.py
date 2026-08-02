@@ -184,16 +184,46 @@ def _replay_record(record: ReviewRecord, benchmark_dir: Path) -> dict[str, objec
     recorded_objective = _sequence(payload, "objective")
     if list(objective.key) != recorded_objective:
         return {"valid": False, "reason": "objective replay mismatch"}
-    native = payload.get("native_execution_statistics")
-    fallback_count = 0
-    if isinstance(native, dict):
-        raw_fallback = native.get("fallback_count", 0)
-        if isinstance(raw_fallback, int) and not isinstance(raw_fallback, bool):
-            fallback_count = raw_fallback
+    fallback_count = payload.get("fallback_count")
+    if isinstance(fallback_count, bool) or not isinstance(fallback_count, int):
+        return {"valid": False, "reason": "fallback evidence is missing or malformed"}
     if fallback_count != 0:
         return {"valid": False, "reason": "native fallback count is non-zero"}
+    semantic_completeness = payload.get("semantic_completeness")
+    semantics_complete = isinstance(semantic_completeness, dict) and all(
+        semantic_completeness.get(field) is True
+        for field in ("candidate_control", "stage04", "measurement_trace")
+    )
+    measurement = payload.get("measurement_evidence")
+    if not isinstance(measurement, dict):
+        return {"valid": False, "reason": "measurement evidence is missing"}
+    recorded_measurement_hash = measurement.get("sha256")
+    if not isinstance(recorded_measurement_hash, str):
+        return {"valid": False, "reason": "measurement evidence hash is missing"}
+    hashed_measurement = dict(measurement)
+    del hashed_measurement["sha256"]
+    recomputed_measurement_hash = hashlib.sha256(
+        json.dumps(
+            hashed_measurement,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    if recorded_measurement_hash != recomputed_measurement_hash:
+        return {"valid": False, "reason": "measurement evidence hash mismatch"}
+    for field in (
+        "operator_statistics",
+        "stage04_statistics",
+        "stage04_events",
+        "candidate_transaction_events",
+    ):
+        if field not in payload:
+            return {"valid": False, "reason": f"{field} evidence is missing"}
     return {
         "valid": True,
+        "semantics_complete": semantics_complete,
         "objective": objective.key,
         "routes": tuple(tuple(route) for route in routes),
     }
@@ -227,6 +257,16 @@ def _family(instance: str) -> str:
     return "C"
 
 
+def _vehicle_count(payload: Mapping[str, object]) -> float:
+    objective = _sequence(payload, "objective")
+    if not objective:
+        raise ValueError("objective must contain vehicle count")
+    value = objective[0]
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError("objective vehicle count must be numeric")
+    return float(value)
+
+
 def _mode_metrics(records: Iterable[ReviewRecord]) -> dict[str, object]:
     values = tuple(record for record in records if record.payload.get("status") == "completed")
     native_queue: list[float] = []
@@ -254,6 +294,32 @@ def _mode_metrics(records: Iterable[ReviewRecord]) -> dict[str, object]:
         ),
         "exact_started_calls": _paired(
             float(_integer(record.payload, "exact_started_calls")) for record in values
+        ),
+        "vehicle_count": _paired(
+            _vehicle_count(record.payload) for record in values
+        ),
+        "effective_iterations_per_second": _paired(
+            _number(_mapping(record.payload, "throughput"), "effective_iterations_per_second")
+            for record in values
+        ),
+        "candidate_transactions_per_second": _paired(
+            _number(_mapping(record.payload, "throughput"), "candidate_transactions_per_second")
+            for record in values
+        ),
+        "screened_routes_per_second": _paired(
+            _number(_mapping(record.payload, "throughput"), "screened_routes_per_second")
+            for record in values
+        ),
+        "exact_started_per_second": _paired(
+            _number(_mapping(record.payload, "throughput"), "exact_started_per_second")
+            for record in values
+        ),
+        "cpu_utilization_percent_of_one_core": _paired(
+            _number(
+                _mapping(record.payload, "topology"),
+                "cpu_utilization_percent_of_one_core",
+            )
+            for record in values
         ),
         "rss_bytes": _paired(
             float(_integer(_mapping(record.payload, "topology"), "rss_bytes"))
@@ -320,6 +386,8 @@ def review_records(
             candidate = modes[mode]
             baseline_trajectory = _sequence(baseline.payload, "trajectory")
             candidate_trajectory = _sequence(candidate.payload, "trajectory")
+            baseline_measurement = _mapping(baseline.payload, "measurement_evidence")
+            candidate_measurement = _mapping(candidate.payload, "measurement_evidence")
             comparisons.append(
                 {
                     "key": key,
@@ -327,7 +395,11 @@ def review_records(
                     == candidate.payload.get("objective"),
                     "routes_equal": baseline.payload.get("routes")
                     == candidate.payload.get("routes"),
-                    "exact_order_and_counts_equal": (
+                    "exact_order_equal": (
+                        baseline_measurement.get("exact_route_order")
+                        == candidate_measurement.get("exact_route_order")
+                    ),
+                    "exact_counts_equal": (
                         baseline.payload.get("exact_started_calls")
                         == candidate.payload.get("exact_started_calls")
                         and baseline.payload.get("exact_completed_calls")
@@ -338,6 +410,32 @@ def review_records(
                     "route_result_hash_equal": baseline.payload.get("route_result_hash")
                     == candidate.payload.get("route_result_hash"),
                     "trajectory_equal": baseline_trajectory == candidate_trajectory,
+                    "operator_statistics_equal": baseline.payload.get(
+                        "operator_statistics"
+                    )
+                    == candidate.payload.get("operator_statistics"),
+                    "stage04_state_equal": (
+                        baseline.payload.get("stage04_statistics")
+                        == candidate.payload.get("stage04_statistics")
+                        and baseline.payload.get("stage04_events")
+                        == candidate.payload.get("stage04_events")
+                    ),
+                    "candidate_transaction_events_equal": baseline.payload.get(
+                        "candidate_transaction_events"
+                    )
+                    == candidate.payload.get("candidate_transaction_events"),
+                    "cache_lifecycle_equal": baseline_measurement.get(
+                        "cache_lifecycle"
+                    )
+                    == candidate_measurement.get("cache_lifecycle"),
+                    "deadline_boundaries_equal": baseline_measurement.get(
+                        "deadline_boundaries"
+                    )
+                    == candidate_measurement.get("deadline_boundaries"),
+                    "measurement_transaction_hash_equal": baseline_measurement.get(
+                        "sha256"
+                    )
+                    == candidate_measurement.get("sha256"),
                     "common_prefix": _common_prefix(
                         baseline_trajectory, candidate_trajectory
                     ),
@@ -352,10 +450,17 @@ def review_records(
                     for field in (
                         "objective_equal",
                         "routes_equal",
-                        "exact_order_and_counts_equal",
+                        "exact_order_equal",
+                        "exact_counts_equal",
                         "candidate_work_hash_equal",
                         "route_result_hash_equal",
                         "trajectory_equal",
+                        "operator_statistics_equal",
+                        "stage04_state_equal",
+                        "candidate_transaction_events_equal",
+                        "cache_lifecycle_equal",
+                        "deadline_boundaries_equal",
+                        "measurement_transaction_hash_equal",
                     )
                 )
                 for comparison in comparisons
@@ -468,11 +573,32 @@ def review_records(
             )
 
     axis_replay_passed = all(bool(value["valid"]) for value in replay.values())
+    semantic_gates_passed = all(
+        bool(value.get("semantics_complete")) for value in replay.values()
+    )
+    architecture_modes = (
+        ArchitectureMode.PER_SOLVE_RUNTIME,
+        ArchitectureMode.FULL_NATIVE_ALNS,
+        ArchitectureMode.HOST_SCHEDULER,
+    )
+    qualification_passed = axis_replay_passed and semantic_gates_passed and all(
+        bool(differential[mode.value]["passed"])
+        and bool(speedups[mode.value]["performance_qualified"])
+        for mode in architecture_modes
+    )
+    review_status = (
+        "COMPARISON_COMPLETE_QUALIFIED"
+        if qualification_passed
+        else "COMPARISON_COMPLETE_NOT_QUALIFIED"
+        if axis_replay_passed
+        else "NOT_READY"
+    )
     return {
         "schema_version": REVIEW_SCHEMA_VERSION,
         "scope": scope,
         "axis_count": len(records),
         "axis_replay_passed": axis_replay_passed,
+        "semantic_gates_passed": semantic_gates_passed,
         "replay_failures": [
             {"path": str(path), **dict(value)}
             for path, value in replay.items()
@@ -494,7 +620,8 @@ def review_records(
         ),
         "formal_started": False,
         "production_default_changed": False,
-        "review_status": "COMPARISON_COMPLETE" if axis_replay_passed else "NOT_READY",
+        "qualification_passed": qualification_passed,
+        "review_status": review_status,
     }
 
 
@@ -553,6 +680,28 @@ def render_report(review: Mapping[str, object]) -> str:
             + " | "
             + _median_scaled_text(raw, "artifact_bytes", 1024**2)
             + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Throughput / resource envelope（吞吐与资源边界）",
+            "",
+            "| Mode | Iter/s | Candidate tx/s | Screened routes/s | Exact/s | "
+            "CPU % of one core | Cache MiB | Persistence median s | Vehicle median |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for mode in MODES:
+        raw = _mapping(metrics, mode.value)
+        lines.append(
+            f"| {mode.value} | {_median_text(raw, 'effective_iterations_per_second')} | "
+            f"{_median_text(raw, 'candidate_transactions_per_second')} | "
+            f"{_median_text(raw, 'screened_routes_per_second')} | "
+            f"{_median_text(raw, 'exact_started_per_second')} | "
+            f"{_median_text(raw, 'cpu_utilization_percent_of_one_core')} | "
+            f"{_median_scaled_text(raw, 'cache_memory_bytes', 1024**2)} | "
+            f"{_median_text(raw, 'persistence_seconds')} | "
+            f"{_median_text(raw, 'vehicle_count')} |"
         )
     lines.extend(
         [
@@ -671,7 +820,7 @@ def main(argv: list[str] | None = None) -> int:
         output_markdown=arguments.output_markdown,
     )
     print(json.dumps(review, indent=2, sort_keys=True))
-    return 0 if review["review_status"] == "COMPARISON_COMPLETE" else 1
+    return 0 if str(review["review_status"]).startswith("COMPARISON_COMPLETE_") else 1
 
 
 if __name__ == "__main__":

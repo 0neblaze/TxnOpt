@@ -4846,6 +4846,8 @@ def _solve_full_native_alns(
             "transaction_sha256": native_result.transaction_sha256,
             "counters": dict(native_result.counters),
             "timings": dict(native_result.timings),
+            "candidate_control_semantics_complete": False,
+            "stage04_semantics_complete": False,
         }
     )
     operator_statistics: dict[str, dict[str, object]] = {
@@ -4942,29 +4944,29 @@ def _solve_full_native_alns(
             else {}
         ),
         candidate_control_statistics={
-            "enabled": True,
+            "enabled": False,
+            "requested": True,
             "worker_protocol": config.worker_protocol,
             "fallback_count": fallback_count,
+            "semantic_status": "experimental_full_native_port_incomplete",
         },
         native_execution_statistics=native_statistics,
         candidate_work_hash=native_result.transaction_sha256,
         route_result_hash=native_result.transaction_sha256,
         stage04_statistics=(
             {
-                "enabled": True,
+                "enabled": False,
+                "requested": True,
                 "native_protocol": config.worker_protocol,
                 "fixed_weights": stage04_config.fixed_weights,
                 "segment_length": stage04_config.segment_length,
                 "min_calls_per_operator": stage04_config.min_calls_per_operator,
+                "semantic_status": "experimental_full_native_port_incomplete",
             }
             if stage04_config is not None and stage04_config.enabled
             else {}
         ),
-        stage04_event_log=(
-            tuple(dict(event) for event in native_result.trajectory)
-            if stage04_config is not None and stage04_config.enabled
-            else ()
-        ),
+        stage04_event_log=(),
         iteration_limit_completed_at_seconds=(
             runtime_seconds if termination_reason == "iteration_limit" else None
         ),

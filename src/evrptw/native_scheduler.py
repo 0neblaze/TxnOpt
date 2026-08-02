@@ -9,8 +9,6 @@ import socket
 import struct
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from multiprocessing.process import BaseProcess
@@ -22,6 +20,7 @@ import numpy.typing as npt
 
 _FRAME = struct.Struct("!Q")
 _READY_TIMEOUT_SECONDS = 10.0
+_IPC_TIMEOUT_SECONDS = 130.0
 _MAX_CONTROL_BYTES = 1 << 20
 
 
@@ -65,102 +64,11 @@ def _array_descriptor(
     )
 
 
-def _handle_request(connection: socket.socket) -> None:
-    segments: list[shared_memory.SharedMemory] = []
-    try:
-        request = json.loads(_recv_frame(connection))
-        if not isinstance(request, dict) or request.get("operation") != "full_native_alns_v1":
-            raise RuntimeError("host scheduler received an unknown operation")
-        raw_arrays = request.get("arrays")
-        if not isinstance(raw_arrays, list) or len(raw_arrays) != 12:
-            raise RuntimeError("host scheduler received an invalid SoA descriptor set")
-        arrays: list[npt.NDArray[np.generic]] = []
-        for raw in raw_arrays:
-            if not isinstance(raw, dict):
-                raise RuntimeError("host scheduler array descriptor is invalid")
-            name = raw.get("name")
-            shape = raw.get("shape")
-            dtype = raw.get("dtype")
-            nbytes = raw.get("nbytes")
-            if (
-                not isinstance(name, str)
-                or not isinstance(shape, list)
-                or not all(isinstance(value, int) and value >= 0 for value in shape)
-                or not isinstance(dtype, str)
-                or not isinstance(nbytes, int)
-                or nbytes < 0
-            ):
-                raise RuntimeError("host scheduler array descriptor fields are invalid")
-            segment = shared_memory.SharedMemory(name=name)
-            segments.append(segment)
-            array = np.ndarray(tuple(shape), dtype=np.dtype(dtype), buffer=segment.buf)
-            if array.nbytes != nbytes or not array.flags.c_contiguous:
-                raise RuntimeError("host scheduler shared-memory array does not reconcile")
-            arrays.append(array)
-
-        from evrptw import _core as native_core
-
-        entrypoint = cast(Callable[..., object], native_core.full_native_alns_v1)
-        result = entrypoint(*arrays)
-        encoded = pickle.dumps(result, protocol=5)
-        output = shared_memory.SharedMemory(create=True, size=max(1, len(encoded)))
-        try:
-            output_buffer = output.buf
-            if output_buffer is None:
-                raise RuntimeError("host scheduler output shared memory is unavailable")
-            output_buffer[: len(encoded)] = encoded
-            _send_frame(
-                connection,
-                json.dumps(
-                    {
-                        "ok": True,
-                        "output_name": output.name,
-                        "output_size": len(encoded),
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8"),
-            )
-        finally:
-            output.close()
-    except BaseException as error:
-        response = json.dumps(
-            {"ok": False, "error_type": type(error).__name__, "error": str(error)},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        with suppress(OSError):
-            _send_frame(connection, response)
-    finally:
-        for segment in segments:
-            segment.close()
-        connection.close()
-
-
 def _scheduler_service_main(socket_path: str, worker_threads: int) -> None:
-    endpoint = Path(socket_path)
-    endpoint.parent.mkdir(parents=True, exist_ok=True)
-    endpoint.unlink(missing_ok=True)
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(socket_path)
-    server.listen(64)
-    try:
-        with ThreadPoolExecutor(max_workers=worker_threads) as executor:
-            while True:
-                connection, _ = server.accept()
-                try:
-                    control = connection.recv(1, socket.MSG_PEEK)
-                except OSError:
-                    connection.close()
-                    continue
-                if control == b"X":
-                    connection.recv(1)
-                    connection.close()
-                    break
-                executor.submit(_handle_request, connection)
-    finally:
-        server.close()
-        endpoint.unlink(missing_ok=True)
+    from evrptw import _core as native_core
+
+    entrypoint = cast(Callable[[str, int], None], native_core.run_host_scheduler_service_v1)
+    entrypoint(socket_path, worker_threads)
 
 
 @dataclass(slots=True)
@@ -210,6 +118,17 @@ class NativeHostScheduler:
         self._process = None
         self.socket_path.unlink(missing_ok=True)
 
+    @property
+    def process_id(self) -> int:
+        process = self._process
+        if process is None or process.pid is None or not process.is_alive():
+            raise RuntimeError("host scheduler is not running")
+        return process.pid
+
+    def observed_thread_count(self) -> int:
+        task_directory = Path("/proc") / str(self.process_id) / "task"
+        return len(tuple(task_directory.iterdir()))
+
     def __enter__(self) -> NativeHostScheduler:
         self.start()
         return self
@@ -237,6 +156,7 @@ def dispatch_full_native_alns(
             separators=(",", ":"),
         ).encode("utf-8")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(_IPC_TIMEOUT_SECONDS)
             connection.connect(socket_path)
             _send_frame(connection, request)
             response = json.loads(_recv_frame(connection))

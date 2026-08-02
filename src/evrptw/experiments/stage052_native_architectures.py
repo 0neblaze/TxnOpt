@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import resource
 import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from evrptw.alns import ALNSResult, solve_alns
 from evrptw.cache_incremental import CacheIncrementalConfig
@@ -24,6 +26,7 @@ from evrptw.measurement import CheapScreeningConfig, MeasurementConfig
 from evrptw.native_execution import Stage052NativeExecutionConfig
 from evrptw.native_kernels import NativeKernelConfig
 from evrptw.native_scheduler import NativeHostScheduler
+from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
 from evrptw.stage04 import Stage04Config
@@ -154,6 +157,60 @@ def _sha256_path(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _verify_installed_wheel(wheel_path: Path) -> dict[str, str]:
+    """Prove that the executing distribution was installed from the supplied wheel."""
+
+    resolved_wheel = wheel_path.resolve()
+    wheel_sha256 = _sha256_path(resolved_wheel)
+    distribution = importlib.metadata.distribution("reproducible-evrptw")
+    direct_url_entry = next(
+        (
+            entry
+            for entry in distribution.files or ()
+            if str(entry).endswith(".dist-info/direct_url.json")
+        ),
+        None,
+    )
+    if direct_url_entry is None:
+        raise RuntimeError("installed distribution has no direct_url.json wheel receipt")
+    direct_url_path = Path(str(distribution.locate_file(direct_url_entry)))
+    if not direct_url_path.is_file():
+        raise RuntimeError("installed distribution has no direct_url.json wheel receipt")
+    direct_url = json.loads(direct_url_path.read_text(encoding="utf-8"))
+    if not isinstance(direct_url, dict):
+        raise RuntimeError("installed wheel receipt has an invalid schema")
+    archive_info = direct_url.get("archive_info")
+    source_url = direct_url.get("url")
+    if not isinstance(archive_info, dict) or not isinstance(source_url, str):
+        raise RuntimeError("executing distribution is not a non-editable wheel install")
+    parsed = urlparse(source_url)
+    installed_source = Path(unquote(parsed.path)).resolve()
+    if parsed.scheme != "file" or installed_source != resolved_wheel:
+        raise RuntimeError("executing distribution was installed from a different wheel")
+    receipt_hash = archive_info.get("hash")
+    expected_receipt_hash = f"sha256={wheel_sha256}"
+    if receipt_hash != expected_receipt_hash:
+        raise RuntimeError("installed wheel receipt SHA-256 does not match supplied wheel")
+    import evrptw
+    from evrptw import _core as native_core
+
+    site_packages = direct_url_path.parent.parent.resolve()
+    package_path = Path(str(evrptw.__file__)).resolve()
+    native_path = Path(str(native_core.__file__)).resolve()
+    if not package_path.is_relative_to(site_packages) or not native_path.is_relative_to(
+        site_packages
+    ):
+        raise RuntimeError("comparison runner imported source outside the installed wheel")
+    return {
+        "wheel_path": str(resolved_wheel),
+        "wheel_sha256": wheel_sha256,
+        "direct_url_path": str(direct_url_path.resolve()),
+        "package_path": str(package_path),
+        "native_path": str(native_path),
+        "native_sha256": _sha256_path(native_path),
+    }
+
+
 def _canonical_bytes(payload: object) -> bytes:
     return json.dumps(
         payload,
@@ -224,6 +281,76 @@ def _metric_int(value: object) -> int:
     return value
 
 
+def _measurement_evidence(result: ALNSResult) -> dict[str, object]:
+    trace = result.measurement_trace
+    if trace is None:
+        semantic = {
+            "present": False,
+            "exact_route_order": [],
+            "cache_lifecycle": [],
+            "deadline_boundaries": [],
+        }
+    else:
+        exact_route_order = [
+            {
+                "evaluation_id": row.evaluation_id,
+                "route_key": row.route_key,
+                "lane": row.lane,
+                "iteration": row.iteration,
+                "operator": row.operator,
+                "kind": row.kind,
+                "exact_started": row.exact_started,
+                "exact_completed": row.exact_completed,
+                "feasible": row.feasible,
+                "failure_reason": row.failure_reason,
+                "cache_key_digest": row.cache_key_digest,
+                "route_change_status": row.route_change_status,
+                "status": row.status,
+            }
+            for row in trace.route_evaluations
+            if row.exact_started or row.exact_completed
+        ]
+        cache_lifecycle = [
+            {
+                "evaluation_id": row.evaluation_id,
+                "route_key": row.route_key,
+                "kind": row.kind,
+                "cache_key_digest": row.cache_key_digest,
+                "status": row.status,
+            }
+            for row in trace.route_evaluations
+            if "cache" in row.kind or row.cache_key_digest
+        ]
+        deadline_boundaries = [
+            {
+                "evaluation_id": row.evaluation_id,
+                "route_key": row.route_key,
+                "deadline_boundary": row.deadline_boundary,
+                "exact_started": row.exact_started,
+                "exact_completed": row.exact_completed,
+                "status": row.status,
+            }
+            for row in trace.route_evaluations
+            if row.deadline_boundary
+        ]
+        semantic = {
+            "present": True,
+            "exact_route_order": exact_route_order,
+            "cache_lifecycle": cache_lifecycle,
+            "deadline_boundaries": deadline_boundaries,
+            "route_dictionary": {
+                key: list(value) for key, value in sorted(trace.route_dictionary.items())
+            },
+            "screening_decisions": [asdict(row) for row in trace.screening_decisions],
+            "events": [dict(row) for row in trace.events],
+            "incremental_propagations": [
+                dict(row) for row in trace.incremental_propagations
+            ],
+        }
+    semantic["sha256"] = hashlib.sha256(_canonical_bytes(semantic)).hexdigest()
+    return semantic
+
+
 def _solve_mode(
     mode: ArchitectureMode,
     task: ArchitectureAxisTask,
@@ -288,18 +415,19 @@ def _solve_mode(
     report = validate_routes(instance, [list(route) for route in result.routes])
     if not report.feasible or result.objective is None:
         raise RuntimeError("architecture axis returned an invalid or objective-less solution")
-    if result.objective.key != (
-        report.vehicle_count,
-        round(report.total_distance, 9),
-        round(report.total_charging_time, 9),
-        result.objective.charging_count,
-    ):
+    if result.objective.key != SolutionObjective.from_report(instance, report).key:
         raise RuntimeError("architecture axis objective does not replay")
     topology: dict[str, object] = {
         "shard_processes": SHARD_PROCESSES,
         "threads_per_shard": THREADS_PER_SHARD,
         "compute_thread_limit": TOTAL_COMPUTE_THREADS,
         "scheduler_threads": 24 if mode is ArchitectureMode.HOST_SCHEDULER else 0,
+        "effective_native_search_threads": (
+            1
+            if mode
+            in {ArchitectureMode.FULL_NATIVE_ALNS, ArchitectureMode.HOST_SCHEDULER}
+            else THREADS_PER_SHARD
+        ),
         "process_id": os.getpid(),
         "threads_before": threads_before,
         "threads_after": _thread_count(),
@@ -330,6 +458,10 @@ def _result_payload(
     backend = result.backend_metrics
     screening = result.screening_statistics
     candidate_transactions = result.candidate_transaction_statistics
+    measurement_evidence = _measurement_evidence(result)
+    native_fallback = result.native_execution_statistics.get("fallback_count", 0)
+    if isinstance(native_fallback, bool) or not isinstance(native_fallback, int):
+        raise RuntimeError("native fallback evidence has an invalid schema")
     return {
         "schema_version": SCHEMA_VERSION,
         "run_label": task.run_labels[mode.value],
@@ -357,7 +489,10 @@ def _result_payload(
         "exact_interrupted_calls": result.exact_interrupted_calls,
         "candidate_work_hash": result.candidate_work_hash,
         "route_result_hash": result.route_result_hash,
+        "fallback_count": native_fallback,
         "trajectory": [dict(event) for event in result.neighborhood_events],
+        "operator_statistics": result.neighborhood_statistics,
+        "stage04_statistics": result.stage04_statistics,
         "stage04_events": [dict(event) for event in result.stage04_event_log],
         "candidate_transaction_events": [
             dict(event) for event in result.candidate_transaction_events
@@ -368,6 +503,14 @@ def _result_payload(
         "backend_metrics": backend,
         "screening_statistics": screening,
         "cache_incremental_statistics": result.cache_incremental_statistics,
+        "measurement_evidence": measurement_evidence,
+        "semantic_completeness": {
+            "candidate_control": mode
+            not in {ArchitectureMode.FULL_NATIVE_ALNS, ArchitectureMode.HOST_SCHEDULER},
+            "stage04": mode
+            not in {ArchitectureMode.FULL_NATIVE_ALNS, ArchitectureMode.HOST_SCHEDULER},
+            "measurement_trace": bool(measurement_evidence["present"]),
+        },
         "topology": topology,
         "throughput": {
             "effective_iterations_per_second": result.effective_iterations
@@ -468,9 +611,8 @@ def run_experiment(
     ).stdout.strip()
     if not wheel_path.is_file():
         raise FileNotFoundError("the frozen comparison wheel does not exist")
-    from evrptw import _core as native_core
-
-    native_path = Path(str(native_core.__file__))
+    wheel_receipt = _verify_installed_wheel(wheel_path)
+    native_path = Path(wheel_receipt["native_path"])
     labels = run_labels_for_scope(scope, attempt)
     for label in labels.values():
         if (output_root / label).exists():
@@ -482,18 +624,24 @@ def run_experiment(
         benchmark_dir=root / "data" / "schneider",
         output_root=output_root,
         scheduler_socket_path=str(scheduler_path),
-        wheel_sha256=_sha256_path(wheel_path),
-        native_sha256=_sha256_path(native_path),
+        wheel_sha256=wheel_receipt["wheel_sha256"],
+        native_sha256=wheel_receipt["native_sha256"],
         revision=revision,
     )
     for label in labels.values():
         (output_root / label).mkdir(parents=True)
     started = time.time()
     written: list[str] = []
+    scheduler = NativeHostScheduler(scheduler_path, worker_threads=24)
     with (
-        NativeHostScheduler(scheduler_path, worker_threads=24),
+        scheduler,
         ProcessPoolExecutor(max_workers=max_workers) as executor,
     ):
+        scheduler_topology = {
+            "process_id": scheduler.process_id,
+            "observed_thread_count": scheduler.observed_thread_count(),
+            "configured_worker_threads": scheduler.worker_threads,
+        }
         futures = [executor.submit(_run_group, task) for task in plan]
         for future in as_completed(futures):
             written.extend(future.result())
@@ -503,10 +651,11 @@ def run_experiment(
         "attempt": attempt,
         "run_labels": labels,
         "revision": revision,
-        "wheel_path": str(wheel_path.resolve()),
-        "wheel_sha256": _sha256_path(wheel_path),
+        "wheel_path": wheel_receipt["wheel_path"],
+        "wheel_sha256": wheel_receipt["wheel_sha256"],
+        "wheel_receipt": wheel_receipt,
         "native_path": str(native_path.resolve()),
-        "native_sha256": _sha256_path(native_path),
+        "native_sha256": wheel_receipt["native_sha256"],
         "axis_count": len(written),
         "expected_axis_count": expected_axis_count(scope),
         "started_unix": started,
@@ -516,6 +665,7 @@ def run_experiment(
             "threads_per_shard": THREADS_PER_SHARD,
             "host_scheduler_threads": 24,
             "compute_thread_limit": TOTAL_COMPUTE_THREADS,
+            "scheduler_observed": scheduler_topology,
         },
         "mode_order_policy": "rotated_by_repeat_instance_seed_axis",
         "formal_started": False,

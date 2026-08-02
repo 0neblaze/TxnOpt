@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import Counter
 from pathlib import Path
@@ -69,6 +70,21 @@ def _review_fixture_records(root: Path) -> tuple[ReviewRecord, ...]:
     assert report.feasible
     objective = SolutionObjective.from_report(instance, report)
     records = []
+    measurement_evidence: dict[str, Any] = {
+        "present": True,
+        "exact_route_order": [],
+        "cache_lifecycle": [],
+        "deadline_boundaries": [],
+    }
+    measurement_evidence["sha256"] = hashlib.sha256(
+        json.dumps(
+            measurement_evidence,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
     for mode in MODES:
         payload: dict[str, Any] = {
             "schema_version": "stage05.2-native-architecture-comparison-v1",
@@ -87,12 +103,32 @@ def _review_fixture_records(root: Path) -> tuple[ReviewRecord, ...]:
             "candidate_work_hash": "a" * 64,
             "route_result_hash": "b" * 64,
             "trajectory": [{"iteration": 1, "accepted": False}],
+            "operator_statistics": {},
+            "stage04_statistics": {},
+            "stage04_events": [],
+            "candidate_transaction_events": [],
+            "measurement_evidence": measurement_evidence,
+            "semantic_completeness": {
+                "candidate_control": True,
+                "stage04": True,
+                "measurement_trace": True,
+            },
+            "fallback_count": 0,
             "native_execution_statistics": {"fallback_count": 0},
             "backend_metrics": {"launch_occupancies": [4]},
-            "topology": {"rss_bytes": 1024},
+            "topology": {
+                "rss_bytes": 1024,
+                "cpu_utilization_percent_of_one_core": 100.0,
+            },
             "cache_memory_bytes": 512,
             "artifact_bytes": 2048,
             "persistence_seconds": 0.01,
+            "throughput": {
+                "effective_iterations_per_second": 50.0,
+                "candidate_transactions_per_second": 10.0,
+                "screened_routes_per_second": 10.0,
+                "exact_started_per_second": 10.0,
+            },
         }
         records.append(ReviewRecord(root / f"{mode.value}.json", payload))
     return tuple(records)

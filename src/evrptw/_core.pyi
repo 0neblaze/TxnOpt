@@ -240,6 +240,7 @@ def full_native_alns_v1(
     npt.NDArray[np.int64],
     str,
 ]: ...
+def run_host_scheduler_service_v1(socket_path: str, worker_threads: int) -> None: ...
 def propagate_routes_numeric(
     node_kind: npt.NDArray[np.int64],
     ready_time: npt.NDArray[np.float64],
