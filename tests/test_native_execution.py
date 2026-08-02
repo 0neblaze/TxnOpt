@@ -22,11 +22,12 @@ from evrptw.cache_incremental import (
 )
 from evrptw.candidate_control import CandidateControlConfig, CandidateControlRuntime
 from evrptw.candidate_transaction import (
+    BoundedNegativeSequenceCache,
     NativeCandidateTransactionConfig,
     NativeCandidateTransactionRuntime,
 )
 from evrptw.charging import solve_exact_charging
-from evrptw.exact_deadline import ExactDeadlineConfig
+from evrptw.exact_deadline import ExactCallController, ExactDeadlineConfig
 from evrptw.experiments.stage052_native_architectures import (
     _semantic_candidate_trajectory,
 )
@@ -1085,6 +1086,7 @@ def test_native_route_cache_atomic_lru_matches_python_cache() -> None:
     assert native_hashes[0].tolist() == hashes((results[0],))[0].tolist()
     assert native_statistics.tolist() == list(python_cache.statistics.to_dict().values())
 
+
     third_offsets, third_indices = packed((routes[2],))
     python_batch = python_cache.begin_store_many_atomic(((routes[2], results[2]),))
     native_statuses, native_evictions, _ = native_cache.begin_store_many_atomic(
@@ -1142,6 +1144,281 @@ def test_native_route_cache_atomic_lru_matches_python_cache() -> None:
     )
     native_statistics = native_cache.commit_store_batch()
     assert native_statistics.tolist() == list(python_cache.statistics.to_dict().values())
+
+
+def test_native_route_cache_restores_typed_exact_payload_on_hit() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    routes = (("C1",), ("C2",), ("C1", "C2"))
+    results = tuple(solve_exact_charging(instance, route) for route in routes)
+    node_index = {node.name: index for index, node in enumerate(instance.nodes)}
+
+    def packed(selected: tuple[tuple[str, ...], ...]) -> tuple[np.ndarray, np.ndarray]:
+        offsets = [0]
+        indices: list[int] = []
+        for route in selected:
+            indices.extend(node_index[name] for name in route)
+            offsets.append(len(indices))
+        return np.asarray(offsets, dtype=np.int64), np.asarray(indices, dtype=np.int64)
+
+    selected = routes[:2]
+    selected_results = results[:2]
+    route_offsets, route_indices = packed(selected)
+    path_offsets, path_indices = packed(
+        tuple(tuple(result.route) for result in selected_results)
+    )
+    metrics = np.asarray(
+        [
+            [
+                result.distance,
+                result.total_energy,
+                result.charged_energy,
+                result.charging_time,
+            ]
+            for result in selected_results
+        ],
+        dtype=np.float64,
+    )
+    labels = np.asarray(
+        [
+            [result.labels_generated, result.labels_expanded, result.labels_pruned]
+            for result in selected_results
+        ],
+        dtype=np.int64,
+    )
+    semantic_hashes = np.asarray(
+        [
+            list(bytes.fromhex(charging_result_semantic_digest(result)))
+            for result in selected_results
+        ],
+        dtype=np.uint8,
+    )
+    entry_bytes = np.asarray(
+        [estimate_cache_entry_bytes(result) for result in selected_results],
+        dtype=np.int64,
+    )
+    cache = native_core.NativeRouteCacheV2(2, 1_000_000)
+    statuses, evictions, _ = cache.begin_store_exact_many_atomic(
+        route_offsets,
+        route_indices,
+        path_offsets,
+        path_indices,
+        np.zeros(2, dtype=np.int64),
+        np.zeros(2, dtype=np.int64),
+        metrics,
+        labels,
+        semantic_hashes,
+        entry_bytes,
+    )
+    assert statuses.tolist() == [0, 0]
+    assert evictions.tolist() == [0, 0]
+    cache.commit_store_batch()
+
+    state_before = cache.snapshot()
+    cache.begin_protocol_transaction()
+    cache.lookup_exact_many(*packed((routes[0],)))
+    cache.rollback_protocol_transaction()
+    state_after = cache.snapshot()
+    assert [item.tolist() for item in state_after] == [
+        item.tolist() for item in state_before
+    ]
+
+    lookup_offsets, lookup_indices = packed((routes[1], routes[2]))
+    payload = cache.lookup_exact_many(lookup_offsets, lookup_indices)
+    (
+        hits,
+        cached_path_offsets,
+        cached_path_indices,
+        cached_statuses,
+        cached_reasons,
+        cached_metrics,
+        cached_labels,
+        cached_hashes,
+        _statistics,
+    ) = payload
+    assert hits.tolist() == [1, 0]
+    assert cached_path_offsets.tolist() == [0, len(results[1].route), len(results[1].route)]
+    assert cached_path_indices.tolist() == [
+        node_index[name] for name in results[1].route
+    ]
+    assert cached_statuses.tolist() == [0, -1]
+    assert cached_reasons.tolist() == [0, -1]
+    assert cached_metrics[0].tolist() == metrics[1].tolist()
+    assert cached_labels[0].tolist() == labels[1].tolist()
+    assert cached_hashes[0].tolist() == semantic_hashes[1].tolist()
+
+    conflicting_metrics = metrics.copy()
+    conflicting_metrics[0, 0] += 1.0
+    with pytest.raises(RuntimeError, match="exact payload conflict"):
+        cache.begin_store_exact_many_atomic(
+            route_offsets,
+            route_indices,
+            path_offsets,
+            path_indices,
+            np.zeros(2, dtype=np.int64),
+            np.zeros(2, dtype=np.int64),
+            conflicting_metrics,
+            labels,
+            semantic_hashes,
+            entry_bytes,
+        )
+
+
+def test_native_negative_route_cache_generation_matches_python() -> None:
+    from evrptw import _core as native_core
+
+    python_cache = BoundedNegativeSequenceCache(capacity=2)
+    native_cache = native_core.NativeNegativeRouteCacheV2(2)
+    node_index = {"C1": 1, "C2": 2, "C3": 3}
+
+    def packed(selected: tuple[tuple[str, ...], ...]) -> tuple[np.ndarray, np.ndarray]:
+        offsets = [0]
+        indices: list[int] = []
+        for route in selected:
+            indices.extend(node_index[name] for name in route)
+            offsets.append(len(indices))
+        return (
+            np.asarray(offsets, dtype=np.int64),
+            np.asarray(indices, dtype=np.int64),
+        )
+
+    def expected_statistics() -> list[int]:
+        statistics = python_cache.statistics()
+        return [
+            int(statistics["stores"]),
+            int(statistics["evictions"]),
+            int(statistics["rollovers"]),
+            int(statistics["current_entries"]),
+            int(statistics["peak_entries"]),
+        ]
+
+    initial_routes = (("C1",), ("C2",))
+    initial_offsets, initial_indices = packed(initial_routes)
+    python_batch = python_cache.begin_store_many_atomic(
+        {initial_routes[0]: "capacity_prefilter", initial_routes[1]: "energy_prefilter"}
+    )
+    native_summary = native_cache.begin_store_many_atomic(
+        initial_offsets,
+        initial_indices,
+        np.asarray([2, 7], dtype=np.int64),
+    )
+    assert native_summary.tolist() == [2, 0, 0]
+    python_cache.commit_store_batch(python_batch)
+    assert native_cache.commit_store_batch().tolist() == expected_statistics()
+
+    first_offsets, first_indices = packed((initial_routes[0],))
+    hits, reasons, statistics = native_cache.lookup_many(first_offsets, first_indices)
+    assert hits.tolist() == [1]
+    assert reasons.tolist() == [2]
+    assert statistics.tolist() == expected_statistics()
+
+    with pytest.raises(RuntimeError, match="reason changed"):
+        python_cache.begin_store_many_atomic({initial_routes[0]: "energy_prefilter"})
+    with pytest.raises(RuntimeError, match="reason changed"):
+        native_cache.begin_store_many_atomic(
+            first_offsets,
+            first_indices,
+            np.asarray([7], dtype=np.int64),
+        )
+
+    replacement = (("C3",),)
+    replacement_offsets, replacement_indices = packed(replacement)
+    python_batch = python_cache.begin_store_many_atomic(
+        {replacement[0]: "forward_time_window_prefilter"}
+    )
+    native_summary = native_cache.begin_store_many_atomic(
+        replacement_offsets,
+        replacement_indices,
+        np.asarray([3], dtype=np.int64),
+    )
+    assert native_summary.tolist() == [1, 2, 1]
+    python_cache.rollback_store_batch(python_batch)
+    assert native_cache.rollback_store_batch().tolist() == expected_statistics()
+
+    snapshot_offsets, snapshot_indices, snapshot_reasons, snapshot_statistics = (
+        native_cache.snapshot()
+    )
+    assert snapshot_offsets.tolist() == [0, 1, 2]
+    assert snapshot_indices.tolist() == [1, 2]
+    assert snapshot_reasons.tolist() == [2, 7]
+    assert snapshot_statistics.tolist() == expected_statistics()
+
+    python_batch = python_cache.begin_store_many_atomic(
+        {replacement[0]: "forward_time_window_prefilter"}
+    )
+    python_cache.commit_store_batch(python_batch)
+    native_cache.begin_store_many_atomic(
+        replacement_offsets,
+        replacement_indices,
+        np.asarray([3], dtype=np.int64),
+    )
+    assert native_cache.commit_store_batch().tolist() == expected_statistics()
+    hits, reasons, _ = native_cache.lookup_many(replacement_offsets, replacement_indices)
+    assert hits.tolist() == [1]
+    assert reasons.tolist() == [3]
+
+
+def test_native_budget_state_matches_python_controllers_and_rollback() -> None:
+    from evrptw import _core as native_core
+
+    exact = ExactCallController(
+        ExactDeadlineConfig.fixed_exact_calls(5, watchdog_seconds=120.0)
+    )
+    candidate = CandidateControlRuntime(
+        CandidateControlConfig(max_exact_calls_per_round=2, worker_count=1)
+    )
+    native = native_core.NativeBudgetStateV2(5, 2)
+
+    candidate.begin_round(7, lane="quality_shadow")
+    state = native.begin_round(4, 7)
+    assert state.tolist()[:5] == [1, 4, 7, 0, 2]
+    assert candidate.reserve(3, atomic=True, context="plan") == 0
+    assert native.reserve_round(3, True).tolist() == [3, 0, 2]
+    assert candidate.reserve(1, atomic=True, context="plan") == 1
+    assert native.reserve_round(1, True).tolist() == [1, 1, 1]
+
+    exact_reservation = exact.reserve(3)
+    native_reservation = native.reserve_exact(3)
+    assert native_reservation.tolist() == [
+        exact_reservation.requested,
+        exact_reservation.granted,
+    ]
+    exact.complete(2)
+    exact.interrupt(1)
+    native.complete_exact(2)
+    native.interrupt_exact(1)
+    snapshot = native.snapshot().copy()
+    candidate_snapshot = candidate.snapshot_protocol_state()
+    assert snapshot.tolist() == [1, 4, 7, 1, 1, 3, 2, 1, 0]
+
+    candidate.reserve(1, atomic=False, context="temporary")
+    native.reserve_round(1, False)
+    native.reserve_exact(2)
+    candidate.rollback_protocol_state(candidate_snapshot)
+    state = native.restore(snapshot)
+    assert candidate.round_remaining == int(state[4]) == 1
+    assert state.tolist() == snapshot.tolist()
+
+    exact_reservation = exact.reserve(4)
+    native_reservation = native.reserve_exact(4)
+    assert native_reservation.tolist() == [
+        exact_reservation.requested,
+        exact_reservation.granted,
+    ]
+    exact.complete(2)
+    state = native.complete_exact(2)
+    assert state.tolist()[5:] == [
+        exact.started_calls,
+        exact.completed_calls,
+        exact.interrupted_calls,
+        exact.budget_exhaustions,
+    ]
+    with pytest.raises(RuntimeError, match="invalid completed"):
+        native.complete_exact(2)
+
+    candidate.finish_round()
+    assert native.finish_round().tolist()[:5] == [0, -1, -1, 0, 2]
 
 
 @pytest.mark.external_data

@@ -85,6 +85,41 @@ class NativeRouteCacheV2:
         npt.NDArray[np.uint8],
         npt.NDArray[np.int64],
     ]: ...
+    def begin_store_exact_many_atomic(
+        self,
+        route_offsets: npt.NDArray[np.int64],
+        route_indices: npt.NDArray[np.int64],
+        path_offsets: npt.NDArray[np.int64],
+        path_indices: npt.NDArray[np.int64],
+        result_statuses: npt.NDArray[np.int64],
+        reason_codes: npt.NDArray[np.int64],
+        result_metrics: npt.NDArray[np.float64],
+        label_counters: npt.NDArray[np.int64],
+        semantic_hashes: npt.NDArray[np.uint8],
+        entry_bytes: npt.NDArray[np.int64],
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+    ]: ...
+    def lookup_exact_many(
+        self,
+        route_offsets: npt.NDArray[np.int64],
+        route_indices: npt.NDArray[np.int64],
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.uint8],
+        npt.NDArray[np.int64],
+    ]: ...
+    def begin_protocol_transaction(self) -> None: ...
+    def commit_protocol_transaction(self) -> npt.NDArray[np.int64]: ...
+    def rollback_protocol_transaction(self) -> npt.NDArray[np.int64]: ...
     def begin_store_many_atomic(
         self,
         route_offsets: npt.NDArray[np.int64],
@@ -105,6 +140,48 @@ class NativeRouteCacheV2:
         npt.NDArray[np.int64],
         npt.NDArray[np.int64],
     ]: ...
+
+class NativeNegativeRouteCacheV2:
+    def __init__(self, capacity: int) -> None: ...
+    def lookup_many(
+        self,
+        route_offsets: npt.NDArray[np.int64],
+        route_indices: npt.NDArray[np.int64],
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+    ]: ...
+    def begin_store_many_atomic(
+        self,
+        route_offsets: npt.NDArray[np.int64],
+        route_indices: npt.NDArray[np.int64],
+        reason_codes: npt.NDArray[np.int64],
+    ) -> npt.NDArray[np.int64]: ...
+    def commit_store_batch(self) -> npt.NDArray[np.int64]: ...
+    def rollback_store_batch(self) -> npt.NDArray[np.int64]: ...
+    def snapshot(self) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+    ]: ...
+
+class NativeBudgetStateV2:
+    def __init__(self, exact_budget: int, round_budget: int) -> None: ...
+    def begin_round(self, lane_id: int, iteration: int) -> npt.NDArray[np.int64]: ...
+    def finish_round(self) -> npt.NDArray[np.int64]: ...
+    def reserve_round(
+        self, requested: int, atomic: bool
+    ) -> npt.NDArray[np.int64]: ...
+    def reserve_exact(self, requested: int) -> npt.NDArray[np.int64]: ...
+    def complete_exact(self, count: int) -> npt.NDArray[np.int64]: ...
+    def interrupt_exact(self, count: int) -> npt.NDArray[np.int64]: ...
+    def snapshot(self) -> npt.NDArray[np.int64]: ...
+    def restore(
+        self, snapshot: npt.NDArray[np.int64]
+    ) -> npt.NDArray[np.int64]: ...
+    def state(self) -> npt.NDArray[np.int64]: ...
 
 __build_git_revision__: str
 

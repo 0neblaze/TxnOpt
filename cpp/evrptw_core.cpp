@@ -1232,6 +1232,200 @@ public:
             std::move(status_array), std::move(eviction_array), statistics_array());
     }
 
+    py::tuple begin_store_exact_many_atomic(
+        py::handle route_offsets,
+        py::handle route_indices,
+        py::handle path_offsets,
+        py::handle path_indices,
+        py::handle result_statuses,
+        py::handle reason_codes,
+        py::handle result_metrics,
+        py::handle label_counters,
+        py::handle semantic_hashes,
+        py::handle entry_bytes) {
+        const auto routes = decode_routes(route_offsets, route_indices);
+        auto path_offsets_array = checked_array<std::int64_t>(
+            path_offsets, "path_offsets", 1);
+        auto path_indices_array = checked_array<std::int64_t>(
+            path_indices, "path_indices", 1);
+        auto statuses_array = checked_array<std::int64_t>(
+            result_statuses, "result_statuses", 1);
+        auto reasons_array = checked_array<std::int64_t>(
+            reason_codes, "reason_codes", 1);
+        auto metrics_array = checked_array<double>(
+            result_metrics, "result_metrics", 2);
+        auto labels_array = checked_array<std::int64_t>(
+            label_counters, "label_counters", 2);
+        const auto count = static_cast<py::ssize_t>(routes.size());
+        if (path_offsets_array.size() != count + 1
+            || statuses_array.size() != count || reasons_array.size() != count
+            || metrics_array.shape(0) != count || metrics_array.shape(1) != 4
+            || labels_array.shape(0) != count || labels_array.shape(1) != 3) {
+            throw std::invalid_argument(
+                "native exact route-cache payload arrays do not align");
+        }
+        const auto* path_boundaries = checked_data<std::int64_t>(path_offsets_array);
+        if (path_boundaries[0] != 0
+            || path_boundaries[count] != path_indices_array.size()) {
+            throw std::invalid_argument(
+                "native exact route-cache path boundary is invalid");
+        }
+        for (py::ssize_t index = 0; index < count; ++index) {
+            if (path_boundaries[index] < 0
+                || path_boundaries[index] > path_boundaries[index + 1]) {
+                throw std::invalid_argument(
+                    "native exact route-cache path offsets must be monotonic");
+            }
+        }
+        auto summary = begin_store_many_atomic(
+            route_offsets, route_indices, semantic_hashes, entry_bytes);
+        const auto* paths = checked_data<std::int64_t>(path_indices_array);
+        const auto* statuses = checked_data<std::int64_t>(statuses_array);
+        const auto* reasons = checked_data<std::int64_t>(reasons_array);
+        const auto* metrics = checked_data<double>(metrics_array);
+        const auto* labels = checked_data<std::int64_t>(labels_array);
+        const std::unordered_set<std::string> inserted(
+            active_batch_->inserted_keys.begin(), active_batch_->inserted_keys.end());
+        try {
+            for (std::size_t index = 0; index < routes.size(); ++index) {
+                if (statuses[index] < 0 || statuses[index] > 2 || reasons[index] < 0) {
+                    throw std::invalid_argument(
+                        "native exact route-cache status/reason is invalid");
+                }
+                const auto key = route_key(routes[index]);
+                const auto entry = find_entry(key);
+                if (entry == entries_.end()) {
+                    // Oversize entries are deliberately not cached.
+                    continue;
+                }
+                ExactPayload payload;
+                payload.path.assign(
+                    paths + path_boundaries[index],
+                    paths + path_boundaries[index + 1]);
+                payload.status = statuses[index];
+                payload.reason = reasons[index];
+                std::copy(
+                    metrics + index * 4, metrics + (index + 1) * 4,
+                    payload.metrics.begin());
+                std::copy(
+                    labels + index * 3, labels + (index + 1) * 3,
+                    payload.label_counters.begin());
+                if (entry->exact_payload.has_value()) {
+                    if (entry->exact_payload != payload) {
+                        throw std::runtime_error(
+                            "atomic native route-cache exact payload conflict");
+                    }
+                } else if (inserted.contains(key)) {
+                    entry->exact_payload = std::move(payload);
+                } else {
+                    throw std::runtime_error(
+                        "existing native route-cache entry lacks exact payload");
+                }
+            }
+        } catch (...) {
+            rollback_store_batch();
+            throw;
+        }
+        return summary;
+    }
+
+    py::tuple lookup_exact_many(
+        py::handle route_offsets,
+        py::handle route_indices) {
+        require_no_active_batch("lookup_exact_many");
+        const auto routes = decode_routes(route_offsets, route_indices);
+        py::array_t<std::int64_t> hit_flags(routes.size());
+        py::array_t<std::int64_t> statuses(routes.size());
+        py::array_t<std::int64_t> reasons(routes.size());
+        py::array_t<double> metrics(
+            {static_cast<py::ssize_t>(routes.size()), py::ssize_t(4)});
+        py::array_t<std::int64_t> labels(
+            {static_cast<py::ssize_t>(routes.size()), py::ssize_t(3)});
+        py::array_t<std::uint8_t> hashes(
+            {static_cast<py::ssize_t>(routes.size()), py::ssize_t(32)});
+        std::fill(checked_data(metrics), checked_data(metrics) + routes.size() * 4, 0.0);
+        std::fill(checked_data(labels), checked_data(labels) + routes.size() * 3, 0);
+        std::fill(checked_data(hashes), checked_data(hashes) + routes.size() * 32, 0);
+        std::vector<std::int64_t> path_offsets{0};
+        std::vector<std::int64_t> path_indices;
+        for (std::size_t index = 0; index < routes.size(); ++index) {
+            ++statistics_[0];
+            const auto key = route_key(routes[index]);
+            seen_keys_.insert(key);
+            statistics_[10] = static_cast<std::int64_t>(seen_keys_.size());
+            const auto found = find_entry(key);
+            if (found == entries_.end()) {
+                ++statistics_[2];
+                checked_data(hit_flags)[index] = 0;
+                checked_data(statuses)[index] = -1;
+                checked_data(reasons)[index] = -1;
+                path_offsets.push_back(static_cast<std::int64_t>(path_indices.size()));
+                continue;
+            }
+            if (!found->exact_payload.has_value()) {
+                throw std::runtime_error(
+                    "native route-cache hit lacks typed exact payload");
+            }
+            ++statistics_[1];
+            checked_data(hit_flags)[index] = 1;
+            const auto& payload = *found->exact_payload;
+            checked_data(statuses)[index] = payload.status;
+            checked_data(reasons)[index] = payload.reason;
+            std::copy(
+                payload.metrics.begin(), payload.metrics.end(),
+                checked_data(metrics) + index * 4);
+            std::copy(
+                payload.label_counters.begin(), payload.label_counters.end(),
+                checked_data(labels) + index * 3);
+            std::copy(
+                found->semantic_hash.begin(), found->semantic_hash.end(),
+                checked_data(hashes) + index * 32);
+            path_indices.insert(
+                path_indices.end(), payload.path.begin(), payload.path.end());
+            path_offsets.push_back(static_cast<std::int64_t>(path_indices.size()));
+            entries_.splice(entries_.end(), entries_, found);
+        }
+        py::array_t<std::int64_t> path_offsets_array(path_offsets.size());
+        py::array_t<std::int64_t> path_indices_array(path_indices.size());
+        std::copy(
+            path_offsets.begin(), path_offsets.end(), checked_data(path_offsets_array));
+        std::copy(
+            path_indices.begin(), path_indices.end(), checked_data(path_indices_array));
+        return py::make_tuple(
+            std::move(hit_flags), std::move(path_offsets_array),
+            std::move(path_indices_array), std::move(statuses), std::move(reasons),
+            std::move(metrics), std::move(labels), std::move(hashes),
+            statistics_array());
+    }
+
+    void begin_protocol_transaction() {
+        require_no_active_batch("begin_protocol_transaction");
+        if (protocol_snapshot_.has_value()) {
+            throw std::runtime_error(
+                "native route-cache protocol transaction is already active");
+        }
+        protocol_snapshot_ = ProtocolSnapshot{
+            entries_, seen_keys_, statistics_,
+        };
+    }
+
+    py::array_t<std::int64_t> commit_protocol_transaction() {
+        require_no_active_batch("commit_protocol_transaction");
+        require_protocol_snapshot("commit_protocol_transaction");
+        protocol_snapshot_.reset();
+        return statistics_array();
+    }
+
+    py::array_t<std::int64_t> rollback_protocol_transaction() {
+        require_no_active_batch("rollback_protocol_transaction");
+        require_protocol_snapshot("rollback_protocol_transaction");
+        entries_ = std::move(protocol_snapshot_->entries);
+        seen_keys_ = std::move(protocol_snapshot_->seen_keys);
+        statistics_ = protocol_snapshot_->statistics;
+        protocol_snapshot_.reset();
+        return statistics_array();
+    }
+
     py::array_t<std::int64_t> commit_store_batch() {
         require_active_batch("commit_store_batch");
         active_batch_.reset();
@@ -1272,17 +1466,32 @@ public:
     }
 
 private:
+    struct ExactPayload {
+        std::vector<std::int64_t> path;
+        std::int64_t status = -1;
+        std::int64_t reason = -1;
+        std::array<double, 4> metrics{};
+        std::array<std::int64_t, 3> label_counters{};
+
+        bool operator==(const ExactPayload&) const = default;
+    };
     struct Entry {
         std::string key;
         std::vector<std::int64_t> route;
         std::array<std::uint8_t, 32> semantic_hash{};
         std::int64_t entry_bytes = 0;
+        std::optional<ExactPayload> exact_payload;
     };
     struct BatchJournal {
         std::vector<std::string> inserted_keys;
         std::vector<Entry> evicted_entries;
         std::array<std::int64_t, 11> statistics_before{};
         bool active = false;
+    };
+    struct ProtocolSnapshot {
+        std::list<Entry> entries;
+        std::unordered_set<std::string> seen_keys;
+        std::array<std::int64_t, 11> statistics;
     };
 
     std::int64_t max_entries_;
@@ -1291,6 +1500,7 @@ private:
     std::unordered_set<std::string> seen_keys_;
     std::array<std::int64_t, 11> statistics_{};
     std::optional<BatchJournal> active_batch_;
+    std::optional<ProtocolSnapshot> protocol_snapshot_;
 
     static std::string route_key(const std::vector<std::int64_t>& route) {
         std::string key;
@@ -1356,6 +1566,14 @@ private:
         }
     }
 
+    void require_protocol_snapshot(const char* operation) const {
+        if (!protocol_snapshot_.has_value()) {
+            throw std::runtime_error(
+                std::string("native route-cache ") + operation
+                + " requires an active protocol transaction");
+        }
+    }
+
     void rollback_journal(const BatchJournal& journal) {
         const std::unordered_set<std::string> inserted(
             journal.inserted_keys.begin(), journal.inserted_keys.end());
@@ -1372,6 +1590,393 @@ private:
         py::array_t<std::int64_t> output(statistics_.size());
         std::copy(statistics_.begin(), statistics_.end(), checked_data(output));
         return output;
+    }
+};
+
+class NativeNegativeRouteCacheV2 {
+public:
+    explicit NativeNegativeRouteCacheV2(std::int64_t capacity)
+        : capacity_(capacity) {
+        if (capacity_ <= 0) {
+            throw std::invalid_argument(
+                "native negative route-cache capacity must be positive");
+        }
+    }
+
+    py::tuple lookup_many(py::handle route_offsets, py::handle route_indices) const {
+        const auto routes = decode_routes(route_offsets, route_indices);
+        py::array_t<std::int64_t> hit_flags(routes.size());
+        py::array_t<std::int64_t> reasons(routes.size());
+        for (std::size_t index = 0; index < routes.size(); ++index) {
+            const auto found = find_entry(route_key(routes[index]));
+            checked_data(hit_flags)[index] = found == entries_.end() ? 0 : 1;
+            checked_data(reasons)[index] = found == entries_.end() ? 0 : found->reason;
+        }
+        return py::make_tuple(
+            std::move(hit_flags), std::move(reasons), statistics_array());
+    }
+
+    py::array_t<std::int64_t> begin_store_many_atomic(
+        py::handle route_offsets,
+        py::handle route_indices,
+        py::handle reason_codes) {
+        if (active_batch_.has_value()) {
+            throw std::runtime_error(
+                "native negative route-cache already has an active batch");
+        }
+        const auto routes = decode_routes(route_offsets, route_indices);
+        auto reasons_array = checked_array<std::int64_t>(
+            reason_codes, "reason_codes", 1);
+        if (reasons_array.size() != static_cast<py::ssize_t>(routes.size())) {
+            throw std::invalid_argument(
+                "native negative route-cache reasons do not align");
+        }
+        const auto* reasons = checked_data<std::int64_t>(reasons_array);
+        std::unordered_set<std::string> input_keys;
+        std::vector<Entry> input;
+        std::vector<Entry> additions;
+        input.reserve(routes.size());
+        additions.reserve(routes.size());
+        for (std::size_t index = 0; index < routes.size(); ++index) {
+            if (reasons[index] <= 0) {
+                throw std::invalid_argument(
+                    "native negative route-cache reason must be positive");
+            }
+            Entry entry{
+                route_key(routes[index]), routes[index], reasons[index],
+            };
+            if (!input_keys.insert(entry.key).second) {
+                throw std::invalid_argument(
+                    "native negative route-cache input routes must be unique");
+            }
+            const auto existing = find_entry(entry.key);
+            if (existing != entries_.end() && existing->reason != entry.reason) {
+                throw std::runtime_error(
+                    "candidate negative cache reason changed during commit");
+            }
+            input.push_back(entry);
+            if (existing == entries_.end()) {
+                additions.push_back(std::move(entry));
+            }
+        }
+        BatchJournal journal;
+        journal.added_keys.reserve(additions.size());
+        for (const auto& entry : additions) {
+            journal.added_keys.push_back(entry.key);
+        }
+        journal.rollover = entries_.size() + additions.size()
+            > static_cast<std::size_t>(capacity_);
+        if (journal.rollover) {
+            if (input.size() > static_cast<std::size_t>(capacity_)) {
+                throw std::runtime_error(
+                    "one candidate transaction exceeds the negative route-cache capacity");
+            }
+            journal.previous_entries = entries_;
+            const std::unordered_set<std::string> replacement_keys(
+                input_keys.begin(), input_keys.end());
+            journal.evicted_count = static_cast<std::int64_t>(std::count_if(
+                entries_.begin(), entries_.end(),
+                [&](const Entry& entry) {
+                    return !replacement_keys.contains(entry.key);
+                }));
+            entries_ = std::move(input);
+        } else {
+            entries_.insert(entries_.end(), additions.begin(), additions.end());
+        }
+        active_batch_ = std::move(journal);
+        return batch_summary();
+    }
+
+    py::array_t<std::int64_t> commit_store_batch() {
+        require_active_batch("commit_store_batch");
+        statistics_[0] += static_cast<std::int64_t>(
+            active_batch_->added_keys.size());
+        statistics_[1] += active_batch_->evicted_count;
+        statistics_[2] += active_batch_->rollover ? 1 : 0;
+        statistics_[4] = std::max(
+            statistics_[4], static_cast<std::int64_t>(entries_.size()));
+        active_batch_.reset();
+        return statistics_array();
+    }
+
+    py::array_t<std::int64_t> rollback_store_batch() {
+        require_active_batch("rollback_store_batch");
+        if (active_batch_->rollover) {
+            entries_ = std::move(active_batch_->previous_entries);
+        } else {
+            const std::unordered_set<std::string> added(
+                active_batch_->added_keys.begin(), active_batch_->added_keys.end());
+            std::erase_if(
+                entries_, [&](const Entry& entry) { return added.contains(entry.key); });
+        }
+        active_batch_.reset();
+        return statistics_array();
+    }
+
+    py::tuple snapshot() const {
+        std::vector<std::int64_t> offsets{0};
+        std::vector<std::int64_t> indices;
+        py::array_t<std::int64_t> reasons(entries_.size());
+        for (std::size_t index = 0; index < entries_.size(); ++index) {
+            indices.insert(
+                indices.end(), entries_[index].route.begin(), entries_[index].route.end());
+            offsets.push_back(static_cast<std::int64_t>(indices.size()));
+            checked_data(reasons)[index] = entries_[index].reason;
+        }
+        py::array_t<std::int64_t> offsets_array(offsets.size());
+        py::array_t<std::int64_t> indices_array(indices.size());
+        std::copy(offsets.begin(), offsets.end(), checked_data(offsets_array));
+        std::copy(indices.begin(), indices.end(), checked_data(indices_array));
+        return py::make_tuple(
+            std::move(offsets_array), std::move(indices_array), std::move(reasons),
+            statistics_array());
+    }
+
+private:
+    struct Entry {
+        std::string key;
+        std::vector<std::int64_t> route;
+        std::int64_t reason;
+    };
+    struct BatchJournal {
+        std::vector<std::string> added_keys;
+        std::vector<Entry> previous_entries;
+        std::int64_t evicted_count = 0;
+        bool rollover = false;
+    };
+
+    std::int64_t capacity_;
+    std::vector<Entry> entries_;
+    // stores, evictions, rollovers, current entries, peak entries
+    std::array<std::int64_t, 5> statistics_{};
+    std::optional<BatchJournal> active_batch_;
+
+    static std::string route_key(const std::vector<std::int64_t>& route) {
+        std::string key;
+        key.resize((route.size() + 1) * sizeof(std::int64_t));
+        const auto length = static_cast<std::int64_t>(route.size());
+        std::memcpy(key.data(), &length, sizeof(length));
+        if (!route.empty()) {
+            std::memcpy(
+                key.data() + sizeof(length), route.data(),
+                route.size() * sizeof(std::int64_t));
+        }
+        return key;
+    }
+
+    static std::vector<std::vector<std::int64_t>> decode_routes(
+        py::handle route_offsets,
+        py::handle route_indices) {
+        auto offsets_array = checked_array<std::int64_t>(
+            route_offsets, "route_offsets", 1);
+        auto indices_array = checked_array<std::int64_t>(
+            route_indices, "route_indices", 1);
+        if (offsets_array.size() < 1) {
+            throw std::invalid_argument(
+                "native negative route-cache offsets cannot be empty");
+        }
+        const auto count = static_cast<std::size_t>(offsets_array.size() - 1);
+        const auto* offsets = checked_data<std::int64_t>(offsets_array);
+        const auto* indices = checked_data<std::int64_t>(indices_array);
+        if (offsets[0] != 0 || offsets[count] != indices_array.size()) {
+            throw std::invalid_argument(
+                "native negative route-cache offsets boundary is invalid");
+        }
+        std::vector<std::vector<std::int64_t>> routes;
+        routes.reserve(count);
+        for (std::size_t route = 0; route < count; ++route) {
+            if (offsets[route] < 0 || offsets[route] > offsets[route + 1]) {
+                throw std::invalid_argument(
+                    "native negative route-cache offsets must be monotonic");
+            }
+            routes.emplace_back(
+                indices + offsets[route], indices + offsets[route + 1]);
+        }
+        return routes;
+    }
+
+    std::vector<Entry>::const_iterator find_entry(const std::string& key) const {
+        return std::find_if(
+            entries_.begin(), entries_.end(),
+            [&](const Entry& entry) { return entry.key == key; });
+    }
+
+    void require_active_batch(const char* operation) const {
+        if (!active_batch_.has_value()) {
+            throw std::runtime_error(
+                std::string("native negative route-cache ") + operation
+                + " requires an active batch");
+        }
+    }
+
+    py::array_t<std::int64_t> batch_summary() const {
+        py::array_t<std::int64_t> output(3);
+        checked_data(output)[0] = static_cast<std::int64_t>(
+            active_batch_->added_keys.size());
+        checked_data(output)[1] = active_batch_->evicted_count;
+        checked_data(output)[2] = active_batch_->rollover ? 1 : 0;
+        return output;
+    }
+
+    py::array_t<std::int64_t> statistics_array() const {
+        auto output_values = statistics_;
+        output_values[3] = static_cast<std::int64_t>(entries_.size());
+        py::array_t<std::int64_t> output(output_values.size());
+        std::copy(output_values.begin(), output_values.end(), checked_data(output));
+        return output;
+    }
+};
+
+class NativeBudgetStateV2 {
+public:
+    NativeBudgetStateV2(std::int64_t exact_budget, std::int64_t round_budget)
+        : exact_budget_(exact_budget), round_budget_(round_budget) {
+        if (exact_budget_ == 0 || exact_budget_ < -1 || round_budget_ <= 0) {
+            throw std::invalid_argument("native budget limits are invalid");
+        }
+    }
+
+    py::array_t<std::int64_t> begin_round(
+        std::int64_t lane_id, std::int64_t iteration) {
+        if (lane_id < 0 || iteration < 0) {
+            throw std::invalid_argument("native round identity must be non-negative");
+        }
+        if (round_active_ && lane_id_ == lane_id && iteration_ == iteration) {
+            return state();
+        }
+        round_active_ = true;
+        lane_id_ = lane_id;
+        iteration_ = iteration;
+        round_used_ = 0;
+        return state();
+    }
+
+    py::array_t<std::int64_t> finish_round() {
+        round_active_ = false;
+        lane_id_ = -1;
+        iteration_ = -1;
+        round_used_ = 0;
+        return state();
+    }
+
+    py::array_t<std::int64_t> reserve_round(
+        std::int64_t requested, bool atomic) {
+        if (requested <= 0) {
+            py::array_t<std::int64_t> output(3);
+            checked_data(output)[0] = requested;
+            checked_data(output)[1] = 0;
+            checked_data(output)[2] = round_remaining();
+            return output;
+        }
+        std::int64_t granted = requested;
+        if (round_active_) {
+            granted = atomic
+                ? (requested <= round_remaining() ? requested : 0)
+                : std::min(requested, round_remaining());
+        }
+        round_used_ += granted;
+        py::array_t<std::int64_t> output(3);
+        checked_data(output)[0] = requested;
+        checked_data(output)[1] = granted;
+        checked_data(output)[2] = round_remaining();
+        return output;
+    }
+
+    py::array_t<std::int64_t> reserve_exact(std::int64_t requested) {
+        if (requested <= 0) {
+            throw std::invalid_argument("exact-call reservation must be positive");
+        }
+        const auto granted = exact_budget_ < 0
+            ? requested
+            : std::min(requested, std::max<std::int64_t>(0, exact_budget_ - started_));
+        started_ += granted;
+        py::array_t<std::int64_t> output(2);
+        checked_data(output)[0] = requested;
+        checked_data(output)[1] = granted;
+        return output;
+    }
+
+    py::array_t<std::int64_t> complete_exact(std::int64_t count) {
+        if (count < 0 || completed_ + count > started_) {
+            throw std::runtime_error("invalid completed exact-call count");
+        }
+        completed_ += count;
+        return state();
+    }
+
+    py::array_t<std::int64_t> interrupt_exact(std::int64_t count) {
+        if (count < 0 || completed_ + interrupted_ + count > started_) {
+            throw std::runtime_error("invalid interrupted exact-call count");
+        }
+        interrupted_ += count;
+        return state();
+    }
+
+    py::array_t<std::int64_t> snapshot() const {
+        return state();
+    }
+
+    py::array_t<std::int64_t> restore(py::handle snapshot) {
+        auto snapshot_array = checked_array<std::int64_t>(
+            snapshot, "snapshot", 1);
+        if (snapshot_array.size() != 9) {
+            throw std::invalid_argument("native budget snapshot shape is invalid");
+        }
+        const auto* values = checked_data<std::int64_t>(snapshot_array);
+        if ((values[0] != 0 && values[0] != 1) || values[3] < 0
+            || values[5] < 0 || values[6] < 0 || values[7] < 0
+            || values[6] + values[7] > values[5]
+            || (values[0] == 1 && (values[1] < 0 || values[2] < 0))) {
+            throw std::invalid_argument("native budget snapshot values are invalid");
+        }
+        round_active_ = values[0] == 1;
+        lane_id_ = values[1];
+        iteration_ = values[2];
+        round_used_ = values[3];
+        started_ = values[5];
+        completed_ = values[6];
+        interrupted_ = values[7];
+        if (!round_active_) {
+            lane_id_ = -1;
+            iteration_ = -1;
+            round_used_ = 0;
+        }
+        if (round_used_ > round_budget_
+            || (exact_budget_ >= 0 && started_ > exact_budget_)) {
+            throw std::invalid_argument("native budget snapshot exceeds configured limits");
+        }
+        return state();
+    }
+
+    py::array_t<std::int64_t> state() const {
+        py::array_t<std::int64_t> output(9);
+        auto* values = checked_data(output);
+        values[0] = round_active_ ? 1 : 0;
+        values[1] = lane_id_;
+        values[2] = iteration_;
+        values[3] = round_used_;
+        values[4] = round_remaining();
+        values[5] = started_;
+        values[6] = completed_;
+        values[7] = interrupted_;
+        values[8] = exact_budget_ >= 0 && started_ >= exact_budget_ ? 1 : 0;
+        return output;
+    }
+
+private:
+    std::int64_t exact_budget_;
+    std::int64_t round_budget_;
+    bool round_active_ = false;
+    std::int64_t lane_id_ = -1;
+    std::int64_t iteration_ = -1;
+    std::int64_t round_used_ = 0;
+    std::int64_t started_ = 0;
+    std::int64_t completed_ = 0;
+    std::int64_t interrupted_ = 0;
+
+    [[nodiscard]] std::int64_t round_remaining() const {
+        return round_active_ ? std::max<std::int64_t>(0, round_budget_ - round_used_)
+                             : round_budget_;
     }
 };
 
@@ -7098,9 +7703,66 @@ PYBIND11_MODULE(_core, module) {
             &NativeRouteCacheV2::begin_store_many_atomic,
             py::arg("route_offsets"), py::arg("route_indices"),
             py::arg("semantic_hashes"), py::arg("entry_bytes"))
+        .def(
+            "begin_store_exact_many_atomic",
+            &NativeRouteCacheV2::begin_store_exact_many_atomic,
+            py::arg("route_offsets"), py::arg("route_indices"),
+            py::arg("path_offsets"), py::arg("path_indices"),
+            py::arg("result_statuses"), py::arg("reason_codes"),
+            py::arg("result_metrics"), py::arg("label_counters"),
+            py::arg("semantic_hashes"), py::arg("entry_bytes"))
+        .def(
+            "lookup_exact_many", &NativeRouteCacheV2::lookup_exact_many,
+            py::arg("route_offsets"), py::arg("route_indices"))
+        .def(
+            "begin_protocol_transaction",
+            &NativeRouteCacheV2::begin_protocol_transaction)
+        .def(
+            "commit_protocol_transaction",
+            &NativeRouteCacheV2::commit_protocol_transaction)
+        .def(
+            "rollback_protocol_transaction",
+            &NativeRouteCacheV2::rollback_protocol_transaction)
         .def("commit_store_batch", &NativeRouteCacheV2::commit_store_batch)
         .def("rollback_store_batch", &NativeRouteCacheV2::rollback_store_batch)
         .def("snapshot", &NativeRouteCacheV2::snapshot);
+    py::class_<NativeNegativeRouteCacheV2>(module, "NativeNegativeRouteCacheV2")
+        .def(py::init<std::int64_t>(), py::arg("capacity"))
+        .def(
+            "lookup_many", &NativeNegativeRouteCacheV2::lookup_many,
+            py::arg("route_offsets"), py::arg("route_indices"))
+        .def(
+            "begin_store_many_atomic",
+            &NativeNegativeRouteCacheV2::begin_store_many_atomic,
+            py::arg("route_offsets"), py::arg("route_indices"),
+            py::arg("reason_codes"))
+        .def("commit_store_batch", &NativeNegativeRouteCacheV2::commit_store_batch)
+        .def(
+            "rollback_store_batch", &NativeNegativeRouteCacheV2::rollback_store_batch)
+        .def("snapshot", &NativeNegativeRouteCacheV2::snapshot);
+    py::class_<NativeBudgetStateV2>(module, "NativeBudgetStateV2")
+        .def(
+            py::init<std::int64_t, std::int64_t>(),
+            py::arg("exact_budget"), py::arg("round_budget"))
+        .def(
+            "begin_round", &NativeBudgetStateV2::begin_round,
+            py::arg("lane_id"), py::arg("iteration"))
+        .def("finish_round", &NativeBudgetStateV2::finish_round)
+        .def(
+            "reserve_round", &NativeBudgetStateV2::reserve_round,
+            py::arg("requested"), py::arg("atomic"))
+        .def(
+            "reserve_exact", &NativeBudgetStateV2::reserve_exact,
+            py::arg("requested"))
+        .def(
+            "complete_exact", &NativeBudgetStateV2::complete_exact,
+            py::arg("count"))
+        .def(
+            "interrupt_exact", &NativeBudgetStateV2::interrupt_exact,
+            py::arg("count"))
+        .def("snapshot", &NativeBudgetStateV2::snapshot)
+        .def("restore", &NativeBudgetStateV2::restore, py::arg("snapshot"))
+        .def("state", &NativeBudgetStateV2::state);
     py::class_<Stage052ReplayState>(module, "Stage052ReplayState")
         .def(
             py::init<const py::dict&, const py::dict&>(),
