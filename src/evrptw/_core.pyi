@@ -387,6 +387,33 @@ def candidate_control_repair_v2(
     npt.NDArray[np.int64],
     npt.NDArray[np.int64],
 ]: ...
+def constraint_removal_v2(
+    operation: int,
+    node_kind: npt.NDArray[np.int64],
+    demand: npt.NDArray[np.float64],
+    ready_time: npt.NDArray[np.float64],
+    due_date: npt.NDArray[np.float64],
+    service_time: npt.NDArray[np.float64],
+    distance: npt.NDArray[np.float64],
+    reachable: npt.NDArray[np.uint8],
+    vehicle: npt.NDArray[np.float64],
+    lexical_rank: npt.NDArray[np.int64],
+    route_offsets: npt.NDArray[np.int64],
+    route_indices: npt.NDArray[np.int64],
+    path_offsets: npt.NDArray[np.int64],
+    path_indices: npt.NDArray[np.int64],
+    result_metrics: npt.NDArray[np.float64],
+    requested_count: int,
+    seed: int,
+) -> tuple[
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.float64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+]: ...
 def screen_route_batch_transaction_v2(
     node_kind: npt.NDArray[np.int64],
     demand: npt.NDArray[np.float64],

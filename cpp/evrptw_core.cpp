@@ -6980,6 +6980,374 @@ py::tuple candidate_control_repair_v2(
         std::move(counters));
 }
 
+py::tuple constraint_removal_v2(
+    std::int64_t operation,
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle lexical_rank,
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle path_offsets,
+    py::handle path_indices,
+    py::handle result_metrics,
+    std::int64_t requested_count,
+    std::uint64_t seed) {
+    auto kind_array = checked_array<std::int64_t>(node_kind, "node_kind", 1);
+    auto demand_array = checked_array<double>(demand, "demand", 1);
+    auto ready_array = checked_array<double>(ready_time, "ready_time", 1);
+    auto due_array = checked_array<double>(due_date, "due_date", 1);
+    auto service_array = checked_array<double>(service_time, "service_time", 1);
+    auto distance_array = checked_array<double>(distance, "distance", 2);
+    auto reachable_array = checked_array<std::uint8_t>(reachable, "reachable", 2);
+    auto vehicle_array = checked_array<double>(vehicle, "vehicle", 1);
+    auto lexical_array = checked_array<std::int64_t>(
+        lexical_rank, "lexical_rank", 1);
+    auto route_offsets_array = checked_array<std::int64_t>(
+        route_offsets, "route_offsets", 1);
+    auto route_indices_array = checked_array<std::int64_t>(
+        route_indices, "route_indices", 1);
+    auto path_offsets_array = checked_array<std::int64_t>(
+        path_offsets, "path_offsets", 1);
+    auto path_indices_array = checked_array<std::int64_t>(
+        path_indices, "path_indices", 1);
+    auto metrics_array = checked_array<double>(result_metrics, "result_metrics", 2);
+    const auto node_count = static_cast<std::size_t>(kind_array.size());
+    if (operation < 0 || operation > 3 || requested_count < 0 || node_count == 0
+        || demand_array.size() != kind_array.size()
+        || ready_array.size() != kind_array.size()
+        || due_array.size() != kind_array.size()
+        || service_array.size() != kind_array.size()
+        || lexical_array.size() != kind_array.size()
+        || distance_array.shape(0) != kind_array.size()
+        || distance_array.shape(1) != kind_array.size()
+        || reachable_array.shape(0) != kind_array.size()
+        || reachable_array.shape(1) != kind_array.size()
+        || vehicle_array.size() != 5 || route_offsets_array.size() < 2) {
+        throw std::invalid_argument(
+            "constraint removal v2 input/config shape is invalid");
+    }
+    const auto route_count = static_cast<std::size_t>(
+        route_offsets_array.size() - 1);
+    if (path_offsets_array.size() != static_cast<py::ssize_t>(route_count + 1)
+        || metrics_array.shape(0) != static_cast<py::ssize_t>(route_count)
+        || metrics_array.shape(1) != 4) {
+        throw std::invalid_argument(
+            "constraint removal v2 exact payload does not align with routes");
+    }
+    const auto* kinds = checked_data<std::int64_t>(kind_array);
+    const auto* demands = checked_data<double>(demand_array);
+    const auto* ready = checked_data<double>(ready_array);
+    const auto* due = checked_data<double>(due_array);
+    const auto* service = checked_data<double>(service_array);
+    const auto* distances = checked_data<double>(distance_array);
+    const auto* vehicle_values = checked_data<double>(vehicle_array);
+    const auto* lexical = checked_data<std::int64_t>(lexical_array);
+    const auto* route_boundaries = checked_data<std::int64_t>(route_offsets_array);
+    const auto* route_values = checked_data<std::int64_t>(route_indices_array);
+    const auto* path_boundaries = checked_data<std::int64_t>(path_offsets_array);
+    const auto* path_values = checked_data<std::int64_t>(path_indices_array);
+    const auto* metrics = checked_data<double>(metrics_array);
+    if (route_boundaries[0] != 0
+        || route_boundaries[route_count] != route_indices_array.size()
+        || path_boundaries[0] != 0
+        || path_boundaries[route_count] != path_indices_array.size()) {
+        throw std::invalid_argument(
+            "constraint removal v2 route/path boundaries are invalid");
+    }
+    std::unordered_set<std::int64_t> lexical_values;
+    std::vector<std::int64_t> all_instance_customers;
+    std::int64_t depot = -1;
+    for (std::size_t node = 0; node < node_count; ++node) {
+        if (lexical[node] < 0 || lexical[node] >= static_cast<std::int64_t>(node_count)
+            || !lexical_values.insert(lexical[node]).second) {
+            throw std::invalid_argument(
+                "constraint removal lexical_rank must be a permutation");
+        }
+        if (kinds[node] == customer_kind) {
+            all_instance_customers.push_back(static_cast<std::int64_t>(node));
+        } else if (kinds[node] == depot_kind) {
+            if (depot >= 0) {
+                throw std::invalid_argument(
+                    "constraint removal requires exactly one depot");
+            }
+            depot = static_cast<std::int64_t>(node);
+        } else if (kinds[node] != depot_kind && kinds[node] != station_kind) {
+            throw std::invalid_argument(
+                "constraint removal node_kind contains an unknown code");
+        }
+    }
+    if (depot < 0) {
+        throw std::invalid_argument(
+            "constraint removal requires exactly one depot");
+    }
+    std::vector<std::vector<std::int64_t>> routes;
+    routes.reserve(route_count);
+    std::unordered_set<std::int64_t> all_customers;
+    for (std::size_t route = 0; route < route_count; ++route) {
+        if (route_boundaries[route] < 0
+            || route_boundaries[route] >= route_boundaries[route + 1]
+            || path_boundaries[route] < 0
+            || path_boundaries[route] >= path_boundaries[route + 1]) {
+            throw std::invalid_argument(
+                "constraint removal routes must be non-empty and monotonic");
+        }
+        routes.emplace_back(
+            route_values + route_boundaries[route],
+            route_values + route_boundaries[route + 1]);
+        for (const auto customer : routes.back()) {
+            if (customer < 0 || static_cast<std::size_t>(customer) >= node_count
+                || kinds[customer] != customer_kind
+                || !all_customers.insert(customer).second) {
+                throw std::invalid_argument(
+                    "constraint removal requires unique customer-only routes");
+            }
+        }
+        for (auto position = path_boundaries[route];
+             position < path_boundaries[route + 1]; ++position) {
+            const auto node = path_values[position];
+            if (node < 0 || static_cast<std::size_t>(node) >= node_count) {
+                throw std::invalid_argument(
+                    "constraint removal exact path contains an invalid node");
+            }
+        }
+        for (std::size_t field = 0; field < 4; ++field) {
+            if (!std::isfinite(metrics[route * 4 + field])
+                || metrics[route * 4 + field] < 0.0) {
+                throw std::invalid_argument(
+                    "constraint removal exact metrics are invalid");
+            }
+        }
+    }
+
+    struct Score {
+        std::int64_t customer;
+        double value;
+        std::size_t route;
+    };
+    std::vector<Score> scores;
+    std::int64_t anchor = -1;
+    if (operation == 3) {
+        auto ordered_customers = std::vector<std::int64_t>(
+            all_customers.begin(), all_customers.end());
+        std::sort(
+            ordered_customers.begin(), ordered_customers.end(),
+            [&](std::int64_t left, std::int64_t right) {
+                return lexical[left] < lexical[right];
+            });
+        if (!ordered_customers.empty()) {
+            PythonRandom random(seed);
+            anchor = ordered_customers[random.randbelow(ordered_customers.size())];
+        }
+    }
+    const auto path_distance = [&](const std::int64_t* values, std::size_t count) {
+        PythonFloatSum total;
+        for (std::size_t position = 1; position < count; ++position) {
+            total.add(distances[
+                static_cast<std::size_t>(values[position - 1]) * node_count
+                + static_cast<std::size_t>(values[position])]);
+        }
+        return total.value();
+    };
+    for (std::size_t route = 0; route < route_count; ++route) {
+        const auto* path = path_values + path_boundaries[route];
+        const auto path_size = static_cast<std::size_t>(
+            path_boundaries[route + 1] - path_boundaries[route]);
+        if (operation == 0 || operation == 2) {
+            std::vector<std::pair<std::size_t, std::int64_t>> positions;
+            for (std::size_t position = 0; position < path_size; ++position) {
+                if (kinds[path[position]] == customer_kind) {
+                    positions.emplace_back(position, path[position]);
+                }
+            }
+            const auto station_count = static_cast<double>(std::count_if(
+                path, path + path_size, [&](std::int64_t node) {
+                    return kinds[node] == station_kind;
+                }));
+            const auto route_pressure = 2.0 * station_count
+                + metrics[route * 4 + 2] + 10.0 * metrics[route * 4 + 3];
+            for (std::size_t index = 0; index < positions.size(); ++index) {
+                const auto left = index == 0 ? std::size_t{0} : positions[index - 1].first;
+                const auto right = index + 1 < positions.size()
+                    ? positions[index + 1].first
+                    : path_size - 1;
+                const auto local_distance = path_distance(path + left, right - left + 1);
+                const auto direct = distances[
+                    static_cast<std::size_t>(path[left]) * node_count
+                    + static_cast<std::size_t>(path[right])];
+                auto value = local_distance - direct;
+                if (operation == 0) {
+                    const auto local_stations = static_cast<double>(std::count_if(
+                        path + left, path + right + 1, [&](std::int64_t node) {
+                            return kinds[node] == station_kind;
+                        }));
+                    value += 2.0 * local_stations
+                        + route_pressure
+                            / static_cast<double>(std::max<std::size_t>(1, positions.size()));
+                }
+                scores.push_back(Score{positions[index].second, value, route});
+            }
+            continue;
+        }
+        if (operation == 1) {
+            double current_time = std::max(0.0, ready[depot]);
+            double battery = vehicle_values[0];
+            for (std::size_t position = 1; position < path_size; ++position) {
+                const auto origin = path[position - 1];
+                const auto destination = path[position];
+                const auto leg = distances[
+                    static_cast<std::size_t>(origin) * node_count
+                    + static_cast<std::size_t>(destination)];
+                battery -= leg * vehicle_values[2];
+                current_time += leg / vehicle_values[4];
+                current_time = std::max(current_time, ready[destination]);
+                if (kinds[destination] == station_kind) {
+                    const auto charged = vehicle_values[0] - std::max(0.0, battery);
+                    current_time += charged * vehicle_values[3];
+                    battery = vehicle_values[0];
+                } else if (kinds[destination] == customer_kind) {
+                    scores.push_back(Score{
+                        destination, -(due[destination] - current_time), route});
+                    current_time += service[destination];
+                }
+            }
+            continue;
+        }
+        double maximum_distance = 0.0;
+        double maximum_time = 0.0;
+        double maximum_demand = 0.0;
+        for (const auto customer : all_instance_customers) {
+            maximum_distance = std::max(
+                maximum_distance,
+                distances[static_cast<std::size_t>(anchor) * node_count
+                          + static_cast<std::size_t>(customer)]);
+            maximum_time = std::max(maximum_time, due[customer]);
+            maximum_demand = std::max(maximum_demand, demands[customer]);
+        }
+        for (const auto customer : routes[route]) {
+            const auto normalized_distance = distances[
+                static_cast<std::size_t>(anchor) * node_count
+                + static_cast<std::size_t>(customer)]
+                / std::max(maximum_distance, exact_epsilon);
+            const auto time_difference = (
+                std::fabs(ready[anchor] - ready[customer])
+                + std::fabs(due[anchor] - due[customer]))
+                / std::max(maximum_time, exact_epsilon);
+            const auto demand_difference = std::fabs(
+                demands[anchor] - demands[customer])
+                / std::max(maximum_demand, exact_epsilon);
+            const auto energy_reachable = [&]() {
+                if (anchor == customer) {
+                    return true;
+                }
+                std::vector<std::int64_t> frontier{anchor};
+                std::unordered_set<std::int64_t> visited_stations;
+                while (!frontier.empty()) {
+                    const auto current = frontier.back();
+                    frontier.pop_back();
+                    if (distances[
+                            static_cast<std::size_t>(current) * node_count
+                            + static_cast<std::size_t>(customer)]
+                            * vehicle_values[2]
+                        <= vehicle_values[0] + exact_epsilon) {
+                        return true;
+                    }
+                    if (current != anchor && kinds[current] != depot_kind
+                        && kinds[current] != station_kind) {
+                        continue;
+                    }
+                    for (std::size_t station = 0; station < node_count; ++station) {
+                        if (kinds[station] != station_kind
+                            || static_cast<std::int64_t>(station) == current
+                            || visited_stations.contains(
+                                static_cast<std::int64_t>(station))) {
+                            continue;
+                        }
+                        if (distances[
+                                static_cast<std::size_t>(current) * node_count + station]
+                                * vehicle_values[2]
+                            <= vehicle_values[0] + exact_epsilon) {
+                            visited_stations.insert(static_cast<std::int64_t>(station));
+                            frontier.push_back(static_cast<std::int64_t>(station));
+                        }
+                    }
+                }
+                return false;
+            }();
+            const auto energy_penalty = energy_reachable ? 0.0 : 1.0;
+            scores.push_back(Score{
+                customer,
+                normalized_distance + 0.25 * time_difference
+                    + 0.25 * demand_difference + energy_penalty,
+                route});
+        }
+    }
+    std::stable_sort(scores.begin(), scores.end(), [&](const Score& left, const Score& right) {
+        if (left.value != right.value) {
+            return operation == 3 ? left.value < right.value : left.value > right.value;
+        }
+        if (left.route != right.route) {
+            return left.route < right.route;
+        }
+        return lexical[left.customer] < lexical[right.customer];
+    });
+    const auto actual_count = std::min<std::size_t>(
+        {static_cast<std::size_t>(requested_count), scores.size(),
+         all_customers.empty() ? std::size_t{0} : all_customers.size() - 1});
+    std::unordered_set<std::int64_t> chosen;
+    std::vector<std::int64_t> removed_output;
+    removed_output.reserve(actual_count);
+    for (std::size_t index = 0; index < actual_count; ++index) {
+        chosen.insert(scores[index].customer);
+        removed_output.push_back(scores[index].customer);
+    }
+    std::vector<std::int64_t> partial_offsets{0};
+    std::vector<std::int64_t> partial_indices;
+    for (const auto& route : routes) {
+        for (const auto customer : route) {
+            if (!chosen.contains(customer)) {
+                partial_indices.push_back(customer);
+            }
+        }
+        if (partial_offsets.back() != static_cast<std::int64_t>(partial_indices.size())) {
+            partial_offsets.push_back(static_cast<std::int64_t>(partial_indices.size()));
+        }
+    }
+    py::array_t<std::int64_t> partial_offsets_array(partial_offsets.size());
+    py::array_t<std::int64_t> partial_indices_array(partial_indices.size());
+    py::array_t<std::int64_t> removed_output_array(removed_output.size());
+    py::array_t<std::int64_t> score_nodes(scores.size());
+    py::array_t<double> score_values(scores.size());
+    py::array_t<std::int64_t> score_routes(scores.size());
+    py::array_t<std::int64_t> metadata(3);
+    std::copy(
+        partial_offsets.begin(), partial_offsets.end(),
+        checked_data(partial_offsets_array));
+    std::copy(
+        partial_indices.begin(), partial_indices.end(),
+        checked_data(partial_indices_array));
+    std::copy(
+        removed_output.begin(), removed_output.end(),
+        checked_data(removed_output_array));
+    for (std::size_t index = 0; index < scores.size(); ++index) {
+        checked_data(score_nodes)[index] = scores[index].customer;
+        checked_data(score_values)[index] = scores[index].value;
+        checked_data(score_routes)[index] = static_cast<std::int64_t>(scores[index].route);
+    }
+    checked_data(metadata)[0] = scores.empty() ? 1 : 0;
+    checked_data(metadata)[1] = anchor;
+    checked_data(metadata)[2] = static_cast<std::int64_t>(actual_count);
+    return py::make_tuple(
+        std::move(partial_offsets_array), std::move(partial_indices_array),
+        std::move(removed_output_array), std::move(score_nodes),
+        std::move(score_values), std::move(score_routes), std::move(metadata));
+}
+
 py::tuple screen_route_batch_transaction_impl(
     py::handle node_kind,
     py::handle demand,
@@ -9272,6 +9640,26 @@ PYBIND11_MODULE(_core, module) {
         py::arg("epsilon"),
         py::arg("route_change_limit"),
         py::arg("allow_new_routes"));
+    module.def(
+        "constraint_removal_v2",
+        &constraint_removal_v2,
+        py::arg("operation"),
+        py::arg("node_kind"),
+        py::arg("demand"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("reachable"),
+        py::arg("vehicle"),
+        py::arg("lexical_rank"),
+        py::arg("route_offsets"),
+        py::arg("route_indices"),
+        py::arg("path_offsets"),
+        py::arg("path_indices"),
+        py::arg("result_metrics"),
+        py::arg("requested_count"),
+        py::arg("seed"));
     module.def(
         "screen_route_batch_transaction_v2",
         &screen_route_batch_transaction_v2,

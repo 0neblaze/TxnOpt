@@ -1318,6 +1318,147 @@ def test_native_candidate_control_repair_matches_python_safe_bound_selection(
     assert int(counters[6]) == (0 if expected.sequences is not None else len(removed))
 
 
+@pytest.mark.parametrize(
+    ("operation", "operator_name"),
+    [
+        (0, "station_pressure"),
+        (1, "time_window_conflict"),
+        (2, "worst_energy_detour"),
+        (3, "shaw_related"),
+    ],
+)
+def test_native_constraint_removal_matches_python_ranking_and_rng(
+    operation: int,
+    operator_name: str,
+) -> None:
+    from evrptw import _core as native_core
+    from evrptw import neighborhoods
+
+    instance = _candidate_plan_fixture()
+    sequences = (("C1", "C2"), ("C3", "C4"))
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    lexical_names = sorted(context.node_names)
+    lexical_by_name = {name: rank for rank, name in enumerate(lexical_names)}
+    lexical_rank = np.asarray(
+        [lexical_by_name[name] for name in context.node_names],
+        dtype=np.int64,
+    )
+    route_offsets = np.asarray([0, 2, 4], dtype=np.int64)
+    route_indices = np.asarray(
+        [context.name_to_index[name] for route in sequences for name in route],
+        dtype=np.int64,
+    )
+    exact_payload = native_core.exact_charging_batch_numeric(
+        context.node_kind,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.vehicle,
+        route_offsets,
+        route_indices,
+        np.asarray([10.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+    )
+    payload = native_core.constraint_removal_v2(
+        operation,
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        lexical_rank,
+        route_offsets,
+        route_indices,
+        exact_payload[0],
+        exact_payload[1],
+        exact_payload[4],
+        2,
+        0x5EED,
+    )
+    (
+        partial_offsets,
+        partial_indices,
+        removed_indices,
+        score_nodes,
+        score_values,
+        score_routes,
+        metadata,
+    ) = payload
+    observed_partial = tuple(
+        tuple(
+            context.node_names[int(index)]
+            for index in partial_indices[
+                int(partial_offsets[route]) : int(partial_offsets[route + 1])
+            ]
+        )
+        for route in range(len(partial_offsets) - 1)
+    )
+    observed_removed = tuple(
+        context.node_names[int(index)] for index in removed_indices
+    )
+    observed_ranking = tuple(
+        (
+            context.node_names[int(node)],
+            float(score),
+            int(route),
+        )
+        for node, score, route in zip(
+            score_nodes,
+            score_values,
+            score_routes,
+            strict=True,
+        )
+    )
+
+    class PrecomputedEvaluator:
+        calls = 0
+
+    exact_results = tuple(
+        solve_exact_charging(instance, sequence) for sequence in sequences
+    )
+    selection = neighborhoods.RemovalSizeSelection(
+        tier=neighborhoods.RemovalTier.SMALL,
+        requested_count=2,
+        lower_bound=1,
+        upper_bound=2,
+        stagnation_iterations=0,
+        trigger_reason="test",
+        reset_observed=False,
+    )
+    expected = neighborhoods.propose_constraint_removal(
+        instance,
+        sequences,
+        PrecomputedEvaluator(),  # type: ignore[arg-type]
+        operator=operator_name,
+        selection=selection,
+        seed=0x5EED,
+        precomputed_routes=dict(zip(sequences, exact_results, strict=True)),
+    )
+
+    assert int(metadata[0]) == 0
+    assert int(metadata[2]) == len(expected.removed_customers)
+    assert observed_partial == expected.partial
+    assert observed_removed == expected.removed_customers
+    assert [item[0] for item in observed_ranking] == [
+        name for name, _score in expected.scores
+    ]
+    assert [item[1] for item in observed_ranking] == pytest.approx(
+        [score for _name, score in expected.scores]
+    )
+    route_by_name = {
+        name: route
+        for route, sequence in enumerate(sequences)
+        for name in sequence
+    }
+    assert [item[2] for item in observed_ranking] == [
+        route_by_name[name] for name, _score in expected.scores
+    ]
+
+
 def test_native_candidate_plan_ranking_matches_python_rank_key() -> None:
     from evrptw import _core as native_core
 
