@@ -9,8 +9,10 @@ from typing import Any
 from evrptw.charging import solve_exact_charging
 from evrptw.experiments.stage052_native_architecture_review import (
     ReviewRecord,
+    _scheduler_screening_occupancy,
     render_report,
     review_records,
+    write_review,
 )
 from evrptw.experiments.stage052_native_architectures import (
     MODES,
@@ -98,6 +100,10 @@ def _review_fixture_records(root: Path) -> tuple[ReviewRecord, ...]:
             "axis": "fixed_work",
             "instance": "c101C5",
             "seed": 2014,
+            "revision": "c" * 40,
+            "wheel_sha256": "d" * 64,
+            "native_sha256": "e" * 64,
+            "run_label": f"stage05.2_native_architecture_{mode.value}_test_attempt01",
             "routes": routes,
             "objective": list(objective.key),
             "solver_seconds": 1.0,
@@ -151,6 +157,73 @@ def test_independent_review_replays_routes_and_accepts_equal_fixed_work() -> Non
     assert isinstance(gates, dict)
     assert all(bool(gates[mode.value]["passed"]) for mode in MODES[2:])
     assert "五模式事实表" in render_report(review)
+
+
+def test_cuda_condition_does_not_reuse_exact_backend_occupancy() -> None:
+    root = Path(__file__).resolve().parents[1]
+    records = list(_review_fixture_records(root))
+    host = next(record for record in records if record.mode.value == "host_scheduler")
+    assert isinstance(host.payload, dict)
+    host.payload["backend_metrics"] = {"launch_occupancies": [64]}
+
+    condition = _scheduler_screening_occupancy((host,))
+
+    assert condition == {
+        "available": False,
+        "condition_met": False,
+        "maximum": None,
+        "reason": "native candidate-screening occupancy is not recorded",
+    }
+
+
+def test_review_writer_emits_hash_bound_review_manifest(tmp_path: Path) -> None:
+    output_json = tmp_path / "paired_review.json"
+    output_markdown = tmp_path / "paired_report.md"
+    review = {
+        "schema_version": "test-review-v1",
+        "scope": "paired",
+        "review_status": "NOT_READY",
+        "reviewer_provenance": {
+            "repository_revision": "a" * 40,
+            "source_sha256": "b" * 64,
+        },
+        "producer_identity": {
+            "repository_revisions": ["c" * 40],
+            "wheel_sha256": ["d" * 64],
+            "native_sha256": ["e" * 64],
+            "run_labels": ["stage05.2_native_architecture_test_attempt01"],
+        },
+        "mode_metrics": {mode.value: {} for mode in MODES},
+        "performance": {},
+        "differential_gates": {},
+        "historical_attempt72": {
+            "available": False,
+            "identity_verified": False,
+            "comparison_count": 0,
+        },
+        "cuda_evaluation_condition": {
+            "available": False,
+            "condition_met": False,
+            "maximum": None,
+            "reason": "native candidate-screening occupancy is not recorded",
+        },
+        "axis_replay_passed": False,
+        "axis_count": 0,
+    }
+
+    write_review(review, output_json=output_json, output_markdown=output_markdown)
+
+    manifest = json.loads(
+        (tmp_path / "paired_review_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["reviewer_provenance"] == review["reviewer_provenance"]
+    assert manifest["producer_identity"] == review["producer_identity"]
+    assert manifest["files"][output_json.name] == hashlib.sha256(
+        output_json.read_bytes()
+    ).hexdigest()
+    assert manifest["files"][output_markdown.name] == hashlib.sha256(
+        output_markdown.read_bytes()
+    ).hexdigest()
 
 
 def test_one_wall_clock_group_runs_all_five_modes_with_one_scheduler(

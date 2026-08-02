@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import statistics
+import subprocess
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -27,10 +28,18 @@ from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.validation import validate_routes
 
-REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v3"
+REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v4"
 HISTORICAL_PILOT_ROOT = Path(
     "/mnt/e/Reproducible-EVRPTW-archive/stage05.2/runs/"
     "stage05.2_benchmark_attempt72/generation-0001/d_benchmark"
+)
+HISTORICAL_PILOT_RUN_LABEL = "stage05.2_benchmark_attempt72"
+HISTORICAL_PILOT_REVISION = "a5cf00f7580fc2632179495a739a110786ace87d"
+HISTORICAL_PILOT_RAW_MANIFEST_SHA256 = (
+    "5aa8b773c39ea3e0a8cd31434756f4219c3ec51f430bdcae1e61107fdd3f38e4"
+)
+HISTORICAL_PILOT_REVIEW_MANIFEST_SHA256 = (
+    "24de9cc93ad99f7d607617e11e8c9bee7fda224a421da1f97dd3af1bd6277727"
 )
 
 
@@ -352,23 +361,170 @@ def _mode_metrics(records: Iterable[ReviewRecord]) -> dict[str, object]:
     }
 
 
-def _historical_pilot() -> dict[tuple[str, int], dict[str, object]]:
-    if not HISTORICAL_PILOT_ROOT.is_dir():
-        return {}
-    records: dict[tuple[str, int], dict[str, object]] = {}
-    for path in HISTORICAL_PILOT_ROOT.glob(
-        "batch*/*/*/stage05.2_benchmark_attempt72_raw_*.json"
-    ):
-        payload = json.loads(path.read_bytes())
-        if not isinstance(payload, dict):
-            continue
-        axes = payload.get("axes")
-        if not isinstance(axes, dict) or not isinstance(axes.get("wall_clock_30"), dict):
-            continue
-        records[(str(payload["instance"]), int(payload["seed"]))] = dict(
-            axes["wall_clock_30"]
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _verify_sidecar(path: Path) -> str:
+    sidecar = path.with_suffix(path.suffix + ".sha256")
+    if not sidecar.is_file():
+        sidecar = path.with_suffix(".sha256")
+    expected = sidecar.read_text(encoding="ascii").strip().split()[0]
+    actual = _sha256(path)
+    if expected != actual:
+        raise ValueError(f"checksum mismatch: {path}")
+    return actual
+
+
+def _historical_pilot(
+    root: Path = HISTORICAL_PILOT_ROOT,
+) -> tuple[dict[tuple[str, int], dict[str, object]], dict[str, object]]:
+    if not root.is_dir():
+        return {}, {
+            "available": False,
+            "identity_verified": False,
+            "error": "historical archive is not available",
+        }
+    active = root.parent / "wsl_active"
+    try:
+        campaign_path = active / "campaign_manifest.json"
+        raw_manifest_path = active / "control" / f"{HISTORICAL_PILOT_RUN_LABEL}_manifest.json"
+        run_metadata_path = (
+            active / "control" / f"{HISTORICAL_PILOT_RUN_LABEL}_run_metadata.json"
         )
-    return records
+        review_manifest_path = active / "review" / "review_manifest.json"
+        review_execution_path = active / "review" / "review_execution.json"
+        campaign_sha256 = _verify_sidecar(campaign_path)
+        raw_manifest_sha256 = _verify_sidecar(raw_manifest_path)
+        if raw_manifest_sha256 != HISTORICAL_PILOT_RAW_MANIFEST_SHA256:
+            raise ValueError("historical raw manifest is not the accepted identity")
+        review_manifest_sha256 = _sha256(review_manifest_path)
+        if review_manifest_sha256 != HISTORICAL_PILOT_REVIEW_MANIFEST_SHA256:
+            raise ValueError("historical review manifest is not the accepted identity")
+
+        campaign = json.loads(campaign_path.read_bytes())
+        raw_manifest = json.loads(raw_manifest_path.read_bytes())
+        run_metadata = json.loads(run_metadata_path.read_bytes())
+        review_manifest = json.loads(review_manifest_path.read_bytes())
+        review_execution = json.loads(review_execution_path.read_bytes())
+        if not all(
+            isinstance(value, dict)
+            for value in (
+                campaign,
+                raw_manifest,
+                run_metadata,
+                review_manifest,
+                review_execution,
+            )
+        ):
+            raise ValueError("historical identity documents must be JSON objects")
+        if (
+            campaign.get("run_label") != HISTORICAL_PILOT_RUN_LABEL
+            or campaign.get("scope") != "pilot"
+            or campaign.get("status") != "complete"
+            or campaign.get("axis_count") != 36
+            or campaign.get("shard_count") != 36
+            or raw_manifest.get("run_label") != HISTORICAL_PILOT_RUN_LABEL
+            or raw_manifest.get("status") != "complete"
+            or run_metadata.get("repository_revision") != HISTORICAL_PILOT_REVISION
+            or review_manifest.get("run_label") != HISTORICAL_PILOT_RUN_LABEL
+            or review_manifest.get("scope") != "pilot"
+            or review_manifest.get("status")
+            != "READY_FOR_STAGE052_FORMAL_BENCHMARK"
+            or review_execution.get("review_manifest_sha256")
+            != review_manifest_sha256
+            or review_execution.get("raw_manifest_sha256_before")
+            != raw_manifest_sha256
+            or review_execution.get("raw_manifest_sha256_after")
+            != raw_manifest_sha256
+            or review_execution.get("producer_repository_revision")
+            != HISTORICAL_PILOT_REVISION
+        ):
+            raise ValueError("historical accepted-Pilot identity fields do not match")
+        gates = review_manifest.get("gates")
+        if not isinstance(gates, dict) or not gates or any(
+            not isinstance(gate, dict) or gate.get("passed") is not True
+            for gate in gates.values()
+        ):
+            raise ValueError("historical accepted review gates do not all pass")
+
+        batches = campaign.get("batches")
+        if not isinstance(batches, list) or len(batches) != 3:
+            raise ValueError("historical campaign must contain exactly three batches")
+        records: dict[tuple[str, int], dict[str, object]] = {}
+        for batch in batches:
+            if not isinstance(batch, dict):
+                raise ValueError("historical batch entry must be an object")
+            batch_id = _string(batch, "batch_id")
+            batch_root = root / batch_id
+            batch_manifest_path = batch_root / "batch_manifest.json"
+            _verify_sidecar(batch_manifest_path)
+            batch_manifest = json.loads(batch_manifest_path.read_bytes())
+            if batch_manifest != batch or batch.get("status") != "archived":
+                raise ValueError(f"historical batch identity mismatch: {batch_id}")
+            shard_hashes = batch.get("shard_manifest_sha256_by_id")
+            if not isinstance(shard_hashes, dict) or len(shard_hashes) != 12:
+                raise ValueError(f"historical batch shard map is invalid: {batch_id}")
+            shard_paths = tuple(batch_root.glob("*/*/*_shard_manifest_*.json"))
+            if len(shard_paths) != 12:
+                raise ValueError(f"historical batch must contain 12 shard manifests: {batch_id}")
+            for shard_path in shard_paths:
+                shard = json.loads(shard_path.read_bytes())
+                if not isinstance(shard, dict):
+                    raise ValueError("historical shard manifest must be an object")
+                ordinal = _integer(shard, "shard_ordinal") + 1
+                shard_id = f"shard{ordinal:04d}"
+                if shard_hashes.get(shard_id) != _sha256(shard_path):
+                    raise ValueError(f"historical shard manifest mismatch: {shard_id}")
+                if (
+                    shard.get("run_label") != HISTORICAL_PILOT_RUN_LABEL
+                    or shard.get("evidence_completeness") != "complete"
+                ):
+                    raise ValueError(f"historical shard is not complete: {shard_id}")
+                artifacts = shard.get("artifacts")
+                if not isinstance(artifacts, list):
+                    raise ValueError("historical shard artifacts must be an array")
+                raw_artifacts = [
+                    artifact
+                    for artifact in artifacts
+                    if isinstance(artifact, dict) and artifact.get("artifact_type") == "raw"
+                ]
+                if len(raw_artifacts) != 1:
+                    raise ValueError(f"historical shard raw identity is ambiguous: {shard_id}")
+                raw_artifact = raw_artifacts[0]
+                raw_path = batch_root / _string(raw_artifact, "relative_path")
+                if raw_artifact.get("checksum") != _sha256(raw_path):
+                    raise ValueError(f"historical raw checksum mismatch: {shard_id}")
+                payload = json.loads(raw_path.read_bytes())
+                if not isinstance(payload, dict):
+                    raise ValueError("historical raw payload must be an object")
+                axes = payload.get("axes")
+                if not isinstance(axes, dict) or not isinstance(
+                    axes.get("wall_clock_30"), dict
+                ):
+                    raise ValueError("historical raw payload lacks wall_clock_30")
+                key = (_string(payload, "instance"), _integer(payload, "seed"))
+                if key in records:
+                    raise ValueError(f"duplicate historical instance/seed: {key}")
+                records[key] = dict(axes["wall_clock_30"])
+        expected_keys = {(name, seed) for name in FORMAL_INSTANCES for seed in SEEDS}
+        if set(records) != expected_keys:
+            raise ValueError("historical accepted-Pilot geometry does not match 12x3")
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        return {}, {
+            "available": True,
+            "identity_verified": False,
+            "error": str(exc),
+        }
+    return records, {
+        "available": True,
+        "identity_verified": True,
+        "error": None,
+        "campaign_manifest_sha256": campaign_sha256,
+        "raw_manifest_sha256": raw_manifest_sha256,
+        "review_manifest_sha256": review_manifest_sha256,
+        "producer_revision": HISTORICAL_PILOT_REVISION,
+    }
 
 
 def review_records(
@@ -590,7 +746,18 @@ def review_records(
             "performance_qualified": performance_qualified,
         }
 
-    historical = _historical_pilot() if scope == "pilot" else {}
+    historical, historical_identity = (
+        _historical_pilot()
+        if scope == "pilot"
+        else (
+            {},
+            {
+                "available": False,
+                "identity_verified": False,
+                "error": "not assessed for paired scope",
+            },
+        )
+    )
     historical_drift: list[dict[str, object]] = []
     if historical:
         for record in by_mode[ArchitectureMode.CURRENT_STAGE052]:
@@ -637,6 +804,9 @@ def review_records(
         if axis_replay_passed
         else "NOT_READY"
     )
+    cuda_evaluation_condition = _scheduler_screening_occupancy(
+        by_mode[ArchitectureMode.HOST_SCHEDULER]
+    )
     return {
         "schema_version": REVIEW_SCHEMA_VERSION,
         "scope": scope,
@@ -655,13 +825,16 @@ def review_records(
         "differential_gates": differential,
         "performance": speedups,
         "historical_attempt72": {
-            "available": bool(historical),
+            **historical_identity,
             "comparison_count": len(historical_drift),
             "drift": historical_drift,
         },
-        "cuda_evaluation_condition_met": _scheduler_occupancy_at_least_32(
-            by_mode[ArchitectureMode.HOST_SCHEDULER]
+        "cuda_evaluation_condition": cuda_evaluation_condition,
+        "cuda_evaluation_condition_met": bool(
+            cuda_evaluation_condition["condition_met"]
         ),
+        "producer_identity": _producer_identity(records),
+        "reviewer_provenance": _reviewer_provenance(),
         "formal_started": False,
         "production_default_changed": False,
         "qualification_passed": qualification_passed,
@@ -669,20 +842,77 @@ def review_records(
     }
 
 
-def _scheduler_occupancy_at_least_32(records: Iterable[ReviewRecord]) -> bool:
+def _scheduler_screening_occupancy(
+    records: Iterable[ReviewRecord],
+) -> dict[str, object]:
     occupancy: list[int] = []
     for record in records:
-        backend = record.payload.get("backend_metrics")
-        if not isinstance(backend, dict):
+        native = record.payload.get("native_execution_statistics")
+        if not isinstance(native, dict):
             continue
-        values = backend.get("launch_occupancies")
+        values = native.get("candidate_screening_occupancies")
         if isinstance(values, list):
             occupancy.extend(
                 value
                 for value in values
-                if isinstance(value, int) and not isinstance(value, bool)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0
             )
-    return bool(occupancy) and max(occupancy) >= 32
+    if not occupancy:
+        return {
+            "available": False,
+            "condition_met": False,
+            "maximum": None,
+            "reason": "native candidate-screening occupancy is not recorded",
+        }
+    maximum = max(occupancy)
+    return {
+        "available": True,
+        "condition_met": maximum >= 32,
+        "maximum": maximum,
+        "reason": "native candidate-screening occupancy replayed",
+    }
+
+
+def _producer_identity(records: Iterable[ReviewRecord]) -> dict[str, object]:
+    values = tuple(records)
+    return {
+        "repository_revisions": sorted(
+            {_string(record.payload, "revision") for record in values}
+        ),
+        "wheel_sha256": sorted(
+            {_string(record.payload, "wheel_sha256") for record in values}
+        ),
+        "native_sha256": sorted(
+            {_string(record.payload, "native_sha256") for record in values}
+        ),
+        "run_labels": sorted(
+            {_string(record.payload, "run_label") for record in values}
+        ),
+    }
+
+
+def _reviewer_provenance() -> dict[str, object]:
+    source_path = Path(__file__).resolve()
+    repository_root = source_path.parents[3]
+    revision: str | None = None
+    try:
+        completed = subprocess.run(
+            ("git", "rev-parse", "HEAD"),
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        candidate = completed.stdout.strip()
+        if len(candidate) == 40:
+            revision = candidate
+    except (OSError, subprocess.CalledProcessError):
+        revision = None
+    return {
+        "repository_revision": revision,
+        "source_path": "src/evrptw/experiments/stage052_native_architecture_review.py",
+        "source_sha256": _sha256(source_path),
+    }
 
 
 def render_report(review: Mapping[str, object]) -> str:
@@ -690,6 +920,7 @@ def render_report(review: Mapping[str, object]) -> str:
     performance = _mapping(review, "performance")
     differential = _mapping(review, "differential_gates")
     historical = _mapping(review, "historical_attempt72")
+    cuda = _mapping(review, "cuda_evaluation_condition")
     lines = [
         "# Stage 5.2 五种原生架构同机对比报告",
         "",
@@ -795,10 +1026,13 @@ def render_report(review: Mapping[str, object]) -> str:
             "Accepted Pilot `attempt72` 仅用于长期漂移核验，不替代同机实测。",
             "",
             f"- Historical available（历史证据可用）：`{historical.get('available')}`",
+            f"- Historical identity verified（历史身份已核验）："
+            f"`{historical.get('identity_verified')}`",
             f"- Historical comparisons（历史配对数）："
             f"`{historical.get('comparison_count')}`",
             f"- CUDA condition（CUDA 条件）："
-            f"`{review.get('cuda_evaluation_condition_met')}`；本轮未自动运行 CUDA。",
+            f"`{cuda.get('condition_met')}`；{cuda.get('reason')}；"
+            "本轮未自动运行 CUDA。",
             "",
             "## 边界",
             "",
@@ -837,6 +1071,27 @@ def write_review(
     )
     output_markdown.parent.mkdir(parents=True, exist_ok=True)
     output_markdown.write_text(render_report(review), encoding="utf-8")
+    reviewer = _mapping(review, "reviewer_provenance")
+    producer = _mapping(review, "producer_identity")
+    manifest = {
+        "schema_version": "stage05.2-native-architecture-review-manifest-v1",
+        "scope": _string(review, "scope"),
+        "status": _string(review, "review_status"),
+        "reviewer_provenance": dict(reviewer),
+        "producer_identity": dict(producer),
+        "files": {
+            output_json.name: _sha256(output_json),
+            output_json.with_suffix(output_json.suffix + ".sha256").name: _sha256(
+                output_json.with_suffix(output_json.suffix + ".sha256")
+            ),
+            output_markdown.name: _sha256(output_markdown),
+        },
+    }
+    manifest_path = output_json.with_name(output_json.stem + "_manifest.json")
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -879,6 +1134,8 @@ __all__ = (
     "HISTORICAL_PILOT_ROOT",
     "REVIEW_SCHEMA_VERSION",
     "ReviewRecord",
+    "_historical_pilot",
+    "_scheduler_screening_occupancy",
     "load_records",
     "render_report",
     "review_records",
