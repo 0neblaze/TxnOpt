@@ -104,6 +104,7 @@ from evrptw.objective import (
 )
 from evrptw.stage04 import Stage04Config
 from evrptw.validation import validate_routes
+from evrptw.warm_start import WarmStartValidationConfig
 
 __all__ = (
     "ALNSResult",
@@ -2866,6 +2867,7 @@ def _solve_alns(
     candidate_transaction_config: NativeCandidateTransactionConfig | None = None,
     initial_customer_sequences: tuple[tuple[str, ...], ...] | None = None,
     initial_solution_provenance: Mapping[str, object] | None = None,
+    warm_start_validation_config: WarmStartValidationConfig | None = None,
     stage04_config: Stage04Config | None = None,
     native_kernel_config: NativeKernelConfig | None = None,
     native_execution_config: Stage052NativeExecutionConfig | None = None,
@@ -3051,24 +3053,31 @@ def _solve_alns(
             if initial_customer_sequences is None:
                 initial_sequences = _construct_initial_solution(instance, evaluator)
             else:
-                if candidate_control_runtime is None:
+                if (
+                    candidate_control_runtime is None
+                    and warm_start_validation_config is None
+                ):
                     raise RuntimeError("inherited initialization requires candidate control")
-                candidate_control_runtime.events.append(
-                    {
-                        "event_type": "candidate_initial_solution",
-                        "status": "submitted",
-                        "customer_sequences": [
-                            list(sequence) for sequence in initial_customer_sequences
-                        ],
-                        **dict(initial_solution_provenance or {}),
-                    }
-                )
-                selected_initial = evaluator.select_feasible_candidate_plan(
-                    (initial_customer_sequences,),
-                    current_sequences=(),
-                    allow_vehicle_increase=True,
-                )
-                initial_sequences = selected_initial or ()
+                initialization_event = {
+                    "event_type": "candidate_initial_solution",
+                    "status": "submitted",
+                    "customer_sequences": [
+                        list(sequence) for sequence in initial_customer_sequences
+                    ],
+                    **dict(initial_solution_provenance or {}),
+                }
+                if candidate_control_runtime is not None:
+                    candidate_control_runtime.events.append(initialization_event)
+                    selected_initial = evaluator.select_feasible_candidate_plan(
+                        (initial_customer_sequences,),
+                        current_sequences=(),
+                        allow_vehicle_increase=True,
+                    )
+                    initial_sequences = selected_initial or ()
+                else:
+                    if measurement_trace is not None:
+                        measurement_trace.events.append(initialization_event)
+                    initial_sequences = initial_customer_sequences
             if candidate_control_runtime is not None and initial_customer_sequences is None:
                 initial_sequences = _refine_controlled_initial_solution(
                     instance,
@@ -4813,6 +4822,10 @@ def _solve_full_native_alns(
     backend: ExactChargingBackend | str,
     batch_size: int,
     termination_mode: str,
+    removal_fraction: float,
+    vehicle_operator_config: VehicleOperatorConfig | None,
+    screening_config: CheapScreeningConfig | None,
+    cache_incremental_config: CacheIncrementalConfig | None,
     config: Stage052NativeExecutionConfig,
     exact_deadline_config: ExactDeadlineConfig | None,
     initial_customer_sequences: tuple[tuple[str, ...], ...] | None,
@@ -4822,6 +4835,14 @@ def _solve_full_native_alns(
 
     if max_iterations is None:
         raise ValueError("full native ALNS currently requires a finite iteration limit")
+    if initial_customer_sequences is None:
+        raise ValueError("full native v2 requires an explicit warm start")
+    if screening_config is None or not screening_config.enabled:
+        raise ValueError("full native v2 requires enabled screening")
+    if cache_incremental_config is None or not cache_incremental_config.enabled:
+        raise ValueError("full native v2 requires enabled cache/incremental control")
+    if stage04_config is None or not stage04_config.enabled:
+        raise ValueError("full native v2 requires enabled Stage 4")
     started = time.perf_counter()
     native_runtime = NativeKernelRuntime.build(instance, config.native_kernel_config)
     dispatcher: Callable[..., object] | None = None
@@ -4850,6 +4871,14 @@ def _solve_full_native_alns(
         ),
         native_runtime=native_runtime,
         initial_customer_sequences=initial_customer_sequences,
+        candidate_control_config=config.candidate_control_config,
+        stage04_config=stage04_config,
+        vehicle_operator_config=vehicle_operator_config or VehicleOperatorConfig(),
+        screening_config=screening_config,
+        cache_incremental_config=cache_incremental_config,
+        removal_fraction=removal_fraction,
+        termination_mode=termination_mode,
+        operator_profile=OperatorProfile(operator_profile).value,
         exact_call_budget=(
             exact_deadline_config.exact_call_budget
             if exact_deadline_config is not None
@@ -5030,6 +5059,7 @@ def solve_alns(
     candidate_control_config: CandidateControlConfig | None = None,
     initial_customer_sequences: tuple[tuple[str, ...], ...] | None = None,
     initial_solution_provenance: Mapping[str, object] | None = None,
+    warm_start_validation_config: WarmStartValidationConfig | None = None,
     stage04_config: Stage04Config | None = None,
     native_kernel_config: NativeKernelConfig | None = None,
     candidate_transaction_config: NativeCandidateTransactionConfig | None = None,
@@ -5107,16 +5137,29 @@ def solve_alns(
     ):
         raise ValueError("Stage 5.2 candidate transactions require cpu_batch")
     if initial_customer_sequences is not None:
-        if not candidate_control_enabled:
-            raise ValueError("an inherited initial solution requires candidate control")
+        if not candidate_control_enabled and warm_start_validation_config is None:
+            raise ValueError(
+                "an inherited initial solution requires candidate control or the explicit "
+                "warm-start validation protocol"
+            )
         supplied_customers = [
             customer for sequence in initial_customer_sequences for customer in sequence
         ]
         expected_customers = sorted(customer.name for customer in instance.customers)
         if sorted(supplied_customers) != expected_customers:
             raise ValueError("inherited initial solution must cover every customer exactly once")
+        if warm_start_validation_config is not None:
+            source_sha256 = (initial_solution_provenance or {}).get(
+                "source_solution_sha256"
+            )
+            if not isinstance(source_sha256, str) or len(source_sha256) != 64:
+                raise ValueError(
+                    "warm-start validation requires a source solution SHA-256"
+                )
     elif initial_solution_provenance is not None:
         raise ValueError("initial solution provenance requires inherited customer sequences")
+    elif warm_start_validation_config is not None:
+        raise ValueError("warm-start validation requires inherited customer sequences")
     if (
         candidate_control_enabled
         and ExactChargingBackend(backend) is not ExactChargingBackend.CPU_BATCH
@@ -5147,6 +5190,10 @@ def solve_alns(
             backend=backend,
             batch_size=batch_size,
             termination_mode=termination_mode,
+            removal_fraction=removal_fraction,
+            vehicle_operator_config=vehicle_operator_config,
+            screening_config=screening_config,
+            cache_incremental_config=cache_incremental_config,
             config=native_execution_config,
             exact_deadline_config=exact_deadline_config,
             initial_customer_sequences=initial_customer_sequences,
@@ -5208,6 +5255,7 @@ def solve_alns(
                 candidate_control_runtime=candidate_control_runtime,
                 initial_customer_sequences=initial_customer_sequences,
                 initial_solution_provenance=initial_solution_provenance,
+                warm_start_validation_config=warm_start_validation_config,
                 stage04_config=stage04_config,
                 native_kernel_config=native_kernel_config,
                 candidate_transaction_config=candidate_transaction_config,
@@ -5253,6 +5301,7 @@ def solve_alns(
             candidate_control_runtime=candidate_control_runtime,
             initial_customer_sequences=initial_customer_sequences,
             initial_solution_provenance=initial_solution_provenance,
+            warm_start_validation_config=warm_start_validation_config,
             stage04_config=stage04_config,
             native_kernel_config=native_kernel_config,
             candidate_transaction_config=candidate_transaction_config,

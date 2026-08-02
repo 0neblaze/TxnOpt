@@ -98,6 +98,12 @@ class NativeHostScheduler:
                 self.socket_path.unlink(missing_ok=True)
                 raise RuntimeError("host scheduler exited before becoming ready")
             if self.socket_path.exists():
+                try:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                        probe.connect(str(self.socket_path))
+                except ConnectionRefusedError:
+                    time.sleep(0.01)
+                    continue
                 return
             time.sleep(0.01)
         self.close(force=True)

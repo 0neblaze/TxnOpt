@@ -303,6 +303,634 @@ py::tuple python_random_golden_v1(
         std::move(shuffled_values));
 }
 
+py::array_t<std::int64_t> native_objective_acceptance_v1(
+    py::handle current_integer,
+    py::handle current_float,
+    py::handle candidate_integer,
+    py::handle candidate_float,
+    py::handle temperatures,
+    py::handle random_draws) {
+    auto current_i = checked_array<std::int64_t>(
+        current_integer, "current_integer", 2);
+    auto current_f = checked_array<double>(current_float, "current_float", 2);
+    auto candidate_i = checked_array<std::int64_t>(
+        candidate_integer, "candidate_integer", 2);
+    auto candidate_f = checked_array<double>(candidate_float, "candidate_float", 2);
+    auto temperature_array = checked_array<double>(temperatures, "temperatures", 1);
+    auto random_array = checked_array<double>(random_draws, "random_draws", 1);
+    const auto rows = current_i.shape(0);
+    if (current_i.shape(1) != 2 || candidate_i.shape(0) != rows
+        || candidate_i.shape(1) != 2 || current_f.shape(0) != rows
+        || current_f.shape(1) != 2 || candidate_f.shape(0) != rows
+        || candidate_f.shape(1) != 2 || temperature_array.size() != rows
+        || random_array.size() != rows) {
+        throw std::invalid_argument("native objective acceptance arrays do not align");
+    }
+    const auto* current_integer_values = checked_data<std::int64_t>(current_i);
+    const auto* current_float_values = checked_data<double>(current_f);
+    const auto* candidate_integer_values = checked_data<std::int64_t>(candidate_i);
+    const auto* candidate_float_values = checked_data<double>(candidate_f);
+    const auto* temperature_values = checked_data<double>(temperature_array);
+    const auto* random_values = checked_data<double>(random_array);
+    py::array_t<std::int64_t> output(rows);
+    auto* accepted = checked_data(output);
+    const auto round_objective = [](double value) {
+        constexpr auto scale = 1'000'000'000.0;
+        return std::nearbyint(value * scale) / scale;
+    };
+    for (py::ssize_t row = 0; row < rows; ++row) {
+        const auto current_vehicles = current_integer_values[row * 2];
+        const auto candidate_vehicles = candidate_integer_values[row * 2];
+        const auto current_key = std::make_tuple(
+            current_vehicles,
+            round_objective(current_float_values[row * 2]),
+            round_objective(current_float_values[row * 2 + 1]),
+            current_integer_values[row * 2 + 1]);
+        const auto candidate_key = std::make_tuple(
+            candidate_vehicles,
+            round_objective(candidate_float_values[row * 2]),
+            round_objective(candidate_float_values[row * 2 + 1]),
+            candidate_integer_values[row * 2 + 1]);
+        if (!std::isfinite(temperature_values[row]) || temperature_values[row] <= 0.0
+            || !std::isfinite(random_values[row]) || random_values[row] < 0.0
+            || random_values[row] > 1.0) {
+            throw std::invalid_argument("native acceptance temperature/draw is invalid");
+        }
+        if (candidate_vehicles < current_vehicles) {
+            accepted[row] = 1;
+        } else if (candidate_vehicles > current_vehicles) {
+            accepted[row] = 0;
+        } else if (candidate_key <= current_key) {
+            accepted[row] = 1;
+        } else if (std::get<1>(candidate_key) == std::get<1>(current_key)) {
+            accepted[row] = 0;
+        } else {
+            const auto distance_delta = candidate_float_values[row * 2]
+                - current_float_values[row * 2];
+            accepted[row] = random_values[row]
+                    < std::exp(-distance_delta / temperature_values[row])
+                ? 1
+                : 0;
+        }
+    }
+    return output;
+}
+
+py::tuple stage04_segment_update_v1(
+    py::handle weights,
+    py::handle reward_sums,
+    py::handle calls,
+    py::handle options) {
+    auto weight_array = checked_array<double>(weights, "weights", 1);
+    auto reward_array = checked_array<double>(reward_sums, "reward_sums", 1);
+    auto call_array = checked_array<std::int64_t>(calls, "calls", 1);
+    auto option_array = checked_array<double>(options, "options", 1);
+    if (reward_array.size() != weight_array.size()
+        || call_array.size() != weight_array.size() || option_array.size() != 4) {
+        throw std::invalid_argument("Stage 4 segment arrays do not align");
+    }
+    const auto* old_weights = checked_data<double>(weight_array);
+    const auto* rewards = checked_data<double>(reward_array);
+    const auto* call_values = checked_data<std::int64_t>(call_array);
+    const auto* config = checked_data<double>(option_array);
+    const auto reaction = config[0];
+    const auto floor = config[1];
+    const auto smoothing = config[2];
+    const auto minimum_calls = static_cast<std::int64_t>(config[3]);
+    if (!(reaction > 0.0 && reaction <= 1.0) || !(floor > 0.0 && floor < 1.0)
+        || !(smoothing >= 0.0 && smoothing <= 1.0) || minimum_calls <= 0) {
+        throw std::invalid_argument("Stage 4 segment options are invalid");
+    }
+    py::array_t<double> updated(weight_array.size());
+    py::array_t<std::int64_t> statuses(weight_array.size());
+    auto* updated_values = checked_data(updated);
+    auto* status_values = checked_data(statuses);
+    for (py::ssize_t index = 0; index < weight_array.size(); ++index) {
+        if (call_values[index] < 0 || !std::isfinite(old_weights[index])
+            || !std::isfinite(rewards[index])) {
+            throw std::invalid_argument("Stage 4 segment values are invalid");
+        }
+        if (call_values[index] < minimum_calls) {
+            updated_values[index] = old_weights[index];
+            status_values[index] = 0;
+            continue;
+        }
+        const auto average = rewards[index] / static_cast<double>(call_values[index]);
+        const auto reacted = std::max(
+            floor,
+            (1.0 - reaction) * old_weights[index] + reaction * average);
+        updated_values[index] = smoothing * old_weights[index]
+            + (1.0 - smoothing) * reacted;
+        status_values[index] = 1;
+    }
+    return py::make_tuple(std::move(updated), std::move(statuses));
+}
+
+py::tuple changed_candidate_pool_v1(
+    std::int64_t operation,
+    py::handle route_offsets,
+    py::handle route_indices) {
+    auto offsets_array = checked_array<std::int64_t>(
+        route_offsets, "route_offsets", 1);
+    auto indices_array = checked_array<std::int64_t>(
+        route_indices, "route_indices", 1);
+    if (operation < 0 || operation > 2 || offsets_array.size() < 2) {
+        throw std::invalid_argument("changed-candidate operation/routes are invalid");
+    }
+    const auto* offsets = checked_data<std::int64_t>(offsets_array);
+    const auto* indices = checked_data<std::int64_t>(indices_array);
+    const auto route_count = static_cast<std::size_t>(offsets_array.size() - 1);
+    if (offsets[0] != 0 || offsets[route_count] != indices_array.size()) {
+        throw std::invalid_argument("changed-candidate route offsets do not span indices");
+    }
+    std::vector<std::vector<std::int64_t>> routes;
+    routes.reserve(route_count);
+    for (std::size_t route = 0; route < route_count; ++route) {
+        if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]) {
+            throw std::invalid_argument(
+                "changed-candidate routes must be monotone and non-empty");
+        }
+        routes.emplace_back(
+            indices + offsets[route],
+            indices + offsets[route + 1]);
+    }
+    std::vector<std::int64_t> changed_route_indices;
+    std::vector<std::int64_t> change_offsets{0};
+    std::vector<std::int64_t> change_indices;
+    std::vector<std::int64_t> removed_offsets{0};
+    std::vector<std::int64_t> removed_indices;
+    const auto append = [&](
+                            std::size_t left_index,
+                            const std::vector<std::int64_t>& left,
+                            std::size_t right_index,
+                            const std::vector<std::int64_t>& right,
+                            const std::vector<std::int64_t>& removed) {
+        changed_route_indices.push_back(static_cast<std::int64_t>(left_index));
+        changed_route_indices.push_back(static_cast<std::int64_t>(right_index));
+        change_indices.insert(change_indices.end(), left.begin(), left.end());
+        change_offsets.push_back(static_cast<std::int64_t>(change_indices.size()));
+        change_indices.insert(change_indices.end(), right.begin(), right.end());
+        change_offsets.push_back(static_cast<std::int64_t>(change_indices.size()));
+        removed_indices.insert(removed_indices.end(), removed.begin(), removed.end());
+        removed_offsets.push_back(static_cast<std::int64_t>(removed_indices.size()));
+    };
+    if (operation == 0) {
+        for (std::size_t source_index = 0; source_index < route_count; ++source_index) {
+            const auto& source = routes[source_index];
+            if (source.size() <= 1) {
+                continue;
+            }
+            for (std::size_t source_position = 0;
+                 source_position < source.size(); ++source_position) {
+                const auto customer = source[source_position];
+                auto source_without = source;
+                source_without.erase(
+                    source_without.begin()
+                    + static_cast<std::ptrdiff_t>(source_position));
+                for (std::size_t target_index = 0; target_index < route_count;
+                     ++target_index) {
+                    if (target_index == source_index) {
+                        continue;
+                    }
+                    const auto& target = routes[target_index];
+                    for (std::size_t target_position = 0;
+                         target_position <= target.size(); ++target_position) {
+                        auto target_with = target;
+                        target_with.insert(
+                            target_with.begin()
+                                + static_cast<std::ptrdiff_t>(target_position),
+                            customer);
+                        if (source_index < target_index) {
+                            append(
+                                source_index, source_without,
+                                target_index, target_with, {customer});
+                        } else {
+                            append(
+                                target_index, target_with,
+                                source_index, source_without, {customer});
+                        }
+                    }
+                }
+            }
+        }
+    } else if (operation == 1) {
+        for (std::size_t left_index = 0; left_index < route_count; ++left_index) {
+            const auto& left = routes[left_index];
+            for (std::size_t right_index = left_index + 1;
+                 right_index < route_count; ++right_index) {
+                const auto& right = routes[right_index];
+                for (std::size_t left_position = 0;
+                     left_position < left.size(); ++left_position) {
+                    for (std::size_t right_position = 0;
+                         right_position < right.size(); ++right_position) {
+                        auto new_left = left;
+                        auto new_right = right;
+                        new_left[left_position] = right[right_position];
+                        new_right[right_position] = left[left_position];
+                        append(
+                            left_index, new_left, right_index, new_right,
+                            {left[left_position], right[right_position]});
+                    }
+                }
+            }
+        }
+    } else {
+        for (std::size_t left_index = 0; left_index < route_count; ++left_index) {
+            const auto& left = routes[left_index];
+            for (std::size_t right_index = left_index + 1;
+                 right_index < route_count; ++right_index) {
+                const auto& right = routes[right_index];
+                for (std::size_t left_cut = 1; left_cut < left.size(); ++left_cut) {
+                    for (std::size_t right_cut = 1; right_cut < right.size(); ++right_cut) {
+                        std::vector<std::int64_t> new_left(
+                            left.begin(),
+                            left.begin() + static_cast<std::ptrdiff_t>(left_cut));
+                        new_left.insert(
+                            new_left.end(),
+                            right.begin() + static_cast<std::ptrdiff_t>(right_cut),
+                            right.end());
+                        std::vector<std::int64_t> new_right(
+                            right.begin(),
+                            right.begin() + static_cast<std::ptrdiff_t>(right_cut));
+                        new_right.insert(
+                            new_right.end(),
+                            left.begin() + static_cast<std::ptrdiff_t>(left_cut),
+                            left.end());
+                        append(left_index, new_left, right_index, new_right, {});
+                    }
+                }
+            }
+        }
+    }
+    py::array_t<std::int64_t> changed_array(
+        std::vector<py::ssize_t>{
+            static_cast<py::ssize_t>(changed_route_indices.size() / 2), 2});
+    py::array_t<std::int64_t> change_offsets_array(change_offsets.size());
+    py::array_t<std::int64_t> change_indices_array(change_indices.size());
+    py::array_t<std::int64_t> removed_offsets_array(removed_offsets.size());
+    py::array_t<std::int64_t> removed_indices_array(removed_indices.size());
+    std::copy(
+        changed_route_indices.begin(), changed_route_indices.end(),
+        checked_data(changed_array));
+    std::copy(
+        change_offsets.begin(), change_offsets.end(),
+        checked_data(change_offsets_array));
+    std::copy(
+        change_indices.begin(), change_indices.end(),
+        checked_data(change_indices_array));
+    std::copy(
+        removed_offsets.begin(), removed_offsets.end(),
+        checked_data(removed_offsets_array));
+    std::copy(
+        removed_indices.begin(), removed_indices.end(),
+        checked_data(removed_indices_array));
+    return py::make_tuple(
+        std::move(changed_array),
+        std::move(change_offsets_array),
+        std::move(change_indices_array),
+        std::move(removed_offsets_array),
+        std::move(removed_indices_array));
+}
+
+py::tuple assemble_changed_candidate_plans_v1(
+    py::handle current_route_offsets,
+    py::handle current_route_indices,
+    py::handle changed_route_indices,
+    py::handle change_offsets,
+    py::handle change_indices) {
+    auto current_offsets_array = checked_array<std::int64_t>(
+        current_route_offsets, "current_route_offsets", 1);
+    auto current_indices_array = checked_array<std::int64_t>(
+        current_route_indices, "current_route_indices", 1);
+    auto changed_routes_array = checked_array<std::int64_t>(
+        changed_route_indices, "changed_route_indices", 2);
+    auto change_offsets_array = checked_array<std::int64_t>(
+        change_offsets, "change_offsets", 1);
+    auto change_indices_array = checked_array<std::int64_t>(
+        change_indices, "change_indices", 1);
+    if (current_offsets_array.size() < 2 || changed_routes_array.shape(1) != 2) {
+        throw std::invalid_argument("changed-candidate plan shape is invalid");
+    }
+    const auto route_count = static_cast<std::size_t>(
+        current_offsets_array.size() - 1);
+    const auto candidate_count = static_cast<std::size_t>(
+        changed_routes_array.shape(0));
+    if (change_offsets_array.size()
+        != static_cast<py::ssize_t>(candidate_count * 2 + 1)) {
+        throw std::invalid_argument("changed-candidate change offsets do not align");
+    }
+    const auto* current_offsets = checked_data<std::int64_t>(current_offsets_array);
+    const auto* current_indices = checked_data<std::int64_t>(current_indices_array);
+    const auto* changed_routes = checked_data<std::int64_t>(changed_routes_array);
+    const auto* changes = checked_data<std::int64_t>(change_offsets_array);
+    const auto* changed_indices = checked_data<std::int64_t>(change_indices_array);
+    if (current_offsets[0] != 0
+        || current_offsets[route_count] != current_indices_array.size()
+        || changes[0] != 0
+        || changes[candidate_count * 2] != change_indices_array.size()) {
+        throw std::invalid_argument("changed-candidate plan boundary is invalid");
+    }
+    for (std::size_t route = 0; route < route_count; ++route) {
+        if (current_offsets[route] < 0
+            || current_offsets[route] > current_offsets[route + 1]) {
+            throw std::invalid_argument("current route offsets must be monotonic");
+        }
+    }
+    for (std::size_t change = 0; change < candidate_count * 2; ++change) {
+        if (changes[change] < 0 || changes[change] > changes[change + 1]) {
+            throw std::invalid_argument("change offsets must be monotonic");
+        }
+    }
+    std::vector<std::int64_t> plan_offsets{0};
+    std::vector<std::int64_t> plan_route_offsets{0};
+    std::vector<std::int64_t> plan_route_indices;
+    plan_offsets.reserve(candidate_count + 1);
+    plan_route_offsets.reserve(candidate_count * route_count + 1);
+    for (std::size_t candidate = 0; candidate < candidate_count; ++candidate) {
+        const auto left_route = changed_routes[candidate * 2];
+        const auto right_route = changed_routes[candidate * 2 + 1];
+        if (left_route < 0 || right_route <= left_route
+            || right_route >= static_cast<std::int64_t>(route_count)) {
+            throw std::invalid_argument(
+                "changed routes must be two ordered current-route indices");
+        }
+        for (std::size_t route = 0; route < route_count; ++route) {
+            const std::int64_t* source = current_indices;
+            auto begin = current_offsets[route];
+            auto end = current_offsets[route + 1];
+            if (static_cast<std::int64_t>(route) == left_route) {
+                source = changed_indices;
+                begin = changes[candidate * 2];
+                end = changes[candidate * 2 + 1];
+            } else if (static_cast<std::int64_t>(route) == right_route) {
+                source = changed_indices;
+                begin = changes[candidate * 2 + 1];
+                end = changes[candidate * 2 + 2];
+            }
+            plan_route_indices.insert(
+                plan_route_indices.end(), source + begin, source + end);
+            plan_route_offsets.push_back(
+                static_cast<std::int64_t>(plan_route_indices.size()));
+        }
+        plan_offsets.push_back(
+            static_cast<std::int64_t>(plan_route_offsets.size() - 1));
+    }
+    py::array_t<std::int64_t> plan_offsets_output(plan_offsets.size());
+    py::array_t<std::int64_t> route_offsets_output(plan_route_offsets.size());
+    py::array_t<std::int64_t> route_indices_output(plan_route_indices.size());
+    std::copy(
+        plan_offsets.begin(), plan_offsets.end(),
+        checked_data(plan_offsets_output));
+    std::copy(
+        plan_route_offsets.begin(), plan_route_offsets.end(),
+        checked_data(route_offsets_output));
+    std::copy(
+        plan_route_indices.begin(), plan_route_indices.end(),
+        checked_data(route_indices_output));
+    return py::make_tuple(
+        std::move(plan_offsets_output), std::move(route_offsets_output),
+        std::move(route_indices_output));
+}
+
+class PythonFloatSum {
+public:
+    void add(double value) {
+        // Match CPython 3.13's float-specialized sum() exactly.  Stage 5.2
+        // compares native and Python raw evidence bit-for-bit, so ordinary
+        // left-to-right += accumulation is not semantically equivalent.
+        const auto next = total_ + value;
+        if (std::fabs(total_) >= std::fabs(value)) {
+            compensation_ += (total_ - next) + value;
+        } else {
+            compensation_ += (value - next) + total_;
+        }
+        total_ = next;
+    }
+
+    [[nodiscard]] double value() const {
+        auto result = total_;
+        if (compensation_ != 0.0 && std::isfinite(compensation_)) {
+            result += compensation_;
+        }
+        return result;
+    }
+
+private:
+    double total_ = 0.0;
+    double compensation_ = 0.0;
+};
+
+py::tuple rank_candidate_plans_v1(
+    py::handle plan_offsets,
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle route_distance_lower_bounds,
+    py::handle current_route_offsets,
+    py::handle current_route_indices,
+    py::handle lexical_rank,
+    py::handle attempted_flags,
+    std::int64_t top_k) {
+    auto plan_offsets_array = checked_array<std::int64_t>(
+        plan_offsets, "plan_offsets", 1);
+    auto route_offsets_array = checked_array<std::int64_t>(
+        route_offsets, "route_offsets", 1);
+    auto route_indices_array = checked_array<std::int64_t>(
+        route_indices, "route_indices", 1);
+    auto lower_bounds_array = checked_array<double>(
+        route_distance_lower_bounds, "route_distance_lower_bounds", 1);
+    auto current_offsets_array = checked_array<std::int64_t>(
+        current_route_offsets, "current_route_offsets", 1);
+    auto current_indices_array = checked_array<std::int64_t>(
+        current_route_indices, "current_route_indices", 1);
+    auto lexical_array = checked_array<std::int64_t>(
+        lexical_rank, "lexical_rank", 1);
+    auto attempted_array = checked_array<std::int64_t>(
+        attempted_flags, "attempted_flags", 1);
+    if (plan_offsets_array.size() < 1 || route_offsets_array.size() < 1
+        || current_offsets_array.size() < 1 || lexical_array.size() == 0
+        || top_k <= 0) {
+        throw std::invalid_argument("candidate-plan ranking shape/config is invalid");
+    }
+    const auto plan_count = static_cast<std::size_t>(
+        plan_offsets_array.size() - 1);
+    const auto route_count = static_cast<std::size_t>(
+        route_offsets_array.size() - 1);
+    const auto current_count = static_cast<std::size_t>(
+        current_offsets_array.size() - 1);
+    if (lower_bounds_array.size() != static_cast<py::ssize_t>(route_count)
+        || attempted_array.size() != static_cast<py::ssize_t>(plan_count)) {
+        throw std::invalid_argument(
+            "candidate-plan route metrics/flags do not align");
+    }
+    const auto* plans = checked_data<std::int64_t>(plan_offsets_array);
+    const auto* routes = checked_data<std::int64_t>(route_offsets_array);
+    const auto* indices = checked_data<std::int64_t>(route_indices_array);
+    const auto* lower_bounds = checked_data<double>(lower_bounds_array);
+    const auto* current_offsets = checked_data<std::int64_t>(current_offsets_array);
+    const auto* current_indices = checked_data<std::int64_t>(current_indices_array);
+    const auto* lexical = checked_data<std::int64_t>(lexical_array);
+    const auto* attempted = checked_data<std::int64_t>(attempted_array);
+    const auto validate_offsets = [](
+        const std::int64_t* values,
+        std::size_t count,
+        std::int64_t terminal,
+        const char* name) {
+        if (values[0] != 0 || values[count] != terminal) {
+            throw std::invalid_argument(std::string(name) + " boundary is invalid");
+        }
+        for (std::size_t index = 0; index < count; ++index) {
+            if (values[index] < 0 || values[index] > values[index + 1]) {
+                throw std::invalid_argument(std::string(name) + " must be monotonic");
+            }
+        }
+    };
+    validate_offsets(
+        plans, plan_count, static_cast<std::int64_t>(route_count), "plan_offsets");
+    validate_offsets(
+        routes, route_count, static_cast<std::int64_t>(route_indices_array.size()),
+        "route_offsets");
+    validate_offsets(
+        current_offsets, current_count,
+        static_cast<std::int64_t>(current_indices_array.size()),
+        "current_route_offsets");
+    std::unordered_set<std::int64_t> lexical_values;
+    for (py::ssize_t node = 0; node < lexical_array.size(); ++node) {
+        if (lexical[node] < 0 || lexical[node] >= lexical_array.size()
+            || !lexical_values.insert(lexical[node]).second) {
+            throw std::invalid_argument("lexical_rank must be a permutation");
+        }
+    }
+    for (std::size_t route = 0; route < route_count; ++route) {
+        if (!std::isfinite(lower_bounds[route]) || lower_bounds[route] < 0.0) {
+            throw std::invalid_argument(
+                "route_distance_lower_bounds must be finite and non-negative");
+        }
+        for (auto cursor = routes[route]; cursor < routes[route + 1]; ++cursor) {
+            if (indices[cursor] < 0 || indices[cursor] >= lexical_array.size()) {
+                throw std::invalid_argument("candidate plan contains an unknown node");
+            }
+        }
+    }
+    for (std::size_t plan = 0; plan < plan_count; ++plan) {
+        if (attempted[plan] != 0 && attempted[plan] != 1) {
+            throw std::invalid_argument("attempted_flags must contain only zero or one");
+        }
+    }
+
+    const auto route_equal = [](
+        const std::int64_t* left,
+        std::int64_t left_begin,
+        std::int64_t left_end,
+        const std::int64_t* right,
+        std::int64_t right_begin,
+        std::int64_t right_end) {
+        return left_end - left_begin == right_end - right_begin
+            && std::equal(left + left_begin, left + left_end, right + right_begin);
+    };
+    std::vector<std::int64_t> vehicle_counts(plan_count, 0);
+    std::vector<std::int64_t> changed_counts(plan_count, 0);
+    std::vector<double> optimistic_distances(plan_count, 0.0);
+    for (std::size_t plan = 0; plan < plan_count; ++plan) {
+        vehicle_counts[plan] = plans[plan + 1] - plans[plan];
+        PythonFloatSum distance_sum;
+        for (auto route = plans[plan]; route < plans[plan + 1]; ++route) {
+            distance_sum.add(lower_bounds[route]);
+            bool unchanged = false;
+            for (std::size_t current = 0; current < current_count; ++current) {
+                if (route_equal(
+                        indices, routes[route], routes[route + 1], current_indices,
+                        current_offsets[current], current_offsets[current + 1])) {
+                    unchanged = true;
+                    break;
+                }
+            }
+            changed_counts[plan] += unchanged ? 0 : 1;
+        }
+        optimistic_distances[plan] = distance_sum.value();
+    }
+    const auto route_less = [&](std::int64_t left, std::int64_t right) {
+        auto left_cursor = routes[left];
+        auto right_cursor = routes[right];
+        while (left_cursor < routes[left + 1] && right_cursor < routes[right + 1]) {
+            const auto left_rank = lexical[indices[left_cursor]];
+            const auto right_rank = lexical[indices[right_cursor]];
+            if (left_rank != right_rank) {
+                return left_rank < right_rank;
+            }
+            ++left_cursor;
+            ++right_cursor;
+        }
+        return routes[left + 1] - routes[left]
+            < routes[right + 1] - routes[right];
+    };
+    const auto plan_routes_less = [&](std::size_t left, std::size_t right) {
+        auto left_route = plans[left];
+        auto right_route = plans[right];
+        while (left_route < plans[left + 1] && right_route < plans[right + 1]) {
+            if (route_less(left_route, right_route)) {
+                return true;
+            }
+            if (route_less(right_route, left_route)) {
+                return false;
+            }
+            ++left_route;
+            ++right_route;
+        }
+        return vehicle_counts[left] < vehicle_counts[right];
+    };
+    std::vector<std::int64_t> ranked(plan_count);
+    std::iota(ranked.begin(), ranked.end(), 0);
+    std::stable_sort(
+        ranked.begin(), ranked.end(), [&](std::int64_t left_id, std::int64_t right_id) {
+            const auto left = static_cast<std::size_t>(left_id);
+            const auto right = static_cast<std::size_t>(right_id);
+            if (vehicle_counts[left] != vehicle_counts[right]) {
+                return vehicle_counts[left] < vehicle_counts[right];
+            }
+            if (optimistic_distances[left] != optimistic_distances[right]) {
+                return optimistic_distances[left] < optimistic_distances[right];
+            }
+            if (changed_counts[left] != changed_counts[right]) {
+                return changed_counts[left] < changed_counts[right];
+            }
+            if (plan_routes_less(left, right)) {
+                return true;
+            }
+            if (plan_routes_less(right, left)) {
+                return false;
+            }
+            return left < right;
+        });
+    std::vector<std::int64_t> selected;
+    selected.reserve(std::min<std::size_t>(plan_count, static_cast<std::size_t>(top_k)));
+    for (const auto plan_id : ranked) {
+        if (attempted[plan_id] == 0) {
+            selected.push_back(plan_id);
+            if (selected.size() == static_cast<std::size_t>(top_k)) {
+                break;
+            }
+        }
+    }
+    py::array_t<std::int64_t> ranked_array(ranked.size());
+    py::array_t<std::int64_t> selected_array(selected.size());
+    py::array_t<std::int64_t> integer_metrics(
+        {static_cast<py::ssize_t>(plan_count), py::ssize_t(2)});
+    py::array_t<double> float_metrics(plan_count);
+    std::copy(ranked.begin(), ranked.end(), checked_data(ranked_array));
+    std::copy(selected.begin(), selected.end(), checked_data(selected_array));
+    auto* integer_values = checked_data(integer_metrics);
+    for (std::size_t plan = 0; plan < plan_count; ++plan) {
+        integer_values[plan * 2] = vehicle_counts[plan];
+        integer_values[plan * 2 + 1] = changed_counts[plan];
+    }
+    std::copy(
+        optimistic_distances.begin(), optimistic_distances.end(),
+        checked_data(float_metrics));
+    return py::make_tuple(
+        std::move(ranked_array), std::move(selected_array),
+        std::move(integer_metrics), std::move(float_metrics));
+}
+
 template <typename T>
 struct Stage052ReplayNumericColumn {
     py::array_t<T, py::array::c_style | py::array::forcecast> values;
@@ -2892,34 +3520,6 @@ constexpr std::int64_t no_failure_reason = 0;
 constexpr std::int64_t no_feasible_pattern_reason = 1;
 constexpr std::int64_t deadline_reason = 2;
 
-class PythonFloatSum {
-public:
-    void add(double value) {
-        // Match CPython 3.13's float-specialized sum() exactly.  Stage 5.2
-        // compares native and Python raw evidence bit-for-bit, so ordinary
-        // left-to-right += accumulation is not semantically equivalent.
-        const auto next = total_ + value;
-        if (std::fabs(total_) >= std::fabs(value)) {
-            compensation_ += (total_ - next) + value;
-        } else {
-            compensation_ += (value - next) + total_;
-        }
-        total_ = next;
-    }
-
-    [[nodiscard]] double value() const {
-        auto result = total_;
-        if (compensation_ != 0.0 && std::isfinite(compensation_)) {
-            result += compensation_;
-        }
-        return result;
-    }
-
-private:
-    double total_ = 0.0;
-    double compensation_ = 0.0;
-};
-
 struct ExactLabel {
     std::int64_t progress;
     std::int64_t node;
@@ -5411,6 +6011,180 @@ py::tuple full_native_alns_v1(
         digest);
 }
 
+py::tuple full_native_initialize_v2(
+    py::handle node_kind,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle vehicle,
+    py::handle initial_route_offsets,
+    py::handle initial_route_indices,
+    py::handle control,
+    py::handle deadline_remaining) {
+    auto control_array = checked_array<std::int64_t>(control, "control", 1);
+    auto offsets_array = checked_array<std::int64_t>(
+        initial_route_offsets, "initial_route_offsets", 1);
+    if (control_array.size() != 5 || offsets_array.size() < 2) {
+        throw std::invalid_argument(
+            "full native initialization control/warm-start shape is invalid");
+    }
+    const auto route_count = static_cast<std::int64_t>(offsets_array.size() - 1);
+    const auto* control_values = checked_data<std::int64_t>(control_array);
+    if (control_values[2] <= 0 || control_values[4] < -1) {
+        throw std::invalid_argument(
+            "full native initialization batch/budget values are invalid");
+    }
+    if (control_values[4] >= 0 && route_count > control_values[4]) {
+        throw std::runtime_error(
+            "full native warm start does not fit the exact-call budget");
+    }
+    py::array_t<std::int64_t> batch_size(1);
+    checked_data(batch_size)[0] = control_values[2];
+    const auto exact_payload = exact_charging_batch_numeric(
+        node_kind,
+        ready_time,
+        due_date,
+        service_time,
+        distance,
+        vehicle,
+        initial_route_offsets,
+        initial_route_indices,
+        deadline_remaining,
+        batch_size);
+    auto kind_array = checked_array<std::int64_t>(node_kind, "node_kind", 1);
+    auto status_array = py::cast<py::array_t<std::int64_t>>(exact_payload[2]);
+    auto path_array = py::cast<py::array_t<std::int64_t>>(exact_payload[1]);
+    auto metrics_array = py::cast<py::array_t<double>>(exact_payload[4]);
+    auto batch_counters = py::cast<py::array_t<std::int64_t>>(exact_payload[6]);
+    const auto* statuses = checked_data<std::int64_t>(status_array);
+    for (py::ssize_t index = 0; index < status_array.size(); ++index) {
+        if (statuses[index] != 0) {
+            throw std::runtime_error(
+                "full native supplied warm start is not exact-feasible");
+        }
+    }
+    const auto* kinds = checked_data<std::int64_t>(kind_array);
+    const auto* paths = checked_data<std::int64_t>(path_array);
+    const auto* metrics = checked_data<double>(metrics_array);
+    double total_distance = 0.0;
+    double total_charging_time = 0.0;
+    for (py::ssize_t route = 0; route < metrics_array.shape(0); ++route) {
+        total_distance += metrics[route * 4];
+        total_charging_time += metrics[route * 4 + 3];
+    }
+    std::int64_t charging_count = 0;
+    for (py::ssize_t index = 0; index < path_array.size(); ++index) {
+        charging_count += kinds[paths[index]] == station_kind ? 1 : 0;
+    }
+    py::array_t<std::int64_t> objective_integer(2);
+    checked_data(objective_integer)[0] = route_count;
+    checked_data(objective_integer)[1] = charging_count;
+    py::array_t<double> objective_float(2);
+    checked_data(objective_float)[0] = total_distance;
+    checked_data(objective_float)[1] = total_charging_time;
+    py::array_t<std::int64_t> accounting(4);
+    const auto* batch_values = checked_data<std::int64_t>(batch_counters);
+    checked_data(accounting)[0] = route_count;
+    checked_data(accounting)[1] = batch_values[2];
+    checked_data(accounting)[2] = batch_values[3];
+    checked_data(accounting)[3] = 0;
+    return py::make_tuple(
+        exact_payload,
+        std::move(objective_integer),
+        std::move(objective_float),
+        std::move(accounting));
+}
+
+py::tuple full_native_alns_v2(
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle vehicle,
+    py::handle lexical_rank,
+    py::handle initial_route_offsets,
+    py::handle initial_route_indices,
+    py::handle control,
+    py::handle deadline_remaining,
+    py::handle protocol_control,
+    py::handle protocol_options,
+    py::handle stage04_integer,
+    py::handle stage04_float,
+    py::handle operator_integer,
+    py::handle operator_float) {
+    static_cast<void>(node_kind);
+    static_cast<void>(demand);
+    static_cast<void>(ready_time);
+    static_cast<void>(due_date);
+    static_cast<void>(service_time);
+    static_cast<void>(distance);
+    static_cast<void>(vehicle);
+    static_cast<void>(lexical_rank);
+    auto initial_offsets = checked_array<std::int64_t>(
+        initial_route_offsets, "initial_route_offsets", 1);
+    auto initial_indices = checked_array<std::int64_t>(
+        initial_route_indices, "initial_route_indices", 1);
+    auto base_control = checked_array<std::int64_t>(control, "control", 1);
+    auto deadline = checked_array<double>(
+        deadline_remaining, "deadline_remaining", 1);
+    auto protocol_control_array = checked_array<std::int64_t>(
+        protocol_control, "protocol_control", 1);
+    auto protocol_options_array = checked_array<double>(
+        protocol_options, "protocol_options", 1);
+    auto stage04_integer_array = checked_array<std::int64_t>(
+        stage04_integer, "stage04_integer", 1);
+    auto stage04_float_array = checked_array<double>(
+        stage04_float, "stage04_float", 1);
+    auto operator_integer_array = checked_array<std::int64_t>(
+        operator_integer, "operator_integer", 1);
+    auto operator_float_array = checked_array<double>(
+        operator_float, "operator_float", 1);
+    if (initial_offsets.size() < 2 || initial_indices.size() == 0) {
+        throw std::invalid_argument(
+            "full native v2 requires a non-empty warm-start SoA");
+    }
+    if (base_control.size() != 5 || deadline.size() != 1
+        || protocol_control_array.size() != 13
+        || protocol_options_array.size() != 2
+        || stage04_integer_array.size() != 15
+        || stage04_float_array.size() != 15
+        || operator_integer_array.size() != 24
+        || operator_float_array.size() != 7) {
+        throw std::invalid_argument(
+            "full native v2 configuration arrays have an invalid shape");
+    }
+    const auto* protocol_values = checked_data<std::int64_t>(
+        protocol_control_array);
+    if ((protocol_values[0] != 0 && protocol_values[0] != 1)
+        || protocol_values[1] <= 0 || protocol_values[2] <= 0
+        || (protocol_values[3] != 1 && protocol_values[3] != 4)
+        || protocol_values[4] < 10 || protocol_values[5] < 0) {
+        throw std::invalid_argument(
+            "full native v2 Candidate Control values are invalid");
+    }
+    const auto* options = checked_data<double>(protocol_options_array);
+    if (!(options[0] > 0.0 && options[0] <= 1.0)
+        || !std::isfinite(options[1]) || options[1] <= 0.0) {
+        throw std::invalid_argument("full native v2 protocol options are invalid");
+    }
+    static_cast<void>(full_native_initialize_v2(
+        node_kind,
+        ready_time,
+        due_date,
+        service_time,
+        distance,
+        vehicle,
+        initial_route_offsets,
+        initial_route_indices,
+        control,
+        deadline_remaining));
+    throw std::runtime_error(
+        "full native v2 semantic engine is incomplete; refusing prototype fallback");
+}
+
 #ifdef __linux__
 namespace {
 
@@ -5834,6 +6608,48 @@ PYBIND11_MODULE(_core, module) {
         py::arg("sample_size"),
         py::arg("weights"),
         py::arg("shuffle_size"));
+    module.def(
+        "native_objective_acceptance_v1",
+        &native_objective_acceptance_v1,
+        py::arg("current_integer"),
+        py::arg("current_float"),
+        py::arg("candidate_integer"),
+        py::arg("candidate_float"),
+        py::arg("temperatures"),
+        py::arg("random_draws"));
+    module.def(
+        "stage04_segment_update_v1",
+        &stage04_segment_update_v1,
+        py::arg("weights"),
+        py::arg("reward_sums"),
+        py::arg("calls"),
+        py::arg("options"));
+    module.def(
+        "changed_candidate_pool_v1",
+        &changed_candidate_pool_v1,
+        py::arg("operation"),
+        py::arg("route_offsets"),
+        py::arg("route_indices"));
+    module.def(
+        "assemble_changed_candidate_plans_v1",
+        &assemble_changed_candidate_plans_v1,
+        py::arg("current_route_offsets"),
+        py::arg("current_route_indices"),
+        py::arg("changed_route_indices"),
+        py::arg("change_offsets"),
+        py::arg("change_indices"));
+    module.def(
+        "rank_candidate_plans_v1",
+        &rank_candidate_plans_v1,
+        py::arg("plan_offsets"),
+        py::arg("route_offsets"),
+        py::arg("route_indices"),
+        py::arg("route_distance_lower_bounds"),
+        py::arg("current_route_offsets"),
+        py::arg("current_route_indices"),
+        py::arg("lexical_rank"),
+        py::arg("attempted_flags"),
+        py::arg("top_k"));
     py::class_<Stage052ReplayState>(module, "Stage052ReplayState")
         .def(
             py::init<const py::dict&, const py::dict&>(),
@@ -6023,6 +6839,40 @@ PYBIND11_MODULE(_core, module) {
         py::arg("distance"),
         py::arg("vehicle"),
         py::arg("lexical_rank"),
+        py::arg("initial_route_offsets"),
+        py::arg("initial_route_indices"),
+        py::arg("control"),
+        py::arg("deadline_remaining"));
+    module.def(
+        "full_native_alns_v2",
+        &full_native_alns_v2,
+        py::arg("node_kind"),
+        py::arg("demand"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("vehicle"),
+        py::arg("lexical_rank"),
+        py::arg("initial_route_offsets"),
+        py::arg("initial_route_indices"),
+        py::arg("control"),
+        py::arg("deadline_remaining"),
+        py::arg("protocol_control"),
+        py::arg("protocol_options"),
+        py::arg("stage04_integer"),
+        py::arg("stage04_float"),
+        py::arg("operator_integer"),
+        py::arg("operator_float"));
+    module.def(
+        "full_native_initialize_v2",
+        &full_native_initialize_v2,
+        py::arg("node_kind"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("vehicle"),
         py::arg("initial_route_offsets"),
         py::arg("initial_route_indices"),
         py::arg("control"),

@@ -16,6 +16,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
+from typing import cast
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -27,6 +28,7 @@ from evrptw.candidate_transaction import NativeCandidateTransactionConfig
 from evrptw.exact_deadline import ExactDeadlineConfig
 from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES
 from evrptw.measurement import CheapScreeningConfig, MeasurementConfig
+from evrptw.models import Instance
 from evrptw.native_execution import Stage052NativeExecutionConfig
 from evrptw.native_kernels import NativeKernelConfig
 from evrptw.native_scheduler import NativeHostScheduler
@@ -36,6 +38,7 @@ from evrptw.repository import repository_root
 from evrptw.runtime_envelope import ProcessTreeMonitor
 from evrptw.stage04 import Stage04Config
 from evrptw.validation import validate_routes
+from evrptw.warm_start import WarmStartValidationConfig
 
 SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v4"
 SEEDS = (2014, 2015, 2016)
@@ -44,6 +47,10 @@ AXIS_NAMES = ("fixed_work", "wall_clock_30")
 SHARD_PROCESSES = 6
 THREADS_PER_SHARD = 4
 TOTAL_COMPUTE_THREADS = 24
+WARM_START_SCHEMA_VERSION = "stage05.2-native-architecture-warm-start-v1"
+
+WarmStartIdentity = tuple[str, int]
+WarmStartRecord = tuple[tuple[tuple[str, ...], ...], dict[str, object]]
 
 
 class ArchitectureMode(StrEnum):
@@ -71,6 +78,8 @@ class ArchitectureAxisTask:
     wheel_sha256: str
     native_sha256: str
     revision: str
+    initial_customer_sequences: tuple[tuple[str, ...], ...]
+    initial_solution_provenance: dict[str, object]
     scheduler_process_id: int | None = None
 
 
@@ -95,6 +104,7 @@ def build_axis_plan(
     wheel_sha256: str,
     native_sha256: str,
     revision: str,
+    warm_starts: dict[WarmStartIdentity, WarmStartRecord],
 ) -> tuple[ArchitectureAxisTask, ...]:
     instances: tuple[str, ...]
     axes: tuple[str, ...]
@@ -109,6 +119,17 @@ def build_axis_plan(
     else:
         raise ValueError("scope must be paired or pilot")
     labels = run_labels_for_scope(scope, attempt)
+    expected_identities = {
+        (instance_name, seed)
+        for instance_name in instances
+        for seed in SEEDS
+    }
+    if set(warm_starts) != expected_identities:
+        missing = sorted(expected_identities - set(warm_starts))
+        extra = sorted(set(warm_starts) - expected_identities)
+        raise ValueError(
+            f"warm-start identity set mismatch: missing={missing}, extra={extra}"
+        )
     return tuple(
         ArchitectureAxisTask(
             scope=scope,
@@ -123,6 +144,8 @@ def build_axis_plan(
             wheel_sha256=wheel_sha256,
             native_sha256=native_sha256,
             revision=revision,
+            initial_customer_sequences=warm_starts[(instance_name, seed)][0],
+            initial_solution_provenance=dict(warm_starts[(instance_name, seed)][1]),
         )
         for repeat in repeats
         for axis in axes
@@ -161,6 +184,83 @@ def _sha256_path(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def load_warm_start_bundle(
+    path: Path,
+    *,
+    benchmark_dir: Path,
+) -> dict[WarmStartIdentity, WarmStartRecord]:
+    """Verify and decode one immutable cross-mode warm-start input bundle."""
+
+    if not path.is_file():
+        raise FileNotFoundError(f"warm-start bundle does not exist: {path}")
+    sidecar = path.with_suffix(path.suffix + ".sha256")
+    if not sidecar.is_file():
+        raise RuntimeError("warm-start bundle SHA-256 sidecar is missing")
+    bundle_sha256 = _sha256_path(path)
+    expected_sha256 = sidecar.read_text(encoding="ascii").strip()
+    if expected_sha256 != bundle_sha256:
+        raise RuntimeError("warm-start bundle SHA-256 mismatch")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("schema_version") != (
+        WARM_START_SCHEMA_VERSION
+    ):
+        raise RuntimeError("warm-start bundle schema is invalid")
+    raw_records = payload.get("records")
+    if not isinstance(raw_records, list) or not raw_records:
+        raise RuntimeError("warm-start bundle records are missing")
+    output: dict[WarmStartIdentity, WarmStartRecord] = {}
+    instance_cache: dict[str, Instance] = {}
+    for raw in raw_records:
+        if not isinstance(raw, dict):
+            raise RuntimeError("warm-start bundle contains a non-object record")
+        instance_name = raw.get("instance")
+        seed = raw.get("seed")
+        routes = raw.get("customer_sequences")
+        if (
+            not isinstance(instance_name, str)
+            or isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or not isinstance(routes, list)
+            or not routes
+        ):
+            raise RuntimeError("warm-start bundle record identity/routes are invalid")
+        identity = (instance_name, seed)
+        if identity in output:
+            raise RuntimeError(f"duplicate warm-start identity: {identity}")
+        instance = instance_cache.get(instance_name)
+        if instance is None:
+            instance = parse_schneider(benchmark_dir / f"{instance_name}.txt")
+            instance_cache[instance_name] = instance
+        sequences: list[tuple[str, ...]] = []
+        for route in routes:
+            if not isinstance(route, list) or not route or not all(
+                isinstance(name, str) for name in route
+            ):
+                raise RuntimeError(f"warm-start route is invalid for {identity}")
+            sequences.append(tuple(cast(str, name) for name in route))
+        expected_customers = sorted(customer.name for customer in instance.customers)
+        supplied_customers = sorted(name for route in sequences for name in route)
+        if supplied_customers != expected_customers:
+            raise RuntimeError(f"warm-start customer coverage mismatch for {identity}")
+        source_sha256 = raw.get("source_solution_sha256")
+        if not isinstance(source_sha256, str) or len(source_sha256) != 64:
+            raise RuntimeError(f"warm-start source hash is invalid for {identity}")
+        output[identity] = (
+            tuple(sequences),
+            {
+                "source_stage": raw.get("source_stage", "comparison_warm_start"),
+                "source_run_label": raw.get("source_run_label", ""),
+                "source_instance": instance_name,
+                "source_seed": seed,
+                "source_solution_sha256": source_sha256,
+                "source_objective_key": raw.get("source_objective_key", []),
+                "warm_start_bundle_sha256": bundle_sha256,
+                "warm_start_bundle_path": str(path.resolve()),
+            },
+        )
+    return output
 
 
 def _verify_installed_wheel(
@@ -484,6 +584,9 @@ def _solve_mode(
         "termination_mode": "fixed_work" if fixed_work else "wall_clock",
         "exact_deadline_config": exact_deadline,
         "stage04_config": Stage04Config(),
+        "initial_customer_sequences": task.initial_customer_sequences,
+        "initial_solution_provenance": task.initial_solution_provenance,
+        "warm_start_validation_config": WarmStartValidationConfig(),
     }
     additional_roots = (
         (task.scheduler_process_id,)
@@ -743,6 +846,7 @@ def run_experiment(
     attempt: int,
     output_root: Path,
     wheel_path: Path,
+    warm_start_bundle_path: Path,
     max_workers: int = SHARD_PROCESSES,
 ) -> dict[str, object]:
     root = repository_root()
@@ -772,6 +876,10 @@ def run_experiment(
         expected_revision=revision,
     )
     native_path = Path(wheel_receipt["native_path"])
+    warm_starts = load_warm_start_bundle(
+        warm_start_bundle_path,
+        benchmark_dir=root / "data" / "schneider",
+    )
     labels = run_labels_for_scope(scope, attempt)
     for label in labels.values():
         if (output_root / label).exists():
@@ -786,6 +894,7 @@ def run_experiment(
         wheel_sha256=wheel_receipt["wheel_sha256"],
         native_sha256=wheel_receipt["native_sha256"],
         revision=revision,
+        warm_starts=warm_starts,
     )
     for label in labels.values():
         (output_root / label).mkdir(parents=True)
@@ -831,6 +940,8 @@ def run_experiment(
         "wheel_receipt": wheel_receipt,
         "native_path": str(native_path.resolve()),
         "native_sha256": wheel_receipt["native_sha256"],
+        "warm_start_bundle_path": str(warm_start_bundle_path.resolve()),
+        "warm_start_bundle_sha256": _sha256_path(warm_start_bundle_path),
         "axis_count": len(written),
         "expected_axis_count": expected_axis_count(scope),
         "started_unix": started,
@@ -859,12 +970,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--attempt", type=int, required=True)
     parser.add_argument("--output-root", type=Path, default=Path("results"))
     parser.add_argument("--wheel", type=Path, required=True)
+    parser.add_argument("--warm-start-bundle", type=Path, required=True)
     arguments = parser.parse_args(argv)
     manifest = run_experiment(
         arguments.scope,
         attempt=arguments.attempt,
         output_root=arguments.output_root,
         wheel_path=arguments.wheel,
+        warm_start_bundle_path=arguments.warm_start_bundle,
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))
     return 0
@@ -884,6 +997,7 @@ __all__ = (
     "SEEDS",
     "build_axis_plan",
     "expected_axis_count",
+    "load_warm_start_bundle",
     "rotated_modes",
     "run_experiment",
     "run_labels_for_scope",

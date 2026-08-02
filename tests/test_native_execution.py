@@ -38,8 +38,10 @@ from evrptw.native_execution import (
 )
 from evrptw.native_kernels import NativeKernelConfig, NativeKernelRuntime
 from evrptw.native_scheduler import NativeHostScheduler
+from evrptw.objective import SolutionObjective, accept_annealing_move
 from evrptw.parser import parse_schneider
 from evrptw.stage04 import Stage04Config
+from evrptw.warm_start import WarmStartValidationConfig
 
 
 def _fixture_instance() -> Instance:
@@ -85,6 +87,15 @@ def _native_config(mode: str) -> Stage052NativeExecutionConfig:
     )
 
 
+def _full_native_solve_kwargs() -> dict[str, object]:
+    return {
+        "initial_customer_sequences": (("C1", "C2"),),
+        "screening_config": CheapScreeningConfig(),
+        "cache_incremental_config": CacheIncrementalConfig(enabled=True),
+        "stage04_config": Stage04Config(),
+    }
+
+
 def test_per_solve_native_execution_protocol_is_explicit_and_fail_fast() -> None:
     config = _per_solve_config()
 
@@ -98,7 +109,7 @@ def test_per_solve_native_execution_protocol_is_explicit_and_fail_fast() -> None
 @pytest.mark.parametrize(
     ("mode", "expected_protocol"),
     [
-        ("full_native_alns", "full_solve_soa_v1"),
+        ("full_native_alns", "full_solve_soa_v2"),
         ("host_scheduler", "unix_shm_scheduler_v1"),
     ],
 )
@@ -171,6 +182,36 @@ def test_explicit_native_protocol_is_the_only_guard_bypass() -> None:
     assert result.native_execution_statistics["mode"] == "per_solve_runtime"
     assert result.native_execution_statistics["worker_protocol"] == "candidate_round_soa_v2"
     assert result.native_execution_statistics["fallback_count"] == 0
+
+
+def test_explicit_warm_start_validation_does_not_enable_candidate_control() -> None:
+    instance = _fixture_instance()
+    supplied = (("C1", "C2"),)
+    provenance = {"source_solution_sha256": "a" * 64}
+
+    with pytest.raises(ValueError, match="requires candidate control or the explicit"):
+        solve_alns(
+            instance,
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            initial_customer_sequences=supplied,
+            initial_solution_provenance=provenance,
+        )
+
+    result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        initial_customer_sequences=supplied,
+        initial_solution_provenance=provenance,
+        warm_start_validation_config=WarmStartValidationConfig(),
+    )
+
+    assert result.feasible
+    assert result.initial_customer_sequences == supplied
+    assert result.candidate_control_statistics == {}
 
 
 def test_none_preserves_current_stage052_candidate_transaction_path() -> None:
@@ -651,6 +692,307 @@ def test_native_python_random_matches_python313_call_sequence(seed: int) -> None
     assert native[4].tolist() == expected_shuffle
 
 
+def test_full_native_initialization_matches_python_exact_objective_and_budget() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    route = ("C1", "C2")
+    route_offsets = np.asarray([0, 2], dtype=np.int64)
+    route_indices = np.asarray(
+        [context.name_to_index[name] for name in route],
+        dtype=np.int64,
+    )
+    control = np.asarray([2014, 1, 128, 4, 100], dtype=np.int64)
+    deadline = np.asarray([10.0], dtype=np.float64)
+
+    payload = native_core.full_native_initialize_v2(
+        context.node_kind,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.vehicle,
+        route_offsets,
+        route_indices,
+        control,
+        deadline,
+    )
+    expected = solve_exact_charging(instance, route)
+
+    assert payload[1].tolist() == [1, 0]
+    assert payload[2].tolist() == [expected.distance, expected.charging_time]
+    assert payload[3].tolist() == [1, 1, 0, 0]
+
+    insufficient = control.copy()
+    insufficient[4] = 0
+    with pytest.raises(RuntimeError, match="does not fit the exact-call budget"):
+        native_core.full_native_initialize_v2(
+            context.node_kind,
+            context.ready_time,
+            context.due_date,
+            context.service_time,
+            context.distance,
+            context.vehicle,
+            route_offsets,
+            route_indices,
+            insufficient,
+            deadline,
+        )
+
+
+def test_native_objective_acceptance_matches_vehicle_first_python_policy() -> None:
+    from evrptw import _core as native_core
+
+    current = [
+        SolutionObjective(3, 100.0, 10.0, 2),
+        SolutionObjective(2, 100.0, 10.0, 2),
+        SolutionObjective(2, 100.0, 10.0, 2),
+        SolutionObjective(2, 100.0, 10.0, 2),
+        SolutionObjective(2, 100.0, 10.0, 2),
+    ]
+    candidates = [
+        SolutionObjective(2, 1000.0, 100.0, 20),
+        SolutionObjective(3, 1.0, 0.0, 0),
+        SolutionObjective(2, 99.0, 20.0, 5),
+        SolutionObjective(2, 101.0, 10.0, 2),
+        SolutionObjective(2, 100.0, 11.0, 2),
+    ]
+    temperatures = np.asarray([1.0, 1.0, 1.0, 10.0, 10.0], dtype=np.float64)
+    draws = np.asarray([0.5, 0.5, 0.5, 0.01, 0.0], dtype=np.float64)
+
+    observed = native_core.native_objective_acceptance_v1(
+        np.asarray(
+            [(item.vehicle_count, item.charging_count) for item in current],
+            dtype=np.int64,
+        ),
+        np.asarray(
+            [(item.total_distance, item.total_charging_time) for item in current],
+            dtype=np.float64,
+        ),
+        np.asarray(
+            [(item.vehicle_count, item.charging_count) for item in candidates],
+            dtype=np.int64,
+        ),
+        np.asarray(
+            [
+                (item.total_distance, item.total_charging_time)
+                for item in candidates
+            ],
+            dtype=np.float64,
+        ),
+        temperatures,
+        draws,
+    )
+    expected = [
+        accept_annealing_move(
+            current_item,
+            candidate_item,
+            temperature=float(temperature),
+            random_draw=float(draw),
+        )
+        for current_item, candidate_item, temperature, draw in zip(
+            current,
+            candidates,
+            temperatures,
+            draws,
+            strict=True,
+        )
+    ]
+
+    assert observed.tolist() == [int(value) for value in expected]
+
+
+def test_native_stage04_segment_update_matches_python_config() -> None:
+    from evrptw import _core as native_core
+
+    config = Stage04Config()
+    weights = np.asarray([1.0, 2.0, 0.2], dtype=np.float64)
+    rewards = np.asarray([20.0, 1.0, 0.0], dtype=np.float64)
+    calls = np.asarray([5, 4, 8], dtype=np.int64)
+    updated, statuses = native_core.stage04_segment_update_v1(
+        weights,
+        rewards,
+        calls,
+        np.asarray(
+            [
+                config.weight_reaction,
+                config.weight_floor,
+                config.weight_smoothing,
+                config.min_calls_per_operator,
+            ],
+            dtype=np.float64,
+        ),
+    )
+    expected = [
+        (
+            config.apply_segment_update(float(weight), float(reward), int(call_count))
+            if call_count >= config.min_calls_per_operator
+            else float(weight)
+        )
+        for weight, reward, call_count in zip(weights, rewards, calls, strict=True)
+    ]
+
+    assert updated.tolist() == expected
+    assert statuses.tolist() == [1, 0, 1]
+
+
+@pytest.mark.parametrize(
+    ("operation", "generator_name"),
+    [
+        (0, "_relocate_candidates"),
+        (1, "_swap_candidates"),
+        (2, "_two_opt_star_candidates"),
+    ],
+)
+def test_native_changed_candidate_pool_matches_python_order(
+    operation: int,
+    generator_name: str,
+) -> None:
+    from evrptw import _core as native_core
+    from evrptw import neighborhoods
+
+    sequences = ((1, 2), (3, 4, 5), (6,))
+    offsets = np.asarray([0, 2, 5, 6], dtype=np.int64)
+    indices = np.asarray([1, 2, 3, 4, 5, 6], dtype=np.int64)
+    payload = native_core.changed_candidate_pool_v1(operation, offsets, indices)
+    changed_routes, change_offsets, change_indices, removed_offsets, removed_indices = (
+        payload
+    )
+    observed: list[tuple[tuple[tuple[int, tuple[int, ...]], ...], tuple[int, ...]]] = []
+    for candidate in range(len(changed_routes)):
+        changes = tuple(
+            (
+                int(changed_routes[candidate, ordinal]),
+                tuple(
+                    int(value)
+                    for value in change_indices[
+                        int(change_offsets[candidate * 2 + ordinal]) : int(
+                            change_offsets[candidate * 2 + ordinal + 1]
+                        )
+                    ]
+                ),
+            )
+            for ordinal in range(2)
+        )
+        removed = tuple(
+            int(value)
+            for value in removed_indices[
+                int(removed_offsets[candidate]) : int(removed_offsets[candidate + 1])
+            ]
+        )
+        observed.append((changes, removed))
+    generator = getattr(neighborhoods, generator_name)
+    expected = [
+        (candidate.changes, candidate.removed_customers)
+        for candidate in generator(sequences)
+    ]
+
+    assert observed == expected
+
+    plan_offsets, plan_route_offsets, plan_route_indices = (
+        native_core.assemble_changed_candidate_plans_v1(
+            offsets,
+            indices,
+            changed_routes,
+            change_offsets,
+            change_indices,
+        )
+    )
+    observed_plans = tuple(
+        tuple(
+            tuple(
+                int(value)
+                for value in plan_route_indices[
+                    int(plan_route_offsets[route]) : int(plan_route_offsets[route + 1])
+                ]
+            )
+            for route in range(
+                int(plan_offsets[candidate]), int(plan_offsets[candidate + 1])
+            )
+        )
+        for candidate in range(len(observed))
+    )
+    expected_plans = tuple(
+        neighborhoods._apply_changes(sequences, candidate.changes)
+        for candidate in generator(sequences)
+    )
+
+    assert observed_plans == expected_plans
+
+
+def test_native_candidate_plan_ranking_matches_python_rank_key() -> None:
+    from evrptw import _core as native_core
+
+    current = ((1, 2), (3,))
+    plans = (
+        ((1, 3), (2,)),
+        ((1, 2), (3,)),
+        ((1, 2, 3),),
+        ((2, 1), (3,)),
+    )
+    per_route_lower_bounds = (
+        (2.0, 1.0),
+        (2.0, 1.0),
+        (4.0,),
+        (2.0, 1.0),
+    )
+
+    plan_offsets = [0]
+    route_offsets = [0]
+    route_indices: list[int] = []
+    lower_bounds: list[float] = []
+    for plan, plan_bounds in zip(plans, per_route_lower_bounds, strict=True):
+        for route, route_bound in zip(plan, plan_bounds, strict=True):
+            route_indices.extend(route)
+            route_offsets.append(len(route_indices))
+            lower_bounds.append(route_bound)
+        plan_offsets.append(len(route_offsets) - 1)
+    current_offsets = [0]
+    current_indices: list[int] = []
+    for route in current:
+        current_indices.extend(route)
+        current_offsets.append(len(current_indices))
+    attempted = np.asarray([0, 1, 0, 0], dtype=np.int64)
+    ranked, selected, integer_metrics, float_metrics = (
+        native_core.rank_candidate_plans_v1(
+            np.asarray(plan_offsets, dtype=np.int64),
+            np.asarray(route_offsets, dtype=np.int64),
+            np.asarray(route_indices, dtype=np.int64),
+            np.asarray(lower_bounds, dtype=np.float64),
+            np.asarray(current_offsets, dtype=np.int64),
+            np.asarray(current_indices, dtype=np.int64),
+            np.asarray([0, 1, 2, 3, 4], dtype=np.int64),
+            attempted,
+            2,
+        )
+    )
+    current_set = set(current)
+    rank_keys = tuple(
+        (
+            len(plan),
+            sum(plan_bounds),
+            sum(route not in current_set for route in plan),
+            plan,
+            ordinal,
+        )
+        for ordinal, (plan, plan_bounds) in enumerate(
+            zip(plans, per_route_lower_bounds, strict=True)
+        )
+    )
+    expected_ranked = sorted(range(len(plans)), key=rank_keys.__getitem__)
+    expected_selected = [
+        ordinal for ordinal in expected_ranked if not attempted[ordinal]
+    ][:2]
+
+    assert ranked.tolist() == expected_ranked
+    assert selected.tolist() == expected_selected
+    assert integer_metrics.tolist() == [
+        [len(plan), sum(route not in current_set for route in plan)] for plan in plans
+    ]
+    assert float_metrics.tolist() == [sum(bounds) for bounds in per_route_lower_bounds]
+
+
 @pytest.mark.external_data
 @pytest.mark.skipif(
     os.environ.get("EVRPTW_RUN_NATIVE_REAL_DIFFERENTIAL") != "1",
@@ -756,21 +1098,13 @@ def test_per_solve_real_fixed_work_matches_four_worker_python_control(
     ]
 
 
-def test_full_native_alns_calls_cpp_once_and_matches_python_minimal_trajectory(
+def test_full_native_v2_packs_one_complete_soa_and_refuses_prototype_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from evrptw import _core as native_core
 
     instance = _fixture_instance()
-    python_result = solve_alns(
-        instance,
-        seed=2014,
-        max_iterations=1,
-        time_limit_seconds=2.0,
-        screening_config=CheapScreeningConfig(),
-        candidate_control_config=CandidateControlConfig(worker_count=1),
-    )
-    original = native_core.full_native_alns_v1
+    original = native_core.full_native_alns_v2
     invocations = 0
 
     def counted(*args: object) -> object:
@@ -778,56 +1112,43 @@ def test_full_native_alns_calls_cpp_once_and_matches_python_minimal_trajectory(
         invocations += 1
         return original(*args)
 
-    monkeypatch.setattr(native_core, "full_native_alns_v1", counted)
-    native_result = solve_alns(
-        instance,
-        seed=2014,
-        max_iterations=1,
-        time_limit_seconds=2.0,
-        screening_config=CheapScreeningConfig(),
-        native_execution_config=_native_config("full_native_alns"),
-    )
+    monkeypatch.setattr(native_core, "full_native_alns_v2", counted)
+    with pytest.raises(
+        RuntimeError,
+        match="semantic engine is incomplete; refusing prototype fallback",
+    ):
+        solve_alns(
+            instance,
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            **_full_native_solve_kwargs(),  # type: ignore[arg-type]
+            native_execution_config=_native_config("full_native_alns"),
+        )
 
     assert invocations == 1
-    assert native_result.routes == python_result.routes
-    assert native_result.customer_sequences == python_result.customer_sequences
-    assert native_result.objective == python_result.objective
-    assert native_result.native_execution_statistics["mode"] == "full_native_alns"
-    assert native_result.native_execution_statistics["fallback_count"] == 0
 
 
-def test_host_scheduler_uses_uds_shared_memory_and_matches_direct_full_native(
+def test_host_scheduler_v1_cannot_masquerade_as_full_native_v2(
     tmp_path: Path,
 ) -> None:
     instance = _fixture_instance()
-    direct = solve_alns(
-        instance,
-        seed=2014,
-        max_iterations=10,
-        time_limit_seconds=2.0,
-        screening_config=CheapScreeningConfig(),
-        native_execution_config=_native_config("full_native_alns"),
-    )
     endpoint = tmp_path / "native-scheduler.sock"
-    with NativeHostScheduler(endpoint):
-        scheduled = solve_alns(
+    with (
+        NativeHostScheduler(endpoint),
+        pytest.raises(RuntimeError, match="invalid SoA descriptor set"),
+    ):
+        solve_alns(
             instance,
             seed=2014,
             max_iterations=10,
             time_limit_seconds=2.0,
-            screening_config=CheapScreeningConfig(),
+            **_full_native_solve_kwargs(),  # type: ignore[arg-type]
             native_execution_config=replace(
                 _native_config("host_scheduler"),
                 scheduler_socket_path=str(endpoint),
             ),
         )
-
-    assert scheduled.objective == direct.objective
-    assert scheduled.routes == direct.routes
-    assert scheduled.neighborhood_events == direct.neighborhood_events
-    assert scheduled.candidate_work_hash == direct.candidate_work_hash
-    assert scheduled.native_execution_statistics["mode"] == "host_scheduler"
-    assert scheduled.native_execution_statistics["fallback_count"] == 0
 
 
 def test_host_scheduler_exit_fails_fast_without_local_fallback(tmp_path: Path) -> None:
@@ -842,7 +1163,7 @@ def test_host_scheduler_exit_fails_fast_without_local_fallback(tmp_path: Path) -
             seed=2014,
             max_iterations=1,
             time_limit_seconds=2.0,
-            screening_config=CheapScreeningConfig(),
+            **_full_native_solve_kwargs(),  # type: ignore[arg-type]
             native_execution_config=replace(
                 _native_config("host_scheduler"),
                 scheduler_socket_path=str(endpoint),
@@ -859,20 +1180,18 @@ def test_host_scheduler_partial_ipc_rolls_back_and_keeps_service_usable(
             connection.connect(str(endpoint))
             connection.sendall(struct.pack("!Q", 100) + b"{}")
 
-        result = solve_alns(
-            _fixture_instance(),
-            seed=2014,
-            max_iterations=1,
-            time_limit_seconds=2.0,
-            screening_config=CheapScreeningConfig(),
-            native_execution_config=replace(
-                _native_config("host_scheduler"),
-                scheduler_socket_path=str(endpoint),
-            ),
-        )
-
-    assert result.feasible
-    assert result.native_execution_statistics["fallback_count"] == 0
+        with pytest.raises(RuntimeError, match="invalid SoA descriptor set"):
+            solve_alns(
+                _fixture_instance(),
+                seed=2014,
+                max_iterations=1,
+                time_limit_seconds=2.0,
+                **_full_native_solve_kwargs(),  # type: ignore[arg-type]
+                native_execution_config=replace(
+                    _native_config("host_scheduler"),
+                    scheduler_socket_path=str(endpoint),
+                ),
+            )
 
 
 def test_host_scheduler_start_failure_cleans_process_state(tmp_path: Path) -> None:

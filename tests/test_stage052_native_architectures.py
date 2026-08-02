@@ -6,6 +6,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from evrptw.charging import solve_exact_charging
 from evrptw.experiments.stage052_native_architecture_review import (
     ReviewRecord,
@@ -18,10 +20,14 @@ from evrptw.experiments.stage052_native_architecture_review import (
 )
 from evrptw.experiments.stage052_native_architectures import (
     MODES,
+    PAIRED_INSTANCES,
+    SEEDS,
+    WARM_START_SCHEMA_VERSION,
     ArchitectureAxisTask,
     _run_group,
     build_axis_plan,
     expected_axis_count,
+    load_warm_start_bundle,
     rotated_modes,
     run_labels_for_scope,
 )
@@ -32,6 +38,17 @@ from evrptw.validation import validate_routes
 
 
 def _plan(scope: str, tmp_path: Path):  # type: ignore[no-untyped-def]
+    from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES
+
+    instances = PAIRED_INSTANCES if scope == "paired" else tuple(FORMAL_INSTANCES)
+    warm_starts = {
+        (instance_name, seed): (
+            (("C1",),),
+            {"source_solution_sha256": "d" * 64},
+        )
+        for instance_name in instances
+        for seed in SEEDS
+    }
     return build_axis_plan(
         scope,
         attempt=1,
@@ -41,7 +58,53 @@ def _plan(scope: str, tmp_path: Path):  # type: ignore[no-untyped-def]
         wheel_sha256="a" * 64,
         native_sha256="b" * 64,
         revision="c" * 40,
+        warm_starts=warm_starts,
     )
+
+
+def _c5_warm_start(root: Path) -> tuple[tuple[str, ...], ...]:
+    instance = parse_schneider(root / "data/schneider/c101C5.txt")
+    return tuple((customer.name,) for customer in instance.customers)
+
+
+def test_warm_start_bundle_binds_hash_identity_and_customer_coverage(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    routes = _c5_warm_start(root)
+    bundle = tmp_path / "warm-starts.json"
+    payload = {
+        "schema_version": WARM_START_SCHEMA_VERSION,
+        "records": [
+            {
+                "instance": "c101C5",
+                "seed": 2014,
+                "customer_sequences": [list(route) for route in routes],
+                "source_solution_sha256": "a" * 64,
+                "source_objective_key": [2, 1.0, 0.0, 0],
+            }
+        ],
+    }
+    data = json.dumps(payload, sort_keys=True).encode("utf-8")
+    bundle.write_bytes(data)
+    bundle.with_suffix(".json.sha256").write_text(
+        hashlib.sha256(data).hexdigest(),
+        encoding="ascii",
+    )
+
+    loaded = load_warm_start_bundle(
+        bundle,
+        benchmark_dir=root / "data/schneider",
+    )
+
+    assert loaded[("c101C5", 2014)][0] == routes
+    assert loaded[("c101C5", 2014)][1]["warm_start_bundle_sha256"] == (
+        hashlib.sha256(data).hexdigest()
+    )
+
+    bundle.with_suffix(".json.sha256").write_text("0" * 64, encoding="ascii")
+    with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
+        load_warm_start_bundle(bundle, benchmark_dir=root / "data/schneider")
 
 
 def test_paired_plan_has_360_axes_and_rotates_all_five_modes(tmp_path: Path) -> None:
@@ -286,6 +349,8 @@ def test_one_wall_clock_group_runs_all_five_modes_with_one_scheduler(
         wheel_sha256="a" * 64,
         native_sha256="b" * 64,
         revision="c" * 40,
+        initial_customer_sequences=_c5_warm_start(root),
+        initial_solution_provenance={"source_solution_sha256": "d" * 64},
     )
 
     with NativeHostScheduler(endpoint):
@@ -294,7 +359,14 @@ def test_one_wall_clock_group_runs_all_five_modes_with_one_scheduler(
     assert len(written) == len(MODES)
     payloads = [json.loads(Path(path).read_bytes()) for path in written]
     assert {payload["mode"] for payload in payloads} == {mode.value for mode in MODES}
-    assert all(payload["status"] == "completed" for payload in payloads)
+    status_by_mode = {payload["mode"]: payload["status"] for payload in payloads}
+    assert status_by_mode == {
+        "current_stage052": "completed",
+        "python_candidate_control": "completed",
+        "per_solve_runtime": "completed",
+        "full_native_alns": "failed",
+        "host_scheduler": "failed",
+    }
     assert all(payload["persistence_seconds"] > 0.0 for payload in payloads)
     assert not tuple(tmp_path.rglob("*.persistence-probe-*"))
 
@@ -315,6 +387,8 @@ def test_one_fixed_work_group_retains_every_mode_axis(tmp_path: Path) -> None:
         wheel_sha256="a" * 64,
         native_sha256="b" * 64,
         revision="c" * 40,
+        initial_customer_sequences=_c5_warm_start(root),
+        initial_solution_provenance={"source_solution_sha256": "d" * 64},
     )
 
     with NativeHostScheduler(endpoint):
@@ -323,4 +397,11 @@ def test_one_fixed_work_group_retains_every_mode_axis(tmp_path: Path) -> None:
     payloads = [json.loads(Path(path).read_bytes()) for path in written]
     assert len(payloads) == len(MODES)
     assert {payload["mode"] for payload in payloads} == {mode.value for mode in MODES}
-    assert all(payload["status"] == "completed" for payload in payloads)
+    status_by_mode = {payload["mode"]: payload["status"] for payload in payloads}
+    assert status_by_mode == {
+        "current_stage052": "completed",
+        "python_candidate_control": "completed",
+        "per_solve_runtime": "completed",
+        "full_native_alns": "failed",
+        "host_scheduler": "failed",
+    }

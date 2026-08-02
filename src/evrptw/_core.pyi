@@ -18,6 +18,58 @@ def python_random_golden_v1(
     int,
     npt.NDArray[np.int64],
 ]: ...
+def native_objective_acceptance_v1(
+    current_integer: npt.NDArray[np.int64],
+    current_float: npt.NDArray[np.float64],
+    candidate_integer: npt.NDArray[np.int64],
+    candidate_float: npt.NDArray[np.float64],
+    temperatures: npt.NDArray[np.float64],
+    random_draws: npt.NDArray[np.float64],
+) -> npt.NDArray[np.int64]: ...
+def stage04_segment_update_v1(
+    weights: npt.NDArray[np.float64],
+    reward_sums: npt.NDArray[np.float64],
+    calls: npt.NDArray[np.int64],
+    options: npt.NDArray[np.float64],
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int64]]: ...
+def changed_candidate_pool_v1(
+    operation: int,
+    route_offsets: npt.NDArray[np.int64],
+    route_indices: npt.NDArray[np.int64],
+) -> tuple[
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+]: ...
+def assemble_changed_candidate_plans_v1(
+    current_route_offsets: npt.NDArray[np.int64],
+    current_route_indices: npt.NDArray[np.int64],
+    changed_route_indices: npt.NDArray[np.int64],
+    change_offsets: npt.NDArray[np.int64],
+    change_indices: npt.NDArray[np.int64],
+) -> tuple[
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+]: ...
+def rank_candidate_plans_v1(
+    plan_offsets: npt.NDArray[np.int64],
+    route_offsets: npt.NDArray[np.int64],
+    route_indices: npt.NDArray[np.int64],
+    route_distance_lower_bounds: npt.NDArray[np.float64],
+    current_route_offsets: npt.NDArray[np.int64],
+    current_route_indices: npt.NDArray[np.int64],
+    lexical_rank: npt.NDArray[np.int64],
+    attempted_flags: npt.NDArray[np.int64],
+    top_k: int,
+) -> tuple[
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.float64],
+]: ...
 
 __build_git_revision__: str
 
@@ -258,6 +310,67 @@ def full_native_alns_v1(
     npt.NDArray[np.float64],
     npt.NDArray[np.int64],
     str,
+]: ...
+def full_native_alns_v2(
+    node_kind: npt.NDArray[np.int64],
+    demand: npt.NDArray[np.float64],
+    ready_time: npt.NDArray[np.float64],
+    due_date: npt.NDArray[np.float64],
+    service_time: npt.NDArray[np.float64],
+    distance: npt.NDArray[np.float64],
+    vehicle: npt.NDArray[np.float64],
+    lexical_rank: npt.NDArray[np.int64],
+    initial_route_offsets: npt.NDArray[np.int64],
+    initial_route_indices: npt.NDArray[np.int64],
+    control: npt.NDArray[np.int64],
+    deadline_remaining: npt.NDArray[np.float64],
+    protocol_control: npt.NDArray[np.int64],
+    protocol_options: npt.NDArray[np.float64],
+    stage04_integer: npt.NDArray[np.int64],
+    stage04_float: npt.NDArray[np.float64],
+    operator_integer: npt.NDArray[np.int64],
+    operator_float: npt.NDArray[np.float64],
+) -> tuple[
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+    ],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.float64],
+    npt.NDArray[np.int64],
+    str,
+]: ...
+def full_native_initialize_v2(
+    node_kind: npt.NDArray[np.int64],
+    ready_time: npt.NDArray[np.float64],
+    due_date: npt.NDArray[np.float64],
+    service_time: npt.NDArray[np.float64],
+    distance: npt.NDArray[np.float64],
+    vehicle: npt.NDArray[np.float64],
+    initial_route_offsets: npt.NDArray[np.int64],
+    initial_route_indices: npt.NDArray[np.int64],
+    control: npt.NDArray[np.int64],
+    deadline_remaining: npt.NDArray[np.float64],
+) -> tuple[
+    tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+    ],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.float64],
+    npt.NDArray[np.int64],
 ]: ...
 def run_host_scheduler_service_v1(socket_path: str, worker_threads: int) -> None: ...
 def propagate_routes_numeric(

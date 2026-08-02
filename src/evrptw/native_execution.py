@@ -18,6 +18,7 @@ from typing import Literal, cast
 import numpy as np
 import numpy.typing as npt
 
+from evrptw.cache_incremental import CacheIncrementalConfig
 from evrptw.candidate_control import CandidateControlConfig
 from evrptw.candidate_transaction import (
     SCREEN_REASON_BY_CODE,
@@ -30,8 +31,11 @@ from evrptw.candidate_transaction import (
 )
 from evrptw.charging import ChargingSubproblemResult
 from evrptw.cpu_batch import BackendMetrics, decode_exact_charging_batch_numeric
+from evrptw.measurement import CheapScreeningConfig
 from evrptw.models import Instance
 from evrptw.native_kernels import NativeKernelConfig, NativeKernelRuntime
+from evrptw.neighborhoods import VehicleOperatorConfig
+from evrptw.stage04 import Stage04Config
 
 NATIVE_EXECUTION_SCHEMA_VERSION = "stage05.2-native-execution-v2"
 
@@ -42,13 +46,13 @@ NativeExecutionMode = Literal[
 ]
 NativeWorkerProtocol = Literal[
     "candidate_round_soa_v2",
-    "full_solve_soa_v1",
+    "full_solve_soa_v2",
     "unix_shm_scheduler_v1",
 ]
 
 _PROTOCOL_BY_MODE: dict[NativeExecutionMode, NativeWorkerProtocol] = {
     "per_solve_runtime": "candidate_round_soa_v2",
-    "full_native_alns": "full_solve_soa_v1",
+    "full_native_alns": "full_solve_soa_v2",
     "host_scheduler": "unix_shm_scheduler_v1",
 }
 
@@ -82,6 +86,76 @@ FULL_NATIVE_OPERATOR_NAMES = (
     "worst_energy_detour",
     "shaw_related",
     "vehicle_reduction_refinement",
+)
+
+FULL_NATIVE_STAGE04_INTEGER_FIELDS = (
+    "enabled",
+    "segment_length",
+    "min_calls_per_operator",
+    "fixed_weights",
+    "auto_temperature",
+    "temperature_sample_size",
+    "reheat_enabled",
+    "reheat_stagnation_threshold",
+    "max_reheats",
+    "restart_enabled",
+    "restart_stagnation_threshold",
+    "max_restarts",
+    "intensification_enabled",
+    "intensification_iterations",
+    "acceptance_rate_window",
+)
+FULL_NATIVE_STAGE04_FLOAT_FIELDS = (
+    "weight_reaction",
+    "weight_floor",
+    "weight_smoothing",
+    "fixed_weight_value",
+    "reward_rejected",
+    "reward_accepted_worse",
+    "reward_accepted_equal",
+    "reward_distance_improvement",
+    "reward_vehicle_reduction",
+    "reward_new_global_best",
+    "reward_new_global_best_vehicle_reduction",
+    "temperature_target_acceptance_rate",
+    "temperature_fallback_fraction",
+    "reheat_factor",
+    "intensification_removal_fraction",
+)
+FULL_NATIVE_OPERATOR_INTEGER_FIELDS = (
+    "max_route_elimination_attempts",
+    "route_elimination_exact_evaluation_budget",
+    "route_merge_exact_evaluation_budget",
+    "vehicle_repair_exact_evaluation_budget",
+    "vehicle_reduction_refinement_exact_evaluation_budget",
+    "relocate_exact_evaluation_budget",
+    "swap_exact_evaluation_budget",
+    "two_opt_star_exact_evaluation_budget",
+    "route_segment_exact_evaluation_budget",
+    "ejection_chain_exact_evaluation_budget",
+    "quality_probe_exact_evaluation_budget",
+    "quality_route_segment_probe_exact_evaluation_budget",
+    "route_segment_min_length",
+    "route_segment_max_length",
+    "ejection_chain_max_depth",
+    "ejection_chain_beam_width",
+    "constraint_probe_exact_evaluation_budget",
+    "station_pressure_exact_evaluation_budget",
+    "time_window_conflict_exact_evaluation_budget",
+    "worst_energy_detour_exact_evaluation_budget",
+    "shaw_related_exact_evaluation_budget",
+    "medium_stagnation_threshold",
+    "large_stagnation_threshold",
+    "exploration_period",
+)
+FULL_NATIVE_OPERATOR_FLOAT_FIELDS = (
+    "constraint_lane_time_budget_seconds",
+    "small_removal_min_fraction",
+    "small_removal_max_fraction",
+    "medium_removal_min_fraction",
+    "medium_removal_max_fraction",
+    "large_removal_min_fraction",
+    "large_removal_max_fraction",
 )
 
 
@@ -150,6 +224,38 @@ class FullNativeALNSResult:
     transaction_sha256: str
 
 
+def _pack_integer_config(
+    config: object,
+    fields: tuple[str, ...],
+) -> npt.NDArray[np.int64]:
+    values: list[int] = []
+    for name in fields:
+        value = getattr(config, name)
+        if isinstance(value, bool):
+            values.append(int(value))
+        elif isinstance(value, int):
+            values.append(value)
+        else:
+            raise TypeError(f"full native integer config field {name} is not integral")
+    return np.ascontiguousarray(values, dtype=np.int64)
+
+
+def _pack_float_config(
+    config: object,
+    fields: tuple[str, ...],
+) -> npt.NDArray[np.float64]:
+    values: list[float] = []
+    for name in fields:
+        value = getattr(config, name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"full native float config field {name} is not numeric")
+        converted = float(value)
+        if not math.isfinite(converted):
+            raise ValueError(f"full native float config field {name} is not finite")
+        values.append(converted)
+    return np.ascontiguousarray(values, dtype=np.float64)
+
+
 def execute_full_native_alns(
     instance: Instance,
     *,
@@ -159,7 +265,15 @@ def execute_full_native_alns(
     batch_size: int,
     compute_threads: int,
     native_runtime: NativeKernelRuntime,
-    initial_customer_sequences: tuple[CustomerSequence, ...] | None = None,
+    initial_customer_sequences: tuple[CustomerSequence, ...],
+    candidate_control_config: CandidateControlConfig,
+    stage04_config: Stage04Config,
+    vehicle_operator_config: VehicleOperatorConfig,
+    screening_config: CheapScreeningConfig,
+    cache_incremental_config: CacheIncrementalConfig,
+    removal_fraction: float,
+    termination_mode: str,
+    operator_profile: str,
     exact_call_budget: int | None = None,
     dispatcher: Callable[..., object] | None = None,
     clock: Callable[[], float] = time.perf_counter,
@@ -168,6 +282,18 @@ def execute_full_native_alns(
 
     if max_iterations <= 0 or batch_size <= 0 or compute_threads <= 0:
         raise ValueError("full native iteration/batch/thread counts must be positive")
+    if not initial_customer_sequences:
+        raise ValueError("full native v2 requires an explicit non-empty warm start")
+    if operator_profile != "stage02_constraint_guided":
+        raise ValueError("full native v2 requires the Stage 2.3 operator profile")
+    if termination_mode not in {"fixed_work", "wall_clock"}:
+        raise ValueError("full native v2 termination mode is invalid")
+    if not 0.0 < removal_fraction <= 1.0:
+        raise ValueError("full native v2 removal fraction must be in (0, 1]")
+    if not stage04_config.enabled:
+        raise ValueError("full native v2 requires enabled Stage 4 search control")
+    if not screening_config.enabled or not cache_incremental_config.enabled:
+        raise ValueError("full native v2 requires screening and cache/incremental control")
     remaining = deadline - clock()
     if remaining <= 0.0:
         raise RuntimeError("full native ALNS reached its deadline before dispatch")
@@ -179,14 +305,10 @@ def execute_full_native_alns(
         [rank_by_name[name] for name in context.node_names],
         dtype=np.int64,
     )
-    if initial_customer_sequences is None:
-        initial_offsets = np.empty(0, dtype=np.int64)
-        initial_indices = np.empty(0, dtype=np.int64)
-    else:
-        initial_offsets, initial_indices = _pack_routes(
-            initial_customer_sequences,
-            context.name_to_index,
-        )
+    initial_offsets, initial_indices = _pack_routes(
+        initial_customer_sequences,
+        context.name_to_index,
+    )
     if exact_call_budget is not None and exact_call_budget <= 0:
         raise ValueError("full native exact-call budget must be positive")
     control = np.ascontiguousarray(
@@ -200,10 +322,48 @@ def execute_full_native_alns(
         dtype=np.int64,
     )
     deadline_remaining = np.ascontiguousarray([remaining], dtype=np.float64)
+    protocol_control = np.ascontiguousarray(
+        [
+            1 if termination_mode == "fixed_work" else 0,
+            candidate_control_config.proposal_top_k,
+            candidate_control_config.max_exact_calls_per_round,
+            candidate_control_config.worker_count,
+            candidate_control_config.fixed_work_exhaustion_rounds,
+            candidate_control_config.min_iterations_before_exhaustion,
+            1 if screening_config.negative_sequence_cache else 0,
+            cache_incremental_config.max_entries,
+            cache_incremental_config.max_memory_bytes,
+            1 if cache_incremental_config.shared_across_lanes else 0,
+            1 if cache_incremental_config.incremental_relocate else 0,
+            1 if cache_incremental_config.incremental_swap else 0,
+            1 if cache_incremental_config.station_reachability_bitset else 0,
+        ],
+        dtype=np.int64,
+    )
+    protocol_options = np.ascontiguousarray(
+        [removal_fraction, screening_config.epsilon],
+        dtype=np.float64,
+    )
+    stage04_integer = _pack_integer_config(
+        stage04_config,
+        FULL_NATIVE_STAGE04_INTEGER_FIELDS,
+    )
+    stage04_float = _pack_float_config(
+        stage04_config,
+        FULL_NATIVE_STAGE04_FLOAT_FIELDS,
+    )
+    operator_integer = _pack_integer_config(
+        vehicle_operator_config,
+        FULL_NATIVE_OPERATOR_INTEGER_FIELDS,
+    )
+    operator_float = _pack_float_config(
+        vehicle_operator_config,
+        FULL_NATIVE_OPERATOR_FLOAT_FIELDS,
+    )
 
     from evrptw import _core as native_core
 
-    native_entrypoint = native_core.full_native_alns_v1 if dispatcher is None else dispatcher
+    native_entrypoint = native_core.full_native_alns_v2 if dispatcher is None else dispatcher
     payload = native_entrypoint(
         context.node_kind,
         context.demand,
@@ -217,6 +377,12 @@ def execute_full_native_alns(
         initial_indices,
         control,
         deadline_remaining,
+        protocol_control,
+        protocol_options,
+        stage04_integer,
+        stage04_float,
+        operator_integer,
+        operator_float,
     )
     if not isinstance(payload, tuple) or len(payload) != 7:
         raise RuntimeError("full native ALNS returned an invalid payload tuple")
