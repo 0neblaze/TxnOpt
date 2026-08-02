@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import random
 import socket
 import struct
 import time
@@ -21,7 +23,11 @@ from evrptw.candidate_transaction import (
     NativeCandidateTransactionRuntime,
 )
 from evrptw.charging import solve_exact_charging
-from evrptw.measurement import CheapScreeningConfig
+from evrptw.exact_deadline import ExactDeadlineConfig
+from evrptw.experiments.stage052_native_architectures import (
+    _semantic_candidate_trajectory,
+)
+from evrptw.measurement import CheapScreeningConfig, MeasurementConfig, Stage03Trace
 from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.native_execution import (
     NATIVE_EXECUTION_SCHEMA_VERSION,
@@ -32,6 +38,8 @@ from evrptw.native_execution import (
 )
 from evrptw.native_kernels import NativeKernelConfig, NativeKernelRuntime
 from evrptw.native_scheduler import NativeHostScheduler
+from evrptw.parser import parse_schneider
+from evrptw.stage04 import Stage04Config
 
 
 def _fixture_instance() -> Instance:
@@ -41,6 +49,21 @@ def _fixture_instance() -> Instance:
             Node("D0", NodeType.DEPOT, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0),
             Node("C1", NodeType.CUSTOMER, 1.0, 0.0, 1.0, 0.0, 100.0, 0.0),
             Node("C2", NodeType.CUSTOMER, 2.0, 0.0, 1.0, 0.0, 100.0, 0.0),
+        ),
+        Vehicle(10.0, 100.0, 1.0, 0.1, 1.0),
+        distance_backend="python",
+    )
+
+
+def _candidate_control_ranking_fixture() -> Instance:
+    """Make lexical and full-screening distance ranks intentionally disagree."""
+
+    return Instance(
+        "candidate_control_ranking_fixture",
+        (
+            Node("D0", NodeType.DEPOT, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0),
+            Node("C1", NodeType.CUSTOMER, 10.0, 0.0, 1.0, 0.0, 100.0, 0.0),
+            Node("C2", NodeType.CUSTOMER, 1.0, 0.0, 1.0, 0.0, 100.0, 0.0),
         ),
         Vehicle(10.0, 100.0, 1.0, 0.1, 1.0),
         distance_backend="python",
@@ -66,7 +89,7 @@ def test_per_solve_native_execution_protocol_is_explicit_and_fail_fast() -> None
     config = _per_solve_config()
 
     assert config.schema_version == NATIVE_EXECUTION_SCHEMA_VERSION
-    assert config.worker_protocol == "candidate_round_soa_v1"
+    assert config.worker_protocol == "candidate_round_soa_v2"
     assert config.compute_thread_limit == 24
     assert config.fallback_allowed is False
     assert config.failure_policy == "fail_fast_no_fallback"
@@ -146,7 +169,7 @@ def test_explicit_native_protocol_is_the_only_guard_bypass() -> None:
 
     assert result.feasible
     assert result.native_execution_statistics["mode"] == "per_solve_runtime"
-    assert result.native_execution_statistics["worker_protocol"] == "candidate_round_soa_v1"
+    assert result.native_execution_statistics["worker_protocol"] == "candidate_round_soa_v2"
     assert result.native_execution_statistics["fallback_count"] == 0
 
 
@@ -300,7 +323,7 @@ def test_evaluator_per_solve_protocol_crosses_python_native_boundary_once(
         iteration=7,
         operator="relocate",
     )
-    original = native_core.candidate_round_transaction_v1
+    original = native_core.candidate_round_transaction_v2
     invocations = 0
 
     def counted(*args: object) -> object:
@@ -311,7 +334,7 @@ def test_evaluator_per_solve_protocol_crosses_python_native_boundary_once(
     def forbidden(*_args: object) -> object:
         raise AssertionError("per-solve protocol called a second native entry point")
 
-    monkeypatch.setattr(native_core, "candidate_round_transaction_v1", counted)
+    monkeypatch.setattr(native_core, "candidate_round_transaction_v2", counted)
     monkeypatch.setattr(native_core, "screen_route_batch_transaction_v2", forbidden)
     monkeypatch.setattr(native_core, "exact_charging_batch_numeric", forbidden)
 
@@ -335,10 +358,12 @@ def test_per_solve_fixed_work_round_matches_python_candidate_control() -> None:
     control_config = CandidateControlConfig(worker_count=1)
     python_control = CandidateControlRuntime(control_config)
     python_control.begin_round(7, lane="constraint")
+    python_trace = Stage03Trace(MeasurementConfig())
     python_evaluator = _Evaluator(
         instance,
         deadline=time.perf_counter() + 10.0,
         lane="constraint",
+        measurement_trace=python_trace,
         screening_config=CheapScreeningConfig(),
         backend="cpu_batch",
         candidate_control_runtime=python_control,
@@ -352,10 +377,12 @@ def test_per_solve_fixed_work_round_matches_python_candidate_control() -> None:
     execution = _per_solve_config()
     native_control = CandidateControlRuntime(execution.candidate_control_config)
     native_control.begin_round(7, lane="constraint")
+    native_trace = Stage03Trace(MeasurementConfig())
     native_evaluator = _Evaluator(
         instance,
         deadline=time.perf_counter() + 10.0,
         lane="constraint",
+        measurement_trace=native_trace,
         screening_config=CheapScreeningConfig(),
         backend="cpu_batch",
         candidate_control_runtime=native_control,
@@ -385,6 +412,13 @@ def test_per_solve_fixed_work_round_matches_python_candidate_control() -> None:
     ]
     assert native_control.candidate_work_hash == python_control.candidate_work_hash
     assert native_control.route_result_hash == python_control.route_result_hash
+    assert [
+        (event.route_key, event.exact_started, event.exact_completed, event.status)
+        for event in native_trace.route_evaluations
+    ] == [
+        (event.route_key, event.exact_started, event.exact_completed, event.status)
+        for event in python_trace.route_evaluations
+    ]
     python_decisions = [
         event
         for event in python_control.events
@@ -400,6 +434,56 @@ def test_per_solve_fixed_work_round_matches_python_candidate_control() -> None:
     assert native_decisions == python_decisions
 
 
+def test_per_solve_preserves_python_prescreened_ranking_semantics() -> None:
+    instance = _candidate_control_ranking_fixture()
+    candidates = (("C1",), ("C2",))
+    control_config = CandidateControlConfig(worker_count=1)
+    python_control = CandidateControlRuntime(control_config)
+    python_evaluator = _Evaluator(
+        instance,
+        deadline=time.perf_counter() + 10.0,
+        lane="initialization",
+        screening_config=CheapScreeningConfig(),
+        backend="cpu_batch",
+        candidate_control_runtime=python_control,
+    )
+
+    execution = _per_solve_config()
+    native_control = CandidateControlRuntime(execution.candidate_control_config)
+    native_evaluator = _Evaluator(
+        instance,
+        deadline=time.perf_counter() + 10.0,
+        lane="initialization",
+        screening_config=CheapScreeningConfig(),
+        backend="cpu_batch",
+        candidate_control_runtime=native_control,
+        candidate_transaction_runtime=NativeCandidateTransactionRuntime(
+            execution.candidate_transaction_config
+        ),
+        native_runtime=NativeKernelRuntime.build(
+            instance,
+            execution.native_kernel_config,
+        ),
+        native_execution_config=execution,
+    )
+
+    python_results = python_evaluator.candidate_route_batch(
+        candidates,
+        prescreened=True,
+    )
+    native_results = native_evaluator.candidate_route_batch(
+        candidates,
+        prescreened=True,
+        exact_budget=1,
+    )
+
+    assert [charging_result_semantic_payload(result) for result in native_results] == [
+        charging_result_semantic_payload(result) for result in python_results
+    ]
+    assert native_control.candidate_work_hash == python_control.candidate_work_hash
+    assert native_control.route_result_hash == python_control.route_result_hash
+
+
 def test_native_candidate_round_hash_mismatch_fails_without_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -410,13 +494,13 @@ def test_native_candidate_round_hash_mismatch_fails_without_fallback(
     transaction_runtime = NativeCandidateTransactionRuntime(
         NativeCandidateTransactionConfig()
     )
-    original = native_core.candidate_round_transaction_v1
+    original = native_core.candidate_round_transaction_v2
 
     def corrupt_hash(*args: object) -> tuple[object, ...]:
         payload = original(*args)
         return (*payload[:-1], "0" * 64)
 
-    monkeypatch.setattr(native_core, "candidate_round_transaction_v1", corrupt_hash)
+    monkeypatch.setattr(native_core, "candidate_round_transaction_v2", corrupt_hash)
 
     with pytest.raises(RuntimeError, match="transaction SHA-256 mismatch"):
         execute_native_candidate_round(
@@ -534,6 +618,141 @@ def test_native_candidate_round_one_and_four_threads_are_semantically_identical(
     assert serial.transaction_sha256 == parallel.transaction_sha256
     assert [charging_result_semantic_payload(result) for result in serial.exact_results] == [
         charging_result_semantic_payload(result) for result in parallel.exact_results
+    ]
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2014, 2014 ^ 0x5EED23, 2**32 + 17])
+def test_native_python_random_matches_python313_call_sequence(seed: int) -> None:
+    from evrptw import _core as native_core
+
+    bounds = np.asarray([1, 2, 3, 17, 2**16, 2**32], dtype=np.int64)
+    weights = np.asarray([0.25, 1.5, 0.0, 3.25], dtype=np.float64)
+    native = native_core.python_random_golden_v1(
+        seed,
+        12,
+        bounds,
+        100,
+        17,
+        weights,
+        25,
+    )
+    python = random.Random(seed)
+    expected_random = [python.random() for _ in range(12)]
+    expected_bounded = [python.randrange(int(bound)) for bound in bounds]
+    expected_sample = python.sample(range(100), 17)
+    expected_weighted = python.choices(range(len(weights)), weights=weights, k=1)[0]
+    expected_shuffle = list(range(25))
+    python.shuffle(expected_shuffle)
+
+    assert native[0].tolist() == expected_random
+    assert native[1].tolist() == expected_bounded
+    assert native[2].tolist() == expected_sample
+    assert native[3] == expected_weighted
+    assert native[4].tolist() == expected_shuffle
+
+
+@pytest.mark.external_data
+@pytest.mark.skipif(
+    os.environ.get("EVRPTW_RUN_NATIVE_REAL_DIFFERENTIAL") != "1",
+    reason="opt-in real 100-customer native differential gate",
+)
+@pytest.mark.parametrize(
+    ("instance_name", "seed"),
+    [
+        (instance_name, seed)
+        for instance_name in ("c101C5", "c101_21", "r101_21", "rc101_21")
+        for seed in (2014, 2015, 2016)
+    ],
+)
+def test_per_solve_real_fixed_work_matches_four_worker_python_control(
+    instance_name: str,
+    seed: int,
+) -> None:
+    instance_path = Path(f"data/schneider/{instance_name}.txt")
+    if not instance_path.exists():
+        pytest.skip("Schneider benchmark data are not linked")
+    instance = replace(parse_schneider(instance_path), distance_backend="native")
+    control = CandidateControlConfig(worker_count=4)
+    common = {
+        "seed": seed,
+        "max_iterations": 1000,
+        "time_limit_seconds": 120.0,
+        "operator_profile": "stage02_constraint_guided",
+        "measurement_config": MeasurementConfig(),
+        "screening_config": CheapScreeningConfig(),
+        "cache_incremental_config": CacheIncrementalConfig(enabled=True),
+        "backend": "cpu_batch",
+        "batch_size": 128,
+        "termination_mode": "fixed_work",
+        "exact_deadline_config": ExactDeadlineConfig.fixed_exact_calls(
+            100,
+            watchdog_seconds=120.0,
+        ),
+        "stage04_config": Stage04Config(),
+    }
+
+    python_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        candidate_control_config=control,
+    )
+    native_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        native_execution_config=replace(
+            _per_solve_config(),
+            candidate_control_config=control,
+        ),
+    )
+
+    assert python_result.feasible and native_result.feasible
+    assert native_result.objective == python_result.objective
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.candidate_work_hash == python_result.candidate_work_hash
+    assert native_result.route_result_hash == python_result.route_result_hash
+    assert native_result.exact_started_calls == python_result.exact_started_calls
+    assert native_result.exact_completed_calls == python_result.exact_completed_calls
+    telemetry_fields = {
+        "failure_reasons",
+        "prefilter_passed",
+        "prefilter_rejected",
+    }
+    for operator, python_statistics in python_result.neighborhood_statistics.items():
+        native_statistics = native_result.neighborhood_statistics[operator]
+        assert {
+            key: value
+            for key, value in native_statistics.items()
+            if key not in telemetry_fields
+        } == {
+            key: value
+            for key, value in python_statistics.items()
+            if key not in telemetry_fields
+        }, operator
+    assert _semantic_candidate_trajectory(native_result) == _semantic_candidate_trajectory(
+        python_result
+    )
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+    assert native_result.stage04_event_log == python_result.stage04_event_log
+    assert native_result.measurement_trace is not None
+    assert python_result.measurement_trace is not None
+    assert [
+        (
+            row.route_key,
+            row.kind,
+            row.exact_started,
+            row.exact_completed,
+            row.cache_key_digest,
+        )
+        for row in native_result.measurement_trace.route_evaluations
+    ] == [
+        (
+            row.route_key,
+            row.kind,
+            row.exact_started,
+            row.exact_completed,
+            row.cache_key_digest,
+        )
+        for row in python_result.measurement_trace.route_evaluations
     ]
 
 

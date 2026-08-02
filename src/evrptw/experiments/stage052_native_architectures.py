@@ -33,10 +33,11 @@ from evrptw.native_scheduler import NativeHostScheduler
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
+from evrptw.runtime_envelope import ProcessTreeMonitor
 from evrptw.stage04 import Stage04Config
 from evrptw.validation import validate_routes
 
-SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v3"
+SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v4"
 SEEDS = (2014, 2015, 2016)
 PAIRED_INSTANCES = ("c101C5", "c101_21", "r101_21", "rc101_21")
 AXIS_NAMES = ("fixed_work", "wall_clock_30")
@@ -70,6 +71,7 @@ class ArchitectureAxisTask:
     wheel_sha256: str
     native_sha256: str
     revision: str
+    scheduler_process_id: int | None = None
 
 
 def run_labels_for_scope(scope: str, attempt: int) -> dict[str, str]:
@@ -318,6 +320,43 @@ def _evidence_json_value(value: object) -> object:
     return value
 
 
+def _canonical_trace_event(event: dict[str, object]) -> dict[str, object]:
+    """Remove wall-clock telemetry from one replayable semantic event."""
+
+    return {
+        key: value
+        for key, value in event.items()
+        if key not in {"timestamp_seconds", "duration_seconds"}
+    }
+
+
+def _semantic_candidate_trajectory(result: ALNSResult) -> list[dict[str, object]]:
+    trace = result.measurement_trace
+    if trace is None:
+        return []
+    return [
+        _canonical_trace_event(dict(event))
+        for event in trace.events
+        if event.get("event_type") == "candidate_state"
+    ]
+
+
+def _semantic_operator_statistics(result: ALNSResult) -> dict[str, dict[str, object]]:
+    telemetry_fields = {
+        "failure_reasons",
+        "prefilter_passed",
+        "prefilter_rejected",
+    }
+    return {
+        operator: {
+            key: value
+            for key, value in statistics.items()
+            if key not in telemetry_fields
+        }
+        for operator, statistics in sorted(result.neighborhood_statistics.items())
+    }
+
+
 def _measurement_evidence(result: ALNSResult) -> dict[str, object]:
     trace = result.measurement_trace
     if trace is None:
@@ -379,15 +418,41 @@ def _measurement_evidence(result: ALNSResult) -> dict[str, object]:
                 {"key": key, "route": list(value)}
                 for key, value in sorted(trace.route_dictionary.items())
             ),
+            # Only cross-adapter semantics participate in the transaction
+            # digest. Native screening/pruning and incremental telemetry are
+            # audited below but are allowed to use different implementations.
+            "events": _row_evidence(
+                _canonical_trace_event(dict(row))
+                for row in trace.events
+                if row.get("event_type")
+                in {
+                    "operator_call",
+                    "candidate_state",
+                    "deadline_boundary",
+                    "exact_budget_boundary",
+                    "candidate_cache_commit",
+                    "candidate_cache_rollback",
+                    "cache_event",
+                }
+            ),
+            "candidate_trajectory": _row_evidence(
+                _canonical_trace_event(dict(row))
+                for row in trace.events
+                if row.get("event_type") == "candidate_state"
+            ),
+        }
+        semantic["native_telemetry"] = {
             "screening_decisions": _row_evidence(
                 asdict(row) for row in trace.screening_decisions
             ),
-            "events": _row_evidence(dict(row) for row in trace.events),
             "incremental_propagations": _row_evidence(
                 dict(row) for row in trace.incremental_propagations
             ),
         }
-    semantic["sha256"] = hashlib.sha256(_canonical_bytes(semantic)).hexdigest()
+    digest_payload = {
+        key: value for key, value in semantic.items() if key != "native_telemetry"
+    }
+    semantic["sha256"] = hashlib.sha256(_canonical_bytes(digest_payload)).hexdigest()
     return semantic
 
 
@@ -405,9 +470,7 @@ def _solve_mode(
         if fixed_work
         else ExactDeadlineConfig.wall_clock()
     )
-    cpu_before = os.times()
     threads_before = _thread_count()
-    started = time.perf_counter()
     common: dict[str, object] = {
         "seed": task.seed,
         "max_iterations": 1000,
@@ -422,36 +485,43 @@ def _solve_mode(
         "exact_deadline_config": exact_deadline,
         "stage04_config": Stage04Config(),
     }
-    if mode is ArchitectureMode.CURRENT_STAGE052:
-        result = solve_alns(
-            instance,
-            **common,  # type: ignore[arg-type]
-            native_kernel_config=NativeKernelConfig(),
-            candidate_transaction_config=NativeCandidateTransactionConfig(),
-        )
-    elif mode is ArchitectureMode.PYTHON_CANDIDATE_CONTROL:
-        result = solve_alns(
-            instance,
-            **common,  # type: ignore[arg-type]
-            candidate_control_config=CandidateControlConfig(
-                worker_count=THREADS_PER_SHARD
-            ),
-        )
-    else:
-        result = solve_alns(
-            instance,
-            **common,  # type: ignore[arg-type]
-            native_execution_config=_native_config(
-                mode,
-                scheduler_socket_path=(
-                    task.scheduler_socket_path
-                    if mode is ArchitectureMode.HOST_SCHEDULER
-                    else None
+    additional_roots = (
+        (task.scheduler_process_id,)
+        if mode is ArchitectureMode.HOST_SCHEDULER
+        and task.scheduler_process_id is not None
+        else ()
+    )
+    with ProcessTreeMonitor(additional_root_pids=additional_roots) as resource_monitor:
+        started = time.perf_counter()
+        if mode is ArchitectureMode.CURRENT_STAGE052:
+            result = solve_alns(
+                instance,
+                **common,  # type: ignore[arg-type]
+                native_kernel_config=NativeKernelConfig(),
+                candidate_transaction_config=NativeCandidateTransactionConfig(),
+            )
+        elif mode is ArchitectureMode.PYTHON_CANDIDATE_CONTROL:
+            result = solve_alns(
+                instance,
+                **common,  # type: ignore[arg-type]
+                candidate_control_config=CandidateControlConfig(
+                    worker_count=THREADS_PER_SHARD
                 ),
-            ),
-        )
-    solver_seconds = time.perf_counter() - started
-    cpu_after = os.times()
+            )
+        else:
+            result = solve_alns(
+                instance,
+                **common,  # type: ignore[arg-type]
+                native_execution_config=_native_config(
+                    mode,
+                    scheduler_socket_path=(
+                        task.scheduler_socket_path
+                        if mode is ArchitectureMode.HOST_SCHEDULER
+                        else None
+                    ),
+                ),
+            )
+        solver_seconds = time.perf_counter() - started
     report = validate_routes(instance, [list(route) for route in result.routes])
     if not report.feasible or result.objective is None:
         raise RuntimeError("architecture axis returned an invalid or objective-less solution")
@@ -471,18 +541,13 @@ def _solve_mode(
         "process_id": os.getpid(),
         "threads_before": threads_before,
         "threads_after": _thread_count(),
-        "cpu_seconds": (
-            cpu_after.user + cpu_after.system - cpu_before.user - cpu_before.system
-        ),
-        "cpu_utilization_percent_of_one_core": (
-            100.0
-            * (
-                cpu_after.user + cpu_after.system - cpu_before.user - cpu_before.system
-            )
-            / max(solver_seconds, 1e-12)
-        ),
         "rss_bytes": _rss_bytes(),
         "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+        "cpu_affinity": sorted(os.sched_getaffinity(0)),
+        **resource_monitor.statistics(
+            elapsed_seconds=solver_seconds,
+            compute_thread_limit=TOTAL_COMPUTE_THREADS,
+        ),
     }
     return result, solver_seconds, topology
 
@@ -530,10 +595,12 @@ def _result_payload(
         "candidate_work_hash": result.candidate_work_hash,
         "route_result_hash": result.route_result_hash,
         "fallback_count": native_fallback,
+        "semantic_trajectory": _semantic_candidate_trajectory(result),
         "trajectory": _row_evidence(
             dict(event) for event in result.neighborhood_events
         ),
         "operator_statistics": result.neighborhood_statistics,
+        "operator_semantic_statistics": _semantic_operator_statistics(result),
         "stage04_statistics": result.stage04_statistics,
         "stage04_events": _row_evidence(
             dict(event) for event in result.stage04_event_log
@@ -592,38 +659,82 @@ def _axis_path(task: ArchitectureAxisTask, mode: ArchitectureMode) -> Path:
     )
 
 
-def _run_group(task: ArchitectureAxisTask) -> list[str]:
-    written: list[str] = []
-    for mode in rotated_modes(task):
-        path = _axis_path(task, mode)
-        persistence_started = time.perf_counter()
-        try:
-            result, solver_seconds, topology = _solve_mode(mode, task)
-            payload = _result_payload(task, mode, result, solver_seconds, topology)
-        except BaseException as error:
-            payload = {
-                "schema_version": SCHEMA_VERSION,
-                "run_label": task.run_labels[mode.value],
-                "scope": task.scope,
-                "repeat": task.repeat,
-                "axis": task.axis,
-                "mode": mode.value,
-                "instance": task.instance_name,
-                "seed": task.seed,
-                "status": "failed",
-                "revision": task.revision,
-                "wheel_sha256": task.wheel_sha256,
-                "native_sha256": task.native_sha256,
-                "error_type": type(error).__name__,
-                "error": str(error),
-            }
+def _run_mode(task: ArchitectureAxisTask, mode: ArchitectureMode) -> str:
+    path = _axis_path(task, mode)
+    try:
+        result, solver_seconds, topology = _solve_mode(mode, task)
+        payload = _result_payload(task, mode, result, solver_seconds, topology)
+    except BaseException as error:
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "run_label": task.run_labels[mode.value],
+            "scope": task.scope,
+            "repeat": task.repeat,
+            "axis": task.axis,
+            "mode": mode.value,
+            "instance": task.instance_name,
+            "seed": task.seed,
+            "status": "failed",
+            "revision": task.revision,
+            "wheel_sha256": task.wheel_sha256,
+            "native_sha256": task.native_sha256,
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+    # Persistence is measured with a same-directory probe after solving;
+    # solver time must never leak into this field. The final signed artifact
+    # records the probe duration, avoiding a self-referential rewrite loop.
+    payload["persistence_seconds"] = 0.0
+    _set_artifact_size(payload)
+    probe_path = path.with_suffix(path.suffix + f".persistence-probe-{os.getpid()}")
+    probe_sidecar = probe_path.with_suffix(probe_path.suffix + ".sha256")
+    persistence_started = time.perf_counter()
+    try:
+        _write_signed_json(probe_path, payload)
         payload["persistence_seconds"] = time.perf_counter() - persistence_started
-        _set_artifact_size(payload)
-        observed_bytes = _write_signed_json(path, payload)
-        if observed_bytes != payload["artifact_bytes"]:
-            raise RuntimeError("artifact byte count does not reconcile")
-        written.append(str(path))
-    return written
+    finally:
+        probe_path.unlink(missing_ok=True)
+        probe_sidecar.unlink(missing_ok=True)
+    _set_artifact_size(payload)
+    observed_bytes = _write_signed_json(path, payload)
+    if observed_bytes != payload["artifact_bytes"]:
+        raise RuntimeError("artifact byte count does not reconcile")
+    return str(path)
+
+
+def _run_group(task: ArchitectureAxisTask) -> list[str]:
+    """Run one legacy test group; production campaigns use global mode waves."""
+
+    return [_run_mode(task, mode) for mode in rotated_modes(task)]
+
+
+def _mode_wave_batches(
+    plan: tuple[ArchitectureAxisTask, ...],
+) -> tuple[tuple[ArchitectureAxisTask, ...], ...]:
+    return tuple(
+        tuple(plan[offset : offset + SHARD_PROCESSES])
+        for offset in range(0, len(plan), SHARD_PROCESSES)
+    )
+
+
+def _configure_compute_envelope() -> dict[str, object]:
+    available = sorted(os.sched_getaffinity(0))
+    if len(available) < TOTAL_COMPUTE_THREADS:
+        raise RuntimeError("Stage 5.2 comparison host exposes fewer than 24 logical CPUs")
+    selected = available[:TOTAL_COMPUTE_THREADS]
+    os.sched_setaffinity(0, selected)
+    thread_environment = {
+        "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+    }
+    os.environ.update(thread_environment)
+    return {
+        "available_logical_cpus": available,
+        "selected_logical_cpus": selected,
+        "thread_environment": thread_environment,
+    }
 
 
 def run_experiment(
@@ -637,6 +748,7 @@ def run_experiment(
     root = repository_root()
     if max_workers != SHARD_PROCESSES:
         raise ValueError("Stage 5.2 comparison requires exactly six shard processes")
+    compute_envelope = _configure_compute_envelope()
     status = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=root,
@@ -679,19 +791,35 @@ def run_experiment(
         (output_root / label).mkdir(parents=True)
     started = time.time()
     written: list[str] = []
-    scheduler = NativeHostScheduler(scheduler_path, worker_threads=24)
-    with (
-        scheduler,
-        ProcessPoolExecutor(max_workers=max_workers) as executor,
-    ):
-        scheduler_topology = {
-            "process_id": scheduler.process_id,
-            "observed_thread_count": scheduler.observed_thread_count(),
-            "configured_worker_threads": scheduler.worker_threads,
-        }
-        futures = [executor.submit(_run_group, task) for task in plan]
-        for future in as_completed(futures):
-            written.extend(future.result())
+    scheduler_observations: list[dict[str, int]] = []
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        for batch_index, batch in enumerate(_mode_wave_batches(plan)):
+            offset = batch_index % len(MODES)
+            mode_order = MODES[offset:] + MODES[:offset]
+            for mode in mode_order:
+                if mode is ArchitectureMode.HOST_SCHEDULER:
+                    with NativeHostScheduler(scheduler_path, worker_threads=24) as scheduler:
+                        scheduler_observations.append(
+                            {
+                                "process_id": scheduler.process_id,
+                                "observed_thread_count": scheduler.observed_thread_count(),
+                                "configured_worker_threads": scheduler.worker_threads,
+                            }
+                        )
+                        futures = [
+                            executor.submit(
+                                _run_mode,
+                                replace(task, scheduler_process_id=scheduler.process_id),
+                                mode,
+                            )
+                            for task in batch
+                        ]
+                        for future in as_completed(futures):
+                            written.append(future.result())
+                else:
+                    futures = [executor.submit(_run_mode, task, mode) for task in batch]
+                    for future in as_completed(futures):
+                        written.append(future.result())
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "scope": scope,
@@ -712,9 +840,10 @@ def run_experiment(
             "threads_per_shard": THREADS_PER_SHARD,
             "host_scheduler_threads": 24,
             "compute_thread_limit": TOTAL_COMPUTE_THREADS,
-            "scheduler_observed": scheduler_topology,
+            "compute_envelope": compute_envelope,
+            "scheduler_observed": scheduler_observations,
         },
-        "mode_order_policy": "rotated_by_repeat_instance_seed_axis",
+        "mode_order_policy": "six_axis_global_mode_waves_rotated_by_batch",
         "formal_started": False,
     }
     if manifest["axis_count"] != manifest["expected_axis_count"]:

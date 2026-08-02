@@ -781,6 +781,7 @@ class _Evaluator:
                 return self._native_protocol_candidate_route_batch(
                     clean,
                     route_change_status=route_change_status,
+                    prescreened=prescreened,
                     exact_budget=exact_budget,
                     base_sequences=base_sequences,
                 )
@@ -806,6 +807,7 @@ class _Evaluator:
         clean: tuple[tuple[str, ...], ...],
         *,
         route_change_status: str,
+        prescreened: bool,
         exact_budget: int,
         base_sequences: Sequence[tuple[str, ...]] | None,
     ) -> tuple[ChargingSubproblemResult, ...]:
@@ -889,6 +891,7 @@ class _Evaluator:
                 ) = controller_snapshot
 
         try:
+            protocol_started = time.perf_counter()
             native_result = execute_native_candidate_round(
                 self.instance,
                 NativeCandidateRoundRequest(
@@ -902,6 +905,12 @@ class _Evaluator:
                     operator=self.operator,
                     iteration=self.iteration,
                     compute_threads=execution.compute_threads_per_shard,
+                    # Operator candidate pools are already screened through the
+                    # Stage 2 seam.  Candidate Control's Python reference then
+                    # replays the legacy prefilter, whose accepted rows rank
+                    # with a zero distance lower bound.  A direct, unscreened
+                    # evaluator call keeps the full Stage 3.1 screening path.
+                    full_screening=not prescreened,
                     incremental=incremental_rows,
                 ),
                 native_runtime=native_runtime,
@@ -910,6 +919,7 @@ class _Evaluator:
                 record_transaction=False,
                 record_runtime=False,
             )
+            protocol_completed = time.perf_counter()
             screening = native_result.screening
             self.screening_calls += len(clean)
             self.screening_passes += native_result.audit.screening_passes
@@ -1051,6 +1061,33 @@ class _Evaluator:
                 for sequence in exact_sequences:
                     self.evaluated_routes.add(sequence)
                     self.evaluated_route_keys.add((self.lane, sequence))
+                if self.measurement_trace is not None:
+                    started_offset = self.measurement_trace._offset(protocol_started)
+                    completed_offset = self.measurement_trace._offset(protocol_completed)
+                    for sequence, result in zip(
+                        exact_sequences,
+                        native_result.exact_results,
+                        strict=True,
+                    ):
+                        cache_key_digest = (
+                            self.route_cache.make_key(sequence).digest
+                            if self.route_cache is not None
+                            else ""
+                        )
+                        self.measurement_trace.record_route_evaluation(
+                            sequence,
+                            lane=self.lane,
+                            iteration=self.iteration,
+                            operator=self.operator,
+                            kind="exact_call",
+                            started_at=started_offset,
+                            completed_at=completed_offset,
+                            exact_started=True,
+                            exact_completed=True,
+                            cache_key_digest=cache_key_digest,
+                            route_change_status=route_change_status,
+                            **route_result_fields(result),
+                        )
             if time.perf_counter() >= self.deadline:
                 raise CandidateTransactionDeadlineExceeded("before_atomic_commit")
             self._commit_pending_candidate_cache()

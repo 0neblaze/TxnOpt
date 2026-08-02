@@ -29,6 +29,7 @@ from evrptw.parser import parse_schneider
 from evrptw.validation import validate_routes
 
 REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v4"
+LEGACY_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v3"
 HISTORICAL_PILOT_ROOT = Path(
     "/mnt/e/Reproducible-EVRPTW-archive/stage05.2/runs/"
     "stage05.2_benchmark_attempt72/generation-0001/d_benchmark"
@@ -182,7 +183,8 @@ def load_records(
 
 def _replay_record(record: ReviewRecord, benchmark_dir: Path) -> dict[str, object]:
     payload = record.payload
-    if _string(payload, "schema_version") != SCHEMA_VERSION:
+    comparison_schema = _string(payload, "schema_version")
+    if comparison_schema not in {LEGACY_COMPARISON_SCHEMA_VERSION, SCHEMA_VERSION}:
         raise RuntimeError(f"unsupported comparison schema: {record.path}")
     if _string(payload, "status") != "completed":
         return {
@@ -224,6 +226,8 @@ def _replay_record(record: ReviewRecord, benchmark_dir: Path) -> dict[str, objec
         return {"valid": False, "reason": "measurement evidence hash is missing"}
     hashed_measurement = dict(measurement)
     del hashed_measurement["sha256"]
+    if comparison_schema == SCHEMA_VERSION:
+        hashed_measurement.pop("native_telemetry", None)
     recomputed_measurement_hash = hashlib.sha256(
         json.dumps(
             hashed_measurement,
@@ -258,6 +262,19 @@ def _common_prefix(left: list[object], right: list[object]) -> int:
             break
         length += 1
     return length
+
+
+def _semantic_trajectory(payload: Mapping[str, object]) -> list[object]:
+    value = payload.get("semantic_trajectory")
+    if value is not None:
+        if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
+            raise ValueError("semantic_trajectory must be a list of event objects")
+        return list(value)
+    # Stage 5.2 comparison v3 retained only a count/hash summary. Keep it
+    # readable for immutable attempt03 evidence, but do not pretend that it can
+    # identify an event-level divergence.
+    legacy = _mapping(payload, "trajectory")
+    return [dict(legacy)]
 
 
 def _paired(values: Iterable[float]) -> dict[str, float | int | None]:
@@ -636,10 +653,72 @@ def review_records(
                     }
                 )
                 continue
-            baseline_trajectory = _mapping(baseline.payload, "trajectory")
-            candidate_trajectory = _mapping(candidate.payload, "trajectory")
+            baseline_trajectory = _semantic_trajectory(baseline.payload)
+            candidate_trajectory = _semantic_trajectory(candidate.payload)
             baseline_measurement = _mapping(baseline.payload, "measurement_evidence")
             candidate_measurement = _mapping(candidate.payload, "measurement_evidence")
+            exact_order_equal = (
+                baseline_measurement.get("exact_route_order")
+                == candidate_measurement.get("exact_route_order")
+            )
+            exact_counts_equal = (
+                baseline.payload.get("exact_started_calls")
+                == candidate.payload.get("exact_started_calls")
+                and baseline.payload.get("exact_completed_calls")
+                == candidate.payload.get("exact_completed_calls")
+            )
+            candidate_work_hash_equal = (
+                baseline.payload.get("candidate_work_hash")
+                == candidate.payload.get("candidate_work_hash")
+            )
+            route_result_hash_equal = (
+                baseline.payload.get("route_result_hash")
+                == candidate.payload.get("route_result_hash")
+            )
+            cache_lifecycle_equal = (
+                baseline_measurement.get("cache_lifecycle")
+                == candidate_measurement.get("cache_lifecycle")
+            )
+            deadline_boundaries_equal = (
+                baseline_measurement.get("deadline_boundaries")
+                == candidate_measurement.get("deadline_boundaries")
+            )
+            measurement_transaction_hash_equal = (
+                baseline_measurement.get("sha256")
+                == candidate_measurement.get("sha256")
+            )
+            candidate_transaction_semantics_equal = all(
+                (
+                    exact_order_equal,
+                    exact_counts_equal,
+                    candidate_work_hash_equal,
+                    route_result_hash_equal,
+                    cache_lifecycle_equal,
+                    deadline_boundaries_equal,
+                    measurement_transaction_hash_equal,
+                )
+            )
+            common_prefix = _common_prefix(
+                baseline_trajectory,
+                candidate_trajectory,
+            )
+            first_divergence = (
+                None
+                if baseline_trajectory == candidate_trajectory
+                else {
+                    "index": common_prefix,
+                    "baseline": (
+                        baseline_trajectory[common_prefix]
+                        if common_prefix < len(baseline_trajectory)
+                        else None
+                    ),
+                    "candidate": (
+                        candidate_trajectory[common_prefix]
+                        if common_prefix < len(candidate_trajectory)
+                        else None
+                    ),
+                }
+            )
             comparisons.append(
                 {
                     "key": key,
@@ -647,51 +726,39 @@ def review_records(
                     == candidate.payload.get("objective"),
                     "routes_equal": baseline.payload.get("routes")
                     == candidate.payload.get("routes"),
-                    "exact_order_equal": (
-                        baseline_measurement.get("exact_route_order")
-                        == candidate_measurement.get("exact_route_order")
-                    ),
-                    "exact_counts_equal": (
-                        baseline.payload.get("exact_started_calls")
-                        == candidate.payload.get("exact_started_calls")
-                        and baseline.payload.get("exact_completed_calls")
-                        == candidate.payload.get("exact_completed_calls")
-                    ),
-                    "candidate_work_hash_equal": baseline.payload.get("candidate_work_hash")
-                    == candidate.payload.get("candidate_work_hash"),
-                    "route_result_hash_equal": baseline.payload.get("route_result_hash")
-                    == candidate.payload.get("route_result_hash"),
+                    "exact_order_equal": exact_order_equal,
+                    "exact_counts_equal": exact_counts_equal,
+                    "candidate_work_hash_equal": candidate_work_hash_equal,
+                    "route_result_hash_equal": route_result_hash_equal,
                     "trajectory_equal": baseline_trajectory == candidate_trajectory,
                     "operator_statistics_equal": baseline.payload.get(
-                        "operator_statistics"
+                        "operator_semantic_statistics",
+                        baseline.payload.get("operator_statistics"),
                     )
-                    == candidate.payload.get("operator_statistics"),
+                    == candidate.payload.get(
+                        "operator_semantic_statistics",
+                        candidate.payload.get("operator_statistics"),
+                    ),
                     "stage04_state_equal": (
                         baseline.payload.get("stage04_statistics")
                         == candidate.payload.get("stage04_statistics")
                         and baseline.payload.get("stage04_events")
                         == candidate.payload.get("stage04_events")
                     ),
-                    "candidate_transaction_events_equal": baseline.payload.get(
+                    "candidate_transaction_events_equal": (
+                        candidate_transaction_semantics_equal
+                    ),
+                    "candidate_transaction_telemetry_equal": baseline.payload.get(
                         "candidate_transaction_events"
                     )
                     == candidate.payload.get("candidate_transaction_events"),
-                    "cache_lifecycle_equal": baseline_measurement.get(
-                        "cache_lifecycle"
-                    )
-                    == candidate_measurement.get("cache_lifecycle"),
-                    "deadline_boundaries_equal": baseline_measurement.get(
-                        "deadline_boundaries"
-                    )
-                    == candidate_measurement.get("deadline_boundaries"),
-                    "measurement_transaction_hash_equal": baseline_measurement.get(
-                        "sha256"
-                    )
-                    == candidate_measurement.get("sha256"),
-                    "common_prefix": _common_prefix(
-                        [baseline_trajectory], [candidate_trajectory]
-                    )
-                    * _integer(baseline_trajectory, "count"),
+                    "cache_lifecycle_equal": cache_lifecycle_equal,
+                    "deadline_boundaries_equal": deadline_boundaries_equal,
+                    "measurement_transaction_hash_equal": (
+                        measurement_transaction_hash_equal
+                    ),
+                    "common_prefix": common_prefix,
+                    "first_divergence": first_divergence,
                 }
             )
         differential[mode.value] = {

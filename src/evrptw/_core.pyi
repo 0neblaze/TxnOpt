@@ -3,6 +3,22 @@ from collections.abc import Sequence
 import numpy as np
 import numpy.typing as npt
 
+def python_random_golden_v1(
+    seed: int,
+    random_count: int,
+    randbelow_bounds: npt.NDArray[np.int64],
+    sample_population: int,
+    sample_size: int,
+    weights: npt.NDArray[np.float64],
+    shuffle_size: int,
+) -> tuple[
+    npt.NDArray[np.float64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    int,
+    npt.NDArray[np.int64],
+]: ...
+
 __build_git_revision__: str
 
 Point = tuple[float, float]
@@ -212,6 +228,7 @@ def candidate_round_transaction_v1(
     npt.NDArray[np.int64],
     str,
 ]: ...
+candidate_round_transaction_v2 = candidate_round_transaction_v1
 def full_native_alns_v1(
     node_kind: npt.NDArray[np.int64],
     demand: npt.NDArray[np.float64],

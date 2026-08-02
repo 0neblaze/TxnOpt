@@ -33,7 +33,7 @@ from evrptw.cpu_batch import BackendMetrics, decode_exact_charging_batch_numeric
 from evrptw.models import Instance
 from evrptw.native_kernels import NativeKernelConfig, NativeKernelRuntime
 
-NATIVE_EXECUTION_SCHEMA_VERSION = "stage05.2-native-execution-v1"
+NATIVE_EXECUTION_SCHEMA_VERSION = "stage05.2-native-execution-v2"
 
 NativeExecutionMode = Literal[
     "per_solve_runtime",
@@ -41,13 +41,13 @@ NativeExecutionMode = Literal[
     "host_scheduler",
 ]
 NativeWorkerProtocol = Literal[
-    "candidate_round_soa_v1",
+    "candidate_round_soa_v2",
     "full_solve_soa_v1",
     "unix_shm_scheduler_v1",
 ]
 
 _PROTOCOL_BY_MODE: dict[NativeExecutionMode, NativeWorkerProtocol] = {
-    "per_solve_runtime": "candidate_round_soa_v1",
+    "per_solve_runtime": "candidate_round_soa_v2",
     "full_native_alns": "full_solve_soa_v1",
     "host_scheduler": "unix_shm_scheduler_v1",
 }
@@ -99,6 +99,7 @@ class NativeCandidateRoundRequest:
     operator: str
     iteration: int | None
     compute_threads: int = 1
+    full_screening: bool = True
     incremental: npt.NDArray[np.float64] | None = None
 
     def __post_init__(self) -> None:
@@ -354,7 +355,7 @@ def execute_native_candidate_round(
         dtype=np.int64,
     )
     options = np.ascontiguousarray(
-        [1.0, context.reachability_epsilon, 0.0, 0.0],
+        [float(request.full_screening), context.reachability_epsilon, 0.0, 0.0],
         dtype=np.float64,
     )
     incremental = (
@@ -394,7 +395,7 @@ def execute_native_candidate_round(
 
     from evrptw import _core as native_core
 
-    payload = native_core.candidate_round_transaction_v1(
+    payload = native_core.candidate_round_transaction_v2(
         context.node_kind,
         context.demand,
         context.ready_time,
@@ -648,7 +649,7 @@ def _candidate_round_digest(
     exact_payload: object,
     screening_sha256: str,
 ) -> str:
-    evidence = bytearray(b"stage05.2-candidate-round-transaction-v1")
+    evidence = bytearray(b"stage05.2-candidate-round-transaction-v2")
     for values in (
         context_ids,
         resolution_codes,

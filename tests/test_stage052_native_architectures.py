@@ -9,6 +9,7 @@ from typing import Any
 from evrptw.charging import solve_exact_charging
 from evrptw.experiments.stage052_native_architecture_review import (
     ReviewRecord,
+    _common_prefix,
     _raw_axis_inventory,
     _scheduler_screening_occupancy,
     render_report,
@@ -170,6 +171,21 @@ def test_independent_review_replays_routes_and_accepts_equal_fixed_work(
     assert "五模式事实表" in render_report(review)
 
 
+def test_semantic_trajectory_reports_the_real_first_divergence() -> None:
+    baseline = [
+        {"lane": "legacy", "iteration": 0, "operator": "relocate"},
+        {"lane": "constraint", "iteration": 0, "operator": "station_pressure"},
+        {"lane": "legacy", "iteration": 1, "operator": "swap"},
+    ]
+    candidate = [
+        baseline[0],
+        {"lane": "constraint", "iteration": 0, "operator": "shaw_related"},
+        baseline[2],
+    ]
+
+    assert _common_prefix(baseline, candidate) == 1
+
+
 def test_cuda_condition_does_not_reuse_exact_backend_occupancy(
     tmp_path: Path,
 ) -> None:
@@ -279,6 +295,8 @@ def test_one_wall_clock_group_runs_all_five_modes_with_one_scheduler(
     payloads = [json.loads(Path(path).read_bytes()) for path in written]
     assert {payload["mode"] for payload in payloads} == {mode.value for mode in MODES}
     assert all(payload["status"] == "completed" for payload in payloads)
+    assert all(payload["persistence_seconds"] > 0.0 for payload in payloads)
+    assert not tuple(tmp_path.rglob("*.persistence-probe-*"))
 
 
 def test_one_fixed_work_group_retains_every_mode_axis(tmp_path: Path) -> None:

@@ -41,6 +41,268 @@ namespace py = pybind11;
 
 using Point = std::pair<double, double>;
 
+class PythonRandom {
+public:
+    explicit PythonRandom(std::uint64_t seed) {
+        std::vector<std::uint32_t> key;
+        do {
+            key.push_back(static_cast<std::uint32_t>(seed & 0xffffffffULL));
+            seed >>= 32U;
+        } while (seed != 0U);
+        init_by_array(key);
+    }
+
+    double random() {
+        const auto upper = next_u32() >> 5U;
+        const auto lower = next_u32() >> 6U;
+        return (static_cast<double>(upper) * 67108864.0
+                + static_cast<double>(lower))
+            * (1.0 / 9007199254740992.0);
+    }
+
+    std::uint64_t getrandbits(std::uint32_t bits) {
+        if (bits == 0U) {
+            return 0U;
+        }
+        if (bits <= 32U) {
+            return static_cast<std::uint64_t>(next_u32() >> (32U - bits));
+        }
+        if (bits > 64U) {
+            throw std::invalid_argument("native PythonRandom supports at most 64 bits");
+        }
+        const auto low = static_cast<std::uint64_t>(next_u32());
+        const auto remaining = bits - 32U;
+        const auto high = static_cast<std::uint64_t>(
+            next_u32() >> (32U - remaining));
+        return low | (high << 32U);
+    }
+
+    std::uint64_t randbelow(std::uint64_t upper_bound) {
+        if (upper_bound == 0U) {
+            throw std::invalid_argument("PythonRandom randbelow bound must be positive");
+        }
+        std::uint32_t bits = 0U;
+        for (auto value = upper_bound; value != 0U; value >>= 1U) {
+            ++bits;
+        }
+        while (true) {
+            const auto value = getrandbits(bits);
+            if (value < upper_bound) {
+                return value;
+            }
+        }
+    }
+
+    std::vector<std::int64_t> sample_indices(
+        std::int64_t population_size,
+        std::int64_t sample_size) {
+        if (population_size < 0 || sample_size < 0 || sample_size > population_size) {
+            throw std::invalid_argument("PythonRandom sample size is invalid");
+        }
+        std::int64_t set_size = 21;
+        if (sample_size > 5) {
+            auto power = std::int64_t{4};
+            const auto target = sample_size * 3;
+            while (power < target) {
+                power *= 4;
+            }
+            set_size += power;
+        }
+        std::vector<std::int64_t> result;
+        result.reserve(static_cast<std::size_t>(sample_size));
+        if (population_size <= set_size) {
+            std::vector<std::int64_t> pool(static_cast<std::size_t>(population_size));
+            for (std::int64_t index = 0; index < population_size; ++index) {
+                pool[static_cast<std::size_t>(index)] = index;
+            }
+            for (std::int64_t index = 0; index < sample_size; ++index) {
+                const auto selected = static_cast<std::int64_t>(
+                    randbelow(static_cast<std::uint64_t>(population_size - index)));
+                result.push_back(pool[static_cast<std::size_t>(selected)]);
+                pool[static_cast<std::size_t>(selected)] =
+                    pool[static_cast<std::size_t>(population_size - index - 1)];
+            }
+            return result;
+        }
+        std::unordered_set<std::int64_t> selected_indices;
+        for (std::int64_t index = 0; index < sample_size; ++index) {
+            auto selected = static_cast<std::int64_t>(
+                randbelow(static_cast<std::uint64_t>(population_size)));
+            while (selected_indices.contains(selected)) {
+                selected = static_cast<std::int64_t>(
+                    randbelow(static_cast<std::uint64_t>(population_size)));
+            }
+            selected_indices.insert(selected);
+            result.push_back(selected);
+        }
+        return result;
+    }
+
+    std::size_t weighted_index(const std::vector<double>& weights) {
+        if (weights.empty()) {
+            throw std::invalid_argument("PythonRandom weighted choice requires weights");
+        }
+        std::vector<double> cumulative;
+        cumulative.reserve(weights.size());
+        double total = 0.0;
+        for (const auto weight : weights) {
+            total += weight;
+            cumulative.push_back(total);
+        }
+        if (!(total > 0.0) || !std::isfinite(total)) {
+            throw std::invalid_argument("PythonRandom total weight must be finite and positive");
+        }
+        const auto target = random() * total;
+        return static_cast<std::size_t>(
+            std::upper_bound(cumulative.begin(), cumulative.end() - 1, target)
+            - cumulative.begin());
+    }
+
+    void shuffle(std::vector<std::int64_t>& values) {
+        for (std::size_t index = values.size(); index > 1; --index) {
+            const auto selected = static_cast<std::size_t>(randbelow(index));
+            std::swap(values[index - 1], values[selected]);
+        }
+    }
+
+private:
+    static constexpr std::size_t state_size = 624;
+    static constexpr std::size_t period = 397;
+    std::array<std::uint32_t, state_size> state_{};
+    std::size_t cursor_ = state_size;
+
+    void init_genrand(std::uint32_t seed) {
+        state_[0] = seed;
+        for (std::size_t index = 1; index < state_size; ++index) {
+            state_[index] = 1812433253U
+                    * (state_[index - 1] ^ (state_[index - 1] >> 30U))
+                + static_cast<std::uint32_t>(index);
+        }
+        cursor_ = state_size;
+    }
+
+    void init_by_array(const std::vector<std::uint32_t>& key) {
+        init_genrand(19650218U);
+        auto state_index = std::size_t{1};
+        auto key_index = std::size_t{0};
+        auto rounds = std::max(state_size, key.size());
+        for (; rounds != 0; --rounds) {
+            state_[state_index] =
+                (state_[state_index]
+                 ^ ((state_[state_index - 1] ^ (state_[state_index - 1] >> 30U))
+                    * 1664525U))
+                + key[key_index] + static_cast<std::uint32_t>(key_index);
+            ++state_index;
+            ++key_index;
+            if (state_index >= state_size) {
+                state_[0] = state_[state_size - 1];
+                state_index = 1;
+            }
+            if (key_index >= key.size()) {
+                key_index = 0;
+            }
+        }
+        for (rounds = state_size - 1; rounds != 0; --rounds) {
+            state_[state_index] =
+                (state_[state_index]
+                 ^ ((state_[state_index - 1] ^ (state_[state_index - 1] >> 30U))
+                    * 1566083941U))
+                - static_cast<std::uint32_t>(state_index);
+            ++state_index;
+            if (state_index >= state_size) {
+                state_[0] = state_[state_size - 1];
+                state_index = 1;
+            }
+        }
+        state_[0] = 0x80000000U;
+    }
+
+    std::uint32_t next_u32() {
+        if (cursor_ >= state_size) {
+            twist();
+        }
+        auto value = state_[cursor_++];
+        value ^= value >> 11U;
+        value ^= (value << 7U) & 0x9d2c5680U;
+        value ^= (value << 15U) & 0xefc60000U;
+        value ^= value >> 18U;
+        return value;
+    }
+
+    void twist() {
+        constexpr auto upper_mask = std::uint32_t{0x80000000U};
+        constexpr auto lower_mask = std::uint32_t{0x7fffffffU};
+        constexpr auto matrix = std::uint32_t{0x9908b0dfU};
+        for (std::size_t index = 0; index < state_size; ++index) {
+            const auto value = (state_[index] & upper_mask)
+                | (state_[(index + 1) % state_size] & lower_mask);
+            state_[index] = state_[(index + period) % state_size]
+                ^ (value >> 1U)
+                ^ ((value & 1U) != 0U ? matrix : 0U);
+        }
+        cursor_ = 0;
+    }
+};
+
+template <typename T>
+py::array checked_array(py::handle array, const char* name, int expected_ndim);
+
+template <typename T>
+const T* checked_data(const py::array& array);
+
+template <typename T>
+T* checked_data(py::array_t<T>& array);
+
+py::tuple python_random_golden_v1(
+    std::uint64_t seed,
+    std::int64_t random_count,
+    py::handle randbelow_bounds,
+    std::int64_t sample_population,
+    std::int64_t sample_size,
+    py::handle weights,
+    std::int64_t shuffle_size) {
+    if (random_count < 0 || shuffle_size < 0) {
+        throw std::invalid_argument("PythonRandom vector sizes must be non-negative");
+    }
+    auto bound_array = checked_array<std::int64_t>(
+        randbelow_bounds, "randbelow_bounds", 1);
+    auto weight_array = checked_array<double>(weights, "weights", 1);
+    PythonRandom random(seed);
+    py::array_t<double> random_values(random_count);
+    for (std::int64_t index = 0; index < random_count; ++index) {
+        checked_data(random_values)[index] = random.random();
+    }
+    py::array_t<std::int64_t> bounded_values(bound_array.size());
+    for (py::ssize_t index = 0; index < bound_array.size(); ++index) {
+        const auto bound = checked_data<std::int64_t>(bound_array)[index];
+        if (bound <= 0) {
+            throw std::invalid_argument("PythonRandom randbelow bounds must be positive");
+        }
+        checked_data(bounded_values)[index] = static_cast<std::int64_t>(
+            random.randbelow(static_cast<std::uint64_t>(bound)));
+    }
+    const auto sampled = random.sample_indices(sample_population, sample_size);
+    py::array_t<std::int64_t> sampled_values(sampled.size());
+    std::copy(sampled.begin(), sampled.end(), checked_data(sampled_values));
+    std::vector<double> weight_values(
+        checked_data<double>(weight_array),
+        checked_data<double>(weight_array) + weight_array.size());
+    const auto weighted = static_cast<std::int64_t>(random.weighted_index(weight_values));
+    std::vector<std::int64_t> shuffled(static_cast<std::size_t>(shuffle_size));
+    for (std::int64_t index = 0; index < shuffle_size; ++index) {
+        shuffled[static_cast<std::size_t>(index)] = index;
+    }
+    random.shuffle(shuffled);
+    py::array_t<std::int64_t> shuffled_values(shuffled.size());
+    std::copy(shuffled.begin(), shuffled.end(), checked_data(shuffled_values));
+    return py::make_tuple(
+        std::move(random_values),
+        std::move(bounded_values),
+        std::move(sampled_values),
+        weighted,
+        std::move(shuffled_values));
+}
+
 template <typename T>
 struct Stage052ReplayNumericColumn {
     py::array_t<T, py::array::c_style | py::array::forcecast> values;
@@ -4275,7 +4537,7 @@ py::tuple screen_route_batch_transaction_v2(
         1);
 }
 
-py::tuple candidate_round_transaction_v1(
+py::tuple candidate_round_transaction_impl(
     py::handle node_kind,
     py::handle demand,
     py::handle ready_time,
@@ -4297,7 +4559,8 @@ py::tuple candidate_round_transaction_v1(
     py::handle control,
     py::handle deadline_remaining,
     py::handle batch_size,
-    py::handle context_ids) {
+    py::handle context_ids,
+    std::string_view evidence_domain) {
     const auto started = std::chrono::steady_clock::now();
     auto offsets_array = checked_array<std::int64_t>(
         route_offsets, "route_offsets", 1);
@@ -4589,7 +4852,7 @@ py::tuple candidate_round_transaction_v1(
     timing_values[2] = std::chrono::duration<double>(completed - started).count();
     timing_values[3] = 0.0;
 
-    std::string evidence = "stage05.2-candidate-round-transaction-v1";
+    std::string evidence(evidence_domain);
     const auto append_i64 = [&evidence](std::int64_t value) {
         const auto bits = static_cast<std::uint64_t>(value);
         for (std::size_t byte = 0; byte < 8; ++byte) {
@@ -4637,6 +4900,42 @@ py::tuple candidate_round_transaction_v1(
         std::move(counters),
         std::move(timings),
         digest);
+}
+
+py::tuple candidate_round_transaction_v1(
+    py::handle node_kind, py::handle demand, py::handle ready_time,
+    py::handle due_date, py::handle service_time, py::handle distance,
+    py::handle reachable, py::handle vehicle, py::handle route_offsets,
+    py::handle route_indices, py::handle candidate_ids, py::handle lexical_rank,
+    py::handle options, py::handle incremental, py::handle negative_offsets,
+    py::handle negative_indices, py::handle negative_reason_codes,
+    py::handle cache_hit_flags, py::handle control, py::handle deadline_remaining,
+    py::handle batch_size, py::handle context_ids) {
+    return candidate_round_transaction_impl(
+        node_kind, demand, ready_time, due_date, service_time, distance,
+        reachable, vehicle, route_offsets, route_indices, candidate_ids,
+        lexical_rank, options, incremental, negative_offsets, negative_indices,
+        negative_reason_codes, cache_hit_flags, control, deadline_remaining,
+        batch_size, context_ids,
+        "stage05.2-candidate-round-transaction-v1");
+}
+
+py::tuple candidate_round_transaction_v2(
+    py::handle node_kind, py::handle demand, py::handle ready_time,
+    py::handle due_date, py::handle service_time, py::handle distance,
+    py::handle reachable, py::handle vehicle, py::handle route_offsets,
+    py::handle route_indices, py::handle candidate_ids, py::handle lexical_rank,
+    py::handle options, py::handle incremental, py::handle negative_offsets,
+    py::handle negative_indices, py::handle negative_reason_codes,
+    py::handle cache_hit_flags, py::handle control, py::handle deadline_remaining,
+    py::handle batch_size, py::handle context_ids) {
+    return candidate_round_transaction_impl(
+        node_kind, demand, ready_time, due_date, service_time, distance,
+        reachable, vehicle, route_offsets, route_indices, candidate_ids,
+        lexical_rank, options, incremental, negative_offsets, negative_indices,
+        negative_reason_codes, cache_hit_flags, control, deadline_remaining,
+        batch_size, context_ids,
+        "stage05.2-candidate-round-transaction-v2");
 }
 
 py::tuple full_native_alns_v1(
@@ -4860,38 +5159,46 @@ py::tuple full_native_alns_v1(
     std::vector<std::int64_t> trajectory;
     trajectory.reserve(static_cast<std::size_t>(control_values[1]) * 7);
     const auto objective_key = [&](const py::tuple& payload, std::size_t vehicle_count) {
-        return py::cast<py::tuple>(
-            py::module_::import("evrptw.objective")
-                .attr("objective_key_from_exact_numeric")(
-                    node_kind,
-                    payload[1],
-                    payload[4],
-                    py::arg("vehicle_count") = vehicle_count,
-                    py::arg("station_kind") = station_kind));
+        auto path_array = py::cast<py::array_t<std::int64_t>>(payload[1]);
+        auto metrics_array = py::cast<py::array_t<double>>(payload[4]);
+        const auto* paths = checked_data<std::int64_t>(path_array);
+        const auto* metrics = checked_data<double>(metrics_array);
+        double total_distance = 0.0;
+        double total_charging_time = 0.0;
+        for (py::ssize_t route = 0; route < metrics_array.shape(0); ++route) {
+            total_distance += metrics[route * 4];
+            total_charging_time += metrics[route * 4 + 3];
+        }
+        std::int64_t charging_count = 0;
+        for (py::ssize_t index = 0; index < path_array.size(); ++index) {
+            charging_count += kinds[paths[index]] == station_kind ? 1 : 0;
+        }
+        const auto round_objective = [](double value) {
+            constexpr auto scale = 1'000'000'000.0;
+            return std::nearbyint(value * scale) / scale;
+        };
+        return std::make_tuple(
+            static_cast<std::int64_t>(vehicle_count),
+            round_objective(total_distance),
+            round_objective(total_charging_time),
+            charging_count);
     };
     auto current_objective = objective_key(exact_payload, routes.size());
     std::size_t pair_cursor = static_cast<std::size_t>(
         static_cast<std::uint64_t>(control_values[0]) % std::max<std::size_t>(1, routes.size()));
-    std::uint64_t random_state = static_cast<std::uint64_t>(control_values[0])
-        ^ 0x9e3779b97f4a7c15ULL;
-    auto next_random = [&]() {
-        random_state ^= random_state >> 12;
-        random_state ^= random_state << 25;
-        random_state ^= random_state >> 27;
-        return random_state * 0x2545f4914f6cdd1dULL;
-    };
+    PythonRandom random(static_cast<std::uint64_t>(control_values[0]));
     for (std::int64_t iteration = 0; iteration < control_values[1]; ++iteration) {
         if (remaining_seconds() <= 0.0) {
             break;
         }
         ++completed_iterations;
         auto candidate_routes = routes;
-        const auto operator_id = static_cast<std::int64_t>(
-            (next_random() + static_cast<std::uint64_t>(iteration)) % 12ULL);
+        const auto operator_id = static_cast<std::int64_t>(random.randbelow(12));
         auto status_code = std::int64_t{0};
         if (routes.size() >= 2) {
             const auto left = pair_cursor % routes.size();
-            auto right = (left + 1 + static_cast<std::size_t>(next_random() % (routes.size() - 1)))
+            auto right = (left + 1 + static_cast<std::size_t>(
+                random.randbelow(routes.size() - 1)))
                 % routes.size();
             if (right == left) {
                 right = (right + 1) % routes.size();
@@ -5035,12 +5342,7 @@ py::tuple full_native_alns_v1(
         const auto candidate_objective = objective_key(
             candidate_payload, candidate_routes.size());
         const bool vehicle_improvement = candidate_routes.size() < routes.size();
-        const auto comparison = PyObject_RichCompareBool(
-            candidate_objective.ptr(), current_objective.ptr(), Py_LT);
-        if (comparison < 0) {
-            throw py::error_already_set();
-        }
-        if (comparison == 0) {
+        if (!(candidate_objective < current_objective)) {
             ++rejected_moves;
             status_code = 4;
             trajectory.insert(
@@ -5522,6 +5824,16 @@ py::tuple propagate_routes_numeric(
 PYBIND11_MODULE(_core, module) {
     module.doc() = "Native kernels for EVRP-TW route evaluation";
     module.attr("__build_git_revision__") = EVRPTW_BUILD_GIT_REVISION;
+    module.def(
+        "python_random_golden_v1",
+        &python_random_golden_v1,
+        py::arg("seed"),
+        py::arg("random_count"),
+        py::arg("randbelow_bounds"),
+        py::arg("sample_population"),
+        py::arg("sample_size"),
+        py::arg("weights"),
+        py::arg("shuffle_size"));
     py::class_<Stage052ReplayState>(module, "Stage052ReplayState")
         .def(
             py::init<const py::dict&, const py::dict&>(),
@@ -5653,6 +5965,31 @@ PYBIND11_MODULE(_core, module) {
     module.def(
         "candidate_round_transaction_v1",
         &candidate_round_transaction_v1,
+        py::arg("node_kind"),
+        py::arg("demand"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("reachable"),
+        py::arg("vehicle"),
+        py::arg("route_offsets"),
+        py::arg("route_indices"),
+        py::arg("candidate_ids"),
+        py::arg("lexical_rank"),
+        py::arg("options"),
+        py::arg("incremental"),
+        py::arg("negative_offsets"),
+        py::arg("negative_indices"),
+        py::arg("negative_reason_codes"),
+        py::arg("cache_hit_flags"),
+        py::arg("control"),
+        py::arg("deadline_remaining"),
+        py::arg("batch_size"),
+        py::arg("context_ids"));
+    module.def(
+        "candidate_round_transaction_v2",
+        &candidate_round_transaction_v2,
         py::arg("node_kind"),
         py::arg("demand"),
         py::arg("ready_time"),
