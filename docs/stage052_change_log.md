@@ -2958,3 +2958,23 @@ compatibility fallback（兼容回退）。
   `468b368ab395f211dc7fb26e31b15c9b2ca990ab75cacab33a4f896e275898d8`。
   修复必须先以新 clean revision 完成 zero-geometry resource calibration，再以全新 Formal
   label 从零运行；Rerun15 仅作为失败根因证据，不能提供 readiness geometry。
+
+## 2026-08-02：full-retention 单段 archive supersession 路径修复
+
+- `stage05.2_resource_calibration_attempt22` 的独立 reviewer 完整重放 302 个 artifacts、
+  18 个 axis memory releases 与 98 个 batch memory releases 并报告 `ACCEPTED`；full
+  retention（完整保留）归档与 lifecycle `CLOSED` 已完成。关闭事务随后在自动取代前任
+  Attempt21 时 fail fast：既有 retention receipt 合法绑定
+  `generation-0001/wsl_active`，但 supersession controller 仅接受路径末端本身为
+  `generation-NNNN`，导致协议层错误地拒绝 retention 层允许的 canonical single-segment
+  archive（规范单段归档）。Attempt21、Attempt22 的原始回执与证据均未改写。
+- supersession archive validator 与 compaction planner 现在共同接受两种精确形状：
+  `generation-NNNN` 根目录，或其下名称匹配 `[a-z][a-z0-9_]*` 的唯一逻辑 segment leaf。
+  run label、generation、signed inventory、archive tree、writer lease、计划 SHA 与
+  append-only receipts 仍逐项校验；任意更深嵌套、非规范 leaf、内容漂移或活动 writer
+  继续 fail fast。
+- 回归测试新增真实 `generation-0001/wsl_active` predecessor，要求新 current accepted
+  close 在同一事务中生成 supersession receipt、删除仅由计划声明的大型 raw 文件、保留
+  predecessor 原 `CLOSED` record，并使 lifecycle audit 通过。该 controller 修复改变
+  source revision，因此后续 Formal 必须在新 clean commit 上重新执行 resource
+  calibration，并继续使用全新、未创建的 Formal label。

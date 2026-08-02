@@ -3394,15 +3394,35 @@ class ExperimentLifecycleController:
         if retention_class is None:
             raise LifecycleError("compaction has no retention class")
         resolved_run_dir = run_dir.resolve()
+        generation_run_dir = (
+            resolved_run_dir
+            if re.fullmatch(r"generation-[0-9]{4}", resolved_run_dir.name) is not None
+            else resolved_run_dir.parent
+        )
+        supersession_run_dir_is_canonical = (
+            generation_run_dir.parent.name == run_label
+            and re.fullmatch(
+                r"generation-[0-9]{4}", generation_run_dir.name
+            )
+            is not None
+            and (
+                resolved_run_dir == generation_run_dir
+                or (
+                    re.fullmatch(
+                        r"[a-z][a-z0-9_]*", resolved_run_dir.name
+                    )
+                    is not None
+                    and {item.name for item in generation_run_dir.iterdir()}
+                    == {resolved_run_dir.name}
+                )
+            )
+        )
         if (
             supersession is None
             and resolved_run_dir.name != run_label
         ) or (
             supersession is not None
-            and (
-                run_label not in resolved_run_dir.parts
-                or re.fullmatch(r"generation-[0-9]{4}", resolved_run_dir.name) is None
-            )
+            and not supersession_run_dir_is_canonical
         ):
             raise LifecycleError("compaction run directory identity differs")
         inventory, identities = _validated_content_inventory(
@@ -4020,11 +4040,29 @@ class ExperimentLifecycleController:
             / f"{predecessor.run_label}.json"
         )
         archive_path = Path(str(retained_receipt.get("archive_path", ""))).resolve()
+        generation_path = (
+            archive_path
+            if re.fullmatch(r"generation-[0-9]{4}", archive_path.name) is not None
+            else archive_path.parent
+        )
+        archive_path_is_canonical = (
+            generation_path.parent.name == predecessor.run_label
+            and
+            re.fullmatch(r"generation-[0-9]{4}", generation_path.name) is not None
+            and (
+                archive_path == generation_path
+                or (
+                    re.fullmatch(r"[a-z][a-z0-9_]*", archive_path.name) is not None
+                    and {item.name for item in generation_path.iterdir()}
+                    == {archive_path.name}
+                )
+            )
+        )
         if (
             retained_receipt.get("content_inventory_sha256")
             != predecessor.content_inventory_sha256
             or predecessor.run_label not in archive_path.parts
-            or re.fullmatch(r"generation-[0-9]{4}", archive_path.name) is None
+            or not archive_path_is_canonical
             or not archive_path.is_dir()
         ):
             raise LifecycleError("current predecessor archive binding differs")

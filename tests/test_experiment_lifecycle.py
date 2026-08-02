@@ -367,11 +367,14 @@ def _retention_binding(
     run_dir: Path,
     inventory: dict[str, object],
     performance: dict[str, object],
+    archive_leaf: str | None = None,
 ) -> Path:
     generation = 1
     relative_archive = Path(
         "stage00", "runs", label, f"generation-{generation:04d}"
     )
+    if archive_leaf is not None:
+        relative_archive /= archive_leaf
     archive_path = controller.archive_root / relative_archive
     shutil.copytree(run_dir, archive_path)
     files = inventory["files"]
@@ -459,6 +462,8 @@ def _close_current_accepted(
     controller: ExperimentLifecycleController,
     tmp_path: Path,
     label: str,
+    *,
+    archive_leaf: str | None = None,
 ) -> Path:
     plan = _start(controller, tmp_path, label)
     raw = plan.run_dir / "raw" / "large.bin"
@@ -501,6 +506,7 @@ def _close_current_accepted(
         run_dir=plan.run_dir,
         inventory=inventory,
         performance=performance,
+        archive_leaf=archive_leaf,
     )
     controller.mark_retained(
         label,
@@ -2328,6 +2334,46 @@ def test_new_current_close_demotes_previous_current_in_same_transaction(
         / "runs"
         / first
         / "generation-0001"
+        / "raw"
+        / "large.bin"
+    )
+    assert not archived_raw.exists()
+    assert controller.audit()["passed"] is True
+
+
+def test_new_current_close_demotes_segment_leaf_archive(
+    tmp_path: Path,
+) -> None:
+    controller = _controller(tmp_path)
+    first = "stage00_baseline_attempt01"
+    second = "stage00_baseline_attempt02"
+    _close_current_accepted(
+        controller,
+        tmp_path,
+        first,
+        archive_leaf="wsl_active",
+    )
+
+    _close_current_accepted(controller, tmp_path, second)
+
+    supersession = json.loads(
+        (
+            controller.state_root
+            / "close"
+            / "supersessions"
+            / f"{first}.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert supersession["effective_retention_class"] == (
+        RetentionClassV3.SUPERSEDED_ACCEPTED_CAPSULE.value
+    )
+    archived_raw = (
+        controller.archive_root
+        / "stage00"
+        / "runs"
+        / first
+        / "generation-0001"
+        / "wsl_active"
         / "raw"
         / "large.bin"
     )

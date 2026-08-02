@@ -1215,6 +1215,10 @@ The executable workflow and gate table are maintained in
   record is immutable; a signed append-only supersession transaction records
   the effective `superseded_accepted_capsule` projection and `superseded_by`
   identity. Interrupted supersession resumes from that signed checkpoint.
+  The retained archive may be either the canonical `generation-NNNN` root or
+  one canonical single-segment leaf below it (for example `wsl_active`); both
+  shapes remain bound to the exact signed inventory and use the same
+  controller-authored compaction transaction.
 - Runtime source/config/environment and worker/thread/process values must match
   the immutable lifecycle plan again immediately before execution. An
   idempotent retry with any runtime-plan drift is a hard failure rather than a
