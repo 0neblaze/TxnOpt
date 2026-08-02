@@ -10974,6 +10974,410 @@ public:
         }
     }
 
+    py::tuple run_constraint_search(
+        std::int64_t start_iteration,
+        std::int64_t iteration_count,
+        std::int64_t initial_stagnation_iterations,
+        py::handle thresholds,
+        py::handle fractions,
+        py::handle deadline_remaining,
+        py::handle batch_size,
+        std::int64_t route_change_limit) {
+        const auto search_started = std::chrono::steady_clock::now();
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (!initialized_ || !stage04_configured_) {
+            throw std::runtime_error(
+                "full native search engine must be initialized and configured");
+        }
+        if (start_iteration < 0 || iteration_count <= 0
+            || initial_stagnation_iterations < 0) {
+            throw std::invalid_argument(
+                "full native constraint-search iteration values are invalid");
+        }
+        if (start_iteration != last_finished_stage04_iteration_ + 1) {
+            throw std::invalid_argument(
+                "full native constraint search does not start at the active iteration");
+        }
+        if (start_iteration + iteration_count > 4) {
+            throw std::invalid_argument(
+                "constraint-only search beyond the bootstrap rounds requires the native global controller");
+        }
+        auto threshold_array = owned_array_copy<std::int64_t>(
+            thresholds, "thresholds", 1);
+        auto fraction_array = owned_array_copy<double>(fractions, "fractions", 1);
+        auto deadline_array = owned_array_copy<double>(
+            deadline_remaining, "deadline_remaining", 1);
+        auto batch_array = owned_array_copy<std::int64_t>(
+            batch_size, "batch_size", 1);
+        if (threshold_array.size() != 3 || fraction_array.size() != 6
+            || deadline_array.size() != 1 || batch_array.size() != 1
+            || !std::isfinite(checked_data<double>(deadline_array)[0])
+            || checked_data<double>(deadline_array)[0] <= 0.0
+            || checked_data<std::int64_t>(batch_array)[0] <= 0
+            || route_change_limit == 0 || route_change_limit < -1) {
+            throw std::invalid_argument(
+                "full native constraint-search arrays are invalid");
+        }
+
+        const auto total_deadline = checked_data<double>(deadline_array)[0];
+        const auto entry_budget = budget_.native_snapshot();
+        py::array_t<std::int64_t> event_integer(
+            {static_cast<py::ssize_t>(iteration_count), py::ssize_t(16)});
+        py::array_t<std::int64_t> event_objective_integer(
+            {static_cast<py::ssize_t>(iteration_count), py::ssize_t(6)});
+        py::array_t<double> event_objective(
+            {static_cast<py::ssize_t>(iteration_count), py::ssize_t(6)});
+        py::array_t<std::uint8_t> candidate_hashes(
+            {static_cast<py::ssize_t>(iteration_count), py::ssize_t(32)});
+        py::array_t<std::int64_t> stage04_status(
+            {static_cast<py::ssize_t>(iteration_count), py::ssize_t(4)});
+        py::array_t<double> stage04_weights(
+            {static_cast<py::ssize_t>(iteration_count),
+             py::ssize_t(4), py::ssize_t(2)});
+        py::array_t<std::int64_t> stage04_calls(
+            {static_cast<py::ssize_t>(iteration_count), py::ssize_t(4)});
+        py::array_t<double> stage04_rewards(
+            {static_cast<py::ssize_t>(iteration_count), py::ssize_t(4)});
+        std::fill(
+            checked_data(candidate_hashes),
+            checked_data(candidate_hashes) + iteration_count * 32,
+            std::uint8_t{0});
+        std::vector<std::int64_t> plan_offsets{0};
+        std::vector<std::int64_t> route_offsets{0};
+        std::vector<std::int64_t> route_indices;
+        plan_offsets.reserve(static_cast<std::size_t>(iteration_count) + 1);
+
+        auto stagnation_iterations = initial_stagnation_iterations;
+        std::int64_t completed_iterations = 0;
+        std::int64_t termination_reason = 0;
+        const auto injected_deadline_after =
+            constraint_search_deadline_after_completed_injection_;
+        constraint_search_deadline_after_completed_injection_ = -1;
+        for (std::int64_t ordinal = 0; ordinal < iteration_count; ++ordinal) {
+            if (budget_.budget_reached()) {
+                termination_reason = 1;
+                break;
+            }
+            if (injected_deadline_after == completed_iterations) {
+                termination_reason = 2;
+                break;
+            }
+            const auto elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - search_started).count();
+            const auto remaining = total_deadline - elapsed;
+            if (remaining <= 0.0) {
+                termination_reason = 2;
+                break;
+            }
+            py::array_t<double> adjusted_deadline(1);
+            checked_data(adjusted_deadline)[0] = remaining;
+            const auto before_budget = budget_.native_snapshot();
+            const auto iteration = start_iteration + ordinal;
+            py::tuple iteration_payload;
+            try {
+                iteration_payload = constraint_iteration(
+                    iteration,
+                    stagnation_iterations,
+                    false,
+                    threshold_array,
+                    fraction_array,
+                    adjusted_deadline,
+                    batch_array,
+                    route_change_limit);
+            } catch (const std::runtime_error& error) {
+                if (std::string_view(error.what()).find("deadline")
+                    == std::string_view::npos) {
+                    throw;
+                }
+                termination_reason = 2;
+                break;
+            }
+            auto selection = py::cast<py::array_t<std::int64_t>>(
+                iteration_payload[0]);
+            auto probe = py::cast<py::tuple>(iteration_payload[1]);
+            auto outcome = py::cast<py::array_t<std::int64_t>>(
+                iteration_payload[2]);
+            const auto* selection_values = checked_data<std::int64_t>(selection);
+            const auto* outcome_values = checked_data<std::int64_t>(outcome);
+            const auto after_budget = budget_.native_snapshot();
+
+            auto* event = checked_data(event_integer) + ordinal * 16;
+            event[0] = 0;  // candidate_state
+            event[1] = 2;  // constraint_lane
+            event[2] = iteration;
+            event[3] = 7 + outcome_values[0];
+            event[4] = selection_values[1];
+            event[5] = selection_values[2];
+            event[6] = outcome_values[2];
+            event[7] = outcome_values[3];
+            event[8] = outcome_values[4];
+            event[9] = outcome_values[5];
+            event[10] = after_budget.started - before_budget.started;
+            event[11] = after_budget.completed - before_budget.completed;
+            event[12] = after_budget.interrupted - before_budget.interrupted;
+            event[13] = 3;
+            event[14] = current_offsets_.size() - 1;
+            event[15] = best_offsets_.size() - 1;
+
+            std::int64_t appended_routes = 0;
+            if (!probe[1].is_none()) {
+                auto repair = py::cast<py::tuple>(probe[1]);
+                auto repair_offsets = py::cast<py::array_t<std::int64_t>>(repair[0]);
+                auto repair_indices = py::cast<py::array_t<std::int64_t>>(repair[1]);
+                auto repair_metadata = py::cast<py::array_t<std::int64_t>>(repair[2]);
+                const auto* repair_boundaries =
+                    checked_data<std::int64_t>(repair_offsets);
+                const auto* repair_nodes = checked_data<std::int64_t>(repair_indices);
+                if (checked_data<std::int64_t>(repair_metadata)[0] == 0) {
+                    appended_routes = repair_offsets.size() - 1;
+                    for (py::ssize_t route = 0; route < appended_routes; ++route) {
+                        route_indices.insert(
+                            route_indices.end(),
+                            repair_nodes + repair_boundaries[route],
+                            repair_nodes + repair_boundaries[route + 1]);
+                        route_offsets.push_back(
+                            static_cast<std::int64_t>(route_indices.size()));
+                    }
+                    event[13] = outcome_values[2] != 0 ? 0 : 3;
+                } else {
+                    event[13] = 2;
+                }
+            } else {
+                auto removal = py::cast<py::tuple>(probe[0]);
+                auto removal_metadata =
+                    py::cast<py::array_t<std::int64_t>>(removal[6]);
+                event[13] = checked_data<std::int64_t>(removal_metadata)[0] != 0
+                    ? 1 : 3;
+            }
+            plan_offsets.push_back(plan_offsets.back() + appended_routes);
+
+            std::string candidate_evidence(
+                "stage05.2-native-candidate-route-identity-v2");
+            const auto first_route = plan_offsets[
+                static_cast<std::size_t>(ordinal)];
+            const auto last_route = plan_offsets[
+                static_cast<std::size_t>(ordinal + 1)];
+            for (auto route = first_route; route < last_route; ++route) {
+                const auto begin = route_offsets[static_cast<std::size_t>(route)];
+                const auto end = route_offsets[static_cast<std::size_t>(route + 1)];
+                append_evidence_values(
+                    candidate_evidence,
+                    route_indices.data() + begin,
+                    static_cast<std::size_t>(end - begin));
+            }
+            const auto candidate_digest = native_sha256_digest(candidate_evidence);
+            std::copy(
+                candidate_digest.begin(), candidate_digest.end(),
+                checked_data(candidate_hashes) + ordinal * 32);
+
+            auto* objective_integers =
+                checked_data(event_objective_integer) + ordinal * 6;
+            auto* objectives = checked_data(event_objective) + ordinal * 6;
+            objective_integers[0] = -1;
+            objective_integers[1] = -1;
+            objectives[0] = std::numeric_limits<double>::quiet_NaN();
+            objectives[1] = std::numeric_limits<double>::quiet_NaN();
+            if (!probe[2].is_none() && outcome_values[2] != 0) {
+                auto transaction = py::cast<py::tuple>(probe[2]);
+                auto candidate_integers =
+                    py::cast<py::array_t<std::int64_t>>(transaction[2]);
+                auto candidate_floats =
+                    py::cast<py::array_t<double>>(transaction[3]);
+                objective_integers[0] =
+                    checked_data<std::int64_t>(candidate_integers)[0];
+                objective_integers[1] =
+                    checked_data<std::int64_t>(candidate_integers)[1];
+                objectives[0] = checked_data<double>(candidate_floats)[0];
+                objectives[1] = checked_data<double>(candidate_floats)[1];
+            }
+            objective_integers[2] =
+                checked_data<std::int64_t>(current_objective_integer_)[0];
+            objective_integers[3] =
+                checked_data<std::int64_t>(current_objective_integer_)[1];
+            objective_integers[4] =
+                checked_data<std::int64_t>(best_objective_integer_)[0];
+            objective_integers[5] =
+                checked_data<std::int64_t>(best_objective_integer_)[1];
+            objectives[2] = checked_data<double>(current_objective_float_)[0];
+            objectives[3] = checked_data<double>(current_objective_float_)[1];
+            objectives[4] = checked_data<double>(best_objective_float_)[0];
+            objectives[5] = checked_data<double>(best_objective_float_)[1];
+
+            auto stage_boundary = finish_stage04_iteration(
+                iteration, budget_.budget_reached());
+            auto statuses = py::cast<py::array_t<std::int64_t>>(stage_boundary[0]);
+            auto weights = py::cast<py::array_t<double>>(stage_boundary[1]);
+            auto calls = py::cast<py::array_t<std::int64_t>>(stage_boundary[2]);
+            auto rewards = py::cast<py::array_t<double>>(stage_boundary[3]);
+            std::copy(
+                checked_data<std::int64_t>(statuses),
+                checked_data<std::int64_t>(statuses) + 4,
+                checked_data(stage04_status) + ordinal * 4);
+            std::copy(
+                checked_data<double>(weights),
+                checked_data<double>(weights) + 8,
+                checked_data(stage04_weights) + ordinal * 8);
+            std::copy(
+                checked_data<std::int64_t>(calls),
+                checked_data<std::int64_t>(calls) + 4,
+                checked_data(stage04_calls) + ordinal * 4);
+            std::copy(
+                checked_data<double>(rewards),
+                checked_data<double>(rewards) + 4,
+                checked_data(stage04_rewards) + ordinal * 4);
+            stagnation_iterations = outcome_values[4] != 0
+                ? 0 : stagnation_iterations + 1;
+            ++completed_iterations;
+            if (budget_.budget_reached()) {
+                termination_reason = 1;
+                break;
+            }
+        }
+
+        if (completed_iterations != iteration_count) {
+            py::array_t<std::int64_t> trimmed_event_integer(
+                {static_cast<py::ssize_t>(completed_iterations), py::ssize_t(16)});
+            py::array_t<std::int64_t> trimmed_event_objective_integer(
+                {static_cast<py::ssize_t>(completed_iterations), py::ssize_t(6)});
+            py::array_t<double> trimmed_event_objective(
+                {static_cast<py::ssize_t>(completed_iterations), py::ssize_t(6)});
+            py::array_t<std::uint8_t> trimmed_candidate_hashes(
+                {static_cast<py::ssize_t>(completed_iterations), py::ssize_t(32)});
+            py::array_t<std::int64_t> trimmed_stage04_status(
+                {static_cast<py::ssize_t>(completed_iterations), py::ssize_t(4)});
+            py::array_t<double> trimmed_stage04_weights(
+                {static_cast<py::ssize_t>(completed_iterations),
+                 py::ssize_t(4), py::ssize_t(2)});
+            py::array_t<std::int64_t> trimmed_stage04_calls(
+                {static_cast<py::ssize_t>(completed_iterations), py::ssize_t(4)});
+            py::array_t<double> trimmed_stage04_rewards(
+                {static_cast<py::ssize_t>(completed_iterations), py::ssize_t(4)});
+            std::copy(
+                checked_data(event_integer),
+                checked_data(event_integer) + completed_iterations * 16,
+                checked_data(trimmed_event_integer));
+            std::copy(
+                checked_data(event_objective_integer),
+                checked_data(event_objective_integer) + completed_iterations * 6,
+                checked_data(trimmed_event_objective_integer));
+            std::copy(
+                checked_data(event_objective),
+                checked_data(event_objective) + completed_iterations * 6,
+                checked_data(trimmed_event_objective));
+            std::copy(
+                checked_data(candidate_hashes),
+                checked_data(candidate_hashes) + completed_iterations * 32,
+                checked_data(trimmed_candidate_hashes));
+            std::copy(
+                checked_data(stage04_status),
+                checked_data(stage04_status) + completed_iterations * 4,
+                checked_data(trimmed_stage04_status));
+            std::copy(
+                checked_data(stage04_weights),
+                checked_data(stage04_weights) + completed_iterations * 8,
+                checked_data(trimmed_stage04_weights));
+            std::copy(
+                checked_data(stage04_calls),
+                checked_data(stage04_calls) + completed_iterations * 4,
+                checked_data(trimmed_stage04_calls));
+            std::copy(
+                checked_data(stage04_rewards),
+                checked_data(stage04_rewards) + completed_iterations * 4,
+                checked_data(trimmed_stage04_rewards));
+            event_integer = std::move(trimmed_event_integer);
+            event_objective_integer =
+                std::move(trimmed_event_objective_integer);
+            event_objective = std::move(trimmed_event_objective);
+            candidate_hashes = std::move(trimmed_candidate_hashes);
+            stage04_status = std::move(trimmed_stage04_status);
+            stage04_weights = std::move(trimmed_stage04_weights);
+            stage04_calls = std::move(trimmed_stage04_calls);
+            stage04_rewards = std::move(trimmed_stage04_rewards);
+        }
+
+        py::array_t<std::int64_t> plan_offsets_array(plan_offsets.size());
+        py::array_t<std::int64_t> route_offsets_array(route_offsets.size());
+        py::array_t<std::int64_t> route_indices_array(route_indices.size());
+        std::copy(
+            plan_offsets.begin(), plan_offsets.end(),
+            checked_data(plan_offsets_array));
+        std::copy(
+            route_offsets.begin(), route_offsets.end(),
+            checked_data(route_offsets_array));
+        std::copy(
+            route_indices.begin(), route_indices.end(),
+            checked_data(route_indices_array));
+        py::array_t<std::int64_t> termination(13);
+        const auto terminal_budget = budget_.native_snapshot();
+        auto* terminal_values = checked_data(termination);
+        terminal_values[0] = termination_reason;
+        terminal_values[1] = completed_iterations;
+        terminal_values[2] = iteration_count;
+        terminal_values[3] = budget_.exact_budget_;
+        terminal_values[4] = entry_budget.started;
+        terminal_values[5] = entry_budget.completed;
+        terminal_values[6] = entry_budget.interrupted;
+        terminal_values[7] = terminal_budget.started;
+        terminal_values[8] = terminal_budget.completed;
+        terminal_values[9] = terminal_budget.interrupted;
+        std::array<std::int64_t, 3> event_exact_deltas{};
+        for (std::int64_t event = 0; event < completed_iterations; ++event) {
+            for (std::int64_t counter = 0; counter < 3; ++counter) {
+                event_exact_deltas[static_cast<std::size_t>(counter)] +=
+                    checked_data<std::int64_t>(event_integer)[
+                        event * 16 + 10 + counter];
+            }
+        }
+        terminal_values[10] = terminal_budget.started - entry_budget.started
+            - event_exact_deltas[0];
+        terminal_values[11] = terminal_budget.completed - entry_budget.completed
+            - event_exact_deltas[1];
+        terminal_values[12] = terminal_budget.interrupted - entry_budget.interrupted
+            - event_exact_deltas[2];
+        std::string evidence("stage05.2-native-constraint-semantic-stream-v2");
+        append_evidence_array(evidence, event_integer);
+        append_evidence_array(evidence, event_objective_integer);
+        append_evidence_array(evidence, event_objective);
+        append_evidence_array(evidence, plan_offsets_array);
+        append_evidence_array(evidence, route_offsets_array);
+        append_evidence_array(evidence, route_indices_array);
+        append_evidence_array(evidence, candidate_hashes);
+        append_evidence_array(evidence, stage04_status);
+        append_evidence_array(evidence, stage04_weights);
+        append_evidence_array(evidence, stage04_calls);
+        append_evidence_array(evidence, stage04_rewards);
+        append_evidence_array(evidence, termination);
+        return py::make_tuple(
+            std::move(event_integer), std::move(event_objective_integer),
+            std::move(event_objective),
+            std::move(plan_offsets_array), std::move(route_offsets_array),
+            std::move(route_indices_array), std::move(candidate_hashes),
+            std::move(stage04_status), std::move(stage04_weights),
+            std::move(stage04_calls), std::move(stage04_rewards),
+            std::move(termination),
+            native_sha256_hex(evidence));
+    }
+
+    void inject_constraint_search_deadline_after_completed_once(
+        std::int64_t completed_iterations) {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (completed_iterations < 0
+            || constraint_search_deadline_after_completed_injection_ >= 0) {
+            throw std::invalid_argument(
+                "full native constraint-search deadline injection is invalid");
+        }
+        constraint_search_deadline_after_completed_injection_ =
+            completed_iterations;
+    }
+
     void inject_constraint_iteration_deadline_before_commit_once() {
         std::unique_lock state_lock(state_mutex_, std::try_to_lock);
         if (!state_lock.owns_lock()) {
@@ -11093,6 +11497,7 @@ private:
     std::int64_t commit_failure_injection_ = 0;
     bool probe_envelope_failure_injection_ = false;
     bool constraint_iteration_deadline_injection_ = false;
+    std::int64_t constraint_search_deadline_after_completed_injection_ = -1;
     bool defer_composite_commit_ = false;
     bool defer_iteration_commit_ = false;
     bool pending_composite_active_ = false;
@@ -12089,6 +12494,13 @@ PYBIND11_MODULE(_core, module) {
             py::arg("fractions"), py::arg("deadline_remaining"),
             py::arg("batch_size"),
             py::arg("route_change_limit"))
+        .def(
+            "run_constraint_search", &NativeSearchEngineV2::run_constraint_search,
+            py::arg("start_iteration"), py::arg("iteration_count"),
+            py::arg("initial_stagnation_iterations"),
+            py::arg("thresholds"), py::arg("fractions"),
+            py::arg("deadline_remaining"), py::arg("batch_size"),
+            py::arg("route_change_limit"))
         .def("initialized", &NativeSearchEngineV2::initialized)
         .def(
             "inject_commit_failure_once",
@@ -12101,6 +12513,11 @@ PYBIND11_MODULE(_core, module) {
             "inject_constraint_iteration_deadline_before_commit_once",
             &NativeSearchEngineV2::
                 inject_constraint_iteration_deadline_before_commit_once)
+        .def(
+            "inject_constraint_search_deadline_after_completed_once",
+            &NativeSearchEngineV2::
+                inject_constraint_search_deadline_after_completed_once,
+            py::arg("completed_iterations"))
         .def("state", &NativeSearchEngineV2::state)
         .def("solution_state", &NativeSearchEngineV2::solution_state)
         .def(

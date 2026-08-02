@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import struct
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
@@ -222,6 +223,267 @@ class FullNativeALNSResult:
     timings: Mapping[str, float]
     trajectory: tuple[Mapping[str, object], ...]
     transaction_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class NativeConstraintSemanticStream:
+    """Independently validated typed events from the native constraint loop."""
+
+    event_integer: npt.NDArray[np.int64]
+    event_objective_integer: npt.NDArray[np.int64]
+    event_objective: npt.NDArray[np.float64]
+    plan_offsets: npt.NDArray[np.int64]
+    route_offsets: npt.NDArray[np.int64]
+    route_indices: npt.NDArray[np.int64]
+    candidate_hashes: npt.NDArray[np.uint8]
+    stage04_status: npt.NDArray[np.int64]
+    stage04_weights: npt.NDArray[np.float64]
+    stage04_calls: npt.NDArray[np.int64]
+    stage04_rewards: npt.NDArray[np.float64]
+    termination: npt.NDArray[np.int64]
+    transaction_sha256: str
+
+
+def _append_u64(evidence: bytearray, value: int) -> None:
+    evidence.extend((value & ((1 << 64) - 1)).to_bytes(8, "little"))
+
+
+def _append_typed_values(
+    evidence: bytearray,
+    values: npt.NDArray[np.generic],
+) -> None:
+    flattened = values.reshape(-1)
+    _append_u64(evidence, len(flattened))
+    if values.dtype == np.dtype(np.uint8):
+        evidence.extend(flattened.tobytes(order="C"))
+        return
+    if values.dtype == np.dtype(np.int64):
+        for value in flattened:
+            _append_u64(evidence, int(value))
+        return
+    if values.dtype == np.dtype(np.float64):
+        for value in flattened:
+            converted = float(value)
+            bits = (
+                0x7FF8000000000000
+                if math.isnan(converted)
+                else struct.unpack("<Q", struct.pack("<d", converted))[0]
+            )
+            _append_u64(evidence, bits)
+        return
+    raise RuntimeError("native semantic evidence has an unsupported dtype")
+
+
+def _append_typed_array(
+    evidence: bytearray,
+    values: npt.NDArray[np.generic],
+) -> None:
+    _append_u64(evidence, values.ndim)
+    for dimension in values.shape:
+        _append_u64(evidence, dimension)
+    _append_typed_values(evidence, values)
+
+
+def _readonly_copy[T: np.generic](values: npt.NDArray[T]) -> npt.NDArray[T]:
+    copied = np.ascontiguousarray(values.copy())
+    copied.flags.writeable = False
+    return copied
+
+
+def decode_native_constraint_semantic_stream(
+    payload: object,
+) -> NativeConstraintSemanticStream:
+    """Validate native event SoA without trusting producer-side hashes."""
+
+    if not isinstance(payload, tuple) or len(payload) != 13:
+        raise RuntimeError("native constraint semantic stream has an invalid tuple")
+    event_integer = payload[0]
+    if (
+        not isinstance(event_integer, np.ndarray)
+        or event_integer.dtype != np.dtype(np.int64)
+        or event_integer.ndim != 2
+        or event_integer.shape[1] != 16
+        or not event_integer.flags.c_contiguous
+    ):
+        raise RuntimeError("native constraint semantic event integers have an invalid schema")
+    event_count = event_integer.shape[0]
+    expected_arrays: tuple[tuple[object, np.dtype[np.generic], tuple[int, ...], str], ...] = (
+        (payload[1], np.dtype(np.int64), (event_count, 6), "objective integers"),
+        (payload[2], np.dtype(np.float64), (event_count, 6), "objective floats"),
+        (payload[6], np.dtype(np.uint8), (event_count, 32), "candidate hashes"),
+        (payload[7], np.dtype(np.int64), (event_count, 4), "Stage 4 statuses"),
+        (payload[8], np.dtype(np.float64), (event_count, 4, 2), "Stage 4 weights"),
+        (payload[9], np.dtype(np.int64), (event_count, 4), "Stage 4 calls"),
+        (payload[10], np.dtype(np.float64), (event_count, 4), "Stage 4 rewards"),
+    )
+    validated: list[npt.NDArray[np.generic]] = []
+    for value, dtype, shape, name in expected_arrays:
+        validated.append(_require_array(value, dtype=dtype, shape=shape, name=name))
+    event_objective_integer = cast(npt.NDArray[np.int64], validated[0])
+    event_objective = cast(npt.NDArray[np.float64], validated[1])
+    candidate_hashes = cast(npt.NDArray[np.uint8], validated[2])
+    stage04_status = cast(npt.NDArray[np.int64], validated[3])
+    stage04_weights = cast(npt.NDArray[np.float64], validated[4])
+    stage04_calls = cast(npt.NDArray[np.int64], validated[5])
+    stage04_rewards = cast(npt.NDArray[np.float64], validated[6])
+    termination = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[11],
+            dtype=np.dtype(np.int64),
+            shape=(13,),
+            name="termination",
+        ),
+    )
+    plan_offsets = _require_vector(payload[3], "constraint semantic plan offsets")
+    route_offsets = _require_vector(payload[4], "constraint semantic route offsets")
+    route_indices = _require_vector(payload[5], "constraint semantic route indices")
+    if (
+        len(plan_offsets) != event_count + 1
+        or len(route_offsets) == 0
+        or int(plan_offsets[0]) != 0
+        or int(route_offsets[0]) != 0
+        or int(plan_offsets[-1]) != len(route_offsets) - 1
+        or int(route_offsets[-1]) != len(route_indices)
+        or np.any(plan_offsets[:-1] > plan_offsets[1:])
+        or np.any(route_offsets[:-1] > route_offsets[1:])
+    ):
+        raise RuntimeError("native constraint semantic offsets are invalid")
+    if (
+        np.any(event_integer[:, 0] != 0)
+        or np.any(event_integer[:, 1] != 2)
+        or np.any(event_integer[:, 3] < 7)
+        or np.any(event_integer[:, 3] > 10)
+        or np.any(event_integer[1:, 2] != event_integer[:-1, 2] + 1)
+    ):
+        raise RuntimeError("native constraint semantic event identity is invalid")
+    if event_count:
+        candidate_vehicle_present = event_objective_integer[:, 0] >= 0
+        candidate_charging_present = event_objective_integer[:, 1] >= 0
+        candidate_present = candidate_vehicle_present & candidate_charging_present
+        candidate_route_counts = plan_offsets[1:] - plan_offsets[:-1]
+        if (
+            np.any(event_objective_integer[:, 2:] < 0)
+            or np.any(candidate_vehicle_present != candidate_charging_present)
+            or np.any(event_objective_integer[~candidate_present, :2] != -1)
+            or np.any(
+                event_objective_integer[candidate_present, 0]
+                != candidate_route_counts[candidate_present]
+            )
+            or np.any(event_integer[:, 14] != event_objective_integer[:, 2])
+            or np.any(event_integer[:, 15] != event_objective_integer[:, 4])
+            or np.any(event_integer[:, 6].astype(bool) != candidate_present)
+            or np.any(np.isfinite(event_objective[:, :2]) != candidate_present[:, None])
+            or np.any(event_objective[candidate_present, :2] < 0.0)
+            or np.any(~np.isfinite(event_objective[:, 2:]))
+            or np.any(event_objective[:, 2:] < 0.0)
+        ):
+            raise RuntimeError("native constraint semantic objectives are invalid")
+    if (
+        np.any((stage04_status < -1) | (stage04_status > 1))
+        or np.any(stage04_calls < 0)
+        or np.any(~np.isfinite(stage04_weights))
+        or np.any(stage04_weights < 0.0)
+        or np.any(~np.isfinite(stage04_rewards))
+        or np.any(stage04_rewards < 0.0)
+    ):
+        raise RuntimeError("native constraint semantic Stage 4 state is invalid")
+    terminal_reason = int(termination[0])
+    requested_iterations = int(termination[2])
+    exact_budget_limit = int(termination[3])
+    entry_exact = termination[4:7]
+    final_exact = termination[7:10]
+    terminal_tail = termination[10:13]
+    event_exact_deltas = event_integer[:, 10:13].sum(axis=0, dtype=np.int64)
+    budget_configured = exact_budget_limit >= 0
+    budget_reached = budget_configured and int(final_exact[0]) == exact_budget_limit
+    deadline_has_terminal_work = bool(np.any(terminal_tail != 0))
+    if (
+        terminal_reason not in {0, 1, 2}
+        or int(termination[1]) != event_count
+        or requested_iterations <= 0
+        or exact_budget_limit < -1
+        or np.any(entry_exact < 0)
+        or np.any(final_exact < entry_exact)
+        or (
+            budget_configured
+            and (
+                int(entry_exact[0]) > exact_budget_limit
+                or int(final_exact[0]) > exact_budget_limit
+            )
+        )
+        or np.any(terminal_tail < 0)
+        or int(entry_exact[1]) + int(entry_exact[2]) > int(entry_exact[0])
+        or int(final_exact[1]) + int(final_exact[2]) > int(final_exact[0])
+        or np.any(final_exact - entry_exact - event_exact_deltas != terminal_tail)
+        or (
+            terminal_reason == 0
+            and (event_count != requested_iterations or budget_reached)
+        )
+        or (
+            terminal_reason == 1
+            and not budget_reached
+        )
+        or (
+            terminal_reason == 2
+            and (
+                event_count >= requested_iterations
+                or (budget_reached and not deadline_has_terminal_work)
+            )
+        )
+        or (terminal_reason != 2 and np.any(terminal_tail != 0))
+    ):
+        raise RuntimeError("native constraint semantic termination is invalid")
+
+    for event in range(event_count):
+        identity = bytearray(b"stage05.2-native-candidate-route-identity-v2")
+        first_route = int(plan_offsets[event])
+        last_route = int(plan_offsets[event + 1])
+        for route in range(first_route, last_route):
+            _append_typed_values(
+                identity,
+                route_indices[int(route_offsets[route]) : int(route_offsets[route + 1])],
+            )
+        observed = bytes(candidate_hashes[event])
+        if hashlib.sha256(identity).digest() != observed:
+            raise RuntimeError("native candidate identity SHA-256 mismatch")
+
+    transaction_sha256 = payload[12]
+    if not isinstance(transaction_sha256, str) or not _is_sha256(transaction_sha256):
+        raise RuntimeError("native constraint semantic stream SHA-256 is invalid")
+    evidence = bytearray(b"stage05.2-native-constraint-semantic-stream-v2")
+    for values in (
+        event_integer,
+        event_objective_integer,
+        event_objective,
+        plan_offsets,
+        route_offsets,
+        route_indices,
+        candidate_hashes,
+        stage04_status,
+        stage04_weights,
+        stage04_calls,
+        stage04_rewards,
+        termination,
+    ):
+        _append_typed_array(evidence, values)
+    if hashlib.sha256(evidence).hexdigest() != transaction_sha256:
+        raise RuntimeError("native constraint semantic stream SHA-256 mismatch")
+    return NativeConstraintSemanticStream(
+        event_integer=_readonly_copy(event_integer),
+        event_objective_integer=_readonly_copy(event_objective_integer),
+        event_objective=_readonly_copy(event_objective),
+        plan_offsets=_readonly_copy(plan_offsets),
+        route_offsets=_readonly_copy(route_offsets),
+        route_indices=_readonly_copy(route_indices),
+        candidate_hashes=_readonly_copy(candidate_hashes),
+        stage04_status=_readonly_copy(stage04_status),
+        stage04_weights=_readonly_copy(stage04_weights),
+        stage04_calls=_readonly_copy(stage04_calls),
+        stage04_rewards=_readonly_copy(stage04_rewards),
+        termination=_readonly_copy(termination),
+        transaction_sha256=transaction_sha256,
+    )
 
 
 def _pack_integer_config(
@@ -927,10 +1189,12 @@ __all__ = (
     "NativeCandidateResolution",
     "NativeCandidateRoundRequest",
     "NativeCandidateRoundResult",
+    "NativeConstraintSemanticStream",
     "FullNativeALNSResult",
     "FULL_NATIVE_OPERATOR_NAMES",
     "NativeWorkerProtocol",
     "Stage052NativeExecutionConfig",
     "execute_native_candidate_round",
+    "decode_native_constraint_semantic_stream",
     "execute_full_native_alns",
 )
