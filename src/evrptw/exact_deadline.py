@@ -101,7 +101,11 @@ class ExactCallController:
         return ExactCallReservation(requested, granted)
 
     def complete(self, count: int) -> None:
-        if count < 0 or self.completed_calls + count > self.started_calls:
+        if (
+            count < 0
+            or self.completed_calls + self.interrupted_calls + count
+            > self.started_calls
+        ):
             raise RuntimeError("invalid completed exact-call count")
         self.completed_calls += count
 
@@ -109,6 +113,28 @@ class ExactCallController:
         if count < 0 or self.completed_calls + self.interrupted_calls + count > self.started_calls:
             raise RuntimeError("invalid interrupted exact-call count")
         self.interrupted_calls += count
+
+    def record_native_work(
+        self,
+        *,
+        started: int,
+        completed: int,
+        interrupted: int,
+    ) -> bool:
+        """Record an already-executed native receipt without refund semantics."""
+
+        if (
+            started < 0
+            or completed < 0
+            or interrupted < 0
+            or completed + interrupted != started
+        ):
+            raise RuntimeError("invalid native exact-call receipt")
+        within_budget = self.budget is None or self.started_calls + started <= self.budget
+        self.started_calls += started
+        self.completed_calls += completed
+        self.interrupted_calls += interrupted
+        return within_budget
 
     def to_dict(self) -> dict[str, object]:
         return {

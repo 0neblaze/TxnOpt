@@ -511,16 +511,30 @@ py::array_t<std::int64_t> native_objective_acceptance_v1(
     for (py::ssize_t row = 0; row < rows; ++row) {
         const auto current_vehicles = current_integer_values[row * 2];
         const auto candidate_vehicles = candidate_integer_values[row * 2];
+        const auto current_charging_count = current_integer_values[row * 2 + 1];
+        const auto candidate_charging_count = candidate_integer_values[row * 2 + 1];
+        const auto current_distance = current_float_values[row * 2];
+        const auto current_charging_time = current_float_values[row * 2 + 1];
+        const auto candidate_distance = candidate_float_values[row * 2];
+        const auto candidate_charging_time = candidate_float_values[row * 2 + 1];
+        if (current_vehicles < 0 || candidate_vehicles < 0
+            || current_charging_count < 0 || candidate_charging_count < 0
+            || !std::isfinite(current_distance) || current_distance < 0.0
+            || !std::isfinite(current_charging_time) || current_charging_time < 0.0
+            || !std::isfinite(candidate_distance) || candidate_distance < 0.0
+            || !std::isfinite(candidate_charging_time) || candidate_charging_time < 0.0) {
+            throw std::invalid_argument("native objective fields are invalid");
+        }
         const auto current_key = std::make_tuple(
             current_vehicles,
-            round_objective(current_float_values[row * 2]),
-            round_objective(current_float_values[row * 2 + 1]),
-            current_integer_values[row * 2 + 1]);
+            round_objective(current_distance),
+            round_objective(current_charging_time),
+            current_charging_count);
         const auto candidate_key = std::make_tuple(
             candidate_vehicles,
-            round_objective(candidate_float_values[row * 2]),
-            round_objective(candidate_float_values[row * 2 + 1]),
-            candidate_integer_values[row * 2 + 1]);
+            round_objective(candidate_distance),
+            round_objective(candidate_charging_time),
+            candidate_charging_count);
         if (!std::isfinite(temperature_values[row]) || temperature_values[row] <= 0.0
             || !std::isfinite(random_values[row]) || random_values[row] < 0.0
             || random_values[row] > 1.0) {
@@ -2050,7 +2064,7 @@ public:
     }
 
     py::array_t<std::int64_t> complete_exact(std::int64_t count) {
-        if (count < 0 || completed_ + count > started_) {
+        if (count < 0 || completed_ + interrupted_ + count > started_) {
             throw std::runtime_error("invalid completed exact-call count");
         }
         completed_ += count;
@@ -2159,8 +2173,8 @@ public:
         auto ids_array = checked_array<std::int64_t>(plan_ids, "plan_ids", 1);
         const auto* ids = checked_data<std::int64_t>(ids_array);
         std::unordered_set<std::int64_t> unique_ids;
-        std::vector<std::string> additions;
-        py::array_t<std::int64_t> statuses(ids_array.size());
+        std::vector<std::int64_t> validated_ids;
+        validated_ids.reserve(static_cast<std::size_t>(ids_array.size()));
         for (py::ssize_t ordinal = 0; ordinal < ids_array.size(); ++ordinal) {
             if (ids[ordinal] < 0
                 || ids[ordinal] >= static_cast<std::int64_t>(plans.size())
@@ -2168,13 +2182,19 @@ public:
                 throw std::invalid_argument(
                     "native attempted-plan IDs must be unique valid plan rows");
             }
-            const auto key = plan_key(plans[static_cast<std::size_t>(ids[ordinal])]);
+            validated_ids.push_back(ids[ordinal]);
+        }
+        std::vector<std::string> additions;
+        py::array_t<std::int64_t> statuses(ids_array.size());
+        for (std::size_t ordinal = 0; ordinal < validated_ids.size(); ++ordinal) {
+            const auto key = plan_key(
+                plans[static_cast<std::size_t>(validated_ids[ordinal])]);
             if (attempted_.contains(key)) {
-                checked_data(statuses)[ordinal] = 0;
+                checked_data(statuses)[static_cast<py::ssize_t>(ordinal)] = 0;
             } else {
                 attempted_.insert(key);
                 additions.push_back(key);
-                checked_data(statuses)[ordinal] = 1;
+                checked_data(statuses)[static_cast<py::ssize_t>(ordinal)] = 1;
             }
         }
         active_additions_ = std::move(additions);

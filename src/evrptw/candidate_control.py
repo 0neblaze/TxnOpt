@@ -140,14 +140,35 @@ class CandidateControlRuntime:
     def rollback_protocol_state(
         self,
         snapshot: CandidateControlProtocolSnapshot,
+        *,
+        preserve_round_usage: bool = False,
     ) -> None:
         if len(self.events) < snapshot.event_count:
             raise RuntimeError("candidate-control event journal cannot roll forward")
+        preserved_used = self._round_used
+        preserved_budget_events: list[dict[str, object]] = []
+        if preserve_round_usage:
+            for event in self.events[snapshot.event_count :]:
+                granted = event.get("granted")
+                if (
+                    event.get("event_type") == "candidate_control_budget"
+                    and isinstance(granted, int)
+                    and not isinstance(granted, bool)
+                    and granted > 0
+                ):
+                    preserved_budget_events.append(
+                        {**event, "status": "aborted_transaction_consumed"}
+                    )
         del self.events[snapshot.event_count :]
         del self._candidate_work[snapshot.candidate_work_count :]
         del self._route_results[snapshot.route_result_count :]
         self._round_key = snapshot.round_key
-        self._round_used = snapshot.round_used
+        self._round_used = (
+            max(snapshot.round_used, preserved_used)
+            if preserve_round_usage
+            else snapshot.round_used
+        )
+        self.events.extend(preserved_budget_events)
 
     def finish_round(self) -> None:
         if self._round_key is None:
@@ -196,6 +217,29 @@ class CandidateControlRuntime:
             }
         )
         return granted
+
+    def record_native_work(self, started: int, *, context: str) -> bool:
+        """Charge native work that has already started and therefore cannot be refunded."""
+
+        if started < 0:
+            raise ValueError("native started exact-call count must be non-negative")
+        available = self.round_remaining
+        within_budget = self._round_key is None or started <= available
+        self._round_used += started
+        if started:
+            self.events.append(
+                {
+                    "event_type": "candidate_control_budget",
+                    "status": "reserved" if within_budget else "protocol_budget_overrun",
+                    "context": context,
+                    "requested": started,
+                    "granted": started,
+                    "remaining": self.round_remaining,
+                    "iteration": None if self._round_key is None else self._round_key[1],
+                    "accounting": "native_resource_receipt",
+                }
+            )
+        return within_budget
 
     def select_route_candidates(
         self,

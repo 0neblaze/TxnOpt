@@ -643,6 +643,74 @@ def test_native_candidate_round_cache_commit_failure_rolls_back_all_state(
     assert native_runtime.screening_batch_invocations == 0
 
 
+def test_native_candidate_round_failure_does_not_refund_started_exact_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = _fixture_instance()
+    execution = _per_solve_config()
+    route_cache = RouteEvaluationCache(
+        instance,
+        CacheIncrementalConfig(enabled=True, max_entries=4),
+    )
+    cache_before = route_cache.snapshot_state()
+    control_runtime = CandidateControlRuntime(execution.candidate_control_config)
+    control_runtime.begin_round(7, lane="constraint")
+    exact_controller = ExactCallController(
+        ExactDeadlineConfig.fixed_exact_calls(1, watchdog_seconds=120.0)
+    )
+    transaction_runtime = NativeCandidateTransactionRuntime(
+        execution.candidate_transaction_config
+    )
+    native_runtime = NativeKernelRuntime.build(
+        instance,
+        execution.native_kernel_config,
+    )
+    evaluator = _Evaluator(
+        instance,
+        deadline=time.perf_counter() + 10.0,
+        lane="constraint",
+        screening_config=CheapScreeningConfig(),
+        cache_incremental_config=CacheIncrementalConfig(enabled=True),
+        route_cache=route_cache,
+        backend="cpu_batch",
+        exact_call_controller=exact_controller,
+        candidate_control_runtime=control_runtime,
+        candidate_transaction_runtime=transaction_runtime,
+        native_runtime=native_runtime,
+        native_execution_config=execution,
+    )
+    evaluator.set_measurement_context(
+        lane="constraint",
+        iteration=7,
+        operator="relocate",
+    )
+
+    def fail_commit() -> None:
+        raise RuntimeError("injected cache commit failure")
+
+    monkeypatch.setattr(evaluator, "_commit_pending_candidate_cache", fail_commit)
+
+    with pytest.raises(RuntimeError, match="injected cache commit failure"):
+        evaluator.candidate_route_batch((("C1",),), exact_budget=1)
+
+    assert route_cache.snapshot_state() == cache_before
+    assert evaluator.pending_candidate_cache == {}
+    assert exact_controller.started_calls == 1
+    assert exact_controller.completed_calls == 1
+    assert exact_controller.interrupted_calls == 0
+    assert evaluator.backend_metrics.started_calls == 1
+    assert evaluator.backend_metrics.completed_calls == 1
+    assert evaluator.calls == 1
+    control_after = control_runtime.snapshot_protocol_state()
+    assert control_after.round_used == 1
+    assert control_after.candidate_work_count == 0
+    assert control_after.route_result_count == 0
+    assert control_runtime.events[-1]["status"] == "aborted_transaction_consumed"
+    assert transaction_runtime.transaction_count == 0
+    assert transaction_runtime.fallback_count == 0
+    assert native_runtime.screening_batch_invocations == 0
+
+
 def test_native_candidate_round_one_and_four_threads_are_semantically_identical() -> None:
     instance = _fixture_instance()
     candidates = (("C1",), ("C2",), ("C2", "C1"))
@@ -1161,6 +1229,26 @@ def test_native_attempted_plan_identity_is_transactional_across_ordinals() -> No
     assert attempted.lookup(packed_plans, packed_routes, packed_indices).tolist() == [1, 0, 1]
 
 
+def test_native_attempted_plan_invalid_batch_is_atomic() -> None:
+    from evrptw import _core as native_core
+
+    plan_offsets = np.asarray([0, 2, 4], dtype=np.int64)
+    route_offsets = np.asarray([0, 2, 3, 5, 6], dtype=np.int64)
+    route_indices = np.asarray([1, 2, 3, 1, 3, 2], dtype=np.int64)
+    attempted = native_core.NativeAttemptedPlanSetV2()
+
+    with pytest.raises(ValueError, match="unique valid plan rows"):
+        attempted.begin_mark_many_atomic(
+            plan_offsets,
+            route_offsets,
+            route_indices,
+            np.asarray([0, 99], dtype=np.int64),
+        )
+
+    assert attempted.size() == 0
+    assert attempted.lookup(plan_offsets, route_offsets, route_indices).tolist() == [0, 0]
+
+
 def test_native_route_cache_atomic_lru_matches_python_cache() -> None:
     from evrptw import _core as native_core
 
@@ -1564,6 +1652,25 @@ def test_native_budget_state_matches_python_controllers_and_rollback() -> None:
 
     candidate.finish_round()
     assert native.finish_round().tolist()[:5] == [0, -1, -1, 0, 2]
+
+
+def test_exact_budget_states_reject_double_classification() -> None:
+    from evrptw import _core as native_core
+
+    exact = ExactCallController(
+        ExactDeadlineConfig.fixed_exact_calls(1, watchdog_seconds=120.0)
+    )
+    native = native_core.NativeBudgetStateV2(1, 1)
+
+    assert exact.reserve(1).granted == 1
+    assert native.reserve_exact(1).tolist() == [1, 1]
+    exact.interrupt(1)
+    native.interrupt_exact(1)
+
+    with pytest.raises(RuntimeError, match="invalid completed exact-call count"):
+        exact.complete(1)
+    with pytest.raises(RuntimeError, match="invalid completed exact-call count"):
+        native.complete_exact(1)
 
 
 @pytest.mark.external_data

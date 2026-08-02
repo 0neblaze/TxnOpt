@@ -872,6 +872,7 @@ class _Evaluator:
         )
         pending_snapshot = dict(self.pending_candidate_cache)
         pending_negative_snapshot = dict(self.pending_negative_screening_sequences)
+        native_resource_charged = False
 
         def rollback_protocol_state() -> None:
             self.pending_candidate_cache.clear()
@@ -882,8 +883,15 @@ class _Evaluator:
             )
             if self.route_cache is not None and route_cache_snapshot is not None:
                 self.route_cache.restore_state(route_cache_snapshot)
-            control_runtime.rollback_protocol_state(control_snapshot)
-            if controller is not None and controller_snapshot is not None:
+            control_runtime.rollback_protocol_state(
+                control_snapshot,
+                preserve_round_usage=native_resource_charged,
+            )
+            if (
+                not native_resource_charged
+                and controller is not None
+                and controller_snapshot is not None
+            ):
                 (
                     controller.started_calls,
                     controller.completed_calls,
@@ -946,6 +954,81 @@ class _Evaluator:
                 iteration=self.iteration,
                 operator=self.operator,
             )
+            exact_sequences = tuple(
+                clean[index] for index in native_result.exact_candidate_ids
+            )
+            exact_started = native_result.backend_metrics.started_calls
+            exact_completed = native_result.backend_metrics.completed_calls
+            exact_interrupted = native_result.backend_metrics.interrupted_calls
+            if exact_started != len(exact_sequences):
+                raise RuntimeError("native exact started-call receipt diverged")
+            native_resource_charged = exact_started > 0
+            control_within_budget = control_runtime.record_native_work(
+                exact_started,
+                context=f"{self.lane}:{self.operator}:native_candidate_round",
+            )
+            controller_within_budget = True
+            if controller is not None:
+                controller_within_budget = controller.record_native_work(
+                    started=exact_started,
+                    completed=exact_completed,
+                    interrupted=exact_interrupted,
+                )
+            if exact_sequences:
+                completion_ordinals = tuple(
+                    native_result.exact_candidate_ids.index(candidate_id)
+                    for candidate_id in native_result.completion_order
+                )
+                control_runtime.record_native_batch(
+                    exact_sequences,
+                    native_result.exact_results,
+                    completion_order=completion_ordinals,
+                    lane=self.lane,
+                    iteration=self.iteration,
+                    operator=self.operator,
+                    worker_protocol=execution.worker_protocol,
+                )
+                self.backend_metrics.add(native_result.backend_metrics)
+                self.calls += exact_completed
+                self.runtime += native_result.backend_metrics.total_seconds
+                self.labels_generated += sum(
+                    result.labels_generated for result in native_result.exact_results
+                )
+                self.labels_pruned += sum(
+                    result.labels_pruned for result in native_result.exact_results
+                )
+                for sequence in exact_sequences:
+                    self.evaluated_routes.add(sequence)
+                    self.evaluated_route_keys.add((self.lane, sequence))
+                if self.measurement_trace is not None:
+                    started_offset = self.measurement_trace._offset(protocol_started)
+                    completed_offset = self.measurement_trace._offset(protocol_completed)
+                    for sequence, result in zip(
+                        exact_sequences,
+                        native_result.exact_results,
+                        strict=True,
+                    ):
+                        cache_key_digest = (
+                            self.route_cache.make_key(sequence).digest
+                            if self.route_cache is not None
+                            else ""
+                        )
+                        self.measurement_trace.record_route_evaluation(
+                            sequence,
+                            lane=self.lane,
+                            iteration=self.iteration,
+                            operator=self.operator,
+                            kind="exact_call",
+                            started_at=started_offset,
+                            completed_at=completed_offset,
+                            exact_started=True,
+                            exact_completed=True,
+                            cache_key_digest=cache_key_digest,
+                            route_change_status=route_change_status,
+                            **route_result_fields(result),
+                        )
+            if not control_within_budget or not controller_within_budget:
+                raise RuntimeError("native exact work exceeded its declared budget")
             journal_selected = tuple(
                 int(row[0])
                 for row in native_result.cache_journal
@@ -969,16 +1052,8 @@ class _Evaluator:
                     cached_results[index] = cached
             if selected_misses:
                 operator_can_fit = len(selected_misses) <= controller_remaining
-                granted = (
-                    control_runtime.reserve(
-                        len(selected_misses),
-                        atomic=True,
-                        context=f"{self.lane}:{self.operator}:native_candidate_round",
-                    )
-                    if operator_can_fit
-                    else 0
-                )
-                if granted != len(native_result.exact_candidate_ids):
+                expected_exact = len(selected_misses) if operator_can_fit else 0
+                if expected_exact != len(native_result.exact_candidate_ids):
                     raise RuntimeError("native candidate-round budget replay diverged")
             elif native_result.exact_candidate_ids:
                 raise RuntimeError("native candidate round started unrequested exact work")
@@ -990,12 +1065,6 @@ class _Evaluator:
                     strict=True,
                 )
             )
-            if controller is not None and exact_results:
-                reservation = controller.reserve(len(exact_results))
-                if reservation.granted != len(exact_results):
-                    raise RuntimeError("native exact-call controller replay diverged")
-                controller.complete(len(exact_results))
-
             resolved: list[ChargingSubproblemResult | None] = [None] * len(clean)
             for index, resolution in enumerate(native_result.resolutions):
                 if resolution == "screening_rejected":
@@ -1035,60 +1104,6 @@ class _Evaluator:
                 else:
                     raise RuntimeError("native candidate round lost a resolution")
 
-            exact_sequences = tuple(clean[index] for index in native_result.exact_candidate_ids)
-            if exact_sequences:
-                completion_ordinals = tuple(
-                    native_result.exact_candidate_ids.index(candidate_id)
-                    for candidate_id in native_result.completion_order
-                )
-                control_runtime.record_native_batch(
-                    exact_sequences,
-                    native_result.exact_results,
-                    completion_order=completion_ordinals,
-                    lane=self.lane,
-                    iteration=self.iteration,
-                    operator=self.operator,
-                    worker_protocol=execution.worker_protocol,
-                )
-                self.backend_metrics.add(native_result.backend_metrics)
-                self.calls += len(exact_sequences)
-                self.runtime += native_result.backend_metrics.total_seconds
-                self.labels_generated += sum(
-                    result.labels_generated for result in native_result.exact_results
-                )
-                self.labels_pruned += sum(
-                    result.labels_pruned for result in native_result.exact_results
-                )
-                for sequence in exact_sequences:
-                    self.evaluated_routes.add(sequence)
-                    self.evaluated_route_keys.add((self.lane, sequence))
-                if self.measurement_trace is not None:
-                    started_offset = self.measurement_trace._offset(protocol_started)
-                    completed_offset = self.measurement_trace._offset(protocol_completed)
-                    for sequence, result in zip(
-                        exact_sequences,
-                        native_result.exact_results,
-                        strict=True,
-                    ):
-                        cache_key_digest = (
-                            self.route_cache.make_key(sequence).digest
-                            if self.route_cache is not None
-                            else ""
-                        )
-                        self.measurement_trace.record_route_evaluation(
-                            sequence,
-                            lane=self.lane,
-                            iteration=self.iteration,
-                            operator=self.operator,
-                            kind="exact_call",
-                            started_at=started_offset,
-                            completed_at=completed_offset,
-                            exact_started=True,
-                            exact_completed=True,
-                            cache_key_digest=cache_key_digest,
-                            route_change_status=route_change_status,
-                            **route_result_fields(result),
-                        )
             if time.perf_counter() >= self.deadline:
                 raise CandidateTransactionDeadlineExceeded("before_atomic_commit")
             self._commit_pending_candidate_cache()
