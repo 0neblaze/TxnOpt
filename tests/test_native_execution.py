@@ -132,7 +132,7 @@ def test_per_solve_native_execution_protocol_is_explicit_and_fail_fast() -> None
     ("mode", "expected_protocol"),
     [
         ("full_native_alns", "full_solve_soa_v2"),
-        ("host_scheduler", "unix_shm_scheduler_v1"),
+        ("host_scheduler", "unix_shm_scheduler_v2"),
     ],
 )
 def test_native_execution_mode_selects_one_fixed_protocol(

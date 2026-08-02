@@ -47,13 +47,13 @@ NativeExecutionMode = Literal[
 NativeWorkerProtocol = Literal[
     "candidate_round_soa_v2",
     "full_solve_soa_v2",
-    "unix_shm_scheduler_v1",
+    "unix_shm_scheduler_v2",
 ]
 
 _PROTOCOL_BY_MODE: dict[NativeExecutionMode, NativeWorkerProtocol] = {
     "per_solve_runtime": "candidate_round_soa_v2",
     "full_native_alns": "full_solve_soa_v2",
-    "host_scheduler": "unix_shm_scheduler_v1",
+    "host_scheduler": "unix_shm_scheduler_v2",
 }
 
 NativeCandidateResolution = Literal[
