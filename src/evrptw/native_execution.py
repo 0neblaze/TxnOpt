@@ -69,6 +69,21 @@ _RESOLUTION_BY_CODE: dict[int, NativeCandidateResolution] = {
     5: "duplicate",
 }
 
+FULL_NATIVE_OPERATOR_NAMES = (
+    "route_merge",
+    "route_elimination",
+    "relocate",
+    "swap",
+    "two_opt_star",
+    "route_segment_destroy",
+    "ejection_chain",
+    "station_pressure",
+    "time_window_conflict",
+    "worst_energy_detour",
+    "shaw_related",
+    "vehicle_reduction_refinement",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class NativeCandidateRoundRequest:
@@ -119,6 +134,194 @@ class NativeCandidateRoundResult:
     timings: Mapping[str, float]
     transaction_sha256: str
     audit: CandidateTransactionAudit
+
+
+@dataclass(frozen=True, slots=True)
+class FullNativeALNSResult:
+    """Strict output of one full-native solve dispatch."""
+
+    customer_sequences: tuple[CustomerSequence, ...]
+    exact_results: tuple[ChargingSubproblemResult, ...]
+    backend_metrics: BackendMetrics
+    counters: Mapping[str, int]
+    timings: Mapping[str, float]
+    trajectory: tuple[Mapping[str, object], ...]
+    transaction_sha256: str
+
+
+def execute_full_native_alns(
+    instance: Instance,
+    *,
+    seed: int,
+    max_iterations: int,
+    deadline: float,
+    batch_size: int,
+    compute_threads: int,
+    native_runtime: NativeKernelRuntime,
+    initial_customer_sequences: tuple[CustomerSequence, ...] | None = None,
+    exact_call_budget: int | None = None,
+    dispatcher: Callable[..., object] | None = None,
+    clock: Callable[[], float] = time.perf_counter,
+) -> FullNativeALNSResult:
+    """Dispatch one instance/seed to the full-native ALNS ABI."""
+
+    if max_iterations <= 0 or batch_size <= 0 or compute_threads <= 0:
+        raise ValueError("full native iteration/batch/thread counts must be positive")
+    remaining = deadline - clock()
+    if remaining <= 0.0:
+        raise RuntimeError("full native ALNS reached its deadline before dispatch")
+    context = native_runtime.context
+    context.assert_matches(instance)
+    ordered_names = sorted(context.node_names)
+    rank_by_name = {name: rank for rank, name in enumerate(ordered_names)}
+    lexical_rank = np.ascontiguousarray(
+        [rank_by_name[name] for name in context.node_names],
+        dtype=np.int64,
+    )
+    if initial_customer_sequences is None:
+        initial_offsets = np.empty(0, dtype=np.int64)
+        initial_indices = np.empty(0, dtype=np.int64)
+    else:
+        initial_offsets, initial_indices = _pack_routes(
+            initial_customer_sequences,
+            context.name_to_index,
+        )
+    if exact_call_budget is not None and exact_call_budget <= 0:
+        raise ValueError("full native exact-call budget must be positive")
+    control = np.ascontiguousarray(
+        [
+            seed,
+            max_iterations,
+            batch_size,
+            compute_threads,
+            -1 if exact_call_budget is None else exact_call_budget,
+        ],
+        dtype=np.int64,
+    )
+    deadline_remaining = np.ascontiguousarray([remaining], dtype=np.float64)
+
+    from evrptw import _core as native_core
+
+    native_entrypoint = native_core.full_native_alns_v1 if dispatcher is None else dispatcher
+    payload = native_entrypoint(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.vehicle,
+        lexical_rank,
+        initial_offsets,
+        initial_indices,
+        control,
+        deadline_remaining,
+    )
+    if not isinstance(payload, tuple) or len(payload) != 7:
+        raise RuntimeError("full native ALNS returned an invalid payload tuple")
+    route_offsets = _require_vector(payload[0], "full native route offsets")
+    route_indices = _require_vector(payload[1], "full native route indices")
+    if (
+        len(route_offsets) < 2
+        or int(route_offsets[0]) != 0
+        or int(route_offsets[-1]) != len(route_indices)
+        or np.any(route_offsets[:-1] > route_offsets[1:])
+    ):
+        raise RuntimeError("full native ALNS returned invalid route offsets")
+    customer_sequences = tuple(
+        tuple(
+            context.node_names[int(index)]
+            for index in route_indices[
+                int(route_offsets[route]) : int(route_offsets[route + 1])
+            ]
+        )
+        for route in range(len(route_offsets) - 1)
+    )
+    counters_array = _require_array(
+        payload[3],
+        dtype=np.dtype(np.int64),
+        shape=(8,),
+        name="full native counters",
+    )
+    timings_array = _require_array(
+        payload[4],
+        dtype=np.dtype(np.float64),
+        shape=(4,),
+        name="full native timings",
+    )
+    if any(not math.isfinite(float(value)) or float(value) < 0.0 for value in timings_array):
+        raise RuntimeError("full native ALNS returned invalid timings")
+    trajectory_array = payload[5]
+    if (
+        not isinstance(trajectory_array, np.ndarray)
+        or trajectory_array.dtype != np.dtype(np.int64)
+        or trajectory_array.ndim != 2
+        or trajectory_array.shape[1] != 7
+        or not trajectory_array.flags.c_contiguous
+    ):
+        raise RuntimeError("full native ALNS returned an invalid trajectory array")
+    if np.any(trajectory_array[:, 1] < 0) or np.any(
+        trajectory_array[:, 1] >= len(FULL_NATIVE_OPERATOR_NAMES)
+    ):
+        raise RuntimeError("full native ALNS returned an unknown operator id")
+    transaction_sha256 = payload[6]
+    if not isinstance(transaction_sha256, str) or not _is_sha256(transaction_sha256):
+        raise RuntimeError("full native ALNS returned an invalid transaction SHA-256")
+    expected_sha256 = _full_native_digest(
+        route_offsets=route_offsets,
+        route_indices=route_indices,
+        exact_payload=payload[2],
+        counters=counters_array,
+        trajectory=trajectory_array,
+    )
+    if transaction_sha256 != expected_sha256:
+        raise RuntimeError("full native ALNS transaction SHA-256 mismatch")
+    decoded = decode_exact_charging_batch_numeric(
+        instance,
+        customer_sequences,
+        native_runtime=native_runtime,
+        batch_size=batch_size,
+        payload=payload[2],
+        native_kernel_seconds=float(timings_array[2]),
+    )
+    counters = {
+        "iterations": int(counters_array[0]),
+        "exact_started_calls": int(counters_array[1]),
+        "exact_completed_calls": int(counters_array[2]),
+        "accepted_moves": int(counters_array[3]),
+        "improving_moves": int(counters_array[4]),
+        "rejected_moves": int(counters_array[5]),
+        "interrupted_calls": int(counters_array[6]),
+        "fallback_count": int(counters_array[7]),
+    }
+    if counters["fallback_count"] != 0:
+        raise RuntimeError("full native ALNS reported a forbidden fallback")
+    return FullNativeALNSResult(
+        customer_sequences=customer_sequences,
+        exact_results=decoded.results,
+        backend_metrics=decoded.metrics,
+        counters=counters,
+        timings={
+            "search_seconds": float(timings_array[0]),
+            "exact_seconds": float(timings_array[1]),
+            "total_seconds": float(timings_array[2]),
+            "queue_wait_seconds": float(timings_array[3]),
+        },
+        trajectory=tuple(
+            {
+                "iteration": int(row[0]),
+                "operator_id": int(row[1]),
+                "operator": FULL_NATIVE_OPERATOR_NAMES[int(row[1])],
+                "route_count": int(row[2]),
+                "started_exact_calls": int(row[3]),
+                "status_code": int(row[4]),
+                "accepted": int(row[5]),
+                "vehicle_reduction": int(row[6]),
+            }
+            for row in trajectory_array
+        ),
+        transaction_sha256=transaction_sha256,
+    )
 
 
 def execute_native_candidate_round(
@@ -466,6 +669,28 @@ def _candidate_round_digest(
     return hashlib.sha256(evidence).hexdigest()
 
 
+def _full_native_digest(
+    *,
+    route_offsets: npt.NDArray[np.int64],
+    route_indices: npt.NDArray[np.int64],
+    exact_payload: object,
+    counters: npt.NDArray[np.generic],
+    trajectory: npt.NDArray[np.int64],
+) -> str:
+    evidence = bytearray(b"stage05.2-full-native-alns-v1")
+    evidence.extend(route_offsets.tobytes(order="C"))
+    evidence.extend(route_indices.tobytes(order="C"))
+    if not isinstance(exact_payload, tuple) or len(exact_payload) != 7:
+        raise RuntimeError("full native ALNS exact payload has an invalid schema")
+    for value in exact_payload:
+        if not isinstance(value, np.ndarray) or not value.flags.c_contiguous:
+            raise RuntimeError("full native ALNS exact payload is not contiguous")
+        evidence.extend(value.tobytes(order="C"))
+    evidence.extend(counters.tobytes(order="C"))
+    evidence.extend(trajectory.tobytes(order="C"))
+    return hashlib.sha256(evidence).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class Stage052NativeExecutionConfig:
     """Fail-fast selection of one experimental Stage 5.2 native architecture."""
@@ -483,6 +708,7 @@ class Stage052NativeExecutionConfig:
     data_plane: str = "shared_memory_soa"
     failure_policy: str = "fail_fast_no_fallback"
     fallback_allowed: bool = False
+    scheduler_socket_path: str | None = None
 
     def __post_init__(self) -> None:
         if not self.enabled:
@@ -505,6 +731,8 @@ class Stage052NativeExecutionConfig:
             raise ValueError("native execution requires the shared-memory SoA data plane")
         if self.failure_policy != "fail_fast_no_fallback" or self.fallback_allowed:
             raise ValueError("native execution failures must not fall back")
+        if self.scheduler_socket_path is not None and not self.scheduler_socket_path:
+            raise ValueError("native scheduler socket path must be non-empty when supplied")
         if not self.candidate_control_config.enabled:
             raise ValueError("native execution requires enabled Candidate Control")
         if self.candidate_transaction_config.implementation_mode != "candidate_transaction":
@@ -531,7 +759,10 @@ __all__ = (
     "NativeCandidateResolution",
     "NativeCandidateRoundRequest",
     "NativeCandidateRoundResult",
+    "FullNativeALNSResult",
+    "FULL_NATIVE_OPERATOR_NAMES",
     "NativeWorkerProtocol",
     "Stage052NativeExecutionConfig",
     "execute_native_candidate_round",
+    "execute_full_native_alns",
 )

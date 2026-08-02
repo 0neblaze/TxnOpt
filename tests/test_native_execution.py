@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -27,6 +29,7 @@ from evrptw.native_execution import (
     execute_native_candidate_round,
 )
 from evrptw.native_kernels import NativeKernelConfig, NativeKernelRuntime
+from evrptw.native_scheduler import NativeHostScheduler
 
 
 def _fixture_instance() -> Instance:
@@ -43,8 +46,12 @@ def _fixture_instance() -> Instance:
 
 
 def _per_solve_config() -> Stage052NativeExecutionConfig:
+    return _native_config("per_solve_runtime")
+
+
+def _native_config(mode: str) -> Stage052NativeExecutionConfig:
     return Stage052NativeExecutionConfig(
-        mode="per_solve_runtime",
+        mode=mode,
         native_kernel_config=NativeKernelConfig(),
         candidate_transaction_config=NativeCandidateTransactionConfig(),
         candidate_control_config=CandidateControlConfig(worker_count=1),
@@ -526,3 +533,97 @@ def test_native_candidate_round_one_and_four_threads_are_semantically_identical(
     assert [charging_result_semantic_payload(result) for result in serial.exact_results] == [
         charging_result_semantic_payload(result) for result in parallel.exact_results
     ]
+
+
+def test_full_native_alns_calls_cpp_once_and_matches_python_minimal_trajectory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        screening_config=CheapScreeningConfig(),
+        candidate_control_config=CandidateControlConfig(worker_count=1),
+    )
+    original = native_core.full_native_alns_v1
+    invocations = 0
+
+    def counted(*args: object) -> object:
+        nonlocal invocations
+        invocations += 1
+        return original(*args)
+
+    monkeypatch.setattr(native_core, "full_native_alns_v1", counted)
+    native_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        screening_config=CheapScreeningConfig(),
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    assert invocations == 1
+    assert native_result.routes == python_result.routes
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.objective == python_result.objective
+    assert native_result.native_execution_statistics["mode"] == "full_native_alns"
+    assert native_result.native_execution_statistics["fallback_count"] == 0
+
+
+def test_host_scheduler_uses_uds_shared_memory_and_matches_direct_full_native(
+    tmp_path: Path,
+) -> None:
+    instance = _fixture_instance()
+    direct = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=10,
+        time_limit_seconds=2.0,
+        screening_config=CheapScreeningConfig(),
+        native_execution_config=_native_config("full_native_alns"),
+    )
+    endpoint = tmp_path / "native-scheduler.sock"
+    with NativeHostScheduler(endpoint):
+        scheduled = solve_alns(
+            instance,
+            seed=2014,
+            max_iterations=10,
+            time_limit_seconds=2.0,
+            screening_config=CheapScreeningConfig(),
+            native_execution_config=replace(
+                _native_config("host_scheduler"),
+                scheduler_socket_path=str(endpoint),
+            ),
+        )
+
+    assert scheduled.objective == direct.objective
+    assert scheduled.routes == direct.routes
+    assert scheduled.neighborhood_events == direct.neighborhood_events
+    assert scheduled.candidate_work_hash == direct.candidate_work_hash
+    assert scheduled.native_execution_statistics["mode"] == "host_scheduler"
+    assert scheduled.native_execution_statistics["fallback_count"] == 0
+
+
+def test_host_scheduler_exit_fails_fast_without_local_fallback(tmp_path: Path) -> None:
+    endpoint = tmp_path / "native-scheduler.sock"
+    scheduler = NativeHostScheduler(endpoint)
+    scheduler.start()
+    scheduler.close(force=True)
+
+    with pytest.raises(RuntimeError, match="IPC failed without fallback"):
+        solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            screening_config=CheapScreeningConfig(),
+            native_execution_config=replace(
+                _native_config("host_scheduler"),
+                scheduler_socket_path=str(endpoint),
+            ),
+        )

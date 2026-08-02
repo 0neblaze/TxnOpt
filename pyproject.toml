@@ -37,6 +37,8 @@ evrptw-env = "evrptw.environment:main"
 experiment-lifecycle = "evrptw.experiment_lifecycle:main"
 experiment-historical-review = "evrptw.experiments.lifecycle_historical_review:main"
 experiment-legacy-review = "evrptw.experiments.lifecycle_legacy_review:main"
+stage052-native-architectures = "evrptw.experiments.stage052_native_architectures:main"
+stage052-native-architecture-review = "evrptw.experiments.stage052_native_architecture_review:main"
 
 [dependency-groups]
 dev = [

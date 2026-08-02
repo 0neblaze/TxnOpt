@@ -207,6 +207,37 @@ def candidate_round_transaction_v1(
     ],
     npt.NDArray[np.int64],
     npt.NDArray[np.float64],
+    npt.NDArray[np.int64],
+    str,
+]: ...
+def full_native_alns_v1(
+    node_kind: npt.NDArray[np.int64],
+    demand: npt.NDArray[np.float64],
+    ready_time: npt.NDArray[np.float64],
+    due_date: npt.NDArray[np.float64],
+    service_time: npt.NDArray[np.float64],
+    distance: npt.NDArray[np.float64],
+    vehicle: npt.NDArray[np.float64],
+    lexical_rank: npt.NDArray[np.int64],
+    initial_route_offsets: npt.NDArray[np.int64],
+    initial_route_indices: npt.NDArray[np.int64],
+    control: npt.NDArray[np.int64],
+    deadline_remaining: npt.NDArray[np.float64],
+) -> tuple[
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+    ],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.float64],
+    npt.NDArray[np.int64],
     str,
 ]: ...
 def propagate_routes_numeric(

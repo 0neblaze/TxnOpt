@@ -65,8 +65,10 @@ from evrptw.measurement import (
 )
 from evrptw.models import Instance, Node
 from evrptw.native_execution import (
+    FULL_NATIVE_OPERATOR_NAMES,
     NativeCandidateRoundRequest,
     Stage052NativeExecutionConfig,
+    execute_full_native_alns,
     execute_native_candidate_round,
 )
 from evrptw.native_kernels import NativeKernelConfig, NativeKernelRuntime
@@ -4764,6 +4766,211 @@ def _solve_alns(
     )
 
 
+def _solve_full_native_alns(
+    instance: Instance,
+    *,
+    seed: int,
+    max_iterations: int | None,
+    time_limit_seconds: float,
+    operator_profile: OperatorProfile | str,
+    backend: ExactChargingBackend | str,
+    batch_size: int,
+    termination_mode: str,
+    config: Stage052NativeExecutionConfig,
+    exact_deadline_config: ExactDeadlineConfig | None,
+    initial_customer_sequences: tuple[tuple[str, ...], ...] | None,
+    stage04_config: Stage04Config | None,
+) -> ALNSResult:
+    """Run the one-call full-native ABI and independently replay its solution."""
+
+    if max_iterations is None:
+        raise ValueError("full native ALNS currently requires a finite iteration limit")
+    started = time.perf_counter()
+    native_runtime = NativeKernelRuntime.build(instance, config.native_kernel_config)
+    dispatcher: Callable[..., object] | None = None
+    if config.mode == "host_scheduler":
+        if config.scheduler_socket_path is None:
+            raise RuntimeError("host scheduler mode requires an active scheduler socket path")
+        from evrptw.native_scheduler import dispatch_full_native_alns
+
+        def dispatch_via_scheduler(*arrays: npt.NDArray[np.generic]) -> object:
+            return dispatch_full_native_alns(
+                config.scheduler_socket_path or "",
+                *arrays,
+            )
+
+        dispatcher = dispatch_via_scheduler
+    native_result = execute_full_native_alns(
+        instance,
+        seed=seed,
+        max_iterations=max_iterations,
+        deadline=started + time_limit_seconds,
+        batch_size=batch_size,
+        compute_threads=(
+            config.scheduler_threads
+            if config.mode == "host_scheduler"
+            else config.compute_threads_per_shard
+        ),
+        native_runtime=native_runtime,
+        initial_customer_sequences=initial_customer_sequences,
+        exact_call_budget=(
+            exact_deadline_config.exact_call_budget
+            if exact_deadline_config is not None
+            and exact_deadline_config.mode == "exact_call_budget"
+            else None
+        ),
+        dispatcher=dispatcher,
+    )
+    routes = tuple(tuple(result.route) for result in native_result.exact_results)
+    report = validate_routes(instance, [list(route) for route in routes])
+    if not report.feasible:
+        raise RuntimeError("full native ALNS result failed the unified validator")
+    objective = SolutionObjective.from_report(instance, report)
+    runtime_seconds = time.perf_counter() - started
+    queue_wait_seconds = max(
+        0.0,
+        runtime_seconds
+        - native_result.timings["total_seconds"]
+        - native_runtime.context.packing_seconds,
+    )
+    fallback_count = native_result.counters["fallback_count"]
+    if fallback_count != 0 or native_runtime.fallback_count != 0:
+        raise RuntimeError("full native ALNS used a forbidden fallback")
+    native_statistics = config.to_dict()
+    native_statistics.update(
+        {
+            "fallback_count": fallback_count,
+            "worker_protocol_invocations": 1,
+            "worker_protocol_total_seconds": native_result.timings["total_seconds"],
+            "queue_wait_seconds": queue_wait_seconds,
+            "transaction_sha256": native_result.transaction_sha256,
+            "counters": dict(native_result.counters),
+            "timings": dict(native_result.timings),
+        }
+    )
+    operator_statistics: dict[str, dict[str, object]] = {
+        name: OperatorStatistics().to_dict() for name in FULL_NATIVE_OPERATOR_NAMES
+    }
+    for event in native_result.trajectory:
+        operator = str(event["operator"])
+        statistics = operator_statistics[operator]
+        statistics["calls"] = cast(int, statistics["calls"]) + 1
+        if cast(int, event["accepted"]) == 1:
+            statistics["accepted"] = cast(int, statistics["accepted"]) + 1
+            statistics["accepted_improving"] = (
+                cast(int, statistics["accepted_improving"]) + 1
+            )
+            statistics["improved"] = cast(int, statistics["improved"]) + 1
+        else:
+            statistics["rejected"] = cast(int, statistics["rejected"]) + 1
+        if cast(int, event["vehicle_reduction"]) == 1:
+            statistics["vehicle_reductions"] = (
+                cast(int, statistics["vehicle_reductions"]) + 1
+            )
+            statistics["accepted_vehicle_reductions"] = (
+                cast(int, statistics["accepted_vehicle_reductions"]) + 1
+            )
+    exact_budget_reached = (
+        exact_deadline_config is not None
+        and exact_deadline_config.exact_call_budget is not None
+        and native_result.counters["exact_started_calls"]
+        >= exact_deadline_config.exact_call_budget
+    )
+    termination_reason = (
+        "exact_call_budget_exhausted"
+        if exact_budget_reached
+        else "wall_clock_deadline"
+        if runtime_seconds >= time_limit_seconds
+        else "iteration_limit"
+    )
+    return ALNSResult(
+        feasible=True,
+        routes=routes,
+        customer_sequences=native_result.customer_sequences,
+        objective=objective,
+        vehicle_count=objective.vehicle_count,
+        total_energy=sum(result.total_energy for result in native_result.exact_results),
+        total_charged_energy=sum(
+            result.charged_energy for result in native_result.exact_results
+        ),
+        total_charging_time=objective.total_charging_time,
+        iterations=native_result.counters["iterations"],
+        accepted_moves=native_result.counters["accepted_moves"],
+        improving_moves=native_result.counters["improving_moves"],
+        rejected_moves=native_result.counters["rejected_moves"],
+        first_feasible_time=0.0,
+        best_time=0.0,
+        runtime_seconds=runtime_seconds,
+        charging_subproblem_calls=native_result.counters["exact_completed_calls"],
+        charging_subproblem_time=native_result.backend_metrics.total_seconds,
+        charging_labels_generated=sum(
+            result.labels_generated for result in native_result.exact_results
+        ),
+        charging_labels_pruned=sum(
+            result.labels_pruned for result in native_result.exact_results
+        ),
+        destroy_statistics={},
+        repair_statistics={},
+        operator_profile=OperatorProfile(operator_profile).value,
+        neighborhood_statistics=operator_statistics,
+        neighborhood_events=tuple(dict(event) for event in native_result.trajectory),
+        failure_reason="",
+        cache_misses=native_result.counters["exact_started_calls"],
+        unique_route_evaluations=native_result.counters["exact_completed_calls"],
+        effective_iterations=native_result.counters["iterations"],
+        charging_backend=ExactChargingBackend(backend).value,
+        batch_size=batch_size,
+        backend_metrics=native_result.backend_metrics.to_dict(),
+        termination_mode=termination_mode,
+        exact_started_calls=native_result.counters["exact_started_calls"],
+        exact_completed_calls=native_result.counters["exact_completed_calls"],
+        exact_interrupted_calls=native_result.counters["interrupted_calls"],
+        exact_budget_exhaustions=int(exact_budget_reached),
+        termination_reason=termination_reason,
+        exact_deadline_statistics=(
+            {
+                "schema_version": exact_deadline_config.schema_version,
+                "mode": exact_deadline_config.mode,
+                "exact_call_budget": exact_deadline_config.exact_call_budget,
+                "watchdog_seconds": exact_deadline_config.watchdog_seconds,
+                "started_calls": native_result.counters["exact_started_calls"],
+                "completed_calls": native_result.counters["exact_completed_calls"],
+                "interrupted_calls": native_result.counters["interrupted_calls"],
+                "budget_exhaustions": int(exact_budget_reached),
+            }
+            if exact_deadline_config is not None
+            else {}
+        ),
+        candidate_control_statistics={
+            "enabled": True,
+            "worker_protocol": config.worker_protocol,
+            "fallback_count": fallback_count,
+        },
+        native_execution_statistics=native_statistics,
+        candidate_work_hash=native_result.transaction_sha256,
+        route_result_hash=native_result.transaction_sha256,
+        stage04_statistics=(
+            {
+                "enabled": True,
+                "native_protocol": config.worker_protocol,
+                "fixed_weights": stage04_config.fixed_weights,
+                "segment_length": stage04_config.segment_length,
+                "min_calls_per_operator": stage04_config.min_calls_per_operator,
+            }
+            if stage04_config is not None and stage04_config.enabled
+            else {}
+        ),
+        stage04_event_log=(
+            tuple(dict(event) for event in native_result.trajectory)
+            if stage04_config is not None and stage04_config.enabled
+            else ()
+        ),
+        iteration_limit_completed_at_seconds=(
+            runtime_seconds if termination_reason == "iteration_limit" else None
+        ),
+    )
+
+
 def solve_alns(
     instance: Instance,
     *,
@@ -4808,10 +5015,6 @@ def solve_alns(
             raise ValueError(
                 "native_execution_config owns native kernels, candidate transactions, "
                 "and Candidate Control; do not also pass their legacy arguments"
-            )
-        if native_execution_config.mode != "per_solve_runtime":
-            raise NotImplementedError(
-                f"native execution mode {native_execution_config.mode!r} is not wired yet"
             )
         native_kernel_config = native_execution_config.native_kernel_config
         candidate_transaction_config = (
@@ -4886,6 +5089,30 @@ def solve_alns(
         and ExactChargingBackend(backend) is not ExactChargingBackend.CPU_BATCH
     ):
         raise ValueError("Stage 4 adaptive weights requires the cpu_batch backend")
+    if (
+        exact_deadline_config is not None
+        and exact_deadline_config.mode == "exact_call_budget"
+        and exact_deadline_config.watchdog_seconds is not None
+    ):
+        time_limit_seconds = exact_deadline_config.watchdog_seconds
+    if (
+        native_execution_config is not None
+        and native_execution_config.mode in {"full_native_alns", "host_scheduler"}
+    ):
+        return _solve_full_native_alns(
+            instance,
+            seed=seed,
+            max_iterations=max_iterations,
+            time_limit_seconds=time_limit_seconds,
+            operator_profile=operator_profile,
+            backend=backend,
+            batch_size=batch_size,
+            termination_mode=termination_mode,
+            config=native_execution_config,
+            exact_deadline_config=exact_deadline_config,
+            initial_customer_sequences=initial_customer_sequences,
+            stage04_config=stage04_config,
+        )
     candidate_control_runtime = (
         CandidateControlRuntime(candidate_control_config)
         if candidate_control_enabled and candidate_control_config is not None

@@ -4629,6 +4629,472 @@ py::tuple candidate_round_transaction_v1(
         digest);
 }
 
+py::tuple full_native_alns_v1(
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle vehicle,
+    py::handle lexical_rank,
+    py::handle initial_route_offsets,
+    py::handle initial_route_indices,
+    py::handle control,
+    py::handle deadline_remaining) {
+    const auto started = std::chrono::steady_clock::now();
+    auto kind_array = checked_array<std::int64_t>(node_kind, "node_kind", 1);
+    auto demand_array = checked_array<double>(demand, "demand", 1);
+    auto ready_array = checked_array<double>(ready_time, "ready_time", 1);
+    auto due_array = checked_array<double>(due_date, "due_date", 1);
+    auto service_array = checked_array<double>(service_time, "service_time", 1);
+    auto distance_array = checked_array<double>(distance, "distance", 2);
+    auto vehicle_array = checked_array<double>(vehicle, "vehicle", 1);
+    auto lexical_array = checked_array<std::int64_t>(
+        lexical_rank, "lexical_rank", 1);
+    auto initial_offsets_array = checked_array<std::int64_t>(
+        initial_route_offsets, "initial_route_offsets", 1);
+    auto initial_indices_array = checked_array<std::int64_t>(
+        initial_route_indices, "initial_route_indices", 1);
+    auto control_array = checked_array<std::int64_t>(control, "control", 1);
+    auto deadline_array = checked_array<double>(
+        deadline_remaining, "deadline_remaining", 1);
+    const auto node_count = static_cast<std::size_t>(kind_array.request().shape[0]);
+    if (node_count == 0
+        || demand_array.request().shape[0] != kind_array.request().shape[0]
+        || ready_array.request().shape[0] != kind_array.request().shape[0]
+        || due_array.request().shape[0] != kind_array.request().shape[0]
+        || service_array.request().shape[0] != kind_array.request().shape[0]
+        || lexical_array.request().shape[0] != kind_array.request().shape[0]) {
+        throw std::invalid_argument("full native node arrays must share one length");
+    }
+    if (distance_array.request().shape[0] != kind_array.request().shape[0]
+        || distance_array.request().shape[1] != kind_array.request().shape[0]
+        || vehicle_array.request().shape[0] != 5
+        || control_array.request().shape[0] != 5
+        || deadline_array.request().shape[0] != 1) {
+        throw std::invalid_argument("full native fixed-array shape is invalid");
+    }
+    const auto* kinds = checked_data<std::int64_t>(kind_array);
+    const auto* demands = checked_data<double>(demand_array);
+    const auto* ready = checked_data<double>(ready_array);
+    const auto* due = checked_data<double>(due_array);
+    const auto* lexical = checked_data<std::int64_t>(lexical_array);
+    const auto* initial_offsets = checked_data<std::int64_t>(initial_offsets_array);
+    const auto* initial_indices = checked_data<std::int64_t>(initial_indices_array);
+    const auto* vehicle_values = checked_data<double>(vehicle_array);
+    const auto* control_values = checked_data<std::int64_t>(control_array);
+    const auto* deadline_values = checked_data<double>(deadline_array);
+    if (control_values[1] <= 0 || control_values[2] <= 0
+        || control_values[3] <= 0 || control_values[4] < -1) {
+        throw std::invalid_argument("full native iteration/batch/thread counts must be positive");
+    }
+    if (!std::isfinite(deadline_values[0]) || deadline_values[0] <= 0.0) {
+        throw std::invalid_argument("full native deadline must be finite and positive");
+    }
+    std::vector<std::int64_t> customers;
+    for (std::size_t node = 0; node < node_count; ++node) {
+        if (kinds[node] == customer_kind) {
+            customers.push_back(static_cast<std::int64_t>(node));
+        }
+    }
+    if (customers.empty()) {
+        throw std::invalid_argument("full native solve requires at least one customer");
+    }
+    std::stable_sort(
+        customers.begin(),
+        customers.end(),
+        [&](std::int64_t left, std::int64_t right) {
+            if (due[left] != due[right]) {
+                return due[left] < due[right];
+            }
+            if (ready[left] != ready[right]) {
+                return ready[left] < ready[right];
+            }
+            return lexical[left] < lexical[right];
+        });
+    std::vector<std::vector<std::int64_t>> routes;
+    if (initial_offsets_array.size() > 0) {
+        const auto route_count = static_cast<std::size_t>(initial_offsets_array.size() - 1);
+        if (initial_offsets[0] != 0
+            || initial_offsets[route_count] != initial_indices_array.size()) {
+            throw std::invalid_argument("full native initial routes do not span their indices");
+        }
+        std::vector<bool> seen(node_count, false);
+        for (std::size_t route = 0; route < route_count; ++route) {
+            if (initial_offsets[route] < 0
+                || initial_offsets[route] >= initial_offsets[route + 1]) {
+                throw std::invalid_argument("full native initial routes must be non-empty");
+            }
+            routes.emplace_back(
+                initial_indices + initial_offsets[route],
+                initial_indices + initial_offsets[route + 1]);
+            for (const auto node : routes.back()) {
+                if (node < 0 || static_cast<std::size_t>(node) >= node_count
+                    || kinds[node] != customer_kind || seen[static_cast<std::size_t>(node)]) {
+                    throw std::invalid_argument(
+                        "full native initial routes must cover unique customers");
+                }
+                seen[static_cast<std::size_t>(node)] = true;
+            }
+        }
+        for (const auto customer : customers) {
+            if (!seen[static_cast<std::size_t>(customer)]) {
+                throw std::invalid_argument(
+                    "full native initial routes must cover every customer");
+            }
+        }
+    } else {
+        double route_demand = 0.0;
+        for (const auto customer : customers) {
+            if (routes.empty()
+                || route_demand + demands[customer] > vehicle_values[1] + 1e-9) {
+                routes.emplace_back();
+                route_demand = 0.0;
+            }
+            routes.back().push_back(customer);
+            route_demand += demands[customer];
+        }
+    }
+    const auto pack_routes = [](const std::vector<std::vector<std::int64_t>>& values) {
+        std::size_t item_count = 0;
+        for (const auto& route : values) {
+            item_count += route.size();
+        }
+        py::array_t<std::int64_t> offsets(values.size() + 1);
+        py::array_t<std::int64_t> indices(item_count);
+        auto* offset_values = checked_data(offsets);
+        auto* index_values = checked_data(indices);
+        std::size_t cursor = 0;
+        offset_values[0] = 0;
+        for (std::size_t route = 0; route < values.size(); ++route) {
+            std::copy(values[route].begin(), values[route].end(), index_values + cursor);
+            cursor += values[route].size();
+            offset_values[route + 1] = static_cast<std::int64_t>(cursor);
+        }
+        return std::make_pair(std::move(offsets), std::move(indices));
+    };
+    py::array_t<double> exact_deadline(1);
+    py::array_t<std::int64_t> exact_batch_size(1);
+    checked_data(exact_batch_size)[0] = control_values[2];
+    const auto exact_budget = control_values[4];
+    const auto remaining_seconds = [&]() {
+        return deadline_values[0] - std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+    };
+    auto [customer_offsets, customer_indices] = pack_routes(routes);
+    if (exact_budget >= 0
+        && static_cast<std::int64_t>(routes.size()) > exact_budget) {
+        throw std::runtime_error(
+            "full native initial route batch does not fit the exact-call budget");
+    }
+    checked_data(exact_deadline)[0] = remaining_seconds();
+    py::tuple exact_payload = exact_charging_batch_numeric(
+        node_kind, ready_time, due_date, service_time, distance, vehicle,
+        customer_offsets, customer_indices, exact_deadline, exact_batch_size);
+    auto exact_status = py::cast<py::array_t<std::int64_t>>(exact_payload[2]);
+    auto all_exact_feasible = [](const py::array_t<std::int64_t>& statuses) {
+        const auto* values = checked_data<std::int64_t>(statuses);
+        for (py::ssize_t index = 0; index < statuses.size(); ++index) {
+            if (values[index] != 0) {
+                return false;
+            }
+        }
+        return true;
+    };
+    std::int64_t started_calls = static_cast<std::int64_t>(routes.size());
+    std::int64_t completed_calls = 0;
+    while (!all_exact_feasible(exact_status)) {
+        auto initial_batch_counters = py::cast<py::array_t<std::int64_t>>(
+            exact_payload[6]);
+        completed_calls += checked_data(initial_batch_counters)[2];
+        if (initial_offsets_array.size() > 0) {
+            throw std::runtime_error("full native supplied initial routes are not exact-feasible");
+        }
+        const auto* status_values = checked_data<std::int64_t>(exact_status);
+        std::vector<std::vector<std::int64_t>> split_routes;
+        for (std::size_t route = 0; route < routes.size(); ++route) {
+            if (status_values[route] == 0) {
+                split_routes.push_back(routes[route]);
+                continue;
+            }
+            if (routes[route].size() <= 1) {
+                throw std::runtime_error(
+                    "full native singleton initial route is not exact-feasible");
+            }
+            const auto middle = routes[route].size() / 2;
+            split_routes.emplace_back(routes[route].begin(), routes[route].begin() + middle);
+            split_routes.emplace_back(routes[route].begin() + middle, routes[route].end());
+        }
+        routes = std::move(split_routes);
+        if (exact_budget >= 0
+            && started_calls + static_cast<std::int64_t>(routes.size()) > exact_budget) {
+            throw std::runtime_error(
+                "full native initial-route split does not fit the exact-call budget");
+        }
+        std::tie(customer_offsets, customer_indices) = pack_routes(routes);
+        checked_data(exact_deadline)[0] = remaining_seconds();
+        exact_payload = exact_charging_batch_numeric(
+            node_kind, ready_time, due_date, service_time, distance, vehicle,
+            customer_offsets, customer_indices, exact_deadline, exact_batch_size);
+        started_calls += static_cast<std::int64_t>(routes.size());
+        exact_status = py::cast<py::array_t<std::int64_t>>(exact_payload[2]);
+    }
+    auto initial_batch_counters = py::cast<py::array_t<std::int64_t>>(exact_payload[6]);
+    completed_calls += checked_data(initial_batch_counters)[2];
+    std::int64_t accepted_moves = 0;
+    std::int64_t improving_moves = 0;
+    std::int64_t rejected_moves = 0;
+    std::int64_t interrupted_calls = 0;
+    std::int64_t completed_iterations = 0;
+    std::vector<std::int64_t> trajectory;
+    trajectory.reserve(static_cast<std::size_t>(control_values[1]) * 7);
+    const auto total_distance = [](const py::tuple& payload) {
+        const auto metrics = py::cast<py::array_t<double>>(payload[4]);
+        const auto info = metrics.request();
+        const auto* values = checked_data<double>(metrics);
+        PythonFloatSum total;
+        for (py::ssize_t route = 0; route < info.shape[0]; ++route) {
+            total.add(values[static_cast<std::size_t>(route) * 4]);
+        }
+        return total.value();
+    };
+    double current_distance = total_distance(exact_payload);
+    std::size_t pair_cursor = static_cast<std::size_t>(
+        static_cast<std::uint64_t>(control_values[0]) % std::max<std::size_t>(1, routes.size()));
+    std::uint64_t random_state = static_cast<std::uint64_t>(control_values[0])
+        ^ 0x9e3779b97f4a7c15ULL;
+    auto next_random = [&]() {
+        random_state ^= random_state >> 12;
+        random_state ^= random_state << 25;
+        random_state ^= random_state >> 27;
+        return random_state * 0x2545f4914f6cdd1dULL;
+    };
+    for (std::int64_t iteration = 0; iteration < control_values[1]; ++iteration) {
+        if (remaining_seconds() <= 0.0) {
+            break;
+        }
+        ++completed_iterations;
+        auto candidate_routes = routes;
+        const auto operator_id = static_cast<std::int64_t>(
+            (next_random() + static_cast<std::uint64_t>(iteration)) % 12ULL);
+        auto status_code = std::int64_t{0};
+        if (routes.size() >= 2) {
+            const auto left = pair_cursor % routes.size();
+            auto right = (left + 1 + static_cast<std::size_t>(next_random() % (routes.size() - 1)))
+                % routes.size();
+            if (right == left) {
+                right = (right + 1) % routes.size();
+            }
+            pair_cursor = (pair_cursor + 1) % routes.size();
+            if (operator_id == 0 || operator_id == 1 || operator_id == 11) {
+                const auto first = std::min(left, right);
+                const auto second = std::max(left, right);
+                std::vector<std::int64_t> merged = routes[left];
+                if (operator_id == 1) {
+                    merged.insert(merged.begin(), routes[right].begin(), routes[right].end());
+                } else {
+                    merged.insert(merged.end(), routes[right].begin(), routes[right].end());
+                }
+                candidate_routes[first] = std::move(merged);
+                candidate_routes.erase(
+                    candidate_routes.begin() + static_cast<std::ptrdiff_t>(second));
+            } else if (operator_id == 2 && routes[left].size() > 1) {
+                const auto node = candidate_routes[left].back();
+                candidate_routes[left].pop_back();
+                candidate_routes[right].insert(candidate_routes[right].begin(), node);
+            } else if (operator_id == 3) {
+                std::swap(candidate_routes[left].front(), candidate_routes[right].front());
+            } else if (operator_id == 4) {
+                const auto left_cut = candidate_routes[left].size() / 2;
+                const auto right_cut = candidate_routes[right].size() / 2;
+                std::vector<std::int64_t> left_tail(
+                    candidate_routes[left].begin() + static_cast<std::ptrdiff_t>(left_cut),
+                    candidate_routes[left].end());
+                std::vector<std::int64_t> right_tail(
+                    candidate_routes[right].begin() + static_cast<std::ptrdiff_t>(right_cut),
+                    candidate_routes[right].end());
+                candidate_routes[left].erase(
+                    candidate_routes[left].begin() + static_cast<std::ptrdiff_t>(left_cut),
+                    candidate_routes[left].end());
+                candidate_routes[right].erase(
+                    candidate_routes[right].begin() + static_cast<std::ptrdiff_t>(right_cut),
+                    candidate_routes[right].end());
+                candidate_routes[left].insert(
+                    candidate_routes[left].end(), right_tail.begin(), right_tail.end());
+                candidate_routes[right].insert(
+                    candidate_routes[right].end(), left_tail.begin(), left_tail.end());
+            } else if (operator_id == 5 && routes[left].size() > 1) {
+                const auto segment_size = std::max<std::size_t>(1, routes[left].size() / 3);
+                candidate_routes[right].insert(
+                    candidate_routes[right].end(),
+                    candidate_routes[left].begin(),
+                    candidate_routes[left].begin() + static_cast<std::ptrdiff_t>(segment_size));
+                candidate_routes[left].erase(
+                    candidate_routes[left].begin(),
+                    candidate_routes[left].begin() + static_cast<std::ptrdiff_t>(segment_size));
+            } else if (operator_id == 6 && routes.size() >= 3) {
+                const auto third = (right + 1) % routes.size();
+                if (third != left) {
+                    const auto first_node = candidate_routes[left].front();
+                    candidate_routes[left].front() = candidate_routes[right].front();
+                    candidate_routes[right].front() = candidate_routes[third].front();
+                    candidate_routes[third].front() = first_node;
+                }
+            } else {
+                auto& route = candidate_routes[left];
+                if (route.size() > 1) {
+                    if (operator_id == 8) {
+                        std::stable_sort(
+                            route.begin(), route.end(),
+                            [&](std::int64_t a, std::int64_t b) {
+                                return std::tie(due[a], ready[a], lexical[a])
+                                    < std::tie(due[b], ready[b], lexical[b]);
+                            });
+                    } else if (operator_id == 9) {
+                        std::rotate(route.begin(), route.begin() + 1, route.end());
+                    } else {
+                        std::reverse(route.begin(), route.end());
+                    }
+                }
+            }
+        } else if (!candidate_routes.empty() && candidate_routes[0].size() > 1) {
+            auto& route = candidate_routes[0];
+            if (operator_id == 8) {
+                std::stable_sort(
+                    route.begin(), route.end(),
+                    [&](std::int64_t a, std::int64_t b) {
+                        return std::tie(due[a], ready[a], lexical[a])
+                            < std::tie(due[b], ready[b], lexical[b]);
+                    });
+            } else {
+                std::rotate(route.begin(), route.begin() + 1, route.end());
+            }
+        }
+        bool structurally_valid = candidate_routes != routes;
+        for (const auto& route : candidate_routes) {
+            double route_demand = 0.0;
+            for (const auto node : route) {
+                route_demand += demands[node];
+            }
+            structurally_valid = structurally_valid && !route.empty()
+                && route_demand <= vehicle_values[1] + 1e-9;
+        }
+        if (!structurally_valid) {
+            ++rejected_moves;
+            trajectory.insert(
+                trajectory.end(),
+                {iteration, operator_id, static_cast<std::int64_t>(routes.size()),
+                 started_calls, status_code, 0, 0});
+            continue;
+        }
+        const auto candidate_calls = static_cast<std::int64_t>(candidate_routes.size());
+        if (exact_budget >= 0 && started_calls + candidate_calls > exact_budget) {
+            ++rejected_moves;
+            status_code = 1;
+            trajectory.insert(
+                trajectory.end(),
+                {iteration, operator_id, static_cast<std::int64_t>(routes.size()),
+                 started_calls, status_code, 0, 0});
+            continue;
+        }
+        auto [candidate_offsets, candidate_indices] = pack_routes(candidate_routes);
+        checked_data(exact_deadline)[0] = remaining_seconds();
+        auto candidate_payload = exact_charging_batch_numeric(
+            node_kind, ready_time, due_date, service_time, distance, vehicle,
+            candidate_offsets, candidate_indices, exact_deadline, exact_batch_size);
+        started_calls += candidate_calls;
+        auto candidate_status = py::cast<py::array_t<std::int64_t>>(candidate_payload[2]);
+        auto candidate_batch_counters = py::cast<py::array_t<std::int64_t>>(
+            candidate_payload[6]);
+        const auto* batch_counter_values = checked_data(candidate_batch_counters);
+        completed_calls += batch_counter_values[2];
+        interrupted_calls += batch_counter_values[3];
+        if (!all_exact_feasible(candidate_status)) {
+            ++rejected_moves;
+            status_code = batch_counter_values[3] > 0 ? 5 : 2;
+            trajectory.insert(
+                trajectory.end(),
+                {iteration, operator_id, static_cast<std::int64_t>(routes.size()),
+                 started_calls, status_code, 0, 0});
+            if (batch_counter_values[3] > 0) {
+                break;
+            }
+            continue;
+        }
+        const auto candidate_distance = total_distance(candidate_payload);
+        const bool vehicle_improvement = candidate_routes.size() < routes.size();
+        const bool distance_improvement = candidate_routes.size() == routes.size()
+            && candidate_distance + 1e-9 < current_distance;
+        if (!vehicle_improvement && !distance_improvement) {
+            ++rejected_moves;
+            status_code = 4;
+            trajectory.insert(
+                trajectory.end(),
+                {iteration, operator_id, static_cast<std::int64_t>(routes.size()),
+                 started_calls, status_code, 0, 0});
+            continue;
+        }
+        routes = std::move(candidate_routes);
+        customer_offsets = std::move(candidate_offsets);
+        customer_indices = std::move(candidate_indices);
+        exact_payload = std::move(candidate_payload);
+        current_distance = candidate_distance;
+        ++accepted_moves;
+        ++improving_moves;
+        status_code = 3;
+        trajectory.insert(
+            trajectory.end(),
+            {iteration, operator_id, static_cast<std::int64_t>(routes.size()),
+             started_calls, status_code, 1, vehicle_improvement ? 1 : 0});
+    }
+    py::array_t<std::int64_t> trajectory_array(
+        std::vector<py::ssize_t>{
+            static_cast<py::ssize_t>(trajectory.size() / 7), 7});
+    std::copy(
+        trajectory.begin(), trajectory.end(), checked_data(trajectory_array));
+    py::array_t<std::int64_t> counters(8);
+    auto* counter_values = checked_data(counters);
+    counter_values[0] = completed_iterations;
+    counter_values[1] = started_calls;
+    counter_values[2] = completed_calls;
+    counter_values[3] = accepted_moves;
+    counter_values[4] = improving_moves;
+    counter_values[5] = rejected_moves;
+    counter_values[6] = interrupted_calls;
+    counter_values[7] = 0;
+    py::array_t<double> timings(4);
+    auto* timing_values = checked_data(timings);
+    timing_values[0] = 0.0;
+    timing_values[1] = 0.0;
+    timing_values[2] = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    timing_values[3] = 0.0;
+    std::string evidence = "stage05.2-full-native-alns-v1";
+    evidence += py::cast<std::string>(customer_offsets.attr("tobytes")());
+    evidence += py::cast<std::string>(customer_indices.attr("tobytes")());
+    for (const auto item : exact_payload) {
+        evidence += py::cast<std::string>(
+            py::reinterpret_borrow<py::object>(item).attr("tobytes")());
+    }
+    evidence += py::cast<std::string>(counters.attr("tobytes")());
+    evidence += py::cast<std::string>(trajectory_array.attr("tobytes")());
+    const auto digest = py::cast<std::string>(
+        py::module_::import("hashlib")
+            .attr("sha256")(py::bytes(evidence))
+            .attr("hexdigest")());
+    timing_values[2] = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    return py::make_tuple(
+        std::move(customer_offsets),
+        std::move(customer_indices),
+        std::move(exact_payload),
+        std::move(counters),
+        std::move(timings),
+        std::move(trajectory_array),
+        digest);
+}
+
 py::tuple propagate_routes_numeric(
     py::handle node_kind,
     py::handle ready_time,
@@ -4886,6 +5352,21 @@ PYBIND11_MODULE(_core, module) {
         py::arg("deadline_remaining"),
         py::arg("batch_size"),
         py::arg("context_ids"));
+    module.def(
+        "full_native_alns_v1",
+        &full_native_alns_v1,
+        py::arg("node_kind"),
+        py::arg("demand"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("vehicle"),
+        py::arg("lexical_rank"),
+        py::arg("initial_route_offsets"),
+        py::arg("initial_route_indices"),
+        py::arg("control"),
+        py::arg("deadline_remaining"));
     module.def(
         "propagate_routes_numeric",
         &propagate_routes_numeric,

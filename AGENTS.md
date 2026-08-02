@@ -733,10 +733,31 @@ this repository or one of its subdirectories.
   hash and commits cache/control state only after the complete result passes.
   Worker, deadline, integrity, or cache-commit failure rolls back the complete
   transaction and never opens the historical worker pool or another backend.
-  `full_native_alns` and `host_scheduler` are reserved protocol identities and
-  must fail before solve dispatch until their independent worker
-  implementations and differential gates exist. This experimental protocol is
-  not a default-selection or Stage 5.2 readiness promotion.
+  `full_native_alns` uses `full_solve_soa_v1` and crosses the Python/C++
+  boundary once per instance/seed. It currently emits an independently hashed
+  route/exact-result/trajectory transaction and implements deterministic native
+  route reduction plus the complete current operator identity surface. It is
+  experimental evidence only: Python RNG, complete Stage 2.3 lane behavior,
+  cache lifecycle, and Stage 4 segment semantics must pass the fixed-work
+  differential reviewer before it may be called semantically equivalent.
+  `host_scheduler` uses `unix_shm_scheduler_v1`: a run-owned temporary service
+  accepts framed Unix-domain control messages, maps contiguous POSIX shared
+  memory arrays, and dispatches the same all-or-nothing C++ solve ABI through a
+  24-request thread pool. Service loss, partial IPC, schema/hash failure, or
+  output loss fails the transaction without local recovery or fallback. The
+  current transport control loop is Python-owned; replacement with a wholly
+  C++ scheduler loop remains required before the architecture satisfies the
+  proposed host-scheduler design. These experimental protocols do not select a
+  default or promote Stage 5.2 readiness.
+- Five-mode comparisons use
+  `evrptw.experiments.stage052_native_architectures` and independent replay in
+  `stage052_native_architecture_review`. Paired scope is exactly 360 axes and
+  Pilot scope is exactly 180 wall-clock axes. Every mode is rebuilt and rerun
+  from one clean commit, frozen wheel/native hash, input, budget,
+  instrumentation envelope, and 24-compute-thread cap. Failed axes are signed
+  evidence, not deleted. The current Stage 5.2 mode is the primary denominator;
+  accepted Pilot attempt72 is drift evidence only. Neither runner starts
+  Formal, changes the production default, launches CUDA, or reuses a label.
 - Stage 5.2 safe-rejection acceleration is bounded independently from the
   collision-proof identity stores. The scalar `ScreeningResult` cache is a
   65,536-entry solve-local LRU; the Python/native sequence cache is a
