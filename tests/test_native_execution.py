@@ -896,6 +896,65 @@ def test_native_insertion_candidate_plans_match_controlled_python_enumeration() 
     assert metadata.tolist() == [[0, 0], [0, 1], [1, 0]]
 
 
+def test_native_route_merge_pool_preserves_python_order_and_duplicate_policy() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    sequences = (("C1",), ("C2",))
+    offsets = np.asarray([0, 1, 2], dtype=np.int64)
+    indices = np.asarray(
+        [context.name_to_index[name] for route in sequences for name in route],
+        dtype=np.int64,
+    )
+    results = tuple(solve_exact_charging(instance, route) for route in sequences)
+    metrics = np.asarray(
+        [[result.distance, result.charging_time] for result in results],
+        dtype=np.float64,
+    )
+
+    def execute(preserve_duplicates: bool, capacity: float) -> tuple[object, ...]:
+        return native_core.route_merge_candidate_pool_v2(
+            offsets,
+            indices,
+            metrics,
+            context.demand,
+            capacity,
+            1e-9,
+            True,
+            preserve_duplicates,
+        )
+
+    candidate_offsets, candidate_indices, metadata, pruning = execute(
+        False,
+        instance.vehicle.load_capacity,
+    )
+    candidates = tuple(
+        tuple(
+            context.node_names[int(index)]
+            for index in candidate_indices[
+                int(candidate_offsets[row]) : int(candidate_offsets[row + 1])
+            ]
+        )
+        for row in range(len(candidate_offsets) - 1)
+    )
+    assert candidates == (("C1", "C2"), ("C2", "C1"))
+    assert metadata.tolist() == [[0, 1, 0, 1, 0], [0, 1, 0, 1, 1]]
+    assert pruning.tolist() == [0, 0]
+
+    duplicate_offsets, _, duplicate_metadata, _ = execute(
+        True,
+        instance.vehicle.load_capacity,
+    )
+    assert len(duplicate_offsets) - 1 == len(duplicate_metadata) == 4
+
+    pruned_offsets, pruned_indices, pruned_metadata, pruned = execute(True, 1.0)
+    assert pruned_offsets.tolist() == [0]
+    assert pruned_indices.tolist() == []
+    assert pruned_metadata.tolist() == []
+    assert pruned.tolist() == [1, 4]
+
+
 def test_full_native_initialization_matches_python_exact_objective_and_budget() -> None:
     from evrptw import _core as native_core
 

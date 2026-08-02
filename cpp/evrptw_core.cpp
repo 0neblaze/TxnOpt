@@ -1034,6 +1034,179 @@ py::tuple insertion_candidate_plans_v2(
         std::move(metadata_array));
 }
 
+py::tuple route_merge_candidate_pool_v2(
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle route_objective_metrics,
+    py::handle demand,
+    double load_capacity,
+    double epsilon,
+    bool pair_pruning,
+    bool preserve_duplicates) {
+    auto offsets_array = checked_array<std::int64_t>(
+        route_offsets, "route_offsets", 1);
+    auto indices_array = checked_array<std::int64_t>(
+        route_indices, "route_indices", 1);
+    auto metrics_array = checked_array<double>(
+        route_objective_metrics, "route_objective_metrics", 2);
+    auto demand_array = checked_array<double>(demand, "demand", 1);
+    if (offsets_array.size() < 3 || metrics_array.shape(1) != 2
+        || metrics_array.shape(0) != offsets_array.size() - 1
+        || !std::isfinite(load_capacity) || load_capacity < 0.0
+        || !std::isfinite(epsilon) || epsilon < 0.0) {
+        throw std::invalid_argument("route-merge candidate-pool input/config is invalid");
+    }
+    const auto route_count = static_cast<std::size_t>(offsets_array.size() - 1);
+    const auto* offsets = checked_data<std::int64_t>(offsets_array);
+    const auto* indices = checked_data<std::int64_t>(indices_array);
+    const auto* metrics = checked_data<double>(metrics_array);
+    const auto* demands = checked_data<double>(demand_array);
+    if (offsets[0] != 0 || offsets[route_count] != indices_array.size()) {
+        throw std::invalid_argument("route-merge route offsets are invalid");
+    }
+    std::vector<std::vector<std::int64_t>> routes;
+    std::vector<double> route_demands(route_count, 0.0);
+    routes.reserve(route_count);
+    for (std::size_t route = 0; route < route_count; ++route) {
+        if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]) {
+            throw std::invalid_argument("route-merge routes must be non-empty");
+        }
+        routes.emplace_back(
+            indices + offsets[route], indices + offsets[route + 1]);
+        double total = 0.0;
+        double compensation = 0.0;
+        for (const auto node : routes.back()) {
+            if (node < 0 || node >= demand_array.size()) {
+                throw std::invalid_argument("route-merge route contains an unknown node");
+            }
+            const auto value = demands[node];
+            const auto next = total + value;
+            compensation += std::fabs(total) >= std::fabs(value)
+                ? (total - next) + value
+                : (value - next) + total;
+            total = next;
+        }
+        route_demands[route] = compensation != 0.0 && std::isfinite(compensation)
+            ? total + compensation
+            : total;
+        if (!std::isfinite(metrics[route * 2]) || metrics[route * 2] < 0.0
+            || !std::isfinite(metrics[route * 2 + 1]) || metrics[route * 2 + 1] < 0.0) {
+            throw std::invalid_argument("route-merge objective metrics are invalid");
+        }
+    }
+    struct Pair {
+        std::size_t left;
+        std::size_t right;
+    };
+    std::vector<Pair> pairs;
+    for (std::size_t left = 0; left < route_count; ++left) {
+        for (std::size_t right = left + 1; right < route_count; ++right) {
+            pairs.push_back(Pair{left, right});
+        }
+    }
+    std::stable_sort(pairs.begin(), pairs.end(), [&](const Pair& left, const Pair& right) {
+        const auto left_size = routes[left.left].size() + routes[left.right].size();
+        const auto right_size = routes[right.left].size() + routes[right.right].size();
+        if (left_size != right_size) {
+            return left_size < right_size;
+        }
+        const auto left_demand = route_demands[left.left] + route_demands[left.right];
+        const auto right_demand = route_demands[right.left] + route_demands[right.right];
+        if (left_demand != right_demand) {
+            return left_demand < right_demand;
+        }
+        const auto left_distance = metrics[left.left * 2] + metrics[left.right * 2];
+        const auto right_distance = metrics[right.left * 2] + metrics[right.right * 2];
+        if (left_distance != right_distance) {
+            return left_distance > right_distance;
+        }
+        const auto left_charging = metrics[left.left * 2 + 1]
+            + metrics[left.right * 2 + 1];
+        const auto right_charging = metrics[right.left * 2 + 1]
+            + metrics[right.right * 2 + 1];
+        if (left_charging != right_charging) {
+            return left_charging > right_charging;
+        }
+        return std::tie(left.left, left.right) < std::tie(right.left, right.right);
+    });
+    std::vector<std::int64_t> candidate_offsets{0};
+    std::vector<std::int64_t> candidate_indices;
+    std::vector<std::int64_t> metadata;
+    std::unordered_set<std::string> seen;
+    std::int64_t pruned_pairs = 0;
+    std::int64_t pruned_candidates = 0;
+    const auto key_for = [](const std::vector<std::int64_t>& route) {
+        std::string key;
+        key.resize(route.size() * sizeof(std::int64_t));
+        if (!route.empty()) {
+            std::memcpy(key.data(), route.data(), key.size());
+        }
+        return key;
+    };
+    for (const auto& pair : pairs) {
+        if (pair_pruning
+            && route_demands[pair.left] + route_demands[pair.right]
+                > load_capacity + epsilon) {
+            ++pruned_pairs;
+            pruned_candidates += static_cast<std::int64_t>(
+                routes[pair.left].size() + routes[pair.right].size() + 2);
+            continue;
+        }
+        for (const auto [source_index, target_index] : {
+                 std::pair{pair.left, pair.right},
+                 std::pair{pair.right, pair.left},
+             }) {
+            const auto& source = routes[source_index];
+            const auto& target = routes[target_index];
+            for (std::size_t position = 0; position <= target.size(); ++position) {
+                std::vector<std::int64_t> merged(
+                    target.begin(), target.begin() + static_cast<std::ptrdiff_t>(position));
+                merged.insert(merged.end(), source.begin(), source.end());
+                merged.insert(
+                    merged.end(),
+                    target.begin() + static_cast<std::ptrdiff_t>(position),
+                    target.end());
+                const auto key = key_for(merged);
+                if (!preserve_duplicates && !seen.insert(key).second) {
+                    continue;
+                }
+                seen.insert(key);
+                candidate_indices.insert(
+                    candidate_indices.end(), merged.begin(), merged.end());
+                candidate_offsets.push_back(
+                    static_cast<std::int64_t>(candidate_indices.size()));
+                metadata.insert(
+                    metadata.end(),
+                    {static_cast<std::int64_t>(pair.left),
+                     static_cast<std::int64_t>(pair.right),
+                     static_cast<std::int64_t>(source_index),
+                     static_cast<std::int64_t>(target_index),
+                     static_cast<std::int64_t>(position)});
+            }
+        }
+    }
+    py::array_t<std::int64_t> offsets_output(candidate_offsets.size());
+    py::array_t<std::int64_t> indices_output(candidate_indices.size());
+    py::array_t<std::int64_t> metadata_output(
+        std::vector<py::ssize_t>{
+            static_cast<py::ssize_t>(metadata.size() / 5), 5});
+    py::array_t<std::int64_t> pruning_output(2);
+    std::copy(
+        candidate_offsets.begin(), candidate_offsets.end(),
+        checked_data(offsets_output));
+    std::copy(
+        candidate_indices.begin(), candidate_indices.end(),
+        checked_data(indices_output));
+    std::copy(metadata.begin(), metadata.end(), checked_data(metadata_output));
+    checked_data(pruning_output)[0] = pruned_pairs;
+    checked_data(pruning_output)[1] = pruned_candidates;
+    return py::make_tuple(
+        std::move(offsets_output),
+        std::move(indices_output),
+        std::move(metadata_output),
+        std::move(pruning_output));
+}
+
 py::tuple assemble_changed_candidate_plans_v1(
     py::handle current_route_offsets,
     py::handle current_route_indices,
@@ -8401,6 +8574,17 @@ PYBIND11_MODULE(_core, module) {
         py::arg("demand"),
         py::arg("load_capacity"),
         py::arg("epsilon"));
+    module.def(
+        "route_merge_candidate_pool_v2",
+        &route_merge_candidate_pool_v2,
+        py::arg("route_offsets"),
+        py::arg("route_indices"),
+        py::arg("route_objective_metrics"),
+        py::arg("demand"),
+        py::arg("load_capacity"),
+        py::arg("epsilon"),
+        py::arg("pair_pruning"),
+        py::arg("preserve_duplicates"));
     module.def(
         "assemble_changed_candidate_plans_v1",
         &assemble_changed_candidate_plans_v1,
