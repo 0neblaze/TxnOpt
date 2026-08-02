@@ -30,7 +30,7 @@ from evrptw.validation import validate_routes
 REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v3"
 HISTORICAL_PILOT_ROOT = Path(
     "/mnt/e/Reproducible-EVRPTW-archive/stage05.2/runs/"
-    "stage05.2_benchmark_attempt72/generation-0001/d_benchmark/batch0001"
+    "stage05.2_benchmark_attempt72/generation-0001/d_benchmark"
 )
 
 
@@ -357,7 +357,7 @@ def _historical_pilot() -> dict[tuple[str, int], dict[str, object]]:
         return {}
     records: dict[tuple[str, int], dict[str, object]] = {}
     for path in HISTORICAL_PILOT_ROOT.glob(
-        "*/*/stage05.2_benchmark_attempt72_raw_*.json"
+        "batch*/*/*/stage05.2_benchmark_attempt72_raw_*.json"
     ):
         payload = json.loads(path.read_bytes())
         if not isinstance(payload, dict):
