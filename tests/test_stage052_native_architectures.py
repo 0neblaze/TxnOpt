@@ -70,11 +70,15 @@ def _review_fixture_records(root: Path) -> tuple[ReviewRecord, ...]:
     assert report.feasible
     objective = SolutionObjective.from_report(instance, report)
     records = []
+    empty_rows = {
+        "count": 0,
+        "sha256": hashlib.sha256(b"stage05.2-row-evidence-v1\0").hexdigest(),
+    }
     measurement_evidence: dict[str, Any] = {
         "present": True,
-        "exact_route_order": [],
-        "cache_lifecycle": [],
-        "deadline_boundaries": [],
+        "exact_route_order": empty_rows,
+        "cache_lifecycle": empty_rows,
+        "deadline_boundaries": empty_rows,
     }
     measurement_evidence["sha256"] = hashlib.sha256(
         json.dumps(
@@ -87,7 +91,7 @@ def _review_fixture_records(root: Path) -> tuple[ReviewRecord, ...]:
     ).hexdigest()
     for mode in MODES:
         payload: dict[str, Any] = {
-            "schema_version": "stage05.2-native-architecture-comparison-v1",
+            "schema_version": "stage05.2-native-architecture-comparison-v2",
             "status": "completed",
             "mode": mode.value,
             "repeat": 0,
@@ -102,11 +106,11 @@ def _review_fixture_records(root: Path) -> tuple[ReviewRecord, ...]:
             "exact_completed_calls": 10,
             "candidate_work_hash": "a" * 64,
             "route_result_hash": "b" * 64,
-            "trajectory": [{"iteration": 1, "accepted": False}],
+            "trajectory": empty_rows,
             "operator_statistics": {},
             "stage04_statistics": {},
-            "stage04_events": [],
-            "candidate_transaction_events": [],
+            "stage04_events": empty_rows,
+            "candidate_transaction_events": empty_rows,
             "measurement_evidence": measurement_evidence,
             "semantic_completeness": {
                 "candidate_control": True,

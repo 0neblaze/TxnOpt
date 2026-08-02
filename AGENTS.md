@@ -766,6 +766,14 @@ this repository or one of its subdirectories.
   evidence, not deleted. The current Stage 5.2 mode is the primary denominator;
   accepted Pilot attempt72 is drift evidence only. Neither runner starts
   Formal, changes the production default, launches CUDA, or reuses a label.
+  Paired `attempt01` completed all 360 axes but is superseded before review:
+  the v1 JSON producer duplicated complete in-memory measurement/event rows and
+  emitted about 16 GiB for `current_stage052` alone, while the v1 reviewer
+  attempted to materialize every axis simultaneously. The immutable attempt01
+  directories remain failure evidence and must not be reused or promoted. The
+  v2 producer replaces duplicated rows with count-plus-SHA-256 semantic stream
+  evidence; new paired/Pilot evidence must use attempt02 labels and the v2
+  reviewer schema.
 - Stage 5.2 safe-rejection acceleration is bounded independently from the
   collision-proof identity stores. The scalar `ScreeningResult` cache is a
   65,536-entry solve-local LRU; the Python/native sequence cache is a

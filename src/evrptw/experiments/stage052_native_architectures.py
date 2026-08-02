@@ -10,6 +10,7 @@ import os
 import resource
 import subprocess
 import time
+from collections.abc import Iterable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
@@ -32,7 +33,7 @@ from evrptw.repository import repository_root
 from evrptw.stage04 import Stage04Config
 from evrptw.validation import validate_routes
 
-SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v1"
+SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v2"
 SEEDS = (2014, 2015, 2016)
 PAIRED_INSTANCES = ("c101C5", "c101_21", "r101_21", "rc101_21")
 AXIS_NAMES = ("fixed_work", "wall_clock_30")
@@ -289,17 +290,28 @@ def _metric_int(value: object) -> int:
     return value
 
 
+def _row_evidence(rows: Iterable[object]) -> dict[str, object]:
+    digest = hashlib.sha256(b"stage05.2-row-evidence-v1\0")
+    count = 0
+    for row in rows:
+        encoded = _canonical_bytes(row)
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+        count += 1
+    return {"count": count, "sha256": digest.hexdigest()}
+
+
 def _measurement_evidence(result: ALNSResult) -> dict[str, object]:
     trace = result.measurement_trace
     if trace is None:
         semantic = {
             "present": False,
-            "exact_route_order": [],
-            "cache_lifecycle": [],
-            "deadline_boundaries": [],
+            "exact_route_order": _row_evidence(()),
+            "cache_lifecycle": _row_evidence(()),
+            "deadline_boundaries": _row_evidence(()),
         }
     else:
-        exact_route_order = [
+        exact_route_order = (
             {
                 "evaluation_id": row.evaluation_id,
                 "route_key": row.route_key,
@@ -317,8 +329,8 @@ def _measurement_evidence(result: ALNSResult) -> dict[str, object]:
             }
             for row in trace.route_evaluations
             if row.exact_started or row.exact_completed
-        ]
-        cache_lifecycle = [
+        )
+        cache_lifecycle = (
             {
                 "evaluation_id": row.evaluation_id,
                 "route_key": row.route_key,
@@ -328,8 +340,8 @@ def _measurement_evidence(result: ALNSResult) -> dict[str, object]:
             }
             for row in trace.route_evaluations
             if "cache" in row.kind or row.cache_key_digest
-        ]
-        deadline_boundaries = [
+        )
+        deadline_boundaries = (
             {
                 "evaluation_id": row.evaluation_id,
                 "route_key": row.route_key,
@@ -340,20 +352,23 @@ def _measurement_evidence(result: ALNSResult) -> dict[str, object]:
             }
             for row in trace.route_evaluations
             if row.deadline_boundary
-        ]
+        )
         semantic = {
             "present": True,
-            "exact_route_order": exact_route_order,
-            "cache_lifecycle": cache_lifecycle,
-            "deadline_boundaries": deadline_boundaries,
-            "route_dictionary": {
-                key: list(value) for key, value in sorted(trace.route_dictionary.items())
-            },
-            "screening_decisions": [asdict(row) for row in trace.screening_decisions],
-            "events": [dict(row) for row in trace.events],
-            "incremental_propagations": [
+            "exact_route_order": _row_evidence(exact_route_order),
+            "cache_lifecycle": _row_evidence(cache_lifecycle),
+            "deadline_boundaries": _row_evidence(deadline_boundaries),
+            "route_dictionary": _row_evidence(
+                {"key": key, "route": list(value)}
+                for key, value in sorted(trace.route_dictionary.items())
+            ),
+            "screening_decisions": _row_evidence(
+                asdict(row) for row in trace.screening_decisions
+            ),
+            "events": _row_evidence(dict(row) for row in trace.events),
+            "incremental_propagations": _row_evidence(
                 dict(row) for row in trace.incremental_propagations
-            ],
+            ),
         }
     semantic["sha256"] = hashlib.sha256(_canonical_bytes(semantic)).hexdigest()
     return semantic
@@ -498,13 +513,17 @@ def _result_payload(
         "candidate_work_hash": result.candidate_work_hash,
         "route_result_hash": result.route_result_hash,
         "fallback_count": native_fallback,
-        "trajectory": [dict(event) for event in result.neighborhood_events],
+        "trajectory": _row_evidence(
+            dict(event) for event in result.neighborhood_events
+        ),
         "operator_statistics": result.neighborhood_statistics,
         "stage04_statistics": result.stage04_statistics,
-        "stage04_events": [dict(event) for event in result.stage04_event_log],
-        "candidate_transaction_events": [
+        "stage04_events": _row_evidence(
+            dict(event) for event in result.stage04_event_log
+        ),
+        "candidate_transaction_events": _row_evidence(
             dict(event) for event in result.candidate_transaction_events
-        ],
+        ),
         "candidate_control_statistics": result.candidate_control_statistics,
         "candidate_transaction_statistics": candidate_transactions,
         "native_execution_statistics": result.native_execution_statistics,

@@ -27,7 +27,7 @@ from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.validation import validate_routes
 
-REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v1"
+REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v2"
 HISTORICAL_PILOT_ROOT = Path(
     "/mnt/e/Reproducible-EVRPTW-archive/stage05.2/runs/"
     "stage05.2_benchmark_attempt72/generation-0001/d_benchmark/batch0001"
@@ -397,8 +397,8 @@ def review_records(
                 continue
             baseline = modes[ArchitectureMode.PYTHON_CANDIDATE_CONTROL]
             candidate = modes[mode]
-            baseline_trajectory = _sequence(baseline.payload, "trajectory")
-            candidate_trajectory = _sequence(candidate.payload, "trajectory")
+            baseline_trajectory = _mapping(baseline.payload, "trajectory")
+            candidate_trajectory = _mapping(candidate.payload, "trajectory")
             baseline_measurement = _mapping(baseline.payload, "measurement_evidence")
             candidate_measurement = _mapping(candidate.payload, "measurement_evidence")
             comparisons.append(
@@ -450,8 +450,9 @@ def review_records(
                     )
                     == candidate_measurement.get("sha256"),
                     "common_prefix": _common_prefix(
-                        baseline_trajectory, candidate_trajectory
-                    ),
+                        [baseline_trajectory], [candidate_trajectory]
+                    )
+                    * _integer(baseline_trajectory, "count"),
                 }
             )
         differential[mode.value] = {
