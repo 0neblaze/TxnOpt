@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from evrptw.alns import _destroy, _Evaluator, solve_alns
+from evrptw.alns import _destroy, _Evaluator, _IncumbentRouteLedger, solve_alns
 from evrptw.cache_incremental import (
     CacheIncrementalConfig,
     RouteEvaluationCache,
@@ -116,6 +116,11 @@ def _full_native_solve_kwargs() -> dict[str, object]:
         "cache_incremental_config": CacheIncrementalConfig(enabled=True),
         "stage04_config": Stage04Config(),
     }
+
+
+@pytest.fixture(scope="module")
+def native_plan_transaction_receipts() -> dict[int, tuple[bytes, ...]]:
+    return {}
 
 
 def test_per_solve_native_execution_protocol_is_explicit_and_fail_fast() -> None:
@@ -1797,6 +1802,789 @@ def test_native_attempted_plan_invalid_batch_is_atomic() -> None:
 
     assert attempted.size() == 0
     assert attempted.lookup(plan_offsets, route_offsets, route_indices).tolist() == [0, 0]
+
+
+@pytest.mark.parametrize("worker_count", [1, 4])
+def test_native_search_engine_plan_transaction_matches_python_across_rounds(
+    worker_count: int,
+    request: pytest.FixtureRequest,
+    native_plan_transaction_receipts: dict[int, tuple[bytes, ...]],
+) -> None:
+    """The solve-level engine owns plan, cache, and budget state across rounds."""
+
+    from evrptw import _core as native_core
+
+    instance = _candidate_plan_fixture()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    initial = (("C1", "C2"), ("C3", "C4"))
+    plans = (
+        (("C1", "C3"), ("C2", "C4")),
+        (("C1", "C2", "C3", "C4"),),
+    )
+
+    def pack_routes(
+        routes: tuple[tuple[str, ...], ...],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        offsets = [0]
+        indices: list[int] = []
+        for route in routes:
+            indices.extend(context.name_to_index[name] for name in route)
+            offsets.append(len(indices))
+        return np.asarray(offsets, dtype=np.int64), np.asarray(indices, dtype=np.int64)
+
+    plan_offsets = [0]
+    route_offsets = [0]
+    route_indices: list[int] = []
+    for plan in plans:
+        for route in plan:
+            route_indices.extend(context.name_to_index[name] for name in route)
+            route_offsets.append(len(route_indices))
+        plan_offsets.append(len(route_offsets) - 1)
+    packed_plans = np.asarray(plan_offsets, dtype=np.int64)
+    packed_routes = np.asarray(route_offsets, dtype=np.int64)
+    packed_indices = np.asarray(route_indices, dtype=np.int64)
+    initial_offsets, initial_indices = pack_routes(initial)
+    lexical_rank = np.asarray(
+        [
+            rank
+            for rank, _name in sorted(
+                enumerate(context.node_names),
+                key=lambda item: item[1],
+            )
+        ],
+        dtype=np.int64,
+    )
+
+    control_config = CandidateControlConfig(
+        proposal_top_k=2,
+        max_exact_calls_per_round=2,
+        worker_count=worker_count,
+    )
+    python_control = CandidateControlRuntime(control_config)
+    request.addfinalizer(python_control.close)
+    exact_controller = ExactCallController(
+        ExactDeadlineConfig.fixed_exact_calls(20, watchdog_seconds=120.0)
+    )
+    cache_config = CacheIncrementalConfig(
+        enabled=True,
+        max_entries=64,
+        max_memory_bytes=1_000_000,
+    )
+    ledger = _IncumbentRouteLedger()
+    python_evaluator = _Evaluator(
+        instance,
+        deadline=time.perf_counter() + 30.0,
+        lane="constraint",
+        screening_config=CheapScreeningConfig(),
+        cache_incremental_config=cache_config,
+        route_cache=RouteEvaluationCache(instance, cache_config),
+        backend="cpu_batch",
+        exact_call_controller=exact_controller,
+        candidate_control_runtime=python_control,
+        incumbent_route_ledger=ledger,
+    )
+    initial_solution = python_evaluator.solution(initial)
+    assert initial_solution.feasible
+    python_evaluator.remember_incumbent(initial_solution)
+
+    engine = native_core.NativeSearchEngineV2(
+        20,
+        control_config.max_exact_calls_per_round,
+        cache_config.max_entries,
+        cache_config.max_memory_bytes,
+        cache_config.max_entries,
+        control_config.proposal_top_k,
+        context.reachability_epsilon,
+        worker_count,
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        lexical_rank,
+        initial_offsets,
+        initial_indices,
+        np.asarray([2014, 10, 128, 1, 20], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+
+    python_control.begin_round(7, lane="constraint")
+    python_evaluator.set_measurement_context(
+        lane="constraint", iteration=7, operator="relocate"
+    )
+    python_first = python_evaluator.evaluate_feasible_candidate_plans(
+        plans,
+        current_sequences=initial,
+    )
+    native_first = engine.evaluate_plans(
+        packed_plans,
+        packed_routes,
+        packed_indices,
+        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([1, 2, 3, 4], dtype=np.int64),
+    )
+
+    assert python_first == (plans[1],)
+    assert native_first[0].tolist() == [1, 0]
+    assert native_first[1].tolist() == [3, 5]
+    assert native_first[2].tolist() == [[-1, -1], [1, 0]]
+    python_first_solution = python_evaluator.solution(python_first[0])
+    assert python_first_solution.objective is not None
+    assert native_first[3][1].tolist() == pytest.approx(
+        [
+            python_first_solution.objective.total_distance,
+            python_first_solution.objective.total_charging_time,
+        ]
+    )
+    assert native_first[10].tolist()[5:8] == [3, 3, 0]
+    assert native_first[11].tolist() == [1]
+
+    python_control.begin_round(8, lane="constraint")
+    python_evaluator.set_measurement_context(
+        lane="constraint", iteration=8, operator="relocate"
+    )
+    python_second = python_evaluator.evaluate_feasible_candidate_plans(
+        plans,
+        current_sequences=initial,
+    )
+    native_second = engine.evaluate_plans(
+        packed_plans,
+        packed_routes,
+        packed_indices,
+        np.asarray([2, 8, 3], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([1, 2, 3, 4], dtype=np.int64),
+    )
+
+    assert python_second == (plans[0],)
+    assert native_second[0].tolist() == [0]
+    assert native_second[1].tolist() == [5, 1]
+    assert native_second[2][0].tolist() == [2, 0]
+    python_second_solution = python_evaluator.solution(python_second[0])
+    assert python_second_solution.objective is not None
+    assert native_second[3][0].tolist() == pytest.approx(
+        [
+            python_second_solution.objective.total_distance,
+            python_second_solution.objective.total_charging_time,
+        ]
+    )
+    assert native_second[10].tolist()[5:8] == [5, 5, 0]
+    assert native_second[11].tolist() == [0]
+    receipt = tuple(
+        item.tobytes() if isinstance(item, np.ndarray) else item.encode("ascii")
+        for payload in (native_first, native_second)
+        for item in payload
+    )
+    if native_plan_transaction_receipts:
+        assert receipt == next(iter(native_plan_transaction_receipts.values()))
+    native_plan_transaction_receipts[worker_count] = receipt
+
+
+def test_native_search_engine_deadline_before_exact_rolls_back_logical_state() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    lexical_rank = np.arange(len(context.node_names), dtype=np.int64)
+    engine = native_core.NativeSearchEngineV2(
+        10,
+        1,
+        16,
+        1_000_000,
+        16,
+        1,
+        context.reachability_epsilon,
+        1,
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        lexical_rank,
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    plan_offsets = np.asarray([0, 1], dtype=np.int64)
+    route_offsets = np.asarray([0, 2], dtype=np.int64)
+    route_indices = np.asarray([2, 1], dtype=np.int64)
+
+    with pytest.raises(RuntimeError, match="deadline before exact work"):
+        engine.evaluate_plans(
+            plan_offsets,
+            route_offsets,
+            route_indices,
+            np.asarray([2, 7, 3], dtype=np.int64),
+            np.asarray([np.nextafter(0.0, 1.0)], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            np.asarray([1, 2], dtype=np.int64),
+        )
+
+    (
+        _cache_after_failure,
+        budget_after_failure,
+        attempted_after_failure,
+        _negative_after_failure,
+    ) = engine.state()
+    assert budget_after_failure.tolist()[3:8] == [0, 1, 1, 1, 0]
+    assert attempted_after_failure == 0
+
+    recovered = engine.evaluate_plans(
+        plan_offsets,
+        route_offsets,
+        route_indices,
+        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+    )
+    assert recovered[0].tolist() == [0]
+    assert recovered[1].tolist() == [5]
+    assert recovered[10].tolist()[3:8] == [1, 0, 2, 2, 0]
+    assert engine.state()[2] == 1
+
+
+def test_native_search_engine_rejects_warm_start_before_over_budget_work() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        1,
+        1,
+        16,
+        1_000_000,
+        16,
+        1,
+        context.reachability_epsilon,
+        1,
+    )
+
+    with pytest.raises(RuntimeError, match="warm start does not fit"):
+        engine.initialize(
+            context.node_kind,
+            context.demand,
+            context.ready_time,
+            context.due_date,
+            context.service_time,
+            context.distance,
+            context.reachable,
+            context.vehicle,
+            np.arange(len(context.node_names), dtype=np.int64),
+            np.asarray([0, 1, 2], dtype=np.int64),
+            np.asarray([1, 2], dtype=np.int64),
+            np.asarray([2014, 10, 128, 1, 1], dtype=np.int64),
+            np.asarray([30.0], dtype=np.float64),
+        )
+
+    _cache, budget, attempted, _negative = engine.state()
+    assert budget.tolist()[5:8] == [0, 0, 0]
+    assert attempted == 0
+
+
+def test_native_search_engine_rejects_incomplete_warm_start_before_exact_work() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+
+    with pytest.raises(ValueError, match="every customer exactly once"):
+        engine.initialize(
+            context.node_kind,
+            context.demand,
+            context.ready_time,
+            context.due_date,
+            context.service_time,
+            context.distance,
+            context.reachable,
+            context.vehicle,
+            np.arange(len(context.node_names), dtype=np.int64),
+            np.asarray([0, 1], dtype=np.int64),
+            np.asarray([1], dtype=np.int64),
+            np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+            np.asarray([30.0], dtype=np.float64),
+        )
+
+    assert engine.state()[1].tolist()[5:8] == [0, 0, 0]
+
+
+def test_native_search_engine_rejects_incomplete_and_duplicate_customer_plans() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 2, 16, 1_000_000, 16, 2, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+
+    result = engine.evaluate_plans(
+        np.asarray([0, 1, 2], dtype=np.int64),
+        np.asarray([0, 1, 3], dtype=np.int64),
+        np.asarray([1, 1, 1], dtype=np.int64),
+        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+    )
+
+    assert result[0].tolist() == []
+    assert result[1].tolist() == [0, 0]
+    assert result[5].tolist() == []
+    assert result[10].tolist()[5:8] == [1, 1, 0]
+    assert engine.state()[2] == 0
+
+    with pytest.raises(ValueError, match="complete instance customer set"):
+        engine.evaluate_plans(
+            np.asarray([0, 1], dtype=np.int64),
+            np.asarray([0, 1], dtype=np.int64),
+            np.asarray([1], dtype=np.int64),
+            np.asarray([2, 8, 3], dtype=np.int64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            np.asarray([1], dtype=np.int64),
+        )
+
+
+def test_native_search_engine_empty_selection_still_enforces_deadline_atomically() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    before = engine.state()
+
+    with pytest.raises(RuntimeError, match="deadline before return"):
+        engine.evaluate_plans(
+            np.asarray([0, 1], dtype=np.int64),
+            np.asarray([0, 1], dtype=np.int64),
+            np.asarray([1], dtype=np.int64),
+            np.asarray([2, 7, 3], dtype=np.int64),
+            np.asarray([np.nextafter(0.0, 1.0)], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            np.asarray([1, 2], dtype=np.int64),
+        )
+
+    after = engine.state()
+    assert after[0].tolist() == before[0].tolist()
+    assert after[1].tolist() == before[1].tolist()
+    assert after[2] == before[2]
+
+
+def test_native_search_engine_hash_binds_context_for_already_attempted_plan() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    arguments = (
+        np.asarray([0, 1], dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([2, 1], dtype=np.int64),
+    )
+    initial_context = engine.evaluate_plans(
+        *arguments,
+        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+    )
+    assert initial_context[12] == (
+        "f6f272ad9d127cf8efac781b0ad8ee4dcef9b2595eb5f8bb1265214d07c51c43"
+    )
+    first_context = engine.evaluate_plans(
+        *arguments,
+        np.asarray([2, 8, 3], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+    )
+    second_context = engine.evaluate_plans(
+        *arguments,
+        np.asarray([2, 8, 4], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+    )
+
+    for first, second in zip(first_context[:-1], second_context[:-1], strict=True):
+        np.testing.assert_equal(first, second)
+    assert first_context[12] != second_context[12]
+
+    same_semantics_different_wall_clock_remainder = engine.evaluate_plans(
+        *arguments,
+        np.asarray([2, 8, 4], dtype=np.int64),
+        np.asarray([29.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([2, 1], dtype=np.int64),
+    )
+    assert same_semantics_different_wall_clock_remainder[12] == second_context[12]
+
+
+@pytest.mark.parametrize(
+    ("commit_step", "commit_component"),
+    [(1, "route-cache"), (2, "negative-cache"), (3, "attempted-plan")],
+)
+def test_native_search_engine_composite_commit_failure_rolls_back_logical_state(
+    commit_step: int,
+    commit_component: str,
+) -> None:
+    from evrptw import _core as native_core
+
+    base = _candidate_plan_fixture()
+    instance = replace(
+        base,
+        vehicle=replace(base.vehicle, load_capacity=2.0),
+    )
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        20, 4, 16, 1_000_000, 16, 2, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray([1, 2, 3, 4], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 20], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    before = engine.state()
+    arguments = (
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray([0, 2, 4, 7, 8], dtype=np.int64),
+        np.asarray([2, 1, 4, 3, 1, 2, 3, 4], dtype=np.int64),
+    )
+    engine.inject_commit_failure_once(commit_step)
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"injected.*{commit_component} commit preparation failure",
+    ):
+        engine.evaluate_plans(
+            *arguments,
+            np.asarray([2, 7, 3], dtype=np.int64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            np.asarray([1, 2, 3, 4], dtype=np.int64),
+        )
+
+    after_failure = engine.state()
+    assert after_failure[0].tolist() == before[0].tolist()
+    assert after_failure[2] == before[2]
+    assert after_failure[3].tolist() == before[3].tolist()
+    assert after_failure[1].tolist()[:5] == [1, 2, 7, 2, 2]
+    assert after_failure[1].tolist()[5:8] == [4, 4, 0]
+
+    recovered = engine.evaluate_plans(
+        *arguments,
+        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([1, 2, 3, 4], dtype=np.int64),
+    )
+    assert recovered[1].tolist() == [5, 0]
+    assert recovered[5].tolist() == [0, 1]
+    assert recovered[10].tolist()[:5] == [1, 2, 7, 4, 0]
+    assert recovered[10].tolist()[5:8] == [6, 6, 0]
+
+
+def test_native_search_engine_returns_exact_objective_order_not_optimistic_order() -> None:
+    from evrptw import _core as native_core
+
+    instance = _candidate_plan_fixture()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 2, 16, 1_000_000, 16, 2, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray([1, 2, 3, 4], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+
+    result = engine.evaluate_plans(
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray([0, 2, 4, 5, 8], dtype=np.int64),
+        np.asarray([1, 2, 3, 4, 1, 3, 2, 4], dtype=np.int64),
+        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([1, 2, 3, 4], dtype=np.int64),
+    )
+
+    assert result[0].tolist() == [0, 1]
+    assert result[11].tolist() == [1, 0]
+
+
+def test_native_search_engine_counts_exact_infeasible_warm_start_as_completed() -> None:
+    from evrptw import _core as native_core
+
+    instance = replace(
+        _fixture_instance(),
+        vehicle=replace(_fixture_instance().vehicle, battery_capacity=0.5),
+    )
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+
+    with pytest.raises(RuntimeError, match="warm start is not exact-feasible"):
+        engine.initialize(
+            context.node_kind,
+            context.demand,
+            context.ready_time,
+            context.due_date,
+            context.service_time,
+            context.distance,
+            context.reachable,
+            context.vehicle,
+            np.arange(len(context.node_names), dtype=np.int64),
+            np.asarray([0, 2], dtype=np.int64),
+            np.asarray([1, 2], dtype=np.int64),
+            np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+            np.asarray([30.0], dtype=np.float64),
+        )
+
+    assert engine.state()[1].tolist()[5:8] == [1, 1, 0]
+
+
+def test_native_search_engine_negative_screen_cache_is_persistent_and_observable() -> None:
+    from evrptw import _core as native_core
+
+    base = _fixture_instance()
+    instance = replace(
+        base,
+        vehicle=replace(base.vehicle, load_capacity=1.0),
+    )
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 1, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    arguments = (
+        np.asarray([0, 1], dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+    )
+
+    first = engine.evaluate_plans(
+        *arguments,
+        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+    )
+    second = engine.evaluate_plans(
+        *arguments,
+        np.asarray([2, 8, 3], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+    )
+
+    assert first[1].tolist() == [0]
+    assert first[9].tolist()[0] == 1
+    assert first[9].tolist()[3] == 1
+    assert first[7].tolist()[7] == 0
+    assert second[1].tolist() == [0]
+    assert second[7].tolist()[7] == 1
+    assert engine.state()[3].tolist() == second[9].tolist()
+
+
+def test_native_search_engine_preserves_python_duplicate_plan_semantics() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 2, 16, 1_000_000, 16, 2, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+
+    result = engine.evaluate_plans(
+        np.asarray([0, 1, 2], dtype=np.int64),
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray([2, 1, 2, 1], dtype=np.int64),
+        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+    )
+
+    assert result[0].tolist() == [0, 1]
+    assert result[1].tolist() == [5, 5]
+    assert result[5].tolist() == [0]
+    assert engine.state()[2] == 1
+
+
+def test_native_search_engine_owns_problem_and_warm_start_arrays() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    node_kind = context.node_kind.copy()
+    demand = context.demand.copy()
+    ready_time = context.ready_time.copy()
+    due_date = context.due_date.copy()
+    service_time = context.service_time.copy()
+    distance = context.distance.copy()
+    reachable = context.reachable.copy()
+    vehicle = context.vehicle.copy()
+    lexical_rank = np.arange(len(context.node_names), dtype=np.int64)
+    warm_offsets = np.asarray([0, 2], dtype=np.int64)
+    warm_indices = np.asarray([1, 2], dtype=np.int64)
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        node_kind,
+        demand,
+        ready_time,
+        due_date,
+        service_time,
+        distance,
+        reachable,
+        vehicle,
+        lexical_rank,
+        warm_offsets,
+        warm_indices,
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+
+    node_kind.fill(-1)
+    demand.fill(np.nan)
+    ready_time.fill(np.nan)
+    due_date.fill(np.nan)
+    service_time.fill(np.nan)
+    distance.fill(np.nan)
+    reachable.fill(0)
+    vehicle.fill(np.nan)
+    lexical_rank.fill(-1)
+    warm_offsets.fill(-1)
+    warm_indices.fill(-1)
+
+    result = engine.evaluate_plans(
+        np.asarray([0, 1], dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([2, 1], dtype=np.int64),
+        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+    )
+
+    assert result[1].tolist() == [5]
 
 
 def test_native_route_cache_atomic_lru_matches_python_cache() -> None:

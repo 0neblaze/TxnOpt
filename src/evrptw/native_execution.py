@@ -371,6 +371,7 @@ def execute_full_native_alns(
         context.due_date,
         context.service_time,
         context.distance,
+        context.reachable,
         context.vehicle,
         lexical_rank,
         initial_offsets,

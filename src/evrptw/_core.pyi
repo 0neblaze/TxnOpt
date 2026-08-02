@@ -243,6 +243,82 @@ class NativeAttemptedPlanSetV2:
     def rollback_mark_batch(self) -> int: ...
     def size(self) -> int: ...
 
+class NativeSearchEngineV2:
+    def __init__(
+        self,
+        exact_budget: int,
+        round_budget: int,
+        cache_entries: int,
+        cache_memory_bytes: int,
+        negative_cache_entries: int,
+        proposal_top_k: int,
+        screening_epsilon: float,
+        worker_count: int,
+    ) -> None: ...
+    def initialize(
+        self,
+        node_kind: npt.NDArray[np.int64],
+        demand: npt.NDArray[np.float64],
+        ready_time: npt.NDArray[np.float64],
+        due_date: npt.NDArray[np.float64],
+        service_time: npt.NDArray[np.float64],
+        distance: npt.NDArray[np.float64],
+        reachable: npt.NDArray[np.uint8],
+        vehicle: npt.NDArray[np.float64],
+        lexical_rank: npt.NDArray[np.int64],
+        initial_route_offsets: npt.NDArray[np.int64],
+        initial_route_indices: npt.NDArray[np.int64],
+        control: npt.NDArray[np.int64],
+        deadline_remaining: npt.NDArray[np.float64],
+    ) -> tuple[
+        tuple[
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.float64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+        ],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+    ]: ...
+    def evaluate_plans(
+        self,
+        plan_offsets: npt.NDArray[np.int64],
+        route_offsets: npt.NDArray[np.int64],
+        route_indices: npt.NDArray[np.int64],
+        context_ids: npt.NDArray[np.int64],
+        deadline_remaining: npt.NDArray[np.float64],
+        batch_size: npt.NDArray[np.int64],
+        expected_customer_indices: npt.NDArray[np.int64],
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        str,
+    ]: ...
+    def initialized(self) -> bool: ...
+    def inject_commit_failure_once(self, step: int) -> None: ...
+    def state(
+        self,
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        int,
+        npt.NDArray[np.int64],
+    ]: ...
+
 __build_git_revision__: str
 
 Point = tuple[float, float]
@@ -538,6 +614,7 @@ def full_native_alns_v2(
     due_date: npt.NDArray[np.float64],
     service_time: npt.NDArray[np.float64],
     distance: npt.NDArray[np.float64],
+    reachable: npt.NDArray[np.uint8],
     vehicle: npt.NDArray[np.float64],
     lexical_rank: npt.NDArray[np.int64],
     initial_route_offsets: npt.NDArray[np.int64],
