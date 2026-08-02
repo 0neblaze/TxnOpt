@@ -357,7 +357,7 @@ def _mode_metrics(records: Iterable[ReviewRecord]) -> dict[str, object]:
             _number(record.payload, "persistence_seconds") for record in values
         ),
         "queue_wait_seconds": _paired(native_queue),
-        "transaction_occupancy": _paired(float(value) for value in occupancy),
+        "exact_backend_batch_occupancy": _paired(float(value) for value in occupancy),
     }
 
 
@@ -932,7 +932,8 @@ def render_report(review: Mapping[str, object]) -> str:
         "## 五模式事实表",
         "",
         "| Mode | Solver median s | Effective iterations median | Exact calls median | "
-        "Queue wait median s | Occupancy median | RSS median MiB | Artifact median MiB |",
+        "Queue wait median s | Exact batch occupancy median | RSS median MiB | "
+        "Artifact median MiB |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for mode in MODES:
@@ -949,7 +950,7 @@ def render_report(review: Mapping[str, object]) -> str:
             + " | "
             + _median_text(raw, "queue_wait_seconds")
             + " | "
-            + _median_text(raw, "transaction_occupancy")
+            + _median_text(raw, "exact_backend_batch_occupancy")
             + " | "
             + _median_scaled_text(raw, "rss_bytes", 1024**2)
             + " | "
@@ -1033,6 +1034,13 @@ def render_report(review: Mapping[str, object]) -> str:
             f"- CUDA condition（CUDA 条件）："
             f"`{cuda.get('condition_met')}`；{cuda.get('reason')}；"
             "本轮未自动运行 CUDA。",
+            "",
+            "## Instrumentation limitations（测量边界）",
+            "",
+            "Exact batch occupancy（精确批量占用度）不是 native candidate-screening "
+            "occupancy（原生候选筛选占用度），不用于 CUDA 门槛。"
+            "`persistence_seconds` 包含 solver 执行时间，不是独立持久化成本。"
+            "Host 轴的 CPU/RSS 仅测量 client shard，不含 scheduler service。",
             "",
             "## 边界",
             "",
