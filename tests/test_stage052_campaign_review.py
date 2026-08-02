@@ -54,10 +54,13 @@ from evrptw.stage052_campaign import (
     AnytimeCheckpoint,
     BatchManifest,
     BenchmarkCampaignConfig,
+    CampaignIdentity,
     CampaignManifest,
+    CampaignRecoveryController,
     StorageRoot,
     StorageRootLocator,
     VolumeIdentity,
+    authorize_resume,
     directory_byte_count,
     directory_checksum,
     load_campaign_manifest,
@@ -79,6 +82,7 @@ from evrptw.stage052_resources import (
 )
 from evrptw.stage052_retention import RetentionRecord, write_retention_registry
 from evrptw.storage_governance import (
+    POLICY_SCHEMA_VERSION,
     build_cli_failure_manifest,
     compute_tree_sha256,
     write_migration_dry_run,
@@ -2071,6 +2075,7 @@ def _build_complete_pilot_campaign(
     tmp_path: Path,
     *,
     batch_transfer_mode: str = "same_volume_atomic_rename",
+    recovered: bool = False,
 ) -> tuple[Path, StorageRootLocator, VolumeIdentity]:
     prerequisite_dir, predecessor_metadata = _build_accepted_f02(tmp_path)
     prerequisite_review = prerequisite_dir / "review/review_manifest.json"
@@ -2079,15 +2084,165 @@ def _build_complete_pilot_campaign(
     campaign_dir = tmp_path / run_label
     staging_root = tmp_path / "staging"
     archive_root = tmp_path / "archive"
+    staging_alias = "wsl_staging"
+    archive_alias = "e_archive"
     staging_root.mkdir()
     archive_root.mkdir()
     volume = VolumeIdentity(device_uuid="synthetic-apfs-volume", filesystem="apfs")
     locator = StorageRootLocator(
         {
-            "staging": StorageRoot("staging", staging_root, volume),
-            "archive": StorageRoot("archive", archive_root, volume),
+            staging_alias: StorageRoot(staging_alias, staging_root, volume),
+            archive_alias: StorageRoot(archive_alias, archive_root, volume),
         }
     )
+    campaign_config_payload: dict[str, object] = {
+        "scope": "pilot",
+        "batch_count": 1,
+        "shard_count": 36,
+        "axis_count": 36,
+    }
+    campaign_plan_payload: dict[str, object] = {
+        "schema_version": "stage05.2-campaign-plan-test-v1",
+        "run_label": run_label,
+        **campaign_config_payload,
+    }
+    recovery_identity: CampaignIdentity | None = None
+    lifecycle_plan: dict[str, object] | None = None
+    start_evidence_paths: tuple[Path, Path, Path] | None = None
+    if recovered:
+        historical_gate = (
+            archive_root
+            / ".experiment-lifecycle"
+            / "historical-migration"
+            / "gate.json"
+        )
+        _write_signed_json(
+            historical_gate,
+            {"schema_version": "test-historical-migration-v1", "passed": True},
+        )
+        configuration_path = Path("configs/stage052_performance.toml")
+        configuration_sha256 = hashlib.sha256(
+            configuration_path.read_bytes()
+        ).hexdigest()
+        lifecycle_prerequisites = {
+            "campaign_geometry": campaign_review_module._canonical_sha256(  # noqa: SLF001
+                {
+                    "campaign_config": campaign_config_payload,
+                    "campaign_plan": campaign_plan_payload,
+                }
+            ),
+            "historical_migration": hashlib.sha256(
+                historical_gate.read_bytes()
+            ).hexdigest(),
+            "stage051_readiness": hashlib.sha256(
+                Path(
+                    "experiments/manifests/"
+                    "stage05.1_best_known_artifact_manifest.json"
+                ).read_bytes()
+            ).hexdigest(),
+        }
+        lifecycle_plan = {
+            "run_label": run_label,
+            "run_dir": str(campaign_dir),
+            "configuration_sha256": configuration_sha256,
+            "fallback_allowed": False,
+            "workers": 6,
+            "threads": 6,
+            "processes": 6,
+            "prerequisite_sha256_by_contract": lifecycle_prerequisites,
+        }
+        lifecycle_plan_sha256 = campaign_review_module._canonical_sha256(  # noqa: SLF001
+            lifecycle_plan
+        )
+        maintenance_payload = {
+            "schema_version": "experiment-rebuildable-audit-v1",
+            "applied": False,
+            "request_identity": {
+                "schema_version": "experiment-rebuildable-request-v1",
+                "run_label": run_label,
+            },
+            "candidate_paths": [],
+            "retained": [],
+            "candidate_bytes": 0,
+        }
+        maintenance_payload["request_identity_sha256"] = (
+            campaign_review_module._canonical_sha256(  # noqa: SLF001
+                maintenance_payload["request_identity"]
+            )
+        )
+        evidence_dir = tmp_path / "start-evidence"
+        maintenance_path = evidence_dir / "maintenance.json"
+        _write_json(maintenance_path, maintenance_payload)
+        maintenance_sha256 = hashlib.sha256(maintenance_path.read_bytes()).hexdigest()
+        observation_payload = {
+            "schema_version": POLICY_SCHEMA_VERSION,
+            "stage_id": "stage05.2",
+            "run_label": run_label,
+            "run_dir": str(campaign_dir),
+            "stage_plan_sha256": lifecycle_plan_sha256,
+            "maintenance_audit_sha256": maintenance_sha256,
+            "passed": True,
+            "deficits_by_alias": {},
+            "measurement_errors_by_alias": {},
+            "identity_errors": [],
+            "volume_identities_by_alias": {
+                staging_alias: volume.to_dict(),
+                archive_alias: volume.to_dict(),
+                "d_host": volume.to_dict(),
+            },
+            "free_bytes_by_alias": {
+                staging_alias: 10_000_000_000,
+                archive_alias: 10_000_000_000,
+                "d_host": 10_000_000_000,
+            },
+            "required_bytes_by_alias": {
+                staging_alias: 1,
+                archive_alias: 1,
+                "d_host": 1,
+            },
+        }
+        observation_path = evidence_dir / "observation.json"
+        _write_json(observation_path, observation_payload)
+        observation_sha256 = hashlib.sha256(observation_path.read_bytes()).hexdigest()
+        permit_payload = {
+            "schema_version": POLICY_SCHEMA_VERSION,
+            "run_label": run_label,
+            "stage_plan_sha256": lifecycle_plan_sha256,
+            "observation_sha256": observation_sha256,
+            "maintenance_audit_sha256": maintenance_sha256,
+            "maintenance_audit_path": str(maintenance_path),
+            "status": "reserved",
+        }
+        start_permit_path = evidence_dir / "start-permit.json"
+        _write_json(start_permit_path, permit_payload)
+        runtime_identity = predecessor_metadata["runtime_identity"]
+        assert isinstance(runtime_identity, dict)
+        recovery_identity = CampaignIdentity(
+            run_label=run_label,
+            repository_revision=str(predecessor_metadata["repository_revision"]),
+            repository_tree="b" * 40,
+            wheel_sha256=str(runtime_identity.get("wheel_sha256", "d" * 64)),
+            runtime_identity_sha256=campaign_review_module._canonical_sha256(  # noqa: SLF001
+                runtime_identity
+            ),
+            configuration_sha256=configuration_sha256,
+            prerequisite_review_sha256=prerequisite_hash,
+            producer_resource_contract_sha256=(
+                campaign_review_module._canonical_sha256({})  # noqa: SLF001
+            ),
+            campaign_plan_sha256=campaign_review_module._canonical_sha256(  # noqa: SLF001
+                campaign_plan_payload
+            ),
+            lifecycle_plan_sha256=lifecycle_plan_sha256,
+            start_permit_sha256=hashlib.sha256(
+                start_permit_path.read_bytes()
+            ).hexdigest(),
+        )
+        start_evidence_paths = (
+            start_permit_path,
+            observation_path,
+            maintenance_path,
+        )
     batch_dir = archive_root / run_label / "batch0001"
     writer = ArtifactBundleWriter(
         batch_dir,
@@ -2120,11 +2275,18 @@ def _build_complete_pilot_campaign(
         "performance_provenance": predecessor_metadata["performance_provenance"],
         "storage_policy_version": "artifact-storage-v2",
         "screening_schema_version": "screening_decisions_v3",
-        "staging_root_alias": "staging",
-        "archive_root_aliases_exercised": ["archive"],
+        "staging_root_alias": staging_alias,
+        "archive_root_aliases_exercised": [archive_alias],
         "failure_handling_drill_passed": True,
         "raw_replay_drill_passed": True,
     }
+    if recovery_identity is not None:
+        metadata.update(
+            {
+                "campaign_identity_sha256": recovery_identity.identity_sha256,
+                "execution_epoch": 1,
+            }
+        )
     writer.write_control(metadata=metadata)
     bks_counts = {item.instance: item.customer_count for item in BEST_KNOWN_VALUES}
     instances = (
@@ -2552,8 +2714,8 @@ def _build_complete_pilot_campaign(
         run_label=run_label,
         batch_id="batch0001",
         status="verified",
-        root_alias="staging",
-        archive_root_alias="archive",
+        root_alias=staging_alias,
+        archive_root_alias=archive_alias,
         logical_path=f"{run_label}/batch0001",
         volume=volume,
         shard_ids=tuple(f"shard{index:04d}" for index in range(1, 37)),
@@ -2573,7 +2735,7 @@ def _build_complete_pilot_campaign(
     _write_signed_json(verified_manifest_path, verified_batch.to_dict())
     verified_manifest_sha = hashlib.sha256(verified_manifest_path.read_bytes()).hexdigest()
     batch = verified_batch.mark_archived(
-        root_alias="archive",
+        root_alias=archive_alias,
         volume=volume,
         transfer_mode=batch_transfer_mode,
         archive_transfer_seconds=1.0,
@@ -2609,7 +2771,7 @@ def _build_complete_pilot_campaign(
         native_profile="stage05.2-native-kernels-v2",
         storage_policy_version="artifact-storage-v2",
         screening_schema_version="screening_decisions_v3",
-        storage_roots={"staging": volume, "archive": volume},
+        storage_roots={staging_alias: volume, archive_alias: volume},
         shard_count=36,
         axis_count=36,
         declared_solver_seconds=1080,
@@ -2619,7 +2781,62 @@ def _build_complete_pilot_campaign(
             "batch0001": hashlib.sha256(envelope_path.read_bytes()).hexdigest()
         },
     )
-    campaign_dir.mkdir()
+    if recovery_identity is not None:
+        assert lifecycle_plan is not None
+        assert start_evidence_paths is not None
+        planned_recovery_campaign = replace(campaign, status="planned")
+        controller = CampaignRecoveryController(
+            run_dir=campaign_dir,
+            locator=locator,
+        )
+        controller.open(
+            expected_identity=recovery_identity,
+            fresh_campaign=planned_recovery_campaign,
+            resume_permit_path=None,
+        )
+        _write_signed_json(
+            campaign_dir / "campaign_manifest.json",
+            planned_recovery_campaign.to_dict(),
+        )
+        controller.record_start_evidence(
+            lifecycle_plan=lifecycle_plan,
+            start_permit_path=start_evidence_paths[0],
+            start_observation_path=start_evidence_paths[1],
+            maintenance_audit_path=start_evidence_paths[2],
+        )
+        host_loss_path, _ = atomic_write_signed_json(
+            campaign_dir / "control" / "recovery" / "host-loss.json",
+            {
+                "schema_version": "stage05.2-unexpected-host-loss-receipt-v1",
+                "run_label": run_label,
+                "cause": "unexpected_host_loss",
+                "campaign_identity_sha256": recovery_identity.identity_sha256,
+                "writer_absent": True,
+                "service_state": "failed",
+            },
+        )
+        _permit, permit_path = authorize_resume(
+            run_dir=campaign_dir,
+            identity=recovery_identity,
+            locator=locator,
+            cause="unexpected_host_loss",
+            stop_evidence_path=host_loss_path,
+            lifecycle_state="RUNNING",
+            writer_active=False,
+        )
+        resumed = controller.open(
+            expected_identity=recovery_identity,
+            fresh_campaign=planned_recovery_campaign,
+            resume_permit_path=permit_path,
+        )
+        assert resumed.completed_batch_ids == ("batch0001",)
+        assert resumed.pending_batch_ids == ()
+        controller.record_epoch_result(
+            resumed.campaign,
+            status="batch_execution_completed",
+        )
+    else:
+        campaign_dir.mkdir()
     campaign_path = campaign_dir / "campaign_manifest.json"
     _write_signed_json(campaign_path, campaign.to_dict())
     top_writer = ArtifactBundleWriter(
@@ -2630,18 +2847,66 @@ def _build_complete_pilot_campaign(
             screening_schema_version="screening_decisions_v3",
         ),
     )
-    top_writer.write_control(
-        metadata={
+    top_metadata: dict[str, object] = {
             "run_label": run_label,
             "component": "benchmark",
             "scope": "pilot",
-            "staging_root_alias": "staging",
-            "planned_archive_root_aliases": ["archive"],
+            "staging_root_alias": staging_alias,
+            "planned_archive_root_aliases": [archive_alias],
             "source_snapshot": dict(_SOURCE_SNAPSHOT),
             "persistence_attribution": "primary_active_writes_v1",
-        },
+    }
+    if recovery_identity is not None:
+        top_metadata.update(
+            {
+                "repository_revision": recovery_identity.repository_revision,
+                "repository_tree": recovery_identity.repository_tree,
+                "campaign_identity_sha256": recovery_identity.identity_sha256,
+                "recovery_protocol_schema": "stage05.2-campaign-recovery-v1",
+                "runtime_identity": predecessor_metadata["runtime_identity"],
+                "campaign_config": campaign_config_payload,
+                "worker_count": 6,
+            }
+        )
+    top_writer.write_control(
+        metadata=top_metadata,
         configuration_path=Path("configs/stage052_performance.toml"),
     )
+    campaign_plan_path = campaign_dir / "control" / "campaign_plan.json"
+    _write_signed_json(campaign_plan_path, campaign_plan_payload)
+    top_writer.record_existing_file(
+        campaign_plan_path,
+        artifact_type="campaign_plan",
+    )
+    top_writer.record_existing_file(
+        campaign_plan_path.with_suffix(".sha256"),
+        artifact_type="campaign_plan_sidecar",
+        storage_format="sha256_control",
+    )
+    if recovery_identity is not None:
+        identity_path = campaign_dir / "control" / "campaign_identity.json"
+        top_writer.record_existing_file(
+            identity_path,
+            artifact_type="campaign_identity",
+        )
+        top_writer.record_existing_file(
+            identity_path.with_suffix(".sha256"),
+            artifact_type="campaign_identity_sidecar",
+            storage_format="sha256_control",
+        )
+        recovery_root = campaign_dir / "control" / "recovery"
+        for recovery_path in sorted(recovery_root.rglob("*")):
+            if not recovery_path.is_file():
+                continue
+            top_writer.record_existing_file(
+                recovery_path,
+                artifact_type="campaign_recovery_control",
+                storage_format=(
+                    "sha256_control"
+                    if recovery_path.suffix == ".sha256"
+                    else "json"
+                ),
+            )
     top_writer.record_existing_file(campaign_path, artifact_type="campaign_manifest")
     top_writer.record_existing_file(
         campaign_path.with_suffix(".sha256"),
@@ -2691,7 +2956,7 @@ def _build_complete_pilot_campaign(
     planned_batch = replace(
         batch,
         status="planned",
-        root_alias="staging",
+        root_alias=staging_alias,
         checksum_sha256=None,
         actual_bytes=None,
         row_count=None,
@@ -2766,8 +3031,8 @@ def _build_complete_pilot_campaign(
         run_label=run_label,
         batch_id="batch9001",
         status="archived",
-        root_alias="archive",
-        archive_root_alias="archive",
+        root_alias=archive_alias,
+        archive_root_alias=archive_alias,
         logical_path=dry_logical_path,
         volume=volume,
         shard_ids=("shard9001",),
@@ -2792,12 +3057,12 @@ def _build_complete_pilot_campaign(
         {
             "schema_version": "stage05.2-archive-dry-run-v1",
             "run_label": run_label,
-            "staging_root_alias": "staging",
-            "archive_root_aliases_exercised": ["archive"],
+            "staging_root_alias": staging_alias,
+            "archive_root_aliases_exercised": [archive_alias],
             "passed": True,
             "results": [
                 {
-                    "archive_root_alias": "archive",
+                    "archive_root_alias": archive_alias,
                     "logical_path": dry_logical_path,
                     "volume_identity": volume.to_dict(),
                     "transfer_mode": "same_volume_atomic_rename",
@@ -4279,7 +4544,10 @@ def test_actual_reviewer_outputs_match_for_control_and_recovered_semantics(
     roots = (tmp_path / "control", tmp_path / "recovered")
     for root in roots:
         root.mkdir()
-    built = [_build_complete_pilot_campaign(root) for root in roots]
+    built = [
+        _build_complete_pilot_campaign(roots[0]),
+        _build_complete_pilot_campaign(roots[1], recovered=True),
+    ]
     identities: dict[Path, Stage052PrerequisiteIdentity] = {}
     for root in roots:
         prerequisite = root / "stage05.2_accelerator_pilot_attempt02"
@@ -4310,6 +4578,18 @@ def test_actual_reviewer_outputs_match_for_control_and_recovered_semantics(
         "evrptw.experiments.stage052_campaign_review.verify_stage052_evidence_input",
         lambda raw_dir, _requirement: identities[raw_dir.resolve()],
     )
+    real_subprocess_run = campaign_review_module.subprocess.run
+
+    def _review_subprocess_run(*args: object, **kwargs: object) -> object:
+        command = args[0]
+        if (
+            isinstance(command, tuple)
+            and command[-1] == f"{'a' * 40}^{{tree}}"
+        ):
+            return SimpleNamespace(stdout=f"{'b' * 40}\n")
+        return real_subprocess_run(*args, **kwargs)
+
+    monkeypatch.setattr(campaign_review_module.subprocess, "run", _review_subprocess_run)
     reviewed: list[dict[str, Path]] = []
     for root, (campaign, locator, volume) in zip(roots, built, strict=True):
         reviewed.append(
@@ -4323,26 +4603,55 @@ def test_actual_reviewer_outputs_match_for_control_and_recovered_semantics(
                 volume_probe=lambda _path, expected=volume: expected,
             )
         )
+    control_review = json.loads(
+        reviewed[0]["review_manifest"].read_text(encoding="utf-8")
+    )
+    recovered_review = json.loads(
+        reviewed[1]["review_manifest"].read_text(encoding="utf-8")
+    )
+    assert control_review["gates"]["campaign_recovery"]["passed"] is True
+    assert "legacy campaign is immutable" in control_review["gates"][
+        "campaign_recovery"
+    ]["detail"]
+    assert recovered_review["gates"]["campaign_recovery"]["passed"] is True
+    assert "replayed 2 recovery epochs" in recovered_review["gates"][
+        "campaign_recovery"
+    ]["detail"]
+    assert recovered_review["status"] == control_review["status"] == "NOT_READY"
+    recovery_details = {
+        str(control_review["gates"]["campaign_recovery"]["detail"]),
+        str(recovered_review["gates"]["campaign_recovery"]["detail"]),
+    }
     assert set(reviewed[0]) == set(reviewed[1])
     for key in reviewed[0]:
         if key == "review_manifest":
             left = json.loads(reviewed[0][key].read_text(encoding="utf-8"))
             right = json.loads(reviewed[1][key].read_text(encoding="utf-8"))
             for payload in (left, right):
-                payload.pop("raw_manifest_sha256", None)
-                payload.pop("review_generation", None)
-                payload.pop("review_history", None)
-                payload["review_shard_metrics"] = [
-                    {
-                        field: metric[field]
-                        for field in (
-                            "batch_id",
-                            "shard_id",
-                            "canonical_merge_ordinal",
-                        )
-                    }
-                    for metric in payload["review_shard_metrics"]
-                ]
+                for field in (
+                    "raw_manifest_sha256",
+                    "raw_campaign_manifest_sha256",
+                    "persistence_attribution_sha256",
+                    "persistence_attribution_sidecar_sha256",
+                    "storage_publication_identity_sha256",
+                ):
+                    payload[field] = "<PROVENANCE_SHA256>"
+                payload["review_generation"] = "<REVIEW_GENERATION>"
+                payload["review_history"] = "<REVIEW_HISTORY>"
+                payload["files"] = "<PUBLISHED_FILE_LINEAGE>"
+                payload["publication_files"] = "<PUBLISHED_FILE_LINEAGE>"
+                payload["gates"]["campaign_recovery"]["detail"] = (
+                    "<RECOVERY_PROVENANCE>"
+                )
+                for batch_identity in payload["storage_publication_identity"][
+                    "batches"
+                ]:
+                    batch_identity["byte_count"] = "<PROVENANCE_BYTES>"
+                    batch_identity["tree_sha256"] = "<PROVENANCE_SHA256>"
+                for metric in payload["review_shard_metrics"]:
+                    metric["elapsed_seconds"] = "<REPLAY_TIME>"
+                    metric["events_per_second"] = "<REPLAY_RATE>"
+                    metric["child_peak_rss_bytes"] = "<REPLAY_RSS>"
             assert left == right
             continue
         left_text = reviewed[0][key].read_text(encoding="utf-8").replace(
@@ -4351,4 +4660,7 @@ def test_actual_reviewer_outputs_match_for_control_and_recovered_semantics(
         right_text = reviewed[1][key].read_text(encoding="utf-8").replace(
             str(roots[1]), "<ROOT>"
         )
+        for detail in recovery_details:
+            left_text = left_text.replace(detail, "<RECOVERY_PROVENANCE>")
+            right_text = right_text.replace(detail, "<RECOVERY_PROVENANCE>")
         assert left_text == right_text, key
