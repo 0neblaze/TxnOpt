@@ -1897,7 +1897,7 @@ def test_native_search_engine_plan_transaction_matches_python_across_rounds(
         context.reachability_epsilon,
         worker_count,
     )
-    engine.initialize(
+    initialized = engine.initialize(
         context.node_kind,
         context.demand,
         context.ready_time,
@@ -1912,6 +1912,11 @@ def test_native_search_engine_plan_transaction_matches_python_across_rounds(
         np.asarray([2014, 10, 128, 1, 20], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
     )
+    initialized[0][0].fill(0)
+    initialized[0][1].fill(-1)
+    initialized[0][4].fill(-1.0)
+    initialized[1].fill(-1)
+    initialized[2].fill(-1.0)
 
     python_control.begin_round(7, lane="constraint")
     python_evaluator.set_measurement_context(
@@ -2636,6 +2641,93 @@ def test_native_search_engine_constraint_probe_composes_all_native_layers() -> N
     assert transaction[5].tolist() == [0]
     assert transaction[10].tolist()[5:8] == [2, 2, 0]
 
+    with pytest.raises(RuntimeError, match="unapplied candidate"):
+        engine.constraint_probe(
+            0,
+            1,
+            0x5EED,
+            np.asarray([5, 1, 7], dtype=np.int64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        )
+
+    repair[0].fill(0)
+    repair[1].fill(1)
+    transaction[2].fill(-1)
+    transaction[3].fill(999.0)
+
+    assert engine.apply_last_candidate(1.0, 0.5) == (1, 0, 0)
+    solution = engine.solution_state()
+    assert solution[0].tolist() == [0, 2]
+    assert solution[1].tolist() == [2, 1]
+    assert solution[2].tolist() == [1, 0]
+    np.testing.assert_allclose(solution[3], np.asarray([4.0, 0.0]))
+    assert solution[4].tolist() == [0, 2]
+    assert solution[5].tolist() == [1, 2]
+    assert solution[6].tolist() == [1, 0]
+    np.testing.assert_allclose(solution[7], np.asarray([4.0, 0.0]))
+    best_payload = engine.best_solution_payload()
+    assert best_payload[0].tolist() == [0, 2]
+    assert best_payload[1].tolist() == [1, 2]
+    assert best_payload[2][2].tolist() == [0]
+    assert best_payload[3].tolist() == [1, 0]
+    np.testing.assert_allclose(best_payload[4], np.asarray([4.0, 0.0]))
+    solution[1].fill(-1)
+    solution[2].fill(-1)
+    best_payload[1].fill(-1)
+    best_payload[2][4].fill(-1.0)
+    fresh_solution = engine.solution_state()
+    fresh_best = engine.best_solution_payload()
+    assert fresh_solution[1].tolist() == [2, 1]
+    assert fresh_solution[2].tolist() == [1, 0]
+    assert fresh_best[1].tolist() == [1, 2]
+    np.testing.assert_allclose(fresh_best[2][4], np.asarray([[4.0, 4.0, 0.0, 0.0]]))
+    with pytest.raises(RuntimeError, match="no prepared candidate"):
+        engine.apply_last_candidate(1.0, 0.5)
+
+
+def test_native_search_engine_candidate_state_does_not_depend_on_cache_store() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 1, 1, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    assert engine.state()[0].tolist()[6] == 0
+
+    _removal, _repair, transaction = engine.constraint_probe(
+        0,
+        1,
+        0x5EED,
+        np.asarray([5, 0, 7], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+
+    assert transaction is not None
+    assert transaction[1].tolist() == [5]
+    assert engine.state()[0].tolist()[6] == 0
+    assert engine.apply_last_candidate(1.0, 0.5) == (1, 0, 0)
+    assert engine.solution_state()[1].tolist() == [2, 1]
+
 
 def test_native_search_engine_constraint_probe_uses_one_end_to_end_deadline() -> None:
     from evrptw import _core as native_core
@@ -2722,6 +2814,8 @@ def test_native_search_engine_constraint_probe_envelope_failure_rolls_back() -> 
     assert failed[2] == before[2]
     assert failed[3].tolist() == before[3].tolist()
     assert failed[1].tolist()[5:8] == [2, 2, 0]
+    with pytest.raises(RuntimeError, match="no prepared candidate"):
+        engine.apply_last_candidate(1.0, 0.5)
 
     _removal, _repair, recovered = engine.constraint_probe(
         0,

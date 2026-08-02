@@ -1992,19 +1992,20 @@ public:
                 statistics_[7] = std::max(statistics_[7], statistics_[6]);
                 statistics_[9] = std::max(statistics_[9], statistics_[8]);
             }
-        } catch (...) {
-            rollback_journal(journal);
-            throw;
-        }
-        active_batch_ = std::move(journal);
         py::array_t<std::int64_t> status_array(statuses.size());
         py::array_t<std::int64_t> eviction_array(eviction_counts.size());
         std::copy(statuses.begin(), statuses.end(), checked_data(status_array));
         std::copy(
             eviction_counts.begin(), eviction_counts.end(),
             checked_data(eviction_array));
-        return py::make_tuple(
+        auto result = py::make_tuple(
             std::move(status_array), std::move(eviction_array), statistics_array());
+        active_batch_ = std::move(journal);
+        return result;
+        } catch (...) {
+            rollback_journal(journal);
+            throw;
+        }
     }
 
     py::tuple begin_store_exact_many_atomic(
@@ -2613,6 +2614,7 @@ private:
         require_no_active_batch("prepare_protocol_commit");
         require_protocol_snapshot("prepare_protocol_commit");
     }
+
 };
 
 class NativeNegativeRouteCacheV2 {
@@ -9359,6 +9361,16 @@ public:
                 + (path_offsets[route + 1] - path_offsets[route])
                     * static_cast<std::int64_t>(sizeof(std::int64_t)));
         }
+        auto prepared_current_exact = owned_exact_state_copy(exact_payload);
+        auto prepared_current_objective_integer = owned_array_copy<std::int64_t>(
+            initialized[1], "initial_objective_integer", 1);
+        auto prepared_current_objective_float = owned_array_copy<double>(
+            initialized[2], "initial_objective_float", 1);
+        auto prepared_best_offsets = offsets_array;
+        auto prepared_best_indices = indices_array;
+        auto prepared_best_exact = prepared_current_exact;
+        auto prepared_best_objective_integer = prepared_current_objective_integer;
+        auto prepared_best_objective_float = prepared_current_objective_float;
         route_cache_.begin_store_exact_many_atomic(
             initial_route_offsets,
             initial_route_indices,
@@ -9370,14 +9382,19 @@ public:
             exact_payload[5],
             semantic_hashes,
             entry_bytes);
-        route_cache_.commit_store_batch();
-        current_offsets_ = owned_array_copy<std::int64_t>(
-            offsets_array, "initial_route_offsets", 1);
-        current_indices_ = owned_array_copy<std::int64_t>(
-            indices_array, "initial_route_indices", 1);
-        current_exact_payload_ = exact_payload;
-        current_objective_integer_ = py::cast<py::array_t<std::int64_t>>(initialized[1]);
-        current_objective_float_ = py::cast<py::array_t<double>>(initialized[2]);
+        route_cache_.prepare_store_commit();
+        route_cache_.commit_store_batch_noexcept();
+        current_offsets_ = std::move(offsets_array);
+        current_indices_ = std::move(indices_array);
+        current_exact_payload_ = std::move(prepared_current_exact);
+        current_objective_integer_ =
+            std::move(prepared_current_objective_integer);
+        current_objective_float_ = std::move(prepared_current_objective_float);
+        best_offsets_ = std::move(prepared_best_offsets);
+        best_indices_ = std::move(prepared_best_indices);
+        best_exact_payload_ = std::move(prepared_best_exact);
+        best_objective_integer_ = std::move(prepared_best_objective_integer);
+        best_objective_float_ = std::move(prepared_best_objective_float);
         batch_size_ = checked_data<std::int64_t>(control_array)[2];
         initialized_ = true;
         return initialized;
@@ -9400,6 +9417,10 @@ public:
         if (!initialized_) {
             throw std::runtime_error(
                 "full native search engine must be initialized before plan evaluation");
+        }
+        if (last_candidate_ready_) {
+            throw std::runtime_error(
+                "full native search engine has an unapplied candidate");
         }
         auto plans_array = owned_array_copy<std::int64_t>(
             plan_offsets, "plan_offsets", 1);
@@ -10048,8 +10069,30 @@ public:
         append_evidence_array(evidence, negative_statistics);
         append_evidence_array(evidence, budget_state);
         append_evidence_array(evidence, feasible_order_array);
+        std::vector<std::int64_t> transaction_path_offsets{0};
+        std::vector<std::int64_t> transaction_path_indices;
+        py::array_t<std::int64_t> transaction_statuses(route_count);
+        py::array_t<std::int64_t> transaction_reasons(route_count);
+        py::array_t<double> transaction_metrics(
+            {static_cast<py::ssize_t>(route_count), py::ssize_t(4)});
+        py::array_t<std::int64_t> transaction_labels(
+            {static_cast<py::ssize_t>(route_count), py::ssize_t(3)});
+        std::fill(
+            checked_data(transaction_statuses),
+            checked_data(transaction_statuses) + route_count, -1);
+        std::fill(
+            checked_data(transaction_reasons),
+            checked_data(transaction_reasons) + route_count, -1);
+        std::fill(
+            checked_data(transaction_metrics),
+            checked_data(transaction_metrics) + route_count * 4, 0.0);
+        std::fill(
+            checked_data(transaction_labels),
+            checked_data(transaction_labels) + route_count * 3, 0);
         for (std::size_t route = 0; route < route_payloads.size(); ++route) {
             if (!route_payloads[route].has_value()) {
+                transaction_path_offsets.push_back(
+                    static_cast<std::int64_t>(transaction_path_indices.size()));
                 continue;
             }
             const auto& payload = *route_payloads[route];
@@ -10064,7 +10107,34 @@ public:
                 payload.label_counters.size());
             append_evidence_values(
                 evidence, payload.path.data(), payload.path.size());
+            transaction_path_indices.insert(
+                transaction_path_indices.end(), payload.path.begin(), payload.path.end());
+            transaction_path_offsets.push_back(
+                static_cast<std::int64_t>(transaction_path_indices.size()));
+            checked_data(transaction_statuses)[route] = payload.status;
+            checked_data(transaction_reasons)[route] = payload.reason;
+            std::copy(
+                payload.metrics.begin(), payload.metrics.end(),
+                checked_data(transaction_metrics) + route * 4);
+            std::copy(
+                payload.label_counters.begin(), payload.label_counters.end(),
+                checked_data(transaction_labels) + route * 3);
         }
+        py::array_t<std::int64_t> transaction_path_offsets_array(
+            transaction_path_offsets.size());
+        py::array_t<std::int64_t> transaction_path_indices_array(
+            transaction_path_indices.size());
+        std::copy(
+            transaction_path_offsets.begin(), transaction_path_offsets.end(),
+            checked_data(transaction_path_offsets_array));
+        std::copy(
+            transaction_path_indices.begin(), transaction_path_indices.end(),
+            checked_data(transaction_path_indices_array));
+        auto transaction_exact_payload = py::make_tuple(
+            std::move(transaction_path_offsets_array),
+            std::move(transaction_path_indices_array),
+            std::move(transaction_statuses), std::move(transaction_reasons),
+            std::move(transaction_metrics), std::move(transaction_labels));
         auto result = py::make_tuple(
             std::move(selected_array), std::move(status_array),
             std::move(objective_integer), std::move(objective_float),
@@ -10106,6 +10176,8 @@ public:
             pending_negative_store_ = negative_store_active;
             pending_attempted_mark_ = attempted_mark_active;
             pending_budget_snapshot_.emplace(round_budget_snapshot);
+            pending_candidate_exact_payload_ = transaction_exact_payload;
+            pending_candidate_exact_ready_ = !feasible_plan_ids.empty();
             pending_composite_active_ = true;
             round_protocol_active = false;
             negative_store_active = false;
@@ -10154,6 +10226,10 @@ public:
         if (!initialized_) {
             throw std::runtime_error(
                 "full native search engine must be initialized before a constraint probe");
+        }
+        if (last_candidate_ready_) {
+            throw std::runtime_error(
+                "full native search engine has an unapplied candidate");
         }
         const auto probe_started = std::chrono::steady_clock::now();
         auto context_array = owned_array_copy<std::int64_t>(
@@ -10242,6 +10318,7 @@ public:
             return result;
         }
         auto repaired_offsets = py::cast<py::array_t<std::int64_t>>(repair[0]);
+        auto repaired_indices = py::cast<py::array_t<std::int64_t>>(repair[1]);
         py::array_t<std::int64_t> plan_offsets(2);
         checked_data(plan_offsets)[0] = 0;
         checked_data(plan_offsets)[1] = repaired_offsets.size() - 1;
@@ -10269,6 +10346,43 @@ public:
                 batch_array,
                 expected_array);
             defer_composite_commit_ = false;
+            auto feasible_order = py::cast<py::array_t<std::int64_t>>(transaction[11]);
+            const auto candidate_ready = feasible_order.size() > 0;
+            py::tuple candidate_exact;
+            py::array_t<std::int64_t> candidate_offsets;
+            py::array_t<std::int64_t> candidate_indices;
+            py::array_t<std::int64_t> candidate_objective_integer;
+            py::array_t<double> candidate_objective_float;
+            if (candidate_ready) {
+                const auto plan_id = checked_data<std::int64_t>(feasible_order)[0];
+                if (plan_id != 0) {
+                    throw std::logic_error(
+                        "full native constraint probe returned an unknown plan identity");
+                }
+                if (!pending_candidate_exact_ready_) {
+                    throw std::logic_error(
+                        "full native constraint probe lost its exact candidate payload");
+                }
+                candidate_exact = pending_candidate_exact_payload_;
+                candidate_offsets = owned_array_copy<std::int64_t>(
+                    repaired_offsets, "prepared_candidate_offsets", 1);
+                candidate_indices = owned_array_copy<std::int64_t>(
+                    repaired_indices, "prepared_candidate_indices", 1);
+                auto objective_integer_matrix =
+                    py::cast<py::array_t<std::int64_t>>(transaction[2]);
+                auto objective_float_matrix =
+                    py::cast<py::array_t<double>>(transaction[3]);
+                candidate_objective_integer = py::array_t<std::int64_t>(2);
+                candidate_objective_float = py::array_t<double>(2);
+                std::copy(
+                    checked_data<std::int64_t>(objective_integer_matrix),
+                    checked_data<std::int64_t>(objective_integer_matrix) + 2,
+                    checked_data(candidate_objective_integer));
+                std::copy(
+                    checked_data<double>(objective_float_matrix),
+                    checked_data<double>(objective_float_matrix) + 2,
+                    checked_data(candidate_objective_float));
+            }
             auto result = py::make_tuple(
                 std::move(removal), std::move(repair), std::move(transaction));
             require_deadline();
@@ -10278,6 +10392,16 @@ public:
                     "injected full native constraint-probe envelope failure");
             }
             commit_pending_composite_noexcept();
+            if (candidate_ready) {
+                last_candidate_offsets_ = std::move(candidate_offsets);
+                last_candidate_indices_ = std::move(candidate_indices);
+                last_candidate_exact_payload_ = std::move(candidate_exact);
+                last_candidate_objective_integer_ =
+                    std::move(candidate_objective_integer);
+                last_candidate_objective_float_ =
+                    std::move(candidate_objective_float);
+            }
+            last_candidate_ready_ = candidate_ready;
             return result;
         } catch (...) {
             defer_composite_commit_ = false;
@@ -10286,6 +10410,103 @@ public:
             }
             throw;
         }
+    }
+
+    py::tuple apply_last_candidate(double temperature, double random_draw) {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (!last_candidate_ready_) {
+            throw std::runtime_error(
+                "full native search engine has no prepared candidate to apply");
+        }
+        if (!std::isfinite(temperature) || temperature <= 0.0
+            || !std::isfinite(random_draw) || random_draw < 0.0
+            || random_draw > 1.0) {
+            throw std::invalid_argument(
+                "full native candidate acceptance inputs are invalid");
+        }
+        const auto objective_key = [](const py::array_t<std::int64_t>& integers,
+                                      const py::array_t<double>& floats) {
+            constexpr auto scale = 1'000'000'000.0;
+            const auto* integer_values = checked_data<std::int64_t>(integers);
+            const auto* float_values = checked_data<double>(floats);
+            return std::make_tuple(
+                integer_values[0],
+                std::nearbyint(float_values[0] * scale) / scale,
+                std::nearbyint(float_values[1] * scale) / scale,
+                integer_values[1]);
+        };
+        const auto current_key = objective_key(
+            current_objective_integer_, current_objective_float_);
+        const auto candidate_key = objective_key(
+            last_candidate_objective_integer_, last_candidate_objective_float_);
+        const auto best_key = objective_key(
+            best_objective_integer_, best_objective_float_);
+        const auto current_vehicles = std::get<0>(current_key);
+        const auto candidate_vehicles = std::get<0>(candidate_key);
+        bool accepted = false;
+        if (candidate_vehicles < current_vehicles) {
+            accepted = true;
+        } else if (candidate_vehicles == current_vehicles
+                   && candidate_key <= current_key) {
+            accepted = true;
+        } else if (candidate_vehicles == current_vehicles
+                   && std::get<1>(candidate_key) != std::get<1>(current_key)) {
+            const auto distance_delta =
+                checked_data<double>(last_candidate_objective_float_)[0]
+                - checked_data<double>(current_objective_float_)[0];
+            accepted = random_draw < std::exp(-distance_delta / temperature);
+        }
+        const auto improved_best = accepted && candidate_key < best_key;
+        const auto vehicle_reduction = accepted
+            && candidate_vehicles < current_vehicles;
+        py::array_t<std::int64_t> next_current_offsets;
+        py::array_t<std::int64_t> next_current_indices;
+        py::tuple next_current_exact;
+        py::array_t<std::int64_t> next_current_objective_integer;
+        py::array_t<double> next_current_objective_float;
+        py::array_t<std::int64_t> next_best_offsets;
+        py::array_t<std::int64_t> next_best_indices;
+        py::tuple next_best_exact;
+        py::array_t<std::int64_t> next_best_objective_integer;
+        py::array_t<double> next_best_objective_float;
+        if (accepted) {
+            next_current_offsets = last_candidate_offsets_;
+            next_current_indices = last_candidate_indices_;
+            next_current_exact = last_candidate_exact_payload_;
+            next_current_objective_integer = last_candidate_objective_integer_;
+            next_current_objective_float = last_candidate_objective_float_;
+        }
+        if (improved_best) {
+            next_best_offsets = last_candidate_offsets_;
+            next_best_indices = last_candidate_indices_;
+            next_best_exact = last_candidate_exact_payload_;
+            next_best_objective_integer = last_candidate_objective_integer_;
+            next_best_objective_float = last_candidate_objective_float_;
+        }
+        auto result = py::make_tuple(
+            accepted ? 1 : 0,
+            improved_best ? 1 : 0,
+            vehicle_reduction ? 1 : 0);
+        if (accepted) {
+            current_offsets_ = std::move(next_current_offsets);
+            current_indices_ = std::move(next_current_indices);
+            current_exact_payload_ = std::move(next_current_exact);
+            current_objective_integer_ = std::move(next_current_objective_integer);
+            current_objective_float_ = std::move(next_current_objective_float);
+        }
+        if (improved_best) {
+            best_offsets_ = std::move(next_best_offsets);
+            best_indices_ = std::move(next_best_indices);
+            best_exact_payload_ = std::move(next_best_exact);
+            best_objective_integer_ = std::move(next_best_objective_integer);
+            best_objective_float_ = std::move(next_best_objective_float);
+        }
+        last_candidate_ready_ = false;
+        return result;
     }
 
     void inject_constraint_probe_envelope_failure_once() {
@@ -10334,6 +10555,57 @@ public:
             py::cast<py::array_t<std::int64_t>>(negative[3]));
     }
 
+    py::tuple solution_state() const {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (!initialized_) {
+            throw std::runtime_error(
+                "full native search engine must be initialized before solution inspection");
+        }
+        return py::make_tuple(
+            owned_array_copy<std::int64_t>(
+                current_offsets_, "current_route_offsets", 1),
+            owned_array_copy<std::int64_t>(
+                current_indices_, "current_route_indices", 1),
+            owned_array_copy<std::int64_t>(
+                current_objective_integer_, "current_objective_integer", 1),
+            owned_array_copy<double>(
+                current_objective_float_, "current_objective_float", 1),
+            owned_array_copy<std::int64_t>(
+                best_offsets_, "best_route_offsets", 1),
+            owned_array_copy<std::int64_t>(
+                best_indices_, "best_route_indices", 1),
+            owned_array_copy<std::int64_t>(
+                best_objective_integer_, "best_objective_integer", 1),
+            owned_array_copy<double>(
+                best_objective_float_, "best_objective_float", 1));
+    }
+
+    py::tuple best_solution_payload() const {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (!initialized_) {
+            throw std::runtime_error(
+                "full native search engine must be initialized before best inspection");
+        }
+        return py::make_tuple(
+            owned_array_copy<std::int64_t>(
+                best_offsets_, "best_route_offsets", 1),
+            owned_array_copy<std::int64_t>(
+                best_indices_, "best_route_indices", 1),
+            owned_exact_state_copy(best_exact_payload_),
+            owned_array_copy<std::int64_t>(
+                best_objective_integer_, "best_objective_integer", 1),
+            owned_array_copy<double>(
+                best_objective_float_, "best_objective_float", 1));
+    }
+
 private:
     mutable std::recursive_mutex state_mutex_;
     NativeRouteCacheV2 route_cache_;
@@ -10352,6 +10624,8 @@ private:
     bool pending_negative_store_ = false;
     bool pending_attempted_mark_ = false;
     std::optional<NativeBudgetStateV2::NativeSnapshot> pending_budget_snapshot_;
+    bool pending_candidate_exact_ready_ = false;
+    py::tuple pending_candidate_exact_payload_;
     std::int64_t depot_ = -1;
     std::vector<std::int64_t> recharge_nodes_;
     std::unordered_set<std::int64_t> all_customers_;
@@ -10370,12 +10644,38 @@ private:
     py::tuple current_exact_payload_;
     py::array_t<std::int64_t> current_objective_integer_;
     py::array_t<double> current_objective_float_;
+    py::array_t<std::int64_t> best_offsets_;
+    py::array_t<std::int64_t> best_indices_;
+    py::tuple best_exact_payload_;
+    py::array_t<std::int64_t> best_objective_integer_;
+    py::array_t<double> best_objective_float_;
+    bool last_candidate_ready_ = false;
+    py::array_t<std::int64_t> last_candidate_offsets_;
+    py::array_t<std::int64_t> last_candidate_indices_;
+    py::tuple last_candidate_exact_payload_;
+    py::array_t<std::int64_t> last_candidate_objective_integer_;
+    py::array_t<double> last_candidate_objective_float_;
+
+    static py::tuple owned_exact_state_copy(const py::tuple& payload) {
+        if (payload.size() < 6) {
+            throw std::logic_error(
+                "full native exact state lost its typed schema");
+        }
+        return py::make_tuple(
+            owned_array_copy<std::int64_t>(payload[0], "path_offsets", 1),
+            owned_array_copy<std::int64_t>(payload[1], "path_indices", 1),
+            owned_array_copy<std::int64_t>(payload[2], "result_statuses", 1),
+            owned_array_copy<std::int64_t>(payload[3], "reason_codes", 1),
+            owned_array_copy<double>(payload[4], "result_metrics", 2),
+            owned_array_copy<std::int64_t>(payload[5], "label_counters", 2));
+    }
 
     void clear_pending_composite_noexcept() noexcept {
         pending_round_protocol_ = false;
         pending_negative_store_ = false;
         pending_attempted_mark_ = false;
         pending_budget_snapshot_.reset();
+        pending_candidate_exact_ready_ = false;
         pending_composite_active_ = false;
     }
 
@@ -11231,6 +11531,9 @@ PYBIND11_MODULE(_core, module) {
             py::arg("seed"), py::arg("context_ids"),
             py::arg("deadline_remaining"), py::arg("batch_size"),
             py::arg("route_change_limit"))
+        .def(
+            "apply_last_candidate", &NativeSearchEngineV2::apply_last_candidate,
+            py::arg("temperature"), py::arg("random_draw"))
         .def("initialized", &NativeSearchEngineV2::initialized)
         .def(
             "inject_commit_failure_once",
@@ -11239,7 +11542,11 @@ PYBIND11_MODULE(_core, module) {
         .def(
             "inject_constraint_probe_envelope_failure_once",
             &NativeSearchEngineV2::inject_constraint_probe_envelope_failure_once)
-        .def("state", &NativeSearchEngineV2::state);
+        .def("state", &NativeSearchEngineV2::state)
+        .def("solution_state", &NativeSearchEngineV2::solution_state)
+        .def(
+            "best_solution_payload",
+            &NativeSearchEngineV2::best_solution_payload);
     py::class_<Stage052ReplayState>(module, "Stage052ReplayState")
         .def(
             py::init<const py::dict&, const py::dict&>(),

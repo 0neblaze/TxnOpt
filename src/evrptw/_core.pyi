@@ -351,6 +351,11 @@ class NativeSearchEngineV2:
         ]
         | None,
     ]: ...
+    def apply_last_candidate(
+        self,
+        temperature: float,
+        random_draw: float,
+    ) -> tuple[int, int, int]: ...
     def initialized(self) -> bool: ...
     def inject_commit_failure_once(self, step: int) -> None: ...
     def inject_constraint_probe_envelope_failure_once(self) -> None: ...
@@ -361,6 +366,34 @@ class NativeSearchEngineV2:
         npt.NDArray[np.int64],
         int,
         npt.NDArray[np.int64],
+    ]: ...
+    def solution_state(
+        self,
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+    ]: ...
+    def best_solution_payload(
+        self,
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        tuple[
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.int64],
+            npt.NDArray[np.float64],
+            npt.NDArray[np.int64],
+        ],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
     ]: ...
 
 __build_git_revision__: str
