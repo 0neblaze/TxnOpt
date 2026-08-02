@@ -9,6 +9,7 @@ from typing import Any
 from evrptw.charging import solve_exact_charging
 from evrptw.experiments.stage052_native_architecture_review import (
     ReviewRecord,
+    _raw_axis_inventory,
     _scheduler_screening_occupancy,
     render_report,
     review_records,
@@ -63,7 +64,9 @@ def test_pilot_plan_has_180_wall_clock_axes_and_independent_labels(
     assert all("_pilot_attempt01" in label for label in labels.values())
 
 
-def _review_fixture_records(root: Path) -> tuple[ReviewRecord, ...]:
+def _review_fixture_records(
+    root: Path, evidence_root: Path
+) -> tuple[ReviewRecord, ...]:
     instance = parse_schneider(root / "data/schneider/c101C5.txt")
     charging = [solve_exact_charging(instance, (customer.name,)) for customer in instance.customers]
     assert all(result.feasible for result in charging)
@@ -140,14 +143,22 @@ def _review_fixture_records(root: Path) -> tuple[ReviewRecord, ...]:
                 "exact_started_per_second": 10.0,
             },
         }
-        records.append(ReviewRecord(root / f"{mode.value}.json", payload))
+        path = evidence_root / f"{mode.value}.json"
+        data = json.dumps(payload, sort_keys=True).encode("utf-8")
+        path.write_bytes(data)
+        path.with_suffix(path.suffix + ".sha256").write_text(
+            hashlib.sha256(data).hexdigest(), encoding="ascii"
+        )
+        records.append(ReviewRecord(path, payload))
     return tuple(records)
 
 
-def test_independent_review_replays_routes_and_accepts_equal_fixed_work() -> None:
+def test_independent_review_replays_routes_and_accepts_equal_fixed_work(
+    tmp_path: Path,
+) -> None:
     root = Path(__file__).resolve().parents[1]
     review = review_records(
-        _review_fixture_records(root),
+        _review_fixture_records(root, tmp_path),
         scope="paired",
         benchmark_dir=root / "data/schneider",
     )
@@ -159,9 +170,11 @@ def test_independent_review_replays_routes_and_accepts_equal_fixed_work() -> Non
     assert "五模式事实表" in render_report(review)
 
 
-def test_cuda_condition_does_not_reuse_exact_backend_occupancy() -> None:
+def test_cuda_condition_does_not_reuse_exact_backend_occupancy(
+    tmp_path: Path,
+) -> None:
     root = Path(__file__).resolve().parents[1]
-    records = list(_review_fixture_records(root))
+    records = list(_review_fixture_records(root, tmp_path))
     host = next(record for record in records if record.mode.value == "host_scheduler")
     assert isinstance(host.payload, dict)
     host.payload["backend_metrics"] = {"launch_occupancies": [64]}
@@ -174,6 +187,19 @@ def test_cuda_condition_does_not_reuse_exact_backend_occupancy() -> None:
         "maximum": None,
         "reason": "native candidate-screening occupancy is not recorded",
     }
+
+
+def test_raw_axis_inventory_binds_json_and_sidecar_bytes(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    records = _review_fixture_records(root, tmp_path)
+    before = _raw_axis_inventory(records)
+    sidecar = records[0].path.with_suffix(records[0].path.suffix + ".sha256")
+    sidecar.write_text(sidecar.read_text(encoding="ascii") + "\n", encoding="ascii")
+
+    after = _raw_axis_inventory(records)
+
+    assert before["axis_count"] == len(MODES)
+    assert before["tree_sha256"] != after["tree_sha256"]
 
 
 def test_review_writer_emits_hash_bound_review_manifest(tmp_path: Path) -> None:

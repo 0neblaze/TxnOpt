@@ -376,6 +376,60 @@ def _verify_sidecar(path: Path) -> str:
     return actual
 
 
+def _raw_axis_inventory(records: Iterable[ReviewRecord]) -> dict[str, object]:
+    values = tuple(records)
+
+    def inventory(selected: Iterable[ReviewRecord]) -> dict[str, object]:
+        entries: list[dict[str, object]] = []
+        json_bytes = 0
+        sidecar_bytes = 0
+        for record in sorted(
+            selected,
+            key=lambda item: (_string(item.payload, "run_label"), item.key),
+        ):
+            sidecar = record.path.with_suffix(record.path.suffix + ".sha256")
+            raw_data = record.path.read_bytes()
+            sidecar_data = sidecar.read_bytes()
+            json_bytes += len(raw_data)
+            sidecar_bytes += len(sidecar_data)
+            entries.append(
+                {
+                    "logical_axis": [
+                        _string(record.payload, "run_label"),
+                        *record.key,
+                    ],
+                    "json_sha256": hashlib.sha256(raw_data).hexdigest(),
+                    "sidecar_sha256": hashlib.sha256(sidecar_data).hexdigest(),
+                }
+            )
+        canonical = json.dumps(
+            entries,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        return {
+            "axis_count": len(entries),
+            "json_bytes": json_bytes,
+            "sidecar_bytes": sidecar_bytes,
+            "tree_sha256": hashlib.sha256(
+                b"stage05.2-native-axis-inventory-v1\0" + canonical
+            ).hexdigest(),
+        }
+
+    aggregate = inventory(values)
+    aggregate["algorithm"] = (
+        "sha256(stage05.2-native-axis-inventory-v1\\0 + canonical JSON of "
+        "logical axis, JSON SHA-256, and sidecar SHA-256)"
+    )
+    aggregate["by_mode"] = {
+        mode.value: inventory(record for record in values if record.mode is mode)
+        for mode in MODES
+    }
+    return aggregate
+
+
 def _historical_pilot(
     root: Path = HISTORICAL_PILOT_ROOT,
 ) -> tuple[dict[tuple[str, int], dict[str, object]], dict[str, object]]:
@@ -431,6 +485,9 @@ def _historical_pilot(
             or review_manifest.get("scope") != "pilot"
             or review_manifest.get("status")
             != "READY_FOR_STAGE052_FORMAL_BENCHMARK"
+            or review_manifest.get("raw_campaign_manifest_sha256")
+            != campaign_sha256
+            or review_manifest.get("raw_manifest_sha256") != raw_manifest_sha256
             or review_execution.get("review_manifest_sha256")
             != review_manifest_sha256
             or review_execution.get("raw_manifest_sha256_before")
@@ -835,6 +892,7 @@ def review_records(
         ),
         "producer_identity": _producer_identity(records),
         "reviewer_provenance": _reviewer_provenance(),
+        "raw_axis_inventory": _raw_axis_inventory(records),
         "formal_started": False,
         "production_default_changed": False,
         "qualification_passed": qualification_passed,
@@ -1143,6 +1201,7 @@ __all__ = (
     "REVIEW_SCHEMA_VERSION",
     "ReviewRecord",
     "_historical_pilot",
+    "_raw_axis_inventory",
     "_scheduler_screening_occupancy",
     "load_records",
     "render_report",
