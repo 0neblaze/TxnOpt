@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 import socket
@@ -15,7 +16,9 @@ from evrptw.alns import _Evaluator, solve_alns
 from evrptw.cache_incremental import (
     CacheIncrementalConfig,
     RouteEvaluationCache,
+    charging_result_semantic_digest,
     charging_result_semantic_payload,
+    estimate_cache_entry_bytes,
 )
 from evrptw.candidate_control import CandidateControlConfig, CandidateControlRuntime
 from evrptw.candidate_transaction import (
@@ -838,6 +841,29 @@ def test_native_stage04_segment_update_matches_python_config() -> None:
 
 
 @pytest.mark.parametrize(
+    "payload",
+    [
+        b"",
+        b"abc",
+        bytes(range(55)),
+        bytes(range(56)),
+        bytes(range(64)),
+        bytes(range(255)) * 3,
+    ],
+)
+def test_native_sha256_matches_hashlib_across_block_boundaries(payload: bytes) -> None:
+    from evrptw import _core as native_core
+
+    digest, hexadecimal = native_core.native_sha256_v1(
+        np.frombuffer(payload, dtype=np.uint8),
+    )
+    expected = hashlib.sha256(payload).digest()
+
+    assert digest.tobytes() == expected
+    assert hexadecimal == expected.hex()
+
+
+@pytest.mark.parametrize(
     ("operation", "generator_name"),
     [
         (0, "_relocate_candidates"),
@@ -991,6 +1017,131 @@ def test_native_candidate_plan_ranking_matches_python_rank_key() -> None:
         [len(plan), sum(route not in current_set for route in plan)] for plan in plans
     ]
     assert float_metrics.tolist() == [sum(bounds) for bounds in per_route_lower_bounds]
+
+
+def test_native_route_cache_atomic_lru_matches_python_cache() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    config = CacheIncrementalConfig(
+        enabled=True,
+        max_entries=2,
+        max_memory_bytes=1_000_000,
+    )
+    python_cache = RouteEvaluationCache(instance, config)
+    native_cache = native_core.NativeRouteCacheV2(
+        config.max_entries,
+        config.max_memory_bytes,
+    )
+    routes = (("C1",), ("C2",), ("C1", "C2"))
+    results = tuple(solve_exact_charging(instance, route) for route in routes)
+    node_index = {node.name: index for index, node in enumerate(instance.nodes)}
+
+    def packed(selected: tuple[tuple[str, ...], ...]) -> tuple[np.ndarray, np.ndarray]:
+        offsets = [0]
+        indices: list[int] = []
+        for route in selected:
+            indices.extend(node_index[name] for name in route)
+            offsets.append(len(indices))
+        return (
+            np.asarray(offsets, dtype=np.int64),
+            np.asarray(indices, dtype=np.int64),
+        )
+
+    def hashes(selected_results: tuple[object, ...]) -> np.ndarray:
+        return np.asarray(
+            [
+                list(bytes.fromhex(charging_result_semantic_digest(result)))
+                for result in selected_results
+            ],
+            dtype=np.uint8,
+        )
+
+    def entry_sizes(selected_results: tuple[object, ...]) -> np.ndarray:
+        return np.asarray(
+            [estimate_cache_entry_bytes(result) for result in selected_results],
+            dtype=np.int64,
+        )
+
+    initial_offsets, initial_indices = packed(routes[:2])
+    python_cache.store_many_atomic(tuple(zip(routes[:2], results[:2], strict=True)))
+    native_statuses, native_evictions, _ = native_cache.begin_store_many_atomic(
+        initial_offsets,
+        initial_indices,
+        hashes(results[:2]),
+        entry_sizes(results[:2]),
+    )
+    native_cache.commit_store_batch()
+    assert native_statuses.tolist() == [0, 0]
+    assert native_evictions.tolist() == [0, 0]
+
+    first_offsets, first_indices = packed((routes[0],))
+    assert python_cache.lookup(routes[0]).hit
+    native_hits, native_hashes, native_statistics = native_cache.lookup_many(
+        first_offsets,
+        first_indices,
+    )
+    assert native_hits.tolist() == [1]
+    assert native_hashes[0].tolist() == hashes((results[0],))[0].tolist()
+    assert native_statistics.tolist() == list(python_cache.statistics.to_dict().values())
+
+    third_offsets, third_indices = packed((routes[2],))
+    python_batch = python_cache.begin_store_many_atomic(((routes[2], results[2]),))
+    native_statuses, native_evictions, _ = native_cache.begin_store_many_atomic(
+        third_offsets,
+        third_indices,
+        hashes((results[2],)),
+        entry_sizes((results[2],)),
+    )
+    assert native_statuses.tolist() == [0]
+    assert native_evictions.tolist() == [1]
+    python_cache.rollback_store_batch(python_batch)
+    native_statistics = native_cache.rollback_store_batch()
+    assert native_statistics.tolist() == list(python_cache.statistics.to_dict().values())
+
+    snapshot = native_cache.snapshot()
+    snapshot_offsets, snapshot_indices, snapshot_hashes, snapshot_bytes, _ = snapshot
+    native_routes = tuple(
+        tuple(
+            int(value)
+            for value in snapshot_indices[
+                int(snapshot_offsets[index]) : int(snapshot_offsets[index + 1])
+            ]
+        )
+        for index in range(len(snapshot_offsets) - 1)
+    )
+    python_routes = tuple(
+        tuple(node_index[name] for name in key.customer_sequence)
+        for key in python_cache._entries
+    )
+    assert native_routes == python_routes
+    expected_by_route = dict(zip(routes, results, strict=True))
+    ordered_results = tuple(
+        expected_by_route[key.customer_sequence] for key in python_cache._entries
+    )
+    assert snapshot_hashes.tolist() == hashes(ordered_results).tolist()
+    assert snapshot_bytes.tolist() == entry_sizes(ordered_results).tolist()
+
+    with pytest.raises(RuntimeError, match="semantic conflict"):
+        python_cache.begin_store_many_atomic(((routes[0], results[1]),))
+    with pytest.raises(RuntimeError, match="semantic conflict"):
+        native_cache.begin_store_many_atomic(
+            first_offsets,
+            first_indices,
+            hashes((results[1],)),
+            entry_sizes((results[1],)),
+        )
+
+    python_batch = python_cache.begin_store_many_atomic(((routes[2], results[2]),))
+    python_cache.commit_store_batch(python_batch)
+    native_cache.begin_store_many_atomic(
+        third_offsets,
+        third_indices,
+        hashes((results[2],)),
+        entry_sizes((results[2],)),
+    )
+    native_statistics = native_cache.commit_store_batch()
+    assert native_statistics.tolist() == list(python_cache.statistics.to_dict().values())
 
 
 @pytest.mark.external_data

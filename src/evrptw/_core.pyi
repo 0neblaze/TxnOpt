@@ -18,6 +18,9 @@ def python_random_golden_v1(
     int,
     npt.NDArray[np.int64],
 ]: ...
+def native_sha256_v1(
+    payload: npt.NDArray[np.uint8],
+) -> tuple[npt.NDArray[np.uint8], str]: ...
 def native_objective_acceptance_v1(
     current_integer: npt.NDArray[np.int64],
     current_float: npt.NDArray[np.float64],
@@ -70,6 +73,38 @@ def rank_candidate_plans_v1(
     npt.NDArray[np.int64],
     npt.NDArray[np.float64],
 ]: ...
+
+class NativeRouteCacheV2:
+    def __init__(self, max_entries: int, max_memory_bytes: int) -> None: ...
+    def lookup_many(
+        self,
+        route_offsets: npt.NDArray[np.int64],
+        route_indices: npt.NDArray[np.int64],
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.uint8],
+        npt.NDArray[np.int64],
+    ]: ...
+    def begin_store_many_atomic(
+        self,
+        route_offsets: npt.NDArray[np.int64],
+        route_indices: npt.NDArray[np.int64],
+        semantic_hashes: npt.NDArray[np.uint8],
+        entry_bytes: npt.NDArray[np.int64],
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+    ]: ...
+    def commit_store_batch(self) -> npt.NDArray[np.int64]: ...
+    def rollback_store_batch(self) -> npt.NDArray[np.int64]: ...
+    def snapshot(self) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.uint8],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+    ]: ...
 
 __build_git_revision__: str
 

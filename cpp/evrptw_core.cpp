@@ -10,6 +10,7 @@
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -252,6 +253,175 @@ const T* checked_data(const py::array& array);
 
 template <typename T>
 T* checked_data(py::array_t<T>& array);
+
+class NativeSha256 {
+public:
+    void update(const std::uint8_t* data, std::size_t size) {
+        if (finalized_) {
+            throw std::logic_error("SHA-256 update after finalize");
+        }
+        total_bytes_ += size;
+        while (size > 0) {
+            const auto copied = std::min(size, block_.size() - block_size_);
+            std::copy(data, data + copied, block_.begin() + block_size_);
+            block_size_ += copied;
+            data += copied;
+            size -= copied;
+            if (block_size_ == block_.size()) {
+                transform(block_.data());
+                block_size_ = 0;
+            }
+        }
+    }
+
+    std::array<std::uint8_t, 32> finalize() {
+        if (finalized_) {
+            return digest_;
+        }
+        const auto bit_length = static_cast<std::uint64_t>(total_bytes_) * 8U;
+        block_[block_size_++] = 0x80U;
+        if (block_size_ > 56) {
+            std::fill(block_.begin() + block_size_, block_.end(), 0U);
+            transform(block_.data());
+            block_size_ = 0;
+        }
+        std::fill(block_.begin() + block_size_, block_.begin() + 56, 0U);
+        for (std::size_t byte = 0; byte < 8; ++byte) {
+            block_[63 - byte] = static_cast<std::uint8_t>(
+                (bit_length >> (byte * 8U)) & 0xffU);
+        }
+        transform(block_.data());
+        for (std::size_t word = 0; word < state_.size(); ++word) {
+            for (std::size_t byte = 0; byte < 4; ++byte) {
+                digest_[word * 4 + byte] = static_cast<std::uint8_t>(
+                    (state_[word] >> ((3 - byte) * 8U)) & 0xffU);
+            }
+        }
+        finalized_ = true;
+        return digest_;
+    }
+
+private:
+    static constexpr std::array<std::uint32_t, 64> constants_ = {
+        0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
+        0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
+        0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U,
+        0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
+        0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU,
+        0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
+        0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U,
+        0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
+        0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U,
+        0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+        0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U,
+        0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
+        0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U,
+        0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+        0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
+        0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U,
+    };
+    std::array<std::uint32_t, 8> state_ = {
+        0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U,
+    };
+    std::array<std::uint8_t, 64> block_{};
+    std::array<std::uint8_t, 32> digest_{};
+    std::size_t block_size_ = 0;
+    std::size_t total_bytes_ = 0;
+    bool finalized_ = false;
+
+    static std::uint32_t rotate_right(std::uint32_t value, std::uint32_t shift) {
+        return (value >> shift) | (value << (32U - shift));
+    }
+
+    void transform(const std::uint8_t* block) {
+        std::array<std::uint32_t, 64> words{};
+        for (std::size_t index = 0; index < 16; ++index) {
+            words[index] =
+                (static_cast<std::uint32_t>(block[index * 4]) << 24U)
+                | (static_cast<std::uint32_t>(block[index * 4 + 1]) << 16U)
+                | (static_cast<std::uint32_t>(block[index * 4 + 2]) << 8U)
+                | static_cast<std::uint32_t>(block[index * 4 + 3]);
+        }
+        for (std::size_t index = 16; index < words.size(); ++index) {
+            const auto small0 = rotate_right(words[index - 15], 7U)
+                ^ rotate_right(words[index - 15], 18U)
+                ^ (words[index - 15] >> 3U);
+            const auto small1 = rotate_right(words[index - 2], 17U)
+                ^ rotate_right(words[index - 2], 19U)
+                ^ (words[index - 2] >> 10U);
+            words[index] = words[index - 16] + small0 + words[index - 7] + small1;
+        }
+        auto a = state_[0];
+        auto b = state_[1];
+        auto c = state_[2];
+        auto d = state_[3];
+        auto e = state_[4];
+        auto f = state_[5];
+        auto g = state_[6];
+        auto h = state_[7];
+        for (std::size_t index = 0; index < words.size(); ++index) {
+            const auto big1 = rotate_right(e, 6U) ^ rotate_right(e, 11U)
+                ^ rotate_right(e, 25U);
+            const auto choose = (e & f) ^ ((~e) & g);
+            const auto first = h + big1 + choose + constants_[index] + words[index];
+            const auto big0 = rotate_right(a, 2U) ^ rotate_right(a, 13U)
+                ^ rotate_right(a, 22U);
+            const auto majority = (a & b) ^ (a & c) ^ (b & c);
+            const auto second = big0 + majority;
+            h = g;
+            g = f;
+            f = e;
+            e = d + first;
+            d = c;
+            c = b;
+            b = a;
+            a = first + second;
+        }
+        state_[0] += a;
+        state_[1] += b;
+        state_[2] += c;
+        state_[3] += d;
+        state_[4] += e;
+        state_[5] += f;
+        state_[6] += g;
+        state_[7] += h;
+    }
+};
+
+std::array<std::uint8_t, 32> native_sha256_digest(std::string_view payload) {
+    NativeSha256 hasher;
+    hasher.update(
+        reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size());
+    return hasher.finalize();
+}
+
+std::string native_sha256_digest_hex(
+    const std::array<std::uint8_t, 32>& digest) {
+    constexpr std::string_view hexadecimal = "0123456789abcdef";
+    std::string hex;
+    hex.reserve(64);
+    for (const auto byte : digest) {
+        hex.push_back(hexadecimal[byte >> 4U]);
+        hex.push_back(hexadecimal[byte & 0x0fU]);
+    }
+    return hex;
+}
+
+std::string native_sha256_hex(std::string_view payload) {
+    return native_sha256_digest_hex(native_sha256_digest(payload));
+}
+
+py::tuple native_sha256_v1(py::handle payload) {
+    auto payload_array = checked_array<std::uint8_t>(payload, "payload", 1);
+    const auto digest = native_sha256_digest(std::string_view(
+        reinterpret_cast<const char*>(checked_data<std::uint8_t>(payload_array)),
+        static_cast<std::size_t>(payload_array.size())));
+    py::array_t<std::uint8_t> digest_array(digest.size());
+    std::copy(digest.begin(), digest.end(), checked_data(digest_array));
+    return py::make_tuple(
+        std::move(digest_array), native_sha256_digest_hex(digest));
+}
 
 py::tuple python_random_golden_v1(
     std::uint64_t seed,
@@ -930,6 +1100,280 @@ py::tuple rank_candidate_plans_v1(
         std::move(ranked_array), std::move(selected_array),
         std::move(integer_metrics), std::move(float_metrics));
 }
+
+class NativeRouteCacheV2 {
+public:
+    NativeRouteCacheV2(std::int64_t max_entries, std::int64_t max_memory_bytes)
+        : max_entries_(max_entries), max_memory_bytes_(max_memory_bytes) {
+        if (max_entries_ <= 0 || max_memory_bytes_ <= 0) {
+            throw std::invalid_argument("native route-cache limits must be positive");
+        }
+    }
+
+    py::tuple lookup_many(py::handle route_offsets, py::handle route_indices) {
+        require_no_active_batch("lookup");
+        const auto routes = decode_routes(route_offsets, route_indices);
+        py::array_t<std::int64_t> hit_flags(routes.size());
+        py::array_t<std::uint8_t> hashes(
+            {static_cast<py::ssize_t>(routes.size()), py::ssize_t(32)});
+        std::fill(
+            checked_data(hashes), checked_data(hashes) + routes.size() * 32,
+            std::uint8_t{0});
+        for (std::size_t index = 0; index < routes.size(); ++index) {
+            ++statistics_[0];
+            const auto key = route_key(routes[index]);
+            seen_keys_.insert(key);
+            statistics_[10] = static_cast<std::int64_t>(seen_keys_.size());
+            const auto found = find_entry(key);
+            if (found == entries_.end()) {
+                ++statistics_[2];
+                checked_data(hit_flags)[index] = 0;
+                continue;
+            }
+            ++statistics_[1];
+            checked_data(hit_flags)[index] = 1;
+            std::copy(
+                found->semantic_hash.begin(), found->semantic_hash.end(),
+                checked_data(hashes) + index * 32);
+            entries_.splice(entries_.end(), entries_, found);
+        }
+        return py::make_tuple(
+            std::move(hit_flags), std::move(hashes), statistics_array());
+    }
+
+    py::tuple begin_store_many_atomic(
+        py::handle route_offsets,
+        py::handle route_indices,
+        py::handle semantic_hashes,
+        py::handle entry_bytes) {
+        require_no_active_batch("begin_store_many_atomic");
+        const auto routes = decode_routes(route_offsets, route_indices);
+        auto hashes_array = checked_array<std::uint8_t>(
+            semantic_hashes, "semantic_hashes", 2);
+        auto bytes_array = checked_array<std::int64_t>(
+            entry_bytes, "entry_bytes", 1);
+        if (hashes_array.shape(0) != static_cast<py::ssize_t>(routes.size())
+            || hashes_array.shape(1) != 32
+            || bytes_array.size() != static_cast<py::ssize_t>(routes.size())) {
+            throw std::invalid_argument("native route-cache store arrays do not align");
+        }
+        BatchJournal journal;
+        journal.statistics_before = statistics_;
+        journal.active = true;
+        std::vector<std::int64_t> statuses(routes.size(), 0);
+        std::vector<std::int64_t> eviction_counts(routes.size(), 0);
+        const auto* hashes = checked_data<std::uint8_t>(hashes_array);
+        const auto* bytes = checked_data<std::int64_t>(bytes_array);
+        try {
+            for (std::size_t index = 0; index < routes.size(); ++index) {
+                if (bytes[index] <= 0) {
+                    throw std::invalid_argument(
+                        "native route-cache entry bytes must be positive");
+                }
+                const auto key = route_key(routes[index]);
+                const auto existing = find_entry(key);
+                if (existing != entries_.end()) {
+                    if (!std::equal(
+                            existing->semantic_hash.begin(),
+                            existing->semantic_hash.end(), hashes + index * 32)) {
+                        throw std::runtime_error(
+                            "atomic native route-cache semantic conflict");
+                    }
+                    statuses[index] = 1;
+                    continue;
+                }
+                if (bytes[index] > max_memory_bytes_) {
+                    ++statistics_[5];
+                    statuses[index] = 2;
+                    continue;
+                }
+                journal.inserted_keys.push_back(key);
+                const std::unordered_set<std::string> inserted(
+                    journal.inserted_keys.begin(), journal.inserted_keys.end());
+                while (!entries_.empty()
+                       && (statistics_[6] >= max_entries_
+                           || statistics_[8] + bytes[index] > max_memory_bytes_)) {
+                    Entry evicted = std::move(entries_.front());
+                    entries_.pop_front();
+                    --statistics_[6];
+                    statistics_[8] -= evicted.entry_bytes;
+                    ++statistics_[4];
+                    ++eviction_counts[index];
+                    if (!inserted.contains(evicted.key)) {
+                        journal.evicted_entries.push_back(std::move(evicted));
+                    }
+                }
+                Entry stored;
+                stored.key = key;
+                stored.route = routes[index];
+                std::copy(
+                    hashes + index * 32, hashes + (index + 1) * 32,
+                    stored.semantic_hash.begin());
+                stored.entry_bytes = bytes[index];
+                entries_.push_back(std::move(stored));
+                ++statistics_[3];
+                ++statistics_[6];
+                statistics_[8] += bytes[index];
+                statistics_[7] = std::max(statistics_[7], statistics_[6]);
+                statistics_[9] = std::max(statistics_[9], statistics_[8]);
+            }
+        } catch (...) {
+            rollback_journal(journal);
+            throw;
+        }
+        active_batch_ = std::move(journal);
+        py::array_t<std::int64_t> status_array(statuses.size());
+        py::array_t<std::int64_t> eviction_array(eviction_counts.size());
+        std::copy(statuses.begin(), statuses.end(), checked_data(status_array));
+        std::copy(
+            eviction_counts.begin(), eviction_counts.end(),
+            checked_data(eviction_array));
+        return py::make_tuple(
+            std::move(status_array), std::move(eviction_array), statistics_array());
+    }
+
+    py::array_t<std::int64_t> commit_store_batch() {
+        require_active_batch("commit_store_batch");
+        active_batch_.reset();
+        return statistics_array();
+    }
+
+    py::array_t<std::int64_t> rollback_store_batch() {
+        require_active_batch("rollback_store_batch");
+        auto journal = std::move(*active_batch_);
+        active_batch_.reset();
+        rollback_journal(journal);
+        return statistics_array();
+    }
+
+    py::tuple snapshot() const {
+        std::vector<std::int64_t> offsets{0};
+        std::vector<std::int64_t> indices;
+        py::array_t<std::uint8_t> hashes(
+            {static_cast<py::ssize_t>(entries_.size()), py::ssize_t(32)});
+        py::array_t<std::int64_t> entry_bytes(entries_.size());
+        std::size_t ordinal = 0;
+        for (const auto& entry : entries_) {
+            indices.insert(indices.end(), entry.route.begin(), entry.route.end());
+            offsets.push_back(static_cast<std::int64_t>(indices.size()));
+            std::copy(
+                entry.semantic_hash.begin(), entry.semantic_hash.end(),
+                checked_data(hashes) + ordinal * 32);
+            checked_data(entry_bytes)[ordinal] = entry.entry_bytes;
+            ++ordinal;
+        }
+        py::array_t<std::int64_t> offsets_array(offsets.size());
+        py::array_t<std::int64_t> indices_array(indices.size());
+        std::copy(offsets.begin(), offsets.end(), checked_data(offsets_array));
+        std::copy(indices.begin(), indices.end(), checked_data(indices_array));
+        return py::make_tuple(
+            std::move(offsets_array), std::move(indices_array), std::move(hashes),
+            std::move(entry_bytes), statistics_array());
+    }
+
+private:
+    struct Entry {
+        std::string key;
+        std::vector<std::int64_t> route;
+        std::array<std::uint8_t, 32> semantic_hash{};
+        std::int64_t entry_bytes = 0;
+    };
+    struct BatchJournal {
+        std::vector<std::string> inserted_keys;
+        std::vector<Entry> evicted_entries;
+        std::array<std::int64_t, 11> statistics_before{};
+        bool active = false;
+    };
+
+    std::int64_t max_entries_;
+    std::int64_t max_memory_bytes_;
+    std::list<Entry> entries_;
+    std::unordered_set<std::string> seen_keys_;
+    std::array<std::int64_t, 11> statistics_{};
+    std::optional<BatchJournal> active_batch_;
+
+    static std::string route_key(const std::vector<std::int64_t>& route) {
+        std::string key;
+        key.resize((route.size() + 1) * sizeof(std::int64_t));
+        const auto length = static_cast<std::int64_t>(route.size());
+        std::memcpy(key.data(), &length, sizeof(length));
+        if (!route.empty()) {
+            std::memcpy(
+                key.data() + sizeof(length), route.data(),
+                route.size() * sizeof(std::int64_t));
+        }
+        return key;
+    }
+
+    static std::vector<std::vector<std::int64_t>> decode_routes(
+        py::handle route_offsets,
+        py::handle route_indices) {
+        auto offsets_array = checked_array<std::int64_t>(
+            route_offsets, "route_offsets", 1);
+        auto indices_array = checked_array<std::int64_t>(
+            route_indices, "route_indices", 1);
+        if (offsets_array.size() < 1) {
+            throw std::invalid_argument("native route-cache offsets cannot be empty");
+        }
+        const auto count = static_cast<std::size_t>(offsets_array.size() - 1);
+        const auto* offsets = checked_data<std::int64_t>(offsets_array);
+        const auto* indices = checked_data<std::int64_t>(indices_array);
+        if (offsets[0] != 0 || offsets[count] != indices_array.size()) {
+            throw std::invalid_argument("native route-cache offsets boundary is invalid");
+        }
+        std::vector<std::vector<std::int64_t>> routes;
+        routes.reserve(count);
+        for (std::size_t route = 0; route < count; ++route) {
+            if (offsets[route] < 0 || offsets[route] > offsets[route + 1]) {
+                throw std::invalid_argument(
+                    "native route-cache offsets must be monotonic");
+            }
+            routes.emplace_back(
+                indices + offsets[route], indices + offsets[route + 1]);
+        }
+        return routes;
+    }
+
+    std::list<Entry>::iterator find_entry(const std::string& key) {
+        return std::find_if(
+            entries_.begin(), entries_.end(),
+            [&](const Entry& entry) { return entry.key == key; });
+    }
+
+    void require_no_active_batch(const char* operation) const {
+        if (active_batch_.has_value()) {
+            throw std::runtime_error(
+                std::string("native route-cache ") + operation
+                + " is forbidden while a write batch is active");
+        }
+    }
+
+    void require_active_batch(const char* operation) const {
+        if (!active_batch_.has_value() || !active_batch_->active) {
+            throw std::runtime_error(
+                std::string("native route-cache ") + operation
+                + " requires an active write batch");
+        }
+    }
+
+    void rollback_journal(const BatchJournal& journal) {
+        const std::unordered_set<std::string> inserted(
+            journal.inserted_keys.begin(), journal.inserted_keys.end());
+        entries_.remove_if(
+            [&](const Entry& entry) { return inserted.contains(entry.key); });
+        for (auto entry = journal.evicted_entries.rbegin();
+             entry != journal.evicted_entries.rend(); ++entry) {
+            entries_.push_front(*entry);
+        }
+        statistics_ = journal.statistics_before;
+    }
+
+    py::array_t<std::int64_t> statistics_array() const {
+        py::array_t<std::int64_t> output(statistics_.size());
+        std::copy(statistics_.begin(), statistics_.end(), checked_data(output));
+        return output;
+    }
+};
 
 template <typename T>
 struct Stage052ReplayNumericColumn {
@@ -5086,10 +5530,7 @@ py::tuple screen_route_batch_transaction_impl(
     for (std::size_t index = 0; index < 5; ++index) {
         append_i64(counter_values[index]);
     }
-    const auto digest = py::cast<std::string>(
-        py::module_::import("hashlib")
-            .attr("sha256")(py::bytes(evidence))
-            .attr("hexdigest")());
+    const auto digest = native_sha256_hex(evidence);
     return py::make_tuple(
         std::move(returned_ids),
         std::move(status_array),
@@ -5483,10 +5924,7 @@ py::tuple candidate_round_transaction_impl(
             py::reinterpret_borrow<py::object>(item).attr("tobytes")());
     }
     evidence += py::cast<std::string>(screening[6]);
-    const auto digest = py::cast<std::string>(
-        py::module_::import("hashlib")
-            .attr("sha256")(py::bytes(evidence))
-            .attr("hexdigest")());
+    const auto digest = native_sha256_hex(evidence);
     timing_values[2] = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
     return py::make_tuple(
@@ -5995,10 +6433,7 @@ py::tuple full_native_alns_v1(
     }
     evidence += py::cast<std::string>(counters.attr("tobytes")());
     evidence += py::cast<std::string>(trajectory_array.attr("tobytes")());
-    const auto digest = py::cast<std::string>(
-        py::module_::import("hashlib")
-            .attr("sha256")(py::bytes(evidence))
-            .attr("hexdigest")());
+    const auto digest = native_sha256_hex(evidence);
     timing_values[2] = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
     return py::make_tuple(
@@ -6608,6 +7043,7 @@ PYBIND11_MODULE(_core, module) {
         py::arg("sample_size"),
         py::arg("weights"),
         py::arg("shuffle_size"));
+    module.def("native_sha256_v1", &native_sha256_v1, py::arg("payload"));
     module.def(
         "native_objective_acceptance_v1",
         &native_objective_acceptance_v1,
@@ -6650,6 +7086,21 @@ PYBIND11_MODULE(_core, module) {
         py::arg("lexical_rank"),
         py::arg("attempted_flags"),
         py::arg("top_k"));
+    py::class_<NativeRouteCacheV2>(module, "NativeRouteCacheV2")
+        .def(
+            py::init<std::int64_t, std::int64_t>(),
+            py::arg("max_entries"), py::arg("max_memory_bytes"))
+        .def(
+            "lookup_many", &NativeRouteCacheV2::lookup_many,
+            py::arg("route_offsets"), py::arg("route_indices"))
+        .def(
+            "begin_store_many_atomic",
+            &NativeRouteCacheV2::begin_store_many_atomic,
+            py::arg("route_offsets"), py::arg("route_indices"),
+            py::arg("semantic_hashes"), py::arg("entry_bytes"))
+        .def("commit_store_batch", &NativeRouteCacheV2::commit_store_batch)
+        .def("rollback_store_batch", &NativeRouteCacheV2::rollback_store_batch)
+        .def("snapshot", &NativeRouteCacheV2::snapshot);
     py::class_<Stage052ReplayState>(module, "Stage052ReplayState")
         .def(
             py::init<const py::dict&, const py::dict&>(),
