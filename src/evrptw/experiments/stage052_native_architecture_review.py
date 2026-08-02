@@ -27,7 +27,7 @@ from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.validation import validate_routes
 
-REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v2"
+REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v3"
 HISTORICAL_PILOT_ROOT = Path(
     "/mnt/e/Reproducible-EVRPTW-archive/stage05.2/runs/"
     "stage05.2_benchmark_attempt72/generation-0001/d_benchmark/batch0001"
@@ -397,6 +397,32 @@ def review_records(
                 continue
             baseline = modes[ArchitectureMode.PYTHON_CANDIDATE_CONTROL]
             candidate = modes[mode]
+            if (
+                baseline.payload.get("status") != "completed"
+                or candidate.payload.get("status") != "completed"
+            ):
+                comparisons.append(
+                    {
+                        "key": key,
+                        "baseline_status": baseline.payload.get("status"),
+                        "candidate_status": candidate.payload.get("status"),
+                        "objective_equal": False,
+                        "routes_equal": False,
+                        "exact_order_equal": False,
+                        "exact_counts_equal": False,
+                        "candidate_work_hash_equal": False,
+                        "route_result_hash_equal": False,
+                        "trajectory_equal": False,
+                        "operator_statistics_equal": False,
+                        "stage04_state_equal": False,
+                        "candidate_transaction_events_equal": False,
+                        "cache_lifecycle_equal": False,
+                        "deadline_boundaries_equal": False,
+                        "measurement_transaction_hash_equal": False,
+                        "common_prefix": 0,
+                    }
+                )
+                continue
             baseline_trajectory = _mapping(baseline.payload, "trajectory")
             candidate_trajectory = _mapping(candidate.payload, "trajectory")
             baseline_measurement = _mapping(baseline.payload, "measurement_evidence")
@@ -492,16 +518,16 @@ def review_records(
         wall_objective_not_worse = True
         for key, modes in by_identity.items():
             candidate = modes[mode]
-            if candidate.payload.get("status") != "completed":
+            current_record = modes[ArchitectureMode.CURRENT_STAGE052]
+            python_record = modes[ArchitectureMode.PYTHON_CANDIDATE_CONTROL]
+            if any(
+                record.payload.get("status") != "completed"
+                for record in (candidate, current_record, python_record)
+            ):
                 continue
             candidate_seconds = _number(candidate.payload, "solver_seconds")
-            current_seconds = _number(
-                modes[ArchitectureMode.CURRENT_STAGE052].payload, "solver_seconds"
-            )
-            python_seconds = _number(
-                modes[ArchitectureMode.PYTHON_CANDIDATE_CONTROL].payload,
-                "solver_seconds",
-            )
+            current_seconds = _number(current_record.payload, "solver_seconds")
+            python_seconds = _number(python_record.payload, "solver_seconds")
             versus_current.append(current_seconds / candidate_seconds - 1.0)
             versus_python.append(python_seconds / candidate_seconds - 1.0)
             if key[1] == "fixed_work" and key[2].endswith("_21"):
@@ -530,6 +556,10 @@ def review_records(
             if key[1] == "fixed_work"
             and key[2].endswith("_21")
             and by_identity[key][mode].payload.get("status") == "completed"
+            and by_identity[key][ArchitectureMode.CURRENT_STAGE052].payload.get(
+                "status"
+            )
+            == "completed"
             and (
                 current := _number(
                     by_identity[key][ArchitectureMode.CURRENT_STAGE052].payload,

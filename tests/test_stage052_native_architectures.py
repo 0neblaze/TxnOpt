@@ -91,7 +91,7 @@ def _review_fixture_records(root: Path) -> tuple[ReviewRecord, ...]:
     ).hexdigest()
     for mode in MODES:
         payload: dict[str, Any] = {
-            "schema_version": "stage05.2-native-architecture-comparison-v2",
+            "schema_version": "stage05.2-native-architecture-comparison-v3",
             "status": "completed",
             "mode": mode.value,
             "repeat": 0,

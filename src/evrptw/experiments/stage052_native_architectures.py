@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import resource
 import subprocess
@@ -16,6 +17,8 @@ from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+
+import numpy as np
 
 from evrptw.alns import ALNSResult, solve_alns
 from evrptw.cache_incremental import CacheIncrementalConfig
@@ -33,7 +36,7 @@ from evrptw.repository import repository_root
 from evrptw.stage04 import Stage04Config
 from evrptw.validation import validate_routes
 
-SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v2"
+SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v3"
 SEEDS = (2014, 2015, 2016)
 PAIRED_INSTANCES = ("c101C5", "c101_21", "r101_21", "rc101_21")
 AXIS_NAMES = ("fixed_work", "wall_clock_30")
@@ -294,11 +297,25 @@ def _row_evidence(rows: Iterable[object]) -> dict[str, object]:
     digest = hashlib.sha256(b"stage05.2-row-evidence-v1\0")
     count = 0
     for row in rows:
-        encoded = _canonical_bytes(row)
+        encoded = _canonical_bytes(_evidence_json_value(row))
         digest.update(len(encoded).to_bytes(8, "little"))
         digest.update(encoded)
         count += 1
     return {"count": count, "sha256": digest.hexdigest()}
+
+
+def _evidence_json_value(value: object) -> object:
+    if isinstance(value, np.generic):
+        return _evidence_json_value(value.item())
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return {"nonfinite_float": "nan"}
+        return {"nonfinite_float": "positive_inf" if value > 0.0 else "negative_inf"}
+    if isinstance(value, dict):
+        return {str(key): _evidence_json_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_evidence_json_value(item) for item in value]
+    return value
 
 
 def _measurement_evidence(result: ALNSResult) -> dict[str, object]:

@@ -771,9 +771,15 @@ this repository or one of its subdirectories.
   emitted about 16 GiB for `current_stage052` alone, while the v1 reviewer
   attempted to materialize every axis simultaneously. The immutable attempt01
   directories remain failure evidence and must not be reused or promoted. The
-  v2 producer replaces duplicated rows with count-plus-SHA-256 semantic stream
-  evidence; new paired/Pilot evidence must use attempt02 labels and the v2
-  reviewer schema.
+  v2 producer replaced duplicated rows with count-plus-SHA-256 semantic stream
+  evidence. Paired and Pilot attempt02 both completed their fixed axis counts,
+  but paired replay exposed two immutable failure classes: non-finite diagnostic
+  values were not explicitly encoded before strict JSON hashing in some
+  Python/per-solve fixed-work axes, and the experimental full/host initial split
+  could exceed the 100-call budget. The v3 producer explicitly tags non-finite
+  diagnostics, and its reviewer retains failed axes as failed comparisons
+  instead of crashing. New paired/Pilot evidence must use attempt03 labels and
+  the v3 reviewer schema; attempt02 remains unpromoted failure evidence.
 - Stage 5.2 safe-rejection acceleration is bounded independently from the
   collision-proof identity stores. The scalar `ScreeningResult` cache is a
   65,536-entry solve-local LRU; the Python/native sequence cache is a
