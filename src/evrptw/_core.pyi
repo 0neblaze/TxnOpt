@@ -366,6 +366,27 @@ def screen_routes_numeric(
     npt.NDArray[np.int64],
     npt.NDArray[np.float64],
 ]: ...
+def candidate_control_repair_v2(
+    node_kind: npt.NDArray[np.int64],
+    demand: npt.NDArray[np.float64],
+    ready_time: npt.NDArray[np.float64],
+    due_date: npt.NDArray[np.float64],
+    service_time: npt.NDArray[np.float64],
+    distance: npt.NDArray[np.float64],
+    reachable: npt.NDArray[np.uint8],
+    vehicle: npt.NDArray[np.float64],
+    lexical_rank: npt.NDArray[np.int64],
+    partial_route_offsets: npt.NDArray[np.int64],
+    partial_route_indices: npt.NDArray[np.int64],
+    removed_customer_indices: npt.NDArray[np.int64],
+    epsilon: float,
+    route_change_limit: int,
+    allow_new_routes: bool,
+) -> tuple[
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+]: ...
 def screen_route_batch_transaction_v2(
     node_kind: npt.NDArray[np.int64],
     demand: npt.NDArray[np.float64],

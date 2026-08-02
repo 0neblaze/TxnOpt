@@ -1207,6 +1207,117 @@ def test_native_changed_candidate_pool_matches_python_order(
     assert observed_plans == expected_plans
 
 
+@pytest.mark.parametrize(
+    ("partial", "removed", "route_change_limit", "allow_new_routes"),
+    [
+        (
+            (("C1", "C2"), ("C3",)),
+            ("C4",),
+            1,
+            False,
+        ),
+        (
+            (("C1",), ("C2",)),
+            ("C3", "C4"),
+            1,
+            False,
+        ),
+        (
+            (("C1",),),
+            ("C2",),
+            -1,
+            True,
+        ),
+    ],
+)
+def test_native_candidate_control_repair_matches_python_safe_bound_selection(
+    partial: tuple[tuple[str, ...], ...],
+    removed: tuple[str, ...],
+    route_change_limit: int,
+    allow_new_routes: bool,
+) -> None:
+    from evrptw import _core as native_core
+    from evrptw import neighborhoods
+
+    instance = _candidate_plan_fixture()
+    if allow_new_routes:
+        instance = replace(
+            instance,
+            vehicle=replace(instance.vehicle, load_capacity=1.0),
+        )
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    lexical_names = sorted(context.node_names)
+    lexical_by_name = {name: rank for rank, name in enumerate(lexical_names)}
+    lexical_rank = np.asarray(
+        [lexical_by_name[name] for name in context.node_names],
+        dtype=np.int64,
+    )
+    offsets = [0]
+    indices: list[int] = []
+    for route in partial:
+        indices.extend(context.name_to_index[name] for name in route)
+        offsets.append(len(indices))
+
+    payload = native_core.candidate_control_repair_v2(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        lexical_rank,
+        np.asarray(offsets, dtype=np.int64),
+        np.asarray(indices, dtype=np.int64),
+        np.asarray(
+            [context.name_to_index[name] for name in removed],
+            dtype=np.int64,
+        ),
+        context.reachability_epsilon,
+        route_change_limit,
+        allow_new_routes,
+    )
+    output_offsets, output_indices, counters = payload
+    observed = (
+        tuple(
+            tuple(
+                context.node_names[int(index)]
+                for index in output_indices[
+                    int(output_offsets[route]) : int(output_offsets[route + 1])
+                ]
+            )
+            for route in range(len(output_offsets) - 1)
+        )
+        if int(counters[0]) == 0
+        else None
+    )
+
+    class Recorder:
+        def record_candidate_screening_aggregate(
+            self,
+            _counts: object,
+            _candidate_pool_hash: str,
+        ) -> None:
+            return None
+
+    expected = neighborhoods._candidate_control_repair_pass(
+        partial,
+        removed,
+        Recorder(),  # type: ignore[arg-type]
+        instance,
+        allow_new_routes=allow_new_routes,
+        route_change_limit=(
+            None if route_change_limit < 0 else route_change_limit
+        ),
+    )
+
+    assert observed == expected.sequences
+    assert int(counters[1]) == expected.new_routes_created
+    assert int(counters[3]) == int(counters[4]) + int(counters[5])
+    assert int(counters[6]) == (0 if expected.sequences is not None else len(removed))
+
+
 def test_native_candidate_plan_ranking_matches_python_rank_key() -> None:
     from evrptw import _core as native_core
 

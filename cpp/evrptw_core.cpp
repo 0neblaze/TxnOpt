@@ -6695,6 +6695,291 @@ py::tuple screen_routes_numeric(
     return py::make_tuple(std::move(codes), std::move(metrics));
 }
 
+py::tuple candidate_control_repair_v2(
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle lexical_rank,
+    py::handle partial_route_offsets,
+    py::handle partial_route_indices,
+    py::handle removed_customer_indices,
+    double epsilon,
+    std::int64_t route_change_limit,
+    bool allow_new_routes) {
+    auto kind_array = checked_array<std::int64_t>(node_kind, "node_kind", 1);
+    auto demand_array = checked_array<double>(demand, "demand", 1);
+    auto ready_array = checked_array<double>(ready_time, "ready_time", 1);
+    auto due_array = checked_array<double>(due_date, "due_date", 1);
+    auto service_array = checked_array<double>(service_time, "service_time", 1);
+    auto distance_array = checked_array<double>(distance, "distance", 2);
+    auto reachable_array = checked_array<std::uint8_t>(reachable, "reachable", 2);
+    auto vehicle_array = checked_array<double>(vehicle, "vehicle", 1);
+    auto lexical_array = checked_array<std::int64_t>(
+        lexical_rank, "lexical_rank", 1);
+    auto offsets_array = checked_array<std::int64_t>(
+        partial_route_offsets, "partial_route_offsets", 1);
+    auto indices_array = checked_array<std::int64_t>(
+        partial_route_indices, "partial_route_indices", 1);
+    auto removed_array = checked_array<std::int64_t>(
+        removed_customer_indices, "removed_customer_indices", 1);
+    const auto node_count = static_cast<std::size_t>(kind_array.size());
+    if (node_count == 0 || demand_array.size() != kind_array.size()
+        || ready_array.size() != kind_array.size()
+        || due_array.size() != kind_array.size()
+        || service_array.size() != kind_array.size()
+        || lexical_array.size() != kind_array.size()
+        || distance_array.shape(0) != kind_array.size()
+        || distance_array.shape(1) != kind_array.size()
+        || reachable_array.shape(0) != kind_array.size()
+        || reachable_array.shape(1) != kind_array.size()
+        || vehicle_array.size() != 5 || offsets_array.size() < 1
+        || removed_array.size() < 1 || !std::isfinite(epsilon) || epsilon <= 0.0
+        || route_change_limit == 0 || route_change_limit < -1) {
+        throw std::invalid_argument(
+            "candidate-control repair v2 input/config shape is invalid");
+    }
+    const auto* kinds = checked_data<std::int64_t>(kind_array);
+    const auto* demands = checked_data<double>(demand_array);
+    const auto* ready = checked_data<double>(ready_array);
+    const auto* due = checked_data<double>(due_array);
+    const auto* service = checked_data<double>(service_array);
+    const auto* distances = checked_data<double>(distance_array);
+    const auto* reachable_values = checked_data<std::uint8_t>(reachable_array);
+    const auto* vehicle_values = checked_data<double>(vehicle_array);
+    const auto* lexical = checked_data<std::int64_t>(lexical_array);
+    const auto* offsets = checked_data<std::int64_t>(offsets_array);
+    const auto* indices = checked_data<std::int64_t>(indices_array);
+    const auto* removed = checked_data<std::int64_t>(removed_array);
+    if (!std::isfinite(vehicle_values[1]) || vehicle_values[1] < 0.0) {
+        throw std::invalid_argument(
+            "candidate-control repair v2 load capacity is invalid");
+    }
+    std::unordered_set<std::int64_t> lexical_values;
+    std::int64_t depot = -1;
+    std::vector<std::int64_t> recharge_nodes;
+    for (std::size_t node = 0; node < node_count; ++node) {
+        if (lexical[node] < 0 || lexical[node] >= static_cast<std::int64_t>(node_count)
+            || !lexical_values.insert(lexical[node]).second) {
+            throw std::invalid_argument(
+                "candidate-control repair lexical_rank must be a permutation");
+        }
+        if (kinds[node] == depot_kind) {
+            if (depot >= 0) {
+                throw std::invalid_argument(
+                    "candidate-control repair requires exactly one depot");
+            }
+            depot = static_cast<std::int64_t>(node);
+            recharge_nodes.push_back(depot);
+        } else if (kinds[node] == station_kind) {
+            recharge_nodes.push_back(static_cast<std::int64_t>(node));
+        } else if (kinds[node] != customer_kind) {
+            throw std::invalid_argument(
+                "candidate-control repair node_kind contains an unknown code");
+        }
+    }
+    if (depot < 0) {
+        throw std::invalid_argument(
+            "candidate-control repair requires exactly one depot");
+    }
+    const auto route_count = static_cast<std::size_t>(offsets_array.size() - 1);
+    if (offsets[0] != 0 || offsets[route_count] != indices_array.size()) {
+        throw std::invalid_argument(
+            "candidate-control repair route offsets do not span indices");
+    }
+    std::vector<std::vector<std::int64_t>> routes;
+    routes.reserve(route_count);
+    std::unordered_set<std::int64_t> present;
+    for (std::size_t route = 0; route < route_count; ++route) {
+        if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]) {
+            throw std::invalid_argument(
+                "candidate-control repair partial routes must be non-empty");
+        }
+        routes.emplace_back(
+            indices + offsets[route], indices + offsets[route + 1]);
+        for (const auto node : routes.back()) {
+            if (node < 0 || static_cast<std::size_t>(node) >= node_count
+                || kinds[node] != customer_kind || !present.insert(node).second) {
+                throw std::invalid_argument(
+                    "candidate-control repair partial routes contain invalid customers");
+            }
+        }
+    }
+    std::vector<std::int64_t> pending;
+    pending.reserve(static_cast<std::size_t>(removed_array.size()));
+    for (py::ssize_t index = 0; index < removed_array.size(); ++index) {
+        const auto node = removed[index];
+        if (node < 0 || static_cast<std::size_t>(node) >= node_count
+            || kinds[node] != customer_kind || present.contains(node)
+            || std::find(pending.begin(), pending.end(), node) != pending.end()) {
+            throw std::invalid_argument(
+                "candidate-control repair removed customers are invalid");
+        }
+        pending.push_back(node);
+    }
+
+    struct Option {
+        double score;
+        std::int64_t customer;
+        std::size_t route;
+        std::size_t position;
+        std::vector<std::int64_t> sequence;
+    };
+    const auto route_lexical_less = [&](const auto& left, const auto& right) {
+        return std::lexicographical_compare(
+            left.begin(), left.end(), right.begin(), right.end(),
+            [&](std::int64_t lhs, std::int64_t rhs) {
+                return lexical[lhs] < lexical[rhs];
+            });
+    };
+    const auto option_less = [&](const Option& left, const Option& right) {
+        if (left.score != right.score) {
+            return left.score < right.score;
+        }
+        if (lexical[left.customer] != lexical[right.customer]) {
+            return lexical[left.customer] < lexical[right.customer];
+        }
+        if (left.route != right.route) {
+            return left.route < right.route;
+        }
+        if (left.position != right.position) {
+            return left.position < right.position;
+        }
+        return route_lexical_less(left.sequence, right.sequence);
+    };
+    std::unordered_set<std::size_t> changed_routes;
+    std::int64_t new_routes = 0;
+    std::int64_t screening_calls = 0;
+    std::int64_t screening_passes = 0;
+    std::int64_t screening_rejections = 0;
+    std::int64_t failure_code = 0;
+    std::array<double, 6> incremental{};
+    while (!pending.empty()) {
+        std::optional<Option> best;
+        for (const auto customer : pending) {
+            for (std::size_t route = 0; route < routes.size(); ++route) {
+                if (route_change_limit > 0 && !changed_routes.contains(route)
+                    && changed_routes.size()
+                        >= static_cast<std::size_t>(route_change_limit)) {
+                    continue;
+                }
+                PythonFloatSum demand_sum;
+                for (const auto node : routes[route]) {
+                    demand_sum.add(demands[node]);
+                }
+                demand_sum.add(demands[customer]);
+                if (demand_sum.value() > vehicle_values[1] + epsilon) {
+                    continue;
+                }
+                PythonFloatSum reference_sum;
+                auto origin = depot;
+                for (const auto node : routes[route]) {
+                    reference_sum.add(distances[
+                        static_cast<std::size_t>(origin) * node_count
+                        + static_cast<std::size_t>(node)]);
+                    origin = node;
+                }
+                reference_sum.add(distances[
+                    static_cast<std::size_t>(origin) * node_count
+                    + static_cast<std::size_t>(depot)]);
+                for (std::size_t position = 0;
+                     position <= routes[route].size(); ++position) {
+                    auto candidate = routes[route];
+                    candidate.insert(
+                        candidate.begin() + static_cast<std::ptrdiff_t>(position),
+                        customer);
+                    const std::array<double, 4> options{
+                        1.0, epsilon, reference_sum.value(), 1.0};
+                    const auto screened = run_screen_route(
+                        kinds, demands, ready, due, service, distances,
+                        reachable_values, vehicle_values, candidate.data(),
+                        candidate.size(), node_count, depot, recharge_nodes,
+                        options.data(), incremental.data());
+                    ++screening_calls;
+                    if (screened.codes[0] == 0) {
+                        ++screening_rejections;
+                        continue;
+                    }
+                    ++screening_passes;
+                    Option option{
+                        screened.metrics[4], customer, route, position,
+                        std::move(candidate)};
+                    if (!best.has_value() || option_less(option, *best)) {
+                        best = std::move(option);
+                    }
+                }
+            }
+        }
+        if (best.has_value()) {
+            routes[best->route] = std::move(best->sequence);
+            changed_routes.insert(best->route);
+            pending.erase(std::find(
+                pending.begin(), pending.end(), best->customer));
+            continue;
+        }
+        if (!allow_new_routes) {
+            failure_code = 1;
+            break;
+        }
+        const auto customer = *std::min_element(
+            pending.begin(), pending.end(), [&](std::int64_t left, std::int64_t right) {
+                return lexical[left] < lexical[right];
+            });
+        const std::vector<std::int64_t> singleton{customer};
+        const std::array<double, 4> options{1.0, epsilon, 0.0, 0.0};
+        const auto screened = run_screen_route(
+            kinds, demands, ready, due, service, distances, reachable_values,
+            vehicle_values, singleton.data(), singleton.size(), node_count,
+            depot, recharge_nodes, options.data(), incremental.data());
+        ++screening_calls;
+        if (screened.codes[0] == 0) {
+            ++screening_rejections;
+            failure_code = 2;
+            break;
+        }
+        ++screening_passes;
+        routes.push_back(singleton);
+        changed_routes.insert(routes.size() - 1);
+        pending.erase(std::find(pending.begin(), pending.end(), customer));
+        ++new_routes;
+    }
+
+    std::vector<std::int64_t> output_offsets{0};
+    std::vector<std::int64_t> output_indices;
+    if (failure_code == 0) {
+        for (const auto& route : routes) {
+            output_indices.insert(
+                output_indices.end(), route.begin(), route.end());
+            output_offsets.push_back(
+                static_cast<std::int64_t>(output_indices.size()));
+        }
+    }
+    py::array_t<std::int64_t> output_offsets_array(output_offsets.size());
+    py::array_t<std::int64_t> output_indices_array(output_indices.size());
+    py::array_t<std::int64_t> counters(7);
+    std::copy(
+        output_offsets.begin(), output_offsets.end(),
+        checked_data(output_offsets_array));
+    std::copy(
+        output_indices.begin(), output_indices.end(),
+        checked_data(output_indices_array));
+    auto* counter_values = checked_data(counters);
+    counter_values[0] = failure_code;
+    counter_values[1] = new_routes;
+    counter_values[2] = static_cast<std::int64_t>(changed_routes.size());
+    counter_values[3] = screening_calls;
+    counter_values[4] = screening_passes;
+    counter_values[5] = screening_rejections;
+    counter_values[6] = static_cast<std::int64_t>(pending.size());
+    return py::make_tuple(
+        std::move(output_offsets_array), std::move(output_indices_array),
+        std::move(counters));
+}
+
 py::tuple screen_route_batch_transaction_impl(
     py::handle node_kind,
     py::handle demand,
@@ -8969,6 +9254,24 @@ PYBIND11_MODULE(_core, module) {
         py::arg("route_indices"),
         py::arg("options"),
         py::arg("incremental"));
+    module.def(
+        "candidate_control_repair_v2",
+        &candidate_control_repair_v2,
+        py::arg("node_kind"),
+        py::arg("demand"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("reachable"),
+        py::arg("vehicle"),
+        py::arg("lexical_rank"),
+        py::arg("partial_route_offsets"),
+        py::arg("partial_route_indices"),
+        py::arg("removed_customer_indices"),
+        py::arg("epsilon"),
+        py::arg("route_change_limit"),
+        py::arg("allow_new_routes"));
     module.def(
         "screen_route_batch_transaction_v2",
         &screen_route_batch_transaction_v2,
