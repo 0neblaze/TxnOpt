@@ -844,7 +844,7 @@ def _full_native_digest(
     counters: npt.NDArray[np.generic],
     trajectory: npt.NDArray[np.int64],
 ) -> str:
-    evidence = bytearray(b"stage05.2-full-native-alns-v1")
+    evidence = bytearray(b"stage05.2-full-native-alns-v2")
     evidence.extend(route_offsets.tobytes(order="C"))
     evidence.extend(route_indices.tobytes(order="C"))
     if not isinstance(exact_payload, tuple) or len(exact_payload) != 7:

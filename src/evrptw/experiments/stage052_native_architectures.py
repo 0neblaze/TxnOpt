@@ -28,7 +28,7 @@ from evrptw.candidate_transaction import NativeCandidateTransactionConfig
 from evrptw.exact_deadline import ExactDeadlineConfig
 from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES
 from evrptw.measurement import CheapScreeningConfig, MeasurementConfig
-from evrptw.models import Instance
+from evrptw.models import Instance, NodeType
 from evrptw.native_execution import Stage052NativeExecutionConfig
 from evrptw.native_kernels import NativeKernelConfig
 from evrptw.native_scheduler import NativeHostScheduler
@@ -38,7 +38,10 @@ from evrptw.repository import repository_root
 from evrptw.runtime_envelope import ProcessTreeMonitor
 from evrptw.stage04 import Stage04Config
 from evrptw.validation import validate_routes
-from evrptw.warm_start import WarmStartValidationConfig
+from evrptw.warm_start import (
+    WarmStartValidationConfig,
+    canonical_customer_sequences_sha256,
+)
 
 SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v4"
 SEEDS = (2014, 2015, 2016)
@@ -47,7 +50,7 @@ AXIS_NAMES = ("fixed_work", "wall_clock_30")
 SHARD_PROCESSES = 6
 THREADS_PER_SHARD = 4
 TOTAL_COMPUTE_THREADS = 24
-WARM_START_SCHEMA_VERSION = "stage05.2-native-architecture-warm-start-v1"
+WARM_START_SCHEMA_VERSION = "stage05.2-native-architecture-warm-start-v2"
 
 WarmStartIdentity = tuple[str, int]
 WarmStartRecord = tuple[tuple[tuple[str, ...], ...], dict[str, object]]
@@ -245,8 +248,67 @@ def load_warm_start_bundle(
         if supplied_customers != expected_customers:
             raise RuntimeError(f"warm-start customer coverage mismatch for {identity}")
         source_sha256 = raw.get("source_solution_sha256")
-        if not isinstance(source_sha256, str) or len(source_sha256) != 64:
+        if (
+            not isinstance(source_sha256, str)
+            or len(source_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in source_sha256)
+        ):
             raise RuntimeError(f"warm-start source hash is invalid for {identity}")
+        source_path_value = raw.get("source_solution_path")
+        source_axis = raw.get("source_axis")
+        if (
+            not isinstance(source_path_value, str)
+            or not source_path_value
+            or not isinstance(source_axis, str)
+            or not source_axis
+        ):
+            raise RuntimeError(f"warm-start source path/axis is invalid for {identity}")
+        source_path = Path(source_path_value)
+        if not source_path.is_absolute():
+            source_path = path.parent / source_path
+        source_path = source_path.resolve()
+        if not source_path.is_file() or _sha256_path(source_path) != source_sha256:
+            raise RuntimeError(f"warm-start source solution hash mismatch for {identity}")
+        try:
+            source_payload = json.loads(source_path.read_bytes())
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"warm-start source solution is unreadable for {identity}"
+            ) from error
+        source_axes = source_payload.get("axes") if isinstance(source_payload, dict) else None
+        source_record = source_axes.get(source_axis) if isinstance(source_axes, dict) else None
+        if not isinstance(source_record, dict):
+            raise RuntimeError(f"warm-start source axis is missing for {identity}")
+        source_routes = source_record.get("routes")
+        source_objective = source_record.get("objective_key")
+        if not isinstance(source_routes, list) or not all(
+            isinstance(route, list) and all(isinstance(name, str) for name in route)
+            for route in source_routes
+        ):
+            raise RuntimeError(f"warm-start source routes are invalid for {identity}")
+        source_sequences = tuple(
+            tuple(
+                cast(str, name)
+                for name in route
+                if cast(str, name) in instance.by_name
+                and instance.by_name[cast(str, name)].kind is NodeType.CUSTOMER
+            )
+            for route in source_routes
+        )
+        if source_sequences != tuple(sequences):
+            raise RuntimeError(f"warm-start routes diverge from source for {identity}")
+        source_report = validate_routes(instance, source_routes)
+        if not source_report.feasible:
+            raise RuntimeError(f"warm-start source routes are infeasible for {identity}")
+        recomputed_objective = list(
+            SolutionObjective.from_report(instance, source_report).key
+        )
+        if source_objective != recomputed_objective:
+            raise RuntimeError(f"warm-start source objective mismatch for {identity}")
+        declared_objective = raw.get("source_objective_key")
+        if declared_objective != recomputed_objective:
+            raise RuntimeError(f"warm-start declared objective mismatch for {identity}")
+        sequence_sha256 = canonical_customer_sequences_sha256(tuple(sequences))
         output[identity] = (
             tuple(sequences),
             {
@@ -255,7 +317,10 @@ def load_warm_start_bundle(
                 "source_instance": instance_name,
                 "source_seed": seed,
                 "source_solution_sha256": source_sha256,
-                "source_objective_key": raw.get("source_objective_key", []),
+                "source_solution_path": str(source_path),
+                "source_axis": source_axis,
+                "source_customer_sequences_sha256": sequence_sha256,
+                "source_objective_key": recomputed_objective,
                 "warm_start_bundle_sha256": bundle_sha256,
                 "warm_start_bundle_path": str(path.resolve()),
             },

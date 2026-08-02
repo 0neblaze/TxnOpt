@@ -104,7 +104,7 @@ from evrptw.objective import (
 )
 from evrptw.stage04 import Stage04Config
 from evrptw.validation import validate_routes
-from evrptw.warm_start import WarmStartValidationConfig
+from evrptw.warm_start import WarmStartValidationConfig, verify_warm_start_provenance
 
 __all__ = (
     "ALNSResult",
@@ -5164,13 +5164,10 @@ def solve_alns(
         if sorted(supplied_customers) != expected_customers:
             raise ValueError("inherited initial solution must cover every customer exactly once")
         if warm_start_validation_config is not None:
-            source_sha256 = (initial_solution_provenance or {}).get(
-                "source_solution_sha256"
+            verify_warm_start_provenance(
+                tuple(tuple(sequence) for sequence in initial_customer_sequences),
+                initial_solution_provenance or {},
             )
-            if not isinstance(source_sha256, str) or len(source_sha256) != 64:
-                raise ValueError(
-                    "warm-start validation requires a source solution SHA-256"
-                )
     elif initial_solution_provenance is not None:
         raise ValueError("initial solution provenance requires inherited customer sequences")
     elif warm_start_validation_config is not None:

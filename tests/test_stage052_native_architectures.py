@@ -35,6 +35,7 @@ from evrptw.native_scheduler import NativeHostScheduler
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.validation import validate_routes
+from evrptw.warm_start import canonical_customer_sequences_sha256
 
 
 def _plan(scope: str, tmp_path: Path):  # type: ignore[no-untyped-def]
@@ -67,11 +68,33 @@ def _c5_warm_start(root: Path) -> tuple[tuple[str, ...], ...]:
     return tuple((customer.name,) for customer in instance.customers)
 
 
+def _c5_source_provenance(root: Path, destination: Path) -> dict[str, object]:
+    instance = parse_schneider(root / "data/schneider/c101C5.txt")
+    sequences = _c5_warm_start(root)
+    routes = [list(solve_exact_charging(instance, sequence).route) for sequence in sequences]
+    objective_key = list(
+        SolutionObjective.from_report(instance, validate_routes(instance, routes)).key
+    )
+    payload = {"axes": {"wall_clock": {"routes": routes, "objective_key": objective_key}}}
+    destination.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    return {
+        "source_solution_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+        "source_solution_path": str(destination),
+        "source_axis": "wall_clock",
+        "source_customer_sequences_sha256": canonical_customer_sequences_sha256(
+            sequences
+        ),
+        "source_objective_key": objective_key,
+    }
+
+
 def test_warm_start_bundle_binds_hash_identity_and_customer_coverage(
     tmp_path: Path,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
     routes = _c5_warm_start(root)
+    source_path = tmp_path / "source-solution.json"
+    source_provenance = _c5_source_provenance(root, source_path)
     bundle = tmp_path / "warm-starts.json"
     payload = {
         "schema_version": WARM_START_SCHEMA_VERSION,
@@ -80,8 +103,7 @@ def test_warm_start_bundle_binds_hash_identity_and_customer_coverage(
                 "instance": "c101C5",
                 "seed": 2014,
                 "customer_sequences": [list(route) for route in routes],
-                "source_solution_sha256": "a" * 64,
-                "source_objective_key": [2, 1.0, 0.0, 0],
+                **source_provenance,
             }
         ],
     }
@@ -104,6 +126,14 @@ def test_warm_start_bundle_binds_hash_identity_and_customer_coverage(
 
     bundle.with_suffix(".json.sha256").write_text("0" * 64, encoding="ascii")
     with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
+        load_warm_start_bundle(bundle, benchmark_dir=root / "data/schneider")
+
+    bundle.with_suffix(".json.sha256").write_text(
+        hashlib.sha256(data).hexdigest(),
+        encoding="ascii",
+    )
+    source_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="source solution hash mismatch"):
         load_warm_start_bundle(bundle, benchmark_dir=root / "data/schneider")
 
 
@@ -350,7 +380,9 @@ def test_one_wall_clock_group_runs_all_five_modes_with_one_scheduler(
         native_sha256="b" * 64,
         revision="c" * 40,
         initial_customer_sequences=_c5_warm_start(root),
-        initial_solution_provenance={"source_solution_sha256": "d" * 64},
+        initial_solution_provenance=_c5_source_provenance(
+            root, tmp_path / "wall-clock-source.json"
+        ),
     )
 
     with NativeHostScheduler(endpoint):
@@ -388,7 +420,9 @@ def test_one_fixed_work_group_retains_every_mode_axis(tmp_path: Path) -> None:
         native_sha256="b" * 64,
         revision="c" * 40,
         initial_customer_sequences=_c5_warm_start(root),
-        initial_solution_provenance={"source_solution_sha256": "d" * 64},
+        initial_solution_provenance=_c5_source_provenance(
+            root, tmp_path / "fixed-work-source.json"
+        ),
     )
 
     with NativeHostScheduler(endpoint):

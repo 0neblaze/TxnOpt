@@ -45,7 +45,10 @@ from evrptw.native_scheduler import NativeHostScheduler
 from evrptw.objective import SolutionObjective, accept_annealing_move
 from evrptw.parser import parse_schneider
 from evrptw.stage04 import Stage04Config
-from evrptw.warm_start import WarmStartValidationConfig
+from evrptw.warm_start import (
+    WarmStartValidationConfig,
+    canonical_customer_sequences_sha256,
+)
 
 
 def _fixture_instance() -> Instance:
@@ -203,10 +206,20 @@ def test_explicit_native_protocol_is_the_only_guard_bypass() -> None:
     assert result.native_execution_statistics["fallback_count"] == 0
 
 
-def test_explicit_warm_start_validation_does_not_enable_candidate_control() -> None:
+def test_explicit_warm_start_validation_does_not_enable_candidate_control(
+    tmp_path: Path,
+) -> None:
     instance = _fixture_instance()
     supplied = (("C1", "C2"),)
-    provenance = {"source_solution_sha256": "a" * 64}
+    source_path = tmp_path / "source-solution.json"
+    source_path.write_text("{}", encoding="utf-8")
+    provenance = {
+        "source_solution_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        "source_solution_path": str(source_path),
+        "source_customer_sequences_sha256": canonical_customer_sequences_sha256(
+            supplied
+        ),
+    }
 
     with pytest.raises(ValueError, match="requires candidate control or the explicit"):
         solve_alns(
