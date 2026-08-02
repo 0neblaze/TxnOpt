@@ -1995,7 +1995,11 @@ def test_per_solve_real_fixed_work_matches_four_worker_python_control(
     ]
 
 
-def test_full_native_v2_packs_one_complete_soa_and_refuses_prototype_fallback(
+@pytest.mark.xfail(
+    strict=True,
+    reason="full native v2 solve-level search state machine is under implementation",
+)
+def test_full_native_v2_one_call_matches_python_first_iteration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from evrptw import _core as native_core
@@ -2010,20 +2014,31 @@ def test_full_native_v2_packs_one_complete_soa_and_refuses_prototype_fallback(
         return original(*args)
 
     monkeypatch.setattr(native_core, "full_native_alns_v2", counted)
-    with pytest.raises(
-        RuntimeError,
-        match="semantic engine is incomplete; refusing prototype fallback",
-    ):
-        solve_alns(
-            instance,
-            seed=2014,
-            max_iterations=1,
-            time_limit_seconds=2.0,
-            **_full_native_solve_kwargs(),  # type: ignore[arg-type]
-            native_execution_config=_native_config("full_native_alns"),
-        )
+    common = {
+        "seed": 2014,
+        "max_iterations": 1,
+        "time_limit_seconds": 2.0,
+        **_full_native_solve_kwargs(),
+    }
+    python_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        candidate_control_config=CandidateControlConfig(worker_count=1),
+    )
+    native_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        native_execution_config=_native_config("full_native_alns"),
+    )
 
     assert invocations == 1
+    assert native_result.objective == python_result.objective
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.exact_started_calls == python_result.exact_started_calls
+    assert native_result.exact_completed_calls == python_result.exact_completed_calls
+    assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+    assert native_result.stage04_event_log == python_result.stage04_event_log
 
 
 def test_host_scheduler_v1_cannot_masquerade_as_full_native_v2(

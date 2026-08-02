@@ -1170,7 +1170,9 @@ py::tuple route_merge_candidate_pool_v2(
                 if (!preserve_duplicates && !seen.insert(key).second) {
                     continue;
                 }
-                seen.insert(key);
+                if (preserve_duplicates) {
+                    seen.insert(key);
+                }
                 candidate_indices.insert(
                     candidate_indices.end(), merged.begin(), merged.end());
                 candidate_offsets.push_back(
@@ -1689,6 +1691,8 @@ py::tuple changed_candidate_plan_selection_v1(
         ranking[2], ranking[3], digest);
 }
 
+class NativeSearchEngineV2;
+
 class NativeRouteCacheV2 {
 public:
     NativeRouteCacheV2(std::int64_t max_entries, std::int64_t max_memory_bytes)
@@ -2065,6 +2069,7 @@ public:
     }
 
 private:
+    friend class NativeSearchEngineV2;
     struct ExactPayload {
         std::vector<std::int64_t> path;
         std::int64_t status = -1;
@@ -2700,6 +2705,7 @@ public:
     }
 
 private:
+    friend class NativeSearchEngineV2;
     std::int64_t exact_budget_;
     std::int64_t round_budget_;
     bool round_active_ = false;
@@ -2790,6 +2796,7 @@ public:
     }
 
 private:
+    friend class NativeSearchEngineV2;
     using Route = std::vector<std::int64_t>;
     using Plan = std::vector<Route>;
     std::unordered_set<std::string> attempted_;
@@ -8019,6 +8026,144 @@ py::tuple full_native_initialize_v2(
         std::move(accounting));
 }
 
+class NativeSearchEngineV2 {
+public:
+    NativeSearchEngineV2(
+        std::int64_t exact_budget,
+        std::int64_t round_budget,
+        std::int64_t cache_entries,
+        std::int64_t cache_memory_bytes)
+        : route_cache_(cache_entries, cache_memory_bytes),
+          budget_(exact_budget, round_budget) {}
+
+    py::tuple initialize(
+        py::handle node_kind,
+        py::handle ready_time,
+        py::handle due_date,
+        py::handle service_time,
+        py::handle distance,
+        py::handle vehicle,
+        py::handle initial_route_offsets,
+        py::handle initial_route_indices,
+        py::handle control,
+        py::handle deadline_remaining) {
+        if (initialized_) {
+            throw std::runtime_error(
+                "full native v2 search engine cannot be initialized twice");
+        }
+        auto initialized = full_native_initialize_v2(
+            node_kind,
+            ready_time,
+            due_date,
+            service_time,
+            distance,
+            vehicle,
+            initial_route_offsets,
+            initial_route_indices,
+            control,
+            deadline_remaining);
+        auto offsets_array = checked_array<std::int64_t>(
+            initial_route_offsets, "initial_route_offsets", 1);
+        auto indices_array = checked_array<std::int64_t>(
+            initial_route_indices, "initial_route_indices", 1);
+        auto exact_payload = py::cast<py::tuple>(initialized[0]);
+        const auto route_count = static_cast<std::int64_t>(offsets_array.size() - 1);
+        const auto reservation = budget_.reserve_exact(route_count);
+        const auto* reserved = checked_data<std::int64_t>(reservation);
+        if (reserved[1] != route_count) {
+            throw std::runtime_error(
+                "full native warm start does not fit the exact-call budget");
+        }
+        auto exact_counters = py::cast<py::array_t<std::int64_t>>(exact_payload[6]);
+        const auto* counter_values = checked_data<std::int64_t>(exact_counters);
+        if (counter_values[2] != route_count || counter_values[3] != 0) {
+            budget_.interrupt_exact(route_count);
+            throw std::runtime_error(
+                "full native warm-start exact transaction did not complete atomically");
+        }
+        budget_.complete_exact(route_count);
+
+        auto status_array = py::cast<py::array_t<std::int64_t>>(exact_payload[2]);
+        auto reason_array = py::cast<py::array_t<std::int64_t>>(exact_payload[3]);
+        auto metrics_array = py::cast<py::array_t<double>>(exact_payload[4]);
+        auto labels_array = py::cast<py::array_t<std::int64_t>>(exact_payload[5]);
+        auto path_offsets_array = py::cast<py::array_t<std::int64_t>>(exact_payload[0]);
+        auto path_indices_array = py::cast<py::array_t<std::int64_t>>(exact_payload[1]);
+        const auto* route_offsets = checked_data<std::int64_t>(offsets_array);
+        const auto* route_indices = checked_data<std::int64_t>(indices_array);
+        const auto* path_offsets = checked_data<std::int64_t>(path_offsets_array);
+        const auto* path_indices = checked_data<std::int64_t>(path_indices_array);
+        const auto* statuses = checked_data<std::int64_t>(status_array);
+        const auto* reasons = checked_data<std::int64_t>(reason_array);
+        const auto* metrics = checked_data<double>(metrics_array);
+        const auto* labels = checked_data<std::int64_t>(labels_array);
+        py::array_t<std::uint8_t> semantic_hashes(
+            {static_cast<py::ssize_t>(route_count), py::ssize_t(32)});
+        py::array_t<std::int64_t> entry_bytes(route_count);
+        for (std::int64_t route = 0; route < route_count; ++route) {
+            std::string evidence("stage05.2-native-route-result-v2");
+            const auto append = [&evidence](const auto* values, std::size_t count) {
+                evidence.append(
+                    reinterpret_cast<const char*>(values), count * sizeof(*values));
+            };
+            append(
+                route_indices + route_offsets[route],
+                static_cast<std::size_t>(route_offsets[route + 1] - route_offsets[route]));
+            append(statuses + route, 1);
+            append(reasons + route, 1);
+            append(metrics + route * 4, 4);
+            append(labels + route * 3, 3);
+            append(
+                path_indices + path_offsets[route],
+                static_cast<std::size_t>(path_offsets[route + 1] - path_offsets[route]));
+            const auto digest = native_sha256_digest(evidence);
+            std::copy(
+                digest.begin(), digest.end(),
+                checked_data(semantic_hashes) + route * 32);
+            checked_data(entry_bytes)[route] = static_cast<std::int64_t>(
+                256
+                + (route_offsets[route + 1] - route_offsets[route])
+                    * static_cast<std::int64_t>(sizeof(std::int64_t))
+                + (path_offsets[route + 1] - path_offsets[route])
+                    * static_cast<std::int64_t>(sizeof(std::int64_t)));
+        }
+        route_cache_.begin_store_exact_many_atomic(
+            initial_route_offsets,
+            initial_route_indices,
+            exact_payload[0],
+            exact_payload[1],
+            exact_payload[2],
+            exact_payload[3],
+            exact_payload[4],
+            exact_payload[5],
+            semantic_hashes,
+            entry_bytes);
+        route_cache_.commit_store_batch();
+        current_offsets_ = py::cast<py::array_t<std::int64_t>>(offsets_array);
+        current_indices_ = py::cast<py::array_t<std::int64_t>>(indices_array);
+        current_exact_payload_ = exact_payload;
+        current_objective_integer_ = py::cast<py::array_t<std::int64_t>>(initialized[1]);
+        current_objective_float_ = py::cast<py::array_t<double>>(initialized[2]);
+        initialized_ = true;
+        return initialized;
+    }
+
+    [[nodiscard]] bool initialized() const noexcept {
+        return initialized_;
+    }
+
+private:
+    NativeRouteCacheV2 route_cache_;
+    NativeBudgetStateV2 budget_;
+    NativeAttemptedPlanSetV2 attempted_plans_;
+    bool initialized_ = false;
+    py::array_t<std::int64_t> current_offsets_;
+    py::array_t<std::int64_t> current_indices_;
+    py::tuple current_exact_payload_;
+    py::array_t<std::int64_t> current_objective_integer_;
+    py::array_t<double> current_objective_float_;
+};
+
 py::tuple full_native_alns_v2(
     py::handle node_kind,
     py::handle demand,
@@ -8093,7 +8238,13 @@ py::tuple full_native_alns_v2(
         || !std::isfinite(options[1]) || options[1] <= 0.0) {
         throw std::invalid_argument("full native v2 protocol options are invalid");
     }
-    static_cast<void>(full_native_initialize_v2(
+    const auto* base_control_values = checked_data<std::int64_t>(base_control);
+    NativeSearchEngineV2 engine(
+        base_control_values[4],
+        protocol_values[2],
+        protocol_values[7],
+        protocol_values[8]);
+    static_cast<void>(engine.initialize(
         node_kind,
         ready_time,
         due_date,
@@ -8104,6 +8255,9 @@ py::tuple full_native_alns_v2(
         initial_route_indices,
         control,
         deadline_remaining));
+    if (!engine.initialized()) {
+        throw std::logic_error("full native v2 search engine lost initialization state");
+    }
     throw std::runtime_error(
         "full native v2 semantic engine is incomplete; refusing prototype fallback");
 }
