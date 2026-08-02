@@ -41,6 +41,7 @@ from evrptw.native_execution import (
     NativeCandidateRoundResult,
     Stage052NativeExecutionConfig,
     decode_native_constraint_semantic_stream,
+    decode_native_global_semantic_stream,
     execute_native_candidate_round,
 )
 from evrptw.native_kernels import NativeKernelConfig, NativeKernelRuntime
@@ -93,6 +94,32 @@ def _candidate_plan_fixture() -> Instance:
             Node("C4", NodeType.CUSTOMER, 4.0, 0.0, 1.0, 0.0, 1_000.0, 0.0),
         ),
         Vehicle(100.0, 100.0, 1.0, 0.1, 1.0),
+        distance_backend="python",
+    )
+
+
+def _exact_infeasible_candidate_fixture() -> Instance:
+    return Instance(
+        "exact_infeasible_candidate_fixture",
+        (
+            Node("D0", NodeType.DEPOT, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0),
+            Node("C1", NodeType.CUSTOMER, 1.0, 0.0, 1.0, 0.0, 19.5, 0.0),
+            Node("C2", NodeType.CUSTOMER, 10.0, 0.0, 1.0, 0.0, 100.0, 0.0),
+            Node("S1", NodeType.STATION, 5.0, 0.0, 0.0, 0.0, 100.0, 0.0),
+        ),
+        Vehicle(10.0, 10.0, 1.0, 1.0, 1.0),
+        distance_backend="python",
+    )
+
+
+def _one_customer_fixture() -> Instance:
+    return Instance(
+        "one_customer_fixture",
+        (
+            Node("D0", NodeType.DEPOT, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0),
+            Node("C1", NodeType.CUSTOMER, 1.0, 0.0, 1.0, 0.0, 100.0, 0.0),
+        ),
+        Vehicle(10.0, 100.0, 1.0, 0.1, 1.0),
         distance_backend="python",
     )
 
@@ -3137,6 +3164,708 @@ def test_constraint_only_search_fails_before_unscheduled_global_iteration() -> N
         )
     assert engine.state()[1][5:8].tolist() == [1, 1, 0]
     assert engine.solution_state()[1].tolist() == [1, 2]
+
+
+def test_native_global_search_matches_python_first_iteration_events() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **_full_native_solve_kwargs(),
+        candidate_control_config=CandidateControlConfig(worker_count=1),
+    )
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 1, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+
+    payload = engine.run_global_search(
+            0,
+            1,
+            0,
+            np.asarray([4, 8, 3], dtype=np.int64),
+            np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        )
+    decoded = decode_native_global_semantic_stream(
+        instance,
+        payload,
+        node_names=context.node_names,
+        initial_customer_sequences=(("C1", "C2"),),
+        stage04_config=Stage04Config(),
+        expected_start_iteration=0,
+        expected_iteration_count=1,
+    )
+
+    assert decoded.neighborhood_events == python_result.neighborhood_events
+    assert decoded.termination[:4].tolist() == [0, 0, 1, 1]
+    assert decoded.termination[4:].tolist() == [10, 1, 1, 0, 2, 2, 0]
+    assert decoded.stage04_calls.tolist() == [[1, 0, 0, 0]]
+    assert engine.solution_state()[1].tolist() == [2, 1]
+    assert engine.best_solution_payload()[1].tolist() == [1, 2]
+
+    corrupted_events = payload[0].copy()
+    corrupted_events[0, 12] = 99
+    with pytest.raises(RuntimeError, match="semantic stream SHA-256 mismatch"):
+        decode_native_global_semantic_stream(
+            instance,
+            (corrupted_events, *payload[1:]),
+            node_names=context.node_names,
+            initial_customer_sequences=(("C1", "C2"),),
+            stage04_config=Stage04Config(),
+            expected_start_iteration=0,
+            expected_iteration_count=1,
+        )
+
+    corrupted_objective = payload[7].copy()
+    corrupted_objective[1, 0] = -1
+    with pytest.raises(RuntimeError, match="semantic state is invalid"):
+        decode_native_global_semantic_stream(
+            instance,
+            (*payload[:7], corrupted_objective, *payload[8:]),
+            node_names=context.node_names,
+            initial_customer_sequences=(("C1", "C2"),),
+            stage04_config=Stage04Config(),
+            expected_start_iteration=0,
+            expected_iteration_count=1,
+        )
+
+    corrupted_routes = payload[6].copy()
+    corrupted_routes[0] = len(context.node_names)
+    with pytest.raises(RuntimeError, match="contains an unknown node"):
+        decode_native_global_semantic_stream(
+            instance,
+            (*payload[:6], corrupted_routes, *payload[7:]),
+            node_names=context.node_names,
+            initial_customer_sequences=(("C1", "C2"),),
+            stage04_config=Stage04Config(),
+            expected_start_iteration=0,
+            expected_iteration_count=1,
+        )
+
+    malformed_termination = payload[13][:-1]
+    with pytest.raises(RuntimeError, match="global termination"):
+        decode_native_global_semantic_stream(
+            instance,
+            (*payload[:13], malformed_termination, payload[14]),
+            node_names=context.node_names,
+            initial_customer_sequences=(("C1", "C2"),),
+            stage04_config=Stage04Config(),
+            expected_start_iteration=0,
+            expected_iteration_count=1,
+        )
+
+    with pytest.raises(RuntimeError, match="semantic state is invalid"):
+        decode_native_global_semantic_stream(
+            instance,
+            payload,
+            node_names=context.node_names,
+            initial_customer_sequences=(("C1", "C2"),),
+            stage04_config=Stage04Config(),
+            expected_start_iteration=0,
+            expected_iteration_count=2,
+        )
+
+    def with_recomputed_global_hash(
+        candidate_payload: tuple[object, ...],
+    ) -> tuple[object, ...]:
+        from evrptw import native_execution as native_execution_module
+
+        evidence = bytearray(b"stage05.2-native-global-semantic-stream-v2")
+        for values in candidate_payload[:14]:
+            assert isinstance(values, np.ndarray)
+            native_execution_module._append_typed_array(evidence, values)
+        return (*candidate_payload[:14], hashlib.sha256(evidence).hexdigest())
+
+    non_boolean_event = payload[0].copy()
+    non_boolean_event[2, 6] = 2
+    with pytest.raises(RuntimeError, match="event values are invalid"):
+        decode_native_global_semantic_stream(
+            instance,
+            with_recomputed_global_hash((non_boolean_event, *payload[1:])),
+            node_names=context.node_names,
+            initial_customer_sequences=(("C1", "C2"),),
+            stage04_config=Stage04Config(),
+            expected_start_iteration=0,
+            expected_iteration_count=1,
+        )
+
+    negative_exact_count = payload[0].copy()
+    negative_exact_count[2, 11] = -1
+    with pytest.raises(RuntimeError, match="event values are invalid"):
+        decode_native_global_semantic_stream(
+            instance,
+            with_recomputed_global_hash((negative_exact_count, *payload[1:])),
+            node_names=context.node_names,
+            initial_customer_sequences=(("C1", "C2"),),
+            stage04_config=Stage04Config(),
+            expected_start_iteration=0,
+            expected_iteration_count=1,
+        )
+
+    false_budget_terminal = payload[13].copy()
+    false_budget_terminal[0] = 1
+    with pytest.raises(RuntimeError, match="semantic state is invalid"):
+        decode_native_global_semantic_stream(
+            instance,
+            with_recomputed_global_hash(
+                (*payload[:13], false_budget_terminal, payload[14])
+            ),
+            node_names=context.node_names,
+            initial_customer_sequences=(("C1", "C2"),),
+            stage04_config=Stage04Config(),
+            expected_start_iteration=0,
+            expected_iteration_count=1,
+        )
+
+    wrong_event_sequence = payload[0].copy()
+    wrong_event_sequence[[0, 3]] = wrong_event_sequence[[3, 0]]
+    with pytest.raises(RuntimeError, match="canonical event sequence is invalid"):
+        decode_native_global_semantic_stream(
+            instance,
+            with_recomputed_global_hash((wrong_event_sequence, *payload[1:])),
+            node_names=context.node_names,
+            initial_customer_sequences=(("C1", "C2"),),
+            stage04_config=Stage04Config(),
+            expected_start_iteration=0,
+            expected_iteration_count=1,
+        )
+
+    zero_event_payload = (
+        np.empty((0, 26), dtype=np.int64),
+        np.empty(0, dtype=np.float64),
+        np.asarray([0], dtype=np.int64),
+        np.empty(0, dtype=np.int64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([0], dtype=np.int64),
+        np.empty(0, dtype=np.int64),
+        np.empty((0, 2), dtype=np.int64),
+        np.empty((0, 2), dtype=np.float64),
+        *payload[9:14],
+        "",
+    )
+    with pytest.raises(RuntimeError, match="semantic state is invalid"):
+        decode_native_global_semantic_stream(
+            instance,
+            with_recomputed_global_hash(zero_event_payload),
+            node_names=context.node_names,
+            initial_customer_sequences=(("C1", "C2"),),
+            stage04_config=Stage04Config(),
+            expected_start_iteration=0,
+            expected_iteration_count=1,
+        )
+
+    wrong_stage04_calls = payload[11].copy()
+    wrong_stage04_calls[0] = [0, 1, 0, 0]
+    with pytest.raises(RuntimeError, match="canonical event sequence is invalid"):
+        decode_native_global_semantic_stream(
+            instance,
+            with_recomputed_global_hash(
+                (*payload[:11], wrong_stage04_calls, *payload[12:])
+            ),
+            node_names=context.node_names,
+            initial_customer_sequences=(("C1", "C2"),),
+            stage04_config=Stage04Config(),
+            expected_start_iteration=0,
+            expected_iteration_count=1,
+        )
+
+    false_objective = payload[7].copy()
+    false_objective[1:3, 0] = 2
+    with pytest.raises(RuntimeError, match="objective replay is invalid"):
+        decode_native_global_semantic_stream(
+            instance,
+            with_recomputed_global_hash(
+                (*payload[:7], false_objective, *payload[8:])
+            ),
+            node_names=context.node_names,
+            initial_customer_sequences=(("C1", "C2"),),
+            stage04_config=Stage04Config(),
+            expected_start_iteration=0,
+            expected_iteration_count=1,
+        )
+
+    false_stage04_reward = payload[12].copy()
+    false_stage04_reward[0, 0] += 1.0
+    with pytest.raises(RuntimeError, match="Stage 4 replay is invalid"):
+        decode_native_global_semantic_stream(
+            instance,
+            with_recomputed_global_hash(
+                (*payload[:12], false_stage04_reward, *payload[13:])
+            ),
+            node_names=context.node_names,
+            initial_customer_sequences=(("C1", "C2"),),
+            stage04_config=Stage04Config(),
+            expected_start_iteration=0,
+            expected_iteration_count=1,
+        )
+
+    false_stage04_weights = payload[10].copy()
+    false_stage04_weights[0, 0, 1] += 1.0
+    with pytest.raises(RuntimeError, match="Stage 4 replay is invalid"):
+        decode_native_global_semantic_stream(
+            instance,
+            with_recomputed_global_hash(
+                (*payload[:10], false_stage04_weights, *payload[11:])
+            ),
+            node_names=context.node_names,
+            initial_customer_sequences=(("C1", "C2"),),
+            stage04_config=Stage04Config(),
+            expected_start_iteration=0,
+            expected_iteration_count=1,
+        )
+
+
+def test_native_global_search_matches_python_distance_improvement_event() -> None:
+    from evrptw import _core as native_core
+
+    instance = _candidate_plan_fixture()
+    initial = ("C1", "C3", "C2", "C4")
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = (initial,)
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **solve_kwargs,
+        candidate_control_config=CandidateControlConfig(worker_count=1),
+    )
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, len(initial)], dtype=np.int64),
+        np.asarray([context.name_to_index[name] for name in initial], dtype=np.int64),
+        np.asarray([2014, 1, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+
+    decoded = decode_native_global_semantic_stream(
+        instance,
+        engine.run_global_search(
+            0,
+            1,
+            0,
+            np.asarray([4, 8, 3], dtype=np.int64),
+            np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        ),
+        node_names=context.node_names,
+        initial_customer_sequences=(initial,),
+        stage04_config=Stage04Config(),
+        expected_start_iteration=0,
+        expected_iteration_count=1,
+    )
+
+    assert decoded.neighborhood_events == python_result.neighborhood_events
+    assert decoded.neighborhood_events[2]["distance_improvement"] is True
+
+
+def test_native_global_search_matches_python_exact_infeasible_event() -> None:
+    from evrptw import _core as native_core
+
+    instance = _exact_infeasible_candidate_fixture()
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **_full_native_solve_kwargs(),
+        candidate_control_config=CandidateControlConfig(worker_count=1),
+    )
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray(
+            [context.name_to_index["C1"], context.name_to_index["C2"]],
+            dtype=np.int64,
+        ),
+        np.asarray([2014, 1, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+
+    decoded = decode_native_global_semantic_stream(
+        instance,
+        engine.run_global_search(
+            0,
+            1,
+            0,
+            np.asarray([4, 8, 3], dtype=np.int64),
+            np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        ),
+        node_names=context.node_names,
+        initial_customer_sequences=(("C1", "C2"),),
+        stage04_config=Stage04Config(),
+        expected_start_iteration=0,
+        expected_iteration_count=1,
+    )
+
+    assert decoded.neighborhood_events == python_result.neighborhood_events
+    assert decoded.neighborhood_events[2]["status"] == "failed"
+    assert decoded.neighborhood_events[2]["reason"] == "constraint_repair_infeasible"
+    assert decoded.neighborhood_events[2]["candidate_objective_key"] == ()
+    assert decoded.termination[4:].tolist() == [10, 1, 1, 0, 2, 2, 0]
+
+
+def test_native_global_search_matches_python_no_removable_customer_events() -> None:
+    from evrptw import _core as native_core
+
+    instance = _one_customer_fixture()
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = (("C1",),)
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **solve_kwargs,
+        candidate_control_config=CandidateControlConfig(worker_count=1),
+    )
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 1], dtype=np.int64),
+        np.asarray([context.name_to_index["C1"]], dtype=np.int64),
+        np.asarray([2014, 1, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+
+    decoded = decode_native_global_semantic_stream(
+        instance,
+        engine.run_global_search(
+            0,
+            1,
+            0,
+            np.asarray([4, 8, 3], dtype=np.int64),
+            np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        ),
+        node_names=context.node_names,
+        initial_customer_sequences=(("C1",),),
+        stage04_config=Stage04Config(),
+        expected_start_iteration=0,
+        expected_iteration_count=1,
+    )
+
+    assert decoded.neighborhood_events == python_result.neighborhood_events
+    assert len(decoded.neighborhood_events) == 3
+    assert decoded.neighborhood_events[1]["reason"] == "no_removable_customer"
+    assert decoded.stage04_calls.tolist() == [[0, 0, 0, 0]]
+    assert decoded.termination[4:].tolist() == [10, 1, 1, 0, 1, 1, 0]
+
+
+def test_native_global_search_matches_python_fixed_work_budget_boundary() -> None:
+    from evrptw import _core as native_core
+
+    instance = _candidate_plan_fixture()
+    initial = ("C1", "C3", "C2", "C4")
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = (initial,)
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=120.0,
+        exact_deadline_config=ExactDeadlineConfig.fixed_exact_calls(
+            2, watchdog_seconds=120.0
+        ),
+        **solve_kwargs,
+        candidate_control_config=CandidateControlConfig(worker_count=1),
+    )
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        2, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, len(initial)], dtype=np.int64),
+        np.asarray([context.name_to_index[name] for name in initial], dtype=np.int64),
+        np.asarray([2014, 1, 128, 1, 2], dtype=np.int64),
+        np.asarray([120.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+
+    decoded = decode_native_global_semantic_stream(
+        instance,
+        engine.run_global_search(
+            0,
+            1,
+            0,
+            np.asarray([4, 8, 3], dtype=np.int64),
+            np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+            np.asarray([120.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        ),
+        node_names=context.node_names,
+        initial_customer_sequences=(initial,),
+        stage04_config=Stage04Config(),
+        expected_start_iteration=0,
+        expected_iteration_count=1,
+    )
+
+    assert python_result.termination_reason == "exact_call_budget_exhausted"
+    assert decoded.termination[:4].tolist() == [1, 0, 1, 1]
+    assert decoded.termination[4:].tolist() == [2, 1, 1, 0, 2, 2, 0]
+    assert decoded.neighborhood_events == python_result.neighborhood_events
+    assert len(decoded.neighborhood_events) == 3
+    assert decoded.neighborhood_events[-1]["accepted"] is False
+    assert decoded.neighborhood_events[-1]["distance_improvement"] is True
+
+
+def test_native_global_search_returns_pre_exhausted_budget_terminal() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=120.0,
+        exact_deadline_config=ExactDeadlineConfig.fixed_exact_calls(
+            1, watchdog_seconds=120.0
+        ),
+        **_full_native_solve_kwargs(),
+        candidate_control_config=CandidateControlConfig(worker_count=1),
+    )
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        1, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 1, 128, 1, 1], dtype=np.int64),
+        np.asarray([120.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+
+    decoded = decode_native_global_semantic_stream(
+        instance,
+        engine.run_global_search(
+            0,
+            1,
+            0,
+            np.asarray([4, 8, 3], dtype=np.int64),
+            np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+            np.asarray([120.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        ),
+        node_names=context.node_names,
+        initial_customer_sequences=(("C1", "C2"),),
+        stage04_config=Stage04Config(),
+        expected_start_iteration=0,
+        expected_iteration_count=1,
+    )
+
+    assert python_result.termination_reason == "exact_call_budget_exhausted"
+    assert python_result.neighborhood_events == ()
+    assert decoded.neighborhood_events == ()
+    assert decoded.termination.tolist() == [1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 0]
+    assert decoded.stage04_calls.shape == (0, 4)
+
+
+def test_native_global_search_envelope_failure_rolls_back_logical_state() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 1, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    state_before = engine.state()
+    solution_before = engine.solution_state()
+    stage04_before = engine.constraint_stage04_state()
+
+    engine.inject_global_search_envelope_failure_once()
+    with pytest.raises(RuntimeError, match="global-search envelope failure"):
+        engine.run_global_search(
+            0,
+            1,
+            0,
+            np.asarray([4, 8, 3], dtype=np.int64),
+            np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        )
+
+    state_after = engine.state()
+    solution_after = engine.solution_state()
+    stage04_after = engine.constraint_stage04_state()
+    for before, after in zip(solution_before, solution_after, strict=True):
+        np.testing.assert_equal(after, before)
+    for before, after in zip(stage04_before, stage04_after, strict=True):
+        np.testing.assert_equal(after, before)
+    np.testing.assert_equal(state_after[0], state_before[0])
+    assert state_after[2] == state_before[2]
+    np.testing.assert_equal(state_after[3], state_before[3])
+    assert state_after[1][5] > state_before[1][5]
+    np.testing.assert_equal(state_after[1][2:5], state_before[1][2:5])
+
+
+def test_native_global_search_returns_deadline_terminal_without_partial_iteration() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 1, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    state_before = engine.state()
+    solution_before = engine.solution_state()
+    engine.inject_constraint_iteration_deadline_before_commit_once()
+
+    decoded = decode_native_global_semantic_stream(
+        instance,
+        engine.run_global_search(
+            0,
+            1,
+            0,
+            np.asarray([4, 8, 3], dtype=np.int64),
+            np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        ),
+        node_names=context.node_names,
+        initial_customer_sequences=(("C1", "C2"),),
+        stage04_config=Stage04Config(),
+        expected_start_iteration=0,
+        expected_iteration_count=1,
+    )
+
+    assert decoded.termination[:4].tolist() == [2, 0, 0, 0]
+    assert decoded.neighborhood_events == ()
+    assert decoded.stage04_calls.shape == (0, 4)
+    assert decoded.termination[4:].tolist() == [10, 1, 1, 0, 2, 2, 0]
+    assert decoded.termination[8] > state_before[1][5]
+    for before, after in zip(solution_before, engine.solution_state(), strict=True):
+        np.testing.assert_equal(after, before)
 
 
 def test_native_constraint_iteration_deadline_boundary_rolls_back_all_state() -> None:

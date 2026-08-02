@@ -460,6 +460,34 @@ class NativeSearchEngineV2:
         npt.NDArray[np.int64],
         str,
     ]: ...
+    def run_global_search(
+        self,
+        start_iteration: int,
+        iteration_count: int,
+        initial_stagnation_iterations: int,
+        thresholds: npt.NDArray[np.int64],
+        fractions: npt.NDArray[np.float64],
+        deadline_remaining: npt.NDArray[np.float64],
+        batch_size: npt.NDArray[np.int64],
+        route_change_limit: int,
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        str,
+    ]: ...
+    def inject_global_search_envelope_failure_once(self) -> None: ...
     def initialized(self) -> bool: ...
     def inject_commit_failure_once(self, step: int) -> None: ...
     def inject_constraint_probe_envelope_failure_once(self) -> None: ...

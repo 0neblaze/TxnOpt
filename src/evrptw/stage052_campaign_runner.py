@@ -163,7 +163,7 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
 )
 _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
     "cpp/evrptw_core.cpp": (
-        "399bc821faacc82f91ede649bc1283a995acf391170cc5db042002aaf5c5300c"
+        "8e2759420da7782f7d83d5c5c02c42970a540a172ae3e10993e9cc2706c6fded"
     ),
     "src/evrptw/alns.py": "05a5ec099c000330384abe57644792f8063edd567c170caac4b3c8737238b101",
     "src/evrptw/cache_incremental.py": (

@@ -30,12 +30,13 @@ from evrptw.candidate_transaction import (
     NativeCandidateTransactionRuntime,
     decode_native_candidate_screening_payload,
 )
-from evrptw.charging import ChargingSubproblemResult
+from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
 from evrptw.cpu_batch import BackendMetrics, decode_exact_charging_batch_numeric
 from evrptw.measurement import CheapScreeningConfig
 from evrptw.models import Instance
 from evrptw.native_kernels import NativeKernelConfig, NativeKernelRuntime
 from evrptw.neighborhoods import VehicleOperatorConfig
+from evrptw.objective import SolutionObjective
 from evrptw.stage04 import Stage04Config
 
 NATIVE_EXECUTION_SCHEMA_VERSION = "stage05.2-native-execution-v2"
@@ -240,6 +241,17 @@ class NativeConstraintSemanticStream:
     stage04_weights: npt.NDArray[np.float64]
     stage04_calls: npt.NDArray[np.int64]
     stage04_rewards: npt.NDArray[np.float64]
+    termination: npt.NDArray[np.int64]
+    transaction_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class NativeGlobalSemanticStream:
+    """Validated global-iteration events projected into the Python event schema."""
+
+    neighborhood_events: tuple[Mapping[str, object], ...]
+    event_integer: npt.NDArray[np.int64]
+    stage04_calls: npt.NDArray[np.int64]
     termination: npt.NDArray[np.int64]
     transaction_sha256: str
 
@@ -481,6 +493,593 @@ def decode_native_constraint_semantic_stream(
         stage04_weights=_readonly_copy(stage04_weights),
         stage04_calls=_readonly_copy(stage04_calls),
         stage04_rewards=_readonly_copy(stage04_rewards),
+        termination=_readonly_copy(termination),
+        transaction_sha256=transaction_sha256,
+    )
+
+
+def decode_native_global_semantic_stream(
+    instance: Instance,
+    payload: object,
+    *,
+    node_names: tuple[str, ...],
+    initial_customer_sequences: tuple[CustomerSequence, ...],
+    stage04_config: Stage04Config,
+    expected_start_iteration: int,
+    expected_iteration_count: int,
+) -> NativeGlobalSemanticStream:
+    """Independently validate and project one native global semantic stream."""
+
+    if expected_start_iteration < 0 or expected_iteration_count <= 0:
+        raise ValueError("native global semantic expected iteration range is invalid")
+    if not stage04_config.enabled:
+        raise ValueError("native global semantic replay requires enabled Stage 4")
+    if tuple(node.name for node in instance.nodes) != node_names:
+        raise RuntimeError("native global semantic node identity is invalid")
+    if not isinstance(payload, tuple) or len(payload) != 15:
+        raise RuntimeError("native global semantic stream has an invalid tuple")
+    events = payload[0]
+    if (
+        not isinstance(events, np.ndarray)
+        or events.dtype != np.dtype(np.int64)
+        or events.ndim != 2
+        or events.shape[1] != 26
+        or not events.flags.c_contiguous
+    ):
+        raise RuntimeError("native global semantic events have an invalid schema")
+    event_count = events.shape[0]
+    ranking = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            payload[1],
+            dtype=np.dtype(np.float64),
+            shape=(event_count,),
+            name="global ranking",
+        ),
+    )
+    removed_offsets = _require_vector(payload[2], "global removed offsets")
+    removed_indices = _require_vector(payload[3], "global removed indices")
+    plan_offsets = _require_vector(payload[4], "global plan offsets")
+    route_offsets = _require_vector(payload[5], "global route offsets")
+    route_indices = _require_vector(payload[6], "global route indices")
+    objective_integer = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[7],
+            dtype=np.dtype(np.int64),
+            shape=(event_count, 2),
+            name="global objective integers",
+        ),
+    )
+    objective_float = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            payload[8],
+            dtype=np.dtype(np.float64),
+            shape=(event_count, 2),
+            name="global objective floats",
+        ),
+    )
+    termination = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[13],
+            dtype=np.dtype(np.int64),
+            shape=(11,),
+            name="global termination",
+        ),
+    )
+    terminal_reason = int(termination[0])
+    completed_iterations = int(termination[2])
+    exact_budget_limit = int(termination[4])
+    entry_exact = termination[5:8]
+    final_exact = termination[8:11]
+    exact_delta = final_exact - entry_exact
+    stage04_status = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[9],
+            dtype=np.dtype(np.int64),
+            shape=(completed_iterations, 4),
+            name="global Stage 4 status",
+        ),
+    )
+    stage04_weights = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            payload[10],
+            dtype=np.dtype(np.float64),
+            shape=(completed_iterations, 4, 2),
+            name="global Stage 4 weights",
+        ),
+    )
+    stage04_calls = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[11],
+            dtype=np.dtype(np.int64),
+            shape=(completed_iterations, 4),
+            name="global Stage 4 calls",
+        ),
+    )
+    stage04_rewards = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            payload[12],
+            dtype=np.dtype(np.float64),
+            shape=(completed_iterations, 4),
+            name="global Stage 4 rewards",
+        ),
+    )
+    if (
+        len(removed_offsets) != event_count + 1
+        or len(plan_offsets) != event_count + 1
+        or len(route_offsets) == 0
+        or int(removed_offsets[0]) != 0
+        or int(removed_offsets[-1]) != len(removed_indices)
+        or int(plan_offsets[0]) != 0
+        or int(plan_offsets[-1]) != len(route_offsets) - 1
+        or int(route_offsets[0]) != 0
+        or int(route_offsets[-1]) != len(route_indices)
+        or np.any(removed_offsets[:-1] > removed_offsets[1:])
+        or np.any(plan_offsets[:-1] > plan_offsets[1:])
+        or np.any(route_offsets[:-1] > route_offsets[1:])
+    ):
+        raise RuntimeError("native global semantic offsets are invalid")
+    if (
+        np.any(events[:, 0] != 0)
+        or np.any(events[:, 1] < 0)
+        or np.any(events[:, 1] > 2)
+        or np.any(events[:, 3] < 0)
+        or np.any(events[:, 3] >= len(FULL_NATIVE_OPERATOR_NAMES))
+        or np.any(events[:, 4] < 0)
+        or np.any(events[:, 4] > 2)
+        or np.any(events[:, 5] < 0)
+        or np.any(events[:, 5] > 4)
+        or np.any(events[:, 2] < expected_start_iteration)
+        or np.any(events[:, 2] >= expected_start_iteration + completed_iterations)
+        or np.any(~np.isin(events[:, [6, 7, 8, 9, 10, 23]], (0, 1)))
+        or np.any(events[:, [11, 12, 13, 14, 18, 19, 21, 22]] < 0)
+        or np.any(events[:, 6] > events[:, 10])
+        or np.any(events[:, 16:18] < -1)
+        or np.any(events[:, 20] < -2)
+        or np.any(events[:, 24] < -1)
+        or np.any(events[:, 24] > 2)
+        or np.any(events[:, 25] < -1)
+        or np.any(events[:, 25] > 6)
+        or np.any(~np.isfinite(ranking))
+    ):
+        raise RuntimeError("native global semantic event values are invalid")
+    all_node_indices = np.concatenate((removed_indices, route_indices))
+    if np.any(all_node_indices < 0) or np.any(all_node_indices >= len(node_names)):
+        raise RuntimeError("native global semantic event contains an unknown node")
+    objective_present = objective_integer[:, 0] >= 0
+    if (
+        np.any((objective_integer[:, 0] >= 0) != (objective_integer[:, 1] >= 0))
+        or np.any(objective_integer[~objective_present] != -1)
+        or np.any(objective_integer[objective_present] < 0)
+        or np.any(np.isfinite(objective_float) != objective_present[:, None])
+        or np.any(objective_float[objective_present] < 0.0)
+        or np.any((stage04_status < -1) | (stage04_status > 1))
+        or np.any(stage04_calls < 0)
+        or np.any(~np.isfinite(stage04_weights))
+        or np.any(stage04_weights < 0.0)
+        or np.any(~np.isfinite(stage04_rewards))
+        or np.any(stage04_rewards < 0.0)
+        or terminal_reason not in {0, 1, 2}
+        or (terminal_reason == 0 and completed_iterations != expected_iteration_count)
+        or (
+            terminal_reason == 1
+            and not 0 <= completed_iterations <= expected_iteration_count
+        )
+        or (terminal_reason == 2 and completed_iterations != 0)
+        or int(termination[1]) != expected_start_iteration
+        or int(termination[3]) != expected_start_iteration + completed_iterations
+        or exact_budget_limit < -1
+        or np.any(entry_exact < 0)
+        or np.any(final_exact < entry_exact)
+        or int(entry_exact[1]) + int(entry_exact[2]) != int(entry_exact[0])
+        or int(final_exact[1]) + int(final_exact[2]) != int(final_exact[0])
+        or entry_exact.tolist() != [len(initial_customer_sequences)] * 2 + [0]
+        or (
+            exact_budget_limit >= 0
+            and (
+                int(entry_exact[0]) > exact_budget_limit
+                or int(final_exact[0]) > exact_budget_limit
+            )
+        )
+        or (
+            terminal_reason == 0
+            and exact_budget_limit >= 0
+            and int(final_exact[0]) == exact_budget_limit
+        )
+        or (
+            terminal_reason == 1
+            and (
+                exact_budget_limit < 0
+                or int(final_exact[0]) != exact_budget_limit
+            )
+        )
+        or (
+            terminal_reason != 2
+            and (
+                int(exact_delta[0]) != int(events[:, 11].sum(dtype=np.int64))
+                or exact_delta.tolist() != [int(exact_delta[0]), int(exact_delta[0]), 0]
+            )
+        )
+    ):
+        raise RuntimeError("native global semantic state is invalid")
+    initial_names = tuple(name for route in initial_customer_sequences for name in route)
+    expected_customer_names = {customer.name for customer in instance.customers}
+    if (
+        len(initial_customer_sequences) != 1
+        or len(initial_names) != len(expected_customer_names)
+        or set(initial_names) != expected_customer_names
+    ):
+        raise RuntimeError("native global initial incumbent identity is invalid")
+    transaction_sha256 = payload[14]
+    if not isinstance(transaction_sha256, str) or not _is_sha256(transaction_sha256):
+        raise RuntimeError("native global semantic SHA-256 is invalid")
+    evidence = bytearray(b"stage05.2-native-global-semantic-stream-v2")
+    for values in (
+        events,
+        ranking,
+        removed_offsets,
+        removed_indices,
+        plan_offsets,
+        route_offsets,
+        route_indices,
+        objective_integer,
+        objective_float,
+        stage04_status,
+        stage04_weights,
+        stage04_calls,
+        stage04_rewards,
+        termination,
+    ):
+        _append_typed_array(evidence, values)
+    if hashlib.sha256(evidence).hexdigest() != transaction_sha256:
+        raise RuntimeError("native global semantic stream SHA-256 mismatch")
+    if completed_iterations == 0:
+        if (
+            terminal_reason not in {1, 2}
+            or event_count != 0
+            or removed_offsets.tolist() != [0]
+            or len(removed_indices) != 0
+            or plan_offsets.tolist() != [0]
+            or route_offsets.tolist() != [0]
+            or len(route_indices) != 0
+            or objective_integer.shape != (0, 2)
+            or objective_float.shape != (0, 2)
+            or stage04_status.shape != (0, 4)
+            or stage04_weights.shape != (0, 4, 2)
+            or stage04_calls.shape != (0, 4)
+            or stage04_rewards.shape != (0, 4)
+        ):
+            raise RuntimeError("native global empty terminal is invalid")
+        return NativeGlobalSemanticStream(
+            neighborhood_events=(),
+            event_integer=_readonly_copy(events),
+            stage04_calls=_readonly_copy(stage04_calls),
+            termination=_readonly_copy(termination),
+            transaction_sha256=transaction_sha256,
+        )
+    status_by_code = {0: "not_applicable", 1: "candidate_proposed", 2: "failed"}
+    reason_by_code = {
+        0: "only_one_route",
+        1: "constraint_ranked_removal",
+        2: "constraint_removal_repaired",
+        3: "constraint_repair_infeasible",
+        4: "no_removable_customer",
+    }
+
+    def project_events() -> tuple[dict[str, object], ...]:
+        projected: list[dict[str, object]] = []
+        for row_index in range(event_count):
+            row = events[row_index]
+            first_removed = int(removed_offsets[row_index])
+            last_removed = int(removed_offsets[row_index + 1])
+            removed_customers = tuple(
+                node_names[int(node)]
+                for node in removed_indices[first_removed:last_removed]
+            )
+            first_route = int(plan_offsets[row_index])
+            last_route = int(plan_offsets[row_index + 1])
+            candidate_routes = tuple(
+                tuple(
+                    node_names[int(node)]
+                    for node in route_indices[
+                        int(route_offsets[route]) : int(route_offsets[route + 1])
+                    ]
+                )
+                for route in range(first_route, last_route)
+            )
+            operator = FULL_NATIVE_OPERATOR_NAMES[int(row[3])]
+            constraint_event = int(row[15]) == 2
+            objective_key: tuple[int, float, float, int] | tuple[()] = ()
+            if objective_present[row_index]:
+                objective_key = SolutionObjective(
+                    vehicle_count=int(objective_integer[row_index, 0]),
+                    total_distance=float(objective_float[row_index, 0]),
+                    total_charging_time=float(objective_float[row_index, 1]),
+                    charging_count=int(objective_integer[row_index, 1]),
+                ).key
+            projected.append(
+                {
+                    "operator": operator,
+                    "status": status_by_code[int(row[4])],
+                    "reason": reason_by_code[int(row[5])],
+                    "route_indices": (() if int(row[16]) < 0 else (int(row[16]),)),
+                    "affected_route_indices": (
+                        () if int(row[17]) < 0 else (int(row[17]),)
+                    ),
+                    "removed_customers": removed_customers,
+                    "candidate_customer_sequence": (),
+                    "candidate_route_sequences": candidate_routes,
+                    "candidate_vehicle_delta": (
+                        None if int(row[20]) == -2 else int(row[20])
+                    ),
+                    "candidate_feasible": bool(row[10]),
+                    "prefilter_passed": bool(row[9]),
+                    "new_routes_created": int(row[21]),
+                    "exact_route_evaluations": int(row[11]),
+                    "selection_rank": int(row[12]),
+                    "chain_depth": int(row[19]),
+                    "segment_length": int(row[18]),
+                    "track": "constraint_lane" if constraint_event else "legacy",
+                    "constraint_category": operator if constraint_event else "",
+                    "removal_tier": "small" if int(row[24]) == 0 else "",
+                    "removal_size_requested": int(row[13]),
+                    "removal_size_actual": int(row[14]),
+                    "stagnation_iterations": int(row[22]),
+                    "removal_trigger": (
+                        "stagnation_baseline"
+                        if int(row[25]) == 0
+                        else "no_removable_customer"
+                        if int(row[25]) == 1
+                        else ""
+                    ),
+                    "reset_observed": bool(row[23]),
+                    "ranking_score": float(ranking[row_index]),
+                    "iteration": int(row[2]),
+                    "accepted": bool(row[6]),
+                    "vehicle_reduction": bool(row[7]),
+                    "distance_improvement": bool(row[8]),
+                    "candidate_objective_key": objective_key,
+                }
+            )
+        return tuple(projected)
+
+    if len(expected_customer_names) == 1:
+        expected_events = np.asarray(
+            [
+                [1, 2, 0, 0, 0, 0, 0, -1, -2, -1, -1],
+                [2, 7, 0, 4, 0, 0, 2, -1, -2, 0, 1],
+                [0, 1, 0, 0, 0, 0, 0, -1, -2, -1, -1],
+            ],
+            dtype=np.int64,
+        )
+        single_columns = np.asarray(
+            [1, 3, 4, 5, 9, 10, 15, 16, 20, 24, 25],
+            dtype=np.int64,
+        )
+        initial_exact = solve_exact_charging(instance, initial_customer_sequences[0])
+        if (
+            event_count != 3
+            or terminal_reason != 0
+            or not initial_exact.feasible
+            or not np.array_equal(events[:, single_columns], expected_events)
+            or np.any(events[:, 2] != expected_start_iteration)
+            or removed_offsets.tolist() != [0, 0, 0, 0]
+            or len(removed_indices) != 0
+            or plan_offsets.tolist() != [0, 0, 0, 0]
+            or route_offsets.tolist() != [0]
+            or len(route_indices) != 0
+            or np.any(objective_present)
+            or np.any(ranking != 0.0)
+            or stage04_calls.tolist() != [[0, 0, 0, 0]]
+            or stage04_status.tolist() != [[-1, -1, -1, -1]]
+            or not np.array_equal(stage04_weights, np.ones((1, 4, 2)))
+            or not np.array_equal(stage04_rewards, np.zeros((1, 4)))
+        ):
+            raise RuntimeError("native global no-removable replay is invalid")
+        return NativeGlobalSemanticStream(
+            neighborhood_events=project_events(),
+            event_integer=_readonly_copy(events),
+            stage04_calls=_readonly_copy(stage04_calls),
+            termination=_readonly_copy(termination),
+            transaction_sha256=transaction_sha256,
+        )
+    canonical_columns = np.asarray(
+        [1, 3, 4, 5, 9, 10, 15, 16, 20, 24, 25],
+        dtype=np.int64,
+    )
+    candidate_feasible = bool(events[2, 10]) if event_count >= 3 else False
+    normal_canonical_values = np.asarray(
+        [
+            [1, 2, 0, 0, 0, 0, 0, -1, -2, -1, -1],
+            [2, 7, 1, 1, 1, 0, 2, 0, -2, 0, 0],
+            [
+                2,
+                7,
+                1 if candidate_feasible else 2,
+                2 if candidate_feasible else 3,
+                1,
+                1 if candidate_feasible else 0,
+                2,
+                -1,
+                0 if candidate_feasible else -2,
+                0,
+                0,
+            ],
+            [0, 1, 0, 0, 0, 0, 0, -1, -2, -1, -1],
+        ],
+        dtype=np.int64,
+    )
+    expected_event_count = 3 if terminal_reason == 1 else 4
+    canonical_values = normal_canonical_values[:expected_event_count]
+    removed_count = int(events[1, 14]) if event_count == expected_event_count else -1
+    expected_removed_offsets = [0, 0, removed_count, removed_count * 2]
+    expected_plan_offsets = [0, 0, 1, 2]
+    expected_objective_presence = [
+        False,
+        candidate_feasible,
+        candidate_feasible,
+    ]
+    if terminal_reason == 0:
+        expected_removed_offsets.append(removed_count * 2)
+        expected_plan_offsets.append(2)
+        expected_objective_presence.append(False)
+    if (
+        event_count != expected_event_count
+        or not np.array_equal(events[:, canonical_columns], canonical_values)
+        or np.any(events[:, 2] != expected_start_iteration)
+        or events[1, 12] != 1
+        or events[1, 13] <= 0
+        or events[1, 13] != removed_count
+        or events[2, 13] != events[1, 13]
+        or events[2, 14] != removed_count
+        or events[1, 22] != 0
+        or events[2, 22] != 0
+        or events[1, 17] != 0
+        or events[2, 17] not in {-1, 0}
+        or removed_offsets.tolist() != expected_removed_offsets
+        or plan_offsets.tolist() != expected_plan_offsets
+        or len(route_offsets) != 3
+        or not np.array_equal(
+            removed_indices[:removed_count],
+            removed_indices[removed_count:],
+        )
+        or objective_present.tolist() != expected_objective_presence
+        or not np.array_equal(objective_integer[1], objective_integer[2])
+        or not np.array_equal(objective_float[1], objective_float[2], equal_nan=True)
+        or stage04_calls.tolist() != [[1, 0, 0, 0]]
+        or np.any(stage04_rewards[:, 1:] != 0.0)
+    ):
+        raise RuntimeError("native global canonical event sequence is invalid")
+    partial_nodes = route_indices[int(route_offsets[0]) : int(route_offsets[1])]
+    repaired_nodes = route_indices[int(route_offsets[1]) : int(route_offsets[2])]
+    removed_nodes = removed_indices[:removed_count]
+    index_by_name = {name: index for index, name in enumerate(node_names)}
+    expected_customer_nodes = {
+        index_by_name[customer.name] for customer in instance.customers
+    }
+    if (
+        len(set(int(node) for node in removed_nodes)) != len(removed_nodes)
+        or len(set(int(node) for node in partial_nodes)) != len(partial_nodes)
+        or len(set(int(node) for node in repaired_nodes)) != len(repaired_nodes)
+        or set(int(node) for node in partial_nodes) & set(int(node) for node in removed_nodes)
+        or set(int(node) for node in partial_nodes) | set(int(node) for node in removed_nodes)
+        != expected_customer_nodes
+        or set(int(node) for node in repaired_nodes) != expected_customer_nodes
+    ):
+        raise RuntimeError("native global canonical route semantics are invalid")
+    def replay_objective(
+        sequences: tuple[CustomerSequence, ...],
+    ) -> SolutionObjective | None:
+        objective = SolutionObjective.zero()
+        for sequence in sequences:
+            exact = solve_exact_charging(instance, sequence)
+            if not exact.feasible:
+                return None
+            objective += SolutionObjective.from_route(
+                instance,
+                exact.route,
+                total_distance=exact.distance,
+                total_charging_time=exact.charging_time,
+            )
+        return objective
+
+    initial_objective = replay_objective(initial_customer_sequences)
+    if initial_objective is None:
+        raise RuntimeError("native global initial objective replay is infeasible")
+    repaired_sequences = (
+        tuple(node_names[int(node)] for node in repaired_nodes),
+    )
+    replayed_candidate = replay_objective(repaired_sequences)
+    reported_candidate = (
+        SolutionObjective(
+            vehicle_count=int(objective_integer[2, 0]),
+            total_distance=float(objective_float[2, 0]),
+            total_charging_time=float(objective_float[2, 1]),
+            charging_count=int(objective_integer[2, 1]),
+        )
+        if objective_present[2]
+        else None
+    )
+    candidate_better = (
+        replayed_candidate is not None
+        and replayed_candidate.key < initial_objective.key
+    )
+    candidate_equal = (
+        replayed_candidate is not None
+        and replayed_candidate.key == initial_objective.key
+    )
+    expected_vehicle_reduction = bool(
+        replayed_candidate is not None
+        and replayed_candidate.vehicle_count < initial_objective.vehicle_count
+    )
+    expected_distance_improvement = bool(
+        replayed_candidate is not None
+        and replayed_candidate.total_distance < initial_objective.total_distance - 1e-9
+    )
+    accepted = bool(events[2, 6])
+    if (
+        (reported_candidate is None) != (replayed_candidate is None)
+        or (
+            reported_candidate is not None
+            and replayed_candidate is not None
+            and reported_candidate.key != replayed_candidate.key
+        )
+        or candidate_feasible != (replayed_candidate is not None)
+        or bool(events[2, 7]) != expected_vehicle_reduction
+        or bool(events[2, 8]) != expected_distance_improvement
+        or (terminal_reason == 1 and accepted)
+    ):
+        raise RuntimeError("native global objective replay is invalid")
+    comparison = "better" if candidate_better else "equal" if candidate_equal else "worse"
+    expected_reward = stage04_config.reward_for(
+        accepted=accepted,
+        comparison=comparison,
+        is_global_best=accepted and candidate_better,
+        vehicle_reduction=expected_vehicle_reduction,
+    )
+    expected_status = np.full((1, 4), -1, dtype=np.int64)
+    expected_weights = np.ones((1, 4, 2), dtype=np.float64)
+    is_segment_boundary = (
+        (expected_start_iteration + expected_iteration_count)
+        % stage04_config.segment_length
+        == 0
+    )
+    if (
+        is_segment_boundary
+        and terminal_reason != 1
+        and not stage04_config.fixed_weights
+    ):
+        expected_status[0] = [
+            1 if calls >= stage04_config.min_calls_per_operator else 0
+            for calls in stage04_calls[0]
+        ]
+        if expected_status[0, 0] == 1:
+            expected_weights[0, 0, 1] = stage04_config.apply_segment_update(
+                1.0,
+                expected_reward,
+                1,
+            )
+    expected_rewards = np.asarray(
+        [[expected_reward, 0.0, 0.0, 0.0]],
+        dtype=np.float64,
+    )
+    if (
+        not np.array_equal(stage04_status, expected_status)
+        or not np.allclose(stage04_weights, expected_weights, rtol=0.0, atol=1e-12)
+        or not np.allclose(stage04_rewards, expected_rewards, rtol=0.0, atol=1e-12)
+    ):
+        raise RuntimeError("native global Stage 4 replay is invalid")
+    return NativeGlobalSemanticStream(
+        neighborhood_events=project_events(),
+        event_integer=_readonly_copy(events),
+        stage04_calls=_readonly_copy(stage04_calls),
         termination=_readonly_copy(termination),
         transaction_sha256=transaction_sha256,
     )
@@ -1190,11 +1789,13 @@ __all__ = (
     "NativeCandidateRoundRequest",
     "NativeCandidateRoundResult",
     "NativeConstraintSemanticStream",
+    "NativeGlobalSemanticStream",
     "FullNativeALNSResult",
     "FULL_NATIVE_OPERATOR_NAMES",
     "NativeWorkerProtocol",
     "Stage052NativeExecutionConfig",
     "execute_native_candidate_round",
     "decode_native_constraint_semantic_stream",
+    "decode_native_global_semantic_stream",
     "execute_full_native_alns",
 )
