@@ -1,0 +1,33 @@
+{
+  "files": {
+    "stage052_native_architectures_pilot_attempt03_report.md": "f27977c0cff32cd40155096be98ad6ac86d825bf87dba58e24a1b72fc9ebee27",
+    "stage052_native_architectures_pilot_attempt03_review.json": "c280a09610d34d39d6e845eb75921a988a33b43e07c55bf6666c4c0994ffde7c",
+    "stage052_native_architectures_pilot_attempt03_review.json.sha256": "3abc34282f1d0b6f722d2ec91f83b28e3d11271886c8c1e61b053ce3aa528e40"
+  },
+  "producer_identity": {
+    "native_sha256": [
+      "625e7bfab1417183421779a2a01b3c3f945b7784e78066aca6ddcf713d68f019"
+    ],
+    "repository_revisions": [
+      "6443099498dc12ec9e9753201ebbac3875e23af9"
+    ],
+    "run_labels": [
+      "stage05.2_native_architecture_current_stage052_pilot_attempt03",
+      "stage05.2_native_architecture_full_native_alns_pilot_attempt03",
+      "stage05.2_native_architecture_host_scheduler_pilot_attempt03",
+      "stage05.2_native_architecture_per_solve_runtime_pilot_attempt03",
+      "stage05.2_native_architecture_python_candidate_control_pilot_attempt03"
+    ],
+    "wheel_sha256": [
+      "2767e3ee362f2455c6c0fd07633e66371a31216b9e1c1086aed0e88e4ad38076"
+    ]
+  },
+  "reviewer_provenance": {
+    "repository_revision": "c23fc2fc1d209b554857f0f8b0533502a8346e1c",
+    "source_path": "src/evrptw/experiments/stage052_native_architecture_review.py",
+    "source_sha256": "c63c461e2709b2da11249ce054e225afeafeff25d54e99b229970d2415b67eef"
+  },
+  "schema_version": "stage05.2-native-architecture-review-manifest-v1",
+  "scope": "pilot",
+  "status": "COMPARISON_COMPLETE_NOT_QUALIFIED"
+}

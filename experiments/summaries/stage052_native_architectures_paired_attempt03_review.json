@@ -1,0 +1,3437 @@
+{
+  "axis_count": 360,
+  "axis_replay_passed": false,
+  "cuda_evaluation_condition": {
+    "available": false,
+    "condition_met": false,
+    "maximum": null,
+    "reason": "native candidate-screening occupancy is not recorded"
+  },
+  "cuda_evaluation_condition_met": false,
+  "differential_gates": {
+    "full_native_alns": {
+      "comparison_count": 36,
+      "comparisons": [
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101C5",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": true,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101C5",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101C5",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "r101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "r101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "r101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "rc101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "rc101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "rc101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101C5",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": true,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101C5",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101C5",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "r101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "r101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "r101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "rc101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "rc101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "rc101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101C5",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": true,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101C5",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101C5",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "r101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "r101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "r101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "rc101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "rc101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "rc101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        }
+      ],
+      "passed": false
+    },
+    "host_scheduler": {
+      "comparison_count": 36,
+      "comparisons": [
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101C5",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": true,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101C5",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101C5",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "r101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "r101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "r101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "rc101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "rc101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "rc101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101C5",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": true,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101C5",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101C5",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "r101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "r101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "r101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "rc101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "rc101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "rc101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101C5",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": true,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101C5",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": true,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101C5",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "r101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "r101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "r101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "rc101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "rc101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "baseline_status": "completed",
+          "cache_lifecycle_equal": false,
+          "candidate_status": "failed",
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": false,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "rc101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        }
+      ],
+      "passed": false
+    },
+    "per_solve_runtime": {
+      "comparison_count": 36,
+      "comparisons": [
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101C5",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": true,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": true,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101C5",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": true,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": true,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101C5",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": true,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": true,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "c101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "r101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "r101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "r101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": true,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "rc101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": true,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "rc101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": true,
+          "exact_order_equal": false,
+          "key": [
+            0,
+            "fixed_work",
+            "rc101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101C5",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": true,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": true,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101C5",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": true,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": true,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101C5",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": true,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": true,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "c101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "r101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "r101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "r101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": true,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "rc101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": true,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "rc101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": true,
+          "exact_order_equal": false,
+          "key": [
+            1,
+            "fixed_work",
+            "rc101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101C5",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": true,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": true,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101C5",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": true,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": true,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101C5",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": true,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": true,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "c101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "r101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "r101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": false,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "r101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": true,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "rc101_21",
+            2014
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": true,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "rc101_21",
+            2015
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        },
+        {
+          "cache_lifecycle_equal": false,
+          "candidate_transaction_events_equal": false,
+          "candidate_work_hash_equal": false,
+          "common_prefix": 0,
+          "deadline_boundaries_equal": true,
+          "exact_counts_equal": true,
+          "exact_order_equal": false,
+          "key": [
+            2,
+            "fixed_work",
+            "rc101_21",
+            2016
+          ],
+          "measurement_transaction_hash_equal": false,
+          "objective_equal": false,
+          "operator_statistics_equal": false,
+          "route_result_hash_equal": false,
+          "routes_equal": false,
+          "stage04_state_equal": false,
+          "trajectory_equal": false
+        }
+      ],
+      "passed": false
+    }
+  },
+  "formal_started": false,
+  "historical_attempt72": {
+    "available": false,
+    "comparison_count": 0,
+    "drift": [],
+    "error": "not assessed for paired scope",
+    "identity_verified": false
+  },
+  "mode_metrics": {
+    "current_stage052": {
+      "artifact_bytes": {
+        "count": 72,
+        "maximum": 23427.0,
+        "median": 17571.5,
+        "minimum": 16271.0
+      },
+      "cache_memory_bytes": {
+        "count": 72,
+        "maximum": 0.0,
+        "median": 0.0,
+        "minimum": 0.0
+      },
+      "candidate_transactions_per_second": {
+        "count": 72,
+        "maximum": 1.5809290829960887,
+        "median": 0.06647009121413036,
+        "minimum": 0.0
+      },
+      "completed_axes": 72,
+      "cpu_utilization_percent_of_one_core": {
+        "count": 72,
+        "maximum": 104.70702855610676,
+        "median": 100.08886741996255,
+        "minimum": 88.8259064914409
+      },
+      "effective_iterations": {
+        "count": 72,
+        "maximum": 1000.0,
+        "median": 158.5,
+        "minimum": 1.0
+      },
+      "effective_iterations_per_second": {
+        "count": 72,
+        "maximum": 1172.83562017856,
+        "median": 5.27034082016425,
+        "minimum": 1.0681104808787127
+      },
+      "exact_backend_batch_occupancy": {
+        "count": 44910,
+        "maximum": 23.0,
+        "median": 1.0,
+        "minimum": 1.0
+      },
+      "exact_started_calls": {
+        "count": 72,
+        "maximum": 2405.0,
+        "median": 100.0,
+        "minimum": 16.0
+      },
+      "exact_started_per_second": {
+        "count": 72,
+        "maximum": 160.9681614215413,
+        "median": 55.87508714317082,
+        "minimum": 15.343487132641673
+      },
+      "persistence_seconds": {
+        "count": 72,
+        "maximum": 52.61463021899999,
+        "median": 1.6978429355003755,
+        "minimum": 0.7925418689992512
+      },
+      "queue_wait_seconds": {
+        "count": 0,
+        "maximum": null,
+        "median": null,
+        "minimum": null
+      },
+      "rss_bytes": {
+        "count": 72,
+        "maximum": 681848832.0,
+        "median": 533245952.0,
+        "minimum": 65687552.0
+      },
+      "screened_routes_per_second": {
+        "count": 72,
+        "maximum": 25132.049677528776,
+        "median": 15467.370005251832,
+        "minimum": 2756.7931511479574
+      },
+      "solver_seconds": {
+        "count": 72,
+        "maximum": 30.615489379999417,
+        "median": 0.9607637009999053,
+        "minimum": 0.6212408660003348
+      },
+      "vehicle_count": {
+        "count": 72,
+        "maximum": 27.0,
+        "median": 15.5,
+        "minimum": 2.0
+      }
+    },
+    "full_native_alns": {
+      "artifact_bytes": {
+        "count": 45,
+        "maximum": 13687.0,
+        "median": 13409.0,
+        "minimum": 11475.0
+      },
+      "cache_memory_bytes": {
+        "count": 45,
+        "maximum": 0.0,
+        "median": 0.0,
+        "minimum": 0.0
+      },
+      "candidate_transactions_per_second": {
+        "count": 45,
+        "maximum": 0.0,
+        "median": 0.0,
+        "minimum": 0.0
+      },
+      "completed_axes": 45,
+      "cpu_utilization_percent_of_one_core": {
+        "count": 45,
+        "maximum": 245.18782122418892,
+        "median": 100.05996165975144,
+        "minimum": -3.8320534010335925e-10
+      },
+      "effective_iterations": {
+        "count": 45,
+        "maximum": 1000.0,
+        "median": 1000.0,
+        "minimum": 1000.0
+      },
+      "effective_iterations_per_second": {
+        "count": 45,
+        "maximum": 292592.03771835146,
+        "median": 473.3858106594311,
+        "minimum": 361.7195322565665
+      },
+      "exact_backend_batch_occupancy": {
+        "count": 45,
+        "maximum": 63.0,
+        "median": 45.0,
+        "minimum": 2.0
+      },
+      "exact_started_calls": {
+        "count": 45,
+        "maximum": 47077.0,
+        "median": 43740.0,
+        "minimum": 99.0
+      },
+      "exact_started_per_second": {
+        "count": 45,
+        "maximum": 104678.92797944085,
+        "median": 20601.722335330243,
+        "minimum": 15254.869577026018
+      },
+      "persistence_seconds": {
+        "count": 45,
+        "maximum": 2.8561239299997396,
+        "median": 2.154360187000748,
+        "minimum": 0.017106357999182364
+      },
+      "queue_wait_seconds": {
+        "count": 45,
+        "maximum": 0.006755789000492118,
+        "median": 0.0034867569999721404,
+        "minimum": 0.0012227960003608068
+      },
+      "rss_bytes": {
+        "count": 45,
+        "maximum": 670957568.0,
+        "median": 432189440.0,
+        "minimum": 48316416.0
+      },
+      "screened_routes_per_second": {
+        "count": 45,
+        "maximum": 0.0,
+        "median": 0.0,
+        "minimum": 0.0
+      },
+      "solver_seconds": {
+        "count": 45,
+        "maximum": 2.7645728550005515,
+        "median": 2.1124418549998154,
+        "minimum": 0.003417728000385978
+      },
+      "vehicle_count": {
+        "count": 45,
+        "maximum": 63.0,
+        "median": 45.0,
+        "minimum": 2.0
+      }
+    },
+    "host_scheduler": {
+      "artifact_bytes": {
+        "count": 45,
+        "maximum": 13741.0,
+        "median": 13462.0,
+        "minimum": 11501.0
+      },
+      "cache_memory_bytes": {
+        "count": 45,
+        "maximum": 0.0,
+        "median": 0.0,
+        "minimum": 0.0
+      },
+      "candidate_transactions_per_second": {
+        "count": 45,
+        "maximum": 0.0,
+        "median": 0.0,
+        "minimum": 0.0
+      },
+      "completed_axes": 45,
+      "cpu_utilization_percent_of_one_core": {
+        "count": 45,
+        "maximum": 235.8147689234543,
+        "median": 0.7174594260355174,
+        "minimum": -9.666218068870789e-11
+      },
+      "effective_iterations": {
+        "count": 45,
+        "maximum": 1000.0,
+        "median": 1000.0,
+        "minimum": 1000.0
+      },
+      "effective_iterations_per_second": {
+        "count": 45,
+        "maximum": 117907.3844617268,
+        "median": 455.9040238762265,
+        "minimum": 358.72971301824424
+      },
+      "exact_backend_batch_occupancy": {
+        "count": 45,
+        "maximum": 63.0,
+        "median": 45.0,
+        "minimum": 2.0
+      },
+      "exact_started_calls": {
+        "count": 45,
+        "maximum": 47077.0,
+        "median": 43740.0,
+        "minimum": 99.0
+      },
+      "exact_started_per_second": {
+        "count": 45,
+        "maximum": 70837.07777481148,
+        "median": 19598.947181863252,
+        "minimum": 6503.889065464504
+      },
+      "persistence_seconds": {
+        "count": 45,
+        "maximum": 2.803188573000625,
+        "median": 2.2122716670000955,
+        "minimum": 0.021658693999597745
+      },
+      "queue_wait_seconds": {
+        "count": 45,
+        "maximum": 0.012420212000178843,
+        "median": 0.008490721000253831,
+        "minimum": 0.0058018919995447005
+      },
+      "rss_bytes": {
+        "count": 45,
+        "maximum": 607371264.0,
+        "median": 391864320.0,
+        "minimum": 48533504.0
+      },
+      "screened_routes_per_second": {
+        "count": 45,
+        "maximum": 0.0,
+        "median": 0.0,
+        "minimum": 0.0
+      },
+      "solver_seconds": {
+        "count": 45,
+        "maximum": 2.7876140829994256,
+        "median": 2.19344411900056,
+        "minimum": 0.00848123299965664
+      },
+      "vehicle_count": {
+        "count": 45,
+        "maximum": 63.0,
+        "median": 45.0,
+        "minimum": 2.0
+      }
+    },
+    "per_solve_runtime": {
+      "artifact_bytes": {
+        "count": 71,
+        "maximum": 20762.0,
+        "median": 20115.0,
+        "minimum": 16086.0
+      },
+      "cache_memory_bytes": {
+        "count": 71,
+        "maximum": 0.0,
+        "median": 0.0,
+        "minimum": 0.0
+      },
+      "candidate_transactions_per_second": {
+        "count": 71,
+        "maximum": 6.97104138783928,
+        "median": 1.0933628607969574,
+        "minimum": 0.06257153870502385
+      },
+      "completed_axes": 71,
+      "cpu_utilization_percent_of_one_core": {
+        "count": 71,
+        "maximum": 95.46384222850499,
+        "median": 92.45073976201668,
+        "minimum": 10.404458750332452
+      },
+      "effective_iterations": {
+        "count": 71,
+        "maximum": 1000.0,
+        "median": 139.0,
+        "minimum": 51.0
+      },
+      "effective_iterations_per_second": {
+        "count": 71,
+        "maximum": 1120.6600084988386,
+        "median": 4.520712971891412,
+        "minimum": 3.9329054681689692
+      },
+      "exact_backend_batch_occupancy": {
+        "count": 3752,
+        "maximum": 1.0,
+        "median": 1.0,
+        "minimum": 1.0
+      },
+      "exact_started_calls": {
+        "count": 71,
+        "maximum": 105.0,
+        "median": 55.0,
+        "minimum": 8.0
+      },
+      "exact_started_per_second": {
+        "count": 71,
+        "maximum": 18.58944370090475,
+        "median": 2.4064932417553453,
+        "minimum": 1.4298356471271851
+      },
+      "persistence_seconds": {
+        "count": 71,
+        "maximum": 54.914025297999615,
+        "median": 29.63161586699971,
+        "minimum": 0.4566450229995098
+      },
+      "queue_wait_seconds": {
+        "count": 71,
+        "maximum": 0.0,
+        "median": 0.0,
+        "minimum": 0.0
+      },
+      "rss_bytes": {
+        "count": 71,
+        "maximum": 752975872.0,
+        "median": 494592000.0,
+        "minimum": 47661056.0
+      },
+      "screened_routes_per_second": {
+        "count": 71,
+        "maximum": 1816.1750491546072,
+        "median": 912.7059129525109,
+        "minimum": 435.4096292399065
+      },
+      "solver_seconds": {
+        "count": 71,
+        "maximum": 51.21812895600033,
+        "median": 26.18928953000068,
+        "minimum": 0.4303517700000157
+      },
+      "vehicle_count": {
+        "count": 71,
+        "maximum": 22.0,
+        "median": 12.0,
+        "minimum": 2.0
+      }
+    },
+    "python_candidate_control": {
+      "artifact_bytes": {
+        "count": 72,
+        "maximum": 17988.0,
+        "median": 17682.5,
+        "minimum": 13478.0
+      },
+      "cache_memory_bytes": {
+        "count": 72,
+        "maximum": 0.0,
+        "median": 0.0,
+        "minimum": 0.0
+      },
+      "candidate_transactions_per_second": {
+        "count": 72,
+        "maximum": 0.0,
+        "median": 0.0,
+        "minimum": 0.0
+      },
+      "completed_axes": 72,
+      "cpu_utilization_percent_of_one_core": {
+        "count": 72,
+        "maximum": 95.88798446459214,
+        "median": 93.02275484212421,
+        "minimum": 11.326033509494716
+      },
+      "effective_iterations": {
+        "count": 72,
+        "maximum": 1000.0,
+        "median": 139.0,
+        "minimum": 55.0
+      },
+      "effective_iterations_per_second": {
+        "count": 72,
+        "maximum": 1167.2633781250531,
+        "median": 4.5350321995296845,
+        "minimum": 3.656983168004279
+      },
+      "exact_backend_batch_occupancy": {
+        "count": 3929,
+        "maximum": 1.0,
+        "median": 1.0,
+        "minimum": 1.0
+      },
+      "exact_started_calls": {
+        "count": 72,
+        "maximum": 100.0,
+        "median": 55.0,
+        "minimum": 10.0
+      },
+      "exact_started_per_second": {
+        "count": 72,
+        "maximum": 20.41384356308463,
+        "median": 2.3484088711992395,
+        "minimum": 1.3040472673229497
+      },
+      "persistence_seconds": {
+        "count": 72,
+        "maximum": 57.81769131799956,
+        "median": 33.86726972699989,
+        "minimum": 0.5182792909999989
+      },
+      "queue_wait_seconds": {
+        "count": 0,
+        "maximum": null,
+        "median": null,
+        "minimum": null
+      },
+      "rss_bytes": {
+        "count": 72,
+        "maximum": 779485184.0,
+        "median": 451819520.0,
+        "minimum": 46198784.0
+      },
+      "screened_routes_per_second": {
+        "count": 72,
+        "maximum": 1817.4651067082432,
+        "median": 1118.140892776592,
+        "minimum": 210.09587758345734
+      },
+      "solver_seconds": {
+        "count": 72,
+        "maximum": 53.71957442200073,
+        "median": 31.434347908499603,
+        "minimum": 0.4898636540001462
+      },
+      "vehicle_count": {
+        "count": 72,
+        "maximum": 23.0,
+        "median": 16.0,
+        "minimum": 2.0
+      }
+    }
+  },
+  "performance": {
+    "full_native_alns": {
+      "aggregate_100_customer": {
+        "count": 0,
+        "maximum": null,
+        "median": null,
+        "minimum": null
+      },
+      "family_median_improvement": {},
+      "performance_qualified": false,
+      "versus_current": {
+        "count": 45,
+        "maximum": 296.10069463869706,
+        "median": 13.239548130427671,
+        "minimum": 9.874795582840088
+      },
+      "versus_python_candidate_control": {
+        "count": 45,
+        "maximum": 157.82277142558667,
+        "median": 14.258843314768164,
+        "minimum": 10.309395684561787
+      },
+      "wall_clock_objective_not_worse": false
+    },
+    "host_scheduler": {
+      "aggregate_100_customer": {
+        "count": 0,
+        "maximum": null,
+        "median": null,
+        "minimum": null
+      },
+      "family_median_improvement": {},
+      "performance_qualified": false,
+      "versus_current": {
+        "count": 45,
+        "maximum": 111.78638367154296,
+        "median": 12.713692182277157,
+        "minimum": 9.789558582168421
+      },
+      "versus_python_candidate_control": {
+        "count": 45,
+        "maximum": 66.66460808502121,
+        "median": 13.695345551674007,
+        "minimum": 10.198509259362961
+      },
+      "wall_clock_objective_not_worse": false
+    },
+    "per_solve_runtime": {
+      "aggregate_100_customer": {
+        "count": 27,
+        "maximum": -0.9358947584065195,
+        "median": -0.9668438202376723,
+        "minimum": -0.9876431477701256
+      },
+      "family_median_improvement": {
+        "C": -0.9576439544972639,
+        "R": -0.965117089232102,
+        "RC": -0.9851833068258132
+      },
+      "performance_qualified": false,
+      "versus_current": {
+        "count": 71,
+        "maximum": 1.1276102819483924,
+        "median": -0.05952354924848091,
+        "minimum": -0.9876431477701256
+      },
+      "versus_python_candidate_control": {
+        "count": 71,
+        "maximum": 1.2090047051576862,
+        "median": 0.00048651989761516745,
+        "minimum": -0.2958543115111413
+      },
+      "wall_clock_objective_not_worse": false
+    },
+    "python_candidate_control": {
+      "aggregate_100_customer": {
+        "count": 27,
+        "maximum": -0.9410065392859018,
+        "median": -0.9802039406799221,
+        "minimum": -0.9859273476516988
+      },
+      "family_median_improvement": {
+        "C": -0.9519434252034613,
+        "R": -0.9821648224132407,
+        "RC": -0.9833020267655568
+      },
+      "performance_qualified": false,
+      "versus_current": {
+        "count": 72,
+        "maximum": 1.1602946378203938,
+        "median": -0.06424961695896164,
+        "minimum": -0.9859273476516988
+      },
+      "versus_python_candidate_control": {
+        "count": 72,
+        "maximum": 0.0,
+        "median": 0.0,
+        "minimum": 0.0
+      },
+      "wall_clock_objective_not_worse": true
+    }
+  },
+  "producer_identity": {
+    "native_sha256": [
+      "625e7bfab1417183421779a2a01b3c3f945b7784e78066aca6ddcf713d68f019"
+    ],
+    "repository_revisions": [
+      "6443099498dc12ec9e9753201ebbac3875e23af9"
+    ],
+    "run_labels": [
+      "stage05.2_native_architecture_current_stage052_paired_attempt03",
+      "stage05.2_native_architecture_full_native_alns_paired_attempt03",
+      "stage05.2_native_architecture_host_scheduler_paired_attempt03",
+      "stage05.2_native_architecture_per_solve_runtime_paired_attempt03",
+      "stage05.2_native_architecture_python_candidate_control_paired_attempt03"
+    ],
+    "wheel_sha256": [
+      "2767e3ee362f2455c6c0fd07633e66371a31216b9e1c1086aed0e88e4ad38076"
+    ]
+  },
+  "production_default_changed": false,
+  "qualification_passed": false,
+  "raw_axis_inventory": {
+    "algorithm": "sha256(stage05.2-native-axis-inventory-v1\\0 + canonical JSON of logical axis, JSON SHA-256, and sidecar SHA-256)",
+    "axis_count": 360,
+    "by_mode": {
+      "current_stage052": {
+        "axis_count": 72,
+        "json_bytes": 1347088,
+        "sidecar_bytes": 4680,
+        "tree_sha256": "ac4e056fadeadcbea22530c2017f9efa4056b5f9b4c9011da740e8a6e2e2327c"
+      },
+      "full_native_alns": {
+        "axis_count": 72,
+        "json_bytes": 587103,
+        "sidecar_bytes": 4680,
+        "tree_sha256": "2207cd2510ab095a1c01c0a89af56fba11c742a7cbc69ff447706eebe55ae5ce"
+      },
+      "host_scheduler": {
+        "axis_count": 72,
+        "json_bytes": 590296,
+        "sidecar_bytes": 4680,
+        "tree_sha256": "0b5ded12e076cc4a15c5f1f4f731e2ba9419ba74c5aab77a2760a5c0383f29f4"
+      },
+      "per_solve_runtime": {
+        "axis_count": 72,
+        "json_bytes": 1381702,
+        "sidecar_bytes": 4680,
+        "tree_sha256": "ccfacb2f2b75c054a02aabecc09ffd3ee6b238f72b5d6cb1f9f686c2b139a29d"
+      },
+      "python_candidate_control": {
+        "axis_count": 72,
+        "json_bytes": 1217502,
+        "sidecar_bytes": 4680,
+        "tree_sha256": "809887c2728bd6effd0451713c332b156a5575280f7e09a201bd29c0a39f2a84"
+      }
+    },
+    "json_bytes": 5123691,
+    "sidecar_bytes": 23400,
+    "tree_sha256": "754f684e0da2f1c5f07bcb5ffe1fb93bb99e9edb0a1ce50f534768b0dd4522ab"
+  },
+  "replay_failures": [
+    {
+      "path": "results/stage05.2_native_architecture_per_solve_runtime_paired_attempt03/axes/repeat2/wall_clock_30/r101_21/2014.json",
+      "reason": "axis failed: Stage03ExecutionError: measured ALNS execution failed: native candidate round reached its deadline before dispatch",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat1/fixed_work/c101_21/2014.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat1/fixed_work/c101_21/2015.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat1/fixed_work/c101_21/2016.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat1/fixed_work/r101_21/2014.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat1/fixed_work/r101_21/2015.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat1/fixed_work/r101_21/2016.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat1/fixed_work/rc101_21/2014.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat1/fixed_work/rc101_21/2015.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat1/fixed_work/rc101_21/2016.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat2/fixed_work/c101_21/2014.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat2/fixed_work/c101_21/2015.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat2/fixed_work/c101_21/2016.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat2/fixed_work/r101_21/2014.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat2/fixed_work/r101_21/2015.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat2/fixed_work/r101_21/2016.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat2/fixed_work/rc101_21/2014.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat2/fixed_work/rc101_21/2015.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat2/fixed_work/rc101_21/2016.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat3/fixed_work/c101_21/2014.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat3/fixed_work/c101_21/2015.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat3/fixed_work/c101_21/2016.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat3/fixed_work/r101_21/2014.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat3/fixed_work/r101_21/2015.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat3/fixed_work/r101_21/2016.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat3/fixed_work/rc101_21/2014.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat3/fixed_work/rc101_21/2015.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_full_native_alns_paired_attempt03/axes/repeat3/fixed_work/rc101_21/2016.json",
+      "reason": "axis failed: RuntimeError: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat1/fixed_work/c101_21/2014.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat1/fixed_work/c101_21/2015.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat1/fixed_work/c101_21/2016.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat1/fixed_work/r101_21/2014.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat1/fixed_work/r101_21/2015.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat1/fixed_work/r101_21/2016.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat1/fixed_work/rc101_21/2014.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat1/fixed_work/rc101_21/2015.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat1/fixed_work/rc101_21/2016.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat2/fixed_work/c101_21/2014.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat2/fixed_work/c101_21/2015.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat2/fixed_work/c101_21/2016.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat2/fixed_work/r101_21/2014.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat2/fixed_work/r101_21/2015.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat2/fixed_work/r101_21/2016.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat2/fixed_work/rc101_21/2014.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat2/fixed_work/rc101_21/2015.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat2/fixed_work/rc101_21/2016.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat3/fixed_work/c101_21/2014.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat3/fixed_work/c101_21/2015.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat3/fixed_work/c101_21/2016.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat3/fixed_work/r101_21/2014.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat3/fixed_work/r101_21/2015.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat3/fixed_work/r101_21/2016.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat3/fixed_work/rc101_21/2014.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat3/fixed_work/rc101_21/2015.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    },
+    {
+      "path": "results/stage05.2_native_architecture_host_scheduler_paired_attempt03/axes/repeat3/fixed_work/rc101_21/2016.json",
+      "reason": "axis failed: RuntimeError: host scheduler transaction failed: full native initial-route split does not fit the exact-call budget",
+      "valid": false
+    }
+  ],
+  "review_status": "NOT_READY",
+  "reviewer_provenance": {
+    "repository_revision": "c23fc2fc1d209b554857f0f8b0533502a8346e1c",
+    "source_path": "src/evrptw/experiments/stage052_native_architecture_review.py",
+    "source_sha256": "c63c461e2709b2da11249ce054e225afeafeff25d54e99b229970d2415b67eef"
+  },
+  "schema_version": "stage05.2-native-architecture-review-v4",
+  "scope": "paired",
+  "semantic_gates_passed": false
+}

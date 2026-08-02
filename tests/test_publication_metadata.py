@@ -88,6 +88,43 @@ def test_artifact_index_does_not_promote_partial_formal_evidence() -> None:
     }
 
 
+def test_stage052_native_architecture_publication_manifest_is_hash_bound() -> None:
+    path = (
+        ROOT
+        / "experiments/manifests/"
+        "stage052_native_architecture_comparison_attempt03_artifact_manifest.json"
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    expected_manifest_hash = path.with_suffix(path.suffix + ".sha256").read_text(
+        encoding="ascii"
+    ).strip()
+
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == expected_manifest_hash
+    assert payload["status"] == "COMPARISON_COMPLETE_NOT_QUALIFIED"
+    assert payload["formal_started"] is False
+    assert payload["production_default_changed"] is False
+    assert payload["historical_attempt72_identity"]["verified"] is True
+    assert payload["publication_notes"]["cuda_condition_met"] is False
+    assert payload["raw_axis_inventories"] == {
+        "paired": {
+            "axis_count": 360,
+            "tree_sha256": (
+                "754f684e0da2f1c5f07bcb5ffe1fb93bb99e9edb0a1ce50f534768b0dd4522ab"
+            ),
+        },
+        "pilot": {
+            "axis_count": 180,
+            "tree_sha256": (
+                "e38632cc53541cb8ae7d2c33ebb47e0600459ad962140e496888b349cf2dc524"
+            ),
+        },
+    }
+    for relative_path, expected_sha256 in payload["tracked_files"].items():
+        assert hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest() == (
+            expected_sha256
+        )
+
+
 def test_commercial_solvers_are_optional_dependencies() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
         "project"
