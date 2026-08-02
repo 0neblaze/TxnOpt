@@ -12,7 +12,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from evrptw.alns import _destroy, _Evaluator, _IncumbentRouteLedger, solve_alns
+from evrptw.alns import (
+    OperatorProfile,
+    _destroy,
+    _Evaluator,
+    _full_native_operator_statistics,
+    _IncumbentRouteLedger,
+    solve_alns,
+)
 from evrptw.cache_incremental import (
     CacheIncrementalConfig,
     RouteEvaluationCache,
@@ -40,6 +47,8 @@ from evrptw.native_execution import (
     NativeCandidateRoundRequest,
     NativeCandidateRoundResult,
     Stage052NativeExecutionConfig,
+    _full_native_digest,
+    _native_distance_improved,
     decode_native_constraint_semantic_stream,
     decode_native_global_semantic_stream,
     execute_native_candidate_round,
@@ -3868,6 +3877,59 @@ def test_native_global_search_returns_deadline_terminal_without_partial_iteratio
         np.testing.assert_equal(after, before)
 
 
+def test_native_global_search_returns_incumbent_after_exact_kernel_deadline() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 1, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    solution_before = engine.solution_state()
+    engine.inject_exact_kernel_deadline_once()
+
+    decoded = decode_native_global_semantic_stream(
+        instance,
+        engine.run_global_search(
+            0,
+            1,
+            0,
+            np.asarray([4, 8, 3], dtype=np.int64),
+            np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        ),
+        node_names=context.node_names,
+        initial_customer_sequences=(("C1", "C2"),),
+        stage04_config=Stage04Config(),
+        expected_start_iteration=0,
+        expected_iteration_count=1,
+    )
+
+    assert decoded.termination.tolist() == [2, 0, 0, 0, 10, 1, 1, 0, 2, 1, 1]
+    assert decoded.neighborhood_events == ()
+    for before, after in zip(solution_before, engine.solution_state(), strict=True):
+        np.testing.assert_equal(after, before)
+
+
 def test_native_constraint_iteration_deadline_boundary_rolls_back_all_state() -> None:
     from evrptw import _core as native_core
 
@@ -4958,10 +5020,6 @@ def test_per_solve_real_fixed_work_matches_four_worker_python_control(
     ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="full native v2 solve-level search state machine is under implementation",
-)
 def test_full_native_v2_one_call_matches_python_first_iteration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5000,8 +5058,194 @@ def test_full_native_v2_one_call_matches_python_first_iteration(
     assert native_result.exact_started_calls == python_result.exact_started_calls
     assert native_result.exact_completed_calls == python_result.exact_completed_calls
     assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
     assert native_result.stage04_statistics == python_result.stage04_statistics
     assert native_result.stage04_event_log == python_result.stage04_event_log
+    assert native_result.charging_subproblem_calls == 2
+    assert native_result.backend_metrics["exact_calls"] == 2
+    assert native_result.backend_metrics["started_calls"] == 2
+    assert native_result.backend_metrics["completed_calls"] == 2
+    assert native_result.backend_metrics["interrupted_calls"] == 0
+    assert native_result.backend_metrics["batch_launches"] == 2
+    assert native_result.backend_metrics["work_batches"] == 2
+    assert native_result.backend_metrics["launch_occupancies"] == [1, 1]
+    timings = native_result.native_execution_statistics["timings"]
+    assert isinstance(timings, dict)
+    assert timings["exact_seconds"] > 0.0
+    assert timings["total_seconds"] >= timings["exact_seconds"]
+    assert native_result.backend_metrics["total_seconds"] == timings["exact_seconds"]
+
+
+def test_full_native_v2_one_call_matches_python_pre_exhausted_budget() -> None:
+    instance = _fixture_instance()
+    common = {
+        "seed": 2014,
+        "max_iterations": 1,
+        "time_limit_seconds": 120.0,
+        "termination_mode": "fixed_work",
+        "exact_deadline_config": ExactDeadlineConfig.fixed_exact_calls(
+            1, watchdog_seconds=120.0
+        ),
+        **_full_native_solve_kwargs(),
+    }
+    python_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        candidate_control_config=CandidateControlConfig(worker_count=1),
+    )
+    native_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    assert native_result.objective == python_result.objective
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.exact_started_calls == python_result.exact_started_calls == 1
+    assert native_result.exact_completed_calls == python_result.exact_completed_calls == 1
+    assert native_result.neighborhood_events == python_result.neighborhood_events == ()
+    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
+    assert native_result.termination_reason == "exact_call_budget_exhausted"
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+    assert native_result.stage04_event_log == python_result.stage04_event_log
+    assert native_result.charging_subproblem_calls == 1
+    assert native_result.backend_metrics["exact_calls"] == 1
+    assert native_result.backend_metrics["started_calls"] == 1
+    assert native_result.backend_metrics["completed_calls"] == 1
+    assert native_result.backend_metrics["interrupted_calls"] == 0
+    assert native_result.backend_metrics["batch_launches"] == 1
+    assert native_result.backend_metrics["work_batches"] == 1
+    assert native_result.backend_metrics["launch_occupancies"] == [1]
+
+
+def test_full_native_v2_outer_hash_binds_valid_semantic_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw import _core as native_core
+
+    original = native_core.full_native_alns_v2
+
+    def swap_semantic_stream(*args: object) -> object:
+        primary = list(original(*args))
+        alternate_args = list(args)
+        alternate_args[10] = np.ascontiguousarray(
+            np.asarray(alternate_args[10], dtype=np.int64)[::-1]
+        )
+        alternate = original(*alternate_args)
+        assert primary[7][14] != alternate[7][14]
+        primary[7] = alternate[7]
+        return tuple(primary)
+
+    monkeypatch.setattr(native_core, "full_native_alns_v2", swap_semantic_stream)
+    with pytest.raises(RuntimeError, match="transaction SHA-256 mismatch"):
+        solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            **_full_native_solve_kwargs(),
+            native_execution_config=_native_config("full_native_alns"),
+        )
+
+
+def test_full_native_v2_replay_rejects_current_state_as_global_best(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw import _core as native_core
+
+    original = native_core.full_native_alns_v2
+
+    def return_current_instead_of_best(*args: object) -> object:
+        primary = list(original(*args))
+        alternate_args = list(args)
+        alternate_args[10] = np.ascontiguousarray(
+            np.asarray(alternate_args[10], dtype=np.int64)[::-1]
+        )
+        alternate = original(*alternate_args)
+        primary[0] = alternate[0]
+        primary[1] = alternate[1]
+        primary[2] = alternate[2]
+        primary[6] = _full_native_digest(
+            route_offsets=primary[0],
+            route_indices=primary[1],
+            exact_payload=primary[2],
+            counters=primary[3],
+            trajectory=primary[5],
+            semantic_sha256=primary[7][14],
+            backend_payload=primary[8],
+        )
+        return tuple(primary)
+
+    monkeypatch.setattr(native_core, "full_native_alns_v2", return_current_instead_of_best)
+    with pytest.raises(RuntimeError, match="current state instead of global best"):
+        solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            **_full_native_solve_kwargs(),
+            native_execution_config=_native_config("full_native_alns"),
+        )
+
+
+def test_full_native_distance_improvement_uses_native_tolerance_boundary() -> None:
+    current = SolutionObjective(1, 10.0, 0.0, 0)
+
+    assert not _native_distance_improved(
+        SolutionObjective(1, 10.0 - 0.5e-9, 0.0, 0),
+        current,
+    )
+    assert _native_distance_improved(
+        SolutionObjective(1, 10.0 - 2.0e-9, 0.0, 0),
+        current,
+    )
+
+
+def test_full_native_operator_statistics_compare_canonical_objective_keys() -> None:
+    instance = Instance(
+        "native_operator_rounding_fixture",
+        (
+            Node("D0", NodeType.DEPOT, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0),
+            Node("C1", NodeType.CUSTOMER, 1.0, 0.0, 1.0, 0.0, 100.0, 0.0),
+            Node(
+                "C2",
+                NodeType.CUSTOMER,
+                2.0000000002,
+                0.0,
+                1.0,
+                0.0,
+                100.0,
+                0.0,
+            ),
+        ),
+        Vehicle(10.0, 100.0, 1.0, 0.1, 1.0),
+        distance_backend="python",
+    )
+    event: dict[str, object] = {
+        "operator": "station_pressure",
+        "iteration": 0,
+        "status": "candidate_proposed",
+        "reason": "constraint_removal_repaired",
+        "candidate_feasible": True,
+        "prefilter_passed": True,
+        "new_routes_created": 0,
+        "exact_route_evaluations": 1,
+        "accepted": True,
+        "candidate_objective_key": (1, 4.0, 0.0, 0),
+        "distance_improvement": False,
+    }
+
+    statistics = _full_native_operator_statistics(
+        instance,
+        operator_profile=OperatorProfile.STAGE02_CONSTRAINT_GUIDED,
+        initial_customer_sequences=(("C1", "C2"),),
+        semantic_events=(event,),
+        stage04_config=Stage04Config(),
+    )["station_pressure"]
+
+    assert statistics["accepted_equal"] == 1
+    assert statistics["accepted_worse"] == 0
+    assert statistics["segment_reward_sum"] == 1.0
 
 
 def test_host_scheduler_v1_cannot_masquerade_as_full_native_v2(

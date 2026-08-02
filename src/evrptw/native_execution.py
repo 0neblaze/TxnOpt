@@ -38,6 +38,7 @@ from evrptw.native_kernels import NativeKernelConfig, NativeKernelRuntime
 from evrptw.neighborhoods import VehicleOperatorConfig
 from evrptw.objective import SolutionObjective
 from evrptw.stage04 import Stage04Config
+from evrptw.validation import validate_routes
 
 NATIVE_EXECUTION_SCHEMA_VERSION = "stage05.2-native-execution-v2"
 
@@ -223,6 +224,7 @@ class FullNativeALNSResult:
     counters: Mapping[str, int]
     timings: Mapping[str, float]
     trajectory: tuple[Mapping[str, object], ...]
+    semantic_stream: NativeGlobalSemanticStream
     transaction_sha256: str
 
 
@@ -1246,7 +1248,7 @@ def execute_full_native_alns(
         operator_integer,
         operator_float,
     )
-    if not isinstance(payload, tuple) or len(payload) != 7:
+    if not isinstance(payload, tuple) or len(payload) != 9:
         raise RuntimeError("full native ALNS returned an invalid payload tuple")
     route_offsets = _require_vector(payload[0], "full native route offsets")
     route_indices = _require_vector(payload[1], "full native route indices")
@@ -1280,6 +1282,13 @@ def execute_full_native_alns(
     )
     if any(not math.isfinite(float(value)) or float(value) < 0.0 for value in timings_array):
         raise RuntimeError("full native ALNS returned invalid timings")
+    if not math.isclose(
+        float(timings_array[0] + timings_array[1] + timings_array[3]),
+        float(timings_array[2]),
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    ):
+        raise RuntimeError("full native ALNS timing intervals do not reconcile")
     trajectory_array = payload[5]
     if (
         not isinstance(trajectory_array, np.ndarray)
@@ -1296,22 +1305,46 @@ def execute_full_native_alns(
     transaction_sha256 = payload[6]
     if not isinstance(transaction_sha256, str) or not _is_sha256(transaction_sha256):
         raise RuntimeError("full native ALNS returned an invalid transaction SHA-256")
+    semantic_stream = decode_native_global_semantic_stream(
+        instance,
+        payload[7],
+        node_names=context.node_names,
+        initial_customer_sequences=initial_customer_sequences,
+        stage04_config=stage04_config,
+        expected_start_iteration=0,
+        expected_iteration_count=max_iterations,
+    )
+    backend_metrics = _decode_full_native_backend_metrics(
+        payload[8],
+        batch_size=batch_size,
+        exact_seconds=float(timings_array[1]),
+    )
     expected_sha256 = _full_native_digest(
         route_offsets=route_offsets,
         route_indices=route_indices,
         exact_payload=payload[2],
         counters=counters_array,
         trajectory=trajectory_array,
+        semantic_sha256=semantic_stream.transaction_sha256,
+        backend_payload=payload[8],
     )
     if transaction_sha256 != expected_sha256:
         raise RuntimeError("full native ALNS transaction SHA-256 mismatch")
+    if int(semantic_stream.termination[2]) != int(counters_array[0]):
+        raise RuntimeError("full native ALNS semantic iteration count mismatch")
     decoded = decode_exact_charging_batch_numeric(
         instance,
         customer_sequences,
         native_runtime=native_runtime,
         batch_size=batch_size,
         payload=payload[2],
-        native_kernel_seconds=float(timings_array[2]),
+        native_kernel_seconds=0.0,
+    )
+    _verify_full_native_best_projection(
+        instance,
+        initial_customer_sequences=initial_customer_sequences,
+        semantic_stream=semantic_stream,
+        returned_customer_sequences=customer_sequences,
     )
     counters = {
         "iterations": int(counters_array[0]),
@@ -1325,10 +1358,16 @@ def execute_full_native_alns(
     }
     if counters["fallback_count"] != 0:
         raise RuntimeError("full native ALNS reported a forbidden fallback")
+    if (
+        counters["exact_started_calls"] != backend_metrics.started_calls
+        or counters["exact_completed_calls"] != backend_metrics.completed_calls
+        or counters["interrupted_calls"] != backend_metrics.interrupted_calls
+    ):
+        raise RuntimeError("full native ALNS backend counters do not reconcile")
     return FullNativeALNSResult(
         customer_sequences=customer_sequences,
         exact_results=decoded.results,
-        backend_metrics=decoded.metrics,
+        backend_metrics=backend_metrics,
         counters=counters,
         timings={
             "search_seconds": float(timings_array[0]),
@@ -1349,6 +1388,7 @@ def execute_full_native_alns(
             }
             for row in trajectory_array
         ),
+        semantic_stream=semantic_stream,
         transaction_sha256=transaction_sha256,
     )
 
@@ -1705,6 +1745,8 @@ def _full_native_digest(
     exact_payload: object,
     counters: npt.NDArray[np.generic],
     trajectory: npt.NDArray[np.int64],
+    semantic_sha256: str,
+    backend_payload: object,
 ) -> str:
     evidence = bytearray(b"stage05.2-full-native-alns-v2")
     evidence.extend(route_offsets.tobytes(order="C"))
@@ -1717,7 +1759,147 @@ def _full_native_digest(
         evidence.extend(value.tobytes(order="C"))
     evidence.extend(counters.tobytes(order="C"))
     evidence.extend(trajectory.tobytes(order="C"))
+    if not _is_sha256(semantic_sha256):
+        raise RuntimeError("full native ALNS semantic SHA-256 is invalid")
+    evidence.extend(semantic_sha256.encode("ascii"))
+    if not isinstance(backend_payload, tuple) or len(backend_payload) != 3:
+        raise RuntimeError("full native ALNS backend payload has an invalid schema")
+    for value in backend_payload[:2]:
+        if not isinstance(value, np.ndarray) or not value.flags.c_contiguous:
+            raise RuntimeError("full native ALNS backend payload is not contiguous")
+        evidence.extend(value.tobytes(order="C"))
     return hashlib.sha256(evidence).hexdigest()
+
+
+def _decode_full_native_backend_metrics(
+    payload: object,
+    *,
+    batch_size: int,
+    exact_seconds: float,
+) -> BackendMetrics:
+    if not isinstance(payload, tuple) or len(payload) != 3:
+        raise RuntimeError("full native ALNS backend payload has an invalid schema")
+    counters = _require_array(
+        payload[0],
+        dtype=np.dtype(np.int64),
+        shape=(10,),
+        name="full native backend counters",
+    )
+    occupancies = _require_vector(payload[1], "full native launch occupancies")
+    timing = _require_array(
+        payload[2],
+        dtype=np.dtype(np.float64),
+        shape=(1,),
+        name="full native backend timing",
+    )
+    values = tuple(int(value) for value in counters)
+    if any(value < 0 for value in values[:9]) or values[9] != batch_size:
+        raise RuntimeError("full native ALNS backend counters are invalid")
+    if (
+        values[0] != values[1]
+        or values[1] != values[2] + values[3]
+        or values[4] != values[8]
+        or values[8] != len(occupancies)
+        or any(int(value) <= 0 for value in occupancies)
+        or sum(int(value) for value in occupancies) != values[0]
+    ):
+        raise RuntimeError("full native ALNS backend counters do not reconcile")
+    measured_exact_seconds = float(timing[0])
+    if (
+        not math.isfinite(measured_exact_seconds)
+        or measured_exact_seconds < 0.0
+        or measured_exact_seconds != exact_seconds
+    ):
+        raise RuntimeError("full native ALNS backend timing does not reconcile")
+    return BackendMetrics(
+        backend="cpu_batch",
+        batch_size=batch_size,
+        total_seconds=measured_exact_seconds,
+        label_management_seconds=measured_exact_seconds,
+        work_batches=values[4],
+        transition_batches=values[5],
+        transitions=values[6],
+        exact_calls=values[0],
+        batch_launches=values[8],
+        checkpoint_count=values[7],
+        started_calls=values[1],
+        completed_calls=values[2],
+        interrupted_calls=values[3],
+        native_kernel_seconds=measured_exact_seconds,
+        native_invocations=values[8],
+        launch_occupancies=[int(value) for value in occupancies],
+    )
+
+
+def _verify_full_native_best_projection(
+    instance: Instance,
+    *,
+    initial_customer_sequences: tuple[CustomerSequence, ...],
+    semantic_stream: NativeGlobalSemanticStream,
+    returned_customer_sequences: tuple[CustomerSequence, ...],
+) -> None:
+    def replay_objective(
+        customer_sequences: tuple[CustomerSequence, ...],
+    ) -> SolutionObjective:
+        exact_results = tuple(
+            solve_exact_charging(instance, sequence) for sequence in customer_sequences
+        )
+        if any(not result.feasible for result in exact_results):
+            raise RuntimeError("full native semantic replay found an infeasible solution")
+        report = validate_routes(
+            instance,
+            [list(result.route) for result in exact_results],
+        )
+        if not report.feasible:
+            raise RuntimeError("full native semantic replay failed the unified validator")
+        return SolutionObjective.from_report(instance, report)
+
+    current_sequences = initial_customer_sequences
+    current_objective = replay_objective(current_sequences)
+    best_sequences = current_sequences
+    best_objective = current_objective
+    for event in semantic_stream.neighborhood_events:
+        candidate_sequences = cast(
+            tuple[CustomerSequence, ...],
+            event["candidate_route_sequences"],
+        )
+        candidate_feasible = bool(event["candidate_feasible"])
+        accepted = bool(event["accepted"])
+        if accepted and (not candidate_feasible or not candidate_sequences):
+            raise RuntimeError("full native semantic replay accepted a missing candidate")
+        if not candidate_feasible or not candidate_sequences:
+            continue
+        candidate_objective = replay_objective(candidate_sequences)
+        event_objective = cast(tuple[int, float, float, int], event["candidate_objective_key"])
+        if candidate_objective.key != event_objective:
+            raise RuntimeError("full native semantic candidate objective failed replay")
+        if bool(event["vehicle_reduction"]) != (
+            candidate_objective.vehicle_count < current_objective.vehicle_count
+        ):
+            raise RuntimeError("full native semantic vehicle-reduction flag failed replay")
+        if bool(event["distance_improvement"]) != _native_distance_improved(
+            candidate_objective,
+            current_objective,
+        ):
+            raise RuntimeError("full native semantic distance-improvement flag failed replay")
+        if accepted:
+            current_sequences = candidate_sequences
+            current_objective = candidate_objective
+            if current_objective.key < best_objective.key:
+                best_sequences = current_sequences
+                best_objective = current_objective
+    if returned_customer_sequences != best_sequences:
+        raise RuntimeError("full native ALNS returned current state instead of global best")
+
+
+def _native_distance_improved(
+    candidate: SolutionObjective,
+    current: SolutionObjective,
+) -> bool:
+    return (
+        candidate.vehicle_count == current.vehicle_count
+        and candidate.total_distance < current.total_distance - 1e-9
+    )
 
 
 @dataclass(frozen=True, slots=True)

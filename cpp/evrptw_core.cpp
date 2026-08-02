@@ -9176,6 +9176,11 @@ py::tuple full_native_initialize_v2(
         deadline_remaining, true);
 }
 
+class NativeExactDeadlineInterruption final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 class NativeSearchEngineV2 {
 public:
     NativeSearchEngineV2(
@@ -9353,6 +9358,7 @@ public:
                 "full native warm start does not fit the exact-call budget");
         }
         py::tuple initialized;
+        const auto warm_exact_started = std::chrono::steady_clock::now();
         try {
             initialized = full_native_initialize_impl_v2(
                 node_kind_,
@@ -9381,6 +9387,10 @@ public:
             throw std::runtime_error(
                 "full native warm-start exact transaction did not complete atomically");
         }
+        record_exact_backend_metrics(
+            exact_payload,
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - warm_exact_started).count());
         budget_.complete_exact(route_count);
 
         auto status_array = py::cast<py::array_t<std::int64_t>>(exact_payload[2]);
@@ -9906,7 +9916,13 @@ public:
                     }
                     py::array_t<double> exact_deadline(1);
                     checked_data(exact_deadline)[0] = exact_remaining;
+                    if (exact_kernel_deadline_injection_) {
+                        exact_kernel_deadline_injection_ = false;
+                        checked_data(exact_deadline)[0] = 0.0;
+                    }
                     exact_started = true;
+                    const auto candidate_exact_started =
+                        std::chrono::steady_clock::now();
                     exact_payload = exact_charging_batch_numeric(
                         node_kind_, ready_time_, due_date_, service_time_, distance_,
                         vehicle_, missing_offsets_array, missing_indices_array,
@@ -9917,12 +9933,17 @@ public:
                         batch_counters)[2];
                     const auto interrupted = checked_data<std::int64_t>(
                         batch_counters)[3];
+                    record_exact_backend_metrics(
+                        exact_payload,
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now()
+                            - candidate_exact_started).count());
                     budget_.complete_exact(completed);
                     budget_.interrupt_exact(interrupted);
                     exact_accounted = true;
                     if (completed != requested_exact || interrupted != 0) {
-                        throw std::runtime_error(
-                            "full native candidate-plan exact batch was interrupted");
+                        throw NativeExactDeadlineInterruption(
+                            "full native candidate-plan exact batch reached its deadline");
                     }
                     auto exact_path_offsets = py::cast<py::array_t<std::int64_t>>(
                         exact_payload[0]);
@@ -11646,6 +11667,10 @@ public:
                 deadline_array,
                 batch_array,
                 route_change_limit);
+        } catch (const NativeExactDeadlineInterruption&) {
+            rollback.rollback_now();
+            const auto terminal_budget = budget_.native_snapshot();
+            return make_empty_terminal(2, entry_budget, terminal_budget);
         } catch (const std::runtime_error& error) {
             if (std::string_view(error.what()).find("deadline")
                 == std::string_view::npos) {
@@ -12082,6 +12107,15 @@ public:
         constraint_iteration_deadline_injection_ = true;
     }
 
+    void inject_exact_kernel_deadline_once() {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        exact_kernel_deadline_injection_ = true;
+    }
+
     void inject_constraint_probe_envelope_failure_once() {
         std::unique_lock state_lock(state_mutex_, std::try_to_lock);
         if (!state_lock.owns_lock()) {
@@ -12179,6 +12213,30 @@ public:
                 best_objective_float_, "best_objective_float", 1));
     }
 
+    py::tuple exact_backend_metrics_payload() const {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (!initialized_) {
+            throw std::runtime_error(
+                "full native search engine must be initialized before metrics inspection");
+        }
+        py::array_t<std::int64_t> counters(10);
+        std::copy(
+            exact_backend_totals_.begin(), exact_backend_totals_.end(),
+            checked_data(counters));
+        py::array_t<std::int64_t> occupancies(exact_launch_occupancies_.size());
+        std::copy(
+            exact_launch_occupancies_.begin(), exact_launch_occupancies_.end(),
+            checked_data(occupancies));
+        py::array_t<double> timings(1);
+        checked_data(timings)[0] = exact_backend_seconds_;
+        return py::make_tuple(
+            std::move(counters), std::move(occupancies), std::move(timings));
+    }
+
 private:
     mutable std::recursive_mutex state_mutex_;
     NativeRouteCacheV2 route_cache_;
@@ -12192,6 +12250,7 @@ private:
     std::int64_t commit_failure_injection_ = 0;
     bool probe_envelope_failure_injection_ = false;
     bool constraint_iteration_deadline_injection_ = false;
+    bool exact_kernel_deadline_injection_ = false;
     bool global_search_envelope_failure_injection_ = false;
     std::int64_t constraint_search_deadline_after_completed_injection_ = -1;
     bool defer_composite_commit_ = false;
@@ -12225,6 +12284,9 @@ private:
     py::array_t<std::int64_t> best_offsets_;
     py::array_t<std::int64_t> best_indices_;
     py::tuple best_exact_payload_;
+    std::array<std::int64_t, 10> exact_backend_totals_{};
+    std::vector<std::int64_t> exact_launch_occupancies_;
+    double exact_backend_seconds_ = 0.0;
     py::array_t<std::int64_t> best_objective_integer_;
     py::array_t<double> best_objective_float_;
     bool last_candidate_ready_ = false;
@@ -12294,13 +12356,69 @@ private:
             throw std::logic_error(
                 "full native exact state lost its typed schema");
         }
-        return py::make_tuple(
+        auto copied = py::make_tuple(
             owned_array_copy<std::int64_t>(payload[0], "path_offsets", 1),
             owned_array_copy<std::int64_t>(payload[1], "path_indices", 1),
             owned_array_copy<std::int64_t>(payload[2], "result_statuses", 1),
             owned_array_copy<std::int64_t>(payload[3], "reason_codes", 1),
             owned_array_copy<double>(payload[4], "result_metrics", 2),
             owned_array_copy<std::int64_t>(payload[5], "label_counters", 2));
+        if (payload.size() == 6) {
+            return copied;
+        }
+        if (payload.size() != 7) {
+            throw std::logic_error(
+                "full native exact state has an unknown typed schema");
+        }
+        return py::make_tuple(
+            copied[0], copied[1], copied[2], copied[3], copied[4], copied[5],
+            owned_array_copy<std::int64_t>(payload[6], "batch_counters", 1));
+    }
+
+    void record_exact_backend_metrics(
+        const py::tuple& payload,
+        double elapsed_seconds) {
+        if (payload.size() != 7) {
+            throw std::logic_error(
+                "full native exact backend metrics require the complete payload");
+        }
+        if (!std::isfinite(elapsed_seconds) || elapsed_seconds < 0.0) {
+            throw std::logic_error(
+                "full native exact backend elapsed time is invalid");
+        }
+        auto counters = py::cast<py::array_t<std::int64_t>>(payload[6]);
+        if (counters.ndim() != 1 || counters.size() != 10
+            || (counters.flags() & py::array::c_style) == 0) {
+            throw std::logic_error(
+                "full native exact backend counters lost their typed schema");
+        }
+        const auto* values = checked_data<std::int64_t>(counters);
+        if (values[0] < 0 || values[1] < 0 || values[2] < 0
+            || values[3] < 0 || values[4] < 0 || values[5] < 0
+            || values[6] < 0 || values[7] < 0 || values[8] < 0
+            || values[9] <= 0 || values[0] != values[1]
+            || values[1] != values[2] + values[3]
+            || values[4] != values[8] || values[8] > 1) {
+            throw std::logic_error(
+                "full native exact backend counters are inconsistent");
+        }
+        if (exact_backend_totals_[9] != 0
+            && exact_backend_totals_[9] != values[9]) {
+            throw std::logic_error(
+                "full native exact backend batch size changed during solve");
+        }
+        for (std::size_t index = 0; index < 9; ++index) {
+            exact_backend_totals_[index] += values[index];
+        }
+        exact_backend_totals_[9] = values[9];
+        if (values[8] == 1) {
+            if (values[1] <= 0) {
+                throw std::logic_error(
+                    "full native exact launch has no started work");
+            }
+            exact_launch_occupancies_.push_back(values[1]);
+        }
+        exact_backend_seconds_ += elapsed_seconds;
     }
 
     void clear_pending_composite_noexcept() noexcept {
@@ -12490,6 +12608,11 @@ py::tuple full_native_alns_v2(
         throw std::invalid_argument("full native v2 protocol options are invalid");
     }
     const auto* base_control_values = checked_data<std::int64_t>(base_control);
+    if (base_control_values[1] != 1 || initial_offsets.size() != 2) {
+        throw std::runtime_error(
+            "full native v2 currently requires one bootstrap iteration and one warm-start route");
+    }
+    const auto solve_started = std::chrono::steady_clock::now();
     NativeSearchEngineV2 engine(
         base_control_values[4],
         protocol_values[2],
@@ -12517,8 +12640,147 @@ py::tuple full_native_alns_v2(
     if (!engine.initialized()) {
         throw std::logic_error("full native v2 search engine lost initialization state");
     }
-    throw std::runtime_error(
-        "full native v2 semantic engine is incomplete; refusing prototype fallback");
+    py::array_t<std::int64_t> thresholds(3);
+    std::copy(
+        checked_data<std::int64_t>(operator_integer_array) + 21,
+        checked_data<std::int64_t>(operator_integer_array) + 24,
+        checked_data(thresholds));
+    py::array_t<double> fractions(6);
+    std::copy(
+        checked_data<double>(operator_float_array) + 1,
+        checked_data<double>(operator_float_array) + 7,
+        checked_data(fractions));
+    py::array_t<std::int64_t> batch(1);
+    checked_data(batch)[0] = base_control_values[2];
+    auto global = engine.run_global_search(
+        0,
+        base_control_values[1],
+        0,
+        thresholds,
+        fractions,
+        deadline,
+        batch,
+        -1);
+    auto best = engine.best_solution_payload();
+    auto backend_metrics = engine.exact_backend_metrics_payload();
+    auto route_offsets = py::cast<py::array_t<std::int64_t>>(best[0]);
+    auto route_indices = py::cast<py::array_t<std::int64_t>>(best[1]);
+    auto exact_state = py::cast<py::tuple>(best[2]);
+    py::tuple exact_payload(7);
+    for (py::ssize_t index = 0; index < 6; ++index) {
+        exact_payload[index] = exact_state[index];
+    }
+    const auto best_route_count = route_offsets.size() - 1;
+    if (exact_state.size() >= 7) {
+        exact_payload[6] = exact_state[6];
+    } else {
+        py::array_t<std::int64_t> exact_batch_counters(10);
+        auto* exact_counter_values = checked_data(exact_batch_counters);
+        exact_counter_values[0] = best_route_count;
+        exact_counter_values[1] = best_route_count;
+        exact_counter_values[2] = best_route_count;
+        exact_counter_values[3] = 0;
+        exact_counter_values[4] = best_route_count > 0 ? 1 : 0;
+        exact_counter_values[5] = 0;
+        exact_counter_values[6] = 0;
+        exact_counter_values[7] = 0;
+        exact_counter_values[8] = best_route_count > 0 ? 1 : 0;
+        exact_counter_values[9] = base_control_values[2];
+        exact_payload[6] = std::move(exact_batch_counters);
+    }
+    auto events = py::cast<py::array_t<std::int64_t>>(global[0]);
+    auto termination = py::cast<py::array_t<std::int64_t>>(global[13]);
+    const auto* terminal_values = checked_data<std::int64_t>(termination);
+    py::array_t<std::int64_t> counters(8);
+    auto* counter_values = checked_data(counters);
+    counter_values[0] = terminal_values[2];
+    counter_values[1] = terminal_values[8];
+    counter_values[2] = terminal_values[9];
+    counter_values[3] = 0;
+    counter_values[4] = 0;
+    counter_values[5] = terminal_values[2];
+    counter_values[6] = terminal_values[10];
+    counter_values[7] = 0;
+    py::array_t<std::int64_t> trajectory(
+        {static_cast<py::ssize_t>(terminal_values[2]), py::ssize_t(7)});
+    if (terminal_values[2] == 1) {
+        auto* row = checked_data(trajectory);
+        row[0] = 0;
+        row[1] = 7;
+        row[2] = route_offsets.size() - 1;
+        row[3] = terminal_values[8];
+        row[4] = events.shape(0) >= 3
+            ? checked_data<std::int64_t>(events)[2 * 26 + 4]
+            : 0;
+        row[5] = events.shape(0) >= 3
+            ? checked_data<std::int64_t>(events)[2 * 26 + 6]
+            : 0;
+        row[6] = events.shape(0) >= 3
+            ? checked_data<std::int64_t>(events)[2 * 26 + 7]
+            : 0;
+    }
+    const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - solve_started).count();
+    auto backend_timings = py::cast<py::array_t<double>>(backend_metrics[2]);
+    if (backend_timings.ndim() != 1 || backend_timings.size() != 1
+        || (backend_timings.flags() & py::array::c_style) == 0) {
+        throw std::logic_error(
+            "full native v2 backend timings lost their typed schema");
+    }
+    const auto exact_seconds = checked_data<double>(backend_timings)[0];
+    if (!std::isfinite(exact_seconds) || exact_seconds < 0.0
+        || exact_seconds > elapsed) {
+        throw std::logic_error(
+            "full native v2 exact timing is outside the solve interval");
+    }
+    py::array_t<double> timings(4);
+    checked_data(timings)[0] = elapsed - exact_seconds;
+    checked_data(timings)[1] = exact_seconds;
+    checked_data(timings)[2] = elapsed;
+    checked_data(timings)[3] = 0.0;
+    std::string evidence("stage05.2-full-native-alns-v2");
+    const auto append_raw_array = [&](const auto& array) {
+        evidence.append(
+            reinterpret_cast<const char*>(array.data()),
+            static_cast<std::size_t>(array.nbytes()));
+    };
+    append_raw_array(route_offsets);
+    append_raw_array(route_indices);
+    for (const auto item : exact_payload) {
+        const auto array = py::cast<py::array>(item);
+        if ((array.flags() & py::array::c_style) == 0) {
+            throw std::logic_error(
+                "full native v2 exact output is not contiguous");
+        }
+        evidence.append(
+            reinterpret_cast<const char*>(array.data()),
+            static_cast<std::size_t>(array.nbytes()));
+    }
+    append_raw_array(counters);
+    append_raw_array(trajectory);
+    const auto semantic_sha256 = py::cast<std::string>(global[14]);
+    evidence.append(semantic_sha256);
+    for (py::ssize_t index = 0; index < 2; ++index) {
+        const auto item = backend_metrics[index];
+        const auto array = py::cast<py::array>(item);
+        if ((array.flags() & py::array::c_style) == 0) {
+            throw std::logic_error(
+                "full native v2 backend metrics output is not contiguous");
+        }
+        evidence.append(
+            reinterpret_cast<const char*>(array.data()),
+            static_cast<std::size_t>(array.nbytes()));
+    }
+    return py::make_tuple(
+        std::move(route_offsets),
+        std::move(route_indices),
+        std::move(exact_payload),
+        std::move(counters),
+        std::move(timings),
+        std::move(trajectory),
+        native_sha256_hex(evidence),
+        std::move(global),
+        std::move(backend_metrics));
 }
 
 #ifdef __linux__
@@ -13220,6 +13482,9 @@ PYBIND11_MODULE(_core, module) {
             "inject_constraint_iteration_deadline_before_commit_once",
             &NativeSearchEngineV2::
                 inject_constraint_iteration_deadline_before_commit_once)
+        .def(
+            "inject_exact_kernel_deadline_once",
+            &NativeSearchEngineV2::inject_exact_kernel_deadline_once)
         .def(
             "inject_constraint_search_deadline_after_completed_once",
             &NativeSearchEngineV2::
