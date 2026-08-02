@@ -488,11 +488,37 @@ def _evidence_json_value(value: object) -> object:
 def _canonical_trace_event(event: dict[str, object]) -> dict[str, object]:
     """Remove wall-clock telemetry from one replayable semantic event."""
 
-    return {
+    canonical = {
         key: value
         for key, value in event.items()
         if key not in {"timestamp_seconds", "duration_seconds"}
     }
+    if canonical.get("event_type") == "candidate_state":
+        route_keys = canonical.get("candidate_route_keys")
+        if not isinstance(route_keys, list | tuple) or not all(
+            isinstance(key, str) for key in route_keys
+        ):
+            raise ValueError(
+                "candidate_state requires candidate_route_keys as a string array"
+            )
+        full_route_keys = canonical.get("candidate_full_route_keys", [])
+        if not isinstance(full_route_keys, list | tuple) or not all(
+            isinstance(key, str) for key in full_route_keys
+        ):
+            raise ValueError(
+                "candidate_full_route_keys must be a string array when present"
+            )
+        canonical["candidate_route_keys"] = list(route_keys)
+        if "candidate_full_route_keys" in canonical:
+            canonical["candidate_full_route_keys"] = list(full_route_keys)
+        identity = {
+            "candidate_route_keys": list(route_keys),
+            "candidate_full_route_keys": list(full_route_keys),
+        }
+        canonical["candidate_id"] = hashlib.sha256(
+            _canonical_bytes(identity)
+        ).hexdigest()
+    return canonical
 
 
 def _semantic_candidate_trajectory(result: ALNSResult) -> list[dict[str, object]]:

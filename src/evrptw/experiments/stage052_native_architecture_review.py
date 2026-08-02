@@ -191,6 +191,21 @@ def _replay_record(record: ReviewRecord, benchmark_dir: Path) -> dict[str, objec
             "valid": False,
             "reason": f"axis failed: {payload.get('error_type')}: {payload.get('error')}",
         }
+    if comparison_schema == SCHEMA_VERSION:
+        if "semantic_trajectory" not in payload or payload.get(
+            "semantic_trajectory"
+        ) is None:
+            return {
+                "valid": False,
+                "reason": "semantic trajectory replay failed: v4 evidence is missing",
+            }
+        try:
+            _semantic_trajectory(payload)
+        except ValueError as error:
+            return {
+                "valid": False,
+                "reason": f"semantic trajectory replay failed: {error}",
+            }
     instance_name = _string(payload, "instance")
     instance = parse_schneider(benchmark_dir / f"{instance_name}.txt")
     raw_routes = _sequence(payload, "routes")
@@ -264,11 +279,96 @@ def _common_prefix(left: list[object], right: list[object]) -> int:
     return length
 
 
+def _describe_first_divergence(
+    baseline: list[object],
+    candidate: list[object],
+) -> dict[str, object] | None:
+    index = _common_prefix(baseline, candidate)
+    if index == len(baseline) == len(candidate):
+        return None
+    baseline_event = baseline[index] if index < len(baseline) else None
+    candidate_event = candidate[index] if index < len(candidate) else None
+    baseline_mapping = baseline_event if isinstance(baseline_event, dict) else {}
+    candidate_mapping = candidate_event if isinstance(candidate_event, dict) else {}
+    def coordinate_value(field: str) -> object:
+        return (
+            candidate_mapping[field]
+            if field in candidate_mapping
+            else baseline_mapping.get(field)
+        )
+
+    differing_fields: dict[str, object] = {}
+    for field in sorted(set(baseline_mapping) | set(candidate_mapping)):
+        baseline_present = field in baseline_mapping
+        candidate_present = field in candidate_mapping
+        baseline_value = (
+            baseline_mapping[field]
+            if baseline_present
+            else {"field_missing": True}
+        )
+        candidate_value = (
+            candidate_mapping[field]
+            if candidate_present
+            else {"field_missing": True}
+        )
+        if baseline_present != candidate_present or baseline_value != candidate_value:
+            differing_fields[str(field)] = {
+                "baseline": baseline_value,
+                "candidate": candidate_value,
+            }
+    return {
+        "index": index,
+        "lane": coordinate_value("lane"),
+        "iteration": coordinate_value("iteration"),
+        "operator": coordinate_value("operator"),
+        "candidate_id": coordinate_value("candidate_id"),
+        "differing_fields": differing_fields,
+        "baseline": baseline_event,
+        "candidate": candidate_event,
+    }
+
+
 def _semantic_trajectory(payload: Mapping[str, object]) -> list[object]:
     value = payload.get("semantic_trajectory")
     if value is not None:
         if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
             raise ValueError("semantic_trajectory must be a list of event objects")
+        for row in value:
+            if row.get("event_type") != "candidate_state":
+                raise ValueError(
+                    "semantic_trajectory may contain only candidate_state events"
+                )
+            route_keys = row.get("candidate_route_keys")
+            if not isinstance(route_keys, list) or not all(
+                isinstance(key, str) for key in route_keys
+            ):
+                raise ValueError(
+                    "candidate_state requires candidate_route_keys as a string array"
+                )
+            full_route_keys = row.get("candidate_full_route_keys", [])
+            if not isinstance(full_route_keys, list) or not all(
+                isinstance(key, str) for key in full_route_keys
+            ):
+                raise ValueError(
+                    "candidate_full_route_keys must be a string array when present"
+                )
+            identity = {
+                "candidate_route_keys": route_keys,
+                "candidate_full_route_keys": full_route_keys,
+            }
+            expected_candidate_id = hashlib.sha256(
+                json.dumps(
+                    identity,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            if row.get("candidate_id") != expected_candidate_id:
+                raise ValueError(
+                    "semantic candidate_id does not match its canonical route projection"
+                )
         return list(value)
     # Stage 5.2 comparison v3 retained only a count/hash summary. Keep it
     # readable for immutable attempt03 evidence, but do not pretend that it can
@@ -702,22 +802,9 @@ def review_records(
                 baseline_trajectory,
                 candidate_trajectory,
             )
-            first_divergence = (
-                None
-                if baseline_trajectory == candidate_trajectory
-                else {
-                    "index": common_prefix,
-                    "baseline": (
-                        baseline_trajectory[common_prefix]
-                        if common_prefix < len(baseline_trajectory)
-                        else None
-                    ),
-                    "candidate": (
-                        candidate_trajectory[common_prefix]
-                        if common_prefix < len(candidate_trajectory)
-                        else None
-                    ),
-                }
+            first_divergence = _describe_first_divergence(
+                baseline_trajectory,
+                candidate_trajectory,
             )
             comparisons.append(
                 {

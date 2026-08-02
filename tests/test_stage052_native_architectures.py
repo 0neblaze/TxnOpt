@@ -12,8 +12,11 @@ from evrptw.charging import solve_exact_charging
 from evrptw.experiments.stage052_native_architecture_review import (
     ReviewRecord,
     _common_prefix,
+    _describe_first_divergence,
     _raw_axis_inventory,
+    _replay_record,
     _scheduler_screening_occupancy,
+    _semantic_trajectory,
     render_report,
     review_records,
     write_review,
@@ -24,6 +27,7 @@ from evrptw.experiments.stage052_native_architectures import (
     SEEDS,
     WARM_START_SCHEMA_VERSION,
     ArchitectureAxisTask,
+    _canonical_trace_event,
     _run_group,
     build_axis_plan,
     expected_axis_count,
@@ -277,6 +281,190 @@ def test_semantic_trajectory_reports_the_real_first_divergence() -> None:
     ]
 
     assert _common_prefix(baseline, candidate) == 1
+
+
+def test_canonical_candidate_event_has_stable_candidate_identity() -> None:
+    event = {
+        "event_type": "candidate_state",
+        "timestamp_seconds": 1.25,
+        "lane": "constraint_lane",
+        "iteration": 7,
+        "operator": "shaw_related",
+        "candidate_route_keys": ["route-b", "route-a"],
+        "candidate_full_route_keys": ["full-b", "full-a"],
+        "candidate_id": "producer-local-a",
+        "accepted": False,
+    }
+
+    canonical = _canonical_trace_event(event)
+    repeated = _canonical_trace_event(
+        {
+            **event,
+            "timestamp_seconds": 9.0,
+            "candidate_id": "producer-local-b",
+        }
+    )
+
+    assert canonical == repeated
+    assert canonical["candidate_id"] == (
+        "067f6e7fb31c2e26543409583f6b9877247769891162f00de974d42bd994c154"
+    )
+    assert "timestamp_seconds" not in canonical
+
+    with pytest.raises(ValueError, match="candidate_id"):
+        _semantic_trajectory(
+            {"semantic_trajectory": [{**canonical, "candidate_id": "0" * 64}]}
+        )
+    assert _semantic_trajectory({"semantic_trajectory": [canonical]}) == [
+        canonical
+    ]
+    with pytest.raises(ValueError, match="candidate_route_keys"):
+        _canonical_trace_event({"event_type": "candidate_state"})
+    with pytest.raises(ValueError, match="candidate_route_keys"):
+        _semantic_trajectory(
+            {
+                "semantic_trajectory": [
+                    {
+                        "event_type": "candidate_state",
+                        "candidate_route_keys": "not-an-array",
+                        "candidate_id": "0" * 64,
+                    }
+                ]
+            }
+        )
+    with pytest.raises(ValueError, match="only candidate_state"):
+        _semantic_trajectory(
+            {"semantic_trajectory": [{"event_type": "cache_event"}]}
+        )
+
+
+def test_first_divergence_reports_coordinates_and_differing_fields() -> None:
+    baseline = [
+        {
+            "lane": "constraint_lane",
+            "iteration": 4,
+            "operator": "shaw_related",
+            "candidate_id": "candidate-4",
+            "accepted": True,
+            "status": "accepted",
+        }
+    ]
+    candidate = [
+        {
+            "lane": "constraint_lane",
+            "iteration": 4,
+            "operator": "shaw_related",
+            "candidate_id": "candidate-4",
+            "accepted": False,
+            "status": "rejected",
+        }
+    ]
+
+    divergence = _describe_first_divergence(baseline, candidate)
+
+    assert divergence == {
+        "index": 0,
+        "lane": "constraint_lane",
+        "iteration": 4,
+        "operator": "shaw_related",
+        "candidate_id": "candidate-4",
+        "differing_fields": {
+            "accepted": {"baseline": True, "candidate": False},
+            "status": {"baseline": "accepted", "candidate": "rejected"},
+        },
+        "baseline": baseline[0],
+        "candidate": candidate[0],
+    }
+
+
+def test_first_divergence_distinguishes_missing_field_from_null() -> None:
+    baseline = [
+        {
+            "lane": "legacy",
+            "iteration": 2,
+            "operator": "route_merge",
+            "candidate_id": "candidate-2",
+            "reason": None,
+        }
+    ]
+    candidate = [{"lane": "legacy"}]
+
+    divergence = _describe_first_divergence(baseline, candidate)
+
+    assert divergence is not None
+    assert divergence["lane"] == "legacy"
+    assert divergence["iteration"] == 2
+    assert divergence["operator"] == "route_merge"
+    assert divergence["candidate_id"] == "candidate-2"
+    assert divergence["differing_fields"] == {
+        "candidate_id": {
+            "baseline": "candidate-2",
+            "candidate": {"field_missing": True},
+        },
+        "iteration": {
+            "baseline": 2,
+            "candidate": {"field_missing": True},
+        },
+        "operator": {
+            "baseline": "route_merge",
+            "candidate": {"field_missing": True},
+        },
+        "reason": {
+            "baseline": None,
+            "candidate": {"field_missing": True},
+        }
+    }
+
+
+def test_v4_axis_replay_rejects_bad_candidate_id_on_wall_clock_axis(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = _review_fixture_records(root, tmp_path)[0]
+    payload = dict(source.payload)
+    payload["schema_version"] = (
+        "stage05.2-native-architecture-comparison-v4"
+    )
+    payload["axis"] = "wall_clock_30"
+    payload["semantic_trajectory"] = [
+        {
+            "event_type": "candidate_state",
+            "lane": "legacy",
+            "iteration": 0,
+            "operator": "route_elimination",
+            "candidate_route_keys": [],
+            "candidate_id": "0" * 64,
+        }
+    ]
+
+    replay = _replay_record(
+        ReviewRecord(source.path, payload),
+        root / "data" / "schneider",
+    )
+
+    assert replay == {
+        "valid": False,
+        "reason": (
+            "semantic trajectory replay failed: semantic candidate_id does not "
+            "match its canonical route projection"
+        ),
+    }
+
+    for missing_value in ("absent", None):
+        missing_payload = dict(payload)
+        if missing_value == "absent":
+            del missing_payload["semantic_trajectory"]
+        else:
+            missing_payload["semantic_trajectory"] = None
+        assert _replay_record(
+            ReviewRecord(source.path, missing_payload),
+            root / "data" / "schneider",
+        ) == {
+            "valid": False,
+            "reason": (
+                "semantic trajectory replay failed: v4 evidence is missing"
+            ),
+        }
 
 
 def test_cuda_condition_does_not_reuse_exact_backend_occupancy(
