@@ -2972,7 +2972,10 @@ compatibility fallback（兼容回退）。
   `generation-NNNN` 根目录，或其下名称匹配 `[a-z][a-z0-9_]*` 的唯一逻辑 segment leaf。
   run label、generation、signed inventory、archive tree、writer lease、计划 SHA 与
   append-only receipts 仍逐项校验；任意更深嵌套、非规范 leaf、内容漂移或活动 writer
-  继续 fail fast。
+  继续 fail fast。cross-volume（跨卷）归档会把 plan 的 `mtime_ns` 重新绑定到已经通过
+  byte/SHA-256 复验的目标文件系统现场值；为恢复修复前已签名的 PREPARED plan，只允许
+  source nanoseconds 与 9p/NTFS 目标时间戳位于同一 UTC 秒，byte count 与 SHA-256 仍须
+  精确相等，因此不会把实际内容漂移当成时间精度差异。
 - 回归测试新增真实 `generation-0001/wsl_active` predecessor，要求新 current accepted
   close 在同一事务中生成 supersession receipt、删除仅由计划声明的大型 raw 文件、保留
   predecessor 原 `CLOSED` record，并使 lifecycle audit 通过。该 controller 修复改变

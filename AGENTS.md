@@ -1218,7 +1218,10 @@ The executable workflow and gate table are maintained in
   The retained archive may be either the canonical `generation-NNNN` root or
   one canonical single-segment leaf below it (for example `wsl_active`); both
   shapes remain bound to the exact signed inventory and use the same
-  controller-authored compaction transaction.
+  controller-authored compaction transaction. Supersession planning rebinds
+  file timestamps to the already content-verified archive filesystem; legacy
+  plans may accept only same-UTC-second timestamp truncation while still
+  requiring exact byte counts and SHA-256 for every file.
 - Runtime source/config/environment and worker/thread/process values must match
   the immutable lifecycle plan again immediately before execution. An
   idempotent retry with any runtime-plan drift is a hard failure rather than a

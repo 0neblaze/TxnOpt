@@ -3435,6 +3435,52 @@ class ExperimentLifecycleController:
             != record.content_inventory_sha256
         ):
             raise LifecycleError("content inventory differs from independent review")
+        if supersession is not None:
+            expected_paths = {item.relative_path for item in identities}
+            observed_paths: set[str] = set()
+            for root, directories, files in os.walk(resolved_run_dir):
+                directories.sort()
+                files.sort()
+                root_path = Path(root)
+                if any((root_path / name).is_symlink() for name in directories):
+                    raise LifecycleError("compaction source contains a symlink")
+                for name in files:
+                    path = root_path / name
+                    if path.is_symlink() or not path.is_file():
+                        raise LifecycleError(
+                            "compaction source contains a non-regular file"
+                        )
+                    observed_paths.add(
+                        path.relative_to(resolved_run_dir).as_posix()
+                    )
+            if observed_paths != expected_paths:
+                raise LifecycleError("compaction source file set differs")
+            rebound_identities: list[FileIdentity] = []
+            for item in identities:
+                path = resolved_run_dir.joinpath(
+                    *PurePosixPath(item.relative_path).parts
+                )
+                stat_before = path.stat()
+                digest = _sha256_file(path)
+                stat_after = path.stat()
+                if (
+                    stat_after.st_size != stat_before.st_size
+                    or stat_after.st_mtime_ns != stat_before.st_mtime_ns
+                    or stat_after.st_size != item.byte_count
+                    or digest != item.sha256
+                ):
+                    raise LifecycleError(
+                        f"compaction source drift: {item.relative_path}"
+                    )
+                rebound_identities.append(
+                    FileIdentity(
+                        item.relative_path,
+                        item.byte_count,
+                        item.sha256,
+                        stat_after.st_mtime_ns,
+                    )
+                )
+            identities = tuple(rebound_identities)
         representative_prefix = (
             _failure_shard_prefix(record.failure_location)
             if retention_class == RetentionClassV3.UNIQUE_FAILURE_CAPSULE
@@ -3705,9 +3751,19 @@ class ExperimentLifecycleController:
                 raise LifecycleError(
                     f"compaction source drift: {item.relative_path}"
                 ) from error
+            modified_time_matches = stat.st_mtime_ns == item.modified_time_ns
+            if supersession is not None and not modified_time_matches:
+                # Legacy supersession plans copied source nanoseconds into the
+                # plan even though a verified ext4 -> 9p/NTFS archive can
+                # preserve only the same UTC second. Content remains bound by
+                # the exact byte count and SHA-256 below.
+                modified_time_matches = (
+                    stat.st_mtime_ns // 1_000_000_000
+                    == item.modified_time_ns // 1_000_000_000
+                )
             if (
                 stat.st_size != item.byte_count
-                or stat.st_mtime_ns != item.modified_time_ns
+                or not modified_time_matches
                 or _sha256_file(path) != item.sha256
             ):
                 raise LifecycleError(f"compaction source drift: {item.relative_path}")

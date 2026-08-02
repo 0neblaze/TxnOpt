@@ -377,6 +377,18 @@ def _retention_binding(
         relative_archive /= archive_leaf
     archive_path = controller.archive_root / relative_archive
     shutil.copytree(run_dir, archive_path)
+    if archive_leaf is not None:
+        for path in archive_path.rglob("*"):
+            if not path.is_file():
+                continue
+            stat = path.stat()
+            os.utime(
+                path,
+                ns=(
+                    stat.st_atime_ns,
+                    stat.st_mtime_ns // 1_000_000_000 * 1_000_000_000,
+                ),
+            )
     files = inventory["files"]
     assert isinstance(files, list)
     source_bytes = sum(int(item["byte_count"]) for item in files)
