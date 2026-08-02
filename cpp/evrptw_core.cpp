@@ -1279,7 +1279,10 @@ public:
         for (std::size_t index = 0; index < routes.size(); ++index) {
             ++statistics_[0];
             const auto key = route_key(routes[index]);
-            seen_keys_.insert(key);
+            const auto [_, newly_seen] = seen_keys_.insert(key);
+            if (newly_seen) {
+                record_protocol_seen(key);
+            }
             statistics_[10] = static_cast<std::int64_t>(seen_keys_.size());
             const auto found = find_entry(key);
             if (found == entries_.end()) {
@@ -1292,6 +1295,7 @@ public:
             std::copy(
                 found->semantic_hash.begin(), found->semantic_hash.end(),
                 checked_data(hashes) + index * 32);
+            record_protocol_move(found);
             entries_.splice(entries_.end(), entries_, found);
         }
         return py::make_tuple(
@@ -1316,6 +1320,7 @@ public:
         }
         BatchJournal journal;
         journal.statistics_before = statistics_;
+        journal.protocol_operation_count_before = protocol_operation_count();
         journal.active = true;
         std::vector<std::int64_t> statuses(routes.size(), 0);
         std::vector<std::int64_t> eviction_counts(routes.size(), 0);
@@ -1351,6 +1356,8 @@ public:
                        && (statistics_[6] >= max_entries_
                            || statistics_[8] + bytes[index] > max_memory_bytes_)) {
                     Entry evicted = std::move(entries_.front());
+                    record_protocol_eviction(evicted, next_key(entries_.begin()));
+                    index_.erase(evicted.key);
                     entries_.pop_front();
                     --statistics_[6];
                     statistics_[8] -= evicted.entry_bytes;
@@ -1368,6 +1375,9 @@ public:
                     stored.semantic_hash.begin());
                 stored.entry_bytes = bytes[index];
                 entries_.push_back(std::move(stored));
+                auto stored_entry = std::prev(entries_.end());
+                index_.emplace(stored_entry->key, stored_entry);
+                record_protocol_insertion(stored_entry->key);
                 ++statistics_[3];
                 ++statistics_[6];
                 statistics_[8] += bytes[index];
@@ -1508,7 +1518,10 @@ public:
         for (std::size_t index = 0; index < routes.size(); ++index) {
             ++statistics_[0];
             const auto key = route_key(routes[index]);
-            seen_keys_.insert(key);
+            const auto [_, newly_seen] = seen_keys_.insert(key);
+            if (newly_seen) {
+                record_protocol_seen(key);
+            }
             statistics_[10] = static_cast<std::int64_t>(seen_keys_.size());
             const auto found = find_entry(key);
             if (found == entries_.end()) {
@@ -1540,6 +1553,7 @@ public:
             path_indices.insert(
                 path_indices.end(), payload.path.begin(), payload.path.end());
             path_offsets.push_back(static_cast<std::int64_t>(path_indices.size()));
+            record_protocol_move(found);
             entries_.splice(entries_.end(), entries_, found);
         }
         py::array_t<std::int64_t> path_offsets_array(path_offsets.size());
@@ -1561,9 +1575,7 @@ public:
             throw std::runtime_error(
                 "native route-cache protocol transaction is already active");
         }
-        protocol_snapshot_ = ProtocolSnapshot{
-            entries_, seen_keys_, statistics_,
-        };
+        protocol_snapshot_ = ProtocolSnapshot{statistics_, {}};
     }
 
     py::array_t<std::int64_t> commit_protocol_transaction() {
@@ -1576,8 +1588,7 @@ public:
     py::array_t<std::int64_t> rollback_protocol_transaction() {
         require_no_active_batch("rollback_protocol_transaction");
         require_protocol_snapshot("rollback_protocol_transaction");
-        entries_ = std::move(protocol_snapshot_->entries);
-        seen_keys_ = std::move(protocol_snapshot_->seen_keys);
+        rollback_protocol_operations(protocol_snapshot_->operations);
         statistics_ = protocol_snapshot_->statistics;
         protocol_snapshot_.reset();
         return statistics_array();
@@ -1643,17 +1654,30 @@ private:
         std::vector<std::string> inserted_keys;
         std::vector<Entry> evicted_entries;
         std::array<std::int64_t, 11> statistics_before{};
+        std::size_t protocol_operation_count_before = 0;
         bool active = false;
     };
+    enum class ProtocolOperationKind {
+        seen,
+        move,
+        insertion,
+        eviction,
+    };
+    struct ProtocolOperation {
+        ProtocolOperationKind kind;
+        std::string key;
+        std::optional<std::string> next_key;
+        std::optional<Entry> entry;
+    };
     struct ProtocolSnapshot {
-        std::list<Entry> entries;
-        std::unordered_set<std::string> seen_keys;
         std::array<std::int64_t, 11> statistics;
+        std::vector<ProtocolOperation> operations;
     };
 
     std::int64_t max_entries_;
     std::int64_t max_memory_bytes_;
     std::list<Entry> entries_;
+    std::unordered_map<std::string, std::list<Entry>::iterator> index_;
     std::unordered_set<std::string> seen_keys_;
     std::array<std::int64_t, 11> statistics_{};
     std::optional<BatchJournal> active_batch_;
@@ -1702,9 +1726,113 @@ private:
     }
 
     std::list<Entry>::iterator find_entry(const std::string& key) {
-        return std::find_if(
-            entries_.begin(), entries_.end(),
-            [&](const Entry& entry) { return entry.key == key; });
+        const auto found = index_.find(key);
+        return found == index_.end() ? entries_.end() : found->second;
+    }
+
+    [[nodiscard]] std::optional<std::string> next_key(
+        std::list<Entry>::iterator current) const {
+        const auto following = std::next(current);
+        return following == entries_.end()
+            ? std::nullopt
+            : std::optional<std::string>(following->key);
+    }
+
+    [[nodiscard]] std::size_t protocol_operation_count() const {
+        return protocol_snapshot_.has_value()
+            ? protocol_snapshot_->operations.size()
+            : 0;
+    }
+
+    void record_protocol_seen(const std::string& key) {
+        if (protocol_snapshot_.has_value()) {
+            protocol_snapshot_->operations.push_back(ProtocolOperation{
+                ProtocolOperationKind::seen, key, std::nullopt, std::nullopt});
+        }
+    }
+
+    void record_protocol_move(std::list<Entry>::iterator entry) {
+        if (protocol_snapshot_.has_value() && std::next(entry) != entries_.end()) {
+            protocol_snapshot_->operations.push_back(ProtocolOperation{
+                ProtocolOperationKind::move,
+                entry->key,
+                next_key(entry),
+                std::nullopt,
+            });
+        }
+    }
+
+    void record_protocol_insertion(const std::string& key) {
+        if (protocol_snapshot_.has_value()) {
+            protocol_snapshot_->operations.push_back(ProtocolOperation{
+                ProtocolOperationKind::insertion, key, std::nullopt, std::nullopt});
+        }
+    }
+
+    void record_protocol_eviction(
+        const Entry& entry,
+        std::optional<std::string> following_key) {
+        if (protocol_snapshot_.has_value()) {
+            protocol_snapshot_->operations.push_back(ProtocolOperation{
+                ProtocolOperationKind::eviction,
+                entry.key,
+                std::move(following_key),
+                entry,
+            });
+        }
+    }
+
+    void rollback_protocol_operations(
+        const std::vector<ProtocolOperation>& operations) {
+        for (auto operation = operations.rbegin(); operation != operations.rend(); ++operation) {
+            if (operation->kind == ProtocolOperationKind::seen) {
+                seen_keys_.erase(operation->key);
+                continue;
+            }
+            if (operation->kind == ProtocolOperationKind::insertion) {
+                const auto found = find_entry(operation->key);
+                if (found == entries_.end()) {
+                    throw std::runtime_error(
+                        "native route-cache protocol rollback lost an insertion");
+                }
+                index_.erase(operation->key);
+                entries_.erase(found);
+                continue;
+            }
+            if (operation->kind == ProtocolOperationKind::eviction) {
+                if (!operation->entry.has_value() || index_.contains(operation->key)) {
+                    throw std::runtime_error(
+                        "native route-cache protocol eviction journal is invalid");
+                }
+                auto position = entries_.end();
+                if (operation->next_key.has_value()) {
+                    const auto following = index_.find(*operation->next_key);
+                    if (following == index_.end()) {
+                        throw std::runtime_error(
+                            "native route-cache protocol rollback lost an eviction anchor");
+                    }
+                    position = following->second;
+                }
+                auto restored = entries_.insert(position, *operation->entry);
+                index_.emplace(restored->key, restored);
+                continue;
+            }
+            const auto found = find_entry(operation->key);
+            if (found == entries_.end()) {
+                throw std::runtime_error(
+                    "native route-cache protocol rollback lost an LRU entry");
+            }
+            auto position = entries_.end();
+            if (operation->next_key.has_value()) {
+                const auto following = index_.find(*operation->next_key);
+                if (following == index_.end()) {
+                    throw std::runtime_error(
+                        "native route-cache protocol rollback lost an LRU anchor");
+                }
+                position = following->second;
+            }
+            entries_.splice(position, entries_, found);
+        }
     }
 
     void require_no_active_batch(const char* operation) const {
@@ -1732,13 +1860,23 @@ private:
     }
 
     void rollback_journal(const BatchJournal& journal) {
+        if (protocol_snapshot_.has_value()) {
+            protocol_snapshot_->operations.resize(
+                journal.protocol_operation_count_before);
+        }
         const std::unordered_set<std::string> inserted(
             journal.inserted_keys.begin(), journal.inserted_keys.end());
-        entries_.remove_if(
-            [&](const Entry& entry) { return inserted.contains(entry.key); });
+        entries_.remove_if([&](const Entry& entry) {
+            if (!inserted.contains(entry.key)) {
+                return false;
+            }
+            index_.erase(entry.key);
+            return true;
+        });
         for (auto entry = journal.evicted_entries.rbegin();
              entry != journal.evicted_entries.rend(); ++entry) {
             entries_.push_front(*entry);
+            index_[entries_.front().key] = entries_.begin();
         }
         statistics_ = journal.statistics_before;
     }

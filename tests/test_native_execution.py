@@ -1460,6 +1460,47 @@ def test_native_route_cache_restores_typed_exact_payload_on_hit() -> None:
     state_before = cache.snapshot()
     cache.begin_protocol_transaction()
     cache.lookup_exact_many(*packed((routes[0],)))
+    third_route_offsets, third_route_indices = packed((routes[2],))
+    third_path_offsets, third_path_indices = packed((tuple(results[2].route),))
+    third_metrics = np.asarray(
+        [[
+            results[2].distance,
+            results[2].total_energy,
+            results[2].charged_energy,
+            results[2].charging_time,
+        ]],
+        dtype=np.float64,
+    )
+    third_labels = np.asarray(
+        [[
+            results[2].labels_generated,
+            results[2].labels_expanded,
+            results[2].labels_pruned,
+        ]],
+        dtype=np.int64,
+    )
+    third_hash = np.asarray(
+        [list(bytes.fromhex(charging_result_semantic_digest(results[2])))],
+        dtype=np.uint8,
+    )
+    third_bytes = np.asarray(
+        [estimate_cache_entry_bytes(results[2])],
+        dtype=np.int64,
+    )
+    cache.begin_store_exact_many_atomic(
+        third_route_offsets,
+        third_route_indices,
+        third_path_offsets,
+        third_path_indices,
+        np.zeros(1, dtype=np.int64),
+        np.zeros(1, dtype=np.int64),
+        third_metrics,
+        third_labels,
+        third_hash,
+        third_bytes,
+    )
+    cache.commit_store_batch()
+    cache.lookup_exact_many(third_route_offsets, third_route_indices)
     cache.rollback_protocol_transaction()
     state_after = cache.snapshot()
     assert [item.tolist() for item in state_after] == [
