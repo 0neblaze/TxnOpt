@@ -73,6 +73,37 @@ def rank_candidate_plans_v1(
     npt.NDArray[np.int64],
     npt.NDArray[np.float64],
 ]: ...
+def changed_candidate_plan_selection_v1(
+    operation: int,
+    node_kind: npt.NDArray[np.int64],
+    demand: npt.NDArray[np.float64],
+    ready_time: npt.NDArray[np.float64],
+    due_date: npt.NDArray[np.float64],
+    service_time: npt.NDArray[np.float64],
+    distance: npt.NDArray[np.float64],
+    reachable: npt.NDArray[np.uint8],
+    vehicle: npt.NDArray[np.float64],
+    lexical_rank: npt.NDArray[np.int64],
+    current_route_offsets: npt.NDArray[np.int64],
+    current_route_indices: npt.NDArray[np.int64],
+    screening_options: npt.NDArray[np.float64],
+    negative_offsets: npt.NDArray[np.int64],
+    negative_indices: npt.NDArray[np.int64],
+    negative_reason_codes: npt.NDArray[np.int64],
+    attempted_flags: npt.NDArray[np.int64],
+    top_k: int,
+    worker_count: int,
+) -> tuple[
+    object,
+    object,
+    object,
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.float64],
+    str,
+]: ...
 
 class NativeRouteCacheV2:
     def __init__(self, max_entries: int, max_memory_bytes: int) -> None: ...

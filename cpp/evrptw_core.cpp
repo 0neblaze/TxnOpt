@@ -1101,6 +1101,137 @@ py::tuple rank_candidate_plans_v1(
         std::move(integer_metrics), std::move(float_metrics));
 }
 
+py::tuple screen_route_batch_transaction_impl(
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle candidate_ids,
+    py::handle options,
+    py::handle incremental,
+    py::handle negative_offsets,
+    py::handle negative_indices,
+    py::handle negative_reason_codes,
+    std::int64_t worker_count);
+
+py::tuple changed_candidate_plan_selection_v1(
+    std::int64_t operation,
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle lexical_rank,
+    py::handle current_route_offsets,
+    py::handle current_route_indices,
+    py::handle screening_options,
+    py::handle negative_offsets,
+    py::handle negative_indices,
+    py::handle negative_reason_codes,
+    py::handle attempted_flags,
+    std::int64_t top_k,
+    std::int64_t worker_count) {
+    if (top_k <= 0 || worker_count <= 0) {
+        throw std::invalid_argument(
+            "changed candidate-plan selection controls must be positive");
+    }
+    auto pool = changed_candidate_pool_v1(
+        operation, current_route_offsets, current_route_indices);
+    auto plans = assemble_changed_candidate_plans_v1(
+        current_route_offsets, current_route_indices,
+        pool[0], pool[1], pool[2]);
+    auto plan_offsets_array = py::cast<py::array_t<std::int64_t>>(plans[0]);
+    auto route_offsets_array = py::cast<py::array_t<std::int64_t>>(plans[1]);
+    auto route_indices_array = py::cast<py::array_t<std::int64_t>>(plans[2]);
+    const auto plan_count = static_cast<std::size_t>(plan_offsets_array.size() - 1);
+    const auto route_count = static_cast<std::size_t>(route_offsets_array.size() - 1);
+    auto attempted_array = checked_array<std::int64_t>(
+        attempted_flags, "attempted_flags", 1);
+    if (attempted_array.size() != static_cast<py::ssize_t>(plan_count)) {
+        throw std::invalid_argument(
+            "changed candidate-plan attempted flags do not align");
+    }
+    py::array_t<std::int64_t> candidate_ids(route_count);
+    py::array_t<double> incremental(
+        {static_cast<py::ssize_t>(route_count), py::ssize_t(6)});
+    std::fill(checked_data(incremental), checked_data(incremental) + route_count * 6, 0.0);
+    for (std::size_t route = 0; route < route_count; ++route) {
+        checked_data(candidate_ids)[route] = static_cast<std::int64_t>(route);
+    }
+    auto screening = screen_route_batch_transaction_impl(
+        node_kind, demand, ready_time, due_date, service_time, distance,
+        reachable, vehicle, route_offsets_array, route_indices_array,
+        candidate_ids, screening_options, incremental, negative_offsets,
+        negative_indices, negative_reason_codes, worker_count);
+    auto codes_array = py::cast<py::array_t<std::int64_t>>(screening[3]);
+    auto metrics_array = py::cast<py::array_t<double>>(screening[4]);
+    const auto* plan_offsets_values = checked_data<std::int64_t>(plan_offsets_array);
+    const auto* codes = checked_data<std::int64_t>(codes_array);
+    const auto* metrics = checked_data<double>(metrics_array);
+    const auto* attempted = checked_data<std::int64_t>(attempted_array);
+    py::array_t<std::int64_t> eligible(plan_count);
+    py::array_t<std::int64_t> combined_attempted(plan_count);
+    py::array_t<double> lower_bounds(route_count);
+    for (std::size_t route = 0; route < route_count; ++route) {
+        checked_data(lower_bounds)[route] = metrics[route * 15 + 3];
+    }
+    for (std::size_t plan = 0; plan < plan_count; ++plan) {
+        auto valid = true;
+        for (auto route = plan_offsets_values[plan];
+             route < plan_offsets_values[plan + 1]; ++route) {
+            valid = valid && codes[route * 16] == 1;
+        }
+        checked_data(eligible)[plan] = valid ? 1 : 0;
+        checked_data(combined_attempted)[plan] =
+            !valid || attempted[plan] != 0 ? 1 : 0;
+    }
+    auto ranking = rank_candidate_plans_v1(
+        plan_offsets_array, route_offsets_array, route_indices_array,
+        lower_bounds, current_route_offsets, current_route_indices,
+        lexical_rank, combined_attempted, top_k);
+    auto ranked_all = py::cast<py::array_t<std::int64_t>>(ranking[0]);
+    const auto* ranked_values = checked_data<std::int64_t>(ranked_all);
+    std::vector<std::int64_t> rankable;
+    rankable.reserve(plan_count);
+    for (std::size_t rank = 0; rank < plan_count; ++rank) {
+        const auto plan = ranked_values[rank];
+        if (checked_data(eligible)[plan] == 1) {
+            rankable.push_back(plan);
+        }
+    }
+    py::array_t<std::int64_t> rankable_array(rankable.size());
+    std::copy(rankable.begin(), rankable.end(), checked_data(rankable_array));
+    std::string evidence = "stage05.2-changed-candidate-plan-selection-v1";
+    const auto append_array = [&evidence](const py::array& array) {
+        const auto info = array.request();
+        evidence.append(
+            static_cast<const char*>(info.ptr),
+            static_cast<std::size_t>(info.size * info.itemsize));
+    };
+    append_array(plan_offsets_array);
+    append_array(route_offsets_array);
+    append_array(route_indices_array);
+    append_array(codes_array);
+    append_array(metrics_array);
+    append_array(eligible);
+    append_array(rankable_array);
+    append_array(py::cast<py::array>(ranking[1]));
+    const auto digest = native_sha256_hex(evidence);
+    return py::make_tuple(
+        std::move(pool), std::move(plans), std::move(screening),
+        std::move(eligible), std::move(rankable_array), ranking[1],
+        ranking[2], ranking[3], digest);
+}
+
 class NativeRouteCacheV2 {
 public:
     NativeRouteCacheV2(std::int64_t max_entries, std::int64_t max_memory_bytes)
@@ -7691,6 +7822,17 @@ PYBIND11_MODULE(_core, module) {
         py::arg("lexical_rank"),
         py::arg("attempted_flags"),
         py::arg("top_k"));
+    module.def(
+        "changed_candidate_plan_selection_v1",
+        &changed_candidate_plan_selection_v1,
+        py::arg("operation"), py::arg("node_kind"), py::arg("demand"),
+        py::arg("ready_time"), py::arg("due_date"), py::arg("service_time"),
+        py::arg("distance"), py::arg("reachable"), py::arg("vehicle"),
+        py::arg("lexical_rank"), py::arg("current_route_offsets"),
+        py::arg("current_route_indices"), py::arg("screening_options"),
+        py::arg("negative_offsets"), py::arg("negative_indices"),
+        py::arg("negative_reason_codes"), py::arg("attempted_flags"),
+        py::arg("top_k"), py::arg("worker_count"));
     py::class_<NativeRouteCacheV2>(module, "NativeRouteCacheV2")
         .def(
             py::init<std::int64_t, std::int64_t>(),

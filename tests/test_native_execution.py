@@ -76,6 +76,21 @@ def _candidate_control_ranking_fixture() -> Instance:
     )
 
 
+def _candidate_plan_fixture() -> Instance:
+    return Instance(
+        "candidate_plan_fixture",
+        (
+            Node("D0", NodeType.DEPOT, 0.0, 0.0, 0.0, 0.0, 1_000.0, 0.0),
+            Node("C1", NodeType.CUSTOMER, 1.0, 0.0, 1.0, 0.0, 1_000.0, 0.0),
+            Node("C2", NodeType.CUSTOMER, 2.0, 0.0, 1.0, 0.0, 1_000.0, 0.0),
+            Node("C3", NodeType.CUSTOMER, 3.0, 0.0, 1.0, 0.0, 1_000.0, 0.0),
+            Node("C4", NodeType.CUSTOMER, 4.0, 0.0, 1.0, 0.0, 1_000.0, 0.0),
+        ),
+        Vehicle(100.0, 100.0, 1.0, 0.1, 1.0),
+        distance_backend="python",
+    )
+
+
 def _per_solve_config() -> Stage052NativeExecutionConfig:
     return _native_config("per_solve_runtime")
 
@@ -1018,6 +1033,92 @@ def test_native_candidate_plan_ranking_matches_python_rank_key() -> None:
         [len(plan), sum(route not in current_set for route in plan)] for plan in plans
     ]
     assert float_metrics.tolist() == [sum(bounds) for bounds in per_route_lower_bounds]
+
+
+@pytest.mark.parametrize(
+    ("operation", "generator_name"),
+    [(0, "_relocate_candidates"), (1, "_swap_candidates"), (2, "_two_opt_star_candidates")],
+)
+def test_native_changed_plan_selection_matches_python_screen_and_rank(
+    operation: int,
+    generator_name: str,
+) -> None:
+    from evrptw import _core as native_core
+    from evrptw import neighborhoods
+
+    instance = _candidate_plan_fixture()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    sequences = (("C1", "C2"), ("C3", "C4"))
+    route_offsets = np.asarray([0, 2, 4], dtype=np.int64)
+    route_indices = np.asarray([1, 2, 3, 4], dtype=np.int64)
+    generator = getattr(neighborhoods, generator_name)
+    descriptions = tuple(generator(sequences))
+    plans = tuple(
+        neighborhoods._apply_changes(sequences, description.changes)
+        for description in descriptions
+    )
+    attempted = np.zeros(len(plans), dtype=np.int64)
+    if len(attempted) > 1:
+        attempted[1] = 1
+    payload = native_core.changed_candidate_plan_selection_v1(
+        operation,
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        route_offsets,
+        route_indices,
+        np.asarray([1.0, context.reachability_epsilon, 0.0, 0.0], dtype=np.float64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+        attempted,
+        2,
+        4,
+    )
+    eligible = payload[3]
+    ranked = payload[4]
+    selected = payload[5]
+    integer_metrics = payload[6]
+    float_metrics = payload[7]
+    current_set = set(sequences)
+    screens = tuple(
+        tuple(
+            neighborhoods.screen_route_candidate(instance, route, full=True)
+            for route in plan
+        )
+        for plan in plans
+    )
+    expected_eligible = [int(all(screen.accepted for screen in plan)) for plan in screens]
+    expected_keys = tuple(
+        (
+            len(plan),
+            sum(screen.distance_lower_bound for screen in plan_screens),
+            sum(route not in current_set for route in plan),
+            plan,
+            ordinal,
+        )
+        for ordinal, (plan, plan_screens) in enumerate(zip(plans, screens, strict=True))
+    )
+    expected_ranked = sorted(
+        (index for index, valid in enumerate(expected_eligible) if valid),
+        key=expected_keys.__getitem__,
+    )
+    expected_selected = [index for index in expected_ranked if not attempted[index]][:2]
+
+    assert eligible.tolist() == expected_eligible
+    assert ranked.tolist() == expected_ranked
+    assert selected.tolist() == expected_selected
+    assert integer_metrics.tolist() == [
+        [len(plan), sum(route not in current_set for route in plan)] for plan in plans
+    ]
+    assert float_metrics.tolist() == [key[1] for key in expected_keys]
+    assert isinstance(payload[8], str) and len(payload[8]) == 64
 
 
 def test_native_route_cache_atomic_lru_matches_python_cache() -> None:
