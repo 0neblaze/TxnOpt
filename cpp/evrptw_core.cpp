@@ -2133,6 +2133,147 @@ private:
     }
 };
 
+class NativeAttemptedPlanSetV2 {
+public:
+    py::array_t<std::int64_t> lookup(
+        py::handle plan_offsets,
+        py::handle route_offsets,
+        py::handle route_indices) const {
+        const auto plans = decode_plans(plan_offsets, route_offsets, route_indices);
+        py::array_t<std::int64_t> flags(plans.size());
+        for (std::size_t index = 0; index < plans.size(); ++index) {
+            checked_data(flags)[index] = attempted_.contains(plan_key(plans[index])) ? 1 : 0;
+        }
+        return flags;
+    }
+
+    py::array_t<std::int64_t> begin_mark_many_atomic(
+        py::handle plan_offsets,
+        py::handle route_offsets,
+        py::handle route_indices,
+        py::handle plan_ids) {
+        if (active_additions_.has_value()) {
+            throw std::runtime_error("native attempted-plan set already has an active batch");
+        }
+        const auto plans = decode_plans(plan_offsets, route_offsets, route_indices);
+        auto ids_array = checked_array<std::int64_t>(plan_ids, "plan_ids", 1);
+        const auto* ids = checked_data<std::int64_t>(ids_array);
+        std::unordered_set<std::int64_t> unique_ids;
+        std::vector<std::string> additions;
+        py::array_t<std::int64_t> statuses(ids_array.size());
+        for (py::ssize_t ordinal = 0; ordinal < ids_array.size(); ++ordinal) {
+            if (ids[ordinal] < 0
+                || ids[ordinal] >= static_cast<std::int64_t>(plans.size())
+                || !unique_ids.insert(ids[ordinal]).second) {
+                throw std::invalid_argument(
+                    "native attempted-plan IDs must be unique valid plan rows");
+            }
+            const auto key = plan_key(plans[static_cast<std::size_t>(ids[ordinal])]);
+            if (attempted_.contains(key)) {
+                checked_data(statuses)[ordinal] = 0;
+            } else {
+                attempted_.insert(key);
+                additions.push_back(key);
+                checked_data(statuses)[ordinal] = 1;
+            }
+        }
+        active_additions_ = std::move(additions);
+        return statuses;
+    }
+
+    std::int64_t commit_mark_batch() {
+        require_active("commit_mark_batch");
+        active_additions_.reset();
+        return static_cast<std::int64_t>(attempted_.size());
+    }
+
+    std::int64_t rollback_mark_batch() {
+        require_active("rollback_mark_batch");
+        for (const auto& key : *active_additions_) {
+            attempted_.erase(key);
+        }
+        active_additions_.reset();
+        return static_cast<std::int64_t>(attempted_.size());
+    }
+
+    [[nodiscard]] std::int64_t size() const {
+        return static_cast<std::int64_t>(attempted_.size());
+    }
+
+private:
+    using Route = std::vector<std::int64_t>;
+    using Plan = std::vector<Route>;
+    std::unordered_set<std::string> attempted_;
+    std::optional<std::vector<std::string>> active_additions_;
+
+    static std::vector<Plan> decode_plans(
+        py::handle plan_offsets,
+        py::handle route_offsets,
+        py::handle route_indices) {
+        auto plans_array = checked_array<std::int64_t>(
+            plan_offsets, "plan_offsets", 1);
+        auto routes_array = checked_array<std::int64_t>(
+            route_offsets, "route_offsets", 1);
+        auto indices_array = checked_array<std::int64_t>(
+            route_indices, "route_indices", 1);
+        if (plans_array.size() < 1 || routes_array.size() < 1) {
+            throw std::invalid_argument("native attempted-plan offsets cannot be empty");
+        }
+        const auto plan_count = static_cast<std::size_t>(plans_array.size() - 1);
+        const auto route_count = static_cast<std::size_t>(routes_array.size() - 1);
+        const auto* plans = checked_data<std::int64_t>(plans_array);
+        const auto* routes = checked_data<std::int64_t>(routes_array);
+        const auto* indices = checked_data<std::int64_t>(indices_array);
+        if (plans[0] != 0 || plans[plan_count] != static_cast<std::int64_t>(route_count)
+            || routes[0] != 0 || routes[route_count] != indices_array.size()) {
+            throw std::invalid_argument("native attempted-plan boundary is invalid");
+        }
+        std::vector<Plan> output;
+        output.reserve(plan_count);
+        for (std::size_t plan = 0; plan < plan_count; ++plan) {
+            if (plans[plan] < 0 || plans[plan] > plans[plan + 1]) {
+                throw std::invalid_argument("native plan offsets must be monotonic");
+            }
+            Plan decoded;
+            decoded.reserve(static_cast<std::size_t>(plans[plan + 1] - plans[plan]));
+            for (auto route = plans[plan]; route < plans[plan + 1]; ++route) {
+                if (routes[route] < 0 || routes[route] > routes[route + 1]) {
+                    throw std::invalid_argument("native route offsets must be monotonic");
+                }
+                decoded.emplace_back(
+                    indices + routes[route], indices + routes[route + 1]);
+            }
+            output.push_back(std::move(decoded));
+        }
+        return output;
+    }
+
+    static std::string plan_key(const Plan& plan) {
+        std::string key;
+        const auto append = [&key](std::int64_t value) {
+            const auto position = key.size();
+            key.resize(position + sizeof(value));
+            std::memcpy(key.data() + position, &value, sizeof(value));
+        };
+        append(static_cast<std::int64_t>(plan.size()));
+        for (const auto& route : plan) {
+            append(static_cast<std::int64_t>(route.size()));
+            for (const auto node : route) {
+                append(node);
+            }
+        }
+        return key;
+    }
+
+    void require_active(const char* operation) const {
+        if (!active_additions_.has_value()) {
+            throw std::runtime_error(
+                std::string("native attempted-plan ") + operation
+                + " requires an active batch");
+        }
+    }
+};
+
 template <typename T>
 struct Stage052ReplayNumericColumn {
     py::array_t<T, py::array::c_style | py::array::forcecast> values;
@@ -7931,6 +8072,20 @@ PYBIND11_MODULE(_core, module) {
         .def("snapshot", &NativeBudgetStateV2::snapshot)
         .def("restore", &NativeBudgetStateV2::restore, py::arg("snapshot"))
         .def("state", &NativeBudgetStateV2::state);
+    py::class_<NativeAttemptedPlanSetV2>(module, "NativeAttemptedPlanSetV2")
+        .def(py::init<>())
+        .def(
+            "lookup", &NativeAttemptedPlanSetV2::lookup,
+            py::arg("plan_offsets"), py::arg("route_offsets"),
+            py::arg("route_indices"))
+        .def(
+            "begin_mark_many_atomic",
+            &NativeAttemptedPlanSetV2::begin_mark_many_atomic,
+            py::arg("plan_offsets"), py::arg("route_offsets"),
+            py::arg("route_indices"), py::arg("plan_ids"))
+        .def("commit_mark_batch", &NativeAttemptedPlanSetV2::commit_mark_batch)
+        .def("rollback_mark_batch", &NativeAttemptedPlanSetV2::rollback_mark_batch)
+        .def("size", &NativeAttemptedPlanSetV2::size);
     py::class_<Stage052ReplayState>(module, "Stage052ReplayState")
         .def(
             py::init<const py::dict&, const py::dict&>(),

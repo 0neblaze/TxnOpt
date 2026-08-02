@@ -1121,6 +1121,46 @@ def test_native_changed_plan_selection_matches_python_screen_and_rank(
     assert isinstance(payload[8], str) and len(payload[8]) == 64
 
 
+def test_native_attempted_plan_identity_is_transactional_across_ordinals() -> None:
+    from evrptw import _core as native_core
+
+    # Plan 0 and plan 2 are identical but have different proposal ordinals.
+    plans = (((1, 2), (3,)), ((1, 3), (2,)), ((1, 2), (3,)))
+    plan_offsets = [0]
+    route_offsets = [0]
+    route_indices: list[int] = []
+    for plan in plans:
+        for route in plan:
+            route_indices.extend(route)
+            route_offsets.append(len(route_indices))
+        plan_offsets.append(len(route_offsets) - 1)
+    packed_plans = np.asarray(plan_offsets, dtype=np.int64)
+    packed_routes = np.asarray(route_offsets, dtype=np.int64)
+    packed_indices = np.asarray(route_indices, dtype=np.int64)
+    attempted = native_core.NativeAttemptedPlanSetV2()
+
+    assert attempted.lookup(packed_plans, packed_routes, packed_indices).tolist() == [0, 0, 0]
+    statuses = attempted.begin_mark_many_atomic(
+        packed_plans,
+        packed_routes,
+        packed_indices,
+        np.asarray([0, 1], dtype=np.int64),
+    )
+    assert statuses.tolist() == [1, 1]
+    assert attempted.lookup(packed_plans, packed_routes, packed_indices).tolist() == [1, 1, 1]
+    assert attempted.rollback_mark_batch() == 0
+    assert attempted.lookup(packed_plans, packed_routes, packed_indices).tolist() == [0, 0, 0]
+
+    attempted.begin_mark_many_atomic(
+        packed_plans,
+        packed_routes,
+        packed_indices,
+        np.asarray([2], dtype=np.int64),
+    )
+    assert attempted.commit_mark_batch() == 1
+    assert attempted.lookup(packed_plans, packed_routes, packed_indices).tolist() == [1, 0, 1]
+
+
 def test_native_route_cache_atomic_lru_matches_python_cache() -> None:
     from evrptw import _core as native_core
 
