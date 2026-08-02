@@ -92,6 +92,7 @@ _FAILED_FORMAL_MEMORY_FLOOR_REASONS = (
     "aggregate RSS exceeds its campaign lock",
     "runtime guard aborted Stage 5.2 work: aggregate RSS hard limit exceeded:",
     "runtime guard aborted Stage 5.2 work: process RSS hard limit exceeded:",
+    "runtime guard aborted Stage 5.2 work: cgroup v2 memory hard limit exceeded:",
 )
 
 
@@ -167,7 +168,7 @@ class ProducerMemoryFloor:
 
 @dataclass(frozen=True, slots=True)
 class FormalCampaignMemoryFloor:
-    """One sealed, failed Formal batch observation used only as a memory floor."""
+    """One sealed, failed Formal batch observation with typed memory telemetry."""
 
     workers: int
     aggregate_peak_rss_bytes: int
@@ -178,6 +179,10 @@ class FormalCampaignMemoryFloor:
     batch_id: str
     resource_summary_sha256: str
     campaign_geometry_contribution: int = 0
+    aggregate_memory_source: str = "process_tree_rss"
+    aggregate_peak_memory_bytes: int | None = None
+    cgroup_path: str | None = None
+    cgroup_swap_peak_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if self.workers not in _PRODUCER_PROBE_WORKERS:
@@ -203,6 +208,26 @@ class FormalCampaignMemoryFloor:
             raise ValueError("Formal campaign memory floor identity is invalid")
         if self.campaign_geometry_contribution != 0:
             raise ValueError("failed Formal memory floor cannot contribute campaign geometry")
+        if self.aggregate_memory_source not in {"process_tree_rss", "cgroup_v2"}:
+            raise ValueError("failed Formal aggregate memory source is invalid")
+        if self.aggregate_memory_source == "cgroup_v2":
+            if (
+                self.aggregate_peak_memory_bytes is None
+                or self.aggregate_peak_memory_bytes <= 0
+                or self.cgroup_path is None
+                or not is_stage052_dedicated_cgroup_path(self.cgroup_path)
+                or self.cgroup_swap_peak_bytes != 0
+            ):
+                raise ValueError("failed Formal cgroup v2 memory evidence is incomplete")
+        elif any(
+            value is not None
+            for value in (
+                self.aggregate_peak_memory_bytes,
+                self.cgroup_path,
+                self.cgroup_swap_peak_bytes,
+            )
+        ):
+            raise ValueError("failed Formal process RSS evidence claims cgroup fields")
 
 
 def _load_signed_json_object(path: Path, *, evidence_name: str) -> dict[str, object]:
@@ -222,7 +247,7 @@ def load_failed_formal_memory_floor(
     *,
     batch_id: str,
 ) -> FormalCampaignMemoryFloor:
-    """Verify a failed Formal evidence chain and expose only its RSS high-water mark."""
+    """Verify a failed Formal evidence chain and expose typed memory high-water marks."""
 
     if (
         len(batch_id) != len("batch0000")
@@ -259,6 +284,7 @@ def load_failed_formal_memory_floor(
         or not isinstance(batches, list)
     ):
         raise RuntimeError("failed Formal campaign identity is invalid")
+
     matching_batches = [
         item
         for item in batches
@@ -353,6 +379,7 @@ def load_failed_formal_memory_floor(
         "resource_summary",
         expected_relative_path=f"control/{run_label}_resource_summary.json",
     )
+
     metadata_contract = run_metadata.get("producer_resource_contract")
     if (
         run_metadata.get("run_label") != run_label
@@ -396,8 +423,10 @@ def load_failed_formal_memory_floor(
             == len(candidate_descendant_pids)
         ):
             validated_descendant_pids = tuple(candidate_descendant_pids)
+    resource_schema = resource.get("schema_version")
     if (
-        resource.get("schema_version") != "stage05.2-run-resource-v3"
+        resource_schema
+        not in {"stage05.2-run-resource-v3", "stage05.2-run-resource-v4"}
         or resource.get("run_label") != run_label
         or resource.get("component") != "benchmark"
         or resource.get("configured_worker_count") != selected_workers
@@ -414,13 +443,108 @@ def load_failed_formal_memory_floor(
     ):
         raise RuntimeError("failed Formal resource summary is invalid")
     if (
+        isinstance(failure_reason, str)
+        and "cgroup v2 memory hard limit exceeded:" in failure_reason
+        and resource_schema != "stage05.2-run-resource-v4"
+    ):
+        raise RuntimeError(
+            "failed Formal cgroup v2 failure requires a v4 resource summary"
+        )
+    if (
         parent_pid in validated_descendant_pids
         or set(process_peak_by_pid) != set(validated_descendant_pids) | {parent_pid}
     ):
         raise RuntimeError("failed Formal resource summary PID binding is invalid")
-    aggregate_peak = _integer(
+    if resource_schema == "stage05.2-run-resource-v4" and (
+        resource.get("aggregate_memory_source") != "cgroup_v2"
+        or not is_stage052_dedicated_cgroup_path(
+            str(resource.get("cgroup_path", ""))
+        )
+        or resource.get("cgroup_swap_peak_bytes") != 0
+    ):
+        raise RuntimeError("failed Formal cgroup v2 resource binding is invalid")
+    if resource_schema == "stage05.2-run-resource-v4":
+        failure_summary_path = campaign_dir / "failure_summary.json"
+        failure_summary = _load_signed_json_object(
+            failure_summary_path,
+            evidence_name="failed Formal failure summary",
+        )
+        error_type = failure_summary.get("error_type")
+        error_message = failure_summary.get("error_message")
+        if (
+            failure_summary.get("schema_version")
+            != "experiment-cli-failure-summary-v1"
+            or failure_summary.get("run_label") != run_label
+            or failure_summary.get("status") != "failed"
+            or failure_summary.get("failure_code") != "runner_failure"
+            or error_type != "RuntimeError"
+            or not isinstance(error_message, str)
+            or failure_reason != f"{error_type}: {error_message}"
+        ):
+            raise RuntimeError("failed Formal failure summary binding is invalid")
+
+        lifecycle_manifest_path = (
+            campaign_dir
+            / "control"
+            / f"{run_label}_failure_lifecycle_manifest.json"
+        )
+        lifecycle_manifest = _load_signed_json_object(
+            lifecycle_manifest_path,
+            evidence_name="failed Formal lifecycle manifest",
+        )
+        lifecycle_artifacts = lifecycle_manifest.get("artifacts")
+        if (
+            lifecycle_manifest.get("schema_version")
+            != "experiment-cli-failure-manifest-v1"
+            or lifecycle_manifest.get("run_label") != run_label
+            or lifecycle_manifest.get("status") != "failed"
+            or lifecycle_manifest.get("evidence_completeness") != "partial"
+            or lifecycle_manifest.get("artifact_trust")
+            != "untrusted_failure_capsule"
+            or not isinstance(lifecycle_artifacts, list)
+        ):
+            raise RuntimeError("failed Formal lifecycle manifest is invalid")
+
+        def require_lifecycle_artifact(relative_path: str) -> None:
+            matches = [
+                item
+                for item in lifecycle_artifacts
+                if isinstance(item, dict)
+                and item.get("relative_path") == relative_path
+            ]
+            path = (campaign_dir / relative_path).resolve(strict=True)
+            stat = path.stat()
+            if (
+                len(matches) != 1
+                or not path.is_relative_to(campaign_dir)
+                or matches[0].get("checksum") != _sha256(path)
+                or matches[0].get("byte_size") != stat.st_size
+                or matches[0].get("modified_time_ns") != stat.st_mtime_ns
+            ):
+                raise RuntimeError(
+                    "failed Formal lifecycle artifact binding is invalid: "
+                    f"{relative_path}"
+                )
+
+        for relative_path in (
+            "failure_summary.json",
+            "failure_summary.sha256",
+            "campaign_manifest.json",
+            "campaign_manifest.sha256",
+            f"{batch_id}/control/{run_label}_resource_summary.json",
+        ):
+            require_lifecycle_artifact(relative_path)
+    aggregate_peak_rss = _integer(
         resource.get("aggregate_peak_rss_bytes"),
-        "failed Formal aggregate peak RSS",
+        "failed Formal aggregate RSS peak",
+    )
+    aggregate_peak_memory = (
+        _integer(
+            resource.get("aggregate_peak_memory_bytes"),
+            "failed Formal cgroup memory peak",
+        )
+        if resource_schema == "stage05.2-run-resource-v4"
+        else None
     )
     per_worker_peak = max(
         process_peak_by_pid[pid] for pid in validated_descendant_pids
@@ -435,13 +559,32 @@ def load_failed_formal_memory_floor(
     )
     return FormalCampaignMemoryFloor(
         workers=selected_workers,
-        aggregate_peak_rss_bytes=aggregate_peak,
+        aggregate_peak_rss_bytes=aggregate_peak_rss,
         per_worker_peak_rss_bytes=per_worker_peak,
         row_group_size=row_group_size,
         queue_depth=queue_depth,
         run_label=run_label,
         batch_id=batch_id,
         resource_summary_sha256=_sha256(resource_path),
+        aggregate_memory_source=(
+            "cgroup_v2"
+            if resource_schema == "stage05.2-run-resource-v4"
+            else "process_tree_rss"
+        ),
+        aggregate_peak_memory_bytes=aggregate_peak_memory,
+        cgroup_path=(
+            str(resource["cgroup_path"])
+            if resource_schema == "stage05.2-run-resource-v4"
+            else None
+        ),
+        cgroup_swap_peak_bytes=(
+            _integer(
+                resource.get("cgroup_swap_peak_bytes"),
+                "failed Formal cgroup swap peak",
+            )
+            if resource_schema == "stage05.2-run-resource-v4"
+            else None
+        ),
     )
 
 
@@ -1255,10 +1398,11 @@ def run_stage052_resource_calibration(
             "failed Formal memory floor worker count does not match "
             "the selected producer contract"
         )
-    # The failed Formal predecessor used a sum of process RSS values, which
-    # double-counts shared pages and is not commensurate with cgroup memory.
-    # It remains bound as failure provenance but cannot be reused as a physical
-    # aggregate-memory floor.
+    # The replacement aggregate limit is calibrated from this clean revision's
+    # isolated cgroup measurement.  A predecessor process-RSS sum is not
+    # commensurate with cgroup memory; a predecessor cgroup peak remains typed
+    # and bound as failure provenance, but is not a replacement floor because
+    # this calibration validates a source-level page-cache-control change.
     selected_aggregate_peak = formal_benchmark.aggregate_peak_rss_bytes
     selected_per_worker_peak = max(
         formal_memory_measurement.per_worker_peak_rss_bytes,
@@ -1299,10 +1443,16 @@ def run_stage052_resource_calibration(
     atomic_write_signed_json(contract_path, contract.to_dict())
     if not signed_sidecar_matches(contract_path, contract_path.with_suffix(".sha256")):
         raise RuntimeError("resource calibration contract sealing failed")
+    report_schema = (
+        "stage05.2-resource-calibration-report-v4"
+        if formal_campaign_memory_floor is not None
+        and formal_campaign_memory_floor.aggregate_memory_source == "cgroup_v2"
+        else "stage05.2-resource-calibration-report-v3"
+    )
     atomic_write_signed_json(
         output_root / "calibration_report.json",
         {
-            "schema_version": "stage05.2-resource-calibration-report-v3",
+            "schema_version": report_schema,
             "corpus_role": "read_only_benchmark_differential_only",
             "corpus_path": str(corpus_dir),
             "campaign_geometry_contribution": 0,

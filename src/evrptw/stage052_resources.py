@@ -45,6 +45,16 @@ _FORMAL_RECALIBRATION_V3_RESOURCE_SUMMARY_SHA256: Final = (
 _FORMAL_RECALIBRATION_V3_PREDECESSOR_WORKERS: Final = 6
 _FORMAL_RECALIBRATION_V3_PREDECESSOR_ROW_GROUP_SIZE: Final = 262_144
 _FORMAL_RECALIBRATION_V3_PREDECESSOR_QUEUE_DEPTH: Final = 2
+_FORMAL_RECALIBRATION_V4_PREDECESSOR_RUN_LABEL: Final = (
+    "stage05.2_benchmark_rerun15"
+)
+_FORMAL_RECALIBRATION_V4_PREDECESSOR_BATCH_ID: Final = "batch0007"
+_FORMAL_RECALIBRATION_V4_RESOURCE_SUMMARY_SHA256: Final = (
+    "468b368ab395f211dc7fb26e31b15c9b2ca990ab75cacab33a4f896e275898d8"
+)
+_FORMAL_RECALIBRATION_V4_PREDECESSOR_WORKERS: Final = 6
+_FORMAL_RECALIBRATION_V4_PREDECESSOR_ROW_GROUP_SIZE: Final = 16_384
+_FORMAL_RECALIBRATION_V4_PREDECESSOR_QUEUE_DEPTH: Final = 1
 _ROW_GROUP_SIZES: Final = frozenset({16_384, 65_536, 262_144})
 _QUEUE_DEPTHS: Final = frozenset({1, 2})
 
@@ -390,6 +400,10 @@ class FormalResourceRecalibrationEvidence:
     campaign_geometry_contribution: int = 0
     aggregate_memory_source: str = "process_tree_rss"
     replacement_aggregate_peak_memory_bytes: int | None = None
+    predecessor_aggregate_memory_source: str = "process_tree_rss"
+    predecessor_aggregate_peak_memory_bytes: int | None = None
+    predecessor_cgroup_path: str | None = None
+    predecessor_cgroup_swap_peak_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if self.aggregate_memory_source not in {
@@ -409,6 +423,26 @@ class FormalResourceRecalibrationEvidence:
             raise ValueError(
                 "historical process-tree RSS recalibration has a cgroup peak"
             )
+        if self.predecessor_aggregate_memory_source == "cgroup_v2":
+            if (
+                self.predecessor_aggregate_peak_memory_bytes is None
+                or self.predecessor_aggregate_peak_memory_bytes <= 0
+                or self.predecessor_cgroup_path is None
+                or not is_stage052_dedicated_cgroup_path(
+                    self.predecessor_cgroup_path
+                )
+                or self.predecessor_cgroup_swap_peak_bytes != 0
+            ):
+                raise ValueError("predecessor cgroup v2 memory evidence is incomplete")
+        elif self.predecessor_aggregate_memory_source != "process_tree_rss" or any(
+            value is not None
+            for value in (
+                self.predecessor_aggregate_peak_memory_bytes,
+                self.predecessor_cgroup_path,
+                self.predecessor_cgroup_swap_peak_bytes,
+            )
+        ):
+            raise ValueError("predecessor process RSS evidence claims cgroup fields")
 
     def to_dict(self) -> dict[str, int | str]:
         payload: dict[str, int | str] = {
@@ -442,6 +476,22 @@ class FormalResourceRecalibrationEvidence:
             payload["replacement_aggregate_peak_memory_bytes"] = (
                 self.replacement_aggregate_peak_memory_bytes
             )
+        if self.predecessor_aggregate_memory_source == "cgroup_v2":
+            assert self.predecessor_aggregate_peak_memory_bytes is not None
+            assert self.predecessor_cgroup_path is not None
+            assert self.predecessor_cgroup_swap_peak_bytes is not None
+            payload.update(
+                {
+                    "predecessor_aggregate_memory_source": "cgroup_v2",
+                    "predecessor_aggregate_peak_memory_bytes": (
+                        self.predecessor_aggregate_peak_memory_bytes
+                    ),
+                    "predecessor_cgroup_path": self.predecessor_cgroup_path,
+                    "predecessor_cgroup_swap_peak_bytes": (
+                        self.predecessor_cgroup_swap_peak_bytes
+                    ),
+                }
+            )
         return payload
 
 
@@ -470,6 +520,7 @@ def load_formal_resource_recalibration_evidence(
     if report_schema not in {
         "stage05.2-resource-calibration-report-v2",
         "stage05.2-resource-calibration-report-v3",
+        "stage05.2-resource-calibration-report-v4",
     }:
         raise RuntimeError("Formal resource recalibration report schema is unsupported")
     report_run_label = payload.get("run_label")
@@ -571,9 +622,7 @@ def load_formal_resource_recalibration_evidence(
         formal_memory.get("benchmark"),
         "Formal memory",
         require_per_worker=False,
-        require_zero_host_swap=(
-            report_schema == "stage05.2-resource-calibration-report-v2"
-        ),
+        require_zero_host_swap=(report_schema == "stage05.2-resource-calibration-report-v2"),
     )
     formal_per_worker = formal_memory.get("per_worker_peak_rss_bytes")
     if (
@@ -584,7 +633,10 @@ def load_formal_resource_recalibration_evidence(
         raise RuntimeError(
             "Formal resource recalibration Formal per-worker measurement is invalid"
         )
-    if report_schema == "stage05.2-resource-calibration-report-v3" and (
+    if report_schema in {
+        "stage05.2-resource-calibration-report-v3",
+        "stage05.2-resource-calibration-report-v4",
+    } and (
         formal_memory.get("aggregate_memory_source") != "cgroup_v2"
         or not isinstance(formal_memory.get("cgroup_path"), str)
         or not is_stage052_dedicated_cgroup_path(
@@ -663,6 +715,13 @@ def load_formal_resource_recalibration_evidence(
     resource_summary_sha256 = floor.get("resource_summary_sha256")
     expected_predecessor = (
         (
+            _FORMAL_RECALIBRATION_V4_PREDECESSOR_RUN_LABEL,
+            _FORMAL_RECALIBRATION_V4_PREDECESSOR_BATCH_ID,
+            _FORMAL_RECALIBRATION_V4_RESOURCE_SUMMARY_SHA256,
+        )
+        if report_schema == "stage05.2-resource-calibration-report-v4"
+        else
+        (
             _FORMAL_RECALIBRATION_V3_PREDECESSOR_RUN_LABEL,
             _FORMAL_RECALIBRATION_V3_PREDECESSOR_BATCH_ID,
             _FORMAL_RECALIBRATION_V3_RESOURCE_SUMMARY_SHA256,
@@ -680,6 +739,9 @@ def load_formal_resource_recalibration_evidence(
         or resource_summary_sha256 != expected_predecessor[2]
     ):
         expected_identity = (
+            "rerun15 batch0007"
+            if report_schema == "stage05.2-resource-calibration-report-v4"
+            else
             "rerun02 batch0008"
             if report_schema == "stage05.2-resource-calibration-report-v3"
             else "Attempt99 batch0007"
@@ -691,6 +753,13 @@ def load_formal_resource_recalibration_evidence(
     if not _is_exact_zero_int(floor.get("campaign_geometry_contribution")):
         raise RuntimeError("Formal memory floor must contribute zero readiness geometry")
     expected_floor_topology = (
+        (
+            _FORMAL_RECALIBRATION_V4_PREDECESSOR_WORKERS,
+            _FORMAL_RECALIBRATION_V4_PREDECESSOR_ROW_GROUP_SIZE,
+            _FORMAL_RECALIBRATION_V4_PREDECESSOR_QUEUE_DEPTH,
+        )
+        if report_schema == "stage05.2-resource-calibration-report-v4"
+        else
         (
             _FORMAL_RECALIBRATION_V3_PREDECESSOR_WORKERS,
             _FORMAL_RECALIBRATION_V3_PREDECESSOR_ROW_GROUP_SIZE,
@@ -727,6 +796,35 @@ def load_formal_resource_recalibration_evidence(
         )
     ):
         raise RuntimeError("Formal resource recalibration memory floor RSS is invalid")
+    predecessor_aggregate_memory_source = floor.get(
+        "aggregate_memory_source",
+        "process_tree_rss",
+    )
+    predecessor_aggregate_peak_memory = floor.get("aggregate_peak_memory_bytes")
+    predecessor_cgroup_path = floor.get("cgroup_path")
+    predecessor_cgroup_swap_peak = floor.get("cgroup_swap_peak_bytes")
+    if report_schema == "stage05.2-resource-calibration-report-v4":
+        if (
+            predecessor_aggregate_memory_source != "cgroup_v2"
+            or isinstance(predecessor_aggregate_peak_memory, bool)
+            or not isinstance(predecessor_aggregate_peak_memory, int)
+            or predecessor_aggregate_peak_memory <= 0
+            or not isinstance(predecessor_cgroup_path, str)
+            or not is_stage052_dedicated_cgroup_path(predecessor_cgroup_path)
+            or not _is_exact_zero_int(predecessor_cgroup_swap_peak)
+        ):
+            raise RuntimeError(
+                "Formal resource recalibration predecessor cgroup evidence is invalid"
+            )
+    elif (
+        predecessor_aggregate_memory_source != "process_tree_rss"
+        or predecessor_aggregate_peak_memory is not None
+        or predecessor_cgroup_path is not None
+        or predecessor_cgroup_swap_peak is not None
+    ):
+        raise RuntimeError(
+            "Formal resource recalibration predecessor RSS evidence is invalid"
+        )
     provenance = payload.get("provenance")
     if not isinstance(provenance, Mapping):
         raise RuntimeError("Formal resource recalibration provenance is missing")
@@ -764,13 +862,29 @@ def load_formal_resource_recalibration_evidence(
         calibration_repository_revision=revision,
         aggregate_memory_source=(
             "cgroup_v2"
-            if report_schema == "stage05.2-resource-calibration-report-v3"
+            if report_schema in {
+                "stage05.2-resource-calibration-report-v3",
+                "stage05.2-resource-calibration-report-v4",
+            }
             else "process_tree_rss"
         ),
         replacement_aggregate_peak_memory_bytes=(
             contract.selected_aggregate_peak_rss_bytes
-            if report_schema == "stage05.2-resource-calibration-report-v3"
+            if report_schema in {
+                "stage05.2-resource-calibration-report-v3",
+                "stage05.2-resource-calibration-report-v4",
+            }
             else None
+        ),
+        predecessor_aggregate_memory_source=cast(
+            str,
+            predecessor_aggregate_memory_source,
+        ),
+        predecessor_aggregate_peak_memory_bytes=predecessor_aggregate_peak_memory,
+        predecessor_cgroup_path=predecessor_cgroup_path,
+        predecessor_cgroup_swap_peak_bytes=cast(
+            int | None,
+            predecessor_cgroup_swap_peak,
         ),
     )
 

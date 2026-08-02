@@ -26,8 +26,18 @@
   is signed into the producer resource contract, and the asynchronous artifact
   writer drops completed-batch references and calls libc `malloc_trim` after
   every eight batches while holding the measured writer turn. The trace records
-  every periodic release. These releases must not be represented as a relaxed
-  resource gate. A successful calibration is trusted only after independent
+  every periodic release. Large neighborhood spools are durably flushed and
+  release clean page-cache ranges every 64 MiB; completed JSON evidence also
+  performs a durable write followed by cache release. On WSL2 this is enabled
+  only for the native ext4 staging filesystem and remains disabled for DrvFS/9p
+  archive paths. Canonical spool merge also releases already-read clean ranges
+  every 64 MiB so the read pass cannot recreate the same cgroup cache peak.
+  These releases must not be represented as a relaxed resource
+  gate. Failed Formal resource evidence may use either the historical v3
+  process-tree RSS schema or the v4 swap-free dedicated-cgroup schema; v4
+  recalibration must bind `aggregate_peak_memory_bytes`, the exact cgroup path,
+  zero cgroup swap, and the sealed failure summary. A successful calibration is
+  trusted only after independent
   replay of its terminal inventory, v3 report, scoped cgroup measurement/reset
   evidence, allocator and batch-release telemetry, and signed producer resource
   contract. CLI terminal manifests must replay both nested control manifests and
@@ -893,11 +903,11 @@ this repository or one of its subdirectories.
   spooled: candidate records point-query comparison rows while left-only rows
   are derived from each axis's final ordinal tail; bulk DELETEs that dirty the
   SQLite file are forbidden. Per-axis fragments, the final mismatch CSV, and
-  publication copies periodically fsync. Native Linux releases clean page cache
-  with `POSIX_FADV_DONTNEED`; Windows/WSL2 must not call that advisory because
-  the formal host reproduced incorrect page-cache reads after it. WSL relies on
-  fresh process exit, SQLite `shrink_memory`, and scratch cleanup without
-  weakening replay. SQLite construction commits/releases on a bounded
+  publication copies periodically fsync. Native Linux and WSL2 native-ext4
+  paths release clean page cache with `POSIX_FADV_DONTNEED`; Windows and WSL2
+  DrvFS/9p paths must not call that advisory because the formal host reproduced
+  incorrect reads on those mounted Windows filesystems. SQLite construction
+  commits/releases on a bounded
   record window; fragment release uses one aggregate byte window shared by
   all axes and the left-only tail. Raw manifest hashing and Parquet/JSONL
   iterators release their source page cache at file-lifecycle boundaries.

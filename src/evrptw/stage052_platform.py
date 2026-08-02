@@ -55,17 +55,59 @@ $scheme = Get-ItemPropertyValue `
 
 def posix_file_cache_drop_is_safe(
     *,
+    path: Path | None = None,
     platform_name: str | None = None,
     kernel_release: str | None = None,
+    filesystem_name: str | None = None,
 ) -> bool:
     """Return whether POSIX_FADV_DONTNEED is safe for evidence files."""
 
     current_platform = sys.platform if platform_name is None else platform_name
     current_release = platform.release() if kernel_release is None else kernel_release
-    return (
-        current_platform != "win32"
-        and "microsoft-standard-wsl" not in current_release.casefold()
-    )
+    if current_platform == "win32":
+        return False
+    if "microsoft-standard-wsl" not in current_release.casefold():
+        return True
+    if filesystem_name is None and path is not None:
+        filesystem_name = _mounted_filesystem_name(path)
+    # WSL exposes Windows volumes through DrvFS/9p as well as a native ext4
+    # root.  DONTNEED is used only for the native evidence staging volume;
+    # treating every WSL path alike allowed multi-gigabyte clean spool pages to
+    # accumulate inside the Formal cgroup.
+    return filesystem_name == "ext4"
+
+
+def _mounted_filesystem_name(path: Path) -> str | None:
+    """Resolve the longest mount-table match without invoking a subprocess."""
+
+    try:
+        resolved = path.resolve(strict=True)
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    best_length = -1
+    best_filesystem: str | None = None
+    for line in lines:
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+            mount_point = Path(
+                fields[4]
+                .replace("\\040", " ")
+                .replace("\\011", "\t")
+                .replace("\\012", "\n")
+                .replace("\\134", "\\")
+            )
+            filesystem = fields[separator + 1]
+        except (IndexError, ValueError):
+            continue
+        if resolved != mount_point and not resolved.is_relative_to(mount_point):
+            continue
+        mount_length = len(mount_point.parts)
+        if mount_length > best_length:
+            best_length = mount_length
+            best_filesystem = filesystem
+    return best_filesystem
 
 
 @dataclass(frozen=True, slots=True)

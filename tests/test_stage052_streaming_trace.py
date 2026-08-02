@@ -2550,6 +2550,88 @@ def test_large_neighborhood_stream_spills_to_measured_volume_until_canonical_mer
     assert not scratch_path.exists()
 
 
+def test_neighborhood_spool_durably_releases_cache_in_bounded_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    released_offsets: list[int] = []
+
+    def record_release(handle: Any) -> None:
+        released_offsets.append(int(handle.tell()))
+
+    monkeypatch.setattr(
+        stage052_performance,
+        "release_file_page_cache",
+        record_release,
+    )
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=_RecordingShard(),  # type: ignore[arg-type]
+        axis_name="wall_clock_300",
+        buffer_rows=2,
+        neighborhood_buffer_rows=1,
+        neighborhood_spool_cache_release_bytes=1,
+    )
+
+    sink.append_neighborhood_event(
+        {
+            "event_type": "neighborhood_event",
+            "lane": "legacy",
+            "iteration": 1,
+            "status": "failed",
+        }
+    )
+    sink.append_neighborhood_event(
+        {
+            "event_type": "neighborhood_event",
+            "lane": "legacy",
+            "iteration": 2,
+            "status": "failed",
+        }
+    )
+
+    assert len(released_offsets) >= 2
+    assert all(offset > 0 for offset in released_offsets)
+    sink.close()
+
+
+def test_neighborhood_spool_releases_cache_while_canonical_merge_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    released_offsets: list[int] = []
+
+    def record_release(handle: Any) -> None:
+        released_offsets.append(int(handle.tell()))
+
+    monkeypatch.setattr(
+        stage052_performance,
+        "release_file_page_cache",
+        record_release,
+    )
+    sink = stage052_performance._Stage052TraceStreamSink(  # noqa: SLF001
+        shard=_RecordingShard(),  # type: ignore[arg-type]
+        axis_name="wall_clock_300",
+        buffer_rows=2,
+        neighborhood_buffer_rows=1,
+        neighborhood_spool_cache_release_bytes=1,
+    )
+    for iteration in range(4):
+        sink.append_neighborhood_event(
+            {
+                "event_type": "neighborhood_event",
+                "lane": "legacy",
+                "iteration": iteration,
+                "status": "failed",
+            }
+        )
+    released_offsets.clear()
+
+    sink.finish()
+
+    assert len(released_offsets) >= 5
+    assert released_offsets[0] > 0
+    assert released_offsets[1:5] == sorted(released_offsets[1:5])
+    sink.close()
+
+
 def test_memory_neighborhood_drain_preparation_is_charged_to_persistence() -> None:
     class SlowIterationList(list[dict[str, object]]):
         def __iter__(self):  # type: ignore[no-untyped-def]

@@ -226,6 +226,61 @@ def test_formal_resource_recalibration_v3_binds_cgroup_memory_and_rerun02(
     assert evidence.replacement_aggregate_peak_memory_bytes == 3_000_000_000
 
 
+def test_formal_resource_recalibration_v4_keeps_rss_and_cgroup_peaks_typed(
+    tmp_path: Path,
+) -> None:
+    contract = ProducerResourceContract(
+        selected_workers=6,
+        available_memory_bytes=30_000_000_000,
+        selected_aggregate_peak_rss_bytes=14_000_000_000,
+        selected_per_worker_peak_rss_bytes=3_326_586_880,
+        aggregate_memory_limit_bytes=16_800_000_000,
+        per_worker_memory_limit_bytes=3_991_904_256,
+        semantic_digest="a" * 64,
+        calibration_digest="b" * 64,
+        row_group_size=16_384,
+        queue_depth=1,
+    )
+    report_path = tmp_path / "stage052_resource_calibration.local.report.json"
+    _write_formal_recalibration_report(report_path, contract)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = "stage05.2-resource-calibration-report-v4"
+    payload["formal_memory_measurement"].update(
+        {
+            "aggregate_memory_source": "cgroup_v2",
+            "cgroup_path": "/stage052-calibration.service",
+            "cgroup_swap_peak_bytes": 0,
+        }
+    )
+    payload["formal_campaign_memory_floor"].update(
+        {
+            "run_label": "stage05.2_benchmark_rerun15",
+            "batch_id": "batch0007",
+            "aggregate_peak_rss_bytes": 18_590_945_280,
+            "aggregate_memory_source": "cgroup_v2",
+            "aggregate_peak_memory_bytes": 21_812_838_400,
+            "cgroup_path": "/stage052-formal-rerun15.service",
+            "cgroup_swap_peak_bytes": 0,
+            "resource_summary_sha256": (
+                "468b368ab395f211dc7fb26e31b15c9b2ca990ab75cacab33a4f896e275898d8"
+            ),
+        }
+    )
+    raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    report_path.write_bytes(raw)
+    report_path.with_suffix(".sha256").write_text(
+        hashlib.sha256(raw).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = load_formal_resource_recalibration_evidence(report_path, contract)
+
+    assert evidence.predecessor_aggregate_peak_rss_bytes == 18_590_945_280
+    assert evidence.predecessor_aggregate_memory_source == "cgroup_v2"
+    assert evidence.predecessor_aggregate_peak_memory_bytes == 21_812_838_400
+    assert evidence.replacement_aggregate_peak_memory_bytes == 14_000_000_000
+
+
 def test_formal_resource_recalibration_v3_rejects_wrong_predecessor_topology(
     tmp_path: Path,
 ) -> None:

@@ -2925,3 +2925,36 @@ compatibility fallback（兼容回退）。
   与 `git diff --check` 通过。Rerun05 仍须按独立 failure review、adjudication、签名
   retention plan、compaction 与 lifecycle close 完成闭环；修复后只能以新 clean revision
   和 `stage05.2_benchmark_rerun06` 从零运行。
+
+## 2026-08-02：Formal Rerun15 cgroup page-cache 根因修复
+
+- `stage05.2_benchmark_rerun15` 在 clean revision
+  `07c24e6a8e94bef6bcd9260d4bc4354d02161948` 上完成并归档 batch0001--batch0006；
+  batch0007 以正确的 fail-fast 路径报告 cgroup v2 memory hard limit exceeded：首次观测
+  `21,793,177,600` bytes，contract limit `21,792,659,866` bytes，最终 cgroup peak
+  `21,812,838,400` bytes、process-tree RSS peak `18,590,945,280` bytes、swap 0。
+  独立 failure reviewer 复核 504 个 artifacts（`3,337,645,926` bytes）且 raw manifest
+  前后哈希不变；签名 adjudication 将其归类为唯一
+  `stage052-formal-runtime-memory-guard-underestimate-v1`，随后以
+  `unique_failure_capsule` 完成 compaction、permit reconciliation 与 lifecycle
+  `CLOSED`。该 label 与 partial shards 均不得复用。
+- cgroup 与进程树峰值相差约 3.22 GB，而未归档 batch0007 内容约 3.34 GB。代码审计确认
+  大型 neighborhood JSONL spool 和普通 JSON evidence 在 ext4 写入后保留 clean/dirty
+  file-backed pages；`posix_file_cache_drop_is_safe` 又把 WSL2 原生 ext4 与 DrvFS/9p
+  一并禁用，短 calibration scope 未覆盖长批次累计的 cgroup page cache。该证据不支持
+  抬高门禁或减少 Formal geometry。
+- 修复后 mountinfo 采用最长挂载点匹配：WSL2 native ext4 允许
+  `POSIX_FADV_DONTNEED`，`/mnt/e` 等 9p 路径仍禁止。大型 neighborhood spool 每
+  64 MiB 执行 durable flush、`fsync` 和 page-cache release，最终 drain/close 再释放；
+  canonical merge 读取 spool 时也每 64 MiB 释放已读 clean pages，避免读路径重新建立
+  同等峰值；JSON artifacts 与签名 JSON 在 durable write 后同样释放 clean pages。所有
+  I/O 时间仍计入 persistence，不吞掉错误，也不改变事件、objective、validator 或
+  artifact bytes。
+- Formal recalibration failure loader 现在同时接受历史 v3 process-tree RSS 与 v4 dedicated
+  cgroup evidence；v4 必须验证 exact cgroup path、swap 0、sealed resource summary，并把
+  `aggregate_peak_memory_bytes` 绑定为 predecessor high-water mark。Rerun15 batch0007 的
+  实际读取重放得到 aggregate `21,812,838,400`、per-worker `3,662,557,184`、拓扑
+  6/16384/1、resource SHA-256
+  `468b368ab395f211dc7fb26e31b15c9b2ca990ab75cacab33a4f896e275898d8`。
+  修复必须先以新 clean revision 完成 zero-geometry resource calibration，再以全新 Formal
+  label 从零运行；Rerun15 仅作为失败根因证据，不能提供 readiness geometry。

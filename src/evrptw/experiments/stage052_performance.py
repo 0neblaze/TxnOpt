@@ -48,7 +48,9 @@ from evrptw.artifacts import (
     aggregate_diagnostic_events,
     atomic_write_signed_json,
     build_stage03_critical_events,
+    durable_write_bytes,
     iter_stage03_critical_events,
+    release_file_page_cache,
     screening_definition_store_contract,
     signed_sidecar_matches,
 )
@@ -860,9 +862,11 @@ def run_stage052(
         accelerator_mode = _accelerator_mode(accelerator_decision_payload) == ("accelerator_pilot")
         artifact_type = "accelerator_pilot" if accelerator_mode else "accelerator_decision"
         decision_path = resolved_output / "control" / f"{run_label}_{artifact_type}.json"
-        decision_path.write_text(
-            json.dumps(accelerator_decision_payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        durable_write_bytes(
+            decision_path,
+            (json.dumps(accelerator_decision_payload, indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            ),
         )
         parent_writer.record_existing_file(
             decision_path,
@@ -2145,9 +2149,11 @@ def _record_batch_runtime_evidence(
     runtime_evidence: BatchRuntimeEvidence,
 ) -> Path:
     runtime_path = batch_dir / "control" / f"{run_label}_{batch_id}_runtime_evidence.json"
-    runtime_path.write_text(
-        json.dumps(runtime_evidence.to_dict(), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    durable_write_bytes(
+        runtime_path,
+        (json.dumps(runtime_evidence.to_dict(), indent=2, sort_keys=True) + "\n").encode(
+            "utf-8"
+        ),
     )
     writer.record_existing_file(
         runtime_path,
@@ -2281,8 +2287,9 @@ def _run_benchmark_batch(
             / (f"{campaign_config.run_label}_{plan.batch_id}_batch_preflight.json")
         )
         with persistence_recorder.record("batch_preflight_control"):
-            batch_preflight_path.write_text(
-                json.dumps(
+            durable_write_bytes(
+                batch_preflight_path,
+                (json.dumps(
                     {
                         "schema_version": "stage05.2-batch-preflight-v1",
                         "run_label": campaign_config.run_label,
@@ -2294,8 +2301,7 @@ def _run_benchmark_batch(
                     indent=2,
                     sort_keys=True,
                 )
-                + "\n",
-                encoding="utf-8",
+                + "\n").encode("utf-8"),
             )
             writer.record_existing_file(
                 batch_preflight_path,
@@ -2363,8 +2369,9 @@ def _run_benchmark_batch(
             batch_dir / "control" / (f"{campaign_config.run_label}_{plan.batch_id}_power_load.json")
         )
         with persistence_recorder.record("batch_power_load_control"):
-            power_load_path.write_text(
-                json.dumps(
+            durable_write_bytes(
+                power_load_path,
+                (json.dumps(
                     {
                         "schema_version": "stage05.2-batch-power-load-v1",
                         "run_label": campaign_config.run_label,
@@ -2401,8 +2408,7 @@ def _run_benchmark_batch(
                     indent=2,
                     sort_keys=True,
                 )
-                + "\n",
-                encoding="utf-8",
+                + "\n").encode("utf-8"),
             )
             writer.record_existing_file(
                 power_load_path,
@@ -2794,7 +2800,7 @@ def _exercise_campaign_failure_state_machine(
     archive_source.mkdir(parents=True)
     archive_payload_source = archive_source / "payload.bin"
     with recorder.record("failure_state_drill_archive_payload_write"):
-        archive_payload_source.write_bytes(expected_payload)
+        durable_write_bytes(archive_payload_source, expected_payload)
     planned_archive_batch = replace(
         campaign.batches[0],
         root_alias="drill_staging",
@@ -2975,7 +2981,7 @@ def _exercise_archive_roots(
         source.mkdir(parents=True)
         payload_path = source / "archive_probe.bin"
         with recorder.record(f"archive_dry_run_{alias}_payload_write"):
-            payload_path.write_bytes(f"{run_label}:{alias}\n".encode())
+            durable_write_bytes(payload_path, f"{run_label}:{alias}\n".encode())
         payload_sha = _sha256(payload_path)
         actual_bytes = directory_byte_count(source)
         batch = BatchManifest(
@@ -3055,9 +3061,7 @@ def _exercise_publication_transaction(
         generation.mkdir()
         payload = generation / "payload.json"
         with recorder.record("publication_dry_run_payload_write"):
-            payload.write_text('{"status":"dry_run"}\n', encoding="utf-8")
-            with payload.open("rb") as handle:
-                os.fsync(handle.fileno())
+            durable_write_bytes(payload, b'{"status":"dry_run"}\n')
         payload_sha = _sha256(payload)
         with recorder.record("publication_dry_run_trusted_manifest_write"):
             trusted_manifest, trusted_sidecar = atomic_write_signed_json(
@@ -3144,9 +3148,11 @@ def _record_resource_summary(
     summary: RunResourceSummary,
 ) -> Path:
     path = writer.run_dir / "control" / f"{writer.context.run_label}_resource_summary.json"
-    path.write_text(
-        json.dumps(summary.to_dict(), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    durable_write_bytes(
+        path,
+        (json.dumps(summary.to_dict(), indent=2, sort_keys=True) + "\n").encode(
+            "utf-8"
+        ),
     )
     writer.record_existing_file(
         path,
@@ -3167,8 +3173,9 @@ def _record_timing_evidence(
     if any(not isinstance(value, Mapping) for value in timings):
         raise RuntimeError("Stage 5.2 timing evidence is incomplete")
     path = writer.run_dir / "control" / f"{writer.context.run_label}_timing_evidence.json"
-    path.write_text(
-        json.dumps(
+    durable_write_bytes(
+        path,
+        (json.dumps(
             {
                 "schema_version": "stage05.2-timing-evidence-v1",
                 "run_label": writer.context.run_label,
@@ -3178,8 +3185,7 @@ def _record_timing_evidence(
             indent=2,
             sort_keys=True,
         )
-        + "\n",
-        encoding="utf-8",
+        + "\n").encode("utf-8"),
     )
     writer.record_existing_file(
         path,
@@ -4354,6 +4360,7 @@ _NATIVE_ABLATION_TRACE_EVENT_TYPES = frozenset(
     }
 )
 _NATIVE_ABLATION_MAX_AUDIT_ROWS = 65_536
+_NEIGHBORHOOD_SPOOL_CACHE_RELEASE_BYTES = 64 * 1024 * 1024
 
 
 class _Stage052TraceStreamSink(MeasurementTraceSink):
@@ -4367,6 +4374,9 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         buffer_rows: int = 65_536,
         physical_row_group_rows: int = 65_536,
         neighborhood_buffer_rows: int | None = None,
+        neighborhood_spool_cache_release_bytes: int = (
+            _NEIGHBORHOOD_SPOOL_CACHE_RELEASE_BYTES
+        ),
         async_persistence: bool = False,
     ) -> None:
         if isinstance(buffer_rows, bool) or not isinstance(buffer_rows, int) or buffer_rows <= 0:
@@ -4399,6 +4409,14 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             raise ValueError(
                 "async neighborhood buffer may not exceed one Parquet row group"
             )
+        if (
+            isinstance(neighborhood_spool_cache_release_bytes, bool)
+            or not isinstance(neighborhood_spool_cache_release_bytes, int)
+            or neighborhood_spool_cache_release_bytes <= 0
+        ):
+            raise ValueError(
+                "neighborhood_spool_cache_release_bytes must be a positive integer"
+            )
         self._shard = shard
         self.axis_name = axis_name
         self._buffer_rows = buffer_rows
@@ -4419,6 +4437,10 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
         self._neighborhood_spool: Any | None = None
         self._neighborhood_spool_path: Path | None = None
         self._neighborhood_read_offset = 0
+        self._neighborhood_spool_cache_release_bytes = (
+            neighborhood_spool_cache_release_bytes
+        )
+        self._neighborhood_spool_bytes_since_cache_release = 0
         self._legacy_negative_screening_evidence: dict[str, tuple[object, ...]] = {}
         self._typed_negative_screening_evidence: dict[
             str, tuple[int, bytes | None]
@@ -5052,11 +5074,31 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
                         ) from error
                     raise
                 for buffered in self._neighborhood_buffer:
-                    self._neighborhood_spool.write(orjson.dumps(buffered) + b"\n")
+                    self._write_neighborhood_spool_record(buffered)
                 self._neighborhood_buffer.clear()
-            self._neighborhood_spool.write(orjson.dumps(owned) + b"\n")
+            self._write_neighborhood_spool_record(owned)
         finally:
             self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
+
+    def _write_neighborhood_spool_record(
+        self,
+        payload: Mapping[str, object],
+    ) -> None:
+        spool = self._neighborhood_spool
+        if spool is None:
+            raise RuntimeError("neighborhood scratch stream is not open")
+        encoded = orjson.dumps(payload) + b"\n"
+        spool.write(encoded)
+        self._neighborhood_spool_bytes_since_cache_release += len(encoded)
+        if (
+            self._neighborhood_spool_bytes_since_cache_release
+            < self._neighborhood_spool_cache_release_bytes
+        ):
+            return
+        spool.flush()
+        os.fsync(spool.fileno())
+        release_file_page_cache(spool)
+        self._neighborhood_spool_bytes_since_cache_release = 0
 
     def _drain_neighborhood_spool(self) -> None:
         spool = self._neighborhood_spool
@@ -5071,16 +5113,29 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             return
         started_ns = time.perf_counter_ns()
         spool.flush()
+        os.fsync(spool.fileno())
+        release_file_page_cache(spool)
+        self._neighborhood_spool_bytes_since_cache_release = 0
         spool.seek(self._neighborhood_read_offset)
         self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
+        read_since_cache_release = 0
         while True:
             started_ns = time.perf_counter_ns()
             line = spool.readline()
             if not line:
                 self._neighborhood_read_offset = spool.tell()
+                if read_since_cache_release:
+                    release_file_page_cache(spool)
                 spool.seek(0, os.SEEK_END)
                 self.persistence_nanoseconds += time.perf_counter_ns() - started_ns
                 return
+            read_since_cache_release += len(line)
+            if (
+                read_since_cache_release
+                >= self._neighborhood_spool_cache_release_bytes
+            ):
+                release_file_page_cache(spool)
+                read_since_cache_release = 0
             payload = orjson.loads(line)
             if not isinstance(payload, dict):
                 raise RuntimeError("neighborhood scratch record is not a JSON object")
@@ -5127,6 +5182,10 @@ class _Stage052TraceStreamSink(MeasurementTraceSink):
             self._neighborhood_buffer.clear()
             if self._neighborhood_spool is not None:
                 try:
+                    self._neighborhood_spool.flush()
+                    os.fsync(self._neighborhood_spool.fileno())
+                    release_file_page_cache(self._neighborhood_spool)
+                    self._neighborhood_spool_bytes_since_cache_release = 0
                     self._neighborhood_spool.close()
                 except BaseException as error:
                     errors.append(error)

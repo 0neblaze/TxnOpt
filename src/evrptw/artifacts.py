@@ -198,10 +198,12 @@ def atomic_write_signed_json(
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+            release_file_page_cache(handle)
         with temporary_sidecar.open("x", encoding="utf-8") as handle:
             handle.write("".join(f"{item}\n" for item in transition_digests))
             handle.flush()
             os.fsync(handle.fileno())
+            release_file_page_cache(handle)
         replace(temporary_sidecar, sidecar)
         sidecar_replaced = True
         sync_directory(path.parent)
@@ -212,6 +214,7 @@ def atomic_write_signed_json(
             handle.write(digest + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+            release_file_page_cache(handle)
         replace(final_sidecar, sidecar)
         sync_directory(path.parent)
     except BaseException:
@@ -219,6 +222,7 @@ def atomic_write_signed_json(
             if previous_payload is None or previous_sidecar is None:
                 path.unlink(missing_ok=True)
                 sidecar.unlink(missing_ok=True)
+                sync_directory(path.parent)
             else:
                 rollback_payload = path.with_name(f".{path.name}.{os.getpid()}.rollback")
                 rollback_sidecar = sidecar.with_name(f".{sidecar.name}.{os.getpid()}.rollback")
@@ -647,9 +651,23 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _drop_file_page_cache(handle: Any) -> None:
-    if posix_file_cache_drop_is_safe() and hasattr(os, "posix_fadvise"):
+def release_file_page_cache(handle: Any) -> None:
+    """Release clean native-filesystem pages after durable evidence I/O."""
+
+    raw_name = handle.name
+    cache_path = (
+        Path(f"/proc/self/fd/{handle.fileno()}")
+        if isinstance(raw_name, int)
+        else Path(raw_name)
+    )
+    if posix_file_cache_drop_is_safe(path=cache_path) and hasattr(
+        os, "posix_fadvise"
+    ):
         os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+
+
+def _drop_file_page_cache(handle: Any) -> None:
+    release_file_page_cache(handle)
 
 
 def _payload_sha256(payload: object) -> str:
@@ -669,12 +687,24 @@ def _route_sequence_sha256(sequence: tuple[str, ...]) -> str:
     return hashlib.sha256(orjson.dumps(sequence)).hexdigest()
 
 
-def _json_write(path: Path, payload: object) -> None:
+def durable_write_bytes(path: Path, payload: bytes) -> None:
+    """Durably write one file and release clean native-ext4 cache pages."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n",
-        encoding="utf-8",
-    )
+    with path.open("wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+        release_file_page_cache(handle)
+    sync_directory(path.parent)
+
+
+def _json_write(path: Path, payload: object) -> None:
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+        + "\n"
+    ).encode("utf-8")
+    durable_write_bytes(path, encoded)
 
 
 def _json_read(path: Path) -> dict[str, Any]:

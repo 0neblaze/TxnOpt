@@ -30,7 +30,7 @@ def test_linux_peak_rss_uses_getrusage_kib_units() -> None:
     ) == 2 * 1024 * 1024
 
 
-def test_posix_file_cache_drop_is_disabled_on_wsl() -> None:
+def test_posix_file_cache_drop_is_limited_to_native_ext4_on_wsl() -> None:
     assert (
         posix_file_cache_drop_is_safe(
             platform_name="linux",
@@ -49,6 +49,22 @@ def test_posix_file_cache_drop_is_disabled_on_wsl() -> None:
         posix_file_cache_drop_is_safe(
             platform_name="win32",
             kernel_release="10",
+        )
+        is False
+    )
+    assert (
+        posix_file_cache_drop_is_safe(
+            platform_name="linux",
+            kernel_release="6.18.35.2-microsoft-standard-WSL2",
+            filesystem_name="ext4",
+        )
+        is True
+    )
+    assert (
+        posix_file_cache_drop_is_safe(
+            platform_name="linux",
+            kernel_release="6.18.35.2-microsoft-standard-WSL2",
+            filesystem_name="9p",
         )
         is False
     )

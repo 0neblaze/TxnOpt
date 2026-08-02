@@ -181,7 +181,7 @@ _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
         "0bf741d1e4929564882dd8ff48775f0c589e957328aa00c7309176656fd16481"
     ),
     "tests/test_artifacts_v3.py": (
-        "226ca2e494d1a4fe9be27ba6eb4b3ef7fa47d4e0ef4803de14e8f34694e078a5"
+        "3cbb4ef018cab4ba9de8f09810602c7bb7678d235264475e2039a841a7f357d2"
     ),
     "tests/test_candidate_transaction.py": (
         "71581efa9f8e447ac89cb5ae030cc08fdeec362fb28dafcb4cedd228883d8106"
@@ -190,7 +190,7 @@ _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
         "cd8cbcf415b30c3d29d53aca8fecd22bd3ded62099de621b9cbf8c011d827de1"
     ),
     "tests/test_stage052_streaming_trace.py": (
-        "a607b72a78c32bbedc36a948d49c8904d07b311118e5f72e87738da9a637f73e"
+        "c9c01a14fc1e77dc3f9b475c68cadd03a22734df84d2c281eb7b5be3be2d32b9"
     ),
 }
 

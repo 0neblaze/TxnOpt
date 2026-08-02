@@ -828,6 +828,7 @@ def _write_failed_formal_memory_floor(
     failure_reason: str = (
         "RuntimeError: batch process-tree aggregate RSS exceeds its campaign lock"
     ),
+    resource_schema: str = "stage05.2-run-resource-v3",
 ) -> tuple[Path, dict[str, object]]:
     run_label = "stage05.2_benchmark_attempt90"
     batch_id = "batch0003"
@@ -836,7 +837,7 @@ def _write_failed_formal_memory_floor(
     control_dir.mkdir(parents=True)
     resource_path = control_dir / f"{run_label}_resource_summary.json"
     resource = {
-        "schema_version": "stage05.2-run-resource-v3",
+        "schema_version": resource_schema,
         "run_label": run_label,
         "component": "benchmark",
         "configured_worker_count": 6,
@@ -856,6 +857,18 @@ def _write_failed_formal_memory_floor(
             "106": 100_000_000,
         },
     }
+    if resource_schema == "stage05.2-run-resource-v4":
+        resource.update(
+            {
+                "aggregate_memory_source": "cgroup_v2",
+                "aggregate_peak_memory_bytes": 21_812_838_400,
+                "cgroup_path": (
+                    "/user.slice/user-1001.slice/user@1001.service/app.slice/"
+                    "stage052-formal-rerun15.service"
+                ),
+                "cgroup_swap_peak_bytes": 0,
+            }
+        )
     resource_path.write_text(json.dumps(resource), encoding="utf-8")
     resource_sha256 = hashlib.sha256(resource_path.read_bytes()).hexdigest()
     run_metadata_path = control_dir / f"{run_label}_run_metadata.json"
@@ -926,6 +939,48 @@ def _write_failed_formal_memory_floor(
                     "failure_reason": failure_reason,
                 }
             ],
+        },
+    )
+    failure_summary_path, failure_summary_sidecar = atomic_write_signed_json(
+        campaign_dir / "failure_summary.json",
+        {
+            "schema_version": "experiment-cli-failure-summary-v1",
+            "run_label": run_label,
+            "status": "failed",
+            "failure_code": "runner_failure",
+            "error_type": "RuntimeError",
+            "error_message": failure_reason.removeprefix("RuntimeError: "),
+        },
+    )
+
+    def lifecycle_record(path: Path) -> dict[str, object]:
+        stat = path.stat()
+        return {
+            "relative_path": path.relative_to(campaign_dir).as_posix(),
+            "checksum": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "byte_size": stat.st_size,
+            "modified_time_ns": stat.st_mtime_ns,
+        }
+
+    campaign_manifest_path = campaign_dir / "campaign_manifest.json"
+    lifecycle_paths = (
+        failure_summary_path,
+        failure_summary_sidecar,
+        campaign_manifest_path,
+        campaign_manifest_path.with_suffix(".sha256"),
+        resource_path,
+    )
+    lifecycle_control = campaign_dir / "control"
+    lifecycle_control.mkdir()
+    atomic_write_signed_json(
+        lifecycle_control / f"{run_label}_failure_lifecycle_manifest.json",
+        {
+            "schema_version": "experiment-cli-failure-manifest-v1",
+            "run_label": run_label,
+            "status": "failed",
+            "evidence_completeness": "partial",
+            "artifact_trust": "untrusted_failure_capsule",
+            "artifacts": [lifecycle_record(path) for path in lifecycle_paths],
         },
     )
     return resource_path, resource
@@ -1005,6 +1060,53 @@ def test_failed_formal_memory_floor_accepts_aggregate_rss_guard_failure(
     ).hexdigest()
 
 
+def test_failed_formal_memory_floor_accepts_cgroup_v2_guard_failure(
+    tmp_path: Path,
+) -> None:
+    campaign_dir = tmp_path / "stage05.2_benchmark_rerun15"
+    resource_path, _ = _write_failed_formal_memory_floor(
+        campaign_dir,
+        failure_reason=(
+            "RuntimeError: worker failure RuntimeError: runtime guard aborted "
+            "Stage 5.2 work: cgroup v2 memory hard limit exceeded: "
+            "observed=21793177600 limit=21792659866; process-pool abort failure "
+            "RuntimeError: pid=84032: survived terminate and kill"
+        ),
+        resource_schema="stage05.2-run-resource-v4",
+    )
+
+    floor = load_failed_formal_memory_floor(
+        campaign_dir,
+        batch_id="batch0003",
+    )
+
+    assert floor.aggregate_peak_rss_bytes == 18_449_874_944
+    assert floor.aggregate_memory_source == "cgroup_v2"
+    assert floor.aggregate_peak_memory_bytes == 21_812_838_400
+    assert floor.cgroup_swap_peak_bytes == 0
+    assert floor.per_worker_peak_rss_bytes == 3_326_586_880
+    assert floor.resource_summary_sha256 == hashlib.sha256(
+        resource_path.read_bytes()
+    ).hexdigest()
+
+
+def test_failed_formal_memory_floor_rejects_cgroup_failure_with_v3_resource(
+    tmp_path: Path,
+) -> None:
+    campaign_dir = tmp_path / "stage05.2_benchmark_attempt90"
+    _write_failed_formal_memory_floor(
+        campaign_dir,
+        failure_reason=(
+            "RuntimeError: worker failure RuntimeError: runtime guard aborted "
+            "Stage 5.2 work: cgroup v2 memory hard limit exceeded: "
+            "observed=21793177600 limit=21792659866"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="requires a v4 resource summary"):
+        load_failed_formal_memory_floor(campaign_dir, batch_id="batch0003")
+
+
 def test_failed_formal_memory_floor_rejects_non_memory_worker_failure(
     tmp_path: Path,
 ) -> None:
@@ -1016,6 +1118,65 @@ def test_failed_formal_memory_floor_rejects_non_memory_worker_failure(
 
     with pytest.raises(RuntimeError, match="campaign identity"):
         load_failed_formal_memory_floor(campaign_dir, batch_id="batch0003")
+
+
+def test_failed_formal_memory_floor_rejects_failure_summary_drift(
+    tmp_path: Path,
+) -> None:
+    campaign_dir = tmp_path / "stage05.2_benchmark_attempt90"
+    _write_failed_formal_memory_floor(
+        campaign_dir,
+        resource_schema="stage05.2-run-resource-v4",
+    )
+    summary_path = campaign_dir / "failure_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["error_message"] = "different failure"
+    atomic_write_signed_json(summary_path, summary)
+
+    with pytest.raises(RuntimeError, match="failure summary binding"):
+        load_failed_formal_memory_floor(campaign_dir, batch_id="batch0003")
+
+
+def test_failed_formal_memory_floor_rejects_lifecycle_trust_drift(
+    tmp_path: Path,
+) -> None:
+    campaign_dir = tmp_path / "stage05.2_benchmark_attempt90"
+    _write_failed_formal_memory_floor(
+        campaign_dir,
+        resource_schema="stage05.2-run-resource-v4",
+    )
+    lifecycle_path = (
+        campaign_dir
+        / "control"
+        / "stage05.2_benchmark_attempt90_failure_lifecycle_manifest.json"
+    )
+    lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+    lifecycle["artifact_trust"] = "trusted"
+    atomic_write_signed_json(lifecycle_path, lifecycle)
+
+    with pytest.raises(RuntimeError, match="lifecycle manifest"):
+        load_failed_formal_memory_floor(campaign_dir, batch_id="batch0003")
+
+
+def test_failed_formal_memory_floor_preserves_v3_archive_compatibility(
+    tmp_path: Path,
+) -> None:
+    campaign_dir = tmp_path / "stage05.2_benchmark_attempt90"
+    _write_failed_formal_memory_floor(campaign_dir)
+    (campaign_dir / "failure_summary.json").unlink()
+    (campaign_dir / "failure_summary.sha256").unlink()
+    lifecycle_path = (
+        campaign_dir
+        / "control"
+        / "stage05.2_benchmark_attempt90_failure_lifecycle_manifest.json"
+    )
+    lifecycle_path.unlink()
+    lifecycle_path.with_suffix(".sha256").unlink()
+
+    floor = load_failed_formal_memory_floor(campaign_dir, batch_id="batch0003")
+
+    assert floor.aggregate_memory_source == "process_tree_rss"
+    assert floor.aggregate_peak_memory_bytes is None
 
 
 def test_failed_formal_memory_floor_rejects_unbound_resource_edit(
@@ -1073,6 +1234,28 @@ def test_failed_formal_memory_floor_rejects_incomplete_pid_binding(
     )
     resource_record["checksum"] = resource_sha256
     atomic_write_signed_json(artifact_manifest_path, artifact_manifest)
+    lifecycle_manifest_path = (
+        campaign_dir
+        / "control"
+        / "stage05.2_benchmark_attempt90_failure_lifecycle_manifest.json"
+    )
+    lifecycle_manifest = json.loads(
+        lifecycle_manifest_path.read_text(encoding="utf-8")
+    )
+    lifecycle_resource_record = next(
+        item
+        for item in lifecycle_manifest["artifacts"]
+        if item["relative_path"].endswith("_resource_summary.json")
+    )
+    resource_stat = resource_path.stat()
+    lifecycle_resource_record.update(
+        {
+            "checksum": resource_sha256,
+            "byte_size": resource_stat.st_size,
+            "modified_time_ns": resource_stat.st_mtime_ns,
+        }
+    )
+    atomic_write_signed_json(lifecycle_manifest_path, lifecycle_manifest)
 
     with pytest.raises(RuntimeError, match="resource summary"):
         load_failed_formal_memory_floor(campaign_dir, batch_id="batch0003")

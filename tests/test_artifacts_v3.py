@@ -10,6 +10,7 @@ import time
 from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -1236,6 +1237,43 @@ def test_signed_json_second_replace_failure_restores_previous_generation(
     assert hashlib.sha256(path.read_bytes()).hexdigest() == (
         path.with_suffix(".sha256").read_text(encoding="utf-8").strip()
     )
+
+
+def test_signed_json_releases_payload_and_sidecar_page_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    released: list[Path] = []
+
+    def record_release(handle: Any) -> None:
+        released.append(Path(str(handle.name)))
+
+    monkeypatch.setattr(artifacts_module, "release_file_page_cache", record_release)
+    path = tmp_path / "campaign_manifest.json"
+
+    atomic_write_signed_json(path, {"generation": 1})
+
+    assert len(released) == 3
+    assert released[0].name.startswith(f".{path.name}.")
+    assert released[0].name.endswith(".tmp")
+    assert released[1].name.startswith(f".{path.with_suffix('.sha256').name}.")
+    assert released[1].name.endswith(".tmp")
+    assert released[2].name.endswith(".final.tmp")
+
+
+def test_durable_write_bytes_syncs_parent_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    synced: list[Path] = []
+    monkeypatch.setattr(artifacts_module, "release_file_page_cache", lambda _handle: None)
+    monkeypatch.setattr(artifacts_module, "sync_directory", synced.append)
+    path = tmp_path / "control" / "runtime_evidence.json"
+
+    artifacts_module.durable_write_bytes(path, b"{}\n")
+
+    assert path.read_bytes() == b"{}\n"
+    assert synced == [path.parent]
 
 
 @pytest.mark.parametrize(("replace_count", "expected_generation"), ((1, 1), (2, 2)))
