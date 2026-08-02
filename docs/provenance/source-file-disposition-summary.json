@@ -8,8 +8,8 @@
     "school_specific_exclusion": 42,
     "declarative_rename": 3,
     "local_external_artifact": 1,
-    "migrated_modified_publication": 65,
-    "migrated_unchanged": 767
+    "migrated_modified_publication": 66,
+    "migrated_unchanged": 766
   },
   "receipt": "docs/provenance/source-file-disposition.csv"
 }
