@@ -759,6 +759,89 @@ py::tuple stage04_segment_update_v1(
     return py::make_tuple(std::move(updated), std::move(statuses));
 }
 
+py::array_t<std::int64_t> dynamic_removal_selection_v2(
+    std::int64_t customer_count,
+    std::int64_t stagnation_iterations,
+    std::int64_t iteration,
+    py::handle thresholds,
+    py::handle fractions,
+    bool global_best_reset) {
+    auto threshold_array = checked_array<std::int64_t>(
+        thresholds, "thresholds", 1);
+    auto fraction_array = checked_array<double>(fractions, "fractions", 1);
+    if (customer_count < 0 || stagnation_iterations < 0 || iteration < 0
+        || threshold_array.size() != 3 || fraction_array.size() != 6) {
+        throw std::invalid_argument(
+            "dynamic removal selection v2 input/config shape is invalid");
+    }
+    const auto* threshold_values = checked_data<std::int64_t>(threshold_array);
+    const auto* fraction_values = checked_data<double>(fraction_array);
+    const auto medium_threshold = threshold_values[0];
+    const auto large_threshold = threshold_values[1];
+    const auto exploration_period = threshold_values[2];
+    if (medium_threshold < 0 || large_threshold <= medium_threshold
+        || exploration_period <= 0) {
+        throw std::invalid_argument(
+            "dynamic removal thresholds are invalid");
+    }
+    for (std::size_t index = 0; index < 3; ++index) {
+        const auto minimum = fraction_values[index * 2];
+        const auto maximum = fraction_values[index * 2 + 1];
+        if (!std::isfinite(minimum) || !std::isfinite(maximum)
+            || minimum <= 0.0 || maximum < minimum || maximum > 1.0) {
+            throw std::invalid_argument(
+                "dynamic removal fraction bounds are invalid");
+        }
+    }
+    std::int64_t tier = 0;
+    std::int64_t trigger = 0;
+    if (stagnation_iterations >= large_threshold) {
+        tier = 2;
+        trigger = 2;
+    } else if (stagnation_iterations >= medium_threshold) {
+        tier = 1;
+        trigger = 1;
+    }
+    if (iteration > 0 && iteration % exploration_period == 0
+        && stagnation_iterations > medium_threshold && tier < 2) {
+        ++tier;
+        trigger += 3;
+    }
+    std::int64_t requested = 0;
+    std::int64_t lower_bound = 0;
+    std::int64_t upper_bound = 0;
+    if (customer_count > 1) {
+        const auto upper_customer_bound = customer_count - 1;
+        lower_bound = std::max<std::int64_t>(
+            1,
+            std::min<std::int64_t>(
+                upper_customer_bound,
+                static_cast<std::int64_t>(std::ceil(
+                    static_cast<double>(customer_count)
+                    * fraction_values[static_cast<std::size_t>(tier) * 2]))));
+        upper_bound = std::max<std::int64_t>(
+            lower_bound,
+            std::min<std::int64_t>(
+                upper_customer_bound,
+                static_cast<std::int64_t>(std::floor(
+                    static_cast<double>(customer_count)
+                    * fraction_values[static_cast<std::size_t>(tier) * 2 + 1]))));
+        requested = lower_bound;
+    } else {
+        trigger = 6;
+    }
+    py::array_t<std::int64_t> output(7);
+    auto* values = checked_data(output);
+    values[0] = tier;
+    values[1] = requested;
+    values[2] = lower_bound;
+    values[3] = upper_bound;
+    values[4] = stagnation_iterations;
+    values[5] = trigger;
+    values[6] = global_best_reset ? 1 : 0;
+    return output;
+}
+
 py::tuple changed_candidate_pool_v1(
     std::int64_t operation,
     py::handle route_offsets,
@@ -7125,6 +7208,24 @@ py::tuple constraint_removal_v2(
         }
     }
 
+    if (all_customers.size() <= 1 || requested_count == 0) {
+        py::array_t<std::int64_t> partial_offsets_array(1);
+        checked_data(partial_offsets_array)[0] = 0;
+        py::array_t<std::int64_t> partial_indices_array(0);
+        py::array_t<std::int64_t> removed_output_array(0);
+        py::array_t<std::int64_t> score_nodes(0);
+        py::array_t<double> score_values(0);
+        py::array_t<std::int64_t> score_routes(0);
+        py::array_t<std::int64_t> metadata(3);
+        checked_data(metadata)[0] = 2;
+        checked_data(metadata)[1] = -1;
+        checked_data(metadata)[2] = 0;
+        return py::make_tuple(
+            std::move(partial_offsets_array), std::move(partial_indices_array),
+            std::move(removed_output_array), std::move(score_nodes),
+            std::move(score_values), std::move(score_routes), std::move(metadata));
+    }
+
     struct Score {
         std::int64_t customer;
         double value;
@@ -9366,6 +9467,15 @@ PYBIND11_MODULE(_core, module) {
         py::arg("reward_sums"),
         py::arg("calls"),
         py::arg("options"));
+    module.def(
+        "dynamic_removal_selection_v2",
+        &dynamic_removal_selection_v2,
+        py::arg("customer_count"),
+        py::arg("stagnation_iterations"),
+        py::arg("iteration"),
+        py::arg("thresholds"),
+        py::arg("fractions"),
+        py::arg("global_best_reset"));
     module.def(
         "changed_candidate_pool_v1",
         &changed_candidate_pool_v1,

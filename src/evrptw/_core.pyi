@@ -35,6 +35,14 @@ def stage04_segment_update_v1(
     calls: npt.NDArray[np.int64],
     options: npt.NDArray[np.float64],
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int64]]: ...
+def dynamic_removal_selection_v2(
+    customer_count: int,
+    stagnation_iterations: int,
+    iteration: int,
+    thresholds: npt.NDArray[np.int64],
+    fractions: npt.NDArray[np.float64],
+    global_best_reset: bool,
+) -> npt.NDArray[np.int64]: ...
 def changed_candidate_pool_v1(
     operation: int,
     route_offsets: npt.NDArray[np.int64],

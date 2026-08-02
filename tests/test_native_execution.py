@@ -1101,6 +1101,83 @@ def test_native_stage04_segment_update_matches_python_config() -> None:
 
 
 @pytest.mark.parametrize(
+    ("customer_count", "stagnation", "iteration", "global_best_reset"),
+    [
+        (0, 0, 0, False),
+        (1, 9, 3, True),
+        (5, 0, 0, False),
+        (21, 4, 1, False),
+        (100, 5, 3, False),
+        (100, 8, 6, True),
+    ],
+)
+def test_native_dynamic_removal_selection_matches_python_policy(
+    customer_count: int,
+    stagnation: int,
+    iteration: int,
+    global_best_reset: bool,
+) -> None:
+    from evrptw import _core as native_core
+    from evrptw import neighborhoods
+
+    config = neighborhoods.VehicleOperatorConfig()
+    observed = native_core.dynamic_removal_selection_v2(
+        customer_count,
+        stagnation,
+        iteration,
+        np.asarray(
+            [
+                config.medium_stagnation_threshold,
+                config.large_stagnation_threshold,
+                config.exploration_period,
+            ],
+            dtype=np.int64,
+        ),
+        np.asarray(
+            [
+                config.small_removal_min_fraction,
+                config.small_removal_max_fraction,
+                config.medium_removal_min_fraction,
+                config.medium_removal_max_fraction,
+                config.large_removal_min_fraction,
+                config.large_removal_max_fraction,
+            ],
+            dtype=np.float64,
+        ),
+        global_best_reset,
+    )
+    expected = neighborhoods.select_dynamic_removal_size(
+        customer_count,
+        stagnation,
+        iteration,
+        config=config,
+        global_best_reset=global_best_reset,
+    )
+    trigger_codes = {
+        "stagnation_baseline": 0,
+        "medium_stagnation": 1,
+        "large_stagnation": 2,
+        "medium_stagnation+periodic_exploration": 4,
+        "no_removable_customer": 6,
+    }
+    tier_codes = {
+        neighborhoods.RemovalTier.SMALL: 0,
+        neighborhoods.RemovalTier.MEDIUM: 1,
+        neighborhoods.RemovalTier.LARGE: 2,
+    }
+
+    assert observed.tolist() == [
+        tier_codes[expected.tier],
+        expected.requested_count,
+        expected.lower_bound,
+        expected.upper_bound,
+        expected.stagnation_iterations,
+        trigger_codes[expected.trigger_reason],
+        int(expected.reset_observed),
+    ]
+
+
+@pytest.mark.parametrize(
     "payload",
     [
         b"",
@@ -1457,6 +1534,51 @@ def test_native_constraint_removal_matches_python_ranking_and_rng(
     assert [item[2] for item in observed_ranking] == [
         route_by_name[name] for name, _score in expected.scores
     ]
+
+
+def test_native_constraint_removal_reports_no_removable_customer_boundary() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    route_offsets = np.asarray([0, 1], dtype=np.int64)
+    route_indices = np.asarray([context.name_to_index["C1"]], dtype=np.int64)
+    exact_payload = native_core.exact_charging_batch_numeric(
+        context.node_kind,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.vehicle,
+        route_offsets,
+        route_indices,
+        np.asarray([10.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+    )
+    payload = native_core.constraint_removal_v2(
+        0,
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        route_offsets,
+        route_indices,
+        exact_payload[0],
+        exact_payload[1],
+        exact_payload[4],
+        1,
+        0,
+    )
+
+    assert payload[0].tolist() == [0]
+    assert payload[1].tolist() == []
+    assert payload[2].tolist() == []
+    assert payload[6].tolist() == [2, -1, 0]
 
 
 def test_native_candidate_plan_ranking_matches_python_rank_key() -> None:
