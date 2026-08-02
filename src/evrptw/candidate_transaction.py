@@ -415,6 +415,9 @@ class NativeCandidateTransactionRuntime:
     input_candidate_count: int = 0
     screening_occupancies: list[int] = field(default_factory=list)
     fallback_count: int = 0
+    protocol_invocations: int = 0
+    protocol_total_seconds: float = 0.0
+    protocol_queue_wait_seconds: float = 0.0
     _negative_cache_initialized: bool = False
     _negative_cache_sequences: set[CustomerSequence] = field(default_factory=set)
     _negative_cache_offsets: npt.NDArray[np.int64] = field(
@@ -443,6 +446,11 @@ class NativeCandidateTransactionRuntime:
             "native_screening_occupancies": tuple(self.screening_occupancies),
             "native_screening_median_occupancy": median_occupancy,
             "native_candidate_transaction_fallbacks": self.fallback_count,
+            "native_worker_protocol_invocations": self.protocol_invocations,
+            "native_worker_protocol_total_seconds": self.protocol_total_seconds,
+            "native_worker_protocol_queue_wait_seconds": (
+                self.protocol_queue_wait_seconds
+            ),
             "negative_screening_sequence_cache": {
                 "backend": "bounded_generation_safe_rejection",
                 "capacity": STAGE052_NEGATIVE_SEQUENCE_CACHE_ENTRIES,
@@ -463,6 +471,41 @@ class NativeCandidateTransactionRuntime:
                 "event_type": "native_candidate_transaction",
                 "status": "committed",
                 **asdict(audit),
+            }
+        )
+
+    def record_worker_protocol(
+        self,
+        audit: CandidateTransactionAudit,
+        *,
+        worker_protocol: str,
+        total_seconds: float,
+        queue_wait_seconds: float,
+        completion_order: tuple[int, ...],
+    ) -> None:
+        if (
+            not math.isfinite(total_seconds)
+            or total_seconds < 0.0
+            or not math.isfinite(queue_wait_seconds)
+            or queue_wait_seconds < 0.0
+        ):
+            raise RuntimeError("native worker protocol timing is invalid")
+        self.record(audit)
+        self.protocol_invocations += 1
+        self.protocol_total_seconds += total_seconds
+        self.protocol_queue_wait_seconds += queue_wait_seconds
+        self.events.append(
+            {
+                "event_type": "native_worker_protocol",
+                "status": "committed",
+                "worker_protocol": worker_protocol,
+                "lane": audit.lane,
+                "operator": audit.operator,
+                "iteration": audit.iteration,
+                "completion_order": completion_order,
+                "total_seconds": total_seconds,
+                "queue_wait_seconds": queue_wait_seconds,
+                "transaction_sha256": audit.transaction_sha256,
             }
         )
 
@@ -756,6 +799,25 @@ def native_screen_candidate_batch(
             time.perf_counter() - started,
             batch_candidates=len(candidates),
         )
+    return decode_native_candidate_screening_payload(
+        payload,
+        candidates=candidates,
+        candidate_ids=candidate_ids,
+        route_offsets=route_offsets,
+        route_indices=route_indices,
+    )
+
+
+def decode_native_candidate_screening_payload(
+    payload: object,
+    *,
+    candidates: tuple[CustomerSequence, ...],
+    candidate_ids: npt.NDArray[np.int64],
+    route_offsets: npt.NDArray[np.int64],
+    route_indices: npt.NDArray[np.int64],
+) -> CandidateScreeningBatch:
+    """Validate and replay screening arrays returned by a native transaction."""
+
     if not isinstance(payload, tuple) or len(payload) != 7:
         raise RuntimeError("native candidate screening returned an invalid tuple")
     returned_ids = _strict_array(

@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -3883,7 +3884,7 @@ py::tuple screen_routes_numeric(
     return py::make_tuple(std::move(codes), std::move(metrics));
 }
 
-py::tuple screen_route_batch_transaction_v2(
+py::tuple screen_route_batch_transaction_impl(
     py::handle node_kind,
     py::handle demand,
     py::handle ready_time,
@@ -3899,7 +3900,8 @@ py::tuple screen_route_batch_transaction_v2(
     py::handle incremental,
     py::handle negative_offsets,
     py::handle negative_indices,
-    py::handle negative_reason_codes) {
+    py::handle negative_reason_codes,
+    std::int64_t worker_count) {
     auto kind_array = checked_array<std::int64_t>(node_kind, "node_kind", 1);
     auto demand_array = checked_array<double>(demand, "demand", 1);
     auto ready_array = checked_array<double>(ready_time, "ready_time", 1);
@@ -3982,6 +3984,9 @@ py::tuple screen_route_batch_transaction_v2(
     if (option_values[1] <= 0.0 || !std::isfinite(option_values[1])) {
         throw std::invalid_argument(
             "batch screening epsilon must be finite and positive");
+    }
+    if (worker_count <= 0) {
+        throw std::invalid_argument("batch screening worker_count must be positive");
     }
 
     auto validate_offsets = [](
@@ -4068,12 +4073,16 @@ py::tuple screen_route_batch_transaction_v2(
     std::vector<ScreenOutput> outputs(candidate_count);
     std::vector<std::int64_t> statuses(candidate_count, 0);
     std::vector<std::int64_t> duplicate_of(candidate_count, -1);
+    std::vector<std::size_t> duplicate_source(
+        candidate_count, std::numeric_limits<std::size_t>::max());
     std::unordered_map<std::string, std::size_t> first_by_key;
     std::int64_t duplicate_count = 0;
     std::int64_t negative_hit_count = 0;
     std::int64_t screened_count = 0;
     {
         py::gil_scoped_release release;
+        std::vector<std::size_t> screen_indices;
+        screen_indices.reserve(candidate_count);
         for (std::size_t index = 0; index < candidate_count; ++index) {
             const auto begin = static_cast<std::size_t>(offsets[index]);
             const auto end = static_cast<std::size_t>(offsets[index + 1]);
@@ -4082,7 +4091,7 @@ py::tuple screen_route_batch_transaction_v2(
             if (duplicate != first_by_key.end()) {
                 statuses[index] = 1;
                 duplicate_of[index] = ids[duplicate->second];
-                outputs[index] = outputs[duplicate->second];
+                duplicate_source[index] = duplicate->second;
                 ++duplicate_count;
                 continue;
             }
@@ -4095,24 +4104,48 @@ py::tuple screen_route_batch_transaction_v2(
                 ++negative_hit_count;
                 continue;
             }
-            outputs[index] = run_screen_route(
-                kinds,
-                demands,
-                ready,
-                due,
-                service,
-                distances,
-                reachable_values,
-                vehicle_values,
-                routes + begin,
-                end - begin,
-                node_count,
-                depot,
-                recharge_nodes,
-                option_values,
-                incremental_values + index * 6);
-            ++screened_count;
+            screen_indices.push_back(index);
         }
+        const auto active_workers = std::min<std::size_t>(
+            screen_indices.size(), static_cast<std::size_t>(worker_count));
+        std::vector<std::thread> workers;
+        workers.reserve(active_workers);
+        for (std::size_t worker = 0; worker < active_workers; ++worker) {
+            workers.emplace_back([&, worker]() {
+                for (std::size_t position = worker;
+                     position < screen_indices.size();
+                     position += active_workers) {
+                    const auto index = screen_indices[position];
+                    const auto begin = static_cast<std::size_t>(offsets[index]);
+                    const auto end = static_cast<std::size_t>(offsets[index + 1]);
+                    outputs[index] = run_screen_route(
+                        kinds,
+                        demands,
+                        ready,
+                        due,
+                        service,
+                        distances,
+                        reachable_values,
+                        vehicle_values,
+                        routes + begin,
+                        end - begin,
+                        node_count,
+                        depot,
+                        recharge_nodes,
+                        option_values,
+                        incremental_values + index * 6);
+                }
+            });
+        }
+        for (auto& worker : workers) {
+            worker.join();
+        }
+        for (std::size_t index = 0; index < candidate_count; ++index) {
+            if (statuses[index] == 1) {
+                outputs[index] = outputs[duplicate_source[index]];
+            }
+        }
+        screened_count = static_cast<std::int64_t>(screen_indices.size());
     }
 
     py::array_t<std::int64_t> returned_ids(candidate_count);
@@ -4192,6 +4225,407 @@ py::tuple screen_route_batch_transaction_v2(
         std::move(codes_array),
         std::move(metrics_array),
         std::move(counters),
+        digest);
+}
+
+py::tuple screen_route_batch_transaction_v2(
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle candidate_ids,
+    py::handle options,
+    py::handle incremental,
+    py::handle negative_offsets,
+    py::handle negative_indices,
+    py::handle negative_reason_codes) {
+    return screen_route_batch_transaction_impl(
+        node_kind,
+        demand,
+        ready_time,
+        due_date,
+        service_time,
+        distance,
+        reachable,
+        vehicle,
+        route_offsets,
+        route_indices,
+        candidate_ids,
+        options,
+        incremental,
+        negative_offsets,
+        negative_indices,
+        negative_reason_codes,
+        1);
+}
+
+py::tuple candidate_round_transaction_v1(
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle candidate_ids,
+    py::handle lexical_rank,
+    py::handle options,
+    py::handle incremental,
+    py::handle negative_offsets,
+    py::handle negative_indices,
+    py::handle negative_reason_codes,
+    py::handle cache_hit_flags,
+    py::handle control,
+    py::handle deadline_remaining,
+    py::handle batch_size,
+    py::handle context_ids) {
+    const auto started = std::chrono::steady_clock::now();
+    auto offsets_array = checked_array<std::int64_t>(
+        route_offsets, "route_offsets", 1);
+    auto routes_array = checked_array<std::int64_t>(
+        route_indices, "route_indices", 1);
+    auto ids_array = checked_array<std::int64_t>(
+        candidate_ids, "candidate_ids", 1);
+    auto lexical_array = checked_array<std::int64_t>(
+        lexical_rank, "lexical_rank", 1);
+    auto cache_array = checked_array<std::int64_t>(
+        cache_hit_flags, "cache_hit_flags", 1);
+    auto control_array = checked_array<std::int64_t>(control, "control", 1);
+    auto deadline_array = checked_array<double>(
+        deadline_remaining, "deadline_remaining", 1);
+    auto batch_array = checked_array<std::int64_t>(batch_size, "batch_size", 1);
+    auto context_array = checked_array<std::int64_t>(context_ids, "context_ids", 1);
+    const auto candidate_count = static_cast<std::size_t>(ids_array.request().shape[0]);
+    const auto node_count = static_cast<std::size_t>(
+        checked_array<std::int64_t>(node_kind, "node_kind", 1).request().shape[0]);
+    if (offsets_array.request().shape[0]
+            != static_cast<py::ssize_t>(candidate_count + 1)
+        || cache_array.request().shape[0]
+            != static_cast<py::ssize_t>(candidate_count)) {
+        throw std::invalid_argument(
+            "candidate round arrays do not share one candidate row count");
+    }
+    if (lexical_array.request().shape[0] != static_cast<py::ssize_t>(node_count)) {
+        throw std::invalid_argument("lexical_rank must contain one value per node");
+    }
+    if (control_array.request().shape[0] != 3
+        || deadline_array.request().shape[0] != 1
+        || batch_array.request().shape[0] != 1
+        || context_array.request().shape[0] != 3) {
+        throw std::invalid_argument("candidate round scalar-array shape is invalid");
+    }
+    const auto* offsets = checked_data<std::int64_t>(offsets_array);
+    const auto* routes = checked_data<std::int64_t>(routes_array);
+    const auto* ids = checked_data<std::int64_t>(ids_array);
+    const auto* lexical = checked_data<std::int64_t>(lexical_array);
+    const auto* cache_hits = checked_data<std::int64_t>(cache_array);
+    const auto* control_values = checked_data<std::int64_t>(control_array);
+    const auto* deadline_values = checked_data<double>(deadline_array);
+    const auto* batch_values = checked_data<std::int64_t>(batch_array);
+    const auto* context_values = checked_data<std::int64_t>(context_array);
+    if (control_values[0] <= 0 || control_values[1] < 0
+        || control_values[2] <= 0) {
+        throw std::invalid_argument(
+            "candidate round requires positive top-k/thread count and "
+            "non-negative exact budget");
+    }
+    if (!std::isfinite(deadline_values[0]) || deadline_values[0] <= 0.0) {
+        throw std::invalid_argument(
+            "candidate round deadline_remaining must be finite and positive");
+    }
+    if (batch_values[0] <= 0) {
+        throw std::invalid_argument("candidate round batch_size must be positive");
+    }
+    std::unordered_set<std::int64_t> lexical_values;
+    for (std::size_t node = 0; node < node_count; ++node) {
+        if (lexical[node] < 0
+            || lexical[node] >= static_cast<std::int64_t>(node_count)
+            || !lexical_values.insert(lexical[node]).second) {
+            throw std::invalid_argument("lexical_rank must be a permutation");
+        }
+    }
+    for (std::size_t index = 0; index < candidate_count; ++index) {
+        if (cache_hits[index] != 0 && cache_hits[index] != 1) {
+            throw std::invalid_argument("cache_hit_flags must contain only zero or one");
+        }
+    }
+
+    const auto screening_started = std::chrono::steady_clock::now();
+    py::tuple screening = screen_route_batch_transaction_impl(
+        node_kind,
+        demand,
+        ready_time,
+        due_date,
+        service_time,
+        distance,
+        reachable,
+        vehicle,
+        route_offsets,
+        route_indices,
+        candidate_ids,
+        options,
+        incremental,
+        negative_offsets,
+        negative_indices,
+        negative_reason_codes,
+        control_values[2]);
+    const auto screening_completed = std::chrono::steady_clock::now();
+    auto status_array = py::cast<py::array_t<std::int64_t>>(screening[1]);
+    auto duplicate_array = py::cast<py::array_t<std::int64_t>>(screening[2]);
+    auto codes_array = py::cast<py::array_t<std::int64_t>>(screening[3]);
+    auto metrics_array = py::cast<py::array_t<double>>(screening[4]);
+    const auto* statuses = checked_data<std::int64_t>(status_array);
+    const auto* duplicates = checked_data<std::int64_t>(duplicate_array);
+    const auto* codes = checked_data<std::int64_t>(codes_array);
+    const auto* metrics = checked_data<double>(metrics_array);
+
+    struct RankableCandidate {
+        std::size_t index;
+        double distance_lower_bound;
+    };
+    std::vector<RankableCandidate> rankable;
+    rankable.reserve(candidate_count);
+    std::int64_t rejected_count = 0;
+    std::int64_t negative_hit_count = 0;
+    std::int64_t duplicate_count = 0;
+    for (std::size_t index = 0; index < candidate_count; ++index) {
+        if (statuses[index] == 1) {
+            ++duplicate_count;
+            continue;
+        }
+        if (codes[index * 16] == 0) {
+            ++rejected_count;
+            if (statuses[index] == 2) {
+                ++negative_hit_count;
+            }
+            continue;
+        }
+        rankable.push_back({index, metrics[index * 15 + 3]});
+    }
+    const auto route_less = [&](std::size_t left, std::size_t right) {
+        auto left_cursor = offsets[left];
+        auto right_cursor = offsets[right];
+        const auto left_end = offsets[left + 1];
+        const auto right_end = offsets[right + 1];
+        while (left_cursor < left_end && right_cursor < right_end) {
+            const auto left_rank = lexical[routes[left_cursor]];
+            const auto right_rank = lexical[routes[right_cursor]];
+            if (left_rank != right_rank) {
+                return left_rank < right_rank;
+            }
+            ++left_cursor;
+            ++right_cursor;
+        }
+        return (left_end - offsets[left]) < (right_end - offsets[right]);
+    };
+    std::stable_sort(
+        rankable.begin(),
+        rankable.end(),
+        [&](const RankableCandidate& left, const RankableCandidate& right) {
+            if (left.distance_lower_bound != right.distance_lower_bound) {
+                return left.distance_lower_bound < right.distance_lower_bound;
+            }
+            if (route_less(left.index, right.index)) {
+                return true;
+            }
+            if (route_less(right.index, left.index)) {
+                return false;
+            }
+            return ids[left.index] < ids[right.index];
+        });
+    const auto selected_count = std::min<std::size_t>(
+        rankable.size(), static_cast<std::size_t>(control_values[0]));
+
+    std::vector<std::int64_t> resolutions(candidate_count, 3);
+    std::vector<std::int64_t> sources(candidate_count, -1);
+    std::vector<std::int64_t> journal(candidate_count * 3, 0);
+    for (std::size_t index = 0; index < candidate_count; ++index) {
+        journal[index * 3] = ids[index];
+        journal[index * 3 + 2] = -1;
+        if (statuses[index] == 1) {
+            resolutions[index] = 5;
+            sources[index] = duplicates[index];
+            journal[index * 3 + 1] = 6;
+        } else if (codes[index * 16] == 0) {
+            resolutions[index] = 0;
+            journal[index * 3 + 1] = 5;
+        } else {
+            journal[index * 3 + 1] = 4;
+        }
+    }
+    std::vector<std::size_t> exact_indices;
+    std::int64_t cache_hit_count = 0;
+    for (std::size_t rank = 0; rank < selected_count; ++rank) {
+        const auto index = rankable[rank].index;
+        if (cache_hits[index] == 1) {
+            resolutions[index] = 1;
+            journal[index * 3 + 1] = 1;
+            ++cache_hit_count;
+        } else {
+            exact_indices.push_back(index);
+        }
+    }
+    std::int64_t budget_skip_count = 0;
+    if (exact_indices.size() > static_cast<std::size_t>(control_values[1])) {
+        budget_skip_count = static_cast<std::int64_t>(exact_indices.size());
+        for (const auto index : exact_indices) {
+            resolutions[index] = 4;
+            journal[index * 3 + 1] = 3;
+        }
+        exact_indices.clear();
+    }
+
+    std::vector<std::int64_t> exact_offsets(1, 0);
+    std::vector<std::int64_t> exact_routes;
+    std::vector<std::int64_t> exact_ids;
+    exact_ids.reserve(exact_indices.size());
+    for (std::size_t ordinal = 0; ordinal < exact_indices.size(); ++ordinal) {
+        const auto index = exact_indices[ordinal];
+        resolutions[index] = 2;
+        journal[index * 3 + 1] = 2;
+        journal[index * 3 + 2] = static_cast<std::int64_t>(ordinal);
+        exact_ids.push_back(ids[index]);
+        exact_routes.insert(
+            exact_routes.end(), routes + offsets[index], routes + offsets[index + 1]);
+        exact_offsets.push_back(static_cast<std::int64_t>(exact_routes.size()));
+    }
+    py::array_t<std::int64_t> exact_offsets_array(exact_offsets.size());
+    py::array_t<std::int64_t> exact_routes_array(exact_routes.size());
+    std::copy(
+        exact_offsets.begin(), exact_offsets.end(), checked_data(exact_offsets_array));
+    std::copy(
+        exact_routes.begin(), exact_routes.end(), checked_data(exact_routes_array));
+    const auto exact_started = std::chrono::steady_clock::now();
+    const auto elapsed_before_exact = std::chrono::duration<double>(
+        exact_started - started).count();
+    py::array_t<double> exact_deadline_array(1);
+    checked_data(exact_deadline_array)[0] = std::max(
+        0.0, deadline_values[0] - elapsed_before_exact);
+    py::tuple exact_payload = exact_charging_batch_numeric(
+        node_kind,
+        ready_time,
+        due_date,
+        service_time,
+        distance,
+        vehicle,
+        exact_offsets_array,
+        exact_routes_array,
+        exact_deadline_array,
+        batch_array);
+    const auto exact_completed = std::chrono::steady_clock::now();
+
+    for (std::size_t index = 0; index < candidate_count; ++index) {
+        if (statuses[index] != 1) {
+            continue;
+        }
+        const auto source_id = duplicates[index];
+        const auto source = std::find(ids, ids + candidate_count, source_id);
+        if (source == ids + candidate_count) {
+            throw std::runtime_error("native duplicate source identity was lost");
+        }
+        const auto source_index = static_cast<std::size_t>(source - ids);
+        sources[index] = source_id;
+        if (resolutions[source_index] == 0) {
+            resolutions[index] = 0;
+        } else if (resolutions[source_index] == 1
+                   || resolutions[source_index] == 2) {
+            resolutions[index] = 5;
+        } else {
+            resolutions[index] = resolutions[source_index];
+        }
+    }
+
+    py::array_t<std::int64_t> resolution_array(resolutions.size());
+    py::array_t<std::int64_t> source_array(sources.size());
+    py::array_t<std::int64_t> journal_array(
+        {static_cast<py::ssize_t>(candidate_count), py::ssize_t(3)});
+    py::array_t<std::int64_t> exact_ids_array(exact_ids.size());
+    py::array_t<std::int64_t> completion_array(exact_ids.size());
+    std::copy(resolutions.begin(), resolutions.end(), checked_data(resolution_array));
+    std::copy(sources.begin(), sources.end(), checked_data(source_array));
+    std::copy(journal.begin(), journal.end(), checked_data(journal_array));
+    std::copy(exact_ids.begin(), exact_ids.end(), checked_data(exact_ids_array));
+    std::copy(exact_ids.begin(), exact_ids.end(), checked_data(completion_array));
+
+    py::array_t<std::int64_t> counters(10);
+    auto* counter_values = checked_data(counters);
+    counter_values[0] = static_cast<std::int64_t>(candidate_count);
+    counter_values[1] = static_cast<std::int64_t>(rankable.size());
+    counter_values[2] = static_cast<std::int64_t>(selected_count);
+    counter_values[3] = rejected_count;
+    counter_values[4] = negative_hit_count;
+    counter_values[5] = cache_hit_count;
+    counter_values[6] = static_cast<std::int64_t>(exact_ids.size());
+    counter_values[7] = budget_skip_count;
+    counter_values[8] = duplicate_count;
+    counter_values[9] = 0;
+
+    const auto completed = std::chrono::steady_clock::now();
+    py::array_t<double> timings(4);
+    auto* timing_values = checked_data(timings);
+    timing_values[0] = std::chrono::duration<double>(
+        screening_completed - screening_started).count();
+    timing_values[1] = std::chrono::duration<double>(
+        exact_completed - exact_started).count();
+    timing_values[2] = std::chrono::duration<double>(completed - started).count();
+    timing_values[3] = 0.0;
+
+    std::string evidence = "stage05.2-candidate-round-transaction-v1";
+    const auto append_i64 = [&evidence](std::int64_t value) {
+        const auto bits = static_cast<std::uint64_t>(value);
+        for (std::size_t byte = 0; byte < 8; ++byte) {
+            evidence.push_back(
+                static_cast<char>((bits >> (byte * 8)) & 0xffU));
+        }
+    };
+    for (std::size_t index = 0; index < 3; ++index) {
+        append_i64(context_values[index]);
+    }
+    for (const auto value : resolutions) {
+        append_i64(value);
+    }
+    for (const auto value : sources) {
+        append_i64(value);
+    }
+    for (const auto value : journal) {
+        append_i64(value);
+    }
+    for (const auto value : exact_ids) {
+        append_i64(value);
+    }
+    for (const auto value : exact_ids) {
+        append_i64(value);
+    }
+    for (const auto item : exact_payload) {
+        evidence += py::cast<std::string>(
+            py::reinterpret_borrow<py::object>(item).attr("tobytes")());
+    }
+    evidence += py::cast<std::string>(screening[6]);
+    const auto digest = py::cast<std::string>(
+        py::module_::import("hashlib")
+            .attr("sha256")(py::bytes(evidence))
+            .attr("hexdigest")());
+    timing_values[2] = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    return py::make_tuple(
+        std::move(screening),
+        std::move(resolution_array),
+        std::move(source_array),
+        std::move(journal_array),
+        std::move(exact_ids_array),
+        std::move(completion_array),
+        std::move(exact_payload),
+        std::move(counters),
+        std::move(timings),
         digest);
 }
 
@@ -4427,6 +4861,31 @@ PYBIND11_MODULE(_core, module) {
         py::arg("negative_offsets"),
         py::arg("negative_indices"),
         py::arg("negative_reason_codes"));
+    module.def(
+        "candidate_round_transaction_v1",
+        &candidate_round_transaction_v1,
+        py::arg("node_kind"),
+        py::arg("demand"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("reachable"),
+        py::arg("vehicle"),
+        py::arg("route_offsets"),
+        py::arg("route_indices"),
+        py::arg("candidate_ids"),
+        py::arg("lexical_rank"),
+        py::arg("options"),
+        py::arg("incremental"),
+        py::arg("negative_offsets"),
+        py::arg("negative_indices"),
+        py::arg("negative_reason_codes"),
+        py::arg("cache_hit_flags"),
+        py::arg("control"),
+        py::arg("deadline_remaining"),
+        py::arg("batch_size"),
+        py::arg("context_ids"));
     module.def(
         "propagate_routes_numeric",
         &propagate_routes_numeric,

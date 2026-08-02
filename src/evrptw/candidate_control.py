@@ -86,6 +86,17 @@ class CandidateParallelExecutionError(RuntimeError):
     """Parallel exact work failed and must not fall back to another backend."""
 
 
+@dataclass(frozen=True, slots=True)
+class CandidateControlProtocolSnapshot:
+    """O(changes) rollback boundary for one external worker protocol call."""
+
+    event_count: int
+    round_key: tuple[str, int] | None
+    round_used: int
+    candidate_work_count: int
+    route_result_count: int
+
+
 @dataclass(slots=True)
 class CandidateControlRuntime:
     """Process-local shared budget, evidence and worker-pool owner."""
@@ -116,6 +127,27 @@ class CandidateControlRuntime:
                 "budget": self.config.max_exact_calls_per_round,
             }
         )
+
+    def snapshot_protocol_state(self) -> CandidateControlProtocolSnapshot:
+        return CandidateControlProtocolSnapshot(
+            event_count=len(self.events),
+            round_key=self._round_key,
+            round_used=self._round_used,
+            candidate_work_count=len(self._candidate_work),
+            route_result_count=len(self._route_results),
+        )
+
+    def rollback_protocol_state(
+        self,
+        snapshot: CandidateControlProtocolSnapshot,
+    ) -> None:
+        if len(self.events) < snapshot.event_count:
+            raise RuntimeError("candidate-control event journal cannot roll forward")
+        del self.events[snapshot.event_count :]
+        del self._candidate_work[snapshot.candidate_work_count :]
+        del self._route_results[snapshot.route_result_count :]
+        self._round_key = snapshot.round_key
+        self._round_used = snapshot.round_used
 
     def finish_round(self) -> None:
         if self._round_key is None:
@@ -462,6 +494,55 @@ class CandidateControlRuntime:
             }
         )
         return output
+
+    def record_native_batch(
+        self,
+        sequences: tuple[tuple[str, ...], ...],
+        results: tuple[ChargingSubproblemResult, ...],
+        *,
+        completion_order: tuple[int, ...],
+        lane: str,
+        iteration: int | None,
+        operator: str,
+        worker_protocol: str,
+    ) -> None:
+        """Record exact work completed by an explicit non-Python worker protocol."""
+
+        if len(sequences) != len(results):
+            raise RuntimeError("native candidate batch lost an ordered route result")
+        expected_order = tuple(range(len(sequences)))
+        if tuple(sorted(completion_order)) != expected_order:
+            raise RuntimeError("native candidate completion order is not a permutation")
+        self._candidate_work.append(
+            {
+                "lane": lane,
+                "iteration": iteration,
+                "operator": operator,
+                "sequences": [list(sequence) for sequence in sequences],
+            }
+        )
+        self._record_results(
+            sequences,
+            results,
+            lane=lane,
+            iteration=iteration,
+            operator=operator,
+        )
+        self.events.append(
+            {
+                "event_type": "parallel_batch",
+                "status": "native_complete",
+                "worker_count": 0,
+                "worker_protocol": worker_protocol,
+                "submission_order": list(expected_order),
+                "completion_order": list(completion_order),
+                "merge_order": list(expected_order),
+                "customer_sequences": [list(sequence) for sequence in sequences],
+                "lane": lane,
+                "iteration": iteration,
+                "operator": operator,
+            }
+        )
 
     def _record_results(
         self,

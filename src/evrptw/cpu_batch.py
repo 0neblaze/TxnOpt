@@ -523,6 +523,8 @@ def _solve_exact_charging_native(
     metrics: BackendMetrics,
     checkpoint: Callable[[], None],
     completed_indices: set[int],
+    native_payload: object | None = None,
+    native_kernel_seconds: float | None = None,
 ) -> BatchChargingResult:
     """Execute the whole ordered label-setting batch through the native ABI."""
 
@@ -580,20 +582,31 @@ def _solve_exact_charging_native(
         ) from error
 
     native_started = time.perf_counter()
-    payload = native_core.exact_charging_batch_numeric(
-        context.node_kind,
-        context.ready_time,
-        context.due_date,
-        context.service_time,
-        context.distance,
-        context.vehicle,
-        order_offsets,
-        order_indices,
-        deadline_remaining,
-        batch_size_array,
+    payload = (
+        native_core.exact_charging_batch_numeric(
+            context.node_kind,
+            context.ready_time,
+            context.due_date,
+            context.service_time,
+            context.distance,
+            context.vehicle,
+            order_offsets,
+            order_indices,
+            deadline_remaining,
+            batch_size_array,
+        )
+        if native_payload is None
+        else native_payload
     )
     native_completed = time.perf_counter()
-    metrics.native_kernel_seconds += native_completed - native_started
+    native_elapsed = (
+        native_completed - native_started
+        if native_kernel_seconds is None
+        else native_kernel_seconds
+    )
+    if native_elapsed < 0.0 or not math.isfinite(native_elapsed):
+        raise RuntimeError("native exact charging elapsed time is invalid")
+    metrics.native_kernel_seconds += native_elapsed
     metrics.native_invocations += 1
     (
         path_offsets,
@@ -642,7 +655,7 @@ def _solve_exact_charging_native(
                 int(counters[0]),
                 int(counters[1]),
                 int(counters[2]),
-                native_completed - native_started,
+                native_elapsed,
                 "no feasible station-insertion pattern for fixed customer order",
             )
             continue
@@ -685,7 +698,7 @@ def _solve_exact_charging_native(
             int(counters[0]),
             int(counters[1]),
             int(counters[2]),
-            native_completed - native_started,
+            native_elapsed,
             "",
         )
     metrics.unpacking_seconds += time.perf_counter() - unpacking_started
@@ -711,6 +724,51 @@ def _solve_exact_charging_native(
     if len(completed) != len(orders):
         raise RuntimeError("native exact charging lost an ordered route result")
     return BatchChargingResult(completed, metrics)
+
+
+def decode_exact_charging_batch_numeric(
+    instance: Instance,
+    customer_orders: Sequence[Sequence[str]],
+    *,
+    native_runtime: NativeKernelRuntime,
+    batch_size: int,
+    payload: object,
+    native_kernel_seconds: float,
+) -> BatchChargingResult:
+    """Replay and decode an exact payload produced inside a larger native call."""
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    orders = tuple(tuple(order) for order in customer_orders)
+    native_runtime.context.assert_matches(instance)
+    metrics = BackendMetrics(
+        ExactChargingBackend.CPU_BATCH.value,
+        batch_size,
+        work_batches=bool(orders),
+        exact_calls=len(orders),
+        batch_launches=int(bool(orders)),
+        started_calls=len(orders),
+        launch_occupancies=([len(orders)] if orders else []),
+    )
+    started = time.perf_counter()
+    completed_indices: set[int] = set()
+
+    def checkpoint() -> None:
+        metrics.checkpoint_count += 1
+
+    return _solve_exact_charging_native(
+        instance,
+        orders,
+        runtime=native_runtime,
+        batch_size=batch_size,
+        deadline=None,
+        started=started,
+        metrics=metrics,
+        checkpoint=checkpoint,
+        completed_indices=completed_indices,
+        native_payload=payload,
+        native_kernel_seconds=native_kernel_seconds,
+    )
 
 
 def _validate_native_payload(

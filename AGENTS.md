@@ -722,6 +722,21 @@ this repository or one of its subdirectories.
   atomic commit/rollback. Native, worker, deadline, or integrity failure is
   fail-fast with zero Python, serial, CUDA, or `cpu_scalar` fallback. Historical
   Stage 3.4 `CandidateControlConfig` remains a separate path.
+- Experimental native-architecture comparisons use the explicit
+  `Stage052NativeExecutionConfig` schema. Passing `None` preserves the
+  historical Stage 0--5.2 paths and their guards. The implemented
+  `per_solve_runtime` protocol is `candidate_round_soa_v1`: six shard
+  processes are capped at four compute threads each, and each candidate round
+  crosses the Python/native boundary exactly once with contiguous SoA inputs
+  and structured screening, ranking, cache-journal, exact-result, completion,
+  timing, and SHA-256 outputs. Python independently replays the transaction
+  hash and commits cache/control state only after the complete result passes.
+  Worker, deadline, integrity, or cache-commit failure rolls back the complete
+  transaction and never opens the historical worker pool or another backend.
+  `full_native_alns` and `host_scheduler` are reserved protocol identities and
+  must fail before solve dispatch until their independent worker
+  implementations and differential gates exist. This experimental protocol is
+  not a default-selection or Stage 5.2 readiness promotion.
 - Stage 5.2 safe-rejection acceleration is bounded independently from the
   collision-proof identity stores. The scalar `ScreeningResult` cache is a
   65,536-entry solve-local LRU; the Python/native sequence cache is a

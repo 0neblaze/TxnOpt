@@ -163,14 +163,14 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
 )
 _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
     "cpp/evrptw_core.cpp": (
-        "3ba747c01075da990d0526a2e10efafbf2b79d50db6c0bc88fa8325e00445817"
+        "054e4081f58bfb68323a28ffde2c4dcebfc1659b91f65df1f656f1f84781eb0e"
     ),
-    "src/evrptw/alns.py": "388ab7d663c69e769612f86c5d79a8f37579c578f35ab9fe3f3b28c4574b4f54",
+    "src/evrptw/alns.py": "01c74d66409a707a81b1a5ca37c55608a1719981b8a2f10e5a35a8bfda4b9521",
     "src/evrptw/cache_incremental.py": (
         "babe9c2f6315c73a81fbb4c7cbb6d673035cc62c903aa19ee3d430c94e09bdaa"
     ),
     "src/evrptw/candidate_transaction.py": (
-        "1d510f58b5ca6e68962716e8eabb676d8a4e4e96cea1beac690b82172e987e72"
+        "a8e3ca9f6b6158a40db5e02eb07ca6290a74c1a271a323d84be4611eca486d80"
     ),
     "src/evrptw/experiments/stage03_measurement_review.py": (
         "7299f13a15571ecd6a1617299b8d769baba6a8c3773947304231cdce11438fb8"
