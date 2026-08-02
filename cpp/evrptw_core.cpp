@@ -414,6 +414,15 @@ std::string native_sha256_hex(std::string_view payload) {
     return native_sha256_digest_hex(native_sha256_digest(payload));
 }
 
+std::int64_t stable_int63(std::string_view value) {
+    const auto digest = native_sha256_digest(value);
+    std::uint64_t result = 0;
+    for (std::size_t byte = 0; byte < sizeof(result); ++byte) {
+        result |= static_cast<std::uint64_t>(digest[byte]) << (byte * 8U);
+    }
+    return static_cast<std::int64_t>(result & ((1ULL << 63U) - 1ULL));
+}
+
 void append_evidence_u64(std::string& evidence, std::uint64_t value) {
     for (std::size_t byte = 0; byte < sizeof(value); ++byte) {
         evidence.push_back(
@@ -3043,6 +3052,10 @@ public:
         values[7] = interrupted_;
         values[8] = exact_budget_ >= 0 && started_ >= exact_budget_ ? 1 : 0;
         return output;
+    }
+
+    [[nodiscard]] bool budget_reached() const noexcept {
+        return exact_budget_ >= 0 && started_ >= exact_budget_;
     }
 
 private:
@@ -9239,6 +9252,21 @@ public:
             control, "control", 1);
         auto deadline_array = owned_array_copy<double>(
             deadline_remaining, "deadline_remaining", 1);
+        if (control_array.size() != 5) {
+            throw std::invalid_argument(
+                "full native search control must contain five values");
+        }
+        const auto* search_control = checked_data<std::int64_t>(control_array);
+        if (search_control[0] < 0 || search_control[1] <= 0
+            || search_control[2] <= 0 || search_control[3] <= 0
+            || search_control[4] < -1) {
+            throw std::invalid_argument(
+                "full native search control values are invalid");
+        }
+        PythonRandom prepared_rng(
+            static_cast<std::uint64_t>(search_control[0]));
+        PythonRandom prepared_constraint_rng(
+            static_cast<std::uint64_t>(search_control[0]) ^ 0x5EED23ULL);
         if (offsets_array.size() < 2) {
             throw std::invalid_argument(
                 "full native warm start requires at least one route");
@@ -9396,6 +9424,8 @@ public:
         best_objective_integer_ = std::move(prepared_best_objective_integer);
         best_objective_float_ = std::move(prepared_best_objective_float);
         batch_size_ = checked_data<std::int64_t>(control_array)[2];
+        rng_.emplace(std::move(prepared_rng));
+        constraint_rng_.emplace(std::move(prepared_constraint_rng));
         initialized_ = true;
         return initialized;
     }
@@ -9498,7 +9528,7 @@ public:
             checked_data(canonical_expected_array));
 
         auto round_budget_snapshot = budget_.native_snapshot();
-        budget_.begin_round(context[0], context[1]);
+        budget_.begin_round(context[0], context[2]);
         bool round_protocol_active = false;
         bool negative_store_active = false;
         bool attempted_mark_active = false;
@@ -10391,7 +10421,9 @@ public:
                 throw std::runtime_error(
                     "injected full native constraint-probe envelope failure");
             }
-            commit_pending_composite_noexcept();
+            if (!defer_iteration_commit_) {
+                commit_pending_composite_noexcept();
+            }
             if (candidate_ready) {
                 last_candidate_offsets_ = std::move(candidate_offsets);
                 last_candidate_indices_ = std::move(candidate_indices);
@@ -10509,6 +10541,448 @@ public:
         return result;
     }
 
+    void configure_stage04(
+        py::handle integer_config,
+        py::handle float_config) {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (!initialized_) {
+            throw std::runtime_error(
+                "full native search engine must be initialized before Stage 4");
+        }
+        if (stage04_configured_) {
+            throw std::runtime_error(
+                "full native Stage 4 is already configured for this solve");
+        }
+        if (last_candidate_ready_ || pending_composite_active_) {
+            throw std::runtime_error(
+                "full native Stage 4 cannot be configured during a candidate transaction");
+        }
+        auto integers = owned_array_copy<std::int64_t>(
+            integer_config, "stage04_integer", 1);
+        auto floats = owned_array_copy<double>(
+            float_config, "stage04_float", 1);
+        if (integers.size() != 15 || floats.size() != 15) {
+            throw std::invalid_argument(
+                "full native Stage 4 configuration arrays have an invalid shape");
+        }
+        const auto* integer_values = checked_data<std::int64_t>(integers);
+        const auto* float_values = checked_data<double>(floats);
+        if (integer_values[0] != 1 || integer_values[1] <= 0
+            || integer_values[2] <= 0
+            || (integer_values[3] != 0 && integer_values[3] != 1)) {
+            throw std::invalid_argument(
+                "full native Stage 4 integer configuration is invalid");
+        }
+        for (py::ssize_t index = 0; index < floats.size(); ++index) {
+            if (!std::isfinite(float_values[index])) {
+                throw std::invalid_argument(
+                    "full native Stage 4 float configuration is not finite");
+            }
+        }
+        if (!(float_values[0] > 0.0 && float_values[0] <= 1.0)
+            || !(float_values[1] > 0.0 && float_values[1] < 1.0)
+            || !(float_values[2] >= 0.0 && float_values[2] <= 1.0)) {
+            throw std::invalid_argument(
+                "full native Stage 4 weight configuration is invalid");
+        }
+        std::array<double, 7> rewards{};
+        for (std::size_t index = 0; index < rewards.size(); ++index) {
+            rewards[index] = float_values[index + 4];
+            if (rewards[index] < 0.0 || rewards[index] > 64.0) {
+                throw std::invalid_argument(
+                    "full native Stage 4 reward configuration is invalid");
+            }
+        }
+        stage04_segment_length_ = integer_values[1];
+        stage04_min_calls_ = integer_values[2];
+        stage04_fixed_weights_ = integer_values[3] != 0;
+        stage04_weight_reaction_ = float_values[0];
+        stage04_weight_floor_ = float_values[1];
+        stage04_weight_smoothing_ = float_values[2];
+        stage04_rewards_ = rewards;
+        constraint_weights_.fill(1.0);
+        constraint_segment_rewards_.fill(0.0);
+        constraint_segment_calls_.fill(0);
+        for (auto& totals : constraint_totals_) {
+            totals.fill(0);
+        }
+        last_finished_stage04_iteration_ = -1;
+        last_completed_constraint_iteration_ = -1;
+        stage04_configured_ = true;
+    }
+
+    void record_constraint_stage04_outcome(
+        std::int64_t iteration,
+        std::int64_t operation,
+        bool accepted,
+        std::int64_t comparison,
+        bool is_global_best,
+        bool vehicle_reduction) {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (!stage04_configured_) {
+            throw std::runtime_error(
+                "full native Stage 4 must be configured before recording an outcome");
+        }
+        if (iteration < 0 || operation < 0 || operation >= 4
+            || comparison < -1 || comparison > 1) {
+            throw std::invalid_argument(
+                "full native Stage 4 constraint outcome is invalid");
+        }
+        if (iteration <= last_finished_stage04_iteration_) {
+            throw std::invalid_argument(
+                "full native Stage 4 iteration is already finished");
+        }
+        if (iteration != last_finished_stage04_iteration_ + 1) {
+            throw std::invalid_argument(
+                "full native Stage 4 outcome belongs to a future iteration");
+        }
+        if ((!accepted && (is_global_best || vehicle_reduction))
+            || (accepted && is_global_best && comparison >= 0)
+            || (accepted && vehicle_reduction && comparison >= 0)) {
+            throw std::invalid_argument(
+                "full native Stage 4 constraint outcome flags are inconsistent");
+        }
+        if (last_candidate_ready_ || pending_composite_active_) {
+            throw std::runtime_error(
+                "full native Stage 4 outcome cannot cross a candidate transaction");
+        }
+        auto next_rewards = constraint_segment_rewards_;
+        auto next_calls = constraint_segment_calls_;
+        auto next_totals = constraint_totals_;
+        accumulate_constraint_stage04_outcome_noexcept(
+            static_cast<std::size_t>(operation), accepted, comparison,
+            is_global_best, vehicle_reduction,
+            next_rewards, next_calls, next_totals);
+        constraint_segment_rewards_ = next_rewards;
+        constraint_segment_calls_ = next_calls;
+        constraint_totals_ = next_totals;
+    }
+
+    py::tuple constraint_stage04_state() const {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (!stage04_configured_) {
+            throw std::runtime_error(
+                "full native Stage 4 must be configured before state inspection");
+        }
+        py::array_t<double> weights(4);
+        py::array_t<double> reward_sums(4);
+        py::array_t<std::int64_t> segment_calls(4);
+        py::array_t<std::int64_t> totals({py::ssize_t(4), py::ssize_t(8)});
+        std::copy(
+            constraint_weights_.begin(), constraint_weights_.end(),
+            checked_data(weights));
+        std::copy(
+            constraint_segment_rewards_.begin(),
+            constraint_segment_rewards_.end(),
+            checked_data(reward_sums));
+        std::copy(
+            constraint_segment_calls_.begin(), constraint_segment_calls_.end(),
+            checked_data(segment_calls));
+        for (std::size_t operation = 0; operation < 4; ++operation) {
+            std::copy(
+                constraint_totals_[operation].begin(),
+                constraint_totals_[operation].end(),
+                checked_data(totals) + operation * 8);
+        }
+        return py::make_tuple(
+            std::move(weights), std::move(reward_sums),
+            std::move(segment_calls), std::move(totals));
+    }
+
+    py::tuple finish_stage04_iteration(
+        std::int64_t iteration,
+        bool budget_boundary) {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (!stage04_configured_ || iteration < 0) {
+            throw std::invalid_argument(
+                "full native Stage 4 boundary state is invalid");
+        }
+        if (iteration != last_finished_stage04_iteration_ + 1) {
+            throw std::invalid_argument(
+                "full native Stage 4 iterations must finish exactly once in order");
+        }
+        if (last_candidate_ready_ || pending_composite_active_) {
+            throw std::runtime_error(
+                "full native Stage 4 boundary cannot cross a candidate transaction");
+        }
+        py::array_t<std::int64_t> statuses(4);
+        py::array_t<double> old_new_weights(
+            {py::ssize_t(4), py::ssize_t(2)});
+        py::array_t<std::int64_t> calls_at_boundary(4);
+        py::array_t<double> rewards_at_boundary(4);
+        auto* status_values = checked_data(statuses);
+        auto* weight_values = checked_data(old_new_weights);
+        std::copy(
+            constraint_segment_calls_.begin(), constraint_segment_calls_.end(),
+            checked_data(calls_at_boundary));
+        std::copy(
+            constraint_segment_rewards_.begin(),
+            constraint_segment_rewards_.end(),
+            checked_data(rewards_at_boundary));
+        auto next_weights = constraint_weights_;
+        auto next_rewards = constraint_segment_rewards_;
+        auto next_calls = constraint_segment_calls_;
+        const auto is_boundary =
+            (iteration + 1) % stage04_segment_length_ == 0;
+        for (std::size_t index = 0; index < 4; ++index) {
+            status_values[index] = -1;
+            weight_values[index * 2] = constraint_weights_[index];
+            weight_values[index * 2 + 1] = constraint_weights_[index];
+        }
+        const auto effective_budget_boundary =
+            budget_boundary || budget_.budget_reached();
+        if (is_boundary && !effective_budget_boundary
+            && !stage04_fixed_weights_) {
+            for (std::size_t index = 0; index < 4; ++index) {
+                if (next_calls[index] >= stage04_min_calls_) {
+                    const auto average = next_rewards[index]
+                        / static_cast<double>(next_calls[index]);
+                    const auto reacted = std::max(
+                        stage04_weight_floor_,
+                        (1.0 - stage04_weight_reaction_) * next_weights[index]
+                            + stage04_weight_reaction_ * average);
+                    next_weights[index] = stage04_weight_smoothing_
+                            * next_weights[index]
+                        + (1.0 - stage04_weight_smoothing_) * reacted;
+                    status_values[index] = 1;
+                    weight_values[index * 2 + 1] = next_weights[index];
+                } else {
+                    status_values[index] = 0;
+                }
+                next_rewards[index] = 0.0;
+                next_calls[index] = 0;
+            }
+        }
+        auto result = py::make_tuple(
+            std::move(statuses), std::move(old_new_weights),
+            std::move(calls_at_boundary), std::move(rewards_at_boundary));
+        constraint_weights_ = next_weights;
+        constraint_segment_rewards_ = next_rewards;
+        constraint_segment_calls_ = next_calls;
+        last_finished_stage04_iteration_ = iteration;
+        return result;
+    }
+
+    py::tuple constraint_iteration(
+        std::int64_t iteration,
+        std::int64_t stagnation_iterations,
+        bool global_best_reset,
+        py::handle thresholds,
+        py::handle fractions,
+        py::handle deadline_remaining,
+        py::handle batch_size,
+        std::int64_t route_change_limit) {
+        const auto iteration_started = std::chrono::steady_clock::now();
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (!initialized_ || !constraint_rng_.has_value()) {
+            throw std::runtime_error(
+                "full native search engine must be initialized before an iteration");
+        }
+        if (!stage04_configured_) {
+            throw std::runtime_error(
+                "full native Stage 4 must be configured before an iteration");
+        }
+        if (last_candidate_ready_) {
+            throw std::runtime_error(
+                "full native search engine has an unapplied candidate");
+        }
+        if (iteration < 0 || stagnation_iterations < 0) {
+            throw std::invalid_argument(
+                "full native constraint iteration values cannot be negative");
+        }
+        if (iteration <= last_finished_stage04_iteration_) {
+            throw std::invalid_argument(
+                "full native Stage 4 iteration is already finished");
+        }
+        if (iteration != last_finished_stage04_iteration_ + 1) {
+            throw std::invalid_argument(
+                "full native constraint iteration is not the active global iteration");
+        }
+        if (iteration == last_completed_constraint_iteration_) {
+            throw std::invalid_argument(
+                "full native constraint iteration already completed");
+        }
+        auto deadline_array = owned_array_copy<double>(
+            deadline_remaining, "deadline_remaining", 1);
+        if (deadline_array.size() != 1
+            || !std::isfinite(checked_data<double>(deadline_array)[0])
+            || checked_data<double>(deadline_array)[0] <= 0.0) {
+            throw std::invalid_argument(
+                "full native constraint iteration deadline is invalid");
+        }
+        const auto deadline_seconds = checked_data<double>(deadline_array)[0];
+        const auto remaining_at_boundary = [&]() {
+            return deadline_seconds - std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - iteration_started).count();
+        };
+        const auto require_deadline = [&]() {
+            if (remaining_at_boundary() <= 0.0) {
+                throw std::runtime_error(
+                    "full native constraint iteration reached its deadline");
+            }
+        };
+        auto next_constraint_rng = *constraint_rng_;
+        auto next_constraint_weights = constraint_weights_;
+        auto next_segment_rewards = constraint_segment_rewards_;
+        auto next_segment_calls = constraint_segment_calls_;
+        auto next_totals = constraint_totals_;
+        const auto operation = iteration < 4
+            ? iteration
+            : static_cast<std::int64_t>(next_constraint_rng.weighted_index(
+                std::vector<double>(next_constraint_weights.begin(),
+                                    next_constraint_weights.end())));
+        auto selection = dynamic_removal_selection_v2(
+            static_cast<std::int64_t>(all_customers_.size()),
+            stagnation_iterations,
+            iteration,
+            thresholds,
+            fractions,
+            global_best_reset);
+        const auto requested_count = checked_data<std::int64_t>(selection)[1];
+        if (requested_count <= 0) {
+            throw std::runtime_error(
+                "full native constraint iteration has no removable customer");
+        }
+        const auto probe_seed = next_constraint_rng.randbelow(1ULL << 32U);
+        py::array_t<std::int64_t> outcome(6);
+        auto* outcome_values = checked_data(outcome);
+        outcome_values[0] = operation;
+        outcome_values[1] = static_cast<std::int64_t>(probe_seed);
+        outcome_values[2] = 0;
+        outcome_values[3] = 0;
+        outcome_values[4] = 0;
+        outcome_values[5] = 0;
+        py::tuple result(3);
+        result[0] = selection;
+        result[2] = outcome;
+        py::array_t<std::int64_t> context_ids(3);
+        auto* context = checked_data(context_ids);
+        constexpr std::array<std::string_view, 4> operation_names{
+            "station_pressure",
+            "time_window_conflict",
+            "worst_energy_detour",
+            "shaw_related",
+        };
+        context[0] = stable_int63("constraint_lane");
+        context[1] = stable_int63(
+            operation_names[static_cast<std::size_t>(operation)]);
+        context[2] = iteration;
+        py::array_t<double> adjusted_deadline(1);
+        require_deadline();
+        checked_data(adjusted_deadline)[0] = remaining_at_boundary();
+        defer_iteration_commit_ = true;
+        bool iteration_candidate_ready = false;
+        try {
+            auto probe = constraint_probe(
+                operation,
+                requested_count,
+                probe_seed,
+                context_ids,
+                adjusted_deadline,
+                batch_size,
+                route_change_limit);
+            result[1] = probe;
+            iteration_candidate_ready = last_candidate_ready_;
+            outcome_values[2] = iteration_candidate_ready ? 1 : 0;
+            if (constraint_iteration_deadline_injection_) {
+                constraint_iteration_deadline_injection_ = false;
+                throw std::runtime_error(
+                    "injected full native constraint-iteration deadline before commit");
+            }
+            require_deadline();
+            std::int64_t comparison = 1;
+            if (iteration_candidate_ready) {
+                const auto objective_key = [](
+                    const py::array_t<std::int64_t>& integers,
+                    const py::array_t<double>& floats) {
+                    constexpr auto scale = 1'000'000'000.0;
+                    const auto* integer_values =
+                        checked_data<std::int64_t>(integers);
+                    const auto* float_values = checked_data<double>(floats);
+                    return std::make_tuple(
+                        integer_values[0],
+                        std::nearbyint(float_values[0] * scale) / scale,
+                        std::nearbyint(float_values[1] * scale) / scale,
+                        integer_values[1]);
+                };
+                const auto candidate_key = objective_key(
+                    last_candidate_objective_integer_,
+                    last_candidate_objective_float_);
+                const auto current_key = objective_key(
+                    current_objective_integer_, current_objective_float_);
+                comparison = candidate_key < current_key
+                    ? -1
+                    : candidate_key == current_key ? 0 : 1;
+            }
+            if (iteration_candidate_ready && !budget_.budget_reached()) {
+                const auto current_distance =
+                    checked_data<double>(current_objective_float_)[0];
+                const auto applied = apply_last_candidate(
+                    std::max(1.0, current_distance * 0.05), 0.0);
+                outcome_values[2] = 1;
+                outcome_values[3] = PyLong_AS_LONG(applied[0].ptr());
+                outcome_values[4] = PyLong_AS_LONG(applied[1].ptr());
+                outcome_values[5] = PyLong_AS_LONG(applied[2].ptr());
+            } else if (iteration_candidate_ready) {
+                last_candidate_ready_ = false;
+            }
+            const auto accepted = outcome_values[3] != 0;
+            const auto improved_best = outcome_values[4] != 0;
+            const auto vehicle_reduction = outcome_values[5] != 0;
+            accumulate_constraint_stage04_outcome_noexcept(
+                static_cast<std::size_t>(operation), accepted, comparison,
+                improved_best, vehicle_reduction,
+                next_segment_rewards, next_segment_calls, next_totals);
+            commit_pending_composite_noexcept();
+            defer_iteration_commit_ = false;
+            *constraint_rng_ = std::move(next_constraint_rng);
+            constraint_weights_ = next_constraint_weights;
+            constraint_segment_rewards_ = next_segment_rewards;
+            constraint_segment_calls_ = next_segment_calls;
+            constraint_totals_ = next_totals;
+            last_completed_constraint_iteration_ = iteration;
+            return result;
+        } catch (...) {
+            defer_iteration_commit_ = false;
+            if (pending_composite_active_) {
+                rollback_pending_composite();
+            }
+            if (iteration_candidate_ready) {
+                last_candidate_ready_ = false;
+            }
+            throw;
+        }
+    }
+
+    void inject_constraint_iteration_deadline_before_commit_once() {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        constraint_iteration_deadline_injection_ = true;
+    }
+
     void inject_constraint_probe_envelope_failure_once() {
         std::unique_lock state_lock(state_mutex_, std::try_to_lock);
         if (!state_lock.owns_lock()) {
@@ -10618,7 +11092,9 @@ private:
     std::int64_t batch_size_ = 0;
     std::int64_t commit_failure_injection_ = 0;
     bool probe_envelope_failure_injection_ = false;
+    bool constraint_iteration_deadline_injection_ = false;
     bool defer_composite_commit_ = false;
+    bool defer_iteration_commit_ = false;
     bool pending_composite_active_ = false;
     bool pending_round_protocol_ = false;
     bool pending_negative_store_ = false;
@@ -10655,6 +11131,61 @@ private:
     py::tuple last_candidate_exact_payload_;
     py::array_t<std::int64_t> last_candidate_objective_integer_;
     py::array_t<double> last_candidate_objective_float_;
+    std::optional<PythonRandom> rng_;
+    std::optional<PythonRandom> constraint_rng_;
+    bool stage04_configured_ = false;
+    bool stage04_fixed_weights_ = false;
+    std::int64_t stage04_segment_length_ = 0;
+    std::int64_t stage04_min_calls_ = 0;
+    double stage04_weight_reaction_ = 0.0;
+    double stage04_weight_floor_ = 0.0;
+    double stage04_weight_smoothing_ = 0.0;
+    std::array<double, 7> stage04_rewards_{};
+    std::array<double, 4> constraint_weights_{1.0, 1.0, 1.0, 1.0};
+    std::array<double, 4> constraint_segment_rewards_{};
+    std::array<std::int64_t, 4> constraint_segment_calls_{};
+    std::array<std::array<std::int64_t, 8>, 4> constraint_totals_{};
+    std::int64_t last_finished_stage04_iteration_ = -1;
+    std::int64_t last_completed_constraint_iteration_ = -1;
+
+    void accumulate_constraint_stage04_outcome_noexcept(
+        std::size_t operation,
+        bool accepted,
+        std::int64_t comparison,
+        bool is_global_best,
+        bool vehicle_reduction,
+        std::array<double, 4>& segment_rewards,
+        std::array<std::int64_t, 4>& segment_calls,
+        std::array<std::array<std::int64_t, 8>, 4>& totals) const noexcept {
+        auto& operation_totals = totals[operation];
+        ++operation_totals[0];
+        auto reward = stage04_rewards_[0];
+        if (accepted) {
+            ++operation_totals[1];
+            if (comparison < 0) {
+                ++operation_totals[2];
+            } else if (comparison == 0) {
+                ++operation_totals[3];
+            } else {
+                ++operation_totals[4];
+            }
+            reward = is_global_best
+                ? (vehicle_reduction ? stage04_rewards_[6] : stage04_rewards_[5])
+                : comparison < 0
+                ? (vehicle_reduction ? stage04_rewards_[4] : stage04_rewards_[3])
+                : comparison == 0 ? stage04_rewards_[2] : stage04_rewards_[1];
+            if (is_global_best) {
+                ++operation_totals[6];
+            }
+            if (vehicle_reduction) {
+                ++operation_totals[7];
+            }
+        } else {
+            ++operation_totals[5];
+        }
+        segment_rewards[operation] += reward;
+        ++segment_calls[operation];
+    }
 
     static py::tuple owned_exact_state_copy(const py::tuple& payload) {
         if (payload.size() < 6) {
@@ -10880,6 +11411,7 @@ py::tuple full_native_alns_v2(
         initial_route_indices,
         control,
         deadline_remaining));
+    engine.configure_stage04(stage04_integer_array, stage04_float_array);
     if (!engine.initialized()) {
         throw std::logic_error("full native v2 search engine lost initialization state");
     }
@@ -11534,6 +12066,29 @@ PYBIND11_MODULE(_core, module) {
         .def(
             "apply_last_candidate", &NativeSearchEngineV2::apply_last_candidate,
             py::arg("temperature"), py::arg("random_draw"))
+        .def(
+            "configure_stage04", &NativeSearchEngineV2::configure_stage04,
+            py::arg("integer_config"), py::arg("float_config"))
+        .def(
+            "constraint_stage04_state",
+            &NativeSearchEngineV2::constraint_stage04_state)
+        .def(
+            "record_constraint_stage04_outcome",
+            &NativeSearchEngineV2::record_constraint_stage04_outcome,
+            py::arg("iteration"), py::arg("operation"),
+            py::arg("accepted"), py::arg("comparison"),
+            py::arg("is_global_best"), py::arg("vehicle_reduction"))
+        .def(
+            "finish_stage04_iteration",
+            &NativeSearchEngineV2::finish_stage04_iteration,
+            py::arg("iteration"), py::arg("budget_boundary"))
+        .def(
+            "constraint_iteration", &NativeSearchEngineV2::constraint_iteration,
+            py::arg("iteration"), py::arg("stagnation_iterations"),
+            py::arg("global_best_reset"), py::arg("thresholds"),
+            py::arg("fractions"), py::arg("deadline_remaining"),
+            py::arg("batch_size"),
+            py::arg("route_change_limit"))
         .def("initialized", &NativeSearchEngineV2::initialized)
         .def(
             "inject_commit_failure_once",
@@ -11542,6 +12097,10 @@ PYBIND11_MODULE(_core, module) {
         .def(
             "inject_constraint_probe_envelope_failure_once",
             &NativeSearchEngineV2::inject_constraint_probe_envelope_failure_once)
+        .def(
+            "inject_constraint_iteration_deadline_before_commit_once",
+            &NativeSearchEngineV2::
+                inject_constraint_iteration_deadline_before_commit_once)
         .def("state", &NativeSearchEngineV2::state)
         .def("solution_state", &NativeSearchEngineV2::solution_state)
         .def(

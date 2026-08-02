@@ -356,9 +356,89 @@ class NativeSearchEngineV2:
         temperature: float,
         random_draw: float,
     ) -> tuple[int, int, int]: ...
+    def configure_stage04(
+        self,
+        integer_config: npt.NDArray[np.int64],
+        float_config: npt.NDArray[np.float64],
+    ) -> None: ...
+    def constraint_stage04_state(
+        self,
+    ) -> tuple[
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+    ]: ...
+    def record_constraint_stage04_outcome(
+        self,
+        iteration: int,
+        operation: int,
+        accepted: bool,
+        comparison: int,
+        is_global_best: bool,
+        vehicle_reduction: bool,
+    ) -> None: ...
+    def finish_stage04_iteration(
+        self,
+        iteration: int,
+        budget_boundary: bool,
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+    ]: ...
+    def constraint_iteration(
+        self,
+        iteration: int,
+        stagnation_iterations: int,
+        global_best_reset: bool,
+        thresholds: npt.NDArray[np.int64],
+        fractions: npt.NDArray[np.float64],
+        deadline_remaining: npt.NDArray[np.float64],
+        batch_size: npt.NDArray[np.int64],
+        route_change_limit: int,
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        tuple[
+            tuple[
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+                npt.NDArray[np.float64],
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+            ],
+            tuple[
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+            ]
+            | None,
+            tuple[
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+                npt.NDArray[np.float64],
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+                str,
+            ]
+            | None,
+        ],
+        npt.NDArray[np.int64],
+    ]: ...
     def initialized(self) -> bool: ...
     def inject_commit_failure_once(self, step: int) -> None: ...
     def inject_constraint_probe_envelope_failure_once(self) -> None: ...
+    def inject_constraint_iteration_deadline_before_commit_once(self) -> None: ...
     def state(
         self,
     ) -> tuple[

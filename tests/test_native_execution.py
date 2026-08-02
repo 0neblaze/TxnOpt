@@ -34,6 +34,8 @@ from evrptw.experiments.stage052_native_architectures import (
 from evrptw.measurement import CheapScreeningConfig, MeasurementConfig, Stage03Trace
 from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.native_execution import (
+    FULL_NATIVE_STAGE04_FLOAT_FIELDS,
+    FULL_NATIVE_STAGE04_INTEGER_FIELDS,
     NATIVE_EXECUTION_SCHEMA_VERSION,
     NativeCandidateRoundRequest,
     NativeCandidateRoundResult,
@@ -116,6 +118,20 @@ def _full_native_solve_kwargs() -> dict[str, object]:
         "cache_incremental_config": CacheIncrementalConfig(enabled=True),
         "stage04_config": Stage04Config(),
     }
+
+
+def _native_stage04_arrays(
+    config: Stage04Config,
+) -> tuple[np.ndarray, np.ndarray]:
+    integer = np.asarray(
+        [int(getattr(config, name)) for name in FULL_NATIVE_STAGE04_INTEGER_FIELDS],
+        dtype=np.int64,
+    )
+    floating = np.asarray(
+        [float(getattr(config, name)) for name in FULL_NATIVE_STAGE04_FLOAT_FIELDS],
+        dtype=np.float64,
+    )
+    return integer, floating
 
 
 @pytest.fixture(scope="module")
@@ -1930,7 +1946,7 @@ def test_native_search_engine_plan_transaction_matches_python_across_rounds(
         packed_plans,
         packed_routes,
         packed_indices,
-        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([2, 3, 7], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         np.asarray([1, 2, 3, 4], dtype=np.int64),
@@ -1963,7 +1979,7 @@ def test_native_search_engine_plan_transaction_matches_python_across_rounds(
         packed_plans,
         packed_routes,
         packed_indices,
-        np.asarray([2, 8, 3], dtype=np.int64),
+        np.asarray([2, 3, 8], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         np.asarray([1, 2, 3, 4], dtype=np.int64),
@@ -2033,7 +2049,7 @@ def test_native_search_engine_deadline_before_exact_rolls_back_logical_state() -
             plan_offsets,
             route_offsets,
             route_indices,
-            np.asarray([2, 7, 3], dtype=np.int64),
+            np.asarray([2, 3, 7], dtype=np.int64),
             np.asarray([np.nextafter(0.0, 1.0)], dtype=np.float64),
             np.asarray([128], dtype=np.int64),
             np.asarray([1, 2], dtype=np.int64),
@@ -2052,7 +2068,7 @@ def test_native_search_engine_deadline_before_exact_rolls_back_logical_state() -
         plan_offsets,
         route_offsets,
         route_indices,
-        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([2, 3, 7], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         np.asarray([1, 2], dtype=np.int64),
@@ -2158,7 +2174,7 @@ def test_native_search_engine_rejects_incomplete_and_duplicate_customer_plans() 
         np.asarray([0, 1, 2], dtype=np.int64),
         np.asarray([0, 1, 3], dtype=np.int64),
         np.asarray([1, 1, 1], dtype=np.int64),
-        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([2, 3, 7], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         np.asarray([1, 2], dtype=np.int64),
@@ -2175,7 +2191,7 @@ def test_native_search_engine_rejects_incomplete_and_duplicate_customer_plans() 
             np.asarray([0, 1], dtype=np.int64),
             np.asarray([0, 1], dtype=np.int64),
             np.asarray([1], dtype=np.int64),
-            np.asarray([2, 8, 3], dtype=np.int64),
+            np.asarray([2, 3, 8], dtype=np.int64),
             np.asarray([30.0], dtype=np.float64),
             np.asarray([128], dtype=np.int64),
             np.asarray([1], dtype=np.int64),
@@ -2212,7 +2228,7 @@ def test_native_search_engine_empty_selection_still_enforces_deadline_atomically
             np.asarray([0, 1], dtype=np.int64),
             np.asarray([0, 1], dtype=np.int64),
             np.asarray([1], dtype=np.int64),
-            np.asarray([2, 7, 3], dtype=np.int64),
+            np.asarray([2, 3, 7], dtype=np.int64),
             np.asarray([np.nextafter(0.0, 1.0)], dtype=np.float64),
             np.asarray([128], dtype=np.int64),
             np.asarray([1, 2], dtype=np.int64),
@@ -2254,24 +2270,24 @@ def test_native_search_engine_hash_binds_context_for_already_attempted_plan() ->
     )
     initial_context = engine.evaluate_plans(
         *arguments,
-        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([2, 3, 7], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         np.asarray([1, 2], dtype=np.int64),
     )
     assert initial_context[12] == (
-        "f6f272ad9d127cf8efac781b0ad8ee4dcef9b2595eb5f8bb1265214d07c51c43"
+        "753e73c382fb262bbe85c5ef8f6e7e64c04f30ed9ba5ccef280fd70acd680115"
     )
     first_context = engine.evaluate_plans(
         *arguments,
-        np.asarray([2, 8, 3], dtype=np.int64),
+        np.asarray([2, 3, 8], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         np.asarray([1, 2], dtype=np.int64),
     )
     second_context = engine.evaluate_plans(
         *arguments,
-        np.asarray([2, 8, 4], dtype=np.int64),
+        np.asarray([2, 4, 8], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         np.asarray([1, 2], dtype=np.int64),
@@ -2283,7 +2299,7 @@ def test_native_search_engine_hash_binds_context_for_already_attempted_plan() ->
 
     same_semantics_different_wall_clock_remainder = engine.evaluate_plans(
         *arguments,
-        np.asarray([2, 8, 4], dtype=np.int64),
+        np.asarray([2, 4, 8], dtype=np.int64),
         np.asarray([29.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         np.asarray([2, 1], dtype=np.int64),
@@ -2339,7 +2355,7 @@ def test_native_search_engine_composite_commit_failure_rolls_back_logical_state(
     ):
         engine.evaluate_plans(
             *arguments,
-            np.asarray([2, 7, 3], dtype=np.int64),
+            np.asarray([2, 3, 7], dtype=np.int64),
             np.asarray([30.0], dtype=np.float64),
             np.asarray([128], dtype=np.int64),
             np.asarray([1, 2, 3, 4], dtype=np.int64),
@@ -2354,7 +2370,7 @@ def test_native_search_engine_composite_commit_failure_rolls_back_logical_state(
 
     recovered = engine.evaluate_plans(
         *arguments,
-        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([2, 3, 7], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         np.asarray([1, 2, 3, 4], dtype=np.int64),
@@ -2393,7 +2409,7 @@ def test_native_search_engine_returns_exact_objective_order_not_optimistic_order
         np.asarray([0, 2, 4], dtype=np.int64),
         np.asarray([0, 2, 4, 5, 8], dtype=np.int64),
         np.asarray([1, 2, 3, 4, 1, 3, 2, 4], dtype=np.int64),
-        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([2, 3, 7], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         np.asarray([1, 2, 3, 4], dtype=np.int64),
@@ -2401,6 +2417,7 @@ def test_native_search_engine_returns_exact_objective_order_not_optimistic_order
 
     assert result[0].tolist() == [0, 1]
     assert result[11].tolist() == [1, 0]
+    assert engine.state()[1].tolist()[1:3] == [2, 7]
 
 
 def test_native_search_engine_counts_exact_infeasible_warm_start_as_completed() -> None:
@@ -2470,14 +2487,14 @@ def test_native_search_engine_negative_screen_cache_is_persistent_and_observable
 
     first = engine.evaluate_plans(
         *arguments,
-        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([2, 3, 7], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         np.asarray([1, 2], dtype=np.int64),
     )
     second = engine.evaluate_plans(
         *arguments,
-        np.asarray([2, 8, 3], dtype=np.int64),
+        np.asarray([2, 3, 8], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         np.asarray([1, 2], dtype=np.int64),
@@ -2520,7 +2537,7 @@ def test_native_search_engine_preserves_python_duplicate_plan_semantics() -> Non
         np.asarray([0, 1, 2], dtype=np.int64),
         np.asarray([0, 2, 4], dtype=np.int64),
         np.asarray([2, 1, 2, 1], dtype=np.int64),
-        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([2, 3, 7], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         np.asarray([1, 2], dtype=np.int64),
@@ -2583,7 +2600,7 @@ def test_native_search_engine_owns_problem_and_warm_start_arrays() -> None:
         np.asarray([0, 1], dtype=np.int64),
         np.asarray([0, 2], dtype=np.int64),
         np.asarray([2, 1], dtype=np.int64),
-        np.asarray([2, 7, 3], dtype=np.int64),
+        np.asarray([2, 3, 7], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         np.asarray([1, 2], dtype=np.int64),
@@ -2620,7 +2637,7 @@ def test_native_search_engine_constraint_probe_composes_all_native_layers() -> N
         0,
         1,
         0x5EED,
-        np.asarray([5, 0, 7], dtype=np.int64),
+        np.asarray([5, 7, 0], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         -1,
@@ -2646,7 +2663,7 @@ def test_native_search_engine_constraint_probe_composes_all_native_layers() -> N
             0,
             1,
             0x5EED,
-            np.asarray([5, 1, 7], dtype=np.int64),
+            np.asarray([5, 7, 1], dtype=np.int64),
             np.asarray([30.0], dtype=np.float64),
             np.asarray([128], dtype=np.int64),
             -1,
@@ -2687,6 +2704,435 @@ def test_native_search_engine_constraint_probe_composes_all_native_layers() -> N
         engine.apply_last_candidate(1.0, 0.5)
 
 
+def test_native_search_engine_constraint_iteration_owns_python_rng_and_policy() -> None:
+    """The public search-step seam owns RNG, selection, transaction, and apply."""
+
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+
+    selection, probe, outcome = engine.constraint_iteration(
+        0,
+        0,
+        False,
+        np.asarray([4, 8, 3], dtype=np.int64),
+        np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+
+    assert selection.tolist() == [0, 1, 1, 1, 0, 0, 0]
+    assert outcome.tolist() == [0, 2488652245, 1, 1, 0, 0]
+    assert probe[0][2].tolist() == [2]
+    assert probe[1][1].tolist() == [2, 1]
+    assert probe[2][11].tolist() == [0]
+    state = engine.solution_state()
+    assert state[0].tolist() == [0, 2]
+    assert state[1].tolist() == [2, 1]
+    assert state[4].tolist() == [0, 2]
+    assert state[5].tolist() == [1, 2]
+    engine.finish_stage04_iteration(0, False)
+    later_outcomes = []
+    for iteration in range(1, 4):
+        _selection, _probe, later_outcome = engine.constraint_iteration(
+            iteration,
+            0,
+            False,
+            np.asarray([4, 8, 3], dtype=np.int64),
+            np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        )
+        later_outcomes.append(later_outcome.tolist())
+        engine.finish_stage04_iteration(iteration, False)
+    assert later_outcomes == [
+        [1, 3131849611, 1, 1, 0, 0],
+        [2, 338673043, 0, 0, 0, 0],
+        [3, 124452527, 0, 0, 0, 0],
+    ]
+    engine.finish_stage04_iteration(4, False)
+    engine.finish_stage04_iteration(5, False)
+    _selection, _probe, weighted_outcome = engine.constraint_iteration(
+        6,
+        0,
+        False,
+        np.asarray([4, 8, 3], dtype=np.int64),
+        np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+    assert weighted_outcome.tolist() == [1, 3124553668, 0, 0, 0, 0]
+
+
+def test_native_constraint_iteration_deadline_boundary_rolls_back_all_state() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    before = tuple(
+        value.tolist() if isinstance(value, np.ndarray) else value
+        for value in engine.state()
+    )
+
+    engine.inject_constraint_iteration_deadline_before_commit_once()
+    with pytest.raises(RuntimeError, match="deadline before commit"):
+        engine.constraint_iteration(
+            0,
+            0,
+            False,
+            np.asarray([4, 8, 3], dtype=np.int64),
+            np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        )
+
+    after = tuple(
+        value.tolist() if isinstance(value, np.ndarray) else value
+        for value in engine.state()
+    )
+    assert after[0] == before[0]
+    assert after[2:] == before[2:]
+    assert after[1][0] == 1
+    assert after[1][2:5] == [0, 1, 0]
+    assert after[1][5:8] == [2, 2, 0]
+    assert engine.solution_state()[1].tolist() == [1, 2]
+    _selection, _probe, same_round = engine.constraint_iteration(
+        0,
+        0,
+        False,
+        np.asarray([4, 8, 3], dtype=np.int64),
+        np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+    assert same_round.tolist() == [0, 2488652245, 0, 0, 0, 0]
+    engine.finish_stage04_iteration(0, False)
+    _selection, _probe, next_round = engine.constraint_iteration(
+        1,
+        0,
+        False,
+        np.asarray([4, 8, 3], dtype=np.int64),
+        np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+    assert next_round.tolist() == [1, 3131849611, 1, 1, 0, 0]
+
+
+def test_native_constraint_iteration_rejects_at_exact_budget_boundary() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        2, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 2], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(
+        replace(Stage04Config(), segment_length=1, min_calls_per_operator=1)
+    )
+    engine.configure_stage04(stage04_integer, stage04_float)
+
+    _selection, _probe, outcome = engine.constraint_iteration(
+        0,
+        0,
+        False,
+        np.asarray([4, 8, 3], dtype=np.int64),
+        np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+
+    assert outcome.tolist() == [0, 2488652245, 1, 0, 0, 0]
+    assert engine.solution_state()[1].tolist() == [1, 2]
+    assert engine.state()[1].tolist()[8] == 1
+    boundary_statuses = engine.finish_stage04_iteration(0, False)[0]
+    assert boundary_statuses.tolist() == [-1, -1, -1, -1]
+    assert engine.constraint_stage04_state()[2].tolist() == [1, 0, 0, 0]
+    with pytest.raises(RuntimeError, match="no prepared candidate"):
+        engine.apply_last_candidate(1.0, 0.0)
+
+
+def test_native_constraint_iteration_applies_stage04_segment_weights() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    config = replace(
+        Stage04Config(),
+        segment_length=1,
+        min_calls_per_operator=1,
+        reward_accepted_equal=2.0,
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(config)
+    engine.configure_stage04(stage04_integer, stage04_float)
+
+    engine.constraint_iteration(
+        0,
+        0,
+        False,
+        np.asarray([4, 8, 3], dtype=np.int64),
+        np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+    statuses, old_new_weights, segment_calls_at_boundary, rewards_at_boundary = (
+        engine.finish_stage04_iteration(0, False)
+    )
+    weights, reward_sums, segment_calls, totals = engine.constraint_stage04_state()
+
+    assert statuses.tolist() == [1, 0, 0, 0]
+    np.testing.assert_allclose(old_new_weights[0], np.asarray([1.0, 1.04]))
+    assert segment_calls_at_boundary.tolist() == [1, 0, 0, 0]
+    np.testing.assert_allclose(rewards_at_boundary, np.asarray([2.0, 0.0, 0.0, 0.0]))
+    np.testing.assert_allclose(weights, np.asarray([1.04, 1.0, 1.0, 1.0]))
+    np.testing.assert_allclose(reward_sums, np.zeros(4))
+    assert segment_calls.tolist() == [0, 0, 0, 0]
+    assert totals.tolist()[0] == [1, 1, 0, 1, 0, 0, 0, 0]
+
+
+def test_native_stage04_constraint_statistics_are_shared_across_lanes() -> None:
+    """Main and constraint lanes feed one shared constraint-operator record."""
+
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    config = replace(
+        Stage04Config(),
+        segment_length=1,
+        min_calls_per_operator=2,
+        reward_accepted_equal=2.0,
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(config)
+    engine.configure_stage04(stage04_integer, stage04_float)
+
+    engine.record_constraint_stage04_outcome(0, 0, True, 0, False, False)
+    engine.constraint_iteration(
+        0,
+        0,
+        False,
+        np.asarray([4, 8, 3], dtype=np.int64),
+        np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+    statuses, old_new_weights, calls, rewards = engine.finish_stage04_iteration(
+        0, False
+    )
+    weights, reward_sums, segment_calls, totals = engine.constraint_stage04_state()
+
+    assert statuses.tolist() == [1, 0, 0, 0]
+    np.testing.assert_allclose(old_new_weights[0], np.asarray([1.0, 1.04]))
+    assert calls.tolist() == [2, 0, 0, 0]
+    np.testing.assert_allclose(rewards, np.asarray([4.0, 0.0, 0.0, 0.0]))
+    np.testing.assert_allclose(weights, np.asarray([1.04, 1.0, 1.0, 1.0]))
+    np.testing.assert_allclose(reward_sums, np.zeros(4))
+    assert segment_calls.tolist() == [0, 0, 0, 0]
+    assert totals.tolist()[0] == [2, 2, 0, 2, 0, 0, 0, 0]
+
+
+def test_native_stage04_iteration_finish_is_exactly_once_and_monotonic() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    with pytest.raises(RuntimeError, match="already configured"):
+        engine.configure_stage04(stage04_integer, stage04_float)
+
+    with pytest.raises(ValueError, match="exactly once in order"):
+        engine.finish_stage04_iteration(1, False)
+    engine.finish_stage04_iteration(0, False)
+    with pytest.raises(ValueError, match="exactly once in order"):
+        engine.finish_stage04_iteration(0, False)
+    with pytest.raises(ValueError, match="already finished"):
+        engine.record_constraint_stage04_outcome(0, 0, False, 1, False, False)
+    with pytest.raises(ValueError, match="already finished"):
+        engine.constraint_iteration(
+            0,
+            0,
+            False,
+            np.asarray([4, 8, 3], dtype=np.int64),
+            np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        )
+    engine.finish_stage04_iteration(1, False)
+    with pytest.raises(ValueError, match="future iteration"):
+        engine.record_constraint_stage04_outcome(3, 0, False, 1, False, False)
+
+
+def test_native_constraint_iteration_preserves_preexisting_unapplied_candidate() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    engine.constraint_probe(
+        0,
+        1,
+        0x5EED,
+        np.asarray([5, 7, 0], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+
+    with pytest.raises(RuntimeError, match="unapplied candidate"):
+        engine.constraint_iteration(
+            0,
+            0,
+            False,
+            np.asarray([4, 8, 3], dtype=np.int64),
+            np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        )
+    assert engine.apply_last_candidate(1.0, 0.5) == (1, 0, 0)
+
+
 def test_native_search_engine_candidate_state_does_not_depend_on_cache_store() -> None:
     from evrptw import _core as native_core
 
@@ -2716,7 +3162,7 @@ def test_native_search_engine_candidate_state_does_not_depend_on_cache_store() -
         0,
         1,
         0x5EED,
-        np.asarray([5, 0, 7], dtype=np.int64),
+        np.asarray([5, 7, 0], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         -1,
@@ -2759,7 +3205,7 @@ def test_native_search_engine_constraint_probe_uses_one_end_to_end_deadline() ->
             0,
             1,
             0x5EED,
-            np.asarray([5, 0, 7], dtype=np.int64),
+            np.asarray([5, 7, 0], dtype=np.int64),
             np.asarray([np.nextafter(0.0, 1.0)], dtype=np.float64),
             np.asarray([128], dtype=np.int64),
             -1,
@@ -2803,7 +3249,7 @@ def test_native_search_engine_constraint_probe_envelope_failure_rolls_back() -> 
             0,
             1,
             0x5EED,
-            np.asarray([5, 0, 7], dtype=np.int64),
+            np.asarray([5, 7, 0], dtype=np.int64),
             np.asarray([30.0], dtype=np.float64),
             np.asarray([128], dtype=np.int64),
             -1,
@@ -2821,7 +3267,7 @@ def test_native_search_engine_constraint_probe_envelope_failure_rolls_back() -> 
         0,
         1,
         0x5EED,
-        np.asarray([5, 0, 7], dtype=np.int64),
+        np.asarray([5, 7, 0], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         -1,
@@ -2834,7 +3280,7 @@ def test_native_search_engine_constraint_probe_envelope_failure_rolls_back() -> 
         0,
         1,
         0x5EED,
-        np.asarray([5, 1, 7], dtype=np.int64),
+        np.asarray([5, 7, 1], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
         np.asarray([128], dtype=np.int64),
         -1,
