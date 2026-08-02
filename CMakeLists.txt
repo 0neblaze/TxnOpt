@@ -5,6 +5,16 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(PYBIND11_FINDPYTHON ON)
+set(
+  EVRPTW_SANITIZER
+  "none"
+  CACHE STRING
+  "Native sanitizer profile: none, address-undefined, or thread"
+)
+set_property(
+  CACHE EVRPTW_SANITIZER
+  PROPERTY STRINGS none address-undefined thread
+)
 
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
@@ -28,6 +38,27 @@ if(MSVC)
   target_compile_options(_core PRIVATE /O2)
 else()
   target_compile_options(_core PRIVATE -O3 -Wall -Wextra -Wpedantic)
+endif()
+
+if(NOT EVRPTW_SANITIZER STREQUAL "none")
+  if(MSVC)
+    message(FATAL_ERROR "EVRPTW_SANITIZER profiles require GCC or Clang")
+  elseif(EVRPTW_SANITIZER STREQUAL "address-undefined")
+    target_compile_options(
+      _core PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
+    )
+    target_link_options(_core PRIVATE -fsanitize=address,undefined)
+  elseif(EVRPTW_SANITIZER STREQUAL "thread")
+    target_compile_options(
+      _core PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=thread
+    )
+    target_link_options(_core PRIVATE -fsanitize=thread)
+  else()
+    message(
+      FATAL_ERROR
+      "EVRPTW_SANITIZER must be none, address-undefined, or thread"
+    )
+  endif()
 endif()
 
 install(TARGETS _core DESTINATION evrptw)
