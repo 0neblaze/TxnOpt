@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -103,6 +103,28 @@ def compare_objectives(left: SolutionObjective, right: SolutionObjective) -> Obj
     if left.key > right.key:
         return ObjectiveComparison.WORSE
     return ObjectiveComparison.EQUAL
+
+
+def objective_key_from_exact_numeric(
+    node_kinds: Sequence[int],
+    path_indices: Sequence[int],
+    metrics: Sequence[Sequence[float]],
+    *,
+    vehicle_count: int,
+    station_kind: int,
+) -> tuple[int, float, float, int]:
+    """Construct the canonical objective key for a native exact-result batch."""
+
+    objective = SolutionObjective(
+        vehicle_count=vehicle_count,
+        total_distance=sum(float(row[0]) for row in metrics),
+        total_charging_time=sum(float(row[3]) for row in metrics),
+        charging_count=sum(
+            int(node_kinds[int(node_index)]) == station_kind
+            for node_index in path_indices
+        ),
+    )
+    return objective.key
 
 
 def accept_annealing_move(

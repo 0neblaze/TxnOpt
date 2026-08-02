@@ -157,7 +157,11 @@ def _sha256_path(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _verify_installed_wheel(wheel_path: Path) -> dict[str, str]:
+def _verify_installed_wheel(
+    wheel_path: Path,
+    *,
+    expected_revision: str,
+) -> dict[str, str]:
     """Prove that the executing distribution was installed from the supplied wheel."""
 
     resolved_wheel = wheel_path.resolve()
@@ -201,6 +205,9 @@ def _verify_installed_wheel(wheel_path: Path) -> dict[str, str]:
         site_packages
     ):
         raise RuntimeError("comparison runner imported source outside the installed wheel")
+    build_revision = native_core.__build_git_revision__
+    if not isinstance(build_revision, str) or build_revision != expected_revision:
+        raise RuntimeError("installed native wheel was not built from the recorded revision")
     return {
         "wheel_path": str(resolved_wheel),
         "wheel_sha256": wheel_sha256,
@@ -208,6 +215,7 @@ def _verify_installed_wheel(wheel_path: Path) -> dict[str, str]:
         "package_path": str(package_path),
         "native_path": str(native_path),
         "native_sha256": _sha256_path(native_path),
+        "build_git_revision": build_revision,
     }
 
 
@@ -611,7 +619,10 @@ def run_experiment(
     ).stdout.strip()
     if not wheel_path.is_file():
         raise FileNotFoundError("the frozen comparison wheel does not exist")
-    wheel_receipt = _verify_installed_wheel(wheel_path)
+    wheel_receipt = _verify_installed_wheel(
+        wheel_path,
+        expected_revision=revision,
+    )
     native_path = Path(wheel_receipt["native_path"])
     labels = run_labels_for_scope(scope, attempt)
     for label in labels.values():

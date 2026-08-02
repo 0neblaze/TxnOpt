@@ -654,3 +654,14 @@ def test_host_scheduler_partial_ipc_rolls_back_and_keeps_service_usable(
 
     assert result.feasible
     assert result.native_execution_statistics["fallback_count"] == 0
+
+
+def test_host_scheduler_start_failure_cleans_process_state(tmp_path: Path) -> None:
+    endpoint = tmp_path / "native-scheduler.sock"
+    scheduler = NativeHostScheduler(endpoint, worker_threads=23)
+
+    with pytest.raises(RuntimeError, match="exited before becoming ready"):
+        scheduler.start()
+
+    assert not scheduler.is_running
+    assert not endpoint.exists()

@@ -147,6 +147,19 @@ def load_records(
         mode_records = tuple(
             ReviewRecord(path, _verify_signed_json(path)) for path in paths
         )
+        expected_run_label = labels[mode.value]
+        for record in mode_records:
+            payload_identity = (
+                _string(record.payload, "revision"),
+                _string(record.payload, "wheel_sha256"),
+                _string(record.payload, "native_sha256"),
+            )
+            if payload_identity != identity:
+                raise RuntimeError(
+                    f"axis identity does not match its run manifest: {record.path}"
+                )
+            if _string(record.payload, "run_label") != expected_run_label:
+                raise RuntimeError(f"axis run label mismatch: {record.path}")
         keys = {record.key for record in mode_records}
         if keys != _expected_keys(scope) or len(mode_records) != len(keys):
             raise RuntimeError(f"axis identity set is incomplete or duplicated for {mode.value}")
@@ -820,7 +833,11 @@ def main(argv: list[str] | None = None) -> int:
         output_markdown=arguments.output_markdown,
     )
     print(json.dumps(review, indent=2, sort_keys=True))
-    return 0 if str(review["review_status"]).startswith("COMPARISON_COMPLETE_") else 1
+    if review["review_status"] == "COMPARISON_COMPLETE_QUALIFIED":
+        return 0
+    if review["review_status"] == "COMPARISON_COMPLETE_NOT_QUALIFIED":
+        return 2
+    return 1
 
 
 if __name__ == "__main__":

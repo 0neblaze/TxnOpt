@@ -749,10 +749,14 @@ this repository or one of its subdirectories.
   output loss fails the transaction without local recovery or fallback. The
   Unix-domain service loop, bounded IPC reads/writes, queue, and 24 worker
   threads are C++ owned; Python only starts/stops the temporary service and
-  validates the returned structured transaction. Host scheduling therefore
-  has the requested native control plane, but it still inherits the incomplete
-  full-native ALNS semantics above. These experimental protocols do not select
-  a default or promote Stage 5.2 readiness.
+  validates the returned transaction. The current result transport is one
+  pickle-encoded shared-memory blob and each worker holds the Python GIL while
+  executing the Python-aware full-solve ABI, so native search concurrency is
+  effectively one even though the request-control plane has 24 workers. Host
+  scheduling therefore has the requested native control plane but not the
+  requested cross-shard compute parallelism or structured output descriptors;
+  it also inherits the incomplete full-native ALNS semantics above. These
+  experimental protocols do not select a default or promote Stage 5.2 readiness.
 - Five-mode comparisons use
   `evrptw.experiments.stage052_native_architectures` and independent replay in
   `stage052_native_architecture_review`. Paired scope is exactly 360 axes and

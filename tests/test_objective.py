@@ -8,6 +8,7 @@ from evrptw.objective import (
     SolutionObjective,
     accept_annealing_move,
     compare_objectives,
+    objective_key_from_exact_numeric,
 )
 from evrptw.validation import validate_routes
 
@@ -46,6 +47,18 @@ def test_normalized_key_makes_sub_nanounit_noise_equal_and_order_transitive() ->
     assert compare_objectives(first, noise) is ObjectiveComparison.EQUAL
     assert compare_objectives(first, later) is ObjectiveComparison.BETTER
     assert first.key < later.key
+
+
+def test_numeric_exact_objective_uses_canonical_rounding_and_station_count() -> None:
+    key = objective_key_from_exact_numeric(
+        [0, 1, 2],
+        [0, 2, 1, 2, 0],
+        [[5.0000000005, 0.0, 0.0, 1.25]],
+        vehicle_count=1,
+        station_kind=2,
+    )
+
+    assert key == SolutionObjective(1, 5.0000000005, 1.25, 2).key
 
 
 @pytest.mark.parametrize(

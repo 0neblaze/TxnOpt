@@ -93,6 +93,9 @@ class NativeHostScheduler:
         deadline = time.monotonic() + _READY_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             if not process.is_alive():
+                process.join(timeout=1.0)
+                self._process = None
+                self.socket_path.unlink(missing_ok=True)
                 raise RuntimeError("host scheduler exited before becoming ready")
             if self.socket_path.exists():
                 return
@@ -124,6 +127,11 @@ class NativeHostScheduler:
         if process is None or process.pid is None or not process.is_alive():
             raise RuntimeError("host scheduler is not running")
         return process.pid
+
+    @property
+    def is_running(self) -> bool:
+        process = self._process
+        return process is not None and process.is_alive()
 
     def observed_thread_count(self) -> int:
         task_directory = Path("/proc") / str(self.process_id) / "task"
@@ -160,22 +168,42 @@ def dispatch_full_native_alns(
             connection.connect(socket_path)
             _send_frame(connection, request)
             response = json.loads(_recv_frame(connection))
-        if not isinstance(response, dict) or response.get("ok") is not True:
-            message = response.get("error") if isinstance(response, dict) else response
-            raise RuntimeError(f"host scheduler transaction failed: {message}")
-        output_name = response.get("output_name")
-        output_size = response.get("output_size")
-        if not isinstance(output_name, str) or not isinstance(output_size, int) or output_size <= 0:
-            raise RuntimeError("host scheduler returned an invalid output descriptor")
-        output = shared_memory.SharedMemory(name=output_name)
-        try:
-            output_buffer = output.buf
-            if output_buffer is None:
-                raise RuntimeError("host scheduler output shared memory is unavailable")
-            return pickle.loads(bytes(output_buffer[:output_size]))
-        finally:
-            output.close()
-            output.unlink()
+            if not isinstance(response, dict) or response.get("ok") is not True:
+                message = response.get("error") if isinstance(response, dict) else response
+                raise RuntimeError(f"host scheduler transaction failed: {message}")
+            output_name = response.get("output_name")
+            output_size = response.get("output_size")
+            if (
+                not isinstance(output_name, str)
+                or not isinstance(output_size, int)
+                or output_size <= 0
+            ):
+                raise RuntimeError("host scheduler returned an invalid output descriptor")
+            output = shared_memory.SharedMemory(name=output_name, track=False)
+            try:
+                output_buffer = output.buf
+                if output_buffer is None:
+                    raise RuntimeError(
+                        "host scheduler output shared memory is unavailable"
+                    )
+                encoded = bytes(output_buffer[:output_size])
+            finally:
+                output.close()
+            _send_frame(
+                connection,
+                json.dumps(
+                    {"ack_output_name": output_name},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+            )
+            released = json.loads(_recv_frame(connection))
+            if not isinstance(released, dict) or released != {
+                "ok": True,
+                "released": True,
+            }:
+                raise RuntimeError("host scheduler did not confirm output release")
+        return pickle.loads(encoded)
     except (OSError, EOFError, pickle.UnpicklingError) as error:
         raise RuntimeError("host scheduler IPC failed without fallback") from error
     finally:

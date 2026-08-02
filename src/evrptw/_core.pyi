@@ -3,6 +3,8 @@ from collections.abc import Sequence
 import numpy as np
 import numpy.typing as npt
 
+__build_git_revision__: str
+
 Point = tuple[float, float]
 
 class Stage052ReplayState:

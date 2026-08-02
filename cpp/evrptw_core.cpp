@@ -4,6 +4,7 @@
 #include <cctype>
 #include <condition_variable>
 #include <cmath>
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -4859,32 +4860,14 @@ py::tuple full_native_alns_v1(
     std::vector<std::int64_t> trajectory;
     trajectory.reserve(static_cast<std::size_t>(control_values[1]) * 7);
     const auto objective_key = [&](const py::tuple& payload, std::size_t vehicle_count) {
-        const auto metrics = py::cast<py::array_t<double>>(payload[4]);
-        const auto info = metrics.request();
-        const auto* values = checked_data<double>(metrics);
-        PythonFloatSum distance_total;
-        PythonFloatSum charging_time_total;
-        for (py::ssize_t route = 0; route < info.shape[0]; ++route) {
-            distance_total.add(values[static_cast<std::size_t>(route) * 4]);
-            charging_time_total.add(values[static_cast<std::size_t>(route) * 4 + 3]);
-        }
-        const auto path_indices = py::cast<py::array_t<std::int64_t>>(payload[1]);
-        const auto* path_values = checked_data<std::int64_t>(path_indices);
-        std::int64_t charging_count = 0;
-        for (py::ssize_t index = 0; index < path_indices.request().shape[0]; ++index) {
-            if (kinds[path_values[index]] == station_kind) {
-                ++charging_count;
-            }
-        }
-        const auto rounded = [](double value) {
-            constexpr double scale = 1'000'000'000.0;
-            return std::round(value * scale) / scale;
-        };
-        return std::tuple{
-            static_cast<std::int64_t>(vehicle_count),
-            rounded(distance_total.value()),
-            rounded(charging_time_total.value()),
-            charging_count};
+        return py::cast<py::tuple>(
+            py::module_::import("evrptw.objective")
+                .attr("objective_key_from_exact_numeric")(
+                    node_kind,
+                    payload[1],
+                    payload[4],
+                    py::arg("vehicle_count") = vehicle_count,
+                    py::arg("station_kind") = station_kind));
     };
     auto current_objective = objective_key(exact_payload, routes.size());
     std::size_t pair_cursor = static_cast<std::size_t>(
@@ -5052,7 +5035,12 @@ py::tuple full_native_alns_v1(
         const auto candidate_objective = objective_key(
             candidate_payload, candidate_routes.size());
         const bool vehicle_improvement = candidate_routes.size() < routes.size();
-        if (!(candidate_objective < current_objective)) {
+        const auto comparison = PyObject_RichCompareBool(
+            candidate_objective.ptr(), current_objective.ptr(), Py_LT);
+        if (comparison < 0) {
+            throw py::error_already_set();
+        }
+        if (comparison == 0) {
             ++rejected_moves;
             status_code = 4;
             trajectory.insert(
@@ -5212,7 +5200,8 @@ void scheduler_handle_connection(int descriptor) {
         for (const auto item : descriptors) {
             const auto raw = py::cast<py::dict>(item);
             const auto segment = shared_memory.attr("SharedMemory")(
-                py::arg("name") = raw["name"]);
+                py::arg("name") = raw["name"],
+                py::arg("track") = false);
             segments.append(segment);
             const auto array = numpy.attr("ndarray")(
                 raw["shape"],
@@ -5254,7 +5243,25 @@ void scheduler_handle_connection(int descriptor) {
             py::reinterpret_borrow<py::object>(segment).attr("close")();
         }
         scheduler_send_frame(descriptor, response_text);
+        const auto acknowledgement = py::cast<py::dict>(
+            json.attr("loads")(scheduler_read_frame(descriptor)));
+        if (!acknowledgement.contains("ack_output_name")
+            || py::cast<std::string>(acknowledgement["ack_output_name"])
+                != output_name) {
+            throw std::runtime_error("host scheduler output acknowledgement mismatch");
+        }
+        output.attr("unlink")();
         output.attr("close")();
+        output_name.clear();
+        py::dict released;
+        released["ok"] = true;
+        released["released"] = true;
+        scheduler_send_frame(
+            descriptor,
+            py::cast<std::string>(json.attr("dumps")(
+                released,
+                py::arg("sort_keys") = true,
+                py::arg("separators") = py::make_tuple(",", ":"))));
     } catch (const std::exception& error) {
         try {
             py::gil_scoped_acquire acquire;
@@ -5263,7 +5270,8 @@ void scheduler_handle_connection(int descriptor) {
                 const auto shared_memory = py::module_::import(
                     "multiprocessing.shared_memory");
                 const auto orphan = shared_memory.attr("SharedMemory")(
-                    py::arg("name") = output_name);
+                    py::arg("name") = output_name,
+                    py::arg("track") = false);
                 orphan.attr("close")();
                 orphan.attr("unlink")();
             }
@@ -5276,7 +5284,12 @@ void scheduler_handle_connection(int descriptor) {
                 py::arg("sort_keys") = true,
                 py::arg("separators") = py::make_tuple(",", ":")));
             scheduler_send_frame(descriptor, response_text);
-        } catch (...) {
+        } catch (const std::exception& response_error) {
+            std::fprintf(
+                stderr,
+                "host scheduler could not report transaction failure: %s\n",
+                response_error.what());
+            std::fflush(stderr);
         }
     }
     ::close(descriptor);
@@ -5322,6 +5335,7 @@ void run_host_scheduler_service_v1(
     bool stopping = false;
     std::vector<std::thread> workers;
     workers.reserve(static_cast<std::size_t>(worker_threads));
+    int accept_error = 0;
     {
         py::gil_scoped_release release;
         for (std::int64_t index = 0; index < worker_threads; ++index) {
@@ -5349,7 +5363,11 @@ void run_host_scheduler_service_v1(
         while (true) {
             const auto connection = ::accept(server, nullptr, nullptr);
             if (connection < 0) {
-                continue;
+                if (errno == EINTR) {
+                    continue;
+                }
+                accept_error = errno;
+                break;
             }
             char control = '\0';
             const auto peeked = ::recv(connection, &control, 1, MSG_PEEK);
@@ -5383,9 +5401,19 @@ void run_host_scheduler_service_v1(
         for (auto& worker : workers) {
             worker.join();
         }
+        if (accept_error != 0) {
+            std::fprintf(
+                stderr,
+                "host scheduler accept failed with errno %d\n",
+                accept_error);
+            std::fflush(stderr);
+        }
     }
     ::close(server);
     ::unlink(socket_path.c_str());
+    if (accept_error != 0) {
+        throw std::runtime_error("host scheduler accept failed");
+    }
 #endif
 }
 
@@ -5493,6 +5521,7 @@ py::tuple propagate_routes_numeric(
 
 PYBIND11_MODULE(_core, module) {
     module.doc() = "Native kernels for EVRP-TW route evaluation";
+    module.attr("__build_git_revision__") = EVRPTW_BUILD_GIT_REVISION;
     py::class_<Stage052ReplayState>(module, "Stage052ReplayState")
         .def(
             py::init<const py::dict&, const py::dict&>(),
