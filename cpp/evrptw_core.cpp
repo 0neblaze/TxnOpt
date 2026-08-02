@@ -1120,6 +1120,18 @@ py::tuple screen_route_batch_transaction_impl(
     py::handle negative_reason_codes,
     std::int64_t worker_count);
 
+py::tuple exact_charging_batch_numeric(
+    py::handle node_kind,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle vehicle,
+    py::handle order_offsets,
+    py::handle order_indices,
+    py::handle deadline_remaining,
+    py::handle batch_size);
+
 py::tuple changed_candidate_plan_selection_v1(
     std::int64_t operation,
     py::handle node_kind,
@@ -2025,6 +2037,16 @@ public:
         checked_data(output)[0] = requested;
         checked_data(output)[1] = granted;
         return output;
+    }
+
+    [[nodiscard]] std::int64_t exact_remaining() const {
+        return exact_budget_ < 0
+            ? -1
+            : std::max<std::int64_t>(0, exact_budget_ - started_);
+    }
+
+    [[nodiscard]] std::int64_t candidate_round_remaining() const {
+        return round_remaining();
     }
 
     py::array_t<std::int64_t> complete_exact(std::int64_t count) {
@@ -7896,6 +7918,10 @@ PYBIND11_MODULE(_core, module) {
         .def(
             "reserve_exact", &NativeBudgetStateV2::reserve_exact,
             py::arg("requested"))
+        .def("exact_remaining", &NativeBudgetStateV2::exact_remaining)
+        .def(
+            "candidate_round_remaining",
+            &NativeBudgetStateV2::candidate_round_remaining)
         .def(
             "complete_exact", &NativeBudgetStateV2::complete_exact,
             py::arg("count"))

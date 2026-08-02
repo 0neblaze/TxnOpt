@@ -1474,6 +1474,8 @@ def test_native_budget_state_matches_python_controllers_and_rollback() -> None:
     candidate.begin_round(7, lane="quality_shadow")
     state = native.begin_round(4, 7)
     assert state.tolist()[:5] == [1, 4, 7, 0, 2]
+    assert native.exact_remaining() == 5
+    assert native.candidate_round_remaining() == 2
     assert candidate.reserve(3, atomic=True, context="plan") == 0
     assert native.reserve_round(3, True).tolist() == [3, 0, 2]
     assert candidate.reserve(1, atomic=True, context="plan") == 1
@@ -1492,6 +1494,8 @@ def test_native_budget_state_matches_python_controllers_and_rollback() -> None:
     snapshot = native.snapshot().copy()
     candidate_snapshot = candidate.snapshot_protocol_state()
     assert snapshot.tolist() == [1, 4, 7, 1, 1, 3, 2, 1, 0]
+    assert native.exact_remaining() == 2
+    assert native.candidate_round_remaining() == 1
 
     candidate.reserve(1, atomic=False, context="temporary")
     native.reserve_round(1, False)
