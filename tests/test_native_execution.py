@@ -41,6 +41,7 @@ from evrptw.experiments.stage052_native_architectures import (
 from evrptw.measurement import CheapScreeningConfig, MeasurementConfig, Stage03Trace
 from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.native_execution import (
+    FULL_NATIVE_OPERATOR_NAMES,
     FULL_NATIVE_STAGE04_FLOAT_FIELDS,
     FULL_NATIVE_STAGE04_INTEGER_FIELDS,
     NATIVE_EXECUTION_SCHEMA_VERSION,
@@ -51,9 +52,14 @@ from evrptw.native_execution import (
     _native_distance_improved,
     decode_native_constraint_semantic_stream,
     decode_native_global_semantic_stream,
+    decode_native_three_lane_semantic_stream,
     execute_native_candidate_round,
 )
-from evrptw.native_kernels import NativeKernelConfig, NativeKernelRuntime
+from evrptw.native_kernels import (
+    NativeInstanceContext,
+    NativeKernelConfig,
+    NativeKernelRuntime,
+)
 from evrptw.native_scheduler import NativeHostScheduler
 from evrptw.objective import SolutionObjective, accept_annealing_move
 from evrptw.parser import parse_schneider
@@ -104,6 +110,15 @@ def _candidate_plan_fixture() -> Instance:
         ),
         Vehicle(100.0, 100.0, 1.0, 0.1, 1.0),
         distance_backend="python",
+    )
+
+
+def _native_lexical_rank(context: NativeInstanceContext) -> np.ndarray:
+    ordered_names = sorted(context.node_names)
+    rank_by_name = {name: rank for rank, name in enumerate(ordered_names)}
+    return np.asarray(
+        [rank_by_name[name] for name in context.node_names],
+        dtype=np.int64,
     )
 
 
@@ -2808,7 +2823,7 @@ def test_native_search_engine_constraint_iteration_owns_python_rng_and_policy() 
         engine.finish_stage04_iteration(iteration, False)
     assert later_outcomes == [
         [1, 3131849611, 1, 1, 0, 0],
-        [2, 338673043, 0, 0, 0, 0],
+        [2, 338673043, 1, 1, 0, 0],
         [3, 124452527, 0, 0, 0, 0],
     ]
     engine.finish_stage04_iteration(4, False)
@@ -2823,7 +2838,7 @@ def test_native_search_engine_constraint_iteration_owns_python_rng_and_policy() 
         np.asarray([128], dtype=np.int64),
         -1,
     )
-    assert weighted_outcome.tolist() == [1, 3124553668, 0, 0, 0, 0]
+    assert weighted_outcome.tolist() == [1, 3124553668, 1, 1, 0, 0]
 
 
 def test_native_constraint_search_emits_typed_semantic_event_soa() -> None:
@@ -2870,7 +2885,7 @@ def test_native_constraint_search_emits_typed_semantic_event_soa() -> None:
     assert event_integer.dtype == np.dtype(np.int64)
     assert event_integer.flags.c_contiguous
     assert event_integer.tolist() == [
-        [0, 2, 0, 7, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1]
+        [0, 2, 0, 9, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1]
     ]
     assert event_objective_integer.tolist() == [[1, 0, 1, 0, 1, 0]]
     assert event_objective.dtype == np.dtype(np.float64)
@@ -3820,6 +3835,577 @@ def test_native_global_search_envelope_failure_rolls_back_logical_state() -> Non
     np.testing.assert_equal(state_after[1][2:5], state_before[1][2:5])
 
 
+def test_native_search_engine_owns_three_isolated_lane_states() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 1, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    lanes_before = tuple(engine.lane_solution_state(lane) for lane in range(3))
+    for lane in lanes_before[1:]:
+        for expected, actual in zip(lanes_before[0], lane, strict=True):
+            np.testing.assert_equal(actual, expected)
+
+    engine.run_global_search(
+        0,
+        1,
+        0,
+        np.asarray([4, 8, 3], dtype=np.int64),
+        np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+
+    legacy_after = engine.lane_solution_state(0)
+    quality_after = engine.lane_solution_state(1)
+    constraint_after = engine.lane_solution_state(2)
+    for expected, actual in zip(lanes_before[0], legacy_after, strict=True):
+        np.testing.assert_equal(actual, expected)
+    for expected, actual in zip(lanes_before[1], quality_after, strict=True):
+        np.testing.assert_equal(actual, expected)
+    assert constraint_after[1].tolist() == [2, 1]
+
+
+def test_native_quality_relocate_probe_matches_python_candidate_control() -> None:
+    from evrptw import _core as native_core
+
+    instance = _candidate_plan_fixture()
+    initial = (("C1", "C2"), ("C3", "C4"))
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = initial
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **solve_kwargs,
+        candidate_control_config=CandidateControlConfig(
+            worker_count=1,
+            max_exact_calls_per_round=100,
+            proposal_top_k=100,
+        ),
+    )
+    python_quality = tuple(
+        event
+        for event in python_result.neighborhood_events
+        if event.get("operator") == "relocate"
+        and event.get("status") == "candidate_proposed"
+    )
+    assert len(python_quality) == 1
+    assert python_quality[0]["accepted"] is True
+    assert python_quality[0]["candidate_objective_key"] == (2, 10.0, 0.0, 0)
+
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        100, 100, 256, 10_000_000, 256, 100, context.reachability_epsilon, 1
+    )
+    initial_offsets = np.asarray([0, 2, 4], dtype=np.int64)
+    initial_indices = np.asarray(
+        [context.name_to_index[name] for route in initial for name in route],
+        dtype=np.int64,
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        _native_lexical_rank(context),
+        initial_offsets,
+        initial_indices,
+        np.asarray([2014, 1, 128, 1, 100], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    legacy_before = engine.lane_solution_state(0)
+    constraint_before = engine.lane_solution_state(2)
+
+    pool, transaction, outcome, quality_after = engine.quality_changed_probe(
+        0,
+        0,
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+    )
+
+    assert pool[0].shape == (12, 2)
+    assert transaction[11].size > 0
+    assert outcome.tolist() == [int(transaction[11][0]), 1, 1, 0]
+    assert quality_after[0].tolist() == [0, 1, 4]
+    assert quality_after[1].tolist() == [1, 2, 3, 4]
+    assert quality_after[2].tolist() == [2, 0]
+    assert quality_after[3].tolist() == pytest.approx([10.0, 0.0])
+    for expected, actual in zip(legacy_before, engine.lane_solution_state(0), strict=True):
+        np.testing.assert_equal(actual, expected)
+    for expected, actual in zip(
+        constraint_before,
+        engine.lane_solution_state(2),
+        strict=True,
+    ):
+        np.testing.assert_equal(actual, expected)
+
+
+def test_native_legacy_route_elimination_matches_python_candidate_control() -> None:
+    from evrptw import _core as native_core
+    from evrptw import neighborhoods
+
+    instance = _candidate_plan_fixture()
+    initial = (("C1", "C2"), ("C3", "C4"))
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = initial
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **solve_kwargs,
+        candidate_control_config=CandidateControlConfig(
+            worker_count=1,
+            max_exact_calls_per_round=100,
+            proposal_top_k=100,
+        ),
+    )
+    python_legacy = tuple(
+        event
+        for event in python_result.neighborhood_events
+        if event.get("operator") == "route_elimination"
+        and event.get("status") == "candidate_proposed"
+    )
+    assert len(python_legacy) == 1
+    selected_source = int(python_legacy[0]["route_indices"][0])
+
+    class Recorder:
+        def record_candidate_screening_aggregate(
+            self,
+            _counts: object,
+            _candidate_pool_hash: str,
+        ) -> None:
+            return None
+
+    expected_repair = neighborhoods._candidate_control_repair_pass(
+        tuple(route for index, route in enumerate(initial) if index != selected_source),
+        initial[selected_source],
+        Recorder(),  # type: ignore[arg-type]
+        instance,
+        allow_new_routes=False,
+        route_change_limit=None,
+    )
+    expected_routes = expected_repair.sequences
+    assert expected_routes is not None
+
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        100, 100, 256, 10_000_000, 256, 100, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        _native_lexical_rank(context),
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray(
+            [context.name_to_index[name] for route in initial for name in route],
+            dtype=np.int64,
+        ),
+        np.asarray([2014, 1, 128, 1, 100], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    quality_before = engine.lane_solution_state(1)
+    constraint_before = engine.lane_solution_state(2)
+
+    (
+        profile_order,
+        attempts,
+        _plan_offsets,
+        _route_offsets,
+        _route_indices,
+        transaction,
+        outcome,
+        legacy_after,
+    ) = engine.legacy_route_elimination_probe(
+        0,
+        3,
+        -1,
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+    )
+
+    assert profile_order.tolist() == [1, 0]
+    assert attempts[:, :3].tolist() == [[1, 1, 0], [0, 2, 0]]
+    assert transaction is not None
+    selected_plan = int(outcome[0])
+    assert outcome.tolist()[1:4] == [1, 1, 1]
+    assert int(outcome[4]) == int(python_legacy[0]["route_indices"][0])
+    assert transaction[11].tolist()[0] == selected_plan
+    expected_indices = [
+        context.name_to_index[name]
+        for route in expected_routes
+        for name in route
+    ]
+    expected_offsets = [0]
+    for route in expected_routes:
+        expected_offsets.append(expected_offsets[-1] + len(route))
+    assert legacy_after[0].tolist() == expected_offsets
+    assert legacy_after[1].tolist() == expected_indices
+    assert legacy_after[2].tolist() == [1, 0]
+    assert legacy_after[3].tolist() == pytest.approx([8.0, 0.0])
+    candidate_objective = (
+        int(transaction[2][selected_plan, 0]),
+        float(transaction[3][selected_plan, 0]),
+        float(transaction[3][selected_plan, 1]),
+        int(transaction[2][selected_plan, 1]),
+    )
+    assert candidate_objective == python_legacy[0]["candidate_objective_key"]
+    for expected, actual in zip(quality_before, engine.lane_solution_state(1), strict=True):
+        np.testing.assert_equal(actual, expected)
+    for expected, actual in zip(
+        constraint_before,
+        engine.lane_solution_state(2),
+        strict=True,
+    ):
+        np.testing.assert_equal(actual, expected)
+
+
+def test_native_full_search_lanes_share_one_candidate_round_budget() -> None:
+    from evrptw import _core as native_core
+
+    instance = _candidate_plan_fixture()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        100, 1, 256, 10_000_000, 256, 100, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        _native_lexical_rank(context),
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray([1, 2, 3, 4], dtype=np.int64),
+        np.asarray([2014, 1, 128, 1, 100], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+
+    engine.legacy_route_elimination_probe(
+        0,
+        3,
+        -1,
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+    )
+    after_legacy = engine.state()[1].copy()
+    _pool, quality_transaction, _outcome, _quality = engine.quality_changed_probe(
+        0,
+        0,
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+    )
+    after_quality = engine.state()[1]
+
+    assert int(after_legacy[3]) == 1
+    assert int(after_quality[3]) == 1
+    assert int(after_quality[5]) == int(after_legacy[5])
+    assert 3 in quality_transaction[1].tolist()
+
+
+def test_native_three_lane_bootstrap_defers_main_acceptance_until_last() -> None:
+    from evrptw import _core as native_core
+
+    instance = _candidate_plan_fixture()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        100, 100, 256, 10_000_000, 256, 100, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        _native_lexical_rank(context),
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray([1, 2, 3, 4], dtype=np.int64),
+        np.asarray([2014, 1, 128, 1, 100], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+
+    legacy = engine.legacy_route_elimination_probe(
+        0,
+        3,
+        -1,
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        True,
+    )
+    assert legacy[6].tolist()[1:4] == [-2, 0, 0]
+    assert engine.lane_solution_state(0)[2].tolist() == [2, 0]
+
+    _pool, _transaction, quality_outcome, _quality = engine.quality_changed_probe(
+        0,
+        0,
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+    )
+    assert quality_outcome.tolist()[1:4] == [1, 1, 0]
+    assert engine.best_solution_payload()[3].tolist() == [2, 0]
+
+    constraint = engine.constraint_iteration(
+        0,
+        0,
+        False,
+        np.asarray([4, 8, 3], dtype=np.int64),
+        np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+    assert constraint[2][0] == 0
+
+    assert engine.apply_legacy_candidate(1.0, 1.0) == (1, 1, 1)
+    assert engine.lane_solution_state(0)[2].tolist() == [1, 0]
+    assert engine.best_solution_payload()[3].tolist() == [1, 0]
+    engine.finish_stage04_iteration(0, False)
+
+
+def test_native_three_lane_bootstrap_is_one_call_and_matches_python_best() -> None:
+    from evrptw import _core as native_core
+
+    instance = _candidate_plan_fixture()
+    initial = (("C1", "C2"), ("C3", "C4"))
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = initial
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **solve_kwargs,
+        candidate_control_config=CandidateControlConfig(
+            worker_count=1,
+            max_exact_calls_per_round=100,
+            proposal_top_k=100,
+        ),
+    )
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        100, 100, 256, 10_000_000, 256, 100, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        _native_lexical_rank(context),
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray([1, 2, 3, 4], dtype=np.int64),
+        np.asarray([2014, 1, 128, 1, 100], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+
+    payload = engine.run_three_lane_bootstrap(
+        3,
+        512,
+        -1,
+        np.asarray([4, 8, 3], dtype=np.int64),
+        np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+    )
+
+    legacy, refinement, quality, constraint, legacy_acceptance = payload[:5]
+    assert legacy[6].tolist()[1:4] == [-2, 0, 0]
+    assert refinement is not None
+    assert refinement[0].tolist() == [0, 0, 15, 3]
+    assert quality is not None and quality[2].tolist()[1] == 1
+    assert constraint is not None and int(constraint[2][0]) == 0
+    assert legacy_acceptance == (1, 1, 1)
+    best = payload[9]
+    best_offsets, best_indices = best[:2]
+    observed_routes = tuple(
+        tuple(
+            context.node_names[int(index)]
+            for index in best_indices[
+                int(best_offsets[route]) : int(best_offsets[route + 1])
+            ]
+        )
+        for route in range(len(best_offsets) - 1)
+    )
+    assert observed_routes == python_result.customer_sequences
+    assert python_result.objective is not None
+    assert best[3].tolist() == [python_result.objective.vehicle_count, 0]
+    assert best[4].tolist() == pytest.approx(
+        [python_result.objective.total_distance, 0.0]
+    )
+    assert payload[10][0] == pytest.approx(1.0)
+    assert payload[11].tolist()[0] == 0
+    assert payload[11].tolist()[2:5] == [
+        python_result.charging_subproblem_calls,
+        python_result.charging_subproblem_calls,
+        0,
+    ]
+    weights, rewards, calls, totals = engine.full_stage04_state()
+    assert weights.tolist() == [1.0] * len(FULL_NATIVE_OPERATOR_NAMES)
+    assert calls.tolist() == [0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0]
+    assert rewards.tolist() == pytest.approx(
+        [
+            0.0,
+            0.0,
+            16.0,
+            0.0,
+            8.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            4.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ]
+    )
+    assert totals[2].tolist() == [1, 1, 1, 0, 0, 0, 1, 1]
+    assert totals[4].tolist() == [1, 1, 1, 0, 0, 0, 1, 0]
+    assert totals[9].tolist() == [1, 1, 1, 0, 0, 0, 0, 0]
+    assert totals[13].tolist() == [1, 0, 0, 0, 0, 1, 0, 0]
+    semantic = decode_native_three_lane_semantic_stream(
+        instance,
+        payload,
+        node_names=context.node_names,
+        initial_customer_sequences=initial,
+    )
+    assert semantic.neighborhood_events == python_result.neighborhood_events
+    assert semantic.operator_calls.tolist() == calls.tolist()
+    assert semantic.operator_rewards.tolist() == pytest.approx(rewards.tolist())
+    assert semantic.operator_totals.tolist() == totals.tolist()
+    assert len(semantic.transaction_sha256) == 64
+    tampered = list(payload)
+    tampered_initialization = list(tampered[10])
+    tampered_initialization[4] = tampered_initialization[4].copy()
+    tampered_initialization[4][0] += 1
+    tampered[10] = tuple(tampered_initialization)
+    with pytest.raises(RuntimeError, match="semantic stream SHA-256 mismatch"):
+        decode_native_three_lane_semantic_stream(
+            instance,
+            tuple(tampered),
+            node_names=context.node_names,
+            initial_customer_sequences=initial,
+        )
+
+
+def test_native_three_lane_deadline_returns_last_completed_lane_incumbent() -> None:
+    from evrptw import _core as native_core
+
+    instance = _candidate_plan_fixture()
+    initial = (("C1", "C2"), ("C3", "C4"))
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = native_core.NativeSearchEngineV2(
+        100, 100, 256, 10_000_000, 256, 100, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        _native_lexical_rank(context),
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray([1, 2, 3, 4], dtype=np.int64),
+        np.asarray([2014, 1, 128, 1, 100], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    constraint_before = engine.lane_solution_state(2)
+    engine.inject_constraint_iteration_deadline_before_commit_once()
+
+    payload = engine.run_three_lane_bootstrap(
+        3,
+        512,
+        -1,
+        np.asarray([4, 8, 3], dtype=np.int64),
+        np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+    )
+    semantic = decode_native_three_lane_semantic_stream(
+        instance,
+        payload,
+        node_names=context.node_names,
+        initial_customer_sequences=initial,
+    )
+
+    assert semantic.termination[[0, 5]].tolist() == [2, 1]
+    assert len(semantic.neighborhood_events) == 2
+    assert semantic.neighborhood_events[0]["operator"] == "relocate"
+    assert semantic.neighborhood_events[1]["accepted"] is True
+    best_offsets, best_indices = payload[9][:2]
+    best_routes = tuple(
+        tuple(
+            context.node_names[int(index)]
+            for index in best_indices[
+                int(best_offsets[route]) : int(best_offsets[route + 1])
+            ]
+        )
+        for route in range(len(best_offsets) - 1)
+    )
+    assert best_routes == semantic.neighborhood_events[1]["candidate_route_sequences"]
+    constraint_after = engine.lane_solution_state(2)
+    for before, after in zip(constraint_before, constraint_after, strict=True):
+        np.testing.assert_equal(after, before)
+    assert semantic.operator_totals[9].tolist() == [0] * 8
+
+
 def test_native_global_search_returns_deadline_terminal_without_partial_iteration() -> None:
     from evrptw import _core as native_core
 
@@ -3875,6 +4461,323 @@ def test_native_global_search_returns_deadline_terminal_without_partial_iteratio
     assert decoded.termination[8] > state_before[1][5]
     for before, after in zip(solution_before, engine.solution_state(), strict=True):
         np.testing.assert_equal(after, before)
+
+
+def test_full_native_v2_one_call_multi_route_matches_python_three_lane_iteration() -> None:
+    instance = _candidate_plan_fixture()
+    initial = (("C1", "C2"), ("C3", "C4"))
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = initial
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **solve_kwargs,
+        candidate_control_config=CandidateControlConfig(
+            worker_count=1,
+            max_exact_calls_per_round=100,
+            proposal_top_k=100,
+        ),
+    )
+    native_config = replace(
+        _native_config("full_native_alns"),
+        candidate_control_config=CandidateControlConfig(
+            worker_count=1,
+            max_exact_calls_per_round=100,
+            proposal_top_k=100,
+        ),
+    )
+    native_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **solve_kwargs,
+        native_execution_config=native_config,
+    )
+    parallel_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **solve_kwargs,
+        native_execution_config=replace(
+            native_config,
+            candidate_control_config=replace(
+                native_config.candidate_control_config,
+                worker_count=4,
+            ),
+        ),
+    )
+
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.objective == python_result.objective
+    assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
+    assert native_result.iterations == python_result.iterations == 1
+    assert native_result.accepted_moves == python_result.accepted_moves == 1
+    assert native_result.improving_moves == python_result.improving_moves == 1
+    assert native_result.rejected_moves == python_result.rejected_moves == 0
+    assert (
+        native_result.charging_subproblem_calls
+        == python_result.charging_subproblem_calls
+        == 33
+    )
+    assert native_result.termination_reason == python_result.termination_reason
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+    assert native_result.stage04_event_log == python_result.stage04_event_log
+    assert native_result.stage04_weight_history == python_result.stage04_weight_history
+    assert native_result.native_execution_statistics["fallback_count"] == 0
+    assert parallel_result.customer_sequences == native_result.customer_sequences
+    assert parallel_result.objective == native_result.objective
+    assert parallel_result.neighborhood_events == native_result.neighborhood_events
+    assert parallel_result.charging_subproblem_calls == native_result.charging_subproblem_calls
+    assert parallel_result.candidate_work_hash == native_result.candidate_work_hash
+    assert parallel_result.native_execution_statistics["fallback_count"] == 0
+
+
+@pytest.mark.parametrize("exact_budget", [4, 6, 21])
+def test_full_native_v2_multi_route_fixed_work_boundary_matches_python(
+    exact_budget: int,
+) -> None:
+    instance = _candidate_plan_fixture()
+    initial = (("C1", "C2"), ("C3", "C4"))
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = initial
+    exact_config = ExactDeadlineConfig.fixed_exact_calls(
+        exact_budget,
+        watchdog_seconds=120.0,
+    )
+    control = CandidateControlConfig(
+        worker_count=1,
+        max_exact_calls_per_round=100,
+        proposal_top_k=100,
+    )
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=120.0,
+        **solve_kwargs,
+        exact_deadline_config=exact_config,
+        candidate_control_config=control,
+    )
+    native_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=120.0,
+        **solve_kwargs,
+        exact_deadline_config=exact_config,
+        native_execution_config=replace(
+            _native_config("full_native_alns"),
+            candidate_control_config=control,
+        ),
+    )
+
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.objective == python_result.objective
+    assert native_result.termination_reason == python_result.termination_reason
+    assert native_result.iterations == python_result.iterations
+    assert native_result.accepted_moves == python_result.accepted_moves
+    assert native_result.improving_moves == python_result.improving_moves
+    assert native_result.rejected_moves == python_result.rejected_moves
+    assert (
+        native_result.charging_subproblem_calls
+        == python_result.charging_subproblem_calls
+        == exact_budget
+    )
+    assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+    assert native_result.stage04_event_log == python_result.stage04_event_log
+    assert native_result.native_execution_statistics["fallback_count"] == 0
+
+
+def test_full_native_v2_accepts_legal_route_elimination_rejection() -> None:
+    base = _candidate_plan_fixture()
+    instance = Instance(
+        "candidate_plan_capacity_fixture",
+        base.nodes,
+        Vehicle(100.0, 2.0, 1.0, 0.1, 1.0),
+        distance_backend="python",
+    )
+    initial = (("C1", "C2"), ("C3", "C4"))
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = initial
+    control = CandidateControlConfig(
+        worker_count=1,
+        max_exact_calls_per_round=100,
+        proposal_top_k=100,
+    )
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **solve_kwargs,
+        candidate_control_config=control,
+    )
+    native_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **solve_kwargs,
+        native_execution_config=replace(
+            _native_config("full_native_alns"),
+            candidate_control_config=control,
+        ),
+    )
+
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.objective == python_result.objective
+    assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+    assert native_result.stage04_event_log == python_result.stage04_event_log
+    assert native_result.native_execution_statistics["fallback_count"] == 0
+
+
+def test_full_native_v2_two_iterations_match_python_all_three_lanes() -> None:
+    instance = _candidate_plan_fixture()
+    initial = (("C1", "C2"), ("C3", "C4"))
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = initial
+    control = CandidateControlConfig(
+        worker_count=1,
+        max_exact_calls_per_round=100,
+        proposal_top_k=100,
+    )
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=2,
+        time_limit_seconds=10.0,
+        **solve_kwargs,
+        candidate_control_config=control,
+    )
+    native_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=2,
+        time_limit_seconds=10.0,
+        **solve_kwargs,
+        native_execution_config=replace(
+            _native_config("full_native_alns"),
+            candidate_control_config=control,
+        ),
+    )
+
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.objective == python_result.objective
+    assert native_result.iterations == python_result.iterations == 2
+    assert native_result.accepted_moves == python_result.accepted_moves
+    assert native_result.improving_moves == python_result.improving_moves
+    assert native_result.rejected_moves == python_result.rejected_moves
+    assert native_result.charging_subproblem_calls == python_result.charging_subproblem_calls
+    assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+
+
+@pytest.mark.parametrize(
+    "max_iterations",
+        [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+)
+def test_full_native_v2_followup_iterations_match_python_all_three_lanes(
+    max_iterations: int,
+) -> None:
+    instance = _candidate_plan_fixture()
+    initial = (("C1", "C2"), ("C3", "C4"))
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = initial
+    control = CandidateControlConfig(
+        worker_count=1,
+        max_exact_calls_per_round=100,
+        proposal_top_k=100,
+    )
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=max_iterations,
+        time_limit_seconds=10.0,
+        **solve_kwargs,
+        candidate_control_config=control,
+    )
+    native_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=max_iterations,
+        time_limit_seconds=10.0,
+        **solve_kwargs,
+        native_execution_config=replace(
+            _native_config("full_native_alns"),
+            candidate_control_config=control,
+        ),
+    )
+
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.objective == python_result.objective
+    assert native_result.iterations == python_result.iterations == max_iterations
+    assert native_result.accepted_moves == python_result.accepted_moves
+    assert native_result.improving_moves == python_result.improving_moves
+    assert native_result.rejected_moves == python_result.rejected_moves
+    assert native_result.charging_subproblem_calls == python_result.charging_subproblem_calls
+    assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+    assert native_result.stage04_event_log == python_result.stage04_event_log
+    assert native_result.stage04_weight_history == python_result.stage04_weight_history
+    assert native_result.native_execution_statistics["worker_protocol_invocations"] == 1
+    assert native_result.native_execution_statistics["fallback_count"] == 0
+
+
+def test_full_native_v2_failed_regret_repair_preserves_main_rng_alignment() -> None:
+    instance = _candidate_plan_fixture()
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = (("C1", "C2"), ("C3", "C4"))
+    control = CandidateControlConfig(
+        worker_count=1,
+        max_exact_calls_per_round=100,
+        proposal_top_k=100,
+    )
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=20,
+        time_limit_seconds=10.0,
+        **solve_kwargs,
+        candidate_control_config=control,
+    )
+    native_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=20,
+        time_limit_seconds=10.0,
+        **solve_kwargs,
+        native_execution_config=replace(
+            _native_config("full_native_alns"),
+            candidate_control_config=control,
+        ),
+    )
+
+    python_tail = tuple(
+        (event["iteration"], event["operator"], event["reason"])
+        for event in python_result.neighborhood_events
+        if int(event["iteration"]) >= 18
+    )
+    native_tail = tuple(
+        (event["iteration"], event["operator"], event["reason"])
+        for event in native_result.neighborhood_events
+        if int(event["iteration"]) >= 18
+    )
+    assert native_tail == python_tail
+    assert native_tail[-2:] == (
+        (18, "standard", "related+regret2"),
+        (19, "vehicle_count_aware_repair", "existing_route_repair"),
+    )
 
 
 def test_native_global_search_returns_incumbent_after_exact_kernel_deadline() -> None:
@@ -4099,15 +5002,22 @@ def test_native_constraint_iteration_applies_stage04_segment_weights() -> None:
         np.asarray([128], dtype=np.int64),
         -1,
     )
-    statuses, old_new_weights, segment_calls_at_boundary, rewards_at_boundary = (
-        engine.finish_stage04_iteration(0, False)
-    )
+    (
+        statuses,
+        old_new_weights,
+        segment_calls_at_boundary,
+        rewards_at_boundary,
+        control_status,
+        control_float,
+    ) = engine.finish_stage04_iteration(0, False)
     weights, reward_sums, segment_calls, totals = engine.constraint_stage04_state()
 
     assert statuses.tolist() == [1, 0, 0, 0]
     np.testing.assert_allclose(old_new_weights[0], np.asarray([1.0, 1.04]))
     assert segment_calls_at_boundary.tolist() == [1, 0, 0, 0]
     np.testing.assert_allclose(rewards_at_boundary, np.asarray([2.0, 0.0, 0.0, 0.0]))
+    np.testing.assert_equal(control_status, np.zeros(7, dtype=np.int64))
+    np.testing.assert_allclose(control_float, np.zeros(1))
     np.testing.assert_allclose(weights, np.asarray([1.04, 1.0, 1.0, 1.0]))
     np.testing.assert_allclose(reward_sums, np.zeros(4))
     assert segment_calls.tolist() == [0, 0, 0, 0]
@@ -4159,15 +5069,22 @@ def test_native_stage04_constraint_statistics_are_shared_across_lanes() -> None:
         np.asarray([128], dtype=np.int64),
         -1,
     )
-    statuses, old_new_weights, calls, rewards = engine.finish_stage04_iteration(
-        0, False
-    )
+    (
+        statuses,
+        old_new_weights,
+        calls,
+        rewards,
+        control_status,
+        control_float,
+    ) = engine.finish_stage04_iteration(0, False)
     weights, reward_sums, segment_calls, totals = engine.constraint_stage04_state()
 
     assert statuses.tolist() == [1, 0, 0, 0]
     np.testing.assert_allclose(old_new_weights[0], np.asarray([1.0, 1.04]))
     assert calls.tolist() == [2, 0, 0, 0]
     np.testing.assert_allclose(rewards, np.asarray([4.0, 0.0, 0.0, 0.0]))
+    np.testing.assert_equal(control_status, np.zeros(7, dtype=np.int64))
+    np.testing.assert_allclose(control_float, np.zeros(1))
     np.testing.assert_allclose(weights, np.asarray([1.04, 1.0, 1.0, 1.0]))
     np.testing.assert_allclose(reward_sums, np.zeros(4))
     assert segment_calls.tolist() == [0, 0, 0, 0]
@@ -5118,7 +6035,7 @@ def test_full_native_v2_one_call_matches_python_pre_exhausted_budget() -> None:
     assert native_result.backend_metrics["launch_occupancies"] == [1]
 
 
-def test_full_native_v2_outer_hash_binds_valid_semantic_stream(
+def test_full_native_v2_rejects_foreign_semantic_stream_before_outer_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from evrptw import _core as native_core
@@ -5137,7 +6054,7 @@ def test_full_native_v2_outer_hash_binds_valid_semantic_stream(
         return tuple(primary)
 
     monkeypatch.setattr(native_core, "full_native_alns_v2", swap_semantic_stream)
-    with pytest.raises(RuntimeError, match="transaction SHA-256 mismatch"):
+    with pytest.raises(RuntimeError, match="canonical event sequence is invalid"):
         solve_alns(
             _fixture_instance(),
             seed=2014,

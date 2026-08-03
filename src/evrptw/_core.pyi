@@ -309,6 +309,44 @@ class NativeSearchEngineV2:
         npt.NDArray[np.int64],
         str,
     ]: ...
+    def legacy_route_elimination_probe(
+        self,
+        iteration: int,
+        max_attempts: int,
+        route_change_limit: int,
+        deadline_remaining: npt.NDArray[np.float64],
+        batch_size: npt.NDArray[np.int64],
+        defer_acceptance: bool = False,
+    ) -> tuple[object, ...]: ...
+    def apply_legacy_candidate(
+        self,
+        temperature: float,
+        random_draw: float,
+    ) -> tuple[int, int, int]: ...
+    def legacy_vehicle_reduction_refinement(
+        self,
+        iteration: int,
+        evaluation_budget: int,
+        deadline_remaining: npt.NDArray[np.float64],
+        batch_size: npt.NDArray[np.int64],
+    ) -> tuple[object, ...]: ...
+    def quality_changed_probe(
+        self,
+        operation: int,
+        iteration: int,
+        deadline_remaining: npt.NDArray[np.float64],
+        batch_size: npt.NDArray[np.int64],
+    ) -> tuple[object, ...]: ...
+    def run_three_lane_bootstrap(
+        self,
+        max_route_elimination_attempts: int,
+        refinement_budget: int,
+        route_change_limit: int,
+        thresholds: npt.NDArray[np.int64],
+        fractions: npt.NDArray[np.float64],
+        deadline_remaining: npt.NDArray[np.float64],
+        batch_size: npt.NDArray[np.int64],
+    ) -> tuple[object, ...]: ...
     def constraint_probe(
         self,
         operation: int,
@@ -361,7 +399,20 @@ class NativeSearchEngineV2:
         integer_config: npt.NDArray[np.int64],
         float_config: npt.NDArray[np.float64],
     ) -> None: ...
+    def initialize_stage04_search(
+        self,
+        deadline_remaining: npt.NDArray[np.float64],
+        batch_size: npt.NDArray[np.int64],
+    ) -> tuple[object, ...]: ...
     def constraint_stage04_state(
+        self,
+    ) -> tuple[
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+    ]: ...
+    def full_stage04_state(
         self,
     ) -> tuple[
         npt.NDArray[np.float64],
@@ -383,6 +434,8 @@ class NativeSearchEngineV2:
         iteration: int,
         budget_boundary: bool,
     ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
         npt.NDArray[np.int64],
         npt.NDArray[np.float64],
         npt.NDArray[np.int64],
@@ -510,6 +563,15 @@ class NativeSearchEngineV2:
         npt.NDArray[np.int64],
         npt.NDArray[np.int64],
         npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+    ]: ...
+    def lane_solution_state(
+        self,
+        lane: int,
+    ) -> tuple[
         npt.NDArray[np.int64],
         npt.NDArray[np.int64],
         npt.NDArray[np.int64],

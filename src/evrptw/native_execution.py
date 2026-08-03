@@ -9,10 +9,11 @@ the historical guards and execution paths unchanged.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import struct
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Literal, cast
 
@@ -77,8 +78,10 @@ _RESOLUTION_BY_CODE: dict[int, NativeCandidateResolution] = {
 }
 
 FULL_NATIVE_OPERATOR_NAMES = (
-    "route_merge",
+    "standard",
+    "vehicle_count_aware_repair",
     "route_elimination",
+    "route_merge",
     "relocate",
     "swap",
     "two_opt_star",
@@ -224,7 +227,7 @@ class FullNativeALNSResult:
     counters: Mapping[str, int]
     timings: Mapping[str, float]
     trajectory: tuple[Mapping[str, object], ...]
-    semantic_stream: NativeGlobalSemanticStream
+    semantic_stream: NativeGlobalSemanticStream | NativeThreeLaneSemanticStream
     transaction_sha256: str
 
 
@@ -256,6 +259,22 @@ class NativeGlobalSemanticStream:
     stage04_calls: npt.NDArray[np.int64]
     termination: npt.NDArray[np.int64]
     transaction_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class NativeThreeLaneSemanticStream:
+    """Independently replayed semantic projection of one full three-lane iteration."""
+
+    neighborhood_events: tuple[Mapping[str, object], ...]
+    operator_weights: npt.NDArray[np.float64]
+    operator_rewards: npt.NDArray[np.float64]
+    operator_calls: npt.NDArray[np.int64]
+    operator_totals: npt.NDArray[np.int64]
+    operator_activity: npt.NDArray[np.int64]
+    termination: npt.NDArray[np.int64]
+    transaction_sha256: str
+    stage04_events: tuple[Mapping[str, object], ...] = ()
+    stage04_control: npt.NDArray[np.int64] | None = None
 
 
 def _append_u64(evidence: bytearray, value: int) -> None:
@@ -366,7 +385,7 @@ def decode_native_constraint_semantic_stream(
     if (
         np.any(event_integer[:, 0] != 0)
         or np.any(event_integer[:, 1] != 2)
-        or np.any(event_integer[:, 3] < 7)
+        or np.any(event_integer[:, 3] < 9)
         or np.any(event_integer[:, 3] > 10)
         or np.any(event_integer[1:, 2] != event_integer[:-1, 2] + 1)
     ):
@@ -855,9 +874,9 @@ def decode_native_global_semantic_stream(
     if len(expected_customer_names) == 1:
         expected_events = np.asarray(
             [
-                [1, 2, 0, 0, 0, 0, 0, -1, -2, -1, -1],
-                [2, 7, 0, 4, 0, 0, 2, -1, -2, 0, 1],
-                [0, 1, 0, 0, 0, 0, 0, -1, -2, -1, -1],
+                    [1, 4, 0, 0, 0, 0, 0, -1, -2, -1, -1],
+                [2, 9, 0, 4, 0, 0, 2, -1, -2, 0, 1],
+                    [0, 2, 0, 0, 0, 0, 0, -1, -2, -1, -1],
             ],
             dtype=np.int64,
         )
@@ -899,11 +918,11 @@ def decode_native_global_semantic_stream(
     candidate_feasible = bool(events[2, 10]) if event_count >= 3 else False
     normal_canonical_values = np.asarray(
         [
-            [1, 2, 0, 0, 0, 0, 0, -1, -2, -1, -1],
-            [2, 7, 1, 1, 1, 0, 2, 0, -2, 0, 0],
+                [1, 4, 0, 0, 0, 0, 0, -1, -2, -1, -1],
+            [2, 9, 1, 1, 1, 0, 2, 0, -2, 0, 0],
             [
                 2,
-                7,
+                    9,
                 1 if candidate_feasible else 2,
                 2 if candidate_feasible else 3,
                 1,
@@ -914,7 +933,7 @@ def decode_native_global_semantic_stream(
                 0,
                 0,
             ],
-            [0, 1, 0, 0, 0, 0, 0, -1, -2, -1, -1],
+                [0, 2, 0, 0, 0, 0, 0, -1, -2, -1, -1],
         ],
         dtype=np.int64,
     )
@@ -1084,6 +1103,5059 @@ def decode_native_global_semantic_stream(
         stage04_calls=_readonly_copy(stage04_calls),
         termination=_readonly_copy(termination),
         transaction_sha256=transaction_sha256,
+    )
+
+
+def _append_native_nested_evidence(evidence: bytearray, value: object) -> None:
+    if value is None:
+        evidence.extend(b"N")
+    elif isinstance(value, tuple):
+        evidence.extend(b"T")
+        _append_u64(evidence, len(value))
+        for item in value:
+            _append_native_nested_evidence(evidence, item)
+    elif isinstance(value, np.ndarray):
+        evidence.extend(b"A" + value.dtype.str.encode() + b"\0")
+        _append_typed_array(evidence, value)
+    elif isinstance(value, str):
+        encoded = value.encode()
+        evidence.extend(b"S")
+        _append_u64(evidence, len(encoded))
+        evidence.extend(encoded)
+    elif isinstance(value, bool):
+        evidence.extend(b"B" + bytes((int(value),)))
+    elif isinstance(value, int):
+        evidence.extend(b"I")
+        _append_u64(evidence, value)
+    elif isinstance(value, float):
+        evidence.extend(b"F")
+        _append_u64(evidence, struct.unpack("<Q", struct.pack("<d", value))[0])
+    else:
+        raise RuntimeError("native semantic evidence contains an unsupported value")
+
+
+def _verify_native_three_lane_semantic_hash(payload: tuple[object, ...]) -> str:
+    evidence = bytearray(b"stage05.2-native-three-lane-semantic-stream-v2")
+    _append_native_nested_evidence(evidence, payload[:13])
+    producer_sha256 = payload[13]
+    if (
+        not isinstance(producer_sha256, str)
+        or not _is_sha256(producer_sha256)
+        or hashlib.sha256(evidence).hexdigest() != producer_sha256
+    ):
+        raise RuntimeError("native three-lane semantic stream SHA-256 mismatch")
+    return producer_sha256
+
+
+def decode_native_three_lane_semantic_stream(
+    instance: Instance,
+    payload: object,
+    *,
+    node_names: tuple[str, ...],
+    initial_customer_sequences: tuple[CustomerSequence, ...],
+) -> NativeThreeLaneSemanticStream:
+    """Replay one multi-route bootstrap without trusting native search decisions."""
+
+    if not isinstance(payload, tuple) or len(payload) != 14:
+        raise RuntimeError("native three-lane semantic payload has an invalid tuple")
+    producer_sha256 = _verify_native_three_lane_semantic_hash(payload)
+    if tuple(node.name for node in instance.nodes) != node_names:
+        raise RuntimeError("native three-lane semantic node identity is invalid")
+    expected_customers = {customer.name for customer in instance.customers}
+    flattened_initial = tuple(
+        customer for route in initial_customer_sequences for customer in route
+    )
+    if (
+        len(initial_customer_sequences) < 2
+        or len(flattened_initial) != len(expected_customers)
+        or set(flattened_initial) != expected_customers
+    ):
+        raise RuntimeError("native three-lane initial incumbent identity is invalid")
+    name_by_index = node_names
+    termination = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[11],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="three-lane termination",
+        ),
+    )
+    full_stage04_value = payload[12]
+    if not isinstance(full_stage04_value, tuple) or len(full_stage04_value) != 4:
+        raise RuntimeError("native three-lane full Stage 4 has an invalid tuple")
+    weights = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            full_stage04_value[0],
+            dtype=np.dtype(np.float64),
+            shape=(len(FULL_NATIVE_OPERATOR_NAMES),),
+            name="full Stage 4 weights",
+        ),
+    )
+    rewards = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            full_stage04_value[1],
+            dtype=np.dtype(np.float64),
+            shape=(len(FULL_NATIVE_OPERATOR_NAMES),),
+            name="full Stage 4 rewards",
+        ),
+    )
+    calls = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            full_stage04_value[2],
+            dtype=np.dtype(np.int64),
+            shape=(len(FULL_NATIVE_OPERATOR_NAMES),),
+            name="full Stage 4 calls",
+        ),
+    )
+    totals = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            full_stage04_value[3],
+            dtype=np.dtype(np.int64),
+            shape=(len(FULL_NATIVE_OPERATOR_NAMES), 8),
+            name="full Stage 4 totals",
+        ),
+    )
+    if (
+        np.any(weights <= 0.0)
+        or np.any(~np.isfinite(weights))
+        or np.any(rewards < 0.0)
+        or np.any(~np.isfinite(rewards))
+        or np.any(calls < 0)
+        or np.any(totals < 0)
+        or int(termination[0]) not in {0, 1, 2}
+        or int(termination[2]) != int(termination[3]) + int(termination[4])
+        or int(termination[5]) not in {0, 1}
+    ):
+        raise RuntimeError("native three-lane final state is invalid")
+
+    def require_tuple(value: object, size: int, name: str) -> tuple[object, ...]:
+        if not isinstance(value, tuple) or len(value) != size:
+            raise RuntimeError(f"native three-lane {name} has an invalid tuple")
+        return value
+
+    def unpack_routes(
+        offsets_value: object,
+        indices_value: object,
+        name: str,
+    ) -> tuple[CustomerSequence, ...]:
+        offsets = _require_vector(offsets_value, f"{name} offsets")
+        indices = _require_vector(indices_value, f"{name} indices")
+        if (
+            len(offsets) < 2
+            or int(offsets[0]) != 0
+            or int(offsets[-1]) != len(indices)
+            or np.any(offsets[:-1] >= offsets[1:])
+            or np.any(indices < 0)
+            or np.any(indices >= len(name_by_index))
+        ):
+            raise RuntimeError(f"native three-lane {name} route SoA is invalid")
+        routes = tuple(
+            tuple(
+                name_by_index[int(index)]
+                for index in indices[int(offsets[route]) : int(offsets[route + 1])]
+            )
+            for route in range(len(offsets) - 1)
+        )
+        flattened = tuple(customer for route in routes for customer in route)
+        if len(flattened) != len(set(flattened)):
+            raise RuntimeError(f"native three-lane {name} repeats a customer")
+        return routes
+
+    def replay_objective(routes: tuple[CustomerSequence, ...]) -> SolutionObjective:
+        flattened = tuple(customer for route in routes for customer in route)
+        if len(flattened) != len(expected_customers) or set(flattened) != expected_customers:
+            raise RuntimeError("native three-lane candidate customer identity is invalid")
+        objective = SolutionObjective.zero()
+        for route in routes:
+            exact = solve_exact_charging(instance, route)
+            if not exact.feasible:
+                raise RuntimeError("native three-lane candidate objective replay is infeasible")
+            objective += SolutionObjective.from_route(
+                instance,
+                exact.route,
+                total_distance=exact.distance,
+                total_charging_time=exact.charging_time,
+            )
+        return objective
+
+    def require_plan_transaction(
+        value: object,
+        plan_count: int,
+        name: str,
+    ) -> tuple[object, ...]:
+        transaction = require_tuple(value, 13, f"{name} transaction")
+        _require_array(
+            transaction[1],
+            dtype=np.dtype(np.int64),
+            shape=(plan_count,),
+            name=f"{name} plan statuses",
+        )
+        _require_array(
+            transaction[2],
+            dtype=np.dtype(np.int64),
+            shape=(plan_count, 2),
+            name=f"{name} objective integers",
+        )
+        _require_array(
+            transaction[3],
+            dtype=np.dtype(np.float64),
+            shape=(plan_count, 2),
+            name=f"{name} objective floats",
+        )
+        _require_vector(transaction[5], f"{name} exact rows")
+        _require_vector(transaction[11], f"{name} feasible order")
+        transaction_hash = transaction[12]
+        if not isinstance(transaction_hash, str) or not _is_sha256(transaction_hash):
+            raise RuntimeError(f"native three-lane {name} transaction hash is invalid")
+        return transaction
+
+    def reported_objective(
+        transaction: tuple[object, ...],
+        plan: int,
+        replayed: SolutionObjective,
+        name: str,
+    ) -> tuple[int, float, float, int]:
+        integers = cast(npt.NDArray[np.int64], transaction[2])
+        floats = cast(npt.NDArray[np.float64], transaction[3])
+        reported = SolutionObjective(
+            vehicle_count=int(integers[plan, 0]),
+            total_distance=float(floats[plan, 0]),
+            total_charging_time=float(floats[plan, 1]),
+            charging_count=int(integers[plan, 1]),
+        )
+        if reported.key != replayed.key:
+            raise RuntimeError(f"native three-lane {name} objective replay mismatch")
+        return reported.key
+
+    def event(
+        operator: str,
+        status: str,
+        reason: str,
+        *,
+        iteration: int = 0,
+        **changes: object,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "operator": operator,
+            "status": status,
+            "reason": reason,
+            "route_indices": (),
+            "affected_route_indices": (),
+            "removed_customers": (),
+            "candidate_customer_sequence": (),
+            "candidate_route_sequences": (),
+            "candidate_vehicle_delta": None,
+            "candidate_feasible": False,
+            "prefilter_passed": False,
+            "new_routes_created": 0,
+            "exact_route_evaluations": 0,
+            "selection_rank": 0,
+            "chain_depth": 0,
+            "segment_length": 0,
+            "track": "legacy",
+            "constraint_category": "",
+            "removal_tier": "",
+            "removal_size_requested": 0,
+            "removal_size_actual": 0,
+            "stagnation_iterations": 0,
+            "removal_trigger": "",
+            "reset_observed": False,
+            "ranking_score": 0.0,
+            "iteration": iteration,
+            "accepted": False,
+            "vehicle_reduction": False,
+            "distance_improvement": False,
+            "candidate_objective_key": (),
+        }
+        result.update(changes)
+        return result
+
+    def activity_from_events(
+        events: Sequence[Mapping[str, object]],
+    ) -> npt.NDArray[np.int64]:
+        activity = np.zeros((len(FULL_NATIVE_OPERATOR_NAMES), 8), dtype=np.int64)
+        by_name = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
+        for item in events:
+            operator_index = by_name[str(item["operator"])]
+            activity[operator_index, 0] = max(
+                int(activity[operator_index, 0]),
+                int(bool(item["candidate_feasible"])),
+            )
+            activity[operator_index, 1] += int(bool(item["prefilter_passed"]))
+            activity[operator_index, 2] += cast(int, item["exact_route_evaluations"])
+            activity[operator_index, 3] += int(item["status"] == "candidate_proposed")
+            activity[operator_index, 4] += int(bool(item["candidate_feasible"]))
+            activity[operator_index, 5] += int(bool(item["vehicle_reduction"]))
+            activity[operator_index, 6] += int(bool(item["distance_improvement"]))
+        refinement_index = FULL_NATIVE_OPERATOR_NAMES.index(
+            "vehicle_reduction_refinement"
+        )
+        if activity[refinement_index, 1] > 0:
+            activity[refinement_index, 0] = 1
+        return activity
+
+    initial_objective = replay_objective(initial_customer_sequences)
+    if int(termination[0]) in {1, 2}:
+        best = require_tuple(payload[9], 5, "terminal best")
+        terminal_routes = unpack_routes(best[0], best[1], "terminal best")
+        terminal_objective = replay_objective(terminal_routes)
+        terminal_expected_routes = initial_customer_sequences
+        terminal_expected_objective = initial_objective
+        if int(termination[0]) == 1 and (
+            terminal_routes != terminal_expected_routes
+            or terminal_objective.key != terminal_expected_objective.key
+        ):
+            raise RuntimeError(
+                "native three-lane terminal changed the last complete incumbent"
+            )
+        terminal_events: list[dict[str, object]] = []
+        if payload[2] is not None:
+            quality = require_tuple(payload[2], 4, "terminal quality")
+            quality_pool = require_tuple(quality[0], 5, "terminal quality pool")
+            changed_routes = cast(
+                npt.NDArray[np.int64],
+                _require_array(
+                    quality_pool[0],
+                    dtype=np.dtype(np.int64),
+                    shape=(len(cast(npt.NDArray[np.int64], quality_pool[0])), 2),
+                    name="terminal quality changed routes",
+                ),
+            )
+            pool_count = changed_routes.shape[0]
+            change_offsets = _require_vector(
+                quality_pool[1], "terminal quality change offsets"
+            )
+            change_indices = _require_vector(
+                quality_pool[2], "terminal quality change indices"
+            )
+            moved_customers = _require_vector(
+                quality_pool[4], "terminal quality moved customers"
+            )
+            terminal_quality_plans: list[tuple[CustomerSequence, ...]] = []
+            terminal_quality_sources: list[int] = []
+            terminal_seen_quality: set[tuple[CustomerSequence, ...]] = set()
+            for candidate in range(pool_count):
+                routes = list(initial_customer_sequences)
+                for changed_ordinal in range(2):
+                    route = int(changed_routes[candidate, changed_ordinal])
+                    begin = int(change_offsets[candidate * 2 + changed_ordinal])
+                    end = int(change_offsets[candidate * 2 + changed_ordinal + 1])
+                    routes[route] = tuple(
+                        name_by_index[int(index)] for index in change_indices[begin:end]
+                    )
+                plan = tuple(routes)
+                if plan not in terminal_seen_quality:
+                    terminal_seen_quality.add(plan)
+                    terminal_quality_plans.append(plan)
+                    terminal_quality_sources.append(candidate)
+            quality_outcome = cast(
+                npt.NDArray[np.int64],
+                _require_array(
+                    quality[2],
+                    dtype=np.dtype(np.int64),
+                    shape=(4,),
+                    name="terminal quality outcome",
+                ),
+            )
+            selected_quality = int(quality_outcome[0])
+            pool_hash = hashlib.sha256()
+            for plan in terminal_quality_plans:
+                pool_hash.update(json.dumps(plan, separators=(",", ":")).encode())
+            terminal_events.append(
+                event(
+                    "relocate",
+                    "candidate_pool_aggregate",
+                    "relocate_complete_candidate_pool",
+                    aggregate_count=len(terminal_quality_plans),
+                    candidate_pool_hash=pool_hash.hexdigest(),
+                )
+            )
+            if selected_quality >= 0:
+                if selected_quality >= len(terminal_quality_plans):
+                    raise RuntimeError(
+                        "native three-lane terminal quality selection is invalid"
+                    )
+                quality_transaction = require_plan_transaction(
+                    quality[1], len(terminal_quality_plans), "terminal quality"
+                )
+                quality_routes = terminal_quality_plans[selected_quality]
+                quality_objective = replay_objective(quality_routes)
+                quality_objective_key = reported_objective(
+                    quality_transaction,
+                    selected_quality,
+                    quality_objective,
+                    "terminal quality",
+                )
+                source = terminal_quality_sources[selected_quality]
+                moved = int(moved_customers[source])
+                if int(termination[0]) == 1 and (
+                    bool(quality_outcome[1]) or bool(quality_outcome[2])
+                ):
+                    raise RuntimeError(
+                        "native three-lane terminal accepted an incomplete quality move"
+                    )
+                terminal_events.append(
+                    event(
+                        "relocate",
+                        "candidate_proposed",
+                        "relocate_candidate",
+                        route_indices=tuple(int(v) for v in changed_routes[source]),
+                        affected_route_indices=tuple(
+                            int(v) for v in changed_routes[source]
+                        ),
+                        removed_customers=(name_by_index[moved],),
+                        candidate_route_sequences=quality_routes,
+                        candidate_vehicle_delta=len(quality_routes)
+                        - len(initial_customer_sequences),
+                        candidate_feasible=True,
+                        prefilter_passed=True,
+                        accepted=bool(quality_outcome[1]),
+                        vehicle_reduction=bool(quality_outcome[3]),
+                        distance_improvement=quality_objective.total_distance
+                        < initial_objective.total_distance - 1e-9,
+                        candidate_objective_key=quality_objective_key,
+                    )
+                )
+                terminal_events[0]["candidate_objective_key"] = quality_objective_key
+                if bool(quality_outcome[2]):
+                    if not bool(quality_outcome[1]):
+                        raise RuntimeError(
+                            "native three-lane terminal best quality was not accepted"
+                        )
+                    terminal_expected_routes = quality_routes
+                    terminal_expected_objective = quality_objective
+            else:
+                terminal_events.append(
+                    event(
+                        "relocate",
+                        "candidate_control_skipped",
+                        "no_selected_complete_plan_feasible",
+                    )
+                )
+        if payload[3] is not None or payload[4] is not None or payload[5] is not None:
+            raise RuntimeError(
+                "native three-lane terminal retained post-boundary semantic state"
+            )
+        if (
+            terminal_routes != terminal_expected_routes
+            or terminal_objective.key != terminal_expected_objective.key
+        ):
+            raise RuntimeError(
+                "native three-lane terminal best does not match completed transactions"
+            )
+        activity = activity_from_events(terminal_events)
+        if payload[0] is not None:
+            terminal_legacy = require_tuple(payload[0], 8, "terminal legacy")
+            terminal_legacy_outcome = cast(
+                npt.NDArray[np.int64],
+                _require_array(
+                    terminal_legacy[6],
+                    dtype=np.dtype(np.int64),
+                    shape=(5,),
+                    name="terminal legacy outcome",
+                ),
+            )
+            if int(terminal_legacy_outcome[0]) >= 0:
+                terminal_transaction = require_tuple(
+                    terminal_legacy[5], 13, "terminal legacy transaction"
+                )
+                legacy_index = FULL_NATIVE_OPERATOR_NAMES.index("route_elimination")
+                activity[legacy_index] = [
+                    1,
+                    1,
+                    len(_require_vector(terminal_transaction[5], "terminal legacy exact")),
+                    1,
+                    1,
+                    1,
+                    int(
+                        float(cast(npt.NDArray[np.float64], terminal_transaction[3])[
+                            int(terminal_legacy_outcome[0]), 0
+                        ])
+                        < initial_objective.total_distance - 1e-9
+                    ),
+                    0,
+                ]
+        if payload[1] is not None:
+            terminal_refinement = require_tuple(
+                payload[1], 4, "terminal refinement"
+            )
+            refinement_metadata = cast(
+                npt.NDArray[np.int64],
+                _require_array(
+                    terminal_refinement[0],
+                    dtype=np.dtype(np.int64),
+                    shape=(4,),
+                    name="terminal refinement metadata",
+                ),
+            )
+            refinement_index = FULL_NATIVE_OPERATOR_NAMES.index(
+                "vehicle_reduction_refinement"
+            )
+            activity[refinement_index] = [
+                int(refinement_metadata[0]) == 0,
+                1,
+                int(refinement_metadata[2]),
+                0,
+                0,
+                0,
+                0,
+                1 if int(refinement_metadata[0]) != 0 else 2,
+            ]
+        return NativeThreeLaneSemanticStream(
+            neighborhood_events=tuple(terminal_events),
+            operator_weights=_readonly_copy(weights),
+            operator_rewards=_readonly_copy(rewards),
+            operator_calls=_readonly_copy(calls),
+            operator_totals=_readonly_copy(totals),
+            operator_activity=_readonly_copy(activity),
+            termination=_readonly_copy(termination),
+            transaction_sha256=producer_sha256,
+        )
+
+    legacy = require_tuple(payload[0], 8, "legacy")
+    legacy_plan_offsets = _require_vector(legacy[2], "legacy plan offsets")
+    legacy_route_offsets = _require_vector(legacy[3], "legacy route offsets")
+    legacy_route_indices = _require_vector(legacy[4], "legacy route indices")
+    if (
+        int(legacy_plan_offsets[0]) != 0
+        or int(legacy_plan_offsets[-1]) != len(legacy_route_offsets) - 1
+        or int(legacy_route_offsets[0]) != 0
+        or int(legacy_route_offsets[-1]) != len(legacy_route_indices)
+    ):
+        raise RuntimeError("native three-lane legacy plan SoA is invalid")
+    legacy_plan_count = len(legacy_plan_offsets) - 1
+    legacy_outcome = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            legacy[6], dtype=np.dtype(np.int64), shape=(5,), name="legacy outcome"
+        ),
+    )
+    selected_legacy = int(legacy_outcome[0])
+    selected_source = int(legacy_outcome[4])
+    if selected_legacy < 0:
+        if legacy_plan_count != 0 or legacy[5] is not None or selected_source != -1:
+            raise RuntimeError("native three-lane rejected legacy selection is invalid")
+        if payload[1] is not None or payload[4] is not None:
+            raise RuntimeError("native three-lane rejected legacy retained acceptance state")
+        rejected_events: list[dict[str, object]] = []
+
+        quality = require_tuple(payload[2], 4, "rejected quality")
+        quality_pool = require_tuple(quality[0], 5, "rejected quality pool")
+        changed_routes = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                quality_pool[0],
+                dtype=np.dtype(np.int64),
+                shape=(len(cast(npt.NDArray[np.int64], quality_pool[0])), 2),
+                name="rejected quality changed routes",
+            ),
+        )
+        change_offsets = _require_vector(
+            quality_pool[1], "rejected quality change offsets"
+        )
+        change_indices = _require_vector(
+            quality_pool[2], "rejected quality change indices"
+        )
+        moved_customers = _require_vector(
+            quality_pool[4], "rejected quality moved customers"
+        )
+        rejected_quality_plans: list[tuple[CustomerSequence, ...]] = []
+        rejected_quality_sources: list[int] = []
+        rejected_seen_quality: set[tuple[CustomerSequence, ...]] = set()
+        for candidate in range(changed_routes.shape[0]):
+            routes = list(initial_customer_sequences)
+            for changed_ordinal in range(2):
+                route = int(changed_routes[candidate, changed_ordinal])
+                if route < 0 or route >= len(routes):
+                    raise RuntimeError(
+                        "native three-lane rejected quality route is invalid"
+                    )
+                begin = int(change_offsets[candidate * 2 + changed_ordinal])
+                end = int(change_offsets[candidate * 2 + changed_ordinal + 1])
+                routes[route] = tuple(
+                    name_by_index[int(index)] for index in change_indices[begin:end]
+                )
+            plan = tuple(routes)
+            if plan not in rejected_seen_quality:
+                rejected_seen_quality.add(plan)
+                rejected_quality_plans.append(plan)
+                rejected_quality_sources.append(candidate)
+        quality_transaction = require_plan_transaction(
+            quality[1], len(rejected_quality_plans), "rejected quality"
+        )
+        quality_outcome = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                quality[2],
+                dtype=np.dtype(np.int64),
+                shape=(4,),
+                name="rejected quality outcome",
+            ),
+        )
+        pool_hash = hashlib.sha256()
+        for plan in rejected_quality_plans:
+            pool_hash.update(json.dumps(plan, separators=(",", ":")).encode())
+        rejected_events.append(
+            event(
+                "relocate",
+                "candidate_pool_aggregate",
+                "relocate_complete_candidate_pool",
+                aggregate_count=len(rejected_quality_plans),
+                candidate_pool_hash=pool_hash.hexdigest(),
+            )
+        )
+        selected_quality = int(quality_outcome[0])
+        if selected_quality < 0:
+            if bool(quality_outcome[1]) or bool(quality_outcome[2]):
+                raise RuntimeError("native three-lane rejected quality outcome is invalid")
+            rejected_events.append(
+                event(
+                    "relocate",
+                    "candidate_control_skipped",
+                    "no_selected_complete_plan_feasible",
+                )
+            )
+        else:
+            if selected_quality >= len(rejected_quality_plans):
+                raise RuntimeError("native three-lane rejected quality selection is invalid")
+            quality_routes = rejected_quality_plans[selected_quality]
+            quality_objective = replay_objective(quality_routes)
+            quality_key = reported_objective(
+                quality_transaction,
+                selected_quality,
+                quality_objective,
+                "rejected quality",
+            )
+            source = rejected_quality_sources[selected_quality]
+            moved = int(moved_customers[source])
+            rejected_events.append(
+                event(
+                    "relocate",
+                    "candidate_proposed",
+                    "relocate_candidate",
+                    route_indices=tuple(int(v) for v in changed_routes[source]),
+                    affected_route_indices=tuple(
+                        int(v) for v in changed_routes[source]
+                    ),
+                    removed_customers=(name_by_index[moved],),
+                    candidate_route_sequences=quality_routes,
+                    candidate_vehicle_delta=len(quality_routes)
+                    - len(initial_customer_sequences),
+                    candidate_feasible=True,
+                    prefilter_passed=True,
+                    accepted=bool(quality_outcome[1]),
+                    vehicle_reduction=bool(quality_outcome[3]),
+                    distance_improvement=quality_objective.total_distance
+                    < initial_objective.total_distance - 1e-9,
+                    candidate_objective_key=quality_key,
+                )
+            )
+
+        constraint = require_tuple(payload[3], 3, "rejected constraint")
+        selection = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                constraint[0],
+                dtype=np.dtype(np.int64),
+                shape=(7,),
+                name="rejected constraint selection",
+            ),
+        )
+        constraint_probe = require_tuple(
+            constraint[1], 3, "rejected constraint probe"
+        )
+        removal = require_tuple(
+            constraint_probe[0], 7, "rejected constraint removal"
+        )
+        removed_indices = _require_vector(
+            removal[2], "rejected constraint removed customers"
+        )
+        removed_customers = tuple(name_by_index[int(index)] for index in removed_indices)
+        remaining_routes = unpack_routes(
+            removal[0], removal[1], "rejected constraint partial"
+        )
+        repair = require_tuple(constraint_probe[1], 3, "rejected constraint repair")
+        repaired_routes = unpack_routes(
+            repair[0], repair[1], "rejected constraint repaired"
+        )
+        constraint_transaction = require_plan_transaction(
+            constraint_probe[2], 1, "rejected constraint"
+        )
+        constraint_objective = replay_objective(repaired_routes)
+        constraint_key = reported_objective(
+            constraint_transaction, 0, constraint_objective, "rejected constraint"
+        )
+        constraint_outcome = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                constraint[2],
+                dtype=np.dtype(np.int64),
+                shape=(6,),
+                name="rejected constraint outcome",
+            ),
+        )
+        operator = FULL_NATIVE_OPERATOR_NAMES[int(constraint_outcome[0]) + 9]
+        removal_scores = cast(
+            npt.NDArray[np.float64],
+            _require_array(
+                removal[4],
+                dtype=np.dtype(np.float64),
+                shape=(len(removed_indices) * 2 + 2,),
+                name="rejected constraint removal scores",
+            ),
+        )
+        removal_route_indices = _require_vector(
+            removal[5], "rejected constraint route indices"
+        )
+        affected = tuple(
+            index
+            for index, (before, after) in enumerate(
+                zip(initial_customer_sequences, repaired_routes, strict=False)
+            )
+            if before != after
+        )
+        rejected_events.extend(
+            (
+                event(
+                    operator,
+                    "candidate_proposed",
+                    "constraint_ranked_removal",
+                    route_indices=(int(removal_route_indices[0]),),
+                    affected_route_indices=(int(removal_route_indices[0]),),
+                    removed_customers=removed_customers,
+                    candidate_route_sequences=remaining_routes,
+                    prefilter_passed=True,
+                    selection_rank=1,
+                    ranking_score=float(removal_scores[0]),
+                    candidate_objective_key=constraint_key,
+                    track="constraint_lane",
+                    constraint_category=operator,
+                    removal_tier="small" if int(selection[0]) == 0 else "",
+                    removal_size_requested=int(selection[1]),
+                    removal_size_actual=int(selection[2]),
+                    removal_trigger="stagnation_baseline",
+                ),
+                event(
+                    operator,
+                    "candidate_proposed",
+                    "constraint_removal_repaired",
+                    affected_route_indices=affected,
+                    removed_customers=removed_customers,
+                    candidate_route_sequences=repaired_routes,
+                    candidate_vehicle_delta=len(repaired_routes)
+                    - len(initial_customer_sequences),
+                    candidate_feasible=True,
+                    prefilter_passed=True,
+                    exact_route_evaluations=len(
+                        _require_vector(
+                            constraint_transaction[5],
+                            "rejected constraint exact rows",
+                        )
+                    ),
+                    accepted=bool(constraint_outcome[3]),
+                    vehicle_reduction=bool(constraint_outcome[5]),
+                    distance_improvement=constraint_objective.total_distance
+                    < initial_objective.total_distance - 1e-9,
+                    candidate_objective_key=constraint_key,
+                    track="constraint_lane",
+                    constraint_category=operator,
+                    removal_tier="small" if int(selection[0]) == 0 else "",
+                    removal_size_requested=int(selection[1]),
+                    removal_size_actual=int(selection[2]),
+                    removal_trigger="stagnation_baseline",
+                ),
+            )
+        )
+
+        profile_order = _require_vector(legacy[0], "rejected legacy profile order")
+        attempts = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                legacy[1],
+                dtype=np.dtype(np.int64),
+                shape=(len(profile_order), 6),
+                name="rejected legacy attempts",
+            ),
+        )
+        if not np.array_equal(profile_order, attempts[:, 0]):
+            raise RuntimeError("native three-lane rejected legacy order is invalid")
+        for attempt in attempts:
+            source = int(attempt[0])
+            failure_code = int(attempt[2])
+            if failure_code == 0:
+                raise RuntimeError(
+                    "native three-lane rejected legacy lost a feasible plan"
+                )
+            rejected_events.append(
+                event(
+                    "route_elimination",
+                    "failed",
+                    "no_existing_route_insertion"
+                    if failure_code == 1
+                    else "singleton_route_screening_rejected",
+                    route_indices=(source,),
+                    removed_customers=initial_customer_sequences[source],
+                    selection_rank=int(attempt[1]),
+                )
+            )
+        rejected_events.append(
+            event(
+                "route_elimination",
+                "candidate_control_skipped",
+                "no_selected_complete_plan_feasible",
+            )
+        )
+        best = require_tuple(payload[9], 5, "rejected best")
+        best_routes = unpack_routes(best[0], best[1], "rejected best")
+        if best_routes != initial_customer_sequences:
+            raise RuntimeError("native three-lane rejected bootstrap changed global best")
+        activity = activity_from_events(rejected_events)
+        return NativeThreeLaneSemanticStream(
+            neighborhood_events=tuple(rejected_events),
+            operator_weights=_readonly_copy(weights),
+            operator_rewards=_readonly_copy(rewards),
+            operator_calls=_readonly_copy(calls),
+            operator_totals=_readonly_copy(totals),
+            operator_activity=_readonly_copy(activity),
+            termination=_readonly_copy(termination),
+            transaction_sha256=producer_sha256,
+        )
+
+    legacy_transaction = require_plan_transaction(
+        legacy[5], legacy_plan_count, "legacy"
+    )
+    if (
+        selected_legacy >= legacy_plan_count
+        or selected_source < 0
+        or selected_source >= len(initial_customer_sequences)
+    ):
+        raise RuntimeError("native three-lane legacy selection is invalid")
+    first_legacy_route = int(legacy_plan_offsets[selected_legacy])
+    last_legacy_route = int(legacy_plan_offsets[selected_legacy + 1])
+    selected_legacy_offsets = legacy_route_offsets[
+        first_legacy_route : last_legacy_route + 1
+    ] - int(legacy_route_offsets[first_legacy_route])
+    selected_legacy_indices = legacy_route_indices[
+        int(legacy_route_offsets[first_legacy_route]) : int(
+            legacy_route_offsets[last_legacy_route]
+        )
+    ]
+    legacy_routes = unpack_routes(
+        np.ascontiguousarray(selected_legacy_offsets, dtype=np.int64),
+        np.ascontiguousarray(selected_legacy_indices, dtype=np.int64),
+        "selected legacy plan",
+    )
+    legacy_objective = replay_objective(legacy_routes)
+    legacy_objective_key = reported_objective(
+        legacy_transaction, selected_legacy, legacy_objective, "legacy"
+    )
+
+    refinement = require_tuple(payload[1], 4, "refinement")
+    refinement_metadata = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            refinement[0],
+            dtype=np.dtype(np.int64),
+            shape=(4,),
+            name="refinement metadata",
+        ),
+    )
+    refinement_removed_indices = _require_vector(
+        refinement[1], "refinement removed customers"
+    )
+    if np.any(refinement_removed_indices < 0) or np.any(
+        refinement_removed_indices >= len(name_by_index)
+    ):
+        raise RuntimeError("native three-lane refinement removed customer is invalid")
+    refinement_removed = tuple(
+        name_by_index[int(index)] for index in refinement_removed_indices
+    )
+    refinement_selected = bool(refinement_metadata[1])
+    refinement_partial = tuple(
+        tuple(customer for customer in route if customer not in refinement_removed)
+        for route in legacy_routes
+    )
+    refinement_partial = tuple(route for route in refinement_partial if route)
+    refinement_routes = (
+        unpack_routes(
+            require_tuple(refinement[2], 3, "refinement plan")[1],
+            require_tuple(refinement[2], 3, "refinement plan")[2],
+            "refinement final plan",
+        )
+        if refinement_selected
+        else refinement_partial
+    )
+
+    quality = require_tuple(payload[2], 4, "quality")
+    quality_pool = require_tuple(quality[0], 5, "quality pool")
+    changed_routes = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            quality_pool[0],
+            dtype=np.dtype(np.int64),
+            shape=(len(cast(npt.NDArray[np.int64], quality_pool[0])), 2),
+            name="quality changed routes",
+        ),
+    )
+    pool_count = changed_routes.shape[0]
+    change_offsets = _require_vector(quality_pool[1], "quality change offsets")
+    change_indices = _require_vector(quality_pool[2], "quality change indices")
+    moved_customers = _require_vector(quality_pool[4], "quality moved customers")
+    if len(change_offsets) != pool_count * 2 + 1 or len(moved_customers) != pool_count:
+        raise RuntimeError("native three-lane quality pool offsets are invalid")
+    quality_plans: list[tuple[CustomerSequence, ...]] = []
+    quality_sources: list[int] = []
+    seen_quality: set[tuple[CustomerSequence, ...]] = set()
+    for candidate in range(pool_count):
+        routes = list(initial_customer_sequences)
+        for changed_ordinal in range(2):
+            route = int(changed_routes[candidate, changed_ordinal])
+            if route < 0 or route >= len(routes):
+                raise RuntimeError("native three-lane quality changed route is invalid")
+            begin = int(change_offsets[candidate * 2 + changed_ordinal])
+            end = int(change_offsets[candidate * 2 + changed_ordinal + 1])
+            routes[route] = tuple(
+                name_by_index[int(index)] for index in change_indices[begin:end]
+            )
+        plan = tuple(routes)
+        if plan not in seen_quality:
+            seen_quality.add(plan)
+            quality_plans.append(plan)
+            quality_sources.append(candidate)
+    quality_transaction = require_plan_transaction(
+        quality[1], len(quality_plans), "quality"
+    )
+    quality_outcome = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            quality[2], dtype=np.dtype(np.int64), shape=(4,), name="quality outcome"
+        ),
+    )
+    selected_quality = int(quality_outcome[0])
+    if selected_quality < 0 or selected_quality >= len(quality_plans):
+        raise RuntimeError("native three-lane quality selection is invalid")
+    quality_routes = quality_plans[selected_quality]
+    quality_objective = replay_objective(quality_routes)
+    quality_objective_key = reported_objective(
+        quality_transaction, selected_quality, quality_objective, "quality"
+    )
+    quality_source = quality_sources[selected_quality]
+    quality_changed = tuple(int(value) for value in changed_routes[quality_source])
+    moved_customer_index = int(moved_customers[quality_source])
+    if moved_customer_index < 0 or moved_customer_index >= len(name_by_index):
+        raise RuntimeError("native three-lane quality moved customer is invalid")
+    pool_hash = hashlib.sha256()
+    for plan in quality_plans:
+        pool_hash.update(json.dumps(plan, separators=(",", ":")).encode())
+
+    constraint = require_tuple(payload[3], 3, "constraint")
+    selection = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            constraint[0],
+            dtype=np.dtype(np.int64),
+            shape=(7,),
+            name="constraint selection",
+        ),
+    )
+    constraint_probe = require_tuple(constraint[1], 3, "constraint probe")
+    removal = require_tuple(constraint_probe[0], 7, "constraint removal")
+    removed_indices = _require_vector(removal[2], "constraint removed customers")
+    removed_customers = tuple(name_by_index[int(index)] for index in removed_indices)
+    remaining_routes = unpack_routes(removal[0], removal[1], "constraint partial")
+    repair = require_tuple(constraint_probe[1], 3, "constraint repair")
+    repaired_routes = unpack_routes(repair[0], repair[1], "constraint repaired")
+    constraint_transaction = require_plan_transaction(
+        constraint_probe[2], 1, "constraint"
+    )
+    constraint_objective = replay_objective(repaired_routes)
+    constraint_objective_key = reported_objective(
+        constraint_transaction, 0, constraint_objective, "constraint"
+    )
+    constraint_outcome = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            constraint[2],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="constraint outcome",
+        ),
+    )
+    removal_scores = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            removal[4],
+            dtype=np.dtype(np.float64),
+            shape=(len(removed_indices) * 2 + 2,),
+            name="constraint removal scores",
+        ),
+    )
+    removal_route_indices = _require_vector(removal[5], "constraint route indices")
+    if len(removal_route_indices) == 0:
+        raise RuntimeError("native three-lane constraint route identity is missing")
+    constraint_affected = tuple(
+        index
+        for index, (before, after) in enumerate(
+            zip(initial_customer_sequences, repaired_routes, strict=False)
+        )
+        if before != after
+    )
+
+    legacy_acceptance = require_tuple(payload[4], 3, "legacy acceptance")
+    legacy_accepted = bool(legacy_acceptance[0])
+    legacy_best = bool(legacy_acceptance[1])
+    legacy_vehicle_reduction = bool(legacy_acceptance[2])
+    quality_accepted = bool(quality_outcome[1])
+    quality_best = bool(quality_outcome[2])
+    constraint_accepted = bool(constraint_outcome[3])
+    operator_events: list[dict[str, object]] = [
+        event(
+            "relocate",
+            "candidate_pool_aggregate",
+            "relocate_complete_candidate_pool",
+            aggregate_count=len(quality_plans),
+            candidate_pool_hash=pool_hash.hexdigest(),
+            candidate_objective_key=quality_objective_key,
+        ),
+        event(
+            "relocate",
+            "candidate_proposed",
+            "relocate_candidate",
+            route_indices=quality_changed,
+            affected_route_indices=quality_changed,
+            removed_customers=(name_by_index[moved_customer_index],),
+            candidate_route_sequences=quality_routes,
+            candidate_vehicle_delta=len(quality_routes) - len(initial_customer_sequences),
+            candidate_feasible=True,
+            prefilter_passed=True,
+            accepted=quality_accepted,
+            vehicle_reduction=bool(quality_outcome[3]),
+            distance_improvement=quality_objective.total_distance
+            < initial_objective.total_distance - 1e-9,
+            candidate_objective_key=quality_objective_key,
+        ),
+        event(
+            FULL_NATIVE_OPERATOR_NAMES[int(constraint_outcome[0]) + 9],
+            "candidate_proposed",
+            "constraint_ranked_removal",
+            route_indices=(int(removal_route_indices[0]),),
+            affected_route_indices=(int(removal_route_indices[0]),),
+            removed_customers=removed_customers,
+            candidate_route_sequences=remaining_routes,
+            prefilter_passed=True,
+            selection_rank=1,
+            track="constraint_lane",
+            constraint_category=FULL_NATIVE_OPERATOR_NAMES[
+                int(constraint_outcome[0]) + 9
+            ],
+            removal_tier="small" if int(selection[0]) == 0 else "",
+            removal_size_requested=int(selection[1]),
+            removal_size_actual=int(selection[2]),
+            removal_trigger="stagnation_baseline",
+            ranking_score=float(removal_scores[0]),
+            candidate_objective_key=constraint_objective_key,
+        ),
+        event(
+            FULL_NATIVE_OPERATOR_NAMES[int(constraint_outcome[0]) + 9],
+            "candidate_proposed",
+            "constraint_removal_repaired",
+            affected_route_indices=constraint_affected,
+            removed_customers=removed_customers,
+            candidate_route_sequences=repaired_routes,
+            candidate_vehicle_delta=len(repaired_routes)
+            - len(initial_customer_sequences),
+            candidate_feasible=True,
+            prefilter_passed=True,
+            exact_route_evaluations=len(
+                _require_vector(constraint_transaction[5], "constraint exact rows")
+            ),
+            track="constraint_lane",
+            constraint_category=FULL_NATIVE_OPERATOR_NAMES[
+                int(constraint_outcome[0]) + 9
+            ],
+            removal_tier="small" if int(selection[0]) == 0 else "",
+            removal_size_requested=int(selection[1]),
+            removal_size_actual=int(selection[2]),
+            removal_trigger="stagnation_baseline",
+            accepted=constraint_accepted,
+            vehicle_reduction=bool(constraint_outcome[5]),
+            distance_improvement=constraint_objective.total_distance
+            < initial_objective.total_distance - 1e-9,
+            candidate_objective_key=constraint_objective_key,
+        ),
+        event(
+            "route_elimination",
+            "candidate_proposed",
+            "route_eliminated",
+            route_indices=(selected_source,),
+            removed_customers=initial_customer_sequences[selected_source],
+            candidate_vehicle_delta=len(legacy_routes) - len(initial_customer_sequences),
+            candidate_feasible=True,
+            prefilter_passed=True,
+            exact_route_evaluations=len(
+                _require_vector(legacy_transaction[5], "legacy exact rows")
+            ),
+            accepted=legacy_accepted,
+            vehicle_reduction=legacy_vehicle_reduction,
+            distance_improvement=legacy_objective.total_distance
+            < initial_objective.total_distance - 1e-9,
+            candidate_objective_key=legacy_objective_key,
+        ),
+        event(
+            "vehicle_reduction_refinement",
+            "candidate_proposed" if refinement_selected else "failed",
+            "vehicle_reduction_refined" if refinement_selected else "refinement_not_better",
+            affected_route_indices=tuple(
+                index
+                for index, (before, after) in enumerate(
+                    zip(initial_customer_sequences, refinement_routes, strict=False)
+                )
+                if before != after
+            ),
+            removed_customers=refinement_removed,
+            candidate_route_sequences=refinement_routes,
+            candidate_vehicle_delta=(
+                len(refinement_routes) - len(initial_customer_sequences)
+                if refinement_selected
+                else None
+            ),
+            candidate_feasible=refinement_selected,
+            prefilter_passed=bool(refinement_partial),
+            exact_route_evaluations=int(refinement_metadata[2]),
+            accepted=refinement_selected and legacy_accepted,
+            distance_improvement=refinement_selected
+            and legacy_objective.total_distance < initial_objective.total_distance - 1e-9,
+            candidate_objective_key=legacy_objective_key,
+        ),
+    ]
+    quality_expected_accept = quality_objective.key <= initial_objective.key
+    quality_expected_best = quality_expected_accept and (
+        quality_objective.key < initial_objective.key
+    )
+    global_after_quality = (
+        quality_objective if quality_expected_best else initial_objective
+    )
+    constraint_expected_accept = constraint_objective.key <= initial_objective.key
+    constraint_expected_best = constraint_expected_accept and (
+        constraint_objective.key < global_after_quality.key
+    )
+    global_after_constraint = (
+        constraint_objective if constraint_expected_best else global_after_quality
+    )
+    legacy_expected_accept = legacy_objective.key <= initial_objective.key
+    legacy_expected_best = legacy_expected_accept and (
+        legacy_objective.key < global_after_constraint.key
+    )
+    if (
+        quality_accepted != quality_expected_accept
+        or quality_best != quality_expected_best
+        or constraint_accepted != constraint_expected_accept
+        or bool(constraint_outcome[4]) != constraint_expected_best
+        or legacy_accepted != legacy_expected_accept
+        or legacy_best != legacy_expected_best
+    ):
+        raise RuntimeError("native three-lane acceptance trajectory is invalid")
+    expected_best_routes = (
+        legacy_routes
+        if legacy_expected_best
+        else repaired_routes
+        if constraint_expected_best
+        else quality_routes
+        if quality_expected_best
+        else initial_customer_sequences
+    )
+    best = require_tuple(payload[9], 5, "best")
+    if unpack_routes(best[0], best[1], "best") != expected_best_routes:
+        raise RuntimeError("native three-lane best trajectory replay is invalid")
+
+    return NativeThreeLaneSemanticStream(
+        neighborhood_events=tuple(operator_events),
+        operator_weights=_readonly_copy(weights),
+        operator_rewards=_readonly_copy(rewards),
+        operator_calls=_readonly_copy(calls),
+        operator_totals=_readonly_copy(totals),
+        operator_activity=_readonly_copy(activity_from_events(operator_events)),
+        termination=_readonly_copy(termination),
+        transaction_sha256=producer_sha256,
+    )
+
+
+def _verify_native_three_lane_search_hash(payload: tuple[object, ...]) -> str:
+    if len(payload) != 2 or not isinstance(payload[0], tuple):
+        raise RuntimeError("native three-lane search payload has an invalid tuple")
+    evidence = bytearray(b"stage05.2-native-three-lane-search-stream-v2")
+    _append_native_nested_evidence(evidence, payload[0])
+    producer_sha256 = payload[1]
+    if (
+        not isinstance(producer_sha256, str)
+        or not _is_sha256(producer_sha256)
+        or hashlib.sha256(evidence).hexdigest() != producer_sha256
+    ):
+        raise RuntimeError("native three-lane search stream SHA-256 mismatch")
+    return producer_sha256
+
+
+def decode_native_three_lane_search_semantic_stream(
+    instance: Instance,
+    payload: object,
+    *,
+    node_names: tuple[str, ...],
+    initial_customer_sequences: tuple[CustomerSequence, ...],
+) -> NativeThreeLaneSemanticStream:
+    """Replay the two-iteration v2 search envelope event by event."""
+
+    if not isinstance(payload, tuple):
+        raise RuntimeError("native three-lane search payload has an invalid type")
+    producer_sha256 = _verify_native_three_lane_search_hash(payload)
+    iteration_payloads = cast(tuple[object, ...], payload[0])
+    if len(iteration_payloads) not in {
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
+    }:
+        raise RuntimeError("native three-lane search iteration count is invalid")
+    first_payload = cast(tuple[object, ...], iteration_payloads[0])
+    second_payload = cast(tuple[object, ...], iteration_payloads[1])
+    first = decode_native_three_lane_semantic_stream(
+        instance,
+        first_payload,
+        node_names=node_names,
+        initial_customer_sequences=initial_customer_sequences,
+    )
+    _verify_native_three_lane_semantic_hash(second_payload)
+    if tuple(node.name for node in instance.nodes) != node_names:
+        raise RuntimeError("native three-lane search node identity is invalid")
+    if len(second_payload) != 14:
+        raise RuntimeError("native three-lane follow-up has an invalid tuple")
+
+    def require_tuple(value: object, size: int, name: str) -> tuple[object, ...]:
+        if not isinstance(value, tuple) or len(value) != size:
+            raise RuntimeError(f"native three-lane follow-up {name} is invalid")
+        return value
+
+    def unpack_routes(
+        offsets_value: object,
+        indices_value: object,
+        name: str,
+    ) -> tuple[CustomerSequence, ...]:
+        offsets = _require_vector(offsets_value, f"{name} offsets")
+        indices = _require_vector(indices_value, f"{name} indices")
+        if (
+            len(offsets) < 2
+            or int(offsets[0]) != 0
+            or int(offsets[-1]) != len(indices)
+            or np.any(offsets[:-1] >= offsets[1:])
+            or np.any(indices < 0)
+            or np.any(indices >= len(node_names))
+        ):
+            raise RuntimeError(f"native three-lane follow-up {name} SoA is invalid")
+        routes = tuple(
+            tuple(
+                node_names[int(index)]
+                for index in indices[
+                    int(offsets[route]) : int(offsets[route + 1])
+                ]
+            )
+            for route in range(len(offsets) - 1)
+        )
+        flattened = tuple(customer for route in routes for customer in route)
+        if len(flattened) != len(set(flattened)):
+            raise RuntimeError(f"native three-lane follow-up {name} repeats customers")
+        return routes
+
+    expected_customers = {customer.name for customer in instance.customers}
+
+    def replay_objective(routes: tuple[CustomerSequence, ...]) -> SolutionObjective:
+        flattened = tuple(customer for route in routes for customer in route)
+        if len(flattened) != len(expected_customers) or set(flattened) != expected_customers:
+            raise RuntimeError("native three-lane follow-up customer identity is invalid")
+        objective = SolutionObjective.zero()
+        for route in routes:
+            exact = solve_exact_charging(instance, route)
+            if not exact.feasible:
+                raise RuntimeError("native three-lane follow-up replay is infeasible")
+            objective += SolutionObjective.from_route(
+                instance,
+                exact.route,
+                total_distance=exact.distance,
+                total_charging_time=exact.charging_time,
+            )
+        return objective
+
+    def transaction(value: object, count: int, name: str) -> tuple[object, ...]:
+        result = require_tuple(value, 13, f"{name} transaction")
+        _require_array(
+            result[1],
+            dtype=np.dtype(np.int64),
+            shape=(count,),
+            name=f"{name} statuses",
+        )
+        _require_array(
+            result[2],
+            dtype=np.dtype(np.int64),
+            shape=(count, 2),
+            name=f"{name} objective integers",
+        )
+        _require_array(
+            result[3],
+            dtype=np.dtype(np.float64),
+            shape=(count, 2),
+            name=f"{name} objective floats",
+        )
+        _require_vector(result[5], f"{name} exact rows")
+        _require_vector(result[11], f"{name} feasible order")
+        if not isinstance(result[12], str) or not _is_sha256(result[12]):
+            raise RuntimeError(f"native three-lane follow-up {name} hash is invalid")
+        return result
+
+    def objective_key(
+        value: tuple[object, ...],
+        plan: int,
+        replayed: SolutionObjective,
+        name: str,
+    ) -> tuple[int, float, float, int]:
+        integers = cast(npt.NDArray[np.int64], value[2])
+        floats = cast(npt.NDArray[np.float64], value[3])
+        reported = SolutionObjective(
+            vehicle_count=int(integers[plan, 0]),
+            total_distance=float(floats[plan, 0]),
+            total_charging_time=float(floats[plan, 1]),
+            charging_count=int(integers[plan, 1]),
+        )
+        if reported.key != replayed.key:
+            raise RuntimeError(
+                f"native three-lane follow-up {name} objective mismatch"
+            )
+        return reported.key
+
+    def event(operator: str, status: str, reason: str, **changes: object) -> dict[str, object]:
+        result: dict[str, object] = {
+            "operator": operator,
+            "status": status,
+            "reason": reason,
+            "route_indices": (),
+            "affected_route_indices": (),
+            "removed_customers": (),
+            "candidate_customer_sequence": (),
+            "candidate_route_sequences": (),
+            "candidate_vehicle_delta": None,
+            "candidate_feasible": False,
+            "prefilter_passed": False,
+            "new_routes_created": 0,
+            "exact_route_evaluations": 0,
+            "selection_rank": 0,
+            "chain_depth": 0,
+            "segment_length": 0,
+            "track": "legacy",
+            "constraint_category": "",
+            "removal_tier": "",
+            "removal_size_requested": 0,
+            "removal_size_actual": 0,
+            "stagnation_iterations": 0,
+            "removal_trigger": "",
+            "reset_observed": False,
+            "ranking_score": 0.0,
+            "iteration": 1,
+            "accepted": False,
+            "vehicle_reduction": False,
+            "distance_improvement": False,
+            "candidate_objective_key": (),
+        }
+        result.update(changes)
+        return result
+
+    prior_state_payloads = (
+        *(require_tuple(first_payload[index], 4, f"prior state {index}") for index in range(6, 9)),
+        require_tuple(first_payload[9], 5, "prior state 9"),
+    )
+    prior_legacy, prior_quality, prior_constraint, prior_best = tuple(
+        unpack_routes(state[0], state[1], f"prior state {index}")
+        for index, state in enumerate(prior_state_payloads, start=6)
+    )
+    prior_legacy_objective = replay_objective(prior_legacy)
+    prior_quality_objective = replay_objective(prior_quality)
+    prior_constraint_objective = replay_objective(prior_constraint)
+    prior_best_objective = replay_objective(prior_best)
+
+    quality = require_tuple(second_payload[2], 4, "quality")
+    quality_pool = require_tuple(quality[0], 5, "quality pool")
+    changed = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            quality_pool[0],
+            dtype=np.dtype(np.int64),
+            shape=(len(cast(npt.NDArray[np.int64], quality_pool[0])), 2),
+            name="follow-up quality changed routes",
+        ),
+    )
+    pool_count = changed.shape[0]
+    change_offsets = _require_vector(quality_pool[1], "follow-up quality offsets")
+    change_indices = _require_vector(quality_pool[2], "follow-up quality indices")
+    moved = _require_vector(quality_pool[4], "follow-up quality moved customers")
+    if len(change_offsets) != pool_count * 2 + 1 or len(moved) != pool_count * 2:
+        raise RuntimeError("native three-lane follow-up swap pool is invalid")
+    quality_plans: list[tuple[CustomerSequence, ...]] = []
+    quality_sources: list[int] = []
+    seen_quality: set[tuple[CustomerSequence, ...]] = set()
+    for candidate in range(pool_count):
+        routes = list(prior_quality)
+        for changed_ordinal in range(2):
+            route = int(changed[candidate, changed_ordinal])
+            begin = int(change_offsets[candidate * 2 + changed_ordinal])
+            end = int(change_offsets[candidate * 2 + changed_ordinal + 1])
+            routes[route] = tuple(
+                node_names[int(index)] for index in change_indices[begin:end]
+            )
+        plan = tuple(routes)
+        if plan not in seen_quality:
+            seen_quality.add(plan)
+            quality_plans.append(plan)
+            quality_sources.append(candidate)
+    quality_transaction = transaction(quality[1], len(quality_plans), "quality")
+    quality_outcome = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            quality[2],
+            dtype=np.dtype(np.int64),
+            shape=(4,),
+            name="follow-up quality outcome",
+        ),
+    )
+    selected_quality = int(quality_outcome[0])
+    if selected_quality < 0 or selected_quality >= len(quality_plans):
+        raise RuntimeError("native three-lane follow-up quality selection is invalid")
+    quality_routes = quality_plans[selected_quality]
+    quality_objective = replay_objective(quality_routes)
+    quality_key = objective_key(
+        quality_transaction, selected_quality, quality_objective, "quality"
+    )
+    quality_source = quality_sources[selected_quality]
+    quality_moved = tuple(
+        node_names[int(value)]
+        for value in moved[quality_source * 2 : quality_source * 2 + 2]
+    )
+    pool_hash = hashlib.sha256()
+    for plan in quality_plans:
+        pool_hash.update(json.dumps(plan, separators=(",", ":")).encode())
+
+    constraint = require_tuple(second_payload[3], 3, "constraint")
+    selection = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            constraint[0],
+            dtype=np.dtype(np.int64),
+            shape=(7,),
+            name="follow-up constraint selection",
+        ),
+    )
+    constraint_probe = require_tuple(constraint[1], 3, "constraint probe")
+    removal = require_tuple(constraint_probe[0], 7, "constraint removal")
+    removed_indices = _require_vector(removal[2], "follow-up constraint removed")
+    constraint_removed = tuple(node_names[int(index)] for index in removed_indices)
+    constraint_partial = unpack_routes(removal[0], removal[1], "constraint partial")
+    repair = require_tuple(constraint_probe[1], 3, "constraint repair")
+    constraint_routes = unpack_routes(repair[0], repair[1], "constraint repaired")
+    constraint_transaction = transaction(constraint_probe[2], 1, "constraint")
+    constraint_objective = replay_objective(constraint_routes)
+    constraint_key = objective_key(
+        constraint_transaction, 0, constraint_objective, "constraint"
+    )
+    constraint_outcome = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            constraint[2],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="follow-up constraint outcome",
+        ),
+    )
+    if int(constraint_outcome[0]) != 1:
+        raise RuntimeError("native three-lane follow-up constraint operator is invalid")
+    removal_scores = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            removal[4],
+            dtype=np.dtype(np.float64),
+            shape=(len(removed_indices) * 2 + 2,),
+            name="follow-up constraint scores",
+        ),
+    )
+    removal_route_indices = _require_vector(
+        removal[5], "follow-up constraint route indices"
+    )
+    if len(removal_route_indices) == 0:
+        raise RuntimeError("native three-lane follow-up constraint route is missing")
+
+    legacy = require_tuple(second_payload[0], 7, "legacy repair")
+    legacy_metadata = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            legacy[0],
+            dtype=np.dtype(np.int64),
+            shape=(8,),
+            name="follow-up legacy metadata",
+        ),
+    )
+    if (
+        legacy_metadata[:6].tolist() != [1, 0, 1, 0, 0, 0]
+        or int(legacy_metadata[7]) != -2
+    ):
+        raise RuntimeError("native three-lane follow-up legacy decision is invalid")
+    legacy_removed_indices = _require_vector(legacy[1], "follow-up legacy removed")
+    legacy_removed = tuple(node_names[int(index)] for index in legacy_removed_indices)
+    legacy_repair = require_tuple(legacy[4], 3, "legacy repair result")
+    legacy_routes = unpack_routes(legacy_repair[0], legacy_repair[1], "legacy repaired")
+    legacy_transaction = transaction(legacy[5], 1, "legacy")
+    legacy_objective = replay_objective(legacy_routes)
+    legacy_key = objective_key(legacy_transaction, 0, legacy_objective, "legacy")
+    legacy_acceptance = require_tuple(second_payload[4], 3, "legacy acceptance")
+    quality_accepted = bool(quality_outcome[1])
+    constraint_accepted = bool(constraint_outcome[3])
+    legacy_accepted = bool(legacy_acceptance[0])
+    expected_quality_accepted = quality_objective.key <= prior_quality_objective.key
+    expected_constraint_accepted = (
+        constraint_objective.key <= prior_constraint_objective.key
+    )
+    expected_legacy_accepted = legacy_objective.key <= prior_legacy_objective.key
+    if (
+        quality_accepted != expected_quality_accepted
+        or bool(quality_outcome[2])
+        or constraint_accepted != expected_constraint_accepted
+        or bool(constraint_outcome[4])
+        or legacy_accepted != expected_legacy_accepted
+        or bool(legacy_acceptance[1])
+        or bool(legacy_acceptance[2])
+    ):
+        raise RuntimeError("native three-lane follow-up acceptance replay mismatch")
+
+    expected_legacy = legacy_routes if legacy_accepted else prior_legacy
+    expected_quality = quality_routes if quality_accepted else prior_quality
+    expected_constraint = constraint_routes if constraint_accepted else prior_constraint
+    expected_best = prior_best
+    final_state_payloads = (
+        *(
+            require_tuple(second_payload[index], 4, f"final state {index}")
+            for index in range(6, 9)
+        ),
+        require_tuple(second_payload[9], 5, "final state 9"),
+    )
+    final_states = tuple(
+        unpack_routes(state[0], state[1], f"final state {index}")
+        for index, state in enumerate(final_state_payloads, start=6)
+    )
+    if final_states != (
+        expected_legacy,
+        expected_quality,
+        expected_constraint,
+        expected_best,
+    ):
+        raise RuntimeError("native three-lane follow-up lane state replay mismatch")
+    if replay_objective(final_states[3]).key != prior_best_objective.key:
+        raise RuntimeError("native three-lane follow-up changed the global best")
+
+    constraint_affected = tuple(
+        index
+        for index, (before, after) in enumerate(
+            zip(prior_constraint, constraint_routes, strict=False)
+        )
+        if before != after
+    )
+    quality_changed = tuple(int(value) for value in changed[quality_source])
+    followup_events = (
+        event(
+            "swap",
+            "candidate_pool_aggregate",
+            "swap_complete_candidate_pool",
+            aggregate_count=len(quality_plans),
+            candidate_pool_hash=pool_hash.hexdigest(),
+            candidate_objective_key=quality_key,
+        ),
+        event(
+            "swap",
+            "candidate_proposed",
+            "swap_candidate",
+            route_indices=quality_changed,
+            affected_route_indices=quality_changed,
+            removed_customers=quality_moved,
+            candidate_route_sequences=quality_routes,
+            candidate_vehicle_delta=len(quality_routes) - len(prior_quality),
+            candidate_feasible=True,
+            prefilter_passed=True,
+            accepted=quality_accepted,
+            distance_improvement=quality_objective.total_distance
+            < prior_quality_objective.total_distance - 1e-9,
+            candidate_objective_key=quality_key,
+        ),
+        event(
+            "time_window_conflict",
+            "candidate_proposed",
+            "constraint_ranked_removal",
+            route_indices=(int(removal_route_indices[0]),),
+            affected_route_indices=(int(removal_route_indices[0]),),
+            removed_customers=constraint_removed,
+            candidate_route_sequences=constraint_partial,
+            prefilter_passed=True,
+            selection_rank=1,
+            track="constraint_lane",
+            constraint_category="time_window_conflict",
+            removal_tier="small",
+            removal_size_requested=int(selection[1]),
+            removal_size_actual=int(selection[2]),
+            removal_trigger="stagnation_baseline",
+            reset_observed=bool(selection[6]),
+            ranking_score=float(removal_scores[0]),
+            candidate_objective_key=constraint_key,
+        ),
+        event(
+            "time_window_conflict",
+            "candidate_proposed",
+            "constraint_removal_repaired",
+            affected_route_indices=constraint_affected,
+            removed_customers=constraint_removed,
+            candidate_route_sequences=constraint_routes,
+            candidate_vehicle_delta=len(constraint_routes) - len(prior_constraint),
+            candidate_feasible=True,
+            prefilter_passed=True,
+            exact_route_evaluations=len(
+                _require_vector(constraint_transaction[5], "constraint exact rows")
+            ),
+            track="constraint_lane",
+            constraint_category="time_window_conflict",
+            removal_tier="small",
+            removal_size_requested=int(selection[1]),
+            removal_size_actual=int(selection[2]),
+            removal_trigger="stagnation_baseline",
+            reset_observed=bool(selection[6]),
+            accepted=constraint_accepted,
+            distance_improvement=constraint_objective.total_distance
+            < prior_constraint_objective.total_distance - 1e-9,
+            candidate_objective_key=constraint_key,
+        ),
+        event(
+            "vehicle_count_aware_repair",
+            "candidate_proposed",
+            "existing_route_repair",
+            removed_customers=legacy_removed,
+            candidate_vehicle_delta=len(legacy_routes) - len(prior_legacy),
+            candidate_feasible=True,
+            new_routes_created=int(legacy_metadata[4]),
+            exact_route_evaluations=len(
+                _require_vector(legacy_transaction[5], "legacy exact rows")
+            ),
+            accepted=legacy_accepted,
+            distance_improvement=legacy_objective.total_distance
+            < prior_legacy_objective.total_distance - 1e-9,
+            candidate_objective_key=legacy_key,
+        ),
+    )
+    all_events = (*first.neighborhood_events, *followup_events)
+
+    full_stage04 = require_tuple(second_payload[12], 4, "full Stage 4")
+    weights = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            full_stage04[0],
+            dtype=np.dtype(np.float64),
+            shape=(len(FULL_NATIVE_OPERATOR_NAMES),),
+            name="follow-up Stage 4 weights",
+        ),
+    )
+    rewards = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            full_stage04[1],
+            dtype=np.dtype(np.float64),
+            shape=(len(FULL_NATIVE_OPERATOR_NAMES),),
+            name="follow-up Stage 4 rewards",
+        ),
+    )
+    calls = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            full_stage04[2],
+            dtype=np.dtype(np.int64),
+            shape=(len(FULL_NATIVE_OPERATOR_NAMES),),
+            name="follow-up Stage 4 calls",
+        ),
+    )
+    totals = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            full_stage04[3],
+            dtype=np.dtype(np.int64),
+            shape=(len(FULL_NATIVE_OPERATOR_NAMES), 8),
+            name="follow-up Stage 4 totals",
+        ),
+    )
+    termination = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            second_payload[11],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="follow-up termination",
+        ),
+    )
+    if (
+        termination.tolist()[:2] != [0, -1]
+        or int(termination[2]) != int(termination[3]) + int(termination[4])
+        or int(termination[5]) != 2
+        or np.any(weights <= 0.0)
+        or np.any(~np.isfinite(weights))
+        or np.any(rewards < 0.0)
+        or np.any(calls < 0)
+        or np.any(totals < 0)
+    ):
+        raise RuntimeError("native three-lane follow-up final state is invalid")
+    activity = np.zeros((len(FULL_NATIVE_OPERATOR_NAMES), 8), dtype=np.int64)
+    by_name = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
+    for item in all_events:
+        index = by_name[str(item["operator"])]
+        activity[index, 0] = max(
+            int(activity[index, 0]), int(bool(item["candidate_feasible"]))
+        )
+        activity[index, 1] += int(bool(item["prefilter_passed"]))
+        activity[index, 2] += cast(int, item["exact_route_evaluations"])
+        activity[index, 3] += int(item["status"] == "candidate_proposed")
+        activity[index, 4] += int(bool(item["candidate_feasible"]))
+        activity[index, 5] += int(bool(item["vehicle_reduction"]))
+        activity[index, 6] += int(bool(item["distance_improvement"]))
+    refinement_index = FULL_NATIVE_OPERATOR_NAMES.index(
+        "vehicle_reduction_refinement"
+    )
+    if activity[refinement_index, 1] > 0:
+        activity[refinement_index, 0] = 1
+    activity[refinement_index, 7] = first.operator_activity[refinement_index, 7]
+    second_stream = NativeThreeLaneSemanticStream(
+        neighborhood_events=tuple(all_events),
+        operator_weights=_readonly_copy(weights),
+        operator_rewards=_readonly_copy(rewards),
+        operator_calls=_readonly_copy(calls),
+        operator_totals=_readonly_copy(totals),
+        operator_activity=_readonly_copy(activity),
+        termination=_readonly_copy(termination),
+        transaction_sha256=producer_sha256,
+    )
+    if len(iteration_payloads) == 2:
+        return second_stream
+    third_stream = _decode_native_three_lane_third_iteration(
+        instance,
+        cast(tuple[object, ...], iteration_payloads[2]),
+        previous_payload=second_payload,
+        previous_stream=second_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+    )
+    if len(iteration_payloads) == 3:
+        return third_stream
+    fourth_stream = _decode_native_three_lane_fourth_iteration(
+        instance,
+        cast(tuple[object, ...], iteration_payloads[3]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[2]),
+        previous_stream=third_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+    )
+    if len(iteration_payloads) == 4:
+        return fourth_stream
+    fifth_stream = _decode_native_three_lane_fifth_iteration(
+        instance,
+        cast(tuple[object, ...], iteration_payloads[4]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[3]),
+        previous_stream=fourth_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+    )
+    if len(iteration_payloads) == 5:
+        return fifth_stream
+    sixth_stream = _decode_native_three_lane_sixth_iteration(
+        instance,
+        cast(tuple[object, ...], iteration_payloads[5]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[4]),
+        previous_stream=fifth_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=5,
+        expected_metadata=(5, 1, 1, 0, 0, 0, 0, -2),
+        completed_iterations=6,
+    )
+    if len(iteration_payloads) == 6:
+        return sixth_stream
+    seventh_stream = _decode_native_three_lane_seventh_iteration(
+        instance,
+        cast(tuple[object, ...], iteration_payloads[6]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[5]),
+        previous_stream=sixth_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=6,
+        constraint_operator="time_window_conflict",
+        constraint_operator_id=1,
+        legacy_operator="route_merge",
+        legacy_operator_id=3,
+        expected_legacy_metadata=(6, 3, 1, 0),
+        legacy_reason="only_one_route",
+        expected_legacy_statuses=(),
+        expected_legacy_exact_rows=(),
+        expected_selection=(2, 1, 1, 1, 5, 4, 0),
+        removal_trigger="medium_stagnation+periodic_exploration",
+        completed_iterations=7,
+    )
+    if len(iteration_payloads) == 7:
+        return seventh_stream
+    eighth_stream = _decode_native_three_lane_rejection_only_iteration(
+        cast(tuple[object, ...], iteration_payloads[7]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[6]),
+        previous_stream=seventh_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=7,
+        operator="route_elimination",
+        operator_id=2,
+        completed_iterations=8,
+    )
+    if len(iteration_payloads) == 8:
+        return eighth_stream
+    ninth_stream = _decode_native_three_lane_rejection_only_iteration(
+        cast(tuple[object, ...], iteration_payloads[8]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[7]),
+        previous_stream=eighth_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=8,
+        operator="route_merge",
+        operator_id=3,
+        completed_iterations=9,
+    )
+    if len(iteration_payloads) == 9:
+        return ninth_stream
+    tenth_stream = _decode_native_three_lane_constraint_no_change_iteration(
+        instance,
+        cast(tuple[object, ...], iteration_payloads[9]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[8]),
+        previous_stream=ninth_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=9,
+        constraint_operator="shaw_related",
+        constraint_operator_id=3,
+        expected_selection=(2, 1, 1, 1, 8, 2, 0),
+        removal_tier="large",
+        removal_trigger="large_stagnation",
+        legacy_operator="route_elimination",
+        legacy_operator_id=2,
+        completed_iterations=10,
+    )
+    if len(iteration_payloads) == 10:
+        return tenth_stream
+    eleventh_stream = _decode_native_three_lane_standard_energy_rejection_iteration(
+        instance,
+        cast(tuple[object, ...], iteration_payloads[10]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[9]),
+        previous_stream=tenth_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=10,
+        destroy_name="random",
+        repair_name="energy",
+        expected_metadata=(10, 0, 0, 2, 1, 0, 0, 1),
+        expected_statuses=(5, 1, 1, 1, 0),
+        expected_exact_rows=(0,),
+        expected_exact_call_delta=2,
+        candidate_prepared=True,
+        feasible_repair=True,
+        completed_iterations=11,
+    )
+    if len(iteration_payloads) == 11:
+        return eleventh_stream
+    twelfth_stream = _decode_native_three_lane_rejection_only_iteration(
+        cast(tuple[object, ...], iteration_payloads[11]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[10]),
+        previous_stream=eleventh_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=11,
+        operator="route_elimination",
+        operator_id=2,
+        completed_iterations=12,
+    )
+    if len(iteration_payloads) == 12:
+        return twelfth_stream
+    thirteenth_stream = _decode_native_three_lane_constraint_no_change_iteration(
+        instance,
+        cast(tuple[object, ...], iteration_payloads[12]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[11]),
+        previous_stream=twelfth_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=12,
+        constraint_operator="station_pressure",
+        constraint_operator_id=0,
+        expected_selection=(2, 1, 1, 1, 11, 2, 0),
+        removal_tier="large",
+        removal_trigger="large_stagnation",
+        legacy_operator="route_elimination",
+        legacy_operator_id=2,
+        completed_iterations=13,
+    )
+    if len(iteration_payloads) == 13:
+        return thirteenth_stream
+    fourteenth_stream = _decode_native_three_lane_standard_energy_rejection_iteration(
+        instance,
+        cast(tuple[object, ...], iteration_payloads[13]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[12]),
+        previous_stream=thirteenth_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=13,
+        destroy_name="random",
+        repair_name="greedy",
+        expected_metadata=(13, 0, 0, 0, 1, 0, -1, 0),
+        expected_statuses=(1, 1, 1, 1, 0),
+        expected_exact_rows=(),
+        expected_exact_call_delta=0,
+        candidate_prepared=False,
+        feasible_repair=False,
+        completed_iterations=14,
+    )
+    if len(iteration_payloads) == 14:
+        return fourteenth_stream
+    fifteenth_stream = _decode_native_three_lane_rejection_only_iteration(
+        cast(tuple[object, ...], iteration_payloads[14]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[13]),
+        previous_stream=fourteenth_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=14,
+        operator="route_merge",
+        operator_id=3,
+        completed_iterations=15,
+    )
+    if len(iteration_payloads) == 15:
+        return fifteenth_stream
+    sixteenth_stream = _decode_native_three_lane_seventh_iteration(
+        instance,
+        cast(tuple[object, ...], iteration_payloads[15]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[14]),
+        previous_stream=fifteenth_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=15,
+        constraint_operator="time_window_conflict",
+        constraint_operator_id=1,
+        legacy_operator="route_elimination",
+        legacy_operator_id=2,
+        expected_legacy_metadata=(15, 2, 1, 0),
+        legacy_reason="only_one_route",
+        expected_legacy_statuses=(),
+        expected_legacy_exact_rows=(),
+        expected_selection=(2, 1, 1, 1, 14, 2, 0),
+        removal_trigger="large_stagnation",
+        completed_iterations=16,
+    )
+    if len(iteration_payloads) == 16:
+        return sixteenth_stream
+    seventeenth_stream = _decode_native_three_lane_rejection_only_iteration(
+        cast(tuple[object, ...], iteration_payloads[16]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[15]),
+        previous_stream=sixteenth_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=16,
+        operator="route_elimination",
+        operator_id=2,
+        completed_iterations=17,
+    )
+    if len(iteration_payloads) == 17:
+        return seventeenth_stream
+    eighteenth_stream = _decode_native_three_lane_rejection_only_iteration(
+        cast(tuple[object, ...], iteration_payloads[17]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[16]),
+        previous_stream=seventeenth_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=17,
+        operator="route_merge",
+        operator_id=3,
+        completed_iterations=18,
+    )
+    if len(iteration_payloads) == 18:
+        return eighteenth_stream
+    nineteenth_stream = _decode_native_three_lane_seventh_iteration(
+        instance,
+        cast(tuple[object, ...], iteration_payloads[18]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[17]),
+        previous_stream=eighteenth_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=18,
+        constraint_operator="worst_energy_detour",
+        constraint_operator_id=2,
+        legacy_operator="standard",
+        legacy_operator_id=0,
+        expected_legacy_metadata=(18, 0, 2, 1, 1, 0, -1, 0),
+        legacy_reason="related+regret2",
+        expected_legacy_statuses=(1, 1, 1, 1, 0),
+        expected_legacy_exact_rows=(),
+        expected_selection=(2, 1, 1, 1, 17, 2, 0),
+        removal_trigger="large_stagnation",
+        completed_iterations=19,
+    )
+    if len(iteration_payloads) == 19:
+        return nineteenth_stream
+    twentieth_stream = _decode_native_three_lane_sixth_iteration(
+        instance,
+        cast(tuple[object, ...], iteration_payloads[19]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[18]),
+        previous_stream=nineteenth_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=19,
+        expected_metadata=(19, 2, 1, 0, 0, 0, 0, -2),
+        completed_iterations=20,
+    )
+    if len(iteration_payloads) == 20:
+        return twentieth_stream
+    return _decode_native_three_lane_rejection_only_iteration(
+        cast(tuple[object, ...], iteration_payloads[20]),
+        previous_payload=cast(tuple[object, ...], iteration_payloads[19]),
+        previous_stream=twentieth_stream,
+        node_names=node_names,
+        search_sha256=producer_sha256,
+        iteration=20,
+        operator="route_merge",
+        operator_id=3,
+        completed_iterations=21,
+        restart_to_best=True,
+    )
+
+
+def _decode_native_three_lane_third_iteration(
+    instance: Instance,
+    payload: tuple[object, ...],
+    *,
+    previous_payload: tuple[object, ...],
+    previous_stream: NativeThreeLaneSemanticStream,
+    node_names: tuple[str, ...],
+    search_sha256: str,
+) -> NativeThreeLaneSemanticStream:
+    """Replay the route-merge/two-opt-star/energy third iteration."""
+
+    _verify_native_three_lane_semantic_hash(payload)
+    if len(payload) != 14:
+        raise RuntimeError("native three-lane third iteration is invalid")
+
+    def require_tuple(value: object, size: int, name: str) -> tuple[object, ...]:
+        if not isinstance(value, tuple) or len(value) != size:
+            raise RuntimeError(f"native three-lane third {name} is invalid")
+        return value
+
+    def unpack_routes(value: object, name: str) -> tuple[CustomerSequence, ...]:
+        state = require_tuple(value, 5 if "best" in name else 4, name)
+        offsets = _require_vector(state[0], f"{name} offsets")
+        indices = _require_vector(state[1], f"{name} indices")
+        if (
+            len(offsets) < 2
+            or int(offsets[0]) != 0
+            or int(offsets[-1]) != len(indices)
+            or np.any(offsets[:-1] >= offsets[1:])
+            or np.any(indices < 0)
+            or np.any(indices >= len(node_names))
+        ):
+            raise RuntimeError(f"native three-lane third {name} SoA is invalid")
+        return tuple(
+            tuple(
+                node_names[int(index)]
+                for index in indices[
+                    int(offsets[route]) : int(offsets[route + 1])
+                ]
+            )
+            for route in range(len(offsets) - 1)
+        )
+
+    expected_customers = {customer.name for customer in instance.customers}
+
+    def replay(routes: tuple[CustomerSequence, ...]) -> SolutionObjective:
+        flattened = tuple(customer for route in routes for customer in route)
+        if len(flattened) != len(expected_customers) or set(flattened) != expected_customers:
+            raise RuntimeError("native three-lane third customer identity is invalid")
+        objective = SolutionObjective.zero()
+        for route in routes:
+            exact = solve_exact_charging(instance, route)
+            if not exact.feasible:
+                raise RuntimeError("native three-lane third replay is infeasible")
+            objective += SolutionObjective.from_route(
+                instance,
+                exact.route,
+                total_distance=exact.distance,
+                total_charging_time=exact.charging_time,
+            )
+        return objective
+
+    def event(operator: str, status: str, reason: str, **changes: object) -> dict[str, object]:
+        result: dict[str, object] = {
+            "operator": operator,
+            "status": status,
+            "reason": reason,
+            "route_indices": (),
+            "affected_route_indices": (),
+            "removed_customers": (),
+            "candidate_customer_sequence": (),
+            "candidate_route_sequences": (),
+            "candidate_vehicle_delta": None,
+            "candidate_feasible": False,
+            "prefilter_passed": False,
+            "new_routes_created": 0,
+            "exact_route_evaluations": 0,
+            "selection_rank": 0,
+            "chain_depth": 0,
+            "segment_length": 0,
+            "track": "legacy",
+            "constraint_category": "",
+            "removal_tier": "",
+            "removal_size_requested": 0,
+            "removal_size_actual": 0,
+            "stagnation_iterations": 0,
+            "removal_trigger": "",
+            "reset_observed": False,
+            "ranking_score": 0.0,
+            "iteration": 2,
+            "accepted": False,
+            "vehicle_reduction": False,
+            "distance_improvement": False,
+            "candidate_objective_key": (),
+        }
+        result.update(changes)
+        return result
+
+    prior_legacy = unpack_routes(previous_payload[6], "prior legacy")
+    prior_quality = unpack_routes(previous_payload[7], "prior quality")
+    prior_constraint = unpack_routes(previous_payload[8], "prior constraint")
+    prior_best = unpack_routes(previous_payload[9], "prior best")
+    prior_constraint_objective = replay(prior_constraint)
+    prior_best_objective = replay(prior_best)
+
+    legacy = require_tuple(payload[0], 2, "legacy")
+    legacy_metadata = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            legacy[0],
+            dtype=np.dtype(np.int64),
+            shape=(4,),
+            name="third legacy metadata",
+        ),
+    )
+    if legacy_metadata.tolist() != [2, 3, 1, 0] or payload[4] is not None:
+        raise RuntimeError("native three-lane third route-merge decision is invalid")
+
+    quality = require_tuple(payload[2], 4, "quality")
+    quality_pool = require_tuple(quality[0], 5, "quality pool")
+    changed = cast(npt.NDArray[np.int64], quality_pool[0])
+    if (
+        changed.shape != (0, 2)
+        or _require_vector(quality_pool[1], "third quality offsets").tolist() != [0]
+        or len(_require_vector(quality_pool[2], "third quality indices")) != 0
+        or quality[1] is not None
+        or cast(npt.NDArray[np.int64], quality[2]).tolist() != [-1, 0, 0, 0]
+    ):
+        raise RuntimeError("native three-lane third two-opt-star decision is invalid")
+
+    constraint = require_tuple(payload[3], 3, "constraint")
+    selection = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            constraint[0],
+            dtype=np.dtype(np.int64),
+            shape=(7,),
+            name="third constraint selection",
+        ),
+    )
+    probe = require_tuple(constraint[1], 3, "constraint probe")
+    removal = require_tuple(probe[0], 7, "constraint removal")
+    repair = require_tuple(probe[1], 3, "constraint repair")
+    transaction = require_tuple(probe[2], 13, "constraint transaction")
+    outcome = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            constraint[2],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="third constraint outcome",
+        ),
+    )
+    if outcome.tolist()[:1] != [2] or not bool(outcome[3]):
+        raise RuntimeError("native three-lane third constraint decision is invalid")
+    removed_indices = _require_vector(removal[2], "third constraint removed")
+    removed = tuple(node_names[int(index)] for index in removed_indices)
+    partial_state = (removal[0], removal[1], None, None)
+    repaired_state = (repair[0], repair[1], None, None)
+    partial_routes = unpack_routes(partial_state, "constraint partial")
+    repaired_routes = unpack_routes(repaired_state, "constraint repaired")
+    candidate_objective = replay(repaired_routes)
+    objective_integer = cast(npt.NDArray[np.int64], transaction[2])
+    objective_float = cast(npt.NDArray[np.float64], transaction[3])
+    reported = SolutionObjective(
+        int(objective_integer[0, 0]),
+        float(objective_float[0, 0]),
+        float(objective_float[0, 1]),
+        int(objective_integer[0, 1]),
+    )
+    if reported.key != candidate_objective.key:
+        raise RuntimeError("native three-lane third constraint objective mismatch")
+    affected = tuple(
+        index
+        for index, (before, after) in enumerate(
+            zip(prior_constraint, repaired_routes, strict=False)
+        )
+        if before != after
+    )
+    route_indices = _require_vector(removal[5], "third constraint routes")
+    scores = cast(npt.NDArray[np.float64], removal[4])
+    followup_events = (
+        event(
+            "two_opt_star",
+            "candidate_pool_aggregate",
+            "two_opt_star_complete_candidate_pool",
+            aggregate_count=0,
+            candidate_pool_hash=hashlib.sha256().hexdigest(),
+        ),
+        event(
+            "two_opt_star",
+            "candidate_control_skipped",
+            "no_selected_complete_plan_feasible",
+        ),
+        event(
+            "worst_energy_detour",
+            "candidate_proposed",
+            "constraint_ranked_removal",
+            route_indices=(int(route_indices[0]),),
+            affected_route_indices=(int(route_indices[0]),),
+            removed_customers=removed,
+            candidate_route_sequences=partial_routes,
+            prefilter_passed=True,
+            selection_rank=1,
+            track="constraint_lane",
+            constraint_category="worst_energy_detour",
+            removal_tier="small",
+            removal_size_requested=int(selection[1]),
+            removal_size_actual=int(selection[2]),
+            stagnation_iterations=int(selection[4]),
+            removal_trigger="stagnation_baseline",
+            reset_observed=bool(selection[6]),
+            ranking_score=float(scores[0]),
+            candidate_objective_key=candidate_objective.key,
+        ),
+        event(
+            "worst_energy_detour",
+            "candidate_proposed",
+            "constraint_removal_repaired",
+            affected_route_indices=affected,
+            removed_customers=removed,
+            candidate_route_sequences=repaired_routes,
+            candidate_vehicle_delta=len(repaired_routes) - len(prior_constraint),
+            candidate_feasible=True,
+            prefilter_passed=True,
+            exact_route_evaluations=len(
+                _require_vector(transaction[5], "third constraint exact rows")
+            ),
+            track="constraint_lane",
+            constraint_category="worst_energy_detour",
+            removal_tier="small",
+            removal_size_requested=int(selection[1]),
+            removal_size_actual=int(selection[2]),
+            stagnation_iterations=int(selection[4]),
+            removal_trigger="stagnation_baseline",
+            reset_observed=bool(selection[6]),
+            accepted=True,
+            vehicle_reduction=candidate_objective.vehicle_count
+            < prior_constraint_objective.vehicle_count,
+            distance_improvement=candidate_objective.total_distance
+            < prior_constraint_objective.total_distance - 1e-9,
+            candidate_objective_key=candidate_objective.key,
+        ),
+        event("route_merge", "not_applicable", "only_one_route"),
+    )
+    expected_states = (prior_legacy, prior_quality, repaired_routes, prior_best)
+    final_states = (
+        unpack_routes(payload[6], "final legacy"),
+        unpack_routes(payload[7], "final quality"),
+        unpack_routes(payload[8], "final constraint"),
+        unpack_routes(payload[9], "final best"),
+    )
+    if final_states != expected_states or replay(final_states[3]).key != prior_best_objective.key:
+        raise RuntimeError("native three-lane third lane state mismatch")
+
+    stage04 = require_tuple(payload[12], 4, "Stage 4")
+    weights = cast(npt.NDArray[np.float64], stage04[0])
+    rewards = cast(npt.NDArray[np.float64], stage04[1])
+    calls = cast(npt.NDArray[np.int64], stage04[2])
+    totals = cast(npt.NDArray[np.int64], stage04[3])
+    termination = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[11],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="third termination",
+        ),
+    )
+    if (
+        weights.shape != (len(FULL_NATIVE_OPERATOR_NAMES),)
+        or rewards.shape != weights.shape
+        or calls.shape != weights.shape
+        or totals.shape != (len(FULL_NATIVE_OPERATOR_NAMES), 8)
+        or termination.tolist()[-1] != 3
+        or int(termination[0]) != 0
+    ):
+        raise RuntimeError("native three-lane third final state is invalid")
+    all_events = (*previous_stream.neighborhood_events, *followup_events)
+    activity = np.zeros((len(FULL_NATIVE_OPERATOR_NAMES), 8), dtype=np.int64)
+    by_name = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
+    for item in all_events:
+        index = by_name[str(item["operator"])]
+        activity[index, 0] = max(
+            int(activity[index, 0]), int(bool(item["candidate_feasible"]))
+        )
+        activity[index, 1] += int(bool(item["prefilter_passed"]))
+        activity[index, 2] += cast(int, item["exact_route_evaluations"])
+        activity[index, 3] += int(item["status"] == "candidate_proposed")
+        activity[index, 4] += int(bool(item["candidate_feasible"]))
+        activity[index, 5] += int(bool(item["vehicle_reduction"]))
+        activity[index, 6] += int(bool(item["distance_improvement"]))
+    refinement_index = FULL_NATIVE_OPERATOR_NAMES.index(
+        "vehicle_reduction_refinement"
+    )
+    activity[refinement_index, 0] = previous_stream.operator_activity[
+        refinement_index, 0
+    ]
+    activity[refinement_index, 7] = previous_stream.operator_activity[
+        refinement_index, 7
+    ]
+    return NativeThreeLaneSemanticStream(
+        neighborhood_events=tuple(all_events),
+        operator_weights=_readonly_copy(weights),
+        operator_rewards=_readonly_copy(rewards),
+        operator_calls=_readonly_copy(calls),
+        operator_totals=_readonly_copy(totals),
+        operator_activity=_readonly_copy(activity),
+        termination=_readonly_copy(termination),
+        transaction_sha256=search_sha256,
+    )
+
+
+def _decode_native_three_lane_fourth_iteration(
+    instance: Instance,
+    payload: tuple[object, ...],
+    *,
+    previous_payload: tuple[object, ...],
+    previous_stream: NativeThreeLaneSemanticStream,
+    node_names: tuple[str, ...],
+    search_sha256: str,
+) -> NativeThreeLaneSemanticStream:
+    """Replay the standard/route-segment/Shaw fourth iteration."""
+
+    _verify_native_three_lane_semantic_hash(payload)
+    if len(payload) != 14:
+        raise RuntimeError("native three-lane fourth iteration is invalid")
+
+    def require_tuple(value: object, size: int, name: str) -> tuple[object, ...]:
+        if not isinstance(value, tuple) or len(value) != size:
+            raise RuntimeError(f"native three-lane fourth {name} is invalid")
+        return value
+
+    def unpack_state(value: object, name: str) -> tuple[CustomerSequence, ...]:
+        state = require_tuple(value, 5 if "best" in name else 4, name)
+        return unpack_soa(state[0], state[1], name)
+
+    def unpack_soa(
+        offsets_value: object,
+        indices_value: object,
+        name: str,
+    ) -> tuple[CustomerSequence, ...]:
+        offsets = _require_vector(offsets_value, f"{name} offsets")
+        indices = _require_vector(indices_value, f"{name} indices")
+        if (
+            len(offsets) < 2
+            or int(offsets[0]) != 0
+            or int(offsets[-1]) != len(indices)
+            or np.any(offsets[:-1] >= offsets[1:])
+            or np.any(indices < 0)
+            or np.any(indices >= len(node_names))
+        ):
+            raise RuntimeError(f"native three-lane fourth {name} SoA is invalid")
+        routes = tuple(
+            tuple(
+                node_names[int(index)]
+                for index in indices[int(offsets[route]) : int(offsets[route + 1])]
+            )
+            for route in range(len(offsets) - 1)
+        )
+        flattened = tuple(customer for route in routes for customer in route)
+        if len(flattened) != len(set(flattened)):
+            raise RuntimeError(f"native three-lane fourth {name} repeats customers")
+        return routes
+
+    expected_customers = {customer.name for customer in instance.customers}
+
+    def replay(routes: tuple[CustomerSequence, ...]) -> SolutionObjective:
+        flattened = tuple(customer for route in routes for customer in route)
+        if len(flattened) != len(expected_customers) or set(flattened) != expected_customers:
+            raise RuntimeError("native three-lane fourth customer identity is invalid")
+        objective = SolutionObjective.zero()
+        for route in routes:
+            exact = solve_exact_charging(instance, route)
+            if not exact.feasible:
+                raise RuntimeError("native three-lane fourth replay is infeasible")
+            objective += SolutionObjective.from_route(
+                instance,
+                exact.route,
+                total_distance=exact.distance,
+                total_charging_time=exact.charging_time,
+            )
+        return objective
+
+    def transaction(value: object, count: int, name: str) -> tuple[object, ...]:
+        result = require_tuple(value, 13, f"{name} transaction")
+        _require_array(
+            result[1],
+            dtype=np.dtype(np.int64),
+            shape=(count,),
+            name=f"fourth {name} statuses",
+        )
+        _require_array(
+            result[2],
+            dtype=np.dtype(np.int64),
+            shape=(count, 2),
+            name=f"fourth {name} objective integers",
+        )
+        _require_array(
+            result[3],
+            dtype=np.dtype(np.float64),
+            shape=(count, 2),
+            name=f"fourth {name} objective floats",
+        )
+        _require_vector(result[5], f"fourth {name} exact rows")
+        _require_vector(result[11], f"fourth {name} feasible order")
+        if not isinstance(result[12], str) or not _is_sha256(result[12]):
+            raise RuntimeError(f"native three-lane fourth {name} hash is invalid")
+        return result
+
+    def reported_objective(
+        value: tuple[object, ...],
+        plan: int,
+        replayed: SolutionObjective,
+        name: str,
+    ) -> tuple[int, float, float, int]:
+        integers = cast(npt.NDArray[np.int64], value[2])
+        floats = cast(npt.NDArray[np.float64], value[3])
+        reported = SolutionObjective(
+            vehicle_count=int(integers[plan, 0]),
+            total_distance=float(floats[plan, 0]),
+            total_charging_time=float(floats[plan, 1]),
+            charging_count=int(integers[plan, 1]),
+        )
+        if reported.key != replayed.key:
+            raise RuntimeError(f"native three-lane fourth {name} objective mismatch")
+        return reported.key
+
+    def event(
+        operator: str,
+        status: str,
+        reason: str,
+        **changes: object,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "operator": operator,
+            "status": status,
+            "reason": reason,
+            "route_indices": (),
+            "affected_route_indices": (),
+            "removed_customers": (),
+            "candidate_customer_sequence": (),
+            "candidate_route_sequences": (),
+            "candidate_vehicle_delta": None,
+            "candidate_feasible": False,
+            "prefilter_passed": False,
+            "new_routes_created": 0,
+            "exact_route_evaluations": 0,
+            "selection_rank": 0,
+            "chain_depth": 0,
+            "segment_length": 0,
+            "track": "legacy",
+            "constraint_category": "",
+            "removal_tier": "",
+            "removal_size_requested": 0,
+            "removal_size_actual": 0,
+            "stagnation_iterations": 0,
+            "removal_trigger": "",
+            "reset_observed": False,
+            "ranking_score": 0.0,
+            "iteration": 3,
+            "accepted": False,
+            "vehicle_reduction": False,
+            "distance_improvement": False,
+            "candidate_objective_key": (),
+        }
+        result.update(changes)
+        return result
+
+    prior_legacy = unpack_state(previous_payload[6], "prior legacy")
+    prior_quality = unpack_state(previous_payload[7], "prior quality")
+    prior_constraint = unpack_state(previous_payload[8], "prior constraint")
+    prior_best = unpack_state(previous_payload[9], "prior best")
+    prior_legacy_objective = replay(prior_legacy)
+    prior_quality_objective = replay(prior_quality)
+    prior_constraint_objective = replay(prior_constraint)
+    prior_best_objective = replay(prior_best)
+
+    legacy = require_tuple(payload[0], 8, "legacy")
+    legacy_metadata = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            legacy[0],
+            dtype=np.dtype(np.int64),
+            shape=(8,),
+            name="fourth legacy metadata",
+        ),
+    )
+    if legacy_metadata.tolist()[:5] != [3, 0, 0, 1, 1]:
+        raise RuntimeError("native three-lane fourth standard selection is invalid")
+    legacy_removed_indices = _require_vector(legacy[1], "fourth legacy removed")
+    legacy_removed = tuple(node_names[int(index)] for index in legacy_removed_indices)
+    if len(legacy_removed) != 1:
+        raise RuntimeError("native three-lane fourth standard removal is invalid")
+    unpack_soa(legacy[2], legacy[3], "legacy partial")
+    repair = require_tuple(legacy[4], 3, "legacy repair")
+    legacy_routes = unpack_soa(repair[0], repair[1], "legacy repaired")
+    legacy_transaction = transaction(legacy[5], 1, "legacy")
+    insertion_transaction = require_tuple(legacy[6], 13, "insertion transaction")
+    insertion_count = len(
+        _require_vector(insertion_transaction[1], "fourth insertion statuses")
+    )
+    transaction(insertion_transaction, insertion_count, "insertion")
+    if len(_require_vector(insertion_transaction[5], "fourth insertion exact rows")) != 2:
+        raise RuntimeError("native three-lane fourth insertion charging is invalid")
+    legacy_objective = replay(legacy_routes)
+    legacy_key = reported_objective(
+        legacy_transaction, 0, legacy_objective, "legacy"
+    )
+    legacy_acceptance = require_tuple(payload[4], 3, "legacy acceptance")
+    if (
+        legacy_acceptance != (1, 0, 0)
+        or legacy_objective.key != prior_legacy_objective.key
+    ):
+        raise RuntimeError("native three-lane fourth legacy acceptance mismatch")
+
+    quality = require_tuple(payload[2], 7, "quality")
+    attempts = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            quality[0],
+            dtype=np.dtype(np.int64),
+            shape=(2, 8),
+            name="fourth quality attempts",
+        ),
+    )
+    if attempts.tolist() != [
+        [1, 0, 2, 0, 0, 1, 0, 0],
+        [1, 1, 2, 0, 0, 2, 1, 0],
+    ]:
+        raise RuntimeError("native three-lane fourth route-segment order is invalid")
+    removed_offsets = _require_vector(quality[1], "fourth quality removed offsets")
+    removed_indices = _require_vector(quality[2], "fourth quality removed indices")
+    if removed_offsets.tolist() != [0, 2, 4]:
+        raise RuntimeError("native three-lane fourth route-segment offsets are invalid")
+    quality_removed = tuple(
+        tuple(
+            node_names[int(index)]
+            for index in removed_indices[
+                int(removed_offsets[row]) : int(removed_offsets[row + 1])
+            ]
+        )
+        for row in range(2)
+    )
+    selected_repair = require_tuple(quality[3], 3, "quality repair")
+    quality_routes = unpack_soa(
+        selected_repair[0], selected_repair[1], "quality repaired"
+    )
+    quality_transaction = transaction(quality[4], 1, "quality")
+    quality_objective = replay(quality_routes)
+    quality_key = reported_objective(
+        quality_transaction, 0, quality_objective, "quality"
+    )
+    quality_outcome = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            quality[5],
+            dtype=np.dtype(np.int64),
+            shape=(4,),
+            name="fourth quality outcome",
+        ),
+    )
+    if quality_outcome.tolist() != [0, 1, 0, 0]:
+        raise RuntimeError("native three-lane fourth quality acceptance mismatch")
+
+    constraint = require_tuple(payload[3], 3, "constraint")
+    selection = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            constraint[0],
+            dtype=np.dtype(np.int64),
+            shape=(7,),
+            name="fourth constraint selection",
+        ),
+    )
+    probe = require_tuple(constraint[1], 3, "constraint probe")
+    removal = require_tuple(probe[0], 7, "constraint removal")
+    constraint_repair = require_tuple(probe[1], 3, "constraint repair")
+    constraint_transaction = transaction(probe[2], 1, "constraint")
+    constraint_outcome = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            constraint[2],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="fourth constraint outcome",
+        ),
+    )
+    if int(constraint_outcome[0]) != 3 or not bool(constraint_outcome[3]):
+        raise RuntimeError("native three-lane fourth constraint decision is invalid")
+    constraint_removed_indices = _require_vector(
+        removal[2], "fourth constraint removed"
+    )
+    constraint_removed = tuple(
+        node_names[int(index)] for index in constraint_removed_indices
+    )
+    constraint_partial = unpack_soa(
+        removal[0], removal[1], "constraint partial"
+    )
+    constraint_routes = unpack_soa(
+        constraint_repair[0], constraint_repair[1], "constraint repaired"
+    )
+    constraint_objective = replay(constraint_routes)
+    constraint_key = reported_objective(
+        constraint_transaction, 0, constraint_objective, "constraint"
+    )
+    constraint_scores = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            removal[4],
+            dtype=np.dtype(np.float64),
+            shape=(len(constraint_removed_indices) * 2 + 2,),
+            name="fourth constraint scores",
+        ),
+    )
+    constraint_route_indices = _require_vector(
+        removal[5], "fourth constraint route indices"
+    )
+    if len(constraint_route_indices) == 0:
+        raise RuntimeError("native three-lane fourth constraint route is missing")
+    constraint_affected = tuple(
+        index
+        for index, (before, after) in enumerate(
+            zip(prior_constraint, constraint_routes, strict=False)
+        )
+        if before != after
+    )
+
+    final_states = (
+        unpack_state(payload[6], "final legacy"),
+        unpack_state(payload[7], "final quality"),
+        unpack_state(payload[8], "final constraint"),
+        unpack_state(payload[9], "final best"),
+    )
+    expected_states = (legacy_routes, quality_routes, constraint_routes, prior_best)
+    if (
+        final_states != expected_states
+        or replay(final_states[3]).key != prior_best_objective.key
+    ):
+        raise RuntimeError("native three-lane fourth lane state mismatch")
+
+    followup_events = (
+        event(
+            "route_segment_destroy",
+            "failed",
+            "route_segment_no_change",
+            route_indices=(int(attempts[0, 0]),),
+            removed_customers=quality_removed[0],
+            candidate_vehicle_delta=0,
+            prefilter_passed=True,
+            selection_rank=int(attempts[0, 5]),
+            segment_length=int(attempts[0, 2]),
+            candidate_objective_key=prior_quality_objective.key,
+        ),
+        event(
+            "route_segment_destroy",
+            "candidate_proposed",
+            "route_segment_repaired",
+            route_indices=(int(attempts[1, 0]),),
+            affected_route_indices=(int(attempts[1, 0]),),
+            removed_customers=quality_removed[1],
+            candidate_route_sequences=quality_routes,
+            candidate_vehicle_delta=len(quality_routes) - len(prior_quality),
+            candidate_feasible=True,
+            prefilter_passed=True,
+            selection_rank=int(attempts[1, 5]),
+            segment_length=int(attempts[1, 2]),
+            accepted=True,
+            candidate_objective_key=quality_key,
+        ),
+        event(
+            "shaw_related",
+            "candidate_proposed",
+            "constraint_ranked_removal",
+            route_indices=(int(constraint_route_indices[0]),),
+            affected_route_indices=(int(constraint_route_indices[0]),),
+            removed_customers=constraint_removed,
+            candidate_route_sequences=constraint_partial,
+            prefilter_passed=True,
+            selection_rank=1,
+            track="constraint_lane",
+            constraint_category="shaw_related",
+            removal_tier="small",
+            removal_size_requested=int(selection[1]),
+            removal_size_actual=int(selection[2]),
+            stagnation_iterations=int(selection[4]),
+            removal_trigger="stagnation_baseline",
+            reset_observed=bool(selection[6]),
+            ranking_score=float(constraint_scores[0]),
+            candidate_objective_key=constraint_key,
+        ),
+        event(
+            "shaw_related",
+            "candidate_proposed",
+            "constraint_removal_repaired",
+            affected_route_indices=constraint_affected,
+            removed_customers=constraint_removed,
+            candidate_route_sequences=constraint_routes,
+            candidate_vehicle_delta=len(constraint_routes) - len(prior_constraint),
+            candidate_feasible=True,
+            prefilter_passed=True,
+            exact_route_evaluations=len(
+                _require_vector(
+                    constraint_transaction[5], "fourth constraint exact rows"
+                )
+            ),
+            track="constraint_lane",
+            constraint_category="shaw_related",
+            removal_tier="small",
+            removal_size_requested=int(selection[1]),
+            removal_size_actual=int(selection[2]),
+            stagnation_iterations=int(selection[4]),
+            removal_trigger="stagnation_baseline",
+            reset_observed=bool(selection[6]),
+            accepted=True,
+            vehicle_reduction=constraint_objective.vehicle_count
+            < prior_constraint_objective.vehicle_count,
+            distance_improvement=constraint_objective.total_distance
+            < prior_constraint_objective.total_distance - 1e-9,
+            candidate_objective_key=constraint_key,
+        ),
+        event(
+            "standard",
+            "proposal",
+            "random+regret2",
+            removed_customers=legacy_removed,
+            candidate_objective_key=legacy_key,
+        ),
+    )
+    all_events = (*previous_stream.neighborhood_events, *followup_events)
+
+    stage04 = require_tuple(payload[12], 4, "Stage 4")
+    operator_count = len(FULL_NATIVE_OPERATOR_NAMES)
+    weights = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            stage04[0],
+            dtype=np.dtype(np.float64),
+            shape=(operator_count,),
+            name="fourth Stage 4 weights",
+        ),
+    )
+    rewards = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            stage04[1],
+            dtype=np.dtype(np.float64),
+            shape=(operator_count,),
+            name="fourth Stage 4 rewards",
+        ),
+    )
+    calls = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            stage04[2],
+            dtype=np.dtype(np.int64),
+            shape=(operator_count,),
+            name="fourth Stage 4 calls",
+        ),
+    )
+    totals = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            stage04[3],
+            dtype=np.dtype(np.int64),
+            shape=(operator_count, 8),
+            name="fourth Stage 4 totals",
+        ),
+    )
+    termination = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[11],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="fourth termination",
+        ),
+    )
+    if (
+        termination.tolist() != [0, -1, 40, 40, 0, 4]
+        or np.any(weights <= 0.0)
+        or np.any(~np.isfinite(weights))
+        or np.any(rewards < 0.0)
+        or np.any(calls < 0)
+        or np.any(totals < 0)
+    ):
+        raise RuntimeError("native three-lane fourth final state is invalid")
+
+    activity = np.zeros((operator_count, 8), dtype=np.int64)
+    by_name = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
+    for item in all_events:
+        index = by_name[str(item["operator"])]
+        activity[index, 0] = max(
+            int(activity[index, 0]), int(bool(item["candidate_feasible"]))
+        )
+        activity[index, 1] += int(bool(item["prefilter_passed"]))
+        activity[index, 2] += cast(int, item["exact_route_evaluations"])
+        activity[index, 3] += int(item["status"] == "candidate_proposed")
+        activity[index, 4] += int(bool(item["candidate_feasible"]))
+        activity[index, 5] += int(bool(item["vehicle_reduction"]))
+        activity[index, 6] += int(bool(item["distance_improvement"]))
+    activity[by_name["standard"], 0] = 1
+    refinement_index = FULL_NATIVE_OPERATOR_NAMES.index(
+        "vehicle_reduction_refinement"
+    )
+    activity[refinement_index, 0] = previous_stream.operator_activity[
+        refinement_index, 0
+    ]
+    activity[refinement_index, 7] = previous_stream.operator_activity[
+        refinement_index, 7
+    ]
+    return NativeThreeLaneSemanticStream(
+        neighborhood_events=tuple(all_events),
+        operator_weights=_readonly_copy(weights),
+        operator_rewards=_readonly_copy(rewards),
+        operator_calls=_readonly_copy(calls),
+        operator_totals=_readonly_copy(totals),
+        operator_activity=_readonly_copy(activity),
+        termination=_readonly_copy(termination),
+        transaction_sha256=search_sha256,
+    )
+
+
+def _decode_native_three_lane_fifth_iteration(
+    instance: Instance,
+    payload: tuple[object, ...],
+    *,
+    previous_payload: tuple[object, ...],
+    previous_stream: NativeThreeLaneSemanticStream,
+    node_names: tuple[str, ...],
+    search_sha256: str,
+) -> NativeThreeLaneSemanticStream:
+    """Replay the related/energy and ejection-chain fifth iteration."""
+
+    _verify_native_three_lane_semantic_hash(payload)
+    if len(payload) != 14:
+        raise RuntimeError("native three-lane fifth iteration is invalid")
+
+    def require_tuple(value: object, size: int, name: str) -> tuple[object, ...]:
+        if not isinstance(value, tuple) or len(value) != size:
+            raise RuntimeError(f"native three-lane fifth {name} is invalid")
+        return value
+
+    def unpack_soa(
+        offsets_value: object,
+        indices_value: object,
+        name: str,
+    ) -> tuple[CustomerSequence, ...]:
+        offsets = _require_vector(offsets_value, f"fifth {name} offsets")
+        indices = _require_vector(indices_value, f"fifth {name} indices")
+        if (
+            len(offsets) < 2
+            or int(offsets[0]) != 0
+            or int(offsets[-1]) != len(indices)
+            or np.any(offsets[:-1] >= offsets[1:])
+            or np.any(indices < 0)
+            or np.any(indices >= len(node_names))
+        ):
+            raise RuntimeError(f"native three-lane fifth {name} SoA is invalid")
+        routes = tuple(
+            tuple(
+                node_names[int(index)]
+                for index in indices[int(offsets[route]) : int(offsets[route + 1])]
+            )
+            for route in range(len(offsets) - 1)
+        )
+        flattened = tuple(customer for route in routes for customer in route)
+        if len(flattened) != len(set(flattened)):
+            raise RuntimeError(f"native three-lane fifth {name} repeats customers")
+        return routes
+
+    def unpack_state(value: object, name: str) -> tuple[CustomerSequence, ...]:
+        state = require_tuple(value, 5 if "best" in name else 4, name)
+        return unpack_soa(state[0], state[1], name)
+
+    expected_customers = {customer.name for customer in instance.customers}
+
+    def replay(routes: tuple[CustomerSequence, ...]) -> SolutionObjective:
+        flattened = tuple(customer for route in routes for customer in route)
+        if len(flattened) != len(expected_customers) or set(flattened) != expected_customers:
+            raise RuntimeError("native three-lane fifth customer identity is invalid")
+        objective = SolutionObjective.zero()
+        for route in routes:
+            exact = solve_exact_charging(instance, route)
+            if not exact.feasible:
+                raise RuntimeError("native three-lane fifth replay is infeasible")
+            objective += SolutionObjective.from_route(
+                instance,
+                exact.route,
+                total_distance=exact.distance,
+                total_charging_time=exact.charging_time,
+            )
+        return objective
+
+    def event(
+        operator: str,
+        status: str,
+        reason: str,
+        **changes: object,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "operator": operator,
+            "status": status,
+            "reason": reason,
+            "route_indices": (),
+            "affected_route_indices": (),
+            "removed_customers": (),
+            "candidate_customer_sequence": (),
+            "candidate_route_sequences": (),
+            "candidate_vehicle_delta": None,
+            "candidate_feasible": False,
+            "prefilter_passed": False,
+            "new_routes_created": 0,
+            "exact_route_evaluations": 0,
+            "selection_rank": 0,
+            "chain_depth": 0,
+            "segment_length": 0,
+            "track": "legacy",
+            "constraint_category": "",
+            "removal_tier": "",
+            "removal_size_requested": 0,
+            "removal_size_actual": 0,
+            "stagnation_iterations": 0,
+            "removal_trigger": "",
+            "reset_observed": False,
+            "ranking_score": 0.0,
+            "iteration": 4,
+            "accepted": False,
+            "vehicle_reduction": False,
+            "distance_improvement": False,
+            "candidate_objective_key": (),
+        }
+        result.update(changes)
+        return result
+
+    prior_legacy = unpack_state(previous_payload[6], "prior legacy")
+    unpack_state(previous_payload[7], "prior quality")
+    prior_constraint = unpack_state(previous_payload[8], "prior constraint")
+    prior_best = unpack_state(previous_payload[9], "prior best")
+    prior_best_objective = replay(prior_best)
+
+    legacy = require_tuple(payload[0], 8, "legacy")
+    legacy_metadata = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            legacy[0],
+            dtype=np.dtype(np.int64),
+            shape=(8,),
+            name="fifth legacy metadata",
+        ),
+    )
+    if legacy_metadata.tolist() != [4, 0, 2, 2, 1, 0, -1, 0]:
+        raise RuntimeError("native three-lane fifth legacy selection is invalid")
+    legacy_removed_indices = _require_vector(legacy[1], "fifth legacy removed")
+    legacy_removed = tuple(node_names[int(index)] for index in legacy_removed_indices)
+    if legacy_removed != ("C4",) or legacy[5] is not None or payload[4] is not None:
+        raise RuntimeError("native three-lane fifth legacy rejection is invalid")
+    insertion = require_tuple(legacy[6], 13, "legacy insertion transaction")
+    insertion_statuses = _require_vector(insertion[1], "fifth insertion statuses")
+    if insertion_statuses.tolist() != [1, 1, 1, 1, 0]:
+        raise RuntimeError("native three-lane fifth attempted-plan replay is invalid")
+    legacy_state = unpack_state(legacy[7], "legacy embedded state")
+    if legacy_state != prior_legacy:
+        raise RuntimeError("native three-lane fifth changed rejected legacy state")
+
+    quality = require_tuple(payload[2], 4, "quality")
+    pool = require_tuple(quality[0], 5, "quality pool")
+    plan_offsets = _require_vector(pool[0], "fifth quality plan offsets")
+    route_offsets = _require_vector(pool[1], "fifth quality route offsets")
+    route_indices = _require_vector(pool[2], "fifth quality route indices")
+    change_offsets = _require_vector(pool[3], "fifth quality change offsets")
+    change_indices = _require_vector(pool[4], "fifth quality change indices")
+    candidate_count = len(plan_offsets) - 1
+    if (
+        candidate_count != 10
+        or int(plan_offsets[0]) != 0
+        or int(plan_offsets[-1]) != len(route_offsets) - 1
+        or int(route_offsets[0]) != 0
+        or int(route_offsets[-1]) != len(route_indices)
+        or len(change_offsets) != candidate_count + 1
+        or int(change_offsets[0]) != 0
+        or int(change_offsets[-1]) != len(change_indices)
+    ):
+        raise RuntimeError("native three-lane fifth quality pool is invalid")
+    candidate_plans = tuple(
+        tuple(
+            tuple(
+                node_names[int(index)]
+                for index in route_indices[
+                    int(route_offsets[route]) : int(route_offsets[route + 1])
+                ]
+            )
+            for route in range(int(plan_offsets[plan]), int(plan_offsets[plan + 1]))
+        )
+        for plan in range(candidate_count)
+    )
+    candidate_changes: list[tuple[tuple[int, ...], int]] = []
+    for candidate in range(candidate_count):
+        values = change_indices[
+            int(change_offsets[candidate]) : int(change_offsets[candidate + 1])
+        ]
+        if len(values) < 2:
+            raise RuntimeError("native three-lane fifth candidate changes are invalid")
+        candidate_changes.append(
+            (tuple(int(value) for value in values[:-1]), int(values[-1]))
+        )
+    journal = require_tuple(quality[1], 4, "quality journal")
+    statuses = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            journal[0],
+            dtype=np.dtype(np.int64),
+            shape=(candidate_count,),
+            name="fifth quality statuses",
+        ),
+    )
+    objective_integers = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            journal[1],
+            dtype=np.dtype(np.int64),
+            shape=(candidate_count, 2),
+            name="fifth quality objective integers",
+        ),
+    )
+    objective_floats = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            journal[2],
+            dtype=np.dtype(np.float64),
+            shape=(candidate_count, 2),
+            name="fifth quality objective floats",
+        ),
+    )
+    exact_deltas = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            journal[3],
+            dtype=np.dtype(np.int64),
+            shape=(candidate_count,),
+            name="fifth quality exact deltas",
+        ),
+    )
+    if (
+        statuses.tolist() != [5] * candidate_count
+        or exact_deltas.tolist() != [1, 0, 0, 0, 1, 0, 0, 1, 1, 0]
+        or np.any(objective_integers[:, 0] != 2)
+        or np.any(objective_integers[:, 1] != 0)
+        or np.any(~np.isfinite(objective_floats))
+    ):
+        raise RuntimeError("native three-lane fifth quality journal is invalid")
+    outcome = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            quality[2],
+            dtype=np.dtype(np.int64),
+            shape=(4,),
+            name="fifth quality outcome",
+        ),
+    )
+    if outcome.tolist() != [2, 1, 0, 0]:
+        raise RuntimeError("native three-lane fifth quality selection is invalid")
+    selected_plan = candidate_plans[int(outcome[0])]
+    selected_objective = replay(selected_plan)
+    selected_key = selected_objective.key
+    if selected_key != (2, 10.0, 0.0, 0):
+        raise RuntimeError("native three-lane fifth quality objective is invalid")
+    if payload[3] is not None:
+        raise RuntimeError("native three-lane fifth ran an unscheduled constraint lane")
+
+    final_states = (
+        unpack_state(payload[6], "final legacy"),
+        unpack_state(payload[7], "final quality"),
+        unpack_state(payload[8], "final constraint"),
+        unpack_state(payload[9], "final best"),
+    )
+    if final_states != (prior_legacy, selected_plan, prior_constraint, prior_best):
+        raise RuntimeError("native three-lane fifth lane state mismatch")
+    if replay(final_states[3]).key != prior_best_objective.key:
+        raise RuntimeError("native three-lane fifth changed the global best")
+
+    candidate_events = []
+    for candidate, plan in enumerate(candidate_plans):
+        changed, depth = candidate_changes[candidate]
+        changed_sequences = tuple(plan[index] for index in changed)
+        candidate_events.append(
+            event(
+                "ejection_chain",
+                "feasible_candidate",
+                "exact_charging_feasible",
+                route_indices=changed,
+                affected_route_indices=changed,
+                candidate_customer_sequence=(
+                    changed_sequences[0] if len(changed_sequences) == 1 else ()
+                ),
+                candidate_route_sequences=changed_sequences,
+                candidate_feasible=True,
+                prefilter_passed=True,
+                exact_route_evaluations=int(exact_deltas[candidate]),
+                selection_rank=candidate + 1,
+                chain_depth=depth,
+                candidate_objective_key=selected_key,
+            )
+        )
+    selected_changes, selected_depth = candidate_changes[int(outcome[0])]
+    followup_events = (
+        *candidate_events,
+        event(
+            "ejection_chain",
+            "candidate_proposed",
+            "ejection_chain_completed",
+            affected_route_indices=selected_changes,
+            candidate_route_sequences=selected_plan,
+            candidate_vehicle_delta=0,
+            candidate_feasible=True,
+            prefilter_passed=True,
+            chain_depth=selected_depth,
+            accepted=True,
+            candidate_objective_key=selected_key,
+        ),
+        event(
+            "standard",
+            "proposal",
+            "related+energy",
+            removed_customers=legacy_removed,
+        ),
+    )
+    all_events = (*previous_stream.neighborhood_events, *followup_events)
+
+    stage04 = require_tuple(payload[12], 4, "Stage 4")
+    operator_count = len(FULL_NATIVE_OPERATOR_NAMES)
+    weights = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            stage04[0],
+            dtype=np.dtype(np.float64),
+            shape=(operator_count,),
+            name="fifth weights",
+        ),
+    )
+    rewards = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            stage04[1],
+            dtype=np.dtype(np.float64),
+            shape=(operator_count,),
+            name="fifth rewards",
+        ),
+    )
+    calls = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            stage04[2],
+            dtype=np.dtype(np.int64),
+            shape=(operator_count,),
+            name="fifth calls",
+        ),
+    )
+    totals = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            stage04[3],
+            dtype=np.dtype(np.int64),
+            shape=(operator_count, 8),
+            name="fifth totals",
+        ),
+    )
+    termination = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[11],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="fifth termination",
+        ),
+    )
+    if (
+        termination.tolist() != [0, -1, 44, 44, 0, 5]
+        or np.any(weights <= 0.0)
+        or np.any(~np.isfinite(weights))
+        or np.any(rewards < 0.0)
+        or np.any(calls < 0)
+        or np.any(totals < 0)
+    ):
+        raise RuntimeError("native three-lane fifth final state is invalid")
+    activity = np.zeros((operator_count, 8), dtype=np.int64)
+    by_name = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
+    for item in all_events:
+        index = by_name[str(item["operator"])]
+        activity[index, 0] = max(
+            int(activity[index, 0]), int(bool(item["candidate_feasible"]))
+        )
+        activity[index, 1] += int(bool(item["prefilter_passed"]))
+        activity[index, 2] += cast(int, item["exact_route_evaluations"])
+        activity[index, 3] += int(item["status"] == "candidate_proposed")
+        activity[index, 4] += int(bool(item["candidate_feasible"]))
+        activity[index, 5] += int(bool(item["vehicle_reduction"]))
+        activity[index, 6] += int(bool(item["distance_improvement"]))
+    activity[by_name["standard"], 0] = previous_stream.operator_activity[
+        by_name["standard"], 0
+    ]
+    refinement_index = by_name["vehicle_reduction_refinement"]
+    activity[refinement_index, 0] = previous_stream.operator_activity[
+        refinement_index, 0
+    ]
+    activity[refinement_index, 7] = previous_stream.operator_activity[
+        refinement_index, 7
+    ]
+    return NativeThreeLaneSemanticStream(
+        neighborhood_events=tuple(all_events),
+        operator_weights=_readonly_copy(weights),
+        operator_rewards=_readonly_copy(rewards),
+        operator_calls=_readonly_copy(calls),
+        operator_totals=_readonly_copy(totals),
+        operator_activity=_readonly_copy(activity),
+        termination=_readonly_copy(termination),
+        transaction_sha256=search_sha256,
+    )
+
+
+def _decode_native_three_lane_sixth_iteration(
+    instance: Instance,
+    payload: tuple[object, ...],
+    *,
+    previous_payload: tuple[object, ...],
+    previous_stream: NativeThreeLaneSemanticStream,
+    node_names: tuple[str, ...],
+    search_sha256: str,
+    iteration: int,
+    expected_metadata: tuple[int, ...],
+    completed_iterations: int,
+) -> NativeThreeLaneSemanticStream:
+    """Replay the weighted vehicle-count-aware sixth iteration."""
+
+    _verify_native_three_lane_semantic_hash(payload)
+    if len(payload) != 14:
+        raise RuntimeError("native three-lane sixth iteration is invalid")
+
+    def require_tuple(value: object, size: int, name: str) -> tuple[object, ...]:
+        if not isinstance(value, tuple) or len(value) != size:
+            raise RuntimeError(f"native three-lane sixth {name} is invalid")
+        return value
+
+    def unpack(value: object, name: str) -> tuple[CustomerSequence, ...]:
+        state = require_tuple(value, 5 if "best" in name else 4, name)
+        offsets = _require_vector(state[0], f"sixth {name} offsets")
+        indices = _require_vector(state[1], f"sixth {name} indices")
+        if (
+            len(offsets) < 2
+            or int(offsets[0]) != 0
+            or int(offsets[-1]) != len(indices)
+            or np.any(offsets[:-1] >= offsets[1:])
+            or np.any(indices < 0)
+            or np.any(indices >= len(node_names))
+        ):
+            raise RuntimeError(f"native three-lane sixth {name} SoA is invalid")
+        return tuple(
+            tuple(
+                node_names[int(index)]
+                for index in indices[int(offsets[route]) : int(offsets[route + 1])]
+            )
+            for route in range(len(offsets) - 1)
+        )
+
+    expected_customers = {customer.name for customer in instance.customers}
+
+    def replay(routes: tuple[CustomerSequence, ...]) -> SolutionObjective:
+        flattened = tuple(customer for route in routes for customer in route)
+        if len(flattened) != len(expected_customers) or set(flattened) != expected_customers:
+            raise RuntimeError("native three-lane sixth customer identity is invalid")
+        objective = SolutionObjective.zero()
+        for route in routes:
+            exact = solve_exact_charging(instance, route)
+            if not exact.feasible:
+                raise RuntimeError("native three-lane sixth replay is infeasible")
+            objective += SolutionObjective.from_route(
+                instance,
+                exact.route,
+                total_distance=exact.distance,
+                total_charging_time=exact.charging_time,
+            )
+        return objective
+
+    prior_states = (
+        unpack(previous_payload[6], "prior legacy"),
+        unpack(previous_payload[7], "prior quality"),
+        unpack(previous_payload[8], "prior constraint"),
+        unpack(previous_payload[9], "prior best"),
+    )
+    legacy = require_tuple(payload[0], 7, "legacy")
+    metadata = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            legacy[0],
+            dtype=np.dtype(np.int64),
+            shape=(8,),
+            name="sixth legacy metadata",
+        ),
+    )
+    if metadata.tolist() != list(expected_metadata):
+        raise RuntimeError("native three-lane sixth legacy decision is invalid")
+    removed_indices = _require_vector(legacy[1], "sixth legacy removed")
+    removed = tuple(node_names[int(index)] for index in removed_indices)
+    repair = require_tuple(legacy[4], 3, "legacy repair")
+    repaired_state = (repair[0], repair[1], None, None)
+    repaired_routes = unpack(repaired_state, "legacy repaired")
+    transaction = require_tuple(legacy[5], 13, "legacy transaction")
+    statuses = _require_vector(transaction[1], "sixth legacy statuses")
+    exact_rows = _require_vector(transaction[5], "sixth legacy exact rows")
+    if statuses.tolist() != [5] or len(exact_rows) != 0:
+        raise RuntimeError("native three-lane sixth transaction is invalid")
+    repaired_objective = replay(repaired_routes)
+    integers = cast(npt.NDArray[np.int64], transaction[2])
+    floats = cast(npt.NDArray[np.float64], transaction[3])
+    reported = SolutionObjective(
+        int(integers[0, 0]),
+        float(floats[0, 0]),
+        float(floats[0, 1]),
+        int(integers[0, 1]),
+    )
+    if reported.key != repaired_objective.key:
+        raise RuntimeError("native three-lane sixth objective mismatch")
+    if payload[2] is not None or payload[3] is not None or payload[4] != (1, 0, 0):
+        raise RuntimeError("native three-lane sixth lane schedule is invalid")
+    final_states = (
+        unpack(payload[6], "final legacy"),
+        unpack(payload[7], "final quality"),
+        unpack(payload[8], "final constraint"),
+        unpack(payload[9], "final best"),
+    )
+    if final_states != (repaired_routes, *prior_states[1:]):
+        raise RuntimeError("native three-lane sixth lane state mismatch")
+
+    item: dict[str, object] = {
+        "operator": "vehicle_count_aware_repair",
+        "status": "candidate_proposed",
+        "reason": "existing_route_repair",
+        "route_indices": (),
+        "affected_route_indices": (),
+        "removed_customers": removed,
+        "candidate_customer_sequence": (),
+        "candidate_route_sequences": (),
+        "candidate_vehicle_delta": len(repaired_routes) - len(prior_states[0]),
+        "candidate_feasible": True,
+        "prefilter_passed": False,
+        "new_routes_created": 0,
+        "exact_route_evaluations": 0,
+        "selection_rank": 0,
+        "chain_depth": 0,
+        "segment_length": 0,
+        "track": "legacy",
+        "constraint_category": "",
+        "removal_tier": "",
+        "removal_size_requested": 0,
+        "removal_size_actual": 0,
+        "stagnation_iterations": 0,
+        "removal_trigger": "",
+        "reset_observed": False,
+        "ranking_score": 0.0,
+        "iteration": iteration,
+        "accepted": True,
+        "vehicle_reduction": False,
+        "distance_improvement": False,
+        "candidate_objective_key": reported.key,
+    }
+    all_events = (*previous_stream.neighborhood_events, item)
+    boundary = require_tuple(payload[5], 6, "Stage 4 boundary")
+    control = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            boundary[4],
+            dtype=np.dtype(np.int64),
+            shape=(7,),
+            name="sixth Stage 4 control",
+        ),
+    )
+    control_float = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            boundary[5],
+            dtype=np.dtype(np.float64),
+            shape=(1,),
+            name="sixth Stage 4 control float",
+        ),
+    )
+    if (
+        np.any(control < 0)
+        or not math.isfinite(float(control_float[0]))
+        or float(control_float[0]) < 0.0
+    ):
+        raise RuntimeError("native three-lane sixth Stage 4 state is invalid")
+    stage04_events = list(previous_stream.stage04_events)
+    if bool(control[0]):
+        stage04_events.append(
+            {
+                "type": "stage04_reheat",
+                "iteration": iteration,
+                "reheat_count": int(control[1]),
+                "reheat_floor": float(control_float[0]),
+                "stagnation_iterations": int(control[6]),
+            }
+        )
+    if bool(control[2]):
+        stage04_events.append(
+            {
+                "type": "stage04_restart",
+                "iteration": iteration,
+                "restart_count": int(control[3]),
+                "intensification": bool(control[4]),
+                "stagnation_at_trigger": 0,
+            }
+        )
+    stage04 = require_tuple(payload[12], 4, "Stage 4")
+    operator_count = len(FULL_NATIVE_OPERATOR_NAMES)
+    weights = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            stage04[0],
+            dtype=np.dtype(np.float64),
+            shape=(operator_count,),
+            name="sixth weights",
+        ),
+    )
+    rewards = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            stage04[1],
+            dtype=np.dtype(np.float64),
+            shape=(operator_count,),
+            name="sixth rewards",
+        ),
+    )
+    calls = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            stage04[2],
+            dtype=np.dtype(np.int64),
+            shape=(operator_count,),
+            name="sixth calls",
+        ),
+    )
+    totals = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            stage04[3],
+            dtype=np.dtype(np.int64),
+            shape=(operator_count, 8),
+            name="sixth totals",
+        ),
+    )
+    termination = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[11],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="sixth termination",
+        ),
+    )
+    if (
+        termination.tolist()
+        != [
+            0,
+            int(previous_stream.termination[1]),
+            int(previous_stream.termination[2]),
+            int(previous_stream.termination[3]),
+            int(previous_stream.termination[4]),
+            completed_iterations,
+        ]
+        or np.any(weights <= 0.0)
+        or np.any(~np.isfinite(weights))
+        or np.any(rewards < 0.0)
+        or np.any(calls < 0)
+        or np.any(totals < 0)
+    ):
+        raise RuntimeError("native three-lane sixth final state is invalid")
+    activity = np.zeros((operator_count, 8), dtype=np.int64)
+    by_name = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
+    for event_item in all_events:
+        index = by_name[str(event_item["operator"])]
+        activity[index, 0] = max(
+            int(activity[index, 0]), int(bool(event_item["candidate_feasible"]))
+        )
+        activity[index, 1] += int(bool(event_item["prefilter_passed"]))
+        activity[index, 2] += cast(int, event_item["exact_route_evaluations"])
+        activity[index, 3] += int(event_item["status"] == "candidate_proposed")
+        activity[index, 4] += int(bool(event_item["candidate_feasible"]))
+        activity[index, 5] += int(bool(event_item["vehicle_reduction"]))
+        activity[index, 6] += int(bool(event_item["distance_improvement"]))
+    activity[:, 0] = previous_stream.operator_activity[:, 0]
+    repair_index = by_name["vehicle_count_aware_repair"]
+    activity[repair_index, 0] = (
+        previous_stream.operator_activity[repair_index, 0] + 1
+    )
+    refinement_index = by_name["vehicle_reduction_refinement"]
+    activity[refinement_index, 0] = previous_stream.operator_activity[
+        refinement_index, 0
+    ]
+    activity[refinement_index, 7] = previous_stream.operator_activity[
+        refinement_index, 7
+    ]
+    return NativeThreeLaneSemanticStream(
+        neighborhood_events=tuple(all_events),
+        operator_weights=_readonly_copy(weights),
+        operator_rewards=_readonly_copy(rewards),
+        operator_calls=_readonly_copy(calls),
+        operator_totals=_readonly_copy(totals),
+        operator_activity=_readonly_copy(activity),
+        termination=_readonly_copy(termination),
+        transaction_sha256=search_sha256,
+        stage04_events=tuple(stage04_events),
+        stage04_control=_readonly_copy(control),
+    )
+
+
+def _decode_native_three_lane_seventh_iteration(
+    instance: Instance,
+    payload: tuple[object, ...],
+    *,
+    previous_payload: tuple[object, ...],
+    previous_stream: NativeThreeLaneSemanticStream,
+    node_names: tuple[str, ...],
+    search_sha256: str,
+    iteration: int,
+    constraint_operator: str,
+    constraint_operator_id: int,
+    legacy_operator: str,
+    legacy_operator_id: int,
+    expected_legacy_metadata: tuple[int, ...],
+    legacy_reason: str,
+    expected_legacy_statuses: tuple[int, ...],
+    expected_legacy_exact_rows: tuple[int, ...],
+    expected_selection: tuple[int, ...],
+    removal_trigger: str,
+    completed_iterations: int,
+) -> NativeThreeLaneSemanticStream:
+    """Replay periodic constraint exploration and route-merge rejection."""
+
+    _verify_native_three_lane_semantic_hash(payload)
+    if len(payload) != 14:
+        raise RuntimeError("native three-lane seventh iteration is invalid")
+
+    def require_tuple(value: object, size: int, name: str) -> tuple[object, ...]:
+        if not isinstance(value, tuple) or len(value) != size:
+            raise RuntimeError(f"native three-lane seventh {name} is invalid")
+        return value
+
+    def unpack_soa(
+        offsets_value: object,
+        indices_value: object,
+        name: str,
+    ) -> tuple[CustomerSequence, ...]:
+        offsets = _require_vector(offsets_value, f"seventh {name} offsets")
+        indices = _require_vector(indices_value, f"seventh {name} indices")
+        if (
+            len(offsets) < 2
+            or int(offsets[0]) != 0
+            or int(offsets[-1]) != len(indices)
+            or np.any(offsets[:-1] >= offsets[1:])
+            or np.any(indices < 0)
+            or np.any(indices >= len(node_names))
+        ):
+            raise RuntimeError(f"native three-lane seventh {name} SoA is invalid")
+        return tuple(
+            tuple(
+                node_names[int(index)]
+                for index in indices[
+                    int(offsets[route]) : int(offsets[route + 1])
+                ]
+            )
+            for route in range(len(offsets) - 1)
+        )
+
+    def unpack_state(value: object, name: str) -> tuple[CustomerSequence, ...]:
+        state = require_tuple(value, 5 if "best" in name else 4, name)
+        return unpack_soa(state[0], state[1], name)
+
+    expected_customers = {customer.name for customer in instance.customers}
+
+    def replay(routes: tuple[CustomerSequence, ...]) -> SolutionObjective:
+        flattened = tuple(customer for route in routes for customer in route)
+        if (
+            len(flattened) != len(expected_customers)
+            or set(flattened) != expected_customers
+        ):
+            raise RuntimeError("native three-lane seventh customer identity is invalid")
+        objective = SolutionObjective.zero()
+        for route in routes:
+            exact = solve_exact_charging(instance, route)
+            if not exact.feasible:
+                raise RuntimeError("native three-lane seventh replay is infeasible")
+            objective += SolutionObjective.from_route(
+                instance,
+                exact.route,
+                total_distance=exact.distance,
+                total_charging_time=exact.charging_time,
+            )
+        return objective
+
+    def transaction(value: object, name: str) -> tuple[object, ...]:
+        result = require_tuple(value, 13, f"{name} transaction")
+        _require_array(
+            result[1],
+            dtype=np.dtype(np.int64),
+            shape=(1,),
+            name=f"seventh {name} statuses",
+        )
+        _require_array(
+            result[2],
+            dtype=np.dtype(np.int64),
+            shape=(1, 2),
+            name=f"seventh {name} objective integers",
+        )
+        _require_array(
+            result[3],
+            dtype=np.dtype(np.float64),
+            shape=(1, 2),
+            name=f"seventh {name} objective floats",
+        )
+        _require_vector(result[5], f"seventh {name} exact rows")
+        if not isinstance(result[12], str) or not _is_sha256(result[12]):
+            raise RuntimeError(f"native three-lane seventh {name} hash is invalid")
+        return result
+
+    def reported_objective(
+        value: tuple[object, ...],
+        replayed: SolutionObjective,
+        name: str,
+    ) -> tuple[int, float, float, int]:
+        integers = cast(npt.NDArray[np.int64], value[2])
+        floats = cast(npt.NDArray[np.float64], value[3])
+        reported = SolutionObjective(
+            vehicle_count=int(integers[0, 0]),
+            total_distance=float(floats[0, 0]),
+            total_charging_time=float(floats[0, 1]),
+            charging_count=int(integers[0, 1]),
+        )
+        if reported.key != replayed.key:
+            raise RuntimeError(f"native three-lane seventh {name} objective mismatch")
+        return reported.key
+
+    def event(
+        operator: str,
+        status: str,
+        reason: str,
+        **changes: object,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "operator": operator,
+            "status": status,
+            "reason": reason,
+            "route_indices": (),
+            "affected_route_indices": (),
+            "removed_customers": (),
+            "candidate_customer_sequence": (),
+            "candidate_route_sequences": (),
+            "candidate_vehicle_delta": None,
+            "candidate_feasible": False,
+            "prefilter_passed": False,
+            "new_routes_created": 0,
+            "exact_route_evaluations": 0,
+            "selection_rank": 0,
+            "chain_depth": 0,
+            "segment_length": 0,
+            "track": "legacy",
+            "constraint_category": "",
+            "removal_tier": "",
+            "removal_size_requested": 0,
+            "removal_size_actual": 0,
+            "stagnation_iterations": 0,
+            "removal_trigger": "",
+            "reset_observed": False,
+            "ranking_score": 0.0,
+            "iteration": iteration,
+            "accepted": False,
+            "vehicle_reduction": False,
+            "distance_improvement": False,
+            "candidate_objective_key": (),
+        }
+        result.update(changes)
+        return result
+
+    prior_states = (
+        unpack_state(previous_payload[6], "prior legacy"),
+        unpack_state(previous_payload[7], "prior quality"),
+        unpack_state(previous_payload[8], "prior constraint"),
+        unpack_state(previous_payload[9], "prior best"),
+    )
+    legacy = require_tuple(
+        payload[0], 8 if legacy_operator == "standard" else 2, "legacy"
+    )
+    legacy_metadata = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            legacy[0],
+            dtype=np.dtype(np.int64),
+            shape=(len(expected_legacy_metadata),),
+            name="seventh legacy metadata",
+        ),
+    )
+    if legacy_metadata.tolist() != list(expected_legacy_metadata):
+        raise RuntimeError("native three-lane seventh route-merge decision is invalid")
+    legacy_removed: tuple[str, ...] = ()
+    if legacy_operator == "standard":
+        legacy_removed = tuple(
+            node_names[int(index)]
+            for index in _require_vector(legacy[1], "seventh legacy removed")
+        )
+        legacy_transaction = require_tuple(
+            legacy[6], 13, "legacy insertion transaction"
+        )
+        if (
+            legacy[5] is not None
+            or _require_vector(legacy_transaction[1], "legacy statuses").tolist()
+            != list(expected_legacy_statuses)
+            or _require_vector(legacy_transaction[5], "legacy exact rows").tolist()
+            != list(expected_legacy_exact_rows)
+            or len(_require_vector(legacy_transaction[11], "legacy attempted"))
+        ):
+            raise RuntimeError("native three-lane seventh legacy journal is invalid")
+        legacy_state = unpack_state(legacy[7], "legacy state")
+    else:
+        legacy_state = unpack_state(legacy[1], "legacy state")
+    if legacy_state != prior_states[0]:
+        raise RuntimeError("native three-lane seventh legacy state is invalid")
+
+    constraint = require_tuple(payload[3], 3, "constraint")
+    selection = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            constraint[0],
+            dtype=np.dtype(np.int64),
+            shape=(7,),
+            name="seventh constraint selection",
+        ),
+    )
+    if selection.tolist() != list(expected_selection):
+        raise RuntimeError("native three-lane seventh stagnation state is invalid")
+    probe = require_tuple(constraint[1], 3, "constraint probe")
+    removal = require_tuple(probe[0], 7, "constraint removal")
+    repair = require_tuple(probe[1], 3, "constraint repair")
+    constraint_transaction = transaction(probe[2], "constraint")
+    outcome = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            constraint[2],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="seventh constraint outcome",
+        ),
+    )
+    if (
+        int(outcome[0]) != constraint_operator_id
+        or not 0 <= int(outcome[1]) < 2**32
+        or outcome[2:].tolist() != [1, 1, 0, 0]
+    ):
+        raise RuntimeError("native three-lane seventh constraint decision is invalid")
+    removed_indices = _require_vector(removal[2], "seventh constraint removed")
+    removed = tuple(node_names[int(index)] for index in removed_indices)
+    partial_routes = unpack_soa(removal[0], removal[1], "constraint partial")
+    repaired_routes = unpack_soa(repair[0], repair[1], "constraint repaired")
+    constraint_objective = replay(repaired_routes)
+    constraint_key = reported_objective(
+        constraint_transaction,
+        constraint_objective,
+        "constraint",
+    )
+    statuses = _require_vector(
+        constraint_transaction[1], "seventh constraint statuses"
+    )
+    exact_rows = _require_vector(
+        constraint_transaction[5], "seventh constraint exact rows"
+    )
+    if statuses.tolist() != [5] or len(exact_rows) != 0:
+        raise RuntimeError("native three-lane seventh cache transaction is invalid")
+    scores = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            removal[4],
+            dtype=np.dtype(np.float64),
+            shape=(len(removed_indices) * 2 + 2,),
+            name="seventh constraint scores",
+        ),
+    )
+    route_indices = _require_vector(
+        removal[5], "seventh constraint route indices"
+    )
+    if len(route_indices) == 0:
+        raise RuntimeError("native three-lane seventh constraint route is missing")
+    affected = tuple(
+        index
+        for index, (before, after) in enumerate(
+            zip(prior_states[2], repaired_routes, strict=False)
+        )
+        if before != after
+    )
+
+    if payload[1] is not None or payload[2] is not None or payload[4] is not None:
+        raise RuntimeError("native three-lane seventh lane schedule is invalid")
+    final_states = (
+        unpack_state(payload[6], "final legacy"),
+        unpack_state(payload[7], "final quality"),
+        unpack_state(payload[8], "final constraint"),
+        unpack_state(payload[9], "final best"),
+    )
+    if final_states != (
+        prior_states[0],
+        prior_states[1],
+        repaired_routes,
+        prior_states[3],
+    ):
+        raise RuntimeError("native three-lane seventh lane state mismatch")
+
+    followup_events = (
+        event(
+            constraint_operator,
+            "candidate_proposed",
+            "constraint_ranked_removal",
+            route_indices=(int(route_indices[0]),),
+            affected_route_indices=(int(route_indices[0]),),
+            removed_customers=removed,
+            candidate_route_sequences=partial_routes,
+            prefilter_passed=True,
+            selection_rank=1,
+            track="constraint_lane",
+            constraint_category=constraint_operator,
+            removal_tier="large",
+            removal_size_requested=int(selection[1]),
+            removal_size_actual=len(removed),
+            stagnation_iterations=int(selection[4]),
+            removal_trigger=removal_trigger,
+            reset_observed=bool(selection[6]),
+            ranking_score=float(scores[0]),
+            candidate_objective_key=constraint_key,
+        ),
+        event(
+            constraint_operator,
+            "candidate_proposed",
+            "constraint_removal_repaired",
+            affected_route_indices=affected,
+            removed_customers=removed,
+            candidate_route_sequences=repaired_routes,
+            candidate_vehicle_delta=len(repaired_routes) - len(prior_states[2]),
+            candidate_feasible=True,
+            prefilter_passed=True,
+            exact_route_evaluations=len(exact_rows),
+            track="constraint_lane",
+            constraint_category=constraint_operator,
+            removal_tier="large",
+            removal_size_requested=int(selection[1]),
+            removal_size_actual=len(removed),
+            stagnation_iterations=int(selection[4]),
+            removal_trigger=removal_trigger,
+            reset_observed=bool(selection[6]),
+            accepted=True,
+            vehicle_reduction=constraint_objective.vehicle_count
+            < replay(prior_states[2]).vehicle_count,
+            distance_improvement=constraint_objective.total_distance
+            < replay(prior_states[2]).total_distance - 1e-9,
+            candidate_objective_key=constraint_key,
+        ),
+        event(
+            legacy_operator,
+            "proposal" if legacy_operator == "standard" else "not_applicable",
+            legacy_reason,
+            removed_customers=legacy_removed,
+        ),
+    )
+    all_events = (*previous_stream.neighborhood_events, *followup_events)
+
+    boundary = require_tuple(payload[5], 6, "Stage 4 boundary")
+    control = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            boundary[4],
+            dtype=np.dtype(np.int64),
+            shape=(7,),
+            name="seventh Stage 4 control",
+        ),
+    )
+    control_float = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            boundary[5],
+            dtype=np.dtype(np.float64),
+            shape=(1,),
+            name="seventh Stage 4 control float",
+        ),
+    )
+    if (
+        np.any(control < 0)
+        or not math.isfinite(float(control_float[0]))
+        or float(control_float[0]) < 0.0
+    ):
+        raise RuntimeError("native three-lane seventh Stage 4 state is invalid")
+    stage04_events = list(previous_stream.stage04_events)
+    if bool(control[0]):
+        stage04_events.append(
+            {
+                "type": "stage04_reheat",
+                "iteration": iteration,
+                "reheat_count": int(control[1]),
+                "reheat_floor": float(control_float[0]),
+                "stagnation_iterations": int(control[6]),
+            }
+        )
+    if bool(control[2]):
+        stage04_events.append(
+            {
+                "type": "stage04_restart",
+                "iteration": iteration,
+                "restart_count": int(control[3]),
+                "intensification": bool(control[4]),
+                "stagnation_at_trigger": 0,
+            }
+        )
+
+    stage04 = require_tuple(payload[12], 4, "Stage 4")
+    operator_count = len(FULL_NATIVE_OPERATOR_NAMES)
+    weights = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            stage04[0],
+            dtype=np.dtype(np.float64),
+            shape=(operator_count,),
+            name="seventh weights",
+        ),
+    )
+    rewards = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            stage04[1],
+            dtype=np.dtype(np.float64),
+            shape=(operator_count,),
+            name="seventh rewards",
+        ),
+    )
+    calls = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            stage04[2],
+            dtype=np.dtype(np.int64),
+            shape=(operator_count,),
+            name="seventh calls",
+        ),
+    )
+    totals = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            stage04[3],
+            dtype=np.dtype(np.int64),
+            shape=(operator_count, 8),
+            name="seventh totals",
+        ),
+    )
+    termination = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[11],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="seventh termination",
+        ),
+    )
+    if (
+        termination.tolist()
+        != [
+            0,
+            int(previous_stream.termination[1]),
+            int(previous_stream.termination[2]),
+            int(previous_stream.termination[3]),
+            int(previous_stream.termination[4]),
+            completed_iterations,
+        ]
+        or np.any(weights <= 0.0)
+        or np.any(~np.isfinite(weights))
+        or np.any(rewards < 0.0)
+        or np.any(calls < 0)
+        or np.any(totals < 0)
+    ):
+        raise RuntimeError("native three-lane seventh final state is invalid")
+
+    activity = np.zeros((operator_count, 8), dtype=np.int64)
+    by_name = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
+    for event_item in all_events:
+        index = by_name[str(event_item["operator"])]
+        activity[index, 0] = max(
+            int(activity[index, 0]), int(bool(event_item["candidate_feasible"]))
+        )
+        activity[index, 1] += int(bool(event_item["prefilter_passed"]))
+        activity[index, 2] += cast(int, event_item["exact_route_evaluations"])
+        activity[index, 3] += int(event_item["status"] == "candidate_proposed")
+        activity[index, 4] += int(bool(event_item["candidate_feasible"]))
+        activity[index, 5] += int(bool(event_item["vehicle_reduction"]))
+        activity[index, 6] += int(bool(event_item["distance_improvement"]))
+    activity[:, 0] = previous_stream.operator_activity[:, 0]
+    constraint_index = by_name[constraint_operator]
+    activity[constraint_index, 0] = (
+        previous_stream.operator_activity[constraint_index, 0] + 1
+    )
+    refinement_index = by_name["vehicle_reduction_refinement"]
+    activity[refinement_index, 0] = previous_stream.operator_activity[
+        refinement_index, 0
+    ]
+    activity[refinement_index, 7] = previous_stream.operator_activity[
+        refinement_index, 7
+    ]
+    return NativeThreeLaneSemanticStream(
+        neighborhood_events=tuple(all_events),
+        operator_weights=_readonly_copy(weights),
+        operator_rewards=_readonly_copy(rewards),
+        operator_calls=_readonly_copy(calls),
+        operator_totals=_readonly_copy(totals),
+        operator_activity=_readonly_copy(activity),
+        termination=_readonly_copy(termination),
+        transaction_sha256=search_sha256,
+        stage04_events=tuple(stage04_events),
+        stage04_control=_readonly_copy(control),
+    )
+
+
+def _decode_native_three_lane_rejection_only_iteration(
+    payload: tuple[object, ...],
+    *,
+    previous_payload: tuple[object, ...],
+    previous_stream: NativeThreeLaneSemanticStream,
+    node_names: tuple[str, ...],
+    search_sha256: str,
+    iteration: int,
+    operator: str,
+    operator_id: int,
+    completed_iterations: int,
+    restart_to_best: bool = False,
+) -> NativeThreeLaneSemanticStream:
+    """Replay a weighted one-route operator rejection without hidden work."""
+
+    _verify_native_three_lane_semantic_hash(payload)
+    if len(payload) != 14:
+        raise RuntimeError("native three-lane rejection iteration is invalid")
+
+    def require_tuple(value: object, size: int, name: str) -> tuple[object, ...]:
+        if not isinstance(value, tuple) or len(value) != size:
+            raise RuntimeError(f"native three-lane rejection {name} is invalid")
+        return value
+
+    def unpack(value: object, name: str) -> tuple[CustomerSequence, ...]:
+        state = require_tuple(value, 5 if "best" in name else 4, name)
+        offsets = _require_vector(state[0], f"rejection {name} offsets")
+        indices = _require_vector(state[1], f"rejection {name} indices")
+        if (
+            len(offsets) < 2
+            or int(offsets[0]) != 0
+            or int(offsets[-1]) != len(indices)
+            or np.any(offsets[:-1] >= offsets[1:])
+            or np.any(indices < 0)
+            or np.any(indices >= len(node_names))
+        ):
+            raise RuntimeError(f"native three-lane rejection {name} SoA is invalid")
+        return tuple(
+            tuple(
+                node_names[int(index)]
+                for index in indices[
+                    int(offsets[route]) : int(offsets[route + 1])
+                ]
+            )
+            for route in range(len(offsets) - 1)
+        )
+
+    prior_states = (
+        unpack(previous_payload[6], "prior legacy"),
+        unpack(previous_payload[7], "prior quality"),
+        unpack(previous_payload[8], "prior constraint"),
+        unpack(previous_payload[9], "prior best"),
+    )
+    legacy = require_tuple(payload[0], 2, "legacy")
+    metadata = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            legacy[0],
+            dtype=np.dtype(np.int64),
+            shape=(4,),
+            name="rejection legacy metadata",
+        ),
+    )
+    if metadata.tolist() != [iteration, operator_id, 1, 0]:
+        raise RuntimeError("native three-lane rejection decision is invalid")
+    if unpack(legacy[1], "legacy state") != prior_states[0]:
+        raise RuntimeError("native three-lane rejection changed its legacy state")
+    if any(payload[index] is not None for index in (1, 2, 3, 4)):
+        raise RuntimeError("native three-lane rejection lane schedule is invalid")
+    final_states = (
+        unpack(payload[6], "final legacy"),
+        unpack(payload[7], "final quality"),
+        unpack(payload[8], "final constraint"),
+        unpack(payload[9], "final best"),
+    )
+    expected_states = (
+        prior_states[3] if restart_to_best else prior_states[0],
+        prior_states[1],
+        prior_states[2],
+        prior_states[3],
+    )
+    if final_states != expected_states:
+        raise RuntimeError("native three-lane rejection modified solver state")
+    boundary = require_tuple(payload[5], 6, "Stage 4 boundary")
+    control = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            boundary[4],
+            dtype=np.dtype(np.int64),
+            shape=(7,),
+            name="rejection Stage 4 control",
+        ),
+    )
+    control_float = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            boundary[5],
+            dtype=np.dtype(np.float64),
+            shape=(1,),
+            name="rejection Stage 4 control float",
+        ),
+    )
+    if (
+        np.any(control < 0)
+        or not math.isfinite(float(control_float[0]))
+        or float(control_float[0]) < 0.0
+    ):
+        raise RuntimeError("native three-lane rejection Stage 4 state is invalid")
+    if restart_to_best and not bool(control[2]):
+        raise RuntimeError("native three-lane rejection omitted its restart boundary")
+    stage04_events = list(previous_stream.stage04_events)
+    if bool(control[0]):
+        stage04_events.append(
+            {
+                "type": "stage04_reheat",
+                "iteration": iteration,
+                "reheat_count": int(control[1]),
+                "reheat_floor": float(control_float[0]),
+                "stagnation_iterations": int(control[6]),
+            }
+        )
+    if bool(control[2]):
+        stage04_events.append(
+            {
+                "type": "stage04_restart",
+                "iteration": iteration,
+                "restart_count": int(control[3]),
+                "intensification": bool(control[4]),
+                "stagnation_at_trigger": 0,
+            }
+        )
+
+    event: dict[str, object] = {
+        "operator": operator,
+        "status": "not_applicable",
+        "reason": "only_one_route",
+        "route_indices": (),
+        "affected_route_indices": (),
+        "removed_customers": (),
+        "candidate_customer_sequence": (),
+        "candidate_route_sequences": (),
+        "candidate_vehicle_delta": None,
+        "candidate_feasible": False,
+        "prefilter_passed": False,
+        "new_routes_created": 0,
+        "exact_route_evaluations": 0,
+        "selection_rank": 0,
+        "chain_depth": 0,
+        "segment_length": 0,
+        "track": "legacy",
+        "constraint_category": "",
+        "removal_tier": "",
+        "removal_size_requested": 0,
+        "removal_size_actual": 0,
+        "stagnation_iterations": 0,
+        "removal_trigger": "",
+        "reset_observed": False,
+        "ranking_score": 0.0,
+        "iteration": iteration,
+        "accepted": False,
+        "vehicle_reduction": False,
+        "distance_improvement": False,
+        "candidate_objective_key": (),
+    }
+    all_events = (*previous_stream.neighborhood_events, event)
+    stage04 = require_tuple(payload[12], 4, "Stage 4")
+    operator_count = len(FULL_NATIVE_OPERATOR_NAMES)
+    weights = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            stage04[0],
+            dtype=np.dtype(np.float64),
+            shape=(operator_count,),
+            name="rejection weights",
+        ),
+    )
+    rewards = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            stage04[1],
+            dtype=np.dtype(np.float64),
+            shape=(operator_count,),
+            name="rejection rewards",
+        ),
+    )
+    calls = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            stage04[2],
+            dtype=np.dtype(np.int64),
+            shape=(operator_count,),
+            name="rejection calls",
+        ),
+    )
+    totals = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            stage04[3],
+            dtype=np.dtype(np.int64),
+            shape=(operator_count, 8),
+            name="rejection totals",
+        ),
+    )
+    termination = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[11],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="rejection termination",
+        ),
+    )
+    if (
+        termination.tolist()
+        != [
+            0,
+            int(previous_stream.termination[1]),
+            int(previous_stream.termination[2]),
+            int(previous_stream.termination[3]),
+            int(previous_stream.termination[4]),
+            completed_iterations,
+        ]
+        or np.any(weights <= 0.0)
+        or np.any(~np.isfinite(weights))
+        or np.any(rewards < 0.0)
+        or np.any(calls < 0)
+        or np.any(totals < 0)
+    ):
+        raise RuntimeError("native three-lane rejection final state is invalid")
+
+    activity = np.zeros((operator_count, 8), dtype=np.int64)
+    by_name = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
+    for event_item in all_events:
+        index = by_name[str(event_item["operator"])]
+        activity[index, 1] += int(bool(event_item["prefilter_passed"]))
+        activity[index, 2] += cast(int, event_item["exact_route_evaluations"])
+        activity[index, 3] += int(event_item["status"] == "candidate_proposed")
+        activity[index, 4] += int(bool(event_item["candidate_feasible"]))
+        activity[index, 5] += int(bool(event_item["vehicle_reduction"]))
+        activity[index, 6] += int(bool(event_item["distance_improvement"]))
+    activity[:, 0] = previous_stream.operator_activity[:, 0]
+    refinement_index = by_name["vehicle_reduction_refinement"]
+    activity[refinement_index, 7] = previous_stream.operator_activity[
+        refinement_index, 7
+    ]
+    return NativeThreeLaneSemanticStream(
+        neighborhood_events=tuple(all_events),
+        operator_weights=_readonly_copy(weights),
+        operator_rewards=_readonly_copy(rewards),
+        operator_calls=_readonly_copy(calls),
+        operator_totals=_readonly_copy(totals),
+        operator_activity=_readonly_copy(activity),
+        termination=_readonly_copy(termination),
+        transaction_sha256=search_sha256,
+        stage04_events=tuple(stage04_events),
+        stage04_control=_readonly_copy(control),
+    )
+
+
+def _decode_native_three_lane_constraint_no_change_iteration(
+    instance: Instance,
+    payload: tuple[object, ...],
+    *,
+    previous_payload: tuple[object, ...],
+    previous_stream: NativeThreeLaneSemanticStream,
+    node_names: tuple[str, ...],
+    search_sha256: str,
+    iteration: int,
+    constraint_operator: str,
+    constraint_operator_id: int,
+    expected_selection: tuple[int, ...],
+    removal_tier: str,
+    removal_trigger: str,
+    legacy_operator: str,
+    legacy_operator_id: int,
+    completed_iterations: int,
+) -> NativeThreeLaneSemanticStream:
+    """Replay a constraint no-change failure followed by legacy rejection."""
+
+    _verify_native_three_lane_semantic_hash(payload)
+    if len(payload) != 14:
+        raise RuntimeError("native constraint no-change iteration is invalid")
+
+    def require_tuple(value: object, size: int, name: str) -> tuple[object, ...]:
+        if not isinstance(value, tuple) or len(value) != size:
+            raise RuntimeError(f"native constraint no-change {name} is invalid")
+        return value
+
+    def unpack_soa(
+        offsets_value: object,
+        indices_value: object,
+        name: str,
+    ) -> tuple[CustomerSequence, ...]:
+        offsets = _require_vector(offsets_value, f"no-change {name} offsets")
+        indices = _require_vector(indices_value, f"no-change {name} indices")
+        if (
+            len(offsets) < 2
+            or int(offsets[0]) != 0
+            or int(offsets[-1]) != len(indices)
+            or np.any(offsets[:-1] >= offsets[1:])
+            or np.any(indices < 0)
+            or np.any(indices >= len(node_names))
+        ):
+            raise RuntimeError(f"native constraint no-change {name} SoA is invalid")
+        return tuple(
+            tuple(
+                node_names[int(index)]
+                for index in indices[
+                    int(offsets[route]) : int(offsets[route + 1])
+                ]
+            )
+            for route in range(len(offsets) - 1)
+        )
+
+    def unpack_state(value: object, name: str) -> tuple[CustomerSequence, ...]:
+        state = require_tuple(value, 5 if "best" in name else 4, name)
+        return unpack_soa(state[0], state[1], name)
+
+    def replay(routes: tuple[CustomerSequence, ...]) -> SolutionObjective:
+        expected = {customer.name for customer in instance.customers}
+        flattened = tuple(customer for route in routes for customer in route)
+        if len(flattened) != len(expected) or set(flattened) != expected:
+            raise RuntimeError("native constraint no-change identity is invalid")
+        objective = SolutionObjective.zero()
+        for route in routes:
+            exact = solve_exact_charging(instance, route)
+            if not exact.feasible:
+                raise RuntimeError("native constraint no-change replay is infeasible")
+            objective += SolutionObjective.from_route(
+                instance,
+                exact.route,
+                total_distance=exact.distance,
+                total_charging_time=exact.charging_time,
+            )
+        return objective
+
+    def event(
+        operator: str,
+        status: str,
+        reason: str,
+        **changes: object,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "operator": operator,
+            "status": status,
+            "reason": reason,
+            "route_indices": (),
+            "affected_route_indices": (),
+            "removed_customers": (),
+            "candidate_customer_sequence": (),
+            "candidate_route_sequences": (),
+            "candidate_vehicle_delta": None,
+            "candidate_feasible": False,
+            "prefilter_passed": False,
+            "new_routes_created": 0,
+            "exact_route_evaluations": 0,
+            "selection_rank": 0,
+            "chain_depth": 0,
+            "segment_length": 0,
+            "track": "legacy",
+            "constraint_category": "",
+            "removal_tier": "",
+            "removal_size_requested": 0,
+            "removal_size_actual": 0,
+            "stagnation_iterations": 0,
+            "removal_trigger": "",
+            "reset_observed": False,
+            "ranking_score": 0.0,
+            "iteration": iteration,
+            "accepted": False,
+            "vehicle_reduction": False,
+            "distance_improvement": False,
+            "candidate_objective_key": (),
+        }
+        result.update(changes)
+        return result
+
+    prior_states = (
+        unpack_state(previous_payload[6], "prior legacy"),
+        unpack_state(previous_payload[7], "prior quality"),
+        unpack_state(previous_payload[8], "prior constraint"),
+        unpack_state(previous_payload[9], "prior best"),
+    )
+    legacy = require_tuple(payload[0], 2, "legacy")
+    legacy_metadata = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            legacy[0],
+            dtype=np.dtype(np.int64),
+            shape=(4,),
+            name="no-change legacy metadata",
+        ),
+    )
+    if (
+        legacy_metadata.tolist() != [iteration, legacy_operator_id, 1, 0]
+        or unpack_state(legacy[1], "legacy state") != prior_states[0]
+    ):
+        raise RuntimeError("native constraint no-change legacy decision is invalid")
+
+    constraint = require_tuple(payload[3], 3, "constraint")
+    selection = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            constraint[0],
+            dtype=np.dtype(np.int64),
+            shape=(7,),
+            name="no-change constraint selection",
+        ),
+    )
+    if selection.tolist() != list(expected_selection):
+        raise RuntimeError("native constraint no-change stagnation state is invalid")
+    probe = require_tuple(constraint[1], 3, "constraint probe")
+    removal = require_tuple(probe[0], 7, "constraint removal")
+    repair = require_tuple(probe[1], 3, "constraint repair")
+    transaction = require_tuple(probe[2], 13, "constraint transaction")
+    outcome = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            constraint[2],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="no-change constraint outcome",
+        ),
+    )
+    if (
+        int(outcome[0]) != constraint_operator_id
+        or not 0 <= int(outcome[1]) < 2**32
+        or outcome[2:].tolist() != [0, 0, 0, 0]
+    ):
+        raise RuntimeError("native constraint no-change outcome is invalid")
+    removed_indices = _require_vector(removal[2], "no-change removed")
+    removed = tuple(node_names[int(index)] for index in removed_indices)
+    partial_routes = unpack_soa(removal[0], removal[1], "constraint partial")
+    repaired_routes = unpack_soa(repair[0], repair[1], "constraint repaired")
+    if repaired_routes != prior_states[2]:
+        raise RuntimeError("native constraint no-change repair changed its lane")
+    statuses = _require_vector(transaction[1], "no-change statuses")
+    exact_rows = _require_vector(transaction[5], "no-change exact rows")
+    if statuses.tolist() != [5] or len(exact_rows) != 0:
+        raise RuntimeError("native constraint no-change cache journal is invalid")
+    objective_integers = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            transaction[2],
+            dtype=np.dtype(np.int64),
+            shape=(1, 2),
+            name="no-change objective integers",
+        ),
+    )
+    objective_floats = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            transaction[3],
+            dtype=np.dtype(np.float64),
+            shape=(1, 2),
+            name="no-change objective floats",
+        ),
+    )
+    reported = SolutionObjective(
+        int(objective_integers[0, 0]),
+        float(objective_floats[0, 0]),
+        float(objective_floats[0, 1]),
+        int(objective_integers[0, 1]),
+    )
+    if reported.key != replay(repaired_routes).key:
+        raise RuntimeError("native constraint no-change objective mismatch")
+    scores = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            removal[4],
+            dtype=np.dtype(np.float64),
+            shape=(len(removed_indices) * 2 + 2,),
+            name="no-change scores",
+        ),
+    )
+    removal_routes = _require_vector(removal[5], "no-change route indices")
+    if len(removal_routes) == 0:
+        raise RuntimeError("native constraint no-change route is missing")
+
+    if payload[1] is not None or payload[2] is not None or payload[4] is not None:
+        raise RuntimeError("native constraint no-change lane schedule is invalid")
+    final_states = (
+        unpack_state(payload[6], "final legacy"),
+        unpack_state(payload[7], "final quality"),
+        unpack_state(payload[8], "final constraint"),
+        unpack_state(payload[9], "final best"),
+    )
+    if final_states != prior_states:
+        raise RuntimeError("native constraint no-change modified solver state")
+
+    followup_events = (
+        event(
+            constraint_operator,
+            "candidate_proposed",
+            "constraint_ranked_removal",
+            route_indices=(int(removal_routes[0]),),
+            affected_route_indices=(int(removal_routes[0]),),
+            removed_customers=removed,
+            candidate_route_sequences=partial_routes,
+            prefilter_passed=True,
+            selection_rank=1,
+            track="constraint_lane",
+            constraint_category=constraint_operator,
+            removal_tier=removal_tier,
+            removal_size_requested=int(selection[1]),
+            removal_size_actual=len(removed),
+            stagnation_iterations=int(selection[4]),
+            removal_trigger=removal_trigger,
+            ranking_score=float(scores[0]),
+        ),
+        event(
+            constraint_operator,
+            "failed",
+            "constraint_removal_no_change",
+            removed_customers=removed,
+            prefilter_passed=True,
+            track="constraint_lane",
+            constraint_category=constraint_operator,
+            removal_tier=removal_tier,
+            removal_size_requested=int(selection[1]),
+            removal_size_actual=len(removed),
+            stagnation_iterations=int(selection[4]),
+            removal_trigger=removal_trigger,
+        ),
+        event(legacy_operator, "not_applicable", "only_one_route"),
+    )
+    all_events = (*previous_stream.neighborhood_events, *followup_events)
+    boundary = require_tuple(payload[5], 6, "Stage 4 boundary")
+    control = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            boundary[4],
+            dtype=np.dtype(np.int64),
+            shape=(7,),
+            name="no-change Stage 4 control",
+        ),
+    )
+    control_float = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            boundary[5],
+            dtype=np.dtype(np.float64),
+            shape=(1,),
+            name="no-change Stage 4 control float",
+        ),
+    )
+    if (
+        np.any(control < 0)
+        or not math.isfinite(float(control_float[0]))
+        or float(control_float[0]) < 0.0
+    ):
+        raise RuntimeError("native constraint no-change Stage 4 state is invalid")
+    stage04_events = list(previous_stream.stage04_events)
+    if bool(control[0]):
+        stage04_events.append(
+            {
+                "type": "stage04_reheat",
+                "iteration": iteration,
+                "reheat_count": int(control[1]),
+                "reheat_floor": float(control_float[0]),
+                "stagnation_iterations": int(control[6]),
+            }
+        )
+    if bool(control[2]):
+        stage04_events.append(
+            {
+                "type": "stage04_restart",
+                "iteration": iteration,
+                "restart_count": int(control[3]),
+                "intensification": bool(control[4]),
+                "stagnation_at_trigger": 0,
+            }
+        )
+    stage04 = require_tuple(payload[12], 4, "Stage 4")
+    operator_count = len(FULL_NATIVE_OPERATOR_NAMES)
+    weights = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            stage04[0],
+            dtype=np.dtype(np.float64),
+            shape=(operator_count,),
+            name="no-change weights",
+        ),
+    )
+    rewards = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            stage04[1],
+            dtype=np.dtype(np.float64),
+            shape=(operator_count,),
+            name="no-change rewards",
+        ),
+    )
+    calls = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            stage04[2],
+            dtype=np.dtype(np.int64),
+            shape=(operator_count,),
+            name="no-change calls",
+        ),
+    )
+    totals = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            stage04[3],
+            dtype=np.dtype(np.int64),
+            shape=(operator_count, 8),
+            name="no-change totals",
+        ),
+    )
+    termination = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[11],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="no-change termination",
+        ),
+    )
+    if (
+        termination.tolist()
+        != [
+            0,
+            int(previous_stream.termination[1]),
+            int(previous_stream.termination[2]),
+            int(previous_stream.termination[3]),
+            int(previous_stream.termination[4]),
+            completed_iterations,
+        ]
+        or np.any(weights <= 0.0)
+        or np.any(~np.isfinite(weights))
+        or np.any(rewards < 0.0)
+        or np.any(calls < 0)
+        or np.any(totals < 0)
+    ):
+        raise RuntimeError("native constraint no-change final state is invalid")
+    activity = np.zeros((operator_count, 8), dtype=np.int64)
+    by_name = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
+    for event_item in all_events:
+        index = by_name[str(event_item["operator"])]
+        activity[index, 1] += int(bool(event_item["prefilter_passed"]))
+        activity[index, 2] += cast(int, event_item["exact_route_evaluations"])
+        activity[index, 3] += int(event_item["status"] == "candidate_proposed")
+        activity[index, 4] += int(bool(event_item["candidate_feasible"]))
+        activity[index, 5] += int(bool(event_item["vehicle_reduction"]))
+        activity[index, 6] += int(bool(event_item["distance_improvement"]))
+    activity[:, 0] = previous_stream.operator_activity[:, 0]
+    refinement_index = by_name["vehicle_reduction_refinement"]
+    activity[refinement_index, 7] = previous_stream.operator_activity[
+        refinement_index, 7
+    ]
+    return NativeThreeLaneSemanticStream(
+        neighborhood_events=tuple(all_events),
+        operator_weights=_readonly_copy(weights),
+        operator_rewards=_readonly_copy(rewards),
+        operator_calls=_readonly_copy(calls),
+        operator_totals=_readonly_copy(totals),
+        operator_activity=_readonly_copy(activity),
+        termination=_readonly_copy(termination),
+        transaction_sha256=search_sha256,
+        stage04_events=tuple(stage04_events),
+        stage04_control=_readonly_copy(control),
+    )
+
+
+def _decode_native_three_lane_standard_energy_rejection_iteration(
+    instance: Instance,
+    payload: tuple[object, ...],
+    *,
+    previous_payload: tuple[object, ...],
+    previous_stream: NativeThreeLaneSemanticStream,
+    node_names: tuple[str, ...],
+    search_sha256: str,
+    iteration: int,
+    destroy_name: str,
+    repair_name: str,
+    expected_metadata: tuple[int, ...],
+    expected_statuses: tuple[int, ...],
+    expected_exact_rows: tuple[int, ...],
+    expected_exact_call_delta: int,
+    candidate_prepared: bool,
+    feasible_repair: bool,
+    completed_iterations: int,
+) -> NativeThreeLaneSemanticStream:
+    """Replay a standard destroy/repair rejection with an audited journal."""
+
+    _verify_native_three_lane_semantic_hash(payload)
+    if len(payload) != 14:
+        raise RuntimeError("native standard-energy iteration is invalid")
+
+    def require_tuple(value: object, size: int, name: str) -> tuple[object, ...]:
+        if not isinstance(value, tuple) or len(value) != size:
+            raise RuntimeError(f"native standard-energy {name} is invalid")
+        return value
+
+    def unpack_soa(
+        offsets_value: object,
+        indices_value: object,
+        name: str,
+    ) -> tuple[CustomerSequence, ...]:
+        offsets = _require_vector(offsets_value, f"standard-energy {name} offsets")
+        indices = _require_vector(indices_value, f"standard-energy {name} indices")
+        if (
+            len(offsets) < 2
+            or int(offsets[0]) != 0
+            or int(offsets[-1]) != len(indices)
+            or np.any(offsets[:-1] >= offsets[1:])
+            or np.any(indices < 0)
+            or np.any(indices >= len(node_names))
+        ):
+            raise RuntimeError(f"native standard-energy {name} SoA is invalid")
+        return tuple(
+            tuple(
+                node_names[int(index)]
+                for index in indices[
+                    int(offsets[route]) : int(offsets[route + 1])
+                ]
+            )
+            for route in range(len(offsets) - 1)
+        )
+
+    def unpack_state(value: object, name: str) -> tuple[CustomerSequence, ...]:
+        state = require_tuple(value, 5 if "best" in name else 4, name)
+        return unpack_soa(state[0], state[1], name)
+
+    def replay(routes: tuple[CustomerSequence, ...]) -> SolutionObjective:
+        expected = {customer.name for customer in instance.customers}
+        flattened = tuple(customer for route in routes for customer in route)
+        if len(flattened) != len(expected) or set(flattened) != expected:
+            raise RuntimeError("native standard-energy customer identity is invalid")
+        objective = SolutionObjective.zero()
+        for route in routes:
+            exact = solve_exact_charging(instance, route)
+            if not exact.feasible:
+                raise RuntimeError("native standard-energy replay is infeasible")
+            objective += SolutionObjective.from_route(
+                instance,
+                exact.route,
+                total_distance=exact.distance,
+                total_charging_time=exact.charging_time,
+            )
+        return objective
+
+    prior_states = (
+        unpack_state(previous_payload[6], "prior legacy"),
+        unpack_state(previous_payload[7], "prior quality"),
+        unpack_state(previous_payload[8], "prior constraint"),
+        unpack_state(previous_payload[9], "prior best"),
+    )
+    legacy = require_tuple(payload[0], 8, "legacy")
+    metadata = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            legacy[0],
+            dtype=np.dtype(np.int64),
+            shape=(8,),
+            name="standard-energy metadata",
+        ),
+    )
+    if metadata.tolist() != list(expected_metadata):
+        raise RuntimeError("native standard-energy decision is invalid")
+    removed_indices = _require_vector(legacy[1], "standard-energy removed")
+    removed = tuple(node_names[int(index)] for index in removed_indices)
+    repaired = require_tuple(legacy[4], 3, "energy repair")
+    repaired_routes = unpack_soa(repaired[0], repaired[1], "energy repaired")
+    repaired_objective = replay(repaired_routes)
+    if legacy[5] is not None:
+        raise RuntimeError("native standard-energy duplicated its final transaction")
+    transaction = require_tuple(legacy[6], 13, "energy insertion transaction")
+    statuses = _require_vector(transaction[1], "standard-energy statuses")
+    exact_rows = _require_vector(transaction[5], "standard-energy exact rows")
+    if (
+        statuses.tolist() != list(expected_statuses)
+        or exact_rows.tolist() != list(expected_exact_rows)
+    ):
+        raise RuntimeError("native standard-energy insertion journal is invalid")
+    objective_integers = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            transaction[2],
+            dtype=np.dtype(np.int64),
+            shape=(len(expected_statuses), 2),
+            name="standard-energy objective integers",
+        ),
+    )
+    objective_floats = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            transaction[3],
+            dtype=np.dtype(np.float64),
+            shape=(len(expected_statuses), 2),
+            name="standard-energy objective floats",
+        ),
+    )
+    candidate_objective_key: tuple[object, ...]
+    if candidate_prepared:
+        reported = SolutionObjective(
+            int(objective_integers[0, 0]),
+            float(objective_floats[0, 0]),
+            float(objective_floats[0, 1]),
+            int(objective_integers[0, 1]),
+        )
+        if reported.key != repaired_objective.key:
+            raise RuntimeError("native standard-energy objective mismatch")
+        acceptance = require_tuple(payload[4], 3, "legacy acceptance")
+        if acceptance != (0, 0, 0):
+            raise RuntimeError("native standard-energy rejection is invalid")
+        candidate_objective_key = reported.key
+    else:
+        if payload[4] is not None or len(_require_vector(transaction[11], "attempted")):
+            raise RuntimeError("native standard-energy unexpected candidate state")
+        candidate_objective_key = ()
+    if payload[1] is not None or payload[2] is not None or payload[3] is not None:
+        raise RuntimeError("native standard-energy lane schedule is invalid")
+    final_states = (
+        unpack_state(payload[6], "final legacy"),
+        unpack_state(payload[7], "final quality"),
+        unpack_state(payload[8], "final constraint"),
+        unpack_state(payload[9], "final best"),
+    )
+    if final_states != prior_states:
+        raise RuntimeError("native standard-energy rejection modified solver state")
+    boundary = require_tuple(payload[5], 6, "Stage 4 boundary")
+    control = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            boundary[4],
+            dtype=np.dtype(np.int64),
+            shape=(7,),
+            name="standard-energy Stage 4 control",
+        ),
+    )
+    control_float = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            boundary[5],
+            dtype=np.dtype(np.float64),
+            shape=(1,),
+            name="standard-energy Stage 4 control float",
+        ),
+    )
+    if (
+        np.any(control < 0)
+        or not math.isfinite(float(control_float[0]))
+        or float(control_float[0]) < 0.0
+    ):
+        raise RuntimeError("native standard-energy reheat state is invalid")
+
+    event: dict[str, object] = {
+        "operator": "standard",
+        "status": "proposal",
+        "reason": f"{destroy_name}+{repair_name}",
+        "route_indices": (),
+        "affected_route_indices": (),
+        "removed_customers": removed,
+        "candidate_customer_sequence": (),
+        "candidate_route_sequences": (),
+        "candidate_vehicle_delta": None,
+        "candidate_feasible": False,
+        "prefilter_passed": False,
+        "new_routes_created": 0,
+        "exact_route_evaluations": 0,
+        "selection_rank": 0,
+        "chain_depth": 0,
+        "segment_length": 0,
+        "track": "legacy",
+        "constraint_category": "",
+        "removal_tier": "",
+        "removal_size_requested": 0,
+        "removal_size_actual": 0,
+        "stagnation_iterations": 0,
+        "removal_trigger": "",
+        "reset_observed": False,
+        "ranking_score": 0.0,
+        "iteration": iteration,
+        "accepted": False,
+        "vehicle_reduction": False,
+        "distance_improvement": False,
+        "candidate_objective_key": candidate_objective_key,
+    }
+    all_events = (*previous_stream.neighborhood_events, event)
+    stage04 = require_tuple(payload[12], 4, "Stage 4")
+    operator_count = len(FULL_NATIVE_OPERATOR_NAMES)
+    weights = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            stage04[0],
+            dtype=np.dtype(np.float64),
+            shape=(operator_count,),
+            name="standard-energy weights",
+        ),
+    )
+    rewards = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            stage04[1],
+            dtype=np.dtype(np.float64),
+            shape=(operator_count,),
+            name="standard-energy rewards",
+        ),
+    )
+    calls = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            stage04[2],
+            dtype=np.dtype(np.int64),
+            shape=(operator_count,),
+            name="standard-energy calls",
+        ),
+    )
+    totals = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            stage04[3],
+            dtype=np.dtype(np.int64),
+            shape=(operator_count, 8),
+            name="standard-energy totals",
+        ),
+    )
+    termination = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[11],
+            dtype=np.dtype(np.int64),
+            shape=(6,),
+            name="standard-energy termination",
+        ),
+    )
+    if (
+        termination.tolist()
+        != [
+            0,
+            int(previous_stream.termination[1]),
+            int(previous_stream.termination[2]) + expected_exact_call_delta,
+            int(previous_stream.termination[3]) + expected_exact_call_delta,
+            int(previous_stream.termination[4]),
+            completed_iterations,
+        ]
+        or np.any(weights <= 0.0)
+        or np.any(~np.isfinite(weights))
+        or np.any(rewards < 0.0)
+        or np.any(calls < 0)
+        or np.any(totals < 0)
+    ):
+        raise RuntimeError("native standard-energy final state is invalid")
+    activity = np.zeros((operator_count, 8), dtype=np.int64)
+    by_name = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
+    for event_item in all_events:
+        index = by_name[str(event_item["operator"])]
+        activity[index, 1] += int(bool(event_item["prefilter_passed"]))
+        activity[index, 2] += cast(int, event_item["exact_route_evaluations"])
+        activity[index, 3] += int(event_item["status"] == "candidate_proposed")
+        activity[index, 4] += int(bool(event_item["candidate_feasible"]))
+        activity[index, 5] += int(bool(event_item["vehicle_reduction"]))
+        activity[index, 6] += int(bool(event_item["distance_improvement"]))
+    activity[:, 0] = previous_stream.operator_activity[:, 0]
+    standard_index = by_name["standard"]
+    activity[standard_index, 0] += int(feasible_repair)
+    refinement_index = by_name["vehicle_reduction_refinement"]
+    activity[refinement_index, 7] = previous_stream.operator_activity[
+        refinement_index, 7
+    ]
+    return NativeThreeLaneSemanticStream(
+        neighborhood_events=tuple(all_events),
+        operator_weights=_readonly_copy(weights),
+        operator_rewards=_readonly_copy(rewards),
+        operator_calls=_readonly_copy(calls),
+        operator_totals=_readonly_copy(totals),
+        operator_activity=_readonly_copy(activity),
+        termination=_readonly_copy(termination),
+        transaction_sha256=search_sha256,
+        stage04_events=(
+            *previous_stream.stage04_events,
+            *(
+                (
+                    {
+                        "type": "stage04_reheat",
+                        "iteration": iteration,
+                        "reheat_count": int(control[1]),
+                        "reheat_floor": float(control_float[0]),
+                        "stagnation_iterations": int(control[6]),
+                    },
+                )
+                if bool(control[0])
+                else ()
+            ),
+            *(
+                (
+                    {
+                        "type": "stage04_restart",
+                        "iteration": iteration,
+                        "restart_count": int(control[3]),
+                        "intensification": bool(control[4]),
+                        "stagnation_at_trigger": 0,
+                    },
+                )
+                if bool(control[2])
+                else ()
+            ),
+        ),
+        stage04_control=_readonly_copy(control),
     )
 
 
@@ -1305,15 +6377,37 @@ def execute_full_native_alns(
     transaction_sha256 = payload[6]
     if not isinstance(transaction_sha256, str) or not _is_sha256(transaction_sha256):
         raise RuntimeError("full native ALNS returned an invalid transaction SHA-256")
-    semantic_stream = decode_native_global_semantic_stream(
-        instance,
-        payload[7],
-        node_names=context.node_names,
-        initial_customer_sequences=initial_customer_sequences,
-        stage04_config=stage04_config,
-        expected_start_iteration=0,
-        expected_iteration_count=max_iterations,
-    )
+    three_lane_semantics = isinstance(payload[7], tuple) and len(payload[7]) in {
+        2,
+        14,
+    }
+    semantic_stream: NativeGlobalSemanticStream | NativeThreeLaneSemanticStream
+    if three_lane_semantics:
+        semantic_stream = (
+            decode_native_three_lane_search_semantic_stream(
+                instance,
+                payload[7],
+                node_names=context.node_names,
+                initial_customer_sequences=initial_customer_sequences,
+            )
+            if len(cast(tuple[object, ...], payload[7])) == 2
+            else decode_native_three_lane_semantic_stream(
+                instance,
+                payload[7],
+                node_names=context.node_names,
+                initial_customer_sequences=initial_customer_sequences,
+            )
+        )
+    else:
+        semantic_stream = decode_native_global_semantic_stream(
+            instance,
+            payload[7],
+            node_names=context.node_names,
+            initial_customer_sequences=initial_customer_sequences,
+            stage04_config=stage04_config,
+            expected_start_iteration=0,
+            expected_iteration_count=max_iterations,
+        )
     backend_metrics = _decode_full_native_backend_metrics(
         payload[8],
         batch_size=batch_size,
@@ -1330,7 +6424,10 @@ def execute_full_native_alns(
     )
     if transaction_sha256 != expected_sha256:
         raise RuntimeError("full native ALNS transaction SHA-256 mismatch")
-    if int(semantic_stream.termination[2]) != int(counters_array[0]):
+    if (
+        not three_lane_semantics
+        and int(semantic_stream.termination[2]) != int(counters_array[0])
+    ):
         raise RuntimeError("full native ALNS semantic iteration count mismatch")
     decoded = decode_exact_charging_batch_numeric(
         instance,
@@ -1340,12 +6437,36 @@ def execute_full_native_alns(
         payload=payload[2],
         native_kernel_seconds=0.0,
     )
-    _verify_full_native_best_projection(
-        instance,
-        initial_customer_sequences=initial_customer_sequences,
-        semantic_stream=semantic_stream,
-        returned_customer_sequences=customer_sequences,
-    )
+    if three_lane_semantics:
+        raw_semantics = cast(tuple[object, ...], payload[7])
+        final_semantics = (
+            cast(
+                tuple[object, ...],
+                cast(tuple[object, ...], raw_semantics[0])[-1],
+            )
+            if len(raw_semantics) == 2
+            else raw_semantics
+        )
+        raw_best = cast(tuple[object, ...], final_semantics[9])
+        replayed_best = _pack_routes(customer_sequences, context.name_to_index)
+        if not (
+            np.array_equal(
+                _require_vector(raw_best[0], "full native best offsets"),
+                replayed_best[0],
+            )
+            and np.array_equal(
+                _require_vector(raw_best[1], "full native best indices"),
+                replayed_best[1],
+            )
+        ):
+            raise RuntimeError("full native three-lane best projection is invalid")
+    else:
+        _verify_full_native_best_projection(
+            instance,
+            initial_customer_sequences=initial_customer_sequences,
+            semantic_stream=cast(NativeGlobalSemanticStream, semantic_stream),
+            returned_customer_sequences=customer_sequences,
+        )
     counters = {
         "iterations": int(counters_array[0]),
         "exact_started_calls": int(counters_array[1]),
@@ -1972,6 +7093,7 @@ __all__ = (
     "NativeCandidateRoundResult",
     "NativeConstraintSemanticStream",
     "NativeGlobalSemanticStream",
+    "NativeThreeLaneSemanticStream",
     "FullNativeALNSResult",
     "FULL_NATIVE_OPERATOR_NAMES",
     "NativeWorkerProtocol",
@@ -1979,5 +7101,6 @@ __all__ = (
     "execute_native_candidate_round",
     "decode_native_constraint_semantic_stream",
     "decode_native_global_semantic_stream",
+    "decode_native_three_lane_semantic_stream",
     "execute_full_native_alns",
 )
