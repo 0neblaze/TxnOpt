@@ -4450,6 +4450,71 @@ def test_native_three_lane_deadline_returns_last_completed_lane_incumbent() -> N
     assert semantic.operator_totals[9].tolist() == [0] * 8
 
 
+def test_native_three_lane_followup_exact_deadline_returns_terminal_payload() -> None:
+    from evrptw import _core as native_core
+
+    instance = _candidate_plan_fixture()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = _native_search_engine(native_core, context,
+        100, 100, 256, 10_000_000, 256, 100, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        _native_lexical_rank(context),
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray([1, 2, 3, 4], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 100], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    thresholds = np.asarray([4, 8, 3], dtype=np.int64)
+    fractions = np.asarray(
+        [0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64
+    )
+    deadline = np.asarray([30.0], dtype=np.float64)
+    batch = np.asarray([128], dtype=np.int64)
+    bootstrap = engine.run_three_lane_bootstrap(
+        3, 512, -1, thresholds, fractions, deadline, batch
+    )
+    assert bootstrap[11].tolist()[0] == 0
+    best_before = engine.best_solution_payload()
+    engine.inject_exact_kernel_deadline_once()
+
+    payload = engine.run_three_lane_followup(
+        1,
+        10,
+        0.1,
+        3,
+        512,
+        2,
+        4,
+        50,
+        128,
+        3,
+        2,
+        -1,
+        thresholds,
+        fractions,
+        deadline,
+        batch,
+    )
+
+    assert payload[11].tolist()[0] == 2
+    best_after = engine.best_solution_payload()
+    np.testing.assert_equal(best_after[0], best_before[0])
+    np.testing.assert_equal(best_after[1], best_before[1])
+    np.testing.assert_equal(best_after[3], best_before[3])
+    np.testing.assert_allclose(best_after[4], best_before[4])
+
+
 def test_native_global_search_returns_deadline_terminal_without_partial_iteration() -> None:
     from evrptw import _core as native_core
 

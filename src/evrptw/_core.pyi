@@ -352,6 +352,25 @@ class NativeSearchEngineV2:
         deadline_remaining: npt.NDArray[np.float64],
         batch_size: npt.NDArray[np.int64],
     ) -> tuple[object, ...]: ...
+    def run_three_lane_followup(
+        self,
+        iteration: int,
+        max_iterations: int,
+        removal_fraction: float,
+        route_elimination_max_attempts: int,
+        refinement_budget: int,
+        route_segment_min_length: int,
+        route_segment_max_length: int,
+        route_segment_budget: int,
+        ejection_chain_budget: int,
+        ejection_chain_max_depth: int,
+        ejection_chain_beam_width: int,
+        route_change_limit: int,
+        thresholds: npt.NDArray[np.int64],
+        fractions: npt.NDArray[np.float64],
+        deadline_remaining: npt.NDArray[np.float64],
+        batch_size: npt.NDArray[np.int64],
+    ) -> tuple[object, ...]: ...
     def constraint_probe(
         self,
         operation: int,

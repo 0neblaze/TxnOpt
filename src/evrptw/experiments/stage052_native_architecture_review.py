@@ -149,6 +149,38 @@ def load_records(
     for mode in MODES:
         run_dir = results_root / labels[mode.value]
         manifest = _verify_signed_json(run_dir / "run_manifest.json")
+        if _string(manifest, "schema_version") == SCHEMA_VERSION:
+            topology = _mapping(manifest, "topology")
+            mode_waves = topology.get("mode_wave_resources")
+            scheduler_observed = topology.get("scheduler_observed")
+            if (
+                not isinstance(mode_waves, list)
+                or not mode_waves
+                or not isinstance(scheduler_observed, list)
+                or len(scheduler_observed) != 1
+            ):
+                raise RuntimeError("campaign process-tree instrumentation is incomplete")
+            for field in ("scheduler_startup_seconds", "scheduler_shutdown_seconds"):
+                value = topology.get(field)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int | float)
+                    or not math.isfinite(float(value))
+                    or float(value) < 0.0
+                ):
+                    raise RuntimeError(f"campaign {field} is missing or invalid")
+            for wave in mode_waves:
+                if not isinstance(wave, dict) or any(
+                    field not in wave
+                    for field in (
+                        "mode",
+                        "elapsed_seconds",
+                        "process_tree_cpu_seconds",
+                        "peak_aggregate_rss_bytes",
+                        "peak_aggregate_pss_bytes",
+                    )
+                ):
+                    raise RuntimeError("campaign mode-wave resource evidence is incomplete")
         identity = (
             _string(manifest, "revision"),
             _string(manifest, "wheel_sha256"),
@@ -233,6 +265,53 @@ def _replay_record(record: ReviewRecord, benchmark_dir: Path) -> dict[str, objec
         return {"valid": False, "reason": "fallback evidence is missing or malformed"}
     if fallback_count != 0:
         return {"valid": False, "reason": "native fallback count is non-zero"}
+    if comparison_schema == SCHEMA_VERSION:
+        topology = payload.get("topology")
+        if not isinstance(topology, dict):
+            return {"valid": False, "reason": "process-tree topology is missing"}
+        for field in (
+            "sample_count",
+            "peak_concurrent_processes",
+            "peak_aggregate_threads",
+            "peak_aggregate_rss_bytes",
+            "peak_aggregate_pss_bytes",
+            "process_tree_cpu_seconds",
+        ):
+            value = topology.get(field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+            ):
+                return {
+                    "valid": False,
+                    "reason": f"process-tree field is missing or invalid: {field}",
+                }
+        persistence = payload.get("persistence_seconds")
+        if (
+            isinstance(persistence, bool)
+            or not isinstance(persistence, int | float)
+            or not math.isfinite(float(persistence))
+            or float(persistence) < 0.0
+        ):
+            return {"valid": False, "reason": "persistence interval is invalid"}
+        if record.mode is ArchitectureMode.HOST_SCHEDULER:
+            scheduler_pid = topology.get("scheduler_process_id")
+            roots = topology.get("additional_root_pids")
+            if (
+                isinstance(scheduler_pid, bool)
+                or not isinstance(scheduler_pid, int)
+                or scheduler_pid <= 0
+                or not isinstance(roots, list)
+                or scheduler_pid not in roots
+                or topology.get("shared_scheduler_resource_attribution")
+                != "mode_wave_primary_axis_values_overlap"
+            ):
+                return {
+                    "valid": False,
+                    "reason": "host scheduler process-tree attribution is incomplete",
+                }
     semantic_completeness = payload.get("semantic_completeness")
     semantics_complete = isinstance(semantic_completeness, dict) and all(
         semantic_completeness.get(field) is True
@@ -411,6 +490,17 @@ def _vehicle_count(payload: Mapping[str, object]) -> float:
     return float(value)
 
 
+def _topology_integer(
+    payload: Mapping[str, object],
+    field: str,
+    *,
+    legacy_field: str,
+) -> int:
+    topology = _mapping(payload, "topology")
+    selected = field if field in topology else legacy_field
+    return _integer(topology, selected)
+
+
 def _mode_metrics(records: Iterable[ReviewRecord]) -> dict[str, object]:
     values = tuple(record for record in records if record.payload.get("status") == "completed")
     native_queue: list[float] = []
@@ -466,7 +556,23 @@ def _mode_metrics(records: Iterable[ReviewRecord]) -> dict[str, object]:
             for record in values
         ),
         "rss_bytes": _paired(
-            float(_integer(_mapping(record.payload, "topology"), "rss_bytes"))
+            float(
+                _topology_integer(
+                    record.payload,
+                    "peak_aggregate_rss_bytes",
+                    legacy_field="rss_bytes",
+                )
+            )
+            for record in values
+        ),
+        "pss_bytes": _paired(
+            float(
+                _topology_integer(
+                    record.payload,
+                    "peak_aggregate_pss_bytes",
+                    legacy_field="rss_bytes",
+                )
+            )
             for record in values
         ),
         "cache_memory_bytes": _paired(
@@ -1444,8 +1550,9 @@ def render_report(review: Mapping[str, object]) -> str:
             "",
             "Exact batch occupancy（精确批量占用度）不是 native candidate-screening "
             "occupancy（原生候选筛选占用度），不用于 CUDA 门槛。"
-            "`persistence_seconds` 包含 solver 执行时间，不是独立持久化成本。"
-            "Host 轴的 CPU/RSS 仅测量 client shard，不含 scheduler service。",
+            "`persistence_seconds` 是求解结束后的独立同目录写入探针。"
+            "Host 单轴的 process tree（进程树）包含共享 scheduler service；"
+            "并发轴之间存在重叠，因此总 CPU/RSS 只采用 mode-wave 主计量，不跨轴求和。",
             "",
             "## 边界",
             "",

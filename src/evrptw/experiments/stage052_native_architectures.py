@@ -724,9 +724,17 @@ def _solve_mode(
         "initial_solution_provenance": task.initial_solution_provenance,
         "warm_start_validation_config": WarmStartValidationConfig(),
     }
-    # The shared scheduler is accounted once by the parent mode-wave monitor;
-    # including it here would charge the same CPU/RSS to all six shard axes.
-    with ProcessTreeMonitor() as resource_monitor:
+    scheduler_roots = (
+        (task.scheduler_process_id,)
+        if mode is ArchitectureMode.HOST_SCHEDULER
+        and task.scheduler_process_id is not None
+        else ()
+    )
+    # Per-axis telemetry includes the shared scheduler so an individual raw
+    # bundle never omits part of its execution process tree.  These shared-root
+    # values must not be summed across concurrent shard axes; the parent
+    # mode-wave observation is the aggregate accounting source.
+    with ProcessTreeMonitor(additional_root_pids=scheduler_roots) as resource_monitor:
         started = time.perf_counter()
         if mode is ArchitectureMode.CURRENT_STAGE052:
             result = solve_alns(
@@ -774,6 +782,12 @@ def _solve_mode(
             "shared_native_work_pool", False
         ),
         "process_id": os.getpid(),
+        "scheduler_process_id": task.scheduler_process_id,
+        "shared_scheduler_resource_attribution": (
+            "mode_wave_primary_axis_values_overlap"
+            if mode is ArchitectureMode.HOST_SCHEDULER
+            else "not_applicable"
+        ),
         "threads_before": threads_before,
         "threads_after": _thread_count(),
         "rss_bytes": _rss_bytes(),
@@ -1051,26 +1065,34 @@ def run_experiment(
     written: list[str] = []
     scheduler_observations: list[dict[str, int]] = []
     mode_wave_resources: list[dict[str, object]] = []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        for batch_index, batch in enumerate(_mode_wave_batches(plan)):
-            offset = batch_index % len(MODES)
-            mode_order = MODES[offset:] + MODES[:offset]
-            for mode in mode_order:
-                wave_started = time.perf_counter()
-                with ProcessTreeMonitor() as wave_monitor:
-                    if mode is ArchitectureMode.HOST_SCHEDULER:
-                        with NativeHostScheduler(
-                            scheduler_path, worker_threads=24
-                        ) as scheduler:
-                            scheduler_observations.append(
-                                {
-                                    "process_id": scheduler.process_id,
-                                    "observed_thread_count": (
-                                        scheduler.observed_thread_count()
-                                    ),
-                                    "configured_worker_threads": scheduler.worker_threads,
-                                }
-                            )
+    scheduler = NativeHostScheduler(scheduler_path, worker_threads=24)
+    scheduler_start_started = time.perf_counter()
+    scheduler.start()
+    scheduler_startup_seconds = time.perf_counter() - scheduler_start_started
+    scheduler_observations.append(
+        {
+            "process_id": scheduler.process_id,
+            "observed_thread_count": scheduler.observed_thread_count(),
+            "configured_worker_threads": scheduler.worker_threads,
+        }
+    )
+    scheduler_shutdown_seconds = 0.0
+    try:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            for batch_index, batch in enumerate(_mode_wave_batches(plan)):
+                offset = batch_index % len(MODES)
+                mode_order = MODES[offset:] + MODES[:offset]
+                for mode in mode_order:
+                    wave_started = time.perf_counter()
+                    excluded_scheduler = (
+                        ()
+                        if mode is ArchitectureMode.HOST_SCHEDULER
+                        else (scheduler.process_id,)
+                    )
+                    with ProcessTreeMonitor(
+                        excluded_root_pids=excluded_scheduler
+                    ) as wave_monitor:
+                        if mode is ArchitectureMode.HOST_SCHEDULER:
                             futures = [
                                 executor.submit(
                                     _run_mode,
@@ -1082,36 +1104,38 @@ def run_experiment(
                                 )
                                 for task in batch
                             ]
-                            for future in as_completed(futures):
-                                written.append(future.result())
-                    else:
-                        futures = [
-                            executor.submit(_run_mode, task, mode) for task in batch
-                        ]
+                        else:
+                            futures = [
+                                executor.submit(_run_mode, task, mode) for task in batch
+                            ]
                         for future in as_completed(futures):
                             written.append(future.result())
-                wave_elapsed = time.perf_counter() - wave_started
-                mode_wave_resources.append(
-                    {
-                        "batch_index": batch_index,
-                        "mode": mode.value,
-                        "axis_count": len(batch),
-                        "identities": [
-                            {
-                                "repeat": task.repeat,
-                                "axis": task.axis,
-                                "instance": task.instance_name,
-                                "seed": task.seed,
-                            }
-                            for task in batch
-                        ],
-                        "elapsed_seconds": wave_elapsed,
-                        **wave_monitor.statistics(
-                            elapsed_seconds=wave_elapsed,
-                            compute_thread_limit=TOTAL_COMPUTE_THREADS,
-                        ),
-                    }
-                )
+                    wave_elapsed = time.perf_counter() - wave_started
+                    mode_wave_resources.append(
+                        {
+                            "batch_index": batch_index,
+                            "mode": mode.value,
+                            "axis_count": len(batch),
+                            "identities": [
+                                {
+                                    "repeat": task.repeat,
+                                    "axis": task.axis,
+                                    "instance": task.instance_name,
+                                    "seed": task.seed,
+                                }
+                                for task in batch
+                            ],
+                            "elapsed_seconds": wave_elapsed,
+                            **wave_monitor.statistics(
+                                elapsed_seconds=wave_elapsed,
+                                compute_thread_limit=TOTAL_COMPUTE_THREADS,
+                            ),
+                        }
+                    )
+    finally:
+        scheduler_shutdown_started = time.perf_counter()
+        scheduler.close()
+        scheduler_shutdown_seconds = time.perf_counter() - scheduler_shutdown_started
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "scope": scope,
@@ -1136,6 +1160,8 @@ def run_experiment(
             "compute_thread_limit": TOTAL_COMPUTE_THREADS,
             "compute_envelope": compute_envelope,
             "scheduler_observed": scheduler_observations,
+            "scheduler_startup_seconds": scheduler_startup_seconds,
+            "scheduler_shutdown_seconds": scheduler_shutdown_seconds,
             "mode_wave_resources": mode_wave_resources,
         },
         "mode_order_policy": "six_axis_global_mode_waves_rotated_by_batch",

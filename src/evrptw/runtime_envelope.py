@@ -21,6 +21,7 @@ class ProcessTreeMonitor:
     """Sample one solve's complete process tree, including external roots."""
 
     additional_root_pids: tuple[int, ...] = ()
+    excluded_root_pids: tuple[int, ...] = ()
     sample_interval_seconds: float = 0.05
     _stop: threading.Event = field(default_factory=threading.Event, init=False)
     _thread: threading.Thread | None = field(default=None, init=False)
@@ -33,17 +34,23 @@ class ProcessTreeMonitor:
     _peak_processes: int = field(default=0, init=False)
     _peak_threads: int = field(default=0, init=False)
     _sample_count: int = field(default=0, init=False)
+    _baseline_complete: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         if self.sample_interval_seconds <= 0.0:
             raise ValueError("process-tree sample interval must be positive")
         if any(pid <= 0 for pid in self.additional_root_pids):
             raise ValueError("additional process-tree roots must be positive PIDs")
+        if any(pid <= 0 for pid in self.excluded_root_pids):
+            raise ValueError("excluded process-tree roots must be positive PIDs")
+        if set(self.additional_root_pids) & set(self.excluded_root_pids):
+            raise ValueError("a process-tree root cannot be both included and excluded")
 
     def __enter__(self) -> ProcessTreeMonitor:
         if self._thread is not None:
             raise RuntimeError("process-tree monitor is already running")
         self._sample()
+        self._baseline_complete = True
         self._thread = threading.Thread(
             target=self._run,
             name="evrptw-process-tree-monitor",
@@ -78,6 +85,9 @@ class ProcessTreeMonitor:
             "sample_interval_seconds": self.sample_interval_seconds,
             "sample_count": self._sample_count,
             "observed_processes": len(self._observations),
+            "observed_process_ids": sorted(
+                {identity[0] for identity in self._observations}
+            ),
             "peak_concurrent_processes": self._peak_processes,
             "peak_aggregate_threads": self._peak_threads,
             "peak_aggregate_rss_bytes": self._peak_aggregate_rss_bytes,
@@ -91,6 +101,7 @@ class ProcessTreeMonitor:
             ),
             "root_process_id": os.getpid(),
             "additional_root_pids": list(self.additional_root_pids),
+            "excluded_root_pids": list(self.excluded_root_pids),
         }
 
     def _run(self) -> None:
@@ -99,6 +110,18 @@ class ProcessTreeMonitor:
 
     def _sample(self) -> None:
         processes: dict[tuple[int, float], psutil.Process] = {}
+        excluded: set[tuple[int, float]] = set()
+        for pid in self.excluded_root_pids:
+            try:
+                root = psutil.Process(pid)
+                candidates = (root, *root.children(recursive=True))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            for process in candidates:
+                try:
+                    excluded.add((process.pid, process.create_time()))
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
         for pid in (os.getpid(), *self.additional_root_pids):
             try:
                 root = psutil.Process(pid)
@@ -107,7 +130,9 @@ class ProcessTreeMonitor:
                 continue
             for process in candidates:
                 try:
-                    processes[(process.pid, process.create_time())] = process
+                    identity = (process.pid, process.create_time())
+                    if identity not in excluded:
+                        processes[identity] = process
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
         aggregate_rss = 0
@@ -128,7 +153,13 @@ class ProcessTreeMonitor:
             observation = self._observations.get(identity)
             if observation is None:
                 self._observations[identity] = _ProcessObservation(
-                    first_cpu_seconds=cpu_seconds,
+                    # Processes present in the synchronous entry sample may
+                    # have accumulated CPU before this measurement envelope;
+                    # subtract that baseline.  A descendant first discovered
+                    # later was created during the envelope, so its cumulative
+                    # CPU belongs to this solve even if it exits before a
+                    # second sample can observe it.
+                    first_cpu_seconds=(cpu_seconds if not self._baseline_complete else 0.0),
                     last_cpu_seconds=cpu_seconds,
                     maximum_rss_bytes=rss_bytes,
                 )
