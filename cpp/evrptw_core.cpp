@@ -1714,6 +1714,113 @@ py::tuple rank_candidate_plans_v1(
         std::move(integer_metrics), std::move(float_metrics));
 }
 
+py::tuple prepare_candidate_plans_v2(
+    py::handle plan_offsets,
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle expected_customer_indices,
+    py::handle node_kind,
+    py::handle lexical_rank,
+    py::handle complete_customer_indices,
+    std::int64_t customer_kind,
+    bool allow_partial_customer_coverage) {
+    auto plans = checked_array<std::int64_t>(plan_offsets, "plan_offsets", 1);
+    auto routes = checked_array<std::int64_t>(route_offsets, "route_offsets", 1);
+    auto indices = checked_array<std::int64_t>(route_indices, "route_indices", 1);
+    auto expected = checked_array<std::int64_t>(
+        expected_customer_indices, "expected_customer_indices", 1);
+    auto kinds = checked_array<std::int64_t>(node_kind, "node_kind", 1);
+    auto lexical = checked_array<std::int64_t>(lexical_rank, "lexical_rank", 1);
+    auto complete = checked_array<std::int64_t>(
+        complete_customer_indices, "complete_customer_indices", 1);
+    const auto result = evrptw::native_candidate_plan::prepare({
+        {checked_data<std::int64_t>(plans), static_cast<std::size_t>(plans.size())},
+        {checked_data<std::int64_t>(routes), static_cast<std::size_t>(routes.size())},
+        {checked_data<std::int64_t>(indices), static_cast<std::size_t>(indices.size())},
+        {checked_data<std::int64_t>(expected), static_cast<std::size_t>(expected.size())},
+        {checked_data<std::int64_t>(kinds), static_cast<std::size_t>(kinds.size())},
+        {checked_data<std::int64_t>(lexical), static_cast<std::size_t>(lexical.size())},
+        {checked_data<std::int64_t>(complete), static_cast<std::size_t>(complete.size())},
+        customer_kind,
+        allow_partial_customer_coverage,
+    });
+    const auto make_array = [](const std::vector<std::int64_t>& values) {
+        py::array_t<std::int64_t> array(values.size());
+        std::copy(values.begin(), values.end(), checked_data(array));
+        return array;
+    };
+    return py::make_tuple(
+        make_array(result.canonical_expected),
+        make_array(result.coverage_eligible),
+        make_array(result.unique_route_offsets),
+        make_array(result.unique_route_indices),
+        make_array(result.unique_row_by_route));
+}
+
+py::tuple decide_candidate_plans_v2(
+    py::handle plan_offsets,
+    py::handle coverage_eligible,
+    py::handle screening_passed,
+    py::handle attempted_flags,
+    std::int64_t current_route_count) {
+    auto plans = checked_array<std::int64_t>(plan_offsets, "plan_offsets", 1);
+    auto coverage = checked_array<std::int64_t>(
+        coverage_eligible, "coverage_eligible", 1);
+    auto screening = checked_array<std::int64_t>(
+        screening_passed, "screening_passed", 1);
+    auto attempted = checked_array<std::int64_t>(
+        attempted_flags, "attempted_flags", 1);
+    const auto result = evrptw::native_candidate_plan::decide({
+        {checked_data<std::int64_t>(plans), static_cast<std::size_t>(plans.size())},
+        {checked_data<std::int64_t>(coverage), static_cast<std::size_t>(coverage.size())},
+        {checked_data<std::int64_t>(screening), static_cast<std::size_t>(screening.size())},
+        {checked_data<std::int64_t>(attempted), static_cast<std::size_t>(attempted.size())},
+        current_route_count,
+    });
+    py::array_t<std::int64_t> eligible(result.eligible.size());
+    py::array_t<std::int64_t> combined(result.combined_attempted.size());
+    std::copy(result.eligible.begin(), result.eligible.end(), checked_data(eligible));
+    std::copy(
+        result.combined_attempted.begin(), result.combined_attempted.end(),
+        checked_data(combined));
+    return py::make_tuple(std::move(eligible), std::move(combined));
+}
+
+py::array_t<std::int64_t> order_feasible_candidate_plans_v2(
+    py::handle plan_offsets,
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle objective_integer,
+    py::handle objective_float,
+    py::handle lexical_rank,
+    py::handle feasible_plan_ids) {
+    auto plans = checked_array<std::int64_t>(plan_offsets, "plan_offsets", 1);
+    auto routes = checked_array<std::int64_t>(route_offsets, "route_offsets", 1);
+    auto indices = checked_array<std::int64_t>(route_indices, "route_indices", 1);
+    auto integer = checked_array<std::int64_t>(
+        objective_integer, "objective_integer", 2);
+    auto floating = checked_array<double>(objective_float, "objective_float", 2);
+    auto lexical = checked_array<std::int64_t>(lexical_rank, "lexical_rank", 1);
+    auto feasible = checked_array<std::int64_t>(
+        feasible_plan_ids, "feasible_plan_ids", 1);
+    if (integer.shape(1) != 2 || floating.shape(1) != 2) {
+        throw std::invalid_argument(
+            "feasible-plan objective arrays must have exactly two columns");
+    }
+    const auto result = evrptw::native_candidate_plan::order_feasible({
+        {checked_data<std::int64_t>(plans), static_cast<std::size_t>(plans.size())},
+        {checked_data<std::int64_t>(routes), static_cast<std::size_t>(routes.size())},
+        {checked_data<std::int64_t>(indices), static_cast<std::size_t>(indices.size())},
+        {checked_data<std::int64_t>(integer), static_cast<std::size_t>(integer.size())},
+        {checked_data<double>(floating), static_cast<std::size_t>(floating.size())},
+        {checked_data<std::int64_t>(lexical), static_cast<std::size_t>(lexical.size())},
+        {checked_data<std::int64_t>(feasible), static_cast<std::size_t>(feasible.size())},
+    });
+    py::array_t<std::int64_t> output(result.size());
+    std::copy(result.begin(), result.end(), checked_data(output));
+    return output;
+}
+
 py::tuple screen_route_batch_transaction_impl(
     py::handle node_kind,
     py::handle demand,
@@ -9175,35 +9282,28 @@ public:
             throw std::invalid_argument(
                 "full native plan transaction requires a non-empty plan pool");
         }
-        const auto* expected = checked_data<std::int64_t>(expected_array);
-        std::unordered_set<std::int64_t> expected_customers;
-        for (py::ssize_t index = 0; index < expected_array.size(); ++index) {
-            const auto customer = expected[index];
-            if (customer < 0 || customer >= node_kind_.size()
-                || checked_data<std::int64_t>(node_kind_)[customer]
-                    != customer_kind
-                || !expected_customers.insert(customer).second) {
-                throw std::invalid_argument(
-                    "expected_customer_indices must contain unique customer nodes");
-            }
-        }
-        if (expected_customers.empty()) {
-            throw std::invalid_argument(
-                "expected_customer_indices cannot be empty");
-        }
-        if (!allow_partial_customer_coverage_
-            && expected_customers != all_customers_) {
-            throw std::invalid_argument(
-                "expected_customer_indices must attest the complete instance customer set");
-        }
-        std::vector<std::int64_t> canonical_expected(
-            expected_customers.begin(), expected_customers.end());
-        std::stable_sort(
-            canonical_expected.begin(), canonical_expected.end(),
-            [&](std::int64_t left, std::int64_t right) {
-                return checked_data<std::int64_t>(lexical_rank_)[left]
-                    < checked_data<std::int64_t>(lexical_rank_)[right];
-            });
+        std::vector<std::int64_t> complete_customer_indices(
+            all_customers_.begin(), all_customers_.end());
+        const auto prepared_plans = evrptw::native_candidate_plan::prepare({
+            std::span<const std::int64_t>(plan_boundaries, plan_count + 1),
+            std::span<const std::int64_t>(route_boundaries, route_count + 1),
+            std::span<const std::int64_t>(
+                route_nodes, static_cast<std::size_t>(indices_array.size())),
+            std::span<const std::int64_t>(
+                checked_data<std::int64_t>(expected_array),
+                static_cast<std::size_t>(expected_array.size())),
+            std::span<const std::int64_t>(
+                checked_data<std::int64_t>(node_kind_),
+                static_cast<std::size_t>(node_kind_.size())),
+            std::span<const std::int64_t>(
+                checked_data<std::int64_t>(lexical_rank_),
+                static_cast<std::size_t>(lexical_rank_.size())),
+            std::span<const std::int64_t>(
+                complete_customer_indices.data(), complete_customer_indices.size()),
+            customer_kind,
+            allow_partial_customer_coverage_,
+        });
+        const auto& canonical_expected = prepared_plans.canonical_expected;
         py::array_t<std::int64_t> canonical_expected_array(
             canonical_expected.size());
         std::copy(
@@ -9232,25 +9332,24 @@ public:
         }
         const auto* attempted = checked_data<std::int64_t>(attempted_flags);
         py::array_t<double> lower_bounds(route_count);
-        std::vector<std::int64_t> eligible(plan_count, 1);
-        for (std::size_t plan = 0; plan < plan_count; ++plan) {
-            std::unordered_set<std::int64_t> observed;
-            for (auto route = plan_boundaries[plan];
-                 route < plan_boundaries[plan + 1]; ++route) {
-                for (auto cursor = route_boundaries[route];
-                     cursor < route_boundaries[route + 1]; ++cursor) {
-                    if (!observed.insert(route_nodes[cursor]).second) {
-                        eligible[plan] = 0;
-                    }
-                }
-            }
-            if (observed != expected_customers) {
-                eligible[plan] = 0;
-            }
-        }
-        std::unordered_map<std::string, std::size_t> screen_identity;
+        std::vector<std::int64_t> eligible = prepared_plans.coverage_eligible;
         std::vector<std::vector<std::int64_t>> unique_screen_routes;
+        unique_screen_routes.reserve(
+            prepared_plans.unique_route_offsets.size() - 1);
+        for (std::size_t row = 0;
+             row + 1 < prepared_plans.unique_route_offsets.size(); ++row) {
+            unique_screen_routes.emplace_back(
+                prepared_plans.unique_route_indices.begin()
+                    + prepared_plans.unique_route_offsets[row],
+                prepared_plans.unique_route_indices.begin()
+                    + prepared_plans.unique_route_offsets[row + 1]);
+        }
         std::vector<std::size_t> screen_row_by_route(route_count);
+        std::transform(
+            prepared_plans.unique_row_by_route.begin(),
+            prepared_plans.unique_row_by_route.end(),
+            screen_row_by_route.begin(),
+            [](std::int64_t row) { return static_cast<std::size_t>(row); });
         std::array<double, 4> screen_options{
             1.0, screening_epsilon_, 0.0, 0.0};
         std::array<double, 6> no_incremental{};
@@ -9263,25 +9362,8 @@ public:
         const auto* reachable = checked_data<std::uint8_t>(reachable_);
         const auto* vehicle = checked_data<double>(vehicle_);
         const auto node_count = static_cast<std::size_t>(node_kind_.size());
-        for (std::size_t route = 0; route < route_count; ++route) {
-            std::vector<std::int64_t> sequence(
-                route_nodes + route_boundaries[route],
-                route_nodes + route_boundaries[route + 1]);
-            const auto key = NativeRouteCacheV2::route_key(sequence);
-            const auto [found, inserted] = screen_identity.emplace(
-                key, unique_screen_routes.size());
-            if (inserted) {
-                unique_screen_routes.push_back(std::move(sequence));
-            }
-            screen_row_by_route[route] = found->second;
-        }
-        std::vector<std::int64_t> unique_offsets{0};
-        std::vector<std::int64_t> unique_indices;
-        for (const auto& route : unique_screen_routes) {
-            unique_indices.insert(unique_indices.end(), route.begin(), route.end());
-            unique_offsets.push_back(
-                static_cast<std::int64_t>(unique_indices.size()));
-        }
+        const auto& unique_offsets = prepared_plans.unique_route_offsets;
+        const auto& unique_indices = prepared_plans.unique_route_indices;
         py::array_t<std::int64_t> unique_offsets_array(unique_offsets.size());
         py::array_t<std::int64_t> unique_indices_array(unique_indices.size());
         std::copy(
@@ -9418,30 +9500,26 @@ public:
                 rejected_reasons_array);
             negative_store_active = true;
         }
+        std::vector<std::int64_t> screening_passed(route_count);
         for (std::size_t route = 0; route < route_count; ++route) {
             const auto& screen = screen_outputs[screen_row_by_route[route]];
             checked_data(lower_bounds)[route] = screen.metrics[3];
-            if (screen.codes[0] != 1) {
-                for (std::size_t plan = 0; plan < plan_count; ++plan) {
-                    if (static_cast<std::int64_t>(route) >= plan_boundaries[plan]
-                        && static_cast<std::int64_t>(route)
-                            < plan_boundaries[plan + 1]) {
-                        eligible[plan] = 0;
-                        break;
-                    }
-                }
-            }
+            screening_passed[route] = screen.codes[0] == 1 ? 1 : 0;
         }
-        const auto current_route_count = current_offsets_.size() - 1;
+        const auto decision = evrptw::native_candidate_plan::decide({
+            std::span<const std::int64_t>(plan_boundaries, plan_count + 1),
+            std::span<const std::int64_t>(eligible.data(), eligible.size()),
+            std::span<const std::int64_t>(
+                screening_passed.data(), screening_passed.size()),
+            std::span<const std::int64_t>(attempted, plan_count),
+            static_cast<std::int64_t>(current_offsets_.size() - 1),
+        });
+        eligible = decision.eligible;
         py::array_t<std::int64_t> combined_attempted(plan_count);
-        for (std::size_t plan = 0; plan < plan_count; ++plan) {
-            const auto vehicle_count = plan_boundaries[plan + 1] - plan_boundaries[plan];
-            if (vehicle_count > current_route_count) {
-                eligible[plan] = 0;
-            }
-            checked_data(combined_attempted)[plan] =
-                eligible[plan] == 0 || attempted[plan] != 0 ? 1 : 0;
-        }
+        std::copy(
+            decision.combined_attempted.begin(),
+            decision.combined_attempted.end(),
+            checked_data(combined_attempted));
         auto ranking = rank_candidate_plans_v1(
             plans_array, routes_array, indices_array, lower_bounds,
             current_offsets_, current_indices_, lexical_rank_, combined_attempted,
@@ -9764,38 +9842,21 @@ public:
             attempted_mark_active = true;
         }
 
-        const auto round_objective = [](double value) {
-            constexpr auto scale = 1'000'000'000.0;
-            return std::nearbyint(value * scale) / scale;
-        };
-        const auto route_less = [&](const auto& left, const auto& right) {
-            return std::lexicographical_compare(
-                left.begin(), left.end(), right.begin(), right.end(),
-                [&](std::int64_t left_node, std::int64_t right_node) {
-                    return checked_data<std::int64_t>(lexical_rank_)[left_node]
-                        < checked_data<std::int64_t>(lexical_rank_)[right_node];
-                });
-        };
-        const auto plan_less = [&](std::int64_t left_id, std::int64_t right_id) {
-            const auto left = static_cast<std::size_t>(left_id);
-            const auto right = static_cast<std::size_t>(right_id);
-            const auto* integers = checked_data<std::int64_t>(objective_integer);
-            const auto* floats = checked_data<double>(objective_float);
-            const auto left_key = std::make_tuple(
-                integers[left * 2], round_objective(floats[left * 2]),
-                round_objective(floats[left * 2 + 1]), integers[left * 2 + 1]);
-            const auto right_key = std::make_tuple(
-                integers[right * 2], round_objective(floats[right * 2]),
-                round_objective(floats[right * 2 + 1]), integers[right * 2 + 1]);
-            if (left_key != right_key) {
-                return left_key < right_key;
-            }
-            return std::lexicographical_compare(
-                plans[left].begin(), plans[left].end(),
-                plans[right].begin(), plans[right].end(), route_less);
-        };
-        std::stable_sort(
-            feasible_plan_ids.begin(), feasible_plan_ids.end(), plan_less);
+        feasible_plan_ids = evrptw::native_candidate_plan::order_feasible({
+            std::span<const std::int64_t>(plan_boundaries, plan_count + 1),
+            std::span<const std::int64_t>(route_boundaries, route_count + 1),
+            std::span<const std::int64_t>(
+                route_nodes, static_cast<std::size_t>(indices_array.size())),
+            std::span<const std::int64_t>(
+                checked_data<std::int64_t>(objective_integer), plan_count * 2),
+            std::span<const double>(
+                checked_data<double>(objective_float), plan_count * 2),
+            std::span<const std::int64_t>(
+                checked_data<std::int64_t>(lexical_rank_),
+                static_cast<std::size_t>(lexical_rank_.size())),
+            std::span<const std::int64_t>(
+                feasible_plan_ids.data(), feasible_plan_ids.size()),
+        });
 
         py::array_t<std::int64_t> status_array(statuses.size());
         py::array_t<std::int64_t> resolution_array(route_resolutions.size());
@@ -17836,6 +17897,27 @@ PYBIND11_MODULE(_core, module) {
         py::arg("lexical_rank"),
         py::arg("attempted_flags"),
         py::arg("top_k"));
+    module.def(
+        "prepare_candidate_plans_v2",
+        &prepare_candidate_plans_v2,
+        py::arg("plan_offsets"), py::arg("route_offsets"),
+        py::arg("route_indices"), py::arg("expected_customer_indices"),
+        py::arg("node_kind"), py::arg("lexical_rank"),
+        py::arg("complete_customer_indices"), py::arg("customer_kind"),
+        py::arg("allow_partial_customer_coverage"));
+    module.def(
+        "decide_candidate_plans_v2",
+        &decide_candidate_plans_v2,
+        py::arg("plan_offsets"), py::arg("coverage_eligible"),
+        py::arg("screening_passed"), py::arg("attempted_flags"),
+        py::arg("current_route_count"));
+    module.def(
+        "order_feasible_candidate_plans_v2",
+        &order_feasible_candidate_plans_v2,
+        py::arg("plan_offsets"), py::arg("route_offsets"),
+        py::arg("route_indices"), py::arg("objective_integer"),
+        py::arg("objective_float"), py::arg("lexical_rank"),
+        py::arg("feasible_plan_ids"));
     module.def(
         "changed_candidate_plan_selection_v1",
         &changed_candidate_plan_selection_v1,

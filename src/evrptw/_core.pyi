@@ -81,6 +81,39 @@ def rank_candidate_plans_v1(
     npt.NDArray[np.int64],
     npt.NDArray[np.float64],
 ]: ...
+def prepare_candidate_plans_v2(
+    plan_offsets: npt.NDArray[np.int64],
+    route_offsets: npt.NDArray[np.int64],
+    route_indices: npt.NDArray[np.int64],
+    expected_customer_indices: npt.NDArray[np.int64],
+    node_kind: npt.NDArray[np.int64],
+    lexical_rank: npt.NDArray[np.int64],
+    complete_customer_indices: npt.NDArray[np.int64],
+    customer_kind: int,
+    allow_partial_customer_coverage: bool,
+) -> tuple[
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+]: ...
+def decide_candidate_plans_v2(
+    plan_offsets: npt.NDArray[np.int64],
+    coverage_eligible: npt.NDArray[np.int64],
+    screening_passed: npt.NDArray[np.int64],
+    attempted_flags: npt.NDArray[np.int64],
+    current_route_count: int,
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]: ...
+def order_feasible_candidate_plans_v2(
+    plan_offsets: npt.NDArray[np.int64],
+    route_offsets: npt.NDArray[np.int64],
+    route_indices: npt.NDArray[np.int64],
+    objective_integer: npt.NDArray[np.int64],
+    objective_float: npt.NDArray[np.float64],
+    lexical_rank: npt.NDArray[np.int64],
+    feasible_plan_ids: npt.NDArray[np.int64],
+) -> npt.NDArray[np.int64]: ...
 def changed_candidate_plan_selection_v1(
     operation: int,
     node_kind: npt.NDArray[np.int64],
