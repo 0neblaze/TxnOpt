@@ -19,8 +19,9 @@
 class NativeWorkPool final {
 public:
     explicit NativeWorkPool(std::int64_t thread_count) {
-        if (thread_count <= 0) {
-            throw std::invalid_argument("native work-pool thread count must be positive");
+        if (thread_count < 0) {
+            throw std::invalid_argument(
+                "native work-pool thread count must be non-negative");
         }
         threads_.reserve(static_cast<std::size_t>(thread_count));
         try {
@@ -74,6 +75,10 @@ public:
     void parallel_for(std::size_t count, Function function) {
         if (count == 0) {
             return;
+        }
+        if (threads_.empty()) {
+            throw std::runtime_error(
+                "disabled native work pool cannot execute local work");
         }
         struct Completion final {
             std::mutex mutex;

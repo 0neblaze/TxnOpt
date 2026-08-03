@@ -99,6 +99,13 @@ def _native_search_engine(
     return engine
 
 
+def test_native_search_engine_rejects_disabled_local_work_pool() -> None:
+    from evrptw import _core as native_core
+
+    with pytest.raises(ValueError, match="worker_count is invalid"):
+        native_core.NativeSearchEngineV2(100, 100, 10, 4096, 10, 10, 1e-9, 0)
+
+
 def _fixture_instance() -> Instance:
     return Instance(
         "native_execution_fixture",
@@ -6731,9 +6738,8 @@ def test_host_scheduler_v2_six_clients_share_pool_and_isolate_state(
     with NativeHostScheduler(endpoint, worker_threads=24) as scheduler:
 
         def solve_one() -> object:
-            # Each shard owns its complete Python-side input graph.  This keeps
-            # the test focused on scheduler-side solve-state isolation instead
-            # of relying on concurrent reads from shared Python containers.
+            # Each shard owns its input graph.  Scheduler-side solve state must
+            # remain isolated without creating a four-thread client compute pool.
             instance = _candidate_plan_fixture()
             solve_kwargs = _full_native_solve_kwargs()
             solve_kwargs["initial_customer_sequences"] = (
@@ -6775,8 +6781,12 @@ def test_host_scheduler_v2_six_clients_share_pool_and_isolate_state(
             "work_pool_peak_active_tasks"
         ] <= 24
         assert result.native_execution_statistics["work_pool_thread_count"] == 24
-        assert result.native_execution_statistics["client_dispatch_thread_count"] == 4
+        assert result.native_execution_statistics["client_dispatch_thread_count"] == 0
         assert result.native_execution_statistics["remote_kernel_request_count"] > 0
+        assert result.native_execution_statistics["screening_batch_request_count"] > 0
+        assert result.native_execution_statistics["screening_batch_request_count"] < sum(
+            result.native_execution_statistics["candidate_screening_occupancies"]
+        )
 
 
 def test_full_native_v2_concurrent_solves_isolate_state() -> None:

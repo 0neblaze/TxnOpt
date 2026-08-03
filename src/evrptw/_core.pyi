@@ -620,6 +620,8 @@ class NativeSearchEngineV2:
 
 __build_git_revision__: str
 
+def stage052_native_architecture_capabilities_v2() -> npt.NDArray[np.int64]: ...
+
 Point = tuple[float, float]
 
 class Stage052ReplayState:

@@ -6299,6 +6299,56 @@ evrptw::native_kernels::ScreenOutput dispatch_screen_route(
         incremental);
 }
 
+std::vector<evrptw::native_kernels::ScreenOutput> dispatch_screen_routes(
+    const std::int64_t* kinds,
+    const double* demands,
+    const double* ready,
+    const double* due,
+    const double* service,
+    const double* distances,
+    const std::uint8_t* reachable,
+    const double* vehicle,
+    const std::int64_t* route_offsets,
+    const std::int64_t* route_indices,
+    std::size_t route_count,
+    std::size_t route_index_count,
+    std::size_t node_count,
+    std::int64_t depot,
+    const std::vector<std::int64_t>& recharge_nodes,
+    const double* options,
+    const double* incremental) {
+#ifdef __linux__
+    if (native_kernel_scheduler_required
+        && native_kernel_scheduler_endpoint.empty()) {
+        throw std::runtime_error(
+            "host scheduler screening-batch kernel lost its required endpoint");
+    }
+    if (!native_kernel_scheduler_endpoint.empty()) {
+        try {
+            return evrptw::native_client::screen_routes(
+                native_kernel_scheduler_endpoint, kinds, demands, ready, due,
+                service, distances, reachable, vehicle, route_offsets,
+                route_indices, route_count, route_index_count, node_count,
+                options, incremental);
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                std::string("host scheduler IPC failed without fallback: ")
+                + error.what());
+        }
+    }
+#endif
+    std::vector<evrptw::native_kernels::ScreenOutput> outputs(route_count);
+    for (std::size_t route = 0; route < route_count; ++route) {
+        outputs[route] = evrptw::native_kernels::run_screen_route(
+            kinds, demands, ready, due, service, distances, reachable, vehicle,
+            route_indices + route_offsets[route],
+            static_cast<std::size_t>(
+                route_offsets[route + 1] - route_offsets[route]),
+            node_count, depot, recharge_nodes, options, incremental);
+    }
+    return outputs;
+}
+
 struct PropagationOutput {
     std::vector<std::int64_t> codes = std::vector<std::int64_t>(10, 0);
     std::vector<double> metrics = std::vector<double>(3, 0.0);
@@ -8684,9 +8734,16 @@ public:
             throw std::invalid_argument(
                 "full native screening epsilon must be finite and positive");
         }
-        if (worker_count_ <= 0) {
+        const bool remote_scheduler_owns_work =
+#ifdef __linux__
+            !native_kernel_scheduler_endpoint.empty();
+#else
+            false;
+#endif
+        if (worker_count_ < 0
+            || (worker_count_ == 0 && !remote_scheduler_owns_work)) {
             throw std::invalid_argument(
-                "full native worker_count must be positive");
+                "full native worker_count is invalid for its scheduler mode");
         }
         if (work_pool_->thread_count() < worker_count_) {
             throw std::invalid_argument(
@@ -8901,6 +8958,19 @@ public:
 #endif
         {
             py::gil_scoped_release release;
+#ifdef __linux__
+            if (!warm_scheduler_endpoint.empty()) {
+                warm_screening = dispatch_screen_routes(
+                    kinds, warm_demands, warm_ready, warm_due, warm_service,
+                    warm_distances, warm_reachable, warm_vehicle,
+                    warm_offsets, warm_indices,
+                    static_cast<std::size_t>(route_count),
+                    static_cast<std::size_t>(warm_offsets[route_count]),
+                    static_cast<std::size_t>(node_count), depot_, recharge_nodes_,
+                    warm_screen_options.data(), warm_no_incremental.data());
+            } else
+#endif
+            {
             work_pool_->parallel_for(
                 static_cast<std::size_t>(route_count), [&](std::size_t route) {
 #ifdef __linux__
@@ -8926,6 +8996,7 @@ public:
                         depot_, recharge_nodes_, warm_screen_options.data(),
                         warm_no_incremental.data());
                 });
+            }
         }
         record_screening_outputs(
             warm_screening, warm_rows, warm_rows,
@@ -9400,6 +9471,32 @@ public:
 #endif
         {
             py::gil_scoped_release release;
+#ifdef __linux__
+            if (!pool_scheduler_endpoint.empty() && !screen_rows.empty()) {
+                std::vector<std::int64_t> remote_offsets{0};
+                std::vector<std::int64_t> remote_indices;
+                for (const auto row : screen_rows) {
+                    const auto& sequence = unique_screen_routes[row];
+                    remote_indices.insert(
+                        remote_indices.end(), sequence.begin(), sequence.end());
+                    remote_offsets.push_back(
+                        static_cast<std::int64_t>(remote_indices.size()));
+                }
+                auto remote_outputs = dispatch_screen_routes(
+                    kinds, demands, ready, due, service, distances,
+                    reachable, vehicle,
+                    remote_offsets.data(), remote_indices.data(),
+                    screen_rows.size(), remote_indices.size(), node_count,
+                    depot_, recharge_nodes_,
+                    screen_options.data(), no_incremental.data());
+                for (std::size_t position = 0;
+                     position < screen_rows.size(); ++position) {
+                    screen_outputs[screen_rows[position]] =
+                        std::move(remote_outputs[position]);
+                }
+            } else
+#endif
+            {
             work_pool_->parallel_for(screen_rows.size(), [&](std::size_t position) {
 #ifdef __linux__
                 NativeSchedulerThreadContext scheduler_context(
@@ -9414,6 +9511,7 @@ public:
                     node_count, depot_, recharge_nodes_,
                     screen_options.data(), no_incremental.data());
             });
+            }
         }
         record_screening_outputs(
             screen_outputs, screen_rows, screen_row_by_route,
@@ -10494,6 +10592,21 @@ public:
 #endif
         {
             py::gil_scoped_release release;
+#ifdef __linux__
+            if (!merge_scheduler_endpoint.empty()) {
+                merge_screening = dispatch_screen_routes(
+                    kinds, demands, ready, due, service, distances,
+                    reachable, vehicle,
+                    candidate_boundaries, candidate_nodes,
+                    static_cast<std::size_t>(candidate_count),
+                    static_cast<std::size_t>(
+                        candidate_boundaries[candidate_count]),
+                    static_cast<std::size_t>(node_kind_.size()),
+                    depot_, recharge_nodes_,
+                    screen_options.data(), no_incremental.data());
+            } else
+#endif
+            {
             work_pool_->parallel_for(
                 static_cast<std::size_t>(candidate_count),
                 [&](std::size_t candidate) {
@@ -10513,6 +10626,7 @@ public:
                         recharge_nodes_, screen_options.data(),
                         no_incremental.data());
                 });
+            }
         }
         for (py::ssize_t candidate = 0; candidate < candidate_count; ++candidate) {
             const auto first = candidate_boundaries[candidate];
@@ -17159,6 +17273,14 @@ py::tuple full_native_alns_v2(
             "full native v2 iteration count must be positive");
     }
     const auto solve_started = std::chrono::steady_clock::now();
+    const auto client_dispatch_threads =
+#ifdef __linux__
+        native_kernel_scheduler_endpoint.empty()
+            ? base_control_values[3]
+            : std::int64_t{0};
+#else
+        base_control_values[3];
+#endif
     NativeSearchEngineV2 engine(
         base_control_values[4],
         protocol_values[2],
@@ -17167,7 +17289,7 @@ py::tuple full_native_alns_v2(
         protocol_values[7],
         protocol_values[1],
         options[1],
-        base_control_values[3],
+        client_dispatch_threads,
         scheduler_work_pool_context);
     engine.configure_node_names(node_name_offsets, node_name_bytes);
     engine.suppress_plan_screening_negative_cache(true);
@@ -17471,7 +17593,7 @@ py::tuple full_native_alns_v2(
     const auto remote_telemetry =
         evrptw::native_client::telemetry_snapshot();
 #endif
-    py::array_t<double> timings(11);
+    py::array_t<double> timings(12);
     checked_data(timings)[0] = elapsed - exact_seconds;
     checked_data(timings)[1] = exact_seconds;
     checked_data(timings)[2] = elapsed;
@@ -17529,6 +17651,15 @@ py::tuple full_native_alns_v2(
 #ifdef __linux__
         !native_kernel_scheduler_endpoint.empty()
         ? remote_telemetry.request_count
+        : 0
+#else
+        0
+#endif
+    );
+    checked_data(timings)[11] = static_cast<double>(
+#ifdef __linux__
+        !native_kernel_scheduler_endpoint.empty()
+        ? remote_telemetry.screening_batch_request_count
         : 0
 #else
         0
@@ -17736,6 +17867,17 @@ py::tuple propagate_routes_numeric(
 PYBIND11_MODULE(_core, module) {
     module.doc() = "Native kernels for EVRP-TW route evaluation";
     module.attr("__build_git_revision__") = EVRPTW_BUILD_GIT_REVISION;
+    module.def("stage052_native_architecture_capabilities_v2", []() {
+        // These values are production gates, not aspirational feature flags.
+        // Flip a field only together with its end-to-end differential and
+        // process-topology evidence.
+        py::array_t<std::int64_t> capabilities(3);
+        auto* values = checked_data(capabilities);
+        values[0] = 0;  // host scheduler owns the complete candidate transaction
+        values[1] = 0;  // full native search executes without the Python GIL
+        values[2] = 0;  // host wave has one exclusive 24-thread compute pool
+        return capabilities;
+    });
     module.def(
         "python_random_golden_v1",
         &python_random_golden_v1,

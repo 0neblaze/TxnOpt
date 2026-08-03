@@ -5641,6 +5641,9 @@ def _solve_full_native_alns(
             "remote_kernel_request_count": int(
                 native_result.timings["remote_kernel_request_count"]
             ),
+            "screening_batch_request_count": int(
+                native_result.timings["screening_batch_request_count"]
+            ),
             "candidate_transaction_occupancies": list(
                 native_result.backend_metrics.launch_occupancies
             ),

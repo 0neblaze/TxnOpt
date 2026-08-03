@@ -52,6 +52,11 @@ SHARD_PROCESSES = 6
 THREADS_PER_SHARD = 4
 TOTAL_COMPUTE_THREADS = 24
 WARM_START_SCHEMA_VERSION = "stage05.2-native-architecture-warm-start-v2"
+NATIVE_ARCHITECTURE_CAPABILITY_NAMES = (
+    "host_candidate_transaction_scheduler",
+    "whole_search_gil_released",
+    "single_host_24_thread_compute_pool",
+)
 
 WarmStartIdentity = tuple[str, int]
 WarmStartRecord = tuple[tuple[tuple[str, ...], ...], dict[str, object]]
@@ -399,6 +404,33 @@ def _verify_installed_wheel(
         "scheduler_sha256": _sha256_path(scheduler_path),
         "build_git_revision": build_revision,
     }
+
+
+def _require_native_architecture_capabilities() -> dict[str, bool]:
+    """Fail before any run label exists when the native design is incomplete."""
+
+    from evrptw import _core as native_core
+
+    raw = native_core.stage052_native_architecture_capabilities_v2()
+    if (
+        not isinstance(raw, np.ndarray)
+        or raw.dtype != np.dtype(np.int64)
+        or raw.shape != (len(NATIVE_ARCHITECTURE_CAPABILITY_NAMES),)
+        or not raw.flags.c_contiguous
+        or np.any((raw != 0) & (raw != 1))
+    ):
+        raise RuntimeError("native architecture capability receipt is invalid")
+    capabilities = {
+        name: bool(raw[index])
+        for index, name in enumerate(NATIVE_ARCHITECTURE_CAPABILITY_NAMES)
+    }
+    missing = [name for name, available in capabilities.items() if not available]
+    if missing:
+        raise RuntimeError(
+            "native architecture campaign is blocked by incomplete capabilities: "
+            + ", ".join(missing)
+        )
+    return capabilities
 
 
 def _canonical_bytes(payload: object) -> bytes:
@@ -1132,6 +1164,7 @@ def run_experiment(
         wheel_path,
         expected_revision=revision,
     )
+    native_capabilities = _require_native_architecture_capabilities()
     native_path = Path(wheel_receipt["native_path"])
     warm_starts = load_warm_start_bundle(
         warm_start_bundle_path,
@@ -1256,6 +1289,7 @@ def run_experiment(
         "wheel_path": wheel_receipt["wheel_path"],
         "wheel_sha256": wheel_receipt["wheel_sha256"],
         "wheel_receipt": wheel_receipt,
+        "native_architecture_capabilities": native_capabilities,
         "native_path": str(native_path.resolve()),
         "native_sha256": wheel_receipt["native_sha256"],
         "scheduler_path": wheel_receipt["scheduler_path"],
@@ -1323,6 +1357,7 @@ __all__ = (
     "build_axis_plan",
     "expected_axis_count",
     "load_warm_start_bundle",
+    "NATIVE_ARCHITECTURE_CAPABILITY_NAMES",
     "rotated_modes",
     "run_experiment",
     "run_labels_for_scope",

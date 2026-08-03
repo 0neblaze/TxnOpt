@@ -37,12 +37,13 @@ struct KernelClientTelemetry final {
     std::size_t peak_active_tasks = 0;
     std::size_t pool_thread_count = 0;
     std::size_t request_count = 0;
+    std::size_t screening_batch_request_count = 0;
 };
 
 inline thread_local KernelClientTelemetry telemetry;
 class KernelClientTelemetryCollector final {
 public:
-    void record(const double* values) {
+    void record(const double* values, bool screening_batch) {
         std::lock_guard lock(mutex_);
         telemetry_.queue_wait_seconds += values[0];
         telemetry_.peak_queue_depth = std::max(
@@ -53,6 +54,7 @@ public:
             static_cast<std::size_t>(values[2]));
         telemetry_.pool_thread_count = static_cast<std::size_t>(values[3]);
         ++telemetry_.request_count;
+        telemetry_.screening_batch_request_count += screening_batch ? 1U : 0U;
     }
 
     KernelClientTelemetry snapshot() const {
@@ -75,7 +77,9 @@ inline KernelClientTelemetry telemetry_snapshot() {
 }
 
 inline void record_telemetry(
-    const protocol::PayloadView& output, std::size_t index) {
+    const protocol::PayloadView& output,
+    std::size_t index,
+    bool screening_batch = false) {
     const auto& descriptor = output.descriptor(index);
     if (descriptor.type != protocol::NumericType::float64
         || descriptor.count != 4) {
@@ -92,7 +96,7 @@ inline void record_telemetry(
         throw std::runtime_error("native kernel scheduler telemetry values are invalid");
     }
     if (telemetry_collector != nullptr) {
-        telemetry_collector->record(values);
+        telemetry_collector->record(values, screening_batch);
     } else {
         telemetry.queue_wait_seconds += values[0];
         telemetry.peak_queue_depth = std::max(
@@ -101,6 +105,7 @@ inline void record_telemetry(
             telemetry.peak_active_tasks, static_cast<std::size_t>(values[2]));
         telemetry.pool_thread_count = static_cast<std::size_t>(values[3]);
         ++telemetry.request_count;
+        telemetry.screening_batch_request_count += screening_batch ? 1U : 0U;
     }
 }
 
@@ -387,6 +392,77 @@ inline kernels::ScreenOutput screen_route(
     record_telemetry(output, 3);
     acknowledge(socket, response);
     return result;
+}
+
+inline std::vector<kernels::ScreenOutput> screen_routes(
+    std::string_view socket_path,
+    const std::int64_t* kinds,
+    const double* demands,
+    const double* ready,
+    const double* due,
+    const double* service,
+    const double* distances,
+    const std::uint8_t* reachable,
+    const double* vehicle,
+    const std::int64_t* route_offsets,
+    const std::int64_t* route_indices,
+    std::size_t route_count,
+    std::size_t route_index_count,
+    std::size_t node_count,
+    const double* options,
+    const double* incremental) {
+    const auto request_id = request_counter.fetch_add(1);
+    protocol::PayloadBuilder builder(
+        protocol::KernelOperation::screen_routes, request_id);
+    builder.add(protocol::NumericType::int64, kinds, node_count, node_count);
+    builder.add(protocol::NumericType::float64, demands, node_count, node_count);
+    builder.add(protocol::NumericType::float64, ready, node_count, node_count);
+    builder.add(protocol::NumericType::float64, due, node_count, node_count);
+    builder.add(protocol::NumericType::float64, service, node_count, node_count);
+    builder.add(protocol::NumericType::float64, distances,
+        node_count * node_count, node_count, node_count);
+    builder.add(protocol::NumericType::uint8, reachable,
+        node_count * node_count, node_count, node_count);
+    builder.add(protocol::NumericType::float64, vehicle, 5, 5);
+    builder.add(protocol::NumericType::int64, route_offsets,
+        route_count + 1, route_count + 1);
+    builder.add(protocol::NumericType::int64, route_indices,
+        route_index_count, route_index_count);
+    builder.add(protocol::NumericType::float64, options, 4, 4);
+    builder.add(protocol::NumericType::float64, incremental, 6, 6);
+    Socket socket(socket_path);
+    protocol::SharedMapping output_mapping;
+    protocol::ControlFrame response;
+    const auto output = transact(
+        socket_path, builder.finish(), output_mapping, response, socket);
+    const auto expected_code_count = protocol::checked_product(
+        route_count, 16, "native screening-batch code count overflows");
+    const auto expected_metric_count = protocol::checked_product(
+        route_count, 15, "native screening-batch metric count overflows");
+    if (output.header().operation != protocol::KernelOperation::screen_routes
+        || output.header().request_id != response.request_id
+        || output.header().array_count != 4
+        || output.descriptor(0).count != expected_code_count
+        || output.descriptor(1).count != expected_metric_count
+        || output.descriptor(2).count != route_count) {
+        throw std::runtime_error("native screening-batch output schema is invalid");
+    }
+    const auto* codes = output.data<std::int64_t>(
+        0, protocol::NumericType::int64);
+    const auto* metrics = output.data<double>(
+        1, protocol::NumericType::float64);
+    const auto* queries = output.data<std::int64_t>(
+        2, protocol::NumericType::int64);
+    std::vector<kernels::ScreenOutput> results(route_count);
+    for (std::size_t route = 0; route < route_count; ++route) {
+        results[route].codes.assign(codes + route * 16, codes + (route + 1) * 16);
+        results[route].metrics.assign(
+            metrics + route * 15, metrics + (route + 1) * 15);
+        results[route].reachability_queries = queries[route];
+    }
+    record_telemetry(output, 3, true);
+    acknowledge(socket, response);
+    return results;
 }
 
 inline void test_fault(

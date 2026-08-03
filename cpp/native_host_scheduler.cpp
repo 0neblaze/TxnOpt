@@ -263,6 +263,169 @@ std::vector<std::uint8_t> run_screen(
     return builder.finish();
 }
 
+std::vector<std::uint8_t> run_screen_routes(
+    const protocol::PayloadView& input,
+    double queue_wait_seconds,
+    std::size_t queue_depth,
+    NativeWorkPool& pool,
+    std::size_t& request_peak_active_tasks) {
+    if (input.header().array_count != 12) {
+        throw std::runtime_error(
+            "native scheduler screening-batch request shape is invalid");
+    }
+    const auto node_count = static_cast<std::size_t>(input.descriptor(0).count);
+    const auto node_square = protocol::checked_product(
+        node_count, node_count,
+        "native scheduler screening-batch node count overflows");
+    const auto& offset_shape = input.descriptor(8);
+    const auto& index_shape = input.descriptor(9);
+    if (node_count == 0 || input.descriptor(1).count != node_count
+        || input.descriptor(2).count != node_count
+        || input.descriptor(3).count != node_count
+        || input.descriptor(4).count != node_count
+        || input.descriptor(5).count != node_square
+        || input.descriptor(6).count != node_square
+        || input.descriptor(5).shape[0] != node_count
+        || input.descriptor(5).shape[1] != node_count
+        || input.descriptor(6).shape[0] != node_count
+        || input.descriptor(6).shape[1] != node_count
+        || input.descriptor(7).count != 5 || offset_shape.count < 2
+        || input.descriptor(10).count != 4
+        || input.descriptor(11).count != 6) {
+        throw std::runtime_error(
+            "native scheduler screening-batch dimensions are invalid");
+    }
+    const auto route_count = static_cast<std::size_t>(offset_shape.count - 1);
+    const auto code_count = protocol::checked_product(
+        route_count, 16,
+        "native scheduler screening-batch code count overflows");
+    const auto metric_count = protocol::checked_product(
+        route_count, 15,
+        "native scheduler screening-batch metric count overflows");
+    const auto code_bytes = protocol::checked_product(
+        code_count, sizeof(std::int64_t),
+        "native scheduler screening-batch code bytes overflow");
+    const auto metric_bytes = protocol::checked_product(
+        metric_count, sizeof(double),
+        "native scheduler screening-batch metric bytes overflow");
+    const auto query_bytes = protocol::checked_product(
+        route_count, sizeof(std::int64_t),
+        "native scheduler screening-batch query bytes overflow");
+    if (code_bytes > protocol::maximum_payload_bytes
+        || metric_bytes > protocol::maximum_payload_bytes - code_bytes
+        || query_bytes
+            > protocol::maximum_payload_bytes - code_bytes - metric_bytes) {
+        throw std::length_error(
+            "native scheduler screening-batch output exceeds its size limit");
+    }
+    const auto* kinds = input.data<std::int64_t>(
+        0, protocol::NumericType::int64);
+    const auto* offsets = input.data<std::int64_t>(
+        8, protocol::NumericType::int64);
+    const auto* indices = input.data<std::int64_t>(
+        9, protocol::NumericType::int64);
+    if (offsets[0] != 0
+        || offsets[route_count] != static_cast<std::int64_t>(index_shape.count)) {
+        throw std::runtime_error(
+            "native scheduler screening-batch offsets are invalid");
+    }
+    std::int64_t depot = -1;
+    std::vector<std::int64_t> recharge_nodes;
+    for (std::size_t node = 0; node < node_count; ++node) {
+        if (kinds[node] == kernels::depot_kind) {
+            if (depot >= 0) {
+                throw std::runtime_error(
+                    "native scheduler screening-batch depot is duplicated");
+            }
+            depot = static_cast<std::int64_t>(node);
+            recharge_nodes.push_back(depot);
+        } else if (kinds[node] == kernels::station_kind) {
+            recharge_nodes.push_back(static_cast<std::int64_t>(node));
+        } else if (kinds[node] != kernels::customer_kind) {
+            throw std::runtime_error(
+                "native scheduler screening-batch node kind is invalid");
+        }
+    }
+    if (depot < 0) {
+        throw std::runtime_error(
+            "native scheduler screening-batch depot is missing");
+    }
+    for (std::size_t route = 0; route < route_count; ++route) {
+        if (offsets[route] < 0 || offsets[route] > offsets[route + 1]) {
+            throw std::runtime_error(
+                "native scheduler screening-batch offsets are not monotone");
+        }
+        std::vector<bool> seen(node_count, false);
+        for (auto position = offsets[route]; position < offsets[route + 1];
+             ++position) {
+            const auto node = indices[position];
+            if (node < 0 || static_cast<std::size_t>(node) >= node_count
+                || kinds[node] != kernels::customer_kind
+                || seen[static_cast<std::size_t>(node)]) {
+                throw std::runtime_error(
+                    "native scheduler screening-batch route indices are invalid");
+            }
+            seen[static_cast<std::size_t>(node)] = true;
+        }
+    }
+    const auto* demands = input.data<double>(
+        1, protocol::NumericType::float64);
+    const auto* ready = input.data<double>(2, protocol::NumericType::float64);
+    const auto* due = input.data<double>(3, protocol::NumericType::float64);
+    const auto* service = input.data<double>(4, protocol::NumericType::float64);
+    const auto* distances = input.data<double>(
+        5, protocol::NumericType::float64);
+    const auto* reachable = input.data<std::uint8_t>(
+        6, protocol::NumericType::uint8);
+    const auto* vehicle = input.data<double>(7, protocol::NumericType::float64);
+    const auto* options = input.data<double>(10, protocol::NumericType::float64);
+    const auto* incremental = input.data<double>(
+        11, protocol::NumericType::float64);
+    std::vector<kernels::ScreenOutput> outputs(route_count);
+    std::atomic<std::size_t> peak_active{0};
+    pool.parallel_for(route_count, [&](std::size_t route) {
+        const auto active = pool.active_task_count();
+        auto peak = peak_active.load(std::memory_order_relaxed);
+        while (active > peak
+               && !peak_active.compare_exchange_weak(
+                   peak, active, std::memory_order_relaxed)) {
+        }
+        outputs[route] = kernels::run_screen_route(
+            kinds, demands, ready, due, service, distances, reachable, vehicle,
+            indices + offsets[route],
+            static_cast<std::size_t>(offsets[route + 1] - offsets[route]),
+            node_count, depot, recharge_nodes, options, incremental);
+    });
+    request_peak_active_tasks = peak_active.load(std::memory_order_relaxed);
+    std::vector<std::int64_t> codes(code_count);
+    std::vector<double> metrics(metric_count);
+    std::vector<std::int64_t> queries(route_count);
+    for (std::size_t route = 0; route < route_count; ++route) {
+        std::copy(
+            outputs[route].codes.begin(), outputs[route].codes.end(),
+            codes.begin() + static_cast<std::ptrdiff_t>(route * 16));
+        std::copy(
+            outputs[route].metrics.begin(), outputs[route].metrics.end(),
+            metrics.begin() + static_cast<std::ptrdiff_t>(route * 15));
+        queries[route] = outputs[route].reachability_queries;
+    }
+    protocol::PayloadBuilder builder(
+        protocol::KernelOperation::screen_routes, input.header().request_id);
+    builder.add(protocol::NumericType::int64, codes.data(), codes.size(),
+        route_count, 16);
+    builder.add(protocol::NumericType::float64, metrics.data(), metrics.size(),
+        route_count, 15);
+    builder.add(protocol::NumericType::int64, queries.data(), queries.size(),
+        queries.size());
+    const std::array<double, 4> telemetry{
+        queue_wait_seconds, static_cast<double>(queue_depth),
+        static_cast<double>(request_peak_active_tasks),
+        static_cast<double>(pool.thread_count())};
+    builder.add(protocol::NumericType::float64, telemetry.data(),
+        telemetry.size(), telemetry.size());
+    return builder.finish();
+}
+
 std::vector<std::uint8_t> execute(
     const protocol::PayloadView& input,
     double queue_wait_seconds,
@@ -272,6 +435,9 @@ std::vector<std::uint8_t> execute(
         return run_exact(input, queue_wait_seconds, queue_depth);
     case protocol::KernelOperation::screen_route:
         return run_screen(input, queue_wait_seconds, queue_depth);
+    case protocol::KernelOperation::screen_routes:
+        throw std::logic_error(
+            "native screening-batch operation requires the shared work pool");
     }
     throw std::runtime_error("native scheduler operation is invalid");
 }
@@ -394,12 +560,19 @@ void handle_connection(
         }
         std::vector<std::uint8_t> output_bytes;
         std::size_t request_peak_active_tasks = 0;
-        pool.parallel_for(1, [&](std::size_t) {
-            request_peak_active_tasks = pool.active_task_count();
-            output_bytes = execute(input_view, queue_wait_seconds, queue_depth);
-            request_peak_active_tasks = std::max(
-                request_peak_active_tasks, pool.active_task_count());
-        });
+        if (input_view.header().operation
+            == protocol::KernelOperation::screen_routes) {
+            output_bytes = run_screen_routes(
+                input_view, queue_wait_seconds, queue_depth, pool,
+                request_peak_active_tasks);
+        } else {
+            pool.parallel_for(1, [&](std::size_t) {
+                request_peak_active_tasks = pool.active_task_count();
+                output_bytes = execute(input_view, queue_wait_seconds, queue_depth);
+                request_peak_active_tasks = std::max(
+                    request_peak_active_tasks, pool.active_task_count());
+            });
+        }
         patch_pool_telemetry(
             output_bytes, pool, request_peak_active_tasks);
         const auto output_name = "/evrptw-s52-kernel-" + std::to_string(::getpid())

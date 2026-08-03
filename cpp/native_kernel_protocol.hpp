@@ -30,6 +30,7 @@ constexpr std::size_t maximum_payload_bytes = 256U * 1024U * 1024U;
 enum class KernelOperation : std::uint32_t {
     exact_charging = 1,
     screen_route = 2,
+    screen_routes = 3,
 };
 
 enum class NumericType : std::uint32_t {
@@ -179,7 +180,8 @@ public:
             || header_.array_count > maximum_arrays
             || header_.reserved != 0
             || (header_.operation != KernelOperation::exact_charging
-                && header_.operation != KernelOperation::screen_route)) {
+                && header_.operation != KernelOperation::screen_route
+                && header_.operation != KernelOperation::screen_routes)) {
             throw std::runtime_error("native kernel payload header is invalid");
         }
         std::size_t previous_end = sizeof(PayloadHeader);

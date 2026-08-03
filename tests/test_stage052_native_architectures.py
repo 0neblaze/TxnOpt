@@ -31,6 +31,7 @@ from evrptw.experiments.stage052_native_architectures import (
     WARM_START_SCHEMA_VERSION,
     ArchitectureAxisTask,
     _canonical_trace_event,
+    _require_native_architecture_capabilities,
     _run_group,
     _write_signed_json,
     build_axis_plan,
@@ -44,6 +45,17 @@ from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.validation import validate_routes
 from evrptw.warm_start import canonical_customer_sequences_sha256
+
+
+def test_native_campaign_gate_names_every_incomplete_architecture_capability() -> None:
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "host_candidate_transaction_scheduler, "
+            "whole_search_gil_released, single_host_24_thread_compute_pool"
+        ),
+    ):
+        _require_native_architecture_capabilities()
 
 
 def _plan(scope: str, tmp_path: Path):  # type: ignore[no-untyped-def]
