@@ -90,6 +90,27 @@ def inspect(root: Path) -> dict[str, Any] | None:
     return record if active else None
 
 
+def require_owned(
+    root: Path,
+    *,
+    token: str,
+    allowed_phases: frozenset[str] | None = None,
+) -> dict[str, Any]:
+    """Fail unless ``token`` owns the active single-writer lease."""
+
+    if not token:
+        raise RuntimeError("continuity lease token is required")
+    active = inspect(root)
+    if active is None or active.get("token") != token:
+        raise RuntimeError("continuity lease identity is not active")
+    phase = active.get("phase")
+    if allowed_phases is not None and phase not in allowed_phases:
+        raise RuntimeError(
+            f"continuity lease phase {phase!r} is not authorized for this operation"
+        )
+    return active
+
+
 def _holder(
     root: Path,
     *,

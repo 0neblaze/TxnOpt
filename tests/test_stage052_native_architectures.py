@@ -11,6 +11,7 @@ import pytest
 from evrptw.charging import solve_exact_charging
 from evrptw.experiments.stage052_native_architecture_review import (
     ReviewRecord,
+    _canonical_semantic_events,
     _common_prefix,
     _describe_first_divergence,
     _raw_axis_inventory,
@@ -457,14 +458,66 @@ def test_first_divergence_distinguishes_missing_field_from_null() -> None:
     }
 
 
-def test_v5_axis_replay_rejects_bad_candidate_id_on_wall_clock_axis(
+def test_canonical_semantic_streams_find_non_candidate_first_divergence() -> None:
+    empty_streams = {
+        name: []
+        for name in (
+            "candidate_state",
+            "operator",
+            "stage04",
+            "candidate_transaction",
+            "exact_work",
+            "exact_result",
+            "cache",
+            "deadline",
+        )
+    }
+    baseline_streams = {name: list(rows) for name, rows in empty_streams.items()}
+    candidate_streams = {name: list(rows) for name, rows in empty_streams.items()}
+    baseline_streams["stage04"] = [
+        {
+            "lane": "legacy",
+            "iteration": 7,
+            "operator": "route_merge",
+            "candidate_id": "candidate-7",
+            "weight": 2.0,
+            "stream_ordinal": 0,
+        }
+    ]
+    candidate_streams["stage04"] = [
+        {
+            **baseline_streams["stage04"][0],
+            "weight": 3.0,
+        }
+    ]
+
+    baseline = _canonical_semantic_events(
+        {"canonical_semantic_streams": baseline_streams}
+    )
+    candidate = _canonical_semantic_events(
+        {"canonical_semantic_streams": candidate_streams}
+    )
+    divergence = _describe_first_divergence(baseline, candidate)
+
+    assert _common_prefix(baseline, candidate) == 0
+    assert divergence is not None
+    assert divergence["lane"] == "legacy"
+    assert divergence["iteration"] == 7
+    assert divergence["operator"] == "route_merge"
+    assert divergence["candidate_id"] == "candidate-7"
+    assert divergence["differing_fields"] == {
+        "weight": {"baseline": 2.0, "candidate": 3.0}
+    }
+
+
+def test_v6_axis_replay_rejects_bad_candidate_id_on_wall_clock_axis(
     tmp_path: Path,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
     source = _review_fixture_records(root, tmp_path)[0]
     payload = dict(source.payload)
     payload["schema_version"] = (
-        "stage05.2-native-architecture-comparison-v5"
+        "stage05.2-native-architecture-comparison-v6"
     )
     payload["axis"] = "wall_clock_30"
     payload["semantic_trajectory"] = [

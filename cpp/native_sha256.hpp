@@ -167,4 +167,3 @@ std::string native_sha256_hex(std::string_view payload) {
 }
 
 }  // namespace evrptw::native_protocol
-

@@ -9,7 +9,7 @@ import math
 import statistics
 import subprocess
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,7 +33,7 @@ from evrptw.stage052_replay import (
 )
 from evrptw.validation import validate_routes
 
-REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v5"
+REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v6"
 LEGACY_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v3"
 HISTORICAL_PILOT_ROOT = Path(
     "/mnt/e/Reproducible-EVRPTW-archive/stage05.2/runs/"
@@ -277,6 +277,7 @@ def _replay_record(record: ReviewRecord, benchmark_dir: Path) -> dict[str, objec
             }
         try:
             _semantic_trajectory(payload)
+            _canonical_semantic_events(payload)
         except ValueError as error:
             return {
                 "valid": False,
@@ -393,7 +394,7 @@ def _replay_record(record: ReviewRecord, benchmark_dir: Path) -> dict[str, objec
     }
 
 
-def _common_prefix(left: list[object], right: list[object]) -> int:
+def _common_prefix(left: Sequence[object], right: Sequence[object]) -> int:
     length = 0
     for left_event, right_event in zip(left, right, strict=False):
         if left_event != right_event:
@@ -403,8 +404,8 @@ def _common_prefix(left: list[object], right: list[object]) -> int:
 
 
 def _describe_first_divergence(
-    baseline: list[object],
-    candidate: list[object],
+    baseline: Sequence[object],
+    candidate: Sequence[object],
 ) -> dict[str, object] | None:
     index = _common_prefix(baseline, candidate)
     if index == len(baseline) == len(candidate):
@@ -498,6 +499,62 @@ def _semantic_trajectory(payload: Mapping[str, object]) -> list[object]:
     # identify an event-level divergence.
     legacy = _mapping(payload, "trajectory")
     return [dict(legacy)]
+
+
+_SEMANTIC_STREAM_NAMES = (
+    "candidate_state",
+    "operator",
+    "stage04",
+    "candidate_transaction",
+    "exact_work",
+    "exact_result",
+    "cache",
+    "deadline",
+)
+
+
+def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, object]]:
+    raw_streams = payload.get("canonical_semantic_streams")
+    if not isinstance(raw_streams, dict) or set(raw_streams) != set(
+        _SEMANTIC_STREAM_NAMES
+    ):
+        raise ValueError("canonical semantic stream set is incomplete")
+    events: list[dict[str, object]] = []
+    for stream_rank, stream_name in enumerate(_SEMANTIC_STREAM_NAMES):
+        stream = raw_streams[stream_name]
+        if not isinstance(stream, list) or not all(isinstance(row, dict) for row in stream):
+            raise ValueError(f"canonical semantic stream {stream_name} is invalid")
+        for row in stream:
+            events.append(
+                {
+                    **row,
+                    "semantic_stream": stream_name,
+                    "semantic_stream_rank": stream_rank,
+                }
+            )
+    lane_rank = {"legacy": 0, "quality_shadow": 1, "constraint_lane": 2}
+
+    def event_key(event: dict[str, object]) -> tuple[int, int, int, int]:
+        iteration = event.get("iteration")
+        ordinal = event.get("stream_ordinal")
+        stream_rank = event.get("semantic_stream_rank")
+        if not isinstance(stream_rank, int):
+            raise ValueError("canonical semantic stream rank is invalid")
+        return (
+            iteration if isinstance(iteration, int) else 2**62,
+            lane_rank.get(str(event.get("lane")), 3),
+            stream_rank,
+            ordinal if isinstance(ordinal, int) else 2**62,
+        )
+
+    events.sort(key=event_key)
+    return events
+
+
+def _comparison_semantic_events(payload: Mapping[str, object]) -> Sequence[object]:
+    if payload.get("schema_version") == SCHEMA_VERSION:
+        return _canonical_semantic_events(payload)
+    return _semantic_trajectory(payload)
 
 
 def _paired(values: Iterable[float]) -> dict[str, float | int | None]:
@@ -1081,6 +1138,7 @@ def review_records(
                         "candidate_work_hash_equal": False,
                         "route_result_hash_equal": False,
                         "trajectory_equal": False,
+                        "canonical_semantic_events_equal": False,
                         "operator_statistics_equal": False,
                         "stage04_state_equal": False,
                         "candidate_transaction_events_equal": False,
@@ -1093,6 +1151,8 @@ def review_records(
                 continue
             baseline_trajectory = _semantic_trajectory(baseline.payload)
             candidate_trajectory = _semantic_trajectory(candidate.payload)
+            baseline_semantic_events = _comparison_semantic_events(baseline.payload)
+            candidate_semantic_events = _comparison_semantic_events(candidate.payload)
             baseline_measurement = _mapping(baseline.payload, "measurement_evidence")
             candidate_measurement = _mapping(candidate.payload, "measurement_evidence")
             exact_order_equal = (
@@ -1137,12 +1197,12 @@ def review_records(
                 )
             )
             common_prefix = _common_prefix(
-                baseline_trajectory,
-                candidate_trajectory,
+                baseline_semantic_events,
+                candidate_semantic_events,
             )
             first_divergence = _describe_first_divergence(
-                baseline_trajectory,
-                candidate_trajectory,
+                baseline_semantic_events,
+                candidate_semantic_events,
             )
             comparisons.append(
                 {
@@ -1156,6 +1216,9 @@ def review_records(
                     "candidate_work_hash_equal": candidate_work_hash_equal,
                     "route_result_hash_equal": route_result_hash_equal,
                     "trajectory_equal": baseline_trajectory == candidate_trajectory,
+                    "canonical_semantic_events_equal": (
+                        baseline_semantic_events == candidate_semantic_events
+                    ),
                     "operator_statistics_equal": baseline.payload.get(
                         "operator_semantic_statistics",
                         baseline.payload.get("operator_statistics"),
@@ -1200,6 +1263,7 @@ def review_records(
                         "candidate_work_hash_equal",
                         "route_result_hash_equal",
                         "trajectory_equal",
+                        "canonical_semantic_events_equal",
                         "operator_statistics_equal",
                         "stage04_state_equal",
                         "candidate_transaction_events_equal",

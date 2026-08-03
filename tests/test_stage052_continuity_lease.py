@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from evrptw.stage052_continuity_lease import acquire, inspect, release, renew
+from evrptw.stage052_continuity_lease import (
+    acquire,
+    inspect,
+    release,
+    renew,
+    require_owned,
+)
 
 
 def _repository(path: Path) -> Path:
@@ -62,6 +68,19 @@ def test_continuity_lease_is_atomic_renewable_and_identity_bound(
         assert updated["phase"] == "verified"
         assert updated["label"] == "diagnostic-only"
         assert float(updated["renewed_at_epoch"]) > float(lease["renewed_at_epoch"])
+        assert require_owned(
+            repository,
+            token=token,
+            allowed_phases=frozenset({"verified"}),
+        )["owner"] == "thread:test"
+        with pytest.raises(RuntimeError, match="not authorized"):
+            require_owned(
+                repository,
+                token=token,
+                allowed_phases=frozenset({"paired-campaign"}),
+            )
+        with pytest.raises(RuntimeError, match="identity is not active"):
+            require_owned(repository, token="wrong-token")
     finally:
         if inspect(repository) is not None:
             release(repository, token=token)

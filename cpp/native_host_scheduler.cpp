@@ -513,6 +513,19 @@ int main(int argc, char** argv) {
         std::atomic<bool> stopping{false};
         listener = make_listener(socket_path);
         std::vector<std::thread> request_threads;
+        struct RequestThreadGuard {
+            NativeRequestQueue& queue;
+            std::vector<std::thread>& threads;
+
+            ~RequestThreadGuard() noexcept {
+                queue.stop();
+                for (auto& thread : threads) {
+                    if (thread.joinable()) {
+                        thread.join();
+                    }
+                }
+            }
+        } request_thread_guard{queue, request_threads};
         request_threads.reserve(6);
         for (std::size_t index = 0; index < 6; ++index) {
             request_threads.emplace_back([&]() {
@@ -552,10 +565,6 @@ int main(int argc, char** argv) {
                 send_failure(connection, 0, "native scheduler request queue is full");
                 ::close(connection);
             }
-        }
-        queue.stop();
-        for (auto& thread : request_threads) {
-            thread.join();
         }
         ::close(listener);
         listener = -1;

@@ -37,13 +37,14 @@ from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
 from evrptw.runtime_envelope import ProcessTreeMonitor
 from evrptw.stage04 import Stage04Config
+from evrptw.stage052_continuity_lease import require_owned
 from evrptw.validation import validate_routes
 from evrptw.warm_start import (
     WarmStartValidationConfig,
     canonical_customer_sequences_sha256,
 )
 
-SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v5"
+SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v6"
 SEEDS = (2014, 2015, 2016)
 PAIRED_INSTANCES = ("c101C5", "c101_21", "r101_21", "rc101_21")
 AXIS_NAMES = ("fixed_work", "wall_clock_30")
@@ -580,6 +581,80 @@ def _semantic_candidate_trajectory(result: ALNSResult) -> list[dict[str, object]
     return trajectory
 
 
+def _canonical_event_rows(rows: Iterable[object]) -> list[dict[str, object]]:
+    canonical_rows: list[dict[str, object]] = []
+    for ordinal, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError("canonical semantic streams require event objects")
+        canonical = _evidence_json_value(_canonical_trace_event(dict(row)))
+        if not isinstance(canonical, dict):
+            raise AssertionError("canonical event normalization lost object identity")
+        canonical_rows.append({**canonical, "stream_ordinal": ordinal})
+    return canonical_rows
+
+
+def _canonical_semantic_streams(result: ALNSResult) -> dict[str, list[dict[str, object]]]:
+    cache_rows: list[dict[str, object]] = []
+    for batch_ordinal, event in enumerate(result.candidate_work_events):
+        sequences = cast(list[list[str]], event.get("sequences", []))
+        for route_ordinal, sequence in enumerate(sequences):
+            cache_rows.append(
+                {
+                    "batch_ordinal": batch_ordinal,
+                    "route_ordinal": route_ordinal,
+                    "lane": event.get("lane"),
+                    "iteration": event.get("iteration"),
+                    "operator": event.get("operator"),
+                    "customer_sequence": sequence,
+                    "transition": "exact_miss_to_committed_store",
+                }
+            )
+    cache_rows.append(
+        {
+            "transition": "final_cache_state",
+            **{
+                field: result.cache_incremental_statistics.get(field, 0)
+                for field in (
+                    "cache_stores",
+                    "cache_evictions",
+                    "cache_oversize_not_cached",
+                    "entries_current",
+                    "entries_peak",
+                    "bytes_current",
+                    "bytes_peak",
+                    "unique_route_evaluations",
+                )
+            },
+        }
+    )
+    deadline_rows: list[dict[str, object]] = []
+    if result.measurement_trace is not None:
+        deadline_rows = [
+            {
+                "evaluation_id": row.evaluation_id,
+                "route_key": row.route_key,
+                "deadline_boundary": row.deadline_boundary,
+                "exact_started": row.exact_started,
+                "exact_completed": row.exact_completed,
+                "status": row.status,
+            }
+            for row in result.measurement_trace.route_evaluations
+            if row.deadline_boundary
+        ]
+    return {
+        "candidate_state": _canonical_event_rows(_semantic_candidate_trajectory(result)),
+        "operator": _canonical_event_rows(result.neighborhood_events),
+        "stage04": _canonical_event_rows(result.stage04_event_log),
+        "candidate_transaction": _canonical_event_rows(
+            result.candidate_transaction_events
+        ),
+        "exact_work": _canonical_event_rows(result.candidate_work_events),
+        "exact_result": _canonical_event_rows(result.route_result_events),
+        "cache": _canonical_event_rows(cache_rows),
+        "deadline": _canonical_event_rows(deadline_rows),
+    }
+
+
 def _semantic_operator_statistics(result: ALNSResult) -> dict[str, dict[str, object]]:
     telemetry_fields = {
         "failure_reasons",
@@ -872,6 +947,7 @@ def _result_payload(
         "route_result_hash": result.route_result_hash,
         "fallback_count": native_fallback,
         "semantic_trajectory": _semantic_candidate_trajectory(result),
+        "canonical_semantic_streams": _canonical_semantic_streams(result),
         "trajectory": _row_evidence(
             dict(event) for event in result.neighborhood_events
         ),
@@ -1022,9 +1098,15 @@ def run_experiment(
     output_root: Path,
     wheel_path: Path,
     warm_start_bundle_path: Path,
+    continuity_lease_token: str,
     max_workers: int = SHARD_PROCESSES,
 ) -> dict[str, object]:
     root = repository_root()
+    require_owned(
+        root,
+        token=continuity_lease_token,
+        allowed_phases=frozenset({"paired-campaign", "pilot-campaign"}),
+    )
     if max_workers != SHARD_PROCESSES:
         raise ValueError("Stage 5.2 comparison requires exactly six shard processes")
     compute_envelope = _configure_compute_envelope()
@@ -1212,6 +1294,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", type=Path, default=Path("results"))
     parser.add_argument("--wheel", type=Path, required=True)
     parser.add_argument("--warm-start-bundle", type=Path, required=True)
+    parser.add_argument("--continuity-lease-token", required=True)
     arguments = parser.parse_args(argv)
     manifest = run_experiment(
         arguments.scope,
@@ -1219,6 +1302,7 @@ def main(argv: list[str] | None = None) -> int:
         output_root=arguments.output_root,
         wheel_path=arguments.wheel,
         warm_start_bundle_path=arguments.warm_start_bundle,
+        continuity_lease_token=arguments.continuity_lease_token,
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))
     return 0

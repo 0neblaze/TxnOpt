@@ -5599,7 +5599,6 @@ def _solve_full_native_alns(
             0.0,
             host_dispatch_seconds
             - native_result.timings["total_seconds"]
-            - queue_wait_seconds,
         )
         if config.mode == "host_scheduler"
         else 0.0
