@@ -29,6 +29,8 @@ namespace {
 
 std::atomic<std::uint64_t> segment_counter{0};
 std::string scheduler_run_nonce;
+std::string production_fault;
+std::atomic<bool> production_fault_consumed{false};
 
 bool read_exact(int descriptor, void* output, std::size_t size) {
     auto* cursor = static_cast<std::uint8_t*>(output);
@@ -350,12 +352,19 @@ void handle_connection(
             || request.segment_size > protocol::maximum_payload_bytes) {
             throw std::runtime_error("native scheduler request frame is invalid");
         }
-        const auto injected_fault = protocol::bounded_string(
+        const auto request_fault = protocol::bounded_string(
             request.error.data(), request.error.size());
         if ((test_request && !allow_fault_injection)
-            || (!test_request && !injected_fault.empty())) {
+            || (!test_request && !request_fault.empty())) {
             throw std::runtime_error(
                 "native scheduler fault injection is not enabled");
+        }
+        auto injected_fault = request_fault;
+        if (!test_request && allow_fault_injection
+            && !production_fault.empty()
+            && !production_fault_consumed.exchange(
+                true, std::memory_order_acq_rel)) {
+            injected_fault = production_fault;
         }
         if (injected_fault == "pause_before_execute") {
             std::this_thread::sleep_for(std::chrono::seconds(30));
@@ -461,7 +470,7 @@ int make_listener(const std::string& socket_path) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 4 && argc != 5) {
+    if (argc < 4 || argc > 6) {
         std::cerr << "usage: evrptw_native_scheduler SOCKET WORKER_THREADS "
                      "RUN_NONCE [--enable-fault-injection]\n";
         return 2;
@@ -477,10 +486,23 @@ int main(int argc, char** argv) {
         if (!valid_nonce) {
             throw std::invalid_argument("native scheduler run nonce is invalid");
         }
-        const bool allow_fault_injection = argc == 5
-            && std::string_view(argv[4]) == "--enable-fault-injection";
-        if (argc == 5 && !allow_fault_injection) {
-            throw std::invalid_argument("native scheduler option is invalid");
+        bool allow_fault_injection = false;
+        for (int index = 4; index < argc; ++index) {
+            const std::string_view option(argv[index]);
+            if (option == "--enable-fault-injection") {
+                allow_fault_injection = true;
+            } else if (option.starts_with("--production-fault=")) {
+                production_fault = option.substr(
+                    std::string_view("--production-fault=").size());
+            } else {
+                throw std::invalid_argument("native scheduler option is invalid");
+            }
+        }
+        if (!production_fault.empty()
+            && (!allow_fault_injection
+                || production_fault != "pause_before_execute")) {
+            throw std::invalid_argument(
+                "native scheduler production fault is invalid");
         }
         if (worker_threads != 24) {
             throw std::invalid_argument(

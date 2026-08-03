@@ -38,12 +38,17 @@ class NativeHostScheduler:
     socket_path: Path
     worker_threads: int = 24
     enable_fault_injection: bool = False
+    production_fault: str | None = None
     _process: subprocess.Popen[bytes] | None = None
     _run_nonce: str | None = None
 
     def start(self) -> None:
         if self._process is not None:
             raise RuntimeError("host scheduler is already started")
+        if self.production_fault not in {None, "pause_before_execute"}:
+            raise ValueError("native scheduler production fault is invalid")
+        if self.production_fault is not None and not self.enable_fault_injection:
+            raise ValueError("native scheduler production fault requires fault injection")
         from evrptw import _core as native_core
 
         executable = Path(native_core.__file__).with_name("_native_host_scheduler")
@@ -60,6 +65,8 @@ class NativeHostScheduler:
         ]
         if self.enable_fault_injection:
             command.append("--enable-fault-injection")
+        if self.production_fault is not None:
+            command.append(f"--production-fault={self.production_fault}")
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,

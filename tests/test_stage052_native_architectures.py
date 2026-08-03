@@ -17,6 +17,7 @@ from evrptw.experiments.stage052_native_architecture_review import (
     _replay_record,
     _scheduler_screening_occupancy,
     _semantic_trajectory,
+    load_records,
     render_report,
     review_records,
     write_review,
@@ -24,11 +25,13 @@ from evrptw.experiments.stage052_native_architecture_review import (
 from evrptw.experiments.stage052_native_architectures import (
     MODES,
     PAIRED_INSTANCES,
+    SCHEMA_VERSION,
     SEEDS,
     WARM_START_SCHEMA_VERSION,
     ArchitectureAxisTask,
     _canonical_trace_event,
     _run_group,
+    _write_signed_json,
     build_axis_plan,
     expected_axis_count,
     load_warm_start_bundle,
@@ -282,6 +285,43 @@ def test_semantic_trajectory_reports_the_real_first_divergence() -> None:
     ]
 
     assert _common_prefix(baseline, candidate) == 1
+
+
+def test_v5_reviewer_rejects_scheduler_overlap_outside_host_wave(
+    tmp_path: Path,
+) -> None:
+    labels = run_labels_for_scope("paired", 91)
+    run_dir = tmp_path / labels["current_stage052"]
+    _write_signed_json(
+        run_dir / "run_manifest.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "revision": "a" * 40,
+            "wheel_sha256": "b" * 64,
+            "native_sha256": "c" * 64,
+            "scheduler_sha256": "d" * 64,
+            "topology": {
+                "scheduler_startup_seconds": 0.1,
+                "scheduler_shutdown_seconds": 0.1,
+                "scheduler_observed": [],
+                "mode_wave_resources": [
+                    {
+                        "mode": "current_stage052",
+                        "elapsed_seconds": 1.0,
+                        "process_tree_cpu_seconds": 1.0,
+                        "peak_aggregate_rss_bytes": 1,
+                        "peak_aggregate_pss_bytes": 1,
+                        "scheduler_process_id": 123,
+                        "scheduler_startup_seconds": 0.0,
+                        "scheduler_shutdown_seconds": 0.0,
+                    }
+                ],
+            },
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="exclusive mode wave"):
+        load_records("paired", attempt=91, results_root=tmp_path)
 
 
 def test_canonical_candidate_event_has_stable_candidate_identity() -> None:

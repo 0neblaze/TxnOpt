@@ -157,7 +157,12 @@ def load_records(
                 not isinstance(mode_waves, list)
                 or not mode_waves
                 or not isinstance(scheduler_observed, list)
-                or len(scheduler_observed) != 1
+                or len(scheduler_observed)
+                != sum(
+                    isinstance(wave, dict)
+                    and wave.get("mode") == ArchitectureMode.HOST_SCHEDULER.value
+                    for wave in mode_waves
+                )
             ):
                 raise RuntimeError("campaign process-tree instrumentation is incomplete")
             for field in ("scheduler_startup_seconds", "scheduler_shutdown_seconds"):
@@ -178,9 +183,27 @@ def load_records(
                         "process_tree_cpu_seconds",
                         "peak_aggregate_rss_bytes",
                         "peak_aggregate_pss_bytes",
+                        "scheduler_process_id",
+                        "scheduler_startup_seconds",
+                        "scheduler_shutdown_seconds",
                     )
                 ):
                     raise RuntimeError("campaign mode-wave resource evidence is incomplete")
+                scheduler_process_id = wave["scheduler_process_id"]
+                if (
+                    wave["mode"] == ArchitectureMode.HOST_SCHEDULER.value
+                    and (
+                        isinstance(scheduler_process_id, bool)
+                        or not isinstance(scheduler_process_id, int)
+                        or scheduler_process_id <= 0
+                    )
+                ) or (
+                    wave["mode"] != ArchitectureMode.HOST_SCHEDULER.value
+                    and scheduler_process_id is not None
+                ):
+                    raise RuntimeError(
+                        "host scheduler exists outside its exclusive mode wave"
+                    )
         manifest_schema = _string(manifest, "schema_version")
         scheduler_identity = (
             _string(manifest, "scheduler_sha256")

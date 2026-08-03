@@ -7065,6 +7065,58 @@ def test_host_scheduler_crash_after_response_reclaims_owned_output_segment(
     assert _stage052_shared_memory_names().issubset(before)
 
 
+def test_real_full_native_solve_rolls_back_when_scheduler_crashes(
+    tmp_path: Path,
+) -> None:
+    before = _stage052_shared_memory_names()
+    endpoint = tmp_path / "native-scheduler.sock"
+    instance = _candidate_plan_fixture()
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = (
+        ("C1", "C2"),
+        ("C3", "C4"),
+    )
+
+    with NativeHostScheduler(
+        endpoint,
+        enable_fault_injection=True,
+        production_fault="pause_before_execute",
+    ) as scheduler, ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            solve_alns,
+            instance,
+            seed=2014,
+            max_iterations=3,
+            time_limit_seconds=10.0,
+            **solve_kwargs,  # type: ignore[arg-type]
+            native_execution_config=replace(
+                _native_config("host_scheduler"),
+                scheduler_socket_path=str(endpoint),
+            ),
+        )
+        time.sleep(0.1)
+        scheduler.close(force=True)
+        with pytest.raises(RuntimeError, match="partial response"):
+            future.result(timeout=5.0)
+
+    assert _stage052_shared_memory_names().issubset(before)
+    with NativeHostScheduler(endpoint) as scheduler:
+        recovered = solve_alns(
+            instance,
+            seed=2014,
+            max_iterations=3,
+            time_limit_seconds=10.0,
+            **solve_kwargs,  # type: ignore[arg-type]
+            native_execution_config=replace(
+                _native_config("host_scheduler"),
+                scheduler_socket_path=str(endpoint),
+            ),
+        )
+    assert recovered.feasible
+    assert recovered.native_execution_statistics["fallback_count"] == 0
+    assert _stage052_shared_memory_names().issubset(before)
+
+
 @pytest.mark.parametrize(
     "frame",
     [
