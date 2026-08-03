@@ -6,6 +6,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 from evrptw.charging import solve_exact_charging
@@ -40,6 +41,7 @@ from evrptw.experiments.stage052_native_architectures import (
     expected_axis_count,
     load_warm_start_bundle,
     rotated_modes,
+    run_experiment,
     run_labels_for_scope,
 )
 from evrptw.native_scheduler import NativeHostScheduler
@@ -59,6 +61,187 @@ def test_native_campaign_gate_names_every_incomplete_architecture_capability() -
         ),
     ):
         _require_native_architecture_capabilities()
+
+
+def test_native_attempt04_is_blocked_before_capability_incomplete_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A zero capability receipt must stop attempt04 before any run label exists."""
+
+    import evrptw.experiments.stage052_native_architectures as native_architectures
+    from evrptw import _core as native_core
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    output_root = tmp_path / "results"
+    wheel_path = tmp_path / "comparison.whl"
+    wheel_path.write_bytes(b"frozen-wheel")
+
+    class Receipt:
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+
+    monkeypatch.setattr(native_architectures, "repository_root", lambda: root)
+    monkeypatch.setattr(native_architectures, "require_owned", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(native_architectures, "_configure_compute_envelope", lambda: {})
+    monkeypatch.setattr(
+        native_architectures.subprocess,
+        "run",
+        lambda command, **_kwargs: Receipt(
+            "c" * 40 + "\n" if command[1] == "rev-parse" else ""
+        ),
+    )
+    monkeypatch.setattr(
+        native_architectures,
+        "_verify_installed_wheel",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        native_core,
+        "stage052_native_architecture_capabilities_v2",
+        lambda: np.zeros(4, dtype=np.int64),
+    )
+
+    with pytest.raises(RuntimeError, match="incomplete capabilities"):
+        run_experiment(
+            "pilot",
+            attempt=4,
+            output_root=output_root,
+            wheel_path=wheel_path,
+            warm_start_bundle_path=tmp_path / "warm-starts.json",
+            continuity_lease_token="lease-token",
+        )
+
+    assert not tuple(output_root.glob("stage05.2_native_architecture_*/"))
+
+
+_SEMANTIC_STREAM_NAMES = (
+    "candidate_state",
+    "operator",
+    "stage04",
+    "candidate_transaction",
+    "exact_work",
+    "exact_result",
+    "cache",
+    "screening",
+    "deadline",
+    "termination",
+    "native_failure",
+)
+_REQUIRED_CAUSAL_STREAMS = frozenset(
+    {
+        "operator",
+        "stage04",
+        "candidate_transaction",
+        "exact_work",
+        "exact_result",
+        "cache",
+        "screening",
+        "termination",
+    }
+)
+_BOUNDARY_CAUSAL_STREAMS = _REQUIRED_CAUSAL_STREAMS | {"deadline"}
+
+
+def _complete_causal_streams(
+    *,
+    exclude: str | None = None,
+) -> dict[str, list[dict[str, object]]]:
+    event_types = {
+        "candidate_state": "candidate_state",
+        "operator": "operator_call",
+        "stage04": "stage04_segment_update",
+        "candidate_transaction": "candidate_control_budget",
+        "exact_work": "exact_batch_started",
+        "exact_result": "exact_route_result",
+        "cache": "cache_lookup_result",
+        "screening": "screening_decision",
+        "deadline": "deadline_boundary",
+        "termination": "termination",
+    }
+    streams = {name: [] for name in _SEMANTIC_STREAM_NAMES}
+    event_id = 0
+    for stream_name in event_types:
+        if stream_name == exclude:
+            continue
+        event_id += 1
+        streams[stream_name].append(
+            {
+                "event_type": event_types[stream_name],
+                "runtime_event_id": event_id,
+                "semantic_event_id": event_id,
+                "stream_ordinal": 0,
+            }
+        )
+    return streams
+
+
+def test_unified_causal_ids_are_monotonic_and_cover_all_required_domains() -> None:
+    streams = _complete_causal_streams()
+    events = _canonical_semantic_event_sequence(streams)
+
+    assert [event["semantic_event_id"] for event in events] == list(
+        range(1, len(events) + 1)
+    )
+    assert [event["runtime_event_id"] for event in events] == list(
+        range(1, len(events) + 1)
+    )
+    assert {str(event["semantic_stream"]) for event in events} >= (
+        _BOUNDARY_CAUSAL_STREAMS
+    )
+
+    reviewed = _canonical_semantic_events(
+        {
+            "mode": "full_native_alns",
+            "canonical_semantic_streams": streams,
+            "canonical_semantic_events": events,
+        }
+    )
+    assert {str(event["semantic_stream"]) for event in reviewed} >= (
+        _BOUNDARY_CAUSAL_STREAMS
+    )
+
+
+@pytest.mark.parametrize("missing_stream", sorted(_REQUIRED_CAUSAL_STREAMS))
+def test_unified_causal_ids_reject_missing_required_domain(
+    missing_stream: str,
+) -> None:
+    streams = _complete_causal_streams(exclude=missing_stream)
+    events = _canonical_semantic_event_sequence(streams)
+
+    with pytest.raises(ValueError):
+        _canonical_semantic_events(
+            {
+                "mode": "full_native_alns",
+                "canonical_semantic_streams": streams,
+                "canonical_semantic_events": events,
+            }
+        )
+
+
+@pytest.mark.parametrize("corruption", ("missing", "duplicate", "out_of_order"))
+def test_unified_causal_ids_reject_missing_duplicate_or_out_of_order_events(
+    corruption: str,
+) -> None:
+    streams = _complete_causal_streams()
+    events = _canonical_semantic_event_sequence(streams)
+    corrupted = [dict(event) for event in events]
+    if corruption == "missing":
+        corrupted.pop()
+    elif corruption == "duplicate":
+        corrupted[1] = dict(corrupted[0])
+    else:
+        corrupted[0], corrupted[1] = corrupted[1], corrupted[0]
+
+    with pytest.raises(ValueError):
+        _canonical_semantic_events(
+            {
+                "mode": "full_native_alns",
+                "canonical_semantic_streams": streams,
+                "canonical_semantic_events": corrupted,
+            }
+        )
 
 
 def test_campaign_identity_revalidates_lease_revision_and_clean_tree(
@@ -566,7 +749,9 @@ def test_canonical_semantic_streams_find_non_candidate_first_divergence() -> Non
             "exact_work",
             "exact_result",
             "cache",
+            "screening",
             "deadline",
+            "termination",
             "native_failure",
         )
     }
@@ -630,7 +815,9 @@ def test_canonical_semantic_events_require_explicit_contiguous_causal_sequence()
             "exact_work",
             "exact_result",
             "cache",
+            "screening",
             "deadline",
+            "termination",
             "native_failure",
         )
     }
@@ -679,7 +866,9 @@ def test_canonical_semantic_events_reject_empty_runtime_journal() -> None:
             "exact_work",
             "exact_result",
             "cache",
+            "screening",
             "deadline",
+            "termination",
             "native_failure",
         )
     }
@@ -707,7 +896,9 @@ def test_canonical_semantic_events_reconcile_exact_counters() -> None:
             "exact_work",
             "exact_result",
             "cache",
+            "screening",
             "deadline",
+            "termination",
             "native_failure",
         )
     }
@@ -720,6 +911,8 @@ def test_canonical_semantic_events_reconcile_exact_counters() -> None:
             "exact_work",
             "exact_result",
             "cache",
+            "screening",
+            "termination",
         ),
         start=1,
     ):
@@ -730,6 +923,10 @@ def test_canonical_semantic_events_reconcile_exact_counters() -> None:
                     if stream_name == "exact_work"
                     else "exact_route_result"
                     if stream_name == "exact_result"
+                    else "screening_decision"
+                    if stream_name == "screening"
+                    else "termination"
+                    if stream_name == "termination"
                     else stream_name
                 ),
                 "runtime_event_id": event_id,
@@ -743,6 +940,8 @@ def test_canonical_semantic_events_reconcile_exact_counters() -> None:
                         "exact_completed": True,
                     }
                     if stream_name == "exact_result"
+                    else {"status": "iteration_limit"}
+                    if stream_name == "termination"
                     else {}
                 ),
             }
@@ -755,6 +954,7 @@ def test_canonical_semantic_events_reconcile_exact_counters() -> None:
                 "mode": "per_solve_runtime",
                 "exact_started_calls": 2,
                 "exact_completed_calls": 1,
+                "termination_reason": "iteration_limit",
                 "canonical_semantic_streams": streams,
                 "canonical_semantic_events": events,
             }

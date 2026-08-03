@@ -43,6 +43,7 @@ from evrptw.charging import solve_exact_charging
 from evrptw.exact_deadline import ExactCallController, ExactDeadlineConfig
 from evrptw.experiments.stage052_native_architecture_review import (
     _canonical_semantic_events,
+    _describe_first_divergence,
 )
 from evrptw.experiments.stage052_native_architectures import (
     _canonical_semantic_event_sequence,
@@ -57,9 +58,12 @@ from evrptw.native_execution import (
     FULL_NATIVE_STAGE04_FLOAT_FIELDS,
     FULL_NATIVE_STAGE04_INTEGER_FIELDS,
     NATIVE_EXECUTION_SCHEMA_VERSION,
+    FullNativeALNSResult,
     NativeCandidateRoundRequest,
     NativeCandidateRoundResult,
     Stage052NativeExecutionConfig,
+    _append_typed_array,
+    _decode_full_native_causal_journal,
     _full_native_digest,
     _native_distance_improved,
     decode_native_constraint_semantic_stream,
@@ -680,6 +684,8 @@ def test_per_solve_real_c101c5_runtime_journal_matches_python_control() -> None:
                 "mode": mode,
                 "exact_started_calls": result.exact_started_calls,
                 "exact_completed_calls": result.exact_completed_calls,
+                "effective_iterations": result.effective_iterations,
+                "termination_reason": result.termination_reason,
                 "canonical_semantic_streams": streams,
                 "canonical_semantic_events": _canonical_semantic_event_sequence(
                     streams
@@ -4078,8 +4084,64 @@ def test_native_global_search_matches_python_no_removable_customer_events() -> N
     assert decoded.neighborhood_events == python_result.neighborhood_events
     assert len(decoded.neighborhood_events) == 3
     assert decoded.neighborhood_events[1]["reason"] == "no_removable_customer"
-    assert decoded.stage04_calls.tolist() == [[0, 0, 0, 0]]
+    assert decoded.stage04_calls.tolist() == [[1, 0, 0, 0]]
     assert decoded.termination[4:].tolist() == [10, 1, 1, 0, 1, 1, 0]
+
+
+@pytest.mark.parametrize("max_iterations", [2, 3, 5, 6, 22])
+def test_full_native_v2_one_route_global_multi_round_semantics_match_python(
+    max_iterations: int,
+) -> None:
+    """Replay the one-route canonical window for every requested round."""
+
+    instance = _one_customer_fixture()
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = (("C1",),)
+    control = CandidateControlConfig(
+        worker_count=1,
+        max_exact_calls_per_round=100,
+        proposal_top_k=100,
+    )
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=max_iterations,
+        time_limit_seconds=10.0,
+        **solve_kwargs,
+        candidate_control_config=control,
+    )
+    native_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=max_iterations,
+        time_limit_seconds=10.0,
+        **solve_kwargs,
+        native_execution_config=replace(
+            _native_config("full_native_alns"),
+            candidate_control_config=control,
+        ),
+    )
+
+    assert native_result.feasible == python_result.feasible
+    assert native_result.routes == python_result.routes
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.objective == python_result.objective
+    assert native_result.vehicle_count == python_result.vehicle_count
+    assert native_result.total_energy == python_result.total_energy
+    assert native_result.total_charged_energy == python_result.total_charged_energy
+    assert native_result.total_charging_time == python_result.total_charging_time
+    assert native_result.iterations == python_result.iterations == max_iterations
+    assert native_result.charging_subproblem_calls == python_result.charging_subproblem_calls
+    assert native_result.termination_reason == python_result.termination_reason
+    # The canonical event trajectory and Stage 4/operator statistics are
+    # semantic gates, not backend telemetry.  Keep these comparisons strict so
+    # a native producer trajectory cannot be hidden behind matching objectives.
+    assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+    assert native_result.stage04_event_log == python_result.stage04_event_log
+    assert native_result.native_execution_statistics["fallback_count"] == 0
+    assert native_result.native_execution_statistics["counters"]["iterations"] == max_iterations
 
 
 def test_native_global_search_matches_python_fixed_work_budget_boundary() -> None:
@@ -5146,6 +5208,76 @@ def test_full_native_v2_accepts_legal_route_elimination_rejection() -> None:
     assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
     assert native_result.stage04_statistics == python_result.stage04_statistics
     assert native_result.stage04_event_log == python_result.stage04_event_log
+    assert native_result.native_execution_statistics["fallback_count"] == 0
+
+
+@pytest.mark.parametrize("max_iterations", [3, 5])
+def test_full_native_v2_capacity_two_three_lane_semantics_match_after_followup(
+    max_iterations: int,
+) -> None:
+    """A typed feasible-but-discarded constraint candidate must not abort lane 3."""
+
+    base = _candidate_plan_fixture()
+    instance = Instance(
+        "candidate_plan_capacity_fixture",
+        base.nodes,
+        Vehicle(100.0, 2.0, 1.0, 0.1, 1.0),
+        distance_backend="python",
+    )
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = (("C1", "C2"), ("C3", "C4"))
+    control = CandidateControlConfig(
+        worker_count=1,
+        max_exact_calls_per_round=100,
+        proposal_top_k=100,
+    )
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=max_iterations,
+        time_limit_seconds=10.0,
+        **solve_kwargs,
+        candidate_control_config=control,
+    )
+    native_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=max_iterations,
+        time_limit_seconds=10.0,
+        **solve_kwargs,
+        native_execution_config=replace(
+            _native_config("full_native_alns"),
+            candidate_control_config=control,
+        ),
+    )
+
+    # Compare semantic solver products only; timing and backend telemetry are
+    # intentionally owned by their respective execution paths.
+    for field in (
+        "feasible",
+        "routes",
+        "customer_sequences",
+        "objective",
+        "vehicle_count",
+        "total_energy",
+        "total_charged_energy",
+        "total_charging_time",
+        "iterations",
+        "accepted_moves",
+        "improving_moves",
+        "rejected_moves",
+        "charging_subproblem_calls",
+        "neighborhood_statistics",
+        "neighborhood_events",
+        "stage04_statistics",
+        "stage04_weight_history",
+        "stage04_event_log",
+        "candidate_work_events",
+        "route_result_events",
+        "candidate_work_hash",
+        "route_result_hash",
+    ):
+        assert getattr(native_result, field) == getattr(python_result, field)
     assert native_result.native_execution_statistics["fallback_count"] == 0
 
 
@@ -6925,6 +7057,334 @@ def test_full_native_v2_one_call_matches_python_first_iteration(
     assert native_result.backend_metrics["total_seconds"] == timings["exact_seconds"]
 
 
+def test_full_native_completion_flags_are_derived_from_causal_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing a required native stream must make completion false."""
+
+    import evrptw.alns as alns_module
+
+    original = alns_module.execute_full_native_alns
+
+    def omit_screening_stream(
+        *args: object,
+        **kwargs: object,
+    ) -> FullNativeALNSResult:
+        result = original(*args, **kwargs)  # type: ignore[arg-type]
+        stream_counts = np.array(
+            result.causal_journal.stream_counts,
+            dtype=np.int64,
+            copy=True,
+        )
+        stream_counts[2] = 0
+        stream_counts.setflags(write=False)
+        return replace(
+            result,
+            causal_journal=replace(
+                result.causal_journal,
+                stream_counts=stream_counts,
+            ),
+        )
+
+    monkeypatch.setattr(
+        alns_module,
+        "execute_full_native_alns",
+        omit_screening_stream,
+    )
+    result = solve_alns(
+        _fixture_instance(),
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **_full_native_solve_kwargs(),
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    assert result.native_execution_statistics[
+        "candidate_control_semantics_complete"
+    ] is True
+    assert result.native_execution_statistics["stage04_semantics_complete"] is True
+    assert result.native_execution_statistics["instrumentation_complete"] is False
+    assert result.native_execution_statistics["causal_stream_counts"][2] == 0
+
+
+def test_full_native_v2_causal_journal_differential_matches_python_control() -> None:
+    """The one-call native path must emit the same ordered semantic journal."""
+
+    instance = _fixture_instance()
+    common = {
+        "seed": 2014,
+        "max_iterations": 1,
+        "time_limit_seconds": 30.0,
+        "termination_mode": "fixed_work",
+        "exact_deadline_config": ExactDeadlineConfig.fixed_exact_calls(
+            20,
+            watchdog_seconds=30.0,
+        ),
+        "measurement_config": MeasurementConfig(
+            record_runtime_semantic_events=True,
+        ),
+        **_full_native_solve_kwargs(),
+    }
+    python_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        candidate_control_config=CandidateControlConfig(worker_count=1),
+    )
+    native_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    def reviewed_events(mode: str, result: ALNSResult) -> list[dict[str, object]]:
+        streams = _canonical_semantic_streams(result)
+        events = _canonical_semantic_event_sequence(streams)
+        reviewed = _canonical_semantic_events(
+            {
+                "mode": mode,
+                "exact_started_calls": result.exact_started_calls,
+                "exact_completed_calls": result.exact_completed_calls,
+                "effective_iterations": result.effective_iterations,
+                "termination_reason": result.termination_reason,
+                "canonical_semantic_streams": streams,
+                "canonical_semantic_events": events,
+            }
+        )
+        required = {
+            "candidate_transaction",
+            "exact_work",
+            "exact_result",
+            "cache",
+            "screening",
+            "operator",
+            "stage04",
+            "termination",
+        }
+        assert required <= {
+            str(event["semantic_stream"]) for event in reviewed
+        }
+        assert [event["semantic_event_id"] for event in reviewed] == list(
+            range(1, len(reviewed) + 1)
+        )
+        return reviewed
+
+    python_events = reviewed_events("python_candidate_control", python_result)
+    native_events = reviewed_events("full_native_alns", native_result)
+
+    assert native_result.objective == python_result.objective
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.exact_started_calls == python_result.exact_started_calls
+    assert native_result.exact_completed_calls == python_result.exact_completed_calls
+    assert native_events == python_events, _describe_first_divergence(
+        python_events, native_events
+    )
+
+
+def test_full_native_v2_fixed_work_boundary_records_deadline_causal_stream() -> None:
+    """A fixed-work boundary is the axis where the deadline stream is mandatory."""
+
+    instance = _fixture_instance()
+    common = {
+        "seed": 2014,
+        "max_iterations": 1,
+        "time_limit_seconds": 120.0,
+        "termination_mode": "fixed_work",
+        "exact_deadline_config": ExactDeadlineConfig.fixed_exact_calls(
+            1,
+            watchdog_seconds=120.0,
+        ),
+        "measurement_config": MeasurementConfig(
+            record_runtime_semantic_events=True,
+        ),
+        **_full_native_solve_kwargs(),
+    }
+    python_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        candidate_control_config=CandidateControlConfig(worker_count=1),
+    )
+    native_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    assert python_result.termination_reason == "exact_call_budget_exhausted"
+    assert native_result.termination_reason == "exact_call_budget_exhausted"
+    for result in (python_result, native_result):
+        streams = _canonical_semantic_streams(result)
+        assert streams["deadline"]
+        events = _canonical_semantic_event_sequence(streams)
+        assert [event["semantic_event_id"] for event in events] == list(
+            range(1, len(events) + 1)
+        )
+
+
+def test_full_native_v2_raw_causal_payload_has_ordered_stream_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The native ABI must expose one contiguous causal ID space per solve."""
+
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    original = native_core.full_native_alns_v2
+    captured: dict[str, object] = {}
+
+    def capture(*args: object) -> object:
+        payload = original(*args)
+        captured["payload"] = payload
+        return payload
+
+    monkeypatch.setattr(native_core, "full_native_alns_v2", capture)
+    solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **_full_native_solve_kwargs(),
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    payload = captured["payload"]
+    assert isinstance(payload, tuple)
+    assert len(payload) == 12
+    causal = payload[11]
+    assert isinstance(causal, tuple)
+    assert len(causal) == 12
+    arrays = causal[:11]
+    assert all(
+        isinstance(array, np.ndarray)
+        and array.dtype == np.dtype(np.int64)
+        and array.ndim == 1
+        and array.flags.c_contiguous
+        for array in arrays
+    )
+    event_ids, stream_codes, *_rest, stream_counts = arrays
+    digest = causal[11]
+    assert isinstance(digest, str) and len(digest) == 64
+    assert np.array_equal(event_ids, np.arange(event_ids.size, dtype=np.int64))
+    assert np.all((stream_codes >= 0) & (stream_codes < 8))
+    assert np.array_equal(
+        np.bincount(stream_codes, minlength=8),
+        stream_counts,
+    )
+    # operator, candidate-control, cache, exact, and Stage 4 are required on
+    # every completed full-native solve; a deadline row is boundary-specific.
+    assert np.all(stream_counts[[0, 1, 3, 4, 5]] > 0)
+
+
+def test_full_native_v2_raw_causal_payload_marks_fixed_work_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    original = native_core.full_native_alns_v2
+    captured: dict[str, object] = {}
+
+    def capture(*args: object) -> object:
+        payload = original(*args)
+        captured["payload"] = payload
+        return payload
+
+    monkeypatch.setattr(native_core, "full_native_alns_v2", capture)
+    solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=120.0,
+        termination_mode="fixed_work",
+        exact_deadline_config=ExactDeadlineConfig.fixed_exact_calls(
+            1,
+            watchdog_seconds=120.0,
+        ),
+        **_full_native_solve_kwargs(),
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    payload = captured["payload"]
+    assert isinstance(payload, tuple) and len(payload) == 12
+    causal = payload[11]
+    assert isinstance(causal, tuple) and len(causal) == 12
+    stream_counts = causal[10]
+    assert isinstance(stream_counts, np.ndarray)
+    assert stream_counts.shape == (8,)
+    assert stream_counts[6] > 0
+
+
+def _valid_native_causal_payload() -> tuple[object, ...]:
+    columns = [
+        np.arange(8, dtype=np.int64),
+        np.asarray([0, 1, 2, 3, 4, 4, 5, 7], dtype=np.int64),
+        np.asarray([9, 1, 2, 7, 6, 3, 10, 5], dtype=np.int64),
+        np.asarray([0, 0, 0, 0, 0, 0, 0, -1], dtype=np.int64),
+        np.asarray([0, 0, 0, 0, 0, 0, 0, -1], dtype=np.int64),
+        np.asarray([0, 0, 0, 0, 0, 0, 0, 1], dtype=np.int64),
+        np.asarray([0, 0, 0, 0, 0, 0, 0, -1], dtype=np.int64),
+        np.asarray([0, 0, 0, 0, 1, 0, 0, -1], dtype=np.int64),
+        np.asarray([0, 2, 1, 0, 1, 0, 0, 0], dtype=np.int64),
+        np.asarray([1, 1, 1, 1, 1, 1, 1, 0], dtype=np.int64),
+    ]
+    stream_counts = np.asarray([1, 1, 1, 1, 2, 1, 0, 1], dtype=np.int64)
+    evidence = bytearray(b"stage05.2-native-causal-journal-v2")
+    for column in (*columns, stream_counts):
+        _append_typed_array(evidence, column)
+    digest = hashlib.sha256(evidence).hexdigest()
+    return (*columns, stream_counts, digest)
+
+
+def _rehash_native_causal_payload(payload: list[object]) -> tuple[object, ...]:
+    evidence = bytearray(b"stage05.2-native-causal-journal-v2")
+    for column in payload[:11]:
+        assert isinstance(column, np.ndarray)
+        _append_typed_array(evidence, column)
+    payload[11] = hashlib.sha256(evidence).hexdigest()
+    return tuple(payload)
+
+
+@pytest.mark.parametrize("corruption", ("missing", "duplicate", "out_of_order"))
+def test_native_causal_payload_rejects_missing_duplicate_or_out_of_order_ids(
+    corruption: str,
+) -> None:
+    payload = list(_valid_native_causal_payload())
+    if corruption == "missing":
+        payload[0] = np.asarray([0], dtype=np.int64)
+        payload[1] = np.asarray([0], dtype=np.int64)
+    elif corruption == "duplicate":
+        payload[0] = np.asarray([0, 0], dtype=np.int64)
+    else:
+        payload[0] = np.asarray([1, 0], dtype=np.int64)
+
+    with pytest.raises(RuntimeError):
+        _decode_full_native_causal_journal(tuple(payload))
+
+
+@pytest.mark.parametrize(
+    ("column", "row", "value"),
+    (
+        (2, 0, 12),
+        (2, 0, 1),
+        (3, 7, 0),
+        (8, 7, 4),
+        (9, 7, 1),
+    ),
+)
+def test_native_causal_payload_rejects_rehashed_structural_corruption(
+    column: int,
+    row: int,
+    value: int,
+) -> None:
+    payload = list(_valid_native_causal_payload())
+    corrupted = np.array(payload[column], copy=True)
+    corrupted[row] = value
+    payload[column] = corrupted
+
+    with pytest.raises(RuntimeError):
+        _decode_full_native_causal_journal(_rehash_native_causal_payload(payload))
+
+
 def test_full_native_v2_one_call_matches_python_pre_exhausted_budget() -> None:
     instance = _fixture_instance()
     common = {
@@ -6981,12 +7441,17 @@ def test_full_native_v2_rejects_foreign_semantic_stream_before_outer_commit(
             np.asarray(alternate_args[12], dtype=np.int64)[::-1]
         )
         alternate = original(*alternate_args)
-        assert primary[7][14] != alternate[7][14]
+        primary_semantics = primary[7]
+        alternate_semantics = alternate[7]
+        assert isinstance(primary_semantics, tuple)
+        assert isinstance(alternate_semantics, tuple)
+        assert len(primary_semantics) == len(alternate_semantics) == 14
+        assert primary_semantics[13] != alternate_semantics[13]
         primary[7] = alternate[7]
         return tuple(primary)
 
     monkeypatch.setattr(native_core, "full_native_alns_v2", swap_semantic_stream)
-    with pytest.raises(RuntimeError, match="canonical event sequence is invalid"):
+    with pytest.raises(RuntimeError, match="native three-lane"):
         solve_alns(
             _fixture_instance(),
             seed=2014,
@@ -7020,15 +7485,16 @@ def test_full_native_v2_replay_rejects_current_state_as_global_best(
             exact_payload=primary[2],
             counters=primary[3],
             trajectory=primary[5],
-                semantic_sha256=primary[7][14],
-                backend_payload=primary[8],
-                exact_journal_sha256=primary[9][1],
-                control_journal_sha256=primary[10][2],
-            )
+            semantic_sha256=primary[7][13],
+            backend_payload=primary[8],
+            exact_journal_sha256=primary[9][1],
+            control_journal_sha256=primary[10][2],
+            causal_journal_sha256=primary[11][11],
+        )
         return tuple(primary)
 
     monkeypatch.setattr(native_core, "full_native_alns_v2", return_current_instead_of_best)
-    with pytest.raises(RuntimeError, match="current state instead of global best"):
+    with pytest.raises(RuntimeError, match="best projection is invalid"):
         solve_alns(
             _fixture_instance(),
             seed=2014,

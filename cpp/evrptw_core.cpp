@@ -8781,6 +8781,228 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// Stage 5.2's full-native causal journal is deliberately a separate ABI
+// product from the historical semantic and storage journals.  The stream and
+// event codes are integer-only so a consumer never has to reconstruct order
+// from phase-specific Python projections.
+enum class NativeCausalStreamCode : std::int64_t {
+    operator_event = 0,
+    candidate_control = 1,
+    screening = 2,
+    cache = 3,
+    exact = 4,
+    stage04 = 5,
+    deadline = 6,
+    termination = 7,
+};
+
+enum class NativeCausalEventCode : std::int64_t {
+    candidate_plan = 1,
+    screening_decision = 2,
+    exact_route_result = 3,
+    deadline_boundary = 4,
+    termination = 5,
+    exact_work = 6,
+    cache_lookup = 7,
+    cache_store = 8,
+    operator_outcome = 9,
+    stage04_outcome = 10,
+    budget_boundary = 11,
+};
+
+class NativeCausalJournalV2 {
+public:
+    static constexpr std::size_t stream_count = 8;
+
+    struct Snapshot {
+        std::size_t row_count = 0;
+        std::array<std::int64_t, stream_count> stream_counts{};
+        bool terminal_recorded = false;
+    };
+
+    [[nodiscard]] Snapshot snapshot() const noexcept {
+        return Snapshot{event_ids_.size(), stream_counts_, terminal_recorded_};
+    }
+
+    void rollback_noexcept(const Snapshot& snapshot) noexcept {
+        event_ids_.resize(snapshot.row_count);
+        stream_codes_.resize(snapshot.row_count);
+        event_codes_.resize(snapshot.row_count);
+        lane_ids_.resize(snapshot.row_count);
+        operator_ids_.resize(snapshot.row_count);
+        iterations_.resize(snapshot.row_count);
+        transaction_ids_.resize(snapshot.row_count);
+        subject_ids_.resize(snapshot.row_count);
+        status_codes_.resize(snapshot.row_count);
+        flags_.resize(snapshot.row_count);
+        stream_counts_ = snapshot.stream_counts;
+        terminal_recorded_ = snapshot.terminal_recorded;
+    }
+
+    void append(
+        NativeCausalStreamCode stream,
+        NativeCausalEventCode event,
+        std::int64_t lane_id,
+        std::int64_t operator_id,
+        std::int64_t iteration,
+        std::int64_t transaction_id,
+        std::int64_t subject_id,
+        std::int64_t status_code,
+        std::int64_t flags) {
+        const auto stream_value = static_cast<std::int64_t>(stream);
+        if (stream_value < 0
+            || stream_value >= static_cast<std::int64_t>(stream_count)) {
+            throw std::invalid_argument("native causal stream code is invalid");
+        }
+        const auto event_value = static_cast<std::int64_t>(event);
+        if (event_value < static_cast<std::int64_t>(
+                NativeCausalEventCode::candidate_plan)
+            || event_value > static_cast<std::int64_t>(
+                NativeCausalEventCode::budget_boundary)) {
+            throw std::invalid_argument("native causal event code is invalid");
+        }
+        const auto event_matches_stream = [stream, event]() {
+            switch (stream) {
+            case NativeCausalStreamCode::operator_event:
+                return event == NativeCausalEventCode::operator_outcome;
+            case NativeCausalStreamCode::candidate_control:
+                return event == NativeCausalEventCode::candidate_plan;
+            case NativeCausalStreamCode::screening:
+                return event == NativeCausalEventCode::screening_decision;
+            case NativeCausalStreamCode::cache:
+                return event == NativeCausalEventCode::cache_lookup
+                    || event == NativeCausalEventCode::cache_store;
+            case NativeCausalStreamCode::exact:
+                return event == NativeCausalEventCode::exact_route_result
+                    || event == NativeCausalEventCode::exact_work;
+            case NativeCausalStreamCode::stage04:
+                return event == NativeCausalEventCode::stage04_outcome;
+            case NativeCausalStreamCode::deadline:
+                return event == NativeCausalEventCode::deadline_boundary
+                    || event == NativeCausalEventCode::budget_boundary;
+            case NativeCausalStreamCode::termination:
+                return event == NativeCausalEventCode::termination;
+            }
+            return false;
+        };
+        if (!event_matches_stream()) {
+            throw std::invalid_argument(
+                "native causal event does not belong to its stream");
+        }
+        if (terminal_recorded_) {
+            throw std::logic_error(
+                "native causal journal cannot append after termination");
+        }
+        if (iteration < -1 || status_code < 0 || flags < 0) {
+            throw std::invalid_argument("native causal event fields are invalid");
+        }
+        if (stream == NativeCausalStreamCode::deadline
+            || stream == NativeCausalStreamCode::termination) {
+            if (lane_id != -1 || operator_id != -1 || iteration < 0
+                || transaction_id != -1 || subject_id != -1) {
+                throw std::invalid_argument(
+                    "native causal boundary fields are invalid");
+            }
+            if (stream == NativeCausalStreamCode::termination) {
+                if (status_code > 3 || flags != 0) {
+                    throw std::invalid_argument(
+                        "native causal termination fields are invalid");
+                }
+            } else if (status_code < 1 || status_code > 3 || flags != 1
+                || (status_code == 2
+                    && event != NativeCausalEventCode::deadline_boundary)
+                || (status_code != 2
+                    && event != NativeCausalEventCode::budget_boundary)) {
+                throw std::invalid_argument(
+                    "native causal deadline fields are invalid");
+            }
+        } else if (lane_id < 0 || operator_id < 0 || transaction_id < 0
+            || subject_id < 0) {
+            throw std::invalid_argument(
+                "native causal transaction fields are invalid");
+        }
+        if (event_ids_.size()
+            > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) {
+            throw std::overflow_error("native causal journal event ID overflow");
+        }
+        const auto before = snapshot();
+        try {
+            const auto event_id = static_cast<std::int64_t>(event_ids_.size());
+            event_ids_.push_back(event_id);
+            stream_codes_.push_back(stream_value);
+            event_codes_.push_back(static_cast<std::int64_t>(event));
+            lane_ids_.push_back(lane_id);
+            operator_ids_.push_back(operator_id);
+            iterations_.push_back(iteration);
+            transaction_ids_.push_back(transaction_id);
+            subject_ids_.push_back(subject_id);
+            status_codes_.push_back(status_code);
+            flags_.push_back(flags);
+            ++stream_counts_[static_cast<std::size_t>(stream_value)];
+            terminal_recorded_ =
+                stream == NativeCausalStreamCode::termination;
+        } catch (...) {
+            rollback_noexcept(before);
+            throw;
+        }
+    }
+
+    [[nodiscard]] py::tuple payload() const {
+        const auto make_array = [](const std::vector<std::int64_t>& values) {
+            py::array_t<std::int64_t> output(values.size());
+            std::copy(values.begin(), values.end(), checked_data(output));
+            return output;
+        };
+        auto event_ids = make_array(event_ids_);
+        auto stream_codes = make_array(stream_codes_);
+        auto event_codes = make_array(event_codes_);
+        auto lane_ids = make_array(lane_ids_);
+        auto operator_ids = make_array(operator_ids_);
+        auto iterations = make_array(iterations_);
+        auto transaction_ids = make_array(transaction_ids_);
+        auto subject_ids = make_array(subject_ids_);
+        auto status_codes = make_array(status_codes_);
+        auto flags = make_array(flags_);
+        py::array_t<std::int64_t> stream_counts(stream_count);
+        std::copy(
+            stream_counts_.begin(), stream_counts_.end(),
+            checked_data(stream_counts));
+        std::string evidence("stage05.2-native-causal-journal-v2");
+        append_evidence_array(evidence, event_ids);
+        append_evidence_array(evidence, stream_codes);
+        append_evidence_array(evidence, event_codes);
+        append_evidence_array(evidence, lane_ids);
+        append_evidence_array(evidence, operator_ids);
+        append_evidence_array(evidence, iterations);
+        append_evidence_array(evidence, transaction_ids);
+        append_evidence_array(evidence, subject_ids);
+        append_evidence_array(evidence, status_codes);
+        append_evidence_array(evidence, flags);
+        append_evidence_array(evidence, stream_counts);
+        return py::make_tuple(
+            std::move(event_ids), std::move(stream_codes),
+            std::move(event_codes), std::move(lane_ids),
+            std::move(operator_ids), std::move(iterations),
+            std::move(transaction_ids), std::move(subject_ids),
+            std::move(status_codes), std::move(flags),
+            std::move(stream_counts), native_sha256_hex(evidence));
+    }
+
+private:
+    std::vector<std::int64_t> event_ids_;
+    std::vector<std::int64_t> stream_codes_;
+    std::vector<std::int64_t> event_codes_;
+    std::vector<std::int64_t> lane_ids_;
+    std::vector<std::int64_t> operator_ids_;
+    std::vector<std::int64_t> iterations_;
+    std::vector<std::int64_t> transaction_ids_;
+    std::vector<std::int64_t> subject_ids_;
+    std::vector<std::int64_t> status_codes_;
+    std::vector<std::int64_t> flags_;
+    std::array<std::int64_t, stream_count> stream_counts_{};
+    bool terminal_recorded_ = false;
+};
+
 class NativeSearchEngineV2 {
 public:
     NativeSearchEngineV2(
@@ -8994,6 +9216,10 @@ public:
                 "full native warm start requires at least one route");
         }
         const auto route_count = static_cast<std::int64_t>(offsets_array.size() - 1);
+        const auto warm_transaction_id = allocate_causal_transaction();
+        causal_context_ = {
+            stable_int63("initialization"), stable_int63("initial_solution"), -1};
+        causal_context_transaction_id_ = warm_transaction_id;
         const auto* warm_offsets = checked_data<std::int64_t>(offsets_array);
         if (warm_offsets[0] != 0
             || warm_offsets[route_count] != indices_array.size()) {
@@ -9098,7 +9324,8 @@ public:
             },
             warm_offsets, warm_indices, warm_negative_hits.data(), 0,
             std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - warm_screening_started).count());
+                std::chrono::steady_clock::now() - warm_screening_started).count(),
+            warm_transaction_id);
         if (std::any_of(
                 warm_screening.begin(), warm_screening.end(),
                 [](const evrptw::native_kernels::ScreenOutput& output) {
@@ -9114,6 +9341,9 @@ public:
             offsets_array, indices_array);
         auto warm_hit_flags_before = py::cast<py::array_t<std::int64_t>>(
             warm_lookup_before[0]);
+        append_causal_cache_events(
+            {stable_int63("initialization"), stable_int63("initial_solution"), -1},
+            warm_transaction_id, warm_hit_flags_before, false);
         if (std::any_of(
                 checked_data<std::int64_t>(warm_hit_flags_before),
                 checked_data<std::int64_t>(warm_hit_flags_before) + route_count,
@@ -9133,6 +9363,9 @@ public:
         }
         py::tuple initialized;
         const auto warm_exact_started = std::chrono::steady_clock::now();
+        append_causal_exact_work(
+            {stable_int63("initialization"), stable_int63("initial_solution"), -1},
+            warm_transaction_id, route_count);
         try {
             initialized = full_native_initialize_impl_v2(
                 node_kind_,
@@ -9174,7 +9407,8 @@ public:
             },
             offsets_array,
             indices_array,
-            exact_payload);
+            exact_payload,
+            warm_transaction_id);
 
         auto status_array = py::cast<py::array_t<std::int64_t>>(exact_payload[2]);
         auto reason_array = py::cast<py::array_t<std::int64_t>>(exact_payload[3]);
@@ -9266,9 +9500,28 @@ public:
             entry_bytes);
         route_cache_.prepare_store_commit();
         route_cache_.commit_store_batch_noexcept();
+        append_causal_cache_events(
+            {stable_int63("initialization"), stable_int63("initial_solution"), -1},
+            warm_transaction_id, warm_hit_flags_before, true);
+        // Candidate Control re-applies safe screening before accepting the
+        // newly cached warm incumbent.  Reuse the already proven output as a
+        // semantic-only decision; this is not a second physical kernel call.
+        record_screening_outputs(
+            warm_screening, std::vector<std::size_t>{}, warm_rows,
+            {
+                stable_int63("initialization"),
+                stable_int63("initial_solution"),
+                -1,
+            },
+            warm_offsets, warm_indices, warm_negative_hits.data(), 0, 0.0,
+            warm_transaction_id);
         auto warm_lookup_after = route_cache_.lookup_exact_many(
             offsets_array, indices_array);
-        static_cast<void>(warm_lookup_after);
+        auto warm_hit_flags_after = py::cast<py::array_t<std::int64_t>>(
+            warm_lookup_after[0]);
+        append_causal_cache_events(
+            {stable_int63("initialization"), stable_int63("initial_solution"), -1},
+            warm_transaction_id, warm_hit_flags_after, false);
         py::array_t<std::int64_t> initial_plan_offsets(2);
         checked_data(initial_plan_offsets)[0] = 0;
         checked_data(initial_plan_offsets)[1] = route_count;
@@ -9281,6 +9534,7 @@ public:
         ControlJournalBatch initial_control_journal;
         initial_control_journal.context = {
             stable_int63("initialization"), stable_int63("initial_solution"), -1};
+        initial_control_journal.transaction_id = warm_transaction_id;
         initial_control_journal.plan_offsets = {0, route_count};
         initial_control_journal.route_offsets.assign(
             route_offsets, route_offsets + route_count + 1);
@@ -9307,6 +9561,8 @@ public:
             checked_data<std::int64_t>(initial_budget_state)
                 + initial_budget_state.size());
         initial_control_journal.protocol_flags = {0, 0, 0, 0};
+        append_control_journal_causal(
+            std::list<ControlJournalBatch>{initial_control_journal});
         control_journal_.push_back(std::move(initial_control_journal));
         current_offsets_ = std::move(offsets_array);
         current_indices_ = std::move(indices_array);
@@ -9385,6 +9641,10 @@ public:
             throw std::invalid_argument(
                 "full native plan transaction context IDs are invalid");
         }
+        const auto causal_transaction_id = allocate_causal_transaction();
+        const auto causal_snapshot = causal_journal_.snapshot();
+        causal_context_ = {context[0], context[1], context[2]};
+        causal_context_transaction_id_ = causal_transaction_id;
         const auto remaining_seconds = checked_data<double>(deadline_array)[0];
         if (!std::isfinite(remaining_seconds) || remaining_seconds <= 0.0) {
             throw std::invalid_argument(
@@ -9584,7 +9844,8 @@ public:
             {context[0], context[1], context[2]},
             route_boundaries, route_nodes, negative_hits, negative_hit_count,
             std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - screening_started).count());
+                std::chrono::steady_clock::now() - screening_started).count(),
+            causal_transaction_id);
         std::vector<std::int64_t> rejected_offsets{0};
         std::vector<std::int64_t> rejected_indices;
         std::vector<std::int64_t> rejected_reasons;
@@ -9714,6 +9975,9 @@ public:
                 auto cached_metrics = py::cast<py::array_t<double>>(cached[5]);
                 auto cached_labels = py::cast<py::array_t<std::int64_t>>(cached[6]);
                 const auto* hits = checked_data<std::int64_t>(hit_flags);
+                append_causal_cache_events(
+                    {context[0], context[1], context[2]},
+                    causal_transaction_id, hit_flags, false);
                 std::vector<std::int64_t> missing_offsets{0};
                 std::vector<std::int64_t> missing_indices;
                 std::vector<std::size_t> missing_local_rows;
@@ -9802,6 +10066,9 @@ public:
                         checked_data(exact_deadline)[0] = 0.0;
                     }
                     exact_started = true;
+                    append_causal_exact_work(
+                        {context[0], context[1], context[2]},
+                        causal_transaction_id, requested_exact);
                     const auto candidate_exact_started =
                         std::chrono::steady_clock::now();
                     exact_payload = exact_charging_batch_numeric(
@@ -9874,7 +10141,8 @@ public:
                         },
                         missing_offsets_array,
                         missing_indices_array,
-                        exact_payload);
+                        exact_payload,
+                        causal_transaction_id);
                     auto semantic_hashes = exact_semantic_hashes(
                         missing_offsets_array, missing_indices_array, exact_payload);
                     auto entry_bytes = exact_entry_bytes(
@@ -9931,6 +10199,9 @@ public:
                 if (store_active) {
                     route_cache_.commit_store_batch();
                     store_active = false;
+                    append_causal_cache_events(
+                        {context[0], context[1], context[2]},
+                        causal_transaction_id, hit_flags, true);
                 }
             } catch (...) {
                 if (store_active) {
@@ -10010,6 +10281,7 @@ public:
         ControlJournalBatch control_journal_batch;
         std::copy(
             context, context + 3, control_journal_batch.context.begin());
+        control_journal_batch.transaction_id = causal_transaction_id;
         const auto copy_integer_array = [](const py::array_t<std::int64_t>& array) {
             return std::vector<std::int64_t>(
                 checked_data<std::int64_t>(array),
@@ -10189,6 +10461,8 @@ public:
             pending_budget_snapshot_.emplace(round_budget_snapshot);
             pending_candidate_exact_payload_ = transaction_exact_payload;
             pending_candidate_exact_ready_ = !feasible_plan_ids.empty();
+            pending_causal_snapshot_ = causal_snapshot;
+            append_control_journal_causal(staged_control_journal);
             pending_control_journal_.splice(
                 pending_control_journal_.end(), staged_control_journal);
             pending_composite_active_ = true;
@@ -10197,6 +10471,7 @@ public:
             attempted_mark_active = false;
             return result;
         }
+        append_control_journal_causal(staged_control_journal);
         route_cache_.commit_protocol_transaction_noexcept();
         round_protocol_active = false;
         if (negative_store_active) {
@@ -10220,6 +10495,7 @@ public:
             if (round_protocol_active) {
                 route_cache_.rollback_protocol_transaction_noexcept();
             }
+            causal_journal_.rollback_noexcept(causal_snapshot);
             rollback_round_budget_preserving_exact(round_budget_snapshot);
             throw;
         }
@@ -10269,6 +10545,8 @@ public:
             checked_data(empty_outcome), checked_data(empty_outcome) + 5,
             std::int64_t{-1});
         if (route_count <= 1) {
+            accumulate_full_stage04_outcome_noexcept(
+                2, false, 1, false, false, true);
             return py::make_tuple(
                 std::move(empty_profile_order), std::move(empty_attempts),
                 std::move(empty_plan_offsets), std::move(empty_route_offsets),
@@ -12321,7 +12599,8 @@ public:
         const auto customer = removed.front();
         auto insertion_pool = insertion_candidate_plans_v2_impl(
             partial_offsets_array, partial_indices_array, customer, demand_,
-            checked_data<double>(vehicle_)[1], screening_epsilon_, false);
+            checked_data<double>(vehicle_)[1], screening_epsilon_,
+            partial_offsets.size() == 1);
         auto insertion_plan_offsets_array =
             py::cast<py::array_t<std::int64_t>>(insertion_pool[0]);
         auto insertion_route_offsets_array =
@@ -12368,9 +12647,11 @@ public:
             }
             throw;
         }
-        if (repair_operation == 2 && selected_insertion.has_value()) {
-            // Python resolves energy-repair base routes only after at least
-            // one complete insertion plan is feasible.  Preserve the
+        if ((repair_operation == 1 || repair_operation == 2)
+            && selected_insertion.has_value()
+            && partial_offsets.size() > 1) {
+            // Python resolves Candidate Control base routes only after at
+            // least one complete insertion plan is feasible.  Preserve the
             // prepared candidate while the partial-base cache transaction is
             // evaluated; an empty feasible set must consume no base exact
             // work.
@@ -13811,6 +14092,15 @@ public:
         return output;
     }
 
+    std::int64_t main_stagnation_iterations() const {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        return main_stagnation_iterations_;
+    }
+
     py::tuple constraint_probe(
         std::int64_t operation,
         std::int64_t requested_count,
@@ -14767,6 +15057,12 @@ public:
             : static_cast<std::int64_t>(next_constraint_rng.weighted_index(
                 std::vector<double>(next_constraint_weights.begin(),
                                     next_constraint_weights.end())));
+        constexpr std::array<std::string_view, 4> operation_names{
+            "station_pressure",
+            "time_window_conflict",
+            "worst_energy_detour",
+            "shaw_related",
+        };
         auto selection = dynamic_removal_selection_v2(
             static_cast<std::int64_t>(all_customers_.size()),
             stagnation_iterations,
@@ -14774,6 +15070,11 @@ public:
             thresholds,
             fractions,
             global_best_reset);
+        // Python reserves a per-probe seed immediately after selecting the
+        // constraint operator, even when the dynamic removal count is zero.
+        // Consume it on every path so later weighted operator draws remain
+        // byte-for-byte aligned with random.Random.
+        const auto probe_seed = next_constraint_rng.randbelow(1ULL << 32U);
         const auto requested_count = checked_data<std::int64_t>(selection)[1];
         if (requested_count <= 0) {
             auto removal = constraint_removal_v2(
@@ -14801,12 +15102,27 @@ public:
             checked_data(outcome)[0] = operation;
             auto probe = py::make_tuple(
                 std::move(removal), py::none(), py::none());
+            causal_context_ = {
+                stable_int63("constraint_lane"),
+                stable_int63(
+                    operation_names[static_cast<std::size_t>(operation)]),
+                iteration};
+            causal_context_transaction_id_ = allocate_causal_transaction();
+            accumulate_constraint_stage04_outcome_noexcept(
+                static_cast<std::size_t>(operation), false, 1, false, false,
+                next_segment_rewards, next_segment_calls, next_totals);
             *constraint_rng_ = std::move(next_constraint_rng);
+            constraint_weights_ = next_constraint_weights;
+            constraint_segment_rewards_ = next_segment_rewards;
+            constraint_segment_calls_ = next_segment_calls;
+            constraint_totals_ = next_totals;
+            accumulate_full_stage04_outcome_noexcept(
+                static_cast<std::size_t>(operation + 9), false, 1, false,
+                false, true);
             last_completed_constraint_iteration_ = iteration;
             return py::make_tuple(
                 std::move(selection), std::move(probe), std::move(outcome));
         }
-        const auto probe_seed = next_constraint_rng.randbelow(1ULL << 32U);
         py::array_t<std::int64_t> outcome(6);
         auto* outcome_values = checked_data(outcome);
         outcome_values[0] = operation;
@@ -14820,12 +15136,6 @@ public:
         result[2] = outcome;
         py::array_t<std::int64_t> context_ids(3);
         auto* context = checked_data(context_ids);
-        constexpr std::array<std::string_view, 4> operation_names{
-            "station_pressure",
-            "time_window_conflict",
-            "worst_energy_detour",
-            "shaw_related",
-        };
         context[0] = stable_int63("constraint_lane");
         context[1] = stable_int63(
             operation_names[static_cast<std::size_t>(operation)]);
@@ -15336,15 +15646,18 @@ public:
             throw std::runtime_error(
                 "full native search engine must be initialized and configured");
         }
-        if (start_iteration != 0 || iteration_count != 1
-            || last_finished_stage04_iteration_ != -1
-            || current_offsets_.size() != 2) {
+        if (start_iteration < 0 || iteration_count != 1
+            || (start_iteration == 0
+                && (last_finished_stage04_iteration_ != -1
+                    || current_offsets_.size() != 2))
+            || (start_iteration > 0
+                && last_finished_stage04_iteration_ != start_iteration - 1)) {
             throw std::invalid_argument(
-                "native global controller currently requires the one-route bootstrap iteration");
+                "native global controller iteration is not the active one-route round");
         }
-        if (initial_stagnation_iterations != 0) {
+        if (initial_stagnation_iterations < 0) {
             throw std::invalid_argument(
-                "native global bootstrap requires zero initial stagnation");
+                "native global controller stagnation cannot be negative");
         }
         auto threshold_array = owned_array_copy<std::int64_t>(
             thresholds, "thresholds", 1);
@@ -15359,10 +15672,10 @@ public:
             || checked_data<double>(deadline_array)[0] <= 0.0
             || checked_data<std::int64_t>(batch_array)[0] <= 0) {
             throw std::invalid_argument(
-                "native global bootstrap arrays are invalid");
+                "native global controller arrays are invalid");
         }
         const auto entry_budget = budget_.native_snapshot();
-        const auto make_empty_terminal = [this](
+        const auto make_empty_terminal = [this, start_iteration](
             std::int64_t reason,
             const NativeBudgetStateV2::NativeSnapshot& entry,
             const NativeBudgetStateV2::NativeSnapshot& final) {
@@ -15392,9 +15705,9 @@ public:
             py::array_t<std::int64_t> termination(11);
             auto* terminal_values = checked_data(termination);
             terminal_values[0] = reason;
-            terminal_values[1] = 0;
+            terminal_values[1] = start_iteration;
             terminal_values[2] = 0;
-            terminal_values[3] = 0;
+            terminal_values[3] = start_iteration;
             terminal_values[4] = budget_.exact_budget_;
             terminal_values[5] = entry.started;
             terminal_values[6] = entry.completed;
@@ -15457,6 +15770,9 @@ public:
             std::array<std::array<std::int64_t, 8>, 4> constraint_totals;
             std::int64_t last_finished_stage04_iteration;
             std::int64_t last_completed_constraint_iteration;
+            std::int64_t main_stagnation_iterations;
+            bool last_iteration_global_best_improved;
+            NativeCausalJournalV2::Snapshot causal;
         };
         GlobalSearchSnapshot snapshot{
             entry_budget,
@@ -15470,7 +15786,9 @@ public:
             constraint_rng_, constraint_weights_, constraint_segment_rewards_,
             constraint_segment_calls_, constraint_totals_,
             last_finished_stage04_iteration_,
-            last_completed_constraint_iteration_};
+            last_completed_constraint_iteration_,
+            main_stagnation_iterations_, last_iteration_global_best_improved_,
+            causal_journal_.snapshot()};
         defer_global_commit_ = true;
         ScopeRollback rollback(
             [this, snapshot = std::move(snapshot)]() mutable noexcept {
@@ -15478,6 +15796,7 @@ public:
                     rollback_pending_composite();
                 }
                 budget_.rollback_outer_preserving_exact_noexcept(snapshot.budget);
+                causal_journal_.rollback_noexcept(snapshot.causal);
                 defer_composite_commit_ = false;
                 defer_iteration_commit_ = false;
                 defer_global_commit_ = false;
@@ -15516,14 +15835,17 @@ public:
                     snapshot.last_finished_stage04_iteration;
                 last_completed_constraint_iteration_ =
                     snapshot.last_completed_constraint_iteration;
+                main_stagnation_iterations_ = snapshot.main_stagnation_iterations;
+                last_iteration_global_best_improved_ =
+                    snapshot.last_iteration_global_best_improved;
             });
         const auto previous_distance =
             checked_data<double>(current_objective_float_)[0];
         py::tuple constraint;
         try {
             constraint = constraint_iteration(
-                0,
-                0,
+                start_iteration,
+                initial_stagnation_iterations,
                 false,
                 threshold_array,
                 fraction_array,
@@ -15560,12 +15882,14 @@ public:
             if (!probe[2].is_none()
                 || checked_data<std::int64_t>(removal_metadata)[0] != 2
                 || selection_values[1] != 0
-                || outcome_values[0] != 0
+                || outcome_values[0] < 0 || outcome_values[0] >= 4
                 || outcome_values[2] != 0) {
                 throw std::logic_error(
                     "native global no-removable bootstrap is inconsistent");
             }
-            auto stage_boundary = finish_stage04_iteration(0, false);
+            last_iteration_global_best_improved_ = false;
+            main_stagnation_iterations_ = initial_stagnation_iterations + 1;
+            auto stage_boundary = finish_stage04_iteration(start_iteration, false);
             py::array_t<std::int64_t> events(
                 {py::ssize_t(3), py::ssize_t(26)});
             std::fill(
@@ -15573,6 +15897,7 @@ public:
                 std::int64_t{0});
             const auto initialize_event = [&](py::ssize_t row) {
                 auto* event = checked_data(events) + row * 26;
+                event[2] = start_iteration;
                 event[16] = -1;
                 event[17] = -1;
                 event[20] = -2;
@@ -15585,7 +15910,7 @@ public:
             quality[3] = 4;
             auto* constraint_event = initialize_event(1);
             constraint_event[1] = 2;
-            constraint_event[3] = 9;
+            constraint_event[3] = 9 + outcome_values[0];
             constraint_event[5] = 4;
             constraint_event[15] = 2;
             constraint_event[24] = 0;
@@ -15655,9 +15980,9 @@ public:
             py::array_t<std::int64_t> termination(11);
             auto* terminal_values = checked_data(termination);
             terminal_values[0] = 0;
-            terminal_values[1] = 0;
+            terminal_values[1] = start_iteration;
             terminal_values[2] = 1;
-            terminal_values[3] = 1;
+            terminal_values[3] = start_iteration + 1;
             terminal_values[4] = budget_.exact_budget_;
             terminal_values[5] = entry_budget.started;
             terminal_values[6] = entry_budget.completed;
@@ -15703,8 +16028,12 @@ public:
         }
         const auto candidate_feasible = outcome_values[2] != 0;
         const auto budget_boundary = budget_.budget_reached();
+        last_iteration_global_best_improved_ =
+            candidate_feasible && outcome_values[4] != 0;
+        main_stagnation_iterations_ = last_iteration_global_best_improved_
+            ? 0 : initial_stagnation_iterations + 1;
         auto stage_boundary = finish_stage04_iteration(
-            0, budget_boundary);
+            start_iteration, budget_boundary);
 
         const py::ssize_t event_count = budget_boundary ? 3 : 4;
         py::array_t<std::int64_t> events({event_count, py::ssize_t(26)});
@@ -15713,6 +16042,7 @@ public:
             std::int64_t{0});
         const auto initialize_event = [&](py::ssize_t row) {
             auto* event = checked_data(events) + row * 26;
+            event[2] = start_iteration;
             event[16] = -1;
             event[17] = -1;
             event[20] = -2;
@@ -15896,9 +16226,9 @@ public:
         py::array_t<std::int64_t> termination(11);
         auto* terminal_values = checked_data(termination);
         terminal_values[0] = budget_boundary ? 1 : 0;
-        terminal_values[1] = 0;
+        terminal_values[1] = start_iteration;
         terminal_values[2] = 1;
-        terminal_values[3] = 1;
+        terminal_values[3] = start_iteration + 1;
         terminal_values[4] = budget_.exact_budget_;
         terminal_values[5] = entry_budget.started;
         terminal_values[6] = entry_budget.completed;
@@ -16345,6 +16675,7 @@ private:
 
     struct ControlJournalBatch {
         std::array<std::int64_t, 3> context{};
+        std::int64_t transaction_id = -1;
         std::vector<std::int64_t> plan_offsets;
         std::vector<std::int64_t> route_offsets;
         std::vector<std::int64_t> route_indices;
@@ -16400,6 +16731,7 @@ private:
     bool pending_attempted_mark_ = false;
     std::optional<NativeBudgetStateV2::NativeSnapshot> pending_budget_snapshot_;
     std::list<ControlJournalBatch> pending_control_journal_;
+    std::optional<NativeCausalJournalV2::Snapshot> pending_causal_snapshot_;
     bool pending_candidate_exact_ready_ = false;
     py::tuple pending_candidate_exact_payload_;
     std::int64_t depot_ = -1;
@@ -16438,6 +16770,10 @@ private:
     std::vector<std::int64_t> exact_launch_occupancies_;
     std::vector<ExactJournalBatch> exact_journal_;
     std::list<ControlJournalBatch> control_journal_;
+    NativeCausalJournalV2 causal_journal_;
+    std::int64_t next_causal_transaction_id_ = 0;
+    std::array<std::int64_t, 3> causal_context_{-1, -1, -1};
+    std::int64_t causal_context_transaction_id_ = -1;
     std::vector<ScreeningJournalRow> screening_journal_;
     // Semantic route decisions and physical kernel calls are distinct because
     // a native transaction may deduplicate repeated route sequences.
@@ -16687,6 +17023,25 @@ private:
         bool is_global_best,
         bool vehicle_reduction,
         bool adaptive) noexcept {
+        const auto outcome_flags = (comparison < 0 ? std::int64_t{1}
+            : comparison == 0 ? std::int64_t{2} : std::int64_t{4})
+            | (is_global_best ? std::int64_t{8} : std::int64_t{0})
+            | (vehicle_reduction ? std::int64_t{16} : std::int64_t{0})
+            | (adaptive ? std::int64_t{32} : std::int64_t{0});
+        causal_journal_.append(
+            NativeCausalStreamCode::operator_event,
+            NativeCausalEventCode::operator_outcome,
+            causal_context_[0], static_cast<std::int64_t>(operation),
+            causal_context_[2], causal_context_transaction_id_,
+            static_cast<std::int64_t>(operation), accepted ? 1 : 0,
+            outcome_flags);
+        causal_journal_.append(
+            NativeCausalStreamCode::stage04,
+            NativeCausalEventCode::stage04_outcome,
+            causal_context_[0], static_cast<std::int64_t>(operation),
+            causal_context_[2], causal_context_transaction_id_,
+            static_cast<std::int64_t>(operation), accepted ? 1 : 0,
+            outcome_flags);
         auto& totals = full_operator_totals_[operation];
         ++totals[0];
         auto reward = stage04_rewards_[0];
@@ -16809,7 +17164,8 @@ private:
         const std::array<std::int64_t, 3>& context,
         const py::array_t<std::int64_t>& route_offsets,
         const py::array_t<std::int64_t>& route_indices,
-        const py::tuple& exact_payload) {
+        const py::tuple& exact_payload,
+        const std::int64_t transaction_id) {
         if (exact_payload.size() != 7 || route_offsets.size() < 2) {
             throw std::logic_error(
                 "full native exact journal received an invalid batch");
@@ -16860,6 +17216,13 @@ private:
                 checked_data<std::int64_t>(labels) + route * 3,
                 checked_data<std::int64_t>(labels) + (route + 1) * 3,
                 result.label_counters.begin());
+            const auto flags = std::int64_t{1} | std::int64_t{2}
+                | (result.status == 0 ? std::int64_t{4} : std::int64_t{0});
+            causal_journal_.append(
+                NativeCausalStreamCode::exact,
+                NativeCausalEventCode::exact_route_result,
+                context[0], context[1], context[2], transaction_id,
+                static_cast<std::int64_t>(route), result.status, flags);
             batch.results.push_back(std::move(result));
         }
         exact_journal_.push_back(std::move(batch));
@@ -16874,7 +17237,8 @@ private:
         const std::int64_t* route_indices,
         const std::int64_t* negative_hits,
         std::int64_t negative_cache_hits,
-        double elapsed_seconds) {
+        double elapsed_seconds,
+        const std::int64_t transaction_id) {
         screening_statistics_[0] += static_cast<std::int64_t>(
             semantic_rows.size());
         screening_statistics_[3] += negative_cache_hits;
@@ -16912,20 +17276,151 @@ private:
                 output.metrics.begin(), output.metrics.end(), journal.metrics.begin());
             journal.flags[0] = physically_evaluated.contains(unique_row) ? 1 : 0;
             journal.flags[1] = negative_hits[unique_row] != 0 ? 1 : 0;
-            journal.flags[2] = physical_owner_recorded.insert(unique_row).second ? 1 : 0;
+            journal.flags[2] = (
+                physically_evaluated.contains(unique_row)
+                && physical_owner_recorded.insert(unique_row).second)
+                ? 1
+                : 0;
             journal.flags[3] = journal.flags[2] != 0
                 ? output.reachability_queries : 0;
+            const auto flags = journal.flags[0]
+                | (journal.flags[1] << 1)
+                | (journal.flags[2] << 2)
+                | (journal.flags[3] << 8);
+            causal_journal_.append(
+                NativeCausalStreamCode::screening,
+                NativeCausalEventCode::screening_decision,
+                context[0], context[1], context[2], transaction_id,
+                static_cast<std::int64_t>(semantic), output.codes[0], flags);
             screening_journal_.push_back(std::move(journal));
         }
         screening_seconds_ += elapsed_seconds;
     }
 
+    void append_control_journal_causal(
+        const std::list<ControlJournalBatch>& batches) {
+        const auto before = causal_journal_.snapshot();
+        try {
+            for (const auto& batch : batches) {
+                const auto plan_count = batch.plan_offsets.size() - 1;
+                if (batch.decision_codes.size() != plan_count
+                    || batch.statuses.size() != plan_count) {
+                    throw std::logic_error(
+                        "full native causal control batch shape is invalid");
+                }
+                const auto selected = [&batch](const std::size_t plan) {
+                    return std::find(
+                        batch.selected.begin(), batch.selected.end(),
+                        static_cast<std::int64_t>(plan)) != batch.selected.end();
+                };
+                for (std::size_t plan = 0; plan < plan_count; ++plan) {
+                    const auto decision = batch.decision_codes[plan];
+                    const auto flags = (selected(plan) ? std::int64_t{1} : 0)
+                        | (batch.statuses[plan] == 5 ? std::int64_t{2} : 0);
+                    causal_journal_.append(
+                        NativeCausalStreamCode::candidate_control,
+                        NativeCausalEventCode::candidate_plan,
+                        batch.context[0], batch.context[1], batch.context[2],
+                        batch.transaction_id,
+                        static_cast<std::int64_t>(plan), decision, flags);
+                }
+            }
+        } catch (...) {
+            causal_journal_.rollback_noexcept(before);
+            throw;
+        }
+    }
+
+    void append_causal_cache_events(
+        const std::array<std::int64_t, 3>& context,
+        const std::int64_t transaction_id,
+        const py::array_t<std::int64_t>& hit_flags,
+        const bool store) {
+        const auto* hits = checked_data<std::int64_t>(hit_flags);
+        const auto before = causal_journal_.snapshot();
+        try {
+            for (py::ssize_t route = 0; route < hit_flags.size(); ++route) {
+                // A store receipt is emitted only for an actual cache miss;
+                // cache lookups retain both hit and miss decisions.
+                if (store && hits[route] != 0) {
+                    continue;
+                }
+                causal_journal_.append(
+                    NativeCausalStreamCode::cache,
+                    store ? NativeCausalEventCode::cache_store
+                          : NativeCausalEventCode::cache_lookup,
+                    context[0], context[1], context[2], transaction_id,
+                    static_cast<std::int64_t>(route), hits[route],
+                    store ? std::int64_t{2} : std::int64_t{1});
+            }
+        } catch (...) {
+            causal_journal_.rollback_noexcept(before);
+            throw;
+        }
+    }
+
+    void append_causal_exact_work(
+        const std::array<std::int64_t, 3>& context,
+        const std::int64_t transaction_id,
+        const std::int64_t route_count) {
+        causal_journal_.append(
+            NativeCausalStreamCode::exact,
+            NativeCausalEventCode::exact_work,
+            context[0], context[1], context[2], transaction_id,
+            route_count, route_count, 1);
+    }
+
+    [[nodiscard]] std::int64_t allocate_causal_transaction() noexcept {
+        return next_causal_transaction_id_++;
+    }
+
+public:
+    void append_causal_termination(
+        const std::int64_t reason,
+        const std::int64_t completed_iterations) {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (!initialized_ || pending_composite_active_) {
+            throw std::runtime_error(
+                "full native causal termination is not at a committed boundary");
+        }
+        if (reason == 1 || reason == 2 || reason == 3) {
+            causal_journal_.append(
+                NativeCausalStreamCode::deadline,
+                reason == 2 ? NativeCausalEventCode::deadline_boundary
+                             : NativeCausalEventCode::budget_boundary,
+                -1, -1, completed_iterations, -1, -1, reason, 1);
+        }
+        causal_journal_.append(
+            NativeCausalStreamCode::termination,
+            NativeCausalEventCode::termination,
+            -1, -1, completed_iterations, -1, -1, reason, 0);
+    }
+
+    [[nodiscard]] py::tuple causal_journal_payload() const {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (!initialized_ || pending_composite_active_) {
+            throw std::runtime_error(
+                "full native causal journal is not at a committed boundary");
+        }
+        return causal_journal_.payload();
+    }
+
+private:
     void clear_pending_composite_noexcept() noexcept {
         pending_round_protocol_ = false;
         pending_negative_store_ = false;
         pending_attempted_mark_ = false;
         pending_budget_snapshot_.reset();
         pending_candidate_exact_ready_ = false;
+        pending_causal_snapshot_.reset();
         pending_control_journal_.clear();
         pending_composite_active_ = false;
     }
@@ -16960,6 +17455,9 @@ private:
         }
         if (pending_round_protocol_) {
             route_cache_.rollback_protocol_transaction_noexcept();
+        }
+        if (pending_causal_snapshot_.has_value()) {
+            causal_journal_.rollback_noexcept(*pending_causal_snapshot_);
         }
         const auto budget_snapshot = *pending_budget_snapshot_;
         clear_pending_composite_noexcept();
@@ -17329,7 +17827,12 @@ py::tuple full_native_alns_v2(
         checked_data(fractions));
     py::array_t<std::int64_t> batch(1);
     checked_data(batch)[0] = base_control_values[2];
-    const auto three_lane = initial_offsets.size() > 2;
+    // Every Stage 2.3 solve owns the same legacy, quality-shadow, and
+    // constraint lanes, including a warm start that currently contains only
+    // one route.  Route count is search state, not an execution-mode switch:
+    // routing one-route solves through the old global prototype would replace
+    // the real operator/RNG/Stage 4 trajectory with a synthetic event window.
+    const auto three_lane = true;
     py::tuple global;
     py::tuple terminal_global;
     std::optional<py::array_t<std::int64_t>> terminal_override;
@@ -17464,10 +17967,338 @@ py::tuple full_native_alns_v2(
                 std::move(semantic_iterations), native_sha256_hex(semantic_evidence));
         }
     } else {
-        global = engine.run_global_search(
-            0, base_control_values[1], 0, thresholds, fractions,
-            deadline, batch, -1);
-        terminal_global = global;
+        // The global semantic controller emits one canonical round at a time.
+        // Keep that transaction boundary intact while aggregating the rounds
+        // into the flat payload consumed by the full-native result envelope.
+        // This is the one-route counterpart of the multi-route bootstrap /
+        // follow-up stream; no Python-side or scalar fallback is involved.
+        py::list round_payloads;
+        std::int64_t stagnation_iterations = 0;
+        std::int64_t completed_rounds = 0;
+        std::int64_t terminal_reason = 0;
+        py::array_t<std::int64_t> first_termination;
+        py::array_t<std::int64_t> last_termination;
+        for (std::int64_t iteration = 0;
+             iteration < base_control_values[1]; ++iteration) {
+            const auto elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - solve_started).count();
+            const auto remaining = checked_data<double>(deadline)[0] - elapsed;
+            if (remaining <= 0.0) {
+                terminal_reason = 2;
+                break;
+            }
+            py::array_t<double> round_deadline(1);
+            checked_data(round_deadline)[0] = remaining;
+            auto round = engine.run_global_search(
+                iteration, 1, stagnation_iterations, thresholds, fractions,
+                round_deadline, batch, -1);
+            auto round_termination = py::cast<py::array_t<std::int64_t>>(
+                round[13]);
+            if (iteration == 0) {
+                first_termination = round_termination;
+            }
+            last_termination = round_termination;
+            const auto* round_terminal = checked_data<std::int64_t>(
+                round_termination);
+            const auto round_reason = round_terminal[0];
+            const auto round_completed = round_terminal[2];
+            if (round_reason == 0 || round_reason == 1) {
+                if (round_reason == 1 && round_completed == 0) {
+                    terminal_reason = 1;
+                    break;
+                }
+                if (round_completed != 1) {
+                    throw std::logic_error(
+                        "native global round completion count is invalid");
+                }
+                ++completed_rounds;
+                stagnation_iterations = engine.main_stagnation_iterations();
+                round_payloads.append(round);
+                terminal_reason = round_reason;
+            } else if (round_reason == 2) {
+                terminal_reason = 2;
+                if (round_completed != 0) {
+                    throw std::logic_error(
+                        "native global interrupted round is not empty");
+                }
+                break;
+            } else {
+                throw std::logic_error(
+                    "native global round returned an unknown termination reason");
+            }
+            if (round_reason != 0) {
+                break;
+            }
+        }
+        if (round_payloads.size() == 0) {
+            if (!first_termination || terminal_reason != 1) {
+                throw std::logic_error(
+                    "native global controller produced no terminal payload");
+            }
+            py::array_t<std::int64_t> events(
+                py::array::ShapeContainer{0, 26});
+            py::array_t<double> ranking(0);
+            py::array_t<std::int64_t> removed_offsets(1);
+            py::array_t<std::int64_t> removed_indices(0);
+            py::array_t<std::int64_t> plan_offsets(1);
+            py::array_t<std::int64_t> route_offsets(1);
+            py::array_t<std::int64_t> route_indices(0);
+            py::array_t<std::int64_t> objective_integer(
+                py::array::ShapeContainer{0, 2});
+            py::array_t<double> objective_float(
+                py::array::ShapeContainer{0, 2});
+            py::array_t<std::int64_t> stage_status(
+                py::array::ShapeContainer{0, 4});
+            py::array_t<double> stage_weights(
+                py::array::ShapeContainer{0, 4, 2});
+            py::array_t<std::int64_t> stage_calls(
+                py::array::ShapeContainer{0, 4});
+            py::array_t<double> stage_rewards(
+                py::array::ShapeContainer{0, 4});
+            checked_data(removed_offsets)[0] = 0;
+            checked_data(plan_offsets)[0] = 0;
+            checked_data(route_offsets)[0] = 0;
+            py::array_t<std::int64_t> termination(11);
+            auto* terminal_values = checked_data(termination);
+            const auto* first_values = checked_data<std::int64_t>(first_termination);
+            terminal_values[0] = 1;
+            terminal_values[1] = 0;
+            terminal_values[2] = 0;
+            terminal_values[3] = 0;
+            std::copy(first_values + 4, first_values + 11, terminal_values + 4);
+            std::string evidence(
+                "stage05.2-native-global-semantic-stream-v2");
+            append_evidence_array(evidence, events);
+            append_evidence_array(evidence, ranking);
+            append_evidence_array(evidence, removed_offsets);
+            append_evidence_array(evidence, removed_indices);
+            append_evidence_array(evidence, plan_offsets);
+            append_evidence_array(evidence, route_offsets);
+            append_evidence_array(evidence, route_indices);
+            append_evidence_array(evidence, objective_integer);
+            append_evidence_array(evidence, objective_float);
+            append_evidence_array(evidence, stage_status);
+            append_evidence_array(evidence, stage_weights);
+            append_evidence_array(evidence, stage_calls);
+            append_evidence_array(evidence, stage_rewards);
+            append_evidence_array(evidence, termination);
+            global = py::make_tuple(
+                std::move(events), std::move(ranking),
+                std::move(removed_offsets), std::move(removed_indices),
+                std::move(plan_offsets), std::move(route_offsets),
+                std::move(route_indices), std::move(objective_integer),
+                std::move(objective_float), std::move(stage_status),
+                std::move(stage_weights), std::move(stage_calls),
+                std::move(stage_rewards), std::move(termination),
+                native_sha256_hex(evidence));
+            terminal_global = global;
+        } else {
+            std::vector<std::int64_t> event_values;
+            std::vector<double> ranking_values;
+            std::vector<std::int64_t> removed_offsets{0};
+            std::vector<std::int64_t> removed_indices;
+            std::vector<std::int64_t> plan_offsets{0};
+            std::vector<std::int64_t> route_offsets{0};
+            std::vector<std::int64_t> route_indices;
+            std::vector<std::int64_t> objective_integer_values;
+            std::vector<double> objective_float_values;
+            std::vector<std::int64_t> stage_status_values;
+            std::vector<double> stage_weight_values;
+            std::vector<std::int64_t> stage_call_values;
+            std::vector<double> stage_reward_values;
+            std::int64_t route_count_base = 0;
+            for (const auto& item : round_payloads) {
+                auto round = py::cast<py::tuple>(item);
+                auto round_events = py::cast<py::array_t<std::int64_t>>(round[0]);
+                auto round_ranking = py::cast<py::array_t<double>>(round[1]);
+                auto round_removed_offsets =
+                    py::cast<py::array_t<std::int64_t>>(round[2]);
+                auto round_removed_indices =
+                    py::cast<py::array_t<std::int64_t>>(round[3]);
+                auto round_plan_offsets =
+                    py::cast<py::array_t<std::int64_t>>(round[4]);
+                auto round_route_offsets =
+                    py::cast<py::array_t<std::int64_t>>(round[5]);
+                auto round_route_indices =
+                    py::cast<py::array_t<std::int64_t>>(round[6]);
+                auto round_objective_integer =
+                    py::cast<py::array_t<std::int64_t>>(round[7]);
+                auto round_objective_float =
+                    py::cast<py::array_t<double>>(round[8]);
+                auto round_stage_status =
+                    py::cast<py::array_t<std::int64_t>>(round[9]);
+                auto round_stage_weights =
+                    py::cast<py::array_t<double>>(round[10]);
+                auto round_stage_calls =
+                    py::cast<py::array_t<std::int64_t>>(round[11]);
+                auto round_stage_rewards =
+                    py::cast<py::array_t<double>>(round[12]);
+                const auto event_count = round_events.shape(0);
+                event_values.insert(
+                    event_values.end(), checked_data<std::int64_t>(round_events),
+                    checked_data<std::int64_t>(round_events)
+                        + event_count * 26);
+                ranking_values.insert(
+                    ranking_values.end(), checked_data<double>(round_ranking),
+                    checked_data<double>(round_ranking) + event_count);
+                const auto removed_base = removed_indices.size();
+                for (py::ssize_t index = 1;
+                     index < round_removed_offsets.size(); ++index) {
+                    removed_offsets.push_back(
+                        static_cast<std::int64_t>(removed_base)
+                        + checked_data<std::int64_t>(round_removed_offsets)[index]);
+                }
+                removed_indices.insert(
+                    removed_indices.end(),
+                    checked_data<std::int64_t>(round_removed_indices),
+                    checked_data<std::int64_t>(round_removed_indices)
+                        + round_removed_indices.size());
+                const auto plan_base = route_count_base;
+                for (py::ssize_t index = 1;
+                     index < round_plan_offsets.size(); ++index) {
+                    plan_offsets.push_back(
+                        plan_base
+                        + checked_data<std::int64_t>(round_plan_offsets)[index]);
+                }
+                const auto route_base = route_indices.size();
+                for (py::ssize_t index = 1;
+                     index < round_route_offsets.size(); ++index) {
+                    route_offsets.push_back(
+                        static_cast<std::int64_t>(route_base)
+                        + checked_data<std::int64_t>(round_route_offsets)[index]);
+                }
+                route_count_base += round_route_offsets.size() - 1;
+                route_indices.insert(
+                    route_indices.end(),
+                    checked_data<std::int64_t>(round_route_indices),
+                    checked_data<std::int64_t>(round_route_indices)
+                        + round_route_indices.size());
+                objective_integer_values.insert(
+                    objective_integer_values.end(),
+                    checked_data<std::int64_t>(round_objective_integer),
+                    checked_data<std::int64_t>(round_objective_integer)
+                        + event_count * 2);
+                objective_float_values.insert(
+                    objective_float_values.end(),
+                    checked_data<double>(round_objective_float),
+                    checked_data<double>(round_objective_float)
+                        + event_count * 2);
+                stage_status_values.insert(
+                    stage_status_values.end(),
+                    checked_data<std::int64_t>(round_stage_status),
+                    checked_data<std::int64_t>(round_stage_status)
+                        + round_stage_status.size());
+                stage_weight_values.insert(
+                    stage_weight_values.end(),
+                    checked_data<double>(round_stage_weights),
+                    checked_data<double>(round_stage_weights)
+                        + round_stage_weights.size());
+                stage_call_values.insert(
+                    stage_call_values.end(),
+                    checked_data<std::int64_t>(round_stage_calls),
+                    checked_data<std::int64_t>(round_stage_calls)
+                        + round_stage_calls.size());
+                stage_reward_values.insert(
+                    stage_reward_values.end(),
+                    checked_data<double>(round_stage_rewards),
+                    checked_data<double>(round_stage_rewards)
+                        + round_stage_rewards.size());
+            }
+            const auto event_count = ranking_values.size();
+            py::array_t<std::int64_t> events({
+                static_cast<py::ssize_t>(event_count), py::ssize_t(26)});
+            std::copy(event_values.begin(), event_values.end(), checked_data(events));
+            py::array_t<double> ranking(event_count);
+            std::copy(ranking_values.begin(), ranking_values.end(), checked_data(ranking));
+            py::array_t<std::int64_t> removed_offsets_array(removed_offsets.size());
+            std::copy(
+                removed_offsets.begin(), removed_offsets.end(),
+                checked_data(removed_offsets_array));
+            py::array_t<std::int64_t> removed_indices_array(removed_indices.size());
+            std::copy(
+                removed_indices.begin(), removed_indices.end(),
+                checked_data(removed_indices_array));
+            py::array_t<std::int64_t> plan_offsets_array(plan_offsets.size());
+            std::copy(
+                plan_offsets.begin(), plan_offsets.end(),
+                checked_data(plan_offsets_array));
+            py::array_t<std::int64_t> route_offsets_array(route_offsets.size());
+            std::copy(
+                route_offsets.begin(), route_offsets.end(),
+                checked_data(route_offsets_array));
+            py::array_t<std::int64_t> route_indices_array(route_indices.size());
+            std::copy(
+                route_indices.begin(), route_indices.end(),
+                checked_data(route_indices_array));
+            py::array_t<std::int64_t> objective_integer({
+                static_cast<py::ssize_t>(event_count), py::ssize_t(2)});
+            std::copy(
+                objective_integer_values.begin(), objective_integer_values.end(),
+                checked_data(objective_integer));
+            py::array_t<double> objective_float({
+                static_cast<py::ssize_t>(event_count), py::ssize_t(2)});
+            std::copy(
+                objective_float_values.begin(), objective_float_values.end(),
+                checked_data(objective_float));
+            py::array_t<std::int64_t> stage_status({
+                static_cast<py::ssize_t>(completed_rounds), py::ssize_t(4)});
+            std::copy(
+                stage_status_values.begin(), stage_status_values.end(),
+                checked_data(stage_status));
+            py::array_t<double> stage_weights({
+                static_cast<py::ssize_t>(completed_rounds), py::ssize_t(4),
+                py::ssize_t(2)});
+            std::copy(
+                stage_weight_values.begin(), stage_weight_values.end(),
+                checked_data(stage_weights));
+            py::array_t<std::int64_t> stage_calls({
+                static_cast<py::ssize_t>(completed_rounds), py::ssize_t(4)});
+            std::copy(
+                stage_call_values.begin(), stage_call_values.end(),
+                checked_data(stage_calls));
+            py::array_t<double> stage_rewards({
+                static_cast<py::ssize_t>(completed_rounds), py::ssize_t(4)});
+            std::copy(
+                stage_reward_values.begin(), stage_reward_values.end(),
+                checked_data(stage_rewards));
+            py::array_t<std::int64_t> termination(11);
+            auto* terminal_values = checked_data(termination);
+            terminal_values[0] = terminal_reason;
+            terminal_values[1] = 0;
+            terminal_values[2] = completed_rounds;
+            terminal_values[3] = completed_rounds;
+            const auto* first_values = checked_data<std::int64_t>(first_termination);
+            const auto* last_values = checked_data<std::int64_t>(last_termination);
+            terminal_values[4] = last_values[4];
+            std::copy(first_values + 5, first_values + 8, terminal_values + 5);
+            std::copy(last_values + 8, last_values + 11, terminal_values + 8);
+            std::string evidence(
+                "stage05.2-native-global-semantic-stream-v2");
+            append_evidence_array(evidence, events);
+            append_evidence_array(evidence, ranking);
+            append_evidence_array(evidence, removed_offsets_array);
+            append_evidence_array(evidence, removed_indices_array);
+            append_evidence_array(evidence, plan_offsets_array);
+            append_evidence_array(evidence, route_offsets_array);
+            append_evidence_array(evidence, route_indices_array);
+            append_evidence_array(evidence, objective_integer);
+            append_evidence_array(evidence, objective_float);
+            append_evidence_array(evidence, stage_status);
+            append_evidence_array(evidence, stage_weights);
+            append_evidence_array(evidence, stage_calls);
+            append_evidence_array(evidence, stage_rewards);
+            append_evidence_array(evidence, termination);
+            global = py::make_tuple(
+                std::move(events), std::move(ranking),
+                std::move(removed_offsets_array), std::move(removed_indices_array),
+                std::move(plan_offsets_array), std::move(route_offsets_array),
+                std::move(route_indices_array), std::move(objective_integer),
+                std::move(objective_float), std::move(stage_status),
+                std::move(stage_weights), std::move(stage_calls),
+                std::move(stage_rewards), std::move(termination),
+                native_sha256_hex(evidence));
+            terminal_global = global;
+        }
     }
     auto best = engine.best_solution_payload();
     auto backend_metrics = engine.exact_backend_metrics_payload();
@@ -17581,6 +18412,8 @@ py::tuple full_native_alns_v2(
                 : 0;
         }
     }
+    engine.append_causal_termination(terminal_values[0], terminal_values[5]);
+    auto causal_journal = engine.causal_journal_payload();
     const auto elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - solve_started).count();
     auto backend_timings = py::cast<py::array_t<double>>(backend_metrics[2]);
@@ -17707,6 +18540,7 @@ py::tuple full_native_alns_v2(
     }
     evidence.append(py::cast<std::string>(exact_journal[1]));
     evidence.append(py::cast<std::string>(control_journal[2]));
+    evidence.append(py::cast<std::string>(causal_journal[11]));
     return py::make_tuple(
         std::move(route_offsets),
         std::move(route_indices),
@@ -17718,7 +18552,8 @@ py::tuple full_native_alns_v2(
         std::move(global),
         std::move(backend_metrics),
         std::move(exact_journal),
-        std::move(control_journal));
+        std::move(control_journal),
+        std::move(causal_journal));
 }
 
 #ifdef __linux__

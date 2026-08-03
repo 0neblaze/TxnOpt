@@ -537,6 +537,69 @@ def _canonical_trace_event(event: dict[str, object]) -> dict[str, object]:
         for key, value in event.items()
         if key not in {"timestamp_seconds", "duration_seconds"}
     }
+    if canonical.get("event_type") in {
+        "candidate_cache_transaction",
+        "candidate_screening_aggregate",
+    }:
+        return {}
+    if canonical.get("event_type") in {
+        "deadline_boundary",
+        "exact_budget_boundary",
+        "candidate_control_boundary",
+    }:
+        if canonical.get("termination_boundary") is not True:
+            return {}
+        canonical.pop("termination_boundary", None)
+    if canonical.get("event_type") == "screening_decision":
+        raw_checks = canonical.get("checks", [])
+        if isinstance(raw_checks, list):
+            normalized_checks: list[dict[str, object]] = []
+            boolean_checks = {
+                "route_structure",
+                "single_segment_battery_reachability",
+            }
+            for raw_check in raw_checks:
+                if not isinstance(raw_check, dict):
+                    continue
+                check_name = str(raw_check.get("check", ""))
+                check_value = raw_check.get("value")
+                normalized_checks.append(
+                    {
+                        "check": check_name,
+                        "status": raw_check.get("status"),
+                        "value": (
+                            bool(check_value)
+                            if check_name in boolean_checks
+                            else check_value
+                        ),
+                    }
+                )
+            canonical["checks"] = normalized_checks
+        canonical = {
+            key: value
+            for key, value in canonical.items()
+            if key
+            in {
+                "event_type",
+                "route_key",
+                "lane",
+                "iteration",
+                "operator",
+                "status",
+                "first_failed_check",
+                "reason",
+                "checks",
+                "demand",
+                "min_time_window_slack",
+                "distance_lower_bound",
+                "distance_increment_lower_bound",
+                "single_segment_reachable",
+                "structural_energy_lower_bound",
+                "negative_cache_hit",
+                "exact_call_blocked",
+                "semantic_event_id",
+            }
+        }
     if canonical.get("event_type") == "candidate_control_budget":
         canonical.pop("accounting", None)
         context = canonical.get("context")
@@ -546,6 +609,11 @@ def _canonical_trace_event(event: dict[str, object]) -> dict[str, object]:
             ) + ":candidate_pool"
     if canonical.get("event_type") == "exact_batch_started":
         canonical.pop("transaction_sha256", None)
+    if canonical.get("event_type") == "exact_route_result":
+        canonical.pop("evaluation_id", None)
+    if canonical.get("event_type") == "candidate_plan_decision":
+        canonical.pop("batch_ordinal", None)
+        canonical.pop("transaction_status_code", None)
     if canonical.get("event_type") == "cache_event":
         operation = canonical.get("operation")
         if operation in {"lookup", "store", "evict", "reconcile", "oversize_not_cached"}:
@@ -576,6 +644,7 @@ def _canonical_trace_event(event: dict[str, object]) -> dict[str, object]:
             "completion_order",
             "chunk_sizes",
             "completed_indices",
+            "batch_ordinal",
         ):
             canonical.pop(key, None)
     if canonical.get("event_type") == "candidate_state":
@@ -593,9 +662,24 @@ def _canonical_trace_event(event: dict[str, object]) -> dict[str, object]:
             raise ValueError(
                 "candidate_full_route_keys must be a string array when present"
             )
+        canonical = {
+            key: canonical[key]
+            for key in (
+                "event_type",
+                "lane",
+                "iteration",
+                "operator",
+                "candidate_objective_key",
+                "candidate_feasible",
+                "accepted",
+                "status",
+                "reason",
+                "semantic_event_id",
+            )
+            if key in canonical
+        }
         canonical["candidate_route_keys"] = list(route_keys)
-        if "candidate_full_route_keys" in canonical:
-            canonical["candidate_full_route_keys"] = list(full_route_keys)
+        canonical["candidate_full_route_keys"] = list(full_route_keys)
         identity = {
             "candidate_route_keys": list(route_keys),
             "candidate_full_route_keys": list(full_route_keys),
@@ -679,7 +763,9 @@ def _canonical_semantic_streams(result: ALNSResult) -> dict[str, list[dict[str, 
         "exact_work",
         "exact_result",
         "cache",
+        "screening",
         "deadline",
+        "termination",
         "native_failure",
     )
     streams: dict[str, list[dict[str, object]]] = {
@@ -717,13 +803,15 @@ def _canonical_semantic_streams(result: ALNSResult) -> dict[str, list[dict[str, 
             }
         )
     required_nonempty = {
-        "candidate_state",
-        "operator",
         "stage04",
         "exact_work",
         "exact_result",
         "cache",
+        "screening",
+        "termination",
     }
+    if result.effective_iterations > 0:
+        required_nonempty.update({"candidate_state", "operator"})
     if result.candidate_control_statistics.get("enabled") is True:
         required_nonempty.add("candidate_transaction")
     missing = sorted(name for name in required_nonempty if not streams[name])
@@ -731,6 +819,28 @@ def _canonical_semantic_streams(result: ALNSResult) -> dict[str, list[dict[str, 
         raise ValueError(
             "runtime semantic journal is incomplete: " + ", ".join(missing)
         )
+    termination = streams["termination"]
+    if result.objective is None:
+        raise ValueError("runtime semantic termination requires an objective")
+    if (
+        len(termination) != 1
+        or termination[0].get("event_type") != "termination"
+        or termination[0].get("status") != result.termination_reason
+        or termination[0].get("iterations") != result.iterations
+        or termination[0].get("effective_iterations")
+        != result.effective_iterations
+        or termination[0].get("exact_started_calls")
+        != result.exact_started_calls
+        or termination[0].get("exact_completed_calls")
+        != result.exact_completed_calls
+        or termination[0].get("exact_interrupted_calls")
+        != result.exact_interrupted_calls
+        or termination[0].get("objective_key") != list(result.objective.key)
+        or termination[0].get("semantic_event_id") != semantic_event_id
+    ):
+        raise ValueError("runtime semantic termination does not reconcile")
+    if result.termination_reason != "iteration_limit" and not streams["deadline"]:
+        raise ValueError("runtime semantic deadline boundary is missing")
     return streams
 
 
@@ -747,7 +857,9 @@ def _canonical_semantic_event_sequence(
         "exact_work",
         "exact_result",
         "cache",
+        "screening",
         "deadline",
+        "termination",
         "native_failure",
     }
     if set(streams) != expected_streams:

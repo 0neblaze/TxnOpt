@@ -504,20 +504,24 @@ class _Evaluator:
             return
         controller.boundary_recorded = True
         if self.measurement_trace is not None:
-            self.measurement_trace.events.append(
-                {
-                    "event_type": "exact_budget_boundary",
-                    "status": "budget_exhausted",
-                    "timestamp_seconds": self.measurement_trace._offset(),
-                    "lane": self.lane,
-                    "iteration": self.iteration,
-                    "operator": self.operator,
-                    "exact_call_budget": controller.budget,
-                    "started_calls": controller.started_calls,
-                    "completed_calls": controller.completed_calls,
-                    "interrupted_calls": controller.interrupted_calls,
-                }
-            )
+            event: dict[str, object] = {
+                "event_type": "exact_budget_boundary",
+                "status": "budget_exhausted",
+                "timestamp_seconds": self.measurement_trace._offset(),
+                "lane": self.lane,
+                "iteration": self.iteration,
+                "operator": self.operator,
+                "exact_call_budget": controller.budget,
+                "started_calls": controller.started_calls,
+                "completed_calls": controller.completed_calls,
+                "interrupted_calls": controller.interrupted_calls,
+            }
+            self.measurement_trace.events.append(event)
+            if self.measurement_trace.runtime_semantic_enabled:
+                self.measurement_trace.record_runtime_semantic_event(
+                    "deadline",
+                    event,
+                )
 
     def _discard_pending_candidate_cache(self, reason: str) -> None:
         if not self.pending_candidate_cache and not self.pending_negative_screening_sequences:
@@ -5138,8 +5142,6 @@ def _solve_alns(
             else None
         ),
     )
-
-
 def _full_native_operator_statistics(
     instance: Instance,
     *,
@@ -5284,11 +5286,12 @@ def _full_native_operator_statistics(
             values["rejected"] = cast(int, values["rejected"]) + 1
             if any(
                 str(event["reason"])
-                in {
-                    "constraint_removal_no_change",
-                    "constraint_removal_no_existing_route_insertion",
-                    "constraint_repair_infeasible",
-                }
+                    in {
+                        "constraint_removal_no_change",
+                        "constraint_removal_no_existing_route_insertion",
+                        "constraint_repair_infeasible",
+                        "no_removable_customer",
+                    }
                 for event in events
             ):
                 # Python records both the proposal-level no-change cause and
@@ -5910,6 +5913,21 @@ def _solve_full_native_alns(
     if fallback_count != 0 or native_runtime.fallback_count != 0:
         raise RuntimeError("full native ALNS used a forbidden fallback")
     native_statistics = config.to_dict()
+    causal_stream_counts = [
+        int(value) for value in native_result.causal_journal.stream_counts
+    ]
+    candidate_control_semantics_complete = all(
+        causal_stream_counts[index] > 0 for index in (1, 3, 4)
+    )
+    stage04_semantics_complete = all(
+        causal_stream_counts[index] > 0 for index in (0, 5)
+    )
+    instrumentation_complete = (
+        candidate_control_semantics_complete
+        and stage04_semantics_complete
+        and native_result.causal_journal.complete_search_semantics
+        and int(native_result.timings["work_pool_active_tasks_at_return"]) == 0
+    )
     native_statistics.update(
         {
             "fallback_count": fallback_count,
@@ -5971,9 +5989,15 @@ def _solve_full_native_alns(
             "control_journal_sha256": native_result.control_journal_sha256,
             "counters": dict(native_result.counters),
             "timings": dict(native_result.timings),
-            "candidate_control_semantics_complete": True,
-            "stage04_semantics_complete": True,
-            "instrumentation_complete": True,
+            "candidate_control_semantics_complete": (
+                candidate_control_semantics_complete
+            ),
+            "stage04_semantics_complete": stage04_semantics_complete,
+            "instrumentation_complete": instrumentation_complete,
+            "causal_journal_sha256": (
+                native_result.causal_journal.transaction_sha256
+            ),
+            "causal_stream_counts": causal_stream_counts,
             "shared_native_work_pool": config.mode == "host_scheduler",
         }
     )
@@ -6201,7 +6225,430 @@ def _solve_full_native_alns(
         "incremental_fallbacks": 0,
         "station_reachability": station_reachability,
     }
-    return ALNSResult(
+    if measurement_trace is not None and measurement_trace.runtime_semantic_enabled:
+        exact_result_events = tuple(
+            {
+                key: value
+                for key, value in event.items()
+                if key not in {"semantic_stream", "semantic_event_id"}
+            }
+            for event in measurement_trace.runtime_semantic_events
+            if event.get("semantic_stream") == "exact_result"
+        )
+        runtime_projection: list[tuple[str, Mapping[str, object]]] = []
+        initial_runtime_objective = SolutionObjective.zero()
+        for sequence in initial_customer_sequences:
+            exact = solve_exact_charging(instance, sequence)
+            if not exact.feasible:
+                raise RuntimeError(
+                    "full native semantic projection initial replay is infeasible"
+                )
+            initial_runtime_objective += SolutionObjective.from_route(
+                instance,
+                exact.route,
+                total_distance=exact.distance,
+                total_charging_time=exact.charging_time,
+            )
+        exact_journal_by_context: dict[
+            tuple[str, int | None, str], list[dict[str, object]]
+        ] = {}
+        for raw_event in native_result.exact_journal_events:
+            context = (
+                str(raw_event["lane"]),
+                cast(int | None, raw_event["iteration"]),
+                str(raw_event["operator"]),
+            )
+            exact_journal_by_context.setdefault(context, []).append(dict(raw_event))
+        exact_results_by_context: dict[
+            tuple[str, int | None, str], list[dict[str, object]]
+        ] = {}
+        for raw_event in exact_result_events:
+            context = (
+                str(raw_event["lane"]),
+                cast(int | None, raw_event["iteration"]),
+                str(raw_event["operator"]),
+            )
+            exact_results_by_context.setdefault(context, []).append(dict(raw_event))
+        screening_by_context: dict[
+            tuple[str, int | None, str], list[dict[str, object]]
+        ] = {}
+        for raw_event in native_result.control_journal_events:
+            if raw_event.get("event_type") != "screening_decision":
+                continue
+            event = dict(raw_event)
+            screening_sequence = cast(
+                list[str], event.pop("customer_sequence")
+            )
+            screening_raw_iteration = cast(int | None, event.get("iteration"))
+            screening_iteration = (
+                None
+                if screening_raw_iteration == -1
+                else screening_raw_iteration
+            )
+            event["iteration"] = screening_iteration
+            event["route_key"] = measurement_trace.register_route(
+                screening_sequence
+            )
+            for telemetry_field in (
+                "physical_evaluated",
+                "physical_owner",
+                "reachability_queries",
+                "screening_ordinal",
+            ):
+                event.pop(telemetry_field, None)
+            context = (
+                str(event["lane"]),
+                screening_iteration,
+                str(event["operator"]),
+            )
+            screening_by_context.setdefault(context, []).append(event)
+
+        def append_screening_context(
+            context: tuple[str, int | None, str],
+            *,
+            limit: int | None = None,
+        ) -> None:
+            pending = screening_by_context.get(context, [])
+            selected = pending if limit is None else pending[:limit]
+            runtime_projection.extend(
+                ("screening", event)
+                for event in selected
+            )
+            remaining_screening = pending[len(selected) :]
+            if remaining_screening:
+                screening_by_context[context] = remaining_screening
+            else:
+                screening_by_context.pop(context, None)
+
+        def append_exact_context(
+            work: Mapping[str, object],
+            *,
+            remaining: int,
+        ) -> int:
+            lane = str(work["lane"])
+            iteration = cast(int | None, work["iteration"])
+            operator = str(work["operator"])
+            sequences = cast(list[list[str]], work["sequences"])
+            context = (lane, iteration, operator)
+            append_screening_context(context, limit=len(sequences))
+            for sequence in sequences:
+                runtime_projection.append(
+                    (
+                        "cache",
+                        {
+                            "event_type": "cache_event",
+                            "operation": "miss",
+                            "route_key": measurement_trace.register_route(sequence),
+                            "lane": lane,
+                            "iteration": iteration,
+                            "operator": operator,
+                        },
+                    )
+                )
+            requested = len(sequences)
+            runtime_projection.append(
+                (
+                    "candidate_transaction",
+                    {
+                        "event_type": "candidate_control_budget",
+                        "status": "reserved",
+                        "context": f"{lane}:{operator}:single_route"
+                        if requested == 1
+                        else f"{lane}:{operator}:candidate_pool",
+                        "requested": requested,
+                        "granted": requested,
+                        "remaining": remaining,
+                        "iteration": iteration,
+                    },
+                )
+            )
+            runtime_projection.append(
+                (
+                    "exact_work",
+                    {
+                        "event_type": "exact_batch_started",
+                        "lane": lane,
+                        "iteration": iteration,
+                        "operator": operator,
+                        "requested_calls": requested,
+                        "started_calls": requested,
+                        "customer_sequences": sequences,
+                        "route_change_status": "changed",
+                    },
+                )
+            )
+            runtime_projection.extend(
+                ("candidate_transaction", event)
+                for event in exact_journal_by_context.pop(context, [])
+            )
+            runtime_projection.extend(
+                ("exact_result", event)
+                for event in exact_results_by_context.pop(context, [])
+            )
+            return requested
+
+        initial_work = next(
+            (
+                work
+                for work in native_result.candidate_work
+                if work["lane"] == "initialization"
+            ),
+            None,
+        )
+        if initial_work is None:
+            raise RuntimeError("full native semantic projection lost initialization")
+        initial_sequences = [list(sequence) for sequence in initial_customer_sequences]
+        runtime_projection.append(
+            (
+                "candidate_transaction",
+                {
+                    "event_type": "candidate_initial_solution",
+                    "status": "submitted",
+                    "customer_sequences": initial_sequences,
+                },
+            )
+        )
+        initial_plan = next(
+            (
+                dict(event)
+                for event in native_result.control_journal_events
+                if event.get("event_type") == "candidate_plan_decision"
+                and event.get("lane") == "initialization"
+            ),
+            None,
+        )
+        if initial_plan is None:
+            raise RuntimeError("full native semantic projection lost initial plan")
+        initial_plan["iteration"] = 0
+        runtime_projection.append(("candidate_transaction", initial_plan))
+        append_exact_context(
+            initial_work,
+            remaining=config.candidate_control_config.max_exact_calls_per_round,
+        )
+        runtime_projection.append(
+            (
+                "candidate_transaction",
+                {
+                    "event_type": "candidate_plan_attempted",
+                    "status": "complete_transaction",
+                    "lane": "initialization",
+                    "iteration": None,
+                    "operator": "initial_solution",
+                    "candidate_id": 0,
+                    "customer_sequences": initial_sequences,
+                },
+            )
+        )
+        append_screening_context(
+            ("initialization", None, "initial_solution")
+        )
+        for sequence in initial_customer_sequences:
+            runtime_projection.append(
+                (
+                    "cache",
+                    {
+                        "event_type": "cache_event",
+                        "operation": "hit",
+                        "route_key": measurement_trace.register_route(sequence),
+                        "lane": "initialization",
+                        "iteration": None,
+                        "operator": "initial_solution",
+                    },
+                )
+            )
+        runtime_projection.append(
+            (
+                "candidate_transaction",
+                {
+                    "event_type": "candidate_initial_solution",
+                    "status": "verified",
+                    "customer_sequences": initial_sequences,
+                    "objective_key": list(initial_runtime_objective.key),
+                },
+            )
+        )
+        runtime_projection.append(("stage04", dict(stage04_event_log[0])))
+
+        quality_operators = {
+            "relocate",
+            "swap",
+            "two_opt_star",
+            "route_segment_destroy",
+            "ejection_chain",
+        }
+        work_by_iteration_lane: dict[
+            tuple[int, str], list[Mapping[str, object]]
+        ] = {}
+        for work in native_result.candidate_work:
+            if work is initial_work or work["iteration"] is None:
+                continue
+            work_by_iteration_lane.setdefault(
+                (int(cast(int, work["iteration"])), str(work["lane"])), []
+            ).append(work)
+        events_by_iteration_lane: dict[
+            tuple[int, str], list[dict[str, object]]
+        ] = {}
+        for semantic_event in semantic_events:
+            operator = str(semantic_event["operator"])
+            lane = (
+                "constraint_lane"
+                if semantic_event.get("track") == "constraint_lane"
+                else "quality_shadow"
+                if operator in quality_operators
+                else "legacy"
+            )
+            events_by_iteration_lane.setdefault(
+                (int(cast(int, semantic_event["iteration"])), lane), []
+            ).append(dict(semantic_event))
+
+        def append_lane_outcome(iteration: int, lane: str) -> None:
+            lane_events = events_by_iteration_lane.get((iteration, lane), [])
+            if not lane_events:
+                return
+            for screening_context in tuple(screening_by_context):
+                if screening_context[:2] == (lane, iteration):
+                    append_screening_context(screening_context)
+            runtime_projection.extend(("operator", event) for event in lane_events)
+            accepted = any(bool(event.get("accepted")) for event in lane_events)
+            candidate_event = next(
+                (
+                    event
+                    for event in reversed(lane_events)
+                    if event.get("candidate_route_sequences")
+                ),
+                lane_events[-1],
+            )
+            raw_sequences = cast(
+                tuple[tuple[str, ...], ...],
+                candidate_event.get("candidate_route_sequences", ()),
+            )
+            feasible = bool(candidate_event.get("candidate_feasible"))
+            candidate_full_route_keys: list[str] = []
+            if feasible:
+                for sequence in raw_sequences:
+                    exact = solve_exact_charging(instance, sequence)
+                    if not exact.feasible:
+                        raise RuntimeError(
+                            "full native semantic candidate replay is infeasible"
+                        )
+                    candidate_full_route_keys.append(
+                        measurement_trace.register_route(exact.route)
+                    )
+            status = "accepted" if accepted else "rejected"
+            reason = (
+                "quality shadow probe"
+                if lane == "quality_shadow"
+                else "constraint lane probe"
+                if lane == "constraint_lane"
+                else "candidate accepted by lexicographic acceptance"
+                if accepted
+                else "candidate rejected by lexicographic acceptance"
+            )
+            runtime_projection.append(
+                (
+                    "candidate_state",
+                    {
+                        "event_type": "candidate_state",
+                        "lane": lane,
+                        "iteration": iteration,
+                        "operator": candidate_event.get("operator"),
+                        "candidate_route_keys": [
+                            measurement_trace.register_route(sequence)
+                            for sequence in raw_sequences
+                        ]
+                        if feasible
+                        else [],
+                        "candidate_full_route_keys": candidate_full_route_keys,
+                        "candidate_objective_key": candidate_event.get(
+                            "candidate_objective_key", ()
+                        )
+                        if feasible
+                        else (),
+                        "candidate_feasible": feasible,
+                        "accepted": accepted,
+                        "status": status,
+                        "reason": reason,
+                    },
+                )
+            )
+
+        for iteration in range(native_result.counters["iterations"]):
+            round_budget = config.candidate_control_config.max_exact_calls_per_round
+            runtime_projection.append(
+                (
+                    "candidate_transaction",
+                    {
+                        "event_type": "candidate_control_round",
+                        "status": "started",
+                        "lane": "all",
+                        "iteration": iteration,
+                        "budget": round_budget,
+                    },
+                )
+            )
+            used = 0
+            for lane in ("legacy", "quality_shadow", "constraint_lane"):
+                for work in work_by_iteration_lane.get((iteration, lane), []):
+                    used += append_exact_context(
+                        work,
+                        remaining=max(
+                            0,
+                            round_budget
+                            - used
+                            - len(cast(list[list[str]], work["sequences"])),
+                        ),
+                    )
+                if lane == "quality_shadow":
+                    append_lane_outcome(iteration, lane)
+            append_lane_outcome(iteration, "constraint_lane")
+            append_lane_outcome(iteration, "legacy")
+            runtime_projection.extend(
+                ("stage04", dict(event))
+                for event in stage04_event_log[1:]
+                if int(cast(int, event.get("iteration", -1))) == iteration
+            )
+            runtime_projection.append(
+                (
+                    "candidate_transaction",
+                    {
+                        "event_type": "candidate_control_round",
+                        "status": "completed",
+                        "lane": "all",
+                        "iteration": iteration,
+                        "budget": round_budget,
+                        "used": used,
+                        "remainder": max(0, round_budget - used),
+                    },
+                )
+            )
+        if screening_by_context:
+            raise RuntimeError(
+                "full native semantic projection lost screening contexts"
+            )
+        if termination_reason != "iteration_limit":
+            runtime_projection.append(
+                (
+                    "deadline",
+                    {
+                        "event_type": (
+                            "exact_budget_boundary"
+                            if termination_reason == "exact_call_budget_exhausted"
+                            else "deadline_boundary"
+                        ),
+                        "status": termination_reason,
+                        "lane": "all",
+                        "iteration": native_result.counters["iterations"],
+                        "operator": "native_search",
+                        "started_calls": controlled_exact_started,
+                        "completed_calls": controlled_exact_completed,
+                        "interrupted_calls": native_result.counters[
+                            "interrupted_calls"
+                        ],
+                    },
+                )
+            )
+        measurement_trace.replace_runtime_semantic_journal(runtime_projection)
+    result = ALNSResult(
         feasible=True,
         routes=routes,
         customer_sequences=native_result.customer_sequences,
@@ -6321,6 +6768,9 @@ def _solve_full_native_alns(
             runtime_seconds if termination_reason == "iteration_limit" else None
         ),
     )
+    if measurement_trace is not None:
+        measurement_trace.finish(result)
+    return result
 
 
 def solve_alns(

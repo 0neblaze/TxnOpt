@@ -392,6 +392,27 @@ class Stage03Trace:
             raise ValueError("runtime semantic journal checkpoint is invalid")
         del self._runtime_semantic_events[checkpoint:]
 
+    def replace_runtime_semantic_journal(
+        self,
+        events: Iterable[tuple[str, Mapping[str, object]]],
+    ) -> None:
+        """Replace a replayed native journal with one validated causal sequence."""
+
+        replacement = tuple(events)
+        if not self.runtime_semantic_enabled:
+            if replacement:
+                raise ValueError(
+                    "runtime semantic replacement requires enabled recording"
+                )
+            return
+        self._runtime_semantic_events.clear()
+        try:
+            for stream, event in replacement:
+                self.record_runtime_semantic_event(stream, event)
+        except Exception:
+            self._runtime_semantic_events.clear()
+            raise
+
     def __post_init__(self) -> None:
         self._validate_screening_route_dictionary()
         if self.trace_schema_version not in (
@@ -945,6 +966,25 @@ class Stage03Trace:
         normalized_energy = float(structural_energy_lower_bound)
         normalized_negative_hit = bool(negative_cache_hit)
         normalized_blocked = bool(exact_call_blocked)
+        semantic_event = {
+            "event_type": "screening_decision",
+            "route_key": key,
+            "lane": lane,
+            "iteration": iteration,
+            "operator": operator,
+            "status": status,
+            "first_failed_check": first_failed_check,
+            "reason": reason,
+            "checks": [asdict(check) for check in checks],
+            "demand": normalized_demand,
+            "min_time_window_slack": normalized_slack,
+            "distance_lower_bound": normalized_distance,
+            "distance_increment_lower_bound": normalized_increment,
+            "single_segment_reachable": normalized_reachable,
+            "structural_energy_lower_bound": normalized_energy,
+            "negative_cache_hit": normalized_negative_hit,
+            "exact_call_blocked": normalized_blocked,
+        }
         fast_append = self._typed_screening_append
         if fast_append is not None:
             summary = self._stream_summary
@@ -985,6 +1025,8 @@ class Stage03Trace:
                 negative_evidence_signature,
             )
             self.screening_decisions.increment_external_count()
+            if self.runtime_semantic_enabled:
+                self.record_runtime_semantic_event("screening", semantic_event)
             return decision_id
         decision = ScreeningDecision(
             decision_id=decision_id,
@@ -1009,6 +1051,8 @@ class Stage03Trace:
             duration_seconds=max(0.0, completed - started),
         )
         self.screening_decisions.append(decision)
+        if self.runtime_semantic_enabled:
+            self.record_runtime_semantic_event("screening", semantic_event)
         return decision.decision_id
 
     def finish(self, result: object | None = None) -> None:
@@ -1047,6 +1091,61 @@ class Stage03Trace:
                 self.result_summary["candidate_transaction_statistics"] = cast(
                     Any, result
                 ).candidate_transaction_statistics
+            if self.runtime_semantic_enabled:
+                termination_status = str(
+                    getattr(result, "termination_reason", "unknown")
+                )
+                if termination_status != "iteration_limit":
+                    boundary_event_type = (
+                        "exact_budget_boundary"
+                        if termination_status == "exact_call_budget_exhausted"
+                        else "candidate_control_boundary"
+                        if termination_status == "candidate_control_exhausted"
+                        else "deadline_boundary"
+                    )
+                    self.record_runtime_semantic_event(
+                        "deadline",
+                        {
+                            "event_type": boundary_event_type,
+                            "termination_boundary": True,
+                            "status": termination_status,
+                            "lane": "all",
+                            "iteration": getattr(result, "iterations", 0),
+                            "operator": "termination",
+                            "started_calls": getattr(
+                                result, "exact_started_calls", 0
+                            ),
+                            "completed_calls": getattr(
+                                result, "exact_completed_calls", 0
+                            ),
+                            "interrupted_calls": getattr(
+                                result, "exact_interrupted_calls", 0
+                            ),
+                        },
+                    )
+                objective = getattr(result, "objective", None)
+                objective_key = getattr(objective, "key", ())
+                self.record_runtime_semantic_event(
+                    "termination",
+                    {
+                        "event_type": "termination",
+                        "status": termination_status,
+                        "iterations": getattr(result, "iterations", 0),
+                        "effective_iterations": getattr(
+                            result, "effective_iterations", 0
+                        ),
+                        "exact_started_calls": getattr(
+                            result, "exact_started_calls", 0
+                        ),
+                        "exact_completed_calls": getattr(
+                            result, "exact_completed_calls", 0
+                        ),
+                        "exact_interrupted_calls": getattr(
+                            result, "exact_interrupted_calls", 0
+                        ),
+                        "objective_key": list(objective_key),
+                    },
+                )
 
     @property
     def started_calls(self) -> int:

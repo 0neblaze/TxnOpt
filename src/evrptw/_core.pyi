@@ -1034,6 +1034,20 @@ def full_native_alns_v2(
     object,
     object,
     object,
+    tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        str,
+    ],
 ]: ...
 def full_native_alns_host_v2(
     socket_path: str,

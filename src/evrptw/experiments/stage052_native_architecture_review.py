@@ -509,7 +509,9 @@ _SEMANTIC_STREAM_NAMES = (
     "exact_work",
     "exact_result",
     "cache",
+    "screening",
     "deadline",
+    "termination",
     "native_failure",
 )
 def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, object]]:
@@ -578,13 +580,20 @@ def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, 
                 "canonical semantic events lost strict runtime source order"
             )
         required_nonempty = {
-            "candidate_state",
-            "operator",
             "stage04",
             "exact_work",
             "exact_result",
             "cache",
+            "screening",
+            "termination",
         }
+        effective_iterations = payload.get("effective_iterations")
+        if not (
+            isinstance(effective_iterations, int)
+            and not isinstance(effective_iterations, bool)
+            and effective_iterations == 0
+        ):
+            required_nonempty.update({"candidate_state", "operator"})
         if mode != "current_stage052":
             required_nonempty.add("candidate_transaction")
         missing = sorted(name for name in required_nonempty if not streams[name])
@@ -593,6 +602,19 @@ def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, 
                 "canonical semantic runtime journal is incomplete: "
                 + ", ".join(missing)
             )
+        termination = streams["termination"]
+        declared_termination = payload.get("termination_reason")
+        if (
+            len(termination) != 1
+            or termination[0].get("event_type") != "termination"
+            or termination[0].get("status") != declared_termination
+            or events[-1].get("semantic_stream") != "termination"
+        ):
+            raise ValueError(
+                "canonical semantic termination is missing or inconsistent"
+            )
+        if declared_termination != "iteration_limit" and not streams["deadline"]:
+            raise ValueError("canonical semantic deadline boundary is missing")
     declared_started = payload.get("exact_started_calls")
     declared_completed = payload.get("exact_completed_calls")
     if (
