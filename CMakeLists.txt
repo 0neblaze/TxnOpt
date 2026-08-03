@@ -53,6 +53,15 @@ if(NOT EVRPTW_SANITIZER STREQUAL "none")
       _core PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=thread
     )
     target_link_options(_core PRIVATE -fsanitize=thread)
+    add_executable(
+      stage052_native_concurrency_tsan
+      cpp/native_concurrency_tsan.cpp
+    )
+    target_compile_options(
+      stage052_native_concurrency_tsan
+      PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=thread
+    )
+    target_link_options(stage052_native_concurrency_tsan PRIVATE -fsanitize=thread)
   else()
     message(
       FATAL_ERROR

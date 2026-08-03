@@ -648,11 +648,23 @@ class CandidateControlRuntime:
 
     @property
     def candidate_work_hash(self) -> str:
-        return _stable_hash(self._candidate_work)
+        return stable_candidate_payload_hash(self._candidate_work)
+
+    @property
+    def candidate_work(self) -> tuple[dict[str, object], ...]:
+        """Return the ordered semantic exact-work batches for replay."""
+
+        return tuple(dict(item) for item in self._candidate_work)
 
     @property
     def route_result_hash(self) -> str:
-        return _stable_hash(self._route_results)
+        return stable_candidate_payload_hash(self._route_results)
+
+    @property
+    def route_results(self) -> tuple[dict[str, object], ...]:
+        """Return ordered stable exact results without measured runtimes."""
+
+        return tuple(dict(item) for item in self._route_results)
 
     def statistics(self) -> dict[str, object]:
         decisions = [
@@ -754,6 +766,12 @@ def _stable_hash(payload: object) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def stable_candidate_payload_hash(payload: object) -> str:
+    """Hash Candidate Control evidence through its canonical JSON projection."""
+
+    return _stable_hash(payload)
 
 
 def _json_safe(value: object) -> object:

@@ -13,6 +13,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from evrptw.artifacts import ArtifactReader
 from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES
 from evrptw.experiments.stage052_native_architectures import (
     AXIS_NAMES,
@@ -26,6 +27,10 @@ from evrptw.experiments.stage052_native_architectures import (
 )
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
+from evrptw.stage052_replay import (
+    replay_verified_shard,
+    verified_artifact_shard_bundle,
+)
 from evrptw.validation import validate_routes
 
 REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v4"
@@ -547,8 +552,194 @@ def _raw_axis_inventory(records: Iterable[ReviewRecord]) -> dict[str, object]:
     return aggregate
 
 
+def _historical_cross_schema_adapter(
+    root: Path,
+    benchmark_dir: Path,
+) -> dict[str, object]:
+    """Project accepted v1 Pilot evidence onto the v2 core semantic fields."""
+
+    rows: list[dict[str, object]] = []
+    aggregate_digest = hashlib.sha256(b"stage05.2-attempt72-cross-schema-v1\0")
+    for batch_dir in sorted(root.glob("batch[0-9][0-9][0-9][0-9]")):
+        reader = ArtifactReader(batch_dir, verify=False)
+        artifacts = reader.manifest.get("artifacts")
+        if not isinstance(artifacts, list):
+            raise ValueError("historical artifact manifest has no artifact inventory")
+        references = {
+            str(item.get("relative_path")): item
+            for item in artifacts
+            if isinstance(item, dict) and isinstance(item.get("relative_path"), str)
+        }
+        event_paths = sorted(
+            relative
+            for relative, item in references.items()
+            if item.get("artifact_type") == "events"
+            and item.get("artifact_subtype") == "critical"
+        )
+        for event_relative in event_paths:
+            event_path = Path(event_relative)
+            if len(event_path.parts) < 3:
+                raise ValueError("historical event path is not canonical")
+            instance_name = event_path.parts[0]
+            seed = int(event_path.parts[1])
+            raw_relative = str(
+                event_path.with_name(
+                    event_path.name.replace("_events_", "_raw_", 1)
+                ).with_suffix(".json")
+            )
+            solution_relative = str(
+                event_path.with_name(
+                    event_path.name.replace("_events_", "_solution_", 1)
+                ).with_suffix(".json")
+            )
+            trace_relative = str(
+                event_path.with_name(
+                    event_path.name.replace("_events_", "_trace_", 1)
+                ).with_suffix(".json")
+            )
+            trace = reader.read_json(trace_relative)
+            trace_references = (
+                trace.get("route_dictionary_ref"),
+                trace.get("screening_definitions_ref"),
+                trace.get("screening_occurrences_ref"),
+            )
+            required_paths = (
+                event_relative,
+                raw_relative,
+                solution_relative,
+                trace_relative,
+                *trace_references,
+            )
+            for relative in required_paths:
+                if not isinstance(relative, str) or relative not in references:
+                    raise ValueError(
+                        f"historical cross-schema artifact is missing: {relative}"
+                    )
+                reference = references[relative]
+                if reference.get("checksum") != _sha256(batch_dir / relative):
+                    raise ValueError(
+                        f"historical cross-schema checksum mismatch: {relative}"
+                    )
+
+            raw = reader.read_json(raw_relative)
+            solution = reader.read_json(solution_relative)
+            raw_axes = raw.get("axes")
+            solution_axes = solution.get("axes")
+            raw_axis = (
+                raw_axes.get("wall_clock_30")
+                if isinstance(raw_axes, dict)
+                else None
+            )
+            solution_axis = (
+                solution_axes.get("wall_clock_30")
+                if isinstance(solution_axes, dict)
+                else None
+            )
+            if not isinstance(raw_axis, dict) or not isinstance(solution_axis, dict):
+                raise ValueError("historical cross-schema wall-clock axis is missing")
+            bundle = verified_artifact_shard_bundle(
+                reader=reader,
+                shard_id=f"{instance_name}/{seed}",
+                event_relative_path=event_relative,
+                axis_budgets={"wall_clock_30": 30},
+            )
+            summary = replay_verified_shard(bundle, backend="python_reference")
+            event_counts = dict(summary.event_type_counts)
+            exact_counts = dict(
+                (axis, (started, completed))
+                for axis, started, completed in summary.axis_exact_counts
+            )
+            if exact_counts.get("wall_clock_30") != (
+                raw_axis.get("started_calls"),
+                raw_axis.get("completed_calls"),
+            ):
+                raise ValueError("historical exact-call replay does not reconcile")
+            required_families = {
+                "cache_event",
+                "candidate_cache_commit",
+                "candidate_state",
+                "route_evaluation",
+            }
+            if (
+                not required_families.issubset(event_counts)
+                or summary.native_fallback_count != 0
+            ):
+                raise ValueError("historical core transaction event projection is incomplete")
+
+            instance = parse_schneider(benchmark_dir / f"{instance_name}.txt")
+            routes = solution_axis.get("routes")
+            if not isinstance(routes, list) or not all(
+                isinstance(route, list)
+                and all(isinstance(node, str) for node in route)
+                for route in routes
+            ):
+                raise ValueError("historical solution routes are invalid")
+            report = validate_routes(instance, routes)
+            replay_objective = SolutionObjective.from_report(instance, report).key
+            recorded_objective = solution_axis.get("objective_key")
+            if (
+                not report.feasible
+                or list(replay_objective) != recorded_objective
+                or recorded_objective != raw_axis.get("objective_key")
+                or raw_axis.get("validator_passed") is not True
+            ):
+                raise ValueError("historical validator/objective replay does not reconcile")
+
+            projection = {
+                "instance": instance_name,
+                "seed": seed,
+                "validator_passed": True,
+                "objective": list(replay_objective),
+                "exact_started_calls": summary.exact_started,
+                "exact_completed_calls": summary.exact_completed,
+                "accepted_candidates": summary.accepted_candidates,
+                "global_bests": summary.global_bests,
+                "native_fallback_count": summary.native_fallback_count,
+                "deadline_axes": list(summary.deadline_axes),
+                "cache_events": event_counts["cache_event"],
+                "candidate_cache_commits": event_counts["candidate_cache_commit"],
+                "candidate_state_events": event_counts["candidate_state"],
+                "route_evaluations": event_counts["route_evaluation"],
+                "canonical_event_sha256": summary.event_token_sha256,
+            }
+            aggregate_digest.update(
+                json.dumps(
+                    projection,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+            rows.append(projection)
+    expected = {(name, seed) for name in FORMAL_INSTANCES for seed in SEEDS}
+    observed = {
+        (_string(row, "instance"), _integer(row, "seed")) for row in rows
+    }
+    if observed != expected or len(rows) != len(observed):
+        raise ValueError("historical cross-schema adapter geometry is not 12x3")
+    return {
+        "schema_version": "stage05.2-attempt72-cross-schema-v1",
+        "passed": True,
+        "axis_count": len(rows),
+        "mapped_fields": [
+            "validator",
+            "objective",
+            "candidate_state",
+            "cache_lifecycle",
+            "exact_started_completed",
+            "deadline_boundaries",
+            "fallback_count",
+            "canonical_event_stream",
+        ],
+        "aggregate_projection_sha256": aggregate_digest.hexdigest(),
+        "rows": rows,
+    }
+
+
 def _historical_pilot(
     root: Path = HISTORICAL_PILOT_ROOT,
+    *,
+    benchmark_dir: Path,
 ) -> tuple[dict[tuple[str, int], dict[str, object]], dict[str, object]]:
     if not root.is_dir():
         return {}, {
@@ -684,6 +875,7 @@ def _historical_pilot(
         expected_keys = {(name, seed) for name in FORMAL_INSTANCES for seed in SEEDS}
         if set(records) != expected_keys:
             raise ValueError("historical accepted-Pilot geometry does not match 12x3")
+        cross_schema = _historical_cross_schema_adapter(root, benchmark_dir)
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         return {}, {
             "available": True,
@@ -698,6 +890,7 @@ def _historical_pilot(
         "raw_manifest_sha256": raw_manifest_sha256,
         "review_manifest_sha256": review_manifest_sha256,
         "producer_revision": HISTORICAL_PILOT_REVISION,
+        "cross_schema_adapter": cross_schema,
     }
 
 
@@ -958,7 +1151,7 @@ def review_records(
         }
 
     historical, historical_identity = (
-        _historical_pilot()
+        _historical_pilot(benchmark_dir=benchmark_dir)
         if scope == "pilot"
         else (
             {},

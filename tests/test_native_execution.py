@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import random
 import socket
 import struct
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -23,6 +26,7 @@ from evrptw.alns import (
 from evrptw.cache_incremental import (
     CacheIncrementalConfig,
     RouteEvaluationCache,
+    StationReachabilityIndex,
     charging_result_semantic_digest,
     charging_result_semantic_payload,
     estimate_cache_entry_bytes,
@@ -36,6 +40,7 @@ from evrptw.candidate_transaction import (
 from evrptw.charging import solve_exact_charging
 from evrptw.exact_deadline import ExactCallController, ExactDeadlineConfig
 from evrptw.experiments.stage052_native_architectures import (
+    _measurement_evidence,
     _semantic_candidate_trajectory,
 )
 from evrptw.measurement import CheapScreeningConfig, MeasurementConfig, Stage03Trace
@@ -68,6 +73,29 @@ from evrptw.warm_start import (
     WarmStartValidationConfig,
     canonical_customer_sequences_sha256,
 )
+
+
+def _native_search_engine(
+    native_core: Any,
+    context: NativeInstanceContext,
+    *constructor_args: object,
+) -> Any:
+    """Build the low-level engine with the mandatory typed node-name SoA."""
+
+    engine = native_core.NativeSearchEngineV2(*constructor_args)
+    encoded = tuple(name.encode("utf-8") for name in context.node_names)
+    offsets = np.empty(len(encoded) + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(
+        np.asarray([len(value) for value in encoded], dtype=np.int64),
+        out=offsets[1:],
+    )
+    node_bytes = np.frombuffer(b"".join(encoded), dtype=np.uint8).copy()
+    engine.configure_node_names(
+        np.ascontiguousarray(offsets),
+        np.ascontiguousarray(node_bytes),
+    )
+    return engine
 
 
 def _fixture_instance() -> Instance:
@@ -189,6 +217,13 @@ def _native_stage04_arrays(
 @pytest.fixture(scope="module")
 def native_plan_transaction_receipts() -> dict[int, tuple[bytes, ...]]:
     return {}
+
+
+@pytest.fixture(scope="module")
+def native_host_scheduler_socket(tmp_path_factory: pytest.TempPathFactory) -> str:
+    endpoint = tmp_path_factory.mktemp("native-host-scheduler") / "scheduler.sock"
+    with NativeHostScheduler(endpoint):
+        yield str(endpoint)
 
 
 def test_per_solve_native_execution_protocol_is_explicit_and_fail_fast() -> None:
@@ -1955,7 +1990,7 @@ def test_native_search_engine_plan_transaction_matches_python_across_rounds(
     assert initial_solution.feasible
     python_evaluator.remember_incumbent(initial_solution)
 
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         20,
         control_config.max_exact_calls_per_round,
         cache_config.max_entries,
@@ -2067,7 +2102,7 @@ def test_native_search_engine_deadline_before_exact_rolls_back_logical_state() -
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
     lexical_rank = np.arange(len(context.node_names), dtype=np.int64)
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10,
         1,
         16,
@@ -2114,7 +2149,7 @@ def test_native_search_engine_deadline_before_exact_rolls_back_logical_state() -
         _negative_after_failure,
     ) = engine.state()
     assert budget_after_failure.tolist()[3:8] == [0, 1, 1, 1, 0]
-    assert attempted_after_failure == 0
+    assert attempted_after_failure == 1
 
     recovered = engine.evaluate_plans(
         plan_offsets,
@@ -2128,7 +2163,7 @@ def test_native_search_engine_deadline_before_exact_rolls_back_logical_state() -
     assert recovered[0].tolist() == [0]
     assert recovered[1].tolist() == [5]
     assert recovered[10].tolist()[3:8] == [1, 0, 2, 2, 0]
-    assert engine.state()[2] == 1
+    assert engine.state()[2] == 2
 
 
 def test_native_search_engine_rejects_warm_start_before_over_budget_work() -> None:
@@ -2136,7 +2171,7 @@ def test_native_search_engine_rejects_warm_start_before_over_budget_work() -> No
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         1,
         1,
         16,
@@ -2174,7 +2209,7 @@ def test_native_search_engine_rejects_incomplete_warm_start_before_exact_work() 
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
 
@@ -2203,7 +2238,7 @@ def test_native_search_engine_rejects_incomplete_and_duplicate_customer_plans() 
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 2, 16, 1_000_000, 16, 2, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -2236,7 +2271,7 @@ def test_native_search_engine_rejects_incomplete_and_duplicate_customer_plans() 
     assert result[1].tolist() == [0, 0]
     assert result[5].tolist() == []
     assert result[10].tolist()[5:8] == [1, 1, 0]
-    assert engine.state()[2] == 0
+    assert engine.state()[2] == 1
 
     with pytest.raises(ValueError, match="complete instance customer set"):
         engine.evaluate_plans(
@@ -2255,7 +2290,7 @@ def test_native_search_engine_empty_selection_still_enforces_deadline_atomically
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -2297,7 +2332,7 @@ def test_native_search_engine_hash_binds_context_for_already_attempted_plan() ->
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -2328,7 +2363,7 @@ def test_native_search_engine_hash_binds_context_for_already_attempted_plan() ->
         np.asarray([1, 2], dtype=np.int64),
     )
     assert initial_context[12] == (
-        "753e73c382fb262bbe85c5ef8f6e7e64c04f30ed9ba5ccef280fd70acd680115"
+        "6648b4554252317a411e7384ec3bb9d8c4da2e48f5ab996dbedb23a32a29cf63"
     )
     first_context = engine.evaluate_plans(
         *arguments,
@@ -2375,7 +2410,7 @@ def test_native_search_engine_composite_commit_failure_rolls_back_logical_state(
         vehicle=replace(base.vehicle, load_capacity=2.0),
     )
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         20, 4, 16, 1_000_000, 16, 2, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -2438,7 +2473,7 @@ def test_native_search_engine_returns_exact_objective_order_not_optimistic_order
 
     instance = _candidate_plan_fixture()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 2, 16, 1_000_000, 16, 2, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -2452,7 +2487,7 @@ def test_native_search_engine_returns_exact_objective_order_not_optimistic_order
         context.vehicle,
         np.arange(len(context.node_names), dtype=np.int64),
         np.asarray([0, 2, 4], dtype=np.int64),
-        np.asarray([1, 2, 3, 4], dtype=np.int64),
+        np.asarray([3, 4, 1, 2], dtype=np.int64),
         np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
     )
@@ -2472,7 +2507,7 @@ def test_native_search_engine_returns_exact_objective_order_not_optimistic_order
     assert engine.state()[1].tolist()[1:3] == [2, 7]
 
 
-def test_native_search_engine_counts_exact_infeasible_warm_start_as_completed() -> None:
+def test_native_search_engine_safely_rejects_warm_start_before_exact() -> None:
     from evrptw import _core as native_core
 
     instance = replace(
@@ -2480,11 +2515,11 @@ def test_native_search_engine_counts_exact_infeasible_warm_start_as_completed() 
         vehicle=replace(_fixture_instance().vehicle, battery_capacity=0.5),
     )
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
 
-    with pytest.raises(RuntimeError, match="warm start is not exact-feasible"):
+    with pytest.raises(RuntimeError, match="warm start failed safe screening"):
         engine.initialize(
             context.node_kind,
             context.demand,
@@ -2501,7 +2536,7 @@ def test_native_search_engine_counts_exact_infeasible_warm_start_as_completed() 
             np.asarray([30.0], dtype=np.float64),
         )
 
-    assert engine.state()[1].tolist()[5:8] == [1, 1, 0]
+    assert engine.state()[1].tolist()[5:8] == [0, 0, 0]
 
 
 def test_native_search_engine_negative_screen_cache_is_persistent_and_observable() -> None:
@@ -2513,7 +2548,7 @@ def test_native_search_engine_negative_screen_cache_is_persistent_and_observable
         vehicle=replace(base.vehicle, load_capacity=1.0),
     )
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -2566,7 +2601,7 @@ def test_native_search_engine_preserves_python_duplicate_plan_semantics() -> Non
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 2, 16, 1_000_000, 16, 2, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -2598,7 +2633,7 @@ def test_native_search_engine_preserves_python_duplicate_plan_semantics() -> Non
     assert result[0].tolist() == [0, 1]
     assert result[1].tolist() == [5, 5]
     assert result[5].tolist() == [0]
-    assert engine.state()[2] == 1
+    assert engine.state()[2] == 2
 
 
 def test_native_search_engine_owns_problem_and_warm_start_arrays() -> None:
@@ -2617,7 +2652,7 @@ def test_native_search_engine_owns_problem_and_warm_start_arrays() -> None:
     lexical_rank = np.arange(len(context.node_names), dtype=np.int64)
     warm_offsets = np.asarray([0, 2], dtype=np.int64)
     warm_indices = np.asarray([1, 2], dtype=np.int64)
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -2666,7 +2701,7 @@ def test_native_search_engine_constraint_probe_composes_all_native_layers() -> N
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -2763,7 +2798,7 @@ def test_native_search_engine_constraint_iteration_owns_python_rng_and_policy() 
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -2848,7 +2883,7 @@ def test_native_constraint_search_emits_typed_semantic_event_soa() -> None:
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -2909,7 +2944,7 @@ def test_python_independently_validates_native_constraint_semantic_stream() -> N
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -2996,7 +3031,7 @@ def test_native_constraint_search_stops_at_exact_budget_boundary() -> None:
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         2, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -3039,7 +3074,7 @@ def test_native_constraint_search_returns_zero_event_budget_terminal() -> None:
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         1, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -3107,7 +3142,7 @@ def test_native_constraint_search_returns_completed_prefix_at_deadline() -> None
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -3154,7 +3189,7 @@ def test_constraint_only_search_fails_before_unscheduled_global_iteration() -> N
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -3203,7 +3238,7 @@ def test_native_global_search_matches_python_first_iteration_events() -> None:
         candidate_control_config=CandidateControlConfig(worker_count=1),
     )
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -3479,7 +3514,7 @@ def test_native_global_search_matches_python_distance_improvement_event() -> Non
         candidate_control_config=CandidateControlConfig(worker_count=1),
     )
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -3536,7 +3571,7 @@ def test_native_global_search_matches_python_exact_infeasible_event() -> None:
         candidate_control_config=CandidateControlConfig(worker_count=1),
     )
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -3601,7 +3636,7 @@ def test_native_global_search_matches_python_no_removable_customer_events() -> N
         candidate_control_config=CandidateControlConfig(worker_count=1),
     )
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -3667,7 +3702,7 @@ def test_native_global_search_matches_python_fixed_work_budget_boundary() -> Non
         candidate_control_config=CandidateControlConfig(worker_count=1),
     )
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         2, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -3732,7 +3767,7 @@ def test_native_global_search_returns_pre_exhausted_budget_terminal() -> None:
         candidate_control_config=CandidateControlConfig(worker_count=1),
     )
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         1, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -3784,7 +3819,7 @@ def test_native_global_search_envelope_failure_rolls_back_logical_state() -> Non
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -3840,7 +3875,7 @@ def test_native_search_engine_owns_three_isolated_lane_states() -> None:
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -3916,7 +3951,7 @@ def test_native_quality_relocate_probe_matches_python_candidate_control() -> Non
     assert python_quality[0]["candidate_objective_key"] == (2, 10.0, 0.0, 0)
 
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         100, 100, 256, 10_000_000, 256, 100, context.reachability_epsilon, 1
     )
     initial_offsets = np.asarray([0, 2, 4], dtype=np.int64)
@@ -4017,7 +4052,7 @@ def test_native_legacy_route_elimination_matches_python_candidate_control() -> N
     assert expected_routes is not None
 
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         100, 100, 256, 10_000_000, 256, 100, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -4101,7 +4136,7 @@ def test_native_full_search_lanes_share_one_candidate_round_budget() -> None:
 
     instance = _candidate_plan_fixture()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         100, 1, 256, 10_000_000, 256, 100, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -4149,7 +4184,7 @@ def test_native_three_lane_bootstrap_defers_main_acceptance_until_last() -> None
 
     instance = _candidate_plan_fixture()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         100, 100, 256, 10_000_000, 256, 100, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -4228,7 +4263,7 @@ def test_native_three_lane_bootstrap_is_one_call_and_matches_python_best() -> No
         ),
     )
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         100, 100, 256, 10_000_000, 256, 100, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -4292,7 +4327,10 @@ def test_native_three_lane_bootstrap_is_one_call_and_matches_python_best() -> No
     ]
     weights, rewards, calls, totals = engine.full_stage04_state()
     assert weights.tolist() == [1.0] * len(FULL_NATIVE_OPERATOR_NAMES)
-    assert calls.tolist() == [0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0]
+    assert calls.tolist() == [
+        0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0,
+    ]
     assert rewards.tolist() == pytest.approx(
         [
             0.0,
@@ -4305,6 +4343,12 @@ def test_native_three_lane_bootstrap_is_one_call_and_matches_python_best() -> No
             0.0,
             0.0,
             4.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
             0.0,
             0.0,
             0.0,
@@ -4346,7 +4390,7 @@ def test_native_three_lane_deadline_returns_last_completed_lane_incumbent() -> N
     instance = _candidate_plan_fixture()
     initial = (("C1", "C2"), ("C3", "C4"))
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         100, 100, 256, 10_000_000, 256, 100, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -4411,7 +4455,7 @@ def test_native_global_search_returns_deadline_terminal_without_partial_iteratio
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -4529,6 +4573,7 @@ def test_full_native_v2_one_call_multi_route_matches_python_three_lane_iteration
     assert native_result.stage04_event_log == python_result.stage04_event_log
     assert native_result.stage04_weight_history == python_result.stage04_weight_history
     assert native_result.native_execution_statistics["fallback_count"] == 0
+    assert native_result.native_execution_statistics["shared_native_work_pool"] is False
     assert parallel_result.customer_sequences == native_result.customer_sequences
     assert parallel_result.objective == native_result.objective
     assert parallel_result.neighborhood_events == native_result.neighborhood_events
@@ -4684,7 +4729,13 @@ def test_full_native_v2_two_iterations_match_python_all_three_lanes() -> None:
 
 @pytest.mark.parametrize(
     "max_iterations",
-        [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+        [
+            3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+            19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+            34, 35, 36, 37, 38, 39, 40,
+            41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54,
+            55, 56, 57, 58, 59, 60,
+        ],
 )
 def test_full_native_v2_followup_iterations_match_python_all_three_lanes(
     max_iterations: int,
@@ -4717,7 +4768,6 @@ def test_full_native_v2_followup_iterations_match_python_all_three_lanes(
             candidate_control_config=control,
         ),
     )
-
     assert native_result.customer_sequences == python_result.customer_sequences
     assert native_result.objective == python_result.objective
     assert native_result.iterations == python_result.iterations == max_iterations
@@ -4780,12 +4830,390 @@ def test_full_native_v2_failed_regret_repair_preserves_main_rng_alignment() -> N
     )
 
 
+@pytest.mark.external_data
+@pytest.mark.parametrize("max_iterations", [1, 2, 3, 4, 5, 6])
+def test_full_native_v2_matches_real_c101c5_warm_start(
+    max_iterations: int,
+) -> None:
+    instance_path = Path("data/schneider/c101C5.txt")
+    if not instance_path.exists():
+        pytest.skip("Schneider benchmark data are not linked")
+    instance = replace(parse_schneider(instance_path), distance_backend="native")
+    initial = (("C12", "C100"), ("C64", "C30", "C85"))
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = initial
+    control = CandidateControlConfig(
+        worker_count=1,
+        max_exact_calls_per_round=100,
+        proposal_top_k=100,
+    )
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=max_iterations,
+        time_limit_seconds=10.0,
+        **solve_kwargs,
+        candidate_control_config=control,
+    )
+    native_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=max_iterations,
+        time_limit_seconds=10.0,
+        **solve_kwargs,
+        native_execution_config=replace(
+            _native_config("full_native_alns"),
+            candidate_control_config=control,
+        ),
+    )
+
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.objective == python_result.objective
+    assert native_result.charging_subproblem_calls == python_result.charging_subproblem_calls
+    assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+
+
+@pytest.mark.external_data
+@pytest.mark.parametrize("max_iterations", [4, 5, 6, 7, 8, 9, 10, 11, 12])
+def test_full_native_v2_matches_real_c101_21_followup_iterations(
+    max_iterations: int,
+) -> None:
+    instance_path = Path("data/schneider/c101_21.txt")
+    warm_start_path = Path(
+        "results/stage05.2_resource_calibration_attempt04/workers6/c101_21/2014/"
+        "stage05.2_resource_calibration_attempt04_solution_c101_21_2014.json"
+    )
+    if not instance_path.exists() or not warm_start_path.exists():
+        pytest.skip("real c101_21 diagnostic inputs are not linked")
+    instance = replace(parse_schneider(instance_path), distance_backend="native")
+    payload = json.loads(warm_start_path.read_text(encoding="utf-8"))
+    customers = {node.name for node in instance.customers}
+    initial = tuple(
+        tuple(name for name in route if name in customers)
+        for route in payload["axes"]["fixed_work_calibration"]["initial_routes"]
+    )
+    control = CandidateControlConfig(
+        worker_count=1,
+        max_exact_calls_per_round=100,
+        proposal_top_k=100,
+    )
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = initial
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=max_iterations,
+        time_limit_seconds=120.0,
+        **solve_kwargs,
+        candidate_control_config=control,
+    )
+    native_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=max_iterations,
+        time_limit_seconds=120.0,
+        **solve_kwargs,
+        native_execution_config=replace(
+            _native_config("full_native_alns"),
+            candidate_control_config=control,
+        ),
+    )
+
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.objective == python_result.objective
+    assert native_result.charging_subproblem_calls == python_result.charging_subproblem_calls
+    assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+
+
+@pytest.mark.external_data
+@pytest.mark.parametrize("worker_count", [1, 4])
+def test_full_native_v2_real_c101_21_fixed_work_boundary_matches_python(
+    worker_count: int,
+) -> None:
+    instance_path = Path("data/schneider/c101_21.txt")
+    warm_start_path = Path(
+        "results/stage05.2_resource_calibration_attempt04/workers6/c101_21/2014/"
+        "stage05.2_resource_calibration_attempt04_solution_c101_21_2014.json"
+    )
+    if not instance_path.exists() or not warm_start_path.exists():
+        pytest.skip("real c101_21 diagnostic inputs are not linked")
+    instance = replace(parse_schneider(instance_path), distance_backend="native")
+    payload = json.loads(warm_start_path.read_text(encoding="utf-8"))
+    customers = {node.name for node in instance.customers}
+    initial = tuple(
+        tuple(name for name in route if name in customers)
+        for route in payload["axes"]["fixed_work_calibration"]["initial_routes"]
+    )
+    control = CandidateControlConfig(
+        worker_count=worker_count,
+        max_exact_calls_per_round=100,
+        proposal_top_k=100,
+    )
+    exact_config = ExactDeadlineConfig.fixed_exact_calls(
+        100,
+        watchdog_seconds=120.0,
+    )
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = initial
+    common = {
+        "seed": 2014,
+        "max_iterations": 1000,
+        "time_limit_seconds": 120.0,
+        "termination_mode": "fixed_work",
+        "exact_deadline_config": exact_config,
+    }
+    python_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        **solve_kwargs,
+        candidate_control_config=control,
+    )
+    native_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        **solve_kwargs,
+        native_execution_config=replace(
+            _native_config("full_native_alns"),
+            candidate_control_config=control,
+        ),
+    )
+
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.objective == python_result.objective
+    assert native_result.termination_reason == python_result.termination_reason
+    assert native_result.iterations == python_result.iterations
+    assert native_result.exact_started_calls == python_result.exact_started_calls == 100
+    assert native_result.exact_completed_calls == python_result.exact_completed_calls
+    assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+    assert native_result.stage04_event_log == python_result.stage04_event_log
+    assert native_result.stage04_weight_history == python_result.stage04_weight_history
+    assert native_result.native_execution_statistics["fallback_count"] == 0
+
+
+@pytest.mark.external_data
+@pytest.mark.parametrize("instance_name", ["c101C5", "c101_21", "r101_21", "rc101_21"])
+@pytest.mark.parametrize("seed", [2014, 2015, 2016])
+@pytest.mark.parametrize("worker_count", [1, 4])
+def test_per_solve_v2_paired_fixed_work_matches_python_candidate_control(
+    instance_name: str,
+    seed: int,
+    worker_count: int,
+) -> None:
+    instance_path = Path(f"data/schneider/{instance_name}.txt")
+    warm_start_path = Path(
+        "results/"
+        "stage05.2_native_architecture_python_candidate_control_paired_attempt03/"
+        f"axes/repeat1/fixed_work/{instance_name}/{seed}.json"
+    )
+    if not instance_path.exists() or not warm_start_path.exists():
+        pytest.skip("attempt03 paired diagnostic inputs are not linked")
+    instance = replace(parse_schneider(instance_path), distance_backend="native")
+    payload = json.loads(warm_start_path.read_text(encoding="utf-8"))
+    initial = tuple(tuple(route) for route in payload["customer_sequences"])
+    control = CandidateControlConfig(
+        worker_count=worker_count,
+        max_exact_calls_per_round=100,
+        proposal_top_k=100,
+    )
+    exact_config = ExactDeadlineConfig.fixed_exact_calls(
+        100,
+        watchdog_seconds=120.0,
+    )
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = initial
+    common = {
+        "seed": seed,
+        "max_iterations": 1000,
+        "time_limit_seconds": 120.0,
+        "termination_mode": "fixed_work",
+        "exact_deadline_config": exact_config,
+    }
+    python_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        **solve_kwargs,
+        candidate_control_config=control,
+    )
+    native_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        **solve_kwargs,
+        native_execution_config=replace(
+            _native_config("per_solve_runtime"),
+            candidate_control_config=control,
+        ),
+    )
+
+    assert native_result.feasible and python_result.feasible
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.objective == python_result.objective
+    assert native_result.candidate_work_hash == python_result.candidate_work_hash
+    assert native_result.route_result_hash == python_result.route_result_hash
+    assert native_result.termination_reason == python_result.termination_reason
+    assert native_result.iterations == python_result.iterations
+    assert native_result.exact_started_calls == python_result.exact_started_calls
+    assert native_result.exact_completed_calls == python_result.exact_completed_calls
+    assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+    assert native_result.stage04_event_log == python_result.stage04_event_log
+    assert native_result.stage04_weight_history == python_result.stage04_weight_history
+    assert native_result.native_execution_statistics["fallback_count"] == 0
+
+
+@pytest.mark.external_data
+@pytest.mark.parametrize("instance_name", ["c101C5", "c101_21", "r101_21", "rc101_21"])
+@pytest.mark.parametrize("seed", [2014, 2015, 2016])
+def test_host_scheduler_v2_paired_fixed_work_matches_python_candidate_control(
+    instance_name: str,
+    seed: int,
+    native_host_scheduler_socket: str,
+) -> None:
+    instance_path = Path(f"data/schneider/{instance_name}.txt")
+    warm_start_path = Path(
+        "results/"
+        "stage05.2_native_architecture_python_candidate_control_paired_attempt03/"
+        f"axes/repeat1/fixed_work/{instance_name}/{seed}.json"
+    )
+    if not instance_path.exists() or not warm_start_path.exists():
+        pytest.skip("attempt03 paired diagnostic inputs are not linked")
+    instance = replace(parse_schneider(instance_path), distance_backend="native")
+    payload = json.loads(warm_start_path.read_text(encoding="utf-8"))
+    initial = tuple(tuple(route) for route in payload["customer_sequences"])
+    control = CandidateControlConfig(
+        worker_count=1,
+        max_exact_calls_per_round=100,
+        proposal_top_k=100,
+    )
+    exact_config = ExactDeadlineConfig.fixed_exact_calls(
+        100,
+        watchdog_seconds=120.0,
+    )
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = initial
+    common = {
+        "seed": seed,
+        "max_iterations": 1000,
+        "time_limit_seconds": 120.0,
+        "termination_mode": "fixed_work",
+        "exact_deadline_config": exact_config,
+    }
+    python_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        **solve_kwargs,
+        candidate_control_config=control,
+    )
+    native_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        **solve_kwargs,
+        native_execution_config=replace(
+            _native_config("host_scheduler"),
+            candidate_control_config=control,
+            scheduler_socket_path=native_host_scheduler_socket,
+        ),
+    )
+
+    assert native_result.feasible and python_result.feasible
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.objective == python_result.objective
+    assert native_result.candidate_work_hash == python_result.candidate_work_hash
+    assert native_result.route_result_hash == python_result.route_result_hash
+    assert native_result.termination_reason == python_result.termination_reason
+    assert native_result.iterations == python_result.iterations
+    assert native_result.exact_started_calls == python_result.exact_started_calls
+    assert native_result.exact_completed_calls == python_result.exact_completed_calls
+    assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+    assert native_result.stage04_event_log == python_result.stage04_event_log
+    assert native_result.stage04_weight_history == python_result.stage04_weight_history
+    assert native_result.native_execution_statistics["fallback_count"] == 0
+    assert native_result.native_execution_statistics["shared_native_work_pool"] is True
+
+
+@pytest.mark.external_data
+@pytest.mark.parametrize("instance_name", ["c101C5", "c101_21", "r101_21", "rc101_21"])
+@pytest.mark.parametrize("seed", [2014, 2015, 2016])
+def test_full_native_v2_paired_fixed_work_matches_python_candidate_control(
+    instance_name: str,
+    seed: int,
+) -> None:
+    instance_path = Path(f"data/schneider/{instance_name}.txt")
+    warm_start_path = Path(
+        "results/"
+        "stage05.2_native_architecture_python_candidate_control_paired_attempt03/"
+        f"axes/repeat1/fixed_work/{instance_name}/{seed}.json"
+    )
+    if not instance_path.exists() or not warm_start_path.exists():
+        pytest.skip("attempt03 paired diagnostic inputs are not linked")
+    instance = replace(parse_schneider(instance_path), distance_backend="native")
+    payload = json.loads(warm_start_path.read_text(encoding="utf-8"))
+    initial = tuple(tuple(route) for route in payload["customer_sequences"])
+    control = CandidateControlConfig(
+        worker_count=1,
+        max_exact_calls_per_round=100,
+        proposal_top_k=100,
+    )
+    exact_config = ExactDeadlineConfig.fixed_exact_calls(
+        100,
+        watchdog_seconds=120.0,
+    )
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = initial
+    common = {
+        "seed": seed,
+        "max_iterations": 1000,
+        "time_limit_seconds": 120.0,
+        "termination_mode": "fixed_work",
+        "exact_deadline_config": exact_config,
+    }
+    python_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        **solve_kwargs,
+        candidate_control_config=control,
+    )
+    native_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        **solve_kwargs,
+        native_execution_config=replace(
+            _native_config("full_native_alns"),
+            candidate_control_config=control,
+        ),
+    )
+
+    assert native_result.feasible and python_result.feasible
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.objective == python_result.objective
+    assert native_result.candidate_work_hash == python_result.candidate_work_hash
+    assert native_result.route_result_hash == python_result.route_result_hash
+    assert native_result.termination_reason == python_result.termination_reason
+    assert native_result.iterations == python_result.iterations
+    assert native_result.exact_started_calls == python_result.exact_started_calls
+    assert native_result.exact_completed_calls == python_result.exact_completed_calls
+    assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+    assert native_result.stage04_event_log == python_result.stage04_event_log
+    assert native_result.stage04_weight_history == python_result.stage04_weight_history
+    assert native_result.native_execution_statistics["fallback_count"] == 0
+
+
 def test_native_global_search_returns_incumbent_after_exact_kernel_deadline() -> None:
     from evrptw import _core as native_core
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -4838,7 +5266,7 @@ def test_native_constraint_iteration_deadline_boundary_rolls_back_all_state() ->
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -4916,7 +5344,7 @@ def test_native_constraint_iteration_rejects_at_exact_budget_boundary() -> None:
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         2, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -4965,7 +5393,7 @@ def test_native_constraint_iteration_applies_stage04_segment_weights() -> None:
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -5031,7 +5459,7 @@ def test_native_stage04_constraint_statistics_are_shared_across_lanes() -> None:
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -5096,7 +5524,7 @@ def test_native_stage04_iteration_finish_is_exactly_once_and_monotonic() -> None
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -5147,7 +5575,7 @@ def test_native_constraint_iteration_preserves_preexisting_unapplied_candidate()
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -5196,7 +5624,7 @@ def test_native_search_engine_candidate_state_does_not_depend_on_cache_store() -
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 1, 1, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -5238,7 +5666,7 @@ def test_native_search_engine_constraint_probe_uses_one_end_to_end_deadline() ->
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -5281,7 +5709,7 @@ def test_native_search_engine_constraint_probe_envelope_failure_rolls_back() -> 
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
-    engine = native_core.NativeSearchEngineV2(
+    engine = _native_search_engine(native_core, context,
         10, 1, 1, 1_000_000, 16, 1, context.reachability_epsilon, 1
     )
     engine.initialize(
@@ -5972,6 +6400,8 @@ def test_full_native_v2_one_call_matches_python_first_iteration(
     assert invocations == 1
     assert native_result.objective == python_result.objective
     assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.candidate_work_hash == python_result.candidate_work_hash
+    assert native_result.route_result_hash == python_result.route_result_hash
     assert native_result.exact_started_calls == python_result.exact_started_calls
     assert native_result.exact_completed_calls == python_result.exact_completed_calls
     assert native_result.neighborhood_events == python_result.neighborhood_events
@@ -5986,6 +6416,44 @@ def test_full_native_v2_one_call_matches_python_first_iteration(
     assert native_result.backend_metrics["batch_launches"] == 2
     assert native_result.backend_metrics["work_batches"] == 2
     assert native_result.backend_metrics["launch_occupancies"] == [1, 1]
+    assert (
+        native_result.native_execution_statistics[
+            "candidate_control_semantics_complete"
+        ]
+        is True
+    )
+    assert native_result.native_execution_statistics["stage04_semantics_complete"] is True
+    instrumentation = native_result.native_execution_statistics
+    assert instrumentation["instrumentation_complete"] is True
+    assert instrumentation["input_packing_seconds"] >= 0.0
+    assert instrumentation["protocol_boundary_seconds"] >= 0.0
+    assert instrumentation["serialization_ipc_seconds"] == 0.0
+    assert instrumentation["validation_replay_seconds"] >= 0.0
+    assert instrumentation["work_pool_peak_active_tasks"] >= 1
+    assert instrumentation["work_pool_active_tasks_at_return"] == 0
+    assert instrumentation["queue_depth_on_submit"] == 0
+    assert instrumentation["candidate_screening_occupancies"]
+    assert instrumentation["maximum_candidate_screening_occupancy"] >= 1
+    cache_fields = (
+        "cache_lookups",
+        "cache_hits",
+        "cache_misses",
+        "cache_stores",
+        "cache_evictions",
+        "cache_oversize_not_cached",
+        "entries_current",
+        "entries_peak",
+        "bytes_current",
+        "bytes_peak",
+        "unique_route_evaluations",
+    )
+    assert {
+        field: native_result.cache_incremental_statistics[field]
+        for field in cache_fields
+    } == {
+        field: python_result.cache_incremental_statistics[field]
+        for field in cache_fields
+    }
     timings = native_result.native_execution_statistics["timings"]
     assert isinstance(timings, dict)
     assert timings["exact_seconds"] > 0.0
@@ -6045,8 +6513,8 @@ def test_full_native_v2_rejects_foreign_semantic_stream_before_outer_commit(
     def swap_semantic_stream(*args: object) -> object:
         primary = list(original(*args))
         alternate_args = list(args)
-        alternate_args[10] = np.ascontiguousarray(
-            np.asarray(alternate_args[10], dtype=np.int64)[::-1]
+        alternate_args[12] = np.ascontiguousarray(
+            np.asarray(alternate_args[12], dtype=np.int64)[::-1]
         )
         alternate = original(*alternate_args)
         assert primary[7][14] != alternate[7][14]
@@ -6075,8 +6543,8 @@ def test_full_native_v2_replay_rejects_current_state_as_global_best(
     def return_current_instead_of_best(*args: object) -> object:
         primary = list(original(*args))
         alternate_args = list(args)
-        alternate_args[10] = np.ascontiguousarray(
-            np.asarray(alternate_args[10], dtype=np.int64)[::-1]
+        alternate_args[12] = np.ascontiguousarray(
+            np.asarray(alternate_args[12], dtype=np.int64)[::-1]
         )
         alternate = original(*alternate_args)
         primary[0] = alternate[0]
@@ -6088,9 +6556,11 @@ def test_full_native_v2_replay_rejects_current_state_as_global_best(
             exact_payload=primary[2],
             counters=primary[3],
             trajectory=primary[5],
-            semantic_sha256=primary[7][14],
-            backend_payload=primary[8],
-        )
+                semantic_sha256=primary[7][14],
+                backend_payload=primary[8],
+                exact_journal_sha256=primary[9][1],
+                control_journal_sha256=primary[10][2],
+            )
         return tuple(primary)
 
     monkeypatch.setattr(native_core, "full_native_alns_v2", return_current_instead_of_best)
@@ -6165,26 +6635,187 @@ def test_full_native_operator_statistics_compare_canonical_objective_keys() -> N
     assert statistics["segment_reward_sum"] == 1.0
 
 
-def test_host_scheduler_v1_cannot_masquerade_as_full_native_v2(
-    tmp_path: Path,
-) -> None:
-    instance = _fixture_instance()
+def test_host_scheduler_v1_producer_entrypoint_is_not_exposed() -> None:
+    from evrptw import _core as native_core
+
+    assert not hasattr(native_core, "run_host_scheduler_service_v1")
+    assert hasattr(native_core, "run_host_scheduler_service_v2")
+    assert hasattr(native_core, "dispatch_host_scheduler_v2")
+
+
+def test_host_scheduler_v2_owns_one_shared_24_thread_pool(tmp_path: Path) -> None:
     endpoint = tmp_path / "native-scheduler.sock"
-    with (
-        NativeHostScheduler(endpoint),
-        pytest.raises(RuntimeError, match="invalid SoA descriptor set"),
-    ):
-        solve_alns(
+
+    with NativeHostScheduler(endpoint, worker_threads=24) as scheduler:
+        # One service main thread, six request/control threads, and exactly one
+        # shared 24-thread compute pool. Per-request 24-thread pools would make
+        # this count grow with connected shards.
+        assert scheduler.observed_thread_count() == 31
+
+
+@pytest.mark.parametrize("client_count", [1, 2, 6])
+def test_host_scheduler_v2_six_clients_share_pool_and_isolate_state(
+    tmp_path: Path,
+    client_count: int,
+) -> None:
+    endpoint = tmp_path / "native-scheduler.sock"
+    with NativeHostScheduler(endpoint, worker_threads=24) as scheduler:
+
+        def solve_one() -> object:
+            # Each shard owns its complete Python-side input graph.  This keeps
+            # the test focused on scheduler-side solve-state isolation instead
+            # of relying on concurrent reads from shared Python containers.
+            instance = _candidate_plan_fixture()
+            solve_kwargs = _full_native_solve_kwargs()
+            solve_kwargs["initial_customer_sequences"] = (
+                ("C1", "C2"),
+                ("C3", "C4"),
+            )
+            return solve_alns(
+                instance,
+                seed=2014,
+                max_iterations=3,
+                time_limit_seconds=10.0,
+                **solve_kwargs,  # type: ignore[arg-type]
+                native_execution_config=replace(
+                    _native_config("host_scheduler"),
+                    scheduler_socket_path=str(endpoint),
+                ),
+            )
+
+        with ThreadPoolExecutor(max_workers=client_count) as clients:
+            futures = tuple(clients.submit(solve_one) for _ in range(client_count))
+            results = tuple(future.result() for future in futures)
+
+        assert scheduler.observed_thread_count() == 31
+
+    reference = results[0]
+    for result in results:
+        assert result.feasible
+        assert result.objective == reference.objective
+        assert result.customer_sequences == reference.customer_sequences
+        assert result.candidate_work_hash == reference.candidate_work_hash
+        assert result.route_result_hash == reference.route_result_hash
+        assert result.native_execution_statistics["fallback_count"] == 0
+        assert result.native_execution_statistics["shared_native_work_pool"] is True
+        assert result.native_execution_statistics["instrumentation_complete"] is True
+        assert result.native_execution_statistics["serialization_ipc_seconds"] >= 0.0
+        assert result.native_execution_statistics["queue_wait_seconds"] >= 0.0
+        assert result.native_execution_statistics["queue_depth_on_submit"] >= 1
+        assert 1 <= result.native_execution_statistics[
+            "work_pool_peak_active_tasks"
+        ] <= 24
+
+
+def test_full_native_v2_concurrent_solves_isolate_state() -> None:
+    def solve_one() -> object:
+        instance = _candidate_plan_fixture()
+        solve_kwargs = _full_native_solve_kwargs()
+        solve_kwargs["initial_customer_sequences"] = (
+            ("C1", "C2"),
+            ("C3", "C4"),
+        )
+        return solve_alns(
             instance,
             seed=2014,
-            max_iterations=10,
-            time_limit_seconds=2.0,
-            **_full_native_solve_kwargs(),  # type: ignore[arg-type]
-            native_execution_config=replace(
-                _native_config("host_scheduler"),
-                scheduler_socket_path=str(endpoint),
-            ),
+            max_iterations=3,
+            time_limit_seconds=10.0,
+            **solve_kwargs,  # type: ignore[arg-type]
+            native_execution_config=_native_config("full_native_alns"),
         )
+
+    with ThreadPoolExecutor(max_workers=2) as clients:
+        futures = tuple(clients.submit(solve_one) for _ in range(2))
+        results = tuple(future.result() for future in futures)
+
+    assert results[0].objective == results[1].objective
+    assert results[0].candidate_work_hash == results[1].candidate_work_hash
+    assert results[0].route_result_hash == results[1].route_result_hash
+
+
+@pytest.mark.parametrize("max_iterations", [3, 50])
+def test_full_native_v2_canonical_semantics_match_through_failed_refinement(
+    max_iterations: int,
+) -> None:
+    instance = _candidate_plan_fixture()
+    common = {
+        "seed": 2014,
+        "max_iterations": max_iterations,
+        "time_limit_seconds": 10.0,
+        "initial_customer_sequences": (("C1", "C2"), ("C3", "C4")),
+        "screening_config": CheapScreeningConfig(),
+        "cache_incremental_config": CacheIncrementalConfig(enabled=True),
+        "measurement_config": MeasurementConfig(),
+        "stage04_config": Stage04Config(),
+    }
+    python_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        candidate_control_config=CandidateControlConfig(worker_count=1),
+    )
+    native_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    python_trajectory = _semantic_candidate_trajectory(python_result)
+    native_trajectory = _semantic_candidate_trajectory(native_result)
+    assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert (
+        native_result.neighborhood_statistics
+        == python_result.neighborhood_statistics
+    )
+    assert native_result.stage04_event_log == python_result.stage04_event_log
+    assert native_trajectory == python_trajectory
+    assert any(
+        event["operator"] == "vehicle_reduction_refinement"
+        and event["reason"] == "no_existing_route_insertion"
+        for event in native_trajectory
+    )
+    assert _measurement_evidence(native_result)["sha256"] == (
+        _measurement_evidence(python_result)["sha256"]
+    )
+
+
+def test_full_native_v2_records_canonical_screening_and_reachability() -> None:
+    instance = _candidate_plan_fixture()
+    result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=3,
+        time_limit_seconds=10.0,
+        initial_customer_sequences=(("C1", "C2"), ("C3", "C4")),
+        screening_config=CheapScreeningConfig(),
+        cache_incremental_config=CacheIncrementalConfig(enabled=True),
+        measurement_config=MeasurementConfig(),
+        stage04_config=Stage04Config(),
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    trace = result.measurement_trace
+    assert trace is not None
+    semantic_count = result.screening_statistics["screening_semantic_decisions"]
+    assert len(trace.screening_decisions) == semantic_count
+    assert semantic_count > 0
+    assert all(decision.checks for decision in trace.screening_decisions)
+    assert result.screening_statistics["screening_semantic_event_count"] == semantic_count
+    assert (
+        result.screening_statistics["screening_physical_owner_count"]
+        == result.screening_statistics["screening_calls"]
+    )
+    expected_reachability = StationReachabilityIndex(instance).to_dict()
+    observed_reachability = result.cache_incremental_statistics[
+        "station_reachability"
+    ]
+    assert isinstance(observed_reachability, dict)
+    assert observed_reachability["safe_nodes"] == expected_reachability["safe_nodes"]
+    assert observed_reachability["bitsets"] == expected_reachability["bitsets"]
+    assert (
+        observed_reachability["origin_bitsets"]
+        == expected_reachability["origin_bitsets"]
+    )
+    assert observed_reachability["queries"] > 0
 
 
 def test_host_scheduler_exit_fails_fast_without_local_fallback(tmp_path: Path) -> None:
@@ -6202,21 +6833,66 @@ def test_host_scheduler_exit_fails_fast_without_local_fallback(tmp_path: Path) -
             **_full_native_solve_kwargs(),  # type: ignore[arg-type]
             native_execution_config=replace(
                 _native_config("host_scheduler"),
+                candidate_control_config=CandidateControlConfig(
+                    worker_count=1,
+                    max_exact_calls_per_round=100,
+                    proposal_top_k=100,
+                ),
                 scheduler_socket_path=str(endpoint),
             ),
         )
 
 
-def test_host_scheduler_partial_ipc_rolls_back_and_keeps_service_usable(
-    tmp_path: Path,
-) -> None:
-    endpoint = tmp_path / "native-scheduler.sock"
-    with NativeHostScheduler(endpoint):
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.connect(str(endpoint))
-            connection.sendall(struct.pack("!Q", 100) + b"{}")
+def _stage052_shared_memory_names() -> set[str]:
+    shared_memory = Path("/dev/shm")
+    return {
+        path.name
+        for path in shared_memory.glob("evrptw-s52-*")
+        if path.is_file()
+    }
 
-        with pytest.raises(RuntimeError, match="invalid SoA descriptor set"):
+
+@pytest.mark.parametrize(
+    "fault, expected_message",
+    [
+        ("request_hash_mismatch", "request hash mismatch"),
+        (
+            "client_disconnect_after_request",
+            "client disconnect without fallback",
+        ),
+        ("ack_loss", "acknowledgement loss without fallback"),
+        ("invalid_ack", "did not confirm output release"),
+        ("worker_exception", "injected host scheduler worker exception"),
+    ],
+)
+def test_host_scheduler_faults_fail_fast_and_release_shared_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+    expected_message: str,
+) -> None:
+    from evrptw import _core as native_core
+    from evrptw import native_scheduler as native_scheduler_module
+
+    before = _stage052_shared_memory_names()
+    endpoint = tmp_path / "native-scheduler.sock"
+    with NativeHostScheduler(endpoint) as scheduler:
+        def dispatch_with_fault(
+            socket_path: str,
+            *arrays: Any,
+        ) -> object:
+            return native_core._test_host_scheduler_fault_v2(
+                socket_path,
+                fault,
+                *arrays,
+            )
+
+        monkeypatch.setattr(
+            native_scheduler_module,
+            "dispatch_full_native_alns",
+            dispatch_with_fault,
+        )
+        with pytest.raises(RuntimeError, match=expected_message):
             solve_alns(
                 _fixture_instance(),
                 seed=2014,
@@ -6225,9 +6901,165 @@ def test_host_scheduler_partial_ipc_rolls_back_and_keeps_service_usable(
                 **_full_native_solve_kwargs(),  # type: ignore[arg-type]
                 native_execution_config=replace(
                     _native_config("host_scheduler"),
+                    candidate_control_config=CandidateControlConfig(
+                        worker_count=1,
+                        max_exact_calls_per_round=100,
+                        proposal_top_k=100,
+                    ),
                     scheduler_socket_path=str(endpoint),
                 ),
             )
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if _stage052_shared_memory_names() == before:
+                break
+            time.sleep(0.01)
+        assert _stage052_shared_memory_names() == before
+        assert scheduler.is_running
+
+
+def test_host_scheduler_crash_aborts_inflight_transaction_without_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from threading import Event
+
+    from evrptw import _core as native_core
+    from evrptw import native_scheduler as native_scheduler_module
+
+    before = _stage052_shared_memory_names()
+    endpoint = tmp_path / "native-scheduler.sock"
+    dispatch_started = Event()
+    with NativeHostScheduler(endpoint) as scheduler:
+        def paused_dispatch(socket_path: str, *arrays: Any) -> object:
+            dispatch_started.set()
+            return native_core._test_host_scheduler_fault_v2(
+                socket_path,
+                "pause_before_execute",
+                *arrays,
+            )
+
+        monkeypatch.setattr(
+            native_scheduler_module,
+            "dispatch_full_native_alns",
+            paused_dispatch,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                solve_alns,
+                _fixture_instance(),
+                seed=2014,
+                max_iterations=1,
+                time_limit_seconds=30.0,
+                **_full_native_solve_kwargs(),  # type: ignore[arg-type]
+                native_execution_config=replace(
+                    _native_config("host_scheduler"),
+                    candidate_control_config=CandidateControlConfig(
+                        worker_count=1,
+                        max_exact_calls_per_round=100,
+                        proposal_top_k=100,
+                    ),
+                    scheduler_socket_path=str(endpoint),
+                ),
+            )
+            assert dispatch_started.wait(timeout=2.0)
+            time.sleep(0.1)
+            scheduler.close(force=True)
+            with pytest.raises(RuntimeError, match="partial IPC frame"):
+                future.result(timeout=5.0)
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if _stage052_shared_memory_names() == before:
+            break
+        time.sleep(0.01)
+    assert _stage052_shared_memory_names() == before
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        struct.pack("!Q", 0),
+        struct.pack("!Q", (1 << 20) + 1),
+        struct.pack("!Q", 100) + b"{}",
+    ],
+)
+def test_host_scheduler_invalid_frame_isolated_from_next_transaction(
+    tmp_path: Path,
+    frame: bytes,
+) -> None:
+    endpoint = tmp_path / "native-scheduler.sock"
+    with NativeHostScheduler(endpoint):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.connect(str(endpoint))
+            connection.sendall(frame)
+
+        result = solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            **_full_native_solve_kwargs(),  # type: ignore[arg-type]
+            native_execution_config=replace(
+                _native_config("host_scheduler"),
+                candidate_control_config=CandidateControlConfig(
+                    worker_count=1,
+                    max_exact_calls_per_round=100,
+                    proposal_top_k=100,
+                ),
+                scheduler_socket_path=str(endpoint),
+            ),
+        )
+        assert result.native_execution_statistics["fallback_count"] == 0
+
+
+@pytest.mark.external_data
+def test_host_scheduler_partial_ipc_rolls_back_and_keeps_service_usable(
+    tmp_path: Path,
+) -> None:
+    instance_path = Path("data/schneider/c101C5.txt")
+    warm_start_path = Path(
+        "results/"
+        "stage05.2_native_architecture_python_candidate_control_paired_attempt03/"
+        "axes/repeat1/fixed_work/c101C5/2014.json"
+    )
+    if not instance_path.exists() or not warm_start_path.exists():
+        pytest.skip("attempt03 paired diagnostic inputs are not linked")
+    instance = replace(parse_schneider(instance_path), distance_backend="native")
+    warm_start = json.loads(warm_start_path.read_text(encoding="utf-8"))
+    endpoint = tmp_path / "native-scheduler.sock"
+    with NativeHostScheduler(endpoint):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.connect(str(endpoint))
+            connection.sendall(struct.pack("!Q", 100) + b"{}")
+
+        solve_kwargs = _full_native_solve_kwargs()
+        solve_kwargs["initial_customer_sequences"] = tuple(
+            tuple(route) for route in warm_start["customer_sequences"]
+        )
+        result = solve_alns(
+            instance,
+            seed=2014,
+            max_iterations=1000,
+            time_limit_seconds=120.0,
+            termination_mode="fixed_work",
+            exact_deadline_config=ExactDeadlineConfig.fixed_exact_calls(
+                100,
+                watchdog_seconds=120.0,
+            ),
+            **solve_kwargs,  # type: ignore[arg-type]
+            native_execution_config=replace(
+                _native_config("host_scheduler"),
+                candidate_control_config=CandidateControlConfig(
+                    worker_count=1,
+                    max_exact_calls_per_round=100,
+                    proposal_top_k=100,
+                ),
+                scheduler_socket_path=str(endpoint),
+            ),
+        )
+
+        assert result.native_execution_statistics["fallback_count"] == 0
 
 
 def test_host_scheduler_start_failure_cleans_process_state(tmp_path: Path) -> None:

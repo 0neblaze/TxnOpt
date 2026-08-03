@@ -67,6 +67,7 @@ from evrptw.models import Instance, Node
 from evrptw.native_execution import (
     FULL_NATIVE_OPERATOR_NAMES,
     NativeCandidateRoundRequest,
+    NativeGlobalSemanticStream,
     NativeThreeLaneSemanticStream,
     Stage052NativeExecutionConfig,
     execute_full_native_alns,
@@ -306,6 +307,8 @@ class ALNSResult:
     native_execution_statistics: dict[str, object] = field(default_factory=dict)
     candidate_work_hash: str = ""
     route_result_hash: str = ""
+    candidate_work_events: tuple[dict[str, object], ...] = ()
+    route_result_events: tuple[dict[str, object], ...] = ()
     # Stage 4 adaptive-weight and search-control statistics.
     stage04_statistics: dict[str, object] = field(default_factory=dict)
     stage04_weight_history: dict[str, list[tuple[int, float]]] = field(default_factory=dict)
@@ -4767,6 +4770,16 @@ def _solve_alns(
             if candidate_control_runtime is not None
             else ""
         ),
+        candidate_work_events=(
+            candidate_control_runtime.candidate_work
+            if candidate_control_runtime is not None
+            else ()
+        ),
+        route_result_events=(
+            candidate_control_runtime.route_results
+            if candidate_control_runtime is not None
+            else ()
+        ),
         stage04_statistics=(
             {
                 "enabled": stage04_enabled,
@@ -4839,6 +4852,7 @@ def _full_native_operator_statistics(
     native_operator_activity: npt.NDArray[np.int64] | None = None,
     native_operator_calls: npt.NDArray[np.int64] | None = None,
     native_operator_rewards: npt.NDArray[np.float64] | None = None,
+    stage04_segment_events: list[dict[str, object]] | None = None,
 ) -> dict[str, dict[str, object]]:
     names = (*_neighborhood_names(operator_profile), "vehicle_reduction_refinement")
     statistics = {name: OperatorStatistics().to_dict() for name in names}
@@ -4872,7 +4886,8 @@ def _full_native_operator_statistics(
         "constraint_ranked_removal",
         "constraint_removal_repaired",
     }
-    for events in grouped.values():
+    segment_records: list[tuple[int, str, float]] = []
+    for (iteration, _), events in grouped.items():
         operator = str(events[0]["operator"])
         values = statistics[operator]
         values["calls"] = cast(int, values["calls"]) + 1
@@ -4882,19 +4897,37 @@ def _full_native_operator_statistics(
             str(event["status"]) == "candidate_proposed" for event in events
         )
         values["feasible_candidates"] = cast(int, values["feasible_candidates"]) + sum(
-            bool(event["candidate_feasible"]) for event in events
+            cast(int, event.get("aggregate_count", 1))
+            for event in events
+            if bool(event["candidate_feasible"])
         )
-        feasible_repair = any(bool(event["candidate_feasible"]) for event in events)
+        feasible_repair = any(
+            bool(event.get("_operator_feasible_repair", event["candidate_feasible"]))
+            for event in events
+        )
         if operator == "vehicle_reduction_refinement":
-            feasible_repair = any(bool(event["prefilter_passed"]) for event in events)
+            feasible_repair = any(
+                bool(event["candidate_feasible"])
+                or str(event["reason"]) == "refinement_not_better"
+                for event in events
+            )
         values["feasible_repairs"] = cast(int, values["feasible_repairs"]) + int(
             feasible_repair
         )
         values["prefilter_passed"] = cast(int, values["prefilter_passed"]) + sum(
-            bool(event["prefilter_passed"]) for event in events
+            cast(int, event.get("aggregate_count", 1))
+            for event in events
+            if bool(event["prefilter_passed"])
         )
         values["prefilter_rejected"] = cast(int, values["prefilter_rejected"]) + sum(
-            str(event["status"]) == "prefilter_rejected" for event in events
+            (
+                cast(int, event.get("aggregate_count", 0))
+                if str(event["status"]) == "prefilter_rejected_aggregate"
+                else 1
+                if str(event["status"]) == "prefilter_rejected"
+                else 0
+            )
+            for event in events
         )
         values["new_routes_created"] = cast(int, values["new_routes_created"]) + sum(
             cast(int, event["new_routes_created"]) for event in events
@@ -4902,19 +4935,38 @@ def _full_native_operator_statistics(
         values["exact_route_evaluations"] = cast(
             int, values["exact_route_evaluations"]
         ) + sum(cast(int, event["exact_route_evaluations"]) for event in events)
-        values["vehicle_reductions"] = cast(int, values["vehicle_reductions"]) + sum(
-            bool(event.get("vehicle_reduction", False)) for event in events
-        )
+        if operator != "vehicle_reduction_refinement":
+            values["vehicle_reductions"] = cast(
+                int, values["vehicle_reductions"]
+            ) + sum(bool(event.get("vehicle_reduction", False)) for event in events)
         values["distance_improvements"] = cast(
             int, values["distance_improvements"]
         ) + sum(bool(event.get("distance_improvement", False)) for event in events)
         failures = cast(dict[str, int], values["failure_reasons"])
         for event in events:
             reason = str(event["reason"])
+            status = str(event["status"])
+            if status in {
+                "prefilter_rejected_aggregate",
+                "exact_infeasible_aggregate",
+                "candidate_control_skipped_aggregate",
+            }:
+                failures[reason] = failures.get(reason, 0) + cast(
+                    int, event.get("aggregate_count", 0)
+                )
+                continue
             if (
                 reason not in ignored_failure_reasons
                 and not bool(event["candidate_feasible"])
-                and str(event["status"]) in {"not_applicable", "failed"}
+                and status
+                in {
+                    "failed",
+                    "prefilter_rejected",
+                    "exact_infeasible",
+                    "budget_exhausted",
+                    "not_applicable",
+                    "time_limit",
+                }
             ):
                 failures[reason] = failures.get(reason, 0) + 1
 
@@ -4922,9 +4974,18 @@ def _full_native_operator_statistics(
         if len(accepted_events) > 1:
             raise RuntimeError("full native operator replay found duplicate acceptance")
         if not accepted_events:
+            if operator == "vehicle_reduction_refinement" and any(
+                bool(event.get("_operator_budget_discarded", False))
+                for event in events
+            ):
+                # The exact-call boundary discards the enclosing iteration
+                # atomically.  Python preserves refinement work metrics but
+                # records neither an accepted nor a rejected outcome.
+                continue
             values["rejected"] = cast(int, values["rejected"]) + 1
             if any(
-                str(event["reason"]) == "constraint_removal_no_change"
+                str(event["reason"])
+                in {"constraint_removal_no_change", "constraint_repair_infeasible"}
                 for event in events
             ):
                 # Python records both the proposal-level no-change cause and
@@ -4934,9 +4995,13 @@ def _full_native_operator_statistics(
                 failures["candidate_rejected"] = (
                     failures.get("candidate_rejected", 0) + 1
                 )
-            values["segment_reward_sum"] = cast(
-                float, values["segment_reward_sum"]
-            ) + stage04_config.reward_rejected
+            if operator != "vehicle_reduction_refinement":
+                values["segment_reward_sum"] = cast(
+                    float, values["segment_reward_sum"]
+                ) + stage04_config.reward_rejected
+                segment_records.append(
+                    (iteration, operator, stage04_config.reward_rejected)
+                )
             continue
         event = accepted_events[0]
         objective_key = cast(tuple[int, float, float, int], event["candidate_objective_key"])
@@ -4969,15 +5034,28 @@ def _full_native_operator_statistics(
             else "legacy"
         )
         current_objective = current_by_lane[lane]
-        comparison = (
-            "better"
-            if candidate_objective.key < current_objective.key
-            else "equal"
-            if candidate_objective.key == current_objective.key
-            else "worse"
+        comparison = str(
+            event.get(
+                "_operator_comparison",
+                "better"
+                if candidate_objective.key < current_objective.key
+                else "equal"
+                if candidate_objective.key == current_objective.key
+                else "worse",
+            )
         )
-        is_global_best = candidate_objective.key < best_objective.key
-        vehicle_reduction = candidate_objective.vehicle_count < current_objective.vehicle_count
+        is_global_best = bool(
+            event.get(
+                "_operator_is_global_best",
+                candidate_objective.key < best_objective.key,
+            )
+        )
+        vehicle_reduction = bool(
+            event.get(
+                "_operator_vehicle_reduction",
+                candidate_objective.vehicle_count < current_objective.vehicle_count,
+            )
+        )
         values["accepted"] = cast(int, values["accepted"]) + 1
         values[f"accepted_{'improving' if comparison == 'better' else comparison}"] = (
             cast(
@@ -4995,15 +5073,140 @@ def _full_native_operator_statistics(
             values["accepted_vehicle_reductions"] = (
                 cast(int, values["accepted_vehicle_reductions"]) + 1
             )
-        values["segment_reward_sum"] = cast(float, values["segment_reward_sum"]) + (
-            stage04_config.reward_for(
-                accepted=True,
-                comparison=comparison,
-                is_global_best=is_global_best,
-                vehicle_reduction=vehicle_reduction,
-            )
+        reward = stage04_config.reward_for(
+            accepted=True,
+            comparison=comparison,
+            is_global_best=is_global_best,
+            vehicle_reduction=vehicle_reduction,
         )
+        if operator != "vehicle_reduction_refinement":
+            values["segment_reward_sum"] = cast(
+                float, values["segment_reward_sum"]
+            ) + reward
+            segment_records.append((iteration, operator, reward))
         current_by_lane[lane] = candidate_objective
+    if not stage04_config.fixed_weights:
+        adaptive_state = {
+            **{
+                f"neighborhood:{name}": {
+                    "weight": 1.0,
+                    "segment_reward_sum": 0.0,
+                    "segment_calls": 0,
+                    "weight_history": [],
+                }
+                for name in statistics
+                if name != "vehicle_reduction_refinement"
+            },
+            **{
+                f"destroy:{name}": {
+                    "weight": 1.0,
+                    "segment_reward_sum": 0.0,
+                    "segment_calls": 0,
+                    "weight_history": [],
+                }
+                for name in ("random", "worst", "related")
+            },
+            **{
+                f"repair:{name}": {
+                    "weight": 1.0,
+                    "segment_reward_sum": 0.0,
+                    "segment_calls": 0,
+                    "weight_history": [],
+                }
+                for name in ("greedy", "regret2", "energy")
+            },
+        }
+        for record_index, (iteration, operator, reward) in enumerate(
+            segment_records
+        ):
+            if operator != "vehicle_reduction_refinement":
+                role_names = [f"neighborhood:{operator}"]
+                if operator == "standard":
+                    standard_events = grouped[(iteration, operator)]
+                    destroy_name, repair_name = str(
+                        standard_events[-1]["reason"]
+                    ).split("+", maxsplit=1)
+                    role_names.extend(
+                        (f"destroy:{destroy_name}", f"repair:{repair_name}")
+                    )
+                elif operator == "vehicle_count_aware_repair":
+                    vehicle_events = grouped[(iteration, operator)]
+                    destroy_name = str(
+                        vehicle_events[-1]["_operator_destroy_name"]
+                    )
+                    role_names.extend(
+                        (f"destroy:{destroy_name}",)
+                    )
+                for role_name in role_names:
+                    values = adaptive_state[role_name]
+                    values["segment_calls"] = cast(
+                        int, values["segment_calls"]
+                    ) + 1
+                    values["segment_reward_sum"] = cast(
+                        float, values["segment_reward_sum"]
+                    ) + reward
+            next_iteration = (
+                segment_records[record_index + 1][0]
+                if record_index + 1 < len(segment_records)
+                else None
+            )
+            if (
+                (iteration + 1) % stage04_config.segment_length != 0
+                or next_iteration == iteration
+            ):
+                continue
+            for role_name, values in adaptive_state.items():
+                segment_calls = cast(int, values["segment_calls"])
+                if segment_calls >= stage04_config.min_calls_per_operator:
+                    old_weight = cast(float, values["weight"])
+                    new_weight = stage04_config.apply_segment_update(
+                        old_weight,
+                        cast(float, values["segment_reward_sum"]),
+                        segment_calls,
+                    )
+                    values["weight"] = new_weight
+                    cast(
+                        list[tuple[int, float]], values["weight_history"]
+                    ).append((iteration, new_weight))
+                    if stage04_segment_events is not None:
+                        stage04_segment_events.append(
+                            {
+                                "type": "stage04_segment_update",
+                                "operator": role_name,
+                                "role": role_name.partition(":")[0],
+                                "iteration": iteration,
+                                "old_weight": old_weight,
+                                "new_weight": new_weight,
+                                "segment_calls": segment_calls,
+                                "segment_reward_sum": values[
+                                    "segment_reward_sum"
+                                ],
+                            }
+                        )
+                elif stage04_segment_events is not None:
+                    stage04_segment_events.append(
+                        {
+                            "type": "stage04_segment_skip",
+                            "operator": role_name,
+                            "role": role_name.partition(":")[0],
+                            "iteration": iteration,
+                            "segment_calls": segment_calls,
+                            "segment_reward_sum": values[
+                                "segment_reward_sum"
+                            ],
+                            "minimum_calls": stage04_config.min_calls_per_operator,
+                        }
+                    )
+                values["segment_reward_sum"] = 0.0
+                values["segment_calls"] = 0
+        for name, values in statistics.items():
+            if name == "vehicle_reduction_refinement":
+                continue
+            replayed = adaptive_state[f"neighborhood:{name}"]
+            values["weight"] = replayed["weight"]
+            values["segment_reward_sum"] = replayed["segment_reward_sum"]
+            values["segment_calls"] = replayed["segment_calls"]
+            values["weight_history"] = replayed["weight_history"]
     native_arrays = (
         native_operator_totals,
         native_operator_activity,
@@ -5030,30 +5233,88 @@ def _full_native_operator_statistics(
             values = statistics[name]
             totals = native_operator_totals[index]
             activity = native_operator_activity[index]
-            values["calls"] = int(totals[0])
-            values["accepted"] = int(totals[1])
-            values["improved"] = int(totals[2])
-            values["accepted_improving"] = int(totals[2])
-            values["accepted_equal"] = int(totals[3])
-            values["accepted_worse"] = int(totals[4])
-            values["rejected"] = int(totals[5])
-            values["best"] = int(totals[6])
-            values["vehicle_reductions"] = int(activity[5])
-            values["accepted_vehicle_reductions"] = int(totals[7])
-            values["feasible_repairs"] = int(activity[0])
-            values["prefilter_passed"] = int(activity[1])
-            values["exact_route_evaluations"] = int(activity[2])
-            values["candidate_proposals"] = int(activity[3])
-            values["feasible_candidates"] = int(activity[4])
-            values["distance_improvements"] = int(activity[6])
-            values["segment_calls"] = int(native_operator_calls[index])
-            values["segment_reward_sum"] = float(native_operator_rewards[index])
+            replayed_totals = np.asarray(
+                [
+                    values["calls"],
+                    values["accepted"],
+                    values["accepted_improving"],
+                    values["accepted_equal"],
+                    values["accepted_worse"],
+                    values["rejected"],
+                    values["best"],
+                    values["accepted_vehicle_reductions"],
+                ],
+                dtype=np.int64,
+            )
+            replayed_activity = np.asarray(
+                [
+                    values["feasible_repairs"],
+                    values["prefilter_passed"],
+                    values["exact_route_evaluations"],
+                    values["candidate_proposals"],
+                    values["feasible_candidates"],
+                    values["vehicle_reductions"],
+                    values["distance_improvements"],
+                ],
+                dtype=np.int64,
+            )
+            if not np.array_equal(totals, replayed_totals):
+                raise RuntimeError(
+                    "full native operator totals disagree with replay for "
+                    f"{name}: native={totals.tolist()}, "
+                    f"replayed={replayed_totals.tolist()}"
+                )
+            if not np.array_equal(activity[:7], replayed_activity):
+                raise RuntimeError(
+                    "full native operator activity disagrees with replay for "
+                    f"{name}: native={activity[:7].tolist()}, "
+                    f"replayed={replayed_activity.tolist()}"
+                )
+            if int(native_operator_calls[index]) != cast(
+                int, values["segment_calls"]
+            ):
+                raise RuntimeError(
+                    f"full native segment calls disagree with replay for {name}"
+                )
+            if not math.isclose(
+                float(native_operator_rewards[index]),
+                cast(float, values["segment_reward_sum"]),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise RuntimeError(
+                    f"full native segment rewards disagree with replay for {name}"
+                )
             if name == "vehicle_reduction_refinement" and int(activity[7]) != 0:
-                values["failure_reasons"] = {
-                    "time_limit_reached_during_refinement"
-                    if int(activity[7]) == 1
-                    else "refinement_not_better": 1
-                }
+                failure_reason = {
+                    1: "time_limit_reached_during_refinement",
+                    2: "refinement_not_better",
+                    3: "no_existing_route_insertion",
+                    4: "evaluation_budget_exhausted",
+                }.get(int(activity[7]))
+                if failure_reason is None:
+                    raise RuntimeError(
+                        "full native refinement failure code is invalid"
+                    )
+                expected_failure = {failure_reason: 1}
+                if (
+                    int(activity[7]) == 1
+                    and values["failure_reasons"]
+                    in (
+                        {"no_existing_route_insertion": 1},
+                        {"evaluation_budget_exhausted": 1},
+                        {"refinement_not_better": 1},
+                    )
+                ):
+                    # The frozen Python path reports the proposal's concrete
+                    # repair reason in NeighborhoodEvent, but classifies the
+                    # interrupted enclosing operator call as a time-limit in
+                    # OperatorStatistics.  Keep that observable legacy split.
+                    values["failure_reasons"] = expected_failure
+                if values["failure_reasons"] != expected_failure:
+                    raise RuntimeError(
+                        "full native refinement failure disagrees with replay"
+                    )
     return statistics
 
 
@@ -5061,6 +5322,7 @@ def _full_native_maximum_stagnation(
     instance: Instance,
     initial_customer_sequences: tuple[tuple[str, ...], ...],
     semantic_events: tuple[dict[str, object], ...],
+    stage04_events: tuple[dict[str, object], ...],
     completed_iterations: int,
 ) -> int:
     initial = SolutionObjective.zero()
@@ -5077,6 +5339,11 @@ def _full_native_maximum_stagnation(
     best_key = initial.key
     stagnation = 0
     maximum = 0
+    restart_iterations = {
+        int(cast(int, event["iteration"]))
+        for event in stage04_events
+        if event.get("type") == "stage04_restart"
+    }
     for iteration in range(completed_iterations):
         improved = False
         for event in semantic_events:
@@ -5090,7 +5357,41 @@ def _full_native_maximum_stagnation(
                 improved = True
         stagnation = 0 if improved else stagnation + 1
         maximum = max(maximum, stagnation)
+        if iteration in restart_iterations:
+            stagnation = 0
     return maximum
+
+
+def _full_native_acceptance_rate(
+    semantic_events: tuple[dict[str, object], ...],
+    completed_iterations: int,
+) -> float:
+    """Replay Python's bounded 50-iteration main-lane acceptance window."""
+
+    first_iteration = max(0, completed_iterations - 50)
+    accepted_by_iteration = {
+        iteration: False
+        for iteration in range(first_iteration, completed_iterations)
+    }
+    main_operators = {
+        "standard",
+        "vehicle_count_aware_repair",
+        "route_elimination",
+        "route_merge",
+    }
+    for event in semantic_events:
+        iteration = int(cast(int, event["iteration"]))
+        if (
+            iteration in accepted_by_iteration
+            and str(event["operator"]) in main_operators
+            and bool(event["accepted"])
+        ):
+            accepted_by_iteration[iteration] = True
+    return (
+        sum(accepted_by_iteration.values()) / len(accepted_by_iteration)
+        if accepted_by_iteration
+        else 0.0
+    )
 
 
 def _solve_full_native_alns(
@@ -5111,6 +5412,7 @@ def _solve_full_native_alns(
     exact_deadline_config: ExactDeadlineConfig | None,
     initial_customer_sequences: tuple[tuple[str, ...], ...] | None,
     stage04_config: Stage04Config | None,
+    measurement_config: MeasurementConfig | None,
 ) -> ALNSResult:
     """Run the one-call full-native ABI and independently replay its solution."""
 
@@ -5122,23 +5424,35 @@ def _solve_full_native_alns(
         raise ValueError("full native v2 requires enabled screening")
     if cache_incremental_config is None or not cache_incremental_config.enabled:
         raise ValueError("full native v2 requires enabled cache/incremental control")
+    if cache_incremental_config.instance_hash is None:
+        cache_incremental_config = replace(
+            cache_incremental_config,
+            instance_hash=canonical_instance_hash(instance),
+        )
     if stage04_config is None or not stage04_config.enabled:
         raise ValueError("full native v2 requires enabled Stage 4")
     started = time.perf_counter()
     native_runtime = NativeKernelRuntime.build(instance, config.native_kernel_config)
     dispatcher: Callable[..., object] | None = None
+    host_dispatch_seconds = 0.0
     if config.mode == "host_scheduler":
         if config.scheduler_socket_path is None:
             raise RuntimeError("host scheduler mode requires an active scheduler socket path")
         from evrptw.native_scheduler import dispatch_full_native_alns
 
         def dispatch_via_scheduler(*arrays: npt.NDArray[np.generic]) -> object:
-            return dispatch_full_native_alns(
-                config.scheduler_socket_path or "",
-                *arrays,
-            )
+            nonlocal host_dispatch_seconds
+            dispatch_started = time.perf_counter()
+            try:
+                return dispatch_full_native_alns(
+                    config.scheduler_socket_path or "",
+                    *arrays,
+                )
+            finally:
+                host_dispatch_seconds += time.perf_counter() - dispatch_started
 
         dispatcher = dispatch_via_scheduler
+    protocol_started = time.perf_counter()
     native_result = execute_full_native_alns(
         instance,
         seed=seed,
@@ -5168,17 +5482,131 @@ def _solve_full_native_alns(
         ),
         dispatcher=dispatcher,
     )
+    protocol_seconds = time.perf_counter() - protocol_started
+    measurement_trace = (
+        Stage03Trace(
+            measurement_config,
+            screening_config=screening_config,
+            cache_incremental_config=cache_incremental_config,
+            exact_deadline_config=exact_deadline_config,
+            candidate_control_config=config.candidate_control_config,
+        )
+        if measurement_config is not None and measurement_config.enabled
+        else None
+    )
+    if measurement_trace is not None:
+        cache_keys = RouteEvaluationCache(instance, cache_incremental_config)
+        for journal_event in native_result.exact_journal_events:
+            event = dict(journal_event)
+            measurement_trace.events.append(event)
+            if event.get("event_type") != "candidate_route_result":
+                continue
+            customer_sequences = cast(
+                list[list[str]], event["customer_sequences"]
+            )
+            sequence = tuple(customer_sequences[0])
+            measurement_trace.record_route_evaluation(
+                sequence,
+                lane=str(event["lane"]),
+                iteration=cast(int | None, event["iteration"]),
+                operator=str(event["operator"]),
+                kind="exact_call",
+                started_at=0.0,
+                completed_at=0.0,
+                exact_started=True,
+                exact_completed=True,
+                feasible=bool(event["feasible"]),
+                failure_reason=str(event["failure_reason"]),
+                labels_generated=int(cast(int, event["labels_generated"])),
+                labels_expanded=int(cast(int, event["labels_expanded"])),
+                labels_pruned=int(cast(int, event["labels_pruned"])),
+                cache_key_digest=cache_keys.make_key(sequence).digest,
+                route_change_status="changed",
+            )
+        for journal_event in native_result.control_journal_events:
+            event = dict(journal_event)
+            if event.get("event_type") != "screening_decision":
+                continue
+            sequence = tuple(cast(list[str], event["customer_sequence"]))
+            raw_iteration = int(cast(int, event["iteration"]))
+            checks = tuple(
+                ScreeningCheckTrace(
+                    check=str(check["check"]),
+                    status=str(check["status"]),
+                    value=cast(float | bool | None, check["value"]),
+                    reason=str(check["reason"]),
+                )
+                for check in cast(list[dict[str, object]], event["checks"])
+            )
+            measurement_trace.record_screening_decision(
+                sequence,
+                lane=str(event["lane"]),
+                iteration=None if raw_iteration < 0 else raw_iteration,
+                operator=str(event["operator"]),
+                status=str(event["status"]),
+                first_failed_check=str(event["first_failed_check"]),
+                reason=str(event["reason"]),
+                checks=checks,
+                demand=float(cast(float, event["demand"])),
+                min_time_window_slack=float(
+                    cast(float, event["min_time_window_slack"])
+                ),
+                distance_lower_bound=float(
+                    cast(float, event["distance_lower_bound"])
+                ),
+                distance_increment_lower_bound=cast(
+                    float | None, event["distance_increment_lower_bound"]
+                ),
+                single_segment_reachable=bool(
+                    event["single_segment_reachable"]
+                ),
+                structural_energy_lower_bound=float(
+                    cast(float, event["structural_energy_lower_bound"])
+                ),
+                negative_cache_hit=bool(event["negative_cache_hit"]),
+                exact_call_blocked=bool(event["exact_call_blocked"]),
+                started_at=0.0,
+                completed_at=0.0,
+            )
+        measurement_trace.events.extend(
+            dict(event) for event in native_result.control_journal_events
+        )
+    validation_started = time.perf_counter()
     routes = tuple(tuple(result.route) for result in native_result.exact_results)
     report = validate_routes(instance, [list(route) for route in routes])
     if not report.feasible:
         raise RuntimeError("full native ALNS result failed the unified validator")
-    objective = SolutionObjective.from_report(instance, report)
+    report_objective = SolutionObjective.from_report(instance, report)
+    objective = SolutionObjective.zero()
+    for customer_sequence in native_result.customer_sequences:
+        replayed_route = solve_exact_charging(instance, customer_sequence)
+        if not replayed_route.feasible:
+            raise RuntimeError("full native ALNS objective replay is infeasible")
+        objective += SolutionObjective.from_route(
+            instance,
+            replayed_route.route,
+            total_distance=replayed_route.distance,
+            total_charging_time=replayed_route.charging_time,
+        )
+    if objective.key != report_objective.key:
+        raise RuntimeError("full native ALNS objective replay disagrees with validator")
+    validation_replay_seconds = time.perf_counter() - validation_started
     runtime_seconds = time.perf_counter() - started
-    queue_wait_seconds = max(
+    protocol_boundary_seconds = max(
         0.0,
-        runtime_seconds
+        protocol_seconds
         - native_result.timings["total_seconds"]
-        - native_runtime.context.packing_seconds,
+    )
+    queue_wait_seconds = native_result.timings["queue_wait_seconds"]
+    serialization_ipc_seconds = (
+        max(
+            0.0,
+            host_dispatch_seconds
+            - native_result.timings["total_seconds"]
+            - queue_wait_seconds,
+        )
+        if config.mode == "host_scheduler"
+        else 0.0
     )
     fallback_count = native_result.counters["fallback_count"]
     if fallback_count != 0 or native_runtime.fallback_count != 0:
@@ -5190,22 +5618,93 @@ def _solve_full_native_alns(
             "worker_protocol_invocations": 1,
             "worker_protocol_total_seconds": native_result.timings["total_seconds"],
             "queue_wait_seconds": queue_wait_seconds,
+            "input_packing_seconds": native_runtime.context.packing_seconds,
+            "protocol_boundary_seconds": protocol_boundary_seconds,
+            "host_dispatch_seconds": host_dispatch_seconds,
+            "serialization_ipc_seconds": serialization_ipc_seconds,
+            "validation_replay_seconds": validation_replay_seconds,
+            "solver_interval_seconds": runtime_seconds,
+            "work_pool_peak_active_tasks": int(
+                native_result.timings["work_pool_peak_active_tasks"]
+            ),
+            "work_pool_active_tasks_at_return": int(
+                native_result.timings["work_pool_active_tasks_at_return"]
+            ),
+            "queue_depth_on_submit": int(
+                native_result.timings["queue_depth_on_submit"]
+            ),
+            "candidate_transaction_occupancies": list(
+                native_result.backend_metrics.launch_occupancies
+            ),
+            "maximum_candidate_transaction_occupancy": max(
+                native_result.backend_metrics.launch_occupancies,
+                default=0,
+            ),
+            "candidate_screening_occupancies": list(
+                cast(
+                    list[int],
+                    native_result.screening_statistics[
+                        "candidate_screening_occupancies"
+                    ],
+                )
+            ),
+            "maximum_candidate_screening_occupancy": int(
+                cast(
+                    int,
+                    native_result.screening_statistics[
+                        "candidate_screening_maximum_occupancy"
+                    ],
+                )
+            ),
             "transaction_sha256": native_result.transaction_sha256,
+            "exact_journal_sha256": native_result.exact_journal_sha256,
+            "control_journal_sha256": native_result.control_journal_sha256,
             "counters": dict(native_result.counters),
             "timings": dict(native_result.timings),
-            "candidate_control_semantics_complete": False,
-            "stage04_semantics_complete": False,
-            "instrumentation_complete": False,
+            "candidate_control_semantics_complete": True,
+            "stage04_semantics_complete": True,
+            "instrumentation_complete": True,
+            "shared_native_work_pool": config.mode == "host_scheduler",
         }
     )
-    semantic_events = tuple(
+    operator_semantic_events = tuple(
         dict(event) for event in native_result.semantic_stream.neighborhood_events
     )
+    semantic_events = tuple(
+        {
+            **{
+                key: value
+                for key, value in event.items()
+                if not str(key).startswith("_operator_")
+            },
+            "accepted": False,
+            "vehicle_reduction": False,
+            "distance_improvement": False,
+        }
+        if event["operator"] == "standard" and event["status"] == "proposal"
+        else {
+            key: value
+            for key, value in event.items()
+            if not str(key).startswith("_operator_")
+        }
+        for event in operator_semantic_events
+    )
+    stage04_segment_events: list[dict[str, object]] = []
     operator_statistics = _full_native_operator_statistics(
         instance,
         operator_profile=OperatorProfile(operator_profile),
         initial_customer_sequences=initial_customer_sequences,
-        semantic_events=semantic_events,
+        semantic_events=(
+            tuple(
+                dict(event)
+                for event in native_result.semantic_stream.operator_replay_events
+            )
+            if isinstance(
+                native_result.semantic_stream, NativeThreeLaneSemanticStream
+            )
+            and native_result.semantic_stream.operator_replay_events
+            else operator_semantic_events
+        ),
         stage04_config=stage04_config,
         native_operator_totals=(
             native_result.semantic_stream.operator_totals
@@ -5227,6 +5726,7 @@ def _solve_full_native_alns(
             if isinstance(native_result.semantic_stream, NativeThreeLaneSemanticStream)
             else None
         ),
+        stage04_segment_events=stage04_segment_events,
     )
     native_terminal_reason = int(native_result.semantic_stream.termination[0])
     exact_budget_reached = native_terminal_reason == 1
@@ -5234,6 +5734,7 @@ def _solve_full_native_alns(
         0: "iteration_limit",
         1: "exact_call_budget_exhausted",
         2: "wall_clock_deadline",
+        3: "candidate_control_exhausted",
     }[native_terminal_reason]
     controlled_exact_started = (
         native_result.counters["exact_started_calls"]
@@ -5258,20 +5759,138 @@ def _solve_full_native_alns(
         if isinstance(native_result.semantic_stream, NativeThreeLaneSemanticStream)
         else None
     )
+    native_initial_temperature = (
+        native_result.semantic_stream.initial_temperature
+        if isinstance(
+            native_result.semantic_stream,
+            (NativeGlobalSemanticStream, NativeThreeLaneSemanticStream),
+        )
+        else None
+    )
+    if native_initial_temperature is None:
+        raise RuntimeError("full native ALNS omitted its Stage 4 initial temperature")
+    ordered_stage04_events = sorted(
+        (*native_stage04_events, *stage04_segment_events),
+        key=lambda event: (
+            int(cast(int, event.get("iteration", -1))),
+            0 if str(event["type"]).startswith("stage04_segment_") else 1,
+        ),
+    )
     stage04_event_log: tuple[dict[str, object], ...] = (
         {
             "type": "stage04_config",
             "segment_length": stage04_config.segment_length,
             "min_calls_per_operator": stage04_config.min_calls_per_operator,
             "auto_temperature": stage04_config.auto_temperature,
-            "initial_temperature": 1.0,
+            "initial_temperature": native_initial_temperature,
             "reheat_enabled": stage04_config.reheat_enabled,
             "restart_enabled": stage04_config.restart_enabled,
             "intensification_enabled": stage04_config.intensification_enabled,
             "fixed_weights": stage04_config.fixed_weights,
         },
-        *native_stage04_events,
+        *ordered_stage04_events,
     )
+    exact_work_batches = native_result.candidate_work
+    exact_usage_by_iteration: dict[int, int] = {}
+    for work in exact_work_batches:
+        if work["iteration"] is None:
+            continue
+        iteration = int(cast(int, work["iteration"]))
+        exact_usage_by_iteration[iteration] = (
+            exact_usage_by_iteration.get(iteration, 0)
+            + len(cast(list[list[str]], work["sequences"]))
+        )
+    completed_rounds = native_result.counters["iterations"]
+    round_budget = config.candidate_control_config.max_exact_calls_per_round
+    budget_skips = sum(
+        event.get("event_type") == "candidate_plan_decision"
+        and event.get("status") == "selected"
+        and event.get("transaction_status_code") == 3
+        for event in native_result.control_journal_events
+    )
+    candidate_control_statistics = {
+        "enabled": True,
+        "schema_version": config.candidate_control_config.schema_version,
+        "proposal_top_k": config.candidate_control_config.proposal_top_k,
+        "max_exact_calls_per_round": round_budget,
+        "worker_count": config.candidate_control_config.worker_count,
+        "executor_model": "native_thread_pool",
+        "ranking_policy": config.candidate_control_config.ranking_policy,
+        "merge_policy": "submission_order",
+        **native_result.control_journal_statistics,
+        "budget_events": len(exact_work_batches) + budget_skips,
+        "budget_skips": budget_skips,
+        "parallel_batches": (
+            len(exact_work_batches)
+            if config.candidate_control_config.worker_count > 1
+            else 0
+        ),
+        "completed_rounds": completed_rounds,
+        "maximum_exact_calls_per_round": max(
+            exact_usage_by_iteration.values(), default=0
+        ),
+        "total_round_remainder": sum(
+            round_budget - exact_usage_by_iteration.get(iteration, 0)
+            for iteration in range(completed_rounds)
+        ),
+    }
+    route_cache_statistics = dict(native_result.route_cache_statistics)
+    safe_node_indices = tuple(
+        int(index)
+        for index in np.flatnonzero(native_runtime.context.node_kind != 1)
+    )
+    safe_node_names = tuple(
+        native_runtime.context.node_names[index] for index in safe_node_indices
+    )
+
+    def reachability_mask(origin: int) -> int:
+        return sum(
+            1 << safe_ordinal
+            for safe_ordinal, destination in enumerate(safe_node_indices)
+            if native_runtime.context.reachable[origin, destination]
+        )
+
+    station_reachability = {
+        "safe_nodes": list(safe_node_names),
+        "bitsets": {
+            native_runtime.context.node_names[index]: reachability_mask(index)
+            for index in safe_node_indices
+        },
+        "origin_bitsets": dict(
+            sorted(
+                (
+                    native_runtime.context.node_names[index],
+                    reachability_mask(index),
+                )
+                for index in range(len(native_runtime.context.node_names))
+            )
+        ),
+        "queries": int(
+            cast(
+                int,
+                native_result.screening_statistics.get(
+                    "station_reachability_queries", 0
+                ),
+            )
+        ),
+    }
+    cache_incremental_statistics = {
+        "schema_version": cache_incremental_config.schema_version,
+        "config": asdict(cache_incremental_config),
+        **route_cache_statistics,
+        "route_cache": {
+            **route_cache_statistics,
+            "eviction_policy": cache_incremental_config.eviction_policy,
+            "max_entries": cache_incremental_config.max_entries,
+            "max_memory_bytes": cache_incremental_config.max_memory_bytes,
+            "instance_hash": cache_incremental_config.instance_hash,
+        },
+        "incremental_propagations": 0,
+        "incremental_reused_prefix_edges": 0,
+        "incremental_reused_suffix_edges": 0,
+        "incremental_fallbacks": 0,
+        "station_reachability": station_reachability,
+    }
     return ALNSResult(
         feasible=True,
         routes=routes,
@@ -5306,6 +5925,7 @@ def _solve_full_native_alns(
         failure_reason="",
         cache_misses=native_result.counters["exact_started_calls"],
         unique_route_evaluations=native_result.counters["exact_completed_calls"],
+        measurement_trace=measurement_trace,
         effective_iterations=native_result.counters["iterations"],
         charging_backend=ExactChargingBackend(backend).value,
         batch_size=batch_size,
@@ -5330,44 +5950,18 @@ def _solve_full_native_alns(
             if exact_deadline_config is not None
             else {}
         ),
-        candidate_control_statistics={
-            "enabled": True,
-            "schema_version": config.candidate_control_config.schema_version,
-            "proposal_top_k": config.candidate_control_config.proposal_top_k,
-            "max_exact_calls_per_round": (
-                config.candidate_control_config.max_exact_calls_per_round
-            ),
-            "worker_count": config.candidate_control_config.worker_count,
-            "executor_model": "native_thread_pool",
-            "ranking_policy": config.candidate_control_config.ranking_policy,
-            "merge_policy": "submission_order",
-            "candidate_decisions": sum(
-                event["reason"]
-                in {"constraint_removal_repaired", "constraint_repair_infeasible"}
-                for event in semantic_events
-            ),
-            "selected_candidates": sum(
-                event["reason"]
-                in {"constraint_removal_repaired", "constraint_repair_infeasible"}
-                for event in semantic_events
-            ),
-            "skipped_candidates": 0,
-            "budget_events": 2 if native_result.counters["iterations"] else 0,
-            "budget_skips": 0,
-            "parallel_batches": 0,
-            "completed_rounds": native_result.counters["iterations"],
-            "maximum_exact_calls_per_round": max(
-                (
-                    cast(int, event["exact_route_evaluations"])
-                    for event in semantic_events
-                ),
-                default=0,
-            ),
-            "total_round_remainder": 0,
-        },
+        cache_incremental_statistics=cache_incremental_statistics,
+        screening_statistics=dict(native_result.screening_statistics),
+        candidate_control_statistics=candidate_control_statistics,
         native_execution_statistics=native_statistics,
-        candidate_work_hash=native_result.transaction_sha256,
-        route_result_hash=native_result.transaction_sha256,
+        candidate_work_hash=native_result.candidate_work_hash,
+        route_result_hash=native_result.route_result_hash,
+        candidate_work_events=tuple(
+            dict(event) for event in native_result.candidate_work
+        ),
+        route_result_events=tuple(
+            dict(event) for event in native_result.route_results
+        ),
         stage04_statistics=(
             {
                 "enabled": True,
@@ -5386,21 +5980,20 @@ def _solve_full_native_alns(
                     if native_stage04_control is not None
                     else False
                 ),
-                "acceptance_rate": (
-                    native_result.counters["accepted_moves"]
-                    / native_result.counters["iterations"]
-                    if native_result.counters["iterations"]
-                    else 0.0
+                "acceptance_rate": _full_native_acceptance_rate(
+                    operator_semantic_events,
+                    native_result.counters["iterations"],
                 ),
                 "segment_length": stage04_config.segment_length,
                 "min_calls_per_operator": stage04_config.min_calls_per_operator,
                 "fixed_weights": stage04_config.fixed_weights,
                 "auto_temperature": stage04_config.auto_temperature,
-                "initial_temperature": 1.0,
+                "initial_temperature": native_initial_temperature,
                 "maximum_stagnation": _full_native_maximum_stagnation(
                     instance,
                     initial_customer_sequences,
                     semantic_events,
+                    stage04_event_log,
                     native_result.counters["accepted_moves"]
                     + native_result.counters["rejected_moves"],
                 ),
@@ -5408,6 +6001,11 @@ def _solve_full_native_alns(
             if stage04_config is not None and stage04_config.enabled
             else {}
         ),
+        stage04_weight_history={
+            name: list(cast(list[tuple[int, float]], values["weight_history"]))
+            for name, values in operator_statistics.items()
+            if values["weight_history"]
+        },
         stage04_event_log=stage04_event_log,
         iteration_limit_completed_at_seconds=(
             runtime_seconds if termination_reason == "iteration_limit" else None
@@ -5571,6 +6169,7 @@ def solve_alns(
             exact_deadline_config=exact_deadline_config,
             initial_customer_sequences=initial_customer_sequences,
             stage04_config=stage04_config,
+            measurement_config=measurement_config,
         )
     candidate_control_runtime = (
         CandidateControlRuntime(candidate_control_config)

@@ -2055,9 +2055,6 @@ def _propose_controlled_route_merge(
     candidates: list[CustomerSequence] = []
     base_sequences: list[CustomerSequence] = []
     seen_candidates: set[CustomerSequence] = set()
-    preserve_duplicate_candidates = bool(
-        getattr(evaluator, "candidate_transaction_enabled", False)
-    )
     prefilter_counts: Counter[str] = Counter()
     prefilter_digest = hashlib.sha256()
     for _, left, right in pairs:
@@ -2065,7 +2062,7 @@ def _propose_controlled_route_merge(
             instance,
             left,
             right,
-            preserve_duplicates=preserve_duplicate_candidates,
+            preserve_duplicates=False,
         ):
             # Full Stage 3.4 pools can contain tens of thousands of ordinary
             # rejections. Use the same safe screener and persist an aggregate
@@ -2080,7 +2077,7 @@ def _propose_controlled_route_merge(
                     ).encode()
                 )
                 continue
-            if not preserve_duplicate_candidates and merged in seen_candidates:
+            if merged in seen_candidates:
                 continue
             seen_candidates.add(merged)
             metadata.append(

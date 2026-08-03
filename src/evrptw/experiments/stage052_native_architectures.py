@@ -522,14 +522,52 @@ def _canonical_trace_event(event: dict[str, object]) -> dict[str, object]:
 
 
 def _semantic_candidate_trajectory(result: ALNSResult) -> list[dict[str, object]]:
-    trace = result.measurement_trace
-    if trace is None:
-        return []
-    return [
-        _canonical_trace_event(dict(event))
-        for event in trace.events
-        if event.get("event_type") == "candidate_state"
-    ]
+    quality_operators = {
+        "relocate",
+        "swap",
+        "two_opt_star",
+        "route_segment_destroy",
+        "ejection_chain",
+    }
+    trajectory: list[dict[str, object]] = []
+    for ordinal, raw_event in enumerate(result.neighborhood_events):
+        event = {
+            key: value
+            for key, value in raw_event.items()
+            if not str(key).startswith("_")
+            and not (key == "aggregate_count" and value == 1)
+            and not (key == "candidate_pool_hash" and not value)
+        }
+        operator = str(event.get("operator", ""))
+        track = str(event.get("track", ""))
+        lane = (
+            "constraint_lane"
+            if track == "constraint_lane"
+            else "quality_shadow"
+            if operator in quality_operators
+            else "legacy"
+        )
+        identity = {
+            "lane": lane,
+            "iteration": event.get("iteration"),
+            "operator": operator,
+            "status": event.get("status"),
+            "candidate_route_sequences": event.get(
+                "candidate_route_sequences", ()
+            ),
+            "candidate_objective_key": event.get("candidate_objective_key", ()),
+            "ordinal": ordinal,
+        }
+        trajectory.append(
+            {
+                **event,
+                "lane": lane,
+                "candidate_id": hashlib.sha256(
+                    _canonical_bytes(identity)
+                ).hexdigest(),
+            }
+        )
+    return trajectory
 
 
 def _semantic_operator_statistics(result: ALNSResult) -> dict[str, dict[str, object]]:
@@ -558,35 +596,57 @@ def _measurement_evidence(result: ALNSResult) -> dict[str, object]:
             "deadline_boundaries": _row_evidence(()),
         }
     else:
-        exact_route_order = (
+        exact_route_order = tuple(
             {
-                "evaluation_id": row.evaluation_id,
-                "route_key": row.route_key,
-                "lane": row.lane,
-                "iteration": row.iteration,
-                "operator": row.operator,
-                "kind": row.kind,
-                "exact_started": row.exact_started,
-                "exact_completed": row.exact_completed,
-                "feasible": row.feasible,
-                "failure_reason": row.failure_reason,
-                "cache_key_digest": row.cache_key_digest,
-                "route_change_status": row.route_change_status,
-                "status": row.status,
+                "batch_ordinal": ordinal,
+                "lane": event.get("lane"),
+                "iteration": event.get("iteration"),
+                "operator": event.get("operator"),
+                "sequences": event.get("sequences"),
             }
-            for row in trace.route_evaluations
-            if row.exact_started or row.exact_completed
+            for ordinal, event in enumerate(result.candidate_work_events)
         )
-        cache_lifecycle = (
+        semantic_cache_rows: list[dict[str, object]] = []
+        for batch_ordinal, event in enumerate(result.candidate_work_events):
+            for route_ordinal, sequence in enumerate(
+                cast(list[list[str]], event.get("sequences", []))
+            ):
+                semantic_cache_rows.append(
+                    {
+                        "batch_ordinal": batch_ordinal,
+                        "route_ordinal": route_ordinal,
+                        "lane": event.get("lane"),
+                        "iteration": event.get("iteration"),
+                        "operator": event.get("operator"),
+                        "customer_sequence": sequence,
+                        "transition": "exact_miss_to_committed_store",
+                    }
+                )
+        cache_statistics = result.cache_incremental_statistics
+        semantic_cache_rows.append(
             {
-                "evaluation_id": row.evaluation_id,
-                "route_key": row.route_key,
-                "kind": row.kind,
-                "cache_key_digest": row.cache_key_digest,
-                "status": row.status,
+                "transition": "final_cache_state",
+                **{
+                    field: cache_statistics.get(field, 0)
+                    for field in (
+                        "cache_stores",
+                        "cache_evictions",
+                        "cache_oversize_not_cached",
+                        "entries_current",
+                        "entries_peak",
+                        "bytes_current",
+                        "bytes_peak",
+                        "unique_route_evaluations",
+                    )
+                },
             }
-            for row in trace.route_evaluations
-            if "cache" in row.kind or row.cache_key_digest
+        )
+        canonical_routes = sorted(
+            {
+                tuple(sequence)
+                for event in result.candidate_work_events
+                for sequence in cast(list[list[str]], event.get("sequences", []))
+            }
         )
         deadline_boundaries = (
             {
@@ -603,33 +663,18 @@ def _measurement_evidence(result: ALNSResult) -> dict[str, object]:
         semantic = {
             "present": True,
             "exact_route_order": _row_evidence(exact_route_order),
-            "cache_lifecycle": _row_evidence(cache_lifecycle),
+            "exact_route_results": _row_evidence(result.route_result_events),
+            "cache_lifecycle": _row_evidence(semantic_cache_rows),
             "deadline_boundaries": _row_evidence(deadline_boundaries),
             "route_dictionary": _row_evidence(
-                {"key": key, "route": list(value)}
-                for key, value in sorted(trace.route_dictionary.items())
+                {"route": list(route)} for route in canonical_routes
             ),
             # Only cross-adapter semantics participate in the transaction
             # digest. Native screening/pruning and incremental telemetry are
             # audited below but are allowed to use different implementations.
-            "events": _row_evidence(
-                _canonical_trace_event(dict(row))
-                for row in trace.events
-                if row.get("event_type")
-                in {
-                    "operator_call",
-                    "candidate_state",
-                    "deadline_boundary",
-                    "exact_budget_boundary",
-                    "candidate_cache_commit",
-                    "candidate_cache_rollback",
-                    "cache_event",
-                }
-            ),
+            "events": _row_evidence(_semantic_candidate_trajectory(result)),
             "candidate_trajectory": _row_evidence(
-                _canonical_trace_event(dict(row))
-                for row in trace.events
-                if row.get("event_type") == "candidate_state"
+                _semantic_candidate_trajectory(result)
             ),
         }
         semantic["native_telemetry"] = {
@@ -679,13 +724,9 @@ def _solve_mode(
         "initial_solution_provenance": task.initial_solution_provenance,
         "warm_start_validation_config": WarmStartValidationConfig(),
     }
-    additional_roots = (
-        (task.scheduler_process_id,)
-        if mode is ArchitectureMode.HOST_SCHEDULER
-        and task.scheduler_process_id is not None
-        else ()
-    )
-    with ProcessTreeMonitor(additional_root_pids=additional_roots) as resource_monitor:
+    # The shared scheduler is accounted once by the parent mode-wave monitor;
+    # including it here would charge the same CPU/RSS to all six shard axes.
+    with ProcessTreeMonitor() as resource_monitor:
         started = time.perf_counter()
         if mode is ArchitectureMode.CURRENT_STAGE052:
             result = solve_alns(
@@ -727,10 +768,10 @@ def _solve_mode(
         "compute_thread_limit": TOTAL_COMPUTE_THREADS,
         "scheduler_threads": 24 if mode is ArchitectureMode.HOST_SCHEDULER else 0,
         "effective_native_search_threads": (
-            1
-            if mode
-            in {ArchitectureMode.FULL_NATIVE_ALNS, ArchitectureMode.HOST_SCHEDULER}
-            else THREADS_PER_SHARD
+            24 if mode is ArchitectureMode.HOST_SCHEDULER else THREADS_PER_SHARD
+        ),
+        "shared_native_work_pool": result.native_execution_statistics.get(
+            "shared_native_work_pool", False
         ),
         "process_id": os.getpid(),
         "threads_before": threads_before,
@@ -738,6 +779,9 @@ def _solve_mode(
         "rss_bytes": _rss_bytes(),
         "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
         "cpu_affinity": sorted(os.sched_getaffinity(0)),
+        "shared_scheduler_accounting": (
+            "mode_wave" if mode is ArchitectureMode.HOST_SCHEDULER else "none"
+        ),
         **resource_monitor.statistics(
             elapsed_seconds=solver_seconds,
             compute_thread_limit=TOTAL_COMPUTE_THREADS,
@@ -761,6 +805,19 @@ def _result_payload(
     native_fallback = result.native_execution_statistics.get("fallback_count", 0)
     if isinstance(native_fallback, bool) or not isinstance(native_fallback, int):
         raise RuntimeError("native fallback evidence has an invalid schema")
+    native_full_mode = mode in {
+        ArchitectureMode.FULL_NATIVE_ALNS,
+        ArchitectureMode.HOST_SCHEDULER,
+    }
+    candidate_control_complete = result.native_execution_statistics.get(
+        "candidate_control_semantics_complete"
+    )
+    stage04_complete = result.native_execution_statistics.get(
+        "stage04_semantics_complete"
+    )
+    instrumentation_complete = result.native_execution_statistics.get(
+        "instrumentation_complete"
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "run_label": task.run_labels[mode.value],
@@ -810,11 +867,12 @@ def _result_payload(
         "cache_incremental_statistics": result.cache_incremental_statistics,
         "measurement_evidence": measurement_evidence,
         "semantic_completeness": {
-            "candidate_control": mode
-            not in {ArchitectureMode.FULL_NATIVE_ALNS, ArchitectureMode.HOST_SCHEDULER},
-            "stage04": mode
-            not in {ArchitectureMode.FULL_NATIVE_ALNS, ArchitectureMode.HOST_SCHEDULER},
-            "measurement_trace": bool(measurement_evidence["present"]),
+            "candidate_control": (
+                candidate_control_complete is True if native_full_mode else True
+            ),
+            "stage04": stage04_complete is True if native_full_mode else True,
+            "measurement_trace": bool(measurement_evidence["present"])
+            and (instrumentation_complete is True if native_full_mode else True),
         },
         "topology": topology,
         "throughput": {
@@ -836,7 +894,7 @@ def _result_payload(
             / max(solver_seconds, 1e-12),
         },
         "cache_memory_bytes": _metric_int(
-            result.cache_incremental_statistics.get("estimated_memory_bytes", 0)
+            result.cache_incremental_statistics.get("bytes_peak", 0)
         ),
     }
 
@@ -992,34 +1050,68 @@ def run_experiment(
     started = time.time()
     written: list[str] = []
     scheduler_observations: list[dict[str, int]] = []
+    mode_wave_resources: list[dict[str, object]] = []
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         for batch_index, batch in enumerate(_mode_wave_batches(plan)):
             offset = batch_index % len(MODES)
             mode_order = MODES[offset:] + MODES[:offset]
             for mode in mode_order:
-                if mode is ArchitectureMode.HOST_SCHEDULER:
-                    with NativeHostScheduler(scheduler_path, worker_threads=24) as scheduler:
-                        scheduler_observations.append(
-                            {
-                                "process_id": scheduler.process_id,
-                                "observed_thread_count": scheduler.observed_thread_count(),
-                                "configured_worker_threads": scheduler.worker_threads,
-                            }
-                        )
-                        futures = [
-                            executor.submit(
-                                _run_mode,
-                                replace(task, scheduler_process_id=scheduler.process_id),
-                                mode,
+                wave_started = time.perf_counter()
+                with ProcessTreeMonitor() as wave_monitor:
+                    if mode is ArchitectureMode.HOST_SCHEDULER:
+                        with NativeHostScheduler(
+                            scheduler_path, worker_threads=24
+                        ) as scheduler:
+                            scheduler_observations.append(
+                                {
+                                    "process_id": scheduler.process_id,
+                                    "observed_thread_count": (
+                                        scheduler.observed_thread_count()
+                                    ),
+                                    "configured_worker_threads": scheduler.worker_threads,
+                                }
                             )
-                            for task in batch
+                            futures = [
+                                executor.submit(
+                                    _run_mode,
+                                    replace(
+                                        task,
+                                        scheduler_process_id=scheduler.process_id,
+                                    ),
+                                    mode,
+                                )
+                                for task in batch
+                            ]
+                            for future in as_completed(futures):
+                                written.append(future.result())
+                    else:
+                        futures = [
+                            executor.submit(_run_mode, task, mode) for task in batch
                         ]
                         for future in as_completed(futures):
                             written.append(future.result())
-                else:
-                    futures = [executor.submit(_run_mode, task, mode) for task in batch]
-                    for future in as_completed(futures):
-                        written.append(future.result())
+                wave_elapsed = time.perf_counter() - wave_started
+                mode_wave_resources.append(
+                    {
+                        "batch_index": batch_index,
+                        "mode": mode.value,
+                        "axis_count": len(batch),
+                        "identities": [
+                            {
+                                "repeat": task.repeat,
+                                "axis": task.axis,
+                                "instance": task.instance_name,
+                                "seed": task.seed,
+                            }
+                            for task in batch
+                        ],
+                        "elapsed_seconds": wave_elapsed,
+                        **wave_monitor.statistics(
+                            elapsed_seconds=wave_elapsed,
+                            compute_thread_limit=TOTAL_COMPUTE_THREADS,
+                        ),
+                    }
+                )
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "scope": scope,
@@ -1044,6 +1136,7 @@ def run_experiment(
             "compute_thread_limit": TOTAL_COMPUTE_THREADS,
             "compute_envelope": compute_envelope,
             "scheduler_observed": scheduler_observations,
+            "mode_wave_resources": mode_wave_resources,
         },
         "mode_order_policy": "six_axis_global_mode_waves_rotated_by_batch",
         "formal_started": False,

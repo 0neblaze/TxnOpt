@@ -256,6 +256,11 @@ class NativeSearchEngineV2:
         screening_epsilon: float,
         worker_count: int,
     ) -> None: ...
+    def configure_node_names(
+        self,
+        name_offsets: npt.NDArray[np.int64],
+        name_bytes: npt.NDArray[np.uint8],
+    ) -> None: ...
     def initialize(
         self,
         node_kind: npt.NDArray[np.int64],
@@ -892,6 +897,8 @@ def full_native_alns_v2(
     reachable: npt.NDArray[np.uint8],
     vehicle: npt.NDArray[np.float64],
     lexical_rank: npt.NDArray[np.int64],
+    node_name_offsets: npt.NDArray[np.int64],
+    node_name_bytes: npt.NDArray[np.uint8],
     initial_route_offsets: npt.NDArray[np.int64],
     initial_route_indices: npt.NDArray[np.int64],
     control: npt.NDArray[np.int64],
@@ -918,6 +925,10 @@ def full_native_alns_v2(
     npt.NDArray[np.float64],
     npt.NDArray[np.int64],
     str,
+    object,
+    object,
+    object,
+    object,
 ]: ...
 def full_native_initialize_v2(
     node_kind: npt.NDArray[np.int64],
@@ -944,7 +955,16 @@ def full_native_initialize_v2(
     npt.NDArray[np.float64],
     npt.NDArray[np.int64],
 ]: ...
-def run_host_scheduler_service_v1(socket_path: str, worker_threads: int) -> None: ...
+def run_host_scheduler_service_v2(socket_path: str, worker_threads: int) -> None: ...
+def dispatch_host_scheduler_v2(
+    socket_path: str,
+    *arrays: npt.NDArray[np.generic],
+) -> object: ...
+def _test_host_scheduler_fault_v2(
+    socket_path: str,
+    fault: str,
+    *arrays: npt.NDArray[np.generic],
+) -> object: ...
 def propagate_routes_numeric(
     node_kind: npt.NDArray[np.int64],
     ready_time: npt.NDArray[np.float64],

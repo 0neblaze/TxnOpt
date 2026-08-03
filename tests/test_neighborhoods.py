@@ -273,7 +273,7 @@ def test_route_merge_pair_pruning_is_stage052_opt_in() -> None:
     )
 
 
-def test_native_route_merge_preserves_duplicate_candidate_positions() -> None:
+def test_native_route_merge_uses_python_candidate_deduplication() -> None:
     instance = _instance()
 
     class RecordingEvaluator(FakeEvaluator):
@@ -299,8 +299,6 @@ def test_native_route_merge_preserves_duplicate_candidate_positions() -> None:
     assert evaluator.ordered_candidates == (
         ("C1", "C2"),
         ("C2", "C1"),
-        ("C2", "C1"),
-        ("C1", "C2"),
     )
 
 
