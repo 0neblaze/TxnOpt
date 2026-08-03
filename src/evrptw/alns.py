@@ -4985,7 +4985,11 @@ def _full_native_operator_statistics(
             values["rejected"] = cast(int, values["rejected"]) + 1
             if any(
                 str(event["reason"])
-                in {"constraint_removal_no_change", "constraint_repair_infeasible"}
+                in {
+                    "constraint_removal_no_change",
+                    "constraint_removal_no_existing_route_insertion",
+                    "constraint_repair_infeasible",
+                }
                 for event in events
             ):
                 # Python records both the proposal-level no-change cause and

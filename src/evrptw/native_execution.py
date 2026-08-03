@@ -2761,6 +2761,36 @@ def _verify_native_three_lane_search_hash(payload: tuple[object, ...]) -> str:
     return producer_sha256
 
 
+def _native_three_lane_legacy_payload_kind(value: object) -> str:
+    """Identify a legacy-lane payload from its typed shape, never route length."""
+
+    if not isinstance(value, tuple) or not value:
+        return "invalid"
+    metadata = value[0]
+    if not isinstance(metadata, np.ndarray) or metadata.dtype != np.dtype(np.int64):
+        return "invalid"
+    if len(value) == 2 and metadata.ndim == 1 and metadata.shape == (4,):
+        return "simple_rejection"
+    if len(value) == 7:
+        if metadata.ndim == 1 and metadata.shape == (4,):
+            return "route_merge"
+        if metadata.ndim == 1 and metadata.shape == (8,):
+            return "weighted"
+        return "invalid"
+    if len(value) == 8:
+        pool = value[1]
+        if (
+            isinstance(pool, np.ndarray)
+            and pool.dtype == np.dtype(np.int64)
+            and pool.ndim == 2
+            and pool.shape[1] == 6
+        ):
+            return "route_elimination"
+        if metadata.ndim == 1 and metadata.shape == (8,):
+            return "weighted"
+    return "invalid"
+
+
 def decode_native_three_lane_search_semantic_stream(
     instance: Instance,
     payload: object,
@@ -3482,11 +3512,7 @@ def decode_native_three_lane_search_semantic_stream(
         if isinstance(sixth_legacy, tuple) and sixth_legacy
         else np.empty(0, dtype=np.int64)
     )
-    if (
-        isinstance(sixth_legacy, tuple)
-        and len(sixth_legacy) in (7, 8)
-        and len(sixth_metadata) == 8
-    ):
+    if _native_three_lane_legacy_payload_kind(sixth_legacy) == "weighted":
         sixth_stream = _decode_native_three_lane_sixth_iteration(
             instance,
             sixth_payload,
@@ -3571,11 +3597,7 @@ def decode_native_three_lane_search_semantic_stream(
         if isinstance(eighth_legacy, tuple) and eighth_legacy
         else np.empty(0, dtype=np.int64)
     )
-    if (
-        isinstance(eighth_legacy, tuple)
-        and len(eighth_legacy) in (7, 8)
-        and len(eighth_metadata) == 8
-    ):
+    if _native_three_lane_legacy_payload_kind(eighth_legacy) == "weighted":
         eighth_stream = _decode_native_three_lane_sixth_iteration(
             instance,
             eighth_payload,
@@ -3661,12 +3683,7 @@ def decode_native_three_lane_search_semantic_stream(
         if isinstance(tenth_legacy, tuple) and tenth_legacy
         else None
     )
-    if (
-        isinstance(tenth_legacy, tuple)
-        and len(tenth_legacy) in (7, 8)
-        and isinstance(tenth_metadata, np.ndarray)
-        and tenth_metadata.shape == (8,)
-    ):
+    if _native_three_lane_legacy_payload_kind(tenth_legacy) == "weighted":
         tenth_stream = _decode_native_three_lane_sixth_iteration(
             instance,
             tenth_payload,
@@ -3891,7 +3908,7 @@ def decode_native_three_lane_search_semantic_stream(
     )
     if thirteenth_selection[0] == thirteenth_baseline_tier + 1:
         thirteenth_trigger = f"{thirteenth_trigger}+periodic_exploration"
-    if len(thirteenth_legacy_metadata) == 8:
+    if _native_three_lane_legacy_payload_kind(thirteenth_legacy) == "weighted":
         thirteenth_stream = _decode_native_three_lane_sixth_iteration(
             instance,
             thirteenth_payload,
@@ -3974,7 +3991,7 @@ def decode_native_three_lane_search_semantic_stream(
         if isinstance(fourteenth_legacy, tuple) and fourteenth_legacy
         else np.empty(0, dtype=np.int64)
     )
-    if len(fourteenth_metadata) == 8:
+    if _native_three_lane_legacy_payload_kind(fourteenth_legacy) == "weighted":
         fourteenth_stream = _decode_native_three_lane_sixth_iteration(
             instance,
             fourteenth_payload,
@@ -4008,7 +4025,7 @@ def decode_native_three_lane_search_semantic_stream(
     fifteenth_metadata = _require_vector(
         fifteenth_legacy[0], "fifteenth legacy metadata"
     )
-    if len(fifteenth_metadata) == 8:
+    if _native_three_lane_legacy_payload_kind(fifteenth_legacy) == "weighted":
         fifteenth_stream = _decode_native_three_lane_sixth_iteration(
             instance,
             fifteenth_payload,
@@ -4039,10 +4056,7 @@ def decode_native_three_lane_search_semantic_stream(
         return fifteenth_stream
     sixteenth_payload = cast(tuple[object, ...], iteration_payloads[15])
     sixteenth_legacy = cast(tuple[object, ...], sixteenth_payload[0])
-    sixteenth_metadata = _require_vector(
-        sixteenth_legacy[0], "sixteenth legacy metadata"
-    )
-    if len(sixteenth_metadata) == 8:
+    if _native_three_lane_legacy_payload_kind(sixteenth_legacy) == "weighted":
         sixteenth_stream = _decode_native_three_lane_sixth_iteration(
             instance,
             sixteenth_payload,
@@ -4084,7 +4098,7 @@ def decode_native_three_lane_search_semantic_stream(
     seventeenth_metadata = _require_vector(
         seventeenth_legacy[0], "seventeenth legacy metadata"
     )
-    if len(seventeenth_metadata) == 8:
+    if _native_three_lane_legacy_payload_kind(seventeenth_legacy) == "weighted":
         seventeenth_stream = _decode_native_three_lane_sixth_iteration(
             instance,
             seventeenth_payload,
@@ -4120,7 +4134,7 @@ def decode_native_three_lane_search_semantic_stream(
     eighteenth_metadata = _require_vector(
         eighteenth_legacy[0], "eighteenth legacy metadata"
     )
-    if len(eighteenth_metadata) == 8:
+    if _native_three_lane_legacy_payload_kind(eighteenth_legacy) == "weighted":
         eighteenth_stream = _decode_native_three_lane_sixth_iteration(
             instance,
             eighteenth_payload,
@@ -4153,10 +4167,7 @@ def decode_native_three_lane_search_semantic_stream(
         return eighteenth_stream
     nineteenth_payload = cast(tuple[object, ...], iteration_payloads[18])
     nineteenth_legacy = cast(tuple[object, ...], nineteenth_payload[0])
-    nineteenth_metadata = _require_vector(
-        nineteenth_legacy[0], "nineteenth legacy metadata"
-    )
-    if len(nineteenth_metadata) == 8:
+    if _native_three_lane_legacy_payload_kind(nineteenth_legacy) == "weighted":
         nineteenth_stream = _decode_native_three_lane_sixth_iteration(
             instance,
             nineteenth_payload,
@@ -4232,7 +4243,7 @@ def decode_native_three_lane_search_semantic_stream(
     twentieth_metadata = _require_vector(
         twentieth_legacy[0], "twentieth legacy metadata"
     )
-    if len(twentieth_metadata) == 8:
+    if _native_three_lane_legacy_payload_kind(twentieth_legacy) == "weighted":
         twentieth_stream = _decode_native_three_lane_sixth_iteration(
             instance,
             twentieth_payload,
@@ -4266,7 +4277,7 @@ def decode_native_three_lane_search_semantic_stream(
     twenty_first_metadata = _require_vector(
         twenty_first_legacy[0], "twenty-first legacy metadata"
     )
-    if len(twenty_first_metadata) == 8 and len(twenty_first_legacy) in (7, 8):
+    if _native_three_lane_legacy_payload_kind(twenty_first_legacy) == "weighted":
         stream = _decode_native_three_lane_sixth_iteration(
             instance,
             twenty_first_payload,
@@ -4308,12 +4319,17 @@ def decode_native_three_lane_search_semantic_stream(
                 "native three-lane generic follow-up operator is not implemented"
             )
         metadata = _require_vector(generic_legacy[0], "generic legacy metadata")
-        aggregate_merge = len(generic_legacy) == 7 and len(metadata) == 4
-        full_route_elimination = len(generic_legacy) == 8 and len(metadata) == 2
-        simple_rejection = len(generic_legacy) == 2 and len(metadata) == 4
+        legacy_kind = _native_three_lane_legacy_payload_kind(generic_legacy)
+        aggregate_merge = legacy_kind == "route_merge"
+        full_route_elimination = legacy_kind == "route_elimination"
+        simple_rejection = legacy_kind == "simple_rejection"
         rejection_like = (
             aggregate_merge or full_route_elimination or simple_rejection
         )
+        if legacy_kind == "invalid":
+            raise RuntimeError(
+                "native three-lane generic follow-up payload schema is invalid"
+            )
         if rejection_like:
             if aggregate_merge:
                 operator = "route_merge"
@@ -8427,39 +8443,49 @@ def _decode_native_three_lane_sixth_iteration(
             (constraint_repair[0], constraint_repair[1], None, None),
             "constraint repaired",
         )
-        if not constraint_candidate_prepared and constraint_routes != prior_states[2]:
-            raise RuntimeError(
-                "native three-lane constraint no-change modified its lane"
-            )
         constraint_statuses = _require_vector(
             constraint_transaction[1], "sixth constraint statuses"
         )
         constraint_exact_rows = _require_vector(
             constraint_transaction[5], "sixth constraint exact rows"
         )
-        if constraint_statuses.tolist() != [5] or np.any(constraint_exact_rows < 0):
+        constraint_status_values = constraint_statuses.tolist()
+        constraint_exact_infeasible = constraint_status_values == [4]
+        constraint_no_change = constraint_status_values == [5]
+        if (
+            not (constraint_exact_infeasible or constraint_no_change)
+            or np.any(constraint_exact_rows < 0)
+            or (
+                constraint_no_change
+                and not constraint_candidate_prepared
+                and constraint_routes != prior_states[2]
+            )
+        ):
             raise RuntimeError(
                 "native three-lane constraint no-change journal is invalid"
             )
         expected_budget_state[0] += len(constraint_exact_rows)
         expected_budget_state[1] += len(constraint_exact_rows)
-        constraint_integers = cast(
-            npt.NDArray[np.int64], constraint_transaction[2]
-        )
-        constraint_floats = cast(
-            npt.NDArray[np.float64], constraint_transaction[3]
-        )
-        constraint_objective = replay(constraint_routes)
-        reported_constraint = SolutionObjective(
-            int(constraint_integers[0, 0]),
-            float(constraint_floats[0, 0]),
-            float(constraint_floats[0, 1]),
-            int(constraint_integers[0, 1]),
-        )
-        if reported_constraint.key != constraint_objective.key:
-            raise RuntimeError(
-                "native three-lane constraint no-change objective mismatch"
+        constraint_objective: SolutionObjective | None = None
+        reported_constraint: SolutionObjective | None = None
+        if not constraint_exact_infeasible:
+            constraint_integers = cast(
+                npt.NDArray[np.int64], constraint_transaction[2]
             )
+            constraint_floats = cast(
+                npt.NDArray[np.float64], constraint_transaction[3]
+            )
+            constraint_objective = replay(constraint_routes)
+            reported_constraint = SolutionObjective(
+                int(constraint_integers[0, 0]),
+                float(constraint_floats[0, 0]),
+                float(constraint_floats[0, 1]),
+                int(constraint_integers[0, 1]),
+            )
+            if reported_constraint.key != constraint_objective.key:
+                raise RuntimeError(
+                    "native three-lane constraint no-change objective mismatch"
+                )
         scores, removal_routes = _constraint_score_vectors(
             removal,
             constraint_removed_indices,
@@ -8572,6 +8598,7 @@ def _decode_native_three_lane_sixth_iteration(
                 candidate_objective_key=(
                     reported_constraint.key
                     if constraint_candidate_prepared
+                    and reported_constraint is not None
                     else ()
                 ),
             ),
@@ -8588,17 +8615,41 @@ def _decode_native_three_lane_sixth_iteration(
                     exact_route_evaluations=len(constraint_exact_rows),
                     accepted=constraint_accepted,
                     vehicle_reduction=(
-                        constraint_objective.vehicle_count
+                        constraint_objective is not None
+                        and constraint_objective.vehicle_count
                         < replay(prior_states[2]).vehicle_count
                     ),
                     distance_improvement=(
-                        constraint_objective.total_distance
+                        constraint_objective is not None
+                        and constraint_objective.total_distance
                         < replay(prior_states[2]).total_distance - 1e-9
                     ),
-                    candidate_objective_key=reported_constraint.key,
+                    candidate_objective_key=(
+                        reported_constraint.key
+                        if reported_constraint is not None
+                        else ()
+                    ),
                 )
                 if constraint_candidate_prepared
-                else constraint_event("failed", "constraint_removal_no_change")
+                else constraint_event(
+                    "failed",
+                    (
+                        "constraint_repair_infeasible"
+                        if constraint_exact_infeasible
+                        else "constraint_removal_no_change"
+                    ),
+                    affected_route_indices=(
+                        constraint_affected if constraint_exact_infeasible else ()
+                    ),
+                    candidate_route_sequences=(
+                        constraint_routes if constraint_exact_infeasible else ()
+                    ),
+                    exact_route_evaluations=(
+                        len(constraint_exact_rows)
+                        if constraint_exact_infeasible
+                        else 0
+                    ),
+                )
             ),
         )
     all_events = (
@@ -10363,8 +10414,13 @@ def _decode_native_three_lane_constraint_no_change_iteration(
             ),
         )
         if (
-            len(legacy_header) != len(prior_states[0])
-            or not np.array_equal(legacy_header, attempts[:, 0])
+                len(legacy_header) == 0
+                or len(legacy_header) > len(prior_states[0])
+                or not np.array_equal(legacy_header, attempts[:, 0])
+                or len(set(int(value) for value in legacy_header))
+                != len(legacy_header)
+                or np.any(legacy_header < 0)
+                or np.any(legacy_header >= len(prior_states[0]))
             or np.any(attempts[:, 2] == 0)
             or _require_vector(
                 legacy[2], "no-change route-elimination plan offsets"
@@ -10443,7 +10499,6 @@ def _decode_native_three_lane_constraint_no_change_iteration(
     probe = require_tuple(constraint[1], 3, "constraint probe")
     removal = require_tuple(probe[0], 7, "constraint removal")
     repair = require_tuple(probe[1], 3, "constraint repair")
-    transaction = require_tuple(probe[2], 13, "constraint transaction")
     outcome = cast(
         npt.NDArray[np.int64],
         _require_array(
@@ -10462,44 +10517,58 @@ def _decode_native_three_lane_constraint_no_change_iteration(
     removed_indices = _require_vector(removal[2], "no-change removed")
     removed = tuple(node_names[int(index)] for index in removed_indices)
     partial_routes = unpack_soa(removal[0], removal[1], "constraint partial")
-    repaired_routes = unpack_soa(repair[0], repair[1], "constraint repaired")
-    if repaired_routes != prior_states[2]:
-        raise RuntimeError("native constraint no-change repair changed its lane")
-    statuses = _require_vector(transaction[1], "no-change statuses")
-    exact_rows = _require_vector(transaction[5], "no-change exact rows")
-    if statuses.tolist() != [5] or len(exact_rows) != 0:
-        raise RuntimeError("native constraint no-change cache journal is invalid")
-    objective_integers = cast(
-        npt.NDArray[np.int64],
-        _require_array(
-            transaction[2],
-            dtype=np.dtype(np.int64),
-            shape=(1, 2),
-            name="no-change objective integers",
-        ),
-    )
-    objective_floats = cast(
-        npt.NDArray[np.float64],
-        _require_array(
-            transaction[3],
-            dtype=np.dtype(np.float64),
-            shape=(1, 2),
-            name="no-change objective floats",
-        ),
-    )
-    reported = SolutionObjective(
-        int(objective_integers[0, 0]),
-        float(objective_floats[0, 0]),
-        float(objective_floats[0, 1]),
-        int(objective_integers[0, 1]),
-    )
-    if reported.key != replay(repaired_routes).key:
-        raise RuntimeError("native constraint no-change objective mismatch")
+    repair_counters = _require_vector(repair[2], "no-change repair counters")
+    repair_failed = int(repair_counters[0]) != 0
+    if repair_failed:
+        if (
+            _require_vector(repair[0], "failed repair offsets").tolist() != [0]
+            or len(_require_vector(repair[1], "failed repair indices")) != 0
+            or probe[2] is not None
+        ):
+            raise RuntimeError("native constraint failed repair journal is invalid")
+    else:
+        repaired_routes = unpack_soa(repair[0], repair[1], "constraint repaired")
+        if repaired_routes != prior_states[2]:
+            raise RuntimeError("native constraint no-change repair changed its lane")
+        transaction = require_tuple(probe[2], 13, "constraint transaction")
+        statuses = _require_vector(transaction[1], "no-change statuses")
+        exact_rows = _require_vector(transaction[5], "no-change exact rows")
+        if statuses.tolist() != [5] or len(exact_rows) != 0:
+            raise RuntimeError("native constraint no-change cache journal is invalid")
+        objective_integers = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                transaction[2],
+                dtype=np.dtype(np.int64),
+                shape=(1, 2),
+                name="no-change objective integers",
+            ),
+        )
+        objective_floats = cast(
+            npt.NDArray[np.float64],
+            _require_array(
+                transaction[3],
+                dtype=np.dtype(np.float64),
+                shape=(1, 2),
+                name="no-change objective floats",
+            ),
+        )
+        reported = SolutionObjective(
+            int(objective_integers[0, 0]),
+            float(objective_floats[0, 0]),
+            float(objective_floats[0, 1]),
+            int(objective_integers[0, 1]),
+        )
+        if reported.key != replay(repaired_routes).key:
+            raise RuntimeError("native constraint no-change objective mismatch")
     scores, removal_routes = _constraint_score_vectors(
         removal, removed_indices, "no-change"
     )
     if len(removal_routes) == 0:
         raise RuntimeError("native constraint no-change route is missing")
+    affected_routes = tuple(
+        sorted({int(route) for route in removal_routes[: len(removed)]})
+    )
 
     if payload[1] is not None or payload[2] is not None or payload[4] is not None:
         raise RuntimeError("native constraint no-change lane schedule is invalid")
@@ -10517,8 +10586,8 @@ def _decode_native_three_lane_constraint_no_change_iteration(
             constraint_operator,
             "candidate_proposed",
             "constraint_ranked_removal",
-            route_indices=(int(removal_routes[0]),),
-            affected_route_indices=(int(removal_routes[0]),),
+            route_indices=affected_routes,
+            affected_route_indices=affected_routes,
             removed_customers=removed,
             candidate_route_sequences=partial_routes,
             prefilter_passed=True,
@@ -10535,7 +10604,11 @@ def _decode_native_three_lane_constraint_no_change_iteration(
         event(
             constraint_operator,
             "failed",
-            "constraint_removal_no_change",
+            (
+                "constraint_removal_no_existing_route_insertion"
+                if repair_failed
+                else "constraint_removal_no_change"
+            ),
             removed_customers=removed,
             prefilter_passed=True,
             track="constraint_lane",
