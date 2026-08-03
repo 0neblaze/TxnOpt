@@ -949,6 +949,32 @@ def full_native_alns_v2(
     object,
     object,
 ]: ...
+def full_native_alns_host_v2(
+    socket_path: str,
+    node_kind: npt.NDArray[np.int64],
+    demand: npt.NDArray[np.float64],
+    ready_time: npt.NDArray[np.float64],
+    due_date: npt.NDArray[np.float64],
+    service_time: npt.NDArray[np.float64],
+    distance: npt.NDArray[np.float64],
+    reachable: npt.NDArray[np.uint8],
+    vehicle: npt.NDArray[np.float64],
+    lexical_rank: npt.NDArray[np.int64],
+    node_name_offsets: npt.NDArray[np.int64],
+    node_name_bytes: npt.NDArray[np.uint8],
+    initial_route_offsets: npt.NDArray[np.int64],
+    initial_route_indices: npt.NDArray[np.int64],
+    control: npt.NDArray[np.int64],
+    deadline_remaining: npt.NDArray[np.float64],
+    protocol_control: npt.NDArray[np.int64],
+    protocol_options: npt.NDArray[np.float64],
+    stage04_integer: npt.NDArray[np.int64],
+    stage04_float: npt.NDArray[np.float64],
+    operator_integer: npt.NDArray[np.int64],
+    operator_float: npt.NDArray[np.float64],
+) -> tuple[object, ...]: ...
+
+def _test_native_kernel_fault_v2(socket_path: str, fault: str) -> None: ...
 def full_native_initialize_v2(
     node_kind: npt.NDArray[np.int64],
     ready_time: npt.NDArray[np.float64],
@@ -974,16 +1000,6 @@ def full_native_initialize_v2(
     npt.NDArray[np.float64],
     npt.NDArray[np.int64],
 ]: ...
-def run_host_scheduler_service_v2(socket_path: str, worker_threads: int) -> None: ...
-def dispatch_host_scheduler_v2(
-    socket_path: str,
-    *arrays: npt.NDArray[np.generic],
-) -> object: ...
-def _test_host_scheduler_fault_v2(
-    socket_path: str,
-    fault: str,
-    *arrays: npt.NDArray[np.generic],
-) -> object: ...
 def propagate_routes_numeric(
     node_kind: npt.NDArray[np.int64],
     ready_time: npt.NDArray[np.float64],

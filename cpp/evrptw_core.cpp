@@ -48,11 +48,16 @@
 #include <descrobject.h>
 
 #include "native_concurrency.hpp"
+#include "native_kernel_client.hpp"
 #include "native_solver_kernels.hpp"
 
 namespace py = pybind11;
 
 using Point = std::pair<double, double>;
+
+#ifdef __linux__
+thread_local std::string native_kernel_scheduler_endpoint;
+#endif
 
 template <typename Callback>
 class ScopeRollback final {
@@ -6149,6 +6154,22 @@ py::tuple exact_charging_batch_numeric(
     evrptw::native_kernels::ExactBatchOutput result;
     {
         py::gil_scoped_release release;
+#ifdef __linux__
+        if (!native_kernel_scheduler_endpoint.empty()) {
+            try {
+                result = evrptw::native_client::exact_charging(
+                    native_kernel_scheduler_endpoint,
+                    kinds, ready, due, service, distances, vehicle_values,
+                    offsets, indices, node_count, route_count,
+                    static_cast<std::size_t>(indices_info.shape[0]),
+                    deadline[0], batch[0]);
+            } catch (const std::exception& error) {
+                throw std::runtime_error(
+                    std::string("host scheduler IPC failed without fallback: ")
+                    + error.what());
+            }
+        } else {
+#endif
         result = evrptw::native_kernels::run_exact_charging_batch(
             kinds,
             ready,
@@ -6164,6 +6185,9 @@ py::tuple exact_charging_batch_numeric(
             stations,
             deadline[0],
             batch[0]);
+#ifdef __linux__
+        }
+#endif
     }
 
     py::array_t<std::int64_t> path_offsets_array(result.path_offsets.size());
@@ -6197,6 +6221,41 @@ py::tuple exact_charging_batch_numeric(
 
 namespace {
 
+evrptw::native_kernels::ScreenOutput dispatch_screen_route(
+    const std::int64_t* kinds,
+    const double* demands,
+    const double* ready,
+    const double* due,
+    const double* service,
+    const double* distances,
+    const std::uint8_t* reachable,
+    const double* vehicle,
+    const std::int64_t* route,
+    std::size_t route_size,
+    std::size_t node_count,
+    std::int64_t depot,
+    const std::vector<std::int64_t>& recharge_nodes,
+    const double* options,
+    const double* incremental) {
+#ifdef __linux__
+    if (!native_kernel_scheduler_endpoint.empty()) {
+        try {
+            return evrptw::native_client::screen_route(
+                native_kernel_scheduler_endpoint,
+                kinds, demands, ready, due, service, distances, reachable,
+                vehicle, route, route_size, node_count, options, incremental);
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                std::string("host scheduler IPC failed without fallback: ")
+                + error.what());
+        }
+    }
+#endif
+    return evrptw::native_kernels::run_screen_route(
+        kinds, demands, ready, due, service, distances, reachable, vehicle,
+        route, route_size, node_count, depot, recharge_nodes, options,
+        incremental);
+}
 
 struct PropagationOutput {
     std::vector<std::int64_t> codes = std::vector<std::int64_t>(10, 0);
@@ -6490,7 +6549,7 @@ py::tuple screen_routes_numeric(
     evrptw::native_kernels::ScreenOutput result;
     {
         py::gil_scoped_release release;
-        result = evrptw::native_kernels::run_screen_route(
+        result = dispatch_screen_route(
             kinds,
             demands,
             ready,
@@ -6713,7 +6772,7 @@ py::tuple candidate_control_repair_v2(
                         customer);
                     const std::array<double, 4> options{
                         1.0, epsilon, reference_sum.value(), 1.0};
-                    const auto screened = evrptw::native_kernels::run_screen_route(
+                    const auto screened = dispatch_screen_route(
                         kinds, demands, ready, due, service, distances,
                         reachable_values, vehicle_values, candidate.data(),
                         candidate.size(), node_count, depot, recharge_nodes,
@@ -6750,7 +6809,7 @@ py::tuple candidate_control_repair_v2(
             });
         const std::vector<std::int64_t> singleton{customer};
         const std::array<double, 4> options{1.0, epsilon, 0.0, 0.0};
-        const auto screened = evrptw::native_kernels::run_screen_route(
+        const auto screened = dispatch_screen_route(
             kinds, demands, ready, due, service, distances, reachable_values,
             vehicle_values, singleton.data(), singleton.size(), node_count,
             depot, recharge_nodes, options.data(), incremental.data());
@@ -7419,7 +7478,7 @@ py::tuple screen_route_batch_transaction_impl(
                     const auto index = screen_indices[position];
                     const auto begin = static_cast<std::size_t>(offsets[index]);
                     const auto end = static_cast<std::size_t>(offsets[index + 1]);
-                    outputs[index] = evrptw::native_kernels::run_screen_route(
+                    outputs[index] = dispatch_screen_route(
                         kinds,
                         demands,
                         ready,
@@ -8799,7 +8858,7 @@ public:
                     const auto first = warm_offsets[route];
                     const auto last = warm_offsets[route + 1];
                     warm_screening[route] =
-                        evrptw::native_kernels::run_screen_route(
+                        dispatch_screen_route(
                         kinds,
                         warm_demands,
                         warm_ready,
@@ -9285,7 +9344,7 @@ public:
             work_pool_->parallel_for(screen_rows.size(), [&](std::size_t position) {
                 const auto row = screen_rows[position];
                 const auto& sequence = unique_screen_routes[row];
-                screen_outputs[row] = evrptw::native_kernels::run_screen_route(
+                screen_outputs[row] = dispatch_screen_route(
                     kinds, demands, ready, due, service, distances,
                     reachable, vehicle, sequence.data(), sequence.size(),
                     node_count, depot_, recharge_nodes_,
@@ -10371,7 +10430,7 @@ public:
                     const auto first = candidate_boundaries[candidate];
                     const auto last = candidate_boundaries[candidate + 1];
                     merge_screening[candidate] =
-                        evrptw::native_kernels::run_screen_route(
+                        dispatch_screen_route(
                         kinds, demands, ready, due, service, distances,
                         reachable, vehicle, candidate_nodes + first,
                         static_cast<std::size_t>(last - first),
@@ -15756,6 +15815,10 @@ public:
         return work_pool_->peak_active_task_count();
     }
 
+    [[nodiscard]] std::size_t work_pool_thread_count() const noexcept {
+        return static_cast<std::size_t>(work_pool_->thread_count());
+    }
+
     void suppress_plan_screening_negative_cache(bool suppress) noexcept {
         suppress_plan_screening_negative_cache_ = suppress;
     }
@@ -17329,17 +17392,51 @@ py::tuple full_native_alns_v2(
         throw std::logic_error(
             "full native v2 exact timing is outside the solve interval");
     }
-    py::array_t<double> timings(8);
+    py::array_t<double> timings(9);
     checked_data(timings)[0] = elapsed - exact_seconds;
     checked_data(timings)[1] = exact_seconds;
     checked_data(timings)[2] = elapsed;
-    checked_data(timings)[3] = scheduler_queue_wait_seconds_context;
+    checked_data(timings)[3] =
+#ifdef __linux__
+        !native_kernel_scheduler_endpoint.empty()
+        ? evrptw::native_client::telemetry.queue_wait_seconds
+        :
+#endif
+          scheduler_queue_wait_seconds_context;
     checked_data(timings)[4] = static_cast<double>(
+#ifdef __linux__
+        !native_kernel_scheduler_endpoint.empty()
+        ? evrptw::native_client::telemetry.peak_active_tasks
+        :
+#endif
         engine.work_pool_peak_active_tasks());
     checked_data(timings)[5] = static_cast<double>(
+#ifdef __linux__
+        !native_kernel_scheduler_endpoint.empty()
+        ? 0
+        :
+#endif
         engine.work_pool_active_tasks());
-    checked_data(timings)[6] = static_cast<double>(scheduler_queue_depth_context);
-    checked_data(timings)[7] = scheduler_work_pool_context ? 1.0 : 0.0;
+    checked_data(timings)[6] = static_cast<double>(
+#ifdef __linux__
+        !native_kernel_scheduler_endpoint.empty()
+        ? evrptw::native_client::telemetry.peak_queue_depth
+        :
+#endif
+          scheduler_queue_depth_context);
+    checked_data(timings)[7] =
+#ifdef __linux__
+        !native_kernel_scheduler_endpoint.empty()
+        ||
+#endif
+        scheduler_work_pool_context ? 1.0 : 0.0;
+    checked_data(timings)[8] = static_cast<double>(
+#ifdef __linux__
+        !native_kernel_scheduler_endpoint.empty()
+        ? evrptw::native_client::telemetry.pool_thread_count
+        :
+#endif
+        engine.work_pool_thread_count());
     std::string evidence("stage05.2-full-native-alns-v2");
     const auto append_raw_array = [&](const auto& array) {
         evidence.append(
@@ -17391,6 +17488,53 @@ py::tuple full_native_alns_v2(
 }
 
 #ifdef __linux__
+py::tuple full_native_alns_host_v2(
+    const std::string& socket_path,
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle lexical_rank,
+    py::handle node_name_offsets,
+    py::handle node_name_bytes,
+    py::handle initial_route_offsets,
+    py::handle initial_route_indices,
+    py::handle control,
+    py::handle deadline_remaining,
+    py::handle protocol_control,
+    py::handle protocol_options,
+    py::handle stage04_integer,
+    py::handle stage04_float,
+    py::handle operator_integer,
+    py::handle operator_float) {
+    if (socket_path.empty() || !native_kernel_scheduler_endpoint.empty()) {
+        throw std::invalid_argument(
+            "full native host kernel scheduler endpoint is invalid");
+    }
+    native_kernel_scheduler_endpoint = socket_path;
+    evrptw::native_client::reset_telemetry();
+    ScopeRollback clear_endpoint([]() noexcept {
+        native_kernel_scheduler_endpoint.clear();
+    });
+    return full_native_alns_v2(
+        node_kind, demand, ready_time, due_date, service_time, distance,
+        reachable, vehicle, lexical_rank, node_name_offsets, node_name_bytes,
+        initial_route_offsets, initial_route_indices, control,
+        deadline_remaining, protocol_control, protocol_options,
+        stage04_integer, stage04_float, operator_integer, operator_float);
+}
+
+void test_native_kernel_fault_v2(
+    const std::string& socket_path,
+    const std::string& fault) {
+    py::gil_scoped_release release;
+    evrptw::native_client::test_fault(socket_path, fault);
+}
+
 namespace {
 
 constexpr std::uint64_t scheduler_max_control_bytes = 1ULL << 20;
@@ -19069,6 +19213,38 @@ PYBIND11_MODULE(_core, module) {
         py::arg("stage04_float"),
         py::arg("operator_integer"),
         py::arg("operator_float"));
+#ifdef __linux__
+    module.def(
+        "full_native_alns_host_v2",
+        &full_native_alns_host_v2,
+        py::arg("socket_path"),
+        py::arg("node_kind"),
+        py::arg("demand"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("reachable"),
+        py::arg("vehicle"),
+        py::arg("lexical_rank"),
+        py::arg("node_name_offsets"),
+        py::arg("node_name_bytes"),
+        py::arg("initial_route_offsets"),
+        py::arg("initial_route_indices"),
+        py::arg("control"),
+        py::arg("deadline_remaining"),
+        py::arg("protocol_control"),
+        py::arg("protocol_options"),
+        py::arg("stage04_integer"),
+        py::arg("stage04_float"),
+        py::arg("operator_integer"),
+        py::arg("operator_float"));
+    module.def(
+        "_test_native_kernel_fault_v2",
+        &test_native_kernel_fault_v2,
+        py::arg("socket_path"),
+        py::arg("fault"));
+#endif
     module.def(
         "full_native_initialize_v2",
         &full_native_initialize_v2,
@@ -19082,20 +19258,6 @@ PYBIND11_MODULE(_core, module) {
         py::arg("initial_route_indices"),
         py::arg("control"),
         py::arg("deadline_remaining"));
-    module.def(
-        "run_host_scheduler_service_v2",
-        &run_host_scheduler_service_v2,
-        py::arg("socket_path"),
-        py::arg("worker_threads"));
-    module.def(
-        "dispatch_host_scheduler_v2",
-        &dispatch_host_scheduler_v2,
-        py::arg("socket_path"));
-    module.def(
-        "_test_host_scheduler_fault_v2",
-        &test_host_scheduler_fault_v2,
-        py::arg("socket_path"),
-        py::arg("fault"));
     module.def(
         "propagate_routes_numeric",
         &propagate_routes_numeric,

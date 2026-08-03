@@ -1,0 +1,432 @@
+#pragma once
+
+#ifdef __linux__
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <vector>
+
+#include "native_kernel_protocol.hpp"
+#include "native_sha256.hpp"
+#include "native_solver_kernels.hpp"
+
+namespace evrptw::native_client {
+
+namespace protocol = evrptw::native_protocol;
+namespace kernels = evrptw::native_kernels;
+
+inline std::atomic<std::uint64_t> request_counter{1};
+inline std::atomic<std::uint64_t> segment_counter{1};
+
+struct KernelClientTelemetry final {
+    double queue_wait_seconds = 0.0;
+    std::size_t peak_queue_depth = 0;
+    std::size_t peak_active_tasks = 0;
+    std::size_t pool_thread_count = 0;
+    std::size_t request_count = 0;
+};
+
+inline thread_local KernelClientTelemetry telemetry;
+
+inline void reset_telemetry() noexcept { telemetry = {}; }
+
+inline void record_telemetry(
+    const protocol::PayloadView& output, std::size_t index) {
+    const auto& descriptor = output.descriptor(index);
+    if (descriptor.type != protocol::NumericType::float64
+        || descriptor.count != 4) {
+        throw std::runtime_error("native kernel scheduler telemetry is invalid");
+    }
+    const auto* values = output.data<double>(
+        index, protocol::NumericType::float64);
+    if (!std::isfinite(values[0]) || values[0] < 0.0
+        || !std::isfinite(values[1]) || values[1] < 1.0
+        || values[1] != static_cast<double>(static_cast<std::size_t>(values[1]))
+        || !std::isfinite(values[2]) || values[2] < 1.0 || values[2] > 24.0
+        || values[2] != static_cast<double>(static_cast<std::size_t>(values[2]))
+        || values[3] != 24.0) {
+        throw std::runtime_error("native kernel scheduler telemetry values are invalid");
+    }
+    telemetry.queue_wait_seconds += values[0];
+    telemetry.peak_queue_depth = std::max(
+        telemetry.peak_queue_depth, static_cast<std::size_t>(values[1]));
+    telemetry.peak_active_tasks = std::max(
+        telemetry.peak_active_tasks, static_cast<std::size_t>(values[2]));
+    telemetry.pool_thread_count = static_cast<std::size_t>(values[3]);
+    ++telemetry.request_count;
+}
+
+inline bool read_exact(int descriptor, void* output, std::size_t size) {
+    auto* cursor = static_cast<std::uint8_t*>(output);
+    while (size > 0) {
+        const auto received = ::recv(descriptor, cursor, size, 0);
+        if (received <= 0) {
+            return false;
+        }
+        cursor += received;
+        size -= static_cast<std::size_t>(received);
+    }
+    return true;
+}
+
+inline void send_exact(int descriptor, const void* input, std::size_t size) {
+    const auto* cursor = static_cast<const std::uint8_t*>(input);
+    while (size > 0) {
+        const auto sent = ::send(descriptor, cursor, size, MSG_NOSIGNAL);
+        if (sent <= 0) {
+            throw std::runtime_error("native kernel client could not send control data");
+        }
+        cursor += sent;
+        size -= static_cast<std::size_t>(sent);
+    }
+}
+
+class Socket final {
+public:
+    explicit Socket(std::string_view path) {
+        if (path.empty() || path.size() >= sizeof(sockaddr_un::sun_path)) {
+            throw std::invalid_argument("native kernel scheduler socket is invalid");
+        }
+        descriptor_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (descriptor_ < 0) {
+            throw std::runtime_error("native kernel client could not create its socket");
+        }
+        sockaddr_un address{};
+        address.sun_family = AF_UNIX;
+        std::memcpy(address.sun_path, path.data(), path.size());
+        address.sun_path[path.size()] = '\0';
+        if (::connect(
+                descriptor_, reinterpret_cast<const sockaddr*>(&address),
+                sizeof(address)) != 0) {
+            ::close(descriptor_);
+            descriptor_ = -1;
+            throw std::runtime_error("native kernel client could not connect");
+        }
+    }
+    Socket(const Socket&) = delete;
+    Socket& operator=(const Socket&) = delete;
+    ~Socket() noexcept {
+        if (descriptor_ >= 0) {
+            ::close(descriptor_);
+        }
+    }
+    int get() const noexcept { return descriptor_; }
+
+private:
+    int descriptor_ = -1;
+};
+
+inline protocol::PayloadView transact(
+    std::string_view socket_path,
+    std::vector<std::uint8_t> input_bytes,
+    protocol::SharedMapping& output_mapping,
+    protocol::ControlFrame& response,
+    Socket& socket) {
+    const auto request_id = [&]() {
+        protocol::PayloadView view(input_bytes.data(), input_bytes.size());
+        return view.header().request_id;
+    }();
+    const auto segment_name = "/evrptw-s52-client-" + std::to_string(::getpid())
+        + "-" + std::to_string(segment_counter.fetch_add(1));
+    auto input_mapping = protocol::SharedMapping::create(
+        segment_name, input_bytes.size());
+    std::memcpy(input_mapping.address(), input_bytes.data(), input_bytes.size());
+    protocol::ControlFrame request;
+    request.message = protocol::ControlMessage::request;
+    request.request_id = request_id;
+    request.segment_size = input_bytes.size();
+    protocol::copy_bounded(input_mapping.name(), request.segment_name.data(),
+        request.segment_name.size());
+    const auto input_sha = protocol::native_sha256_hex(std::string_view(
+        reinterpret_cast<const char*>(input_bytes.data()), input_bytes.size()));
+    protocol::copy_bounded(input_sha, request.sha256.data(), request.sha256.size());
+    static_cast<void>(socket_path);
+    send_exact(socket.get(), &request, sizeof(request));
+    if (!read_exact(socket.get(), &response, sizeof(response))) {
+        throw std::runtime_error("native kernel scheduler returned a partial response");
+    }
+    if (response.magic != protocol::kernel_magic
+        || response.version != protocol::kernel_protocol_version
+        || response.request_id != request_id) {
+        throw std::runtime_error("native kernel scheduler response identity mismatch");
+    }
+    if (response.message == protocol::ControlMessage::failure) {
+        throw std::runtime_error(protocol::bounded_string(
+            response.error.data(), response.error.size()));
+    }
+    if (response.message != protocol::ControlMessage::response
+        || response.segment_size < sizeof(protocol::PayloadHeader)) {
+        throw std::runtime_error("native kernel scheduler response is invalid");
+    }
+    const auto output_name = protocol::bounded_string(
+        response.segment_name.data(), response.segment_name.size());
+    output_mapping = protocol::SharedMapping::open(
+        output_name, static_cast<std::size_t>(response.segment_size));
+    const std::string_view output_bytes(
+        static_cast<const char*>(output_mapping.address()), output_mapping.size());
+    const auto output_sha = protocol::bounded_string(
+        response.sha256.data(), response.sha256.size());
+    if (protocol::native_sha256_hex(output_bytes) != output_sha) {
+        throw std::runtime_error("native kernel scheduler output hash mismatch");
+    }
+    return protocol::PayloadView(output_mapping.address(), output_mapping.size());
+}
+
+inline void acknowledge(
+    Socket& socket,
+    const protocol::ControlFrame& response) {
+    protocol::ControlFrame acknowledgement;
+    acknowledgement.message = protocol::ControlMessage::acknowledgement;
+    acknowledgement.request_id = response.request_id;
+    acknowledgement.segment_name = response.segment_name;
+    acknowledgement.sha256 = response.sha256;
+    send_exact(socket.get(), &acknowledgement, sizeof(acknowledgement));
+    protocol::ControlFrame released;
+    if (!read_exact(socket.get(), &released, sizeof(released))
+        || released.magic != protocol::kernel_magic
+        || released.version != protocol::kernel_protocol_version
+        || released.message != protocol::ControlMessage::released
+        || released.request_id != response.request_id) {
+        throw std::runtime_error("native kernel scheduler release receipt is invalid");
+    }
+}
+
+inline kernels::ExactBatchOutput exact_charging(
+    std::string_view socket_path,
+    const std::int64_t* node_kinds,
+    const double* ready,
+    const double* due,
+    const double* service,
+    const double* distances,
+    const double* vehicle,
+    const std::int64_t* order_offsets,
+    const std::int64_t* order_indices,
+    std::size_t node_count,
+    std::size_t route_count,
+    std::size_t order_count,
+    double deadline_remaining,
+    std::int64_t batch_size) {
+    const auto request_id = request_counter.fetch_add(1);
+    protocol::PayloadBuilder builder(
+        protocol::KernelOperation::exact_charging, request_id);
+    builder.add(protocol::NumericType::int64, node_kinds, node_count, node_count);
+    builder.add(protocol::NumericType::float64, ready, node_count, node_count);
+    builder.add(protocol::NumericType::float64, due, node_count, node_count);
+    builder.add(protocol::NumericType::float64, service, node_count, node_count);
+    builder.add(protocol::NumericType::float64, distances,
+        node_count * node_count, node_count, node_count);
+    builder.add(protocol::NumericType::float64, vehicle, 5, 5);
+    builder.add(protocol::NumericType::int64, order_offsets,
+        route_count + 1, route_count + 1);
+    builder.add(protocol::NumericType::int64, order_indices,
+        order_count, order_count);
+    builder.add(protocol::NumericType::float64, &deadline_remaining, 1, 1);
+    builder.add(protocol::NumericType::int64, &batch_size, 1, 1);
+    Socket socket(socket_path);
+    protocol::SharedMapping output_mapping;
+    protocol::ControlFrame response;
+    const auto output = transact(
+        socket_path, builder.finish(), output_mapping, response, socket);
+    if (output.header().operation != protocol::KernelOperation::exact_charging
+        || output.header().array_count != 8) {
+        throw std::runtime_error("native exact output schema is invalid");
+    }
+    kernels::ExactBatchOutput result;
+    const auto copy_int64 = [&](std::size_t index) {
+        const auto count = static_cast<std::size_t>(output.descriptor(index).count);
+        const auto* data = output.data<std::int64_t>(
+            index, protocol::NumericType::int64);
+        return std::vector<std::int64_t>(data, data + count);
+    };
+    const auto copy_float64 = [&](std::size_t index) {
+        const auto count = static_cast<std::size_t>(output.descriptor(index).count);
+        const auto* data = output.data<double>(index, protocol::NumericType::float64);
+        return std::vector<double>(data, data + count);
+    };
+    result.path_offsets = copy_int64(0);
+    result.path_indices = copy_int64(1);
+    if (!result.path_offsets.empty()) {
+        result.path_indices.resize(
+            static_cast<std::size_t>(result.path_offsets.back()));
+    }
+    result.statuses = copy_int64(2);
+    result.reasons = copy_int64(3);
+    result.metrics = copy_float64(4);
+    result.label_counters = copy_int64(5);
+    result.batch_counters = copy_int64(6);
+    record_telemetry(output, 7);
+    acknowledge(socket, response);
+    return result;
+}
+
+inline kernels::ScreenOutput screen_route(
+    std::string_view socket_path,
+    const std::int64_t* kinds,
+    const double* demands,
+    const double* ready,
+    const double* due,
+    const double* service,
+    const double* distances,
+    const std::uint8_t* reachable,
+    const double* vehicle,
+    const std::int64_t* route,
+    std::size_t route_size,
+    std::size_t node_count,
+    const double* options,
+    const double* incremental) {
+    const auto request_id = request_counter.fetch_add(1);
+    protocol::PayloadBuilder builder(
+        protocol::KernelOperation::screen_route, request_id);
+    builder.add(protocol::NumericType::int64, kinds, node_count, node_count);
+    builder.add(protocol::NumericType::float64, demands, node_count, node_count);
+    builder.add(protocol::NumericType::float64, ready, node_count, node_count);
+    builder.add(protocol::NumericType::float64, due, node_count, node_count);
+    builder.add(protocol::NumericType::float64, service, node_count, node_count);
+    builder.add(protocol::NumericType::float64, distances,
+        node_count * node_count, node_count, node_count);
+    builder.add(protocol::NumericType::uint8, reachable,
+        node_count * node_count, node_count, node_count);
+    builder.add(protocol::NumericType::float64, vehicle, 5, 5);
+    builder.add(protocol::NumericType::int64, route, route_size, route_size);
+    builder.add(protocol::NumericType::float64, options, 4, 4);
+    builder.add(protocol::NumericType::float64, incremental, 6, 6);
+    Socket socket(socket_path);
+    protocol::SharedMapping output_mapping;
+    protocol::ControlFrame response;
+    const auto output = transact(
+        socket_path, builder.finish(), output_mapping, response, socket);
+    if (output.header().operation != protocol::KernelOperation::screen_route
+        || output.header().array_count != 4
+        || output.descriptor(0).count != 16
+        || output.descriptor(1).count != 15
+        || output.descriptor(2).count != 1) {
+        throw std::runtime_error("native screening output schema is invalid");
+    }
+    kernels::ScreenOutput result;
+    const auto* codes = output.data<std::int64_t>(0, protocol::NumericType::int64);
+    const auto* metrics = output.data<double>(1, protocol::NumericType::float64);
+    result.codes.assign(codes, codes + 16);
+    result.metrics.assign(metrics, metrics + 15);
+    result.reachability_queries = output.data<std::int64_t>(
+        2, protocol::NumericType::int64)[0];
+    record_telemetry(output, 3);
+    acknowledge(socket, response);
+    return result;
+}
+
+inline void test_fault(
+    std::string_view socket_path,
+    std::string_view fault) {
+    if (fault != "request_hash_mismatch"
+        && fault != "client_disconnect_after_request"
+        && fault != "ack_loss"
+        && fault != "invalid_ack"
+        && fault != "worker_exception"
+        && fault != "pause_before_execute") {
+        throw std::invalid_argument("unknown native scheduler fault injection");
+    }
+    const auto request_id = request_counter.fetch_add(1);
+    const std::array<std::int64_t, 1> kinds{kernels::depot_kind};
+    const std::array<double, 1> ready{0.0};
+    const std::array<double, 1> due{1.0e9};
+    const std::array<double, 1> service{0.0};
+    const std::array<double, 1> distances{0.0};
+    const std::array<double, 5> vehicle{1.0, 1.0, 1.0, 1.0, 1.0};
+    const std::array<std::int64_t, 2> offsets{0, 0};
+    const double deadline_remaining = 10.0;
+    const std::int64_t batch_size = 1;
+    protocol::PayloadBuilder builder(
+        protocol::KernelOperation::exact_charging, request_id);
+    builder.add(protocol::NumericType::int64, kinds.data(), 1, 1);
+    builder.add(protocol::NumericType::float64, ready.data(), 1, 1);
+    builder.add(protocol::NumericType::float64, due.data(), 1, 1);
+    builder.add(protocol::NumericType::float64, service.data(), 1, 1);
+    builder.add(protocol::NumericType::float64, distances.data(), 1, 1, 1);
+    builder.add(protocol::NumericType::float64, vehicle.data(), 5, 5);
+    builder.add(protocol::NumericType::int64, offsets.data(), 2, 2);
+    builder.add(protocol::NumericType::int64, nullptr, 0, 0);
+    builder.add(
+        protocol::NumericType::float64, &deadline_remaining, 1, 1);
+    builder.add(protocol::NumericType::int64, &batch_size, 1, 1);
+    auto input_bytes = builder.finish();
+    const auto segment_name = "/evrptw-s52-client-" + std::to_string(::getpid())
+        + "-" + std::to_string(segment_counter.fetch_add(1));
+    auto input_mapping = protocol::SharedMapping::create(
+        segment_name, input_bytes.size());
+    std::memcpy(input_mapping.address(), input_bytes.data(), input_bytes.size());
+    protocol::ControlFrame request;
+    request.message = protocol::ControlMessage::test_request;
+    request.request_id = request_id;
+    request.segment_size = input_bytes.size();
+    protocol::copy_bounded(input_mapping.name(), request.segment_name.data(),
+        request.segment_name.size());
+    auto input_sha = protocol::native_sha256_hex(std::string_view(
+        reinterpret_cast<const char*>(input_bytes.data()), input_bytes.size()));
+    if (fault == "request_hash_mismatch") {
+        input_sha.front() = input_sha.front() == '0' ? '1' : '0';
+    }
+    protocol::copy_bounded(input_sha, request.sha256.data(), request.sha256.size());
+    protocol::copy_bounded(fault, request.error.data(), request.error.size());
+    Socket socket(socket_path);
+    send_exact(socket.get(), &request, sizeof(request));
+    if (fault == "client_disconnect_after_request") {
+        throw std::runtime_error("native scheduler client disconnect without fallback");
+    }
+    protocol::ControlFrame response;
+    if (!read_exact(socket.get(), &response, sizeof(response))) {
+        throw std::runtime_error("native scheduler returned a partial IPC frame");
+    }
+    if (response.magic != protocol::kernel_magic
+        || response.version != protocol::kernel_protocol_version
+        || response.request_id != request_id) {
+        throw std::runtime_error("native scheduler fault response identity mismatch");
+    }
+    if (response.message == protocol::ControlMessage::failure) {
+        throw std::runtime_error(protocol::bounded_string(
+            response.error.data(), response.error.size()));
+    }
+    if (response.message != protocol::ControlMessage::response) {
+        throw std::runtime_error("native scheduler fault response is invalid");
+    }
+    const auto output_name = protocol::bounded_string(
+        response.segment_name.data(), response.segment_name.size());
+    auto output_mapping = protocol::SharedMapping::open(
+        output_name, static_cast<std::size_t>(response.segment_size));
+    const std::string_view output_bytes(
+        static_cast<const char*>(output_mapping.address()), output_mapping.size());
+    if (protocol::native_sha256_hex(output_bytes)
+        != protocol::bounded_string(response.sha256.data(), response.sha256.size())) {
+        throw std::runtime_error("native scheduler fault output hash mismatch");
+    }
+    if (fault == "ack_loss") {
+        throw std::runtime_error(
+            "native scheduler acknowledgement loss without fallback");
+    }
+    protocol::ControlFrame acknowledgement;
+    acknowledgement.message = protocol::ControlMessage::acknowledgement;
+    acknowledgement.request_id = response.request_id;
+    acknowledgement.segment_name = response.segment_name;
+    acknowledgement.sha256 = response.sha256;
+    acknowledgement.sha256[0] = acknowledgement.sha256[0] == '0' ? '1' : '0';
+    send_exact(socket.get(), &acknowledgement, sizeof(acknowledgement));
+    protocol::ControlFrame released;
+    if (!read_exact(socket.get(), &released, sizeof(released))) {
+        throw std::runtime_error(
+            "native scheduler did not confirm output release");
+    }
+    throw std::runtime_error("native scheduler did not confirm output release");
+}
+
+}  // namespace evrptw::native_client
+
+#endif

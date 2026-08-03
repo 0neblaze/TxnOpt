@@ -11996,7 +11996,7 @@ def execute_full_native_alns(
     timings_array = _require_array(
         payload[4],
         dtype=np.dtype(np.float64),
-        shape=(8,),
+        shape=(9,),
         name="full native timings",
     )
     if any(not math.isfinite(float(value)) or float(value) < 0.0 for value in timings_array):
@@ -12008,13 +12008,15 @@ def execute_full_native_alns(
         abs_tol=1e-12,
     ):
         raise RuntimeError("full native ALNS timing intervals do not reconcile")
-    telemetry_values = timings_array[4:8]
+    telemetry_values = timings_array[4:9]
     if any(float(value) != int(value) for value in telemetry_values):
         raise RuntimeError("full native ALNS concurrency telemetry is not integral")
     if int(timings_array[5]) != 0:
         raise RuntimeError("full native ALNS returned with active native work")
     if int(timings_array[7]) not in (0, 1):
         raise RuntimeError("full native ALNS shared-pool telemetry is invalid")
+    if int(timings_array[8]) not in (1, 4, 24):
+        raise RuntimeError("full native ALNS work-pool size is invalid")
     trajectory_array = payload[5]
     if (
         not isinstance(trajectory_array, np.ndarray)
@@ -12185,6 +12187,7 @@ def execute_full_native_alns(
             "work_pool_active_tasks_at_return": float(timings_array[5]),
             "queue_depth_on_submit": float(timings_array[6]),
             "shared_work_pool": float(timings_array[7]),
+            "work_pool_thread_count": float(timings_array[8]),
         },
         trajectory=tuple(
             {

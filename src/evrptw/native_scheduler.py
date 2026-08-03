@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import multiprocessing
 import os
 import socket
+import struct
+import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Any, cast
 
@@ -23,50 +23,54 @@ _NUMERIC_THREAD_ENVIRONMENT = {
 }
 
 
-def _scheduler_service_main(socket_path: str, worker_threads: int) -> None:
-    from evrptw import _core as native_core
-
-    entrypoint = cast(Callable[[str, int], None], native_core.run_host_scheduler_service_v2)
-    entrypoint(socket_path, worker_threads)
+_CONTROL_FRAME = struct.Struct("<QIIQQ128s64s192s")
+_KERNEL_MAGIC = 0x4556525054574B32
+_KERNEL_PROTOCOL_VERSION = 2
+_SHUTDOWN_MESSAGE = 6
+_RELEASED_MESSAGE = 4
 
 
 @dataclass(slots=True)
 class NativeHostScheduler:
-    """One temporary run-wide scheduler with 24 request worker threads."""
+    """One temporary run-wide scheduler with one shared 24-thread compute pool."""
 
     socket_path: Path
     worker_threads: int = 24
-    _process: BaseProcess | None = None
+    enable_fault_injection: bool = False
+    _process: subprocess.Popen[bytes] | None = None
 
     def start(self) -> None:
         if self._process is not None:
             raise RuntimeError("host scheduler is already started")
-        context = multiprocessing.get_context("spawn")
-        process = context.Process(
-            target=_scheduler_service_main,
-            args=(str(self.socket_path), self.worker_threads),
-            name="evrptw-native-host-scheduler",
+        from evrptw import _core as native_core
+
+        executable = Path(native_core.__file__).with_name("_native_host_scheduler")
+        if not executable.is_file():
+            raise RuntimeError("pure C++ host scheduler executable is missing")
+        scheduler_environment = dict(os.environ)
+        scheduler_environment.update(_NUMERIC_THREAD_ENVIRONMENT)
+        command = [str(executable), str(self.socket_path), str(self.worker_threads)]
+        if self.enable_fault_injection:
+            command.append("--enable-fault-injection")
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env=scheduler_environment,
         )
-        previous_environment = {
-            name: os.environ.get(name) for name in _NUMERIC_THREAD_ENVIRONMENT
-        }
-        try:
-            os.environ.update(_NUMERIC_THREAD_ENVIRONMENT)
-            process.start()
-        finally:
-            for name, previous in previous_environment.items():
-                if previous is None:
-                    os.environ.pop(name, None)
-                else:
-                    os.environ[name] = previous
         self._process = process
         deadline = time.monotonic() + _READY_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
-            if not process.is_alive():
-                process.join(timeout=1.0)
+            if process.poll() is not None:
+                stderr = (
+                    process.stderr.read() if process.stderr is not None else b""
+                ).decode("utf-8", errors="replace")
                 self._process = None
                 self.socket_path.unlink(missing_ok=True)
-                raise RuntimeError("host scheduler exited before becoming ready")
+                raise RuntimeError(
+                    f"host scheduler exited before becoming ready: {stderr.strip()}"
+                )
             if self.socket_path.exists():
                 try:
                     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
@@ -85,33 +89,60 @@ class NativeHostScheduler:
         process = self._process
         if process is None:
             return
-        if process.is_alive() and force:
+        if process.poll() is None and force:
             process.terminate()
-        elif process.is_alive():
+        elif process.poll() is None:
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                     connection.connect(str(self.socket_path))
-                    connection.sendall(b"X")
-            except OSError:
+                    connection.sendall(
+                        _CONTROL_FRAME.pack(
+                            _KERNEL_MAGIC,
+                            _KERNEL_PROTOCOL_VERSION,
+                            _SHUTDOWN_MESSAGE,
+                            0,
+                            0,
+                            b"",
+                            b"",
+                            b"",
+                        )
+                    )
+                    response = bytearray()
+                    while len(response) < _CONTROL_FRAME.size:
+                        block = connection.recv(_CONTROL_FRAME.size - len(response))
+                        if not block:
+                            break
+                        response.extend(block)
+                    if len(response) != _CONTROL_FRAME.size:
+                        raise RuntimeError("host scheduler shutdown receipt is partial")
+                    values = _CONTROL_FRAME.unpack(response)
+                    if (
+                        values[0] != _KERNEL_MAGIC
+                        or values[1] != _KERNEL_PROTOCOL_VERSION
+                        or values[2] != _RELEASED_MESSAGE
+                    ):
+                        raise RuntimeError("host scheduler shutdown receipt is invalid")
+            except (OSError, RuntimeError):
                 process.terminate()
-        process.join(timeout=5.0)
-        if process.is_alive():
+        try:
+            process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
             process.terminate()
-            process.join(timeout=5.0)
+            process.wait(timeout=5.0)
         self._process = None
         self.socket_path.unlink(missing_ok=True)
 
     @property
     def process_id(self) -> int:
         process = self._process
-        if process is None or process.pid is None or not process.is_alive():
+        if process is None or process.poll() is not None:
             raise RuntimeError("host scheduler is not running")
         return process.pid
 
     @property
     def is_running(self) -> bool:
         process = self._process
-        return process is not None and process.is_alive()
+        return process is not None and process.poll() is None
 
     def observed_thread_count(self) -> int:
         task_directory = Path("/proc") / str(self.process_id) / "task"
@@ -133,7 +164,7 @@ def dispatch_full_native_alns(
 
     from evrptw import _core as native_core
 
-    entrypoint = cast(Callable[..., object], native_core.dispatch_host_scheduler_v2)
+    entrypoint = cast(Callable[..., object], native_core.full_native_alns_host_v2)
     return entrypoint(socket_path, *arrays)
 
 

@@ -6704,8 +6704,10 @@ def test_host_scheduler_v1_producer_entrypoint_is_not_exposed() -> None:
     from evrptw import _core as native_core
 
     assert not hasattr(native_core, "run_host_scheduler_service_v1")
-    assert hasattr(native_core, "run_host_scheduler_service_v2")
-    assert hasattr(native_core, "dispatch_host_scheduler_v2")
+    assert not hasattr(native_core, "run_host_scheduler_service_v2")
+    assert not hasattr(native_core, "dispatch_host_scheduler_v2")
+    assert not hasattr(native_core, "_test_host_scheduler_fault_v2")
+    assert hasattr(native_core, "_test_native_kernel_fault_v2")
 
 
 def test_host_scheduler_v2_owns_one_shared_24_thread_pool(tmp_path: Path) -> None:
@@ -6770,6 +6772,7 @@ def test_host_scheduler_v2_six_clients_share_pool_and_isolate_state(
         assert 1 <= result.native_execution_statistics[
             "work_pool_peak_active_tasks"
         ] <= 24
+        assert result.native_execution_statistics["work_pool_thread_count"] == 24
 
 
 def test_full_native_v2_concurrent_solves_isolate_state() -> None:
@@ -6920,59 +6923,31 @@ def _stage052_shared_memory_names() -> set[str]:
 @pytest.mark.parametrize(
     "fault, expected_message",
     [
-        ("request_hash_mismatch", "request hash mismatch"),
+        ("request_hash_mismatch", "input hash mismatch"),
         (
             "client_disconnect_after_request",
             "client disconnect without fallback",
         ),
         ("ack_loss", "acknowledgement loss without fallback"),
         ("invalid_ack", "did not confirm output release"),
-        ("worker_exception", "injected host scheduler worker exception"),
+        ("worker_exception", "injected native scheduler worker exception"),
     ],
 )
 def test_host_scheduler_faults_fail_fast_and_release_shared_memory(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     fault: str,
     expected_message: str,
 ) -> None:
     from evrptw import _core as native_core
-    from evrptw import native_scheduler as native_scheduler_module
 
     before = _stage052_shared_memory_names()
     endpoint = tmp_path / "native-scheduler.sock"
-    with NativeHostScheduler(endpoint) as scheduler:
-        def dispatch_with_fault(
-            socket_path: str,
-            *arrays: Any,
-        ) -> object:
-            return native_core._test_host_scheduler_fault_v2(
-                socket_path,
-                fault,
-                *arrays,
-            )
-
-        monkeypatch.setattr(
-            native_scheduler_module,
-            "dispatch_full_native_alns",
-            dispatch_with_fault,
-        )
+    with NativeHostScheduler(
+        endpoint, enable_fault_injection=True
+    ) as scheduler:
         with pytest.raises(RuntimeError, match=expected_message):
-            solve_alns(
-                _fixture_instance(),
-                seed=2014,
-                max_iterations=1,
-                time_limit_seconds=2.0,
-                **_full_native_solve_kwargs(),  # type: ignore[arg-type]
-                native_execution_config=replace(
-                    _native_config("host_scheduler"),
-                    candidate_control_config=CandidateControlConfig(
-                        worker_count=1,
-                        max_exact_calls_per_round=100,
-                        proposal_top_k=100,
-                    ),
-                    scheduler_socket_path=str(endpoint),
-                ),
+            native_core._test_native_kernel_fault_v2(
+                str(endpoint), fault
             )
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
@@ -6981,52 +6956,46 @@ def test_host_scheduler_faults_fail_fast_and_release_shared_memory(
             time.sleep(0.01)
         assert _stage052_shared_memory_names() == before
         assert scheduler.is_running
+        healthy = solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            **_full_native_solve_kwargs(),  # type: ignore[arg-type]
+            native_execution_config=replace(
+                _native_config("host_scheduler"),
+                candidate_control_config=CandidateControlConfig(
+                    worker_count=1,
+                    max_exact_calls_per_round=100,
+                    proposal_top_k=100,
+                ),
+                scheduler_socket_path=str(endpoint),
+            ),
+        )
+        assert healthy.native_execution_statistics["fallback_count"] == 0
 
 
 def test_host_scheduler_crash_aborts_inflight_transaction_without_leak(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from threading import Event
 
     from evrptw import _core as native_core
-    from evrptw import native_scheduler as native_scheduler_module
 
     before = _stage052_shared_memory_names()
     endpoint = tmp_path / "native-scheduler.sock"
     dispatch_started = Event()
-    with NativeHostScheduler(endpoint) as scheduler:
-        def paused_dispatch(socket_path: str, *arrays: Any) -> object:
+    with NativeHostScheduler(
+        endpoint, enable_fault_injection=True
+    ) as scheduler:
+        def paused_dispatch() -> object:
             dispatch_started.set()
-            return native_core._test_host_scheduler_fault_v2(
-                socket_path,
+            return native_core._test_native_kernel_fault_v2(
+                str(endpoint),
                 "pause_before_execute",
-                *arrays,
             )
-
-        monkeypatch.setattr(
-            native_scheduler_module,
-            "dispatch_full_native_alns",
-            paused_dispatch,
-        )
         with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                solve_alns,
-                _fixture_instance(),
-                seed=2014,
-                max_iterations=1,
-                time_limit_seconds=30.0,
-                **_full_native_solve_kwargs(),  # type: ignore[arg-type]
-                native_execution_config=replace(
-                    _native_config("host_scheduler"),
-                    candidate_control_config=CandidateControlConfig(
-                        worker_count=1,
-                        max_exact_calls_per_round=100,
-                        proposal_top_k=100,
-                    ),
-                    scheduler_socket_path=str(endpoint),
-                ),
-            )
+            future = executor.submit(paused_dispatch)
             assert dispatch_started.wait(timeout=2.0)
             time.sleep(0.1)
             scheduler.close(force=True)

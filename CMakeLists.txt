@@ -19,6 +19,12 @@ set_property(
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 pybind11_add_module(_core cpp/evrptw_core.cpp)
+if(UNIX AND NOT APPLE)
+  add_executable(
+    _native_host_scheduler
+    cpp/native_host_scheduler.cpp
+  )
+endif()
 
 execute_process(
   COMMAND git rev-parse HEAD
@@ -38,6 +44,11 @@ if(MSVC)
   target_compile_options(_core PRIVATE /O2)
 else()
   target_compile_options(_core PRIVATE -O3 -Wall -Wextra -Wpedantic)
+  if(TARGET _native_host_scheduler)
+    target_compile_options(
+      _native_host_scheduler PRIVATE -O3 -Wall -Wextra -Wpedantic
+    )
+  endif()
 endif()
 
 if(NOT EVRPTW_SANITIZER STREQUAL "none")
@@ -48,11 +59,27 @@ if(NOT EVRPTW_SANITIZER STREQUAL "none")
       _core PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
     )
     target_link_options(_core PRIVATE -fsanitize=address,undefined)
+    if(TARGET _native_host_scheduler)
+      target_compile_options(
+        _native_host_scheduler
+        PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
+      )
+      target_link_options(
+        _native_host_scheduler PRIVATE -fsanitize=address,undefined
+      )
+    endif()
   elseif(EVRPTW_SANITIZER STREQUAL "thread")
     target_compile_options(
       _core PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=thread
     )
     target_link_options(_core PRIVATE -fsanitize=thread)
+    if(TARGET _native_host_scheduler)
+      target_compile_options(
+        _native_host_scheduler
+        PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=thread
+      )
+      target_link_options(_native_host_scheduler PRIVATE -fsanitize=thread)
+    endif()
     add_executable(
       stage052_native_concurrency_tsan
       cpp/native_concurrency_tsan.cpp
@@ -71,3 +98,6 @@ if(NOT EVRPTW_SANITIZER STREQUAL "none")
 endif()
 
 install(TARGETS _core DESTINATION evrptw)
+if(TARGET _native_host_scheduler)
+  install(TARGETS _native_host_scheduler DESTINATION evrptw)
+endif()

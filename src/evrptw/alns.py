@@ -5633,6 +5633,9 @@ def _solve_full_native_alns(
             "queue_depth_on_submit": int(
                 native_result.timings["queue_depth_on_submit"]
             ),
+            "work_pool_thread_count": int(
+                native_result.timings["work_pool_thread_count"]
+            ),
             "candidate_transaction_occupancies": list(
                 native_result.backend_metrics.launch_occupancies
             ),
