@@ -218,7 +218,13 @@ class CandidateControlRuntime:
         )
         return granted
 
-    def record_native_work(self, started: int, *, context: str) -> bool:
+    def record_native_work(
+        self,
+        started: int,
+        *,
+        context: str,
+        emit_event: bool = True,
+    ) -> bool:
         """Charge native work that has already started and therefore cannot be refunded."""
 
         if started < 0:
@@ -226,20 +232,44 @@ class CandidateControlRuntime:
         available = self.round_remaining
         within_budget = self._round_key is None or started <= available
         self._round_used += started
-        if started:
-            self.events.append(
-                {
-                    "event_type": "candidate_control_budget",
-                    "status": "reserved" if within_budget else "protocol_budget_overrun",
-                    "context": context,
-                    "requested": started,
-                    "granted": started,
-                    "remaining": self.round_remaining,
-                    "iteration": None if self._round_key is None else self._round_key[1],
-                    "accounting": "native_resource_receipt",
-                }
+        if started and emit_event:
+            self.record_native_work_event(
+                started,
+                context=context,
+                within_budget=within_budget,
             )
         return within_budget
+
+    def record_native_work_event(
+        self,
+        started: int,
+        *,
+        context: str,
+        within_budget: bool,
+        status: str | None = None,
+    ) -> None:
+        """Commit evidence for work already charged through the native receipt."""
+
+        if started <= 0:
+            return
+        self.events.append(
+            {
+                "event_type": "candidate_control_budget",
+                "status": (
+                    status
+                    if status is not None
+                    else "reserved"
+                    if within_budget
+                    else "protocol_budget_overrun"
+                ),
+                "context": context,
+                "requested": started,
+                "granted": started,
+                "remaining": self.round_remaining,
+                "iteration": None if self._round_key is None else self._round_key[1],
+                "accounting": "native_resource_receipt",
+            }
+        )
 
     def select_route_candidates(
         self,

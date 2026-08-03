@@ -510,6 +510,7 @@ _SEMANTIC_STREAM_NAMES = (
     "exact_result",
     "cache",
     "deadline",
+    "native_failure",
 )
 def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, object]]:
     raw_streams = payload.get("canonical_semantic_streams")
@@ -529,6 +530,8 @@ def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, 
     ):
         raise ValueError("explicit canonical semantic event sequence is missing")
     events = [dict(row) for row in raw_events]
+    if not events:
+        raise ValueError("canonical semantic event sequence cannot be empty")
     if len(events) != sum(len(rows) for rows in streams.values()):
         raise ValueError("canonical semantic event sequence has missing or duplicate rows")
     sequences = [event.get("semantic_sequence") for event in events]
@@ -557,7 +560,76 @@ def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, 
         raise ValueError(
             "canonical semantic event sequence lacks contiguous runtime event IDs"
         )
-    return events
+    mode = payload.get("mode")
+    if isinstance(mode, str):
+        source_runtime_ids: list[int] = []
+        for event in events:
+            event_id = event.get("runtime_event_id")
+            if isinstance(event_id, bool) or not isinstance(event_id, int):
+                raise ValueError(
+                    "canonical semantic events lost strict runtime source order"
+                )
+            source_runtime_ids.append(event_id)
+        if any(
+            source_runtime_ids[index - 1] >= source_runtime_ids[index]
+            for index in range(1, len(source_runtime_ids))
+        ):
+            raise ValueError(
+                "canonical semantic events lost strict runtime source order"
+            )
+        required_nonempty = {
+            "candidate_state",
+            "operator",
+            "stage04",
+            "exact_work",
+            "exact_result",
+            "cache",
+        }
+        if mode != "current_stage052":
+            required_nonempty.add("candidate_transaction")
+        missing = sorted(name for name in required_nonempty if not streams[name])
+        if missing:
+            raise ValueError(
+                "canonical semantic runtime journal is incomplete: "
+                + ", ".join(missing)
+            )
+    declared_started = payload.get("exact_started_calls")
+    declared_completed = payload.get("exact_completed_calls")
+    if (
+        isinstance(declared_started, int)
+        and not isinstance(declared_started, bool)
+        and isinstance(declared_completed, int)
+        and not isinstance(declared_completed, bool)
+    ):
+        journal_started = 0
+        for event in streams["exact_work"]:
+            started_calls = event.get("started_calls")
+            if (
+                event.get("event_type") == "exact_batch_started"
+                and isinstance(started_calls, int)
+                and not isinstance(started_calls, bool)
+            ):
+                journal_started += started_calls
+        result_started = sum(
+            event.get("exact_started") is True
+            for event in streams["exact_result"]
+        )
+        result_completed = sum(
+            event.get("exact_completed") is True
+            for event in streams["exact_result"]
+        )
+        if journal_started != declared_started or result_started != declared_started:
+            raise ValueError("semantic exact-start counters do not reconcile")
+        if result_completed != declared_completed:
+            raise ValueError("semantic exact-completion counters do not reconcile")
+    return [
+        {
+            key: value
+            for key, value in event.items()
+            if key != "runtime_event_id"
+        }
+        for event in events
+    ]
 
 
 def _comparison_semantic_events(payload: Mapping[str, object]) -> Sequence[object]:

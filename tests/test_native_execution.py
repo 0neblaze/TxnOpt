@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from evrptw.alns import (
+    ALNSResult,
     OperatorProfile,
     _destroy,
     _Evaluator,
@@ -40,7 +41,12 @@ from evrptw.candidate_transaction import (
 )
 from evrptw.charging import solve_exact_charging
 from evrptw.exact_deadline import ExactCallController, ExactDeadlineConfig
+from evrptw.experiments.stage052_native_architecture_review import (
+    _canonical_semantic_events,
+)
 from evrptw.experiments.stage052_native_architectures import (
+    _canonical_semantic_event_sequence,
+    _canonical_semantic_streams,
     _measurement_evidence,
     _semantic_candidate_trajectory,
 )
@@ -547,7 +553,9 @@ def test_per_solve_fixed_work_round_matches_python_candidate_control() -> None:
     control_config = CandidateControlConfig(worker_count=1)
     python_control = CandidateControlRuntime(control_config)
     python_control.begin_round(7, lane="constraint")
-    python_trace = Stage03Trace(MeasurementConfig())
+    python_trace = Stage03Trace(
+        MeasurementConfig(record_runtime_semantic_events=True)
+    )
     python_evaluator = _Evaluator(
         instance,
         deadline=time.perf_counter() + 10.0,
@@ -566,7 +574,9 @@ def test_per_solve_fixed_work_round_matches_python_candidate_control() -> None:
     execution = _per_solve_config()
     native_control = CandidateControlRuntime(execution.candidate_control_config)
     native_control.begin_round(7, lane="constraint")
-    native_trace = Stage03Trace(MeasurementConfig())
+    native_trace = Stage03Trace(
+        MeasurementConfig(record_runtime_semantic_events=True)
+    )
     native_evaluator = _Evaluator(
         instance,
         deadline=time.perf_counter() + 10.0,
@@ -621,6 +631,70 @@ def test_per_solve_fixed_work_round_matches_python_candidate_control() -> None:
         in {"candidate_control_decision", "candidate_control_decision_aggregate"}
     ]
     assert native_decisions == python_decisions
+
+
+def test_per_solve_real_c101c5_runtime_journal_matches_python_control() -> None:
+    instance = replace(
+        parse_schneider(
+            Path(__file__).resolve().parents[1] / "data/schneider/c101C5.txt"
+        ),
+        distance_backend="native",
+    )
+    common: dict[str, object] = {
+        "seed": 2014,
+        "max_iterations": 100,
+        "time_limit_seconds": 30.0,
+        "operator_profile": "stage02_constraint_guided",
+        "measurement_config": MeasurementConfig(
+            record_runtime_semantic_events=True,
+        ),
+        "screening_config": CheapScreeningConfig(),
+        "cache_incremental_config": CacheIncrementalConfig(enabled=True),
+        "backend": "cpu_batch",
+        "batch_size": 128,
+        "termination_mode": "fixed_work",
+        "exact_deadline_config": ExactDeadlineConfig.fixed_exact_calls(
+            20,
+            watchdog_seconds=30.0,
+        ),
+        "stage04_config": Stage04Config(),
+    }
+    python_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        candidate_control_config=CandidateControlConfig(worker_count=1),
+    )
+    per_solve_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        native_execution_config=replace(
+            _per_solve_config(),
+            candidate_control_config=CandidateControlConfig(worker_count=1),
+        ),
+    )
+
+    def reviewed_events(mode: str, result: ALNSResult) -> list[dict[str, object]]:
+        streams = _canonical_semantic_streams(result)
+        return _canonical_semantic_events(
+            {
+                "mode": mode,
+                "exact_started_calls": result.exact_started_calls,
+                "exact_completed_calls": result.exact_completed_calls,
+                "canonical_semantic_streams": streams,
+                "canonical_semantic_events": _canonical_semantic_event_sequence(
+                    streams
+                ),
+            }
+        )
+
+    python_events = reviewed_events("python_candidate_control", python_result)
+    per_solve_events = reviewed_events("per_solve_runtime", per_solve_result)
+
+    assert per_solve_result.objective == python_result.objective
+    assert per_solve_result.customer_sequences == python_result.customer_sequences
+    assert per_solve_result.exact_started_calls == python_result.exact_started_calls
+    assert per_solve_result.exact_completed_calls == python_result.exact_completed_calls
+    assert per_solve_events == python_events
 
 
 def test_per_solve_preserves_python_prescreened_ranking_semantics() -> None:
@@ -772,8 +846,13 @@ def test_native_candidate_round_cache_commit_failure_rolls_back_all_state(
     assert native_runtime.screening_batch_invocations == 0
 
 
+@pytest.mark.parametrize(
+    "failure_stage",
+    ("python_replay", "cache_commit", "post_commit_telemetry"),
+)
 def test_native_candidate_round_failure_does_not_refund_started_exact_work(
     monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
 ) -> None:
     instance = _fixture_instance()
     execution = _per_solve_config()
@@ -813,13 +892,185 @@ def test_native_candidate_round_failure_does_not_refund_started_exact_work(
         iteration=7,
         operator="relocate",
     )
+    transaction_before = transaction_runtime.snapshot_protocol_state()
+    native_negative_before = transaction_runtime.snapshot_negative_cache_state()
+    negative_before = dict(evaluator.negative_screening_sequences)
+    negative_statistics_before = (
+        evaluator.negative_screening_sequences.statistics()
+        if isinstance(
+            evaluator.negative_screening_sequences,
+            BoundedNegativeSequenceCache,
+        )
+        else None
+    )
 
-    def fail_commit() -> None:
-        raise RuntimeError("injected cache commit failure")
+    failure_message = f"injected {failure_stage} failure"
+    if failure_stage == "python_replay":
+        original_selection = CandidateControlRuntime.select_route_candidates
 
-    monkeypatch.setattr(evaluator, "_commit_pending_candidate_cache", fail_commit)
+        def fail_selection(
+            runtime: CandidateControlRuntime,
+            *args: object,
+            **kwargs: object,
+        ) -> tuple[int, ...]:
+            if runtime is control_runtime:
+                raise RuntimeError(failure_message)
+            return original_selection(runtime, *args, **kwargs)  # type: ignore[arg-type]
 
-    with pytest.raises(RuntimeError, match="injected cache commit failure"):
+        monkeypatch.setattr(
+            CandidateControlRuntime,
+            "select_route_candidates",
+            fail_selection,
+        )
+    elif failure_stage == "cache_commit":
+        def fail_commit() -> None:
+            raise RuntimeError(failure_message)
+
+        monkeypatch.setattr(
+            evaluator,
+            "_commit_pending_candidate_cache",
+            fail_commit,
+        )
+    else:
+        original_record_screening = NativeKernelRuntime.record_screening
+
+        def fail_post_commit_telemetry(
+            runtime: NativeKernelRuntime,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            if runtime is native_runtime:
+                assert (
+                    transaction_runtime.snapshot_protocol_state()
+                    != transaction_before
+                )
+                assert dict(evaluator.negative_screening_sequences) != negative_before
+                raise RuntimeError(failure_message)
+            original_record_screening(runtime, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(
+            NativeKernelRuntime,
+            "record_screening",
+            fail_post_commit_telemetry,
+        )
+
+    with pytest.raises(RuntimeError, match=failure_message):
+        evaluator.candidate_route_batch(
+            (
+                (("C1",), ("C1", "C1"))
+                if failure_stage == "post_commit_telemetry"
+                else (("C1",),)
+            ),
+            exact_budget=1,
+        )
+
+    assert route_cache.snapshot_state() == cache_before
+    assert evaluator.pending_candidate_cache == {}
+    assert exact_controller.started_calls == 1
+    assert exact_controller.completed_calls == 1
+    assert exact_controller.interrupted_calls == 0
+    assert evaluator.backend_metrics.started_calls == 1
+    assert evaluator.backend_metrics.completed_calls == 1
+    assert evaluator.calls == 1
+    control_after = control_runtime.snapshot_protocol_state()
+    assert control_after.round_used == 1
+    assert control_after.candidate_work_count == 0
+    assert control_after.route_result_count == 0
+    assert control_runtime.events[-1]["status"] == "aborted_transaction_consumed"
+    assert transaction_runtime.snapshot_protocol_state() == transaction_before
+    native_negative_after = transaction_runtime.snapshot_negative_cache_state()
+    assert native_negative_after.initialized == native_negative_before.initialized
+    assert native_negative_after.sequences == native_negative_before.sequences
+    assert native_negative_after.offsets.tolist() == native_negative_before.offsets.tolist()
+    assert native_negative_after.indices.tolist() == native_negative_before.indices.tolist()
+    assert native_negative_after.reason_codes.tolist() == (
+        native_negative_before.reason_codes.tolist()
+    )
+    assert dict(evaluator.negative_screening_sequences) == negative_before
+    if negative_statistics_before is not None:
+        assert isinstance(
+            evaluator.negative_screening_sequences,
+            BoundedNegativeSequenceCache,
+        )
+        assert (
+            evaluator.negative_screening_sequences.statistics()
+            == negative_statistics_before
+        )
+    assert transaction_runtime.transaction_count == 0
+    assert transaction_runtime.fallback_count == 0
+    assert native_runtime.screening_batch_invocations == 0
+
+
+@pytest.mark.parametrize(
+    ("corruption", "message"),
+    (
+        ("hash", "transaction SHA-256 mismatch"),
+        ("receipt", "backend and resource receipts diverged"),
+    ),
+)
+def test_native_candidate_round_validation_failure_does_not_refund_started_exact_work(
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+    message: str,
+) -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    execution = _per_solve_config()
+    route_cache = RouteEvaluationCache(
+        instance,
+        CacheIncrementalConfig(enabled=True, max_entries=4),
+    )
+    cache_before = route_cache.snapshot_state()
+    control_runtime = CandidateControlRuntime(execution.candidate_control_config)
+    control_runtime.begin_round(7, lane="constraint")
+    exact_controller = ExactCallController(
+        ExactDeadlineConfig.fixed_exact_calls(1, watchdog_seconds=120.0)
+    )
+    transaction_runtime = NativeCandidateTransactionRuntime(
+        execution.candidate_transaction_config
+    )
+    native_runtime = NativeKernelRuntime.build(
+        instance,
+        execution.native_kernel_config,
+    )
+    trace = Stage03Trace(
+        MeasurementConfig(record_runtime_semantic_events=True)
+    )
+    evaluator = _Evaluator(
+        instance,
+        deadline=time.perf_counter() + 10.0,
+        lane="constraint",
+        screening_config=CheapScreeningConfig(),
+        cache_incremental_config=CacheIncrementalConfig(enabled=True),
+        route_cache=route_cache,
+        backend="cpu_batch",
+        exact_call_controller=exact_controller,
+        candidate_control_runtime=control_runtime,
+        candidate_transaction_runtime=transaction_runtime,
+        native_runtime=native_runtime,
+        native_execution_config=execution,
+        measurement_trace=trace,
+    )
+    evaluator.set_measurement_context(
+        lane="constraint",
+        iteration=7,
+        operator="relocate",
+    )
+    original = native_core.candidate_round_transaction_v2
+
+    def corrupt_hash(*args: object) -> tuple[object, ...]:
+        payload = original(*args)
+        if corruption == "receipt":
+            receipt = args[-1]
+            assert isinstance(receipt, np.ndarray)
+            receipt[:] = np.asarray([2, 4, 0, 0, 0, 0], dtype=np.int64)
+            return payload
+        return (*payload[:-1], "0" * 64)
+
+    monkeypatch.setattr(native_core, "candidate_round_transaction_v2", corrupt_hash)
+
+    with pytest.raises(RuntimeError, match=message):
         evaluator.candidate_route_batch((("C1",),), exact_budget=1)
 
     assert route_cache.snapshot_state() == cache_before
@@ -835,6 +1086,10 @@ def test_native_candidate_round_failure_does_not_refund_started_exact_work(
     assert control_after.candidate_work_count == 0
     assert control_after.route_result_count == 0
     assert control_runtime.events[-1]["status"] == "aborted_transaction_consumed"
+    assert trace.runtime_semantic_events[-1]["event_type"] == (
+        "native_candidate_round_failed_after_resource_start"
+    )
+    assert trace.runtime_semantic_events[-1]["started_calls"] == 1
     assert transaction_runtime.transaction_count == 0
     assert transaction_runtime.fallback_count == 0
     assert native_runtime.screening_batch_invocations == 0
@@ -1126,6 +1381,7 @@ def test_native_objective_acceptance_matches_vehicle_first_python_policy() -> No
     current = [
         SolutionObjective(3, 100.0, 10.0, 2),
         SolutionObjective(2, 100.0, 10.0, 2),
+        SolutionObjective(2, 542614.3787160305, 10.0, 2),
         SolutionObjective(2, 100.0, 10.0, 2),
         SolutionObjective(2, 100.0, 10.0, 2),
         SolutionObjective(2, 100.0, 10.0, 2),
@@ -1136,9 +1392,10 @@ def test_native_objective_acceptance_matches_vehicle_first_python_policy() -> No
         SolutionObjective(2, 99.0, 20.0, 5),
         SolutionObjective(2, 101.0, 10.0, 2),
         SolutionObjective(2, 100.0, 11.0, 2),
+        SolutionObjective(2, 542614.378716031, 10.0, 2),
     ]
-    temperatures = np.asarray([1.0, 1.0, 1.0, 10.0, 10.0], dtype=np.float64)
-    draws = np.asarray([0.5, 0.5, 0.5, 0.01, 0.0], dtype=np.float64)
+    temperatures = np.asarray([1.0, 1.0, 1.0, 10.0, 10.0, 1.0], dtype=np.float64)
+    draws = np.asarray([0.5, 0.5, 0.5, 0.01, 0.0, 1.0], dtype=np.float64)
 
     observed = native_core.native_objective_acceptance_v1(
         np.asarray(

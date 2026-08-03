@@ -725,7 +725,7 @@ this repository or one of its subdirectories.
 - Experimental native-architecture comparisons use the explicit
   `Stage052NativeExecutionConfig` schema. Passing `None` preserves the
   historical Stage 0--5.2 paths and their guards. The implemented
-  `per_solve_runtime` protocol is `candidate_round_soa_v1`: six shard
+  `per_solve_runtime` protocol is `candidate_round_soa_v2`: six shard
   processes are capped at four compute threads each, and each candidate round
   crosses the Python/native boundary exactly once with contiguous SoA inputs
   and structured screening, ranking, cache-journal, exact-result, completion,
@@ -733,7 +733,7 @@ this repository or one of its subdirectories.
   hash and commits cache/control state only after the complete result passes.
   Worker, deadline, integrity, or cache-commit failure rolls back the complete
   transaction and never opens the historical worker pool or another backend.
-  `full_native_alns` uses `full_solve_soa_v1` and crosses the Python/C++
+  `full_native_alns` uses `full_solve_soa_v2` and crosses the Python/C++
   boundary once per instance/seed. It currently emits an independently hashed
   route/exact-result/trajectory transaction and exposes the current operator
   identifiers through simplified deterministic native route transformations.
@@ -742,7 +742,7 @@ this repository or one of its subdirectories.
   Stage 4 segment semantics are not yet ported. Raw results must record those
   semantic gates as incomplete, and the fixed-work differential reviewer must
   reject qualification until every one is implemented and replayed.
-  `host_scheduler` uses `unix_shm_scheduler_v1`: a run-owned temporary service
+  `host_scheduler` uses `unix_shm_scheduler_v2`: a run-owned temporary service
   accepts framed Unix-domain control messages, maps contiguous POSIX shared
   memory arrays, and dispatches the same all-or-nothing C++ solve ABI through a
   24-request thread pool. Service loss, partial IPC, schema/hash failure, or

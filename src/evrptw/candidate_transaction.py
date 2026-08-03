@@ -126,6 +126,15 @@ class NegativeSequenceCacheBatch:
     active: bool = True
 
 
+type NegativeSequenceCacheSnapshot = tuple[
+    tuple[tuple[CustomerSequence, str], ...],
+    int,
+    int,
+    int,
+    int,
+]
+
+
 class BoundedNegativeSequenceCache(Mapping[CustomerSequence, str]):
     """Bounded generation cache for native safe-screening rejections.
 
@@ -225,6 +234,32 @@ class BoundedNegativeSequenceCache(Mapping[CustomerSequence, str]):
             "evictions": self._evictions,
             "rollovers": self._rollovers,
         }
+
+    def snapshot_state(
+        self,
+    ) -> NegativeSequenceCacheSnapshot:
+        if self._active_batch is not None:
+            raise RuntimeError("cannot snapshot an active negative cache batch")
+        return (
+            tuple(self._entries.items()),
+            self._peak_entries,
+            self._stores,
+            self._evictions,
+            self._rollovers,
+        )
+
+    def restore_state(
+        self,
+        snapshot: NegativeSequenceCacheSnapshot,
+    ) -> None:
+        if self._active_batch is not None:
+            raise RuntimeError("cannot restore an active negative cache batch")
+        entries, peak_entries, stores, evictions, rollovers = snapshot
+        self._entries = OrderedDict(entries)
+        self._peak_entries = peak_entries
+        self._stores = stores
+        self._evictions = evictions
+        self._rollovers = rollovers
 
     def _require_active(self, batch: NegativeSequenceCacheBatch) -> None:
         if self._active_batch is not batch or not batch.active:
@@ -405,6 +440,33 @@ class NegativeCacheCommit:
     active: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class NativeCandidateTransactionProtocolSnapshot:
+    event_count: int
+    transaction_count: int
+    input_candidate_count: int
+    screening_occupancy_count: int
+    fallback_count: int
+    protocol_invocations: int
+    protocol_total_seconds: float
+    protocol_queue_wait_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class NativeNegativeCacheSnapshot:
+    initialized: bool
+    sequences: frozenset[CustomerSequence]
+    offsets: npt.NDArray[np.int64]
+    indices: npt.NDArray[np.int64]
+    reason_codes: npt.NDArray[np.int64]
+    entry_count: int
+    index_count: int
+    peak_entries: int
+    stores: int
+    evictions: int
+    rollovers: int
+
+
 @dataclass(slots=True)
 class NativeCandidateTransactionRuntime:
     """Solve-local owner of compact transaction evidence."""
@@ -435,6 +497,84 @@ class NativeCandidateTransactionRuntime:
     _negative_cache_stores: int = 0
     _negative_cache_evictions: int = 0
     _negative_cache_rollovers: int = 0
+
+    def snapshot_protocol_state(
+        self,
+    ) -> NativeCandidateTransactionProtocolSnapshot:
+        return NativeCandidateTransactionProtocolSnapshot(
+            event_count=len(self.events),
+            transaction_count=self.transaction_count,
+            input_candidate_count=self.input_candidate_count,
+            screening_occupancy_count=len(self.screening_occupancies),
+            fallback_count=self.fallback_count,
+            protocol_invocations=self.protocol_invocations,
+            protocol_total_seconds=self.protocol_total_seconds,
+            protocol_queue_wait_seconds=self.protocol_queue_wait_seconds,
+        )
+
+    def rollback_protocol_state(
+        self,
+        snapshot: NativeCandidateTransactionProtocolSnapshot,
+    ) -> None:
+        if (
+            len(self.events) < snapshot.event_count
+            or len(self.screening_occupancies) < snapshot.screening_occupancy_count
+        ):
+            raise RuntimeError("candidate transaction journal cannot roll forward")
+        del self.events[snapshot.event_count :]
+        del self.screening_occupancies[snapshot.screening_occupancy_count :]
+        self.transaction_count = snapshot.transaction_count
+        self.input_candidate_count = snapshot.input_candidate_count
+        self.fallback_count = snapshot.fallback_count
+        self.protocol_invocations = snapshot.protocol_invocations
+        self.protocol_total_seconds = snapshot.protocol_total_seconds
+        self.protocol_queue_wait_seconds = snapshot.protocol_queue_wait_seconds
+
+    def snapshot_negative_cache_state(self) -> NativeNegativeCacheSnapshot:
+        return NativeNegativeCacheSnapshot(
+            initialized=self._negative_cache_initialized,
+            sequences=frozenset(self._negative_cache_sequences),
+            offsets=self._negative_cache_offsets[
+                : self._negative_cache_entry_count + 1
+            ].copy(),
+            indices=self._negative_cache_indices[
+                : self._negative_cache_index_count
+            ].copy(),
+            reason_codes=self._negative_cache_reason_codes[
+                : self._negative_cache_entry_count
+            ].copy(),
+            entry_count=self._negative_cache_entry_count,
+            index_count=self._negative_cache_index_count,
+            peak_entries=self._negative_cache_peak_entries,
+            stores=self._negative_cache_stores,
+            evictions=self._negative_cache_evictions,
+            rollovers=self._negative_cache_rollovers,
+        )
+
+    def restore_negative_cache_state(
+        self,
+        snapshot: NativeNegativeCacheSnapshot,
+    ) -> None:
+        self._negative_cache_initialized = snapshot.initialized
+        self._negative_cache_sequences = set(snapshot.sequences)
+        self._negative_cache_offsets = _grow_int64_buffer(
+            snapshot.offsets.copy(),
+            max(8, snapshot.entry_count + 1),
+        )
+        self._negative_cache_indices = _grow_int64_buffer(
+            snapshot.indices.copy(),
+            max(16, snapshot.index_count),
+        )
+        self._negative_cache_reason_codes = _grow_int64_buffer(
+            snapshot.reason_codes.copy(),
+            max(8, snapshot.entry_count),
+        )
+        self._negative_cache_entry_count = snapshot.entry_count
+        self._negative_cache_index_count = snapshot.index_count
+        self._negative_cache_peak_entries = snapshot.peak_entries
+        self._negative_cache_stores = snapshot.stores
+        self._negative_cache_evictions = snapshot.evictions
+        self._negative_cache_rollovers = snapshot.rollovers
 
     def statistics(self) -> dict[str, object]:
         median_occupancy = (

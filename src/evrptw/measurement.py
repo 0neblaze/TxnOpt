@@ -56,6 +56,10 @@ class MeasurementConfig:
     record_route_dictionary: bool = True
     record_operator_events: bool = True
     record_candidate_states: bool = True
+    # Stage 5.2's cross-architecture causal journal is deliberately separate
+    # from the historical Stage 3 measurement surface.  Keeping this false
+    # preserves both the old artifact schema and its wall-clock cost.
+    record_runtime_semantic_events: bool = False
     stream_sink: MeasurementTraceSink | None = field(
         default=None,
         repr=False,
@@ -73,13 +77,16 @@ class MeasurementConfig:
 def _measurement_config_payload(config: MeasurementConfig) -> dict[str, object]:
     """Serialize only stable controls; the live stream sink is never evidence."""
 
-    return {
+    payload: dict[str, object] = {
         "enabled": config.enabled,
         "schema_version": config.schema_version,
         "record_route_dictionary": config.record_route_dictionary,
         "record_operator_events": config.record_operator_events,
         "record_candidate_states": config.record_candidate_states,
     }
+    if config.record_runtime_semantic_events:
+        payload["record_runtime_semantic_events"] = True
+    return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +343,54 @@ class Stage03Trace:
         init=False,
         repr=False,
     )
+    _runtime_semantic_events: list[dict[str, object]] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+    )
+
+    @property
+    def runtime_semantic_events(self) -> tuple[dict[str, object], ...]:
+        return tuple(self._runtime_semantic_events)
+
+    @property
+    def runtime_semantic_enabled(self) -> bool:
+        return self.config.record_runtime_semantic_events
+
+    def record_runtime_semantic_event(
+        self,
+        semantic_stream: str,
+        event: Mapping[str, object],
+    ) -> int:
+        if not self.runtime_semantic_enabled:
+            return 0
+        if not semantic_stream:
+            raise ValueError("runtime semantic stream name cannot be empty")
+        event_id = len(self._runtime_semantic_events) + 1
+        if "semantic_event_id" in event or "semantic_stream" in event:
+            raise ValueError("runtime semantic identity is owned by Stage03Trace")
+        self._runtime_semantic_events.append(
+            {
+                **dict(event),
+                "semantic_stream": semantic_stream,
+                "semantic_event_id": event_id,
+            }
+        )
+        return event_id
+
+    def snapshot_runtime_semantic_journal(self) -> int:
+        """Return an O(1) rollback boundary for one atomic candidate transaction."""
+
+        return len(self._runtime_semantic_events)
+
+    def rollback_runtime_semantic_journal(self, checkpoint: int) -> None:
+        """Discard every semantic event emitted after an uncommitted boundary."""
+
+        if isinstance(checkpoint, bool) or not 0 <= checkpoint <= len(
+            self._runtime_semantic_events
+        ):
+            raise ValueError("runtime semantic journal checkpoint is invalid")
+        del self._runtime_semantic_events[checkpoint:]
 
     def __post_init__(self) -> None:
         self._validate_screening_route_dictionary()
@@ -608,6 +663,24 @@ class Stage03Trace:
             status=resolved_status,
         )
         self.route_evaluations.append(record)
+        if kind == "exact_call" and self.runtime_semantic_enabled:
+            self.record_runtime_semantic_event(
+                "exact_result",
+                {
+                    "event_type": "exact_route_result",
+                    "evaluation_id": record.evaluation_id,
+                    "route_key": record.route_key,
+                    "lane": lane,
+                    "iteration": iteration,
+                    "operator": operator,
+                    "exact_started": exact_started,
+                    "exact_completed": exact_completed,
+                    "feasible": feasible,
+                    "failure_reason": failure_reason,
+                    "deadline_boundary": deadline_boundary,
+                    "status": resolved_status,
+                },
+            )
         return record.evaluation_id
 
     def record_cache_event(
@@ -621,19 +694,20 @@ class Stage03Trace:
         operator: str,
         **fields: object,
     ) -> None:
-        self.events.append(
-            {
-                "event_type": "cache_event",
-                "operation": operation,
-                "route_key": route_key,
-                "cache_key_digest": cache_key_digest,
-                "lane": lane,
-                "iteration": iteration,
-                "operator": operator,
-                "timestamp_seconds": self._offset(),
-                **fields,
-            }
-        )
+        event = {
+            "event_type": "cache_event",
+            "operation": operation,
+            "route_key": route_key,
+            "cache_key_digest": cache_key_digest,
+            "lane": lane,
+            "iteration": iteration,
+            "operator": operator,
+            "timestamp_seconds": self._offset(),
+            **fields,
+        }
+        self.events.append(event)
+        if self.runtime_semantic_enabled:
+            self.record_runtime_semantic_event("cache", event)
 
     def record_incremental_propagation(
         self,
@@ -721,19 +795,20 @@ class Stage03Trace:
         reason: str = "deadline boundary reached",
     ) -> None:
         route_keys = (self.register_route(route_sequence),) if route_sequence else ()
-        self.events.append(
-            {
-                "event_type": "deadline_boundary",
-                "timestamp_seconds": self._offset(),
-                "lane": lane,
-                "iteration": iteration,
-                "operator": operator,
-                "boundary": boundary,
-                "reason": reason,
-                "route_keys": route_keys,
-                "exact_call_id": exact_call_id,
-            }
-        )
+        event = {
+            "event_type": "deadline_boundary",
+            "timestamp_seconds": self._offset(),
+            "lane": lane,
+            "iteration": iteration,
+            "operator": operator,
+            "boundary": boundary,
+            "reason": reason,
+            "route_keys": route_keys,
+            "exact_call_id": exact_call_id,
+        }
+        self.events.append(event)
+        if self.runtime_semantic_enabled:
+            self.record_runtime_semantic_event("deadline", event)
 
     def record_operator_call(
         self,
@@ -745,16 +820,15 @@ class Stage03Trace:
     ) -> None:
         if not self.config.record_operator_events:
             return
-        self.events.append(
-            {
-                "event_type": "operator_call",
-                "timestamp_seconds": self._offset(),
-                "lane": lane,
-                "iteration": iteration,
-                "operator": operator,
-                "statistics_group": statistics_group,
-            }
-        )
+        event = {
+            "event_type": "operator_call",
+            "timestamp_seconds": self._offset(),
+            "lane": lane,
+            "iteration": iteration,
+            "operator": operator,
+            "statistics_group": statistics_group,
+        }
+        self.events.append(event)
 
     def record_candidate_state(
         self,
@@ -806,6 +880,8 @@ class Stage03Trace:
         if candidate_full_keys:
             event["candidate_full_route_keys"] = candidate_full_keys
         self.events.append(event)
+        if self.runtime_semantic_enabled:
+            self.record_runtime_semantic_event("candidate_state", event)
 
     def record_execution_error(self, error: BaseException) -> None:
         self.events.append(
@@ -1382,6 +1458,11 @@ class Stage03Trace:
             },
             "route_evaluations": [asdict(record) for record in self.route_evaluations],
             "events": list(self.events),
+            **(
+                {"runtime_semantic_events": list(self._runtime_semantic_events)}
+                if self.runtime_semantic_enabled
+                else {}
+            ),
             "summary": {
                 "started_calls": self.started_calls,
                 "completed_calls": self.completed_calls,
@@ -1496,6 +1577,17 @@ class Stage03Trace:
             for item in payload.get("route_evaluations", [])
         ]
         trace.events = [dict(event) for event in payload.get("events", [])]
+        runtime_semantic_payload = payload.get("runtime_semantic_events", [])
+        if (
+            runtime_semantic_payload
+            and not config.record_runtime_semantic_events
+        ):
+            raise ValueError(
+                "runtime semantic events require their explicit measurement flag"
+            )
+        trace._runtime_semantic_events = [
+            dict(event) for event in runtime_semantic_payload
+        ]
         trace.finished_at = (
             None if payload.get("finished_at") is None else float(payload["finished_at"])
         )

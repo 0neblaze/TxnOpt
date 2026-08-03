@@ -221,6 +221,35 @@ class NativeCandidateRoundRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class NativeCandidateResourceReceipt:
+    """Out-of-band accounting written before result-payload validation."""
+
+    phase: int
+    started_calls: int
+    completed_calls: int
+    interrupted_calls: int
+    fallback_count: int
+    fail_closed: bool = False
+
+    @property
+    def work_started(self) -> bool:
+        return self.started_calls > 0
+
+
+class NativeCandidateRoundFailure(RuntimeError):
+    """A failed native round whose resource receipt remains authoritative."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        resource_receipt: NativeCandidateResourceReceipt,
+    ) -> None:
+        super().__init__(message)
+        self.resource_receipt = resource_receipt
+
+
+@dataclass(frozen=True, slots=True)
 class NativeCandidateRoundResult:
     """Strictly decoded output of one native candidate-round invocation."""
 
@@ -236,6 +265,7 @@ class NativeCandidateRoundResult:
     timings: Mapping[str, float]
     transaction_sha256: str
     audit: CandidateTransactionAudit
+    resource_receipt: NativeCandidateResourceReceipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -12344,13 +12374,71 @@ def execute_full_native_alns(
     )
 
 
-def execute_native_candidate_round(
+def _decode_candidate_resource_receipt(
+    values: npt.NDArray[np.int64],
+    *,
+    fail_closed_started_calls: int,
+) -> NativeCandidateResourceReceipt:
+    """Decode caller-owned receipt memory, charging conservatively if corrupt."""
+
+    raw = tuple(int(value) for value in values)
+    if (
+        len(raw) == 6
+        and raw[0] == 2
+        and 0 <= raw[1] <= 4
+        and all(value >= 0 for value in raw[2:])
+        and raw[5] == 0
+        and (raw[1] >= 2 or raw[2:5] == (0, 0, 0))
+        and (raw[1] < 2 or raw[3] + raw[4] <= raw[2])
+    ):
+        unaccounted = raw[2] - raw[3] - raw[4]
+        return NativeCandidateResourceReceipt(
+            phase=raw[1],
+            started_calls=raw[2],
+            completed_calls=raw[3],
+            interrupted_calls=raw[4] + unaccounted,
+            fallback_count=raw[5],
+            fail_closed=unaccounted > 0,
+        )
+    return NativeCandidateResourceReceipt(
+        phase=-1,
+        started_calls=fail_closed_started_calls,
+        completed_calls=0,
+        interrupted_calls=fail_closed_started_calls,
+        fallback_count=0,
+        fail_closed=True,
+    )
+
+
+def _reconcile_candidate_resource_receipt_fail_closed(
+    receipt: NativeCandidateResourceReceipt,
+    backend_metrics: BackendMetrics,
+) -> NativeCandidateResourceReceipt:
+    """Merge disagreeing authorities without ever lowering observed work."""
+
+    started = max(receipt.started_calls, backend_metrics.started_calls)
+    completed = min(
+        started,
+        max(receipt.completed_calls, backend_metrics.completed_calls),
+    )
+    return NativeCandidateResourceReceipt(
+        phase=receipt.phase,
+        started_calls=started,
+        completed_calls=completed,
+        interrupted_calls=started - completed,
+        fallback_count=max(receipt.fallback_count, backend_metrics.native_fallbacks),
+        fail_closed=True,
+    )
+
+
+def _execute_native_candidate_round(
     instance: Instance,
     request: NativeCandidateRoundRequest,
     *,
     native_runtime: NativeKernelRuntime,
     transaction_runtime: NativeCandidateTransactionRuntime,
     negative_cache: Mapping[CustomerSequence, str],
+    resource_receipt_values: npt.NDArray[np.int64],
     clock: Callable[[], float] = time.perf_counter,
     record_transaction: bool = True,
     record_runtime: bool = True,
@@ -12437,6 +12525,7 @@ def execute_native_candidate_round(
         deadline_remaining,
         batch_size,
         context_ids,
+        resource_receipt_values,
     )
     if not isinstance(payload, tuple) or len(payload) != 10:
         raise RuntimeError("native candidate round returned an invalid payload tuple")
@@ -12516,6 +12605,13 @@ def execute_native_candidate_round(
     )
     if transaction_sha256 != expected_transaction_sha256:
         raise RuntimeError("native candidate round transaction SHA-256 mismatch")
+
+    resource_receipt = _decode_candidate_resource_receipt(
+        resource_receipt_values,
+        fail_closed_started_calls=request.exact_budget,
+    )
+    if resource_receipt.phase != 4 or resource_receipt.fail_closed:
+        raise RuntimeError("native candidate round resource receipt is incomplete")
 
     exact_orders = tuple(request.candidates[index] for index in exact_ids)
     decoded = decode_exact_charging_batch_numeric(
@@ -12597,7 +12693,77 @@ def execute_native_candidate_round(
         },
         transaction_sha256=transaction_sha256,
         audit=audit,
+        resource_receipt=resource_receipt,
     )
+
+
+def execute_native_candidate_round(
+    instance: Instance,
+    request: NativeCandidateRoundRequest,
+    *,
+    native_runtime: NativeKernelRuntime,
+    transaction_runtime: NativeCandidateTransactionRuntime,
+    negative_cache: Mapping[CustomerSequence, str],
+    clock: Callable[[], float] = time.perf_counter,
+    record_transaction: bool = True,
+    record_runtime: bool = True,
+) -> NativeCandidateRoundResult:
+    """Execute one round and preserve native accounting across every failure path."""
+
+    resource_receipt_values = np.zeros(6, dtype=np.int64)
+    resource_receipt_values[0] = 2
+    try:
+        result = _execute_native_candidate_round(
+            instance,
+            request,
+            native_runtime=native_runtime,
+            transaction_runtime=transaction_runtime,
+            negative_cache=negative_cache,
+            resource_receipt_values=resource_receipt_values,
+            clock=clock,
+            record_transaction=record_transaction,
+            record_runtime=record_runtime,
+        )
+    except NativeCandidateRoundFailure:
+        raise
+    except BaseException as error:
+        receipt = _decode_candidate_resource_receipt(
+            resource_receipt_values,
+            fail_closed_started_calls=request.exact_budget,
+        )
+        # An error before the C++ entry point preserves its historical Python
+        # exception type; once native validation began, callers need the typed
+        # receipt even if no exact work was selected.
+        if receipt.phase == 0 and not receipt.fail_closed:
+            raise
+        raise NativeCandidateRoundFailure(
+            str(error),
+            resource_receipt=receipt,
+        ) from error
+    if result.resource_receipt.started_calls != result.backend_metrics.started_calls:
+        fail_closed_receipt = _reconcile_candidate_resource_receipt_fail_closed(
+            result.resource_receipt,
+            result.backend_metrics,
+        )
+        raise NativeCandidateRoundFailure(
+            "native candidate-round backend and resource receipts diverged",
+            resource_receipt=fail_closed_receipt,
+        )
+    if (
+        result.resource_receipt.completed_calls
+        != result.backend_metrics.completed_calls
+        or result.resource_receipt.interrupted_calls
+        != result.backend_metrics.interrupted_calls
+    ):
+        fail_closed_receipt = _reconcile_candidate_resource_receipt_fail_closed(
+            result.resource_receipt,
+            result.backend_metrics,
+        )
+        raise NativeCandidateRoundFailure(
+            "native candidate-round completion receipt diverged",
+            resource_receipt=fail_closed_receipt,
+        )
+    return result
 
 
 def _pack_routes(
@@ -12927,6 +13093,8 @@ __all__ = (
     "NATIVE_EXECUTION_SCHEMA_VERSION",
     "NativeExecutionMode",
     "NativeCandidateResolution",
+    "NativeCandidateResourceReceipt",
+    "NativeCandidateRoundFailure",
     "NativeCandidateRoundRequest",
     "NativeCandidateRoundResult",
     "NativeConstraintSemanticStream",

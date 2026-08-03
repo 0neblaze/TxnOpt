@@ -537,6 +537,47 @@ def _canonical_trace_event(event: dict[str, object]) -> dict[str, object]:
         for key, value in event.items()
         if key not in {"timestamp_seconds", "duration_seconds"}
     }
+    if canonical.get("event_type") == "candidate_control_budget":
+        canonical.pop("accounting", None)
+        context = canonical.get("context")
+        if isinstance(context, str) and context.endswith(":native_candidate_round"):
+            canonical["context"] = context.removesuffix(
+                ":native_candidate_round"
+            ) + ":candidate_pool"
+    if canonical.get("event_type") == "exact_batch_started":
+        canonical.pop("transaction_sha256", None)
+    if canonical.get("event_type") == "cache_event":
+        operation = canonical.get("operation")
+        if operation in {"lookup", "store", "evict", "reconcile", "oversize_not_cached"}:
+            return {}
+        if operation in {"hit", "candidate_pending_hit", "miss"}:
+            canonical = {
+                key: value
+                for key, value in canonical.items()
+                if key
+                in {
+                    "event_type",
+                    "route_key",
+                    "lane",
+                    "iteration",
+                    "operator",
+                    "semantic_event_id",
+                }
+            }
+            canonical["event_type"] = "cache_lookup_result"
+            canonical["status"] = "miss" if operation == "miss" else "hit"
+    if canonical.get("event_type") == "parallel_batch":
+        canonical["event_type"] = "candidate_batch_complete"
+        canonical["status"] = "complete"
+        for key in (
+            "worker_count",
+            "worker_protocol",
+            "submission_order",
+            "completion_order",
+            "chunk_sizes",
+            "completed_indices",
+        ):
+            canonical.pop(key, None)
     if canonical.get("event_type") == "candidate_state":
         route_keys = canonical.get("candidate_route_keys")
         if not isinstance(route_keys, list | tuple) or not all(
@@ -627,65 +668,70 @@ def _canonical_event_rows(rows: Iterable[object]) -> list[dict[str, object]]:
 
 
 def _canonical_semantic_streams(result: ALNSResult) -> dict[str, list[dict[str, object]]]:
-    cache_rows: list[dict[str, object]] = []
-    for batch_ordinal, event in enumerate(result.candidate_work_events):
-        sequences = cast(list[list[str]], event.get("sequences", []))
-        for route_ordinal, sequence in enumerate(sequences):
-            cache_rows.append(
-                {
-                    "batch_ordinal": batch_ordinal,
-                    "route_ordinal": route_ordinal,
-                    "lane": event.get("lane"),
-                    "iteration": event.get("iteration"),
-                    "operator": event.get("operator"),
-                    "customer_sequence": sequence,
-                    "transition": "exact_miss_to_committed_store",
-                }
-            )
-    cache_rows.append(
-        {
-            "transition": "final_cache_state",
-            **{
-                field: result.cache_incremental_statistics.get(field, 0)
-                for field in (
-                    "cache_stores",
-                    "cache_evictions",
-                    "cache_oversize_not_cached",
-                    "entries_current",
-                    "entries_peak",
-                    "bytes_current",
-                    "bytes_peak",
-                    "unique_route_evaluations",
-                )
-            },
-        }
+    trace = result.measurement_trace
+    if trace is None:
+        raise ValueError("canonical semantic streams require a measurement trace")
+    stream_names = (
+        "candidate_state",
+        "operator",
+        "stage04",
+        "candidate_transaction",
+        "exact_work",
+        "exact_result",
+        "cache",
+        "deadline",
+        "native_failure",
     )
-    deadline_rows: list[dict[str, object]] = []
-    if result.measurement_trace is not None:
-        deadline_rows = [
-            {
-                "evaluation_id": row.evaluation_id,
-                "route_key": row.route_key,
-                "deadline_boundary": row.deadline_boundary,
-                "exact_started": row.exact_started,
-                "exact_completed": row.exact_completed,
-                "status": row.status,
-            }
-            for row in result.measurement_trace.route_evaluations
-            if row.deadline_boundary
-        ]
-    return {
-        "candidate_state": _canonical_event_rows(_semantic_candidate_trajectory(result)),
-        "operator": _canonical_event_rows(result.neighborhood_events),
-        "stage04": _canonical_event_rows(result.stage04_event_log),
-        "candidate_transaction": _canonical_event_rows(
-            result.candidate_transaction_events
-        ),
-        "exact_work": _canonical_event_rows(result.candidate_work_events),
-        "exact_result": _canonical_event_rows(result.route_result_events),
-        "cache": _canonical_event_rows(cache_rows),
-        "deadline": _canonical_event_rows(deadline_rows),
+    streams: dict[str, list[dict[str, object]]] = {
+        name: [] for name in stream_names
     }
+    runtime_events = trace.runtime_semantic_events
+    runtime_ids = [event.get("semantic_event_id") for event in runtime_events]
+    if runtime_ids != list(range(1, len(runtime_events) + 1)):
+        raise ValueError("runtime semantic trace IDs are not contiguous")
+    semantic_event_id = 0
+    for raw_event in runtime_events:
+        stream_name = raw_event.get("semantic_stream")
+        if not isinstance(stream_name, str) or stream_name not in streams:
+            raise ValueError("runtime semantic event names an unknown stream")
+        event = {
+            key: value
+            for key, value in raw_event.items()
+            if key != "semantic_stream"
+        }
+        canonical = _evidence_json_value(_canonical_trace_event(event))
+        if not isinstance(canonical, dict):
+            raise AssertionError("canonical event normalization lost object identity")
+        if not canonical:
+            continue
+        runtime_event_id = canonical.pop("semantic_event_id", None)
+        if not isinstance(runtime_event_id, int) or isinstance(runtime_event_id, bool):
+            raise ValueError("runtime semantic event lost its event ID")
+        semantic_event_id += 1
+        streams[stream_name].append(
+            {
+                **canonical,
+                "runtime_event_id": runtime_event_id,
+                "semantic_event_id": semantic_event_id,
+                "stream_ordinal": len(streams[stream_name]),
+            }
+        )
+    required_nonempty = {
+        "candidate_state",
+        "operator",
+        "stage04",
+        "exact_work",
+        "exact_result",
+        "cache",
+    }
+    if result.candidate_control_statistics.get("enabled") is True:
+        required_nonempty.add("candidate_transaction")
+    missing = sorted(name for name in required_nonempty if not streams[name])
+    if missing:
+        raise ValueError(
+            "runtime semantic journal is incomplete: " + ", ".join(missing)
+        )
+    return streams
 
 
 def _canonical_semantic_event_sequence(
@@ -702,9 +748,12 @@ def _canonical_semantic_event_sequence(
         "exact_result",
         "cache",
         "deadline",
+        "native_failure",
     }
     if set(streams) != expected_streams:
         raise ValueError("canonical semantic stream set is incomplete")
+    if not any(streams.values()):
+        raise ValueError("canonical semantic runtime journal cannot be empty")
     events: list[dict[str, object]] = []
     for stream_name, rows in streams.items():
         previous_event_id = 0
@@ -880,7 +929,9 @@ def _solve_mode(
         "max_iterations": 1000,
         "time_limit_seconds": 120.0 if fixed_work else 30.0,
         "operator_profile": "stage02_constraint_guided",
-        "measurement_config": MeasurementConfig(),
+        "measurement_config": MeasurementConfig(
+            record_runtime_semantic_events=True,
+        ),
         "screening_config": CheapScreeningConfig(),
         "cache_incremental_config": CacheIncrementalConfig(enabled=True),
         "backend": "cpu_batch",

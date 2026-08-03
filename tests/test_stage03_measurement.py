@@ -68,9 +68,99 @@ def test_stage03_trace_keeps_canonical_route_dictionary_and_call_states() -> Non
     assert trace.exact_calls == 1
     assert trace.cache_hits == 1
     assert trace.route_evaluations[0].route_key == trace.route_evaluations[1].route_key
-    assert trace.to_dict()["route_dictionary"] == {
+    payload = trace.to_dict()
+    assert payload["route_dictionary"] == {
         trace.route_evaluations[0].route_key: ["C1", "C2"]
     }
+    assert "runtime_semantic_events" not in payload
+    assert trace.runtime_semantic_events == ()
+    assert Stage03Trace.from_dict(payload).runtime_semantic_events == ()
+
+
+def test_runtime_semantic_journal_is_explicit_and_round_trips() -> None:
+    trace = Stage03Trace(
+        MeasurementConfig(record_runtime_semantic_events=True)
+    )
+    trace.record_route_evaluation(
+        ("C1", "C2"),
+        lane="legacy",
+        iteration=3,
+        operator="relocate",
+        kind="exact_call",
+        started_at=0.1,
+        completed_at=0.4,
+        exact_started=True,
+        exact_completed=True,
+        feasible=True,
+        failure_reason="",
+        labels_generated=4,
+        labels_expanded=3,
+        labels_pruned=1,
+    )
+
+    payload = trace.to_dict()
+    assert payload["config"]["record_runtime_semantic_events"] is True
+    assert payload["runtime_semantic_events"] == [
+        {
+            "event_type": "exact_route_result",
+            "evaluation_id": 1,
+            "route_key": trace.route_evaluations[0].route_key,
+            "lane": "legacy",
+            "iteration": 3,
+            "operator": "relocate",
+            "exact_started": True,
+            "exact_completed": True,
+            "feasible": True,
+            "failure_reason": "",
+            "deadline_boundary": "",
+            "status": "completed_feasible",
+            "semantic_stream": "exact_result",
+            "semantic_event_id": 1,
+        }
+    ]
+    assert Stage03Trace.from_dict(payload).runtime_semantic_events == (
+        payload["runtime_semantic_events"][0],
+    )
+
+
+def test_runtime_semantic_journal_rolls_back_atomically() -> None:
+    trace = Stage03Trace(
+        MeasurementConfig(record_runtime_semantic_events=True)
+    )
+    trace.record_runtime_semantic_event("operator", {"event_type": "before"})
+    checkpoint = trace.snapshot_runtime_semantic_journal()
+    trace.record_runtime_semantic_event("exact_work", {"event_type": "work"})
+    trace.record_runtime_semantic_event("exact_result", {"event_type": "result"})
+
+    trace.rollback_runtime_semantic_journal(checkpoint)
+
+    assert trace.runtime_semantic_events == (
+        {
+            "event_type": "before",
+            "semantic_stream": "operator",
+            "semantic_event_id": 1,
+        },
+    )
+    assert trace.record_runtime_semantic_event(
+        "deadline", {"event_type": "deadline"}
+    ) == 2
+
+
+def test_runtime_semantic_journal_rejects_hidden_payload() -> None:
+    payload = Stage03Trace(MeasurementConfig()).to_dict()
+    payload["runtime_semantic_events"] = [
+        {
+            "event_type": "forged",
+            "semantic_stream": "operator",
+            "semantic_event_id": 1,
+        }
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match="require their explicit measurement flag",
+    ):
+        Stage03Trace.from_dict(payload)
 
 
 @pytest.mark.parametrize(

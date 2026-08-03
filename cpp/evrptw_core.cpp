@@ -57,6 +57,68 @@ namespace py = pybind11;
 
 using Point = std::pair<double, double>;
 
+template <typename T>
+const T* checked_data(const py::array& array);
+
+namespace evrptw::formal_objective {
+
+using Key = std::tuple<std::int64_t, double, double, std::int64_t>;
+
+[[nodiscard]] double canonical_component(double value) {
+    if (!std::isfinite(value) || value < 0.0) {
+        throw std::invalid_argument(
+            "objective component must be finite and non-negative");
+    }
+    // Python round(value, 9) performs correctly-rounded decimal conversion.
+    // Scaling by 1e9 first is not equivalent near binary half-way values.
+    std::array<char, 384> buffer{};
+    const auto formatted = std::to_chars(
+        buffer.data(), buffer.data() + buffer.size(), value,
+        std::chars_format::fixed, 9);
+    if (formatted.ec != std::errc{}) {
+        throw std::runtime_error(
+            "objective component decimal canonicalization failed");
+    }
+    double canonical = 0.0;
+    const auto parsed = std::from_chars(
+        buffer.data(), formatted.ptr, canonical, std::chars_format::fixed);
+    if (parsed.ec != std::errc{} || parsed.ptr != formatted.ptr) {
+        throw std::runtime_error(
+            "canonical objective component could not be decoded");
+    }
+    return canonical;
+}
+
+[[nodiscard]] Key key(
+    std::int64_t vehicle_count,
+    double total_distance,
+    double total_charging_time,
+    std::int64_t charging_count) {
+    if (vehicle_count < 0 || charging_count < 0) {
+        throw std::invalid_argument(
+            "objective integer components must be non-negative");
+    }
+    return {
+        vehicle_count,
+        canonical_component(total_distance),
+        canonical_component(total_charging_time),
+        charging_count,
+    };
+}
+
+template <typename IntegerArray, typename FloatArray>
+[[nodiscard]] Key key_from_arrays(
+    const IntegerArray& integers,
+    const FloatArray& floats) {
+    return key(
+        checked_data<std::int64_t>(integers)[0],
+        checked_data<double>(floats)[0],
+        checked_data<double>(floats)[1],
+        checked_data<std::int64_t>(integers)[1]);
+}
+
+}  // namespace evrptw::formal_objective
+
 #ifdef __linux__
 thread_local std::string native_kernel_scheduler_endpoint;
 thread_local bool native_kernel_scheduler_required = false;
@@ -859,10 +921,6 @@ py::array_t<std::int64_t> native_objective_acceptance_v1(
     const auto* random_values = checked_data<double>(random_array);
     py::array_t<std::int64_t> output(rows);
     auto* accepted = checked_data(output);
-    const auto round_objective = [](double value) {
-        constexpr auto scale = 1'000'000'000.0;
-        return std::nearbyint(value * scale) / scale;
-    };
     for (py::ssize_t row = 0; row < rows; ++row) {
         const auto current_vehicles = current_integer_values[row * 2];
         const auto candidate_vehicles = candidate_integer_values[row * 2];
@@ -880,15 +938,15 @@ py::array_t<std::int64_t> native_objective_acceptance_v1(
             || !std::isfinite(candidate_charging_time) || candidate_charging_time < 0.0) {
             throw std::invalid_argument("native objective fields are invalid");
         }
-        const auto current_key = std::make_tuple(
+        const auto current_key = evrptw::formal_objective::key(
             current_vehicles,
-            round_objective(current_distance),
-            round_objective(current_charging_time),
+            current_distance,
+            current_charging_time,
             current_charging_count);
-        const auto candidate_key = std::make_tuple(
+        const auto candidate_key = evrptw::formal_objective::key(
             candidate_vehicles,
-            round_objective(candidate_distance),
-            round_objective(candidate_charging_time),
+            candidate_distance,
+            candidate_charging_time,
             candidate_charging_count);
         if (!std::isfinite(temperature_values[row]) || temperature_values[row] <= 0.0
             || !std::isfinite(random_values[row]) || random_values[row] < 0.0
@@ -1814,8 +1872,6 @@ py::array_t<std::int64_t> order_feasible_candidate_plans_v2(
         throw std::invalid_argument("plan_offsets cannot be empty");
     }
     const auto plan_count = plans.size() - 1;
-    const auto canonical_component = py::module_::import(
-        "evrptw.objective").attr("canonical_objective_component");
     const auto* feasible_values = checked_data<std::int64_t>(feasible);
     for (py::ssize_t index = 0; index < feasible.size(); ++index) {
         const auto plan = feasible_values[index];
@@ -1824,10 +1880,12 @@ py::array_t<std::int64_t> order_feasible_candidate_plans_v2(
                 "feasible_plan_ids must identify candidate plans");
         }
         const auto offset = static_cast<std::size_t>(plan) * 2;
-        canonical_floating[offset] = py::cast<double>(
-            canonical_component(canonical_floating[offset]));
-        canonical_floating[offset + 1] = py::cast<double>(
-            canonical_component(canonical_floating[offset + 1]));
+        canonical_floating[offset] =
+            evrptw::formal_objective::canonical_component(
+                canonical_floating[offset]);
+        canonical_floating[offset + 1] =
+            evrptw::formal_objective::canonical_component(
+                canonical_floating[offset + 1]);
     }
     const auto result = evrptw::native_candidate_plan::order_feasible({
         {checked_data<std::int64_t>(plans), static_cast<std::size_t>(plans.size())},
@@ -7731,6 +7789,7 @@ py::tuple candidate_round_transaction_impl(
     py::handle deadline_remaining,
     py::handle batch_size,
     py::handle context_ids,
+    py::handle resource_receipt,
     std::string_view evidence_domain) {
     const auto started = std::chrono::steady_clock::now();
     auto offsets_array = checked_array<std::int64_t>(
@@ -7748,6 +7807,13 @@ py::tuple candidate_round_transaction_impl(
         deadline_remaining, "deadline_remaining", 1);
     auto batch_array = checked_array<std::int64_t>(batch_size, "batch_size", 1);
     auto context_array = checked_array<std::int64_t>(context_ids, "context_ids", 1);
+    auto receipt_checked = checked_array<std::int64_t>(
+        resource_receipt, "resource_receipt", 1);
+    if (!receipt_checked.writeable()) {
+        throw std::invalid_argument("resource_receipt must be writable");
+    }
+    auto receipt_array = py::reinterpret_borrow<py::array_t<std::int64_t>>(
+        receipt_checked);
     const auto candidate_count = static_cast<std::size_t>(ids_array.request().shape[0]);
     const auto node_count = static_cast<std::size_t>(
         checked_array<std::int64_t>(node_kind, "node_kind", 1).request().shape[0]);
@@ -7764,7 +7830,8 @@ py::tuple candidate_round_transaction_impl(
     if (control_array.request().shape[0] != 3
         || deadline_array.request().shape[0] != 1
         || batch_array.request().shape[0] != 1
-        || context_array.request().shape[0] != 3) {
+        || context_array.request().shape[0] != 3
+        || receipt_array.request().shape[0] != 6) {
         throw std::invalid_argument("candidate round scalar-array shape is invalid");
     }
     const auto* offsets = checked_data<std::int64_t>(offsets_array);
@@ -7776,6 +7843,14 @@ py::tuple candidate_round_transaction_impl(
     const auto* deadline_values = checked_data<double>(deadline_array);
     const auto* batch_values = checked_data<std::int64_t>(batch_array);
     const auto* context_values = checked_data<std::int64_t>(context_array);
+    auto* receipt_values = checked_data<std::int64_t>(receipt_array);
+    if (receipt_values[0] != 2
+        || receipt_values[1] != 0
+        || std::any_of(receipt_values + 2, receipt_values + 6,
+                       [](std::int64_t value) { return value != 0; })) {
+        throw std::invalid_argument(
+            "candidate round resource receipt was not initialized for v2");
+    }
     if (control_values[0] <= 0 || control_values[1] < 0
         || control_values[2] <= 0) {
         throw std::invalid_argument(
@@ -7802,6 +7877,10 @@ py::tuple candidate_round_transaction_impl(
             throw std::invalid_argument("cache_hit_flags must contain only zero or one");
         }
     }
+    // The receipt is caller-owned, contiguous memory.  It remains readable if
+    // a later native or Python validation step throws, so started work cannot
+    // be silently refunded with the result payload.
+    receipt_values[1] = 1;
 
     const auto screening_started = std::chrono::steady_clock::now();
     py::tuple screening = screen_route_batch_transaction_impl(
@@ -7954,17 +8033,33 @@ py::tuple candidate_round_transaction_impl(
     py::array_t<double> exact_deadline_array(1);
     checked_data(exact_deadline_array)[0] = std::max(
         0.0, deadline_values[0] - elapsed_before_exact);
-    py::tuple exact_payload = exact_charging_batch_numeric(
-        node_kind,
-        ready_time,
-        due_date,
-        service_time,
-        distance,
-        vehicle,
-        exact_offsets_array,
-        exact_routes_array,
-        exact_deadline_array,
-        batch_array);
+    receipt_values[1] = 2;
+    receipt_values[2] = static_cast<std::int64_t>(exact_ids.size());
+    py::tuple exact_payload;
+    try {
+        exact_payload = exact_charging_batch_numeric(
+            node_kind,
+            ready_time,
+            due_date,
+            service_time,
+            distance,
+            vehicle,
+            exact_offsets_array,
+            exact_routes_array,
+            exact_deadline_array,
+            batch_array);
+    } catch (...) {
+        receipt_values[4] = receipt_values[2];
+        throw;
+    }
+    auto exact_batch_counters = py::cast<py::array_t<std::int64_t>>(
+        exact_payload[6]);
+    const auto* exact_counter_values = checked_data<std::int64_t>(
+        exact_batch_counters);
+    receipt_values[1] = 3;
+    receipt_values[2] = exact_counter_values[1];
+    receipt_values[3] = exact_counter_values[2];
+    receipt_values[4] = exact_counter_values[3];
     const auto exact_completed = std::chrono::steady_clock::now();
 
     for (std::size_t index = 0; index < candidate_count; ++index) {
@@ -8057,6 +8152,7 @@ py::tuple candidate_round_transaction_impl(
     const auto digest = native_sha256_hex(evidence);
     timing_values[2] = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
+    receipt_values[1] = 4;
     return py::make_tuple(
         std::move(screening),
         std::move(resolution_array),
@@ -8079,12 +8175,16 @@ py::tuple candidate_round_transaction_v1(
     py::handle negative_indices, py::handle negative_reason_codes,
     py::handle cache_hit_flags, py::handle control, py::handle deadline_remaining,
     py::handle batch_size, py::handle context_ids) {
+    py::array_t<std::int64_t> resource_receipt(6);
+    std::fill(
+        checked_data(resource_receipt), checked_data(resource_receipt) + 6, 0);
+    checked_data(resource_receipt)[0] = 2;
     return candidate_round_transaction_impl(
         node_kind, demand, ready_time, due_date, service_time, distance,
         reachable, vehicle, route_offsets, route_indices, candidate_ids,
         lexical_rank, options, incremental, negative_offsets, negative_indices,
         negative_reason_codes, cache_hit_flags, control, deadline_remaining,
-        batch_size, context_ids,
+        batch_size, context_ids, resource_receipt,
         "stage05.2-candidate-round-transaction-v1");
 }
 
@@ -8096,13 +8196,14 @@ py::tuple candidate_round_transaction_v2(
     py::handle options, py::handle incremental, py::handle negative_offsets,
     py::handle negative_indices, py::handle negative_reason_codes,
     py::handle cache_hit_flags, py::handle control, py::handle deadline_remaining,
-    py::handle batch_size, py::handle context_ids) {
+    py::handle batch_size, py::handle context_ids,
+    py::handle resource_receipt) {
     return candidate_round_transaction_impl(
         node_kind, demand, ready_time, due_date, service_time, distance,
         reachable, vehicle, route_offsets, route_indices, candidate_ids,
         lexical_rank, options, incremental, negative_offsets, negative_indices,
         negative_reason_codes, cache_hit_flags, control, deadline_remaining,
-        batch_size, context_ids,
+        batch_size, context_ids, resource_receipt,
         "stage05.2-candidate-round-transaction-v2");
 }
 
@@ -8341,14 +8442,10 @@ py::tuple full_native_alns_v1(
         for (py::ssize_t index = 0; index < path_array.size(); ++index) {
             charging_count += kinds[paths[index]] == station_kind ? 1 : 0;
         }
-        const auto round_objective = [](double value) {
-            constexpr auto scale = 1'000'000'000.0;
-            return std::nearbyint(value * scale) / scale;
-        };
-        return std::make_tuple(
+        return evrptw::formal_objective::key(
             static_cast<std::int64_t>(vehicle_count),
-            round_objective(total_distance),
-            round_objective(total_charging_time),
+            total_distance,
+            total_charging_time,
             charging_count);
     };
     auto current_objective = objective_key(exact_payload, routes.size());
@@ -11454,18 +11551,12 @@ public:
                     throw std::logic_error(
                         "full native refinement lost its final feasible plan");
                 }
-                const auto objective_key = [](const auto& integers, const auto& floats) {
-                    constexpr auto scale = 1'000'000'000.0;
-                    return std::make_tuple(
-                        checked_data<std::int64_t>(integers)[0],
-                        std::nearbyint(checked_data<double>(floats)[0] * scale) / scale,
-                        std::nearbyint(checked_data<double>(floats)[1] * scale) / scale,
-                        checked_data<std::int64_t>(integers)[1]);
-                };
-                const auto refined_key = objective_key(
+                const auto refined_key =
+                    evrptw::formal_objective::key_from_arrays(
                     last_candidate_objective_integer_,
                     last_candidate_objective_float_);
-                const auto legacy_key = objective_key(
+                const auto legacy_key =
+                    evrptw::formal_objective::key_from_arrays(
                     legacy_candidate_objective_integer_,
                     legacy_candidate_objective_float_);
                 commit_pending_composite_noexcept();
@@ -13946,22 +14037,11 @@ public:
             throw std::invalid_argument(
                 "full native candidate acceptance inputs are invalid");
         }
-        const auto objective_key = [](const py::array_t<std::int64_t>& integers,
-                                      const py::array_t<double>& floats) {
-            constexpr auto scale = 1'000'000'000.0;
-            const auto* integer_values = checked_data<std::int64_t>(integers);
-            const auto* float_values = checked_data<double>(floats);
-            return std::make_tuple(
-                integer_values[0],
-                std::nearbyint(float_values[0] * scale) / scale,
-                std::nearbyint(float_values[1] * scale) / scale,
-                integer_values[1]);
-        };
-        const auto current_key = objective_key(
+        const auto current_key = evrptw::formal_objective::key_from_arrays(
             current_objective_integer_, current_objective_float_);
-        const auto candidate_key = objective_key(
+        const auto candidate_key = evrptw::formal_objective::key_from_arrays(
             last_candidate_objective_integer_, last_candidate_objective_float_);
-        const auto best_key = objective_key(
+        const auto best_key = evrptw::formal_objective::key_from_arrays(
             best_objective_integer_, best_objective_float_);
         const auto current_vehicles = std::get<0>(current_key);
         const auto candidate_vehicles = std::get<0>(candidate_key);
@@ -14794,23 +14874,12 @@ public:
             require_deadline();
             std::int64_t comparison = 1;
             if (iteration_candidate_ready) {
-                const auto objective_key = [](
-                    const py::array_t<std::int64_t>& integers,
-                    const py::array_t<double>& floats) {
-                    constexpr auto scale = 1'000'000'000.0;
-                    const auto* integer_values =
-                        checked_data<std::int64_t>(integers);
-                    const auto* float_values = checked_data<double>(floats);
-                    return std::make_tuple(
-                        integer_values[0],
-                        std::nearbyint(float_values[0] * scale) / scale,
-                        std::nearbyint(float_values[1] * scale) / scale,
-                        integer_values[1]);
-                };
-                const auto candidate_key = objective_key(
+                const auto candidate_key =
+                    evrptw::formal_objective::key_from_arrays(
                     last_candidate_objective_integer_,
                     last_candidate_objective_float_);
-                const auto current_key = objective_key(
+                const auto current_key =
+                    evrptw::formal_objective::key_from_arrays(
                     current_objective_integer_, current_objective_float_);
                 comparison = candidate_key < current_key
                     ? -1
@@ -16604,17 +16673,9 @@ private:
             throw std::logic_error(
                 "full native candidate comparison has no prepared candidate");
         }
-        const auto objective_key = [](const auto& integers, const auto& floats) {
-            constexpr auto scale = 1'000'000'000.0;
-            return std::make_tuple(
-                checked_data<std::int64_t>(integers)[0],
-                std::nearbyint(checked_data<double>(floats)[0] * scale) / scale,
-                std::nearbyint(checked_data<double>(floats)[1] * scale) / scale,
-                checked_data<std::int64_t>(integers)[1]);
-        };
-        const auto candidate = objective_key(
+        const auto candidate = evrptw::formal_objective::key_from_arrays(
             last_candidate_objective_integer_, last_candidate_objective_float_);
-        const auto current = objective_key(
+        const auto current = evrptw::formal_objective::key_from_arrays(
             current_objective_integer_, current_objective_float_);
         return candidate < current ? -1 : candidate == current ? 0 : 1;
     }
@@ -18418,7 +18479,8 @@ PYBIND11_MODULE(_core, module) {
         py::arg("control"),
         py::arg("deadline_remaining"),
         py::arg("batch_size"),
-        py::arg("context_ids"));
+        py::arg("context_ids"),
+        py::arg("resource_receipt"));
     module.def(
         "full_native_alns_v1",
         &full_native_alns_v1,

@@ -41,8 +41,10 @@ from evrptw.candidate_transaction import (
     CandidateTransactionRequest,
     NativeCandidateTransactionConfig,
     NativeCandidateTransactionRuntime,
+    NativeNegativeCacheSnapshot,
     NegativeCacheCommit,
     NegativeSequenceCacheBatch,
+    NegativeSequenceCacheSnapshot,
     execute_candidate_transaction,
     native_screen_candidate_batch,
 )
@@ -66,6 +68,8 @@ from evrptw.measurement import (
 from evrptw.models import Instance, Node
 from evrptw.native_execution import (
     FULL_NATIVE_OPERATOR_NAMES,
+    NativeCandidateResourceReceipt,
+    NativeCandidateRoundFailure,
     NativeCandidateRoundRequest,
     NativeGlobalSemanticStream,
     NativeThreeLaneSemanticStream,
@@ -864,6 +868,7 @@ class _Evaluator:
             self.route_cache.snapshot_state() if self.route_cache is not None else None
         )
         control_snapshot = control_runtime.snapshot_protocol_state()
+        transaction_snapshot = transaction_runtime.snapshot_protocol_state()
         controller_snapshot = (
             None
             if controller is None
@@ -876,7 +881,24 @@ class _Evaluator:
         )
         pending_snapshot = dict(self.pending_candidate_cache)
         pending_negative_snapshot = dict(self.pending_negative_screening_sequences)
+        native_negative_cache_snapshot: NativeNegativeCacheSnapshot = (
+            transaction_runtime.snapshot_negative_cache_state()
+        )
+        bounded_negative_cache_snapshot: NegativeSequenceCacheSnapshot | None = None
+        dictionary_negative_cache_snapshot: dict[tuple[str, ...], str] | None = None
+        semantic_journal_snapshot = (
+            self.measurement_trace.snapshot_runtime_semantic_journal()
+            if self.measurement_trace is not None
+            and self.measurement_trace.runtime_semantic_enabled
+            else None
+        )
         native_resource_charged = False
+        charged_resource_receipt: NativeCandidateResourceReceipt | None = None
+        native_charge_event_emitted = False
+        native_charge_within_budget = True
+        native_charge_context = (
+            f"{self.lane}:{self.operator}:native_candidate_round"
+        )
 
         def rollback_protocol_state() -> None:
             self.pending_candidate_cache.clear()
@@ -887,6 +909,31 @@ class _Evaluator:
             )
             if self.route_cache is not None and route_cache_snapshot is not None:
                 self.route_cache.restore_state(route_cache_snapshot)
+            transaction_runtime.rollback_protocol_state(transaction_snapshot)
+            transaction_runtime.restore_negative_cache_state(
+                native_negative_cache_snapshot
+            )
+            if bounded_negative_cache_snapshot is not None:
+                assert isinstance(
+                    self.negative_screening_sequences,
+                    BoundedNegativeSequenceCache,
+                )
+                self.negative_screening_sequences.restore_state(
+                    bounded_negative_cache_snapshot
+                )
+            if dictionary_negative_cache_snapshot is not None:
+                assert isinstance(self.negative_screening_sequences, dict)
+                self.negative_screening_sequences.clear()
+                self.negative_screening_sequences.update(
+                    dictionary_negative_cache_snapshot
+                )
+            if (
+                self.measurement_trace is not None
+                and semantic_journal_snapshot is not None
+            ):
+                self.measurement_trace.rollback_runtime_semantic_journal(
+                    semantic_journal_snapshot
+                )
             control_runtime.rollback_protocol_state(
                 control_snapshot,
                 preserve_round_usage=native_resource_charged,
@@ -933,6 +980,36 @@ class _Evaluator:
                 record_runtime=False,
             )
             protocol_completed = time.perf_counter()
+            charged_resource_receipt = native_result.resource_receipt
+            exact_started = charged_resource_receipt.started_calls
+            exact_completed = charged_resource_receipt.completed_calls
+            exact_interrupted = charged_resource_receipt.interrupted_calls
+            native_resource_charged = exact_started > 0
+            control_within_budget = control_runtime.record_native_work(
+                exact_started,
+                context=native_charge_context,
+                emit_event=False,
+            )
+            native_charge_within_budget = control_within_budget
+            controller_within_budget = True
+            if controller is not None:
+                controller_within_budget = controller.record_native_work(
+                    started=exact_started,
+                    completed=exact_completed,
+                    interrupted=exact_interrupted,
+                )
+            if native_resource_charged:
+                self.backend_metrics.add(native_result.backend_metrics)
+                self.calls += exact_completed
+                self.runtime += native_result.backend_metrics.total_seconds
+                self.labels_generated += sum(
+                    result.labels_generated for result in native_result.exact_results
+                )
+                self.labels_pruned += sum(
+                    result.labels_pruned for result in native_result.exact_results
+                )
+            if not control_within_budget or not controller_within_budget:
+                raise RuntimeError("native exact work exceeded its declared budget")
             screening = native_result.screening
             self.screening_calls += len(clean)
             self.screening_passes += native_result.audit.screening_passes
@@ -958,31 +1035,62 @@ class _Evaluator:
                 iteration=self.iteration,
                 operator=self.operator,
             )
+            cached_results: dict[int, ChargingSubproblemResult] = {}
+            selected_misses: list[int] = []
+            for index in selected:
+                cached, _digest = self._lookup_cached_result(
+                    clean[index],
+                    route_change_status,
+                )
+                if (cached is not None) != cache_flags[index]:
+                    raise RuntimeError("native candidate cache prediction diverged")
+                if cached is None:
+                    selected_misses.append(index)
+                else:
+                    cached_results[index] = cached
+            if selected_misses:
+                operator_can_fit = len(selected_misses) <= controller_remaining
+                expected_exact = len(selected_misses) if operator_can_fit else 0
+                if expected_exact != len(native_result.exact_candidate_ids):
+                    raise RuntimeError("native candidate-round budget replay diverged")
+            elif native_result.exact_candidate_ids:
+                raise RuntimeError("native candidate round started unrequested exact work")
             exact_sequences = tuple(
                 clean[index] for index in native_result.exact_candidate_ids
             )
-            exact_started = native_result.backend_metrics.started_calls
-            exact_completed = native_result.backend_metrics.completed_calls
-            exact_interrupted = native_result.backend_metrics.interrupted_calls
             if exact_started != len(exact_sequences):
                 raise RuntimeError("native exact started-call receipt diverged")
-            native_resource_charged = exact_started > 0
-            control_within_budget = control_runtime.record_native_work(
+            control_runtime.record_native_work_event(
                 exact_started,
-                context=f"{self.lane}:{self.operator}:native_candidate_round",
+                context=native_charge_context,
+                within_budget=control_within_budget,
             )
-            controller_within_budget = True
-            if controller is not None:
-                controller_within_budget = controller.record_native_work(
-                    started=exact_started,
-                    completed=exact_completed,
-                    interrupted=exact_interrupted,
-                )
+            native_charge_event_emitted = exact_started > 0
             if exact_sequences:
                 completion_ordinals = tuple(
                     native_result.exact_candidate_ids.index(candidate_id)
                     for candidate_id in native_result.completion_order
                 )
+                if (
+                    self.measurement_trace is not None
+                    and self.measurement_trace.runtime_semantic_enabled
+                ):
+                    self.measurement_trace.record_runtime_semantic_event(
+                        "exact_work",
+                        {
+                            "event_type": "exact_batch_started",
+                            "lane": self.lane,
+                            "iteration": self.iteration,
+                            "operator": self.operator,
+                            "customer_sequences": [
+                                list(sequence) for sequence in exact_sequences
+                            ],
+                            "route_change_status": route_change_status,
+                            "requested_calls": len(exact_sequences),
+                            "started_calls": exact_started,
+                            "transaction_sha256": native_result.transaction_sha256,
+                        },
+                    )
                 control_runtime.record_native_batch(
                     exact_sequences,
                     native_result.exact_results,
@@ -991,15 +1099,6 @@ class _Evaluator:
                     iteration=self.iteration,
                     operator=self.operator,
                     worker_protocol=execution.worker_protocol,
-                )
-                self.backend_metrics.add(native_result.backend_metrics)
-                self.calls += exact_completed
-                self.runtime += native_result.backend_metrics.total_seconds
-                self.labels_generated += sum(
-                    result.labels_generated for result in native_result.exact_results
-                )
-                self.labels_pruned += sum(
-                    result.labels_pruned for result in native_result.exact_results
                 )
                 for sequence in exact_sequences:
                     self.evaluated_routes.add(sequence)
@@ -1031,8 +1130,6 @@ class _Evaluator:
                             route_change_status=route_change_status,
                             **route_result_fields(result),
                         )
-            if not control_within_budget or not controller_within_budget:
-                raise RuntimeError("native exact work exceeded its declared budget")
             journal_selected = tuple(
                 int(row[0])
                 for row in native_result.cache_journal
@@ -1040,27 +1137,6 @@ class _Evaluator:
             )
             if selected != journal_selected:
                 raise RuntimeError("native Candidate Control selection diverged from Python replay")
-
-            cached_results: dict[int, ChargingSubproblemResult] = {}
-            selected_misses: list[int] = []
-            for index in selected:
-                cached, _digest = self._lookup_cached_result(
-                    clean[index],
-                    route_change_status,
-                )
-                if (cached is not None) != cache_flags[index]:
-                    raise RuntimeError("native candidate cache prediction diverged")
-                if cached is None:
-                    selected_misses.append(index)
-                else:
-                    cached_results[index] = cached
-            if selected_misses:
-                operator_can_fit = len(selected_misses) <= controller_remaining
-                expected_exact = len(selected_misses) if operator_can_fit else 0
-                if expected_exact != len(native_result.exact_candidate_ids):
-                    raise RuntimeError("native candidate-round budget replay diverged")
-            elif native_result.exact_candidate_ids:
-                raise RuntimeError("native candidate round started unrequested exact work")
 
             exact_results = dict(
                 zip(
@@ -1110,6 +1186,18 @@ class _Evaluator:
 
             if time.perf_counter() >= self.deadline:
                 raise CandidateTransactionDeadlineExceeded("before_atomic_commit")
+            if self.pending_negative_screening_sequences:
+                if isinstance(
+                    self.negative_screening_sequences,
+                    BoundedNegativeSequenceCache,
+                ):
+                    bounded_negative_cache_snapshot = (
+                        self.negative_screening_sequences.snapshot_state()
+                    )
+                else:
+                    dictionary_negative_cache_snapshot = dict(
+                        self.negative_screening_sequences
+                    )
             self._commit_pending_candidate_cache()
             transaction_runtime.record_worker_protocol(
                 native_result.audit,
@@ -1143,11 +1231,82 @@ class _Evaluator:
             if len(completed) != len(clean):
                 raise RuntimeError("native candidate round lost an ordered result")
             return completed
+        except NativeCandidateRoundFailure as error:
+            receipt = error.resource_receipt
+            control_within_budget = control_runtime.record_native_work(
+                receipt.started_calls,
+                context=f"{self.lane}:{self.operator}:failed_native_candidate_round",
+            )
+            controller_within_budget = True
+            if controller is not None:
+                controller_within_budget = controller.record_native_work(
+                    started=receipt.started_calls,
+                    completed=receipt.completed_calls,
+                    interrupted=receipt.interrupted_calls,
+                )
+            if receipt.work_started:
+                native_resource_charged = True
+                self.backend_metrics.work_batches += 1
+                self.backend_metrics.exact_calls += receipt.started_calls
+                self.backend_metrics.batch_launches += 1
+                self.backend_metrics.started_calls += receipt.started_calls
+                self.backend_metrics.completed_calls += receipt.completed_calls
+                self.backend_metrics.interrupted_calls += receipt.interrupted_calls
+                self.backend_metrics.native_invocations += 1
+                self.backend_metrics.launch_occupancies.append(
+                    receipt.started_calls
+                )
+                self.calls += receipt.completed_calls
+            rollback_protocol_state()
+            if (
+                self.measurement_trace is not None
+                and self.measurement_trace.runtime_semantic_enabled
+                and receipt.work_started
+            ):
+                self.measurement_trace.record_runtime_semantic_event(
+                    "native_failure",
+                    {
+                        "event_type": (
+                            "native_candidate_round_failed_after_resource_start"
+                        ),
+                        "lane": self.lane,
+                        "iteration": self.iteration,
+                        "operator": self.operator,
+                        "receipt_phase": receipt.phase,
+                        "started_calls": receipt.started_calls,
+                        "completed_calls": receipt.completed_calls,
+                        "interrupted_calls": receipt.interrupted_calls,
+                        "fail_closed": receipt.fail_closed,
+                        "control_within_budget": control_within_budget,
+                        "controller_within_budget": controller_within_budget,
+                        "failure_type": type(error.__cause__).__name__,
+                        "reason": str(error),
+                    },
+                )
+            if isinstance(error.__cause__, ExactBatchDeadlineExceeded):
+                if self.measurement_trace is not None:
+                    self.measurement_trace.record_deadline_boundary(
+                        lane=self.lane,
+                        iteration=self.iteration,
+                        operator=self.operator,
+                        boundary="native_exact_batch",
+                        reason=str(error),
+                    )
+                raise _TimeLimitReached(clean[0]) from error
+            raise
         except CandidateTransactionDeadlineExceeded as error:
             self._discard_pending_candidate_cache(
                 f"native_candidate_round_deadline:{error.boundary}"
             )
             rollback_protocol_state()
+            if native_resource_charged and not native_charge_event_emitted:
+                assert charged_resource_receipt is not None
+                control_runtime.record_native_work_event(
+                    charged_resource_receipt.started_calls,
+                    context=native_charge_context,
+                    within_budget=native_charge_within_budget,
+                    status="aborted_transaction_consumed",
+                )
             if self.measurement_trace is not None:
                 self.measurement_trace.record_deadline_boundary(
                     lane=self.lane,
@@ -1156,9 +1315,63 @@ class _Evaluator:
                     boundary=error.boundary,
                     reason=str(error),
                 )
+                if (
+                    self.measurement_trace.runtime_semantic_enabled
+                    and charged_resource_receipt is not None
+                    and charged_resource_receipt.work_started
+                ):
+                    self.measurement_trace.record_runtime_semantic_event(
+                        "native_failure",
+                        {
+                            "event_type": (
+                                "native_candidate_round_deadline_after_resource_start"
+                            ),
+                            "lane": self.lane,
+                            "iteration": self.iteration,
+                            "operator": self.operator,
+                            "boundary": error.boundary,
+                            "receipt_phase": charged_resource_receipt.phase,
+                            "started_calls": charged_resource_receipt.started_calls,
+                            "completed_calls": charged_resource_receipt.completed_calls,
+                            "interrupted_calls": (
+                                charged_resource_receipt.interrupted_calls
+                            ),
+                            "fail_closed": charged_resource_receipt.fail_closed,
+                        },
+                    )
             raise _TimeLimitReached(clean[0]) from error
-        except BaseException:
+        except BaseException as error:
             rollback_protocol_state()
+            if native_resource_charged and not native_charge_event_emitted:
+                assert charged_resource_receipt is not None
+                control_runtime.record_native_work_event(
+                    charged_resource_receipt.started_calls,
+                    context=native_charge_context,
+                    within_budget=native_charge_within_budget,
+                    status="aborted_transaction_consumed",
+                )
+            if (
+                self.measurement_trace is not None
+                and self.measurement_trace.runtime_semantic_enabled
+                and charged_resource_receipt is not None
+                and charged_resource_receipt.work_started
+            ):
+                self.measurement_trace.record_runtime_semantic_event(
+                    "native_failure",
+                    {
+                        "event_type": "native_candidate_round_python_replay_failed",
+                        "lane": self.lane,
+                        "iteration": self.iteration,
+                        "operator": self.operator,
+                        "receipt_phase": charged_resource_receipt.phase,
+                        "started_calls": charged_resource_receipt.started_calls,
+                        "completed_calls": charged_resource_receipt.completed_calls,
+                        "interrupted_calls": charged_resource_receipt.interrupted_calls,
+                        "fail_closed": charged_resource_receipt.fail_closed,
+                        "failure_type": type(error).__name__,
+                        "reason": str(error),
+                    },
+                )
             raise
 
     def _candidate_incremental_rows(
@@ -1460,7 +1673,10 @@ class _Evaluator:
             )
             raise
         runtime.record(transaction.audit)
-        if self.measurement_trace is not None:
+        if (
+            self.measurement_trace is not None
+            and self.measurement_trace.runtime_semantic_enabled
+        ):
             self.measurement_trace.record_screening_aggregate(
                 {
                     "event_type": "native_candidate_transaction",
@@ -1779,7 +1995,10 @@ class _Evaluator:
             if result.accepted
             else "rejected"
         )
-        if self.measurement_trace is not None:
+        if (
+            self.measurement_trace is not None
+            and self.measurement_trace.runtime_semantic_enabled
+        ):
             decision_checks = (
                 _NEGATIVE_SEQUENCE_CACHE_HIT_CHECKS if negative_cache_hit else result.checks
             )
@@ -2046,6 +2265,23 @@ class _Evaluator:
             self._discard_pending_candidate_cache("exact_call_budget_exhausted")
             self._record_exact_budget_boundary()
             raise _TimeLimitReached(sequence)
+        if (
+            self.measurement_trace is not None
+            and self.measurement_trace.runtime_semantic_enabled
+        ):
+            self.measurement_trace.record_runtime_semantic_event(
+                "exact_work",
+                {
+                    "event_type": "exact_batch_started",
+                    "lane": self.lane,
+                    "iteration": self.iteration,
+                    "operator": self.operator,
+                    "customer_sequences": [list(sequence)],
+                    "route_change_status": route_change_status,
+                    "requested_calls": 1,
+                    "started_calls": 1,
+                },
+            )
         started = time.perf_counter()
         if self.measurement_trace is not None:
             started_offset = self.measurement_trace._offset(started)
@@ -2540,6 +2776,23 @@ class _Evaluator:
         active_sequences = (
             sequences[: reservation.granted] if reservation is not None else sequences
         )
+        if (
+            self.measurement_trace is not None
+            and self.measurement_trace.runtime_semantic_enabled
+        ):
+            self.measurement_trace.record_runtime_semantic_event(
+                "exact_work",
+                {
+                    "event_type": "exact_batch_started",
+                    "lane": self.lane,
+                    "iteration": self.iteration,
+                    "operator": self.operator,
+                    "customer_sequences": [list(sequence) for sequence in active_sequences],
+                    "route_change_status": route_change_status,
+                    "requested_calls": len(sequences),
+                    "started_calls": len(active_sequences),
+                },
+            )
         partial_budget_batch = reservation is not None and reservation.partial
         batch_started = time.perf_counter()
         started_offset = (
@@ -2845,12 +3098,18 @@ class _NeighborhoodEventStream(list[dict[str, object]]):
     def __init__(
         self,
         sink: Callable[[Mapping[str, object]], None] | None = None,
+        trace: Stage03Trace | None = None,
     ) -> None:
         super().__init__()
         self._sink = sink
+        self._trace = (
+            trace if trace is not None and trace.runtime_semantic_enabled else None
+        )
         self.emitted_count = 0
 
     def append(self, event: dict[str, object]) -> None:
+        if self._trace is not None:
+            self._trace.record_runtime_semantic_event("operator", event)
         if self._sink is None:
             super().append(event)
         else:
@@ -2858,9 +3117,36 @@ class _NeighborhoodEventStream(list[dict[str, object]]):
             self.emitted_count += 1
 
     def extend(self, events: Iterable[dict[str, object]]) -> None:
-        if self._sink is None:
+        if self._sink is None and self._trace is None:
             super().extend(events)
             return
+        for event in events:
+            self.append(event)
+
+
+class _RuntimeSemanticEventList(list[dict[str, object]]):
+    """Retain a historical event list and stamp each append at runtime."""
+
+    def __init__(
+        self,
+        trace: Stage03Trace | None,
+        semantic_stream: str,
+    ) -> None:
+        super().__init__()
+        self._trace = (
+            trace if trace is not None and trace.runtime_semantic_enabled else None
+        )
+        self._semantic_stream = semantic_stream
+
+    def append(self, event: dict[str, object]) -> None:
+        super().append(event)
+        if self._trace is not None:
+            self._trace.record_runtime_semantic_event(
+                self._semantic_stream,
+                event,
+            )
+
+    def extend(self, events: Iterable[dict[str, object]]) -> None:
         for event in events:
             self.append(event)
 
@@ -3168,7 +3454,16 @@ def _solve_alns(
     refinement_stats = OperatorStatistics()
     if profile is OperatorProfile.STAGE02_CONSTRAINT_GUIDED:
         neighborhood_stats["vehicle_reduction_refinement"] = refinement_stats
-    neighborhood_events = _NeighborhoodEventStream(neighborhood_event_sink)
+    semantic_trace = (
+        measurement_trace
+        if measurement_trace is not None
+        and measurement_trace.runtime_semantic_enabled
+        else None
+    )
+    neighborhood_events = _NeighborhoodEventStream(
+        neighborhood_event_sink,
+        semantic_trace,
+    )
     accepted = 0
     improved = 0
     rejected = 0
@@ -3182,7 +3477,11 @@ def _solve_alns(
 
     # ── Stage 4 adaptive weights and search control ──────────────
     stage04_enabled = stage04_config is not None and stage04_config.enabled
-    stage04_events: list[dict[str, object]] = []
+    stage04_events: list[dict[str, object]] = (
+        _RuntimeSemanticEventList(semantic_trace, "stage04")
+        if semantic_trace is not None
+        else []
+    )
     temperature_history: list[tuple[int, float]] = []
     reheat_count = 0
     restart_count = 0
@@ -6264,6 +6563,11 @@ def solve_alns(
         exact_deadline_config=exact_deadline_config,
         candidate_control_config=(candidate_control_config if candidate_control_enabled else None),
     )
+    if candidate_control_runtime is not None and trace.runtime_semantic_enabled:
+        candidate_control_runtime.events = _RuntimeSemanticEventList(
+            trace,
+            "candidate_transaction",
+        )
     try:
         result = _solve_alns(
             instance,
