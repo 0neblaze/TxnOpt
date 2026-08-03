@@ -56,6 +56,7 @@ NATIVE_ARCHITECTURE_CAPABILITY_NAMES = (
     "host_candidate_transaction_scheduler",
     "whole_search_gil_released",
     "single_host_24_thread_compute_pool",
+    "runtime_semantic_event_journal",
 )
 
 WarmStartIdentity = tuple[str, int]
@@ -687,57 +688,50 @@ def _canonical_semantic_streams(result: ALNSResult) -> dict[str, list[dict[str, 
     }
 
 
-_SEMANTIC_STREAM_PHASE = {
-    "operator": 10,
-    "candidate_transaction": 20,
-    "exact_work": 30,
-    "exact_result": 40,
-    "cache": 50,
-    "candidate_state": 60,
-    "stage04": 70,
-    "deadline": 80,
-}
-
-
 def _canonical_semantic_event_sequence(
     streams: dict[str, list[dict[str, object]]],
 ) -> list[dict[str, object]]:
-    """Project independent journals into one explicit logical-causal sequence."""
+    """Merge runtime-stamped journals without inventing cross-stream order."""
 
-    expected_streams = set(_SEMANTIC_STREAM_PHASE)
+    expected_streams = {
+        "candidate_state",
+        "operator",
+        "stage04",
+        "candidate_transaction",
+        "exact_work",
+        "exact_result",
+        "cache",
+        "deadline",
+    }
     if set(streams) != expected_streams:
         raise ValueError("canonical semantic stream set is incomplete")
     events: list[dict[str, object]] = []
     for stream_name, rows in streams.items():
+        previous_event_id = 0
         for row in rows:
+            event_id = row.get("semantic_event_id")
+            if (
+                isinstance(event_id, bool)
+                or not isinstance(event_id, int)
+                or event_id <= previous_event_id
+            ):
+                raise ValueError(
+                    f"canonical semantic stream {stream_name} lacks ordered runtime event IDs"
+                )
+            previous_event_id = event_id
             events.append({**row, "semantic_stream": stream_name})
-    lane_rank = {"legacy": 0, "quality_shadow": 1, "constraint_lane": 2}
+    def runtime_event_id(event: dict[str, object]) -> int:
+        value = event["semantic_event_id"]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise AssertionError("validated runtime event ID changed type")
+        return value
 
-    def causal_key(event: dict[str, object]) -> tuple[int, int, int, int]:
-        stream_name = str(event["semantic_stream"])
-        iteration = event.get("iteration")
-        ordinal = event.get("stream_ordinal")
-        is_final_cache_state = (
-            stream_name == "cache"
-            and event.get("transition") == "final_cache_state"
+    events.sort(key=runtime_event_id)
+    event_ids = [runtime_event_id(event) for event in events]
+    if event_ids != list(range(1, len(events) + 1)):
+        raise ValueError(
+            "canonical semantic runtime event IDs must be unique and contiguous"
         )
-        logical_iteration = (
-            2**62
-            if is_final_cache_state
-            else iteration
-            if isinstance(iteration, int) and not isinstance(iteration, bool)
-            else -1
-        )
-        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 0:
-            raise ValueError("canonical semantic stream ordinal is invalid")
-        return (
-            logical_iteration,
-            lane_rank.get(str(event.get("lane")), 3),
-            _SEMANTIC_STREAM_PHASE[stream_name],
-            ordinal,
-        )
-
-    events.sort(key=causal_key)
     return [
         {**event, "semantic_sequence": sequence}
         for sequence, event in enumerate(events)

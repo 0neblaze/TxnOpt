@@ -511,18 +511,6 @@ _SEMANTIC_STREAM_NAMES = (
     "cache",
     "deadline",
 )
-_SEMANTIC_STREAM_PHASE = {
-    "operator": 10,
-    "candidate_transaction": 20,
-    "exact_work": 30,
-    "exact_result": 40,
-    "cache": 50,
-    "candidate_state": 60,
-    "stage04": 70,
-    "deadline": 80,
-}
-
-
 def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, object]]:
     raw_streams = payload.get("canonical_semantic_streams")
     if not isinstance(raw_streams, dict) or set(raw_streams) != set(
@@ -564,31 +552,11 @@ def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, 
         raise ValueError(
             "canonical semantic event sequence does not preserve every stream journal"
         )
-    lane_rank = {"legacy": 0, "quality_shadow": 1, "constraint_lane": 2}
-
-    def event_key(event: dict[str, object]) -> tuple[int, int, int, int]:
-        stream_name = str(event.get("semantic_stream"))
-        iteration = event.get("iteration")
-        ordinal = event.get("stream_ordinal")
-        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 0:
-            raise ValueError("canonical semantic stream ordinal is invalid")
-        final_cache_state = (
-            stream_name == "cache"
-            and event.get("transition") == "final_cache_state"
+    runtime_event_ids = [event.get("semantic_event_id") for event in events]
+    if runtime_event_ids != list(range(1, len(events) + 1)):
+        raise ValueError(
+            "canonical semantic event sequence lacks contiguous runtime event IDs"
         )
-        return (
-            2**62
-            if final_cache_state
-            else iteration
-            if isinstance(iteration, int) and not isinstance(iteration, bool)
-            else -1,
-            lane_rank.get(str(event.get("lane")), 3),
-            _SEMANTIC_STREAM_PHASE[stream_name],
-            ordinal,
-        )
-
-    if events != sorted(events, key=event_key):
-        raise ValueError("canonical semantic event sequence violates causal ordering")
     return events
 
 

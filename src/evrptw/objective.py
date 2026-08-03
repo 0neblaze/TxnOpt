@@ -12,6 +12,14 @@ OBJECTIVE_PRECISION_DIGITS = 9
 OBJECTIVE_SCHEMA_VERSION = "vehicles,distance,charging_time,charging_count"
 
 
+def canonical_objective_component(value: float) -> float:
+    """Normalize one continuous objective field under the formal policy."""
+
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError("objective component must be finite and non-negative")
+    return round(value, OBJECTIVE_PRECISION_DIGITS)
+
+
 def count_charging_visits(instance: Instance, routes: Iterable[Iterable[str]]) -> int:
     """Count charging-station visits using the instance's node types."""
 
@@ -49,8 +57,8 @@ class SolutionObjective:
     def key(self) -> tuple[int, float, float, int]:
         return (
             self.vehicle_count,
-            round(self.total_distance, OBJECTIVE_PRECISION_DIGITS),
-            round(self.total_charging_time, OBJECTIVE_PRECISION_DIGITS),
+            canonical_objective_component(self.total_distance),
+            canonical_objective_component(self.total_charging_time),
             self.charging_count,
         )
 

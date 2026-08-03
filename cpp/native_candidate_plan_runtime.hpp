@@ -94,6 +94,21 @@ inline void validate_offsets(
     }
 }
 
+inline void validate_lexical_rank(
+    std::span<const std::int64_t> lexical_rank) {
+    if (lexical_rank.empty()) {
+        throw std::invalid_argument("lexical_rank cannot be empty");
+    }
+    std::unordered_set<std::int64_t> values;
+    values.reserve(lexical_rank.size());
+    for (const auto rank : lexical_rank) {
+        if (rank < 0 || rank >= static_cast<std::int64_t>(lexical_rank.size())
+            || !values.insert(rank).second) {
+            throw std::invalid_argument("lexical_rank must be a permutation");
+        }
+    }
+}
+
 struct RouteSequenceHash final {
     [[nodiscard]] std::size_t operator()(
         const std::vector<std::int64_t>& route) const noexcept {
@@ -120,6 +135,7 @@ inline PlanPreparationResult prepare(const PlanPreparationInput& input) {
     }
     validate_offsets(input.plan_offsets, route_count, "plan_offsets");
     validate_offsets(input.route_offsets, input.route_indices.size(), "route_offsets");
+    validate_lexical_rank(input.lexical_rank);
 
     std::unordered_set<std::int64_t> expected;
     expected.reserve(input.expected_customer_indices.size());
@@ -265,6 +281,7 @@ inline std::vector<std::int64_t> order_feasible(
     const auto route_count = input.route_offsets.size() - 1;
     validate_offsets(input.plan_offsets, route_count, "plan_offsets");
     validate_offsets(input.route_offsets, input.route_indices.size(), "route_offsets");
+    validate_lexical_rank(input.lexical_rank);
     if (input.objective_integer.size() != plan_count * 2
         || input.objective_float.size() != plan_count * 2) {
         throw std::invalid_argument("feasible-plan objectives do not align");
@@ -277,12 +294,16 @@ inline std::vector<std::int64_t> order_feasible(
                 "feasible_plan_ids must identify unique candidate plans");
         }
         const auto offset = static_cast<std::size_t>(plan) * 2;
-        if (input.objective_integer[offset] < 0
+        const auto vehicle_count = input.plan_offsets[static_cast<std::size_t>(plan) + 1]
+            - input.plan_offsets[static_cast<std::size_t>(plan)];
+        if (input.objective_integer[offset] != vehicle_count
             || input.objective_integer[offset + 1] < 0
             || !std::isfinite(input.objective_float[offset])
-            || !std::isfinite(input.objective_float[offset + 1])) {
+            || input.objective_float[offset] < 0.0
+            || !std::isfinite(input.objective_float[offset + 1])
+            || input.objective_float[offset + 1] < 0.0) {
             throw std::invalid_argument(
-                "feasible plans require complete finite objective fields");
+                "feasible plans require canonical objective fields aligned to routes");
         }
     }
     const auto route_less = [&](std::int64_t left, std::int64_t right) {
@@ -314,22 +335,18 @@ inline std::vector<std::int64_t> order_feasible(
         return left_end - input.route_offsets[static_cast<std::size_t>(left)]
             < right_end - input.route_offsets[static_cast<std::size_t>(right)];
     };
-    const auto round_objective = [](double value) {
-        constexpr auto scale = 1'000'000'000.0;
-        return std::nearbyint(value * scale) / scale;
-    };
     const auto plan_less = [&](std::int64_t left, std::int64_t right) {
         const auto left_offset = static_cast<std::size_t>(left) * 2;
         const auto right_offset = static_cast<std::size_t>(right) * 2;
         const auto left_key = std::make_tuple(
             input.objective_integer[left_offset],
-            round_objective(input.objective_float[left_offset]),
-            round_objective(input.objective_float[left_offset + 1]),
+            input.objective_float[left_offset],
+            input.objective_float[left_offset + 1],
             input.objective_integer[left_offset + 1]);
         const auto right_key = std::make_tuple(
             input.objective_integer[right_offset],
-            round_objective(input.objective_float[right_offset]),
-            round_objective(input.objective_float[right_offset + 1]),
+            input.objective_float[right_offset],
+            input.objective_float[right_offset + 1],
             input.objective_integer[right_offset + 1]);
         if (left_key != right_key) {
             return left_key < right_key;
@@ -377,15 +394,7 @@ inline RankingResult rank(const RankingInput& input) {
     validate_offsets(
         input.current_route_offsets, input.current_route_indices.size(),
         "current_route_offsets");
-    std::unordered_set<std::int64_t> lexical_values;
-    lexical_values.reserve(input.lexical_rank.size());
-    for (const auto rank : input.lexical_rank) {
-        if (rank < 0
-            || rank >= static_cast<std::int64_t>(input.lexical_rank.size())
-            || !lexical_values.insert(rank).second) {
-            throw std::invalid_argument("lexical_rank must be a permutation");
-        }
-    }
+    validate_lexical_rank(input.lexical_rank);
     for (std::size_t route = 0; route < route_count; ++route) {
         const auto lower_bound = input.route_distance_lower_bounds[route];
         if (!std::isfinite(lower_bound) || lower_bound < 0.0) {

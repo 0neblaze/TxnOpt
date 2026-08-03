@@ -54,7 +54,8 @@ def test_native_campaign_gate_names_every_incomplete_architecture_capability() -
         RuntimeError,
         match=(
             "host_candidate_transaction_scheduler, "
-            "whole_search_gil_released, single_host_24_thread_compute_pool"
+            "whole_search_gil_released, single_host_24_thread_compute_pool, "
+            "runtime_semantic_event_journal"
         ),
     ):
         _require_native_architecture_capabilities()
@@ -578,6 +579,7 @@ def test_canonical_semantic_streams_find_non_candidate_first_divergence() -> Non
             "candidate_id": "candidate-7",
             "weight": 2.0,
             "stream_ordinal": 0,
+            "semantic_event_id": 1,
         }
     ]
     candidate_streams["stage04"] = [
@@ -631,10 +633,20 @@ def test_canonical_semantic_events_require_explicit_contiguous_causal_sequence()
         )
     }
     streams["operator"] = [
-        {"iteration": 0, "lane": "legacy", "stream_ordinal": 0}
+        {
+            "iteration": 0,
+            "lane": "legacy",
+            "stream_ordinal": 0,
+            "semantic_event_id": 1,
+        }
     ]
     streams["exact_work"] = [
-        {"iteration": 0, "lane": "legacy", "stream_ordinal": 0}
+        {
+            "iteration": 0,
+            "lane": "legacy",
+            "stream_ordinal": 0,
+            "semantic_event_id": 2,
+        }
     ]
     events = _canonical_semantic_event_sequence(streams)
 
@@ -645,7 +657,7 @@ def test_canonical_semantic_events_require_explicit_contiguous_causal_sequence()
         {**events[1], "semantic_sequence": 0},
         {**events[0], "semantic_sequence": 1},
     ]
-    with pytest.raises(ValueError, match="causal ordering"):
+    with pytest.raises(ValueError, match="runtime event IDs"):
         _canonical_semantic_events(
             {
                 "canonical_semantic_streams": streams,
@@ -822,12 +834,19 @@ def test_one_wall_clock_group_runs_all_five_modes_with_one_scheduler(
     assert {payload["scheduler_sha256"] for payload in payloads} == {"f" * 64}
     status_by_mode = {payload["mode"]: payload["status"] for payload in payloads}
     assert status_by_mode == {
-        "current_stage052": "completed",
-        "python_candidate_control": "completed",
-        "per_solve_runtime": "completed",
+        "current_stage052": "failed",
+        "python_candidate_control": "failed",
+        "per_solve_runtime": "failed",
         "full_native_alns": "failed",
         "host_scheduler": "failed",
     }
+    for payload in payloads:
+        if payload["mode"] in {
+            "current_stage052",
+            "python_candidate_control",
+            "per_solve_runtime",
+        }:
+            assert "lacks ordered runtime event IDs" in payload["error"]
     assert all(payload["persistence_seconds"] > 0.0 for payload in payloads)
     assert not tuple(tmp_path.rglob("*.persistence-probe-*"))
 
@@ -863,9 +882,9 @@ def test_one_fixed_work_group_retains_every_mode_axis(tmp_path: Path) -> None:
     assert {payload["mode"] for payload in payloads} == {mode.value for mode in MODES}
     status_by_mode = {payload["mode"]: payload["status"] for payload in payloads}
     assert status_by_mode == {
-        "current_stage052": "completed",
-        "python_candidate_control": "completed",
-        "per_solve_runtime": "completed",
+        "current_stage052": "failed",
+        "python_candidate_control": "failed",
+        "per_solve_runtime": "failed",
         "full_native_alns": "failed",
         "host_scheduler": "failed",
     }

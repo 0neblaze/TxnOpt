@@ -1771,6 +1771,7 @@ def test_native_candidate_plan_ranking_matches_python_rank_key() -> None:
 
 def test_native_candidate_plan_preparation_and_decision_are_typed_and_atomic() -> None:
     from evrptw import _core as native_core
+    from evrptw.objective import canonical_objective_component
 
     plan_offsets = np.asarray([0, 2, 4, 5, 8], dtype=np.int64)
     route_offsets = np.asarray([0, 2, 3, 5, 7, 9, 10, 11, 12], dtype=np.int64)
@@ -1821,13 +1822,57 @@ def test_native_candidate_plan_preparation_and_decision_are_typed_and_atomic() -
         route_indices,
         np.asarray([[2, 1], [2, 1], [1, 0], [3, 0]], dtype=np.int64),
         np.asarray(
-            [[10.0000000001, 2.0], [10.0000000004, 2.0], [12.0, 0.0], [5.0, 0.0]],
+            [
+                [542614.3787160304, 2.0],
+                [542614.3787160305, 2.0],
+                [12.0, 0.0],
+                [5.0, 0.0],
+            ],
             dtype=np.float64,
         ),
         np.asarray([0, 2, 3, 1], dtype=np.int64),
         np.asarray([3, 0, 2, 1], dtype=np.int64),
     )
-    assert ordered.tolist() == [2, 1, 0, 3]
+    assert canonical_objective_component(542614.3787160305) == 542614.378716031
+    assert ordered.tolist() == [2, 0, 1, 3]
+
+    with pytest.raises(ValueError, match="permutation"):
+        native_core.prepare_candidate_plans_v2(
+            plan_offsets,
+            route_offsets,
+            route_indices,
+            np.asarray([3, 1, 2], dtype=np.int64),
+            np.asarray([0, 1, 1, 1], dtype=np.int64),
+            np.asarray([0, 2, 2, 1], dtype=np.int64),
+            np.asarray([1, 2, 3], dtype=np.int64),
+            1,
+            False,
+        )
+
+    with pytest.raises(ValueError, match="aligned to routes"):
+        native_core.order_feasible_candidate_plans_v2(
+            plan_offsets,
+            route_offsets,
+            route_indices,
+            np.asarray([[99, 0], [2, 0], [1, 0], [3, 0]], dtype=np.int64),
+            np.zeros((4, 2), dtype=np.float64),
+            np.asarray([0, 2, 3, 1], dtype=np.int64),
+            np.asarray([0], dtype=np.int64),
+        )
+
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        native_core.order_feasible_candidate_plans_v2(
+            plan_offsets,
+            route_offsets,
+            route_indices,
+            np.asarray([[2, 0], [2, 0], [1, 0], [3, 0]], dtype=np.int64),
+            np.asarray(
+                [[-1.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+                dtype=np.float64,
+            ),
+            np.asarray([0, 2, 3, 1], dtype=np.int64),
+            np.asarray([0], dtype=np.int64),
+        )
 
     with pytest.raises(ValueError, match="unique customer nodes"):
         native_core.prepare_candidate_plans_v2(

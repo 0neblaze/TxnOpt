@@ -1807,12 +1807,34 @@ py::array_t<std::int64_t> order_feasible_candidate_plans_v2(
         throw std::invalid_argument(
             "feasible-plan objective arrays must have exactly two columns");
     }
+    std::vector<double> canonical_floating(
+        checked_data<double>(floating),
+        checked_data<double>(floating) + floating.size());
+    if (plans.size() < 1) {
+        throw std::invalid_argument("plan_offsets cannot be empty");
+    }
+    const auto plan_count = plans.size() - 1;
+    const auto canonical_component = py::module_::import(
+        "evrptw.objective").attr("canonical_objective_component");
+    const auto* feasible_values = checked_data<std::int64_t>(feasible);
+    for (py::ssize_t index = 0; index < feasible.size(); ++index) {
+        const auto plan = feasible_values[index];
+        if (plan < 0 || plan >= plan_count) {
+            throw std::invalid_argument(
+                "feasible_plan_ids must identify candidate plans");
+        }
+        const auto offset = static_cast<std::size_t>(plan) * 2;
+        canonical_floating[offset] = py::cast<double>(
+            canonical_component(canonical_floating[offset]));
+        canonical_floating[offset + 1] = py::cast<double>(
+            canonical_component(canonical_floating[offset + 1]));
+    }
     const auto result = evrptw::native_candidate_plan::order_feasible({
         {checked_data<std::int64_t>(plans), static_cast<std::size_t>(plans.size())},
         {checked_data<std::int64_t>(routes), static_cast<std::size_t>(routes.size())},
         {checked_data<std::int64_t>(indices), static_cast<std::size_t>(indices.size())},
         {checked_data<std::int64_t>(integer), static_cast<std::size_t>(integer.size())},
-        {checked_data<double>(floating), static_cast<std::size_t>(floating.size())},
+        {canonical_floating.data(), canonical_floating.size()},
         {checked_data<std::int64_t>(lexical), static_cast<std::size_t>(lexical.size())},
         {checked_data<std::int64_t>(feasible), static_cast<std::size_t>(feasible.size())},
     });
@@ -9842,21 +9864,18 @@ public:
             attempted_mark_active = true;
         }
 
-        feasible_plan_ids = evrptw::native_candidate_plan::order_feasible({
-            std::span<const std::int64_t>(plan_boundaries, plan_count + 1),
-            std::span<const std::int64_t>(route_boundaries, route_count + 1),
-            std::span<const std::int64_t>(
-                route_nodes, static_cast<std::size_t>(indices_array.size())),
-            std::span<const std::int64_t>(
-                checked_data<std::int64_t>(objective_integer), plan_count * 2),
-            std::span<const double>(
-                checked_data<double>(objective_float), plan_count * 2),
-            std::span<const std::int64_t>(
-                checked_data<std::int64_t>(lexical_rank_),
-                static_cast<std::size_t>(lexical_rank_.size())),
-            std::span<const std::int64_t>(
-                feasible_plan_ids.data(), feasible_plan_ids.size()),
-        });
+        py::array_t<std::int64_t> unordered_feasible_plan_ids(
+            feasible_plan_ids.size());
+        std::copy(
+            feasible_plan_ids.begin(), feasible_plan_ids.end(),
+            checked_data(unordered_feasible_plan_ids));
+        auto canonical_feasible_order = order_feasible_candidate_plans_v2(
+            plans_array, routes_array, indices_array, objective_integer,
+            objective_float, lexical_rank_, unordered_feasible_plan_ids);
+        feasible_plan_ids.assign(
+            checked_data<std::int64_t>(canonical_feasible_order),
+            checked_data<std::int64_t>(canonical_feasible_order)
+                + canonical_feasible_order.size());
 
         py::array_t<std::int64_t> status_array(statuses.size());
         py::array_t<std::int64_t> resolution_array(route_resolutions.size());
@@ -17797,11 +17816,12 @@ PYBIND11_MODULE(_core, module) {
         // These values are production gates, not aspirational feature flags.
         // Flip a field only together with its end-to-end differential and
         // process-topology evidence.
-        py::array_t<std::int64_t> capabilities(3);
+        py::array_t<std::int64_t> capabilities(4);
         auto* values = checked_data(capabilities);
         values[0] = 0;  // host scheduler owns the complete candidate transaction
         values[1] = 0;  // full native search executes without the Python GIL
         values[2] = 0;  // host wave has one exclusive 24-thread compute pool
+        values[3] = 0;  // every canonical event has a runtime causal ID
         return capabilities;
     });
     module.def(

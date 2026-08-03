@@ -7,6 +7,7 @@ from evrptw.objective import (
     ObjectiveComparison,
     SolutionObjective,
     accept_annealing_move,
+    canonical_objective_component,
     compare_objectives,
     objective_key_from_exact_numeric,
 )
@@ -47,6 +48,14 @@ def test_normalized_key_makes_sub_nanounit_noise_equal_and_order_transitive() ->
     assert compare_objectives(first, noise) is ObjectiveComparison.EQUAL
     assert compare_objectives(first, later) is ObjectiveComparison.BETTER
     assert first.key < later.key
+
+
+def test_canonical_objective_component_preserves_python_half_boundary() -> None:
+    assert canonical_objective_component(542614.3787160304) == 542614.37871603
+    assert canonical_objective_component(542614.3787160305) == 542614.378716031
+
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        canonical_objective_component(-1.0)
 
 
 def test_numeric_exact_objective_uses_canonical_rounding_and_station_count() -> None:
