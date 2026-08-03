@@ -511,6 +511,16 @@ _SEMANTIC_STREAM_NAMES = (
     "cache",
     "deadline",
 )
+_SEMANTIC_STREAM_PHASE = {
+    "operator": 10,
+    "candidate_transaction": 20,
+    "exact_work": 30,
+    "exact_result": 40,
+    "cache": 50,
+    "candidate_state": 60,
+    "stage04": 70,
+    "deadline": 80,
+}
 
 
 def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, object]]:
@@ -519,35 +529,66 @@ def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, 
         _SEMANTIC_STREAM_NAMES
     ):
         raise ValueError("canonical semantic stream set is incomplete")
-    events: list[dict[str, object]] = []
-    for stream_rank, stream_name in enumerate(_SEMANTIC_STREAM_NAMES):
+    streams: dict[str, list[dict[str, object]]] = {}
+    for stream_name in _SEMANTIC_STREAM_NAMES:
         stream = raw_streams[stream_name]
         if not isinstance(stream, list) or not all(isinstance(row, dict) for row in stream):
             raise ValueError(f"canonical semantic stream {stream_name} is invalid")
-        for row in stream:
-            events.append(
-                {
-                    **row,
-                    "semantic_stream": stream_name,
-                    "semantic_stream_rank": stream_rank,
-                }
-            )
+        streams[stream_name] = [dict(row) for row in stream]
+    raw_events = payload.get("canonical_semantic_events")
+    if not isinstance(raw_events, list) or not all(
+        isinstance(row, dict) for row in raw_events
+    ):
+        raise ValueError("explicit canonical semantic event sequence is missing")
+    events = [dict(row) for row in raw_events]
+    if len(events) != sum(len(rows) for rows in streams.values()):
+        raise ValueError("canonical semantic event sequence has missing or duplicate rows")
+    sequences = [event.get("semantic_sequence") for event in events]
+    if sequences != list(range(len(events))):
+        raise ValueError("canonical semantic sequence IDs are not contiguous")
+    projected_streams: dict[str, list[dict[str, object]]] = {
+        name: [] for name in _SEMANTIC_STREAM_NAMES
+    }
+    for event in events:
+        raw_stream_name = event.get("semantic_stream")
+        if not isinstance(raw_stream_name, str) or raw_stream_name not in projected_streams:
+            raise ValueError("canonical semantic event names an unknown stream")
+        projected_streams[raw_stream_name].append(
+            {
+                key: value
+                for key, value in event.items()
+                if key not in {"semantic_stream", "semantic_sequence"}
+            }
+        )
+    if projected_streams != streams:
+        raise ValueError(
+            "canonical semantic event sequence does not preserve every stream journal"
+        )
     lane_rank = {"legacy": 0, "quality_shadow": 1, "constraint_lane": 2}
 
     def event_key(event: dict[str, object]) -> tuple[int, int, int, int]:
+        stream_name = str(event.get("semantic_stream"))
         iteration = event.get("iteration")
         ordinal = event.get("stream_ordinal")
-        stream_rank = event.get("semantic_stream_rank")
-        if not isinstance(stream_rank, int):
-            raise ValueError("canonical semantic stream rank is invalid")
+        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 0:
+            raise ValueError("canonical semantic stream ordinal is invalid")
+        final_cache_state = (
+            stream_name == "cache"
+            and event.get("transition") == "final_cache_state"
+        )
         return (
-            iteration if isinstance(iteration, int) else 2**62,
+            2**62
+            if final_cache_state
+            else iteration
+            if isinstance(iteration, int) and not isinstance(iteration, bool)
+            else -1,
             lane_rank.get(str(event.get("lane")), 3),
-            stream_rank,
-            ordinal if isinstance(ordinal, int) else 2**62,
+            _SEMANTIC_STREAM_PHASE[stream_name],
+            ordinal,
         )
 
-    events.sort(key=event_key)
+    if events != sorted(events, key=event_key):
+        raise ValueError("canonical semantic event sequence violates causal ordering")
     return events
 
 

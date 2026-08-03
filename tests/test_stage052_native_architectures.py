@@ -30,6 +30,7 @@ from evrptw.experiments.stage052_native_architectures import (
     SEEDS,
     WARM_START_SCHEMA_VERSION,
     ArchitectureAxisTask,
+    _canonical_semantic_event_sequence,
     _canonical_trace_event,
     _require_campaign_identity,
     _require_native_architecture_capabilities,
@@ -587,10 +588,20 @@ def test_canonical_semantic_streams_find_non_candidate_first_divergence() -> Non
     ]
 
     baseline = _canonical_semantic_events(
-        {"canonical_semantic_streams": baseline_streams}
+        {
+            "canonical_semantic_streams": baseline_streams,
+            "canonical_semantic_events": _canonical_semantic_event_sequence(
+                baseline_streams
+            ),
+        }
     )
     candidate = _canonical_semantic_events(
-        {"canonical_semantic_streams": candidate_streams}
+        {
+            "canonical_semantic_streams": candidate_streams,
+            "canonical_semantic_events": _canonical_semantic_event_sequence(
+                candidate_streams
+            ),
+        }
     )
     divergence = _describe_first_divergence(baseline, candidate)
 
@@ -603,6 +614,44 @@ def test_canonical_semantic_streams_find_non_candidate_first_divergence() -> Non
     assert divergence["differing_fields"] == {
         "weight": {"baseline": 2.0, "candidate": 3.0}
     }
+
+
+def test_canonical_semantic_events_require_explicit_contiguous_causal_sequence() -> None:
+    streams = {
+        name: []
+        for name in (
+            "candidate_state",
+            "operator",
+            "stage04",
+            "candidate_transaction",
+            "exact_work",
+            "exact_result",
+            "cache",
+            "deadline",
+        )
+    }
+    streams["operator"] = [
+        {"iteration": 0, "lane": "legacy", "stream_ordinal": 0}
+    ]
+    streams["exact_work"] = [
+        {"iteration": 0, "lane": "legacy", "stream_ordinal": 0}
+    ]
+    events = _canonical_semantic_event_sequence(streams)
+
+    with pytest.raises(ValueError, match="explicit canonical semantic event sequence"):
+        _canonical_semantic_events({"canonical_semantic_streams": streams})
+
+    reordered = [
+        {**events[1], "semantic_sequence": 0},
+        {**events[0], "semantic_sequence": 1},
+    ]
+    with pytest.raises(ValueError, match="causal ordering"):
+        _canonical_semantic_events(
+            {
+                "canonical_semantic_streams": streams,
+                "canonical_semantic_events": reordered,
+            }
+        )
 
 
 def test_v6_axis_replay_rejects_bad_candidate_id_on_wall_clock_axis(

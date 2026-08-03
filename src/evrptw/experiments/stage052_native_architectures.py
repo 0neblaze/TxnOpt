@@ -687,6 +687,63 @@ def _canonical_semantic_streams(result: ALNSResult) -> dict[str, list[dict[str, 
     }
 
 
+_SEMANTIC_STREAM_PHASE = {
+    "operator": 10,
+    "candidate_transaction": 20,
+    "exact_work": 30,
+    "exact_result": 40,
+    "cache": 50,
+    "candidate_state": 60,
+    "stage04": 70,
+    "deadline": 80,
+}
+
+
+def _canonical_semantic_event_sequence(
+    streams: dict[str, list[dict[str, object]]],
+) -> list[dict[str, object]]:
+    """Project independent journals into one explicit logical-causal sequence."""
+
+    expected_streams = set(_SEMANTIC_STREAM_PHASE)
+    if set(streams) != expected_streams:
+        raise ValueError("canonical semantic stream set is incomplete")
+    events: list[dict[str, object]] = []
+    for stream_name, rows in streams.items():
+        for row in rows:
+            events.append({**row, "semantic_stream": stream_name})
+    lane_rank = {"legacy": 0, "quality_shadow": 1, "constraint_lane": 2}
+
+    def causal_key(event: dict[str, object]) -> tuple[int, int, int, int]:
+        stream_name = str(event["semantic_stream"])
+        iteration = event.get("iteration")
+        ordinal = event.get("stream_ordinal")
+        is_final_cache_state = (
+            stream_name == "cache"
+            and event.get("transition") == "final_cache_state"
+        )
+        logical_iteration = (
+            2**62
+            if is_final_cache_state
+            else iteration
+            if isinstance(iteration, int) and not isinstance(iteration, bool)
+            else -1
+        )
+        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 0:
+            raise ValueError("canonical semantic stream ordinal is invalid")
+        return (
+            logical_iteration,
+            lane_rank.get(str(event.get("lane")), 3),
+            _SEMANTIC_STREAM_PHASE[stream_name],
+            ordinal,
+        )
+
+    events.sort(key=causal_key)
+    return [
+        {**event, "semantic_sequence": sequence}
+        for sequence, event in enumerate(events)
+    ]
+
+
 def _semantic_operator_statistics(result: ALNSResult) -> dict[str, dict[str, object]]:
     telemetry_fields = {
         "failure_reasons",
@@ -949,6 +1006,10 @@ def _result_payload(
     instrumentation_complete = result.native_execution_statistics.get(
         "instrumentation_complete"
     )
+    canonical_semantic_streams = _canonical_semantic_streams(result)
+    canonical_semantic_events = _canonical_semantic_event_sequence(
+        canonical_semantic_streams
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "run_label": task.run_labels[mode.value],
@@ -979,7 +1040,8 @@ def _result_payload(
         "route_result_hash": result.route_result_hash,
         "fallback_count": native_fallback,
         "semantic_trajectory": _semantic_candidate_trajectory(result),
-        "canonical_semantic_streams": _canonical_semantic_streams(result),
+        "canonical_semantic_streams": canonical_semantic_streams,
+        "canonical_semantic_events": canonical_semantic_events,
         "trajectory": _row_evidence(
             dict(event) for event in result.neighborhood_events
         ),
