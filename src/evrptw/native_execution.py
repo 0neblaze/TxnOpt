@@ -10519,6 +10519,9 @@ def _decode_native_three_lane_constraint_no_change_iteration(
     partial_routes = unpack_soa(removal[0], removal[1], "constraint partial")
     repair_counters = _require_vector(repair[2], "no-change repair counters")
     repair_failed = int(repair_counters[0]) != 0
+    constraint_exact_infeasible = False
+    repaired_routes: tuple[CustomerSequence, ...] = ()
+    exact_rows = np.empty(0, dtype=np.int64)
     if repair_failed:
         if (
             _require_vector(repair[0], "failed repair offsets").tolist() != [0]
@@ -10528,39 +10531,43 @@ def _decode_native_three_lane_constraint_no_change_iteration(
             raise RuntimeError("native constraint failed repair journal is invalid")
     else:
         repaired_routes = unpack_soa(repair[0], repair[1], "constraint repaired")
-        if repaired_routes != prior_states[2]:
-            raise RuntimeError("native constraint no-change repair changed its lane")
         transaction = require_tuple(probe[2], 13, "constraint transaction")
         statuses = _require_vector(transaction[1], "no-change statuses")
         exact_rows = _require_vector(transaction[5], "no-change exact rows")
-        if statuses.tolist() != [5] or len(exact_rows) != 0:
+        constraint_exact_infeasible = statuses.tolist() == [4]
+        if (
+            statuses.tolist() not in ([4], [5])
+            or (statuses.tolist() == [5] and len(exact_rows) != 0)
+            or (statuses.tolist() == [5] and repaired_routes != prior_states[2])
+        ):
             raise RuntimeError("native constraint no-change cache journal is invalid")
-        objective_integers = cast(
-            npt.NDArray[np.int64],
-            _require_array(
-                transaction[2],
-                dtype=np.dtype(np.int64),
-                shape=(1, 2),
-                name="no-change objective integers",
-            ),
-        )
-        objective_floats = cast(
-            npt.NDArray[np.float64],
-            _require_array(
-                transaction[3],
-                dtype=np.dtype(np.float64),
-                shape=(1, 2),
-                name="no-change objective floats",
-            ),
-        )
-        reported = SolutionObjective(
-            int(objective_integers[0, 0]),
-            float(objective_floats[0, 0]),
-            float(objective_floats[0, 1]),
-            int(objective_integers[0, 1]),
-        )
-        if reported.key != replay(repaired_routes).key:
-            raise RuntimeError("native constraint no-change objective mismatch")
+        if not constraint_exact_infeasible:
+            objective_integers = cast(
+                npt.NDArray[np.int64],
+                _require_array(
+                    transaction[2],
+                    dtype=np.dtype(np.int64),
+                    shape=(1, 2),
+                    name="no-change objective integers",
+                ),
+            )
+            objective_floats = cast(
+                npt.NDArray[np.float64],
+                _require_array(
+                    transaction[3],
+                    dtype=np.dtype(np.float64),
+                    shape=(1, 2),
+                    name="no-change objective floats",
+                ),
+            )
+            reported = SolutionObjective(
+                int(objective_integers[0, 0]),
+                float(objective_floats[0, 0]),
+                float(objective_floats[0, 1]),
+                int(objective_integers[0, 1]),
+            )
+            if reported.key != replay(repaired_routes).key:
+                raise RuntimeError("native constraint no-change objective mismatch")
     scores, removal_routes = _constraint_score_vectors(
         removal, removed_indices, "no-change"
     )
@@ -10568,6 +10575,13 @@ def _decode_native_three_lane_constraint_no_change_iteration(
         raise RuntimeError("native constraint no-change route is missing")
     affected_routes = tuple(
         sorted({int(route) for route in removal_routes[: len(removed)]})
+    )
+    repaired_affected = tuple(
+        index
+        for index, (before, after) in enumerate(
+            zip(prior_states[2], repaired_routes, strict=False)
+        )
+        if before != after
     )
 
     if payload[1] is not None or payload[2] is not None or payload[4] is not None:
@@ -10578,7 +10592,19 @@ def _decode_native_three_lane_constraint_no_change_iteration(
         unpack_state(payload[8], "final constraint"),
         unpack_state(payload[9], "final best"),
     )
-    if final_states != prior_states:
+    boundary_preview = require_tuple(payload[5], 6, "Stage 4 boundary preview")
+    control_preview = _require_vector(
+        boundary_preview[4], "no-change Stage 4 control preview"
+    )
+    if len(control_preview) != 7:
+        raise RuntimeError("native constraint no-change Stage 4 control is invalid")
+    expected_final_states = (
+        prior_states[3] if bool(control_preview[2]) else prior_states[0],
+        prior_states[1],
+        prior_states[2],
+        prior_states[3],
+    )
+    if final_states != expected_final_states:
         raise RuntimeError("native constraint no-change modified solver state")
 
     followup_events = (
@@ -10607,10 +10633,21 @@ def _decode_native_three_lane_constraint_no_change_iteration(
             (
                 "constraint_removal_no_existing_route_insertion"
                 if repair_failed
+                else "constraint_repair_infeasible"
+                if constraint_exact_infeasible
                 else "constraint_removal_no_change"
             ),
+            affected_route_indices=(
+                repaired_affected if constraint_exact_infeasible else ()
+            ),
             removed_customers=removed,
+            candidate_route_sequences=(
+                repaired_routes if constraint_exact_infeasible else ()
+            ),
             prefilter_passed=True,
+            exact_route_evaluations=(
+                len(exact_rows) if constraint_exact_infeasible else 0
+            ),
             track="constraint_lane",
             constraint_category=constraint_operator,
             removal_tier=removal_tier,
@@ -10724,8 +10761,8 @@ def _decode_native_three_lane_constraint_no_change_iteration(
         != [
             termination_reason,
             int(previous_stream.termination[1]),
-            int(previous_stream.termination[2]),
-            int(previous_stream.termination[3]),
+            int(previous_stream.termination[2]) + len(exact_rows),
+            int(previous_stream.termination[3]) + len(exact_rows),
             int(previous_stream.termination[4]),
             completed_iterations,
         ]

@@ -4942,7 +4942,7 @@ def test_full_native_v2_matches_real_c101c5_warm_start(
 
 
 @pytest.mark.external_data
-@pytest.mark.parametrize("max_iterations", [4, 5, 6, 7, 8, 9, 10, 11, 12, 22])
+@pytest.mark.parametrize("max_iterations", [4, 5, 6, 7, 8, 9, 10, 11, 12, 22, 30])
 def test_full_native_v2_matches_real_c101_21_followup_iterations(
     max_iterations: int,
 ) -> None:
