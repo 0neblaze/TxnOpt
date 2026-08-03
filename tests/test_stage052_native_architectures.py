@@ -31,6 +31,7 @@ from evrptw.experiments.stage052_native_architectures import (
     WARM_START_SCHEMA_VERSION,
     ArchitectureAxisTask,
     _canonical_trace_event,
+    _require_campaign_identity,
     _require_native_architecture_capabilities,
     _run_group,
     _write_signed_json,
@@ -56,6 +57,88 @@ def test_native_campaign_gate_names_every_incomplete_architecture_capability() -
         ),
     ):
         _require_native_architecture_capabilities()
+
+
+def test_campaign_identity_revalidates_lease_revision_and_clean_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    lease_calls: list[tuple[Path, str, frozenset[str]]] = []
+
+    def fake_require_owned(
+        root: Path,
+        *,
+        token: str,
+        allowed_phases: frozenset[str],
+    ) -> None:
+        lease_calls.append((root, token, allowed_phases))
+
+    class Receipt:
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+
+    def fake_run(command: list[str], **_: object) -> Receipt:
+        return Receipt("a" * 40 + "\n" if command[1] == "rev-parse" else "")
+
+    monkeypatch.setattr(
+        "evrptw.experiments.stage052_native_architectures.require_owned",
+        fake_require_owned,
+    )
+    monkeypatch.setattr(
+        "evrptw.experiments.stage052_native_architectures.subprocess.run",
+        fake_run,
+    )
+
+    _require_campaign_identity(
+        tmp_path,
+        continuity_lease_token="lease-token",
+        expected_revision="a" * 40,
+    )
+
+    assert lease_calls == [
+        (
+            tmp_path,
+            "lease-token",
+            frozenset({"paired-campaign", "pilot-campaign"}),
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("revision", "status", "message"),
+    [
+        ("b" * 40, "", "Git revision changed"),
+        ("a" * 40, " M source.py\n", "worktree changed"),
+    ],
+)
+def test_campaign_identity_rejects_checkout_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    revision: str,
+    status: str,
+    message: str,
+) -> None:
+    class Receipt:
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+
+    monkeypatch.setattr(
+        "evrptw.experiments.stage052_native_architectures.require_owned",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "evrptw.experiments.stage052_native_architectures.subprocess.run",
+        lambda command, **_kwargs: Receipt(
+            revision + "\n" if command[1] == "rev-parse" else status
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        _require_campaign_identity(
+            tmp_path,
+            continuity_lease_token="lease-token",
+            expected_revision="a" * 40,
+        )
 
 
 def _plan(scope: str, tmp_path: Path):  # type: ignore[no-untyped-def]

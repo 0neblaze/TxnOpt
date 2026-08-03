@@ -21,6 +21,7 @@
 #include <optional>
 #include <queue>
 #include <sstream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -48,6 +49,7 @@
 #include <descrobject.h>
 
 #include "native_concurrency.hpp"
+#include "native_candidate_plan_runtime.hpp"
 #include "native_kernel_client.hpp"
 #include "native_solver_kernels.hpp"
 
@@ -1664,185 +1666,48 @@ py::tuple rank_candidate_plans_v1(
         lexical_rank, "lexical_rank", 1);
     auto attempted_array = checked_array<std::int64_t>(
         attempted_flags, "attempted_flags", 1);
-    if (plan_offsets_array.size() < 1 || route_offsets_array.size() < 1
-        || current_offsets_array.size() < 1 || lexical_array.size() == 0
-        || top_k <= 0) {
-        throw std::invalid_argument("candidate-plan ranking shape/config is invalid");
-    }
-    const auto plan_count = static_cast<std::size_t>(
-        plan_offsets_array.size() - 1);
-    const auto route_count = static_cast<std::size_t>(
-        route_offsets_array.size() - 1);
-    const auto current_count = static_cast<std::size_t>(
-        current_offsets_array.size() - 1);
-    if (lower_bounds_array.size() != static_cast<py::ssize_t>(route_count)
-        || attempted_array.size() != static_cast<py::ssize_t>(plan_count)) {
-        throw std::invalid_argument(
-            "candidate-plan route metrics/flags do not align");
-    }
-    const auto* plans = checked_data<std::int64_t>(plan_offsets_array);
-    const auto* routes = checked_data<std::int64_t>(route_offsets_array);
-    const auto* indices = checked_data<std::int64_t>(route_indices_array);
-    const auto* lower_bounds = checked_data<double>(lower_bounds_array);
-    const auto* current_offsets = checked_data<std::int64_t>(current_offsets_array);
-    const auto* current_indices = checked_data<std::int64_t>(current_indices_array);
-    const auto* lexical = checked_data<std::int64_t>(lexical_array);
-    const auto* attempted = checked_data<std::int64_t>(attempted_array);
-    const auto validate_offsets = [](
-        const std::int64_t* values,
-        std::size_t count,
-        std::int64_t terminal,
-        const char* name) {
-        if (values[0] != 0 || values[count] != terminal) {
-            throw std::invalid_argument(std::string(name) + " boundary is invalid");
-        }
-        for (std::size_t index = 0; index < count; ++index) {
-            if (values[index] < 0 || values[index] > values[index + 1]) {
-                throw std::invalid_argument(std::string(name) + " must be monotonic");
-            }
-        }
-    };
-    validate_offsets(
-        plans, plan_count, static_cast<std::int64_t>(route_count), "plan_offsets");
-    validate_offsets(
-        routes, route_count, static_cast<std::int64_t>(route_indices_array.size()),
-        "route_offsets");
-    validate_offsets(
-        current_offsets, current_count,
-        static_cast<std::int64_t>(current_indices_array.size()),
-        "current_route_offsets");
-    std::unordered_set<std::int64_t> lexical_values;
-    for (py::ssize_t node = 0; node < lexical_array.size(); ++node) {
-        if (lexical[node] < 0 || lexical[node] >= lexical_array.size()
-            || !lexical_values.insert(lexical[node]).second) {
-            throw std::invalid_argument("lexical_rank must be a permutation");
-        }
-    }
-    for (std::size_t route = 0; route < route_count; ++route) {
-        if (!std::isfinite(lower_bounds[route]) || lower_bounds[route] < 0.0) {
-            throw std::invalid_argument(
-                "route_distance_lower_bounds must be finite and non-negative");
-        }
-        for (auto cursor = routes[route]; cursor < routes[route + 1]; ++cursor) {
-            if (indices[cursor] < 0 || indices[cursor] >= lexical_array.size()) {
-                throw std::invalid_argument("candidate plan contains an unknown node");
-            }
-        }
-    }
-    for (std::size_t plan = 0; plan < plan_count; ++plan) {
-        if (attempted[plan] != 0 && attempted[plan] != 1) {
-            throw std::invalid_argument("attempted_flags must contain only zero or one");
-        }
-    }
-
-    const auto route_equal = [](
-        const std::int64_t* left,
-        std::int64_t left_begin,
-        std::int64_t left_end,
-        const std::int64_t* right,
-        std::int64_t right_begin,
-        std::int64_t right_end) {
-        return left_end - left_begin == right_end - right_begin
-            && std::equal(left + left_begin, left + left_end, right + right_begin);
-    };
-    std::vector<std::int64_t> vehicle_counts(plan_count, 0);
-    std::vector<std::int64_t> changed_counts(plan_count, 0);
-    std::vector<double> optimistic_distances(plan_count, 0.0);
-    for (std::size_t plan = 0; plan < plan_count; ++plan) {
-        vehicle_counts[plan] = plans[plan + 1] - plans[plan];
-        PythonFloatSum distance_sum;
-        for (auto route = plans[plan]; route < plans[plan + 1]; ++route) {
-            distance_sum.add(lower_bounds[route]);
-            bool unchanged = false;
-            for (std::size_t current = 0; current < current_count; ++current) {
-                if (route_equal(
-                        indices, routes[route], routes[route + 1], current_indices,
-                        current_offsets[current], current_offsets[current + 1])) {
-                    unchanged = true;
-                    break;
-                }
-            }
-            changed_counts[plan] += unchanged ? 0 : 1;
-        }
-        optimistic_distances[plan] = distance_sum.value();
-    }
-    const auto route_less = [&](std::int64_t left, std::int64_t right) {
-        auto left_cursor = routes[left];
-        auto right_cursor = routes[right];
-        while (left_cursor < routes[left + 1] && right_cursor < routes[right + 1]) {
-            const auto left_rank = lexical[indices[left_cursor]];
-            const auto right_rank = lexical[indices[right_cursor]];
-            if (left_rank != right_rank) {
-                return left_rank < right_rank;
-            }
-            ++left_cursor;
-            ++right_cursor;
-        }
-        return routes[left + 1] - routes[left]
-            < routes[right + 1] - routes[right];
-    };
-    const auto plan_routes_less = [&](std::size_t left, std::size_t right) {
-        auto left_route = plans[left];
-        auto right_route = plans[right];
-        while (left_route < plans[left + 1] && right_route < plans[right + 1]) {
-            if (route_less(left_route, right_route)) {
-                return true;
-            }
-            if (route_less(right_route, left_route)) {
-                return false;
-            }
-            ++left_route;
-            ++right_route;
-        }
-        return vehicle_counts[left] < vehicle_counts[right];
-    };
-    std::vector<std::int64_t> ranked(plan_count);
-    std::iota(ranked.begin(), ranked.end(), 0);
-    std::stable_sort(
-        ranked.begin(), ranked.end(), [&](std::int64_t left_id, std::int64_t right_id) {
-            const auto left = static_cast<std::size_t>(left_id);
-            const auto right = static_cast<std::size_t>(right_id);
-            if (vehicle_counts[left] != vehicle_counts[right]) {
-                return vehicle_counts[left] < vehicle_counts[right];
-            }
-            if (optimistic_distances[left] != optimistic_distances[right]) {
-                return optimistic_distances[left] < optimistic_distances[right];
-            }
-            if (changed_counts[left] != changed_counts[right]) {
-                return changed_counts[left] < changed_counts[right];
-            }
-            if (plan_routes_less(left, right)) {
-                return true;
-            }
-            if (plan_routes_less(right, left)) {
-                return false;
-            }
-            return left < right;
-        });
-    std::vector<std::int64_t> selected;
-    selected.reserve(std::min<std::size_t>(plan_count, static_cast<std::size_t>(top_k)));
-    for (const auto plan_id : ranked) {
-        if (attempted[plan_id] == 0) {
-            selected.push_back(plan_id);
-            if (selected.size() == static_cast<std::size_t>(top_k)) {
-                break;
-            }
-        }
-    }
-    py::array_t<std::int64_t> ranked_array(ranked.size());
-    py::array_t<std::int64_t> selected_array(selected.size());
+    const auto result = evrptw::native_candidate_plan::rank({
+        std::span<const std::int64_t>(
+            checked_data<std::int64_t>(plan_offsets_array),
+            static_cast<std::size_t>(plan_offsets_array.size())),
+        std::span<const std::int64_t>(
+            checked_data<std::int64_t>(route_offsets_array),
+            static_cast<std::size_t>(route_offsets_array.size())),
+        std::span<const std::int64_t>(
+            checked_data<std::int64_t>(route_indices_array),
+            static_cast<std::size_t>(route_indices_array.size())),
+        std::span<const double>(
+            checked_data<double>(lower_bounds_array),
+            static_cast<std::size_t>(lower_bounds_array.size())),
+        std::span<const std::int64_t>(
+            checked_data<std::int64_t>(current_offsets_array),
+            static_cast<std::size_t>(current_offsets_array.size())),
+        std::span<const std::int64_t>(
+            checked_data<std::int64_t>(current_indices_array),
+            static_cast<std::size_t>(current_indices_array.size())),
+        std::span<const std::int64_t>(
+            checked_data<std::int64_t>(lexical_array),
+            static_cast<std::size_t>(lexical_array.size())),
+        std::span<const std::int64_t>(
+            checked_data<std::int64_t>(attempted_array),
+            static_cast<std::size_t>(attempted_array.size())),
+        top_k,
+    });
+    const auto plan_count = result.ranked.size();
+    py::array_t<std::int64_t> ranked_array(result.ranked.size());
+    py::array_t<std::int64_t> selected_array(result.selected.size());
     py::array_t<std::int64_t> integer_metrics(
         {static_cast<py::ssize_t>(plan_count), py::ssize_t(2)});
     py::array_t<double> float_metrics(plan_count);
-    std::copy(ranked.begin(), ranked.end(), checked_data(ranked_array));
-    std::copy(selected.begin(), selected.end(), checked_data(selected_array));
-    auto* integer_values = checked_data(integer_metrics);
-    for (std::size_t plan = 0; plan < plan_count; ++plan) {
-        integer_values[plan * 2] = vehicle_counts[plan];
-        integer_values[plan * 2 + 1] = changed_counts[plan];
-    }
     std::copy(
-        optimistic_distances.begin(), optimistic_distances.end(),
+        result.ranked.begin(), result.ranked.end(), checked_data(ranked_array));
+    std::copy(
+        result.selected.begin(), result.selected.end(), checked_data(selected_array));
+    std::copy(
+        result.integer_metrics.begin(), result.integer_metrics.end(),
+        checked_data(integer_metrics));
+    std::copy(
+        result.optimistic_distances.begin(), result.optimistic_distances.end(),
         checked_data(float_metrics));
     return py::make_tuple(
         std::move(ranked_array), std::move(selected_array),

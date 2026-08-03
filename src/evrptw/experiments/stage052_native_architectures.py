@@ -1123,6 +1123,39 @@ def _configure_compute_envelope() -> dict[str, object]:
     }
 
 
+def _require_campaign_identity(
+    root: Path,
+    *,
+    continuity_lease_token: str,
+    expected_revision: str,
+) -> None:
+    """Revalidate the single writer and frozen checkout around every mode wave."""
+
+    require_owned(
+        root,
+        token=continuity_lease_token,
+        allowed_phases=frozenset({"paired-campaign", "pilot-campaign"}),
+    )
+    observed_revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if observed_revision != expected_revision:
+        raise RuntimeError("native architecture campaign Git revision changed")
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    if status:
+        raise RuntimeError("native architecture campaign worktree changed")
+
+
 def run_experiment(
     scope: str,
     *,
@@ -1200,6 +1233,11 @@ def run_experiment(
             offset = batch_index % len(MODES)
             mode_order = MODES[offset:] + MODES[:offset]
             for mode in mode_order:
+                _require_campaign_identity(
+                    root,
+                    continuity_lease_token=continuity_lease_token,
+                    expected_revision=revision,
+                )
                 scheduler: NativeHostScheduler | None = None
                 scheduler_process_id: int | None = None
                 wave_scheduler_startup = 0.0
@@ -1247,6 +1285,11 @@ def run_experiment(
                             ]
                         for future in as_completed(futures):
                             written.append(future.result())
+                    _require_campaign_identity(
+                        root,
+                        continuity_lease_token=continuity_lease_token,
+                        expected_revision=revision,
+                    )
                     wave_elapsed = time.perf_counter() - wave_started
                 finally:
                     if scheduler is not None:
