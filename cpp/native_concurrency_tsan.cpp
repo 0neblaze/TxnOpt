@@ -37,7 +37,9 @@ int main() {
         });
     }
     for (std::size_t request = 0; request < request_count; ++request) {
-        requests.submit(static_cast<int>(request));
+        while (!requests.submit(static_cast<int>(request))) {
+            std::this_thread::yield();
+        }
     }
     requests.stop();
     for (auto& consumer : consumers) {
