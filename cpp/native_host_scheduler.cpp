@@ -1,8 +1,10 @@
 #ifdef __linux__
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -10,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <thread>
 #include <vector>
@@ -25,11 +28,15 @@ namespace kernels = evrptw::native_kernels;
 namespace {
 
 std::atomic<std::uint64_t> segment_counter{0};
+std::string scheduler_run_nonce;
 
 bool read_exact(int descriptor, void* output, std::size_t size) {
     auto* cursor = static_cast<std::uint8_t*>(output);
     while (size > 0) {
         const auto received = ::recv(descriptor, cursor, size, 0);
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
         if (received <= 0) {
             return false;
         }
@@ -43,6 +50,9 @@ void send_exact(int descriptor, const void* input, std::size_t size) {
     const auto* cursor = static_cast<const std::uint8_t*>(input);
     while (size > 0) {
         const auto sent = ::send(descriptor, cursor, size, MSG_NOSIGNAL);
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
         if (sent <= 0) {
             throw std::runtime_error("native scheduler could not send a control frame");
         }
@@ -70,14 +80,18 @@ std::vector<std::uint8_t> run_exact(
     const auto& vehicle_shape = input.descriptor(5);
     const auto& offset_shape = input.descriptor(6);
     const auto& index_shape = input.descriptor(7);
+    const auto node_count = static_cast<std::size_t>(kind_shape.count);
     if (kind_shape.dimensions != 1 || distance_shape.dimensions != 2
+        || node_count == 0
+        || input.descriptor(1).count != kind_shape.count
+        || input.descriptor(2).count != kind_shape.count
+        || input.descriptor(3).count != kind_shape.count
         || distance_shape.shape[0] != kind_shape.count
         || distance_shape.shape[1] != kind_shape.count
         || vehicle_shape.count != 5 || offset_shape.count < 1
         || input.descriptor(8).count != 1 || input.descriptor(9).count != 1) {
         throw std::runtime_error("native scheduler exact dimensions are invalid");
     }
-    const auto node_count = static_cast<std::size_t>(kind_shape.count);
     const auto route_count = static_cast<std::size_t>(offset_shape.count - 1);
     const auto* kinds = input.data<std::int64_t>(0, protocol::NumericType::int64);
     const auto* offsets = input.data<std::int64_t>(6, protocol::NumericType::int64);
@@ -103,6 +117,32 @@ std::vector<std::uint8_t> run_exact(
     if (depot < 0) {
         throw std::runtime_error("native scheduler exact depot is missing");
     }
+    for (std::size_t route = 0; route < route_count; ++route) {
+        if (offsets[route] < 0 || offsets[route] > offsets[route + 1]) {
+            throw std::runtime_error(
+                "native scheduler exact offsets are not monotone");
+        }
+        std::vector<bool> seen(node_count, false);
+        for (auto position = offsets[route]; position < offsets[route + 1];
+             ++position) {
+            const auto node = indices[position];
+            if (node < 0 || static_cast<std::size_t>(node) >= node_count
+                || kinds[node] != kernels::customer_kind
+                || seen[static_cast<std::size_t>(node)]) {
+                throw std::runtime_error(
+                    "native scheduler exact route indices are invalid");
+            }
+            seen[static_cast<std::size_t>(node)] = true;
+        }
+    }
+    const auto deadline =
+        input.data<double>(8, protocol::NumericType::float64)[0];
+    const auto batch_size =
+        input.data<std::int64_t>(9, protocol::NumericType::int64)[0];
+    if (!std::isfinite(deadline) || deadline <= 0.0 || batch_size <= 0) {
+        throw std::runtime_error(
+            "native scheduler exact control values are invalid");
+    }
     const auto output = kernels::run_exact_charging_batch(
         kinds,
         input.data<double>(1, protocol::NumericType::float64),
@@ -111,8 +151,7 @@ std::vector<std::uint8_t> run_exact(
         input.data<double>(4, protocol::NumericType::float64),
         input.data<double>(5, protocol::NumericType::float64),
         offsets, indices, node_count, route_count, depot, stations,
-        input.data<double>(8, protocol::NumericType::float64)[0],
-        input.data<std::int64_t>(9, protocol::NumericType::int64)[0]);
+        deadline, batch_size);
     protocol::PayloadBuilder builder(
         protocol::KernelOperation::exact_charging, input.header().request_id);
     builder.add(protocol::NumericType::int64, output.path_offsets.data(),
@@ -144,7 +183,16 @@ std::vector<std::uint8_t> run_screen(
         throw std::runtime_error("native scheduler screening request shape is invalid");
     }
     const auto node_count = static_cast<std::size_t>(input.descriptor(0).count);
-    if (node_count == 0 || input.descriptor(5).shape[0] != node_count
+    const auto node_square = protocol::checked_product(
+        node_count, node_count,
+        "native scheduler screening node count overflows");
+    if (node_count == 0 || input.descriptor(1).count != node_count
+        || input.descriptor(2).count != node_count
+        || input.descriptor(3).count != node_count
+        || input.descriptor(4).count != node_count
+        || input.descriptor(5).count != node_square
+        || input.descriptor(6).count != node_square
+        || input.descriptor(5).shape[0] != node_count
         || input.descriptor(5).shape[1] != node_count
         || input.descriptor(6).shape[0] != node_count
         || input.descriptor(6).shape[1] != node_count
@@ -171,6 +219,19 @@ std::vector<std::uint8_t> run_screen(
     if (depot < 0) {
         throw std::runtime_error("native scheduler screening depot is missing");
     }
+    const auto* route = input.data<std::int64_t>(
+        8, protocol::NumericType::int64);
+    std::vector<bool> seen(node_count, false);
+    for (std::size_t index = 0; index < input.descriptor(8).count; ++index) {
+        const auto node = route[index];
+        if (node < 0 || static_cast<std::size_t>(node) >= node_count
+            || kinds[node] != kernels::customer_kind
+            || seen[static_cast<std::size_t>(node)]) {
+            throw std::runtime_error(
+                "native scheduler screening route indices are invalid");
+        }
+        seen[static_cast<std::size_t>(node)] = true;
+    }
     const auto output = kernels::run_screen_route(
         kinds,
         input.data<double>(1, protocol::NumericType::float64),
@@ -180,7 +241,7 @@ std::vector<std::uint8_t> run_screen(
         input.data<double>(5, protocol::NumericType::float64),
         input.data<std::uint8_t>(6, protocol::NumericType::uint8),
         input.data<double>(7, protocol::NumericType::float64),
-        input.data<std::int64_t>(8, protocol::NumericType::int64),
+        route,
         static_cast<std::size_t>(input.descriptor(8).count), node_count, depot,
         recharge_nodes,
         input.data<double>(9, protocol::NumericType::float64),
@@ -215,7 +276,8 @@ std::vector<std::uint8_t> execute(
 
 void patch_pool_telemetry(
     std::vector<std::uint8_t>& output,
-    const NativeWorkPool& pool) {
+    const NativeWorkPool& pool,
+    std::size_t request_peak_active_tasks) {
     const protocol::PayloadView view(output.data(), output.size());
     if (view.header().array_count == 0) {
         throw std::logic_error("native scheduler output telemetry is missing");
@@ -227,7 +289,7 @@ void patch_pool_telemetry(
     }
     auto* values = reinterpret_cast<double*>(
         output.data() + descriptor.offset);
-    values[2] = static_cast<double>(pool.peak_active_task_count());
+    values[2] = static_cast<double>(request_peak_active_tasks);
     values[3] = static_cast<double>(pool.thread_count());
 }
 
@@ -261,6 +323,16 @@ void handle_connection(
         validate_control(request);
         request_id = request.request_id;
         if (request.message == protocol::ControlMessage::shutdown) {
+            if (request.request_id != 0 || request.segment_size != 0
+                || !protocol::bounded_string(
+                        request.segment_name.data(), request.segment_name.size()).empty()
+                || !protocol::bounded_string(
+                        request.sha256.data(), request.sha256.size()).empty()
+                || !protocol::bounded_string(
+                        request.error.data(), request.error.size()).empty()) {
+                throw std::runtime_error(
+                    "native scheduler shutdown frame is invalid");
+            }
             stopping.store(true, std::memory_order_release);
             ::shutdown(listening_descriptor, SHUT_RDWR);
             protocol::ControlFrame released;
@@ -273,7 +345,9 @@ void handle_connection(
         const auto test_request =
             request.message == protocol::ControlMessage::test_request;
         if ((request.message != protocol::ControlMessage::request && !test_request)
-            || request.segment_size < sizeof(protocol::PayloadHeader)) {
+            || request.request_id == 0
+            || request.segment_size < sizeof(protocol::PayloadHeader)
+            || request.segment_size > protocol::maximum_payload_bytes) {
             throw std::runtime_error("native scheduler request frame is invalid");
         }
         const auto injected_fault = protocol::bounded_string(
@@ -288,6 +362,11 @@ void handle_connection(
         }
         const auto input_name = protocol::bounded_string(
             request.segment_name.data(), request.segment_name.size());
+        if (!input_name.starts_with("/evrptw-s52-client-")
+            || input_name.find('/', 1) != std::string::npos) {
+            throw std::runtime_error(
+                "native scheduler input shared-memory identity is invalid");
+        }
         auto input = protocol::SharedMapping::open(
             input_name, static_cast<std::size_t>(request.segment_size));
         const std::string_view input_bytes(
@@ -305,12 +384,18 @@ void handle_connection(
                 "injected native scheduler worker exception");
         }
         std::vector<std::uint8_t> output_bytes;
+        std::size_t request_peak_active_tasks = 0;
         pool.parallel_for(1, [&](std::size_t) {
+            request_peak_active_tasks = pool.active_task_count();
             output_bytes = execute(input_view, queue_wait_seconds, queue_depth);
+            request_peak_active_tasks = std::max(
+                request_peak_active_tasks, pool.active_task_count());
         });
-        patch_pool_telemetry(output_bytes, pool);
+        patch_pool_telemetry(
+            output_bytes, pool, request_peak_active_tasks);
         const auto output_name = "/evrptw-s52-kernel-" + std::to_string(::getpid())
-            + "-" + std::to_string(segment_counter.fetch_add(1));
+            + "-" + scheduler_run_nonce + "-"
+            + std::to_string(segment_counter.fetch_add(1));
         auto output = protocol::SharedMapping::create(output_name, output_bytes.size());
         std::memcpy(output.address(), output_bytes.data(), output_bytes.size());
         const auto output_sha = protocol::native_sha256_hex(std::string_view(
@@ -323,6 +408,9 @@ void handle_connection(
             response.segment_name.size());
         protocol::copy_bounded(output_sha, response.sha256.data(), response.sha256.size());
         send_exact(descriptor, &response, sizeof(response));
+        if (injected_fault == "pause_after_response_before_ack") {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+        }
         protocol::ControlFrame acknowledgement;
         if (!read_exact(descriptor, &acknowledgement, sizeof(acknowledgement))) {
             throw std::runtime_error("native scheduler acknowledgement is missing");
@@ -362,6 +450,7 @@ int make_listener(const std::string& socket_path) {
     std::memcpy(address.sun_path, socket_path.c_str(), socket_path.size() + 1);
     if (::bind(descriptor, reinterpret_cast<const sockaddr*>(&address), sizeof(address))
             != 0
+        || ::chmod(socket_path.c_str(), 0600) != 0
         || ::listen(descriptor, 64) != 0) {
         ::close(descriptor);
         throw std::runtime_error("native scheduler could not bind/listen");
@@ -372,21 +461,27 @@ int make_listener(const std::string& socket_path) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 3 && argc != 4) {
+    if (argc != 4 && argc != 5) {
         std::cerr << "usage: evrptw_native_scheduler SOCKET WORKER_THREADS "
-                     "[--enable-fault-injection]\n";
+                     "RUN_NONCE [--enable-fault-injection]\n";
         return 2;
     }
     const std::string socket_path(argv[1]);
-    const auto worker_threads = std::stoll(argv[2]);
-    const bool allow_fault_injection = argc == 4
-        && std::string_view(argv[3]) == "--enable-fault-injection";
-    if (argc == 4 && !allow_fault_injection) {
-        std::cerr << "native scheduler failure: invalid option\n";
-        return 2;
-    }
     int listener = -1;
     try {
+        const auto worker_threads = std::stoll(argv[2]);
+        scheduler_run_nonce = argv[3];
+        const bool valid_nonce = scheduler_run_nonce.size() == 16
+            && scheduler_run_nonce.find_first_not_of("0123456789abcdef")
+                == std::string::npos;
+        if (!valid_nonce) {
+            throw std::invalid_argument("native scheduler run nonce is invalid");
+        }
+        const bool allow_fault_injection = argc == 5
+            && std::string_view(argv[4]) == "--enable-fault-injection";
+        if (argc == 5 && !allow_fault_injection) {
+            throw std::invalid_argument("native scheduler option is invalid");
+        }
         if (worker_threads != 24) {
             throw std::invalid_argument(
                 "native scheduler requires exactly 24 compute threads");
@@ -420,7 +515,21 @@ int main(int argc, char** argv) {
                 }
                 throw std::runtime_error("native scheduler accept failed");
             }
-            queue.submit(connection);
+            timeval timeout{};
+            timeout.tv_sec = 5;
+            if (::setsockopt(
+                    connection, SOL_SOCKET, SO_RCVTIMEO,
+                    &timeout, sizeof(timeout)) != 0
+                || ::setsockopt(
+                    connection, SOL_SOCKET, SO_SNDTIMEO,
+                    &timeout, sizeof(timeout)) != 0) {
+                ::close(connection);
+                continue;
+            }
+            if (!queue.submit(connection)) {
+                send_failure(connection, 0, "native scheduler request queue is full");
+                ::close(connection);
+            }
         }
         queue.stop();
         for (auto& thread : request_threads) {

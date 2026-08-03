@@ -23,8 +23,22 @@ public:
             throw std::invalid_argument("native work-pool thread count must be positive");
         }
         threads_.reserve(static_cast<std::size_t>(thread_count));
-        for (std::int64_t index = 0; index < thread_count; ++index) {
-            threads_.emplace_back([this]() { worker_loop(); });
+        try {
+            for (std::int64_t index = 0; index < thread_count; ++index) {
+                threads_.emplace_back([this]() { worker_loop(); });
+            }
+        } catch (...) {
+            {
+                std::lock_guard lock(mutex_);
+                stopping_ = true;
+            }
+            ready_.notify_all();
+            for (auto& thread : threads_) {
+                if (thread.joinable()) {
+                    thread.join();
+                }
+            }
+            throw;
         }
     }
 
@@ -148,15 +162,20 @@ struct NativeQueuedRequest final {
 
 class NativeRequestQueue final {
 public:
+    static constexpr std::size_t maximum_pending_requests = 64;
+
     NativeRequestQueue() = default;
     NativeRequestQueue(const NativeRequestQueue&) = delete;
     NativeRequestQueue& operator=(const NativeRequestQueue&) = delete;
 
-    void submit(int descriptor) {
+    bool submit(int descriptor) {
         {
             std::lock_guard lock(mutex_);
             if (stopping_) {
                 throw std::runtime_error("native request queue is stopping");
+            }
+            if (descriptors_.size() >= maximum_pending_requests) {
+                return false;
             }
             descriptors_.push_back(NativeQueuedRequest{
                 descriptor,
@@ -165,6 +184,7 @@ public:
             });
         }
         ready_.notify_one();
+        return true;
     }
 
     std::optional<NativeQueuedRequest> take() {

@@ -5,6 +5,7 @@ import json
 import os
 import random
 import socket
+import stat
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -6718,6 +6719,7 @@ def test_host_scheduler_v2_owns_one_shared_24_thread_pool(tmp_path: Path) -> Non
         # shared 24-thread compute pool. Per-request 24-thread pools would make
         # this count grow with connected shards.
         assert scheduler.observed_thread_count() == 31
+        assert stat.S_IMODE(endpoint.stat().st_mode) == 0o600
 
 
 @pytest.mark.parametrize("client_count", [1, 2, 6])
@@ -6773,6 +6775,8 @@ def test_host_scheduler_v2_six_clients_share_pool_and_isolate_state(
             "work_pool_peak_active_tasks"
         ] <= 24
         assert result.native_execution_statistics["work_pool_thread_count"] == 24
+        assert result.native_execution_statistics["client_dispatch_thread_count"] == 4
+        assert result.native_execution_statistics["remote_kernel_request_count"] > 0
 
 
 def test_full_native_v2_concurrent_solves_isolate_state() -> None:
@@ -6931,6 +6935,11 @@ def _stage052_shared_memory_names() -> set[str]:
         ("ack_loss", "acknowledgement loss without fallback"),
         ("invalid_ack", "did not confirm output release"),
         ("worker_exception", "injected native scheduler worker exception"),
+        ("descriptor_count_overflow", "array byte size overflows"),
+        ("route_index_oob", "route indices are invalid"),
+        ("trailing_payload", "payload has trailing bytes"),
+        ("oversized_control", "request frame is invalid"),
+        ("shared_memory_identity", "shared-memory identity is invalid"),
     ],
 )
 def test_host_scheduler_faults_fail_fast_and_release_shared_memory(
@@ -6951,10 +6960,10 @@ def test_host_scheduler_faults_fail_fast_and_release_shared_memory(
             )
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
-            if _stage052_shared_memory_names() == before:
+            if _stage052_shared_memory_names().issubset(before):
                 break
             time.sleep(0.01)
-        assert _stage052_shared_memory_names() == before
+        assert _stage052_shared_memory_names().issubset(before)
         assert scheduler.is_running
         healthy = solve_alns(
             _fixture_instance(),
@@ -7004,10 +7013,56 @@ def test_host_scheduler_crash_aborts_inflight_transaction_without_leak(
 
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
-        if _stage052_shared_memory_names() == before:
+        if _stage052_shared_memory_names().issubset(before):
             break
         time.sleep(0.01)
-    assert _stage052_shared_memory_names() == before
+    assert _stage052_shared_memory_names().issubset(before)
+
+
+def test_host_scheduler_crash_after_response_reclaims_owned_output_segment(
+    tmp_path: Path,
+) -> None:
+    from threading import Event
+
+    from evrptw import _core as native_core
+
+    before = _stage052_shared_memory_names()
+    endpoint = tmp_path / "native-scheduler.sock"
+    dispatch_started = Event()
+    with NativeHostScheduler(
+        endpoint, enable_fault_injection=True
+    ) as scheduler:
+        def paused_dispatch() -> object:
+            dispatch_started.set()
+            return native_core._test_native_kernel_fault_v2(
+                str(endpoint),
+                "pause_after_response_before_ack",
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(paused_dispatch)
+            assert dispatch_started.wait(timeout=2.0)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                owned_prefix = (
+                    f"evrptw-s52-kernel-{scheduler.process_id}-"
+                )
+                if any(
+                    name.startswith(owned_prefix)
+                    for name in _stage052_shared_memory_names()
+                ):
+                    break
+                time.sleep(0.01)
+            scheduler.close(force=True)
+            with pytest.raises(RuntimeError, match="did not confirm output release"):
+                future.result(timeout=5.0)
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if _stage052_shared_memory_names().issubset(before):
+            break
+        time.sleep(0.01)
+    assert _stage052_shared_memory_names().issubset(before)
 
 
 @pytest.mark.parametrize(
@@ -7093,6 +7148,36 @@ def test_host_scheduler_partial_ipc_rolls_back_and_keeps_service_usable(
             ),
         )
 
+        assert result.native_execution_statistics["fallback_count"] == 0
+
+
+def test_host_scheduler_lingering_partial_frame_times_out_and_recovers(
+    tmp_path: Path,
+) -> None:
+    endpoint = tmp_path / "native-scheduler.sock"
+    with NativeHostScheduler(endpoint):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(7.0)
+            connection.connect(str(endpoint))
+            connection.sendall(struct.pack("<Q", 0))
+            assert connection.recv(1) == b""
+
+        result = solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            **_full_native_solve_kwargs(),  # type: ignore[arg-type]
+            native_execution_config=replace(
+                _native_config("host_scheduler"),
+                candidate_control_config=CandidateControlConfig(
+                    worker_count=1,
+                    max_exact_calls_per_round=100,
+                    proposal_top_k=100,
+                ),
+                scheduler_socket_path=str(endpoint),
+            ),
+        )
         assert result.native_execution_statistics["fallback_count"] == 0
 
 

@@ -33,7 +33,7 @@ from evrptw.stage052_replay import (
 )
 from evrptw.validation import validate_routes
 
-REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v4"
+REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v5"
 LEGACY_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v3"
 HISTORICAL_PILOT_ROOT = Path(
     "/mnt/e/Reproducible-EVRPTW-archive/stage05.2/runs/"
@@ -145,7 +145,7 @@ def load_records(
 ) -> tuple[ReviewRecord, ...]:
     labels = run_labels_for_scope(scope, attempt)
     records: list[ReviewRecord] = []
-    common_identity: tuple[str, str, str] | None = None
+    common_identity: tuple[str, str, str, str] | None = None
     for mode in MODES:
         run_dir = results_root / labels[mode.value]
         manifest = _verify_signed_json(run_dir / "run_manifest.json")
@@ -181,10 +181,17 @@ def load_records(
                     )
                 ):
                     raise RuntimeError("campaign mode-wave resource evidence is incomplete")
+        manifest_schema = _string(manifest, "schema_version")
+        scheduler_identity = (
+            _string(manifest, "scheduler_sha256")
+            if manifest_schema == SCHEMA_VERSION
+            else str(manifest.get("scheduler_sha256") or "legacy-unattested")
+        )
         identity = (
             _string(manifest, "revision"),
             _string(manifest, "wheel_sha256"),
             _string(manifest, "native_sha256"),
+            scheduler_identity,
         )
         if common_identity is None:
             common_identity = identity
@@ -196,10 +203,19 @@ def load_records(
         )
         expected_run_label = labels[mode.value]
         for record in mode_records:
+            payload_scheduler_identity = (
+                _string(record.payload, "scheduler_sha256")
+                if manifest_schema == SCHEMA_VERSION
+                else str(
+                    record.payload.get("scheduler_sha256")
+                    or "legacy-unattested"
+                )
+            )
             payload_identity = (
                 _string(record.payload, "revision"),
                 _string(record.payload, "wheel_sha256"),
                 _string(record.payload, "native_sha256"),
+                payload_scheduler_identity,
             )
             if payload_identity != identity:
                 raise RuntimeError(
@@ -1395,6 +1411,16 @@ def _producer_identity(records: Iterable[ReviewRecord]) -> dict[str, object]:
         ),
         "native_sha256": sorted(
             {_string(record.payload, "native_sha256") for record in values}
+        ),
+        "scheduler_sha256": sorted(
+            {
+                value
+                for record in values
+                if isinstance(
+                    value := record.payload.get("scheduler_sha256"), str
+                )
+                and value
+            }
         ),
         "run_labels": sorted(
             {_string(record.payload, "run_label") for record in values}

@@ -5459,11 +5459,7 @@ def _solve_full_native_alns(
         max_iterations=max_iterations,
         deadline=started + time_limit_seconds,
         batch_size=batch_size,
-        compute_threads=(
-            config.scheduler_threads
-            if config.mode == "host_scheduler"
-            else config.compute_threads_per_shard
-        ),
+        compute_threads=config.compute_threads_per_shard,
         native_runtime=native_runtime,
         initial_customer_sequences=initial_customer_sequences,
         candidate_control_config=config.candidate_control_config,
@@ -5635,6 +5631,12 @@ def _solve_full_native_alns(
             ),
             "work_pool_thread_count": int(
                 native_result.timings["work_pool_thread_count"]
+            ),
+            "client_dispatch_thread_count": int(
+                native_result.timings["client_dispatch_thread_count"]
+            ),
+            "remote_kernel_request_count": int(
+                native_result.timings["remote_kernel_request_count"]
             ),
             "candidate_transaction_occupancies": list(
                 native_result.backend_metrics.launch_occupancies

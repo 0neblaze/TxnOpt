@@ -5,9 +5,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -37,8 +40,39 @@ struct KernelClientTelemetry final {
 };
 
 inline thread_local KernelClientTelemetry telemetry;
+class KernelClientTelemetryCollector final {
+public:
+    void record(const double* values) {
+        std::lock_guard lock(mutex_);
+        telemetry_.queue_wait_seconds += values[0];
+        telemetry_.peak_queue_depth = std::max(
+            telemetry_.peak_queue_depth,
+            static_cast<std::size_t>(values[1]));
+        telemetry_.peak_active_tasks = std::max(
+            telemetry_.peak_active_tasks,
+            static_cast<std::size_t>(values[2]));
+        telemetry_.pool_thread_count = static_cast<std::size_t>(values[3]);
+        ++telemetry_.request_count;
+    }
+
+    KernelClientTelemetry snapshot() const {
+        std::lock_guard lock(mutex_);
+        return telemetry_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    KernelClientTelemetry telemetry_;
+};
+
+inline thread_local KernelClientTelemetryCollector* telemetry_collector = nullptr;
 
 inline void reset_telemetry() noexcept { telemetry = {}; }
+
+inline KernelClientTelemetry telemetry_snapshot() {
+    return telemetry_collector == nullptr
+        ? telemetry : telemetry_collector->snapshot();
+}
 
 inline void record_telemetry(
     const protocol::PayloadView& output, std::size_t index) {
@@ -57,19 +91,26 @@ inline void record_telemetry(
         || values[3] != 24.0) {
         throw std::runtime_error("native kernel scheduler telemetry values are invalid");
     }
-    telemetry.queue_wait_seconds += values[0];
-    telemetry.peak_queue_depth = std::max(
-        telemetry.peak_queue_depth, static_cast<std::size_t>(values[1]));
-    telemetry.peak_active_tasks = std::max(
-        telemetry.peak_active_tasks, static_cast<std::size_t>(values[2]));
-    telemetry.pool_thread_count = static_cast<std::size_t>(values[3]);
-    ++telemetry.request_count;
+    if (telemetry_collector != nullptr) {
+        telemetry_collector->record(values);
+    } else {
+        telemetry.queue_wait_seconds += values[0];
+        telemetry.peak_queue_depth = std::max(
+            telemetry.peak_queue_depth, static_cast<std::size_t>(values[1]));
+        telemetry.peak_active_tasks = std::max(
+            telemetry.peak_active_tasks, static_cast<std::size_t>(values[2]));
+        telemetry.pool_thread_count = static_cast<std::size_t>(values[3]);
+        ++telemetry.request_count;
+    }
 }
 
 inline bool read_exact(int descriptor, void* output, std::size_t size) {
     auto* cursor = static_cast<std::uint8_t*>(output);
     while (size > 0) {
         const auto received = ::recv(descriptor, cursor, size, 0);
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
         if (received <= 0) {
             return false;
         }
@@ -83,6 +124,9 @@ inline void send_exact(int descriptor, const void* input, std::size_t size) {
     const auto* cursor = static_cast<const std::uint8_t*>(input);
     while (size > 0) {
         const auto sent = ::send(descriptor, cursor, size, MSG_NOSIGNAL);
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
         if (sent <= 0) {
             throw std::runtime_error("native kernel client could not send control data");
         }
@@ -100,6 +144,19 @@ public:
         descriptor_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
         if (descriptor_ < 0) {
             throw std::runtime_error("native kernel client could not create its socket");
+        }
+        timeval timeout{};
+        timeout.tv_sec = 125;
+        if (::setsockopt(
+                descriptor_, SOL_SOCKET, SO_RCVTIMEO,
+                &timeout, sizeof(timeout)) != 0
+            || ::setsockopt(
+                descriptor_, SOL_SOCKET, SO_SNDTIMEO,
+                &timeout, sizeof(timeout)) != 0) {
+            ::close(descriptor_);
+            descriptor_ = -1;
+            throw std::runtime_error(
+                "native kernel client could not configure socket timeouts");
         }
         sockaddr_un address{};
         address.sun_family = AF_UNIX;
@@ -165,11 +222,17 @@ inline protocol::PayloadView transact(
             response.error.data(), response.error.size()));
     }
     if (response.message != protocol::ControlMessage::response
-        || response.segment_size < sizeof(protocol::PayloadHeader)) {
+        || response.segment_size < sizeof(protocol::PayloadHeader)
+        || response.segment_size > protocol::maximum_payload_bytes) {
         throw std::runtime_error("native kernel scheduler response is invalid");
     }
     const auto output_name = protocol::bounded_string(
         response.segment_name.data(), response.segment_name.size());
+    if (!output_name.starts_with("/evrptw-s52-kernel-")
+        || output_name.find('/', 1) != std::string::npos) {
+        throw std::runtime_error(
+            "native kernel scheduler output identity is invalid");
+    }
     output_mapping = protocol::SharedMapping::open(
         output_name, static_cast<std::size_t>(response.segment_size));
     const std::string_view output_bytes(
@@ -238,6 +301,7 @@ inline kernels::ExactBatchOutput exact_charging(
     const auto output = transact(
         socket_path, builder.finish(), output_mapping, response, socket);
     if (output.header().operation != protocol::KernelOperation::exact_charging
+        || output.header().request_id != response.request_id
         || output.header().array_count != 8) {
         throw std::runtime_error("native exact output schema is invalid");
     }
@@ -306,6 +370,7 @@ inline kernels::ScreenOutput screen_route(
     const auto output = transact(
         socket_path, builder.finish(), output_mapping, response, socket);
     if (output.header().operation != protocol::KernelOperation::screen_route
+        || output.header().request_id != response.request_id
         || output.header().array_count != 4
         || output.descriptor(0).count != 16
         || output.descriptor(1).count != 15
@@ -332,7 +397,13 @@ inline void test_fault(
         && fault != "ack_loss"
         && fault != "invalid_ack"
         && fault != "worker_exception"
-        && fault != "pause_before_execute") {
+        && fault != "pause_before_execute"
+        && fault != "pause_after_response_before_ack"
+        && fault != "descriptor_count_overflow"
+        && fault != "route_index_oob"
+        && fault != "trailing_payload"
+        && fault != "oversized_control"
+        && fault != "shared_memory_identity") {
         throw std::invalid_argument("unknown native scheduler fault injection");
     }
     const auto request_id = request_counter.fetch_add(1);
@@ -342,7 +413,10 @@ inline void test_fault(
     const std::array<double, 1> service{0.0};
     const std::array<double, 1> distances{0.0};
     const std::array<double, 5> vehicle{1.0, 1.0, 1.0, 1.0, 1.0};
-    const std::array<std::int64_t, 2> offsets{0, 0};
+    const bool invalid_route = fault == "route_index_oob";
+    const std::array<std::int64_t, 2> offsets{
+        0, invalid_route ? 1 : 0};
+    const std::array<std::int64_t, 1> invalid_indices{99};
     const double deadline_remaining = 10.0;
     const std::int64_t batch_size = 1;
     protocol::PayloadBuilder builder(
@@ -354,11 +428,22 @@ inline void test_fault(
     builder.add(protocol::NumericType::float64, distances.data(), 1, 1, 1);
     builder.add(protocol::NumericType::float64, vehicle.data(), 5, 5);
     builder.add(protocol::NumericType::int64, offsets.data(), 2, 2);
-    builder.add(protocol::NumericType::int64, nullptr, 0, 0);
+    builder.add(protocol::NumericType::int64,
+        invalid_route ? invalid_indices.data() : nullptr,
+        invalid_route ? 1 : 0,
+        invalid_route ? 1 : 0);
     builder.add(
         protocol::NumericType::float64, &deadline_remaining, 1, 1);
     builder.add(protocol::NumericType::int64, &batch_size, 1, 1);
     auto input_bytes = builder.finish();
+    if (fault == "descriptor_count_overflow") {
+        auto* header = reinterpret_cast<protocol::PayloadHeader*>(
+            input_bytes.data());
+        header->arrays[0].count = std::numeric_limits<std::uint64_t>::max();
+        header->arrays[0].shape[0] = header->arrays[0].count;
+    } else if (fault == "trailing_payload") {
+        input_bytes.push_back(0U);
+    }
     const auto segment_name = "/evrptw-s52-client-" + std::to_string(::getpid())
         + "-" + std::to_string(segment_counter.fetch_add(1));
     auto input_mapping = protocol::SharedMapping::create(
@@ -367,9 +452,16 @@ inline void test_fault(
     protocol::ControlFrame request;
     request.message = protocol::ControlMessage::test_request;
     request.request_id = request_id;
-    request.segment_size = input_bytes.size();
+    request.segment_size = fault == "oversized_control"
+        ? protocol::maximum_payload_bytes + 1ULL
+        : input_bytes.size();
     protocol::copy_bounded(input_mapping.name(), request.segment_name.data(),
         request.segment_name.size());
+    if (fault == "shared_memory_identity") {
+        protocol::copy_bounded(
+            "/not-evrptw-owned", request.segment_name.data(),
+            request.segment_name.size());
+    }
     auto input_sha = protocol::native_sha256_hex(std::string_view(
         reinterpret_cast<const char*>(input_bytes.data()), input_bytes.size()));
     if (fault == "request_hash_mismatch") {

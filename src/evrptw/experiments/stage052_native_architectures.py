@@ -43,7 +43,7 @@ from evrptw.warm_start import (
     canonical_customer_sequences_sha256,
 )
 
-SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v4"
+SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v5"
 SEEDS = (2014, 2015, 2016)
 PAIRED_INSTANCES = ("c101C5", "c101_21", "r101_21", "rc101_21")
 AXIS_NAMES = ("fixed_work", "wall_clock_30")
@@ -80,6 +80,7 @@ class ArchitectureAxisTask:
     scheduler_socket_path: str
     wheel_sha256: str
     native_sha256: str
+    scheduler_sha256: str
     revision: str
     initial_customer_sequences: tuple[tuple[str, ...], ...]
     initial_solution_provenance: dict[str, object]
@@ -106,6 +107,7 @@ def build_axis_plan(
     scheduler_socket_path: str,
     wheel_sha256: str,
     native_sha256: str,
+    scheduler_sha256: str,
     revision: str,
     warm_starts: dict[WarmStartIdentity, WarmStartRecord],
 ) -> tuple[ArchitectureAxisTask, ...]:
@@ -146,6 +148,7 @@ def build_axis_plan(
             scheduler_socket_path=scheduler_socket_path,
             wheel_sha256=wheel_sha256,
             native_sha256=native_sha256,
+            scheduler_sha256=scheduler_sha256,
             revision=revision,
             initial_customer_sequences=warm_starts[(instance_name, seed)][0],
             initial_solution_provenance=dict(warm_starts[(instance_name, seed)][1]),
@@ -372,10 +375,15 @@ def _verify_installed_wheel(
     site_packages = direct_url_path.parent.parent.resolve()
     package_path = Path(str(evrptw.__file__)).resolve()
     native_path = Path(str(native_core.__file__)).resolve()
-    if not package_path.is_relative_to(site_packages) or not native_path.is_relative_to(
-        site_packages
+    scheduler_path = native_path.with_name("_native_host_scheduler")
+    if (
+        not package_path.is_relative_to(site_packages)
+        or not native_path.is_relative_to(site_packages)
+        or not scheduler_path.is_relative_to(site_packages)
     ):
         raise RuntimeError("comparison runner imported source outside the installed wheel")
+    if not scheduler_path.is_file() or not os.access(scheduler_path, os.X_OK):
+        raise RuntimeError("installed wheel has no executable native host scheduler")
     build_revision = native_core.__build_git_revision__
     if not isinstance(build_revision, str) or build_revision != expected_revision:
         raise RuntimeError("installed native wheel was not built from the recorded revision")
@@ -386,6 +394,8 @@ def _verify_installed_wheel(
         "package_path": str(package_path),
         "native_path": str(native_path),
         "native_sha256": _sha256_path(native_path),
+        "scheduler_path": str(scheduler_path),
+        "scheduler_sha256": _sha256_path(scheduler_path),
         "build_git_revision": build_revision,
     }
 
@@ -845,6 +855,7 @@ def _result_payload(
         "revision": task.revision,
         "wheel_sha256": task.wheel_sha256,
         "native_sha256": task.native_sha256,
+        "scheduler_sha256": task.scheduler_sha256,
         "solver_seconds": solver_seconds,
         "objective": list(result.objective.key),
         "routes": [list(route) for route in result.routes],
@@ -944,6 +955,7 @@ def _run_mode(task: ArchitectureAxisTask, mode: ArchitectureMode) -> str:
             "revision": task.revision,
             "wheel_sha256": task.wheel_sha256,
             "native_sha256": task.native_sha256,
+            "scheduler_sha256": task.scheduler_sha256,
             "error_type": type(error).__name__,
             "error": str(error),
         }
@@ -1056,6 +1068,7 @@ def run_experiment(
         scheduler_socket_path=str(scheduler_path),
         wheel_sha256=wheel_receipt["wheel_sha256"],
         native_sha256=wheel_receipt["native_sha256"],
+        scheduler_sha256=wheel_receipt["scheduler_sha256"],
         revision=revision,
         warm_starts=warm_starts,
     )
@@ -1147,6 +1160,8 @@ def run_experiment(
         "wheel_receipt": wheel_receipt,
         "native_path": str(native_path.resolve()),
         "native_sha256": wheel_receipt["native_sha256"],
+        "scheduler_path": wheel_receipt["scheduler_path"],
+        "scheduler_sha256": wheel_receipt["scheduler_sha256"],
         "warm_start_bundle_path": str(warm_start_bundle_path.resolve()),
         "warm_start_bundle_sha256": _sha256_path(warm_start_bundle_path),
         "axis_count": len(written),

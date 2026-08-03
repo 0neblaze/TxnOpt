@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -24,6 +25,7 @@ constexpr std::uint64_t kernel_magic = 0x4556525054574b32ULL;
 constexpr std::uint32_t kernel_protocol_version = 2;
 constexpr std::size_t maximum_arrays = 16;
 constexpr std::size_t maximum_segment_name = 128;
+constexpr std::size_t maximum_payload_bytes = 256U * 1024U * 1024U;
 
 enum class KernelOperation : std::uint32_t {
     exact_charging = 1,
@@ -89,8 +91,25 @@ inline std::size_t numeric_size(NumericType type) {
     throw std::runtime_error("native kernel protocol has an unknown numeric type");
 }
 
-inline std::size_t align_eight(std::size_t value) noexcept {
+inline std::size_t align_eight(std::size_t value) {
+    if (value > std::numeric_limits<std::size_t>::max() - 7U) {
+        throw std::overflow_error("native kernel payload alignment overflow");
+    }
     return (value + 7U) & ~std::size_t{7U};
+}
+
+inline std::size_t checked_product(
+    std::uint64_t left,
+    std::uint64_t right,
+    std::string_view message) {
+    if (left != 0 && right > std::numeric_limits<std::uint64_t>::max() / left) {
+        throw std::runtime_error(std::string(message));
+    }
+    const auto product = left * right;
+    if (product > std::numeric_limits<std::size_t>::max()) {
+        throw std::runtime_error(std::string(message));
+    }
+    return static_cast<std::size_t>(product);
 }
 
 class PayloadBuilder final {
@@ -110,7 +129,10 @@ public:
         if (header_.array_count >= maximum_arrays
             || (count > 0 && source == nullptr)
             || (second_extent == 0 && count != first_extent)
-            || (second_extent != 0 && first_extent * second_extent != count)) {
+            || (second_extent != 0
+                && checked_product(
+                       first_extent, second_extent,
+                       "native kernel payload shape overflows") != count)) {
             throw std::invalid_argument("native kernel payload array is invalid");
         }
         bytes_.resize(align_eight(bytes_.size()), 0U);
@@ -120,7 +142,13 @@ public:
         descriptor.offset = bytes_.size();
         descriptor.count = count;
         descriptor.shape = {first_extent, second_extent};
-        const auto size = static_cast<std::size_t>(count) * numeric_size(type);
+        const auto size = checked_product(
+            count, numeric_size(type),
+            "native kernel payload byte size overflows");
+        if (bytes_.size() > maximum_payload_bytes
+            || size > maximum_payload_bytes - bytes_.size()) {
+            throw std::length_error("native kernel payload exceeds its size limit");
+        }
         if (size > 0) {
             const auto* first = static_cast<const std::uint8_t*>(source);
             bytes_.insert(bytes_.end(), first, first + size);
@@ -141,20 +169,29 @@ class PayloadView final {
 public:
     PayloadView(const void* address, std::size_t size)
         : address_(static_cast<const std::uint8_t*>(address)), size_(size) {
-        if (address_ == nullptr || size_ < sizeof(PayloadHeader)) {
+        if (address_ == nullptr || size_ < sizeof(PayloadHeader)
+            || size_ > maximum_payload_bytes) {
             throw std::runtime_error("native kernel payload is truncated");
         }
         std::memcpy(&header_, address_, sizeof(header_));
         if (header_.magic != kernel_magic
             || header_.version != kernel_protocol_version
-            || header_.array_count > maximum_arrays) {
+            || header_.array_count > maximum_arrays
+            || header_.reserved != 0
+            || (header_.operation != KernelOperation::exact_charging
+                && header_.operation != KernelOperation::screen_route)) {
             throw std::runtime_error("native kernel payload header is invalid");
         }
+        std::size_t previous_end = sizeof(PayloadHeader);
         for (std::size_t index = 0; index < header_.array_count; ++index) {
             const auto& descriptor = header_.arrays[index];
-            const auto bytes = descriptor.count * numeric_size(descriptor.type);
+            const auto bytes = checked_product(
+                descriptor.count, numeric_size(descriptor.type),
+                "native kernel array byte size overflows");
             if ((descriptor.dimensions != 1 && descriptor.dimensions != 2)
                 || descriptor.offset < sizeof(PayloadHeader)
+                || descriptor.offset % 8 != 0
+                || descriptor.offset < previous_end
                 || descriptor.offset > size_
                 || bytes > size_ - descriptor.offset
                 || (descriptor.dimensions == 1
@@ -162,10 +199,16 @@ public:
                         || descriptor.shape[0] != descriptor.count))
                 || (descriptor.dimensions == 2
                     && (descriptor.shape[1] == 0
-                        || descriptor.shape[0] * descriptor.shape[1]
+                        || checked_product(
+                               descriptor.shape[0], descriptor.shape[1],
+                               "native kernel array shape overflows")
                             != descriptor.count))) {
                 throw std::runtime_error("native kernel array descriptor is invalid");
             }
+            previous_end = static_cast<std::size_t>(descriptor.offset) + bytes;
+        }
+        if (previous_end != size_) {
+            throw std::runtime_error("native kernel payload has trailing bytes");
         }
     }
 
@@ -209,7 +252,7 @@ public:
     ~SharedMapping() noexcept { reset(); }
 
     static SharedMapping create(std::string name, std::size_t size) {
-        if (name.empty() || size == 0) {
+        if (name.empty() || size == 0 || size > maximum_payload_bytes) {
             throw std::invalid_argument("native kernel shared segment is invalid");
         }
         SharedMapping mapping;
@@ -236,7 +279,7 @@ public:
 
     static SharedMapping open(
         std::string name, std::size_t size, bool writable = false) {
-        if (name.empty() || size == 0) {
+        if (name.empty() || size == 0 || size > maximum_payload_bytes) {
             throw std::invalid_argument("native kernel shared segment is invalid");
         }
         SharedMapping mapping;

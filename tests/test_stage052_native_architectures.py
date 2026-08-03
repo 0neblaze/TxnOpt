@@ -62,6 +62,7 @@ def _plan(scope: str, tmp_path: Path):  # type: ignore[no-untyped-def]
         scheduler_socket_path=str(tmp_path / "scheduler.sock"),
         wheel_sha256="a" * 64,
         native_sha256="b" * 64,
+        scheduler_sha256="f" * 64,
         revision="c" * 40,
         warm_starts=warm_starts,
     )
@@ -416,14 +417,14 @@ def test_first_divergence_distinguishes_missing_field_from_null() -> None:
     }
 
 
-def test_v4_axis_replay_rejects_bad_candidate_id_on_wall_clock_axis(
+def test_v5_axis_replay_rejects_bad_candidate_id_on_wall_clock_axis(
     tmp_path: Path,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
     source = _review_fixture_records(root, tmp_path)[0]
     payload = dict(source.payload)
     payload["schema_version"] = (
-        "stage05.2-native-architecture-comparison-v4"
+        "stage05.2-native-architecture-comparison-v5"
     )
     payload["axis"] = "wall_clock_30"
     payload["semantic_trajectory"] = [
@@ -514,6 +515,7 @@ def test_review_writer_emits_hash_bound_review_manifest(tmp_path: Path) -> None:
             "repository_revisions": ["c" * 40],
             "wheel_sha256": ["d" * 64],
             "native_sha256": ["e" * 64],
+            "scheduler_sha256": ["f" * 64],
             "run_labels": ["stage05.2_native_architecture_test_attempt01"],
         },
         "mode_metrics": {mode.value: {} for mode in MODES},
@@ -566,6 +568,7 @@ def test_one_wall_clock_group_runs_all_five_modes_with_one_scheduler(
         scheduler_socket_path=str(endpoint),
         wheel_sha256="a" * 64,
         native_sha256="b" * 64,
+        scheduler_sha256="f" * 64,
         revision="c" * 40,
         initial_customer_sequences=_c5_warm_start(root),
         initial_solution_provenance=_c5_source_provenance(
@@ -579,6 +582,7 @@ def test_one_wall_clock_group_runs_all_five_modes_with_one_scheduler(
     assert len(written) == len(MODES)
     payloads = [json.loads(Path(path).read_bytes()) for path in written]
     assert {payload["mode"] for payload in payloads} == {mode.value for mode in MODES}
+    assert {payload["scheduler_sha256"] for payload in payloads} == {"f" * 64}
     status_by_mode = {payload["mode"]: payload["status"] for payload in payloads}
     assert status_by_mode == {
         "current_stage052": "completed",
@@ -606,6 +610,7 @@ def test_one_fixed_work_group_retains_every_mode_axis(tmp_path: Path) -> None:
         scheduler_socket_path=str(endpoint),
         wheel_sha256="a" * 64,
         native_sha256="b" * 64,
+        scheduler_sha256="f" * 64,
         revision="c" * 40,
         initial_customer_sequences=_c5_warm_start(root),
         initial_solution_provenance=_c5_source_provenance(

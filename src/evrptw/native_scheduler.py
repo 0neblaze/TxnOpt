@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import socket
 import struct
 import subprocess
@@ -38,6 +39,7 @@ class NativeHostScheduler:
     worker_threads: int = 24
     enable_fault_injection: bool = False
     _process: subprocess.Popen[bytes] | None = None
+    _run_nonce: str | None = None
 
     def start(self) -> None:
         if self._process is not None:
@@ -49,7 +51,13 @@ class NativeHostScheduler:
             raise RuntimeError("pure C++ host scheduler executable is missing")
         scheduler_environment = dict(os.environ)
         scheduler_environment.update(_NUMERIC_THREAD_ENVIRONMENT)
-        command = [str(executable), str(self.socket_path), str(self.worker_threads)]
+        run_nonce = secrets.token_hex(8)
+        command = [
+            str(executable),
+            str(self.socket_path),
+            str(self.worker_threads),
+            run_nonce,
+        ]
         if self.enable_fault_injection:
             command.append("--enable-fault-injection")
         process = subprocess.Popen(
@@ -60,6 +68,7 @@ class NativeHostScheduler:
             env=scheduler_environment,
         )
         self._process = process
+        self._run_nonce = run_nonce
         deadline = time.monotonic() + _READY_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             if process.poll() is not None:
@@ -68,6 +77,8 @@ class NativeHostScheduler:
                 ).decode("utf-8", errors="replace")
                 self._process = None
                 self.socket_path.unlink(missing_ok=True)
+                self._cleanup_owned_segments(process.pid, run_nonce)
+                self._run_nonce = None
                 raise RuntimeError(
                     f"host scheduler exited before becoming ready: {stderr.strip()}"
                 )
@@ -89,6 +100,7 @@ class NativeHostScheduler:
         process = self._process
         if process is None:
             return
+        run_nonce = self._run_nonce
         if process.poll() is None and force:
             process.terminate()
         elif process.poll() is None:
@@ -131,6 +143,16 @@ class NativeHostScheduler:
             process.wait(timeout=5.0)
         self._process = None
         self.socket_path.unlink(missing_ok=True)
+        if run_nonce is not None:
+            self._cleanup_owned_segments(process.pid, run_nonce)
+        self._run_nonce = None
+
+    @staticmethod
+    def _cleanup_owned_segments(process_id: int, run_nonce: str) -> None:
+        prefix = f"evrptw-s52-kernel-{process_id}-{run_nonce}-"
+        for segment in Path("/dev/shm").glob(f"{prefix}*"):
+            if segment.is_file() and segment.name.startswith(prefix):
+                segment.unlink(missing_ok=True)
 
     @property
     def process_id(self) -> int:

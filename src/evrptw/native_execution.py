@@ -11996,7 +11996,7 @@ def execute_full_native_alns(
     timings_array = _require_array(
         payload[4],
         dtype=np.dtype(np.float64),
-        shape=(9,),
+        shape=(11,),
         name="full native timings",
     )
     if any(not math.isfinite(float(value)) or float(value) < 0.0 for value in timings_array):
@@ -12008,7 +12008,7 @@ def execute_full_native_alns(
         abs_tol=1e-12,
     ):
         raise RuntimeError("full native ALNS timing intervals do not reconcile")
-    telemetry_values = timings_array[4:9]
+    telemetry_values = timings_array[4:11]
     if any(float(value) != int(value) for value in telemetry_values):
         raise RuntimeError("full native ALNS concurrency telemetry is not integral")
     if int(timings_array[5]) != 0:
@@ -12017,6 +12017,13 @@ def execute_full_native_alns(
         raise RuntimeError("full native ALNS shared-pool telemetry is invalid")
     if int(timings_array[8]) not in (1, 4, 24):
         raise RuntimeError("full native ALNS work-pool size is invalid")
+    if int(timings_array[7]) == 1:
+        if int(timings_array[8]) != 24 or int(timings_array[9]) != 4:
+            raise RuntimeError("host scheduler thread topology is invalid")
+        if int(timings_array[10]) <= 0:
+            raise RuntimeError("host scheduler reported no remote kernel requests")
+    elif int(timings_array[9]) != 0 or int(timings_array[10]) != 0:
+        raise RuntimeError("local full-native reported host-only telemetry")
     trajectory_array = payload[5]
     if (
         not isinstance(trajectory_array, np.ndarray)
@@ -12188,6 +12195,8 @@ def execute_full_native_alns(
             "queue_depth_on_submit": float(timings_array[6]),
             "shared_work_pool": float(timings_array[7]),
             "work_pool_thread_count": float(timings_array[8]),
+            "client_dispatch_thread_count": float(timings_array[9]),
+            "remote_kernel_request_count": float(timings_array[10]),
         },
         trajectory=tuple(
             {

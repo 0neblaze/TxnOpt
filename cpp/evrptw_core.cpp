@@ -57,6 +57,7 @@ using Point = std::pair<double, double>;
 
 #ifdef __linux__
 thread_local std::string native_kernel_scheduler_endpoint;
+thread_local bool native_kernel_scheduler_required = false;
 #endif
 
 template <typename Callback>
@@ -89,6 +90,37 @@ private:
     Callback callback_;
     bool active_ = true;
 };
+
+#ifdef __linux__
+class NativeSchedulerThreadContext final {
+public:
+    NativeSchedulerThreadContext(
+        std::string endpoint,
+        bool required,
+        evrptw::native_client::KernelClientTelemetryCollector* collector)
+        : previous_endpoint_(std::exchange(
+              native_kernel_scheduler_endpoint, std::move(endpoint))),
+          previous_required_(std::exchange(
+              native_kernel_scheduler_required, required)),
+          previous_collector_(std::exchange(
+              evrptw::native_client::telemetry_collector, collector)) {}
+
+    NativeSchedulerThreadContext(const NativeSchedulerThreadContext&) = delete;
+    NativeSchedulerThreadContext& operator=(
+        const NativeSchedulerThreadContext&) = delete;
+
+    ~NativeSchedulerThreadContext() noexcept {
+        native_kernel_scheduler_endpoint = std::move(previous_endpoint_);
+        native_kernel_scheduler_required = previous_required_;
+        evrptw::native_client::telemetry_collector = previous_collector_;
+    }
+
+private:
+    std::string previous_endpoint_;
+    bool previous_required_;
+    evrptw::native_client::KernelClientTelemetryCollector* previous_collector_;
+};
+#endif
 
 class PythonRandom {
 public:
@@ -6155,6 +6187,11 @@ py::tuple exact_charging_batch_numeric(
     {
         py::gil_scoped_release release;
 #ifdef __linux__
+        if (native_kernel_scheduler_required
+            && native_kernel_scheduler_endpoint.empty()) {
+            throw std::runtime_error(
+                "host scheduler exact kernel lost its required endpoint");
+        }
         if (!native_kernel_scheduler_endpoint.empty()) {
             try {
                 result = evrptw::native_client::exact_charging(
@@ -6238,6 +6275,11 @@ evrptw::native_kernels::ScreenOutput dispatch_screen_route(
     const double* options,
     const double* incremental) {
 #ifdef __linux__
+    if (native_kernel_scheduler_required
+        && native_kernel_scheduler_endpoint.empty()) {
+        throw std::runtime_error(
+            "host scheduler screening kernel lost its required endpoint");
+    }
     if (!native_kernel_scheduler_endpoint.empty()) {
         try {
             return evrptw::native_client::screen_route(
@@ -8851,10 +8893,21 @@ public:
         const auto warm_screening_started = std::chrono::steady_clock::now();
         screening_occupancies_.push_back(
             static_cast<std::int64_t>(route_count));
+#ifdef __linux__
+        const auto warm_scheduler_endpoint = native_kernel_scheduler_endpoint;
+        const auto warm_scheduler_required = native_kernel_scheduler_required;
+        auto* warm_telemetry_collector =
+            evrptw::native_client::telemetry_collector;
+#endif
         {
             py::gil_scoped_release release;
             work_pool_->parallel_for(
                 static_cast<std::size_t>(route_count), [&](std::size_t route) {
+#ifdef __linux__
+                    NativeSchedulerThreadContext scheduler_context(
+                        warm_scheduler_endpoint, warm_scheduler_required,
+                        warm_telemetry_collector);
+#endif
                     const auto first = warm_offsets[route];
                     const auto last = warm_offsets[route + 1];
                     warm_screening[route] =
@@ -9339,9 +9392,20 @@ public:
         const auto screening_started = std::chrono::steady_clock::now();
         screening_occupancies_.push_back(
             static_cast<std::int64_t>(screen_rows.size()));
+#ifdef __linux__
+        const auto pool_scheduler_endpoint = native_kernel_scheduler_endpoint;
+        const auto pool_scheduler_required = native_kernel_scheduler_required;
+        auto* pool_telemetry_collector =
+            evrptw::native_client::telemetry_collector;
+#endif
         {
             py::gil_scoped_release release;
             work_pool_->parallel_for(screen_rows.size(), [&](std::size_t position) {
+#ifdef __linux__
+                NativeSchedulerThreadContext scheduler_context(
+                    pool_scheduler_endpoint, pool_scheduler_required,
+                    pool_telemetry_collector);
+#endif
                 const auto row = screen_rows[position];
                 const auto& sequence = unique_screen_routes[row];
                 screen_outputs[row] = dispatch_screen_route(
@@ -10422,11 +10486,22 @@ public:
         std::vector<evrptw::native_kernels::ScreenOutput> merge_screening(
             static_cast<std::size_t>(candidate_count));
         screening_occupancies_.push_back(candidate_count);
+#ifdef __linux__
+        const auto merge_scheduler_endpoint = native_kernel_scheduler_endpoint;
+        const auto merge_scheduler_required = native_kernel_scheduler_required;
+        auto* merge_telemetry_collector =
+            evrptw::native_client::telemetry_collector;
+#endif
         {
             py::gil_scoped_release release;
             work_pool_->parallel_for(
                 static_cast<std::size_t>(candidate_count),
                 [&](std::size_t candidate) {
+#ifdef __linux__
+                    NativeSchedulerThreadContext scheduler_context(
+                        merge_scheduler_endpoint, merge_scheduler_required,
+                        merge_telemetry_collector);
+#endif
                     const auto first = candidate_boundaries[candidate];
                     const auto last = candidate_boundaries[candidate + 1];
                     merge_screening[candidate] =
@@ -17092,7 +17167,7 @@ py::tuple full_native_alns_v2(
         protocol_values[7],
         protocol_values[1],
         options[1],
-        protocol_values[3],
+        base_control_values[3],
         scheduler_work_pool_context);
     engine.configure_node_names(node_name_offsets, node_name_bytes);
     engine.suppress_plan_screening_negative_cache(true);
@@ -17392,21 +17467,25 @@ py::tuple full_native_alns_v2(
         throw std::logic_error(
             "full native v2 exact timing is outside the solve interval");
     }
-    py::array_t<double> timings(9);
+#ifdef __linux__
+    const auto remote_telemetry =
+        evrptw::native_client::telemetry_snapshot();
+#endif
+    py::array_t<double> timings(11);
     checked_data(timings)[0] = elapsed - exact_seconds;
     checked_data(timings)[1] = exact_seconds;
     checked_data(timings)[2] = elapsed;
     checked_data(timings)[3] =
 #ifdef __linux__
         !native_kernel_scheduler_endpoint.empty()
-        ? evrptw::native_client::telemetry.queue_wait_seconds
+        ? remote_telemetry.queue_wait_seconds
         :
 #endif
           scheduler_queue_wait_seconds_context;
     checked_data(timings)[4] = static_cast<double>(
 #ifdef __linux__
         !native_kernel_scheduler_endpoint.empty()
-        ? evrptw::native_client::telemetry.peak_active_tasks
+        ? remote_telemetry.peak_active_tasks
         :
 #endif
         engine.work_pool_peak_active_tasks());
@@ -17420,7 +17499,7 @@ py::tuple full_native_alns_v2(
     checked_data(timings)[6] = static_cast<double>(
 #ifdef __linux__
         !native_kernel_scheduler_endpoint.empty()
-        ? evrptw::native_client::telemetry.peak_queue_depth
+        ? remote_telemetry.peak_queue_depth
         :
 #endif
           scheduler_queue_depth_context);
@@ -17433,10 +17512,28 @@ py::tuple full_native_alns_v2(
     checked_data(timings)[8] = static_cast<double>(
 #ifdef __linux__
         !native_kernel_scheduler_endpoint.empty()
-        ? evrptw::native_client::telemetry.pool_thread_count
+        ? remote_telemetry.pool_thread_count
         :
 #endif
         engine.work_pool_thread_count());
+    checked_data(timings)[9] = static_cast<double>(
+#ifdef __linux__
+        !native_kernel_scheduler_endpoint.empty()
+        ? engine.work_pool_thread_count()
+        : 0
+#else
+        0
+#endif
+    );
+    checked_data(timings)[10] = static_cast<double>(
+#ifdef __linux__
+        !native_kernel_scheduler_endpoint.empty()
+        ? remote_telemetry.request_count
+        : 0
+#else
+        0
+#endif
+    );
     std::string evidence("stage05.2-full-native-alns-v2");
     const auto append_raw_array = [&](const auto& array) {
         evidence.append(
@@ -17515,11 +17612,9 @@ py::tuple full_native_alns_host_v2(
         throw std::invalid_argument(
             "full native host kernel scheduler endpoint is invalid");
     }
-    native_kernel_scheduler_endpoint = socket_path;
-    evrptw::native_client::reset_telemetry();
-    ScopeRollback clear_endpoint([]() noexcept {
-        native_kernel_scheduler_endpoint.clear();
-    });
+    evrptw::native_client::KernelClientTelemetryCollector telemetry_collector;
+    NativeSchedulerThreadContext scheduler_context(
+        socket_path, true, &telemetry_collector);
     return full_native_alns_v2(
         node_kind, demand, ready_time, due_date, service_time, distance,
         reachable, vehicle, lexical_rank, node_name_offsets, node_name_bytes,
