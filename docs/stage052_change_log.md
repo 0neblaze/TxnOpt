@@ -3180,3 +3180,13 @@ compatibility fallback（兼容回退）。
 - exact-wheel 相关 operator/round/Stage4 回归为 `103 passed`；四实例三 seed fixed-work
   全字段配对门控为 `12 passed`、耗时 `92.14s`。本切片仍保持 capability bits 全 0，且不创建
   attempt04、不启动 Paired/Pilot/Formal/CUDA。
+- clean checkpoint `125072223f679def5ef225097adf98e8b89000b8` 的 exact wheel
+  SHA-256 为 `55ae4f32fb2c75fbeed57d6302cc09c39e77298ae95143649be74900aca57327`，
+  extension 为 `7c9a26e8c5b89891db95bc356918a583039a26d6ff28b81ab582f758d7cf3b28`，
+  scheduler 保持
+  `0aa1e822f98f55a1e8440199e6fa234b8c38ac4b55527b54e6673a10755c9b31`。
+  exact-wheel 扩大回归为 `151 passed, 187 deselected`、耗时 `434.66s`；独立规格复审与
+  标准复审均接受该提交，确认所有搜索决策已停止读取持久 lane mirror，未发现新的
+  生命周期、异常安全或语义 blocker。复审同时保留非阻断债务：旧 helper 的临时 py-array
+  projection、逐次 O(n) lane validation 和缺少防止未来重新读取 mirror 的静态守卫，均需在
+  后续 typed helper/GIL ownership 切片继续处理。
