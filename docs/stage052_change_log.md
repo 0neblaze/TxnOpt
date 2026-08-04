@@ -3268,3 +3268,25 @@ compatibility fallback（兼容回退）。
   Ruff、83-file strict mypy 与 `git diff --check` 通过。独立 Spec 审查 ACCEPT；Standards
   首轮发现 projection 后置 buffer-request blocker，修复后复审 ACCEPT。production capability
   bits 继续全部为 0，不创建 attempt04，不启动 Paired/Pilot/Formal/CUDA，不切换默认架构。
+
+## 2026-08-04：Stage 4 boundary 完成 typed staged commit
+
+- 新增 C++ `Stage04BoundaryStateV2`，在 owned boundary 中统一计算 segment status、四个
+  constraint operator 的 old/new weights、boundary calls/rewards、reheat、restart、
+  intensification 和 stagnation 状态。`Stage04BoundaryProjectionV2` 在任何状态修改前分配完整
+  tuple/arrays 并缓存 raw pointers；commit 后只复制固定大小基础类型并 move payload。
+- reheat/restart/intensification 改为 staged next-state。restart 需要的 best-lane routes、exact
+  payload 和 objective mirrors 全部在提交前构造；发布阶段只移动 C++/pybind owned objects 并
+  更新标量。新增 projection failure injection 证明失败后 weights、segment accumulators 和
+  last-finished iteration 均不变，同一 iteration 可按原输入成功重试。
+- clean code checkpoint `dfb38a82240792f9fad06f4a4642bf043a21a287` 的 wheel
+  SHA-256 为 `f9b548b8d1b0d287a3b7d568fa214a995fade4608fd4395f54a5a9ac6cc3579f`，
+  extension 为 `512c3ef52def97e4636a70a028f2f961d68c5b7e8c49c275a9722857a4b69839`，
+  scheduler 保持 `a1cd6e81caa49cdd7d162e44ee1274b7645dd26fd0f6b8760ae004b8d5e80617`；
+  安装后的 extension 自报 revision 与 checkpoint 完全一致。
+- clean-wheel 验证：Stage 4/three-lane 扩大集合 `71 passed, 270 deselected`；四实例三 seed
+  fixed-work 全字段差分 `12 passed`、耗时 `93.62s`；完整
+  `tests/test_native_execution.py` 为 `329 passed, 12 skipped`、耗时 `798.47s`。
+  Ruff、83-file strict mypy 与 `git diff --check` 通过；独立 Spec 与 Standards 双审查均
+  ACCEPT。production capability bits 继续全部为 0，不创建 attempt04，不启动
+  Paired/Pilot/Formal/CUDA，不切换默认架构。
