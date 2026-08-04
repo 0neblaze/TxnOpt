@@ -196,6 +196,72 @@ struct RepairResultV2 final {
     }
 };
 
+struct InsertionPlanPoolV2 final {
+    std::vector<std::int64_t> plan_offsets;
+    std::vector<std::int64_t> route_offsets;
+    std::vector<std::int64_t> route_indices;
+    std::vector<std::int64_t> metadata;
+
+    [[nodiscard]] std::size_t plan_count() const noexcept {
+        return plan_offsets.empty() ? 0 : plan_offsets.size() - 1;
+    }
+
+    void validate() const {
+        constexpr auto maximum_i64_size =
+            static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
+        if (plan_offsets.empty() || route_offsets.empty()
+            || plan_count() > maximum_i64_size
+            || route_offsets.size() - 1 > maximum_i64_size
+            || route_indices.size() > maximum_i64_size
+            || plan_offsets.front() != 0 || route_offsets.front() != 0
+            || plan_offsets.back()
+                != static_cast<std::int64_t>(route_offsets.size() - 1)
+            || route_offsets.back()
+                != static_cast<std::int64_t>(route_indices.size())
+            || metadata.size() % 2 != 0
+            || metadata.size() / 2 != plan_count()) {
+            throw std::logic_error(
+                "native insertion plan pool is inconsistent");
+        }
+        for (std::size_t route = 0; route + 1 < route_offsets.size(); ++route) {
+            if (route_offsets[route] < 0
+                || route_offsets[route] >= route_offsets[route + 1]
+                || route_offsets[route + 1]
+                    > static_cast<std::int64_t>(route_indices.size())) {
+                throw std::logic_error(
+                    "native insertion route offsets are not strictly monotonic");
+            }
+        }
+        for (std::size_t plan = 0; plan < plan_count(); ++plan) {
+            if (plan_offsets[plan] < 0
+                || plan_offsets[plan] >= plan_offsets[plan + 1]
+                || plan_offsets[plan + 1]
+                    > static_cast<std::int64_t>(route_offsets.size() - 1)) {
+                throw std::logic_error(
+                    "native insertion plan offsets are not strictly monotonic");
+            }
+        }
+        for (std::size_t plan = 0; plan < plan_count(); ++plan) {
+            const auto target = metadata[plan * 2];
+            const auto position = metadata[plan * 2 + 1];
+            const auto plan_route_count =
+                plan_offsets[plan + 1] - plan_offsets[plan];
+            if (target < 0 || target >= plan_route_count || position < 0) {
+                throw std::logic_error(
+                    "native insertion plan metadata is invalid");
+            }
+            const auto target_route = plan_offsets[plan] + target;
+            const auto target_size =
+                route_offsets[static_cast<std::size_t>(target_route + 1)]
+                - route_offsets[static_cast<std::size_t>(target_route)];
+            if (position >= target_size) {
+                throw std::logic_error(
+                    "native insertion position is outside its target route");
+            }
+        }
+    }
+};
+
 [[nodiscard]] inline DynamicRemovalSelectionV2 select_dynamic_removal_v2(
     const std::int64_t customer_count,
     const std::int64_t stagnation_iterations,

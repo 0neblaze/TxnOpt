@@ -1245,41 +1245,44 @@ py::tuple changed_candidate_pool_v1(
         std::move(removed_indices_array));
 }
 
-py::tuple insertion_candidate_plans_v2_impl(
-    py::handle current_route_offsets,
-    py::handle current_route_indices,
+evrptw::native_search::InsertionPlanPoolV2
+insertion_candidate_plans_owned_v2(
+    std::span<const std::int64_t> current_route_offsets,
+    std::span<const std::int64_t> current_route_indices,
     std::int64_t customer,
-    py::handle demand,
+    std::span<const double> demand,
     double load_capacity,
     double epsilon,
     bool allow_new_route) {
-    auto offsets_array = checked_array<std::int64_t>(
-        current_route_offsets, "current_route_offsets", 1);
-    auto indices_array = checked_array<std::int64_t>(
-        current_route_indices, "current_route_indices", 1);
-    auto demand_array = checked_array<double>(demand, "demand", 1);
-    if (offsets_array.size() < 1 || customer < 0
-        || customer >= demand_array.size() || !std::isfinite(load_capacity)
+    if (current_route_offsets.empty() || demand.empty() || customer < 0
+        || customer >= static_cast<std::int64_t>(demand.size())
+        || !std::isfinite(load_capacity)
         || load_capacity < 0.0 || !std::isfinite(epsilon) || epsilon < 0.0) {
         throw std::invalid_argument("insertion candidate-plan input/config is invalid");
     }
-    const auto route_count = static_cast<std::size_t>(offsets_array.size() - 1);
-    const auto* offsets = checked_data<std::int64_t>(offsets_array);
-    const auto* indices = checked_data<std::int64_t>(indices_array);
-    const auto* demands = checked_data<double>(demand_array);
-    if (offsets[0] != 0 || offsets[route_count] != indices_array.size()) {
+    const auto route_count = current_route_offsets.size() - 1;
+    const auto* offsets = current_route_offsets.data();
+    const auto* indices = current_route_indices.data();
+    const auto* demands = demand.data();
+    if (offsets[0] != 0
+        || offsets[route_count]
+            != static_cast<std::int64_t>(current_route_indices.size())) {
         throw std::invalid_argument("insertion current routes do not span indices");
     }
     std::vector<std::vector<std::int64_t>> routes;
     routes.reserve(route_count);
     for (std::size_t route = 0; route < route_count; ++route) {
-        if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]) {
+        if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]
+            || offsets[route + 1]
+                > static_cast<std::int64_t>(current_route_indices.size())) {
             throw std::invalid_argument("insertion current routes must be non-empty");
         }
         routes.emplace_back(
             indices + offsets[route], indices + offsets[route + 1]);
         for (const auto node : routes.back()) {
-            if (node < 0 || node >= demand_array.size() || node == customer) {
+            if (node < 0
+                || node >= static_cast<std::int64_t>(demand.size())
+                || node == customer) {
                 throw std::invalid_argument(
                     "insertion routes contain an invalid or already-present customer");
             }
@@ -1336,24 +1339,69 @@ py::tuple insertion_candidate_plans_v2_impl(
             metadata.push_back(static_cast<std::int64_t>(position));
         }
     }
-    py::array_t<std::int64_t> plan_offsets_array(plan_offsets.size());
-    py::array_t<std::int64_t> route_offsets_array(route_offsets.size());
-    py::array_t<std::int64_t> route_indices_array(route_indices.size());
+    evrptw::native_search::InsertionPlanPoolV2 result{
+        std::move(plan_offsets),
+        std::move(route_offsets),
+        std::move(route_indices),
+        std::move(metadata),
+    };
+    result.validate();
+    return result;
+}
+
+py::tuple project_insertion_candidate_plans_v2(
+    const evrptw::native_search::InsertionPlanPoolV2& pool) {
+    pool.validate();
+    py::array_t<std::int64_t> plan_offsets_array(pool.plan_offsets.size());
+    py::array_t<std::int64_t> route_offsets_array(pool.route_offsets.size());
+    py::array_t<std::int64_t> route_indices_array(pool.route_indices.size());
     py::array_t<std::int64_t> metadata_array(
         std::vector<py::ssize_t>{
-            static_cast<py::ssize_t>(metadata.size() / 2), 2});
+            static_cast<py::ssize_t>(pool.plan_count()), 2});
     std::copy(
-        plan_offsets.begin(), plan_offsets.end(), checked_data(plan_offsets_array));
+        pool.plan_offsets.begin(), pool.plan_offsets.end(),
+        checked_data(plan_offsets_array));
     std::copy(
-        route_offsets.begin(), route_offsets.end(), checked_data(route_offsets_array));
+        pool.route_offsets.begin(), pool.route_offsets.end(),
+        checked_data(route_offsets_array));
     std::copy(
-        route_indices.begin(), route_indices.end(), checked_data(route_indices_array));
-    std::copy(metadata.begin(), metadata.end(), checked_data(metadata_array));
+        pool.route_indices.begin(), pool.route_indices.end(),
+        checked_data(route_indices_array));
+    std::copy(
+        pool.metadata.begin(), pool.metadata.end(), checked_data(metadata_array));
     return py::make_tuple(
         std::move(plan_offsets_array),
         std::move(route_offsets_array),
         std::move(route_indices_array),
         std::move(metadata_array));
+}
+
+py::tuple insertion_candidate_plans_v2_impl(
+    py::handle current_route_offsets,
+    py::handle current_route_indices,
+    std::int64_t customer,
+    py::handle demand,
+    double load_capacity,
+    double epsilon,
+    bool allow_new_route) {
+    auto offsets_array = checked_array<std::int64_t>(
+        current_route_offsets, "current_route_offsets", 1);
+    auto indices_array = checked_array<std::int64_t>(
+        current_route_indices, "current_route_indices", 1);
+    auto demand_array = checked_array<double>(demand, "demand", 1);
+    const auto pool = insertion_candidate_plans_owned_v2(
+        std::span<const std::int64_t>{
+            checked_data<std::int64_t>(offsets_array),
+            static_cast<std::size_t>(offsets_array.size())},
+        std::span<const std::int64_t>{
+            checked_data<std::int64_t>(indices_array),
+            static_cast<std::size_t>(indices_array.size())},
+        customer,
+        std::span<const double>{
+            checked_data<double>(demand_array),
+            static_cast<std::size_t>(demand_array.size())},
+        load_capacity, epsilon, allow_new_route);
+    return project_insertion_candidate_plans_v2(pool);
 }
 
 py::tuple insertion_candidate_plans_v2(
@@ -13152,13 +13200,17 @@ public:
             py::object last_transaction = py::none();
             std::int64_t exact_rows_seen = 0;
             const auto transaction_started = std::chrono::steady_clock::now();
-            const auto make_routes_soa = [](const auto& routes) {
+            const auto make_routes_vectors = [](const auto& routes) {
                 std::vector<std::int64_t> offsets{0};
                 std::vector<std::int64_t> indices;
                 for (const auto& route : routes) {
                     indices.insert(indices.end(), route.begin(), route.end());
                     offsets.push_back(static_cast<std::int64_t>(indices.size()));
                 }
+                return std::make_pair(std::move(offsets), std::move(indices));
+            };
+            const auto make_routes_soa = [&](const auto& routes) {
+                auto [offsets, indices] = make_routes_vectors(routes);
                 py::array_t<std::int64_t> offsets_array(offsets.size());
                 py::array_t<std::int64_t> indices_array(indices.size());
                 std::copy(offsets.begin(), offsets.end(), checked_data(offsets_array));
@@ -13203,11 +13255,17 @@ public:
                 for (std::size_t pending_index = 0;
                      pending_index < pending.size(); ++pending_index) {
                     const auto [current_offsets, current_indices] =
-                        make_routes_soa(sequential_routes);
-                    auto pool = insertion_candidate_plans_v2_impl(
+                        make_routes_vectors(sequential_routes);
+                    if (!live_problem_.has_value()) {
+                        throw std::logic_error(
+                            "full native insertion planning lost its problem state");
+                    }
+                    const auto pool_state = insertion_candidate_plans_owned_v2(
                         current_offsets, current_indices, pending[pending_index],
-                        demand_, checked_data<double>(vehicle_)[1],
-                        screening_epsilon_, false);
+                        live_problem_->demand,
+                        checked_data<double>(vehicle_)[1], screening_epsilon_,
+                        false);
+                    auto pool = project_insertion_candidate_plans_v2(pool_state);
                     auto pool_plan_offsets =
                         py::cast<py::array_t<std::int64_t>>(pool[0]);
                     if (pool_plan_offsets.size() <= 1) {
@@ -13217,8 +13275,6 @@ public:
                         py::cast<py::array_t<std::int64_t>>(pool[1]);
                     auto pool_route_indices =
                         py::cast<py::array_t<std::int64_t>>(pool[2]);
-                    auto pool_metadata =
-                        py::cast<py::array_t<std::int64_t>>(pool[3]);
                     auto expected_routes = sequential_routes;
                     expected_routes.push_back({pending[pending_index]});
                     auto expected = make_expected(expected_routes);
@@ -13251,8 +13307,7 @@ public:
                             candidate_round.route_offsets.data();
                         const auto* route_nodes =
                             candidate_round.route_indices.data();
-                        const auto* metadata_values =
-                            checked_data<std::int64_t>(pool_metadata);
+                        const auto* metadata_values = pool_state.metadata.data();
                         for (std::size_t order = 0;
                              order < feasible_order.size(); ++order) {
                             const auto plan = feasible_order[order];
@@ -13434,10 +13489,16 @@ public:
                 py::none(), std::move(last_transaction), lane_solution_state(0));
         }
         const auto customer = removed.front();
-        auto insertion_pool = insertion_candidate_plans_v2_impl(
-            partial_offsets_array, partial_indices_array, customer, demand_,
+        if (!live_problem_.has_value()) {
+            throw std::logic_error(
+                "full native insertion planning lost its problem state");
+        }
+        const auto insertion_pool_state = insertion_candidate_plans_owned_v2(
+            partial_offsets, partial_indices, customer, live_problem_->demand,
             checked_data<double>(vehicle_)[1], screening_epsilon_,
             partial_offsets.size() == 1);
+        auto insertion_pool =
+            project_insertion_candidate_plans_v2(insertion_pool_state);
         auto insertion_plan_offsets_array =
             py::cast<py::array_t<std::int64_t>>(insertion_pool[0]);
         auto insertion_route_offsets_array =
