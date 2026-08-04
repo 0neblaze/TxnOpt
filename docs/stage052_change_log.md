@@ -3466,3 +3466,43 @@ compatibility fallback（兼容回退）。
   whole-call GIL-safe 或性能收益。production capability bits 继续全部为 0；不创建 attempt04，
   不启动 Paired/Pilot/Formal/CUDA，不切换默认架构。下一 helper slice 为
   `route_merge_candidate_pool_v2`。
+
+## 2026-08-04：route-merge candidate pool 完成 typed ownership
+
+- 新增 C++ `RouteMergeCandidatePoolV2`，自有保存 candidate CSR、五列
+  `[pair_left, pair_right, source, target, position]` metadata、pair-pruning 两计数和仅供内部校验的
+  input route count。`route_merge_candidate_pool_owned_v2()` 接收连续 spans，公开
+  `route_merge_candidate_pool_v2()` 仍返回历史四数组 ABI：`int64[K+1]` offsets、`int64[M]`
+  indices、连续 `int64[K,5]` metadata 与 `int64[2]` pruning；全剪枝空池保持
+  `[0], [], shape=(0,5)`。
+- pair 排序键、两种 source/target 方向、position `0..target.size()`、exact sequence duplicate
+  identity、`preserve_duplicates` 和严格 `combined_demand > capacity + epsilon` 的整 pair 剪枝
+  顺序完全保持。pruned-candidate 仍按 `len(left)+len(right)+2` 计费；新增的 bounds/overflow
+  gate 只让非法或不可表示输入 fail fast。
+- `legacy_route_merge_probe` 现在从 legacy lane 和 frozen `ProblemV2` 构造 route metrics、demand、
+  capacity，并直接读取 owned candidate offsets/indices/metadata 完成并行 screening、journal、plan
+  重建与 source-candidate identity；公开 pool projection 在任何 screening/state mutation 前一次性
+  分配，既保留旧返回 envelope，也不让 Python array 反向控制搜索。released-GIL screening 段只读
+  生命周期由 state mutex 与局部 `pool_state` 覆盖的 owned buffers。
+- 输入 route CSR 在构造 pointer range 前验证 terminal、严格非空、单调和每段上界；输出 validator
+  分层验证 CSR、metadata shape、pair/source-target identity、route bounds、position 和非负 pruning。
+  Standards 首轮复审发现一个继承自旧公开 helper 的 P2：NaN/Inf/负 demand 会进入 pair sorting
+  key，破坏 `stable_sort` 的 strict weak ordering。现已在每个 demand 进入补偿求和前要求 finite 且
+  non-negative，并用 NaN、+Inf、-Inf、-1.0 四类公开 ABI 回归关闭；复审最终 ACCEPT。
+- 测试补强覆盖输出 dtype/C-contiguity、duplicate on/off、pair-pruning on/off、全剪枝空池、剪枝
+  计数、畸形非单调 offset 和四类非法 demand。验证过程有一次命令组合误把 C++ 源文件直接传给
+  Python Ruff，Ruff 按 Python 语法解析后失败；该次仅是验证命令误用，不计入通过证据。随后标准
+  `ruff check .`、83-file strict mypy 与 `git diff --check` 均通过。
+- clean code checkpoint `7a0d797dbb6603d29b15ed2ed3492c429ff6b817` 的 wheel SHA-256 为
+  `640bf4b4ad8601d013ad25059e7b3ec8dda6a5d4de75ca4530fb56991f96205b`，extension 为
+  `3e2638583dd8199b530d0e0fa105a709770135f2197817b3a734a1febc8dae86`，scheduler 保持
+  `a1cd6e81caa49cdd7d162e44ee1274b7645dd26fd0f6b8760ae004b8d5e80617`；安装后的 extension
+  自报 revision 与 checkpoint 完全一致。
+- clean-wheel route-merge/follow-up 聚焦集合为 `59 passed, 285 deselected`；扩大非真实数据
+  full-native 集合为 `86 passed, 258 deselected`；完整 `tests/test_native_execution.py` 为
+  `332 passed, 12 skipped`、耗时 `802.42s`；四实例三 seed 真实 per-solve fixed-work 全字段差分
+  为 `12 passed`、耗时 `420.39s`。独立 Spec 与 Standards 最终均 ACCEPT。
+- 本条仍只完成 route-merge pool 的 pure-span computation/owned output。公开 adapter/projector、
+  probe envelope 和其余 screening input mirrors 仍依赖 pybind/NumPy；不能宣称 whole-call GIL-safe
+  或性能收益。production capability bits 继续全部为 0；不创建 attempt04，不启动
+  Paired/Pilot/Formal/CUDA，不切换默认架构。下一 slice 为 changed-candidate pool 与 plan assembly。
