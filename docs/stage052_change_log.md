@@ -3141,3 +3141,17 @@ compatibility fallback（兼容回退）。
   operators、cache adapters、terminal projection 和外层 whole-call GIL release 仍需继续
   迁移并通过完整 differential/fault gates。production capability bits 保持 0，不创建
   attempt04，不启动 Paired/Pilot/Formal/CUDA。
+- 独立规格/标准审查随后发现并阻断了四个异常路径缺口。global-search snapshot 现完整保存
+  四条 lane 的 Python mirrors、constraint/full-operator Stage 4 weights/rewards/calls/totals、
+  reheat/restart/intensification state；故障注入移动到 Stage 4 boundary 和 restart 已发生之后，
+  rollback 后逐 lane、best、两组 Stage 4 状态保持一致并允许同 iteration 重试。
+- legacy candidate apply 不再在比较前破坏性移动所有权：原 legacy owner 保留到验证、发布和
+  Stage 4 计数全部成功，mirror fault 后仍可从原入口重试。所有 last-to-legacy ownership
+  transfer 在 `std::move(optional)` 后显式 reset source，维持 `ready == has_value`；candidate
+  在 objective comparison 前用初始化时固化的纯 C++ `ProblemV2` 执行完整 `validate_live()`，
+  accepted current/best publication 另有强异常安全快照。针对 restart-envelope rollback、
+  current candidate mirror retry 与 legacy owner retry 的聚焦回归为 `3 passed`，扩展相关集合
+  为 `13 passed`。`ProblemV2` 的 O(n²) 静态数组只在 initialize gate 完整验证一次，后续仍
+  逐次执行完整 lane/customer/path/objective 验证，避免把不变距离矩阵验证变成搜索主成本；
+  真实四实例三 seed fixed-work 门控复跑为 `12 passed`、耗时 `90.98s`。Ruff、83-file
+  strict mypy 与 `git diff --check` 通过。

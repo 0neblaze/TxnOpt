@@ -4299,18 +4299,26 @@ def test_native_global_search_envelope_failure_rolls_back_logical_state() -> Non
         np.asarray([2014, 1, 128, 1, 10], dtype=np.int64),
         np.asarray([30.0], dtype=np.float64),
     )
-    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    stage04_integer, stage04_float = _native_stage04_arrays(
+        Stage04Config(
+            reheat_stagnation_threshold=1,
+            restart_stagnation_threshold=2,
+        )
+    )
     engine.configure_stage04(stage04_integer, stage04_float)
     state_before = engine.state()
     solution_before = engine.solution_state()
+    lanes_before = tuple(engine.lane_solution_state(lane) for lane in range(3))
+    best_before = engine.best_solution_payload()
     stage04_before = engine.constraint_stage04_state()
+    full_stage04_before = engine.full_stage04_state()
 
     engine.inject_global_search_envelope_failure_once()
     with pytest.raises(RuntimeError, match="global-search envelope failure"):
         engine.run_global_search(
             0,
             1,
-            0,
+            1,
             np.asarray([4, 8, 3], dtype=np.int64),
             np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
             np.asarray([30.0], dtype=np.float64),
@@ -4320,16 +4328,38 @@ def test_native_global_search_envelope_failure_rolls_back_logical_state() -> Non
 
     state_after = engine.state()
     solution_after = engine.solution_state()
+    lanes_after = tuple(engine.lane_solution_state(lane) for lane in range(3))
+    best_after = engine.best_solution_payload()
     stage04_after = engine.constraint_stage04_state()
+    full_stage04_after = engine.full_stage04_state()
     for before, after in zip(solution_before, solution_after, strict=True):
         np.testing.assert_equal(after, before)
     for before, after in zip(stage04_before, stage04_after, strict=True):
+        np.testing.assert_equal(after, before)
+    for lane_before, lane_after in zip(lanes_before, lanes_after, strict=True):
+        for before, after in zip(lane_before, lane_after, strict=True):
+            np.testing.assert_equal(after, before)
+    for before, after in zip(best_before, best_after, strict=True):
+        np.testing.assert_equal(after, before)
+    for before, after in zip(full_stage04_before, full_stage04_after, strict=True):
         np.testing.assert_equal(after, before)
     np.testing.assert_equal(state_after[0], state_before[0])
     assert state_after[2] == state_before[2]
     np.testing.assert_equal(state_after[3], state_before[3])
     assert state_after[1][5] > state_before[1][5]
     np.testing.assert_equal(state_after[1][2:5], state_before[1][2:5])
+
+    retry = engine.run_global_search(
+        0,
+        1,
+        1,
+        np.asarray([4, 8, 3], dtype=np.int64),
+        np.asarray([0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+    assert retry[13].tolist()[2] == 1
 
 
 def test_native_search_engine_owns_three_isolated_lane_states() -> None:
@@ -4787,6 +4817,69 @@ def test_native_live_lane_cpp_state_rejects_and_repairs_mirror_tamper() -> None:
     for expected, actual in zip(before, after, strict=True):
         np.testing.assert_equal(actual, expected)
     assert engine.apply_last_candidate(1.0, 0.5) == (1, 0, 0)
+
+
+def test_native_legacy_candidate_owner_survives_apply_failure_for_retry() -> None:
+    """A legacy apply failure must retain the candidate at its original owner."""
+
+    from evrptw import _core as native_core
+
+    instance = _candidate_plan_fixture()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = _native_search_engine(
+        native_core,
+        context,
+        100,
+        100,
+        256,
+        10_000_000,
+        256,
+        100,
+        context.reachability_epsilon,
+        1,
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        _native_lexical_rank(context),
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray([1, 2, 3, 4], dtype=np.int64),
+        np.asarray([2014, 1, 128, 1, 100], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    legacy = engine.legacy_route_elimination_probe(
+        0,
+        3,
+        -1,
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        True,
+    )
+    assert legacy[6].tolist()[1:4] == [-2, 0, 0]
+    before = tuple(engine.lane_solution_state(lane) for lane in range(3))
+    best_before = engine.best_solution_payload()
+
+    engine.inject_live_lane_mirror_tamper_once()
+    with pytest.raises(RuntimeError, match="live.constraint.objective_integer"):
+        engine.apply_legacy_candidate(1.0, 1.0)
+
+    after_failure = tuple(engine.lane_solution_state(lane) for lane in range(3))
+    for lane_before, lane_after in zip(before, after_failure, strict=True):
+        for expected, actual in zip(lane_before, lane_after, strict=True):
+            np.testing.assert_equal(actual, expected)
+    for expected, actual in zip(
+        best_before, engine.best_solution_payload(), strict=True
+    ):
+        np.testing.assert_equal(actual, expected)
+    assert engine.apply_legacy_candidate(1.0, 1.0) == (1, 1, 1)
 
 
 def test_native_full_search_lanes_share_one_candidate_round_budget() -> None:

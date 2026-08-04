@@ -602,6 +602,15 @@ struct LaneStateV2 final {
 
     void validate_live(const ProblemV2& problem) const {
         problem.validate();
+        validate_live_assuming_problem_valid(problem);
+    }
+
+    // The search engine freezes and validates one ProblemV2 during
+    // initialization.  Re-validating its O(node_count^2) distance and
+    // reachability buffers at every lane read would turn an invariant check
+    // into the dominant solve cost.  This entry keeps the complete lane-level
+    // validation while relying on that immutable initialization gate.
+    void validate_live_assuming_problem_valid(const ProblemV2& problem) const {
         if (route_offsets.size() < 2 || route_offsets.front() != 0
             || route_offsets.back()
                 != static_cast<std::int64_t>(route_indices.size())) {
