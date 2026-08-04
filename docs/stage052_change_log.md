@@ -3244,3 +3244,27 @@ compatibility fallback（兼容回退）。
   `790.29s`。Ruff、83-file strict mypy 与 `git diff --check` 通过；独立 Spec 与 Standards
   两轴复审均 ACCEPT。production capability bits 继续全部为 0，不创建 attempt04，不启动
   Paired/Pilot/Formal/CUDA，不切换默认架构。
+
+## 2026-08-04：three-lane termination state 完成 typed ownership
+
+- 新增 C++ `ThreeLaneTerminationStateV2`，统一持有 reason、exact budget、started、
+  completed、interrupted 和 completed iterations。bootstrap、follow-up、outer deadline、
+  budget boundary 与 fixed-work exhaustion 的搜索控制全部读取 typed state；reason 3
+  exhaustion 只修改 typed reason，再重算单轮与总 search-stream canonical hash。Python
+  termination array 仅在最终 ABI/证据边界生成，不再反馈 three-lane 搜索决策。
+- `ThreeLaneTerminationProjectionV2` 在搜索开始前分配 NumPy array 并缓存 raw pointer；
+  `finish()` 只执行六个 `int64_t` 写入与 move。lifetime coverage receipt 的第 5 位仅在
+  projection 返回后置 1，关闭了“typed state 已发布但 buffer request 失败”的异常窗口；
+  未执行 three-lane terminal projection 的普通 candidate transaction 仍诚实保持第 5 位为 0。
+- clean code checkpoint `fbe2daf611a0d934fb09afaf67f6e4db0eb7af38` 的 wheel
+  SHA-256 为 `201830b775f8261c6c3ea7a86bfd88e8e42f39c551a18e3778441676ff0802c4`，
+  extension 为 `06d6e033f8956ac147f6a7d41b7a1baa6c02c004c9e455a710c9e03664c1041f`，
+  scheduler 保持 `a1cd6e81caa49cdd7d162e44ee1274b7645dd26fd0f6b8760ae004b8d5e80617`；
+  安装后的 extension 自报 revision 与 checkpoint 完全一致。
+- clean-wheel 验证：聚焦 terminal/cache/deadline/causal 集合 `6 passed`；扩大
+  three-lane/full-native 集合 `121 passed, 219 deselected`、耗时 `429.49s`；四实例三 seed
+  fixed-work 全字段差分 `12 passed`、耗时 `93.09s`；完整
+  `tests/test_native_execution.py` 为 `328 passed, 12 skipped`、耗时 `791.08s`。
+  Ruff、83-file strict mypy 与 `git diff --check` 通过。独立 Spec 审查 ACCEPT；Standards
+  首轮发现 projection 后置 buffer-request blocker，修复后复审 ACCEPT。production capability
+  bits 继续全部为 0，不创建 attempt04，不启动 Paired/Pilot/Formal/CUDA，不切换默认架构。
