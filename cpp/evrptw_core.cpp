@@ -10672,10 +10672,9 @@ public:
             rollback_owned_locally = false;
             if (candidate_round_mirror_tamper_injection_) {
                 candidate_round_mirror_tamper_injection_ = false;
-                auto mirror_objective =
-                    py::cast<py::array_t<std::int64_t>>(result[2]);
-                checked_data(mirror_objective)[0] =
-                    checked_data(mirror_objective)[0] == -1 ? 0 : -1;
+                auto mirror_counters =
+                    py::cast<py::array_t<std::int64_t>>(result[7]);
+                ++checked_data(mirror_counters)[0];
             }
             try {
                 validate_candidate_round_result_mirror(
@@ -17160,6 +17159,23 @@ private:
                     throw std::logic_error(
                         "full native staged exact status/reason is invalid");
                 }
+                if (statuses[row] == -1
+                    && (reasons[row] != -1
+                        || path_offsets[row] != path_offsets[row + 1]
+                        || std::any_of(
+                            metrics.begin() + static_cast<std::ptrdiff_t>(row * 4),
+                            metrics.begin()
+                                + static_cast<std::ptrdiff_t>((row + 1) * 4),
+                            [](double value) { return value != 0.0; })
+                        || std::any_of(
+                            label_counters.begin()
+                                + static_cast<std::ptrdiff_t>(row * 3),
+                            label_counters.begin()
+                                + static_cast<std::ptrdiff_t>((row + 1) * 3),
+                            [](std::int64_t value) { return value != 0; }))) {
+                    throw std::logic_error(
+                        "full native staged exact sentinel is not canonical");
+                }
             }
         }
     };
@@ -17591,8 +17607,24 @@ private:
         const auto objective_integer =
             py::cast<py::array_t<std::int64_t>>(result[2]);
         const auto objective_float = py::cast<py::array_t<double>>(result[3]);
+        const auto selected =
+            py::cast<py::array_t<std::int64_t>>(result[0]);
+        const auto statuses =
+            py::cast<py::array_t<std::int64_t>>(result[1]);
+        const auto route_resolutions =
+            py::cast<py::array_t<std::int64_t>>(result[4]);
         const auto exact_route_rows =
             py::cast<py::array_t<std::int64_t>>(result[5]);
+        const auto completion_order =
+            py::cast<py::array_t<std::int64_t>>(result[6]);
+        const auto counters =
+            py::cast<py::array_t<std::int64_t>>(result[7]);
+        const auto cache_statistics =
+            py::cast<py::array_t<std::int64_t>>(result[8]);
+        const auto negative_statistics =
+            py::cast<py::array_t<std::int64_t>>(result[9]);
+        const auto budget_state =
+            py::cast<py::array_t<std::int64_t>>(result[10]);
         const auto feasible_order =
             py::cast<py::array_t<std::int64_t>>(result[11]);
         if (objective_integer.ndim() != 2 || objective_integer.shape(1) != 2
@@ -17605,7 +17637,24 @@ private:
         require_candidate_round_mirror_equal<double>(
             objective_float, staged.objective_float, "objective_float", 2);
         require_candidate_round_mirror_equal<std::int64_t>(
+            selected, staged.selected, "selected");
+        require_candidate_round_mirror_equal<std::int64_t>(
+            statuses, staged.statuses, "statuses");
+        require_candidate_round_mirror_equal<std::int64_t>(
+            route_resolutions, staged.route_resolutions, "route_resolutions");
+        require_candidate_round_mirror_equal<std::int64_t>(
             exact_route_rows, staged.exact_route_rows, "exact_route_rows");
+        require_candidate_round_mirror_equal<std::int64_t>(
+            completion_order, staged.completion_order, "completion_order");
+        require_candidate_round_mirror_equal<std::int64_t>(
+            counters, staged.counters, "counters");
+        require_candidate_round_mirror_equal<std::int64_t>(
+            cache_statistics, staged.cache_statistics, "cache_statistics");
+        require_candidate_round_mirror_equal<std::int64_t>(
+            negative_statistics, staged.negative_statistics,
+            "negative_statistics");
+        require_candidate_round_mirror_equal<std::int64_t>(
+            budget_state, staged.budget_state, "budget_state");
         require_candidate_round_mirror_equal<std::int64_t>(
             feasible_order, staged.feasible_order, "feasible_order");
         const auto transaction_sha256 = py::cast<std::string>(result[12]);

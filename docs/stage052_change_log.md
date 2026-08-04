@@ -3108,7 +3108,11 @@ compatibility fallback（兼容回退）。
   rollback 路径撤销事务。发布顺序也改为先完成可能抛错的 causal journal，再原子公开
   pending members，消除 active flag 设置前留下半发布状态的异常窗口。搜索、温度估计、
   quality/refinement 与事件投影不再从返回 tuple 读取状态、可行顺序或 objective，而从
-  C++-owned round state 读取；tuple 只保留 ABI 和证据用途。
+  C++-owned round state 读取；tuple 只保留 ABI 和证据用途。返回前逐字段校验 tuple 的
+  selected/status/objective/resolution/exact/completion/counters/cache/negative/budget/feasible
+  投影及事务哈希，故障注入专门篡改非 objective counter（计数器）以覆盖证据字段漂移；
+  未求解 exact sentinel（精确结果哨兵）的 reason、path、metrics 与 label counters 也必须
+  保持规范零值。
 - 本切片的原始 1-thread/4-thread transaction、deadline、duplicate plan、cache、budget、
   commit failure、objective ordering 与 canonical journal 聚焦回归为 `19 passed`；扩大到
   所有 `native_search_engine`/`full_native` 路径的 non-host 回归为
