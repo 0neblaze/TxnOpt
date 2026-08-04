@@ -433,6 +433,102 @@ struct CandidatePlanPoolV1 final {
     }
 };
 
+struct ScreenBatchInputV2 final {
+    std::span<const std::int64_t> node_kind;
+    std::span<const double> demand;
+    std::span<const double> ready_time;
+    std::span<const double> due_date;
+    std::span<const double> service_time;
+    std::span<const double> distance;
+    std::span<const std::uint8_t> reachable;
+    std::span<const double> vehicle;
+    std::span<const std::int64_t> route_offsets;
+    std::span<const std::int64_t> route_indices;
+    std::span<const std::int64_t> candidate_ids;
+    std::span<const double> options;
+    std::span<const double> incremental;
+    std::span<const std::int64_t> negative_offsets;
+    std::span<const std::int64_t> negative_indices;
+    std::span<const std::int64_t> negative_reason_codes;
+    std::int64_t worker_count = 0;
+};
+
+struct ScreenBatchResultV2 final {
+    std::vector<std::int64_t> candidate_ids;
+    std::vector<std::int64_t> statuses;
+    std::vector<std::int64_t> duplicate_of;
+    std::vector<std::int64_t> codes;
+    std::vector<double> metrics;
+    std::array<std::int64_t, 5> counters{};
+    std::string digest;
+
+    [[nodiscard]] std::size_t candidate_count() const noexcept {
+        return candidate_ids.size();
+    }
+
+    void validate() const {
+        constexpr auto maximum_i64_size =
+            static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
+        if (candidate_count() > maximum_i64_size
+            || statuses.size() != candidate_count()
+            || duplicate_of.size() != candidate_count()
+            || candidate_count() > std::numeric_limits<std::size_t>::max() / 16
+            || codes.size() != candidate_count() * 16
+            || candidate_count() > std::numeric_limits<std::size_t>::max() / 15
+            || metrics.size() != candidate_count() * 15
+            || counters[0] != static_cast<std::int64_t>(candidate_count())
+            || counters[1] < 0 || counters[2] < 0 || counters[3] < 0
+            || counters[4] < 0 || counters[1] > counters[0]
+            || counters[2] > counters[0] || counters[3] > counters[1]
+            || counters[4] > counters[1]
+            || counters[1] != counters[0] - counters[2]
+            || counters[3] != counters[1] - counters[4]
+            || digest.size() != 64
+            || !std::all_of(
+                digest.begin(), digest.end(), [](const char value) {
+                    return (value >= '0' && value <= '9')
+                        || (value >= 'a' && value <= 'f');
+                })) {
+            throw std::logic_error(
+                "native screen-batch result is inconsistent");
+        }
+        std::unordered_set<std::int64_t> observed_ids;
+        std::int64_t duplicate_count = 0;
+        std::int64_t negative_count = 0;
+        std::int64_t screened_count = 0;
+        for (std::size_t candidate = 0; candidate < candidate_count(); ++candidate) {
+            if (!observed_ids.insert(candidate_ids[candidate]).second
+                || statuses[candidate] < 0 || statuses[candidate] > 2) {
+                throw std::logic_error(
+                    "native screen-batch candidate identity is invalid");
+            }
+            if (statuses[candidate] == 1) {
+                ++duplicate_count;
+                if (duplicate_of[candidate] == candidate_ids[candidate]
+                    || !observed_ids.contains(duplicate_of[candidate])) {
+                    throw std::logic_error(
+                        "native screen-batch duplicate identity is invalid");
+                }
+            } else {
+                if (duplicate_of[candidate] != -1) {
+                    throw std::logic_error(
+                        "native screen-batch duplicate sentinel is invalid");
+                }
+                if (statuses[candidate] == 2) {
+                    ++negative_count;
+                } else {
+                    ++screened_count;
+                }
+            }
+        }
+        if (duplicate_count != counters[2] || negative_count != counters[3]
+            || screened_count != counters[4]) {
+            throw std::logic_error(
+                "native screen-batch counters are inconsistent");
+        }
+    }
+};
+
 [[nodiscard]] inline DynamicRemovalSelectionV2 select_dynamic_removal_v2(
     const std::int64_t customer_count,
     const std::int64_t stagnation_iterations,

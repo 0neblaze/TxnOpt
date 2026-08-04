@@ -589,6 +589,71 @@ def test_screen_route_batch_transaction_v2_preserves_order_and_cache_semantics()
     assert second[-1] == digest
 
 
+def test_screen_route_batch_transaction_v2_rejects_flattened_shape_aliases() -> None:
+    instance = _instance()
+    scalar_inputs = _screen_pack(instance, ("C1",), full=True)
+    common = scalar_inputs[:8]
+    route_offsets = np.asarray([0, 1], dtype=np.int64)
+    route_indices = scalar_inputs[8]
+    candidate_ids = np.asarray([10], dtype=np.int64)
+    options = scalar_inputs[9]
+    incremental = np.zeros((1, 6), dtype=np.float64)
+    negative_offsets = np.asarray([0], dtype=np.int64)
+    negative_indices = np.asarray([], dtype=np.int64)
+    negative_reason_codes = np.asarray([], dtype=np.int64)
+
+    with pytest.raises(ValueError, match="shape \\(n, n\\)"):
+        screen_route_batch_transaction_v2(
+            *common[:5],
+            common[5].reshape(1, -1),
+            common[6],
+            common[7],
+            route_offsets,
+            route_indices,
+            candidate_ids,
+            options,
+            incremental,
+            negative_offsets,
+            negative_indices,
+            negative_reason_codes,
+        )
+    with pytest.raises(ValueError, match="incremental must have shape"):
+        screen_route_batch_transaction_v2(
+            *common,
+            route_offsets,
+            route_indices,
+            candidate_ids,
+            options,
+            incremental.reshape(2, 3),
+            negative_offsets,
+            negative_indices,
+            negative_reason_codes,
+        )
+
+
+def test_screen_route_batch_transaction_v2_accepts_empty_owned_batch() -> None:
+    instance = _instance()
+    scalar_inputs = _screen_pack(instance, ("C1",), full=True)
+    result = screen_route_batch_transaction_v2(
+        *scalar_inputs[:8],
+        np.asarray([0], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+        scalar_inputs[9],
+        np.empty((0, 6), dtype=np.float64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+    )
+
+    assert result[0].shape == (0,)
+    assert result[3].shape == (0, 16)
+    assert result[4].shape == (0, 15)
+    np.testing.assert_array_equal(result[5], np.zeros(5, dtype=np.int64))
+    assert isinstance(result[6], str)
+    assert len(result[6]) == 64
+
+
 def test_screen_routes_numeric_randomized_python_differential() -> None:
     random = np.random.default_rng(8181)
     for case in range(15):

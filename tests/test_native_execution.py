@@ -60,6 +60,7 @@ from evrptw.native_execution import (
     FULL_NATIVE_STAGE04_INTEGER_FIELDS,
     NATIVE_EXECUTION_SCHEMA_VERSION,
     FullNativeALNSResult,
+    NativeCandidateRoundFailure,
     NativeCandidateRoundRequest,
     NativeCandidateRoundResult,
     Stage052NativeExecutionConfig,
@@ -491,6 +492,52 @@ def test_native_candidate_round_is_one_structured_soa_call() -> None:
     assert timings.shape == (4,)
     assert len(transaction_sha256) == 64
     assert set(transaction_sha256) <= set("0123456789abcdef")
+
+
+def test_native_candidate_round_thread_launch_failure_joins_and_preserves_receipt() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    native_runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+    transaction_runtime = NativeCandidateTransactionRuntime(
+        NativeCandidateTransactionConfig()
+    )
+    native_core._test_screen_batch_thread_launch_failure_v2(1)
+
+    with pytest.raises(
+        NativeCandidateRoundFailure,
+        match="injected native screen-batch thread launch failure",
+    ) as failure:
+        execute_native_candidate_round(
+            instance,
+            NativeCandidateRoundRequest(
+                candidates=(("C1",), ("C2",), ("C2", "C1")),
+                cache_hit_flags=(False, False, False),
+                proposal_top_k=2,
+                exact_budget=1,
+                deadline=100.0,
+                batch_size=128,
+                lane="constraint",
+                operator="relocate",
+                iteration=7,
+                compute_threads=4,
+            ),
+            native_runtime=native_runtime,
+            transaction_runtime=transaction_runtime,
+            negative_cache={},
+            clock=lambda: 90.0,
+        )
+
+    receipt = failure.value.resource_receipt
+    assert receipt.phase == 1
+    assert receipt.started_calls == 0
+    assert receipt.completed_calls == 0
+    assert receipt.interrupted_calls == 0
+    assert receipt.fallback_count == 0
+    assert not receipt.fail_closed
+    assert transaction_runtime.transaction_count == 0
+    assert transaction_runtime.fallback_count == 0
+    assert native_runtime.screening_batch_invocations == 0
 
 
 def test_native_candidate_round_decodes_exact_results_and_records_one_invocation() -> None:
