@@ -45,7 +45,11 @@ class NativeHostScheduler:
     def start(self) -> None:
         if self._process is not None:
             raise RuntimeError("host scheduler is already started")
-        if self.production_fault not in {None, "pause_before_execute"}:
+        if self.production_fault not in {
+            None,
+            "pause_before_execute",
+            "initial_state_path_offset_oob",
+        }:
             raise ValueError("native scheduler production fault is invalid")
         if self.production_fault is not None and not self.enable_fault_injection:
             raise ValueError("native scheduler production fault requires fault injection")

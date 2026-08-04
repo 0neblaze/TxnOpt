@@ -456,6 +456,49 @@ std::vector<std::uint8_t> execute(
             telemetry.size(), telemetry.size());
         return builder.finish();
     }
+    case protocol::KernelOperation::search_initial_state: {
+        const auto request = evrptw::native_search::request_from_payload(input);
+        const auto state = evrptw::native_search::initialize_state(request);
+        const auto sha256 = state.sha256();
+        const auto route_count = state.exact.statuses.size();
+        protocol::PayloadBuilder builder(
+            protocol::KernelOperation::search_initial_state,
+            input.header().request_id);
+        builder.add(protocol::NumericType::int64,
+            state.exact.path_offsets.data(), state.exact.path_offsets.size(),
+            state.exact.path_offsets.size());
+        builder.add(protocol::NumericType::int64,
+            state.exact.path_indices.data(), state.exact.path_indices.size(),
+            state.exact.path_indices.size());
+        builder.add(protocol::NumericType::int64, state.exact.statuses.data(),
+            state.exact.statuses.size(), state.exact.statuses.size());
+        builder.add(protocol::NumericType::int64, state.exact.reasons.data(),
+            state.exact.reasons.size(), state.exact.reasons.size());
+        builder.add(protocol::NumericType::float64, state.exact.metrics.data(),
+            state.exact.metrics.size(), route_count, 4);
+        builder.add(protocol::NumericType::int64,
+            state.exact.label_counters.data(),
+            state.exact.label_counters.size(), route_count, 3);
+        builder.add(protocol::NumericType::int64,
+            state.exact.batch_counters.data(),
+            state.exact.batch_counters.size(),
+            state.exact.batch_counters.size());
+        builder.add(protocol::NumericType::int64,
+            state.objective_integer.data(), state.objective_integer.size(),
+            state.objective_integer.size());
+        builder.add(protocol::NumericType::float64,
+            state.objective_float.data(), state.objective_float.size(),
+            state.objective_float.size());
+        builder.add(protocol::NumericType::int64, state.accounting.data(),
+            state.accounting.size(), state.accounting.size());
+        builder.add(protocol::NumericType::uint8, sha256.data(), sha256.size(),
+            sha256.size());
+        const std::array<double, 4> telemetry{
+            queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0};
+        builder.add(protocol::NumericType::float64, telemetry.data(),
+            telemetry.size(), telemetry.size());
+        return builder.finish();
+    }
     }
     throw std::runtime_error("native scheduler operation is invalid");
 }
@@ -591,6 +634,21 @@ void handle_connection(
                     request_peak_active_tasks, pool.active_task_count());
             });
         }
+        if (injected_fault == "initial_state_path_offset_oob") {
+            const protocol::PayloadView output_view(
+                output_bytes.data(), output_bytes.size());
+            if (output_view.header().operation
+                    != protocol::KernelOperation::search_initial_state
+                || output_view.descriptor(0).count < 2) {
+                throw std::runtime_error(
+                    "injected initial-state corruption has the wrong operation");
+            }
+            const auto& offsets = output_view.descriptor(0);
+            auto* offset_values = reinterpret_cast<std::int64_t*>(
+                output_bytes.data() + offsets.offset);
+            offset_values[offsets.count - 1] = static_cast<std::int64_t>(
+                output_view.descriptor(1).count + 1);
+        }
         patch_pool_telemetry(
             output_bytes, pool, request_peak_active_tasks);
         const auto output_name = "/evrptw-s52-kernel-" + std::to_string(::getpid())
@@ -691,7 +749,9 @@ int main(int argc, char** argv) {
         }
         if (!production_fault.empty()
             && (!allow_fault_injection
-                || production_fault != "pause_before_execute")) {
+                || (production_fault != "pause_before_execute"
+                    && production_fault
+                        != "initial_state_path_offset_oob"))) {
             throw std::invalid_argument(
                 "native scheduler production fault is invalid");
         }

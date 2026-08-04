@@ -269,6 +269,17 @@ class NativeCandidateRoundResult:
 
 
 @dataclass(frozen=True, slots=True)
+class NativeInitialStateReceipt:
+    """Hashed ownership receipt for the full-native initial-state operation."""
+
+    host_owned: bool
+    operation_count: int
+    request_sha256: str
+    state_sha256: str
+    transaction_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class FullNativeALNSResult:
     """Strict output of one full-native solve dispatch."""
 
@@ -292,6 +303,7 @@ class FullNativeALNSResult:
     route_cache_statistics: Mapping[str, int]
     screening_statistics: Mapping[str, object]
     causal_journal: NativeCausalJournal
+    initial_state_receipt: NativeInitialStateReceipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -13285,6 +13297,44 @@ def _decode_full_native_causal_journal(payload: object) -> NativeCausalJournal:
     )
 
 
+def _decode_native_initial_state_receipt(
+    payload: object,
+) -> NativeInitialStateReceipt:
+    """Validate the causal ownership receipt for native initial-state work."""
+
+    if not isinstance(payload, tuple) or len(payload) != 4:
+        raise RuntimeError("full native initial-state receipt has an invalid tuple")
+    flags = _require_array(
+        payload[0],
+        dtype=np.dtype(np.int64),
+        shape=(2,),
+        name="full native initial-state receipt flags",
+    )
+    host_owned = int(flags[0])
+    operation_count = int(flags[1])
+    if host_owned not in (0, 1) or operation_count != host_owned:
+        raise RuntimeError("full native initial-state receipt ownership is invalid")
+    request_sha256, state_sha256, transaction_sha256 = payload[1:]
+    if not all(
+        isinstance(value, str) and _is_sha256(value)
+        for value in (request_sha256, state_sha256, transaction_sha256)
+    ):
+        raise RuntimeError("full native initial-state receipt SHA-256 is invalid")
+    evidence = bytearray(b"stage05.2-native-initial-state-receipt-v2")
+    evidence.extend(flags.tobytes(order="C"))
+    evidence.extend(request_sha256.encode("ascii"))
+    evidence.extend(state_sha256.encode("ascii"))
+    if hashlib.sha256(evidence).hexdigest() != transaction_sha256:
+        raise RuntimeError("full native initial-state receipt SHA-256 mismatch")
+    return NativeInitialStateReceipt(
+        host_owned=bool(host_owned),
+        operation_count=operation_count,
+        request_sha256=request_sha256,
+        state_sha256=state_sha256,
+        transaction_sha256=transaction_sha256,
+    )
+
+
 def execute_full_native_alns(
     instance: Instance,
     *,
@@ -13323,8 +13373,7 @@ def execute_full_native_alns(
         raise ValueError("full native v2 requires enabled Stage 4 search control")
     if not screening_config.enabled or not cache_incremental_config.enabled:
         raise ValueError("full native v2 requires screening and cache/incremental control")
-    remaining = deadline - clock()
-    if remaining <= 0.0:
+    if deadline - clock() <= 0.0:
         raise RuntimeError("full native ALNS reached its deadline before dispatch")
     context = native_runtime.context
     context.assert_matches(instance)
@@ -13356,7 +13405,6 @@ def execute_full_native_alns(
         ],
         dtype=np.int64,
     )
-    deadline_remaining = np.ascontiguousarray([remaining], dtype=np.float64)
     protocol_control = np.ascontiguousarray(
         [
             1 if termination_mode == "fixed_work" else 0,
@@ -13395,6 +13443,10 @@ def execute_full_native_alns(
         vehicle_operator_config,
         FULL_NATIVE_OPERATOR_FLOAT_FIELDS,
     )
+    remaining = deadline - clock()
+    if remaining <= 0.0:
+        raise RuntimeError("full native ALNS reached its deadline during input packing")
+    deadline_remaining = np.ascontiguousarray([remaining], dtype=np.float64)
 
     from evrptw import _core as native_core
 
@@ -13422,7 +13474,7 @@ def execute_full_native_alns(
         operator_integer,
         operator_float,
     )
-    if not isinstance(payload, tuple) or len(payload) != 12:
+    if not isinstance(payload, tuple) or len(payload) != 13:
         raise RuntimeError("full native ALNS returned an invalid payload tuple")
     route_offsets = _require_vector(payload[0], "full native route offsets")
     route_indices = _require_vector(payload[1], "full native route indices")
@@ -13451,7 +13503,7 @@ def execute_full_native_alns(
     timings_array = _require_array(
         payload[4],
         dtype=np.dtype(np.float64),
-        shape=(12,),
+        shape=(13,),
         name="full native timings",
     )
     if any(not math.isfinite(float(value)) or float(value) < 0.0 for value in timings_array):
@@ -13463,9 +13515,17 @@ def execute_full_native_alns(
         abs_tol=1e-12,
     ):
         raise RuntimeError("full native ALNS timing intervals do not reconcile")
-    telemetry_values = timings_array[4:12]
+    telemetry_values = timings_array[4:13]
     if any(float(value) != int(value) for value in telemetry_values):
         raise RuntimeError("full native ALNS concurrency telemetry is not integral")
+    initial_state_receipt = _decode_native_initial_state_receipt(payload[12])
+    if (
+        int(timings_array[12]) != initial_state_receipt.operation_count
+        or bool(int(timings_array[7])) != initial_state_receipt.host_owned
+    ):
+        raise RuntimeError(
+            "full native initial-state ownership receipt does not reconcile"
+        )
     if int(timings_array[5]) != 0:
         raise RuntimeError("full native ALNS returned with active native work")
     if int(timings_array[7]) not in (0, 1):
@@ -13479,10 +13539,15 @@ def execute_full_native_alns(
             raise RuntimeError("host scheduler reported no remote kernel requests")
         if int(timings_array[11]) <= 0:
             raise RuntimeError("host scheduler reported no screening-batch requests")
+        if int(timings_array[12]) != 1:
+            raise RuntimeError(
+                "host scheduler did not own exactly one initial search state"
+            )
     elif (
         int(timings_array[9]) != 0
         or int(timings_array[10]) != 0
         or int(timings_array[11]) != 0
+        or int(timings_array[12]) != 0
     ):
         raise RuntimeError("local full-native reported host-only telemetry")
     trajectory_array = payload[5]
@@ -13579,6 +13644,7 @@ def execute_full_native_alns(
         exact_journal_sha256=exact_journal_sha256,
         control_journal_sha256=control_journal_sha256,
         causal_journal_sha256=causal_journal.transaction_sha256,
+        initial_state_receipt=payload[12],
     )
     if transaction_sha256 != expected_sha256:
         raise RuntimeError("full native ALNS transaction SHA-256 mismatch")
@@ -13661,6 +13727,7 @@ def execute_full_native_alns(
             "client_dispatch_thread_count": float(timings_array[9]),
             "remote_kernel_request_count": float(timings_array[10]),
             "screening_batch_request_count": float(timings_array[11]),
+            "initial_state_request_count": float(timings_array[12]),
         },
         trajectory=tuple(
             {
@@ -13689,6 +13756,7 @@ def execute_full_native_alns(
         route_cache_statistics=route_cache_statistics,
         screening_statistics=screening_statistics,
         causal_journal=causal_journal,
+        initial_state_receipt=initial_state_receipt,
     )
 
 
@@ -14185,6 +14253,7 @@ def _full_native_digest(
     exact_journal_sha256: str,
     control_journal_sha256: str,
     causal_journal_sha256: str,
+    initial_state_receipt: object,
 ) -> str:
     evidence = bytearray(b"stage05.2-full-native-alns-v2")
     evidence.extend(route_offsets.tobytes(order="C"))
@@ -14215,6 +14284,12 @@ def _full_native_digest(
     if not _is_sha256(causal_journal_sha256):
         raise RuntimeError("full native ALNS causal journal SHA-256 is invalid")
     evidence.extend(causal_journal_sha256.encode("ascii"))
+    receipt = _decode_native_initial_state_receipt(initial_state_receipt)
+    flags = cast(tuple[object, ...], initial_state_receipt)[0]
+    evidence.extend(cast(npt.NDArray[np.int64], flags).tobytes(order="C"))
+    evidence.extend(receipt.request_sha256.encode("ascii"))
+    evidence.extend(receipt.state_sha256.encode("ascii"))
+    evidence.extend(receipt.transaction_sha256.encode("ascii"))
     return hashlib.sha256(evidence).hexdigest()
 
 
@@ -14414,6 +14489,7 @@ class Stage052NativeExecutionConfig:
 __all__ = (
     "NATIVE_EXECUTION_SCHEMA_VERSION",
     "NativeExecutionMode",
+    "NativeInitialStateReceipt",
     "NativeCandidateResolution",
     "NativeCandidateResourceReceipt",
     "NativeCandidateRoundFailure",

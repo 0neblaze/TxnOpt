@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -172,7 +173,9 @@ private:
 
 struct ConfigV2 final {
     std::array<std::int64_t, 5> search_control{};
-    double deadline_remaining = 0.0;
+    // Relative duration is retained for audit; the absolute steady-clock
+    // boundary is authoritative across local and same-host scheduler processes.
+    std::array<double, 2> deadline{};
     std::array<std::int64_t, 13> protocol_control{};
     std::array<double, 2> protocol_options{};
     std::array<std::int64_t, 15> stage04_integer{};
@@ -183,8 +186,9 @@ struct ConfigV2 final {
     void validate() const {
         if (search_control[0] < 0 || search_control[1] <= 0
             || search_control[2] <= 0 || search_control[3] <= 0
-            || search_control[4] < -1 || !std::isfinite(deadline_remaining)
-            || deadline_remaining <= 0.0) {
+            || search_control[4] < -1
+            || !std::isfinite(deadline[0]) || deadline[0] <= 0.0
+            || !std::isfinite(deadline[1]) || deadline[1] <= 0.0) {
             throw std::invalid_argument(
                 "native search base control is invalid");
         }
@@ -239,7 +243,10 @@ struct RequestV2 final {
         append(evidence, problem.initial_route_offsets);
         append(evidence, problem.initial_route_indices);
         append(evidence, config.search_control);
-        append_scalar(evidence, config.deadline_remaining);
+        // The relative budget is semantic input.  The absolute monotonic
+        // boundary is transport/runtime state and must not make otherwise
+        // identical local and host requests hash differently.
+        append_scalar(evidence, config.deadline[0]);
         append(evidence, config.protocol_control);
         append(evidence, config.protocol_options);
         append(evidence, config.stage04_integer);
@@ -268,6 +275,266 @@ private:
     }
 };
 
+struct InitialStateV2 final {
+    native_kernels::ExactBatchOutput exact;
+    std::array<std::int64_t, 2> objective_integer{};
+    std::array<double, 2> objective_float{};
+    std::array<std::int64_t, 4> accounting{};
+    std::string request_sha256;
+
+    [[nodiscard]] std::string sha256() const {
+        if (request_sha256.size() != 64) {
+            throw std::logic_error(
+                "native initial search state lost its request identity");
+        }
+        std::string evidence("stage05.2-native-initial-search-state-v2");
+        evidence.append(request_sha256);
+        append(evidence, exact.path_offsets);
+        append(evidence, exact.path_indices);
+        append(evidence, exact.statuses);
+        append(evidence, exact.reasons);
+        append(evidence, exact.metrics);
+        append(evidence, exact.label_counters);
+        append(evidence, exact.batch_counters);
+        append(evidence, objective_integer);
+        append(evidence, objective_float);
+        append(evidence, accounting);
+        return native_protocol::native_sha256_hex(evidence);
+    }
+
+    void validate(const RequestV2& request) const {
+        request.validate();
+        if (request_sha256 != request.sha256()) {
+            throw std::runtime_error(
+                "native initial search state request identity is invalid");
+        }
+        const auto route_count = request.problem.route_count();
+        if (exact.path_offsets.size() != route_count + 1
+            || exact.path_offsets.front() != 0
+            || exact.path_offsets.back()
+                != static_cast<std::int64_t>(exact.path_indices.size())
+            || exact.statuses.size() != route_count
+            || exact.reasons.size() != route_count
+            || exact.metrics.size() != route_count * 4
+            || exact.label_counters.size() != route_count * 3
+            || exact.batch_counters.size() != 10) {
+            throw std::runtime_error(
+                "native initial search state typed schema is invalid");
+        }
+        std::int64_t depot = -1;
+        for (std::size_t node = 0; node < request.problem.node_count(); ++node) {
+            if (request.problem.node_kind[node] == native_kernels::depot_kind) {
+                if (depot >= 0) {
+                    throw std::runtime_error(
+                        "native initial search state problem has multiple depots");
+                }
+                depot = static_cast<std::int64_t>(node);
+            }
+        }
+        if (depot < 0) {
+            throw std::runtime_error(
+                "native initial search state problem has no depot");
+        }
+        double total_distance = 0.0;
+        double total_charging_time = 0.0;
+        std::int64_t charging_count = 0;
+        for (std::size_t route = 0; route < route_count; ++route) {
+            const auto first = exact.path_offsets[route];
+            const auto last = exact.path_offsets[route + 1];
+            auto expected_customer = request.problem.initial_route_offsets[route];
+            const auto expected_customer_end =
+                request.problem.initial_route_offsets[route + 1];
+            if (first < 0 || first >= last
+                || last > static_cast<std::int64_t>(exact.path_indices.size())
+                || exact.path_indices[static_cast<std::size_t>(first)] != depot
+                || exact.path_indices[static_cast<std::size_t>(last - 1)]
+                    != depot
+                || exact.statuses[route] != native_kernels::feasible_status
+                || exact.reasons[route] != native_kernels::no_failure_reason) {
+                throw std::runtime_error(
+                    "native initial search state route result is invalid");
+            }
+            for (auto position = first; position < last; ++position) {
+                const auto node = exact.path_indices[
+                    static_cast<std::size_t>(position)];
+                if (node < 0
+                    || static_cast<std::size_t>(node)
+                        >= request.problem.node_count()) {
+                    throw std::runtime_error(
+                        "native initial search state path node is invalid");
+                }
+                charging_count += request.problem.node_kind[
+                        static_cast<std::size_t>(node)]
+                        == native_kernels::station_kind
+                    ? 1 : 0;
+                if (request.problem.node_kind[static_cast<std::size_t>(node)]
+                    == native_kernels::customer_kind) {
+                    if (expected_customer >= expected_customer_end
+                        || request.problem.initial_route_indices[
+                            static_cast<std::size_t>(expected_customer)]
+                            != node) {
+                        throw std::runtime_error(
+                            "native initial search state path/customer order is invalid");
+                    }
+                    ++expected_customer;
+                } else if (node == depot && position != first
+                    && position != last - 1) {
+                    throw std::runtime_error(
+                        "native initial search state path contains an interior depot");
+                }
+            }
+            if (expected_customer != expected_customer_end) {
+                throw std::runtime_error(
+                    "native initial search state path omits a customer");
+            }
+            for (std::size_t field = 0; field < 4; ++field) {
+                const auto value = exact.metrics[route * 4 + field];
+                if (!std::isfinite(value) || value < 0.0) {
+                    throw std::runtime_error(
+                        "native initial search state metric is invalid");
+                }
+            }
+            total_distance += exact.metrics[route * 4];
+            total_charging_time += exact.metrics[route * 4 + 3];
+        }
+        if (std::any_of(
+                exact.label_counters.begin(), exact.label_counters.end(),
+                [](std::int64_t value) { return value < 0; })) {
+            throw std::runtime_error(
+                "native initial search state label counter is invalid");
+        }
+        const auto& counters = exact.batch_counters;
+        if (counters[0] != static_cast<std::int64_t>(route_count)
+            || counters[1] != static_cast<std::int64_t>(route_count)
+            || counters[2] != static_cast<std::int64_t>(route_count)
+            || counters[3] != 0 || counters[4] != 1 || counters[8] != 1
+            || counters[9] != request.config.search_control[2]
+            || std::any_of(
+                counters.begin() + 5, counters.begin() + 8,
+                [](std::int64_t value) { return value < 0; })) {
+            throw std::runtime_error(
+                "native initial search state exact counters are invalid");
+        }
+        if (objective_integer[0] != static_cast<std::int64_t>(route_count)
+            || objective_integer[1] != charging_count
+            || objective_float[0] != total_distance
+            || objective_float[1] != total_charging_time
+            || accounting
+                != std::array<std::int64_t, 4>{
+                    static_cast<std::int64_t>(route_count),
+                    static_cast<std::int64_t>(route_count), 0, 0}) {
+            throw std::runtime_error(
+                "native initial search state objective/accounting is invalid");
+        }
+    }
+
+private:
+    template <typename Container>
+    static void append(std::string& output, const Container& values) {
+        const auto count = static_cast<std::uint64_t>(values.size());
+        output.append(reinterpret_cast<const char*>(&count), sizeof(count));
+        if (!values.empty()) {
+            output.append(
+                reinterpret_cast<const char*>(values.data()),
+                values.size() * sizeof(typename Container::value_type));
+        }
+    }
+};
+
+inline InitialStateV2 initialize_state(const RequestV2& request) {
+    request.validate();
+    const auto& problem = request.problem;
+    const auto route_count = problem.route_count();
+    const auto exact_budget = request.config.search_control[4];
+    if (exact_budget >= 0
+        && route_count > static_cast<std::size_t>(exact_budget)) {
+        throw std::runtime_error(
+            "native search warm start does not fit the exact-call budget");
+    }
+    std::int64_t depot = -1;
+    std::vector<std::int64_t> stations;
+    for (std::size_t node = 0; node < problem.node_count(); ++node) {
+        if (problem.node_kind[node] == native_kernels::depot_kind) {
+            if (depot >= 0) {
+                throw std::invalid_argument(
+                    "native search problem contains multiple depots");
+            }
+            depot = static_cast<std::int64_t>(node);
+        } else if (problem.node_kind[node] == native_kernels::station_kind) {
+            stations.push_back(static_cast<std::int64_t>(node));
+        }
+    }
+    if (depot < 0) {
+        throw std::invalid_argument(
+            "native search problem does not contain a depot");
+    }
+    InitialStateV2 state;
+    state.request_sha256 = request.sha256();
+    const auto remaining_seconds = request.config.deadline[1]
+        - std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (remaining_seconds <= 0.0) {
+        throw std::runtime_error(
+            "native search deadline expired before initial exact work");
+    }
+    state.exact = native_kernels::run_exact_charging_batch(
+        problem.node_kind.data(), problem.ready_time.data(),
+        problem.due_date.data(), problem.service_time.data(),
+        problem.distance.data(), problem.vehicle.data(),
+        problem.initial_route_offsets.data(),
+        problem.initial_route_indices.data(), problem.node_count(), route_count,
+        depot, stations, remaining_seconds,
+        request.config.search_control[2]);
+    if (state.exact.statuses.size() != route_count
+        || state.exact.reasons.size() != route_count
+        || state.exact.metrics.size() != route_count * 4
+        || state.exact.label_counters.size() != route_count * 3
+        || state.exact.path_offsets.size() != route_count + 1
+        || state.exact.batch_counters.size() != 10) {
+        throw std::logic_error(
+            "native search initial exact state has an invalid schema");
+    }
+    if (std::any_of(
+            state.exact.statuses.begin(), state.exact.statuses.end(),
+            [](std::int64_t status) {
+                return status != native_kernels::feasible_status;
+            })) {
+        throw std::runtime_error(
+            "native search supplied warm start is not exact-feasible");
+    }
+    double total_distance = 0.0;
+    double total_charging_time = 0.0;
+    for (std::size_t route = 0; route < route_count; ++route) {
+        total_distance += state.exact.metrics[route * 4];
+        total_charging_time += state.exact.metrics[route * 4 + 3];
+    }
+    std::int64_t charging_count = 0;
+    for (const auto node : state.exact.path_indices) {
+        if (node < 0
+            || static_cast<std::size_t>(node) >= problem.node_count()) {
+            throw std::logic_error(
+                "native search initial exact path contains an invalid node");
+        }
+        charging_count += problem.node_kind[static_cast<std::size_t>(node)]
+                == native_kernels::station_kind
+            ? 1 : 0;
+    }
+    state.objective_integer = {
+        static_cast<std::int64_t>(route_count), charging_count};
+    state.objective_float = {total_distance, total_charging_time};
+    state.accounting = {
+        static_cast<std::int64_t>(route_count),
+        state.exact.batch_counters[2], state.exact.batch_counters[3], 0};
+    if (std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()
+        >= request.config.deadline[1]) {
+        throw std::runtime_error(
+            "native search initial exact work completed at or after deadline");
+    }
+    state.validate(request);
+    return state;
+}
+
 inline std::array<std::int64_t, 8> receipt_counts(
     const RequestV2& request) {
     request.validate();
@@ -286,11 +553,18 @@ inline std::array<std::int64_t, 8> receipt_counts(
 
 inline std::vector<std::uint8_t> request_payload(
     const RequestV2& request,
-    std::uint64_t request_id) {
+    std::uint64_t request_id,
+    native_protocol::KernelOperation operation =
+        native_protocol::KernelOperation::search_request_receipt) {
     request.validate();
+    if (operation != native_protocol::KernelOperation::search_request_receipt
+        && operation
+            != native_protocol::KernelOperation::search_initial_state) {
+        throw std::invalid_argument(
+            "native search request operation is invalid");
+    }
     native_protocol::PayloadBuilder builder(
-        native_protocol::KernelOperation::search_request_receipt,
-        request_id);
+        operation, request_id);
     const auto& problem = request.problem;
     const auto nodes = problem.node_count();
     builder.add(native_protocol::NumericType::int64, problem.node_kind.data(),
@@ -330,7 +604,7 @@ inline std::vector<std::uint8_t> request_payload(
         config.search_control.data(), config.search_control.size(),
         config.search_control.size());
     builder.add(native_protocol::NumericType::float64,
-        &config.deadline_remaining, 1, 1);
+        config.deadline.data(), config.deadline.size(), config.deadline.size());
     builder.add(native_protocol::NumericType::int64,
         config.protocol_control.data(), config.protocol_control.size(),
         config.protocol_control.size());
@@ -354,8 +628,10 @@ inline std::vector<std::uint8_t> request_payload(
 
 inline RequestV2 request_from_payload(
     const native_protocol::PayloadView& payload) {
-    if (payload.header().operation
+    if ((payload.header().operation
             != native_protocol::KernelOperation::search_request_receipt
+        && payload.header().operation
+            != native_protocol::KernelOperation::search_initial_state)
         || payload.header().array_count != 21) {
         throw std::runtime_error(
             "native search request payload envelope is invalid");
@@ -432,8 +708,8 @@ inline RequestV2 request_from_payload(
     auto& config = request.config;
     config.search_control = copy_array.template operator()<std::int64_t, 5>(
         13, native_protocol::NumericType::int64);
-    config.deadline_remaining = payload.data<double>(
-        14, native_protocol::NumericType::float64)[0];
+    config.deadline = copy_array.template operator()<double, 2>(
+        14, native_protocol::NumericType::float64);
     config.protocol_control = copy_array.template operator()<std::int64_t, 13>(
         15, native_protocol::NumericType::int64);
     config.protocol_options = copy_array.template operator()<double, 2>(
@@ -453,7 +729,7 @@ inline RequestV2 request_from_payload(
         || payload.descriptor(6).dimensions != 2
         || payload.descriptor(6).shape[0] != nodes
         || payload.descriptor(6).shape[1] != nodes
-        || payload.descriptor(14).count != 1
+        || payload.descriptor(14).count != 2
         || payload.descriptor(14).dimensions != 1) {
         throw std::runtime_error(
             "native search request matrix/control shape is invalid");

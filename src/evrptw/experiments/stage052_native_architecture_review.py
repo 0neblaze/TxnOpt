@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import statistics
+import struct
 import subprocess
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
@@ -33,7 +34,7 @@ from evrptw.stage052_replay import (
 )
 from evrptw.validation import validate_routes
 
-REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v6"
+REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v7"
 LEGACY_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v3"
 HISTORICAL_PILOT_ROOT = Path(
     "/mnt/e/Reproducible-EVRPTW-archive/stage05.2/runs/"
@@ -305,6 +306,13 @@ def _replay_record(record: ReviewRecord, benchmark_dir: Path) -> dict[str, objec
         return {"valid": False, "reason": "fallback evidence is missing or malformed"}
     if fallback_count != 0:
         return {"valid": False, "reason": "native fallback count is non-zero"}
+    if comparison_schema == SCHEMA_VERSION and record.mode in {
+        ArchitectureMode.FULL_NATIVE_ALNS,
+        ArchitectureMode.HOST_SCHEDULER,
+    }:
+        receipt_error = _replay_initial_state_receipt(payload, record.mode)
+        if receipt_error is not None:
+            return {"valid": False, "reason": receipt_error}
     if comparison_schema == SCHEMA_VERSION:
         topology = payload.get("topology")
         if not isinstance(topology, dict):
@@ -392,6 +400,56 @@ def _replay_record(record: ReviewRecord, benchmark_dir: Path) -> dict[str, objec
         "objective": objective.key,
         "routes": tuple(tuple(route) for route in routes),
     }
+
+
+def _replay_initial_state_receipt(
+    payload: Mapping[str, object],
+    mode: ArchitectureMode,
+) -> str | None:
+    """Independently replay the persisted request-to-initial-state binding."""
+
+    native = payload.get("native_execution_statistics")
+    if not isinstance(native, dict):
+        return "native execution evidence is missing"
+    receipt = native.get("initial_state_receipt")
+    if not isinstance(receipt, dict):
+        return "initial-state ownership receipt is missing"
+    if receipt.get("schema_version") != "stage05.2-native-initial-state-receipt-v2":
+        return "initial-state ownership receipt schema is invalid"
+    host_owned = receipt.get("host_owned")
+    operation_count = receipt.get("operation_count")
+    telemetry_count = native.get("initial_state_request_count")
+    expected_host_owned = mode is ArchitectureMode.HOST_SCHEDULER
+    if (
+        not isinstance(host_owned, bool)
+        or isinstance(operation_count, bool)
+        or not isinstance(operation_count, int)
+        or isinstance(telemetry_count, bool)
+        or not isinstance(telemetry_count, int)
+        or host_owned is not expected_host_owned
+        or operation_count != int(host_owned)
+        or telemetry_count != operation_count
+    ):
+        return "initial-state ownership receipt does not reconcile"
+    hashes = tuple(
+        receipt.get(field)
+        for field in ("request_sha256", "state_sha256", "transaction_sha256")
+    )
+    if any(
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in hashes
+    ):
+        return "initial-state ownership receipt hash is invalid"
+    request_sha256, state_sha256, transaction_sha256 = hashes
+    evidence = bytearray(b"stage05.2-native-initial-state-receipt-v2")
+    evidence.extend(struct.pack("<qq", int(host_owned), operation_count))
+    evidence.extend(str(request_sha256).encode("ascii"))
+    evidence.extend(str(state_sha256).encode("ascii"))
+    if hashlib.sha256(evidence).hexdigest() != transaction_sha256:
+        return "initial-state ownership receipt hash mismatch"
+    return None
 
 
 def _common_prefix(left: Sequence[object], right: Sequence[object]) -> int:

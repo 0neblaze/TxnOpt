@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from evrptw.experiments.stage052_native_architecture_review import (
     _common_prefix,
     _describe_first_divergence,
     _raw_axis_inventory,
+    _replay_initial_state_receipt,
     _replay_record,
     _scheduler_screening_occupancy,
     _semantic_trajectory,
@@ -31,6 +33,7 @@ from evrptw.experiments.stage052_native_architectures import (
     SEEDS,
     WARM_START_SCHEMA_VERSION,
     ArchitectureAxisTask,
+    ArchitectureMode,
     _canonical_semantic_event_sequence,
     _canonical_trace_event,
     _require_campaign_identity,
@@ -61,6 +64,46 @@ def test_native_campaign_gate_names_every_incomplete_architecture_capability() -
         ),
     ):
         _require_native_architecture_capabilities()
+
+
+def test_reviewer_independently_replays_persisted_initial_state_receipt() -> None:
+    request_sha256 = "a" * 64
+    state_sha256 = "b" * 64
+    evidence = bytearray(b"stage05.2-native-initial-state-receipt-v2")
+    evidence.extend(struct.pack("<qq", 1, 1))
+    evidence.extend(request_sha256.encode("ascii"))
+    evidence.extend(state_sha256.encode("ascii"))
+    receipt_sha256 = hashlib.sha256(evidence).hexdigest()
+    payload: dict[str, object] = {
+        "native_execution_statistics": {
+            "initial_state_request_count": 1,
+            "initial_state_receipt": {
+                "schema_version": "stage05.2-native-initial-state-receipt-v2",
+                "host_owned": True,
+                "operation_count": 1,
+                "request_sha256": request_sha256,
+                "state_sha256": state_sha256,
+                "transaction_sha256": receipt_sha256,
+            },
+        }
+    }
+
+    assert _replay_initial_state_receipt(
+        payload, ArchitectureMode.HOST_SCHEDULER
+    ) is None
+    native = payload["native_execution_statistics"]
+    assert isinstance(native, dict)
+    initial = native["initial_state_receipt"]
+    assert isinstance(initial, dict)
+    initial["state_sha256"] = "c" * 64
+    assert _replay_initial_state_receipt(
+        payload, ArchitectureMode.HOST_SCHEDULER
+    ) == "initial-state ownership receipt hash mismatch"
+    initial["state_sha256"] = state_sha256
+    native["initial_state_request_count"] = True
+    assert _replay_initial_state_receipt(
+        payload, ArchitectureMode.HOST_SCHEDULER
+    ) == "initial-state ownership receipt does not reconcile"
 
 
 def test_native_attempt04_is_blocked_before_capability_incomplete_outputs(

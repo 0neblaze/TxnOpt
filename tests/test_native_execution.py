@@ -7024,6 +7024,18 @@ def test_full_native_v2_one_call_matches_python_first_iteration(
     assert instrumentation["input_packing_seconds"] >= 0.0
     assert instrumentation["protocol_boundary_seconds"] >= 0.0
     assert instrumentation["serialization_ipc_seconds"] == 0.0
+    assert instrumentation["initial_state_request_count"] == 0
+    initial_state_receipt = instrumentation["initial_state_receipt"]
+    assert isinstance(initial_state_receipt, dict)
+    assert initial_state_receipt["host_owned"] is False
+    assert initial_state_receipt["operation_count"] == 0
+    receipt_evidence = bytearray(b"stage05.2-native-initial-state-receipt-v2")
+    receipt_evidence.extend(struct.pack("<qq", 0, 0))
+    receipt_evidence.extend(initial_state_receipt["request_sha256"].encode("ascii"))
+    receipt_evidence.extend(initial_state_receipt["state_sha256"].encode("ascii"))
+    assert hashlib.sha256(receipt_evidence).hexdigest() == initial_state_receipt[
+        "transaction_sha256"
+    ]
     assert instrumentation["validation_replay_seconds"] >= 0.0
     assert instrumentation["work_pool_peak_active_tasks"] >= 1
     assert instrumentation["work_pool_active_tasks_at_return"] == 0
@@ -7089,6 +7101,52 @@ def test_full_native_v2_owns_and_hashes_the_complete_request(
             *mutated_distance
         )
         assert changed_receipt[1] != request_sha256
+        initial_state = native_core.native_search_initial_state_v2(*args)
+        assert isinstance(initial_state, tuple) and len(initial_state) == 6
+        (
+            exact,
+            objective_integer,
+            objective_float,
+            accounting,
+            state_request_sha256,
+            state_sha256,
+        ) = initial_state
+        reference = native_core.full_native_initialize_v2(
+            args[0],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[7],
+            args[11],
+            args[12],
+            args[13],
+            args[14],
+        )
+        assert isinstance(exact, tuple) and len(exact) == 7
+        for actual, expected in zip(exact, reference[0], strict=True):
+            np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(objective_integer, reference[1])
+        np.testing.assert_array_equal(objective_float, reference[2])
+        np.testing.assert_array_equal(accounting, reference[3])
+        assert state_request_sha256 == request_sha256
+        assert isinstance(state_sha256, str) and len(state_sha256) == 64
+        state_evidence = bytearray(b"stage05.2-native-initial-search-state-v2")
+        state_evidence.extend(state_request_sha256.encode("ascii"))
+        for values in (
+            *exact,
+            objective_integer,
+            objective_float,
+            accounting,
+        ):
+            state_evidence.extend(struct.pack("<Q", values.size))
+            state_evidence.extend(values.tobytes(order="C"))
+        assert hashlib.sha256(state_evidence).hexdigest() == state_sha256
+        changed_state = native_core.native_search_initial_state_v2(
+            *mutated_distance
+        )
+        assert changed_state[4] == changed_receipt[1]
+        assert changed_state[5] != state_sha256
         receipts.append((counts, request_sha256))
         return original(*args)
 
@@ -7135,6 +7193,7 @@ def test_full_native_v2_complete_request_crosses_host_binary_protocol(
     local_counts, local_sha256 = native_core.native_search_request_receipt_v2(
         *captured[0]
     )
+    local_state = native_core.native_search_initial_state_v2(*captured[0])
     endpoint = tmp_path / "native-search-request.sock"
     with NativeHostScheduler(endpoint, worker_threads=24):
         host_counts, host_sha256 = (
@@ -7142,9 +7201,134 @@ def test_full_native_v2_complete_request_crosses_host_binary_protocol(
                 str(endpoint), *captured[0]
             )
         )
+        host_state = native_core.native_search_initial_state_host_v2(
+            str(endpoint), *captured[0]
+        )
+        insufficient_budget = list(captured[0])
+        budget_control = np.array(insufficient_budget[13], copy=True)
+        budget_control[4] = 0
+        insufficient_budget[13] = budget_control
+        with pytest.raises(RuntimeError, match="does not fit the exact-call budget"):
+            native_core.native_search_initial_state_host_v2(
+                str(endpoint), *insufficient_budget
+            )
+        recovered_counts, recovered_sha256 = (
+            native_core.native_search_request_host_receipt_v2(
+                str(endpoint), *captured[0]
+            )
+        )
 
     np.testing.assert_array_equal(host_counts, local_counts)
     assert host_sha256 == local_sha256
+    np.testing.assert_array_equal(recovered_counts, local_counts)
+    assert recovered_sha256 == local_sha256
+    assert host_state[4:] == local_state[4:]
+    for actual, expected in zip(host_state[0], local_state[0], strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    for actual, expected in zip(host_state[1:4], local_state[1:4], strict=True):
+        np.testing.assert_array_equal(actual, expected)
+
+
+def test_host_initial_state_rejects_self_hashed_invalid_path_before_ack(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from evrptw import _core as native_core
+
+    original = native_core.full_native_alns_v2
+    captured: list[tuple[object, ...]] = []
+
+    def capture_request(*args: object) -> object:
+        captured.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(native_core, "full_native_alns_v2", capture_request)
+    solve_alns(
+        _fixture_instance(),
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **_full_native_solve_kwargs(),
+        native_execution_config=_native_config("full_native_alns"),
+    )
+    assert len(captured) == 1
+
+    before = _stage052_shared_memory_names()
+    endpoint = tmp_path / "native-search-corruption.sock"
+    with NativeHostScheduler(
+        endpoint,
+        enable_fault_injection=True,
+        production_fault="initial_state_path_offset_oob",
+    ):
+        with pytest.raises(RuntimeError, match="typed schema is invalid"):
+            native_core.native_search_initial_state_host_v2(
+                str(endpoint), *captured[0]
+            )
+        recovered = native_core.native_search_request_host_receipt_v2(
+            str(endpoint), *captured[0]
+        )
+        assert recovered[1] == native_core.native_search_request_receipt_v2(
+            *captured[0]
+        )[1]
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if _stage052_shared_memory_names().issubset(before):
+            break
+        time.sleep(0.01)
+    assert _stage052_shared_memory_names().issubset(before)
+
+
+def test_host_initial_state_ipc_obeys_absolute_deadline_without_ack(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from evrptw import _core as native_core
+
+    original = native_core.full_native_alns_v2
+    captured: list[tuple[object, ...]] = []
+
+    def capture_request(*args: object) -> object:
+        captured.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(native_core, "full_native_alns_v2", capture_request)
+    solve_alns(
+        _fixture_instance(),
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **_full_native_solve_kwargs(),
+        native_execution_config=_native_config("full_native_alns"),
+    )
+    assert len(captured) == 1
+    deadline_args = list(captured[0])
+    deadline_args[14] = np.ascontiguousarray([0.05], dtype=np.float64)
+
+    before = _stage052_shared_memory_names()
+    endpoint = tmp_path / "native-search-deadline.sock"
+    scheduler = NativeHostScheduler(
+        endpoint,
+        enable_fault_injection=True,
+        production_fault="pause_before_execute",
+    )
+    scheduler.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match="partial response"):
+            native_core.native_search_initial_state_host_v2(
+                str(endpoint), *deadline_args
+            )
+    finally:
+        scheduler.close(force=True)
+    assert time.monotonic() - started < 2.0
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if _stage052_shared_memory_names().issubset(before):
+            break
+        time.sleep(0.01)
+    assert _stage052_shared_memory_names().issubset(before)
 
 
 def test_full_native_completion_flags_are_derived_from_causal_evidence(
@@ -7339,7 +7523,7 @@ def test_full_native_v2_raw_causal_payload_has_ordered_stream_counts(
 
     payload = captured["payload"]
     assert isinstance(payload, tuple)
-    assert len(payload) == 12
+    assert len(payload) == 13
     causal = payload[11]
     assert isinstance(causal, tuple)
     assert len(causal) == 12
@@ -7395,7 +7579,7 @@ def test_full_native_v2_raw_causal_payload_marks_fixed_work_boundary(
     )
 
     payload = captured["payload"]
-    assert isinstance(payload, tuple) and len(payload) == 12
+    assert isinstance(payload, tuple) and len(payload) == 13
     causal = payload[11]
     assert isinstance(causal, tuple) and len(causal) == 12
     stream_counts = causal[10]
@@ -7580,6 +7764,7 @@ def test_full_native_v2_replay_rejects_current_state_as_global_best(
             exact_journal_sha256=primary[9][1],
             control_journal_sha256=primary[10][2],
             causal_journal_sha256=primary[11][11],
+            initial_state_receipt=primary[12],
         )
         return tuple(primary)
 
@@ -7676,6 +7861,74 @@ def test_host_scheduler_v2_owns_one_shared_24_thread_pool(tmp_path: Path) -> Non
         assert stat.S_IMODE(endpoint.stat().st_mode) == 0o600
 
 
+@pytest.mark.parametrize("reported_count", [0.0, 2.0])
+def test_host_scheduler_requires_exactly_one_owned_initial_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    reported_count: float,
+) -> None:
+    from evrptw import _core as native_core
+
+    original = native_core.full_native_alns_host_v2
+
+    def corrupt_initial_state_count(*args: object) -> object:
+        payload = list(original(*args))
+        timings = np.array(payload[4], copy=True)
+        timings[12] = reported_count
+        payload[4] = timings
+        return tuple(payload)
+
+    monkeypatch.setattr(
+        native_core,
+        "full_native_alns_host_v2",
+        corrupt_initial_state_count,
+    )
+    endpoint = tmp_path / "native-scheduler.sock"
+    with NativeHostScheduler(endpoint, worker_threads=24), pytest.raises(
+        RuntimeError,
+        match="ownership receipt does not reconcile",
+    ):
+        solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            **_full_native_solve_kwargs(),
+            native_execution_config=replace(
+                _native_config("host_scheduler"),
+                scheduler_socket_path=str(endpoint),
+            ),
+        )
+
+
+def test_local_full_native_cannot_forge_host_initial_state_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw import _core as native_core
+
+    original = native_core.full_native_alns_v2
+
+    def forge_host_telemetry(*args: object) -> object:
+        payload = list(original(*args))
+        timings = np.array(payload[4], copy=True)
+        timings[7] = 1.0
+        timings[8] = 24.0
+        timings[10:13] = 1.0
+        payload[4] = timings
+        return tuple(payload)
+
+    monkeypatch.setattr(native_core, "full_native_alns_v2", forge_host_telemetry)
+    with pytest.raises(RuntimeError, match="ownership receipt does not reconcile"):
+        solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            **_full_native_solve_kwargs(),
+            native_execution_config=_native_config("full_native_alns"),
+        )
+
+
 @pytest.mark.parametrize("client_count", [1, 2, 6])
 def test_host_scheduler_v2_six_clients_share_pool_and_isolate_state(
     tmp_path: Path,
@@ -7731,6 +7984,13 @@ def test_host_scheduler_v2_six_clients_share_pool_and_isolate_state(
         assert result.native_execution_statistics["client_dispatch_thread_count"] == 0
         assert result.native_execution_statistics["remote_kernel_request_count"] > 0
         assert result.native_execution_statistics["screening_batch_request_count"] > 0
+        assert result.native_execution_statistics["initial_state_request_count"] == 1
+        initial_state_receipt = result.native_execution_statistics[
+            "initial_state_receipt"
+        ]
+        assert isinstance(initial_state_receipt, dict)
+        assert initial_state_receipt["host_owned"] is True
+        assert initial_state_receipt["operation_count"] == 1
         assert result.native_execution_statistics["screening_batch_request_count"] < sum(
             result.native_execution_statistics["candidate_screening_occupancies"]
         )

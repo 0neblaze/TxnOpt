@@ -3006,3 +3006,40 @@ compatibility fallback（兼容回退）。
   变化直接拒绝。
 - 本变更只实现和验证协议；未启动 Formal Rerun16，未启用 Scheduled Task，未删除历史
   evidence，也不声明 `READY_FOR_STAGE05_3`。
+
+## 2026-08-04：原生执行 v2 的 owned request 与 initial-state 边界
+
+- 三种实验架构继续使用 `stage052-native-execution-v2`，但 host binary kernel
+  protocol（主机二进制内核协议）因新增完整搜索请求和初始状态操作升级到版本 3，magic
+  同步升级；旧版本仅可读取 attempt03 的冻结证据，不再生产新结果。协议输入固定为 21
+  个 typed SoA arrays（类型化结构分离数组），包含完整 problem、warm start、Candidate
+  Control、Stage 4、operator、budget 和 deadline 配置。
+- 新增纯 C++ `RequestV2`、`InitialStateV2` 和 `initialize_state()`。本地 full-native
+  入口拥有请求副本后释放 GIL 执行初始 exact charging；host 入口把同一完整请求经 UDS
+  和 POSIX shared memory 提交给 scheduler。初始路线、objective、exact-call 计费和
+  deadline 与 Python warm-start 路径对齐，不再允许替代拆分算法。
+- 初始状态输出包含 path、status/reason、metrics、label counters、batch counters、正式
+  objective、accounting、request hash 与 independently recomputable state hash（可独立复算
+  的状态哈希）。客户端在 ACK 前校验完整 typed schema、路径结构、客户投影、计数、目标、
+  request/state identity 和 deadline；partial IPC、offset corruption、budget failure 或超时
+  均 fail fast 且不提交共享内存状态。
+- full-native 总事务新增 initial-state ownership receipt（初始状态所有权回执），把
+  local/host ownership、operation count、request hash、state hash 和 receipt hash 纳入总
+  transaction digest（事务摘要）。性能 telemetry 只用于与已哈希回执交叉核对，不能单独
+  证明 host 真正拥有该操作。
+- 本条只闭合纯原生搜索迁移的输入和初始状态边界；三种架构 capability bits（能力位）仍为
+  0。必须继续迁移完整三 lane 搜索状态、Candidate Control、cache、Stage 4 与 terminal
+  projection，并通过 12/12 fixed-work 语义门控后，才允许创建 attempt04 标签或运行性能
+  实验。本条未启动 Formal、CUDA，未切换默认架构，未清理或复用 attempt01--03。
+- 验证使用同一新 wheel 分两个不重叠的 mode waves：非 host 回归
+  `278 passed, 12 skipped`，host scheduler/UDS/shared-memory 回归 `43 passed`；公开投影、
+  ownership 伪造与 reviewer tamper（审查器篡改）聚焦回归 `8 passed`，architecture gate
+  tests `37 passed`，Ruff、strict mypy（83 个 source files）和 `git diff --check` 通过。
+  聚焦回归所用 wheel SHA-256 为
+  `670ad226eef691330b6c91d5877c980763e6af2a5fd14160fc56e1eb4f8ee53f`，native extension
+  为 `0ebd279e8cfc485f82ef0d5e334e59a8c4872273e1a0838a98fd70c21949e7bc`，scheduler 为
+  `0aa1e822f98f55a1e8440199e6fa234b8c38ac4b55527b54e6673a10755c9b31`。独立 follow-up
+  review 要求公开 `ALNSResult` 持久化 ownership receipt；修复后 raw architecture
+  reviewer 独立重算 receipt hash 并核对 mode、operation count 与 telemetry，避免底层
+  回执在实验投影中丢失；对所有计数字段显式拒绝 Python `bool` 与 JSON boolean，新增
+  门禁对应的 review schema 升级为 v7。

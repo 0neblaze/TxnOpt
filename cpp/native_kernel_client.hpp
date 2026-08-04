@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -15,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <vector>
@@ -39,12 +41,16 @@ struct KernelClientTelemetry final {
     std::size_t pool_thread_count = 0;
     std::size_t request_count = 0;
     std::size_t screening_batch_request_count = 0;
+    std::size_t initial_state_request_count = 0;
 };
 
 inline thread_local KernelClientTelemetry telemetry;
 class KernelClientTelemetryCollector final {
 public:
-    void record(const double* values, bool screening_batch) {
+    void record(
+        const double* values,
+        bool screening_batch,
+        bool initial_state) {
         std::lock_guard lock(mutex_);
         telemetry_.queue_wait_seconds += values[0];
         telemetry_.peak_queue_depth = std::max(
@@ -56,6 +62,7 @@ public:
         telemetry_.pool_thread_count = static_cast<std::size_t>(values[3]);
         ++telemetry_.request_count;
         telemetry_.screening_batch_request_count += screening_batch ? 1U : 0U;
+        telemetry_.initial_state_request_count += initial_state ? 1U : 0U;
     }
 
     KernelClientTelemetry snapshot() const {
@@ -80,10 +87,12 @@ inline KernelClientTelemetry telemetry_snapshot() {
 inline void record_telemetry(
     const protocol::PayloadView& output,
     std::size_t index,
-    bool screening_batch = false) {
+    bool screening_batch = false,
+    bool initial_state = false) {
     const auto& descriptor = output.descriptor(index);
     if (descriptor.type != protocol::NumericType::float64
-        || descriptor.count != 4) {
+        || descriptor.count != 4 || descriptor.dimensions != 1
+        || descriptor.shape[0] != 4 || descriptor.shape[1] != 0) {
         throw std::runtime_error("native kernel scheduler telemetry is invalid");
     }
     const auto* values = output.data<double>(
@@ -97,7 +106,7 @@ inline void record_telemetry(
         throw std::runtime_error("native kernel scheduler telemetry values are invalid");
     }
     if (telemetry_collector != nullptr) {
-        telemetry_collector->record(values, screening_batch);
+        telemetry_collector->record(values, screening_batch, initial_state);
     } else {
         telemetry.queue_wait_seconds += values[0];
         telemetry.peak_queue_depth = std::max(
@@ -107,6 +116,7 @@ inline void record_telemetry(
         telemetry.pool_thread_count = static_cast<std::size_t>(values[3]);
         ++telemetry.request_count;
         telemetry.screening_batch_request_count += screening_batch ? 1U : 0U;
+        telemetry.initial_state_request_count += initial_state ? 1U : 0U;
     }
 }
 
@@ -313,6 +323,136 @@ inline SearchRequestReceipt search_request_receipt(
     record_telemetry(output, 2);
     acknowledge(socket, response);
     return receipt;
+}
+
+inline evrptw::native_search::InitialStateV2 search_initial_state(
+    std::string_view socket_path,
+    const evrptw::native_search::RequestV2& request) {
+    const auto request_id = request_counter.fetch_add(1);
+    Socket socket(socket_path);
+    const auto timeout_seconds = request.config.deadline[1]
+        - std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (timeout_seconds <= 0.0) {
+        throw std::runtime_error(
+            "native initial-search-state deadline expired before IPC");
+    }
+    timeval socket_timeout{};
+    socket_timeout.tv_sec = static_cast<decltype(socket_timeout.tv_sec)>(
+        timeout_seconds);
+    socket_timeout.tv_usec = static_cast<decltype(socket_timeout.tv_usec)>(
+        std::ceil(
+            (timeout_seconds - static_cast<double>(socket_timeout.tv_sec))
+            * 1'000'000.0));
+    if (socket_timeout.tv_usec >= 1'000'000) {
+        ++socket_timeout.tv_sec;
+        socket_timeout.tv_usec = 0;
+    }
+    if (::setsockopt(socket.get(), SOL_SOCKET, SO_RCVTIMEO, &socket_timeout,
+            sizeof(socket_timeout)) != 0
+        || ::setsockopt(socket.get(), SOL_SOCKET, SO_SNDTIMEO, &socket_timeout,
+            sizeof(socket_timeout)) != 0) {
+        throw std::runtime_error(
+            "native initial-search-state IPC deadline could not be installed");
+    }
+    protocol::SharedMapping output_mapping;
+    protocol::ControlFrame response;
+    const auto output = transact(
+        socket_path,
+        evrptw::native_search::request_payload(
+            request, request_id,
+            protocol::KernelOperation::search_initial_state),
+        output_mapping, response, socket);
+    const auto route_count = request.problem.route_count();
+    for (const auto index : {
+             std::size_t{0}, std::size_t{1}, std::size_t{2}, std::size_t{3},
+             std::size_t{6}, std::size_t{7}, std::size_t{8}, std::size_t{9},
+             std::size_t{10}, std::size_t{11}}) {
+        const auto& descriptor = output.descriptor(index);
+        if (descriptor.dimensions != 1
+            || descriptor.shape[0] != descriptor.count
+            || descriptor.shape[1] != 0) {
+            throw std::runtime_error(
+                "native initial-search-state vector descriptor is invalid");
+        }
+    }
+    if (output.header().operation
+            != protocol::KernelOperation::search_initial_state
+        || output.header().request_id != response.request_id
+        || output.header().array_count != 12
+        || output.descriptor(0).count != route_count + 1
+        || output.descriptor(2).count != route_count
+        || output.descriptor(3).count != route_count
+        || output.descriptor(4).count != route_count * 4
+        || output.descriptor(4).dimensions != 2
+        || output.descriptor(4).shape[0] != route_count
+        || output.descriptor(4).shape[1] != 4
+        || output.descriptor(5).count != route_count * 3
+        || output.descriptor(5).dimensions != 2
+        || output.descriptor(5).shape[0] != route_count
+        || output.descriptor(5).shape[1] != 3
+        || output.descriptor(6).count != 10
+        || output.descriptor(7).count != 2
+        || output.descriptor(8).count != 2
+        || output.descriptor(9).count != 4
+        || output.descriptor(10).count != 64) {
+        throw std::runtime_error(
+            "native initial-search-state response schema is invalid");
+    }
+    evrptw::native_search::InitialStateV2 state;
+    state.request_sha256 = request.sha256();
+    const auto copy_vector = [&output]<typename T>(
+        std::size_t index, protocol::NumericType type) {
+        const auto count = static_cast<std::size_t>(
+            output.descriptor(index).count);
+        const auto* values = output.data<T>(index, type);
+        return std::vector<T>(values, values + count);
+    };
+    state.exact.path_offsets = copy_vector.template operator()<std::int64_t>(
+        0, protocol::NumericType::int64);
+    state.exact.path_indices = copy_vector.template operator()<std::int64_t>(
+        1, protocol::NumericType::int64);
+    state.exact.statuses = copy_vector.template operator()<std::int64_t>(
+        2, protocol::NumericType::int64);
+    state.exact.reasons = copy_vector.template operator()<std::int64_t>(
+        3, protocol::NumericType::int64);
+    state.exact.metrics = copy_vector.template operator()<double>(
+        4, protocol::NumericType::float64);
+    state.exact.label_counters =
+        copy_vector.template operator()<std::int64_t>(
+            5, protocol::NumericType::int64);
+    state.exact.batch_counters =
+        copy_vector.template operator()<std::int64_t>(
+            6, protocol::NumericType::int64);
+    const auto* objective_integer = output.data<std::int64_t>(
+        7, protocol::NumericType::int64);
+    std::copy(objective_integer, objective_integer + 2,
+        state.objective_integer.begin());
+    const auto* objective_float = output.data<double>(
+        8, protocol::NumericType::float64);
+    std::copy(objective_float, objective_float + 2,
+        state.objective_float.begin());
+    const auto* accounting = output.data<std::int64_t>(
+        9, protocol::NumericType::int64);
+    std::copy(accounting, accounting + 4, state.accounting.begin());
+    const auto* sha256 = output.data<std::uint8_t>(
+        10, protocol::NumericType::uint8);
+    const std::string remote_sha256(
+        reinterpret_cast<const char*>(sha256), 64);
+    state.validate(request);
+    if (state.sha256() != remote_sha256) {
+        throw std::runtime_error(
+            "native initial-search-state response hash mismatch");
+    }
+    if (std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()
+        >= request.config.deadline[1]) {
+        throw std::runtime_error(
+            "native initial-search-state response arrived at or after deadline");
+    }
+    record_telemetry(output, 11, false, true);
+    acknowledge(socket, response);
+    return state;
 }
 
 inline kernels::ExactBatchOutput exact_charging(

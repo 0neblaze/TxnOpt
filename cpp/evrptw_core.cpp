@@ -9137,6 +9137,16 @@ public:
         node_names_ = std::move(decoded);
     }
 
+    void configure_owned_request(
+        const evrptw::native_search::RequestV2& request) {
+        if (initialized_) {
+            throw std::runtime_error(
+                "full native owned request cannot change after initialization");
+        }
+        request.validate();
+        owned_request_ = request;
+    }
+
     py::tuple initialize(
         py::handle node_kind,
         py::handle demand,
@@ -9403,18 +9413,47 @@ public:
             {stable_int63("initialization"), stable_int63("initial_solution"), -1},
             warm_transaction_id, route_count);
         try {
-            initialized = full_native_initialize_impl_v2(
-                node_kind_,
-                ready_time_,
-                due_date_,
-                service_time_,
-                distance_,
-                vehicle_,
-                offsets_array,
-                indices_array,
-                control_array,
-                deadline_array,
-                false);
+            if (owned_request_.has_value()) {
+                evrptw::native_search::InitialStateV2 state;
+                {
+                    py::gil_scoped_release release;
+#ifdef __linux__
+                    if (!native_kernel_scheduler_endpoint.empty()) {
+                        state = evrptw::native_client::search_initial_state(
+                            native_kernel_scheduler_endpoint,
+                            *owned_request_);
+                    } else
+#endif
+                    {
+                        state = evrptw::native_search::initialize_state(
+                            *owned_request_);
+                    }
+                }
+                initial_request_sha256_ = state.request_sha256;
+                initial_state_sha256_ = state.sha256();
+                initial_state_host_owned_ =
+#ifdef __linux__
+                    !native_kernel_scheduler_endpoint.empty();
+#else
+                    false;
+#endif
+                initial_state_operation_count_ =
+                    initial_state_host_owned_ ? 1 : 0;
+                initialized = legacy_initial_state_payload(std::move(state));
+            } else {
+                initialized = full_native_initialize_impl_v2(
+                    node_kind_,
+                    ready_time_,
+                    due_date_,
+                    service_time_,
+                    distance_,
+                    vehicle_,
+                    offsets_array,
+                    indices_array,
+                    control_array,
+                    deadline_array,
+                    false);
+            }
         } catch (...) {
             budget_.interrupt_exact(route_count);
             throw;
@@ -16701,6 +16740,28 @@ public:
             native_sha256_hex(evidence));
     }
 
+    [[nodiscard]] py::tuple initial_state_receipt_payload() const {
+        if (!initialized_ || initial_request_sha256_.size() != 64
+            || initial_state_sha256_.size() != 64
+            || initial_state_operation_count_
+                != (initial_state_host_owned_ ? 1 : 0)) {
+            throw std::logic_error(
+                "full native initial-state ownership receipt is incomplete");
+        }
+        py::array_t<std::int64_t> flags(2);
+        checked_data(flags)[0] = initial_state_host_owned_ ? 1 : 0;
+        checked_data(flags)[1] = initial_state_operation_count_;
+        std::string evidence("stage05.2-native-initial-state-receipt-v2");
+        evidence.append(
+            reinterpret_cast<const char*>(checked_data(flags)),
+            static_cast<std::size_t>(flags.nbytes()));
+        evidence.append(initial_request_sha256_);
+        evidence.append(initial_state_sha256_);
+        return py::make_tuple(
+            std::move(flags), initial_request_sha256_, initial_state_sha256_,
+            native_sha256_hex(evidence));
+    }
+
 private:
     struct ExactJournalBatch {
         std::array<std::int64_t, 3> context{};
@@ -16774,6 +16835,11 @@ private:
     std::vector<std::int64_t> recharge_nodes_;
     std::unordered_set<std::int64_t> all_customers_;
     std::vector<std::string> node_names_;
+    std::optional<evrptw::native_search::RequestV2> owned_request_;
+    std::string initial_request_sha256_;
+    std::string initial_state_sha256_;
+    bool initial_state_host_owned_ = false;
+    std::int64_t initial_state_operation_count_ = 0;
     bool initialized_ = false;
     py::array_t<std::int64_t> node_kind_;
     py::array_t<double> demand_;
@@ -17108,6 +17174,52 @@ private:
             full_operator_segment_rewards_[operation] += reward;
             ++full_operator_segment_calls_[operation];
         }
+    }
+
+    static py::tuple legacy_initial_state_payload(
+        evrptw::native_search::InitialStateV2 state) {
+        const auto integer_vector = [](
+            const std::vector<std::int64_t>& source) {
+            py::array_t<std::int64_t> output(source.size());
+            std::copy(source.begin(), source.end(), checked_data(output));
+            return output;
+        };
+        auto path_offsets = integer_vector(state.exact.path_offsets);
+        auto path_indices = integer_vector(state.exact.path_indices);
+        auto statuses = integer_vector(state.exact.statuses);
+        auto reasons = integer_vector(state.exact.reasons);
+        py::array_t<double> metrics({
+            static_cast<py::ssize_t>(state.exact.statuses.size()),
+            py::ssize_t{4}});
+        std::copy(
+            state.exact.metrics.begin(), state.exact.metrics.end(),
+            checked_data(metrics));
+        py::array_t<std::int64_t> labels({
+            static_cast<py::ssize_t>(state.exact.statuses.size()),
+            py::ssize_t{3}});
+        std::copy(
+            state.exact.label_counters.begin(),
+            state.exact.label_counters.end(), checked_data(labels));
+        auto batch_counters = integer_vector(state.exact.batch_counters);
+        auto exact = py::make_tuple(
+            std::move(path_offsets), std::move(path_indices),
+            std::move(statuses), std::move(reasons), std::move(metrics),
+            std::move(labels), std::move(batch_counters));
+        py::array_t<std::int64_t> objective_integer(2);
+        std::copy(
+            state.objective_integer.begin(), state.objective_integer.end(),
+            checked_data(objective_integer));
+        py::array_t<double> objective_float(2);
+        std::copy(
+            state.objective_float.begin(), state.objective_float.end(),
+            checked_data(objective_float));
+        py::array_t<std::int64_t> accounting(4);
+        std::copy(
+            state.accounting.begin(), state.accounting.end(),
+            checked_data(accounting));
+        return py::make_tuple(
+            std::move(exact), std::move(objective_integer),
+            std::move(objective_float), std::move(accounting));
     }
 
     static py::tuple owned_exact_state_copy(const py::tuple& payload) {
@@ -17810,7 +17922,10 @@ evrptw::native_search::RequestV2 owned_native_search_request_v2(
         throw std::invalid_argument(
             "deadline_remaining has an invalid fixed shape");
     }
-    config.deadline_remaining = checked_data<double>(deadline_array)[0];
+    config.deadline[0] = checked_data<double>(deadline_array)[0];
+    config.deadline[1] = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()
+        + config.deadline[0];
     config.protocol_control = owned_search_array<std::int64_t, 13>(
         protocol_control, "protocol_control");
     config.protocol_options = owned_search_array<double, 2>(
@@ -17868,6 +17983,86 @@ py::tuple native_search_request_receipt_v2(
     values[6] = request.config.protocol_control[2];
     values[7] = request.config.search_control[3];
     return py::make_tuple(std::move(counts), request.sha256());
+}
+
+py::tuple native_initial_state_payload(
+    evrptw::native_search::InitialStateV2 state) {
+    const auto integer_vector = [](const std::vector<std::int64_t>& source) {
+        py::array_t<std::int64_t> output(source.size());
+        std::copy(source.begin(), source.end(), checked_data(output));
+        return output;
+    };
+    auto path_offsets = integer_vector(state.exact.path_offsets);
+    auto path_indices = integer_vector(state.exact.path_indices);
+    auto statuses = integer_vector(state.exact.statuses);
+    auto reasons = integer_vector(state.exact.reasons);
+    py::array_t<double> metrics({
+        static_cast<py::ssize_t>(state.exact.statuses.size()), py::ssize_t{4}});
+    std::copy(
+        state.exact.metrics.begin(), state.exact.metrics.end(),
+        checked_data(metrics));
+    py::array_t<std::int64_t> labels({
+        static_cast<py::ssize_t>(state.exact.statuses.size()), py::ssize_t{3}});
+    std::copy(
+        state.exact.label_counters.begin(), state.exact.label_counters.end(),
+        checked_data(labels));
+    auto batch_counters = integer_vector(state.exact.batch_counters);
+    auto exact = py::make_tuple(
+        std::move(path_offsets), std::move(path_indices), std::move(statuses),
+        std::move(reasons), std::move(metrics), std::move(labels),
+        std::move(batch_counters));
+    py::array_t<std::int64_t> objective_integer(2);
+    std::copy(
+        state.objective_integer.begin(), state.objective_integer.end(),
+        checked_data(objective_integer));
+    py::array_t<double> objective_float(2);
+    std::copy(
+        state.objective_float.begin(), state.objective_float.end(),
+        checked_data(objective_float));
+    py::array_t<std::int64_t> accounting(4);
+    std::copy(
+        state.accounting.begin(), state.accounting.end(),
+        checked_data(accounting));
+    return py::make_tuple(
+        std::move(exact), std::move(objective_integer),
+        std::move(objective_float), std::move(accounting),
+        state.request_sha256, state.sha256());
+}
+
+py::tuple native_search_initial_state_v2(
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle lexical_rank,
+    py::handle node_name_offsets,
+    py::handle node_name_bytes,
+    py::handle initial_route_offsets,
+    py::handle initial_route_indices,
+    py::handle control,
+    py::handle deadline_remaining,
+    py::handle protocol_control,
+    py::handle protocol_options,
+    py::handle stage04_integer,
+    py::handle stage04_float,
+    py::handle operator_integer,
+    py::handle operator_float) {
+    const auto request = owned_native_search_request_v2(
+        node_kind, demand, ready_time, due_date, service_time, distance,
+        reachable, vehicle, lexical_rank, node_name_offsets, node_name_bytes,
+        initial_route_offsets, initial_route_indices, control,
+        deadline_remaining, protocol_control, protocol_options,
+        stage04_integer, stage04_float, operator_integer, operator_float);
+    evrptw::native_search::InitialStateV2 state;
+    {
+        py::gil_scoped_release release;
+        state = evrptw::native_search::initialize_state(request);
+    }
+    return native_initial_state_payload(std::move(state));
 }
 
 py::tuple full_native_alns_v2(
@@ -17973,6 +18168,7 @@ py::tuple full_native_alns_v2(
         client_dispatch_threads,
         scheduler_work_pool_context);
     engine.configure_node_names_owned(owned_request.problem);
+    engine.configure_owned_request(owned_request);
     engine.suppress_plan_screening_negative_cache(true);
     static_cast<void>(engine.initialize(
         node_kind,
@@ -18591,6 +18787,7 @@ py::tuple full_native_alns_v2(
     }
     engine.append_causal_termination(terminal_values[0], terminal_values[5]);
     auto causal_journal = engine.causal_journal_payload();
+    auto initial_state_receipt = engine.initial_state_receipt_payload();
     const auto elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - solve_started).count();
     auto backend_timings = py::cast<py::array_t<double>>(backend_metrics[2]);
@@ -18609,7 +18806,7 @@ py::tuple full_native_alns_v2(
     const auto remote_telemetry =
         evrptw::native_client::telemetry_snapshot();
 #endif
-    py::array_t<double> timings(12);
+    py::array_t<double> timings(13);
     checked_data(timings)[0] = elapsed - exact_seconds;
     checked_data(timings)[1] = exact_seconds;
     checked_data(timings)[2] = elapsed;
@@ -18681,6 +18878,15 @@ py::tuple full_native_alns_v2(
         0
 #endif
     );
+    checked_data(timings)[12] = static_cast<double>(
+#ifdef __linux__
+        !native_kernel_scheduler_endpoint.empty()
+        ? remote_telemetry.initial_state_request_count
+        : 0
+#else
+        0
+#endif
+    );
     std::string evidence("stage05.2-full-native-alns-v2");
     const auto append_raw_array = [&](const auto& array) {
         evidence.append(
@@ -18718,6 +18924,11 @@ py::tuple full_native_alns_v2(
     evidence.append(py::cast<std::string>(exact_journal[1]));
     evidence.append(py::cast<std::string>(control_journal[2]));
     evidence.append(py::cast<std::string>(causal_journal[11]));
+    append_raw_array(py::cast<py::array_t<std::int64_t>>(
+        initial_state_receipt[0]));
+    evidence.append(py::cast<std::string>(initial_state_receipt[1]));
+    evidence.append(py::cast<std::string>(initial_state_receipt[2]));
+    evidence.append(py::cast<std::string>(initial_state_receipt[3]));
     return py::make_tuple(
         std::move(route_offsets),
         std::move(route_indices),
@@ -18730,7 +18941,8 @@ py::tuple full_native_alns_v2(
         std::move(backend_metrics),
         std::move(exact_journal),
         std::move(control_journal),
-        std::move(causal_journal));
+        std::move(causal_journal),
+        std::move(initial_state_receipt));
 }
 
 #ifdef __linux__
@@ -18777,6 +18989,48 @@ py::tuple native_search_request_host_receipt_v2(
     std::copy(
         receipt.counts.begin(), receipt.counts.end(), checked_data(counts));
     return py::make_tuple(std::move(counts), std::move(receipt.sha256));
+}
+
+py::tuple native_search_initial_state_host_v2(
+    const std::string& socket_path,
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle lexical_rank,
+    py::handle node_name_offsets,
+    py::handle node_name_bytes,
+    py::handle initial_route_offsets,
+    py::handle initial_route_indices,
+    py::handle control,
+    py::handle deadline_remaining,
+    py::handle protocol_control,
+    py::handle protocol_options,
+    py::handle stage04_integer,
+    py::handle stage04_float,
+    py::handle operator_integer,
+    py::handle operator_float) {
+    if (socket_path.empty()) {
+        throw std::invalid_argument(
+            "native initial-state scheduler endpoint is empty");
+    }
+    const auto request = owned_native_search_request_v2(
+        node_kind, demand, ready_time, due_date, service_time, distance,
+        reachable, vehicle, lexical_rank, node_name_offsets, node_name_bytes,
+        initial_route_offsets, initial_route_indices, control,
+        deadline_remaining, protocol_control, protocol_options,
+        stage04_integer, stage04_float, operator_integer, operator_float);
+    evrptw::native_search::InitialStateV2 state;
+    {
+        py::gil_scoped_release release;
+        state = evrptw::native_client::search_initial_state(
+            socket_path, request);
+    }
+    return native_initial_state_payload(std::move(state));
 }
 
 py::tuple full_native_alns_host_v2(
@@ -19578,6 +19832,30 @@ PYBIND11_MODULE(_core, module) {
         py::arg("operator_integer"),
         py::arg("operator_float"));
     module.def(
+        "native_search_initial_state_v2",
+        &native_search_initial_state_v2,
+        py::arg("node_kind"),
+        py::arg("demand"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("reachable"),
+        py::arg("vehicle"),
+        py::arg("lexical_rank"),
+        py::arg("node_name_offsets"),
+        py::arg("node_name_bytes"),
+        py::arg("initial_route_offsets"),
+        py::arg("initial_route_indices"),
+        py::arg("control"),
+        py::arg("deadline_remaining"),
+        py::arg("protocol_control"),
+        py::arg("protocol_options"),
+        py::arg("stage04_integer"),
+        py::arg("stage04_float"),
+        py::arg("operator_integer"),
+        py::arg("operator_float"));
+    module.def(
         "full_native_alns_v2",
         &full_native_alns_v2,
         py::arg("node_kind"),
@@ -19605,6 +19883,31 @@ PYBIND11_MODULE(_core, module) {
     module.def(
         "native_search_request_host_receipt_v2",
         &native_search_request_host_receipt_v2,
+        py::arg("socket_path"),
+        py::arg("node_kind"),
+        py::arg("demand"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("reachable"),
+        py::arg("vehicle"),
+        py::arg("lexical_rank"),
+        py::arg("node_name_offsets"),
+        py::arg("node_name_bytes"),
+        py::arg("initial_route_offsets"),
+        py::arg("initial_route_indices"),
+        py::arg("control"),
+        py::arg("deadline_remaining"),
+        py::arg("protocol_control"),
+        py::arg("protocol_options"),
+        py::arg("stage04_integer"),
+        py::arg("stage04_float"),
+        py::arg("operator_integer"),
+        py::arg("operator_float"));
+    module.def(
+        "native_search_initial_state_host_v2",
+        &native_search_initial_state_host_v2,
         py::arg("socket_path"),
         py::arg("node_kind"),
         py::arg("demand"),
