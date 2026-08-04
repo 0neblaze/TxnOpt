@@ -3155,3 +3155,12 @@ compatibility fallback（兼容回退）。
   逐次执行完整 lane/customer/path/objective 验证，避免把不变距离矩阵验证变成搜索主成本；
   真实四实例三 seed fixed-work 门控复跑为 `12 passed`、耗时 `90.98s`。Ruff、83-file
   strict mypy 与 `git diff --check` 通过。
+- clean checkpoint `e938e42cfca48123ab32d2f56d192438d891b8bf` 的 exact wheel
+  SHA-256 为 `2b04216697974e5c8f58f27cad8a1663d9544ad6d9d6e7e21bb0ce7483e8d0d8`，
+  extension 为 `af8ba4ead1c79fa4a932573577450f12a589468a7c853cf7689031b05ff798c1`，
+  scheduler 保持
+  `0aa1e822f98f55a1e8440199e6fa234b8c38ac4b55527b54e6673a10755c9b31`。
+  exact-wheel 扩大回归（含新增 legacy/current retry）为
+  `151 passed, 187 deselected`；两份独立复审逐项关闭全部六个原 blocker，接受该提交为
+  live-lane ownership checkpoint。内存侧 non-blocker 是 `live_problem_` 当前额外持有一份
+  O(n²) immutable problem copy，后续资源测量必须单列 RSS/PSS 并评估共享 ownership。
