@@ -10009,16 +10009,30 @@ public:
             static_cast<std::int64_t>(current_offsets_.size() - 1),
         });
         eligible = decision.eligible;
-        py::array_t<std::int64_t> combined_attempted(plan_count);
+        const auto ranking = evrptw::native_candidate_plan::rank({
+            std::span<const std::int64_t>(plan_boundaries, plan_count + 1),
+            std::span<const std::int64_t>(route_boundaries, route_count + 1),
+            std::span<const std::int64_t>(route_nodes, indices_array.size()),
+            std::span<const double>(checked_data<double>(lower_bounds), route_count),
+            std::span<const std::int64_t>(
+                checked_data<std::int64_t>(current_offsets_),
+                current_offsets_.size()),
+            std::span<const std::int64_t>(
+                checked_data<std::int64_t>(current_indices_),
+                current_indices_.size()),
+            std::span<const std::int64_t>(
+                checked_data<std::int64_t>(lexical_rank_), lexical_rank_.size()),
+            decision.combined_attempted,
+            proposal_top_k_,
+        });
+        py::array_t<std::int64_t> ranked_array(ranking.ranked.size());
+        py::array_t<std::int64_t> selected_array(ranking.selected.size());
         std::copy(
-            decision.combined_attempted.begin(),
-            decision.combined_attempted.end(),
-            checked_data(combined_attempted));
-        auto ranking = rank_candidate_plans_v1(
-            plans_array, routes_array, indices_array, lower_bounds,
-            current_offsets_, current_indices_, lexical_rank_, combined_attempted,
-            proposal_top_k_);
-        auto selected_array = py::cast<py::array_t<std::int64_t>>(ranking[1]);
+            ranking.ranked.begin(), ranking.ranked.end(),
+            checked_data(ranked_array));
+        std::copy(
+            ranking.selected.begin(), ranking.selected.end(),
+            checked_data(selected_array));
         const auto* selected = checked_data<std::int64_t>(selected_array);
         std::vector<std::int64_t> statuses(plan_count, 2);
         for (std::size_t plan = 0; plan < plan_count; ++plan) {
@@ -10346,18 +10360,18 @@ public:
             attempted_mark_active = true;
         }
 
-        py::array_t<std::int64_t> unordered_feasible_plan_ids(
-            feasible_plan_ids.size());
-        std::copy(
-            feasible_plan_ids.begin(), feasible_plan_ids.end(),
-            checked_data(unordered_feasible_plan_ids));
-        auto canonical_feasible_order = order_feasible_candidate_plans_v2(
-            plans_array, routes_array, indices_array, objective_integer,
-            objective_float, lexical_rank_, unordered_feasible_plan_ids);
-        feasible_plan_ids.assign(
-            checked_data<std::int64_t>(canonical_feasible_order),
-            checked_data<std::int64_t>(canonical_feasible_order)
-                + canonical_feasible_order.size());
+        feasible_plan_ids = evrptw::native_candidate_plan::order_feasible({
+            std::span<const std::int64_t>(plan_boundaries, plan_count + 1),
+            std::span<const std::int64_t>(route_boundaries, route_count + 1),
+            std::span<const std::int64_t>(route_nodes, indices_array.size()),
+            std::span<const std::int64_t>(
+                checked_data<std::int64_t>(objective_integer), plan_count * 2),
+            std::span<const double>(
+                checked_data<double>(objective_float), plan_count * 2),
+            std::span<const std::int64_t>(
+                checked_data<std::int64_t>(lexical_rank_), lexical_rank_.size()),
+            feasible_plan_ids,
+        });
 
         py::array_t<std::int64_t> status_array(statuses.size());
         py::array_t<std::int64_t> resolution_array(route_resolutions.size());
@@ -10404,16 +10418,11 @@ public:
         control_journal_batch.plan_offsets = copy_integer_array(plans_array);
         control_journal_batch.route_offsets = copy_integer_array(routes_array);
         control_journal_batch.route_indices = copy_integer_array(indices_array);
-        control_journal_batch.ranked = copy_integer_array(
-            py::cast<py::array_t<std::int64_t>>(ranking[0]));
-        control_journal_batch.selected = copy_integer_array(selected_array);
+        control_journal_batch.ranked = ranking.ranked;
+        control_journal_batch.selected = ranking.selected;
         control_journal_batch.statuses = statuses;
-        control_journal_batch.ranking_integer = copy_integer_array(
-            py::cast<py::array_t<std::int64_t>>(ranking[2]));
-        auto ranking_float_array = py::cast<py::array_t<double>>(ranking[3]);
-        control_journal_batch.ranking_float.assign(
-            checked_data<double>(ranking_float_array),
-            checked_data<double>(ranking_float_array) + ranking_float_array.size());
+        control_journal_batch.ranking_integer = ranking.integer_metrics;
+        control_journal_batch.ranking_float = ranking.optimistic_distances;
         control_journal_batch.route_resolutions = route_resolutions;
         control_journal_batch.cache_statistics = copy_integer_array(cache_statistics);
         control_journal_batch.budget_state = copy_integer_array(budget_state);
@@ -10445,8 +10454,7 @@ public:
         append_evidence_array(evidence, canonical_expected_array);
         append_evidence_array(evidence, batch_array);
         append_evidence_array(evidence, lower_bounds);
-        append_evidence_array(
-            evidence, py::cast<py::array_t<std::int64_t>>(ranking[0]));
+        append_evidence_array(evidence, ranked_array);
         append_evidence_array(evidence, status_array);
         append_evidence_array(evidence, objective_integer);
         append_evidence_array(evidence, objective_float);
@@ -10466,30 +10474,16 @@ public:
         append_evidence_array(evidence, negative_statistics);
         append_evidence_array(evidence, budget_state);
         append_evidence_array(evidence, feasible_order_array);
-        std::vector<std::int64_t> transaction_path_offsets{0};
-        std::vector<std::int64_t> transaction_path_indices;
-        py::array_t<std::int64_t> transaction_statuses(route_count);
-        py::array_t<std::int64_t> transaction_reasons(route_count);
-        py::array_t<double> transaction_metrics(
-            {static_cast<py::ssize_t>(route_count), py::ssize_t(4)});
-        py::array_t<std::int64_t> transaction_labels(
-            {static_cast<py::ssize_t>(route_count), py::ssize_t(3)});
-        std::fill(
-            checked_data(transaction_statuses),
-            checked_data(transaction_statuses) + route_count, -1);
-        std::fill(
-            checked_data(transaction_reasons),
-            checked_data(transaction_reasons) + route_count, -1);
-        std::fill(
-            checked_data(transaction_metrics),
-            checked_data(transaction_metrics) + route_count * 4, 0.0);
-        std::fill(
-            checked_data(transaction_labels),
-            checked_data(transaction_labels) + route_count * 3, 0);
+        CandidateExactBatchState transaction_exact;
+        transaction_exact.statuses.assign(route_count, -1);
+        transaction_exact.reasons.assign(route_count, -1);
+        transaction_exact.metrics.assign(route_count * 4, 0.0);
+        transaction_exact.label_counters.assign(route_count * 3, 0);
         for (std::size_t route = 0; route < route_payloads.size(); ++route) {
             if (!route_payloads[route].has_value()) {
-                transaction_path_offsets.push_back(
-                    static_cast<std::int64_t>(transaction_path_indices.size()));
+                transaction_exact.path_offsets.push_back(
+                    static_cast<std::int64_t>(
+                        transaction_exact.path_indices.size()));
                 continue;
             }
             const auto& payload = *route_payloads[route];
@@ -10504,34 +10498,51 @@ public:
                 payload.label_counters.size());
             append_evidence_values(
                 evidence, payload.path.data(), payload.path.size());
-            transaction_path_indices.insert(
-                transaction_path_indices.end(), payload.path.begin(), payload.path.end());
-            transaction_path_offsets.push_back(
-                static_cast<std::int64_t>(transaction_path_indices.size()));
-            checked_data(transaction_statuses)[route] = payload.status;
-            checked_data(transaction_reasons)[route] = payload.reason;
+            transaction_exact.path_indices.insert(
+                transaction_exact.path_indices.end(),
+                payload.path.begin(), payload.path.end());
+            transaction_exact.path_offsets.push_back(
+                static_cast<std::int64_t>(
+                    transaction_exact.path_indices.size()));
+            transaction_exact.statuses[route] = payload.status;
+            transaction_exact.reasons[route] = payload.reason;
             std::copy(
                 payload.metrics.begin(), payload.metrics.end(),
-                checked_data(transaction_metrics) + route * 4);
+                transaction_exact.metrics.begin()
+                    + static_cast<std::ptrdiff_t>(route * 4));
             std::copy(
                 payload.label_counters.begin(), payload.label_counters.end(),
-                checked_data(transaction_labels) + route * 3);
+                transaction_exact.label_counters.begin()
+                    + static_cast<std::ptrdiff_t>(route * 3));
         }
-        py::array_t<std::int64_t> transaction_path_offsets_array(
-            transaction_path_offsets.size());
-        py::array_t<std::int64_t> transaction_path_indices_array(
-            transaction_path_indices.size());
-        std::copy(
-            transaction_path_offsets.begin(), transaction_path_offsets.end(),
-            checked_data(transaction_path_offsets_array));
-        std::copy(
-            transaction_path_indices.begin(), transaction_path_indices.end(),
-            checked_data(transaction_path_indices_array));
-        auto transaction_exact_payload = py::make_tuple(
-            std::move(transaction_path_offsets_array),
-            std::move(transaction_path_indices_array),
-            std::move(transaction_statuses), std::move(transaction_reasons),
-            std::move(transaction_metrics), std::move(transaction_labels));
+        transaction_exact.validate(route_count);
+        const auto transaction_sha256 = native_sha256_hex(evidence);
+        CandidateRoundState staged_candidate_round{
+            copy_integer_array(plans_array),
+            copy_integer_array(routes_array),
+            copy_integer_array(indices_array),
+            feasible_plan_ids,
+            exact_route_rows,
+            std::vector<std::int64_t>(
+                checked_data<std::int64_t>(objective_integer),
+                checked_data<std::int64_t>(objective_integer)
+                    + objective_integer.size()),
+            std::vector<double>(
+                checked_data<double>(objective_float),
+                checked_data<double>(objective_float) + objective_float.size()),
+            std::move(transaction_exact),
+            transaction_sha256,
+        };
+        staged_candidate_round.validate();
+        if (candidate_round_mirror_tamper_injection_) {
+            candidate_round_mirror_tamper_injection_ = false;
+            checked_data(objective_integer)[0] =
+                checked_data(objective_integer)[0] == -1 ? 0 : -1;
+        }
+        validate_candidate_round_mirror(
+            staged_candidate_round, plans_array, routes_array, indices_array,
+            objective_integer, objective_float, exact_rows_array,
+            feasible_order_array, transaction_sha256);
         auto result = py::make_tuple(
             std::move(selected_array), std::move(status_array),
             std::move(objective_integer), std::move(objective_float),
@@ -10540,7 +10551,7 @@ public:
             std::move(cache_statistics), std::move(negative_statistics),
             std::move(budget_state),
             std::move(feasible_order_array),
-            native_sha256_hex(evidence));
+            transaction_sha256);
         route_cache_.prepare_protocol_commit();
         route_cache_.prepare_protocol_rollback();
         if (commit_failure_injection_ == 1) {
@@ -10573,8 +10584,8 @@ public:
             pending_negative_store_ = negative_store_active;
             pending_attempted_mark_ = attempted_mark_active;
             pending_budget_snapshot_.emplace(round_budget_snapshot);
-            pending_candidate_exact_payload_ = transaction_exact_payload;
-            pending_candidate_exact_ready_ = !feasible_plan_ids.empty();
+            pending_candidate_round_.emplace(
+                std::move(staged_candidate_round));
             pending_causal_snapshot_ = causal_snapshot;
             append_control_journal_causal(staged_control_journal);
             pending_control_journal_.splice(
@@ -10873,9 +10884,7 @@ public:
                 plan_offsets_array, route_offsets_array, route_indices_array,
                 context, deadline_array, batch_array, expected_array);
             defer_composite_commit_ = false;
-            const auto selected_plan = prepare_first_feasible_candidate(
-                plan_offsets_array, route_offsets_array, route_indices_array,
-                transaction);
+            const auto selected_plan = prepare_first_feasible_candidate();
             if (selected_plan.has_value()) {
                 commit_pending_composite_noexcept();
                 checked_data(outcome)[0] = *selected_plan;
@@ -11177,9 +11186,7 @@ public:
                 plan_offsets_array, route_offsets_array, route_indices_array,
                 context, deadline_array, batch_array, expected_array);
             defer_composite_commit_ = false;
-            const auto selected = prepare_first_feasible_candidate(
-                plan_offsets_array, route_offsets_array, route_indices_array,
-                transaction);
+            const auto selected = prepare_first_feasible_candidate();
             if (selected.has_value()) {
                 commit_pending_composite_noexcept();
                 checked_data(outcome)[0] = *selected;
@@ -11535,8 +11542,7 @@ public:
                 plan_offsets, repaired_offsets, repaired_indices, context,
                 deadline_array, batch_array, expected_array);
             defer_composite_commit_ = false;
-            const auto selected = prepare_first_feasible_candidate(
-                plan_offsets, repaired_offsets, repaired_indices, transaction);
+            const auto selected = prepare_first_feasible_candidate();
             metadata_values[6] = static_cast<std::int64_t>(
                 py::cast<py::array_t<std::int64_t>>(transaction[5]).size());
             if (selected.has_value()) {
@@ -11934,11 +11940,7 @@ public:
                     final_plan[0], final_plan[1], final_plan[2], context,
                     next_deadline(), batch_array, expected_array);
                 defer_composite_commit_ = false;
-                const auto selected = prepare_first_feasible_candidate(
-                    py::cast<py::array_t<std::int64_t>>(final_plan[0]),
-                    py::cast<py::array_t<std::int64_t>>(final_plan[1]),
-                    py::cast<py::array_t<std::int64_t>>(final_plan[2]),
-                    final_transaction);
+                const auto selected = prepare_first_feasible_candidate();
                 if (!selected.has_value()) {
                     throw std::logic_error(
                         "full native refinement lost its final feasible plan");
@@ -12144,9 +12146,7 @@ public:
             py::array_t<std::int64_t> outcome(4);
             std::fill(checked_data(outcome), checked_data(outcome) + 4, 0);
             checked_data(outcome)[0] = -1;
-            const auto selected_plan = prepare_first_feasible_candidate(
-                plan_offsets_array, route_offsets_array, route_indices_array,
-                transaction);
+            const auto selected_plan = prepare_first_feasible_candidate();
             if (selected_plan.has_value()) {
                 commit_pending_composite_noexcept();
                 checked_data(outcome)[0] = *selected_plan;
@@ -12516,24 +12516,29 @@ public:
                             pool_plan_offsets, pool_route_offsets,
                             pool_route_indices, insertion_context,
                             remaining_deadline(), batch_array, expected);
-                        auto feasible_order =
-                            py::cast<py::array_t<std::int64_t>>(transaction[11]);
-                        auto objectives =
-                            py::cast<py::array_t<double>>(transaction[3]);
-                        auto exact_metrics = py::cast<py::array_t<double>>(
-                            pending_candidate_exact_payload_[4]);
+                        if (!pending_candidate_round_.has_value()) {
+                            throw std::logic_error(
+                                "full native sequential repair lost its staged round");
+                        }
+                        const auto& candidate_round = *pending_candidate_round_;
+                        candidate_round.validate();
+                        const auto& feasible_order =
+                            candidate_round.feasible_order;
+                        const auto* objectives =
+                            candidate_round.objective_float.data();
+                        const auto* exact_metrics =
+                            candidate_round.exact.metrics.data();
                         const auto* plan_boundaries =
-                            checked_data<std::int64_t>(pool_plan_offsets);
+                            candidate_round.plan_offsets.data();
                         const auto* route_boundaries =
-                            checked_data<std::int64_t>(pool_route_offsets);
+                            candidate_round.route_offsets.data();
                         const auto* route_nodes =
-                            checked_data<std::int64_t>(pool_route_indices);
+                            candidate_round.route_indices.data();
                         const auto* metadata_values =
                             checked_data<std::int64_t>(pool_metadata);
-                        for (py::ssize_t order = 0;
+                        for (std::size_t order = 0;
                              order < feasible_order.size(); ++order) {
-                            const auto plan =
-                                checked_data<std::int64_t>(feasible_order)[order];
+                            const auto plan = feasible_order[order];
                             const auto first_route = plan_boundaries[plan];
                             const auto end_route = plan_boundaries[plan + 1];
                             const auto target = metadata_values[plan * 2];
@@ -12546,9 +12551,9 @@ public:
                                     route_nodes + route_boundaries[route],
                                     route_nodes + route_boundaries[route + 1]);
                             }
-                            auto score = checked_data<double>(objectives)[plan * 2];
+                            auto score = objectives[plan * 2];
                             if (repair_operation == 2) {
-                                score += 0.05 * checked_data<double>(exact_metrics)[
+                                score += 0.05 * exact_metrics[
                                     (first_route + target) * 4 + 2];
                             }
                             options_by_customer[pending_index].push_back(
@@ -12556,8 +12561,7 @@ public:
                                     score, pending[pending_index], target, position,
                                     std::move(candidate_routes)});
                         }
-                        exact_rows_seen += py::cast<py::array_t<std::int64_t>>(
-                            transaction[5]).size();
+                        exact_rows_seen += candidate_round.exact_route_rows.size();
                         last_transaction = transaction;
                         defer_composite_commit_ = false;
                         commit_pending_composite_noexcept();
@@ -12649,9 +12653,7 @@ public:
                         selected_plan_offsets, selected_offsets, selected_indices,
                         insertion_context, remaining_deadline(), batch_array,
                         selected_expected);
-                    const auto selected_plan = prepare_first_feasible_candidate(
-                        selected_plan_offsets, selected_offsets, selected_indices,
-                        selected_transaction);
+                    const auto selected_plan = prepare_first_feasible_candidate();
                     if (!selected_plan.has_value()) {
                         throw std::logic_error(
                             "full native standard sequential selection lost feasibility");
@@ -12747,11 +12749,7 @@ public:
                 insertion_route_indices_array, insertion_context,
                 deadline_array, batch_array, insertion_expected_array);
             defer_composite_commit_ = false;
-            selected_insertion = prepare_first_feasible_candidate(
-                insertion_plan_offsets_array,
-                insertion_route_offsets_array,
-                insertion_route_indices_array,
-                insertion_transaction);
+            selected_insertion = prepare_first_feasible_candidate();
             commit_pending_composite_noexcept();
             restore_insertion_lane.rollback_now();
         } catch (...) {
@@ -13118,8 +13116,7 @@ public:
                 plan_offsets, selected_offsets, selected_indices, context,
                 deadline_array, batch_array, expected_array);
             defer_composite_commit_ = false;
-            const auto selected = prepare_first_feasible_candidate(
-                plan_offsets, selected_offsets, selected_indices, transaction);
+            const auto selected = prepare_first_feasible_candidate();
             if (selected.has_value()) {
                 commit_pending_composite_noexcept();
                 checked_data(outcome)[0] = *selected;
@@ -13452,10 +13449,7 @@ public:
                     py::cast<py::array_t<std::int64_t>>(selected_plan[1]);
                 auto selected_route_indices =
                     py::cast<py::array_t<std::int64_t>>(selected_plan[2]);
-                const auto selected = prepare_first_feasible_candidate(
-                    selected_plan_offsets, selected_route_offsets,
-                    selected_route_indices,
-                    selected_transaction);
+                const auto selected = prepare_first_feasible_candidate();
                 if (!selected.has_value() || *selected != 0) {
                     throw std::logic_error(
                         "full native ejection-chain best candidate replay failed");
@@ -14368,28 +14362,28 @@ public:
                     throw std::logic_error(
                         "full native constraint probe returned an unknown plan identity");
                 }
-                if (!pending_candidate_exact_ready_) {
+                if (!pending_candidate_round_.has_value()) {
                     throw std::logic_error(
                         "full native constraint probe lost its exact candidate payload");
                 }
-                candidate_exact = pending_candidate_exact_payload_;
+                const auto& candidate_round = *pending_candidate_round_;
+                candidate_round.validate();
+                candidate_exact = project_candidate_exact(
+                    candidate_round.exact, 0,
+                    candidate_round.exact.statuses.size());
                 candidate_offsets = owned_array_copy<std::int64_t>(
                     repaired_offsets, "prepared_candidate_offsets", 1);
                 candidate_indices = owned_array_copy<std::int64_t>(
                     repaired_indices, "prepared_candidate_indices", 1);
-                auto objective_integer_matrix =
-                    py::cast<py::array_t<std::int64_t>>(transaction[2]);
-                auto objective_float_matrix =
-                    py::cast<py::array_t<double>>(transaction[3]);
                 candidate_objective_integer = py::array_t<std::int64_t>(2);
                 candidate_objective_float = py::array_t<double>(2);
                 std::copy(
-                    checked_data<std::int64_t>(objective_integer_matrix),
-                    checked_data<std::int64_t>(objective_integer_matrix) + 2,
+                    candidate_round.objective_integer.begin(),
+                    candidate_round.objective_integer.begin() + 2,
                     checked_data(candidate_objective_integer));
                 std::copy(
-                    checked_data<double>(objective_float_matrix),
-                    checked_data<double>(objective_float_matrix) + 2,
+                    candidate_round.objective_float.begin(),
+                    candidate_round.objective_float.begin() + 2,
                     checked_data(candidate_objective_float));
             }
             auto result = py::make_tuple(
@@ -16403,6 +16397,19 @@ public:
         initial_mirror_schema_failure_injection_ = code;
     }
 
+    void inject_candidate_round_mirror_tamper_once() {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (candidate_round_mirror_tamper_injection_) {
+            throw std::runtime_error(
+                "full native candidate-round mirror injection is already armed");
+        }
+        candidate_round_mirror_tamper_injection_ = true;
+    }
+
     void inject_constraint_search_deadline_after_completed_once(
         std::int64_t completed_iterations) {
         std::unique_lock state_lock(state_mutex_, std::try_to_lock);
@@ -17051,6 +17058,102 @@ private:
         std::array<std::int64_t, 4> flags{};
     };
 
+    struct CandidateExactBatchState {
+        std::vector<std::int64_t> path_offsets{0};
+        std::vector<std::int64_t> path_indices;
+        std::vector<std::int64_t> statuses;
+        std::vector<std::int64_t> reasons;
+        std::vector<double> metrics;
+        std::vector<std::int64_t> label_counters;
+
+        void validate(std::size_t route_count) const {
+            if (path_offsets.size() != route_count + 1
+                || path_offsets.front() != 0
+                || path_offsets.back()
+                    != static_cast<std::int64_t>(path_indices.size())
+                || statuses.size() != route_count
+                || reasons.size() != route_count
+                || metrics.size() != route_count * 4
+                || label_counters.size() != route_count * 3) {
+                throw std::logic_error(
+                    "full native staged exact result has an invalid typed shape");
+            }
+            for (std::size_t row = 0; row < route_count; ++row) {
+                if (path_offsets[row] < 0
+                    || path_offsets[row] > path_offsets[row + 1]) {
+                    throw std::logic_error(
+                        "full native staged exact offsets are not monotone");
+                }
+                if (statuses[row] < -1 || statuses[row] > 2
+                    || reasons[row] < -1) {
+                    throw std::logic_error(
+                        "full native staged exact status/reason is invalid");
+                }
+            }
+        }
+    };
+
+    struct CandidateRoundState {
+        std::vector<std::int64_t> plan_offsets;
+        std::vector<std::int64_t> route_offsets;
+        std::vector<std::int64_t> route_indices;
+        std::vector<std::int64_t> feasible_order;
+        std::vector<std::int64_t> exact_route_rows;
+        std::vector<std::int64_t> objective_integer;
+        std::vector<double> objective_float;
+        CandidateExactBatchState exact;
+        std::string transaction_sha256;
+
+        void validate() const {
+            if (plan_offsets.size() < 2 || route_offsets.size() < 2
+                || plan_offsets.front() != 0 || route_offsets.front() != 0
+                || plan_offsets.back()
+                    != static_cast<std::int64_t>(route_offsets.size() - 1)
+                || route_offsets.back()
+                    != static_cast<std::int64_t>(route_indices.size())
+                || transaction_sha256.size() != 64) {
+                throw std::logic_error(
+                    "full native staged candidate round has an invalid identity");
+            }
+            const auto plan_count = plan_offsets.size() - 1;
+            const auto route_count = route_offsets.size() - 1;
+            for (std::size_t row = 0; row < plan_count; ++row) {
+                if (plan_offsets[row] < 0
+                    || plan_offsets[row] >= plan_offsets[row + 1]) {
+                    throw std::logic_error(
+                        "full native staged plan offsets are not monotone");
+                }
+            }
+            for (std::size_t row = 0; row < route_count; ++row) {
+                if (route_offsets[row] < 0
+                    || route_offsets[row] >= route_offsets[row + 1]) {
+                    throw std::logic_error(
+                        "full native staged route offsets are not monotone");
+                }
+            }
+            if (objective_integer.size() != plan_count * 2
+                || objective_float.size() != plan_count * 2) {
+                throw std::logic_error(
+                    "full native staged objective matrix has an invalid shape");
+            }
+            for (const auto plan : feasible_order) {
+                if (plan < 0
+                    || plan >= static_cast<std::int64_t>(plan_count)) {
+                    throw std::logic_error(
+                        "full native staged feasible order has an invalid plan");
+                }
+            }
+            for (const auto route : exact_route_rows) {
+                if (route < 0
+                    || route >= static_cast<std::int64_t>(route_count)) {
+                    throw std::logic_error(
+                        "full native staged exact order has an invalid route");
+                }
+            }
+            exact.validate(route_count);
+        }
+    };
+
     mutable std::recursive_mutex state_mutex_;
     NativeRouteCacheV2 route_cache_;
     NativeNegativeRouteCacheV2 negative_cache_;
@@ -17067,6 +17170,7 @@ private:
     bool exact_kernel_deadline_injection_ = false;
     bool global_search_envelope_failure_injection_ = false;
     std::int64_t initial_mirror_schema_failure_injection_ = 0;
+    bool candidate_round_mirror_tamper_injection_ = false;
     std::int64_t constraint_search_deadline_after_completed_injection_ = -1;
     bool defer_composite_commit_ = false;
     bool defer_iteration_commit_ = false;
@@ -17082,8 +17186,7 @@ private:
     std::optional<NativeBudgetStateV2::NativeSnapshot> pending_budget_snapshot_;
     std::list<ControlJournalBatch> pending_control_journal_;
     std::optional<NativeCausalJournalV2::Snapshot> pending_causal_snapshot_;
-    bool pending_candidate_exact_ready_ = false;
-    py::tuple pending_candidate_exact_payload_;
+    std::optional<CandidateRoundState> pending_candidate_round_;
     std::int64_t depot_ = -1;
     std::vector<std::int64_t> recharge_nodes_;
     std::unordered_set<std::int64_t> all_customers_;
@@ -17201,117 +17304,161 @@ private:
     std::int64_t main_stagnation_iterations_ = 0;
     bool last_iteration_global_best_improved_ = false;
 
-    std::optional<std::int64_t> prepare_first_feasible_candidate(
+    static py::tuple project_candidate_exact(
+        const CandidateExactBatchState& exact,
+        std::size_t first_route,
+        std::size_t end_route) {
+        if (first_route > end_route || end_route > exact.statuses.size()) {
+            throw std::logic_error(
+                "full native staged exact projection has an invalid route range");
+        }
+        const auto route_count = end_route - first_route;
+        const auto first_path = exact.path_offsets[first_route];
+        const auto end_path = exact.path_offsets[end_route];
+        py::array_t<std::int64_t> path_offsets(route_count + 1);
+        for (std::size_t route = 0; route <= route_count; ++route) {
+            checked_data(path_offsets)[route] =
+                exact.path_offsets[first_route + route] - first_path;
+        }
+        py::array_t<std::int64_t> path_indices(end_path - first_path);
+        std::copy(
+            exact.path_indices.begin() + first_path,
+            exact.path_indices.begin() + end_path,
+            checked_data(path_indices));
+        py::array_t<std::int64_t> statuses(route_count);
+        py::array_t<std::int64_t> reasons(route_count);
+        py::array_t<double> metrics(
+            {static_cast<py::ssize_t>(route_count), py::ssize_t(4)});
+        py::array_t<std::int64_t> labels(
+            {static_cast<py::ssize_t>(route_count), py::ssize_t(3)});
+        std::copy(
+            exact.statuses.begin() + static_cast<std::ptrdiff_t>(first_route),
+            exact.statuses.begin() + static_cast<std::ptrdiff_t>(end_route),
+            checked_data(statuses));
+        std::copy(
+            exact.reasons.begin() + static_cast<std::ptrdiff_t>(first_route),
+            exact.reasons.begin() + static_cast<std::ptrdiff_t>(end_route),
+            checked_data(reasons));
+        std::copy(
+            exact.metrics.begin() + static_cast<std::ptrdiff_t>(first_route * 4),
+            exact.metrics.begin() + static_cast<std::ptrdiff_t>(end_route * 4),
+            checked_data(metrics));
+        std::copy(
+            exact.label_counters.begin()
+                + static_cast<std::ptrdiff_t>(first_route * 3),
+            exact.label_counters.begin()
+                + static_cast<std::ptrdiff_t>(end_route * 3),
+            checked_data(labels));
+        return py::make_tuple(
+            std::move(path_offsets), std::move(path_indices),
+            std::move(statuses), std::move(reasons), std::move(metrics),
+            std::move(labels));
+    }
+
+    template <typename T>
+    static void require_candidate_round_mirror_equal(
+        const py::array_t<T>& mirror,
+        std::span<const T> expected,
+        std::string_view field,
+        py::ssize_t expected_ndim = 1) {
+        if (mirror.ndim() != expected_ndim
+            || mirror.size() != static_cast<py::ssize_t>(expected.size())
+            || (mirror.size() > 0
+                && std::memcmp(
+                    checked_data<T>(mirror), expected.data(),
+                    expected.size() * sizeof(T)) != 0)) {
+            throw std::runtime_error(
+                "full native candidate round mirror mismatch: "
+                + std::string(field));
+        }
+    }
+
+    static void validate_candidate_round_mirror(
+        const CandidateRoundState& staged,
         const py::array_t<std::int64_t>& plan_offsets,
         const py::array_t<std::int64_t>& route_offsets,
         const py::array_t<std::int64_t>& route_indices,
-        const py::tuple& transaction) {
-        auto feasible_order =
-            py::cast<py::array_t<std::int64_t>>(transaction[11]);
-        if (feasible_order.size() == 0) {
+        const py::array_t<std::int64_t>& objective_integer,
+        const py::array_t<double>& objective_float,
+        const py::array_t<std::int64_t>& exact_route_rows,
+        const py::array_t<std::int64_t>& feasible_order,
+        std::string_view transaction_sha256) {
+        staged.validate();
+        require_candidate_round_mirror_equal<std::int64_t>(
+            plan_offsets, staged.plan_offsets, "plan_offsets");
+        require_candidate_round_mirror_equal<std::int64_t>(
+            route_offsets, staged.route_offsets, "route_offsets");
+        require_candidate_round_mirror_equal<std::int64_t>(
+            route_indices, staged.route_indices, "route_indices");
+        if (objective_integer.ndim() != 2 || objective_integer.shape(1) != 2
+            || objective_float.ndim() != 2 || objective_float.shape(1) != 2) {
+            throw std::runtime_error(
+                "full native candidate round mirror mismatch: objective shape");
+        }
+        require_candidate_round_mirror_equal<std::int64_t>(
+            objective_integer, staged.objective_integer, "objective_integer", 2);
+        require_candidate_round_mirror_equal<double>(
+            objective_float, staged.objective_float, "objective_float", 2);
+        require_candidate_round_mirror_equal<std::int64_t>(
+            exact_route_rows, staged.exact_route_rows, "exact_route_rows");
+        require_candidate_round_mirror_equal<std::int64_t>(
+            feasible_order, staged.feasible_order, "feasible_order");
+        if (transaction_sha256 != staged.transaction_sha256) {
+            throw std::runtime_error(
+                "full native candidate round mirror mismatch: transaction_sha256");
+        }
+    }
+
+    std::optional<std::int64_t> prepare_first_feasible_candidate() {
+        if (!pending_candidate_round_.has_value()) {
+            throw std::logic_error(
+                "full native candidate round has no staged C++ state");
+        }
+        const auto& staged = *pending_candidate_round_;
+        staged.validate();
+        if (staged.feasible_order.empty()) {
             return std::nullopt;
         }
-        const auto plan_id = checked_data<std::int64_t>(feasible_order)[0];
-        if (plan_id < 0 || plan_id + 1 >= plan_offsets.size()
-            || !pending_candidate_exact_ready_) {
+        const auto plan_id = staged.feasible_order.front();
+        if (plan_id < 0
+            || plan_id + 1 >= static_cast<std::int64_t>(staged.plan_offsets.size())) {
             throw std::logic_error(
                 "full native selected plan lost its exact payload");
         }
-        const auto* plan_boundaries =
-            checked_data<std::int64_t>(plan_offsets);
-        const auto first_route = plan_boundaries[plan_id];
-        const auto end_route = plan_boundaries[plan_id + 1];
+        const auto first_route = staged.plan_offsets[plan_id];
+        const auto end_route = staged.plan_offsets[plan_id + 1];
         if (first_route < 0 || end_route <= first_route
-            || end_route >= route_offsets.size()) {
+            || end_route >= static_cast<std::int64_t>(staged.route_offsets.size())) {
             throw std::logic_error(
                 "full native selected plan has invalid route boundaries");
         }
-        const auto* route_boundaries =
-            checked_data<std::int64_t>(route_offsets);
-        const auto first_index = route_boundaries[first_route];
-        const auto end_index = route_boundaries[end_route];
+        const auto first_index = staged.route_offsets[first_route];
+        const auto end_index = staged.route_offsets[end_route];
         const auto selected_route_count = end_route - first_route;
         py::array_t<std::int64_t> candidate_offsets(selected_route_count + 1);
         for (std::int64_t route = 0; route <= selected_route_count; ++route) {
             checked_data(candidate_offsets)[route] =
-                route_boundaries[first_route + route] - first_index;
+                staged.route_offsets[first_route + route] - first_index;
         }
         py::array_t<std::int64_t> candidate_indices(end_index - first_index);
         std::copy(
-            checked_data<std::int64_t>(route_indices) + first_index,
-            checked_data<std::int64_t>(route_indices) + end_index,
+            staged.route_indices.begin() + first_index,
+            staged.route_indices.begin() + end_index,
             checked_data(candidate_indices));
 
-        auto all_path_offsets = py::cast<py::array_t<std::int64_t>>(
-            pending_candidate_exact_payload_[0]);
-        auto all_path_indices = py::cast<py::array_t<std::int64_t>>(
-            pending_candidate_exact_payload_[1]);
-        auto all_statuses = py::cast<py::array_t<std::int64_t>>(
-            pending_candidate_exact_payload_[2]);
-        auto all_reasons = py::cast<py::array_t<std::int64_t>>(
-            pending_candidate_exact_payload_[3]);
-        auto all_metrics = py::cast<py::array_t<double>>(
-            pending_candidate_exact_payload_[4]);
-        auto all_labels = py::cast<py::array_t<std::int64_t>>(
-            pending_candidate_exact_payload_[5]);
-        const auto* all_path_boundaries =
-            checked_data<std::int64_t>(all_path_offsets);
-        const auto first_path = all_path_boundaries[first_route];
-        const auto end_path = all_path_boundaries[end_route];
-        py::array_t<std::int64_t> candidate_path_offsets(
-            selected_route_count + 1);
-        for (std::int64_t route = 0; route <= selected_route_count; ++route) {
-            checked_data(candidate_path_offsets)[route] =
-                all_path_boundaries[first_route + route] - first_path;
-        }
-        py::array_t<std::int64_t> candidate_path_indices(end_path - first_path);
-        std::copy(
-            checked_data<std::int64_t>(all_path_indices) + first_path,
-            checked_data<std::int64_t>(all_path_indices) + end_path,
-            checked_data(candidate_path_indices));
-        py::array_t<std::int64_t> candidate_statuses(selected_route_count);
-        py::array_t<std::int64_t> candidate_reasons(selected_route_count);
-        py::array_t<double> candidate_metrics(
-            {static_cast<py::ssize_t>(selected_route_count), py::ssize_t(4)});
-        py::array_t<std::int64_t> candidate_labels(
-            {static_cast<py::ssize_t>(selected_route_count), py::ssize_t(3)});
-        std::copy(
-            checked_data<std::int64_t>(all_statuses) + first_route,
-            checked_data<std::int64_t>(all_statuses) + end_route,
-            checked_data(candidate_statuses));
-        std::copy(
-            checked_data<std::int64_t>(all_reasons) + first_route,
-            checked_data<std::int64_t>(all_reasons) + end_route,
-            checked_data(candidate_reasons));
-        std::copy(
-            checked_data<double>(all_metrics) + first_route * 4,
-            checked_data<double>(all_metrics) + end_route * 4,
-            checked_data(candidate_metrics));
-        std::copy(
-            checked_data<std::int64_t>(all_labels) + first_route * 3,
-            checked_data<std::int64_t>(all_labels) + end_route * 3,
-            checked_data(candidate_labels));
-        auto candidate_exact = py::make_tuple(
-            std::move(candidate_path_offsets),
-            std::move(candidate_path_indices),
-            std::move(candidate_statuses),
-            std::move(candidate_reasons),
-            std::move(candidate_metrics),
-            std::move(candidate_labels));
+        auto candidate_exact = project_candidate_exact(
+            staged.exact, static_cast<std::size_t>(first_route),
+            static_cast<std::size_t>(end_route));
 
-        auto objective_integer_matrix =
-            py::cast<py::array_t<std::int64_t>>(transaction[2]);
-        auto objective_float_matrix =
-            py::cast<py::array_t<double>>(transaction[3]);
         py::array_t<std::int64_t> candidate_objective_integer(2);
         py::array_t<double> candidate_objective_float(2);
         std::copy(
-            checked_data<std::int64_t>(objective_integer_matrix) + plan_id * 2,
-            checked_data<std::int64_t>(objective_integer_matrix) + plan_id * 2 + 2,
+            staged.objective_integer.begin() + plan_id * 2,
+            staged.objective_integer.begin() + plan_id * 2 + 2,
             checked_data(candidate_objective_integer));
         std::copy(
-            checked_data<double>(objective_float_matrix) + plan_id * 2,
-            checked_data<double>(objective_float_matrix) + plan_id * 2 + 2,
+            staged.objective_float.begin() + plan_id * 2,
+            staged.objective_float.begin() + plan_id * 2 + 2,
             checked_data(candidate_objective_float));
         last_candidate_offsets_ = std::move(candidate_offsets);
         last_candidate_indices_ = std::move(candidate_indices);
@@ -17823,7 +17970,7 @@ private:
         pending_negative_store_ = false;
         pending_attempted_mark_ = false;
         pending_budget_snapshot_.reset();
-        pending_candidate_exact_ready_ = false;
+        pending_candidate_round_.reset();
         pending_causal_snapshot_.reset();
         pending_control_journal_.clear();
         pending_composite_active_ = false;
@@ -19820,6 +19967,9 @@ PYBIND11_MODULE(_core, module) {
             "inject_commit_failure_once",
             &NativeSearchEngineV2::inject_commit_failure_once,
             py::arg("step"))
+        .def(
+            "inject_candidate_round_mirror_tamper_once",
+            &NativeSearchEngineV2::inject_candidate_round_mirror_tamper_once)
         .def(
             "inject_constraint_probe_envelope_failure_once",
             &NativeSearchEngineV2::inject_constraint_probe_envelope_failure_once)

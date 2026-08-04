@@ -4593,6 +4593,140 @@ def test_native_legacy_route_elimination_matches_python_candidate_control() -> N
         np.testing.assert_equal(actual, expected)
 
 
+def test_native_deferred_candidate_round_owns_cpp_staged_state_and_rejects_mirror_tamper() -> None:
+    """The deferred composite seam must select from C++ state, not its mirror.
+
+    legacy_route_elimination_probe(..., defer_acceptance=True) is the
+    smallest public path that exercises
+    evaluate_plans -> deferred composite -> prepare_first_feasible_candidate.
+    The planned v2 fault seam mutates the Python-return mirror after the native
+    transaction has staged its result.  The adapter must detect that mismatch,
+    fail closed, and leave the logical transaction recoverable.  The normal
+    retry is compared with the existing Python Candidate Control event so this
+    test guards both the semantic path and the rollback boundary.
+    """
+
+    from evrptw import _core as native_core
+
+    instance = _candidate_plan_fixture()
+    initial = (("C1", "C2"), ("C3", "C4"))
+    python_result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        initial_customer_sequences=initial,
+        screening_config=CheapScreeningConfig(),
+        cache_incremental_config=CacheIncrementalConfig(enabled=True),
+        stage04_config=Stage04Config(),
+        candidate_control_config=CandidateControlConfig(
+            worker_count=1,
+            max_exact_calls_per_round=100,
+            proposal_top_k=100,
+        ),
+    )
+    python_events = tuple(
+        event
+        for event in python_result.neighborhood_events
+        if event.get("operator") == "route_elimination"
+        and event.get("status") == "candidate_proposed"
+    )
+    assert len(python_events) == 1
+    python_event = python_events[0]
+
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = _native_search_engine(
+        native_core,
+        context,
+        100,
+        100,
+        256,
+        10_000_000,
+        256,
+        100,
+        context.reachability_epsilon,
+        1,
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        _native_lexical_rank(context),
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray(
+            [context.name_to_index[name] for route in initial for name in route],
+            dtype=np.int64,
+        ),
+        np.asarray([2014, 1, 128, 1, 100], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+
+    before_state = engine.state()
+    before_solution = engine.solution_state()
+    before_lanes = tuple(engine.lane_solution_state(lane) for lane in range(3))
+
+    # Expected v2 production seam.  It mutates only the Python-return mirror;
+    # the C++ staged selection must remain the source of truth and the adapter
+    # must reject the inconsistent mirror before composite commit.
+    engine.inject_candidate_round_mirror_tamper_once()
+    with pytest.raises(RuntimeError, match="candidate round mirror mismatch"):
+        engine.legacy_route_elimination_probe(
+            0,
+            3,
+            -1,
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            True,
+        )
+
+    after_failure_state = engine.state()
+    after_failure_solution = engine.solution_state()
+    after_failure_lanes = tuple(
+        engine.lane_solution_state(lane) for lane in range(3)
+    )
+    # Exact work may remain accounted as started work, but no candidate/cache/
+    # lane state may leak past the failed deferred composite.
+    np.testing.assert_equal(after_failure_state[0], before_state[0])
+    assert after_failure_state[2] == before_state[2]
+    np.testing.assert_equal(after_failure_state[3], before_state[3])
+    for before, after in zip(before_solution, after_failure_solution, strict=True):
+        np.testing.assert_equal(after, before)
+    for before_lane, after_lane in zip(
+        before_lanes, after_failure_lanes, strict=True
+    ):
+        for before, after in zip(before_lane, after_lane, strict=True):
+            np.testing.assert_equal(after, before)
+
+    recovered = engine.legacy_route_elimination_probe(
+        0,
+        3,
+        -1,
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        True,
+    )
+    transaction = recovered[5]
+    outcome = recovered[6]
+    assert transaction is not None
+    selected_plan = int(outcome[0])
+    assert outcome.tolist()[1:4] == [-2, 0, 0]
+    assert transaction[11].tolist()[0] == selected_plan
+    candidate_objective = (
+        int(transaction[2][selected_plan, 0]),
+        float(transaction[3][selected_plan, 0]),
+        float(transaction[3][selected_plan, 1]),
+        int(transaction[2][selected_plan, 1]),
+    )
+    assert candidate_objective == python_event["candidate_objective_key"]
+
+
 def test_native_full_search_lanes_share_one_candidate_round_budget() -> None:
     from evrptw import _core as native_core
 

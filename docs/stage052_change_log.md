@@ -3080,3 +3080,29 @@ compatibility fallback（兼容回退）。
   复用 attempt01--03。下一步必须把 candidate-round 唯一 ownership 和原子提交迁入
   C++，再依次迁移三 lane、Stage 4、terminal envelope 与整次调用 GIL release；只有三种
   新架构各自通过 12/12 fixed-work 全字段语义门控，才允许开始五模式重测。
+
+## 2026-08-04：candidate-round staged state 的纯 C++ ownership
+
+- `NativeSearchEngineV2` 新增纯 C++ `CandidateRoundState` 与
+  `CandidateExactBatchState`，在一个候选事务完成时拥有原始 plan/route SoA、规范
+  feasible order、objective matrix、exact route completion rows、逐路线 exact payload
+  和 transaction SHA-256。deferred composite commit（延迟复合提交）不再保存
+  `py::tuple pending_candidate_exact_payload_`；pending state 在 commit/rollback 后显式
+  reset，避免失效 Python tuple 继续持有事务内存。
+- `prepare_first_feasible_candidate()`、sequential repair（顺序修复）和 constraint probe
+  （约束探针）改为只消费上述 C++ staged state。返回给 Python 的 transaction tuple
+  仍用于 ABI/证据投影，但不再能改变候选选择、路线、exact payload 或 objective。
+  排名和可行计划规范排序也直接调用纯 C++ `native_candidate_plan::rank()` 与
+  `order_feasible()`，不再经内部 Python tuple wrapper 重演。
+- 新增 strict mirror validation（严格镜像校验）：输入 SoA、objective、exact completion
+  order、feasible order 和 transaction identity 必须与 C++ staged state 一致。比较采用
+  typed-buffer byte equality（类型化缓冲区逐字节相等），因此能正确处理 canonical NaN
+  sentinel，同时仍区分 `-0.0` 和不同 NaN payload。一次性 mirror-tamper fault injection
+  （镜像篡改故障注入）证明不一致会 fail fast，并回滚 route cache、negative cache、
+  attempted plans、budget、causal journal、solution 和三条 lane；同一操作随后可正常重试。
+- 本切片的原始 1-thread/4-thread transaction、deadline、duplicate plan、cache、budget、
+  commit failure、objective ordering 与 canonical journal 聚焦回归为 `19 passed`；扩大到
+  所有 `native_search_engine`/`full_native` 路径的 non-host 回归为
+  `149 passed, 187 deselected`。本条仍未迁移 route/negative cache 与 budget 的 Python
+  receipt adapters，也未迁移 live lane apply、Stage 4 controller 或 terminal projection；
+  capability bits 继续全部为 0，不创建 attempt04，不启动 Paired/Pilot/Formal/CUDA。
