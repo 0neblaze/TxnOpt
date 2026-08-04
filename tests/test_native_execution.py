@@ -2236,6 +2236,36 @@ def test_native_candidate_plan_ranking_matches_python_rank_key() -> None:
         [len(plan), sum(route not in current_set for route in plan)] for plan in plans
     ]
     assert float_metrics.tolist() == [sum(bounds) for bounds in per_route_lower_bounds]
+    for array in (ranked, selected, integer_metrics, float_metrics):
+        assert array.flags.c_contiguous
+
+    with pytest.raises(ValueError, match="current candidate plan contains an unknown node"):
+        native_core.rank_candidate_plans_v1(
+            np.asarray(plan_offsets, dtype=np.int64),
+            np.asarray(route_offsets, dtype=np.int64),
+            np.asarray(route_indices, dtype=np.int64),
+            np.asarray(lower_bounds, dtype=np.float64),
+            np.asarray([0, 1], dtype=np.int64),
+            np.asarray([99], dtype=np.int64),
+            np.asarray([0, 1, 2, 3, 4], dtype=np.int64),
+            attempted,
+            2,
+        )
+
+    empty_candidate_route_offsets = np.asarray(route_offsets, dtype=np.int64)
+    empty_candidate_route_offsets[1] = 0
+    with pytest.raises(ValueError, match="route_offsets cannot contain an empty row"):
+        native_core.rank_candidate_plans_v1(
+            np.asarray(plan_offsets, dtype=np.int64),
+            empty_candidate_route_offsets,
+            np.asarray(route_indices, dtype=np.int64),
+            np.asarray(lower_bounds, dtype=np.float64),
+            np.asarray(current_offsets, dtype=np.int64),
+            np.asarray(current_indices, dtype=np.int64),
+            np.asarray([0, 1, 2, 3, 4], dtype=np.int64),
+            attempted,
+            2,
+        )
 
 
 def test_native_candidate_plan_preparation_and_decision_are_typed_and_atomic() -> None:
@@ -2264,6 +2294,8 @@ def test_native_candidate_plan_preparation_and_decision_are_typed_and_atomic() -
     assert prepared[2].tolist() == [0, 2, 3, 5, 7, 8, 9]
     assert prepared[3].tolist() == [1, 2, 3, 1, 1, 2, 3, 1, 2]
     assert prepared[4].tolist() == [0, 1, 2, 3, 0, 4, 5, 1]
+    assert all(array.dtype == np.int64 for array in prepared)
+    assert all(array.ndim == 1 and array.flags.c_contiguous for array in prepared)
 
     eligible, combined = native_core.decide_candidate_plans_v2(
         plan_offsets,
@@ -2274,6 +2306,7 @@ def test_native_candidate_plan_preparation_and_decision_are_typed_and_atomic() -
     )
     assert eligible.tolist() == [1, 0, 0, 0]
     assert combined.tolist() == [0, 1, 1, 1]
+    assert eligible.flags.c_contiguous and combined.flags.c_contiguous
 
     attempted_eligible, attempted_combined = native_core.decide_candidate_plans_v2(
         plan_offsets,
@@ -2304,6 +2337,21 @@ def test_native_candidate_plan_preparation_and_decision_are_typed_and_atomic() -
     )
     assert canonical_objective_component(542614.3787160305) == 542614.378716031
     assert ordered.tolist() == [2, 0, 1, 3]
+    assert ordered.dtype == np.int64 and ordered.flags.c_contiguous
+
+    canonical_tie_order = native_core.order_feasible_candidate_plans_v2(
+        np.asarray([0, 1, 2], dtype=np.int64),
+        np.asarray([0, 1, 2], dtype=np.int64),
+        np.asarray([2, 1], dtype=np.int64),
+        np.asarray([[1, 0], [1, 0]], dtype=np.int64),
+        np.asarray(
+            [[10.0000000001, 0.0], [10.0000000002, 0.0]],
+            dtype=np.float64,
+        ),
+        np.asarray([0, 1, 2], dtype=np.int64),
+        np.asarray([0, 1], dtype=np.int64),
+    )
+    assert canonical_tie_order.tolist() == [1, 0]
 
     with pytest.raises(ValueError, match="permutation"):
         native_core.prepare_candidate_plans_v2(
@@ -2343,6 +2391,19 @@ def test_native_candidate_plan_preparation_and_decision_are_typed_and_atomic() -
             np.asarray([0], dtype=np.int64),
         )
 
+    invalid_single_plan_routes = route_indices.copy()
+    invalid_single_plan_routes[route_offsets[4]] = 99
+    with pytest.raises(ValueError, match="unknown node"):
+        native_core.order_feasible_candidate_plans_v2(
+            plan_offsets,
+            route_offsets,
+            invalid_single_plan_routes,
+            np.asarray([[2, 0], [2, 0], [1, 0], [3, 0]], dtype=np.int64),
+            np.zeros((4, 2), dtype=np.float64),
+            np.asarray([0, 2, 3, 1], dtype=np.int64),
+            np.asarray([2], dtype=np.int64),
+        )
+
     with pytest.raises(ValueError, match="unique customer nodes"):
         native_core.prepare_candidate_plans_v2(
             plan_offsets,
@@ -2367,6 +2428,84 @@ def test_native_candidate_plan_preparation_and_decision_are_typed_and_atomic() -
             np.asarray([0, 1, 1, 1], dtype=np.int64),
             np.asarray([0, 2, 3, 1], dtype=np.int64),
             np.asarray([1, 2, 3], dtype=np.int64),
+            1,
+            False,
+        )
+
+    empty_plan_offsets = plan_offsets.copy()
+    empty_plan_offsets[1] = 0
+    with pytest.raises(ValueError, match="plan_offsets cannot contain an empty row"):
+        native_core.decide_candidate_plans_v2(
+            empty_plan_offsets,
+            np.ones(4, dtype=np.int64),
+            np.ones(8, dtype=np.int64),
+            np.zeros(4, dtype=np.int64),
+            3,
+        )
+
+    empty_route_offsets = route_offsets.copy()
+    empty_route_offsets[1] = 0
+    with pytest.raises(ValueError, match="route_offsets cannot contain an empty row"):
+        native_core.prepare_candidate_plans_v2(
+            plan_offsets,
+            empty_route_offsets,
+            route_indices,
+            np.asarray([3, 1, 2], dtype=np.int64),
+            np.asarray([0, 1, 1, 1], dtype=np.int64),
+            np.asarray([0, 2, 3, 1], dtype=np.int64),
+            np.asarray([1, 2, 3], dtype=np.int64),
+            1,
+            False,
+        )
+
+
+def test_native_candidate_plan_empty_pool_and_empty_feasible_semantics() -> None:
+    from evrptw import _core as native_core
+
+    ranked = native_core.rank_candidate_plans_v1(
+        np.asarray([0], dtype=np.int64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+        np.asarray([], dtype=np.float64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+        1,
+    )
+    assert [array.shape for array in ranked] == [(0,), (0,), (0, 2), (0,)]
+    assert all(array.flags.c_contiguous for array in ranked)
+
+    eligible, combined = native_core.decide_candidate_plans_v2(
+        np.asarray([0], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+        1,
+    )
+    assert eligible.shape == (0,) and combined.shape == (0,)
+
+    ordered = native_core.order_feasible_candidate_plans_v2(
+        np.asarray([0, 1], dtype=np.int64),
+        np.asarray([0, 1], dtype=np.int64),
+        np.asarray([1], dtype=np.int64),
+        np.asarray([[1, 0]], dtype=np.int64),
+        np.asarray([[float("nan"), float("nan")]], dtype=np.float64),
+        np.asarray([0, 1], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+    )
+    assert ordered.shape == (0,)
+    assert ordered.dtype == np.int64 and ordered.flags.c_contiguous
+
+    with pytest.raises(ValueError, match="non-empty plan pool"):
+        native_core.prepare_candidate_plans_v2(
+            np.asarray([0], dtype=np.int64),
+            np.asarray([0], dtype=np.int64),
+            np.asarray([], dtype=np.int64),
+            np.asarray([1], dtype=np.int64),
+            np.asarray([0, 1], dtype=np.int64),
+            np.asarray([0, 1], dtype=np.int64),
+            np.asarray([1], dtype=np.int64),
             1,
             False,
         )

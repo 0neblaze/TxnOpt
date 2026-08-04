@@ -1907,7 +1907,7 @@ private:
     double compensation_ = 0.0;
 };
 
-py::tuple rank_candidate_plans_v1(
+evrptw::native_candidate_plan::RankingResult rank_candidate_plans_owned_v1(
     py::handle plan_offsets,
     py::handle route_offsets,
     py::handle route_indices,
@@ -1960,6 +1960,11 @@ py::tuple rank_candidate_plans_v1(
             static_cast<std::size_t>(attempted_array.size())),
         top_k,
     });
+    return result;
+}
+
+py::tuple project_candidate_plan_ranking_v1(
+    const evrptw::native_candidate_plan::RankingResult& result) {
     const auto plan_count = result.ranked.size();
     py::array_t<std::int64_t> ranked_array(result.ranked.size());
     py::array_t<std::int64_t> selected_array(result.selected.size());
@@ -1981,7 +1986,24 @@ py::tuple rank_candidate_plans_v1(
         std::move(integer_metrics), std::move(float_metrics));
 }
 
-py::tuple prepare_candidate_plans_v2(
+py::tuple rank_candidate_plans_v1(
+    py::handle plan_offsets,
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle route_distance_lower_bounds,
+    py::handle current_route_offsets,
+    py::handle current_route_indices,
+    py::handle lexical_rank,
+    py::handle attempted_flags,
+    std::int64_t top_k) {
+    return project_candidate_plan_ranking_v1(rank_candidate_plans_owned_v1(
+        plan_offsets, route_offsets, route_indices, route_distance_lower_bounds,
+        current_route_offsets, current_route_indices, lexical_rank,
+        attempted_flags, top_k));
+}
+
+evrptw::native_candidate_plan::PlanPreparationResult
+prepare_candidate_plans_owned_v2(
     py::handle plan_offsets,
     py::handle route_offsets,
     py::handle route_indices,
@@ -2011,6 +2033,11 @@ py::tuple prepare_candidate_plans_v2(
         customer_kind,
         allow_partial_customer_coverage,
     });
+    return result;
+}
+
+py::tuple project_candidate_plan_preparation_v2(
+    const evrptw::native_candidate_plan::PlanPreparationResult& result) {
     const auto make_array = [](const std::vector<std::int64_t>& values) {
         py::array_t<std::int64_t> array(values.size());
         std::copy(values.begin(), values.end(), checked_data(array));
@@ -2024,7 +2051,26 @@ py::tuple prepare_candidate_plans_v2(
         make_array(result.unique_row_by_route));
 }
 
-py::tuple decide_candidate_plans_v2(
+py::tuple prepare_candidate_plans_v2(
+    py::handle plan_offsets,
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle expected_customer_indices,
+    py::handle node_kind,
+    py::handle lexical_rank,
+    py::handle complete_customer_indices,
+    std::int64_t customer_kind,
+    bool allow_partial_customer_coverage) {
+    return project_candidate_plan_preparation_v2(
+        prepare_candidate_plans_owned_v2(
+            plan_offsets, route_offsets, route_indices,
+            expected_customer_indices, node_kind, lexical_rank,
+            complete_customer_indices, customer_kind,
+            allow_partial_customer_coverage));
+}
+
+evrptw::native_candidate_plan::PlanDecisionResult
+decide_candidate_plans_owned_v2(
     py::handle plan_offsets,
     py::handle coverage_eligible,
     py::handle screening_passed,
@@ -2044,6 +2090,11 @@ py::tuple decide_candidate_plans_v2(
         {checked_data<std::int64_t>(attempted), static_cast<std::size_t>(attempted.size())},
         current_route_count,
     });
+    return result;
+}
+
+py::tuple project_candidate_plan_decision_v2(
+    const evrptw::native_candidate_plan::PlanDecisionResult& result) {
     py::array_t<std::int64_t> eligible(result.eligible.size());
     py::array_t<std::int64_t> combined(result.combined_attempted.size());
     std::copy(result.eligible.begin(), result.eligible.end(), checked_data(eligible));
@@ -2053,7 +2104,59 @@ py::tuple decide_candidate_plans_v2(
     return py::make_tuple(std::move(eligible), std::move(combined));
 }
 
-py::array_t<std::int64_t> order_feasible_candidate_plans_v2(
+py::tuple decide_candidate_plans_v2(
+    py::handle plan_offsets,
+    py::handle coverage_eligible,
+    py::handle screening_passed,
+    py::handle attempted_flags,
+    std::int64_t current_route_count) {
+    return project_candidate_plan_decision_v2(
+        decide_candidate_plans_owned_v2(
+            plan_offsets, coverage_eligible, screening_passed,
+            attempted_flags, current_route_count));
+}
+
+std::vector<std::int64_t> order_feasible_candidate_plans_owned_v2(
+    const evrptw::native_candidate_plan::FeasibleOrderingInput& input) {
+    if (input.plan_offsets.empty()) {
+        throw std::invalid_argument("plan_offsets cannot be empty");
+    }
+    const auto plan_count = input.plan_offsets.size() - 1;
+    if (plan_count > std::numeric_limits<std::size_t>::max() / 2
+        || input.objective_float.size() != plan_count * 2) {
+        throw std::invalid_argument("feasible-plan objectives do not align");
+    }
+    std::vector<double> canonical_floating(input.objective_float.size());
+    if (!canonical_floating.empty()) {
+        std::copy(
+            input.objective_float.begin(), input.objective_float.end(),
+            canonical_floating.begin());
+    }
+    for (const auto plan : input.feasible_plan_ids) {
+        if (plan < 0 || plan >= static_cast<std::int64_t>(plan_count)) {
+            throw std::invalid_argument(
+                "feasible_plan_ids must identify candidate plans");
+        }
+        const auto offset = static_cast<std::size_t>(plan) * 2;
+        canonical_floating[offset] =
+            evrptw::formal_objective::canonical_component(
+                canonical_floating[offset]);
+        canonical_floating[offset + 1] =
+            evrptw::formal_objective::canonical_component(
+                canonical_floating[offset + 1]);
+    }
+    return evrptw::native_candidate_plan::order_feasible({
+        input.plan_offsets,
+        input.route_offsets,
+        input.route_indices,
+        input.objective_integer,
+        canonical_floating,
+        input.lexical_rank,
+        input.feasible_plan_ids,
+    });
+}
+
+std::vector<std::int64_t> order_feasible_candidate_plans_from_python_v2(
     py::handle plan_offsets,
     py::handle route_offsets,
     py::handle route_indices,
@@ -2074,9 +2177,6 @@ py::array_t<std::int64_t> order_feasible_candidate_plans_v2(
         throw std::invalid_argument(
             "feasible-plan objective arrays must have exactly two columns");
     }
-    std::vector<double> canonical_floating(
-        checked_data<double>(floating),
-        checked_data<double>(floating) + floating.size());
     if (plans.size() < 1) {
         throw std::invalid_argument("plan_offsets cannot be empty");
     }
@@ -2088,26 +2188,37 @@ py::array_t<std::int64_t> order_feasible_candidate_plans_v2(
             throw std::invalid_argument(
                 "feasible_plan_ids must identify candidate plans");
         }
-        const auto offset = static_cast<std::size_t>(plan) * 2;
-        canonical_floating[offset] =
-            evrptw::formal_objective::canonical_component(
-                canonical_floating[offset]);
-        canonical_floating[offset + 1] =
-            evrptw::formal_objective::canonical_component(
-                canonical_floating[offset + 1]);
     }
-    const auto result = evrptw::native_candidate_plan::order_feasible({
+    return order_feasible_candidate_plans_owned_v2({
         {checked_data<std::int64_t>(plans), static_cast<std::size_t>(plans.size())},
         {checked_data<std::int64_t>(routes), static_cast<std::size_t>(routes.size())},
         {checked_data<std::int64_t>(indices), static_cast<std::size_t>(indices.size())},
         {checked_data<std::int64_t>(integer), static_cast<std::size_t>(integer.size())},
-        {canonical_floating.data(), canonical_floating.size()},
+        {checked_data<double>(floating), static_cast<std::size_t>(floating.size())},
         {checked_data<std::int64_t>(lexical), static_cast<std::size_t>(lexical.size())},
         {checked_data<std::int64_t>(feasible), static_cast<std::size_t>(feasible.size())},
     });
+}
+
+py::array_t<std::int64_t> project_feasible_candidate_plan_order_v2(
+    const std::vector<std::int64_t>& result) {
     py::array_t<std::int64_t> output(result.size());
     std::copy(result.begin(), result.end(), checked_data(output));
     return output;
+}
+
+py::array_t<std::int64_t> order_feasible_candidate_plans_v2(
+    py::handle plan_offsets,
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle objective_integer,
+    py::handle objective_float,
+    py::handle lexical_rank,
+    py::handle feasible_plan_ids) {
+    return project_feasible_candidate_plan_order_v2(
+        order_feasible_candidate_plans_from_python_v2(
+            plan_offsets, route_offsets, route_indices, objective_integer,
+            objective_float, lexical_rank, feasible_plan_ids));
 }
 
 py::tuple screen_route_batch_transaction_impl(
@@ -2128,6 +2239,40 @@ py::tuple screen_route_batch_transaction_impl(
     py::handle negative_indices,
     py::handle negative_reason_codes,
     std::int64_t worker_count);
+
+class ScreenBatchPythonProblemV2 final {
+public:
+    ScreenBatchPythonProblemV2(
+        py::handle node_kind,
+        py::handle demand,
+        py::handle ready_time,
+        py::handle due_date,
+        py::handle service_time,
+        py::handle distance,
+        py::handle reachable,
+        py::handle vehicle);
+
+    evrptw::native_search::ScreenBatchResultV2 execute(
+        std::span<const std::int64_t> route_offsets,
+        std::span<const std::int64_t> route_indices,
+        std::span<const std::int64_t> candidate_ids,
+        const py::array_t<double>& options,
+        std::span<const double> incremental,
+        const py::array_t<std::int64_t>& negative_offsets,
+        const py::array_t<std::int64_t>& negative_indices,
+        const py::array_t<std::int64_t>& negative_reason_codes,
+        std::int64_t worker_count) const;
+
+private:
+    py::array_t<std::int64_t> node_kind_;
+    py::array_t<double> demand_;
+    py::array_t<double> ready_time_;
+    py::array_t<double> due_date_;
+    py::array_t<double> service_time_;
+    py::array_t<double> distance_;
+    py::array_t<std::uint8_t> reachable_;
+    py::array_t<double> vehicle_;
+};
 
 evrptw::native_search::ScreenBatchResultV2
 screen_route_batch_transaction_owned_from_python_v2(
@@ -2203,40 +2348,47 @@ py::tuple changed_candidate_plan_selection_v1(
     const auto plans_state = assemble_changed_candidate_plans_owned_v1(
         current_offsets, current_indices, pool_state.changed_route_indices,
         pool_state.change_offsets, pool_state.change_indices);
-    auto pool = project_changed_candidate_pool_v1(pool_state);
-    auto plans = project_candidate_plan_pool_v1(plans_state);
-    auto plan_offsets_array = py::cast<py::array_t<std::int64_t>>(plans[0]);
-    auto route_offsets_array = py::cast<py::array_t<std::int64_t>>(plans[1]);
-    auto route_indices_array = py::cast<py::array_t<std::int64_t>>(plans[2]);
-    const auto plan_count = static_cast<std::size_t>(plan_offsets_array.size() - 1);
-    const auto route_count = static_cast<std::size_t>(route_offsets_array.size() - 1);
+    const auto plan_count = plans_state.plan_offsets.size() - 1;
+    const auto route_count = plans_state.route_offsets.size() - 1;
     auto attempted_array = checked_array<std::int64_t>(
         attempted_flags, "attempted_flags", 1);
     if (attempted_array.size() != static_cast<py::ssize_t>(plan_count)) {
         throw std::invalid_argument(
             "changed candidate-plan attempted flags do not align");
     }
-    py::array_t<std::int64_t> candidate_ids(route_count);
-    py::array_t<double> incremental(
-        {static_cast<py::ssize_t>(route_count), py::ssize_t(6)});
-    std::fill(checked_data(incremental), checked_data(incremental) + route_count * 6, 0.0);
-    for (std::size_t route = 0; route < route_count; ++route) {
-        checked_data(candidate_ids)[route] = static_cast<std::int64_t>(route);
-    }
-    auto screening_state = screen_route_batch_transaction_owned_from_python_v2(
+    std::vector<std::int64_t> candidate_ids(route_count);
+    std::iota(candidate_ids.begin(), candidate_ids.end(), 0);
+    std::vector<double> incremental(route_count * 6, 0.0);
+    ScreenBatchPythonProblemV2 screen_problem(
         node_kind, demand, ready_time, due_date, service_time, distance,
-        reachable, vehicle, route_offsets_array, route_indices_array,
-        candidate_ids, screening_options, incremental, negative_offsets,
-        negative_indices, negative_reason_codes, worker_count);
-    const auto* plan_offsets_values = checked_data<std::int64_t>(plan_offsets_array);
+        reachable, vehicle);
+    auto options_array = checked_array<double>(
+        screening_options, "options", 1);
+    auto negative_offsets_array = checked_array<std::int64_t>(
+        negative_offsets, "negative_offsets", 1);
+    auto negative_indices_array = checked_array<std::int64_t>(
+        negative_indices, "negative_indices", 1);
+    auto negative_reason_codes_array = checked_array<std::int64_t>(
+        negative_reason_codes, "negative_reason_codes", 1);
+    auto screening_state = screen_problem.execute(
+        plans_state.route_offsets,
+        plans_state.route_indices,
+        candidate_ids,
+        options_array,
+        incremental,
+        negative_offsets_array,
+        negative_indices_array,
+        negative_reason_codes_array,
+        worker_count);
+    const auto* plan_offsets_values = plans_state.plan_offsets.data();
     const auto* codes = screening_state.codes.data();
     const auto* metrics = screening_state.metrics.data();
     const auto* attempted = checked_data<std::int64_t>(attempted_array);
-    py::array_t<std::int64_t> eligible(plan_count);
-    py::array_t<std::int64_t> combined_attempted(plan_count);
-    py::array_t<double> lower_bounds(route_count);
+    std::vector<std::int64_t> eligible(plan_count);
+    std::vector<std::int64_t> combined_attempted(plan_count);
+    std::vector<double> lower_bounds(route_count);
     for (std::size_t route = 0; route < route_count; ++route) {
-        checked_data(lower_bounds)[route] = metrics[route * 15 + 3];
+        lower_bounds[route] = metrics[route * 15 + 3];
     }
     for (std::size_t plan = 0; plan < plan_count; ++plan) {
         auto valid = true;
@@ -2244,27 +2396,45 @@ py::tuple changed_candidate_plan_selection_v1(
              route < plan_offsets_values[plan + 1]; ++route) {
             valid = valid && codes[route * 16] == 1;
         }
-        checked_data(eligible)[plan] = valid ? 1 : 0;
-        checked_data(combined_attempted)[plan] =
+        eligible[plan] = valid ? 1 : 0;
+        combined_attempted[plan] =
             !valid || attempted[plan] != 0 ? 1 : 0;
     }
-    auto ranking = rank_candidate_plans_v1(
-        plan_offsets_array, route_offsets_array, route_indices_array,
-        lower_bounds, current_route_offsets, current_route_indices,
-        lexical_rank, combined_attempted, top_k);
-    auto ranked_all = py::cast<py::array_t<std::int64_t>>(ranking[0]);
-    const auto* ranked_values = checked_data<std::int64_t>(ranked_all);
+    auto lexical_array = checked_array<std::int64_t>(
+        lexical_rank, "lexical_rank", 1);
+    const auto ranking_state = evrptw::native_candidate_plan::rank({
+        plans_state.plan_offsets,
+        plans_state.route_offsets,
+        plans_state.route_indices,
+        lower_bounds,
+        current_offsets,
+        current_indices,
+        std::span<const std::int64_t>{
+            checked_data<std::int64_t>(lexical_array),
+            static_cast<std::size_t>(lexical_array.size())},
+        combined_attempted,
+        top_k,
+    });
+    const auto& ranked_values = ranking_state.ranked;
     std::vector<std::int64_t> rankable;
     rankable.reserve(plan_count);
     for (std::size_t rank = 0; rank < plan_count; ++rank) {
         const auto plan = ranked_values[rank];
-        if (checked_data(eligible)[plan] == 1) {
+        if (eligible[static_cast<std::size_t>(plan)] == 1) {
             rankable.push_back(plan);
         }
     }
+    auto pool = project_changed_candidate_pool_v1(pool_state);
+    auto plans = project_candidate_plan_pool_v1(plans_state);
+    auto plan_offsets_array = py::cast<py::array_t<std::int64_t>>(plans[0]);
+    auto route_offsets_array = py::cast<py::array_t<std::int64_t>>(plans[1]);
+    auto route_indices_array = py::cast<py::array_t<std::int64_t>>(plans[2]);
+    auto screening = project_screen_batch_result_v2(screening_state);
+    auto ranking = project_candidate_plan_ranking_v1(ranking_state);
+    py::array_t<std::int64_t> eligible_array(eligible.size());
+    std::copy(eligible.begin(), eligible.end(), checked_data(eligible_array));
     py::array_t<std::int64_t> rankable_array(rankable.size());
     std::copy(rankable.begin(), rankable.end(), checked_data(rankable_array));
-    auto screening = project_screen_batch_result_v2(screening_state);
     auto codes_array = py::cast<py::array_t<std::int64_t>>(screening[3]);
     auto metrics_array = py::cast<py::array_t<double>>(screening[4]);
     std::string evidence = "stage05.2-changed-candidate-plan-selection-v1";
@@ -2279,13 +2449,13 @@ py::tuple changed_candidate_plan_selection_v1(
     append_array(route_indices_array);
     append_array(codes_array);
     append_array(metrics_array);
-    append_array(eligible);
+    append_array(eligible_array);
     append_array(rankable_array);
     append_array(py::cast<py::array>(ranking[1]));
     const auto digest = native_sha256_hex(evidence);
     return py::make_tuple(
         std::move(pool), std::move(plans), std::move(screening),
-        std::move(eligible), std::move(rankable_array), ranking[1],
+        std::move(eligible_array), std::move(rankable_array), ranking[1],
         ranking[2], ranking[3], digest);
 }
 
@@ -8523,6 +8693,77 @@ py::tuple project_screen_batch_result_v2(
         std::move(codes), std::move(metrics), std::move(counters), result.digest);
 }
 
+ScreenBatchPythonProblemV2::ScreenBatchPythonProblemV2(
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle)
+    : node_kind_(checked_array<std::int64_t>(node_kind, "node_kind", 1)),
+      demand_(checked_array<double>(demand, "demand", 1)),
+      ready_time_(checked_array<double>(ready_time, "ready_time", 1)),
+      due_date_(checked_array<double>(due_date, "due_date", 1)),
+      service_time_(checked_array<double>(service_time, "service_time", 1)),
+      distance_(checked_array<double>(distance, "distance", 2)),
+      reachable_(checked_array<std::uint8_t>(reachable, "reachable", 2)),
+      vehicle_(checked_array<double>(vehicle, "vehicle", 1)) {}
+
+evrptw::native_search::ScreenBatchResultV2
+ScreenBatchPythonProblemV2::execute(
+    std::span<const std::int64_t> route_offsets,
+    std::span<const std::int64_t> route_indices,
+    std::span<const std::int64_t> candidate_ids,
+    const py::array_t<double>& options,
+    std::span<const double> incremental,
+    const py::array_t<std::int64_t>& negative_offsets,
+    const py::array_t<std::int64_t>& negative_indices,
+    const py::array_t<std::int64_t>& negative_reason_codes,
+    std::int64_t worker_count) const {
+    const auto node_count = node_kind_.shape(0);
+    if (distance_.shape(0) != node_count || distance_.shape(1) != node_count
+        || reachable_.shape(0) != node_count
+        || reachable_.shape(1) != node_count) {
+        throw std::invalid_argument(
+            "batch screening distance and reachable must have shape (n, n)");
+    }
+    const auto span_i64 = [](const py::array_t<std::int64_t>& array) {
+        return std::span<const std::int64_t>(
+            checked_data<std::int64_t>(array),
+            static_cast<std::size_t>(array.size()));
+    };
+    const auto span_f64 = [](const py::array_t<double>& array) {
+        return std::span<const double>(
+            checked_data<double>(array),
+            static_cast<std::size_t>(array.size()));
+    };
+    const evrptw::native_search::ScreenBatchInputV2 input{
+        span_i64(node_kind_),
+        span_f64(demand_),
+        span_f64(ready_time_),
+        span_f64(due_date_),
+        span_f64(service_time_),
+        span_f64(distance_),
+        std::span<const std::uint8_t>(
+            checked_data<std::uint8_t>(reachable_),
+            static_cast<std::size_t>(reachable_.size())),
+        span_f64(vehicle_),
+        route_offsets,
+        route_indices,
+        candidate_ids,
+        span_f64(options),
+        incremental,
+        span_i64(negative_offsets),
+        span_i64(negative_indices),
+        span_i64(negative_reason_codes),
+        worker_count,
+    };
+    py::gil_scoped_release release;
+    return screen_route_batch_transaction_owned_v2(input);
+}
+
 evrptw::native_search::ScreenBatchResultV2
 screen_route_batch_transaction_owned_from_python_v2(
     py::handle node_kind,
@@ -8542,16 +8783,9 @@ screen_route_batch_transaction_owned_from_python_v2(
     py::handle negative_indices,
     py::handle negative_reason_codes,
     std::int64_t worker_count) {
-    auto node_kind_array = checked_array<std::int64_t>(
-        node_kind, "node_kind", 1);
-    auto demand_array = checked_array<double>(demand, "demand", 1);
-    auto ready_array = checked_array<double>(ready_time, "ready_time", 1);
-    auto due_array = checked_array<double>(due_date, "due_date", 1);
-    auto service_array = checked_array<double>(service_time, "service_time", 1);
-    auto distance_array = checked_array<double>(distance, "distance", 2);
-    auto reachable_array = checked_array<std::uint8_t>(
-        reachable, "reachable", 2);
-    auto vehicle_array = checked_array<double>(vehicle, "vehicle", 1);
+    ScreenBatchPythonProblemV2 problem(
+        node_kind, demand, ready_time, due_date, service_time, distance,
+        reachable, vehicle);
     auto route_offsets_array = checked_array<std::int64_t>(
         route_offsets, "route_offsets", 1);
     auto route_indices_array = checked_array<std::int64_t>(
@@ -8567,53 +8801,30 @@ screen_route_batch_transaction_owned_from_python_v2(
         negative_indices, "negative_indices", 1);
     auto negative_reason_codes_array = checked_array<std::int64_t>(
         negative_reason_codes, "negative_reason_codes", 1);
-    const auto node_count = node_kind_array.shape(0);
     const auto candidate_count = candidate_ids_array.shape(0);
-    if (distance_array.shape(0) != node_count
-        || distance_array.shape(1) != node_count
-        || reachable_array.shape(0) != node_count
-        || reachable_array.shape(1) != node_count) {
-        throw std::invalid_argument(
-            "batch screening distance and reachable must have shape (n, n)");
-    }
     if (incremental_array.shape(0) != candidate_count
         || incremental_array.shape(1) != 6) {
         throw std::invalid_argument(
             "batch screening incremental must have shape (candidate_count, 6)");
     }
-    const auto span_i64 = [](const py::array_t<std::int64_t>& array) {
-        return std::span<const std::int64_t>(
-            checked_data<std::int64_t>(array),
-            static_cast<std::size_t>(array.size()));
-    };
-    const auto span_f64 = [](const py::array_t<double>& array) {
-        return std::span<const double>(
-            checked_data<double>(array),
-            static_cast<std::size_t>(array.size()));
-    };
-    const evrptw::native_search::ScreenBatchInputV2 input{
-        span_i64(node_kind_array),
-        span_f64(demand_array),
-        span_f64(ready_array),
-        span_f64(due_array),
-        span_f64(service_array),
-        span_f64(distance_array),
-        std::span<const std::uint8_t>(
-            checked_data<std::uint8_t>(reachable_array),
-            static_cast<std::size_t>(reachable_array.size())),
-        span_f64(vehicle_array),
-        span_i64(route_offsets_array),
-        span_i64(route_indices_array),
-        span_i64(candidate_ids_array),
-        span_f64(options_array),
-        span_f64(incremental_array),
-        span_i64(negative_offsets_array),
-        span_i64(negative_indices_array),
-        span_i64(negative_reason_codes_array),
-        worker_count,
-    };
-    py::gil_scoped_release release;
-    return screen_route_batch_transaction_owned_v2(input);
+    return problem.execute(
+        std::span<const std::int64_t>(
+            checked_data<std::int64_t>(route_offsets_array),
+            static_cast<std::size_t>(route_offsets_array.size())),
+        std::span<const std::int64_t>(
+            checked_data<std::int64_t>(route_indices_array),
+            static_cast<std::size_t>(route_indices_array.size())),
+        std::span<const std::int64_t>(
+            checked_data<std::int64_t>(candidate_ids_array),
+            static_cast<std::size_t>(candidate_ids_array.size())),
+        options_array,
+        std::span<const double>(
+            checked_data<double>(incremental_array),
+            static_cast<std::size_t>(incremental_array.size())),
+        negative_offsets_array,
+        negative_indices_array,
+        negative_reason_codes_array,
+        worker_count);
 }
 
 py::tuple screen_route_batch_transaction_impl(
@@ -10913,11 +11124,6 @@ public:
             allow_partial_customer_coverage_,
         });
         const auto& canonical_expected = prepared_plans.canonical_expected;
-        py::array_t<std::int64_t> canonical_expected_array(
-            canonical_expected.size());
-        std::copy(
-            canonical_expected.begin(), canonical_expected.end(),
-            checked_data(canonical_expected_array));
 
         auto round_budget_snapshot = budget_.native_snapshot();
         if (!suppress_round_budget_) {
@@ -10941,7 +11147,7 @@ public:
                 std::int64_t{0});
         }
         const auto* attempted = checked_data<std::int64_t>(attempted_flags);
-        py::array_t<double> lower_bounds(route_count);
+        std::vector<double> lower_bounds(route_count);
         std::vector<std::int64_t> eligible = prepared_plans.coverage_eligible;
         std::vector<std::vector<std::int64_t>> unique_screen_routes;
         unique_screen_routes.reserve(
@@ -11083,7 +11289,7 @@ public:
         std::vector<std::int64_t> screening_passed(route_count);
         for (std::size_t route = 0; route < route_count; ++route) {
             const auto& screen = screen_outputs[screen_row_by_route[route]];
-            checked_data(lower_bounds)[route] = screen.metrics[3];
+            lower_bounds[route] = screen.metrics[3];
             screening_passed[route] = screen.codes[0] == 1 ? 1 : 0;
         }
         const auto& active_lane = live_lane_state(2);
@@ -11100,7 +11306,7 @@ public:
             std::span<const std::int64_t>(plan_boundaries, plan_count + 1),
             std::span<const std::int64_t>(route_boundaries, route_count + 1),
             std::span<const std::int64_t>(route_nodes, indices_array.size()),
-            std::span<const double>(checked_data<double>(lower_bounds), route_count),
+            std::span<const double>(lower_bounds),
             std::span<const std::int64_t>(active_lane.route_offsets),
             std::span<const std::int64_t>(active_lane.route_indices),
             std::span<const std::int64_t>(
@@ -11108,30 +11314,13 @@ public:
             decision.combined_attempted,
             proposal_top_k_,
         });
-        py::array_t<std::int64_t> ranked_array(ranking.ranked.size());
-        py::array_t<std::int64_t> selected_array(ranking.selected.size());
-        std::copy(
-            ranking.ranked.begin(), ranking.ranked.end(),
-            checked_data(ranked_array));
-        std::copy(
-            ranking.selected.begin(), ranking.selected.end(),
-            checked_data(selected_array));
-        const auto* selected = checked_data<std::int64_t>(selected_array);
         std::vector<std::int64_t> statuses(plan_count, 2);
         for (std::size_t plan = 0; plan < plan_count; ++plan) {
             statuses[plan] = eligible[plan] == 0 ? 0 : attempted[plan] != 0 ? 1 : 2;
         }
-        py::array_t<std::int64_t> objective_integer(
-            {static_cast<py::ssize_t>(plan_count), py::ssize_t(2)});
-        py::array_t<double> objective_float(
-            {static_cast<py::ssize_t>(plan_count), py::ssize_t(2)});
-        std::fill(
-            checked_data(objective_integer),
-            checked_data(objective_integer) + plan_count * 2, -1);
-        std::fill(
-            checked_data(objective_float),
-            checked_data(objective_float) + plan_count * 2,
-            std::numeric_limits<double>::quiet_NaN());
+        std::vector<std::int64_t> objective_integer(plan_count * 2, -1);
+        std::vector<double> objective_float(
+            plan_count * 2, std::numeric_limits<double>::quiet_NaN());
         std::vector<std::int64_t> route_resolutions(route_count, 0);
         std::vector<std::optional<NativeRouteCacheV2::ExactPayload>> route_payloads(
             route_count);
@@ -11146,9 +11335,10 @@ public:
         route_cache_.begin_protocol_transaction();
         round_protocol_active = true;
 
-        for (py::ssize_t selected_ordinal = 0;
-             selected_ordinal < selected_array.size(); ++selected_ordinal) {
-            const auto plan = static_cast<std::size_t>(selected[selected_ordinal]);
+        for (std::size_t selected_ordinal = 0;
+             selected_ordinal < ranking.selected.size(); ++selected_ordinal) {
+            const auto plan =
+                static_cast<std::size_t>(ranking.selected[selected_ordinal]);
             const auto first_route = static_cast<std::size_t>(plan_boundaries[plan]);
             const auto last_route = static_cast<std::size_t>(plan_boundaries[plan + 1]);
             std::vector<std::int64_t> local_offsets{0};
@@ -11357,11 +11547,11 @@ public:
                     statuses[plan] = 5;
                     ++feasible_count;
                     feasible_plan_ids.push_back(static_cast<std::int64_t>(plan));
-                    checked_data(objective_integer)[plan * 2] =
+                    objective_integer[plan * 2] =
                         static_cast<std::int64_t>(last_route - first_route);
-                    checked_data(objective_integer)[plan * 2 + 1] = charging_count;
-                    checked_data(objective_float)[plan * 2] = total_distance.value();
-                    checked_data(objective_float)[plan * 2 + 1] =
+                    objective_integer[plan * 2 + 1] = charging_count;
+                    objective_float[plan * 2] = total_distance.value();
+                    objective_float[plan * 2 + 1] =
                         total_charging_time.value();
                 } else {
                     statuses[plan] = 4;
@@ -11410,19 +11600,44 @@ public:
             attempted_mark_active = true;
         }
 
-        feasible_plan_ids = evrptw::native_candidate_plan::order_feasible({
+        feasible_plan_ids = order_feasible_candidate_plans_owned_v2({
             std::span<const std::int64_t>(plan_boundaries, plan_count + 1),
             std::span<const std::int64_t>(route_boundaries, route_count + 1),
             std::span<const std::int64_t>(route_nodes, indices_array.size()),
-            std::span<const std::int64_t>(
-                checked_data<std::int64_t>(objective_integer), plan_count * 2),
-            std::span<const double>(
-                checked_data<double>(objective_float), plan_count * 2),
+            std::span<const std::int64_t>(objective_integer),
+            std::span<const double>(objective_float),
             std::span<const std::int64_t>(
                 checked_data<std::int64_t>(lexical_rank_), lexical_rank_.size()),
             feasible_plan_ids,
         });
 
+        py::array_t<std::int64_t> canonical_expected_array(
+            canonical_expected.size());
+        py::array_t<double> lower_bounds_array(lower_bounds.size());
+        py::array_t<std::int64_t> ranked_array(ranking.ranked.size());
+        py::array_t<std::int64_t> selected_array(ranking.selected.size());
+        py::array_t<std::int64_t> objective_integer_array(
+            {static_cast<py::ssize_t>(plan_count), py::ssize_t(2)});
+        py::array_t<double> objective_float_array(
+            {static_cast<py::ssize_t>(plan_count), py::ssize_t(2)});
+        std::copy(
+            canonical_expected.begin(), canonical_expected.end(),
+            checked_data(canonical_expected_array));
+        std::copy(
+            lower_bounds.begin(), lower_bounds.end(),
+            checked_data(lower_bounds_array));
+        std::copy(
+            ranking.ranked.begin(), ranking.ranked.end(),
+            checked_data(ranked_array));
+        std::copy(
+            ranking.selected.begin(), ranking.selected.end(),
+            checked_data(selected_array));
+        std::copy(
+            objective_integer.begin(), objective_integer.end(),
+            checked_data(objective_integer_array));
+        std::copy(
+            objective_float.begin(), objective_float.end(),
+            checked_data(objective_float_array));
         py::array_t<std::int64_t> status_array(statuses.size());
         py::array_t<std::int64_t> resolution_array(route_resolutions.size());
         py::array_t<std::int64_t> exact_rows_array(exact_route_rows.size());
@@ -11443,7 +11658,8 @@ public:
             checked_data(feasible_order_array));
         py::array_t<std::int64_t> counters(8);
         checked_data(counters)[0] = static_cast<std::int64_t>(plan_count);
-        checked_data(counters)[1] = static_cast<std::int64_t>(selected_array.size());
+        checked_data(counters)[1] =
+            static_cast<std::int64_t>(ranking.selected.size());
         checked_data(counters)[2] = feasible_count;
         checked_data(counters)[3] = infeasible_count;
         checked_data(counters)[4] = budget_skip_count;
@@ -11503,11 +11719,11 @@ public:
         append_evidence_array(evidence, context_array);
         append_evidence_array(evidence, canonical_expected_array);
         append_evidence_array(evidence, batch_array);
-        append_evidence_array(evidence, lower_bounds);
+        append_evidence_array(evidence, lower_bounds_array);
         append_evidence_array(evidence, ranked_array);
         append_evidence_array(evidence, status_array);
-        append_evidence_array(evidence, objective_integer);
-        append_evidence_array(evidence, objective_float);
+        append_evidence_array(evidence, objective_integer_array);
+        append_evidence_array(evidence, objective_float_array);
         append_evidence_array(evidence, resolution_array);
         append_evidence_array(evidence, exact_rows_array);
         append_evidence_array(evidence, completion_array);
@@ -11567,11 +11783,6 @@ public:
         }
         transaction_exact.validate(route_count);
         const auto transaction_sha256 = native_sha256_hex(evidence);
-        const auto copy_double_array = [](const py::array_t<double>& array) {
-            return std::vector<double>(
-                checked_data<double>(array),
-                checked_data<double>(array) + array.size());
-        };
         const auto copy_byte_array = [](const py::array_t<std::uint8_t>& array) {
             return std::vector<std::uint8_t>(
                 checked_data<std::uint8_t>(array),
@@ -11590,23 +11801,20 @@ public:
                 "full native route-cache hash snapshot has an invalid shape");
         }
         CandidateRoundState staged_candidate_round;
-        staged_candidate_round.selected = copy_integer_array(selected_array);
+        staged_candidate_round.selected = ranking.selected;
         staged_candidate_round.plan_offsets = copy_integer_array(plans_array);
         staged_candidate_round.route_offsets = copy_integer_array(routes_array);
         staged_candidate_round.route_indices = copy_integer_array(indices_array);
         staged_candidate_round.context = copy_integer_array(context_array);
-        staged_candidate_round.expected_customers =
-            copy_integer_array(canonical_expected_array);
+        staged_candidate_round.expected_customers = canonical_expected;
         staged_candidate_round.batch = copy_integer_array(batch_array);
-        staged_candidate_round.lower_bounds = copy_double_array(lower_bounds);
-        staged_candidate_round.ranked = copy_integer_array(ranked_array);
+        staged_candidate_round.lower_bounds = lower_bounds;
+        staged_candidate_round.ranked = ranking.ranked;
         staged_candidate_round.statuses = statuses;
         staged_candidate_round.feasible_order = feasible_plan_ids;
         staged_candidate_round.exact_route_rows = exact_route_rows;
-        staged_candidate_round.objective_integer =
-            copy_integer_array(objective_integer);
-        staged_candidate_round.objective_float =
-            copy_double_array(objective_float);
+        staged_candidate_round.objective_integer = objective_integer;
+        staged_candidate_round.objective_float = objective_float;
         staged_candidate_round.route_resolutions = route_resolutions;
         staged_candidate_round.completion_order = completion_order;
         staged_candidate_round.counters = copy_integer_array(counters);
@@ -11630,16 +11838,16 @@ public:
         if (candidate_round_mirror_tamper_injection_
             && !defer_composite_commit_) {
             candidate_round_mirror_tamper_injection_ = false;
-            checked_data(objective_integer)[0] =
-                checked_data(objective_integer)[0] == -1 ? 0 : -1;
+            checked_data(objective_integer_array)[0] =
+                checked_data(objective_integer_array)[0] == -1 ? 0 : -1;
         }
         validate_candidate_round_mirror(
             staged_candidate_round, plans_array, routes_array, indices_array,
-            objective_integer, objective_float, exact_rows_array,
+            objective_integer_array, objective_float_array, exact_rows_array,
             feasible_order_array, transaction_sha256);
         auto result = py::make_tuple(
             std::move(selected_array), std::move(status_array),
-            std::move(objective_integer), std::move(objective_float),
+            std::move(objective_integer_array), std::move(objective_float_array),
             std::move(resolution_array), std::move(exact_rows_array),
             std::move(completion_array), std::move(counters),
             std::move(cache_statistics), std::move(negative_statistics),
