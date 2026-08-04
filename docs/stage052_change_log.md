@@ -3631,3 +3631,34 @@ compatibility fallback（兼容回退）。
   whole-call GIL-safe 或性能收益。production capability bits 继续全部为 0；不创建 attempt04，不启动
   Paired/Pilot/Formal/CUDA，不切换默认架构。下一 slice 为 typed exact dispatch 与 candidate-round
   transaction envelope。
+
+## 2026-08-05：typed exact candidate-round 边界与 per-solve 真实门控完成
+
+- solver code checkpoint 为 `9aca455d9e37e125ce151123c98772e1573e192e`。冻结 wheel 位于
+  `build/stage052-wheels/9aca455/reproducible_evrptw-0.1.0-cp313-cp313-linux_x86_64.whl`，SHA-256 为
+  `3b9a629792144dc4990a12e2ad0c28ec16de8a2864aa1928d0fc83640cb84693`；wheel 内嵌 build revision
+  与 code checkpoint 完全一致。本条后续只提交证据文档和对应 provenance hash，不改变该 solver
+  checkpoint，也不生成冒充新 solver identity 的 wheel。
+- candidate round 的 typed exact 输出现在包含 canonical feasible order、实际 completion order、exact
+  result、cache journal、deadline/budget 状态和三类 transaction hash；initial/lane state hash 显式绑定
+  completion order。standalone、four-lane、full-native 与 host projection 共用同一验证边界，Python 只验证
+  journal 并原子提交；worker/IPC/deadline/hash/cache commit 失败继续整体 rollback、fail fast、fallback=0。
+- 最终冻结 wheel 上的完整 pytest 为 `1507 passed, 12 skipped`，耗时 `990.99s`；JUnit 为
+  `/tmp/stage052-9aca455-full-pytest.xml`。全量 Ruff 通过；83-file strict mypy 为 `Success: no issues
+  found in 83 source files`；publication metadata 为 `8 passed`；`git diff --check` 通过。
+- 真实 fixed-work 门控使用 `c101C5`、`c101_21`、`r101_21`、`rc101_21` × seeds
+  2014/2015/2016，以 Python Candidate Control 对比 `per_solve_runtime`，结果为 `12 passed`，耗时
+  `425.41s`，JUnit 为 `/tmp/stage052-9aca455-real-12.xml`。每轴核验 validator、objective、routes、
+  candidate-work/route-result hash、exact started/completed、规范语义轨迹、operator statistics 与 Stage 4
+  statistics/log/history；因此 `per_solve_runtime` 的本轮真实 12/12 语义门控完成。
+- 兼容回归明确保留历史 generic exact/screen 空路线语义；candidate-round 在 receipt phase 1 显式拒绝
+  空路线，并保持 exact started/completed/interrupted 全零。Stage 3 screening decision/aggregate trace 的
+  历史记录条件恢复。local/host empty-route differential、ACK/RAII、worker launch failure、hash mismatch 与
+  publication provenance 均纳入最终完整测试。
+- publication provenance 共 878 行，其中 67 项 `migrated_modified_publication`、765 项
+  `migrated_unchanged`，最终 mismatch count 为 0。独立 Spec 与 Standards 对最终修复 diff 均给出
+  ACCEPT，无 P1/P2 finding。
+- 本条只完成 `per_solve_runtime` 真实 12/12 门控。`full_native_alns` 与 `host_scheduler` 各自的真实
+  12/12 仍未完成，三种新架构的总语义门控仍为关闭；不创建 attempt04，不启动 360-axis Paired、
+  180-axis Pilot、Formal 或 CUDA，不切换默认架构。下一 phase 继续补齐 full-native/host 的完整搜索执行面
+  和真实差分门控。
