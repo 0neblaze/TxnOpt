@@ -4672,9 +4672,10 @@ def test_native_deferred_candidate_round_owns_cpp_staged_state_and_rejects_mirro
     before_solution = engine.solution_state()
     before_lanes = tuple(engine.lane_solution_state(lane) for lane in range(3))
 
-    # Expected v2 production seam.  It mutates only the Python-return mirror;
-    # the C++ staged selection must remain the source of truth and the adapter
-    # must reject the inconsistent mirror before composite commit.
+    # Expected v2 production seam.  It mutates only the actual Python-return
+    # mirror after the deferred C++ state has been published.  C++ remains the
+    # source of truth; validation must use the formal pending rollback path
+    # before the inconsistent tuple can escape to the caller.
     engine.inject_candidate_round_mirror_tamper_once()
     with pytest.raises(RuntimeError, match="candidate round mirror mismatch"):
         engine.legacy_route_elimination_probe(

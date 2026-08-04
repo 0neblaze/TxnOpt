@@ -3099,7 +3099,16 @@ compatibility fallback（兼容回退）。
   typed-buffer byte equality（类型化缓冲区逐字节相等），因此能正确处理 canonical NaN
   sentinel，同时仍区分 `-0.0` 和不同 NaN payload。一次性 mirror-tamper fault injection
   （镜像篡改故障注入）证明不一致会 fail fast，并回滚 route cache、negative cache、
-  attempted plans、budget、causal journal、solution 和三条 lane；同一操作随后可正常重试。
+  attempted plans、候选轮预算 reservation（预留）、causal journal、solution 和三条 lane；
+  started exact accounting（已启动精确调用计费）按既有失败语义保留，同一操作随后可正常
+  重试。
+- 独立复审后继续收紧此边界：`CandidateRoundState` 现在拥有事务哈希覆盖的全部 typed
+  字段，并可从自身规范状态独立重算 SHA-256；返回镜像校验不再只比较同源字符串。故障
+  注入移动到 deferred state 已发布、实际返回 tuple 已构造之后，校验失败通过正式 pending
+  rollback 路径撤销事务。发布顺序也改为先完成可能抛错的 causal journal，再原子公开
+  pending members，消除 active flag 设置前留下半发布状态的异常窗口。搜索、温度估计、
+  quality/refinement 与事件投影不再从返回 tuple 读取状态、可行顺序或 objective，而从
+  C++-owned round state 读取；tuple 只保留 ABI 和证据用途。
 - 本切片的原始 1-thread/4-thread transaction、deadline、duplicate plan、cache、budget、
   commit failure、objective ordering 与 canonical journal 聚焦回归为 `19 passed`；扩大到
   所有 `native_search_engine`/`full_native` 路径的 non-host 回归为

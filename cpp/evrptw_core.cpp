@@ -620,6 +620,26 @@ void append_evidence_array(
         evidence, checked_data<T>(array), static_cast<std::size_t>(array.size()));
 }
 
+template <typename T>
+void append_evidence_vector(
+    std::string& evidence,
+    std::span<const T> values,
+    std::initializer_list<std::size_t> shape) {
+    append_evidence_u64(
+        evidence, static_cast<std::uint64_t>(shape.size()));
+    std::size_t expected_size = 1;
+    for (const auto dimension : shape) {
+        append_evidence_u64(
+            evidence, static_cast<std::uint64_t>(dimension));
+        expected_size *= dimension;
+    }
+    if (expected_size != values.size()) {
+        throw std::logic_error(
+            "native evidence vector shape does not match its payload");
+    }
+    append_evidence_values(evidence, values.data(), values.size());
+}
+
 void append_nested_evidence(std::string& evidence, py::handle value) {
     if (value.is_none()) {
         evidence.push_back('N');
@@ -9730,6 +9750,11 @@ public:
             throw std::runtime_error(
                 "full native search engine has an unapplied candidate");
         }
+        if (pending_composite_active_) {
+            throw std::runtime_error(
+                "full native search engine has an unresolved candidate round");
+        }
+        last_committed_candidate_round_.reset();
         auto plans_array = owned_array_copy<std::int64_t>(
             plan_offsets, "plan_offsets", 1);
         auto routes_array = owned_array_copy<std::int64_t>(
@@ -9813,6 +9838,7 @@ public:
         bool round_protocol_active = false;
         bool negative_store_active = false;
         bool attempted_mark_active = false;
+        bool rollback_owned_locally = true;
         try {
         auto attempted_flags = suppress_attempted_plan_journal_
             ? py::array_t<std::int64_t>(plan_count)
@@ -10517,24 +10543,68 @@ public:
         }
         transaction_exact.validate(route_count);
         const auto transaction_sha256 = native_sha256_hex(evidence);
-        CandidateRoundState staged_candidate_round{
-            copy_integer_array(plans_array),
-            copy_integer_array(routes_array),
-            copy_integer_array(indices_array),
-            feasible_plan_ids,
-            exact_route_rows,
-            std::vector<std::int64_t>(
-                checked_data<std::int64_t>(objective_integer),
-                checked_data<std::int64_t>(objective_integer)
-                    + objective_integer.size()),
-            std::vector<double>(
-                checked_data<double>(objective_float),
-                checked_data<double>(objective_float) + objective_float.size()),
-            std::move(transaction_exact),
-            transaction_sha256,
+        const auto copy_double_array = [](const py::array_t<double>& array) {
+            return std::vector<double>(
+                checked_data<double>(array),
+                checked_data<double>(array) + array.size());
         };
+        const auto copy_byte_array = [](const py::array_t<std::uint8_t>& array) {
+            return std::vector<std::uint8_t>(
+                checked_data<std::uint8_t>(array),
+                checked_data<std::uint8_t>(array) + array.size());
+        };
+        const auto cache_hashes =
+            py::cast<py::array_t<std::uint8_t>>(cache_snapshot[2]);
+        const auto negative_offsets =
+            py::cast<py::array_t<std::int64_t>>(negative_snapshot[0]);
+        const auto negative_indices =
+            py::cast<py::array_t<std::int64_t>>(negative_snapshot[1]);
+        const auto negative_snapshot_reasons =
+            py::cast<py::array_t<std::int64_t>>(negative_snapshot[2]);
+        if (cache_hashes.ndim() != 2 || cache_hashes.shape(1) != 32) {
+            throw std::logic_error(
+                "full native route-cache hash snapshot has an invalid shape");
+        }
+        CandidateRoundState staged_candidate_round;
+        staged_candidate_round.selected = copy_integer_array(selected_array);
+        staged_candidate_round.plan_offsets = copy_integer_array(plans_array);
+        staged_candidate_round.route_offsets = copy_integer_array(routes_array);
+        staged_candidate_round.route_indices = copy_integer_array(indices_array);
+        staged_candidate_round.context = copy_integer_array(context_array);
+        staged_candidate_round.expected_customers =
+            copy_integer_array(canonical_expected_array);
+        staged_candidate_round.batch = copy_integer_array(batch_array);
+        staged_candidate_round.lower_bounds = copy_double_array(lower_bounds);
+        staged_candidate_round.ranked = copy_integer_array(ranked_array);
+        staged_candidate_round.statuses = statuses;
+        staged_candidate_round.feasible_order = feasible_plan_ids;
+        staged_candidate_round.exact_route_rows = exact_route_rows;
+        staged_candidate_round.objective_integer =
+            copy_integer_array(objective_integer);
+        staged_candidate_round.objective_float =
+            copy_double_array(objective_float);
+        staged_candidate_round.route_resolutions = route_resolutions;
+        staged_candidate_round.completion_order = completion_order;
+        staged_candidate_round.counters = copy_integer_array(counters);
+        staged_candidate_round.cache_statistics =
+            copy_integer_array(cache_statistics);
+        staged_candidate_round.cache_hashes = copy_byte_array(cache_hashes);
+        staged_candidate_round.cache_hash_rows =
+            static_cast<std::size_t>(cache_hashes.shape(0));
+        staged_candidate_round.negative_offsets =
+            copy_integer_array(negative_offsets);
+        staged_candidate_round.negative_indices =
+            copy_integer_array(negative_indices);
+        staged_candidate_round.negative_reasons =
+            copy_integer_array(negative_snapshot_reasons);
+        staged_candidate_round.negative_statistics =
+            copy_integer_array(negative_statistics);
+        staged_candidate_round.budget_state = copy_integer_array(budget_state);
+        staged_candidate_round.exact = std::move(transaction_exact);
+        staged_candidate_round.transaction_sha256 = transaction_sha256;
         staged_candidate_round.validate();
-        if (candidate_round_mirror_tamper_injection_) {
+        if (candidate_round_mirror_tamper_injection_
+            && !defer_composite_commit_) {
             candidate_round_mirror_tamper_injection_ = false;
             checked_data(objective_integer)[0] =
                 checked_data(objective_integer)[0] == -1 ? 0 : -1;
@@ -10580,22 +10650,44 @@ public:
                 throw std::logic_error(
                     "full native composite transaction is already pending");
             }
-            pending_round_protocol_ = round_protocol_active;
-            pending_negative_store_ = negative_store_active;
-            pending_attempted_mark_ = attempted_mark_active;
-            pending_budget_snapshot_.emplace(round_budget_snapshot);
-            pending_candidate_round_.emplace(
-                std::move(staged_candidate_round));
-            pending_causal_snapshot_ = causal_snapshot;
             append_control_journal_causal(staged_control_journal);
-            pending_control_journal_.splice(
-                pending_control_journal_.end(), staged_control_journal);
-            pending_composite_active_ = true;
+            try {
+                pending_budget_snapshot_.emplace(round_budget_snapshot);
+                pending_candidate_round_.emplace(
+                    std::move(staged_candidate_round));
+                pending_causal_snapshot_.emplace(causal_snapshot);
+                pending_round_protocol_ = round_protocol_active;
+                pending_negative_store_ = negative_store_active;
+                pending_attempted_mark_ = attempted_mark_active;
+                pending_control_journal_.splice(
+                    pending_control_journal_.end(), staged_control_journal);
+                pending_composite_active_ = true;
+            } catch (...) {
+                clear_pending_composite_noexcept();
+                throw;
+            }
             round_protocol_active = false;
             negative_store_active = false;
             attempted_mark_active = false;
+            rollback_owned_locally = false;
+            if (candidate_round_mirror_tamper_injection_) {
+                candidate_round_mirror_tamper_injection_ = false;
+                auto mirror_objective =
+                    py::cast<py::array_t<std::int64_t>>(result[2]);
+                checked_data(mirror_objective)[0] =
+                    checked_data(mirror_objective)[0] == -1 ? 0 : -1;
+            }
+            try {
+                validate_candidate_round_result_mirror(
+                    *pending_candidate_round_, result);
+            } catch (...) {
+                rollback_pending_composite();
+                throw;
+            }
             return result;
         }
+        last_committed_candidate_round_.emplace(
+            std::move(staged_candidate_round));
         append_control_journal_causal(staged_control_journal);
         route_cache_.commit_protocol_transaction_noexcept();
         round_protocol_active = false;
@@ -10611,6 +10703,7 @@ public:
             control_journal_.end(), staged_control_journal);
         return result;
         } catch (...) {
+            last_committed_candidate_round_.reset();
             if (attempted_mark_active) {
                 attempted_plans_.rollback_mark_batch_noexcept();
             }
@@ -10620,8 +10713,10 @@ public:
             if (round_protocol_active) {
                 route_cache_.rollback_protocol_transaction_noexcept();
             }
-            causal_journal_.rollback_noexcept(causal_snapshot);
-            rollback_round_budget_preserving_exact(round_budget_snapshot);
+            if (rollback_owned_locally) {
+                causal_journal_.rollback_noexcept(causal_snapshot);
+                rollback_round_budget_preserving_exact(round_budget_snapshot);
+            }
             throw;
         }
     }
@@ -11544,7 +11639,7 @@ public:
             defer_composite_commit_ = false;
             const auto selected = prepare_first_feasible_candidate();
             metadata_values[6] = static_cast<std::int64_t>(
-                py::cast<py::array_t<std::int64_t>>(transaction[5]).size());
+                candidate_round_state().exact_route_rows.size());
             if (selected.has_value()) {
                 commit_pending_composite_noexcept();
                 metadata_values[5] = *selected;
@@ -11808,13 +11903,11 @@ public:
                 static_cast<std::int64_t>(evaluation_route_offsets.size() - 1));
             evaluation_exact_deltas.push_back(
                 budget_.native_snapshot().started - exact_before);
-            auto feasible =
-                py::cast<py::array_t<std::int64_t>>(transaction[11]);
-            if (feasible.size() == 0) {
+            const auto& candidate_round = candidate_round_state();
+            if (candidate_round.feasible_order.empty()) {
                 return std::nullopt;
             }
-            auto objective = py::cast<py::array_t<double>>(transaction[3]);
-            return checked_data<double>(objective)[0];
+            return candidate_round.objective_float[0];
         };
         std::int64_t failure_code = 0;
         while (!removed.empty()) {
@@ -12743,6 +12836,7 @@ public:
         defer_composite_commit_ = true;
         py::tuple insertion_transaction;
         std::optional<std::int64_t> selected_insertion;
+        std::size_t feasible_insertion_count = 0;
         try {
             insertion_transaction = evaluate_plans(
                 insertion_plan_offsets_array, insertion_route_offsets_array,
@@ -12751,6 +12845,8 @@ public:
             defer_composite_commit_ = false;
             selected_insertion = prepare_first_feasible_candidate();
             commit_pending_composite_noexcept();
+            feasible_insertion_count =
+                candidate_round_state().feasible_order.size();
             restore_insertion_lane.rollback_now();
         } catch (...) {
             defer_composite_commit_ = false;
@@ -12876,8 +12972,6 @@ public:
                 std::move(selected_repair), py::none(),
                 std::move(insertion_transaction), lane_solution_state(0));
         }
-        const auto feasible_insertion_count = py::cast<py::array_t<std::int64_t>>(
-            insertion_transaction[11]).size();
         if (repair_operation == 1 && feasible_insertion_count != 0) {
             // Python evaluates insertion feasibility before regret tie-breaking.
             // A failed regret repair therefore consumes no random draw.
@@ -13389,21 +13483,15 @@ public:
                     deadline_array, batch_array, expected_array);
                 defer_composite_commit_ = false;
                 commit_pending_composite_noexcept();
-                auto transaction_statuses =
-                    py::cast<py::array_t<std::int64_t>>(transaction[1]);
-                auto transaction_integers =
-                    py::cast<py::array_t<std::int64_t>>(transaction[2]);
-                auto transaction_floats =
-                    py::cast<py::array_t<double>>(transaction[3]);
-                const auto status = checked_data<std::int64_t>(
-                    transaction_statuses)[0];
+                const auto& candidate_round = candidate_round_state();
+                const auto status = candidate_round.statuses[0];
                 statuses.push_back(status);
                 objective_integers.push_back({
-                    checked_data<std::int64_t>(transaction_integers)[0],
-                    checked_data<std::int64_t>(transaction_integers)[1]});
+                    candidate_round.objective_integer[0],
+                    candidate_round.objective_integer[1]});
                 objective_floats.push_back({
-                    checked_data<double>(transaction_floats)[0],
-                    checked_data<double>(transaction_floats)[1]});
+                    candidate_round.objective_float[0],
+                    candidate_round.objective_float[1]});
                 exact_deltas.push_back(
                     budget_.native_snapshot().started - exact_before);
                 if (status != 5) {
@@ -14349,24 +14437,19 @@ public:
                 batch_array,
                 expected_array);
             defer_composite_commit_ = false;
-            auto feasible_order = py::cast<py::array_t<std::int64_t>>(transaction[11]);
-            const auto candidate_ready = feasible_order.size() > 0;
+            const auto& candidate_round = candidate_round_state();
+            const auto candidate_ready = !candidate_round.feasible_order.empty();
             py::tuple candidate_exact;
             py::array_t<std::int64_t> candidate_offsets;
             py::array_t<std::int64_t> candidate_indices;
             py::array_t<std::int64_t> candidate_objective_integer;
             py::array_t<double> candidate_objective_float;
             if (candidate_ready) {
-                const auto plan_id = checked_data<std::int64_t>(feasible_order)[0];
+                const auto plan_id = candidate_round.feasible_order.front();
                 if (plan_id != 0) {
                     throw std::logic_error(
                         "full native constraint probe returned an unknown plan identity");
                 }
-                if (!pending_candidate_round_.has_value()) {
-                    throw std::logic_error(
-                        "full native constraint probe lost its exact candidate payload");
-                }
-                const auto& candidate_round = *pending_candidate_round_;
                 candidate_round.validate();
                 candidate_exact = project_candidate_exact(
                     candidate_round.exact, 0,
@@ -14751,14 +14834,11 @@ public:
                 auto transaction = evaluate_plans(
                     plan_offsets, route_offsets, route_indices, context,
                     next_deadline(), batch_array, expected_array);
-                auto feasible = py::cast<py::array_t<std::int64_t>>(
-                    transaction[11]);
-                if (feasible.size() == 0) {
+                const auto& candidate_round = candidate_round_state();
+                if (candidate_round.feasible_order.empty()) {
                     continue;
                 }
-                auto objective =
-                    py::cast<py::array_t<double>>(transaction[3]);
-                const auto delta = checked_data<double>(objective)[0]
+                const auto delta = candidate_round.objective_float[0]
                     - current_distance;
                 if (delta > 0.0) {
                     positive_deltas.push_back(delta);
@@ -15556,17 +15636,11 @@ public:
             objectives[0] = std::numeric_limits<double>::quiet_NaN();
             objectives[1] = std::numeric_limits<double>::quiet_NaN();
             if (!probe[2].is_none() && outcome_values[2] != 0) {
-                auto transaction = py::cast<py::tuple>(probe[2]);
-                auto candidate_integers =
-                    py::cast<py::array_t<std::int64_t>>(transaction[2]);
-                auto candidate_floats =
-                    py::cast<py::array_t<double>>(transaction[3]);
-                objective_integers[0] =
-                    checked_data<std::int64_t>(candidate_integers)[0];
-                objective_integers[1] =
-                    checked_data<std::int64_t>(candidate_integers)[1];
-                objectives[0] = checked_data<double>(candidate_floats)[0];
-                objectives[1] = checked_data<double>(candidate_floats)[1];
+                const auto& candidate_round = candidate_round_state();
+                objective_integers[0] = candidate_round.objective_integer[0];
+                objective_integers[1] = candidate_round.objective_integer[1];
+                objectives[0] = candidate_round.objective_float[0];
+                objectives[1] = candidate_round.objective_float[1];
             }
             objective_integers[2] =
                 checked_data<std::int64_t>(current_objective_integer_)[0];
@@ -16187,13 +16261,13 @@ public:
         repaired[5] = candidate_feasible ? 2 : 3;
         repaired[6] = outcome_values[3];
         repaired[7] = outcome_values[5];
+        const auto& candidate_round = candidate_round_state();
         repaired[8] = candidate_feasible
-            && checked_data<double>(
-                py::cast<py::array_t<double>>(transaction[3]))[0]
-                < previous_distance - 1e-9;
+            && candidate_round.objective_float[0] < previous_distance - 1e-9;
         repaired[9] = 1;
         repaired[10] = outcome_values[2];
-        repaired[11] = py::cast<py::array_t<std::int64_t>>(transaction[5]).size();
+        repaired[11] = static_cast<std::int64_t>(
+            candidate_round.exact_route_rows.size());
         repaired[13] = selection_values[1];
         repaired[14] = selection_values[2];
         repaired[15] = 2;
@@ -16289,17 +16363,14 @@ public:
             checked_data(objective_float),
             checked_data(objective_float) + event_count * 2,
             std::numeric_limits<double>::quiet_NaN());
-        auto transaction_integer =
-            py::cast<py::array_t<std::int64_t>>(transaction[2]);
-        auto transaction_float = py::cast<py::array_t<double>>(transaction[3]);
         for (py::ssize_t row : {py::ssize_t(1), py::ssize_t(2)}) {
             std::copy(
-                checked_data<std::int64_t>(transaction_integer),
-                checked_data<std::int64_t>(transaction_integer) + 2,
+                candidate_round.objective_integer.begin(),
+                candidate_round.objective_integer.begin() + 2,
                 checked_data(objective_integer) + row * 2);
             std::copy(
-                checked_data<double>(transaction_float),
-                checked_data<double>(transaction_float) + 2,
+                candidate_round.objective_float.begin(),
+                candidate_round.objective_float.begin() + 2,
                 checked_data(objective_float) + row * 2);
         }
         auto stage_status = py::cast<py::array_t<std::int64_t>>(stage_boundary[0]);
@@ -17094,15 +17165,107 @@ private:
     };
 
     struct CandidateRoundState {
+        std::vector<std::int64_t> selected;
         std::vector<std::int64_t> plan_offsets;
         std::vector<std::int64_t> route_offsets;
         std::vector<std::int64_t> route_indices;
+        std::vector<std::int64_t> context;
+        std::vector<std::int64_t> expected_customers;
+        std::vector<std::int64_t> batch;
+        std::vector<double> lower_bounds;
+        std::vector<std::int64_t> ranked;
+        std::vector<std::int64_t> statuses;
         std::vector<std::int64_t> feasible_order;
         std::vector<std::int64_t> exact_route_rows;
         std::vector<std::int64_t> objective_integer;
         std::vector<double> objective_float;
+        std::vector<std::int64_t> route_resolutions;
+        std::vector<std::int64_t> completion_order;
+        std::vector<std::int64_t> counters;
+        std::vector<std::int64_t> cache_statistics;
+        std::vector<std::uint8_t> cache_hashes;
+        std::size_t cache_hash_rows = 0;
+        std::vector<std::int64_t> negative_offsets;
+        std::vector<std::int64_t> negative_indices;
+        std::vector<std::int64_t> negative_reasons;
+        std::vector<std::int64_t> negative_statistics;
+        std::vector<std::int64_t> budget_state;
         CandidateExactBatchState exact;
         std::string transaction_sha256;
+
+        [[nodiscard]] std::string sha256() const {
+            const auto plan_count = plan_offsets.size() - 1;
+            std::string evidence(
+                "stage05.2-native-solution-plan-transaction-v2");
+            append_evidence_vector<std::int64_t>(
+                evidence, selected, {selected.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, plan_offsets, {plan_offsets.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, route_offsets, {route_offsets.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, route_indices, {route_indices.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, context, {context.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, expected_customers, {expected_customers.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, batch, {batch.size()});
+            append_evidence_vector<double>(
+                evidence, lower_bounds, {lower_bounds.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, ranked, {ranked.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, statuses, {statuses.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, objective_integer, {plan_count, 2});
+            append_evidence_vector<double>(
+                evidence, objective_float, {plan_count, 2});
+            append_evidence_vector<std::int64_t>(
+                evidence, route_resolutions, {route_resolutions.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, exact_route_rows, {exact_route_rows.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, completion_order, {completion_order.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, counters, {counters.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, cache_statistics, {cache_statistics.size()});
+            append_evidence_vector<std::uint8_t>(
+                evidence, cache_hashes, {cache_hash_rows, 32});
+            append_evidence_vector<std::int64_t>(
+                evidence, negative_offsets, {negative_offsets.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, negative_indices, {negative_indices.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, negative_reasons, {negative_reasons.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, negative_statistics,
+                {negative_statistics.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, budget_state, {budget_state.size()});
+            append_evidence_vector<std::int64_t>(
+                evidence, feasible_order, {feasible_order.size()});
+            for (std::size_t route = 0; route < exact.statuses.size(); ++route) {
+                if (exact.statuses[route] < 0) {
+                    continue;
+                }
+                append_evidence_i64(
+                    evidence, static_cast<std::int64_t>(route));
+                append_evidence_i64(evidence, exact.statuses[route]);
+                append_evidence_i64(evidence, exact.reasons[route]);
+                append_evidence_values(
+                    evidence, exact.metrics.data() + route * 4, 4);
+                append_evidence_values(
+                    evidence, exact.label_counters.data() + route * 3, 3);
+                const auto first = exact.path_offsets[route];
+                const auto last = exact.path_offsets[route + 1];
+                append_evidence_values(
+                    evidence, exact.path_indices.data() + first,
+                    static_cast<std::size_t>(last - first));
+            }
+            return native_sha256_hex(evidence);
+        }
 
         void validate() const {
             if (plan_offsets.size() < 2 || route_offsets.size() < 2
@@ -17132,7 +17295,9 @@ private:
                 }
             }
             if (objective_integer.size() != plan_count * 2
-                || objective_float.size() != plan_count * 2) {
+                || objective_float.size() != plan_count * 2
+                || statuses.size() != plan_count
+                || cache_hashes.size() != cache_hash_rows * 32) {
                 throw std::logic_error(
                     "full native staged objective matrix has an invalid shape");
             }
@@ -17151,6 +17316,10 @@ private:
                 }
             }
             exact.validate(route_count);
+            if (transaction_sha256 != sha256()) {
+                throw std::logic_error(
+                    "full native staged candidate round hash is invalid");
+            }
         }
     };
 
@@ -17187,6 +17356,7 @@ private:
     std::list<ControlJournalBatch> pending_control_journal_;
     std::optional<NativeCausalJournalV2::Snapshot> pending_causal_snapshot_;
     std::optional<CandidateRoundState> pending_candidate_round_;
+    std::optional<CandidateRoundState> last_committed_candidate_round_;
     std::int64_t depot_ = -1;
     std::vector<std::int64_t> recharge_nodes_;
     std::unordered_set<std::int64_t> all_customers_;
@@ -17403,10 +17573,58 @@ private:
             exact_route_rows, staged.exact_route_rows, "exact_route_rows");
         require_candidate_round_mirror_equal<std::int64_t>(
             feasible_order, staged.feasible_order, "feasible_order");
-        if (transaction_sha256 != staged.transaction_sha256) {
+        const auto recomputed_sha256 = staged.sha256();
+        if (transaction_sha256 != staged.transaction_sha256
+            || transaction_sha256 != recomputed_sha256) {
             throw std::runtime_error(
                 "full native candidate round mirror mismatch: transaction_sha256");
         }
+    }
+
+    static void validate_candidate_round_result_mirror(
+        const CandidateRoundState& staged,
+        const py::tuple& result) {
+        if (result.size() != 13) {
+            throw std::runtime_error(
+                "full native candidate round mirror mismatch: result schema");
+        }
+        const auto objective_integer =
+            py::cast<py::array_t<std::int64_t>>(result[2]);
+        const auto objective_float = py::cast<py::array_t<double>>(result[3]);
+        const auto exact_route_rows =
+            py::cast<py::array_t<std::int64_t>>(result[5]);
+        const auto feasible_order =
+            py::cast<py::array_t<std::int64_t>>(result[11]);
+        if (objective_integer.ndim() != 2 || objective_integer.shape(1) != 2
+            || objective_float.ndim() != 2 || objective_float.shape(1) != 2) {
+            throw std::runtime_error(
+                "full native candidate round mirror mismatch: objective shape");
+        }
+        require_candidate_round_mirror_equal<std::int64_t>(
+            objective_integer, staged.objective_integer, "objective_integer", 2);
+        require_candidate_round_mirror_equal<double>(
+            objective_float, staged.objective_float, "objective_float", 2);
+        require_candidate_round_mirror_equal<std::int64_t>(
+            exact_route_rows, staged.exact_route_rows, "exact_route_rows");
+        require_candidate_round_mirror_equal<std::int64_t>(
+            feasible_order, staged.feasible_order, "feasible_order");
+        const auto transaction_sha256 = py::cast<std::string>(result[12]);
+        if (transaction_sha256 != staged.transaction_sha256
+            || transaction_sha256 != staged.sha256()) {
+            throw std::runtime_error(
+                "full native candidate round mirror mismatch: transaction_sha256");
+        }
+    }
+
+    [[nodiscard]] const CandidateRoundState& candidate_round_state() const {
+        if (pending_candidate_round_.has_value()) {
+            return *pending_candidate_round_;
+        }
+        if (last_committed_candidate_round_.has_value()) {
+            return *last_committed_candidate_round_;
+        }
+        throw std::logic_error(
+            "full native candidate round has no C++-owned result state");
     }
 
     std::optional<std::int64_t> prepare_first_feasible_candidate() {
@@ -17980,6 +18198,8 @@ private:
         if (!pending_composite_active_) {
             return;
         }
+        last_committed_candidate_round_ =
+            std::move(pending_candidate_round_);
         if (pending_round_protocol_) {
             route_cache_.commit_protocol_transaction_noexcept();
         }
