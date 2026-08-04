@@ -809,6 +809,24 @@ int make_listener(const std::string& socket_path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--build-attestation") {
+        std::cout
+            << "{\"schema_version\":1,\"revision\":\""
+            << EVRPTW_BUILD_GIT_REVISION
+            << "\",\"git_tree\":\"" << EVRPTW_BUILD_GIT_TREE
+            << "\",\"source_manifest_sha256\":\""
+            << EVRPTW_BUILD_SOURCE_MANIFEST_SHA256
+            << "\",\"tracked_file_count\":"
+            << EVRPTW_BUILD_TRACKED_FILE_COUNT
+            << ",\"source_dirty\":"
+            << (EVRPTW_BUILD_SOURCE_DIRTY ? "true" : "false")
+            << ",\"development_override\":"
+            << (EVRPTW_BUILD_DEVELOPMENT_OVERRIDE ? "true" : "false")
+            << ",\"cpp_source_kind\":\"" << EVRPTW_BUILD_CPP_SOURCE_KIND
+            << "\""
+            << "}\n";
+        return 0;
+    }
     if (argc < 4 || argc > 6) {
         std::cerr << "usage: evrptw_native_scheduler SOCKET WORKER_THREADS "
                      "RUN_NONCE [--enable-fault-injection]\n";

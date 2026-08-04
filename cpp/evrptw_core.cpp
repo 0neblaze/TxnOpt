@@ -22648,6 +22648,17 @@ py::tuple propagate_routes_numeric(
 PYBIND11_MODULE(_core, module) {
     module.doc() = "Native kernels for EVRP-TW route evaluation";
     module.attr("__build_git_revision__") = EVRPTW_BUILD_GIT_REVISION;
+    module.attr("__build_git_tree__") = EVRPTW_BUILD_GIT_TREE;
+    module.attr("__build_source_manifest_sha256__") =
+        EVRPTW_BUILD_SOURCE_MANIFEST_SHA256;
+    module.attr("__build_tracked_file_count__") =
+        static_cast<std::int64_t>(EVRPTW_BUILD_TRACKED_FILE_COUNT);
+    module.attr("__build_source_dirty__") =
+        static_cast<bool>(EVRPTW_BUILD_SOURCE_DIRTY);
+    module.attr("__build_development_override__") =
+        static_cast<bool>(EVRPTW_BUILD_DEVELOPMENT_OVERRIDE);
+    module.attr("__build_cpp_source_kind__") = EVRPTW_BUILD_CPP_SOURCE_KIND;
+    module.attr("__build_source_attestation_version__") = 1;
     module.def("stage052_native_architecture_capabilities_v2", []() {
         // These values are production gates, not aspirational feature flags.
         // Flip a field only together with its end-to-end differential and

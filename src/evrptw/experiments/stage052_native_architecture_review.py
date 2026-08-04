@@ -12,7 +12,7 @@ import subprocess
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from evrptw.artifacts import ArtifactReader
 from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES
@@ -29,11 +29,17 @@ from evrptw.experiments.stage052_native_architectures import (
 from evrptw.models import NodeType
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
+from evrptw.repository import repository_root
 from evrptw.stage052_replay import (
     replay_verified_shard,
     verified_artifact_shard_bundle,
 )
 from evrptw.validation import validate_routes
+from tools.native_build_attestation import (
+    committed_source_attestation,
+    committed_wheel_project_entry_sha256,
+    validate_scheduler_build_attestation,
+)
 
 REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v8"
 LEGACY_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v3"
@@ -121,6 +127,142 @@ def _verify_signed_json(path: Path) -> Mapping[str, object]:
     return payload
 
 
+def _review_build_attestation(manifest: Mapping[str, object]) -> tuple[str, str]:
+    def lower_hex(value: object, length: int) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == length
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    revision = _string(manifest, "revision")
+    git_tree = _string(manifest, "git_tree")
+    if not lower_hex(revision, 40) or not lower_hex(git_tree, 40):
+        raise RuntimeError("campaign Git revision/tree identity is invalid")
+    observed_tree = subprocess.run(
+        ("git", "rev-parse", f"{revision}^{{tree}}"),
+        cwd=repository_root(),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if git_tree != observed_tree:
+        raise RuntimeError("campaign Git tree does not match its revision")
+    committed_attestation = committed_source_attestation(
+        repository_root(),
+        revision,
+    )
+    receipt = _mapping(manifest, "wheel_receipt")
+
+    expected_strings = {
+        "build_git_revision": revision,
+        "build_git_tree": git_tree,
+        "wheel_sha256": _string(manifest, "wheel_sha256"),
+        "native_sha256": _string(manifest, "native_sha256"),
+        "scheduler_sha256": _string(manifest, "scheduler_sha256"),
+    }
+    if any(
+        not lower_hex(value, 40 if field.startswith("build_git_") else 64)
+        for field, value in expected_strings.items()
+    ):
+        raise RuntimeError("campaign wheel receipt identity has invalid hashes")
+    if any(receipt.get(field) != value for field, value in expected_strings.items()):
+        raise RuntimeError("campaign wheel receipt identity does not reconcile")
+    source_manifest_sha256 = receipt.get("build_source_manifest_sha256")
+    if not lower_hex(source_manifest_sha256, 64):
+        raise RuntimeError("campaign source manifest SHA-256 is invalid")
+    tracked_file_count = receipt.get("build_tracked_file_count")
+    if isinstance(tracked_file_count, bool) or not isinstance(tracked_file_count, int):
+        raise RuntimeError("campaign tracked-file count is invalid")
+    if tracked_file_count <= 0:
+        raise RuntimeError("campaign tracked-file count is invalid")
+    if (
+        source_manifest_sha256
+        != committed_attestation["source_manifest_sha256"]
+        or tracked_file_count != committed_attestation["tracked_file_count"]
+    ):
+        raise RuntimeError("campaign source manifest does not match Git blobs")
+    if receipt.get("build_source_dirty") is not False:
+        raise RuntimeError("campaign wheel source is dirty")
+    if receipt.get("build_development_override") is not False:
+        raise RuntimeError("campaign wheel used a development build override")
+    if receipt.get("build_cpp_source_kind") != "git_blob_snapshot":
+        raise RuntimeError("campaign wheel did not use a Git-blob C++ snapshot")
+    attestation_version = receipt.get("build_source_attestation_version")
+    if isinstance(attestation_version, bool) or attestation_version != 1:
+        raise RuntimeError("campaign source attestation version is invalid")
+    wheel_entries = receipt.get("wheel_entry_sha256")
+    if (
+        not isinstance(wheel_entries, dict)
+        or not wheel_entries
+        or any(
+            not isinstance(path, str)
+            or not path.startswith(("evrptw/", "tools/"))
+            or PurePosixPath(path).is_absolute()
+            or ".." in PurePosixPath(path).parts
+            or str(PurePosixPath(path)) != path
+            or not lower_hex(sha256, 64)
+            for path, sha256 in wheel_entries.items()
+        )
+    ):
+        raise RuntimeError("campaign wheel entry receipt is invalid")
+    required_entries = {
+        "native_wheel_entry": expected_strings["native_sha256"],
+        "scheduler_wheel_entry": expected_strings["scheduler_sha256"],
+        "runner_wheel_entry": None,
+    }
+    normalized_entries: dict[str, str] = {}
+    for field, expected_sha256 in required_entries.items():
+        entry = receipt.get(field)
+        if not isinstance(entry, str):
+            raise RuntimeError("campaign required wheel entry identity is missing")
+        normalized = PurePosixPath(entry)
+        if normalized.is_absolute() or ".." in normalized.parts or str(normalized) != entry:
+            raise RuntimeError("campaign wheel entry path is not canonical")
+        sha256 = wheel_entries.get(entry)
+        if not lower_hex(sha256, 64) or (
+            expected_sha256 is not None and sha256 != expected_sha256
+        ):
+            raise RuntimeError("campaign required wheel entry is not hash-bound")
+        normalized_entries[field] = entry
+    native_entry = PurePosixPath(normalized_entries["native_wheel_entry"])
+    if native_entry.parent != PurePosixPath("evrptw") or not native_entry.name.startswith(
+        "_core."
+    ):
+        raise RuntimeError("campaign native extension wheel entry is not hash-bound")
+    if normalized_entries["scheduler_wheel_entry"] != (
+        "evrptw/_native_host_scheduler"
+    ):
+        raise RuntimeError("campaign scheduler wheel entry is not hash-bound")
+    if normalized_entries["runner_wheel_entry"] != (
+        "evrptw/experiments/stage052_native_architectures.py"
+    ):
+        raise RuntimeError("campaign runner wheel entry is not hash-bound")
+    expected_source_entries = committed_wheel_project_entry_sha256(
+        repository_root(), revision
+    )
+    expected_wheel_entries = set(expected_source_entries) | {
+        normalized_entries["native_wheel_entry"],
+        normalized_entries["scheduler_wheel_entry"],
+    }
+    if set(wheel_entries) != expected_wheel_entries or any(
+        wheel_entries[path] != expected_sha256
+        for path, expected_sha256 in expected_source_entries.items()
+    ):
+        raise RuntimeError("campaign wheel project inventory does not match Git")
+    scheduler_attestation = receipt.get("scheduler_build_attestation")
+    if not isinstance(scheduler_attestation, dict):
+        raise RuntimeError("campaign scheduler build attestation is invalid")
+    validate_scheduler_build_attestation(
+        scheduler_attestation,
+        revision=revision,
+        git_tree=git_tree,
+        source_manifest_sha256=str(source_manifest_sha256),
+        tracked_file_count=tracked_file_count,
+    )
+    return git_tree, str(source_manifest_sha256)
+
+
 def _expected_keys(scope: str) -> set[tuple[int, str, str, int]]:
     if scope == "paired":
         return {
@@ -147,11 +289,12 @@ def load_records(
 ) -> tuple[ReviewRecord, ...]:
     labels = run_labels_for_scope(scope, attempt)
     records: list[ReviewRecord] = []
-    common_identity: tuple[str, str, str, str] | None = None
+    common_identity: tuple[str, str, str, str, str, str] | None = None
     for mode in MODES:
         run_dir = results_root / labels[mode.value]
         manifest = _verify_signed_json(run_dir / "run_manifest.json")
         if _string(manifest, "schema_version") == SCHEMA_VERSION:
+            git_tree, source_manifest_sha256 = _review_build_attestation(manifest)
             topology = _mapping(manifest, "topology")
             mode_waves = topology.get("mode_wave_resources")
             scheduler_observed = topology.get("scheduler_observed")
@@ -207,6 +350,9 @@ def load_records(
                         "host scheduler exists outside its exclusive mode wave"
                     )
         manifest_schema = _string(manifest, "schema_version")
+        if manifest_schema != SCHEMA_VERSION:
+            git_tree = "legacy-unattested"
+            source_manifest_sha256 = "legacy-unattested"
         scheduler_identity = (
             _string(manifest, "scheduler_sha256")
             if manifest_schema == SCHEMA_VERSION
@@ -217,6 +363,8 @@ def load_records(
             _string(manifest, "wheel_sha256"),
             _string(manifest, "native_sha256"),
             scheduler_identity,
+            git_tree,
+            source_manifest_sha256,
         )
         if common_identity is None:
             common_identity = identity
@@ -242,7 +390,7 @@ def load_records(
                 _string(record.payload, "native_sha256"),
                 payload_scheduler_identity,
             )
-            if payload_identity != identity:
+            if payload_identity != identity[:4]:
                 raise RuntimeError(
                     f"axis identity does not match its run manifest: {record.path}"
                 )

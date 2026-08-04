@@ -679,6 +679,13 @@ class NativeSearchEngineV2:
     ]: ...
 
 __build_git_revision__: str
+__build_git_tree__: str
+__build_source_manifest_sha256__: str
+__build_tracked_file_count__: int
+__build_source_dirty__: bool
+__build_development_override__: bool
+__build_cpp_source_kind__: str
+__build_source_attestation_version__: int
 
 def stage052_native_architecture_capabilities_v2() -> npt.NDArray[np.int64]: ...
 

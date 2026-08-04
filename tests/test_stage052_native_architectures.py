@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+import subprocess
+import zipfile
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -19,6 +22,7 @@ from evrptw.experiments.stage052_native_architecture_review import (
     _raw_axis_inventory,
     _replay_initial_state_receipt,
     _replay_record,
+    _review_build_attestation,
     _scheduler_screening_occupancy,
     _semantic_trajectory,
     load_records,
@@ -39,6 +43,8 @@ from evrptw.experiments.stage052_native_architectures import (
     _require_campaign_identity,
     _require_native_architecture_capabilities,
     _run_group,
+    _validate_native_build_attestation,
+    _verify_installed_project_files,
     _write_signed_json,
     build_axis_plan,
     expected_axis_count,
@@ -52,6 +58,11 @@ from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.validation import validate_routes
 from evrptw.warm_start import canonical_customer_sequences_sha256
+from tools.native_build_attestation import (
+    committed_source_attestation,
+    committed_wheel_project_entries,
+    committed_wheel_project_entry_sha256,
+)
 
 
 def test_native_campaign_gate_names_every_incomplete_architecture_capability() -> None:
@@ -64,6 +75,144 @@ def test_native_campaign_gate_names_every_incomplete_architecture_capability() -
         ),
     ):
         _require_native_architecture_capabilities()
+
+
+def test_native_build_attestation_rejects_dirty_or_mismatched_source() -> None:
+    clean = SimpleNamespace(
+        __build_git_revision__="a" * 40,
+        __build_git_tree__="b" * 40,
+        __build_source_manifest_sha256__="c" * 64,
+        __build_tracked_file_count__=878,
+        __build_source_dirty__=False,
+        __build_development_override__=False,
+        __build_cpp_source_kind__="git_blob_snapshot",
+        __build_source_attestation_version__=1,
+    )
+    assert _validate_native_build_attestation(
+        clean,
+        expected_revision="a" * 40,
+        expected_tree="b" * 40,
+        expected_source_manifest_sha256="c" * 64,
+        expected_tracked_file_count=878,
+    ) is None
+
+    for field, value, message in (
+        ("__build_source_dirty__", True, "dirty source tree"),
+        ("__build_source_dirty__", 0, "invalid dirty-source flag"),
+        ("__build_development_override__", True, "development build override"),
+        ("__build_development_override__", 0, "invalid development override"),
+        ("__build_cpp_source_kind__", "working_tree_override", "Git-blob C\\+\\+ snapshot"),
+        ("__build_git_revision__", "d" * 40, "recorded revision"),
+        ("__build_git_tree__", "d" * 40, "Git tree"),
+        ("__build_source_attestation_version__", 2, "unknown source attestation"),
+        ("__build_source_attestation_version__", True, "unknown source attestation"),
+        ("__build_source_manifest_sha256__", "g" * 64, "does not match Git"),
+        ("__build_tracked_file_count__", True, "invalid tracked-file count"),
+    ):
+        invalid = SimpleNamespace(**vars(clean))
+        setattr(invalid, field, value)
+        with pytest.raises(RuntimeError, match=message):
+            _validate_native_build_attestation(
+                invalid,
+                expected_revision="a" * 40,
+                expected_tree="b" * 40,
+                expected_source_manifest_sha256="c" * 64,
+                expected_tracked_file_count=878,
+            )
+
+    missing = SimpleNamespace(**vars(clean))
+    del missing.__build_git_tree__
+    with pytest.raises(RuntimeError, match="lacks source attestation"):
+        _validate_native_build_attestation(
+            missing,
+            expected_revision="a" * 40,
+            expected_tree="b" * 40,
+            expected_source_manifest_sha256="c" * 64,
+            expected_tracked_file_count=878,
+        )
+
+
+def test_wheel_receipt_rejects_installed_project_file_tampering(
+    tmp_path: Path,
+) -> None:
+    wheel = tmp_path / "comparison.whl"
+    site_packages = tmp_path / "site-packages"
+    package = site_packages / "evrptw"
+    package.mkdir(parents=True)
+    installed = package / "runtime.py"
+    installed.write_bytes(b"reviewed-runtime")
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("evrptw/runtime.py", b"reviewed-runtime")
+
+    receipt = _verify_installed_project_files(wheel, site_packages=site_packages)
+    assert receipt == {
+        "evrptw/runtime.py": hashlib.sha256(b"reviewed-runtime").hexdigest()
+    }
+
+    installed.write_bytes(b"tampered-runtime")
+    with pytest.raises(RuntimeError, match="differs from its archive"):
+        _verify_installed_project_files(wheel, site_packages=site_packages)
+
+    installed.write_bytes(b"reviewed-runtime")
+    (package / "stale_runtime.py").write_bytes(b"stale-runtime")
+    with pytest.raises(RuntimeError, match="absent from the supplied wheel"):
+        _verify_installed_project_files(wheel, site_packages=site_packages)
+
+
+def test_wheel_receipt_requires_hash_bound_entries_and_safe_paths(
+    tmp_path: Path,
+) -> None:
+    wheel = tmp_path / "comparison.whl"
+    site_packages = tmp_path / "site-packages"
+    package = site_packages / "evrptw"
+    package.mkdir(parents=True)
+    installed = package / "runtime.py"
+    installed.write_bytes(b"reviewed-runtime")
+    runtime_sha256 = hashlib.sha256(b"reviewed-runtime").hexdigest()
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("evrptw/runtime.py", b"reviewed-runtime")
+
+    with pytest.raises(RuntimeError, match="required wheel entry"):
+        _verify_installed_project_files(
+            wheel,
+            site_packages=site_packages,
+            required_entry_sha256={"evrptw/missing.py": runtime_sha256},
+        )
+    with pytest.raises(RuntimeError, match="source inventory does not match Git"):
+        _verify_installed_project_files(
+            wheel,
+            site_packages=site_packages,
+            expected_source_entries={"evrptw/other.py": runtime_sha256},
+        )
+    with pytest.raises(RuntimeError, match="source inventory does not match Git"):
+        _verify_installed_project_files(
+            wheel,
+            site_packages=site_packages,
+            expected_source_entries={"evrptw/runtime.py": "0" * 64},
+        )
+
+    unsafe_wheel = tmp_path / "unsafe.whl"
+    with zipfile.ZipFile(unsafe_wheel, "w") as archive:
+        archive.writestr("evrptw/../runtime.py", b"reviewed-runtime")
+    with pytest.raises(RuntimeError, match="unsafe project entry"):
+        _verify_installed_project_files(
+            unsafe_wheel,
+            site_packages=site_packages,
+        )
+
+    extra_core = package / "_core.extra.so"
+    extra_core.write_bytes(b"unloaded-native")
+    extra_core_wheel = tmp_path / "extra-core.whl"
+    with zipfile.ZipFile(extra_core_wheel, "w") as archive:
+        archive.writestr("evrptw/runtime.py", b"reviewed-runtime")
+        archive.writestr("evrptw/_core.extra.so", b"unloaded-native")
+    with pytest.raises(RuntimeError, match="source inventory does not match Git"):
+        _verify_installed_project_files(
+            extra_core_wheel,
+            site_packages=site_packages,
+            expected_source_entries={"evrptw/runtime.py": runtime_sha256},
+            generated_entries={"evrptw/_core.primary.so"},
+        )
 
 
 def _initial_four_lane_projection(
@@ -441,6 +590,19 @@ def test_native_attempt04_is_blocked_before_capability_incomplete_outputs(
         native_architectures,
         "_verify_installed_wheel",
         lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        native_architectures,
+        "committed_source_attestation",
+        lambda *_args, **_kwargs: {
+            "source_manifest_sha256": "d" * 64,
+            "tracked_file_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        native_architectures,
+        "committed_wheel_project_entry_sha256",
+        lambda *_args, **_kwargs: {"evrptw/runtime.py": "d" * 64},
     )
     monkeypatch.setattr(
         native_core,
@@ -916,16 +1078,70 @@ def test_semantic_trajectory_reports_the_real_first_divergence() -> None:
 def test_v5_reviewer_rejects_scheduler_overlap_outside_host_wave(
     tmp_path: Path,
 ) -> None:
+    root = Path(__file__).resolve().parents[1]
+    revision = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    git_tree = subprocess.run(
+        ("git", "rev-parse", "HEAD^{tree}"),
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    source_attestation = committed_source_attestation(root, revision)
+    source_manifest_sha256 = source_attestation["source_manifest_sha256"]
+    tracked_file_count = source_attestation["tracked_file_count"]
+    wheel_entries = committed_wheel_project_entry_sha256(root, revision)
+    wheel_entries.update(
+        {
+            "evrptw/_core.cpython-313-x86_64-linux-gnu.so": "c" * 64,
+            "evrptw/_native_host_scheduler": "d" * 64,
+        }
+    )
+    wheel_receipt = {
+        "build_git_revision": revision,
+        "build_git_tree": git_tree,
+        "wheel_sha256": "b" * 64,
+        "native_sha256": "c" * 64,
+        "scheduler_sha256": "d" * 64,
+        "build_source_manifest_sha256": source_manifest_sha256,
+        "build_tracked_file_count": tracked_file_count,
+        "build_source_dirty": False,
+        "build_development_override": False,
+        "build_cpp_source_kind": "git_blob_snapshot",
+        "build_source_attestation_version": 1,
+        "wheel_entry_sha256": wheel_entries,
+        "native_wheel_entry": "evrptw/_core.cpython-313-x86_64-linux-gnu.so",
+        "scheduler_wheel_entry": "evrptw/_native_host_scheduler",
+        "runner_wheel_entry": "evrptw/experiments/stage052_native_architectures.py",
+        "scheduler_build_attestation": {
+            "schema_version": 1,
+            "revision": revision,
+            "git_tree": git_tree,
+            "source_manifest_sha256": source_manifest_sha256,
+            "tracked_file_count": tracked_file_count,
+            "source_dirty": False,
+            "development_override": False,
+            "cpp_source_kind": "git_blob_snapshot",
+        },
+    }
     labels = run_labels_for_scope("paired", 91)
     run_dir = tmp_path / labels["current_stage052"]
     _write_signed_json(
         run_dir / "run_manifest.json",
         {
             "schema_version": SCHEMA_VERSION,
-            "revision": "a" * 40,
+            "revision": revision,
+            "git_tree": git_tree,
             "wheel_sha256": "b" * 64,
             "native_sha256": "c" * 64,
             "scheduler_sha256": "d" * 64,
+            "wheel_receipt": wheel_receipt,
             "topology": {
                 "scheduler_startup_seconds": 0.1,
                 "scheduler_shutdown_seconds": 0.1,
@@ -948,6 +1164,119 @@ def test_v5_reviewer_rejects_scheduler_overlap_outside_host_wave(
 
     with pytest.raises(RuntimeError, match="exclusive mode wave"):
         load_records("paired", attempt=91, results_root=tmp_path)
+
+
+def test_reviewer_rejects_dirty_or_mismatched_build_attestation() -> None:
+    root = Path(__file__).resolve().parents[1]
+    revision = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    git_tree = subprocess.run(
+        ("git", "rev-parse", "HEAD^{tree}"),
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    source_attestation = committed_source_attestation(root, revision)
+    source_manifest_sha256 = source_attestation["source_manifest_sha256"]
+    tracked_file_count = source_attestation["tracked_file_count"]
+    wheel_entries = committed_wheel_project_entry_sha256(root, revision)
+    wheel_entries.update(
+        {
+            "evrptw/_core.cpython-313-x86_64-linux-gnu.so": "c" * 64,
+            "evrptw/_native_host_scheduler": "d" * 64,
+        }
+    )
+    receipt: dict[str, object] = {
+        "build_git_revision": revision,
+        "build_git_tree": git_tree,
+        "wheel_sha256": "b" * 64,
+        "native_sha256": "c" * 64,
+        "scheduler_sha256": "d" * 64,
+        "build_source_manifest_sha256": source_manifest_sha256,
+        "build_tracked_file_count": tracked_file_count,
+        "build_source_dirty": False,
+        "build_development_override": False,
+        "build_cpp_source_kind": "git_blob_snapshot",
+        "build_source_attestation_version": 1,
+        "wheel_entry_sha256": wheel_entries,
+        "native_wheel_entry": "evrptw/_core.cpython-313-x86_64-linux-gnu.so",
+        "scheduler_wheel_entry": "evrptw/_native_host_scheduler",
+        "runner_wheel_entry": "evrptw/experiments/stage052_native_architectures.py",
+        "scheduler_build_attestation": {
+            "schema_version": 1,
+            "revision": revision,
+            "git_tree": git_tree,
+            "source_manifest_sha256": source_manifest_sha256,
+            "tracked_file_count": tracked_file_count,
+            "source_dirty": False,
+            "development_override": False,
+            "cpp_source_kind": "git_blob_snapshot",
+        },
+    }
+    manifest: dict[str, object] = {
+        "revision": revision,
+        "git_tree": git_tree,
+        "wheel_sha256": "b" * 64,
+        "native_sha256": "c" * 64,
+        "scheduler_sha256": "d" * 64,
+        "wheel_receipt": receipt,
+    }
+    assert _review_build_attestation(manifest) == (
+        git_tree,
+        source_manifest_sha256,
+    )
+
+    for field, value, message in (
+        ("build_source_dirty", True, "source is dirty"),
+        ("build_development_override", True, "development build override"),
+        ("build_cpp_source_kind", "working_tree_override", "Git-blob C\\+\\+ snapshot"),
+        ("build_source_attestation_version", True, "version is invalid"),
+        ("build_git_tree", "0" * 40, "identity does not reconcile"),
+    ):
+        invalid_receipt = dict(receipt)
+        invalid_receipt[field] = value
+        invalid_manifest = {**manifest, "wheel_receipt": invalid_receipt}
+        with pytest.raises(RuntimeError, match=message):
+            _review_build_attestation(invalid_manifest)
+
+    for mutate in ("missing", "unexpected"):
+        invalid_entries = dict(wheel_entries)
+        if mutate == "missing":
+            committed_entry = next(
+                entry
+                for entry in committed_wheel_project_entries(root, revision)
+                if entry
+                != "evrptw/experiments/stage052_native_architectures.py"
+            )
+            invalid_entries.pop(committed_entry)
+        else:
+            invalid_entries["evrptw/uncommitted.py"] = "a" * 64
+        invalid_receipt = {**receipt, "wheel_entry_sha256": invalid_entries}
+        with pytest.raises(RuntimeError, match="inventory does not match Git"):
+            _review_build_attestation(
+                {**manifest, "wheel_receipt": invalid_receipt}
+            )
+
+    modified_runner_entries = dict(wheel_entries)
+    modified_runner_entries[
+        "evrptw/experiments/stage052_native_architectures.py"
+    ] = "0" * 64
+    with pytest.raises(RuntimeError, match="inventory does not match Git"):
+        _review_build_attestation(
+            {
+                **manifest,
+                "wheel_receipt": {
+                    **receipt,
+                    "wheel_entry_sha256": modified_runner_entries,
+                },
+            }
+        )
 
 
 def test_canonical_candidate_event_has_stable_candidate_identity() -> None:

@@ -11,12 +11,13 @@ import os
 import resource
 import subprocess
 import time
-from collections.abc import Iterable
+import zipfile
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
-from pathlib import Path
-from typing import cast
+from pathlib import Path, PurePosixPath
+from typing import Protocol, TypedDict, cast
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -43,6 +44,11 @@ from evrptw.warm_start import (
     WarmStartValidationConfig,
     canonical_customer_sequences_sha256,
 )
+from tools.native_build_attestation import (
+    committed_source_attestation,
+    committed_wheel_project_entry_sha256,
+    validate_scheduler_build_attestation,
+)
 
 SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v6"
 SEEDS = (2014, 2015, 2016)
@@ -61,6 +67,41 @@ NATIVE_ARCHITECTURE_CAPABILITY_NAMES = (
 
 WarmStartIdentity = tuple[str, int]
 WarmStartRecord = tuple[tuple[tuple[str, ...], ...], dict[str, object]]
+
+
+class NativeBuildAttestation(Protocol):
+    __build_git_revision__: str
+    __build_git_tree__: str
+    __build_source_manifest_sha256__: str
+    __build_tracked_file_count__: int
+    __build_source_dirty__: bool
+    __build_development_override__: bool
+    __build_cpp_source_kind__: str
+    __build_source_attestation_version__: int
+
+
+class WheelReceipt(TypedDict):
+    wheel_path: str
+    wheel_sha256: str
+    direct_url_path: str
+    package_path: str
+    native_path: str
+    native_sha256: str
+    scheduler_path: str
+    scheduler_sha256: str
+    build_git_revision: str
+    build_git_tree: str
+    build_source_manifest_sha256: str
+    build_tracked_file_count: int
+    build_source_dirty: bool
+    build_development_override: bool
+    build_cpp_source_kind: str
+    build_source_attestation_version: int
+    wheel_entry_sha256: dict[str, str]
+    native_wheel_entry: str
+    scheduler_wheel_entry: str
+    runner_wheel_entry: str
+    scheduler_build_attestation: dict[str, object]
 
 
 class ArchitectureMode(StrEnum):
@@ -338,11 +379,138 @@ def load_warm_start_bundle(
     return output
 
 
+def _validate_native_build_attestation(
+    native_core: NativeBuildAttestation,
+    *,
+    expected_revision: str,
+    expected_tree: str,
+    expected_source_manifest_sha256: str,
+    expected_tracked_file_count: int,
+) -> None:
+    def is_lower_hex(value: object, length: int) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == length
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    try:
+        build_revision = native_core.__build_git_revision__
+        build_tree = native_core.__build_git_tree__
+        source_manifest_sha256 = native_core.__build_source_manifest_sha256__
+        tracked_file_count = native_core.__build_tracked_file_count__
+        source_dirty = native_core.__build_source_dirty__
+        development_override = native_core.__build_development_override__
+        cpp_source_kind = native_core.__build_cpp_source_kind__
+        attestation_version = native_core.__build_source_attestation_version__
+    except AttributeError as error:
+        raise RuntimeError("installed native wheel lacks source attestation") from error
+    if not is_lower_hex(build_revision, 40) or build_revision != expected_revision:
+        raise RuntimeError("installed native wheel was not built from the recorded revision")
+    if not is_lower_hex(build_tree, 40) or build_tree != expected_tree:
+        raise RuntimeError("installed native wheel Git tree does not match the checkout")
+    if type(attestation_version) is not int or attestation_version != 1:
+        raise RuntimeError("installed native wheel has an unknown source attestation")
+    if (
+        not is_lower_hex(source_manifest_sha256, 64)
+        or source_manifest_sha256 != expected_source_manifest_sha256
+    ):
+        raise RuntimeError("installed native wheel source manifest does not match Git")
+    if type(tracked_file_count) is not int or tracked_file_count <= 0:
+        raise RuntimeError("installed native wheel has an invalid tracked-file count")
+    if tracked_file_count != expected_tracked_file_count:
+        raise RuntimeError("installed native wheel tracked-file count does not match Git")
+    if type(source_dirty) is not bool:
+        raise RuntimeError("installed native wheel has an invalid dirty-source flag")
+    if source_dirty:
+        raise RuntimeError("installed native wheel was built from a dirty source tree")
+    if type(development_override) is not bool:
+        raise RuntimeError("installed native wheel has an invalid development override")
+    if development_override:
+        raise RuntimeError("installed native wheel used the development build override")
+    if cpp_source_kind != "git_blob_snapshot":
+        raise RuntimeError("installed native wheel did not use a Git-blob C++ snapshot")
+
+
+def _verify_installed_project_files(
+    wheel_path: Path,
+    *,
+    site_packages: Path,
+    required_entry_sha256: Mapping[str, str] | None = None,
+    expected_source_entries: Mapping[str, str] | None = None,
+    generated_entries: set[str] | None = None,
+) -> dict[str, str]:
+    wheel_entry_sha256: dict[str, str] = {}
+    with zipfile.ZipFile(wheel_path) as archive:
+        project_entries = tuple(
+            entry
+            for entry in archive.infolist()
+            if not entry.is_dir()
+            and entry.filename.startswith(("evrptw/", "tools/"))
+        )
+        if not project_entries:
+            raise RuntimeError("supplied wheel contains no project files")
+        for entry in project_entries:
+            entry_path = PurePosixPath(entry.filename)
+            if (
+                entry_path.is_absolute()
+                or ".." in entry_path.parts
+                or "\\" in entry.filename
+                or entry.filename in wheel_entry_sha256
+            ):
+                raise RuntimeError("supplied wheel has an unsafe project entry")
+            installed_path = site_packages / entry.filename
+            if not installed_path.is_file():
+                raise RuntimeError(
+                    f"installed wheel file is missing: {entry.filename}"
+                )
+            expected_sha256 = hashlib.sha256(archive.read(entry)).hexdigest()
+            if _sha256_path(installed_path) != expected_sha256:
+                raise RuntimeError(
+                    f"installed wheel file differs from its archive: {entry.filename}"
+                )
+            wheel_entry_sha256[entry.filename] = expected_sha256
+    installed_project_files = {
+        str(path.relative_to(site_packages)).replace(os.sep, "/")
+        for package_name in ("evrptw", "tools")
+        for path in (site_packages / package_name).rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    }
+    unexpected_files = sorted(installed_project_files - set(wheel_entry_sha256))
+    if unexpected_files:
+        raise RuntimeError(
+            "installed project files are absent from the supplied wheel: "
+            + ", ".join(unexpected_files[:8])
+        )
+    if expected_source_entries is not None:
+        source_entries = {
+            entry
+            for entry in wheel_entry_sha256
+            if entry not in (generated_entries or set())
+        }
+        expected_source_entry_hashes = dict(expected_source_entries)
+        if source_entries != set(expected_source_entry_hashes) or any(
+            wheel_entry_sha256[entry] != expected_sha256
+            for entry, expected_sha256 in expected_source_entry_hashes.items()
+        ):
+            raise RuntimeError("wheel project source inventory does not match Git")
+    for required_entry, expected_sha256 in (required_entry_sha256 or {}).items():
+        if wheel_entry_sha256.get(required_entry) != expected_sha256:
+            raise RuntimeError(
+                f"required wheel entry is not hash-bound: {required_entry}"
+            )
+    return dict(sorted(wheel_entry_sha256.items()))
+
+
 def _verify_installed_wheel(
     wheel_path: Path,
     *,
     expected_revision: str,
-) -> dict[str, str]:
+    expected_tree: str,
+    expected_source_manifest_sha256: str,
+    expected_tracked_file_count: int,
+    expected_source_entries: Mapping[str, str],
+) -> WheelReceipt:
     """Prove that the executing distribution was installed from the supplied wheel."""
 
     resolved_wheel = wheel_path.resolve()
@@ -391,19 +559,75 @@ def _verify_installed_wheel(
         raise RuntimeError("comparison runner imported source outside the installed wheel")
     if not scheduler_path.is_file() or not os.access(scheduler_path, os.X_OK):
         raise RuntimeError("installed wheel has no executable native host scheduler")
-    build_revision = native_core.__build_git_revision__
-    if not isinstance(build_revision, str) or build_revision != expected_revision:
-        raise RuntimeError("installed native wheel was not built from the recorded revision")
+    _validate_native_build_attestation(
+        native_core,
+        expected_revision=expected_revision,
+        expected_tree=expected_tree,
+        expected_source_manifest_sha256=expected_source_manifest_sha256,
+        expected_tracked_file_count=expected_tracked_file_count,
+    )
+    native_sha256 = _sha256_path(native_path)
+    scheduler_sha256 = _sha256_path(scheduler_path)
+    runner_path = Path(__file__).resolve()
+    if not runner_path.is_relative_to(site_packages):
+        raise RuntimeError("comparison runner was imported outside the installed wheel")
+    native_wheel_entry = native_path.relative_to(site_packages).as_posix()
+    scheduler_wheel_entry = scheduler_path.relative_to(site_packages).as_posix()
+    runner_wheel_entry = runner_path.relative_to(site_packages).as_posix()
+    wheel_entry_sha256 = _verify_installed_project_files(
+        resolved_wheel,
+        site_packages=site_packages,
+        required_entry_sha256={
+            native_wheel_entry: native_sha256,
+            scheduler_wheel_entry: scheduler_sha256,
+            runner_wheel_entry: _sha256_path(runner_path),
+        },
+        expected_source_entries=expected_source_entries,
+        generated_entries={native_wheel_entry, scheduler_wheel_entry},
+    )
+    scheduler_attestation_raw = subprocess.run(
+        [str(scheduler_path), "--build-attestation"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    try:
+        scheduler_attestation = json.loads(scheduler_attestation_raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("native scheduler build attestation is invalid") from error
+    if not isinstance(scheduler_attestation, dict):
+        raise RuntimeError("native scheduler build attestation is invalid")
+    validate_scheduler_build_attestation(
+        scheduler_attestation,
+        revision=native_core.__build_git_revision__,
+        git_tree=native_core.__build_git_tree__,
+        source_manifest_sha256=native_core.__build_source_manifest_sha256__,
+        tracked_file_count=native_core.__build_tracked_file_count__,
+    )
     return {
         "wheel_path": str(resolved_wheel),
         "wheel_sha256": wheel_sha256,
         "direct_url_path": str(direct_url_path.resolve()),
         "package_path": str(package_path),
         "native_path": str(native_path),
-        "native_sha256": _sha256_path(native_path),
+        "native_sha256": native_sha256,
         "scheduler_path": str(scheduler_path),
-        "scheduler_sha256": _sha256_path(scheduler_path),
-        "build_git_revision": build_revision,
+        "scheduler_sha256": scheduler_sha256,
+        "build_git_revision": native_core.__build_git_revision__,
+        "build_git_tree": native_core.__build_git_tree__,
+        "build_source_manifest_sha256": (
+            native_core.__build_source_manifest_sha256__
+        ),
+        "build_tracked_file_count": native_core.__build_tracked_file_count__,
+        "build_source_dirty": False,
+        "build_development_override": False,
+        "build_cpp_source_kind": native_core.__build_cpp_source_kind__,
+        "build_source_attestation_version": 1,
+        "wheel_entry_sha256": wheel_entry_sha256,
+        "native_wheel_entry": native_wheel_entry,
+        "scheduler_wheel_entry": scheduler_wheel_entry,
+        "runner_wheel_entry": runner_wheel_entry,
+        "scheduler_build_attestation": dict(scheduler_attestation),
     }
 
 
@@ -1422,11 +1646,29 @@ def run_experiment(
         capture_output=True,
         text=True,
     ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    committed_attestation = committed_source_attestation(root, revision)
+    expected_source_entries = committed_wheel_project_entry_sha256(root, revision)
+    source_manifest_sha256 = cast(
+        str,
+        committed_attestation["source_manifest_sha256"],
+    )
+    tracked_file_count = cast(int, committed_attestation["tracked_file_count"])
     if not wheel_path.is_file():
         raise FileNotFoundError("the frozen comparison wheel does not exist")
     wheel_receipt = _verify_installed_wheel(
         wheel_path,
         expected_revision=revision,
+        expected_tree=tree,
+        expected_source_manifest_sha256=source_manifest_sha256,
+        expected_tracked_file_count=tracked_file_count,
+        expected_source_entries=expected_source_entries,
     )
     native_capabilities = _require_native_architecture_capabilities()
     native_path = Path(wheel_receipt["native_path"])
@@ -1560,6 +1802,7 @@ def run_experiment(
         "attempt": attempt,
         "run_labels": labels,
         "revision": revision,
+        "git_tree": tree,
         "wheel_path": wheel_receipt["wheel_path"],
         "wheel_sha256": wheel_receipt["wheel_sha256"],
         "wheel_receipt": wheel_receipt,
