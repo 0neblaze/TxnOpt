@@ -84,6 +84,16 @@ struct Stage04BoundaryStateV2 final {
     double reheat_floor = 0.0;
 };
 
+struct ConstraintIterationOutcomeV2 final {
+    std::int64_t operation = 0;
+    std::int64_t probe_seed = 0;
+    std::int64_t candidate_feasible = 0;
+    std::int64_t accepted = 0;
+    std::int64_t improved_global_best = 0;
+    std::int64_t vehicle_reduction = 0;
+    std::int64_t iteration = -1;
+};
+
 struct ProblemV2 final {
     std::vector<std::int64_t> node_kind;
     std::vector<double> demand;

@@ -9507,6 +9507,38 @@ private:
     double* control_float_values_;
 };
 
+class ConstraintIterationProjectionV2 final {
+public:
+    ConstraintIterationProjectionV2()
+        : payload_(3), outcome_(6), outcome_values_(checked_data(outcome_)) {
+        payload_[2] = outcome_;
+    }
+
+    void set_selection(py::handle selection) {
+        payload_[0] = selection;
+    }
+
+    void set_probe(py::handle probe) {
+        payload_[1] = probe;
+    }
+
+    py::tuple finish(
+        const evrptw::native_search::ConstraintIterationOutcomeV2& outcome) {
+        outcome_values_[0] = outcome.operation;
+        outcome_values_[1] = outcome.probe_seed;
+        outcome_values_[2] = outcome.candidate_feasible;
+        outcome_values_[3] = outcome.accepted;
+        outcome_values_[4] = outcome.improved_global_best;
+        outcome_values_[5] = outcome.vehicle_reduction;
+        return std::move(payload_);
+    }
+
+private:
+    py::tuple payload_;
+    py::array_t<std::int64_t> outcome_;
+    std::int64_t* outcome_values_;
+};
+
 class NativeSearchEngineV2 {
 public:
     NativeSearchEngineV2(
@@ -14850,6 +14882,19 @@ public:
             && last_three_lane_legacy_acceptance_outcome_->accepted != 0;
     }
 
+    [[nodiscard]] const evrptw::native_search::ConstraintIterationOutcomeV2&
+    last_constraint_iteration_outcome_owned(
+        std::int64_t expected_iteration) const {
+        if (!last_constraint_iteration_outcome_.has_value()
+            || last_constraint_iteration_outcome_->iteration
+                != expected_iteration
+            || last_completed_constraint_iteration_ != expected_iteration) {
+            throw std::logic_error(
+                "full native constraint iteration outcome is unavailable");
+        }
+        return *last_constraint_iteration_outcome_;
+    }
+
     std::int64_t main_stagnation_iterations() const {
         std::unique_lock state_lock(state_mutex_, std::try_to_lock);
         if (!state_lock.owns_lock()) {
@@ -15882,6 +15927,8 @@ public:
             throw std::invalid_argument(
                 "full native constraint iteration deadline is invalid");
         }
+        last_constraint_iteration_outcome_.reset();
+        ConstraintIterationProjectionV2 projection;
         const auto deadline_seconds = checked_data<double>(deadline_array)[0];
         const auto remaining_at_boundary = [&]() {
             return deadline_seconds - std::chrono::duration<double>(
@@ -15916,12 +15963,22 @@ public:
             thresholds,
             fractions,
             global_best_reset);
+        projection.set_selection(selection);
         // Python reserves a per-probe seed immediately after selecting the
         // constraint operator, even when the dynamic removal count is zero.
         // Consume it on every path so later weighted operator draws remain
         // byte-for-byte aligned with random.Random.
         const auto probe_seed = next_constraint_rng.randbelow(1ULL << 32U);
         const auto requested_count = checked_data<std::int64_t>(selection)[1];
+        evrptw::native_search::ConstraintIterationOutcomeV2 outcome{
+            operation,
+            static_cast<std::int64_t>(probe_seed),
+            0,
+            0,
+            0,
+            0,
+            iteration,
+        };
         if (requested_count <= 0) {
             const auto& constraint_lane = live_lane_state(2);
             auto constraint_offsets = lane_vector_array(
@@ -15947,13 +16004,10 @@ public:
                 constraint_exact[4],
                 requested_count,
                 0);
-            py::array_t<std::int64_t> outcome(6);
-            std::fill(
-                checked_data(outcome), checked_data(outcome) + 6,
-                std::int64_t{0});
-            checked_data(outcome)[0] = operation;
+            outcome.probe_seed = 0;
             auto probe = py::make_tuple(
                 std::move(removal), py::none(), py::none());
+            projection.set_probe(probe);
             causal_context_ = {
                 stable_int63("constraint_lane"),
                 stable_int63(
@@ -15972,20 +16026,9 @@ public:
                 static_cast<std::size_t>(operation + 9), false, 1, false,
                 false, true);
             last_completed_constraint_iteration_ = iteration;
-            return py::make_tuple(
-                std::move(selection), std::move(probe), std::move(outcome));
+            last_constraint_iteration_outcome_ = outcome;
+            return projection.finish(*last_constraint_iteration_outcome_);
         }
-        py::array_t<std::int64_t> outcome(6);
-        auto* outcome_values = checked_data(outcome);
-        outcome_values[0] = operation;
-        outcome_values[1] = static_cast<std::int64_t>(probe_seed);
-        outcome_values[2] = 0;
-        outcome_values[3] = 0;
-        outcome_values[4] = 0;
-        outcome_values[5] = 0;
-        py::tuple result(3);
-        result[0] = selection;
-        result[2] = outcome;
         py::array_t<std::int64_t> context_ids(3);
         auto* context = checked_data(context_ids);
         context[0] = stable_int63("constraint_lane");
@@ -16006,7 +16049,7 @@ public:
                 adjusted_deadline,
                 batch_size,
                 route_change_limit);
-            result[1] = probe;
+            projection.set_probe(probe);
             iteration_candidate_ready = last_candidate_ready_;
             if (iteration_candidate_ready) {
                 if (!last_candidate_lane_state_.has_value()) {
@@ -16024,7 +16067,7 @@ public:
                     iteration_candidate_ready = false;
                 }
             }
-            outcome_values[2] = iteration_candidate_ready ? 1 : 0;
+            outcome.candidate_feasible = iteration_candidate_ready ? 1 : 0;
             if (constraint_iteration_deadline_injection_) {
                 constraint_iteration_deadline_injection_ = false;
                 throw std::runtime_error(
@@ -16041,17 +16084,17 @@ public:
                 const auto applied = apply_last_candidate_owned(
                     std::max(1.0, current_distance * 0.05), 0.0);
                 last_constraint_acceptance_outcome_ = applied;
-                outcome_values[2] = 1;
-                outcome_values[3] = applied.accepted;
-                outcome_values[4] = applied.improved_global_best;
-                outcome_values[5] = applied.vehicle_reduction;
+                outcome.candidate_feasible = 1;
+                outcome.accepted = applied.accepted;
+                outcome.improved_global_best = applied.improved_global_best;
+                outcome.vehicle_reduction = applied.vehicle_reduction;
             } else if (iteration_candidate_ready) {
                 last_candidate_lane_state_.reset();
                 last_candidate_ready_ = false;
             }
-            const auto accepted = outcome_values[3] != 0;
-            const auto improved_best = outcome_values[4] != 0;
-            const auto vehicle_reduction = outcome_values[5] != 0;
+            const auto accepted = outcome.accepted != 0;
+            const auto improved_best = outcome.improved_global_best != 0;
+            const auto vehicle_reduction = outcome.vehicle_reduction != 0;
             accumulate_constraint_stage04_outcome_noexcept(
                 static_cast<std::size_t>(operation), accepted, comparison,
                 improved_best, vehicle_reduction,
@@ -16069,7 +16112,8 @@ public:
                 static_cast<std::size_t>(operation + 9), accepted, comparison,
                 improved_best, vehicle_reduction, true);
             last_completed_constraint_iteration_ = iteration;
-            return result;
+            last_constraint_iteration_outcome_ = outcome;
+            return projection.finish(*last_constraint_iteration_outcome_);
         } catch (...) {
             defer_iteration_commit_ = false;
             if (pending_composite_active_) {
@@ -16208,23 +16252,22 @@ public:
             auto selection = py::cast<py::array_t<std::int64_t>>(
                 iteration_payload[0]);
             auto probe = py::cast<py::tuple>(iteration_payload[1]);
-            auto outcome = py::cast<py::array_t<std::int64_t>>(
-                iteration_payload[2]);
+            const auto outcome = last_constraint_iteration_outcome_owned(
+                iteration);
             const auto* selection_values = checked_data<std::int64_t>(selection);
-            const auto* outcome_values = checked_data<std::int64_t>(outcome);
             const auto after_budget = budget_.native_snapshot();
 
             auto* event = checked_data(event_integer) + ordinal * 16;
             event[0] = 0;  // candidate_state
             event[1] = 2;  // constraint_lane
             event[2] = iteration;
-            event[3] = 9 + outcome_values[0];
+            event[3] = 9 + outcome.operation;
             event[4] = selection_values[1];
             event[5] = selection_values[2];
-            event[6] = outcome_values[2];
-            event[7] = outcome_values[3];
-            event[8] = outcome_values[4];
-            event[9] = outcome_values[5];
+            event[6] = outcome.candidate_feasible;
+            event[7] = outcome.accepted;
+            event[8] = outcome.improved_global_best;
+            event[9] = outcome.vehicle_reduction;
             event[10] = after_budget.started - before_budget.started;
             event[11] = after_budget.completed - before_budget.completed;
             event[12] = after_budget.interrupted - before_budget.interrupted;
@@ -16251,7 +16294,7 @@ public:
                         route_offsets.push_back(
                             static_cast<std::int64_t>(route_indices.size()));
                     }
-                    event[13] = outcome_values[2] != 0 ? 0 : 3;
+                    event[13] = outcome.candidate_feasible != 0 ? 0 : 3;
                 } else {
                     event[13] = 2;
                 }
@@ -16290,7 +16333,7 @@ public:
             objective_integers[1] = -1;
             objectives[0] = std::numeric_limits<double>::quiet_NaN();
             objectives[1] = std::numeric_limits<double>::quiet_NaN();
-            if (!probe[2].is_none() && outcome_values[2] != 0) {
+            if (!probe[2].is_none() && outcome.candidate_feasible != 0) {
                 const auto& candidate_round = candidate_round_state();
                 objective_integers[0] = candidate_round.objective_integer[0];
                 objective_integers[1] = candidate_round.objective_integer[1];
@@ -16330,7 +16373,7 @@ public:
                 checked_data<double>(rewards),
                 checked_data<double>(rewards) + 4,
                 checked_data(stage04_rewards) + ordinal * 4);
-            stagnation_iterations = outcome_values[4] != 0
+            stagnation_iterations = outcome.improved_global_best != 0
                 ? 0 : stagnation_iterations + 1;
             ++completed_iterations;
             if (budget_.budget_reached()) {
@@ -16771,18 +16814,18 @@ public:
         }
         auto selection = py::cast<py::array_t<std::int64_t>>(constraint[0]);
         auto probe = py::cast<py::tuple>(constraint[1]);
-        auto outcome = py::cast<py::array_t<std::int64_t>>(constraint[2]);
+        const auto outcome = last_constraint_iteration_outcome_owned(
+            start_iteration);
         auto removal = py::cast<py::tuple>(probe[0]);
         const auto* selection_values = checked_data<std::int64_t>(selection);
-        const auto* outcome_values = checked_data<std::int64_t>(outcome);
         if (probe[1].is_none()) {
             auto removal_metadata =
                 py::cast<py::array_t<std::int64_t>>(removal[6]);
             if (!probe[2].is_none()
                 || checked_data<std::int64_t>(removal_metadata)[0] != 2
                 || selection_values[1] != 0
-                || outcome_values[0] < 0 || outcome_values[0] >= 4
-                || outcome_values[2] != 0) {
+                || outcome.operation < 0 || outcome.operation >= 4
+                || outcome.candidate_feasible != 0) {
                 throw std::logic_error(
                     "native global no-removable bootstrap is inconsistent");
             }
@@ -16814,7 +16857,7 @@ public:
             quality[3] = 4;
             auto* constraint_event = initialize_event(1);
             constraint_event[1] = 2;
-            constraint_event[3] = 9 + outcome_values[0];
+            constraint_event[3] = 9 + outcome.operation;
             constraint_event[5] = 4;
             constraint_event[15] = 2;
             constraint_event[24] = 0;
@@ -16925,15 +16968,15 @@ public:
         }
         auto repair = py::cast<py::tuple>(probe[1]);
         auto transaction = py::cast<py::tuple>(probe[2]);
-        if (outcome_values[0] != 0
+        if (outcome.operation != 0
             || py::cast<py::array_t<std::int64_t>>(repair[0]).size() != 2) {
             throw std::logic_error(
                 "native global bootstrap did not produce the expected constraint transaction");
         }
-        const auto candidate_feasible = outcome_values[2] != 0;
+        const auto candidate_feasible = outcome.candidate_feasible != 0;
         const auto budget_boundary = budget_.budget_reached();
         last_iteration_global_best_improved_ =
-            candidate_feasible && outcome_values[4] != 0;
+            candidate_feasible && outcome.improved_global_best != 0;
         main_stagnation_iterations_ = last_iteration_global_best_improved_
             ? 0 : initial_stagnation_iterations + 1;
         auto stage_boundary = finish_stage04_iteration(
@@ -16986,13 +17029,13 @@ public:
         repaired[3] = 9;
         repaired[4] = candidate_feasible ? 1 : 2;
         repaired[5] = candidate_feasible ? 2 : 3;
-        repaired[6] = outcome_values[3];
-        repaired[7] = outcome_values[5];
+        repaired[6] = outcome.accepted;
+        repaired[7] = outcome.vehicle_reduction;
         const auto& candidate_round = candidate_round_state();
         repaired[8] = candidate_feasible
             && candidate_round.objective_float[0] < previous_distance - 1e-9;
         repaired[9] = 1;
-        repaired[10] = outcome_values[2];
+        repaired[10] = outcome.candidate_feasible;
         repaired[11] = static_cast<std::int64_t>(
             candidate_round.exact_route_rows.size());
         repaired[13] = selection_values[1];
@@ -18232,6 +18275,8 @@ private:
         last_three_lane_legacy_acceptance_outcome_;
     std::optional<evrptw::native_search::ThreeLaneTerminationStateV2>
         last_three_lane_termination_state_;
+    std::optional<evrptw::native_search::ConstraintIterationOutcomeV2>
+        last_constraint_iteration_outcome_;
     std::vector<std::int64_t> exact_launch_occupancies_;
     std::vector<ExactJournalBatch> exact_journal_;
     std::list<ControlJournalBatch> control_journal_;
