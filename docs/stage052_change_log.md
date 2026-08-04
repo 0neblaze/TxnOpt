@@ -3221,3 +3221,26 @@ compatibility fallback（兼容回退）。
   两轴复审均 ACCEPT，确认 ACK 前验证、active-batch 异常安全和回执误报三个 blocker 全部关闭。
   本条仍不是 full-native/host-scheduler 完工证明，不创建 attempt04，不启动
   Paired/Pilot/Formal/CUDA，不切换默认架构。
+
+## 2026-08-04：原生 acceptance outcome 成为唯一搜索控制源
+
+- 新增命名的 C++ `AcceptanceOutcomeV2`，统一表示 accepted、improved-global-best 和
+  vehicle-reduction。legacy、quality-shadow、constraint、Stage 4 stagnation/global-best 与
+  fixed-work exhaustion 的内部决策全部读取 typed outcome，不再解析 Python tuple 槽位；
+  公开 `apply_last_candidate()` / `apply_legacy_candidate()` tuple ABI 和规范事件保持不变。
+- `AcceptanceOutcomeProjectionV2` 在任何 owned acceptance commit 前预分配 tuple 和 0/1 Python
+  对象；commit 后 `finish()` 仅做已有引用赋值，避免 Python allocation failure 发生在 live-lane
+  publication、candidate owner 清除或 Stage 4 accounting 之后。quality/constraint/legacy 的
+  typed optional outcome 在每轮入口 reset，仅在实际 apply 成功后发布，保留原 retry/rollback、
+  RNG consumption 和 operator statistics 顺序。
+- clean code checkpoint `41c2aa29c5e3fb24561b87584e74dbe173b54c86` 的 wheel SHA-256 为
+  `c1363ccb0de5bcf3b7e5df1c6794e501d3043fbfaee1afb60ec7e6de312ec646`，extension 为
+  `4ad569fc759e7e338c4596273a069e8a0171e6ec93e4daed7298970ea4cbad9e`，scheduler 保持
+  `a1cd6e81caa49cdd7d162e44ee1274b7645dd26fd0f6b8760ae004b8d5e80617`；安装后的 extension
+  自报 revision 与 checkpoint 完全一致。
+- clean-wheel 验证：acceptance/three-lane/constraint/Stage 4 聚焦集合
+  `15 passed, 325 deselected`；四实例三 seed fixed-work 全字段差分 `12 passed`、耗时
+  `91.27s`；完整 `tests/test_native_execution.py` 为 `328 passed, 12 skipped`、耗时
+  `790.29s`。Ruff、83-file strict mypy 与 `git diff --check` 通过；独立 Spec 与 Standards
+  两轴复审均 ACCEPT。production capability bits 继续全部为 0，不创建 attempt04，不启动
+  Paired/Pilot/Formal/CUDA，不切换默认架构。
