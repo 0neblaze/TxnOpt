@@ -3545,3 +3545,46 @@ compatibility fallback（兼容回退）。
   public adapters、quality return envelope 和 outer probe 仍存在 pybind/NumPy seam，不能宣称
   whole-call GIL-safe 或性能收益。production capability bits 继续全部为 0；不创建 attempt04，
   不启动 Paired/Pilot/Formal/CUDA，不切换默认架构。下一 slice 为 typed screen batch。
+
+## 2026-08-05：screen batch 完成 typed input/output boundary
+
+- 新增 C++ `ScreenBatchInputV2` 与 `ScreenBatchResultV2`。筛选核心现只接收连续 spans，并自有保存
+  candidate IDs、status、duplicate source、连续 `codes[N,16]`、`metrics[N,15]`、五项 counters 与
+  transaction digest；Python/NumPy 分配被移到单一 checked adapter 与 projector。公开
+  `screen_route_batch_transaction_v2()` 仍严格返回历史七项 ABI，dtype、C-contiguity、shape、候选顺序、
+  duplicate first-source、negative-cache 优先级、counters 与 digest 字节序均保持不变。
+- `candidate_round_transaction_impl` 与 `changed_candidate_plan_selection_v1` 直接读取 owned screening
+  state，仅在原公开 envelope 需要时投影一次。candidate-round resource receipt 仍在筛选前进入 phase 1；
+  输入、筛选、projection 或后续事务失败均不退款、不提交且 fallback 为零。二维 distance/reachable 与
+  incremental 现在在 flatten 前核验精确 shape，拒绝元素数相同但维度错误的别名输入。
+- canonical route key 改用安全 subspan；零候选、零 route indices 与空 negative-cache route 不再执行
+  `nullptr + 0` 指针算术。输出 validator 独立核验 aligned vector sizes、乘法溢出、status、唯一
+  candidate identity、duplicate 只能引用更早候选、五项 counter 恒等式及 64 位小写十六进制 digest。
+- 筛选 worker 的异常由各线程捕获、触发 atomic cancel、汇合全部 worker 后在调用线程重新抛出。
+  Standards 首轮发现 P1：逐个构造 `std::thread` 时，第 N 个线程创建失败会在栈展开销毁先前仍
+  joinable 的线程并触发 `std::terminate`。实现已改为作用域内 `std::vector<std::jthread>`；所有
+  mutex、exception、cancel、scheduler context 和 typed buffers 均在线程组前构造，创建循环失败先
+  cancel，随后 RAII 自动 join。新增 one-shot fault injection 在第二次 launch 前故障，回归证明只抛
+  `NativeCandidateRoundFailure`，receipt 保持 phase 1、exact started/completed/interrupted 全零、fallback
+  为零，transaction/runtime 均未提交。Standards 复审最终 ACCEPT。
+- Linux host-scheduler endpoint、required flag 与 telemetry collector 显式复制到每个筛选子线程的
+  `NativeSchedulerThreadContext`，关闭 thread-local context 丢失后误走本地 kernel 的 hidden fallback
+  风险。collector 本身使用 mutex 汇总；成功结果仍按 submission/candidate order 合并。
+- clean code checkpoint `32251c6fdc8bd0ec598ba4ac33e17c16bfc5709b` 的 wheel SHA-256 为
+  `915f1d432b135b62ee470e36b4feba00daba1d34d14f78142d9b35aaf0271016`，extension 为
+  `d2dc7083e88df9a7205f492750c303a35d6bca28b70aa85790542db030188a0d`，scheduler 为
+  `6bf66e7bfcfc4cb2c6ee8dae8c39fd6c54280771612944886780e34962307e30`；安装后的 extension 自报
+  revision 与 checkpoint 完全一致。
+- clean-wheel 聚焦空批次、shape alias、公开语义与线程 launch failure 为 `4 passed`；candidate-round/
+  changed-plan 聚焦集合为 `13 passed, 333 deselected`；扩大非真实数据 full-native 集合为
+  `106 passed, 240 deselected`；完整 `tests/test_native_execution.py` 为 `334 passed, 12 skipped`、耗时
+  `818.02s`；四实例三 seed 真实 per-solve fixed-work 全字段差分为 `12 passed`、耗时 `418.34s`。
+  Ruff、83-file strict mypy 与 `git diff --check` 通过；独立 Spec 与 Standards 最终均 ACCEPT。
+- 第一次真实 12 轴验证在 Codex tool connection 被用户中断后继续运行，但其 deleted stdout descriptor
+  未留下 pytest 摘要；仅凭进程消失不计为通过证据。随后在相同 revision/wheel/lease 下完整重跑并取得
+  上述 `12 passed` 与退出码 0。本条不创建或复用 campaign label，也不修改 raw evidence。
+- 本条完成 screen-batch owned computation、worker failure containment 与 Python boundary projection；
+  ranking/prepare/decide/order、exact dispatch、outer candidate-round envelope 和完整 search engine 仍有
+  pybind/NumPy seam，不能宣称 whole-call GIL-safe 或性能收益。production capability bits 继续全部为 0；
+  不创建 attempt04，不启动 Paired/Pilot/Formal/CUDA，不切换默认架构。下一 slice 为 typed
+  ranking/prepare/decide/order。
