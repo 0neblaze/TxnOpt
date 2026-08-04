@@ -3662,3 +3662,28 @@ compatibility fallback（兼容回退）。
   12/12 仍未完成，三种新架构的总语义门控仍为关闭；不创建 attempt04，不启动 360-axis Paired、
   180-axis Pilot、Formal 或 CUDA，不切换默认架构。下一 phase 继续补齐 full-native/host 的完整搜索执行面
   和真实差分门控。
+
+## 2026-08-05：full-native 与 host 真实 12/12 语义门控完成
+
+- 在 solver code checkpoint `9aca455d9e37e125ce151123c98772e1573e192e`、冻结 wheel SHA-256
+  `3b9a629792144dc4990a12e2ad0c28ec16de8a2864aa1928d0fc83640cb84693` 和证据提交
+  `f834eacef2aa4b9a0fd5552dfc4d46e695755e81` 上，按 global mode wave 串行执行两个剩余真实门控；
+  本地 full-native 与 host scheduler 没有重叠运行。
+- `full_native_alns` 使用 attempt03 冻结 Python Candidate Control paired warm start，在
+  `c101C5/c101_21/r101_21/rc101_21` × seeds 2014/2015/2016 的 100-call fixed-work 范围逐轴
+  对比，结果为 `12 passed in 90.95s`、退出码 0；JUnit 为
+  `/tmp/stage052-f834eac-full-native-real-12.xml`。
+- `host_scheduler` 使用同一输入和字段门控，通过 binary UDS、POSIX shared memory 与独占
+  24-thread scheduler 运行，结果为 `12 passed in 243.76s`、退出码 0；JUnit 为
+  `/tmp/stage052-f834eac-host-real-12.xml`。scheduler fixture 在全部轴结束后正常退出；没有本地或 Python
+  fallback。
+- 两组测试都逐轴核验 validator/feasible、objective、routes、candidate-work hash、route-result hash、
+  termination、iterations、exact started/completed、neighborhood events/statistics、Stage 4
+  statistics/event log/weight history 和 fallback=0；host 另外要求 shared native work pool 为 true。
+- 加上上一 checkpoint 的 `per_solve_runtime` `12 passed in 425.41s`，三种新架构的真实 fixed-work
+  语义门控现均为 12/12。这里的 pytest wall time 不是正式性能测量，尤其 host 测试在单一 fixture 内串行
+  经过 IPC，不能用作架构 speedup 结论。
+- attempt01–03 保持不可变；本条尚未创建 attempt04 标签或性能 raw evidence。下一 phase 必须先通过
+  writer/lease、Git identity、wheel/native hash、五个新 label 不存在、容量、affinity 和 runner
+  instrumentation preflight，随后才允许启动五模式 360-axis Paired；Formal、CUDA、push、默认架构切换和
+  evidence cleanup 仍被禁止。
