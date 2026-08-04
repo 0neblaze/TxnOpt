@@ -3043,3 +3043,40 @@ compatibility fallback（兼容回退）。
   reviewer 独立重算 receipt hash 并核对 mode、operation count 与 telemetry，避免底层
   回执在实验投影中丢失；对所有计数字段显式拒绝 Python `bool` 与 JSON boolean，新增
   门禁对应的 review schema 升级为 v7。
+
+## 2026-08-04：纯 C++ 初始四 lane ownership 与可复算 receipt v3
+
+- `InitialStateV2` 之后新增纯 C++ `LaneStateV2` 与
+  `InitialFourLaneStateV2`。它们分别拥有 constraint、legacy、quality-shadow 和
+  global-best 的初始路线、exact 结果、正式 objective、accounting、两条 Python
+  `random.Random` 兼容 RNG 的初始 seed、iteration 0 以及 request/initial-state
+  identity。此对象只是四 lane 的初始快照，不是 live search state（实时搜索状态）；
+  当前搜索迭代仍由既有 Python-backed mirrors（Python 支撑镜像）承载，后续必须继续
+  迁移 candidate transaction、lane apply、Stage 4 和 terminal projection。
+- owned-request 路径从同一个 `InitialStateV2` 构造四份独立 lane ownership，并在进入
+  搜索前严格核对现有四组镜像的 C-contiguous dtype、维度、精确 shape 和逐值相等。
+  测试专用一次性 fault injection 覆盖错误维度和错误 dtype；注入使用新建 tuple，避免
+  在共享 Python tuple 上原位替换造成 CPython `SystemError`。任何镜像 drift（漂移）均
+  fail fast，且 capability bits 仍全部为 0。
+- initial-state ownership receipt 升级为 v3：除 host ownership、operation count、
+  request/state hash 外，新增初始四-lane state hash 和 17-column typed projection。
+  Python decoder 与 raw reviewer v8 分别独立重算 lane/state/receipt SHA-256；持久化投影
+  使用 JSON-safe 规范字段。reviewer 对 boolean count、越界 int64、非有限或溢出 float、
+  route/path/shape/objective/accounting/RNG/iteration 不一致均把该轴判 invalid，不允许异常
+  数值使整个 review CLI 崩溃。两端还从投影独立重算 initial-state hash，并把 seed、
+  node-kind、batch-size 与调用输入/独立解析的 benchmark 绑定，要求所有 customer 恰好
+  覆盖一次；自洽重签的虚假 initial-state identity 同样被拒绝。
+- 本切片提交前验证使用 wheel SHA-256
+  `12a1241728effdc29ab5bfe01748b8bf6aa10f1aad5720283c033d14696ae80f`；已安装 native
+  extension 为
+  `77c7575d03054e965e91827805a8f0bd64bf39a2e05cd0f169432f607c3c4c1f`，host scheduler
+  仍为
+  `0aa1e822f98f55a1e8440199e6fa234b8c38ac4b55527b54e6673a10755c9b31`。互斥 mode waves
+  的 non-host full-native 回归为 `124 passed, 211 deselected`，host UDS/shared-memory
+  回归为 `43 passed, 292 deselected`；架构和一调用语义回归 `51 passed`，receipt、
+  ownership 与故障注入聚焦回归 `21 passed`。Ruff、strict mypy 和 `git diff --check`
+  通过，独立代码审查未发现新的 C++ 正确性、UB、哈希歧义或 copy/move 生命周期问题。
+- 本条不创建 attempt04、不启动 Paired/Pilot/Formal/CUDA、不切换默认架构，也不改写或
+  复用 attempt01--03。下一步必须把 candidate-round 唯一 ownership 和原子提交迁入
+  C++，再依次迁移三 lane、Stage 4、terminal envelope 与整次调用 GIL release；只有三种
+  新架构各自通过 12/12 fixed-work 全字段语义门控，才允许开始五模式重测。

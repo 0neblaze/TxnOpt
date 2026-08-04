@@ -26,6 +26,7 @@ from evrptw.experiments.stage052_native_architectures import (
     expected_axis_count,
     run_labels_for_scope,
 )
+from evrptw.models import NodeType
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.stage052_replay import (
@@ -34,7 +35,7 @@ from evrptw.stage052_replay import (
 )
 from evrptw.validation import validate_routes
 
-REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v7"
+REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v8"
 LEGACY_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v3"
 HISTORICAL_PILOT_ROOT = Path(
     "/mnt/e/Reproducible-EVRPTW-archive/stage05.2/runs/"
@@ -310,7 +311,19 @@ def _replay_record(record: ReviewRecord, benchmark_dir: Path) -> dict[str, objec
         ArchitectureMode.FULL_NATIVE_ALNS,
         ArchitectureMode.HOST_SCHEDULER,
     }:
-        receipt_error = _replay_initial_state_receipt(payload, record.mode)
+        kind_codes = {
+            NodeType.DEPOT: 0,
+            NodeType.CUSTOMER: 1,
+            NodeType.STATION: 2,
+        }
+        receipt_error = _replay_initial_state_receipt(
+            payload,
+            record.mode,
+            expected_node_kind=tuple(
+                kind_codes[node.kind] for node in instance.nodes
+            ),
+            expected_exact_batch_size=128,
+        )
         if receipt_error is not None:
             return {"valid": False, "reason": receipt_error}
     if comparison_schema == SCHEMA_VERSION:
@@ -405,6 +418,9 @@ def _replay_record(record: ReviewRecord, benchmark_dir: Path) -> dict[str, objec
 def _replay_initial_state_receipt(
     payload: Mapping[str, object],
     mode: ArchitectureMode,
+    *,
+    expected_node_kind: Sequence[int],
+    expected_exact_batch_size: int,
 ) -> str | None:
     """Independently replay the persisted request-to-initial-state binding."""
 
@@ -414,11 +430,12 @@ def _replay_initial_state_receipt(
     receipt = native.get("initial_state_receipt")
     if not isinstance(receipt, dict):
         return "initial-state ownership receipt is missing"
-    if receipt.get("schema_version") != "stage05.2-native-initial-state-receipt-v2":
+    if receipt.get("schema_version") != "stage05.2-native-initial-state-receipt-v3":
         return "initial-state ownership receipt schema is invalid"
     host_owned = receipt.get("host_owned")
     operation_count = receipt.get("operation_count")
     telemetry_count = native.get("initial_state_request_count")
+    seed = payload.get("seed")
     expected_host_owned = mode is ArchitectureMode.HOST_SCHEDULER
     if (
         not isinstance(host_owned, bool)
@@ -431,9 +448,20 @@ def _replay_initial_state_receipt(
         or telemetry_count != operation_count
     ):
         return "initial-state ownership receipt does not reconcile"
+    if (
+        isinstance(seed, bool)
+        or not isinstance(seed, int)
+        or not -(1 << 63) <= seed <= (1 << 63) - 1
+    ):
+        return "initial-state ownership receipt seed is invalid"
     hashes = tuple(
         receipt.get(field)
-        for field in ("request_sha256", "state_sha256", "transaction_sha256")
+        for field in (
+            "request_sha256",
+            "state_sha256",
+            "initial_four_lane_state_sha256",
+            "transaction_sha256",
+        )
     )
     if any(
         not isinstance(value, str)
@@ -442,13 +470,296 @@ def _replay_initial_state_receipt(
         for value in hashes
     ):
         return "initial-state ownership receipt hash is invalid"
-    request_sha256, state_sha256, transaction_sha256 = hashes
-    evidence = bytearray(b"stage05.2-native-initial-state-receipt-v2")
+    (
+        request_sha256,
+        state_sha256,
+        initial_four_lane_state_sha256,
+        transaction_sha256,
+    ) = hashes
+    evidence = bytearray(b"stage05.2-native-initial-state-receipt-v3")
     evidence.extend(struct.pack("<qq", int(host_owned), operation_count))
     evidence.extend(str(request_sha256).encode("ascii"))
     evidence.extend(str(state_sha256).encode("ascii"))
+    evidence.extend(str(initial_four_lane_state_sha256).encode("ascii"))
     if hashlib.sha256(evidence).hexdigest() != transaction_sha256:
         return "initial-state ownership receipt hash mismatch"
+    return _replay_initial_four_lane_projection(
+        receipt,
+        request_sha256=str(request_sha256),
+        initial_state_sha256=str(state_sha256),
+        expected_sha256=str(initial_four_lane_state_sha256),
+        expected_seed=seed,
+        expected_node_kind=expected_node_kind,
+        expected_exact_batch_size=expected_exact_batch_size,
+    )
+
+
+def _replay_initial_four_lane_projection(
+    receipt: Mapping[str, object],
+    *,
+    request_sha256: str,
+    initial_state_sha256: str,
+    expected_sha256: str,
+    expected_seed: int,
+    expected_node_kind: Sequence[int],
+    expected_exact_batch_size: int,
+) -> str | None:
+    """Rebuild the producer-independent initial four-lane state hash."""
+
+    projection = receipt.get("initial_four_lane_projection")
+    if not isinstance(projection, dict):
+        return "initial four-lane projection is missing"
+    if projection.get("schema_version") != "stage05.2-native-initial-four-lane-projection-v1":
+        return "initial four-lane projection schema is invalid"
+    int64_min = -(1 << 63)
+    int64_max = (1 << 63) - 1
+
+    def is_int64(value: object) -> bool:
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and int64_min <= value <= int64_max
+        )
+
+    def integers(field: str) -> list[int]:
+        values = projection.get(field)
+        if not isinstance(values, list) or any(not is_int64(value) for value in values):
+            raise ValueError(f"initial four-lane {field} is invalid")
+        return [int(value) for value in values]
+
+    def floats(field: str) -> list[float]:
+        values = projection.get(field)
+        if not isinstance(values, list) or any(
+            isinstance(value, bool) or not isinstance(value, int | float)
+            for value in values
+        ):
+            raise ValueError(f"initial four-lane {field} is invalid")
+        try:
+            output = [float(value) for value in values]
+        except (OverflowError, TypeError, ValueError) as error:
+            raise ValueError(f"initial four-lane {field} is invalid") from error
+        if len(output) != len(values) or any(not math.isfinite(value) for value in output):
+            raise ValueError(f"initial four-lane {field} is invalid")
+        return output
+
+    def integer_matrix(field: str, width: int) -> list[int]:
+        rows = projection.get(field)
+        if not isinstance(rows, list) or any(
+            not isinstance(row, list) or len(row) != width for row in rows
+        ):
+            raise ValueError(f"initial four-lane {field} matrix is invalid")
+        flattened = [value for row in rows for value in row]
+        if any(not is_int64(value) for value in flattened):
+            raise ValueError(f"initial four-lane {field} matrix is invalid")
+        return [int(value) for value in flattened]
+
+    def float_matrix(field: str, width: int) -> list[float]:
+        rows = projection.get(field)
+        if not isinstance(rows, list) or any(
+            not isinstance(row, list) or len(row) != width for row in rows
+        ):
+            raise ValueError(f"initial four-lane {field} matrix is invalid")
+        flattened = [value for row in rows for value in row]
+        if any(
+            isinstance(value, bool) or not isinstance(value, int | float)
+            for value in flattened
+        ):
+            raise ValueError(f"initial four-lane {field} matrix is invalid")
+        try:
+            output = [float(value) for value in flattened]
+        except (OverflowError, TypeError, ValueError) as error:
+            raise ValueError(f"initial four-lane {field} matrix is invalid") from error
+        if len(output) != len(flattened) or any(not math.isfinite(value) for value in output):
+            raise ValueError(f"initial four-lane {field} matrix is invalid")
+        return output
+
+    try:
+        route_offsets = integers("route_offsets")
+        route_indices = integers("route_indices")
+        path_offsets = integers("path_offsets")
+        path_indices = integers("path_indices")
+        statuses = integers("statuses")
+        reasons = integers("reasons")
+        metrics = float_matrix("metrics", 4)
+        labels = integer_matrix("label_counters", 3)
+        batch_counters = integers("batch_counters")
+        objective_integer = integers("objective_integer")
+        objective_float = floats("objective_float")
+        accounting = integers("accounting")
+        rng_seeds = integers("rng_seeds")
+        node_kind = integers("node_kind")
+    except ValueError as error:
+        return str(error)
+    next_iteration = projection.get("next_iteration")
+    lane_count = projection.get("lane_count")
+    exact_batch_size = projection.get("exact_batch_size")
+    if (
+        not is_int64(next_iteration)
+        or not is_int64(lane_count)
+        or not is_int64(exact_batch_size)
+    ):
+        return "initial four-lane scalar projection is invalid"
+    assert isinstance(next_iteration, int)
+    assert isinstance(lane_count, int)
+    assert isinstance(exact_batch_size, int)
+    next_iteration_value = int(next_iteration)
+    lane_count_value = int(lane_count)
+    exact_batch_size_value = int(exact_batch_size)
+    if (
+        len(route_offsets) < 2
+        or route_offsets[0] != 0
+        or route_offsets[-1] != len(route_indices)
+        or any(left >= right for left, right in zip(route_offsets, route_offsets[1:], strict=False))
+        or any(value < 0 for value in route_indices)
+    ):
+        return "initial four-lane route projection is invalid"
+    route_count = len(route_offsets) - 1
+    if (
+        len(path_offsets) != route_count + 1
+        or path_offsets[0] != 0
+        or path_offsets[-1] != len(path_indices)
+        or any(left >= right for left, right in zip(path_offsets, path_offsets[1:], strict=False))
+        or any(value < 0 for value in path_indices)
+        or len(statuses) != route_count
+        or len(reasons) != route_count
+        or statuses != [0] * route_count
+        or reasons != [0] * route_count
+        or len(metrics) != route_count * 4
+        or any(value < 0.0 for value in metrics)
+        or len(labels) != route_count * 3
+        or any(value < 0 for value in labels)
+        or len(batch_counters) != 10
+        or len(objective_integer) != 2
+        or objective_integer[0] != route_count
+        or any(value < 0 for value in objective_integer)
+        or len(objective_float) != 2
+        or any(value < 0.0 for value in objective_float)
+        or accounting != [route_count, route_count, 0, 0]
+        or rng_seeds != [expected_seed, expected_seed ^ 0x5EED23]
+        or next_iteration_value != 0
+        or lane_count_value != 4
+        or not node_kind
+        or any(kind not in {0, 1, 2} for kind in node_kind)
+        or node_kind.count(0) != 1
+        or exact_batch_size_value <= 0
+        or node_kind != list(expected_node_kind)
+        or exact_batch_size_value != expected_exact_batch_size
+        or any(
+            node >= len(node_kind) or node_kind[node] != 1
+            for node in route_indices
+        )
+        or sorted(route_indices)
+        != [index for index, kind in enumerate(node_kind) if kind == 1]
+        or projection.get("state_sha256") != expected_sha256
+    ):
+        return "initial four-lane projection values do not reconcile"
+    depot = node_kind.index(0)
+    charging_count = 0
+    for route in range(route_count):
+        path_first = path_offsets[route]
+        path_last = path_offsets[route + 1]
+        expected_customers = route_indices[
+            route_offsets[route] : route_offsets[route + 1]
+        ]
+        observed_customers: list[int] = []
+        if (
+            path_first < 0
+            or path_first >= path_last
+            or path_last > len(path_indices)
+            or path_indices[path_first] != depot
+            or path_indices[path_last - 1] != depot
+        ):
+            return "initial four-lane path projection is invalid"
+        for position in range(path_first, path_last):
+            node = path_indices[position]
+            if node < 0 or node >= len(node_kind):
+                return "initial four-lane path node is invalid"
+            kind = node_kind[node]
+            charging_count += int(kind == 2)
+            if kind == 1:
+                observed_customers.append(node)
+            elif node == depot and position not in {path_first, path_last - 1}:
+                return "initial four-lane path contains an interior depot"
+        if observed_customers != expected_customers:
+            return "initial four-lane customer path is invalid"
+    total_distance = 0.0
+    total_charging_time = 0.0
+    for route in range(route_count):
+        total_distance += metrics[route * 4]
+        total_charging_time += metrics[route * 4 + 3]
+    if (
+        batch_counters[0:3] != [route_count] * 3
+        or batch_counters[3] != 0
+        or batch_counters[4] != 1
+        or any(value < 0 for value in batch_counters[5:8])
+        or batch_counters[8] != 1
+        or batch_counters[9] != exact_batch_size_value
+        or objective_integer != [route_count, charging_count]
+        or objective_float != [total_distance, total_charging_time]
+    ):
+        return "initial four-lane exact/objective projection is invalid"
+
+    def packed_integer(values: Sequence[int]) -> bytes:
+        return struct.pack(f"<{len(values)}q", *values)
+
+    def packed_float(values: Sequence[float]) -> bytes:
+        return struct.pack(f"<{len(values)}d", *values)
+
+    initial_state_evidence = bytearray(
+        b"stage05.2-native-initial-search-state-v2"
+    )
+    initial_state_evidence.extend(request_sha256.encode("ascii"))
+    initial_arrays: tuple[tuple[Sequence[int] | Sequence[float], bytes], ...] = (
+        (path_offsets, packed_integer(path_offsets)),
+        (path_indices, packed_integer(path_indices)),
+        (statuses, packed_integer(statuses)),
+        (reasons, packed_integer(reasons)),
+        (metrics, packed_float(metrics)),
+        (labels, packed_integer(labels)),
+        (batch_counters, packed_integer(batch_counters)),
+        (objective_integer, packed_integer(objective_integer)),
+        (objective_float, packed_float(objective_float)),
+        (accounting, packed_integer(accounting)),
+    )
+    for values, raw in initial_arrays:
+        initial_state_evidence.extend(struct.pack("<Q", len(values)))
+        initial_state_evidence.extend(raw)
+    if hashlib.sha256(initial_state_evidence).hexdigest() != initial_state_sha256:
+        return "initial-state projection hash mismatch"
+
+    lane_evidence = bytearray(b"stage05.2-native-lane-state-v2")
+    arrays: tuple[tuple[Sequence[int] | Sequence[float], bytes], ...] = (
+        (route_offsets, packed_integer(route_offsets)),
+        (route_indices, packed_integer(route_indices)),
+        (path_offsets, packed_integer(path_offsets)),
+        (path_indices, packed_integer(path_indices)),
+        (statuses, packed_integer(statuses)),
+        (reasons, packed_integer(reasons)),
+        (metrics, packed_float(metrics)),
+        (labels, packed_integer(labels)),
+        (batch_counters, packed_integer(batch_counters)),
+        (objective_integer, packed_integer(objective_integer)),
+        (objective_float, packed_float(objective_float)),
+    )
+    for values, raw in arrays:
+        lane_evidence.extend(struct.pack("<Q", len(values)))
+        lane_evidence.extend(raw)
+    lane_sha256 = hashlib.sha256(lane_evidence).hexdigest()
+    if projection.get("lane_sha256") != lane_sha256:
+        return "initial four-lane lane hash mismatch"
+    state_evidence = bytearray(b"stage05.2-native-initial-four-lane-state-v2")
+    state_evidence.extend(request_sha256.encode("ascii"))
+    state_evidence.extend(initial_state_sha256.encode("ascii"))
+    state_evidence.extend(lane_sha256.encode("ascii") * 4)
+    for values in (accounting, rng_seeds):
+        state_evidence.extend(struct.pack("<Q", len(values)))
+        state_evidence.extend(packed_integer(values))
+    state_evidence.extend(struct.pack("<q", 0))
+    state_evidence.extend(struct.pack("<Q", len(node_kind)))
+    state_evidence.extend(packed_integer(node_kind))
+    state_evidence.extend(struct.pack("<q", exact_batch_size_value))
+    if hashlib.sha256(state_evidence).hexdigest() != expected_sha256:
+        return "initial four-lane state hash mismatch"
     return None
 
 

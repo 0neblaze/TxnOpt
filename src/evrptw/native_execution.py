@@ -276,7 +276,9 @@ class NativeInitialStateReceipt:
     operation_count: int
     request_sha256: str
     state_sha256: str
+    initial_four_lane_state_sha256: str
     transaction_sha256: str
+    initial_four_lane_projection: Mapping[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -13297,12 +13299,296 @@ def _decode_full_native_causal_journal(payload: object) -> NativeCausalJournal:
     )
 
 
+def _decode_initial_four_lane_projection(
+    payload: object,
+    *,
+    request_sha256: str,
+    initial_state_sha256: str,
+    expected_sha256: str,
+    expected_seed: int,
+    expected_node_kind: npt.NDArray[np.int64],
+    expected_exact_batch_size: int,
+) -> Mapping[str, object]:
+    """Replay the pure C++ initial four-lane state from typed evidence."""
+
+    if not isinstance(payload, tuple) or len(payload) != 17:
+        raise RuntimeError("native initial four-lane projection has an invalid tuple")
+    route_offsets = _require_vector(payload[0], "initial lane route offsets")
+    route_indices = _require_vector(payload[1], "initial lane route indices")
+    if (
+        len(route_offsets) < 2
+        or int(route_offsets[0]) != 0
+        or int(route_offsets[-1]) != len(route_indices)
+        or np.any(route_offsets[:-1] >= route_offsets[1:])
+        or np.any(route_indices < 0)
+    ):
+        raise RuntimeError("native initial lane routes are invalid")
+    route_count = len(route_offsets) - 1
+    path_offsets = _require_vector(payload[2], "initial lane path offsets")
+    path_indices = _require_vector(payload[3], "initial lane path indices")
+    statuses = _require_vector(payload[4], "initial lane statuses")
+    reasons = _require_vector(payload[5], "initial lane reasons")
+    metrics = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            payload[6],
+            dtype=np.dtype(np.float64),
+            shape=(route_count, 4),
+            name="initial lane metrics",
+        ),
+    )
+    labels = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[7],
+            dtype=np.dtype(np.int64),
+            shape=(route_count, 3),
+            name="initial lane label counters",
+        ),
+    )
+    batch_counters = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[8],
+            dtype=np.dtype(np.int64),
+            shape=(10,),
+            name="initial lane batch counters",
+        ),
+    )
+    objective_integer = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[9],
+            dtype=np.dtype(np.int64),
+            shape=(2,),
+            name="initial lane objective integer",
+        ),
+    )
+    objective_float = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            payload[10],
+            dtype=np.dtype(np.float64),
+            shape=(2,),
+            name="initial lane objective float",
+        ),
+    )
+    accounting = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[11],
+            dtype=np.dtype(np.int64),
+            shape=(4,),
+            name="initial four-lane accounting",
+        ),
+    )
+    rng_seeds = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[12],
+            dtype=np.dtype(np.int64),
+            shape=(2,),
+            name="initial four-lane RNG seeds",
+        ),
+    )
+    next_iteration = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[13],
+            dtype=np.dtype(np.int64),
+            shape=(1,),
+            name="initial four-lane iteration",
+        ),
+    )
+    lane_count = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[14],
+            dtype=np.dtype(np.int64),
+            shape=(1,),
+            name="initial four-lane count",
+        ),
+    )
+    node_kind = _require_vector(payload[15], "initial four-lane node kinds")
+    exact_batch_size = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[16],
+            dtype=np.dtype(np.int64),
+            shape=(1,),
+            name="initial four-lane exact batch size",
+        ),
+    )
+    node_kinds = [int(value) for value in node_kind]
+    depots = [index for index, kind in enumerate(node_kinds) if kind == 0]
+    if (
+        len(path_offsets) != route_count + 1
+        or int(path_offsets[0]) != 0
+        or int(path_offsets[-1]) != len(path_indices)
+        or np.any(path_offsets[:-1] >= path_offsets[1:])
+        or len(statuses) != route_count
+        or len(reasons) != route_count
+        or np.any(statuses != 0)
+        or np.any(reasons != 0)
+        or np.any(labels < 0)
+        or np.any(~np.isfinite(metrics))
+        or np.any(metrics < 0.0)
+        or np.any(~np.isfinite(objective_float))
+        or np.any(objective_float < 0.0)
+        or objective_integer[0] != route_count
+        or np.any(objective_integer < 0)
+        or accounting.tolist() != [route_count, route_count, 0, 0]
+        or int(next_iteration[0]) != 0
+        or int(lane_count[0]) != 4
+        or len(node_kinds) == 0
+        or any(kind not in {0, 1, 2} for kind in node_kinds)
+        or len(depots) != 1
+        or int(exact_batch_size[0]) <= 0
+        or [int(value) for value in node_kind]
+        != [int(value) for value in expected_node_kind]
+        or int(exact_batch_size[0]) != expected_exact_batch_size
+        or rng_seeds.tolist()
+        != [expected_seed, expected_seed ^ 0x5EED23]
+        or any(
+            int(node) >= len(node_kinds) or node_kinds[int(node)] != 1
+            for node in route_indices
+        )
+        or sorted(int(node) for node in route_indices)
+        != [index for index, kind in enumerate(node_kinds) if kind == 1]
+    ):
+        raise RuntimeError("native initial four-lane projection values are invalid")
+    depot = depots[0]
+    charging_count = 0
+    for route in range(route_count):
+        path_first = int(path_offsets[route])
+        path_last = int(path_offsets[route + 1])
+        expected = [
+            int(value)
+            for value in route_indices[
+                int(route_offsets[route]) : int(route_offsets[route + 1])
+            ]
+        ]
+        observed: list[int] = []
+        if (
+            path_first < 0
+            or path_first >= path_last
+            or path_last > len(path_indices)
+            or int(path_indices[path_first]) != depot
+            or int(path_indices[path_last - 1]) != depot
+        ):
+            raise RuntimeError("native initial four-lane path projection is invalid")
+        for position in range(path_first, path_last):
+            node = int(path_indices[position])
+            if node < 0 or node >= len(node_kinds):
+                raise RuntimeError("native initial four-lane path node is invalid")
+            kind = node_kinds[node]
+            charging_count += int(kind == 2)
+            if kind == 1:
+                observed.append(node)
+            elif node == depot and position not in {path_first, path_last - 1}:
+                raise RuntimeError("native initial four-lane path has an interior depot")
+        if observed != expected:
+            raise RuntimeError("native initial four-lane customer path is invalid")
+    batch_values = [int(value) for value in batch_counters]
+    expected_batch_size = int(exact_batch_size[0])
+    if (
+        batch_values[0:3] != [route_count] * 3
+        or batch_values[3] != 0
+        or batch_values[4] != 1
+        or any(value < 0 for value in batch_values[5:8])
+        or batch_values[8] != 1
+        or batch_values[9] != expected_batch_size
+        or objective_integer.tolist() != [route_count, charging_count]
+        or objective_float.tolist()
+        != [float(sum(metrics[:, 0])), float(sum(metrics[:, 3]))]
+    ):
+        raise RuntimeError(
+            "native initial four-lane exact/objective projection is invalid"
+        )
+    initial_state_evidence = bytearray(
+        b"stage05.2-native-initial-search-state-v2"
+    )
+    initial_state_evidence.extend(request_sha256.encode("ascii"))
+    for values in (
+        path_offsets,
+        path_indices,
+        statuses,
+        reasons,
+        metrics,
+        labels,
+        batch_counters,
+        objective_integer,
+        objective_float,
+        accounting,
+    ):
+        initial_state_evidence.extend(struct.pack("<Q", values.size))
+        initial_state_evidence.extend(values.tobytes(order="C"))
+    if hashlib.sha256(initial_state_evidence).hexdigest() != initial_state_sha256:
+        raise RuntimeError("native initial-state projection SHA-256 mismatch")
+    lane_evidence = bytearray(b"stage05.2-native-lane-state-v2")
+    for values in (
+        route_offsets,
+        route_indices,
+        path_offsets,
+        path_indices,
+        statuses,
+        reasons,
+        metrics,
+        labels,
+        batch_counters,
+        objective_integer,
+        objective_float,
+    ):
+        lane_evidence.extend(struct.pack("<Q", values.size))
+        lane_evidence.extend(values.tobytes(order="C"))
+    lane_sha256 = hashlib.sha256(lane_evidence).hexdigest()
+    state_evidence = bytearray(b"stage05.2-native-initial-four-lane-state-v2")
+    state_evidence.extend(request_sha256.encode("ascii"))
+    state_evidence.extend(initial_state_sha256.encode("ascii"))
+    state_evidence.extend(lane_sha256.encode("ascii") * 4)
+    for values in (accounting, rng_seeds):
+        state_evidence.extend(struct.pack("<Q", values.size))
+        state_evidence.extend(values.tobytes(order="C"))
+    state_evidence.extend(next_iteration.tobytes(order="C"))
+    state_evidence.extend(struct.pack("<Q", node_kind.size))
+    state_evidence.extend(node_kind.tobytes(order="C"))
+    state_evidence.extend(exact_batch_size.tobytes(order="C"))
+    if hashlib.sha256(state_evidence).hexdigest() != expected_sha256:
+        raise RuntimeError("native initial four-lane state SHA-256 mismatch")
+    return {
+        "schema_version": "stage05.2-native-initial-four-lane-projection-v1",
+        "route_offsets": route_offsets.tolist(),
+        "route_indices": route_indices.tolist(),
+        "path_offsets": path_offsets.tolist(),
+        "path_indices": path_indices.tolist(),
+        "statuses": statuses.tolist(),
+        "reasons": reasons.tolist(),
+        "metrics": metrics.tolist(),
+        "label_counters": labels.tolist(),
+        "batch_counters": batch_counters.tolist(),
+        "objective_integer": objective_integer.tolist(),
+        "objective_float": objective_float.tolist(),
+        "accounting": accounting.tolist(),
+        "rng_seeds": rng_seeds.tolist(),
+        "next_iteration": int(next_iteration[0]),
+        "lane_count": int(lane_count[0]),
+        "node_kind": node_kind.tolist(),
+        "exact_batch_size": int(exact_batch_size[0]),
+        "lane_sha256": lane_sha256,
+        "state_sha256": expected_sha256,
+    }
+
+
 def _decode_native_initial_state_receipt(
     payload: object,
+    *,
+    expected_seed: int,
+    expected_node_kind: npt.NDArray[np.int64],
+    expected_exact_batch_size: int,
 ) -> NativeInitialStateReceipt:
     """Validate the causal ownership receipt for native initial-state work."""
 
-    if not isinstance(payload, tuple) or len(payload) != 4:
+    if not isinstance(payload, tuple) or len(payload) != 6:
         raise RuntimeError("full native initial-state receipt has an invalid tuple")
     flags = _require_array(
         payload[0],
@@ -13314,24 +13600,46 @@ def _decode_native_initial_state_receipt(
     operation_count = int(flags[1])
     if host_owned not in (0, 1) or operation_count != host_owned:
         raise RuntimeError("full native initial-state receipt ownership is invalid")
-    request_sha256, state_sha256, transaction_sha256 = payload[1:]
+    (
+        request_sha256,
+        state_sha256,
+        initial_four_lane_state_sha256,
+        transaction_sha256,
+    ) = payload[1:5]
     if not all(
         isinstance(value, str) and _is_sha256(value)
-        for value in (request_sha256, state_sha256, transaction_sha256)
+        for value in (
+            request_sha256,
+            state_sha256,
+            initial_four_lane_state_sha256,
+            transaction_sha256,
+        )
     ):
         raise RuntimeError("full native initial-state receipt SHA-256 is invalid")
-    evidence = bytearray(b"stage05.2-native-initial-state-receipt-v2")
+    evidence = bytearray(b"stage05.2-native-initial-state-receipt-v3")
     evidence.extend(flags.tobytes(order="C"))
     evidence.extend(request_sha256.encode("ascii"))
     evidence.extend(state_sha256.encode("ascii"))
+    evidence.extend(initial_four_lane_state_sha256.encode("ascii"))
     if hashlib.sha256(evidence).hexdigest() != transaction_sha256:
         raise RuntimeError("full native initial-state receipt SHA-256 mismatch")
+    projection = _decode_initial_four_lane_projection(
+        payload[5],
+        request_sha256=request_sha256,
+        initial_state_sha256=state_sha256,
+        expected_sha256=initial_four_lane_state_sha256,
+        expected_seed=expected_seed,
+        expected_node_kind=expected_node_kind,
+        expected_exact_batch_size=expected_exact_batch_size,
+    )
     return NativeInitialStateReceipt(
         host_owned=bool(host_owned),
         operation_count=operation_count,
         request_sha256=request_sha256,
         state_sha256=state_sha256,
+        initial_four_lane_state_sha256=initial_four_lane_state_sha256,
         transaction_sha256=transaction_sha256,
+        initial_four_lane_projection=projection,
     )
 
 
@@ -13518,7 +13826,12 @@ def execute_full_native_alns(
     telemetry_values = timings_array[4:13]
     if any(float(value) != int(value) for value in telemetry_values):
         raise RuntimeError("full native ALNS concurrency telemetry is not integral")
-    initial_state_receipt = _decode_native_initial_state_receipt(payload[12])
+    initial_state_receipt = _decode_native_initial_state_receipt(
+        payload[12],
+        expected_seed=seed,
+        expected_node_kind=context.node_kind,
+        expected_exact_batch_size=batch_size,
+    )
     if (
         int(timings_array[12]) != initial_state_receipt.operation_count
         or bool(int(timings_array[7])) != initial_state_receipt.host_owned
@@ -13644,7 +13957,7 @@ def execute_full_native_alns(
         exact_journal_sha256=exact_journal_sha256,
         control_journal_sha256=control_journal_sha256,
         causal_journal_sha256=causal_journal.transaction_sha256,
-        initial_state_receipt=payload[12],
+        initial_state_receipt=initial_state_receipt,
     )
     if transaction_sha256 != expected_sha256:
         raise RuntimeError("full native ALNS transaction SHA-256 mismatch")
@@ -14253,7 +14566,7 @@ def _full_native_digest(
     exact_journal_sha256: str,
     control_journal_sha256: str,
     causal_journal_sha256: str,
-    initial_state_receipt: object,
+    initial_state_receipt: NativeInitialStateReceipt,
 ) -> str:
     evidence = bytearray(b"stage05.2-full-native-alns-v2")
     evidence.extend(route_offsets.tobytes(order="C"))
@@ -14284,12 +14597,17 @@ def _full_native_digest(
     if not _is_sha256(causal_journal_sha256):
         raise RuntimeError("full native ALNS causal journal SHA-256 is invalid")
     evidence.extend(causal_journal_sha256.encode("ascii"))
-    receipt = _decode_native_initial_state_receipt(initial_state_receipt)
-    flags = cast(tuple[object, ...], initial_state_receipt)[0]
-    evidence.extend(cast(npt.NDArray[np.int64], flags).tobytes(order="C"))
-    evidence.extend(receipt.request_sha256.encode("ascii"))
-    evidence.extend(receipt.state_sha256.encode("ascii"))
-    evidence.extend(receipt.transaction_sha256.encode("ascii"))
+    flags = np.ascontiguousarray(
+        [int(initial_state_receipt.host_owned), initial_state_receipt.operation_count],
+        dtype=np.int64,
+    )
+    evidence.extend(flags.tobytes(order="C"))
+    evidence.extend(initial_state_receipt.request_sha256.encode("ascii"))
+    evidence.extend(initial_state_receipt.state_sha256.encode("ascii"))
+    evidence.extend(
+        initial_state_receipt.initial_four_lane_state_sha256.encode("ascii")
+    )
+    evidence.extend(initial_state_receipt.transaction_sha256.encode("ascii"))
     return hashlib.sha256(evidence).hexdigest()
 
 

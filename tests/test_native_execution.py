@@ -64,6 +64,7 @@ from evrptw.native_execution import (
     Stage052NativeExecutionConfig,
     _append_typed_array,
     _decode_full_native_causal_journal,
+    _decode_native_initial_state_receipt,
     _full_native_digest,
     _native_distance_improved,
     decode_native_constraint_semantic_stream,
@@ -7029,10 +7030,13 @@ def test_full_native_v2_one_call_matches_python_first_iteration(
     assert isinstance(initial_state_receipt, dict)
     assert initial_state_receipt["host_owned"] is False
     assert initial_state_receipt["operation_count"] == 0
-    receipt_evidence = bytearray(b"stage05.2-native-initial-state-receipt-v2")
+    receipt_evidence = bytearray(b"stage05.2-native-initial-state-receipt-v3")
     receipt_evidence.extend(struct.pack("<qq", 0, 0))
     receipt_evidence.extend(initial_state_receipt["request_sha256"].encode("ascii"))
     receipt_evidence.extend(initial_state_receipt["state_sha256"].encode("ascii"))
+    receipt_evidence.extend(
+        initial_state_receipt["initial_four_lane_state_sha256"].encode("ascii")
+    )
     assert hashlib.sha256(receipt_evidence).hexdigest() == initial_state_receipt[
         "transaction_sha256"
     ]
@@ -7147,8 +7151,72 @@ def test_full_native_v2_owns_and_hashes_the_complete_request(
         )
         assert changed_state[4] == changed_receipt[1]
         assert changed_state[5] != state_sha256
+        lane_evidence = bytearray(b"stage05.2-native-lane-state-v2")
+        for values in (
+            args[11],
+            args[12],
+            *exact,
+            objective_integer,
+            objective_float,
+        ):
+            assert isinstance(values, np.ndarray)
+            lane_evidence.extend(struct.pack("<Q", values.size))
+            lane_evidence.extend(values.tobytes(order="C"))
+        lane_sha256 = hashlib.sha256(lane_evidence).hexdigest()
+        search_evidence = bytearray(b"stage05.2-native-initial-four-lane-state-v2")
+        search_evidence.extend(request_sha256.encode("ascii"))
+        search_evidence.extend(state_sha256.encode("ascii"))
+        search_evidence.extend(lane_sha256.encode("ascii") * 4)
+        search_evidence.extend(struct.pack("<Q", accounting.size))
+        search_evidence.extend(accounting.tobytes(order="C"))
+        control = np.asarray(args[13], dtype=np.int64)
+        rng_seeds = np.asarray([int(control[0]), int(control[0]) ^ 0x5EED23], dtype=np.int64)
+        search_evidence.extend(struct.pack("<Q", rng_seeds.size))
+        search_evidence.extend(rng_seeds.tobytes(order="C"))
+        search_evidence.extend(struct.pack("<q", 0))
+        node_kind = np.asarray(args[0], dtype=np.int64)
+        search_evidence.extend(struct.pack("<Q", node_kind.size))
+        search_evidence.extend(node_kind.tobytes(order="C"))
+        exact_batch_size = np.asarray([int(control[2])], dtype=np.int64)
+        search_evidence.extend(exact_batch_size.tobytes(order="C"))
+        initial_four_lane_state_sha256 = hashlib.sha256(search_evidence).hexdigest()
         receipts.append((counts, request_sha256))
-        return original(*args)
+        full_payload = original(*args)
+        initial_receipt = full_payload[12]
+        assert isinstance(initial_receipt, tuple) and len(initial_receipt) == 6
+        flags = initial_receipt[0]
+        assert isinstance(flags, np.ndarray)
+        assert initial_receipt[1:4] == (
+            request_sha256,
+            state_sha256,
+            initial_four_lane_state_sha256,
+        )
+        receipt_evidence = bytearray(b"stage05.2-native-initial-state-receipt-v3")
+        receipt_evidence.extend(flags.tobytes(order="C"))
+        for value in initial_receipt[1:4]:
+            receipt_evidence.extend(value.encode("ascii"))
+        assert hashlib.sha256(receipt_evidence).hexdigest() == initial_receipt[4]
+        projection = initial_receipt[5]
+        assert isinstance(projection, tuple) and len(projection) == 17
+        for actual, expected in zip(
+            projection[:11],
+            (
+                args[11],
+                args[12],
+                *exact,
+                objective_integer,
+                objective_float,
+            ),
+            strict=True,
+        ):
+            np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(projection[11], accounting)
+        np.testing.assert_array_equal(projection[12], rng_seeds)
+        np.testing.assert_array_equal(projection[13], np.asarray([0], dtype=np.int64))
+        np.testing.assert_array_equal(projection[14], np.asarray([4], dtype=np.int64))
+        np.testing.assert_array_equal(projection[15], node_kind)
+        np.testing.assert_array_equal(projection[16], exact_batch_size)
+        return full_payload
 
     monkeypatch.setattr(native_core, "full_native_alns_v2", inspect_request)
     solve_alns(
@@ -7162,6 +7230,31 @@ def test_full_native_v2_owns_and_hashes_the_complete_request(
 
     assert len(receipts) == 1
     assert receipts[0][0].tolist() == [3, 1, 2, 6, 9, 1, 1, 4]
+
+
+@pytest.mark.parametrize(
+    ("fault_code", "message"),
+    [
+        (1, "unexpected number of dimensions"),
+        (2, "requested numeric dtype"),
+    ],
+)
+def test_full_native_initial_search_state_mirror_rejects_schema_drift(
+    fault_code: int,
+    message: str,
+) -> None:
+    from evrptw import _core as native_core
+
+    native_core._test_full_native_initial_mirror_fault_v2(fault_code)
+    with pytest.raises(ValueError, match=message):
+        solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            **_full_native_solve_kwargs(),
+            native_execution_config=_native_config("full_native_alns"),
+        )
 
 
 def test_full_native_v2_complete_request_crosses_host_binary_protocol(
@@ -7753,6 +7846,15 @@ def test_full_native_v2_replay_rejects_current_state_as_global_best(
         primary[0] = alternate[0]
         primary[1] = alternate[1]
         primary[2] = alternate[2]
+        control = np.asarray(args[13], dtype=np.int64)
+        initial_state_receipt = _decode_native_initial_state_receipt(
+            primary[12],
+            expected_seed=int(control[0]),
+            expected_node_kind=np.ascontiguousarray(
+                np.asarray(args[0], dtype=np.int64)
+            ),
+            expected_exact_batch_size=int(control[2]),
+        )
         primary[6] = _full_native_digest(
             route_offsets=primary[0],
             route_indices=primary[1],
@@ -7764,7 +7866,7 @@ def test_full_native_v2_replay_rejects_current_state_as_global_best(
             exact_journal_sha256=primary[9][1],
             control_journal_sha256=primary[10][2],
             causal_journal_sha256=primary[11][11],
-            initial_state_receipt=primary[12],
+            initial_state_receipt=initial_state_receipt,
         )
         return tuple(primary)
 

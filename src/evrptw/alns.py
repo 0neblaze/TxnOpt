@@ -5965,7 +5965,7 @@ def _solve_full_native_alns(
                 native_result.timings["initial_state_request_count"]
             ),
             "initial_state_receipt": {
-                "schema_version": "stage05.2-native-initial-state-receipt-v2",
+                "schema_version": "stage05.2-native-initial-state-receipt-v3",
                 "host_owned": native_result.initial_state_receipt.host_owned,
                 "operation_count": (
                     native_result.initial_state_receipt.operation_count
@@ -5974,6 +5974,12 @@ def _solve_full_native_alns(
                     native_result.initial_state_receipt.request_sha256
                 ),
                 "state_sha256": native_result.initial_state_receipt.state_sha256,
+                "initial_four_lane_state_sha256": (
+                    native_result.initial_state_receipt.initial_four_lane_state_sha256
+                ),
+                "initial_four_lane_projection": dict(
+                    native_result.initial_state_receipt.initial_four_lane_projection
+                ),
                 "transaction_sha256": (
                     native_result.initial_state_receipt.transaction_sha256
                 ),

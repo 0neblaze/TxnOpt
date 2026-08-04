@@ -1109,7 +1109,7 @@ def full_native_alns_v2(
         npt.NDArray[np.int64],
         str,
     ],
-    tuple[npt.NDArray[np.int64], str, str, str],
+    tuple[npt.NDArray[np.int64], str, str, str, str, object],
 ]: ...
 def native_search_request_host_receipt_v2(
     socket_path: str,
@@ -1200,6 +1200,7 @@ def full_native_alns_host_v2(
 ) -> tuple[object, ...]: ...
 
 def _test_native_kernel_fault_v2(socket_path: str, fault: str) -> None: ...
+def _test_full_native_initial_mirror_fault_v2(code: int) -> None: ...
 def full_native_initialize_v2(
     node_kind: npt.NDArray[np.int64],
     ready_time: npt.NDArray[np.float64],

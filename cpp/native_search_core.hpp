@@ -14,6 +14,7 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "native_sha256.hpp"
@@ -533,6 +534,192 @@ inline InitialStateV2 initialize_state(const RequestV2& request) {
     }
     state.validate(request);
     return state;
+}
+
+struct LaneStateV2 final {
+    std::vector<std::int64_t> route_offsets;
+    std::vector<std::int64_t> route_indices;
+    native_kernels::ExactBatchOutput exact;
+    std::array<std::int64_t, 2> objective_integer{};
+    std::array<double, 2> objective_float{};
+
+    [[nodiscard]] std::string sha256() const {
+        std::string evidence("stage05.2-native-lane-state-v2");
+        append(evidence, route_offsets);
+        append(evidence, route_indices);
+        append(evidence, exact.path_offsets);
+        append(evidence, exact.path_indices);
+        append(evidence, exact.statuses);
+        append(evidence, exact.reasons);
+        append(evidence, exact.metrics);
+        append(evidence, exact.label_counters);
+        append(evidence, exact.batch_counters);
+        append(evidence, objective_integer);
+        append(evidence, objective_float);
+        return native_protocol::native_sha256_hex(evidence);
+    }
+
+    void validate_initial(const RequestV2& request) const {
+        if (route_offsets != request.problem.initial_route_offsets
+            || route_indices != request.problem.initial_route_indices) {
+            throw std::runtime_error(
+                "native initial lane routes do not match the owned request");
+        }
+        InitialStateV2 initial;
+        initial.exact = exact;
+        initial.objective_integer = objective_integer;
+        initial.objective_float = objective_float;
+        const auto route_count = static_cast<std::int64_t>(
+            request.problem.route_count());
+        initial.accounting = {route_count, route_count, 0, 0};
+        initial.request_sha256 = request.sha256();
+        initial.validate(request);
+    }
+
+private:
+    template <typename Container>
+    static void append(std::string& output, const Container& values) {
+        const auto count = static_cast<std::uint64_t>(values.size());
+        output.append(reinterpret_cast<const char*>(&count), sizeof(count));
+        if (!values.empty()) {
+            output.append(
+                reinterpret_cast<const char*>(values.data()),
+                values.size() * sizeof(typename Container::value_type));
+        }
+    }
+};
+
+struct InitialFourLaneStateV2 final {
+    // `constraint` is the existing engine's global/current constraint-guided
+    // lane.  The other two Stage 2.3 lanes and global best are separately
+    // owned from the first exact transaction onward.
+    LaneStateV2 constraint;
+    LaneStateV2 legacy;
+    LaneStateV2 quality_shadow;
+    LaneStateV2 global_best;
+    std::array<std::int64_t, 4> accounting{};
+    std::array<std::int64_t, 2> rng_seeds{};
+    std::int64_t next_iteration = 0;
+    std::vector<std::int64_t> node_kind;
+    std::int64_t exact_batch_size = 0;
+    std::string request_sha256;
+    std::string initial_state_sha256;
+
+    [[nodiscard]] std::string sha256() const {
+        if (request_sha256.size() != 64 || initial_state_sha256.size() != 64) {
+            throw std::logic_error(
+                "native search state lost its request/initial identity");
+        }
+        std::string evidence("stage05.2-native-initial-four-lane-state-v2");
+        evidence.append(request_sha256);
+        evidence.append(initial_state_sha256);
+        for (const auto* lane : {
+                 &constraint, &legacy, &quality_shadow, &global_best}) {
+            evidence.append(lane->sha256());
+        }
+        append(evidence, accounting);
+        append(evidence, rng_seeds);
+        append_scalar(evidence, next_iteration);
+        append(evidence, node_kind);
+        append_scalar(evidence, exact_batch_size);
+        return native_protocol::native_sha256_hex(evidence);
+    }
+
+    void validate_initial(const RequestV2& request) const {
+        request.validate();
+        if (request_sha256 != request.sha256() || next_iteration != 0) {
+            throw std::runtime_error(
+                "native initial search state identity/iteration is invalid");
+        }
+        if (node_kind != request.problem.node_kind
+            || exact_batch_size != request.config.search_control[2]) {
+            throw std::runtime_error(
+                "native initial search state problem/config projection is invalid");
+        }
+        constraint.validate_initial(request);
+        legacy.validate_initial(request);
+        quality_shadow.validate_initial(request);
+        global_best.validate_initial(request);
+        const auto constraint_sha256 = constraint.sha256();
+        if (legacy.sha256() != constraint_sha256
+            || quality_shadow.sha256() != constraint_sha256
+            || global_best.sha256() != constraint_sha256) {
+            throw std::runtime_error(
+                "native initial lane states are not identical");
+        }
+        InitialStateV2 reconstructed;
+        reconstructed.exact = constraint.exact;
+        reconstructed.objective_integer = constraint.objective_integer;
+        reconstructed.objective_float = constraint.objective_float;
+        reconstructed.accounting = accounting;
+        reconstructed.request_sha256 = request_sha256;
+        reconstructed.validate(request);
+        if (initial_state_sha256 != reconstructed.sha256()) {
+            throw std::runtime_error(
+                "native search state lost its initial-state identity");
+        }
+        const auto seed = request.config.search_control[0];
+        if (rng_seeds != std::array<std::int64_t, 2>{
+                seed, seed ^ std::int64_t{0x5EED23}}) {
+            throw std::runtime_error(
+                "native search state RNG seeds are invalid");
+        }
+    }
+
+private:
+    template <typename Container>
+    static void append(std::string& output, const Container& values) {
+        const auto count = static_cast<std::uint64_t>(values.size());
+        append_scalar(output, count);
+        if (!values.empty()) {
+            output.append(
+                reinterpret_cast<const char*>(values.data()),
+                values.size() * sizeof(typename Container::value_type));
+        }
+    }
+
+    template <typename T>
+    static void append_scalar(std::string& output, const T& value) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        output.append(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+};
+
+inline InitialFourLaneStateV2 initialize_initial_four_lane_state(
+    const RequestV2& request,
+    const InitialStateV2& initial) {
+    initial.validate(request);
+    LaneStateV2 lane{
+        request.problem.initial_route_offsets,
+        request.problem.initial_route_indices,
+        initial.exact,
+        initial.objective_integer,
+        initial.objective_float,
+    };
+    InitialFourLaneStateV2 state{
+        lane,
+        lane,
+        lane,
+        std::move(lane),
+        initial.accounting,
+        {
+            request.config.search_control[0],
+            request.config.search_control[0] ^ std::int64_t{0x5EED23},
+        },
+        0,
+        request.problem.node_kind,
+        request.config.search_control[2],
+        initial.request_sha256,
+        initial.sha256(),
+    };
+    state.validate_initial(request);
+    return state;
+}
+
+inline InitialFourLaneStateV2 initialize_initial_four_lane_state(
+    const RequestV2& request) {
+    const auto initial = initialize_state(request);
+    return initialize_initial_four_lane_state(request, initial);
 }
 
 inline std::array<std::int64_t, 8> receipt_counts(

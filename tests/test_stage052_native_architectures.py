@@ -66,44 +66,346 @@ def test_native_campaign_gate_names_every_incomplete_architecture_capability() -
         _require_native_architecture_capabilities()
 
 
+def _initial_four_lane_projection(
+    *, request_sha256: str
+) -> tuple[dict[str, object], str, str]:
+    route_offsets = [0, 1]
+    route_indices = [1]
+    path_offsets = [0, 3]
+    path_indices = [0, 1, 0]
+    statuses = [0]
+    reasons = [0]
+    metrics = [[2.0, 2.0, 0.0, 0.0]]
+    labels = [[1, 1, 0]]
+    batch_counters = [1, 1, 1, 0, 1, 0, 0, 0, 1, 128]
+    objective_integer = [1, 0]
+    objective_float = [2.0, 0.0]
+    accounting = [1, 1, 0, 0]
+    rng_seeds = [2014, 2014 ^ 0x5EED23]
+    node_kind = [0, 1]
+    exact_batch_size = 128
+    lane_evidence = bytearray(b"stage05.2-native-lane-state-v2")
+    integer_columns = (
+        route_offsets,
+        route_indices,
+        path_offsets,
+        path_indices,
+        statuses,
+        reasons,
+    )
+    for values in integer_columns:
+        lane_evidence.extend(struct.pack("<Q", len(values)))
+        lane_evidence.extend(struct.pack(f"<{len(values)}q", *values))
+    flattened_metrics = [value for row in metrics for value in row]
+    lane_evidence.extend(struct.pack("<Q", len(flattened_metrics)))
+    lane_evidence.extend(struct.pack(f"<{len(flattened_metrics)}d", *flattened_metrics))
+    for values in (
+        [value for row in labels for value in row],
+        batch_counters,
+        objective_integer,
+    ):
+        lane_evidence.extend(struct.pack("<Q", len(values)))
+        lane_evidence.extend(struct.pack(f"<{len(values)}q", *values))
+    lane_evidence.extend(struct.pack("<Q", len(objective_float)))
+    lane_evidence.extend(struct.pack("<2d", *objective_float))
+    lane_sha256 = hashlib.sha256(lane_evidence).hexdigest()
+    initial_state_evidence = bytearray(
+        b"stage05.2-native-initial-search-state-v2"
+    )
+    initial_state_evidence.extend(request_sha256.encode("ascii"))
+    for values in (path_offsets, path_indices, statuses, reasons):
+        initial_state_evidence.extend(struct.pack("<Q", len(values)))
+        initial_state_evidence.extend(struct.pack(f"<{len(values)}q", *values))
+    initial_state_evidence.extend(struct.pack("<Q", len(flattened_metrics)))
+    initial_state_evidence.extend(
+        struct.pack(f"<{len(flattened_metrics)}d", *flattened_metrics)
+    )
+    for values in (
+        [value for row in labels for value in row],
+        batch_counters,
+        objective_integer,
+    ):
+        initial_state_evidence.extend(struct.pack("<Q", len(values)))
+        initial_state_evidence.extend(struct.pack(f"<{len(values)}q", *values))
+    initial_state_evidence.extend(struct.pack("<Q", len(objective_float)))
+    initial_state_evidence.extend(struct.pack("<2d", *objective_float))
+    initial_state_evidence.extend(struct.pack("<Q", len(accounting)))
+    initial_state_evidence.extend(struct.pack("<4q", *accounting))
+    initial_state_sha256 = hashlib.sha256(initial_state_evidence).hexdigest()
+    state_evidence = bytearray(b"stage05.2-native-initial-four-lane-state-v2")
+    state_evidence.extend(request_sha256.encode("ascii"))
+    state_evidence.extend(initial_state_sha256.encode("ascii"))
+    state_evidence.extend(lane_sha256.encode("ascii") * 4)
+    for values in (accounting, rng_seeds):
+        state_evidence.extend(struct.pack("<Q", len(values)))
+        state_evidence.extend(struct.pack(f"<{len(values)}q", *values))
+    state_evidence.extend(struct.pack("<q", 0))
+    state_evidence.extend(struct.pack("<Q", len(node_kind)))
+    state_evidence.extend(struct.pack(f"<{len(node_kind)}q", *node_kind))
+    state_evidence.extend(struct.pack("<q", exact_batch_size))
+    state_sha256 = hashlib.sha256(state_evidence).hexdigest()
+    return (
+        {
+            "schema_version": "stage05.2-native-initial-four-lane-projection-v1",
+            "route_offsets": route_offsets,
+            "route_indices": route_indices,
+            "path_offsets": path_offsets,
+            "path_indices": path_indices,
+            "statuses": statuses,
+            "reasons": reasons,
+            "metrics": metrics,
+            "label_counters": labels,
+            "batch_counters": batch_counters,
+            "objective_integer": objective_integer,
+            "objective_float": objective_float,
+            "accounting": accounting,
+            "rng_seeds": rng_seeds,
+            "next_iteration": 0,
+            "lane_count": 4,
+            "node_kind": node_kind,
+            "exact_batch_size": exact_batch_size,
+            "lane_sha256": lane_sha256,
+            "state_sha256": state_sha256,
+        },
+        initial_state_sha256,
+        state_sha256,
+    )
+
+
 def test_reviewer_independently_replays_persisted_initial_state_receipt() -> None:
     request_sha256 = "a" * 64
-    state_sha256 = "b" * 64
-    evidence = bytearray(b"stage05.2-native-initial-state-receipt-v2")
+    (
+        projection,
+        state_sha256,
+        initial_four_lane_state_sha256,
+    ) = _initial_four_lane_projection(
+        request_sha256=request_sha256,
+    )
+    evidence = bytearray(b"stage05.2-native-initial-state-receipt-v3")
     evidence.extend(struct.pack("<qq", 1, 1))
     evidence.extend(request_sha256.encode("ascii"))
     evidence.extend(state_sha256.encode("ascii"))
+    evidence.extend(initial_four_lane_state_sha256.encode("ascii"))
     receipt_sha256 = hashlib.sha256(evidence).hexdigest()
     payload: dict[str, object] = {
+        "seed": 2014,
         "native_execution_statistics": {
             "initial_state_request_count": 1,
             "initial_state_receipt": {
-                "schema_version": "stage05.2-native-initial-state-receipt-v2",
+                "schema_version": "stage05.2-native-initial-state-receipt-v3",
                 "host_owned": True,
                 "operation_count": 1,
                 "request_sha256": request_sha256,
                 "state_sha256": state_sha256,
+                "initial_four_lane_state_sha256": (initial_four_lane_state_sha256),
+                "initial_four_lane_projection": projection,
                 "transaction_sha256": receipt_sha256,
             },
         }
     }
 
     assert _replay_initial_state_receipt(
-        payload, ArchitectureMode.HOST_SCHEDULER
+        payload,
+        ArchitectureMode.HOST_SCHEDULER,
+        expected_node_kind=(0, 1),
+        expected_exact_batch_size=128,
     ) is None
     native = payload["native_execution_statistics"]
     assert isinstance(native, dict)
     initial = native["initial_state_receipt"]
     assert isinstance(initial, dict)
-    initial["state_sha256"] = "c" * 64
-    assert _replay_initial_state_receipt(
-        payload, ArchitectureMode.HOST_SCHEDULER
-    ) == "initial-state ownership receipt hash mismatch"
+    initial["state_sha256"] = "d" * 64
+    assert (
+        _replay_initial_state_receipt(
+            payload,
+            ArchitectureMode.HOST_SCHEDULER,
+            expected_node_kind=(0, 1),
+            expected_exact_batch_size=128,
+        )
+        == "initial-state ownership receipt hash mismatch"
+    )
     initial["state_sha256"] = state_sha256
     native["initial_state_request_count"] = True
     assert _replay_initial_state_receipt(
-        payload, ArchitectureMode.HOST_SCHEDULER
+        payload,
+        ArchitectureMode.HOST_SCHEDULER,
+        expected_node_kind=(0, 1),
+        expected_exact_batch_size=128,
     ) == "initial-state ownership receipt does not reconcile"
+
+
+def test_reviewer_rejects_rehashed_false_initial_state_identity() -> None:
+    request_sha256 = "a" * 64
+    projection, _, _ = _initial_four_lane_projection(
+        request_sha256=request_sha256,
+    )
+    false_initial_sha256 = "d" * 64
+    lane_sha256 = str(projection["lane_sha256"])
+    accounting = list(projection["accounting"])
+    rng_seeds = list(projection["rng_seeds"])
+    node_kind = list(projection["node_kind"])
+    exact_batch_size = int(projection["exact_batch_size"])
+    state_evidence = bytearray(b"stage05.2-native-initial-four-lane-state-v2")
+    state_evidence.extend(request_sha256.encode("ascii"))
+    state_evidence.extend(false_initial_sha256.encode("ascii"))
+    state_evidence.extend(lane_sha256.encode("ascii") * 4)
+    for values in (accounting, rng_seeds):
+        state_evidence.extend(struct.pack("<Q", len(values)))
+        state_evidence.extend(struct.pack(f"<{len(values)}q", *values))
+    state_evidence.extend(struct.pack("<q", 0))
+    state_evidence.extend(struct.pack("<Q", len(node_kind)))
+    state_evidence.extend(struct.pack(f"<{len(node_kind)}q", *node_kind))
+    state_evidence.extend(struct.pack("<q", exact_batch_size))
+    false_four_lane_sha256 = hashlib.sha256(state_evidence).hexdigest()
+    projection["state_sha256"] = false_four_lane_sha256
+    receipt_evidence = bytearray(b"stage05.2-native-initial-state-receipt-v3")
+    receipt_evidence.extend(struct.pack("<qq", 1, 1))
+    receipt_evidence.extend(request_sha256.encode("ascii"))
+    receipt_evidence.extend(false_initial_sha256.encode("ascii"))
+    receipt_evidence.extend(false_four_lane_sha256.encode("ascii"))
+    payload: dict[str, object] = {
+        "seed": 2014,
+        "native_execution_statistics": {
+            "initial_state_request_count": 1,
+            "initial_state_receipt": {
+                "schema_version": "stage05.2-native-initial-state-receipt-v3",
+                "host_owned": True,
+                "operation_count": 1,
+                "request_sha256": request_sha256,
+                "state_sha256": false_initial_sha256,
+                "initial_four_lane_state_sha256": false_four_lane_sha256,
+                "initial_four_lane_projection": projection,
+                "transaction_sha256": hashlib.sha256(
+                    receipt_evidence
+                ).hexdigest(),
+            },
+        },
+    }
+
+    assert _replay_initial_state_receipt(
+        payload,
+        ArchitectureMode.HOST_SCHEDULER,
+        expected_node_kind=(0, 1),
+        expected_exact_batch_size=128,
+    ) == "initial-state projection hash mismatch"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "route_offsets",
+        "metrics",
+        "objective_float",
+        "rng_seeds",
+        "next_iteration",
+        "lane_count",
+        "batch_counters",
+        "node_kind",
+        "exact_batch_size",
+    ],
+)
+def test_reviewer_rejects_invalid_initial_projection_values(
+    field: str,
+) -> None:
+    request_sha256 = "a" * 64
+    (
+        projection,
+        state_sha256,
+        initial_four_lane_state_sha256,
+    ) = _initial_four_lane_projection(
+        request_sha256=request_sha256,
+    )
+    if field == "route_offsets":
+        projection[field] = [0, 1 << 80]
+    elif field == "metrics":
+        projection[field] = [[1 << 2000, 2.0, 0.0, 0.0]]
+    elif field == "objective_float":
+        projection[field] = ["2.0", 0.0]
+    elif field == "rng_seeds":
+        projection[field] = [2015, 2015 ^ 0x5EED23]
+    elif field == "next_iteration":
+        projection[field] = 0.0
+    elif field == "lane_count":
+        projection[field] = 4.0
+    elif field == "batch_counters":
+        projection[field] = [1, 1, 1, 0, 1, 0, 0, 0, 1, 127]
+    elif field == "node_kind":
+        projection[field] = [0, 2]
+    else:
+        projection[field] = 127
+    evidence = bytearray(b"stage05.2-native-initial-state-receipt-v3")
+    evidence.extend(struct.pack("<qq", 1, 1))
+    evidence.extend(request_sha256.encode("ascii"))
+    evidence.extend(state_sha256.encode("ascii"))
+    evidence.extend(initial_four_lane_state_sha256.encode("ascii"))
+    payload: dict[str, object] = {
+        "seed": 2014,
+        "native_execution_statistics": {
+            "initial_state_request_count": 1,
+            "initial_state_receipt": {
+                "schema_version": "stage05.2-native-initial-state-receipt-v3",
+                "host_owned": True,
+                "operation_count": 1,
+                "request_sha256": request_sha256,
+                "state_sha256": state_sha256,
+                "initial_four_lane_state_sha256": (initial_four_lane_state_sha256),
+                "initial_four_lane_projection": projection,
+                "transaction_sha256": hashlib.sha256(evidence).hexdigest(),
+            },
+        }
+    }
+
+    assert (
+        _replay_initial_state_receipt(
+            payload,
+            ArchitectureMode.HOST_SCHEDULER,
+            expected_node_kind=(0, 1),
+            expected_exact_batch_size=128,
+        )
+        is not None
+    )
+
+
+def test_reviewer_rejects_initial_projection_customer_omission() -> None:
+    request_sha256 = "a" * 64
+    (
+        projection,
+        state_sha256,
+        initial_four_lane_state_sha256,
+    ) = _initial_four_lane_projection(
+        request_sha256=request_sha256,
+    )
+    projection["node_kind"] = [0, 1, 1]
+    evidence = bytearray(b"stage05.2-native-initial-state-receipt-v3")
+    evidence.extend(struct.pack("<qq", 1, 1))
+    evidence.extend(request_sha256.encode("ascii"))
+    evidence.extend(state_sha256.encode("ascii"))
+    evidence.extend(initial_four_lane_state_sha256.encode("ascii"))
+    payload: dict[str, object] = {
+        "seed": 2014,
+        "native_execution_statistics": {
+            "initial_state_request_count": 1,
+            "initial_state_receipt": {
+                "schema_version": "stage05.2-native-initial-state-receipt-v3",
+                "host_owned": True,
+                "operation_count": 1,
+                "request_sha256": request_sha256,
+                "state_sha256": state_sha256,
+                "initial_four_lane_state_sha256": (
+                    initial_four_lane_state_sha256
+                ),
+                "initial_four_lane_projection": projection,
+                "transaction_sha256": hashlib.sha256(evidence).hexdigest(),
+            },
+        },
+    }
+
+    assert _replay_initial_state_receipt(
+        payload,
+        ArchitectureMode.HOST_SCHEDULER,
+        expected_node_kind=(0, 1, 1),
+        expected_exact_batch_size=128,
+    ) == "initial four-lane projection values do not reconcile"
 
 
 def test_native_attempt04_is_blocked_before_capability_incomplete_outputs(

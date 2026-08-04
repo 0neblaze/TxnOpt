@@ -9431,6 +9431,12 @@ public:
                 }
                 initial_request_sha256_ = state.request_sha256;
                 initial_state_sha256_ = state.sha256();
+                auto initial_four_lane_state =
+                    evrptw::native_search::initialize_initial_four_lane_state(
+                        *owned_request_, state);
+                initial_four_lane_state_sha256_ =
+                    initial_four_lane_state.sha256();
+                initial_four_lane_state_ = std::move(initial_four_lane_state);
                 initial_state_host_owned_ =
 #ifdef __linux__
                     !native_kernel_scheduler_endpoint.empty();
@@ -9665,6 +9671,39 @@ public:
         batch_size_ = checked_data<std::int64_t>(control_array)[2];
         rng_.emplace(std::move(prepared_rng));
         constraint_rng_.emplace(std::move(prepared_constraint_rng));
+        if (owned_request_.has_value()) {
+            if (initial_mirror_schema_failure_injection_ != 0) {
+                const auto original = py::cast<py::array>(
+                    current_exact_payload_[4]);
+                py::tuple corrupted(current_exact_payload_.size());
+                for (py::ssize_t index = 0;
+                     index < current_exact_payload_.size(); ++index) {
+                    corrupted[index] = current_exact_payload_[index];
+                }
+                if (initial_mirror_schema_failure_injection_ == 1) {
+                    py::array_t<double> flattened(original.size());
+                    std::copy(
+                        checked_data<double>(original),
+                        checked_data<double>(original) + original.size(),
+                        checked_data(flattened));
+                    corrupted[4] = std::move(flattened);
+                } else {
+                    py::array_t<std::int64_t> wrong_dtype(
+                        {original.shape(0), original.shape(1)});
+                    std::transform(
+                        checked_data<double>(original),
+                        checked_data<double>(original) + original.size(),
+                        checked_data(wrong_dtype),
+                        [](double value) {
+                            return static_cast<std::int64_t>(value);
+                        });
+                    corrupted[4] = std::move(wrong_dtype);
+                }
+                current_exact_payload_ = std::move(corrupted);
+                initial_mirror_schema_failure_injection_ = 0;
+            }
+            validate_initial_search_state_mirror();
+        }
         initialized_ = true;
         return initialized;
     }
@@ -16350,6 +16389,20 @@ public:
         global_search_envelope_failure_injection_ = true;
     }
 
+    void inject_initial_mirror_schema_failure_once(std::int64_t code) {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if ((code != 1 && code != 2)
+            || initial_mirror_schema_failure_injection_ != 0) {
+            throw std::invalid_argument(
+                "full native initial mirror schema injection is invalid");
+        }
+        initial_mirror_schema_failure_injection_ = code;
+    }
+
     void inject_constraint_search_deadline_after_completed_once(
         std::int64_t completed_iterations) {
         std::unique_lock state_lock(state_mutex_, std::try_to_lock);
@@ -16743,6 +16796,8 @@ public:
     [[nodiscard]] py::tuple initial_state_receipt_payload() const {
         if (!initialized_ || initial_request_sha256_.size() != 64
             || initial_state_sha256_.size() != 64
+            || initial_four_lane_state_sha256_.size() != 64
+            || !initial_four_lane_state_.has_value()
             || initial_state_operation_count_
                 != (initial_state_host_owned_ ? 1 : 0)) {
             throw std::logic_error(
@@ -16751,18 +16806,215 @@ public:
         py::array_t<std::int64_t> flags(2);
         checked_data(flags)[0] = initial_state_host_owned_ ? 1 : 0;
         checked_data(flags)[1] = initial_state_operation_count_;
-        std::string evidence("stage05.2-native-initial-state-receipt-v2");
+        std::string evidence("stage05.2-native-initial-state-receipt-v3");
         evidence.append(
             reinterpret_cast<const char*>(checked_data(flags)),
             static_cast<std::size_t>(flags.nbytes()));
         evidence.append(initial_request_sha256_);
         evidence.append(initial_state_sha256_);
+        evidence.append(initial_four_lane_state_sha256_);
+        const auto& initial = *initial_four_lane_state_;
+        const auto& lane = initial.constraint;
+        const auto integer_vector = [](const std::vector<std::int64_t>& source) {
+            py::array_t<std::int64_t> output(source.size());
+            std::copy(source.begin(), source.end(), checked_data(output));
+            return output;
+        };
+        auto route_offsets = integer_vector(lane.route_offsets);
+        auto route_indices = integer_vector(lane.route_indices);
+        auto path_offsets = integer_vector(lane.exact.path_offsets);
+        auto path_indices = integer_vector(lane.exact.path_indices);
+        auto statuses = integer_vector(lane.exact.statuses);
+        auto reasons = integer_vector(lane.exact.reasons);
+        const auto route_count = static_cast<py::ssize_t>(
+            lane.route_offsets.size() - 1);
+        py::array_t<double> metrics({route_count, py::ssize_t{4}});
+        std::copy(
+            lane.exact.metrics.begin(), lane.exact.metrics.end(),
+            checked_data(metrics));
+        py::array_t<std::int64_t> labels({route_count, py::ssize_t{3}});
+        std::copy(
+            lane.exact.label_counters.begin(),
+            lane.exact.label_counters.end(), checked_data(labels));
+        auto batch_counters = integer_vector(lane.exact.batch_counters);
+        py::array_t<std::int64_t> objective_integer(2);
+        std::copy(
+            lane.objective_integer.begin(), lane.objective_integer.end(),
+            checked_data(objective_integer));
+        py::array_t<double> objective_float(2);
+        std::copy(
+            lane.objective_float.begin(), lane.objective_float.end(),
+            checked_data(objective_float));
+        py::array_t<std::int64_t> accounting(initial.accounting.size());
+        std::copy(
+            initial.accounting.begin(), initial.accounting.end(),
+            checked_data(accounting));
+        py::array_t<std::int64_t> rng_seeds(initial.rng_seeds.size());
+        std::copy(
+            initial.rng_seeds.begin(), initial.rng_seeds.end(),
+            checked_data(rng_seeds));
+        py::array_t<std::int64_t> next_iteration(1);
+        checked_data(next_iteration)[0] = initial.next_iteration;
+        py::array_t<std::int64_t> lane_count(1);
+        checked_data(lane_count)[0] = 4;
+        auto node_kind = integer_vector(initial.node_kind);
+        py::array_t<std::int64_t> exact_batch_size(1);
+        checked_data(exact_batch_size)[0] = initial.exact_batch_size;
+        auto projection = py::make_tuple(
+            std::move(route_offsets), std::move(route_indices),
+            std::move(path_offsets), std::move(path_indices),
+            std::move(statuses), std::move(reasons), std::move(metrics),
+            std::move(labels), std::move(batch_counters),
+            std::move(objective_integer), std::move(objective_float),
+            std::move(accounting), std::move(rng_seeds),
+            std::move(next_iteration), std::move(lane_count),
+            std::move(node_kind), std::move(exact_batch_size));
         return py::make_tuple(
             std::move(flags), initial_request_sha256_, initial_state_sha256_,
-            native_sha256_hex(evidence));
+            initial_four_lane_state_sha256_, native_sha256_hex(evidence),
+            std::move(projection));
     }
 
 private:
+    template <typename Container>
+    static void require_initial_mirror_equal(
+        const py::array& actual,
+        const Container& expected,
+        std::string_view name) {
+        using T = typename Container::value_type;
+        if (actual.size() != static_cast<py::ssize_t>(expected.size())
+            || !std::equal(
+                checked_data<T>(actual),
+                checked_data<T>(actual) + actual.size(),
+                expected.begin(), expected.end())) {
+            throw std::logic_error(
+                "full native initial search-state mirror mismatch: "
+                + std::string(name));
+        }
+    }
+
+    void validate_initial_lane_mirror(
+        const evrptw::native_search::LaneStateV2& expected,
+        const py::array_t<std::int64_t>& offsets,
+        const py::array_t<std::int64_t>& indices,
+        const py::tuple& exact,
+        const py::array_t<std::int64_t>& objective_integer,
+        const py::array_t<double>& objective_float,
+        std::string_view lane) const {
+        if (exact.size() != 7) {
+            throw std::logic_error(
+                "full native initial search-state exact mirror is invalid");
+        }
+        const auto route_count = static_cast<py::ssize_t>(
+            expected.route_offsets.size() - 1);
+        const auto checked = [](py::handle value, const std::string& name,
+                                 int dimensions, auto type_tag) {
+            using Value = decltype(type_tag);
+            return checked_array<Value>(value, name.c_str(), dimensions);
+        };
+        const auto offsets_checked = checked(
+            offsets, std::string(lane) + ".offsets", 1, std::int64_t{});
+        const auto indices_checked = checked(
+            indices, std::string(lane) + ".indices", 1, std::int64_t{});
+        require_initial_mirror_equal(
+            offsets_checked, expected.route_offsets,
+            std::string(lane) + ".offsets");
+        require_initial_mirror_equal(
+            indices_checked, expected.route_indices,
+            std::string(lane) + ".indices");
+        const auto path_offsets = checked(
+            exact[0], std::string(lane) + ".exact.path_offsets", 1,
+            std::int64_t{});
+        const auto path_indices = checked(
+            exact[1], std::string(lane) + ".exact.path_indices", 1,
+            std::int64_t{});
+        const auto statuses = checked(
+            exact[2], std::string(lane) + ".exact.statuses", 1,
+            std::int64_t{});
+        const auto reasons = checked(
+            exact[3], std::string(lane) + ".exact.reasons", 1,
+            std::int64_t{});
+        const auto metrics = checked(
+            exact[4], std::string(lane) + ".exact.metrics", 2, double{});
+        const auto labels = checked(
+            exact[5], std::string(lane) + ".exact.label_counters", 2,
+            std::int64_t{});
+        const auto batch_counters = checked(
+            exact[6], std::string(lane) + ".exact.batch_counters", 1,
+            std::int64_t{});
+        const auto objective_integer_checked = checked(
+            objective_integer, std::string(lane) + ".objective_integer", 1,
+            std::int64_t{});
+        const auto objective_float_checked = checked(
+            objective_float, std::string(lane) + ".objective_float", 1,
+            double{});
+        if (metrics.shape(0) != route_count || metrics.shape(1) != 4
+            || labels.shape(0) != route_count || labels.shape(1) != 3
+            || objective_integer_checked.shape(0) != 2
+            || objective_float_checked.shape(0) != 2) {
+            throw std::logic_error(
+                "full native initial search-state mirror shape is invalid: "
+                + std::string(lane));
+        }
+        require_initial_mirror_equal(
+            path_offsets, expected.exact.path_offsets,
+            std::string(lane) + ".exact.path_offsets");
+        require_initial_mirror_equal(
+            path_indices, expected.exact.path_indices,
+            std::string(lane) + ".exact.path_indices");
+        require_initial_mirror_equal(
+            statuses, expected.exact.statuses,
+            std::string(lane) + ".exact.statuses");
+        require_initial_mirror_equal(
+            reasons, expected.exact.reasons,
+            std::string(lane) + ".exact.reasons");
+        require_initial_mirror_equal(
+            metrics, expected.exact.metrics,
+            std::string(lane) + ".exact.metrics");
+        require_initial_mirror_equal(
+            labels, expected.exact.label_counters,
+            std::string(lane) + ".exact.label_counters");
+        require_initial_mirror_equal(
+            batch_counters, expected.exact.batch_counters,
+            std::string(lane) + ".exact.batch_counters");
+        require_initial_mirror_equal(
+            objective_integer_checked, expected.objective_integer,
+            std::string(lane) + ".objective_integer");
+        require_initial_mirror_equal(
+            objective_float_checked, expected.objective_float,
+            std::string(lane) + ".objective_float");
+    }
+
+    void validate_initial_search_state_mirror() const {
+        if (!initial_four_lane_state_.has_value() || !owned_request_.has_value()) {
+            throw std::logic_error(
+                "full native initial search state is not C++ owned");
+        }
+        initial_four_lane_state_->validate_initial(*owned_request_);
+        if (initial_four_lane_state_sha256_
+            != initial_four_lane_state_->sha256()) {
+            throw std::logic_error(
+                "full native initial search-state hash is invalid");
+        }
+        validate_initial_lane_mirror(
+            initial_four_lane_state_->constraint,
+            current_offsets_, current_indices_, current_exact_payload_,
+            current_objective_integer_, current_objective_float_, "constraint");
+        validate_initial_lane_mirror(
+            initial_four_lane_state_->legacy,
+            legacy_offsets_, legacy_indices_, legacy_exact_payload_,
+            legacy_objective_integer_, legacy_objective_float_, "legacy");
+        validate_initial_lane_mirror(
+            initial_four_lane_state_->quality_shadow,
+            quality_offsets_, quality_indices_, quality_exact_payload_,
+            quality_objective_integer_, quality_objective_float_,
+            "quality_shadow");
+        validate_initial_lane_mirror(
+            initial_four_lane_state_->global_best,
+            best_offsets_, best_indices_, best_exact_payload_,
+            best_objective_integer_, best_objective_float_, "global_best");
+    }
+
     struct ExactJournalBatch {
         std::array<std::int64_t, 3> context{};
         std::vector<std::int64_t> route_offsets;
@@ -16814,6 +17066,7 @@ private:
     bool constraint_iteration_deadline_injection_ = false;
     bool exact_kernel_deadline_injection_ = false;
     bool global_search_envelope_failure_injection_ = false;
+    std::int64_t initial_mirror_schema_failure_injection_ = 0;
     std::int64_t constraint_search_deadline_after_completed_injection_ = -1;
     bool defer_composite_commit_ = false;
     bool defer_iteration_commit_ = false;
@@ -16836,8 +17089,11 @@ private:
     std::unordered_set<std::int64_t> all_customers_;
     std::vector<std::string> node_names_;
     std::optional<evrptw::native_search::RequestV2> owned_request_;
+    std::optional<evrptw::native_search::InitialFourLaneStateV2>
+        initial_four_lane_state_;
     std::string initial_request_sha256_;
     std::string initial_state_sha256_;
+    std::string initial_four_lane_state_sha256_;
     bool initial_state_host_owned_ = false;
     std::int64_t initial_state_operation_count_ = 0;
     bool initialized_ = false;
@@ -17840,6 +18096,7 @@ private:
 thread_local std::shared_ptr<NativeWorkPool> scheduler_work_pool_context;
 thread_local double scheduler_queue_wait_seconds_context = 0.0;
 thread_local std::size_t scheduler_queue_depth_context = 0;
+thread_local std::int64_t initial_mirror_schema_failure_context = 0;
 
 template <typename T>
 std::vector<T> owned_search_vector(
@@ -18167,6 +18424,11 @@ py::tuple full_native_alns_v2(
         options[1],
         client_dispatch_threads,
         scheduler_work_pool_context);
+    if (initial_mirror_schema_failure_context != 0) {
+        engine.inject_initial_mirror_schema_failure_once(
+            initial_mirror_schema_failure_context);
+        initial_mirror_schema_failure_context = 0;
+    }
     engine.configure_node_names_owned(owned_request.problem);
     engine.configure_owned_request(owned_request);
     engine.suppress_plan_screening_negative_cache(true);
@@ -18929,6 +19191,7 @@ py::tuple full_native_alns_v2(
     evidence.append(py::cast<std::string>(initial_state_receipt[1]));
     evidence.append(py::cast<std::string>(initial_state_receipt[2]));
     evidence.append(py::cast<std::string>(initial_state_receipt[3]));
+    evidence.append(py::cast<std::string>(initial_state_receipt[4]));
     return py::make_tuple(
         std::move(route_offsets),
         std::move(route_indices),
@@ -19078,6 +19341,15 @@ void test_native_kernel_fault_v2(
     evrptw::native_client::test_fault(socket_path, fault);
 }
 #endif
+
+void test_full_native_initial_mirror_fault_v2(std::int64_t code) {
+    if ((code != 1 && code != 2)
+        || initial_mirror_schema_failure_context != 0) {
+        throw std::invalid_argument(
+            "full native initial mirror test fault is invalid");
+    }
+    initial_mirror_schema_failure_context = code;
+}
 
 py::tuple propagate_routes_numeric(
     py::handle node_kind,
@@ -19961,6 +20233,10 @@ PYBIND11_MODULE(_core, module) {
         py::arg("socket_path"),
         py::arg("fault"));
 #endif
+    module.def(
+        "_test_full_native_initial_mirror_fault_v2",
+        &test_full_native_initial_mirror_fault_v2,
+        py::arg("code"));
     module.def(
         "full_native_initialize_v2",
         &full_native_initialize_v2,
