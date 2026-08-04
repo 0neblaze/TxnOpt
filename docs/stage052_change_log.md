@@ -3290,3 +3290,28 @@ compatibility fallback（兼容回退）。
   Ruff、83-file strict mypy 与 `git diff --check` 通过；独立 Spec 与 Standards 双审查均
   ACCEPT。production capability bits 继续全部为 0，不创建 attempt04，不启动
   Paired/Pilot/Formal/CUDA，不切换默认架构。
+
+## 2026-08-04：constraint iteration outcome 完成 typed ownership
+
+- 新增 C++ `ConstraintIterationOutcomeV2`，统一持有 operation、probe seed、candidate
+  feasible、accepted、improved-global-best、vehicle-reduction 与仅供内部校验的 iteration
+  identity。`ConstraintIterationProjectionV2` 保持公开 `(selection, probe, int64[6])` ABI，
+  但 projection tuple/array/raw pointer 与 selection/probe slots 均在搜索状态提交前准备；
+  commit 后只写六个 `int64_t` 并 move payload。
+- zero-removal 路径仍消费一次真实 RNG seed 以保持 Python `random.Random` 调用序列，但公开
+  probe seed 继续按历史语义投影为 0。正常路径保存真实 seed。constraint-search、global-search
+  和 three-lane 事件、stagnation 与 feasibility 控制全部改读 typed outcome，不再解析 outcome
+  NumPy array。getter 同时校验 outcome iteration 与 `last_completed_constraint_iteration_`，外层
+  rollback 后的同迭代或跨迭代 stale outcome 均 fail fast。
+- clean code checkpoint `857852ae4be952ce28ae9c1dfeb78c4de21d1d7e` 的 wheel
+  SHA-256 为 `e260ffda84e2de559f33eb262231cb33cea02d3dccb8124b18498c29b85c4a83`，
+  extension 为 `ae7edaf4f31e0fa487f151a72ff2b2be799236557a333e06eaa3fd0c070619f5`，
+  scheduler 保持 `a1cd6e81caa49cdd7d162e44ee1274b7645dd26fd0f6b8760ae004b8d5e80617`；
+  安装后的 extension 自报 revision 与 checkpoint 完全一致。
+- clean-wheel 验证：constraint/global/three-lane 扩大集合
+  `84 passed, 257 deselected`；四实例三 seed fixed-work 全字段差分 `12 passed`、耗时
+  `92.38s`；完整 `tests/test_native_execution.py` 为 `329 passed, 12 skipped`、耗时
+  `792.96s`。Ruff、83-file strict mypy 与 `git diff --check` 通过；独立 Spec 与 Standards
+  双审查均 ACCEPT，并按 Standards 建议补上同 iteration rollback 身份门。production
+  capability bits 继续全部为 0，不创建 attempt04，不启动 Paired/Pilot/Formal/CUDA，
+  不切换默认架构。
