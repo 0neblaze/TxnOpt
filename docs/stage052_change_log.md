@@ -3506,3 +3506,42 @@ compatibility fallback（兼容回退）。
   probe envelope 和其余 screening input mirrors 仍依赖 pybind/NumPy；不能宣称 whole-call GIL-safe
   或性能收益。production capability bits 继续全部为 0；不创建 attempt04，不启动
   Paired/Pilot/Formal/CUDA，不切换默认架构。下一 slice 为 changed-candidate pool 与 plan assembly。
+
+## 2026-08-04：changed-candidate pool 与 plan assembly 完成 typed ownership
+
+- 新增 C++ `ChangedCandidatePoolV1`，自有保存 ordered changed-route pairs、两条 changed route 的
+  CSR、removed-customer CSR、operation identity 与 input route count；新增 `CandidatePlanPoolV1`
+  自有保存 plan→route 与 route→customer 两层 CSR 及 routes-per-plan identity。公开
+  `changed_candidate_pool_v1()` 继续返回历史五数组 ABI，公开
+  `assemble_changed_candidate_plans_v1()` 继续返回历史三数组 ABI；dtype、C-contiguity、shape、
+  candidate ordinal 与 route order 均保持不变。
+- relocate、swap、two-opt-star 三个 generator 的循环、left/right 规范顺序、target insertion/cut
+  顺序和 removed 数量语义保持为 1/2/0。`changed_candidate_plan_selection_v1` 在一次 checked input
+  adapter 后直接组合两个 owned cores，再仅为现有 screening/ranking/公开 return seam 投影一次；
+  selection eligible/rank/top-k 和 evidence digest 仍使用相同数组字节与顺序。
+- `quality_changed_probe` 直接从 quality lane vectors 构造 owned changed pool，quality first-seen
+  plan dedup、identity 字节编码、plan packing、source ordinal 与 Stage 4/acceptance 流全部读取 owned
+  buffers；公开 pool projection 在状态修改前预分配，异常与返回 ABI 顺序保持。新增 append 和 plan
+  assembly 累积长度的 `int64_t` overflow gates，局部分配/追加失败不发布部分状态。
+- 输入 current/change CSR 在任何 pointer-range 构造前验证 terminal、上界、严格单调和非空；真正
+  zero-candidate pool 仍规范保存 `[0]` changed/removed offsets 与 `[0],[0],[]` plan sentinel。测试覆盖
+  三 operation Python 顺序、dtype/contiguity、empty pool、畸形非单调 offsets、全空 current/change、
+  仅一条 current route 为空和仅一条 changed route 为空。
+- Standards 首轮发现非空 plan 允许零长度 route 时，空 vector `data()+0` 可能产生未定义指针算术；
+  current/change inputs 与 `CandidatePlanPoolV1` output 已统一要求实际 route 严格非空。复审又发现
+  removed count 在验证 offsets 前做有符号减法可能使损坏 typed state 触发 signed overflow；validator
+  现分两阶段先验证非负/单调/terminal，再计算差值并核验 relocate/swap/two-opt-star 为 1/2/0。
+  两项 P2 均经独立 Spec 与 Standards 复审关闭，最终无 P0–P3 finding。
+- clean code checkpoint `a3d5209e90bc5d29238c0c65ff98e1a222c61373` 的 wheel SHA-256 为
+  `15116d0ee42d697e95e64f8f11a009681497dc0b3dcf8bfc152acc1aaceb4fa5`，extension 为
+  `beff6271fdd458c1a269885e022677e17e1a182044a11b8a9751879ec4418ca3`，scheduler 保持
+  `a1cd6e81caa49cdd7d162e44ee1274b7645dd26fd0f6b8760ae004b8d5e80617`；安装后的 extension
+  自报 revision 与 checkpoint 完全一致。
+- clean-wheel changed/assemble/selection/quality 聚焦复核为 `9 passed, 336 deselected`；扩大
+  非真实数据 full-native 为 `86 passed, 259 deselected`；完整 `tests/test_native_execution.py`
+  为 `333 passed, 12 skipped`、耗时 `793.85s`；四实例三 seed 真实 per-solve fixed-work 全字段
+  差分为 `12 passed`、耗时 `420.51s`。Ruff、83-file strict mypy 与 `git diff --check` 通过。
+- 本条仍只完成 changed/assembled pool computation 与 output ownership。screening、ranking、
+  public adapters、quality return envelope 和 outer probe 仍存在 pybind/NumPy seam，不能宣称
+  whole-call GIL-safe 或性能收益。production capability bits 继续全部为 0；不创建 attempt04，
+  不启动 Paired/Pilot/Formal/CUDA，不切换默认架构。下一 slice 为 typed screen batch。
