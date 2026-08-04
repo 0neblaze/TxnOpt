@@ -1416,41 +1416,45 @@ py::tuple insertion_candidate_plans_v2(
         load_capacity, epsilon, true);
 }
 
-py::tuple route_merge_candidate_pool_v2(
-    py::handle route_offsets,
-    py::handle route_indices,
-    py::handle route_objective_metrics,
-    py::handle demand,
+evrptw::native_search::RouteMergeCandidatePoolV2
+route_merge_candidate_pool_owned_v2(
+    std::span<const std::int64_t> route_offsets,
+    std::span<const std::int64_t> route_indices,
+    std::span<const double> route_objective_metrics,
+    std::span<const double> demand,
     double load_capacity,
     double epsilon,
     bool pair_pruning,
     bool preserve_duplicates) {
-    auto offsets_array = checked_array<std::int64_t>(
-        route_offsets, "route_offsets", 1);
-    auto indices_array = checked_array<std::int64_t>(
-        route_indices, "route_indices", 1);
-    auto metrics_array = checked_array<double>(
-        route_objective_metrics, "route_objective_metrics", 2);
-    auto demand_array = checked_array<double>(demand, "demand", 1);
-    if (offsets_array.size() < 3 || metrics_array.shape(1) != 2
-        || metrics_array.shape(0) != offsets_array.size() - 1
+    constexpr auto maximum_i64_size =
+        static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
+    if (route_offsets.size() < 3
+        || route_offsets.size() - 1 > maximum_i64_size
+        || route_indices.size() > maximum_i64_size
+        || demand.size() > maximum_i64_size
+        || route_objective_metrics.size() % 2 != 0
+        || route_objective_metrics.size() / 2 != route_offsets.size() - 1
         || !std::isfinite(load_capacity) || load_capacity < 0.0
         || !std::isfinite(epsilon) || epsilon < 0.0) {
         throw std::invalid_argument("route-merge candidate-pool input/config is invalid");
     }
-    const auto route_count = static_cast<std::size_t>(offsets_array.size() - 1);
-    const auto* offsets = checked_data<std::int64_t>(offsets_array);
-    const auto* indices = checked_data<std::int64_t>(indices_array);
-    const auto* metrics = checked_data<double>(metrics_array);
-    const auto* demands = checked_data<double>(demand_array);
-    if (offsets[0] != 0 || offsets[route_count] != indices_array.size()) {
+    const auto route_count = route_offsets.size() - 1;
+    const auto* offsets = route_offsets.data();
+    const auto* indices = route_indices.data();
+    const auto* metrics = route_objective_metrics.data();
+    const auto* demands = demand.data();
+    if (offsets[0] != 0
+        || offsets[route_count]
+            != static_cast<std::int64_t>(route_indices.size())) {
         throw std::invalid_argument("route-merge route offsets are invalid");
     }
     std::vector<std::vector<std::int64_t>> routes;
     std::vector<double> route_demands(route_count, 0.0);
     routes.reserve(route_count);
     for (std::size_t route = 0; route < route_count; ++route) {
-        if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]) {
+        if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]
+            || offsets[route + 1]
+                > static_cast<std::int64_t>(route_indices.size())) {
             throw std::invalid_argument("route-merge routes must be non-empty");
         }
         routes.emplace_back(
@@ -1458,10 +1462,15 @@ py::tuple route_merge_candidate_pool_v2(
         double total = 0.0;
         double compensation = 0.0;
         for (const auto node : routes.back()) {
-            if (node < 0 || node >= demand_array.size()) {
+            if (node < 0
+                || node >= static_cast<std::int64_t>(demand.size())) {
                 throw std::invalid_argument("route-merge route contains an unknown node");
             }
             const auto value = demands[node];
+            if (!std::isfinite(value) || value < 0.0) {
+                throw std::invalid_argument(
+                    "route-merge demand values must be finite and non-negative");
+            }
             const auto next = total + value;
             compensation += std::fabs(total) >= std::fabs(value)
                 ? (total - next) + value
@@ -1530,8 +1539,16 @@ py::tuple route_merge_candidate_pool_v2(
             && route_demands[pair.left] + route_demands[pair.right]
                 > load_capacity + epsilon) {
             ++pruned_pairs;
-            pruned_candidates += static_cast<std::int64_t>(
-                routes[pair.left].size() + routes[pair.right].size() + 2);
+            const auto skipped =
+                routes[pair.left].size() + routes[pair.right].size() + 2;
+            if (skipped > maximum_i64_size
+                || pruned_candidates
+                    > std::numeric_limits<std::int64_t>::max()
+                        - static_cast<std::int64_t>(skipped)) {
+                throw std::overflow_error(
+                    "route-merge pruned-candidate count overflowed");
+            }
+            pruned_candidates += static_cast<std::int64_t>(skipped);
             continue;
         }
         for (const auto& [source_index, target_index] : std::array{
@@ -1555,6 +1572,11 @@ py::tuple route_merge_candidate_pool_v2(
                 if (preserve_duplicates) {
                     seen.insert(key);
                 }
+                if (candidate_indices.size()
+                    > maximum_i64_size - merged.size()) {
+                    throw std::overflow_error(
+                        "route-merge candidate indices overflowed");
+                }
                 candidate_indices.insert(
                     candidate_indices.end(), merged.begin(), merged.end());
                 candidate_offsets.push_back(
@@ -1569,26 +1591,77 @@ py::tuple route_merge_candidate_pool_v2(
             }
         }
     }
-    py::array_t<std::int64_t> offsets_output(candidate_offsets.size());
-    py::array_t<std::int64_t> indices_output(candidate_indices.size());
+    evrptw::native_search::RouteMergeCandidatePoolV2 result{
+        std::move(candidate_offsets),
+        std::move(candidate_indices),
+        std::move(metadata),
+        {pruned_pairs, pruned_candidates},
+        static_cast<std::int64_t>(route_count),
+    };
+    result.validate();
+    return result;
+}
+
+py::tuple project_route_merge_candidate_pool_v2(
+    const evrptw::native_search::RouteMergeCandidatePoolV2& pool) {
+    pool.validate();
+    py::array_t<std::int64_t> offsets_output(pool.candidate_offsets.size());
+    py::array_t<std::int64_t> indices_output(pool.candidate_indices.size());
     py::array_t<std::int64_t> metadata_output(
         std::vector<py::ssize_t>{
-            static_cast<py::ssize_t>(metadata.size() / 5), 5});
+            static_cast<py::ssize_t>(pool.candidate_count()), 5});
     py::array_t<std::int64_t> pruning_output(2);
     std::copy(
-        candidate_offsets.begin(), candidate_offsets.end(),
+        pool.candidate_offsets.begin(), pool.candidate_offsets.end(),
         checked_data(offsets_output));
     std::copy(
-        candidate_indices.begin(), candidate_indices.end(),
+        pool.candidate_indices.begin(), pool.candidate_indices.end(),
         checked_data(indices_output));
-    std::copy(metadata.begin(), metadata.end(), checked_data(metadata_output));
-    checked_data(pruning_output)[0] = pruned_pairs;
-    checked_data(pruning_output)[1] = pruned_candidates;
+    std::copy(
+        pool.metadata.begin(), pool.metadata.end(), checked_data(metadata_output));
+    std::copy(
+        pool.pruning.begin(), pool.pruning.end(), checked_data(pruning_output));
     return py::make_tuple(
         std::move(offsets_output),
         std::move(indices_output),
         std::move(metadata_output),
         std::move(pruning_output));
+}
+
+py::tuple route_merge_candidate_pool_v2(
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle route_objective_metrics,
+    py::handle demand,
+    double load_capacity,
+    double epsilon,
+    bool pair_pruning,
+    bool preserve_duplicates) {
+    auto offsets_array = checked_array<std::int64_t>(
+        route_offsets, "route_offsets", 1);
+    auto indices_array = checked_array<std::int64_t>(
+        route_indices, "route_indices", 1);
+    auto metrics_array = checked_array<double>(
+        route_objective_metrics, "route_objective_metrics", 2);
+    auto demand_array = checked_array<double>(demand, "demand", 1);
+    if (metrics_array.shape(1) != 2) {
+        throw std::invalid_argument("route-merge candidate-pool input/config is invalid");
+    }
+    const auto pool = route_merge_candidate_pool_owned_v2(
+        std::span<const std::int64_t>{
+            checked_data<std::int64_t>(offsets_array),
+            static_cast<std::size_t>(offsets_array.size())},
+        std::span<const std::int64_t>{
+            checked_data<std::int64_t>(indices_array),
+            static_cast<std::size_t>(indices_array.size())},
+        std::span<const double>{
+            checked_data<double>(metrics_array),
+            static_cast<std::size_t>(metrics_array.size())},
+        std::span<const double>{
+            checked_data<double>(demand_array),
+            static_cast<std::size_t>(demand_array.size())},
+        load_capacity, epsilon, pair_pruning, preserve_duplicates);
+    return project_route_merge_candidate_pool_v2(pool);
 }
 
 py::tuple assemble_changed_candidate_plans_v1(
@@ -11697,37 +11770,34 @@ public:
             return py::make_tuple(std::move(metadata), lane_solution_state(0));
         }
 
-        py::array_t<double> route_metrics(
-            py::array::ShapeContainer{
-                static_cast<py::ssize_t>(route_count), py::ssize_t{2}});
+        std::vector<double> route_metrics(route_count * 2);
         for (std::size_t route = 0; route < route_count; ++route) {
-            checked_data(route_metrics)[route * 2] =
+            route_metrics[route * 2] =
                 legacy_lane.exact.metrics[route * 4];
-            checked_data(route_metrics)[route * 2 + 1] =
+            route_metrics[route * 2 + 1] =
                 legacy_lane.exact.metrics[route * 4 + 3];
         }
-        auto live_offsets = lane_vector_array(legacy_lane.route_offsets);
-        auto live_indices = lane_vector_array(legacy_lane.route_indices);
-        auto pool = route_merge_candidate_pool_v2(
-            live_offsets, live_indices, route_metrics, demand_,
-            checked_data<double>(vehicle_)[1], screening_epsilon_, true, false);
-        auto candidate_offsets = py::cast<py::array_t<std::int64_t>>(pool[0]);
-        auto candidate_indices = py::cast<py::array_t<std::int64_t>>(pool[1]);
-        auto candidate_metadata = py::cast<py::array_t<std::int64_t>>(pool[2]);
-        const auto candidate_count = candidate_offsets.size() - 1;
+        if (!live_problem_.has_value()) {
+            throw std::logic_error(
+                "full native route-merge planning lost its problem state");
+        }
+        const auto pool_state = route_merge_candidate_pool_owned_v2(
+            legacy_lane.route_offsets, legacy_lane.route_indices, route_metrics,
+            live_problem_->demand,
+            live_problem_->vehicle[1], screening_epsilon_, true, false);
+        auto pool = project_route_merge_candidate_pool_v2(pool_state);
+        const auto candidate_count = pool_state.candidate_count();
         metadata_values[3] = candidate_count;
-        py::array_t<std::int64_t> screening_reasons(candidate_count);
+        py::array_t<std::int64_t> screening_reasons(
+            static_cast<py::ssize_t>(candidate_count));
 
         std::vector<std::int64_t> plan_offsets{0};
         std::vector<std::int64_t> route_offsets{0};
         std::vector<std::int64_t> route_indices;
         std::vector<std::int64_t> source_candidates;
-        const auto* candidate_boundaries =
-            checked_data<std::int64_t>(candidate_offsets);
-        const auto* candidate_nodes =
-            checked_data<std::int64_t>(candidate_indices);
-        const auto* pool_metadata =
-            checked_data<std::int64_t>(candidate_metadata);
+        const auto* candidate_boundaries = pool_state.candidate_offsets.data();
+        const auto* candidate_nodes = pool_state.candidate_indices.data();
+        const auto* pool_metadata = pool_state.metadata.data();
         const auto* legacy_boundaries = legacy_lane.route_offsets.data();
         const auto* legacy_nodes = legacy_lane.route_indices.data();
         const auto* kinds = checked_data<std::int64_t>(node_kind_);
@@ -11790,7 +11860,7 @@ public:
                 });
             }
         }
-        for (py::ssize_t candidate = 0; candidate < candidate_count; ++candidate) {
+        for (std::size_t candidate = 0; candidate < candidate_count; ++candidate) {
             const auto first = candidate_boundaries[candidate];
             const auto last = candidate_boundaries[candidate + 1];
             const auto& screen = merge_screening[
@@ -11825,11 +11895,11 @@ public:
             }
             const auto left = pool_metadata[candidate * 5];
             const auto right = pool_metadata[candidate * 5 + 1];
-            for (py::ssize_t route = 0; route < route_count; ++route) {
-                if (route == right) {
+            for (std::size_t route = 0; route < route_count; ++route) {
+                if (static_cast<std::int64_t>(route) == right) {
                     continue;
                 }
-                if (route == left) {
+                if (static_cast<std::int64_t>(route) == left) {
                     route_indices.insert(
                         route_indices.end(), candidate_nodes + first,
                         candidate_nodes + last);
@@ -11843,7 +11913,7 @@ public:
             }
             plan_offsets.push_back(
                 static_cast<std::int64_t>(route_offsets.size() - 1));
-            source_candidates.push_back(candidate);
+            source_candidates.push_back(static_cast<std::int64_t>(candidate));
         }
         screening_seconds_ += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - merge_screening_started).count();

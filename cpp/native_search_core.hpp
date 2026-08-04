@@ -262,6 +262,64 @@ struct InsertionPlanPoolV2 final {
     }
 };
 
+struct RouteMergeCandidatePoolV2 final {
+    std::vector<std::int64_t> candidate_offsets;
+    std::vector<std::int64_t> candidate_indices;
+    std::vector<std::int64_t> metadata;
+    std::array<std::int64_t, 2> pruning{};
+    std::int64_t input_route_count = 0;
+
+    [[nodiscard]] std::size_t candidate_count() const noexcept {
+        return candidate_offsets.empty() ? 0 : candidate_offsets.size() - 1;
+    }
+
+    void validate() const {
+        constexpr auto maximum_i64_size =
+            static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
+        if (candidate_offsets.empty() || candidate_offsets.front() != 0
+            || candidate_count() > maximum_i64_size
+            || candidate_indices.size() > maximum_i64_size
+            || candidate_offsets.back()
+                != static_cast<std::int64_t>(candidate_indices.size())
+            || metadata.size() % 5 != 0
+            || metadata.size() / 5 != candidate_count()
+            || pruning[0] < 0 || pruning[1] < 0
+            || input_route_count < 2) {
+            throw std::logic_error(
+                "native route-merge candidate pool is inconsistent");
+        }
+        for (std::size_t candidate = 0; candidate < candidate_count(); ++candidate) {
+            if (candidate_offsets[candidate] < 0
+                || candidate_offsets[candidate]
+                    >= candidate_offsets[candidate + 1]
+                || candidate_offsets[candidate + 1]
+                    > static_cast<std::int64_t>(candidate_indices.size())) {
+                throw std::logic_error(
+                    "native route-merge candidate offsets are invalid");
+            }
+        }
+        for (std::size_t candidate = 0; candidate < candidate_count(); ++candidate) {
+            const auto left = metadata[candidate * 5];
+            const auto right = metadata[candidate * 5 + 1];
+            const auto source = metadata[candidate * 5 + 2];
+            const auto target = metadata[candidate * 5 + 3];
+            const auto position = metadata[candidate * 5 + 4];
+            const auto pair_matches =
+                (source == left && target == right)
+                || (source == right && target == left);
+            const auto candidate_size =
+                candidate_offsets[candidate + 1]
+                - candidate_offsets[candidate];
+            if (left < 0 || right <= left || right >= input_route_count
+                || !pair_matches || position < 0
+                || position >= candidate_size) {
+                throw std::logic_error(
+                    "native route-merge candidate metadata is invalid");
+            }
+        }
+    }
+};
+
 [[nodiscard]] inline DynamicRemovalSelectionV2 select_dynamic_removal_v2(
     const std::int64_t customer_count,
     const std::int64_t stagnation_iterations,

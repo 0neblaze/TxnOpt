@@ -1329,7 +1329,12 @@ def test_native_route_merge_pool_preserves_python_order_and_duplicate_policy() -
         dtype=np.float64,
     )
 
-    def execute(preserve_duplicates: bool, capacity: float) -> tuple[object, ...]:
+    def execute(
+        preserve_duplicates: bool,
+        capacity: float,
+        *,
+        pair_pruning: bool = True,
+    ) -> tuple[object, ...]:
         return native_core.route_merge_candidate_pool_v2(
             offsets,
             indices,
@@ -1337,7 +1342,7 @@ def test_native_route_merge_pool_preserves_python_order_and_duplicate_policy() -
             context.demand,
             capacity,
             1e-9,
-            True,
+            pair_pruning,
             preserve_duplicates,
         )
 
@@ -1357,6 +1362,9 @@ def test_native_route_merge_pool_preserves_python_order_and_duplicate_policy() -
     assert candidates == (("C1", "C2"), ("C2", "C1"))
     assert metadata.tolist() == [[0, 1, 0, 1, 0], [0, 1, 0, 1, 1]]
     assert pruning.tolist() == [0, 0]
+    for output in (candidate_offsets, candidate_indices, metadata, pruning):
+        assert output.dtype == np.int64
+        assert output.flags.c_contiguous
 
     duplicate_offsets, _, duplicate_metadata, _ = execute(
         True,
@@ -1368,7 +1376,46 @@ def test_native_route_merge_pool_preserves_python_order_and_duplicate_policy() -
     assert pruned_offsets.tolist() == [0]
     assert pruned_indices.tolist() == []
     assert pruned_metadata.tolist() == []
+    assert pruned_metadata.shape == (0, 5)
     assert pruned.tolist() == [1, 4]
+
+    unpruned_offsets, _, unpruned_metadata, unpruned_counts = execute(
+        True,
+        1.0,
+        pair_pruning=False,
+    )
+    assert len(unpruned_offsets) - 1 == len(unpruned_metadata) == 4
+    assert unpruned_counts.tolist() == [0, 0]
+
+    with pytest.raises(ValueError, match="route-merge routes must be non-empty"):
+        native_core.route_merge_candidate_pool_v2(
+            np.asarray([0, 3, 2], dtype=np.int64),
+            indices,
+            metrics,
+            context.demand,
+            instance.vehicle.load_capacity,
+            1e-9,
+            True,
+            False,
+        )
+
+    for invalid_demand in (float("nan"), float("inf"), float("-inf"), -1.0):
+        malformed_demand = np.asarray(context.demand, dtype=np.float64).copy()
+        malformed_demand[int(indices[0])] = invalid_demand
+        with pytest.raises(
+            ValueError,
+            match="route-merge demand values must be finite and non-negative",
+        ):
+            native_core.route_merge_candidate_pool_v2(
+                offsets,
+                indices,
+                metrics,
+                malformed_demand,
+                instance.vehicle.load_capacity,
+                1e-9,
+                True,
+                False,
+            )
 
 
 def test_full_native_initialization_matches_python_exact_objective_and_budget() -> None:
