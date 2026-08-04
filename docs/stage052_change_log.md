@@ -3164,3 +3164,19 @@ compatibility fallback（兼容回退）。
   `151 passed, 187 deselected`；两份独立复审逐项关闭全部六个原 blocker，接受该提交为
   live-lane ownership checkpoint。内存侧 non-blocker 是 `live_problem_` 当前额外持有一份
   O(n²) immutable problem copy，后续资源测量必须单列 RSS/PSS 并评估共享 ownership。
+
+## 2026-08-04：搜索决策停止读取持久 lane mirrors
+
+- Candidate Control 的 route-count eligibility、ranking incumbent identity，Stage 4 auto-
+  temperature 初始路线/目标、legacy/quality/constraint operators 的 incumbent routes/exact、
+  refinement candidate、global-search previous state，以及 terminal event 的 current/best
+  objective 和 route count 全部改读 C++ `LaneStateV2`。持久 `current_/legacy_/quality_/best_`
+  Python arrays/tuples 现在只用于初始化 ABI、fault injection、独立 mirror validation、异常
+  rollback 和兼容投影，不再参与搜索选择、接受、Stage 4 或终止判断。
+- 仍要求 py-array ABI 的 route-merge/changed-route/constraint-removal helper，由 C++ lane 临时
+  生成输入 projection；其决策源不再是持久 mirror。下一步必须把这些 helper 抽成 span/vector
+  typed return，并将 exact/negative cache、repair、AcceptanceOutcome、Stage4 boundary 和
+  terminal stream 一并改为 owned structs，才能在外层一次性释放 GIL。
+- exact-wheel 相关 operator/round/Stage4 回归为 `103 passed`；四实例三 seed fixed-work
+  全字段配对门控为 `12 passed`、耗时 `92.14s`。本切片仍保持 capability bits 全 0，且不创建
+  attempt04、不启动 Paired/Pilot/Formal/CUDA。

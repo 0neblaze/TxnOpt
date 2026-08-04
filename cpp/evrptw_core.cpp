@@ -10086,13 +10086,14 @@ public:
             checked_data(lower_bounds)[route] = screen.metrics[3];
             screening_passed[route] = screen.codes[0] == 1 ? 1 : 0;
         }
+        const auto& active_lane = live_lane_state(2);
         const auto decision = evrptw::native_candidate_plan::decide({
             std::span<const std::int64_t>(plan_boundaries, plan_count + 1),
             std::span<const std::int64_t>(eligible.data(), eligible.size()),
             std::span<const std::int64_t>(
                 screening_passed.data(), screening_passed.size()),
             std::span<const std::int64_t>(attempted, plan_count),
-            static_cast<std::int64_t>(current_offsets_.size() - 1),
+            static_cast<std::int64_t>(active_lane.route_offsets.size() - 1),
         });
         eligible = decision.eligible;
         const auto ranking = evrptw::native_candidate_plan::rank({
@@ -10100,12 +10101,8 @@ public:
             std::span<const std::int64_t>(route_boundaries, route_count + 1),
             std::span<const std::int64_t>(route_nodes, indices_array.size()),
             std::span<const double>(checked_data<double>(lower_bounds), route_count),
-            std::span<const std::int64_t>(
-                checked_data<std::int64_t>(current_offsets_),
-                current_offsets_.size()),
-            std::span<const std::int64_t>(
-                checked_data<std::int64_t>(current_indices_),
-                current_indices_.size()),
+            std::span<const std::int64_t>(active_lane.route_offsets),
+            std::span<const std::int64_t>(active_lane.route_indices),
             std::span<const std::int64_t>(
                 checked_data<std::int64_t>(lexical_rank_), lexical_rank_.size()),
             decision.combined_attempted,
@@ -10810,7 +10807,8 @@ public:
             throw std::invalid_argument(
                 "full native legacy route-elimination deadline/batch is invalid");
         }
-        const auto route_count = legacy_offsets_.size() - 1;
+        const auto& legacy_lane = live_lane_state(0);
+        const auto route_count = legacy_lane.route_offsets.size() - 1;
         py::array_t<std::int64_t> empty_profile_order(0);
         py::array_t<std::int64_t> empty_attempts(
             py::array::ShapeContainer{0, 6});
@@ -10840,20 +10838,11 @@ public:
             double charging_time;
             std::int64_t charging_count;
         };
-        auto path_offsets = py::cast<py::array_t<std::int64_t>>(
-            legacy_exact_payload_[0]);
-        auto path_indices = py::cast<py::array_t<std::int64_t>>(
-            legacy_exact_payload_[1]);
-        auto statuses = py::cast<py::array_t<std::int64_t>>(
-            legacy_exact_payload_[2]);
-        auto metrics = py::cast<py::array_t<double>>(
-            legacy_exact_payload_[4]);
-        const auto* route_boundaries =
-            checked_data<std::int64_t>(legacy_offsets_);
-        const auto* path_boundaries = checked_data<std::int64_t>(path_offsets);
-        const auto* paths = checked_data<std::int64_t>(path_indices);
-        const auto* status_values = checked_data<std::int64_t>(statuses);
-        const auto* metric_values = checked_data<double>(metrics);
+        const auto* route_boundaries = legacy_lane.route_offsets.data();
+        const auto* path_boundaries = legacy_lane.exact.path_offsets.data();
+        const auto* paths = legacy_lane.exact.path_indices.data();
+        const auto* status_values = legacy_lane.exact.statuses.data();
+        const auto* metric_values = legacy_lane.exact.metrics.data();
         std::vector<RouteProfile> profiles;
         profiles.reserve(static_cast<std::size_t>(route_count));
         for (std::int64_t route = 0; route < route_count; ++route) {
@@ -10905,7 +10894,7 @@ public:
         std::vector<std::int64_t> packed_route_indices;
         std::vector<std::int64_t> source_route_by_plan;
         std::unordered_set<std::string> seen_plans;
-        const auto* legacy_nodes = checked_data<std::int64_t>(legacy_indices_);
+        const auto* legacy_nodes = legacy_lane.route_indices.data();
         for (std::int64_t rank = 0; rank < attempt_count; ++rank) {
             const auto source_route = profiles[static_cast<std::size_t>(rank)].route;
             checked_data(profile_order)[rank] = source_route;
@@ -11122,7 +11111,8 @@ public:
             throw std::invalid_argument(
                 "full native route-merge deadline/batch is invalid");
         }
-        const auto route_count = legacy_offsets_.size() - 1;
+        const auto& legacy_lane = live_lane_state(0);
+        const auto route_count = legacy_lane.route_offsets.size() - 1;
         py::array_t<std::int64_t> metadata(4);
         auto* metadata_values = checked_data(metadata);
         metadata_values[0] = iteration;
@@ -11135,18 +11125,19 @@ public:
             return py::make_tuple(std::move(metadata), lane_solution_state(0));
         }
 
-        auto exact_metrics = py::cast<py::array_t<double>>(
-            legacy_exact_payload_[4]);
         py::array_t<double> route_metrics(
-            {route_count, py::ssize_t{2}});
-        for (py::ssize_t route = 0; route < route_count; ++route) {
+            py::array::ShapeContainer{
+                static_cast<py::ssize_t>(route_count), py::ssize_t{2}});
+        for (std::size_t route = 0; route < route_count; ++route) {
             checked_data(route_metrics)[route * 2] =
-                checked_data<double>(exact_metrics)[route * 4];
+                legacy_lane.exact.metrics[route * 4];
             checked_data(route_metrics)[route * 2 + 1] =
-                checked_data<double>(exact_metrics)[route * 4 + 3];
+                legacy_lane.exact.metrics[route * 4 + 3];
         }
+        auto live_offsets = lane_vector_array(legacy_lane.route_offsets);
+        auto live_indices = lane_vector_array(legacy_lane.route_indices);
         auto pool = route_merge_candidate_pool_v2(
-            legacy_offsets_, legacy_indices_, route_metrics, demand_,
+            live_offsets, live_indices, route_metrics, demand_,
             checked_data<double>(vehicle_)[1], screening_epsilon_, true, false);
         auto candidate_offsets = py::cast<py::array_t<std::int64_t>>(pool[0]);
         auto candidate_indices = py::cast<py::array_t<std::int64_t>>(pool[1]);
@@ -11165,9 +11156,8 @@ public:
             checked_data<std::int64_t>(candidate_indices);
         const auto* pool_metadata =
             checked_data<std::int64_t>(candidate_metadata);
-        const auto* legacy_boundaries =
-            checked_data<std::int64_t>(legacy_offsets_);
-        const auto* legacy_nodes = checked_data<std::int64_t>(legacy_indices_);
+        const auto* legacy_boundaries = legacy_lane.route_offsets.data();
+        const auto* legacy_nodes = legacy_lane.route_indices.data();
         const auto* kinds = checked_data<std::int64_t>(node_kind_);
         const auto* demands = checked_data<double>(demand_);
         const auto* ready = checked_data<double>(ready_time_);
@@ -11518,8 +11508,9 @@ public:
             throw std::invalid_argument(
                 "full native vehicle-count-aware deadline/batch is invalid");
         }
+        const auto& legacy_lane = live_lane_state(0);
         const auto customer_count = static_cast<std::int64_t>(
-            legacy_indices_.size());
+            legacy_lane.route_indices.size());
         auto remove_count = std::max<std::int64_t>(
             1, static_cast<std::int64_t>(std::ceil(
                 static_cast<double>(all_customers_.size()) * removal_fraction)));
@@ -11554,11 +11545,10 @@ public:
                 static_cast<std::size_t>(14 + destroy_operation), accepted,
                 comparison, is_global_best, vehicle_reduction, true);
         };
-        const auto* route_boundaries =
-            checked_data<std::int64_t>(legacy_offsets_);
-        const auto* route_nodes = checked_data<std::int64_t>(legacy_indices_);
+        const auto* route_boundaries = legacy_lane.route_offsets.data();
+        const auto* route_nodes = legacy_lane.route_indices.data();
         std::vector<std::int64_t> customers(
-            route_nodes, route_nodes + legacy_indices_.size());
+            route_nodes, route_nodes + legacy_lane.route_indices.size());
         std::vector<std::int64_t> removed;
         removed.reserve(static_cast<std::size_t>(remove_count));
         if (destroy_operation == 0) {
@@ -11574,7 +11564,8 @@ public:
             std::vector<Contribution> contributions;
             const auto node_count = static_cast<std::size_t>(node_kind_.size());
             const auto* distances = checked_data<double>(distance_);
-            for (py::ssize_t route = 0; route + 1 < legacy_offsets_.size(); ++route) {
+            for (std::size_t route = 0;
+                 route + 1 < legacy_lane.route_offsets.size(); ++route) {
                 auto previous = depot_;
                 for (auto cursor = route_boundaries[route];
                      cursor < route_boundaries[route + 1]; ++cursor) {
@@ -11629,7 +11620,8 @@ public:
             removed.begin(), removed.end());
         std::vector<std::int64_t> partial_offsets{0};
         std::vector<std::int64_t> partial_indices;
-        for (py::ssize_t route = 0; route + 1 < legacy_offsets_.size(); ++route) {
+        for (std::size_t route = 0;
+             route + 1 < legacy_lane.route_offsets.size(); ++route) {
             const auto before = partial_indices.size();
             for (auto cursor = route_boundaries[route];
                  cursor < route_boundaries[route + 1]; ++cursor) {
@@ -11811,11 +11803,17 @@ public:
             return output;
         };
         const auto entry_budget = budget_.native_snapshot();
-        const auto route_count = legacy_candidate_offsets_.size() - 1;
+        if (!legacy_candidate_lane_state_.has_value()
+            || !live_problem_.has_value()) {
+            throw std::logic_error(
+                "full native legacy refinement lost candidate ownership");
+        }
+        const auto& legacy_candidate = *legacy_candidate_lane_state_;
+        legacy_candidate.validate_live_assuming_problem_valid(*live_problem_);
+        const auto route_count = legacy_candidate.route_offsets.size() - 1;
         const auto* candidate_boundaries =
-            checked_data<std::int64_t>(legacy_candidate_offsets_);
-        const auto* candidate_nodes =
-            checked_data<std::int64_t>(legacy_candidate_indices_);
+            legacy_candidate.route_offsets.data();
+        const auto* candidate_nodes = legacy_candidate.route_indices.data();
         std::vector<std::vector<std::int64_t>> candidate_routes;
         candidate_routes.reserve(static_cast<std::size_t>(route_count));
         for (std::int64_t route = 0; route < route_count; ++route) {
@@ -12219,15 +12217,18 @@ public:
             throw std::invalid_argument(
                 "full native quality relocate deadline/batch is invalid");
         }
+        const auto& quality_lane = live_lane_state(1);
+        auto live_offsets = lane_vector_array(quality_lane.route_offsets);
+        auto live_indices = lane_vector_array(quality_lane.route_indices);
         auto pool = changed_candidate_pool_v1(
-            operation, quality_offsets_, quality_indices_);
+            operation, live_offsets, live_indices);
         auto changed_routes = py::cast<py::array_t<std::int64_t>>(pool[0]);
         auto change_offsets = py::cast<py::array_t<std::int64_t>>(pool[1]);
         auto change_indices = py::cast<py::array_t<std::int64_t>>(pool[2]);
         const auto candidate_count = changed_routes.shape(0);
-        const auto route_count = quality_offsets_.size() - 1;
-        const auto* base_offsets = checked_data<std::int64_t>(quality_offsets_);
-        const auto* base_indices = checked_data<std::int64_t>(quality_indices_);
+        const auto route_count = quality_lane.route_offsets.size() - 1;
+        const auto* base_offsets = quality_lane.route_offsets.data();
+        const auto* base_indices = quality_lane.route_indices.data();
         const auto* changed = checked_data<std::int64_t>(changed_routes);
         const auto* changes = checked_data<std::int64_t>(change_offsets);
         const auto* changed_indices = checked_data<std::int64_t>(change_indices);
@@ -12399,6 +12400,7 @@ public:
                 "full native standard deadline/batch is invalid");
         }
         const auto entry_exact_started = budget_.native_snapshot().started;
+        const auto& legacy_lane = live_lane_state(0);
         auto next_rng = *rng_;
         const std::vector<double> main_weights{
             full_operator_weights_[0], full_operator_weights_[1],
@@ -12420,14 +12422,13 @@ public:
             remove_count = std::min<std::int64_t>(remove_count, 3);
         }
         remove_count = std::min<std::int64_t>(
-            remove_count, legacy_indices_.size());
+            remove_count, legacy_lane.route_indices.size());
         std::vector<std::int64_t> customers(
-            checked_data<std::int64_t>(legacy_indices_),
-            checked_data<std::int64_t>(legacy_indices_) + legacy_indices_.size());
+            legacy_lane.route_indices.begin(), legacy_lane.route_indices.end());
         std::vector<std::int64_t> removed;
         if (destroy == 0) {
             const auto sampled = next_rng.sample_indices(
-                legacy_indices_.size(), remove_count);
+                legacy_lane.route_indices.size(), remove_count);
             for (const auto index : sampled) {
                 removed.push_back(customers[static_cast<std::size_t>(index)]);
             }
@@ -12435,8 +12436,9 @@ public:
             std::vector<std::pair<double, std::int64_t>> contributions;
             const auto node_count = static_cast<std::size_t>(node_kind_.size());
             const auto* distances = checked_data<double>(distance_);
-            const auto* route_offsets = checked_data<std::int64_t>(legacy_offsets_);
-            for (py::ssize_t route = 0; route + 1 < legacy_offsets_.size(); ++route) {
+            const auto* route_offsets = legacy_lane.route_offsets.data();
+            for (std::size_t route = 0;
+                 route + 1 < legacy_lane.route_offsets.size(); ++route) {
                 for (auto cursor = route_offsets[route];
                      cursor < route_offsets[route + 1]; ++cursor) {
                     const auto before = cursor == route_offsets[route]
@@ -12514,11 +12516,12 @@ public:
         };
         const std::unordered_set<std::int64_t> removed_set(
             removed.begin(), removed.end());
-        const auto* boundaries = checked_data<std::int64_t>(legacy_offsets_);
-        const auto* nodes = checked_data<std::int64_t>(legacy_indices_);
+        const auto* boundaries = legacy_lane.route_offsets.data();
+        const auto* nodes = legacy_lane.route_indices.data();
         std::vector<std::int64_t> partial_offsets{0};
         std::vector<std::int64_t> partial_indices;
-        for (py::ssize_t route = 0; route + 1 < legacy_offsets_.size(); ++route) {
+        for (std::size_t route = 0;
+             route + 1 < legacy_lane.route_offsets.size(); ++route) {
             const auto before = partial_indices.size();
             for (auto cursor = boundaries[route]; cursor < boundaries[route + 1]; ++cursor) {
                 if (!removed_set.contains(nodes[cursor])) {
@@ -13153,8 +13156,9 @@ public:
             throw std::invalid_argument(
                 "full native quality route-segment deadline/batch is invalid");
         }
-        const auto* boundaries = checked_data<std::int64_t>(quality_offsets_);
-        const auto* nodes = checked_data<std::int64_t>(quality_indices_);
+        const auto& quality_lane = live_lane_state(1);
+        const auto* boundaries = quality_lane.route_offsets.data();
+        const auto* nodes = quality_lane.route_indices.data();
         std::vector<std::array<std::int64_t, 8>> attempt_rows;
         std::vector<std::int64_t> removed_offsets{0};
         std::vector<std::int64_t> removed_indices;
@@ -13165,8 +13169,9 @@ public:
             16, evaluation_budget * 4);
         std::int64_t considered = 0;
         bool found = false;
-        for (py::ssize_t source = 0;
-             source + 1 < quality_offsets_.size() && !found; ++source) {
+        for (std::size_t source = 0;
+             source + 1 < quality_lane.route_offsets.size() && !found;
+             ++source) {
             const auto source_size = boundaries[source + 1] - boundaries[source];
             if (source_size <= min_length) {
                 continue;
@@ -13182,8 +13187,8 @@ public:
                     std::vector<std::int64_t> partial_offsets{0};
                     std::vector<std::int64_t> partial_indices;
                     std::vector<std::int64_t> removed;
-                    for (py::ssize_t route = 0;
-                         route + 1 < quality_offsets_.size(); ++route) {
+                    for (std::size_t route = 0;
+                         route + 1 < quality_lane.route_offsets.size(); ++route) {
                         for (auto cursor = boundaries[route];
                              cursor < boundaries[route + 1]; ++cursor) {
                             const auto relative = cursor - boundaries[route];
@@ -13224,18 +13229,22 @@ public:
                     const auto failure = checked_data<std::int64_t>(counters)[0];
                     bool changed = false;
                     if (failure == 0
-                        && repaired_offsets.size() == quality_offsets_.size()
-                        && repaired_indices.size() == quality_indices_.size()) {
+                        && repaired_offsets.size()
+                            == static_cast<py::ssize_t>(
+                                quality_lane.route_offsets.size())
+                        && repaired_indices.size()
+                            == static_cast<py::ssize_t>(
+                                quality_lane.route_indices.size())) {
                         changed = !std::equal(
                             checked_data<std::int64_t>(repaired_offsets),
                             checked_data<std::int64_t>(repaired_offsets)
                                 + repaired_offsets.size(),
-                            checked_data<std::int64_t>(quality_offsets_))
+                            quality_lane.route_offsets.data())
                             || !std::equal(
                                 checked_data<std::int64_t>(repaired_indices),
                                 checked_data<std::int64_t>(repaired_indices)
                                     + repaired_indices.size(),
-                                checked_data<std::int64_t>(quality_indices_));
+                                quality_lane.route_indices.data());
                     }
                     attempt_rows.push_back({
                         static_cast<std::int64_t>(source), start, length,
@@ -13377,8 +13386,8 @@ public:
             throw std::invalid_argument(
                 "full native quality ejection-chain deadline/batch is invalid");
         }
-        const auto route_count = static_cast<std::size_t>(
-            quality_offsets_.size() - 1);
+        const auto& quality_lane = live_lane_state(1);
+        const auto route_count = quality_lane.route_offsets.size() - 1;
         if (route_count <= 1) {
             py::array_t<std::int64_t> outcome(4);
             std::fill(
@@ -13391,8 +13400,8 @@ public:
                 py::none(), py::none(), std::move(outcome),
                 lane_solution_state(1));
         }
-        const auto* boundaries = checked_data<std::int64_t>(quality_offsets_);
-        const auto* nodes = checked_data<std::int64_t>(quality_indices_);
+        const auto* boundaries = quality_lane.route_offsets.data();
+        const auto* nodes = quality_lane.route_indices.data();
         std::vector<std::vector<std::int64_t>> base;
         base.reserve(route_count);
         for (std::size_t route = 0; route < route_count; ++route) {
@@ -13855,9 +13864,9 @@ public:
             1, static_cast<std::int64_t>(
                 std::ceil(static_cast<double>(all_customers_.size()) / 5.0)) - 1);
         if (legacy_candidate_ready_ && all_customers_.size() > 1
-            && legacy_candidate_offsets_.size() - 1
-                < legacy_offsets_.size() - 1
-            && legacy_candidate_offsets_.size() - 1
+            && legacy_candidate_lane_state_->route_offsets.size()
+                    < live_lane_state(0).route_offsets.size()
+            && legacy_candidate_lane_state_->route_offsets.size() - 1
                 <= reduced_vehicle_threshold
             && !budget_.budget_reached()) {
             refinement_totals_before = full_operator_totals_[13];
@@ -14175,12 +14184,15 @@ public:
                 legacy = legacy_vehicle_count_aware_probe(
                     iteration, removal_fraction, route_change_limit,
                     next_deadline(), batch_array, true, true);
-            } else if (selected_main == 2 && legacy_offsets_.size() == 2) {
+            } else if (
+                selected_main == 2
+                && live_lane_state(0).route_offsets.size() == 2) {
                 *rng_ = std::move(selector);
                 py::array_t<std::int64_t> metadata(4);
                 checked_data(metadata)[0] = iteration;
                 checked_data(metadata)[1] = 2;
-                checked_data(metadata)[2] = legacy_offsets_.size() - 1;
+                checked_data(metadata)[2] =
+                    live_lane_state(0).route_offsets.size() - 1;
                 checked_data(metadata)[3] = 0;
                 accumulate_full_stage04_outcome_noexcept(
                     2, false, 1, false, false, true);
@@ -14211,9 +14223,9 @@ public:
             1, static_cast<std::int64_t>(
                 std::ceil(static_cast<double>(all_customers_.size()) / 5.0)) - 1);
         if (legacy_candidate_ready_ && all_customers_.size() > 1
-            && legacy_candidate_offsets_.size() - 1
-                < legacy_offsets_.size() - 1
-            && legacy_candidate_offsets_.size() - 1
+            && legacy_candidate_lane_state_->route_offsets.size()
+                    < live_lane_state(0).route_offsets.size()
+            && legacy_candidate_lane_state_->route_offsets.size() - 1
                 <= reduced_vehicle_threshold
             && !budget_.budget_reached()) {
             refinement_totals_before = full_operator_totals_[13];
@@ -14465,6 +14477,12 @@ public:
                     "full native constraint probe reached its deadline");
             }
         };
+        const auto& constraint_lane = live_lane_state(2);
+        auto constraint_offsets = lane_vector_array(
+            constraint_lane.route_offsets);
+        auto constraint_indices = lane_vector_array(
+            constraint_lane.route_indices);
+        auto constraint_exact = lane_exact_payload(constraint_lane);
         auto removal = constraint_removal_v2(
             operation,
             node_kind_,
@@ -14476,11 +14494,11 @@ public:
             reachable_,
             vehicle_,
             lexical_rank_,
-            current_offsets_,
-            current_indices_,
-            current_exact_payload_[0],
-            current_exact_payload_[1],
-            current_exact_payload_[4],
+            constraint_offsets,
+            constraint_indices,
+            constraint_exact[0],
+            constraint_exact[1],
+            constraint_exact[4],
             requested_count,
             seed);
         auto removal_metadata = py::cast<py::array_t<std::int64_t>>(removal[6]);
@@ -14893,8 +14911,8 @@ public:
             checked_data(output)[0] = remaining;
             return output;
         };
-        const auto current_distance =
-            checked_data<double>(current_objective_float_)[0];
+        const auto& initialization_lane = live_lane_state(2);
+        const auto current_distance = initialization_lane.objective_float[0];
         const auto fallback = std::max(
             1.0, current_distance * stage04_temperature_fallback_fraction_);
         std::vector<double> positive_deltas;
@@ -14902,12 +14920,11 @@ public:
         std::vector<std::int64_t> evaluated_route_offsets{0};
         std::vector<std::int64_t> evaluated_route_indices;
         auto next_rng = *rng_;
-        const auto route_count = current_offsets_.size() - 1;
+        const auto route_count = initialization_lane.route_offsets.size() - 1;
         if (stage04_auto_temperature_ && route_count > 1) {
             const auto* route_boundaries =
-                checked_data<std::int64_t>(current_offsets_);
-            const auto* route_nodes =
-                checked_data<std::int64_t>(current_indices_);
+                initialization_lane.route_offsets.data();
+            const auto* route_nodes = initialization_lane.route_indices.data();
             std::vector<std::vector<std::int64_t>> base_routes;
             for (py::ssize_t route = 0; route < route_count; ++route) {
                 base_routes.emplace_back(
@@ -15415,6 +15432,12 @@ public:
         const auto probe_seed = next_constraint_rng.randbelow(1ULL << 32U);
         const auto requested_count = checked_data<std::int64_t>(selection)[1];
         if (requested_count <= 0) {
+            const auto& constraint_lane = live_lane_state(2);
+            auto constraint_offsets = lane_vector_array(
+                constraint_lane.route_offsets);
+            auto constraint_indices = lane_vector_array(
+                constraint_lane.route_indices);
+            auto constraint_exact = lane_exact_payload(constraint_lane);
             auto removal = constraint_removal_v2(
                 operation,
                 node_kind_,
@@ -15426,11 +15449,11 @@ public:
                 reachable_,
                 vehicle_,
                 lexical_rank_,
-                current_offsets_,
-                current_indices_,
-                current_exact_payload_[0],
-                current_exact_payload_[1],
-                current_exact_payload_[4],
+                constraint_offsets,
+                constraint_indices,
+                constraint_exact[0],
+                constraint_exact[1],
+                constraint_exact[4],
                 requested_count,
                 0);
             py::array_t<std::int64_t> outcome(6);
@@ -15714,8 +15737,8 @@ public:
             event[11] = after_budget.completed - before_budget.completed;
             event[12] = after_budget.interrupted - before_budget.interrupted;
             event[13] = 3;
-            event[14] = current_offsets_.size() - 1;
-            event[15] = best_offsets_.size() - 1;
+            event[14] = live_lane_state(2).route_offsets.size() - 1;
+            event[15] = live_lane_state(3).route_offsets.size() - 1;
 
             std::int64_t appended_routes = 0;
             if (!probe[1].is_none()) {
@@ -15782,18 +15805,16 @@ public:
                 objectives[0] = candidate_round.objective_float[0];
                 objectives[1] = candidate_round.objective_float[1];
             }
-            objective_integers[2] =
-                checked_data<std::int64_t>(current_objective_integer_)[0];
-            objective_integers[3] =
-                checked_data<std::int64_t>(current_objective_integer_)[1];
-            objective_integers[4] =
-                checked_data<std::int64_t>(best_objective_integer_)[0];
-            objective_integers[5] =
-                checked_data<std::int64_t>(best_objective_integer_)[1];
-            objectives[2] = checked_data<double>(current_objective_float_)[0];
-            objectives[3] = checked_data<double>(current_objective_float_)[1];
-            objectives[4] = checked_data<double>(best_objective_float_)[0];
-            objectives[5] = checked_data<double>(best_objective_float_)[1];
+            const auto& current_lane = live_lane_state(2);
+            const auto& best_lane = live_lane_state(3);
+            objective_integers[2] = current_lane.objective_integer[0];
+            objective_integers[3] = current_lane.objective_integer[1];
+            objective_integers[4] = best_lane.objective_integer[0];
+            objective_integers[5] = best_lane.objective_integer[1];
+            objectives[2] = current_lane.objective_float[0];
+            objectives[3] = current_lane.objective_float[1];
+            objectives[4] = best_lane.objective_float[0];
+            objectives[5] = best_lane.objective_float[1];
 
             auto stage_boundary = finish_stage04_iteration(
                 iteration, budget_.budget_reached());
@@ -15971,7 +15992,7 @@ public:
         if (start_iteration < 0 || iteration_count != 1
             || (start_iteration == 0
                 && (last_finished_stage04_iteration_ != -1
-                    || current_offsets_.size() != 2))
+                    || live_lane_state(2).route_offsets.size() != 2))
             || (start_iteration > 0
                 && last_finished_stage04_iteration_ != start_iteration - 1)) {
             throw std::invalid_argument(
@@ -16066,7 +16087,7 @@ public:
         if (budget_.budget_reached()) {
             return make_empty_terminal(1, entry_budget, entry_budget);
         }
-        auto previous_indices = current_indices_;
+        auto previous_indices = live_lane_state(2).route_indices;
         struct GlobalSearchSnapshot {
             NativeBudgetStateV2::NativeSnapshot budget;
             std::array<
@@ -16231,8 +16252,7 @@ public:
                 last_iteration_global_best_improved_ =
                     snapshot.last_iteration_global_best_improved;
             });
-        const auto previous_distance =
-            checked_data<double>(current_objective_float_)[0];
+        const auto previous_distance = live_lane_state(2).objective_float[0];
         py::tuple constraint;
         try {
             constraint = constraint_iteration(
@@ -16534,11 +16554,10 @@ public:
         auto repaired_offsets = py::cast<py::array_t<std::int64_t>>(repair[0]);
         auto repaired_indices = py::cast<py::array_t<std::int64_t>>(repair[1]);
         const auto repaired_route_changed =
-            previous_indices.size() != repaired_indices.size()
+            previous_indices.size()
+                != static_cast<std::size_t>(repaired_indices.size())
             || !std::equal(
-                checked_data<std::int64_t>(previous_indices),
-                checked_data<std::int64_t>(previous_indices)
-                    + previous_indices.size(),
+                previous_indices.begin(), previous_indices.end(),
                 checked_data<std::int64_t>(repaired_indices));
         repaired[17] = repaired_route_changed ? 0 : -1;
         py::array_t<std::int64_t> plan_offsets(event_count + 1);
