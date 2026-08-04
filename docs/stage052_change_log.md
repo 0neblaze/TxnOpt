@@ -3353,3 +3353,39 @@ compatibility fallback（兼容回退）。
   Spec 与 Standards 双审查均 ACCEPT。production capability bits 继续全部为 0；本条只封存
   per-solve 与 reviewer semantic projection 检查点，不声称 full-native/host-scheduler 已完成，
   不创建 attempt04，不启动 Paired/Pilot/Formal/CUDA，不切换默认架构。
+
+## 2026-08-04：constraint removal 输出完成 typed ownership
+
+- 新增 C++ `ConstraintRemovalResultV2`，自有保存 partial-route CSR、removed customers、
+  ranking score 三列、三字段 metadata 与 iteration identity。原公开
+  `constraint_removal_v2()` 继续返回历史七数组 ABI；`project_constraint_removal_v2()` 每次
+  复制到新的 NumPy arrays，Python 修改公开返回值不能污染搜索引擎保存的 owned state。
+  `constraint_removal_state(expected_iteration)` 提供只读验证投影并拒绝 stale iteration。
+- constraint probe 的三个成功出口、zero-removal constraint iteration、正常 constraint
+  iteration、constraint search 与 global search 均改为发布或读取 typed removal state，而不再
+  从返回 tuple 的 metadata、scores、removed/partial arrays 反向读取搜索控制。初始化会清除
+  上轮状态；constraint-iteration 异常恢复 previous optional，global-search snapshot 同时保存
+  并恢复非空 removal state。global rollback 的 `noexcept` guard 使用 move restore，避免
+  optional<vector> 深复制分配失败导致 `std::terminate`。
+- 测试过程保留两项非通过记录。第一次把“非空 removal 快照恢复”直接塞进旧 global rollback
+  测试后，预先 probe 造成后续 exact/cache 命中，旧断言所要求的 started-call 增量不再出现；
+  该组合测试诚实失败，随后恢复旧测试原样，并增加独立 non-empty snapshot regression，二者
+  同时通过。另一次使用过宽的 `-k full_native` 选择器误收集 154 个慢用例，184 秒外层
+  watchdog 超时后留下 pytest PID 96206；按精确 PID 正常终止并确认退出，该次不计入通过
+  证据。之后用精确 constraint/global 集合复验为 `28 passed, 315 deselected`。
+- clean code checkpoint `497398905337a3c4c75b22fd37c9f9bf98b75d39` 的 wheel SHA-256
+  为 `6dbeeb7c70f15ae38fd1f25014195efb7357a580c6b48603fbf5bc95d817104a`，extension
+  为 `378212c1f01ce0f77e08c174017c7da94432a990d2da108fb1c39d95313e72df`，安装态
+  scheduler 保持
+  `a1cd6e81caa49cdd7d162e44ee1274b7645dd26fd0f6b8760ae004b8d5e80617`。
+- clean-wheel 完整 `tests/test_native_execution.py` 为 `331 passed, 12 skipped`、耗时
+  `791.84s`；四实例三 seed 真实 per-solve fixed-work 全字段差分为 `12 passed`、耗时
+  `421.74s`。Ruff、83-file strict mypy 与 `git diff --check` 通过。独立 Spec、Standards 与
+  code review 三路均 ACCEPT；Standards 首轮发现 `noexcept` 深复制 blocker，move restore 与
+  非空快照回归完成后复审接受。
+- 本条只完成 constraint-removal **输出端** ownership。`constraint_removal_owned_v2()` 仍接收
+  `py::handle`/NumPy 输入，repair 仍消费 Python projection，因此尚不是 GIL-safe input core，
+  也不证明 full-native/host-scheduler 完工。下一顺序仍是 typed repair、typed helper pools、
+  typed evaluate-plans/probe/outer search inputs，最后才能释放 whole-call GIL。production
+  capability bits 继续全部为 0；不创建性能 attempt04，不启动 Paired/Pilot/Formal/CUDA，
+  不切换默认架构。
