@@ -56,6 +56,16 @@ struct RouteBatchViewV2 final {
     }
 };
 
+struct AcceptanceOutcomeV2 final {
+    std::int64_t accepted = 0;
+    std::int64_t improved_global_best = 0;
+    std::int64_t vehicle_reduction = 0;
+
+    [[nodiscard]] std::array<std::int64_t, 3> values() const noexcept {
+        return {accepted, improved_global_best, vehicle_reduction};
+    }
+};
+
 struct ProblemV2 final {
     std::vector<std::int64_t> node_kind;
     std::vector<double> demand;

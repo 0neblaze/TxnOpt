@@ -9412,6 +9412,25 @@ private:
     bool terminal_recorded_ = false;
 };
 
+class AcceptanceOutcomeProjectionV2 final {
+public:
+    AcceptanceOutcomeProjectionV2()
+        : payload_(3), zero_(0), one_(1) {}
+
+    py::tuple finish(
+        const evrptw::native_search::AcceptanceOutcomeV2& outcome) {
+        payload_[0] = outcome.accepted == 0 ? zero_ : one_;
+        payload_[1] = outcome.improved_global_best == 0 ? zero_ : one_;
+        payload_[2] = outcome.vehicle_reduction == 0 ? zero_ : one_;
+        return std::move(payload_);
+    }
+
+private:
+    py::tuple payload_;
+    py::int_ zero_;
+    py::int_ one_;
+};
+
 class NativeSearchEngineV2 {
 public:
     NativeSearchEngineV2(
@@ -11379,13 +11398,10 @@ public:
                     checked_data(outcome)[3] = 0;
                 } else {
                     const auto comparison = last_candidate_comparison();
-                    auto acceptance = apply_last_candidate(1.0, 1.0);
-                    checked_data(outcome)[1] =
-                        py::cast<std::int64_t>(acceptance[0]);
-                    checked_data(outcome)[2] =
-                        py::cast<std::int64_t>(acceptance[1]);
-                    checked_data(outcome)[3] =
-                        py::cast<std::int64_t>(acceptance[2]);
+                    const auto acceptance = apply_last_candidate_owned(1.0, 1.0);
+                    checked_data(outcome)[1] = acceptance.accepted;
+                    checked_data(outcome)[2] = acceptance.improved_global_best;
+                    checked_data(outcome)[3] = acceptance.vehicle_reduction;
                     accumulate_full_stage04_outcome_noexcept(
                         2, checked_data(outcome)[1] != 0, comparison,
                         checked_data(outcome)[2] != 0,
@@ -11687,13 +11703,10 @@ public:
                     checked_data(outcome)[3] = 0;
                 } else {
                     const auto comparison = last_candidate_comparison();
-                    auto acceptance = apply_last_candidate(1.0, 1.0);
-                    checked_data(outcome)[1] =
-                        py::cast<std::int64_t>(acceptance[0]);
-                    checked_data(outcome)[2] =
-                        py::cast<std::int64_t>(acceptance[1]);
-                    checked_data(outcome)[3] =
-                        py::cast<std::int64_t>(acceptance[2]);
+                    const auto acceptance = apply_last_candidate_owned(1.0, 1.0);
+                    checked_data(outcome)[1] = acceptance.accepted;
+                    checked_data(outcome)[2] = acceptance.improved_global_best;
+                    checked_data(outcome)[3] = acceptance.vehicle_reduction;
                     accumulate_full_stage04_outcome_noexcept(
                         3, checked_data(outcome)[1] != 0, comparison,
                         checked_data(outcome)[2] != 0,
@@ -11720,6 +11733,14 @@ public:
     }
 
     py::tuple apply_legacy_candidate(double temperature, double random_draw) {
+        AcceptanceOutcomeProjectionV2 projection;
+        const auto outcome = apply_legacy_candidate_owned(temperature, random_draw);
+        return projection.finish(outcome);
+    }
+
+    evrptw::native_search::AcceptanceOutcomeV2 apply_legacy_candidate_owned(
+        double temperature,
+        double random_draw) {
         std::unique_lock state_lock(state_mutex_, std::try_to_lock);
         if (!state_lock.owns_lock()) {
             throw std::runtime_error(
@@ -11772,16 +11793,16 @@ public:
             last_candidate_ready_ = false;
         });
         const auto comparison = last_candidate_comparison();
-        auto outcome = apply_last_candidate(temperature, random_draw);
+        auto outcome = apply_last_candidate_owned(temperature, random_draw);
         accumulate_full_stage04_outcome_noexcept(
             static_cast<std::size_t>(operator_index),
-            py::cast<std::int64_t>(outcome[0]) != 0, comparison,
-            py::cast<std::int64_t>(outcome[1]) != 0,
-            py::cast<std::int64_t>(outcome[2]) != 0, true);
+            outcome.accepted != 0, comparison,
+            outcome.improved_global_best != 0,
+            outcome.vehicle_reduction != 0, true);
         if (operator_index == 0 || operator_index == 1) {
-            const auto accepted = py::cast<std::int64_t>(outcome[0]) != 0;
-            const auto is_global_best = py::cast<std::int64_t>(outcome[1]) != 0;
-            const auto vehicle_reduction = py::cast<std::int64_t>(outcome[2]) != 0;
+            const auto accepted = outcome.accepted != 0;
+            const auto is_global_best = outcome.improved_global_best != 0;
+            const auto vehicle_reduction = outcome.vehicle_reduction != 0;
             accumulate_full_stage04_outcome_noexcept(
                 static_cast<std::size_t>(14 + legacy_candidate_destroy_operator_),
                 accepted, comparison, is_global_best, vehicle_reduction, true);
@@ -12057,13 +12078,13 @@ public:
                 } else {
                     const auto comparison = last_candidate_comparison();
                     const auto draw = next_rng.random();
-                    auto acceptance = apply_last_candidate(
+                    const auto acceptance = apply_last_candidate_owned(
                         stage04_initial_temperature_, draw);
-                    metadata_values[7] = py::cast<std::int64_t>(acceptance[0]);
+                    metadata_values[7] = acceptance.accepted;
                     accumulate_vehicle_repair_outcome(
                         metadata_values[7] != 0, comparison,
-                        py::cast<std::int64_t>(acceptance[1]) != 0,
-                        py::cast<std::int64_t>(acceptance[2]) != 0);
+                        acceptance.improved_global_best != 0,
+                        acceptance.vehicle_reduction != 0);
                 }
             } else {
                 commit_pending_composite_noexcept();
@@ -12543,6 +12564,7 @@ public:
             throw std::invalid_argument(
                 "full native quality relocate deadline/batch is invalid");
         }
+        last_quality_acceptance_outcome_.reset();
         const auto& quality_lane = live_lane_state(1);
         auto live_offsets = lane_vector_array(quality_lane.route_offsets);
         auto live_indices = lane_vector_array(quality_lane.route_indices);
@@ -12660,13 +12682,11 @@ public:
                 checked_data(outcome)[0] = *selected_plan;
                 const auto comparison = last_candidate_comparison();
                 if (!budget_.budget_reached()) {
-                    auto acceptance = apply_last_candidate(1.0, 1.0);
-                    checked_data(outcome)[1] =
-                        py::cast<std::int64_t>(acceptance[0]);
-                    checked_data(outcome)[2] =
-                        py::cast<std::int64_t>(acceptance[1]);
-                    checked_data(outcome)[3] =
-                        py::cast<std::int64_t>(acceptance[2]);
+                    const auto acceptance = apply_last_candidate_owned(1.0, 1.0);
+                    last_quality_acceptance_outcome_ = acceptance;
+                    checked_data(outcome)[1] = acceptance.accepted;
+                    checked_data(outcome)[2] = acceptance.improved_global_best;
+                    checked_data(outcome)[3] = acceptance.vehicle_reduction;
                 } else {
                     last_candidate_lane_state_.reset();
                     last_candidate_ready_ = false;
@@ -13482,6 +13502,7 @@ public:
             throw std::invalid_argument(
                 "full native quality route-segment deadline/batch is invalid");
         }
+        last_quality_acceptance_outcome_.reset();
         const auto& quality_lane = live_lane_state(1);
         const auto* boundaries = quality_lane.route_offsets.data();
         const auto* nodes = quality_lane.route_indices.data();
@@ -13653,10 +13674,11 @@ public:
                 commit_pending_composite_noexcept();
                 checked_data(outcome)[0] = *selected;
                 const auto comparison = last_candidate_comparison();
-                auto acceptance = apply_last_candidate(1.0, 1.0);
-                checked_data(outcome)[1] = py::cast<std::int64_t>(acceptance[0]);
-                checked_data(outcome)[2] = py::cast<std::int64_t>(acceptance[1]);
-                checked_data(outcome)[3] = py::cast<std::int64_t>(acceptance[2]);
+                const auto acceptance = apply_last_candidate_owned(1.0, 1.0);
+                last_quality_acceptance_outcome_ = acceptance;
+                checked_data(outcome)[1] = acceptance.accepted;
+                checked_data(outcome)[2] = acceptance.improved_global_best;
+                checked_data(outcome)[3] = acceptance.vehicle_reduction;
                 accumulate_full_stage04_outcome_noexcept(
                     7, checked_data(outcome)[1] != 0, comparison,
                     checked_data(outcome)[2] != 0,
@@ -13712,6 +13734,7 @@ public:
             throw std::invalid_argument(
                 "full native quality ejection-chain deadline/batch is invalid");
         }
+        last_quality_acceptance_outcome_.reset();
         const auto& quality_lane = live_lane_state(1);
         const auto route_count = quality_lane.route_offsets.size() - 1;
         if (route_count <= 1) {
@@ -13984,10 +14007,11 @@ public:
                 checked_data(outcome)[0] =
                     static_cast<std::int64_t>(selected_candidate);
                 const auto comparison = last_candidate_comparison();
-                auto acceptance = apply_last_candidate(1.0, 1.0);
-                checked_data(outcome)[1] = py::cast<std::int64_t>(acceptance[0]);
-                checked_data(outcome)[2] = py::cast<std::int64_t>(acceptance[1]);
-                checked_data(outcome)[3] = py::cast<std::int64_t>(acceptance[2]);
+                const auto acceptance = apply_last_candidate_owned(1.0, 1.0);
+                last_quality_acceptance_outcome_ = acceptance;
+                checked_data(outcome)[1] = acceptance.accepted;
+                checked_data(outcome)[2] = acceptance.improved_global_best;
+                checked_data(outcome)[3] = acceptance.vehicle_reduction;
                 accumulate_full_stage04_outcome_noexcept(
                     8, checked_data(outcome)[1] != 0, comparison,
                     checked_data(outcome)[2] != 0,
@@ -14116,6 +14140,9 @@ public:
             throw std::invalid_argument(
                 "full native three-lane bootstrap inputs are invalid");
         }
+        last_quality_acceptance_outcome_.reset();
+        last_constraint_acceptance_outcome_.reset();
+        last_three_lane_legacy_acceptance_outcome_.reset();
         const auto total_deadline = checked_data<double>(deadline_array)[0];
         const auto remaining_deadline = [&]() {
             return total_deadline - std::chrono::duration<double>(
@@ -14184,6 +14211,7 @@ public:
         py::object quality = py::none();
         py::object constraint = py::none();
         py::object legacy_acceptance = py::none();
+        AcceptanceOutcomeProjectionV2 legacy_acceptance_projection;
         py::object stage_boundary = py::none();
         std::optional<std::array<std::int64_t, 8>> refinement_totals_before;
         const auto reduced_vehicle_threshold = std::max<std::int64_t>(
@@ -14295,20 +14323,21 @@ public:
                 throw std::logic_error(
                     "full native legacy acceptance lost its RNG state");
             }
-            legacy_acceptance = apply_legacy_candidate(
+            last_three_lane_legacy_acceptance_outcome_ =
+                apply_legacy_candidate_owned(
                 stage04_initial_temperature_, rng_->random());
+            legacy_acceptance = legacy_acceptance_projection.finish(
+                *last_three_lane_legacy_acceptance_outcome_);
         }
-        const auto quality_global_best = !quality.is_none()
-            && checked_data<std::int64_t>(
-                py::cast<py::array_t<std::int64_t>>(
-                    py::cast<py::tuple>(quality)[2]))[2] != 0;
-        const auto constraint_global_best = !constraint.is_none()
-            && checked_data<std::int64_t>(
-                py::cast<py::array_t<std::int64_t>>(
-                    py::cast<py::tuple>(constraint)[2]))[4] != 0;
-        const auto legacy_global_best = !legacy_acceptance.is_none()
-            && py::cast<std::int64_t>(
-                py::cast<py::tuple>(legacy_acceptance)[1]) != 0;
+        const auto quality_global_best =
+            last_quality_acceptance_outcome_.has_value()
+            && last_quality_acceptance_outcome_->improved_global_best != 0;
+        const auto constraint_global_best =
+            last_constraint_acceptance_outcome_.has_value()
+            && last_constraint_acceptance_outcome_->improved_global_best != 0;
+        const auto legacy_global_best =
+            last_three_lane_legacy_acceptance_outcome_.has_value()
+            && last_three_lane_legacy_acceptance_outcome_->improved_global_best != 0;
         last_iteration_global_best_improved_ = quality_global_best
             || constraint_global_best || legacy_global_best;
         main_stagnation_iterations_ = last_iteration_global_best_improved_
@@ -14396,6 +14425,9 @@ public:
             throw std::invalid_argument(
                 "full native three-lane follow-up inputs are invalid");
         }
+        last_quality_acceptance_outcome_.reset();
+        last_constraint_acceptance_outcome_.reset();
+        last_three_lane_legacy_acceptance_outcome_.reset();
         const auto total_deadline = checked_data<double>(deadline_array)[0];
         const auto remaining_deadline = [&]() {
             return total_deadline - std::chrono::duration<double>(
@@ -14435,6 +14467,7 @@ public:
         py::object constraint = py::none();
         py::object refinement = py::none();
         py::object legacy_acceptance = py::none();
+        AcceptanceOutcomeProjectionV2 legacy_acceptance_projection;
         py::object stage_boundary = py::none();
         std::optional<std::array<std::int64_t, 8>> refinement_totals_before;
         const auto make_deadline_result = [&]() {
@@ -14658,35 +14691,26 @@ public:
             const auto cooling = std::max(
                 0.001, 1.0 - static_cast<double>(iteration)
                     / static_cast<double>(max_iterations));
-            legacy_acceptance = apply_legacy_candidate(
+            last_three_lane_legacy_acceptance_outcome_ =
+                apply_legacy_candidate_owned(
                 std::max(
                     stage04_initial_temperature_ * cooling,
                     stage04_reheat_floor_),
                 rng_->random());
-            legacy_candidate_was_accepted = py::cast<std::int64_t>(
-                py::cast<py::tuple>(legacy_acceptance)[0]) != 0;
+            legacy_candidate_was_accepted =
+                last_three_lane_legacy_acceptance_outcome_->accepted != 0;
+            legacy_acceptance = legacy_acceptance_projection.finish(
+                *last_three_lane_legacy_acceptance_outcome_);
         }
-        const auto quality_global_best = [&]() {
-            if (quality.is_none()) {
-                return false;
-            }
-            const auto quality_payload = py::cast<py::tuple>(quality);
-            // The route-segment payload carries its acceptance outcome at
-            // slot 5; the changed-route and ejection-chain payloads carry it
-            // at slot 2.  Reading the route-segment removed-customer vector
-            // as an outcome silently reset stagnation after iteration 3.
-            const auto outcome_index = iteration == 3 ? 5 : 2;
-            return checked_data<std::int64_t>(
-                py::cast<py::array_t<std::int64_t>>(
-                    quality_payload[outcome_index]))[2] != 0;
-        }();
-        const auto constraint_global_best = !constraint.is_none()
-            && checked_data<std::int64_t>(
-                py::cast<py::array_t<std::int64_t>>(
-                    py::cast<py::tuple>(constraint)[2]))[4] != 0;
-        const auto legacy_global_best = !legacy_acceptance.is_none()
-            && py::cast<std::int64_t>(
-                py::cast<py::tuple>(legacy_acceptance)[1]) != 0;
+        const auto quality_global_best =
+            last_quality_acceptance_outcome_.has_value()
+            && last_quality_acceptance_outcome_->improved_global_best != 0;
+        const auto constraint_global_best =
+            last_constraint_acceptance_outcome_.has_value()
+            && last_constraint_acceptance_outcome_->improved_global_best != 0;
+        const auto legacy_global_best =
+            last_three_lane_legacy_acceptance_outcome_.has_value()
+            && last_three_lane_legacy_acceptance_outcome_->improved_global_best != 0;
         last_iteration_global_best_improved_ = quality_global_best
             || constraint_global_best || legacy_global_best;
         main_stagnation_iterations_ = last_iteration_global_best_improved_
@@ -14733,6 +14757,11 @@ public:
         checked_data(output)[4] = budget.interrupted;
         checked_data(output)[5] = completed_iterations;
         return output;
+    }
+
+    [[nodiscard]] bool last_three_lane_acceptance_accepted() const noexcept {
+        return last_three_lane_legacy_acceptance_outcome_.has_value()
+            && last_three_lane_legacy_acceptance_outcome_->accepted != 0;
     }
 
     std::int64_t main_stagnation_iterations() const {
@@ -14784,6 +14813,7 @@ public:
                 "full native constraint probe context IDs must be non-negative");
         }
         const auto deadline_seconds = checked_data<double>(deadline_array)[0];
+        last_constraint_acceptance_outcome_.reset();
         if (!std::isfinite(deadline_seconds) || deadline_seconds <= 0.0) {
             throw std::invalid_argument(
                 "full native constraint probe deadline must be finite and positive");
@@ -14963,6 +14993,14 @@ public:
     }
 
     py::tuple apply_last_candidate(double temperature, double random_draw) {
+        AcceptanceOutcomeProjectionV2 projection;
+        const auto outcome = apply_last_candidate_owned(temperature, random_draw);
+        return projection.finish(outcome);
+    }
+
+    evrptw::native_search::AcceptanceOutcomeV2 apply_last_candidate_owned(
+        double temperature,
+        double random_draw) {
         std::unique_lock state_lock(state_mutex_, std::try_to_lock);
         if (!state_lock.owns_lock()) {
             throw std::runtime_error(
@@ -15032,10 +15070,11 @@ public:
         const auto improved_best = accepted && candidate_key < best_key;
         const auto vehicle_reduction = accepted
             && candidate_vehicles < current_vehicles;
-        auto result = py::make_tuple(
+        const evrptw::native_search::AcceptanceOutcomeV2 result{
             accepted ? 1 : 0,
             improved_best ? 1 : 0,
-            vehicle_reduction ? 1 : 0);
+            vehicle_reduction ? 1 : 0,
+        };
         if (accepted) {
             struct LiveCommitSnapshot {
                 std::optional<evrptw::native_search::LaneStateV2> current;
@@ -15873,12 +15912,13 @@ public:
             if (iteration_candidate_ready && !budget_.budget_reached()) {
                 const auto current_distance =
                     live_lane_state(2).objective_float[0];
-                const auto applied = apply_last_candidate(
+                const auto applied = apply_last_candidate_owned(
                     std::max(1.0, current_distance * 0.05), 0.0);
+                last_constraint_acceptance_outcome_ = applied;
                 outcome_values[2] = 1;
-                outcome_values[3] = PyLong_AS_LONG(applied[0].ptr());
-                outcome_values[4] = PyLong_AS_LONG(applied[1].ptr());
-                outcome_values[5] = PyLong_AS_LONG(applied[2].ptr());
+                outcome_values[3] = applied.accepted;
+                outcome_values[4] = applied.improved_global_best;
+                outcome_values[5] = applied.vehicle_reduction;
             } else if (iteration_candidate_ready) {
                 last_candidate_lane_state_.reset();
                 last_candidate_ready_ = false;
@@ -18045,6 +18085,12 @@ private:
     // ownership evidence.  Index 4 remains zero until typed terminal-state
     // projection replaces the Python-facing snapshot adapters.
     std::array<std::int64_t, 5> cache_execution_coverage_flags_{};
+    std::optional<evrptw::native_search::AcceptanceOutcomeV2>
+        last_quality_acceptance_outcome_;
+    std::optional<evrptw::native_search::AcceptanceOutcomeV2>
+        last_constraint_acceptance_outcome_;
+    std::optional<evrptw::native_search::AcceptanceOutcomeV2>
+        last_three_lane_legacy_acceptance_outcome_;
     std::vector<std::int64_t> exact_launch_occupancies_;
     std::vector<ExactJournalBatch> exact_journal_;
     std::list<ControlJournalBatch> control_journal_;
@@ -19923,15 +19969,6 @@ py::tuple full_native_alns_v2(
     py::tuple terminal_global;
     std::optional<py::array_t<std::int64_t>> terminal_override;
     if (three_lane) {
-        const auto counts_toward_fixed_work_exhaustion = [](
-            const py::tuple& semantic) {
-            if (semantic.size() != 14 || semantic[4].is_none()) {
-                return false;
-            }
-            const auto acceptance = py::cast<py::tuple>(semantic[4]);
-            return acceptance.size() >= 1
-                && py::cast<std::int64_t>(acceptance[0]) != 0;
-        };
         const auto mark_three_lane_termination = [](
             const py::tuple& semantic,
             std::int64_t reason) {
@@ -19974,6 +20011,8 @@ py::tuple full_native_alns_v2(
             operator_integer_values[0],
             operator_integer_values[4],
             -1, thresholds, fractions, deadline, batch);
+        const auto bootstrap_exhaustion_eligible =
+            engine.last_three_lane_acceptance_accepted();
         terminal_global = bootstrap;
         if (base_control_values[1] == 1
             || checked_data<std::int64_t>(
@@ -19987,7 +20026,7 @@ py::tuple full_native_alns_v2(
             std::int64_t previous_started =
                 checked_data<std::int64_t>(bootstrap_termination)[2];
             std::int64_t no_exact_rounds =
-                counts_toward_fixed_work_exhaustion(bootstrap)
+                bootstrap_exhaustion_eligible
                 && previous_started == pre_bootstrap_started
                 ? 1 : 0;
             for (std::int64_t iteration = 1;
@@ -20024,7 +20063,7 @@ py::tuple full_native_alns_v2(
                     checked_data<std::int64_t>(followup_termination);
                 const auto started = followup_terminal_values[2];
                 const auto exhaustion_eligible =
-                    counts_toward_fixed_work_exhaustion(followup);
+                    engine.last_three_lane_acceptance_accepted();
                 if (exhaustion_eligible) {
                     no_exact_rounds = started == previous_started
                         ? no_exact_rounds + 1 : 0;
