@@ -529,6 +529,225 @@ struct ScreenBatchResultV2 final {
     }
 };
 
+struct CandidateRoundResultV2 final {
+    ScreenBatchResultV2 screening;
+    std::vector<std::int64_t> resolutions;
+    std::vector<std::int64_t> sources;
+    std::vector<std::int64_t> cache_journal;
+    std::vector<std::int64_t> exact_candidate_ids;
+    std::vector<std::int64_t> completion_order;
+    native_kernels::ExactBatchOutput exact;
+    std::array<std::int64_t, 10> counters{};
+    std::array<double, 4> timings{};
+    std::string digest;
+
+    [[nodiscard]] std::size_t candidate_count() const noexcept {
+        return screening.candidate_count();
+    }
+
+    void validate() const {
+        screening.validate();
+        const auto count = candidate_count();
+        if (resolutions.size() != count || sources.size() != count
+            || count > std::numeric_limits<std::size_t>::max() / 3
+            || cache_journal.size() != count * 3
+            || exact_candidate_ids.size() != exact.statuses.size()
+            || exact.path_offsets.size() != exact.statuses.size() + 1
+            || exact.reasons.size() != exact.statuses.size()
+            || exact.statuses.size()
+                > std::numeric_limits<std::size_t>::max() / 4
+            || exact.metrics.size() != exact.statuses.size() * 4
+            || exact.statuses.size()
+                > std::numeric_limits<std::size_t>::max() / 3
+            || exact.label_counters.size() != exact.statuses.size() * 3
+            || exact.batch_counters.size() != 10
+            || exact.path_offsets.empty() || exact.path_offsets.front() != 0
+            || exact.path_offsets.back()
+                != static_cast<std::int64_t>(exact.path_indices.size())
+            || counters[0] != static_cast<std::int64_t>(count)
+            || counters[1] < 0 || counters[2] < 0 || counters[3] < 0
+            || counters[4] < 0 || counters[5] < 0 || counters[6] < 0
+            || counters[7] < 0 || counters[8] < 0 || counters[9] != 0
+            || counters[1] > counters[0] || counters[2] > counters[1]
+            || counters[4] > counters[3] || counters[5] > counters[2]
+            || counters[6]
+                != static_cast<std::int64_t>(exact_candidate_ids.size())
+            || counters[8] != screening.counters[2]
+            || exact.batch_counters[0] != counters[6]
+            || exact.batch_counters[1] != counters[6]
+            || exact.batch_counters[1] < 0
+            || exact.batch_counters[2] < 0
+            || exact.batch_counters[3] < 0
+            || exact.batch_counters[2] > exact.batch_counters[1]
+            || exact.batch_counters[3]
+                != exact.batch_counters[1] - exact.batch_counters[2]
+            || std::any_of(
+                timings.begin(), timings.end(), [](const double value) {
+                    return !std::isfinite(value) || value < 0.0;
+                })
+            || digest.size() != 64
+            || !std::all_of(
+                digest.begin(), digest.end(), [](const char value) {
+                    return (value >= '0' && value <= '9')
+                        || (value >= 'a' && value <= 'f');
+                })) {
+            throw std::logic_error(
+                "native candidate-round result is inconsistent");
+        }
+        for (std::size_t index = 0; index + 1 < exact.path_offsets.size(); ++index) {
+            if (exact.path_offsets[index] < 0
+                || exact.path_offsets[index] > exact.path_offsets[index + 1]
+                || exact.path_offsets[index + 1]
+                    > static_cast<std::int64_t>(exact.path_indices.size())) {
+                throw std::logic_error(
+                    "native candidate-round exact paths are inconsistent");
+            }
+        }
+        std::unordered_map<std::int64_t, std::size_t> candidate_positions;
+        candidate_positions.reserve(count);
+        for (std::size_t candidate = 0; candidate < count; ++candidate) {
+            candidate_positions.emplace(screening.candidate_ids[candidate], candidate);
+        }
+        std::unordered_set<std::int64_t> exact_id_set;
+        exact_id_set.reserve(exact_candidate_ids.size());
+        for (const auto candidate_id : exact_candidate_ids) {
+            if (!candidate_positions.contains(candidate_id)
+                || !exact_id_set.insert(candidate_id).second) {
+                throw std::logic_error(
+                    "native candidate-round exact identity is inconsistent");
+            }
+        }
+        auto completion_id_set = std::unordered_set<std::int64_t>{};
+        completion_id_set.reserve(completion_order.size());
+        for (const auto candidate_id : completion_order) {
+            if (!exact_id_set.contains(candidate_id)
+                || !completion_id_set.insert(candidate_id).second) {
+                throw std::logic_error(
+                    "native candidate-round completion order is inconsistent");
+            }
+        }
+        if (completion_id_set.size()
+                != static_cast<std::size_t>(exact.batch_counters[2])
+            || (exact.batch_counters[3] == 0
+                && completion_id_set.size() != exact_id_set.size())) {
+            throw std::logic_error(
+                "native candidate-round completion order is inconsistent");
+        }
+        if (exact.completion_order.size() != completion_order.size()) {
+            throw std::logic_error(
+                "native candidate-round completion projection is inconsistent");
+        }
+        for (std::size_t index = 0; index < completion_order.size(); ++index) {
+            const auto ordinal = exact.completion_order[index];
+            if (ordinal < 0
+                || static_cast<std::size_t>(ordinal) >= exact_candidate_ids.size()
+                || completion_order[index]
+                    != exact_candidate_ids[static_cast<std::size_t>(ordinal)]) {
+                throw std::logic_error(
+                    "native candidate-round completion projection is inconsistent");
+            }
+        }
+        std::array<std::int64_t, 9> observed{};
+        observed[0] = static_cast<std::int64_t>(count);
+        for (std::size_t candidate = 0; candidate < count; ++candidate) {
+            const auto resolution = resolutions[candidate];
+            const auto status = screening.statuses[candidate];
+            const auto passed = screening.codes[candidate * 16] == 1;
+            const auto decision = cache_journal[candidate * 3 + 1];
+            const auto ordinal = cache_journal[candidate * 3 + 2];
+            if (resolution < 0 || resolution > 5
+                || cache_journal[candidate * 3]
+                    != screening.candidate_ids[candidate]) {
+                throw std::logic_error(
+                    "native candidate-round decision journal is inconsistent");
+            }
+            if (status == 1) {
+                ++observed[8];
+                const auto source_position = candidate_positions.find(
+                    screening.duplicate_of[candidate]);
+                if (sources[candidate] != screening.duplicate_of[candidate]
+                    || source_position == candidate_positions.end()
+                    || source_position->second >= candidate || decision != 6
+                    || ordinal != -1) {
+                    throw std::logic_error(
+                        "native candidate-round duplicate journal is inconsistent");
+                }
+                const auto source_resolution = resolutions[source_position->second];
+                const auto expected_resolution = source_resolution == 0
+                    ? 0
+                    : ((source_resolution == 1 || source_resolution == 2)
+                           ? 5
+                           : source_resolution);
+                if (resolution != expected_resolution) {
+                    throw std::logic_error(
+                        "native candidate-round duplicate resolution is inconsistent");
+                }
+                continue;
+            }
+            if (sources[candidate] != -1 || resolution == 5) {
+                throw std::logic_error(
+                    "native candidate-round source is inconsistent");
+            }
+            if (!passed) {
+                ++observed[3];
+                if (status == 2) {
+                    ++observed[4];
+                }
+                if (resolution != 0 || decision != 5 || ordinal != -1) {
+                    throw std::logic_error(
+                        "native candidate-round rejection is inconsistent");
+                }
+                continue;
+            }
+            ++observed[1];
+            switch (resolution) {
+            case 1:
+                ++observed[2];
+                ++observed[5];
+                if (decision != 1 || ordinal != -1) {
+                    throw std::logic_error(
+                        "native candidate-round cache decision is inconsistent");
+                }
+                break;
+            case 2:
+                ++observed[2];
+                ++observed[6];
+                if (decision != 2 || ordinal < 0
+                    || static_cast<std::size_t>(ordinal) >= exact_candidate_ids.size()
+                    || exact_candidate_ids[static_cast<std::size_t>(ordinal)]
+                        != screening.candidate_ids[candidate]) {
+                    throw std::logic_error(
+                        "native candidate-round exact ordinal is inconsistent");
+                }
+                break;
+            case 3:
+                if (decision != 4 || ordinal != -1) {
+                    throw std::logic_error(
+                        "native candidate-round unselected decision is inconsistent");
+                }
+                break;
+            case 4:
+                ++observed[2];
+                ++observed[7];
+                if (decision != 3 || ordinal != -1) {
+                    throw std::logic_error(
+                        "native candidate-round budget decision is inconsistent");
+                }
+                break;
+            default:
+                throw std::logic_error(
+                    "native candidate-round accepted resolution is inconsistent");
+            }
+        }
+        if (observed[0] != observed[1] + observed[3] + observed[8]
+            || observed[2] != observed[5] + observed[6] + observed[7]
+            || !std::equal(observed.begin(), observed.end(), counters.begin())) {
+            throw std::logic_error(
+                "native candidate-round decision counters are inconsistent");
+        }
+    }
+};
+
 [[nodiscard]] inline DynamicRemovalSelectionV2 select_dynamic_removal_v2(
     const std::int64_t customer_count,
     const std::int64_t stagnation_iterations,
@@ -895,6 +1114,7 @@ struct InitialStateV2 final {
         append(evidence, exact.metrics);
         append(evidence, exact.label_counters);
         append(evidence, exact.batch_counters);
+        append(evidence, exact.completion_order);
         append(evidence, objective_integer);
         append(evidence, objective_float);
         append(evidence, accounting);
@@ -916,9 +1136,19 @@ struct InitialStateV2 final {
             || exact.reasons.size() != route_count
             || exact.metrics.size() != route_count * 4
             || exact.label_counters.size() != route_count * 3
-            || exact.batch_counters.size() != 10) {
+            || exact.batch_counters.size() != 10
+            || exact.completion_order.size() != route_count) {
             throw std::runtime_error(
                 "native initial search state typed schema is invalid");
+        }
+        std::vector<bool> completion_seen(route_count, false);
+        for (const auto ordinal : exact.completion_order) {
+            if (ordinal < 0 || static_cast<std::size_t>(ordinal) >= route_count
+                || completion_seen[static_cast<std::size_t>(ordinal)]) {
+                throw std::runtime_error(
+                    "native initial search state completion order is invalid");
+            }
+            completion_seen[static_cast<std::size_t>(ordinal)] = true;
         }
         std::int64_t depot = -1;
         for (std::size_t node = 0; node < request.problem.node_count(); ++node) {
@@ -1152,6 +1382,7 @@ struct LaneStateV2 final {
         append(evidence, exact.metrics);
         append(evidence, exact.label_counters);
         append(evidence, exact.batch_counters);
+        append(evidence, exact.completion_order);
         append(evidence, objective_integer);
         append(evidence, objective_float);
         return native_protocol::native_sha256_hex(evidence);

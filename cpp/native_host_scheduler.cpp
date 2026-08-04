@@ -79,24 +79,50 @@ std::vector<std::uint8_t> run_exact(
         throw std::runtime_error("native scheduler exact request shape is invalid");
     }
     const auto& kind_shape = input.descriptor(0);
-    const auto& distance_shape = input.descriptor(4);
-    const auto& vehicle_shape = input.descriptor(5);
     const auto& offset_shape = input.descriptor(6);
     const auto& index_shape = input.descriptor(7);
     const auto node_count = static_cast<std::size_t>(kind_shape.count);
-    if (kind_shape.dimensions != 1 || distance_shape.dimensions != 2
-        || node_count == 0
-        || input.descriptor(1).count != kind_shape.count
-        || input.descriptor(2).count != kind_shape.count
-        || input.descriptor(3).count != kind_shape.count
-        || distance_shape.shape[0] != kind_shape.count
-        || distance_shape.shape[1] != kind_shape.count
-        || vehicle_shape.count != 5 || offset_shape.count < 1
-        || input.descriptor(8).count != 1 || input.descriptor(9).count != 1) {
+    const auto one_dimensional = [&](const std::size_t index,
+                                     const protocol::NumericType type,
+                                     const std::uint64_t count) {
+        const auto& item = input.descriptor(index);
+        return item.type == type && item.dimensions == 1
+            && item.count == count && item.shape[0] == count
+            && item.shape[1] == 0;
+    };
+    const auto two_dimensional = [&](const std::size_t index,
+                                     const protocol::NumericType type,
+                                     const std::uint64_t first,
+                                     const std::uint64_t second) {
+        const auto& item = input.descriptor(index);
+        return item.type == type && item.dimensions == 2
+            && item.count == first * second && item.shape[0] == first
+            && item.shape[1] == second;
+    };
+    if (node_count == 0
+        || !one_dimensional(0, protocol::NumericType::int64, node_count)
+        || !one_dimensional(1, protocol::NumericType::float64, node_count)
+        || !one_dimensional(2, protocol::NumericType::float64, node_count)
+        || !one_dimensional(3, protocol::NumericType::float64, node_count)
+        || !two_dimensional(
+            4, protocol::NumericType::float64, node_count, node_count)
+        || !one_dimensional(5, protocol::NumericType::float64, 5)
+        || offset_shape.count < 1
+        || !one_dimensional(
+            6, protocol::NumericType::int64, offset_shape.count)
+        || !one_dimensional(
+            7, protocol::NumericType::int64, index_shape.count)
+        || !one_dimensional(8, protocol::NumericType::float64, 1)
+        || !one_dimensional(9, protocol::NumericType::int64, 1)) {
         throw std::runtime_error("native scheduler exact dimensions are invalid");
     }
     const auto route_count = static_cast<std::size_t>(offset_shape.count - 1);
     const auto* kinds = input.data<std::int64_t>(0, protocol::NumericType::int64);
+    const auto* ready = input.data<double>(1, protocol::NumericType::float64);
+    const auto* due = input.data<double>(2, protocol::NumericType::float64);
+    const auto* service = input.data<double>(3, protocol::NumericType::float64);
+    const auto* distances = input.data<double>(4, protocol::NumericType::float64);
+    const auto* vehicle = input.data<double>(5, protocol::NumericType::float64);
     const auto* offsets = input.data<std::int64_t>(6, protocol::NumericType::int64);
     const auto* indices = input.data<std::int64_t>(7, protocol::NumericType::int64);
     if (offsets[0] != 0
@@ -106,6 +132,19 @@ std::vector<std::uint8_t> run_exact(
     std::int64_t depot = -1;
     std::vector<std::int64_t> stations;
     for (std::size_t node = 0; node < node_count; ++node) {
+        if (!std::isfinite(ready[node]) || !std::isfinite(due[node])
+            || !std::isfinite(service[node])) {
+            throw std::runtime_error(
+                "native scheduler exact node metadata is invalid");
+        }
+        for (std::size_t destination = 0; destination < node_count;
+             ++destination) {
+            const auto distance = distances[node * node_count + destination];
+            if (!std::isfinite(distance) || distance < 0.0) {
+                throw std::runtime_error(
+                    "native scheduler exact distance is invalid");
+            }
+        }
         if (kinds[node] == kernels::depot_kind) {
             if (depot >= 0) {
                 throw std::runtime_error("native scheduler exact depot is duplicated");
@@ -120,8 +159,15 @@ std::vector<std::uint8_t> run_exact(
     if (depot < 0) {
         throw std::runtime_error("native scheduler exact depot is missing");
     }
+    if (!std::isfinite(vehicle[0]) || vehicle[0] < 0.0
+        || !std::isfinite(vehicle[2]) || vehicle[2] < 0.0
+        || !std::isfinite(vehicle[3]) || vehicle[3] < 0.0
+        || !std::isfinite(vehicle[4]) || vehicle[4] <= 0.0) {
+        throw std::runtime_error(
+            "native scheduler exact vehicle parameters are invalid");
+    }
     for (std::size_t route = 0; route < route_count; ++route) {
-        if (offsets[route] < 0 || offsets[route] > offsets[route + 1]) {
+        if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]) {
             throw std::runtime_error(
                 "native scheduler exact offsets are not monotone");
         }
@@ -138,14 +184,23 @@ std::vector<std::uint8_t> run_exact(
             seen[static_cast<std::size_t>(node)] = true;
         }
     }
-    const auto deadline =
+    const auto deadline_absolute =
         input.data<double>(8, protocol::NumericType::float64)[0];
     const auto batch_size =
         input.data<std::int64_t>(9, protocol::NumericType::int64)[0];
-    if (!std::isfinite(deadline) || deadline <= 0.0 || batch_size <= 0) {
+    if (std::isnan(deadline_absolute) || deadline_absolute < 0.0
+        || batch_size <= 0) {
         throw std::runtime_error(
             "native scheduler exact control values are invalid");
     }
+    const auto execution_deadline = std::isfinite(deadline_absolute)
+        ? std::max(
+              0.0,
+              deadline_absolute
+                  - std::chrono::duration<double>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count())
+        : deadline_absolute;
     const auto output = kernels::run_exact_charging_batch(
         kinds,
         input.data<double>(1, protocol::NumericType::float64),
@@ -154,7 +209,7 @@ std::vector<std::uint8_t> run_exact(
         input.data<double>(4, protocol::NumericType::float64),
         input.data<double>(5, protocol::NumericType::float64),
         offsets, indices, node_count, route_count, depot, stations,
-        deadline, batch_size);
+        execution_deadline, batch_size);
     protocol::PayloadBuilder builder(
         protocol::KernelOperation::exact_charging, input.header().request_id);
     builder.add(protocol::NumericType::int64, output.path_offsets.data(),
@@ -171,6 +226,8 @@ std::vector<std::uint8_t> run_exact(
         output.label_counters.size(), route_count, 3);
     builder.add(protocol::NumericType::int64, output.batch_counters.data(),
         output.batch_counters.size(), output.batch_counters.size());
+    builder.add(protocol::NumericType::int64, output.completion_order.data(),
+        output.completion_order.size(), output.completion_order.size());
     const std::array<double, 4> telemetry{
         queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0};
     builder.add(protocol::NumericType::float64, telemetry.data(),
@@ -493,6 +550,10 @@ std::vector<std::uint8_t> execute(
             state.accounting.size(), state.accounting.size());
         builder.add(protocol::NumericType::uint8, sha256.data(), sha256.size(),
             sha256.size());
+        builder.add(protocol::NumericType::int64,
+            state.exact.completion_order.data(),
+            state.exact.completion_order.size(),
+            state.exact.completion_order.size());
         const std::array<double, 4> telemetry{
             queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0};
         builder.add(protocol::NumericType::float64, telemetry.data(),
@@ -636,9 +697,14 @@ void handle_connection(
                 input_view, queue_wait_seconds, queue_depth, pool,
                 request_peak_active_tasks);
         } else {
+            const auto pool_submitted_at = std::chrono::steady_clock::now();
             pool.parallel_for(1, [&](std::size_t) {
+                const auto pool_wait_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - pool_submitted_at).count();
                 request_peak_active_tasks = pool.active_task_count();
-                output_bytes = execute(input_view, queue_wait_seconds, queue_depth);
+                output_bytes = execute(
+                    input_view, queue_wait_seconds + pool_wait_seconds,
+                    queue_depth);
                 request_peak_active_tasks = std::max(
                     request_peak_active_tasks, pool.active_task_count());
             });

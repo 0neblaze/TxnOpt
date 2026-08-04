@@ -431,6 +431,7 @@ def test_none_preserves_current_stage052_candidate_transaction_path() -> None:
 
 def test_native_candidate_round_is_one_structured_soa_call() -> None:
     from evrptw import _core as native_core
+    from evrptw.native_execution import _candidate_round_digest
 
     instance = _fixture_instance()
     context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
@@ -492,6 +493,80 @@ def test_native_candidate_round_is_one_structured_soa_call() -> None:
     assert timings.shape == (4,)
     assert len(transaction_sha256) == 64
     assert set(transaction_sha256) <= set("0123456789abcdef")
+    receipt = np.zeros(6, dtype=np.int64)
+    receipt[0] = 2
+    payload_v2 = native_core.candidate_round_transaction_v2(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        route_offsets,
+        route_indices,
+        candidate_ids,
+        lexical_rank,
+        np.asarray(
+            [1.0, context.reachability_epsilon, 0.0, 0.0], dtype=np.float64
+        ),
+        np.zeros((len(candidates), 6), dtype=np.float64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+        np.asarray([1, 0, 0], dtype=np.int64),
+        np.asarray([2, 1, 4], dtype=np.int64),
+        np.asarray([10.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([7, 11, 13], dtype=np.int64),
+        receipt,
+    )
+    screening_v2 = payload_v2[0]
+    resolutions_v2 = payload_v2[1]
+    sources_v2 = payload_v2[2]
+    cache_journal_v2 = payload_v2[3]
+    exact_candidate_ids_v2 = payload_v2[4]
+    completion_order_v2 = payload_v2[5]
+    exact_payload_v2 = payload_v2[6]
+    counters_v2 = payload_v2[7]
+    transaction_sha256_v2 = payload_v2[9]
+    recomputed = _candidate_round_digest(
+        context_ids=np.asarray([7, 11, 13], dtype=np.int64),
+        resolution_codes=resolutions_v2,
+        sources=sources_v2,
+        cache_journal=cache_journal_v2,
+        exact_candidate_ids=exact_candidate_ids_v2,
+        completion_order=completion_order_v2,
+        exact_payload=exact_payload_v2,
+        screening_sha256=screening_v2[6],
+        counters=counters_v2,
+    )
+    assert recomputed == transaction_sha256_v2
+    assert _candidate_round_digest(
+        context_ids=np.asarray([7, 11, 13], dtype=np.int64),
+        resolution_codes=resolutions_v2,
+        sources=sources_v2,
+        cache_journal=cache_journal_v2.reshape(-1),
+        exact_candidate_ids=exact_candidate_ids_v2,
+        completion_order=completion_order_v2,
+        exact_payload=exact_payload_v2,
+        screening_sha256=screening_v2[6],
+        counters=counters_v2,
+    ) != transaction_sha256_v2
+    changed_counters = counters_v2.copy()
+    changed_counters[9] = 1
+    assert _candidate_round_digest(
+        context_ids=np.asarray([7, 11, 13], dtype=np.int64),
+        resolution_codes=resolutions_v2,
+        sources=sources_v2,
+        cache_journal=cache_journal_v2,
+        exact_candidate_ids=exact_candidate_ids_v2,
+        completion_order=completion_order_v2,
+        exact_payload=exact_payload_v2,
+        screening_sha256=screening_v2[6],
+        counters=changed_counters,
+    ) != transaction_sha256_v2
 
 
 def test_native_candidate_round_thread_launch_failure_joins_and_preserves_receipt() -> None:
@@ -540,6 +615,135 @@ def test_native_candidate_round_thread_launch_failure_joins_and_preserves_receip
     assert native_runtime.screening_batch_invocations == 0
 
 
+def test_native_candidate_round_projection_failure_preserves_phase3_receipt() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    native_runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+    transaction_runtime = NativeCandidateTransactionRuntime(
+        NativeCandidateTransactionConfig()
+    )
+    native_core._test_candidate_round_projection_failure_v2()
+
+    with pytest.raises(
+        NativeCandidateRoundFailure,
+        match="injected native candidate-round result projection failure",
+    ) as failure:
+        execute_native_candidate_round(
+            instance,
+            NativeCandidateRoundRequest(
+                candidates=(("C1",),),
+                cache_hit_flags=(False,),
+                proposal_top_k=1,
+                exact_budget=1,
+                deadline=100.0,
+                batch_size=128,
+                lane="constraint",
+                operator="relocate",
+                iteration=7,
+                compute_threads=1,
+            ),
+            native_runtime=native_runtime,
+            transaction_runtime=transaction_runtime,
+            negative_cache={},
+            clock=lambda: 90.0,
+        )
+
+    receipt = failure.value.resource_receipt
+    assert receipt.phase == 3
+    assert receipt.started_calls == 1
+    assert receipt.completed_calls == 1
+    assert receipt.interrupted_calls == 0
+    assert receipt.fallback_count == 0
+    assert transaction_runtime.transaction_count == 0
+    assert transaction_runtime.fallback_count == 0
+    assert native_runtime.screening_batch_invocations == 0
+
+
+def test_native_candidate_round_semantic_validator_rejects_contradiction() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    native_runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+    transaction_runtime = NativeCandidateTransactionRuntime(
+        NativeCandidateTransactionConfig()
+    )
+    native_core._test_candidate_round_semantic_failure_v2()
+
+    with pytest.raises(
+        NativeCandidateRoundFailure,
+        match="native candidate-round source is inconsistent",
+    ) as failure:
+        execute_native_candidate_round(
+            instance,
+            NativeCandidateRoundRequest(
+                candidates=(("C1",),),
+                cache_hit_flags=(False,),
+                proposal_top_k=1,
+                exact_budget=1,
+                deadline=100.0,
+                batch_size=128,
+                lane="constraint",
+                operator="relocate",
+                iteration=7,
+                compute_threads=1,
+            ),
+            native_runtime=native_runtime,
+            transaction_runtime=transaction_runtime,
+            negative_cache={},
+            clock=lambda: 90.0,
+        )
+
+    receipt = failure.value.resource_receipt
+    assert receipt.phase == 3
+    assert receipt.started_calls == 1
+    assert receipt.completed_calls == 1
+    assert receipt.interrupted_calls == 0
+    assert receipt.fallback_count == 0
+    assert transaction_runtime.transaction_count == 0
+
+
+def test_native_candidate_round_rejects_empty_route_at_phase1() -> None:
+    instance = _fixture_instance()
+    native_runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+    transaction_runtime = NativeCandidateTransactionRuntime(
+        NativeCandidateTransactionConfig()
+    )
+
+    with pytest.raises(
+        NativeCandidateRoundFailure,
+        match="empty candidate row",
+    ) as failure:
+        execute_native_candidate_round(
+            instance,
+            NativeCandidateRoundRequest(
+                candidates=((),),
+                cache_hit_flags=(False,),
+                proposal_top_k=1,
+                exact_budget=1,
+                deadline=100.0,
+                batch_size=128,
+                lane="constraint",
+                operator="relocate",
+                iteration=7,
+                compute_threads=1,
+            ),
+            native_runtime=native_runtime,
+            transaction_runtime=transaction_runtime,
+            negative_cache={},
+            clock=lambda: 90.0,
+        )
+
+    receipt = failure.value.resource_receipt
+    assert receipt.phase == 1
+    assert receipt.started_calls == 0
+    assert receipt.completed_calls == 0
+    assert receipt.interrupted_calls == 0
+    assert receipt.fallback_count == 0
+    assert transaction_runtime.transaction_count == 0
+    assert native_runtime.screening_batch_invocations == 0
+
+
 def test_native_candidate_round_decodes_exact_results_and_records_one_invocation() -> None:
     instance = _fixture_instance()
     native_runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
@@ -574,6 +778,95 @@ def test_native_candidate_round_decodes_exact_results_and_records_one_invocation
     assert result.completion_order == (1,)
     assert transaction_runtime.transaction_count == 1
     assert native_runtime.screening_batch_invocations == 1
+
+
+def test_native_candidate_round_validates_real_negative_cache_decision() -> None:
+    instance = _fixture_instance()
+    native_runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+    transaction_runtime = NativeCandidateTransactionRuntime(
+        NativeCandidateTransactionConfig()
+    )
+    result = execute_native_candidate_round(
+        instance,
+        NativeCandidateRoundRequest(
+            candidates=(("C1",),),
+            cache_hit_flags=(False,),
+            proposal_top_k=1,
+            exact_budget=1,
+            deadline=100.0,
+            batch_size=128,
+            lane="constraint",
+            operator="relocate",
+            iteration=7,
+            compute_threads=1,
+        ),
+        native_runtime=native_runtime,
+        transaction_runtime=transaction_runtime,
+        negative_cache={("C1",): "forward_time_window_prefilter"},
+        clock=lambda: 90.0,
+    )
+
+    assert result.resolutions == ("screening_rejected",)
+    assert result.exact_candidate_ids == ()
+    assert result.counters["negative_cache_hits"] == 1
+    assert result.resource_receipt.started_calls == 0
+
+
+def test_full_native_exact_journal_preserves_non_submission_completion_order(
+    tmp_path: Path,
+) -> None:
+    from evrptw import _core as native_core
+    from evrptw.native_execution import execute_full_native_alns
+    from evrptw.neighborhoods import VehicleOperatorConfig
+
+    instance = _candidate_plan_fixture()
+    native_runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
+    arguments: dict[str, object] = {
+        "seed": 2014,
+        "max_iterations": 1,
+        "deadline": time.perf_counter() + 10.0,
+        "batch_size": 128,
+        "compute_threads": 4,
+        "native_runtime": native_runtime,
+        "initial_customer_sequences": (("C1", "C2", "C3"), ("C4",)),
+        "candidate_control_config": CandidateControlConfig(
+            max_exact_calls_per_round=8,
+            worker_count=4,
+        ),
+        "stage04_config": Stage04Config(),
+        "vehicle_operator_config": VehicleOperatorConfig(),
+        "screening_config": CheapScreeningConfig(),
+        "cache_incremental_config": CacheIncrementalConfig(enabled=True),
+        "removal_fraction": 0.2,
+        "termination_mode": "wall_clock",
+        "operator_profile": "stage02_constraint_guided",
+    }
+    result = execute_full_native_alns(instance, **arguments)  # type: ignore[arg-type]
+
+    parallel_batches = [
+        event
+        for event in result.exact_journal_events
+        if event["event_type"] == "parallel_batch"
+    ]
+    assert parallel_batches
+    assert parallel_batches[0]["submission_order"] == [0, 1]
+    assert parallel_batches[0]["completion_order"] == [1, 0]
+
+    endpoint = tmp_path / "full-native-journal-order.sock"
+    with NativeHostScheduler(endpoint):
+        host_result = execute_full_native_alns(
+            instance,
+            **arguments,  # type: ignore[arg-type]
+            dispatcher=lambda *values: native_core.full_native_alns_host_v2(
+                str(endpoint), *values
+            ),
+        )
+    host_parallel_batches = [
+        event
+        for event in host_result.exact_journal_events
+        if event["event_type"] == "parallel_batch"
+    ]
+    assert host_parallel_batches[0]["completion_order"] == [1, 0]
 
 
 def test_evaluator_per_solve_protocol_crosses_python_native_boundary_once(
@@ -7819,6 +8112,55 @@ def test_exact_budget_states_reject_double_classification() -> None:
         native.complete_exact(1)
 
 
+def test_native_budget_projection_failure_is_exception_atomic() -> None:
+    from evrptw import _core as native_core
+
+    native = native_core.NativeBudgetStateV2(2, 2)
+    assert native.reserve_exact(2).tolist() == [2, 2]
+    before = native.snapshot().copy()
+
+    native._test_fail_next_state_projection()
+    with pytest.raises(
+        RuntimeError, match="injected native budget state projection failure"
+    ):
+        native.complete_exact(1)
+
+    assert native.snapshot().tolist() == before.tolist()
+    assert native.complete_exact(1).tolist()[5:8] == [2, 1, 0]
+    assert native.interrupt_exact(1).tolist()[5:8] == [2, 1, 1]
+
+
+def test_native_budget_round_mutators_and_restore_are_exception_atomic() -> None:
+    from evrptw import _core as native_core
+
+    native = native_core.NativeBudgetStateV2(5, 2)
+    initial = native.snapshot().copy()
+    native._test_fail_next_state_projection()
+    with pytest.raises(RuntimeError, match="projection failure"):
+        native.begin_round(4, 7)
+    assert native.snapshot().tolist() == initial.tolist()
+
+    active = native.begin_round(4, 7).copy()
+    native._test_fail_next_state_projection()
+    with pytest.raises(RuntimeError, match="projection failure"):
+        native.finish_round()
+    assert native.snapshot().tolist() == active.tolist()
+
+    replacement = np.asarray([1, 9, 11, 1, 1, 2, 1, 1, 0], dtype=np.int64)
+    native._test_fail_next_state_projection()
+    with pytest.raises(RuntimeError, match="projection failure"):
+        native.restore(replacement)
+    assert native.snapshot().tolist() == active.tolist()
+
+    overflow_snapshot = replacement.copy()
+    overflow_snapshot[5] = np.iinfo(np.int64).max
+    overflow_snapshot[6] = np.iinfo(np.int64).max
+    overflow_snapshot[7] = np.iinfo(np.int64).max
+    with pytest.raises(ValueError, match="snapshot values are invalid"):
+        native.restore(overflow_snapshot)
+    assert native.snapshot().tolist() == active.tolist()
+
+
 @pytest.mark.external_data
 @pytest.mark.skipif(
     os.environ.get("EVRPTW_RUN_NATIVE_REAL_DIFFERENTIAL") != "1",
@@ -8089,9 +8431,12 @@ def test_full_native_v2_owns_and_hashes_the_complete_request(
             args[13],
             args[14],
         )
-        assert isinstance(exact, tuple) and len(exact) == 7
-        for actual, expected in zip(exact, reference[0], strict=True):
+        assert isinstance(exact, tuple) and len(exact) == 8
+        for actual, expected in zip(exact[:-1], reference[0], strict=True):
             np.testing.assert_array_equal(actual, expected)
+        assert sorted(int(value) for value in exact[-1]) == list(
+            range(len(exact[-1]))
+        )
         np.testing.assert_array_equal(objective_integer, reference[1])
         np.testing.assert_array_equal(objective_float, reference[2])
         np.testing.assert_array_equal(accounting, reference[3])
@@ -8159,9 +8504,9 @@ def test_full_native_v2_owns_and_hashes_the_complete_request(
             receipt_evidence.extend(value.encode("ascii"))
         assert hashlib.sha256(receipt_evidence).hexdigest() == initial_receipt[4]
         projection = initial_receipt[5]
-        assert isinstance(projection, tuple) and len(projection) == 17
+        assert isinstance(projection, tuple) and len(projection) == 18
         for actual, expected in zip(
-            projection[:11],
+            projection[:12],
             (
                 args[11],
                 args[12],
@@ -8172,12 +8517,12 @@ def test_full_native_v2_owns_and_hashes_the_complete_request(
             strict=True,
         ):
             np.testing.assert_array_equal(actual, expected)
-        np.testing.assert_array_equal(projection[11], accounting)
-        np.testing.assert_array_equal(projection[12], rng_seeds)
-        np.testing.assert_array_equal(projection[13], np.asarray([0], dtype=np.int64))
-        np.testing.assert_array_equal(projection[14], np.asarray([4], dtype=np.int64))
-        np.testing.assert_array_equal(projection[15], node_kind)
-        np.testing.assert_array_equal(projection[16], exact_batch_size)
+        np.testing.assert_array_equal(projection[12], accounting)
+        np.testing.assert_array_equal(projection[13], rng_seeds)
+        np.testing.assert_array_equal(projection[14], np.asarray([0], dtype=np.int64))
+        np.testing.assert_array_equal(projection[15], np.asarray([4], dtype=np.int64))
+        np.testing.assert_array_equal(projection[16], node_kind)
+        np.testing.assert_array_equal(projection[17], exact_batch_size)
         return full_payload
 
     monkeypatch.setattr(native_core, "full_native_alns_v2", inspect_request)
@@ -9261,6 +9606,8 @@ def _stage052_shared_memory_names() -> set[str]:
         ("worker_exception", "injected native scheduler worker exception"),
         ("descriptor_count_overflow", "array byte size overflows"),
         ("route_index_oob", "route indices are invalid"),
+        ("empty_route", "offsets are not monotone"),
+        ("wrong_rank", "dimensions are invalid"),
         ("trailing_payload", "payload has trailing bytes"),
         ("oversized_control", "request frame is invalid"),
         ("shared_memory_identity", "shared-memory identity is invalid"),

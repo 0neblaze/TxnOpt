@@ -109,6 +109,10 @@ struct ExactBatchOutput {
     std::vector<double> metrics;
     std::vector<std::int64_t> label_counters;
     std::vector<std::int64_t> batch_counters;
+    // Route ordinals in the order the backend classified them as completed.
+    // This is telemetry, so the historical seven-array Python projection stays
+    // unchanged while typed candidate transactions can bind real completion.
+    std::vector<std::int64_t> completion_order;
 };
 
 bool exact_dominates(const ExactLabel& left, const ExactLabel& right) {
@@ -196,6 +200,7 @@ ExactBatchOutput run_exact_charging_batch(
     }
 
     std::vector<ExactSearchState> states(route_count);
+    std::vector<bool> completion_recorded(route_count, false);
     for (std::size_t route = 0; route < route_count; ++route) {
         if (deadline_expired()) {
             output.batch_counters[3] = static_cast<std::int64_t>(route_count);
@@ -229,13 +234,24 @@ ExactBatchOutput run_exact_charging_batch(
         std::vector<ExactRequest> requests;
         bool progressed = false;
         for (std::size_t route = 0; route < route_count; ++route) {
+            if (deadline_expired()) {
+                deadline_hit = true;
+                break;
+            }
             auto& state = states[route];
             if (state.completed) {
                 continue;
             }
             const auto live_index = pop_live_exact_label(state);
             if (!live_index.has_value()) {
+                if (deadline_expired()) {
+                    deadline_hit = true;
+                    break;
+                }
                 state.completed = true;
+                output.completion_order.push_back(
+                    static_cast<std::int64_t>(route));
+                completion_recorded[route] = true;
                 continue;
             }
             const auto& label = state.labels[*live_index];
@@ -398,6 +414,10 @@ ExactBatchOutput run_exact_charging_batch(
         if (state.interrupted) {
             continue;
         }
+        if (!completion_recorded[route]) {
+            output.completion_order.push_back(static_cast<std::int64_t>(route));
+            completion_recorded[route] = true;
+        }
         ++output.batch_counters[2];
         if (!state.best.has_value()) {
             output.statuses[route] = infeasible_status;
@@ -469,6 +489,24 @@ inline void validate_exact_batch_output(
         || counters[8] != (route_count == 0 ? 0 : 1)
         || counters[9] != batch_size) {
         invalid("batch counters are inconsistent");
+    }
+    if (output.completion_order.size()
+        != static_cast<std::size_t>(counters[2])) {
+        invalid("completion order extent is inconsistent");
+    }
+    std::vector<bool> completion_seen(route_count, false);
+    for (const auto ordinal : output.completion_order) {
+        if (ordinal < 0 || static_cast<std::size_t>(ordinal) >= route_count
+            || completion_seen[static_cast<std::size_t>(ordinal)]) {
+            invalid("completion order identity is inconsistent");
+        }
+        completion_seen[static_cast<std::size_t>(ordinal)] = true;
+    }
+    for (std::size_t route = 0; route < route_count; ++route) {
+        if (completion_seen[route]
+            != (output.statuses[route] != interrupted_status)) {
+            invalid("completion order and route status diverge");
+        }
     }
     std::int64_t completed = 0;
     std::int64_t interrupted = 0;

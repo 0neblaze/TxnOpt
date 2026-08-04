@@ -12461,7 +12461,7 @@ def _decode_full_native_exact_journal(
     events: list[Mapping[str, object]] = []
     total_routes = 0
     for batch_ordinal, batch_value in enumerate(batches_value):
-        if not isinstance(batch_value, tuple) or len(batch_value) != 9:
+        if not isinstance(batch_value, tuple) or len(batch_value) != 10:
             raise RuntimeError("full native exact journal batch is invalid")
         _append_native_nested_evidence(evidence, batch_value)
         context = cast(
@@ -12480,6 +12480,10 @@ def _decode_full_native_exact_journal(
             batch_value[2], "full native exact journal route indices"
         )
         route_count = len(route_offsets) - 1
+        completion_order_array = _require_vector(
+            batch_value[9], "full native exact journal completion order"
+        )
+        completion_order = [int(value) for value in completion_order_array]
         if (
             route_count <= 0
             or int(route_offsets[0]) != 0
@@ -12487,6 +12491,8 @@ def _decode_full_native_exact_journal(
             or np.any(route_offsets[:-1] > route_offsets[1:])
             or np.any(route_indices < 0)
             or np.any(route_indices >= len(native_runtime.context.node_names))
+            or len(completion_order) != route_count
+            or sorted(completion_order) != list(range(route_count))
         ):
             raise RuntimeError("full native exact journal route SoA is invalid")
         try:
@@ -12571,7 +12577,7 @@ def _decode_full_native_exact_journal(
                 "worker_count": 0,
                 "worker_protocol": "full_solve_soa_v2",
                 "submission_order": list(range(route_count)),
-                "completion_order": list(range(route_count)),
+                "completion_order": completion_order,
                 "merge_order": list(range(route_count)),
                 "customer_sequences": [list(sequence) for sequence in sequences],
                 "lane": lane,
@@ -13311,7 +13317,7 @@ def _decode_initial_four_lane_projection(
 ) -> Mapping[str, object]:
     """Replay the pure C++ initial four-lane state from typed evidence."""
 
-    if not isinstance(payload, tuple) or len(payload) != 17:
+    if not isinstance(payload, tuple) or len(payload) != 18:
         raise RuntimeError("native initial four-lane projection has an invalid tuple")
     route_offsets = _require_vector(payload[0], "initial lane route offsets")
     route_indices = _require_vector(payload[1], "initial lane route indices")
@@ -13355,10 +13361,19 @@ def _decode_initial_four_lane_projection(
             name="initial lane batch counters",
         ),
     )
-    objective_integer = cast(
+    completion_order = cast(
         npt.NDArray[np.int64],
         _require_array(
             payload[9],
+            dtype=np.dtype(np.int64),
+            shape=(route_count,),
+            name="initial lane completion order",
+        ),
+    )
+    objective_integer = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[10],
             dtype=np.dtype(np.int64),
             shape=(2,),
             name="initial lane objective integer",
@@ -13367,7 +13382,7 @@ def _decode_initial_four_lane_projection(
     objective_float = cast(
         npt.NDArray[np.float64],
         _require_array(
-            payload[10],
+            payload[11],
             dtype=np.dtype(np.float64),
             shape=(2,),
             name="initial lane objective float",
@@ -13376,7 +13391,7 @@ def _decode_initial_four_lane_projection(
     accounting = cast(
         npt.NDArray[np.int64],
         _require_array(
-            payload[11],
+            payload[12],
             dtype=np.dtype(np.int64),
             shape=(4,),
             name="initial four-lane accounting",
@@ -13385,7 +13400,7 @@ def _decode_initial_four_lane_projection(
     rng_seeds = cast(
         npt.NDArray[np.int64],
         _require_array(
-            payload[12],
+            payload[13],
             dtype=np.dtype(np.int64),
             shape=(2,),
             name="initial four-lane RNG seeds",
@@ -13394,7 +13409,7 @@ def _decode_initial_four_lane_projection(
     next_iteration = cast(
         npt.NDArray[np.int64],
         _require_array(
-            payload[13],
+            payload[14],
             dtype=np.dtype(np.int64),
             shape=(1,),
             name="initial four-lane iteration",
@@ -13403,17 +13418,17 @@ def _decode_initial_four_lane_projection(
     lane_count = cast(
         npt.NDArray[np.int64],
         _require_array(
-            payload[14],
+            payload[15],
             dtype=np.dtype(np.int64),
             shape=(1,),
             name="initial four-lane count",
         ),
     )
-    node_kind = _require_vector(payload[15], "initial four-lane node kinds")
+    node_kind = _require_vector(payload[16], "initial four-lane node kinds")
     exact_batch_size = cast(
         npt.NDArray[np.int64],
         _require_array(
-            payload[16],
+            payload[17],
             dtype=np.dtype(np.int64),
             shape=(1,),
             name="initial four-lane exact batch size",
@@ -13430,6 +13445,8 @@ def _decode_initial_four_lane_projection(
         or len(reasons) != route_count
         or np.any(statuses != 0)
         or np.any(reasons != 0)
+        or sorted(int(value) for value in completion_order)
+        != list(range(route_count))
         or np.any(labels < 0)
         or np.any(~np.isfinite(metrics))
         or np.any(metrics < 0.0)
@@ -13517,6 +13534,7 @@ def _decode_initial_four_lane_projection(
         metrics,
         labels,
         batch_counters,
+        completion_order,
         objective_integer,
         objective_float,
         accounting,
@@ -13536,6 +13554,7 @@ def _decode_initial_four_lane_projection(
         metrics,
         labels,
         batch_counters,
+        completion_order,
         objective_integer,
         objective_float,
     ):
@@ -13566,6 +13585,7 @@ def _decode_initial_four_lane_projection(
         "metrics": metrics.tolist(),
         "label_counters": labels.tolist(),
         "batch_counters": batch_counters.tolist(),
+        "completion_order": completion_order.tolist(),
         "objective_integer": objective_integer.tolist(),
         "objective_float": objective_float.tolist(),
         "accounting": accounting.tolist(),
@@ -14273,8 +14293,11 @@ def _execute_native_candidate_round(
         for candidate_id in exact_ids
     ):
         raise RuntimeError("native candidate round returned invalid exact identities")
-    if sorted(completion_order) != sorted(exact_ids):
-        raise RuntimeError("native candidate round completion order is not a permutation")
+    exact_id_set = set(exact_ids)
+    if len(set(completion_order)) != len(completion_order) or any(
+        candidate_id not in exact_id_set for candidate_id in completion_order
+    ):
+        raise RuntimeError("native candidate round completion order is invalid")
     counters_array = _require_array(
         payload[7],
         dtype=np.dtype(np.int64),
@@ -14301,6 +14324,7 @@ def _execute_native_candidate_round(
         completion_order=completion_array,
         exact_payload=payload[6],
         screening_sha256=screening.candidate_pool_hash,
+        counters=counters_array,
     )
     if transaction_sha256 != expected_transaction_sha256:
         raise RuntimeError("native candidate round transaction SHA-256 mismatch")
@@ -14321,6 +14345,13 @@ def _execute_native_candidate_round(
         payload=payload[6],
         native_kernel_seconds=float(timings_array[1]),
     )
+    if len(completion_order) != decoded.metrics.completed_calls or (
+        decoded.metrics.interrupted_calls == 0
+        and set(completion_order) != exact_id_set
+    ):
+        raise RuntimeError(
+            "native candidate round completion order does not reconcile"
+        )
     if record_runtime:
         native_runtime.record_screening(
             float(timings_array[0]),
@@ -14532,25 +14563,68 @@ def _candidate_round_digest(
     completion_order: npt.NDArray[np.int64],
     exact_payload: object,
     screening_sha256: str,
+    counters: npt.NDArray[np.generic],
 ) -> str:
-    evidence = bytearray(b"stage05.2-candidate-round-transaction-v2")
-    for values in (
-        context_ids,
-        resolution_codes,
-        sources,
-        cache_journal.reshape(-1),
-        exact_candidate_ids,
-        completion_order,
-    ):
-        for value in values:
-            evidence.extend(int(value).to_bytes(8, "little", signed=True))
     if not isinstance(exact_payload, tuple) or len(exact_payload) != 7:
         raise RuntimeError("native candidate round exact payload has an invalid schema")
     for value in exact_payload:
         if not isinstance(value, np.ndarray) or not value.flags.c_contiguous:
             raise RuntimeError("native candidate round exact payload is not contiguous")
-        evidence.extend(value.tobytes(order="C"))
-    evidence.extend(screening_sha256.encode("ascii"))
+
+    evidence = bytearray(b"stage05.2-typed-evidence-v2")
+
+    def add_header(
+        field_id: int,
+        dtype_code: int,
+        shape: tuple[int, ...],
+        byte_length: int,
+    ) -> None:
+        evidence.extend(field_id.to_bytes(8, "little", signed=False))
+        evidence.extend(dtype_code.to_bytes(8, "little", signed=False))
+        evidence.extend(len(shape).to_bytes(8, "little", signed=False))
+        for dimension in shape:
+            evidence.extend(int(dimension).to_bytes(8, "little", signed=False))
+        evidence.extend(byte_length.to_bytes(8, "little", signed=False))
+
+    def add_i64(field_id: int, values: npt.NDArray[np.generic]) -> None:
+        if values.dtype != np.dtype(np.int64) or not values.flags.c_contiguous:
+            raise RuntimeError("typed candidate evidence requires contiguous int64")
+        add_header(field_id, 1, values.shape, values.size * 8)
+        for value in values.reshape(-1):
+            evidence.extend(int(value).to_bytes(8, "little", signed=True))
+
+    def add_f64(field_id: int, values: npt.NDArray[np.generic]) -> None:
+        if values.dtype != np.dtype(np.float64) or not values.flags.c_contiguous:
+            raise RuntimeError("typed candidate evidence requires contiguous float64")
+        add_header(field_id, 2, values.shape, values.size * 8)
+        for value in values.reshape(-1):
+            number = float(value)
+            evidence.extend(
+                struct.pack("<Q", 0x7FF8000000000000)
+                if math.isnan(number)
+                else struct.pack("<d", number)
+            )
+
+    def add_bytes(field_id: int, values: bytes) -> None:
+        add_header(field_id, 3, (len(values),), len(values))
+        evidence.extend(values)
+
+    add_bytes(0, b"stage05.2-candidate-round-transaction-v2")
+    add_i64(1, context_ids)
+    add_i64(2, resolution_codes)
+    add_i64(3, sources)
+    add_i64(4, cache_journal)
+    add_i64(5, exact_candidate_ids)
+    add_i64(6, completion_order)
+    add_i64(7, exact_payload[0])
+    add_i64(8, exact_payload[1])
+    add_i64(9, exact_payload[2])
+    add_i64(10, exact_payload[3])
+    add_f64(11, exact_payload[4])
+    add_i64(12, exact_payload[5])
+    add_i64(13, exact_payload[6])
+    add_bytes(14, screening_sha256.encode("ascii"))
+    add_i64(15, counters)
     return hashlib.sha256(evidence).hexdigest()
 
 

@@ -33,6 +33,8 @@ namespace kernels = evrptw::native_kernels;
 
 inline std::atomic<std::uint64_t> request_counter{1};
 inline std::atomic<std::uint64_t> segment_counter{1};
+inline thread_local double transaction_deadline_absolute =
+    std::numeric_limits<double>::infinity();
 
 struct KernelClientTelemetry final {
     double queue_wait_seconds = 0.0;
@@ -153,7 +155,10 @@ inline void send_exact(int descriptor, const void* input, std::size_t size) {
 
 class Socket final {
 public:
-    explicit Socket(std::string_view path) {
+    explicit Socket(
+        std::string_view path,
+        double deadline_absolute = transaction_deadline_absolute)
+        : deadline_absolute_(deadline_absolute) {
         if (path.empty() || path.size() >= sizeof(sockaddr_un::sun_path)) {
             throw std::invalid_argument("native kernel scheduler socket is invalid");
         }
@@ -161,14 +166,7 @@ public:
         if (descriptor_ < 0) {
             throw std::runtime_error("native kernel client could not create its socket");
         }
-        timeval timeout{};
-        timeout.tv_sec = 125;
-        if (::setsockopt(
-                descriptor_, SOL_SOCKET, SO_RCVTIMEO,
-                &timeout, sizeof(timeout)) != 0
-            || ::setsockopt(
-                descriptor_, SOL_SOCKET, SO_SNDTIMEO,
-                &timeout, sizeof(timeout)) != 0) {
+        if (!configure_timeout()) {
             ::close(descriptor_);
             descriptor_ = -1;
             throw std::runtime_error(
@@ -195,8 +193,43 @@ public:
     }
     int get() const noexcept { return descriptor_; }
 
+    [[nodiscard]] bool deadline_expired() const noexcept {
+        return std::isfinite(deadline_absolute_)
+            && monotonic_seconds() >= deadline_absolute_;
+    }
+
+    void refresh_timeout() {
+        if (!configure_timeout()) {
+            throw std::runtime_error(
+                "native kernel client could not refresh socket timeout");
+        }
+    }
+
 private:
+    [[nodiscard]] static double monotonic_seconds() noexcept {
+        return std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    bool configure_timeout() noexcept {
+        const auto remaining = std::isfinite(deadline_absolute_)
+            ? std::max(0.001, deadline_absolute_ - monotonic_seconds())
+            : 125.0;
+        const auto bounded = std::min(125.0, remaining);
+        timeval timeout{};
+        timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(bounded);
+        timeout.tv_usec = static_cast<decltype(timeout.tv_usec)>(
+            (bounded - static_cast<double>(timeout.tv_sec)) * 1'000'000.0);
+        return ::setsockopt(
+                   descriptor_, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof(timeout)) == 0
+            && ::setsockopt(
+                   descriptor_, SOL_SOCKET, SO_SNDTIMEO,
+                   &timeout, sizeof(timeout)) == 0;
+    }
+
     int descriptor_ = -1;
+    double deadline_absolute_ = std::numeric_limits<double>::infinity();
 };
 
 inline protocol::PayloadView transact(
@@ -227,6 +260,10 @@ inline protocol::PayloadView transact(
     send_exact(socket.get(), &request, sizeof(request));
     if (!read_exact(socket.get(), &response, sizeof(response))) {
         throw std::runtime_error("native kernel scheduler returned a partial response");
+    }
+    if (socket.deadline_expired()) {
+        throw std::runtime_error(
+            "native kernel scheduler response crossed its deadline");
     }
     if (response.magic != protocol::kernel_magic
         || response.version != protocol::kernel_protocol_version
@@ -264,6 +301,11 @@ inline protocol::PayloadView transact(
 inline void acknowledge(
     Socket& socket,
     const protocol::ControlFrame& response) {
+    if (socket.deadline_expired()) {
+        throw std::runtime_error(
+            "native kernel scheduler acknowledgement crossed its deadline");
+    }
+    socket.refresh_timeout();
     protocol::ControlFrame acknowledgement;
     acknowledgement.message = protocol::ControlMessage::acknowledgement;
     acknowledgement.request_id = response.request_id;
@@ -278,6 +320,10 @@ inline void acknowledge(
         || released.request_id != response.request_id) {
         throw std::runtime_error("native kernel scheduler release receipt is invalid");
     }
+    if (socket.deadline_expired()) {
+        throw std::runtime_error(
+            "native kernel scheduler release crossed its deadline");
+    }
 }
 
 struct SearchRequestReceipt final {
@@ -289,7 +335,10 @@ inline SearchRequestReceipt search_request_receipt(
     std::string_view socket_path,
     const evrptw::native_search::RequestV2& request) {
     const auto request_id = request_counter.fetch_add(1);
-    Socket socket(socket_path);
+    Socket socket(
+        socket_path,
+        std::min(
+            request.config.deadline[1], transaction_deadline_absolute));
     protocol::SharedMapping output_mapping;
     protocol::ControlFrame response;
     const auto output = transact(
@@ -329,31 +378,12 @@ inline evrptw::native_search::InitialStateV2 search_initial_state(
     std::string_view socket_path,
     const evrptw::native_search::RequestV2& request) {
     const auto request_id = request_counter.fetch_add(1);
-    Socket socket(socket_path);
-    const auto timeout_seconds = request.config.deadline[1]
-        - std::chrono::duration<double>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (timeout_seconds <= 0.0) {
+    Socket socket(
+        socket_path,
+        std::min(request.config.deadline[1], transaction_deadline_absolute));
+    if (socket.deadline_expired()) {
         throw std::runtime_error(
             "native initial-search-state deadline expired before IPC");
-    }
-    timeval socket_timeout{};
-    socket_timeout.tv_sec = static_cast<decltype(socket_timeout.tv_sec)>(
-        timeout_seconds);
-    socket_timeout.tv_usec = static_cast<decltype(socket_timeout.tv_usec)>(
-        std::ceil(
-            (timeout_seconds - static_cast<double>(socket_timeout.tv_sec))
-            * 1'000'000.0));
-    if (socket_timeout.tv_usec >= 1'000'000) {
-        ++socket_timeout.tv_sec;
-        socket_timeout.tv_usec = 0;
-    }
-    if (::setsockopt(socket.get(), SOL_SOCKET, SO_RCVTIMEO, &socket_timeout,
-            sizeof(socket_timeout)) != 0
-        || ::setsockopt(socket.get(), SOL_SOCKET, SO_SNDTIMEO, &socket_timeout,
-            sizeof(socket_timeout)) != 0) {
-        throw std::runtime_error(
-            "native initial-search-state IPC deadline could not be installed");
     }
     protocol::SharedMapping output_mapping;
     protocol::ControlFrame response;
@@ -367,7 +397,7 @@ inline evrptw::native_search::InitialStateV2 search_initial_state(
     for (const auto index : {
              std::size_t{0}, std::size_t{1}, std::size_t{2}, std::size_t{3},
              std::size_t{6}, std::size_t{7}, std::size_t{8}, std::size_t{9},
-             std::size_t{10}, std::size_t{11}}) {
+             std::size_t{10}, std::size_t{11}, std::size_t{12}}) {
         const auto& descriptor = output.descriptor(index);
         if (descriptor.dimensions != 1
             || descriptor.shape[0] != descriptor.count
@@ -379,7 +409,7 @@ inline evrptw::native_search::InitialStateV2 search_initial_state(
     if (output.header().operation
             != protocol::KernelOperation::search_initial_state
         || output.header().request_id != response.request_id
-        || output.header().array_count != 12
+        || output.header().array_count != 13
         || output.descriptor(0).count != route_count + 1
         || output.descriptor(2).count != route_count
         || output.descriptor(3).count != route_count
@@ -395,7 +425,8 @@ inline evrptw::native_search::InitialStateV2 search_initial_state(
         || output.descriptor(7).count != 2
         || output.descriptor(8).count != 2
         || output.descriptor(9).count != 4
-        || output.descriptor(10).count != 64) {
+        || output.descriptor(10).count != 64
+        || output.descriptor(11).count != route_count) {
         throw std::runtime_error(
             "native initial-search-state response schema is invalid");
     }
@@ -424,6 +455,9 @@ inline evrptw::native_search::InitialStateV2 search_initial_state(
     state.exact.batch_counters =
         copy_vector.template operator()<std::int64_t>(
             6, protocol::NumericType::int64);
+    state.exact.completion_order =
+        copy_vector.template operator()<std::int64_t>(
+            11, protocol::NumericType::int64);
     const auto* objective_integer = output.data<std::int64_t>(
         7, protocol::NumericType::int64);
     std::copy(objective_integer, objective_integer + 2,
@@ -450,7 +484,7 @@ inline evrptw::native_search::InitialStateV2 search_initial_state(
         throw std::runtime_error(
             "native initial-search-state response arrived at or after deadline");
     }
-    record_telemetry(output, 11, false, true);
+    record_telemetry(output, 12, false, true);
     acknowledge(socket, response);
     return state;
 }
@@ -473,6 +507,15 @@ inline kernels::ExactBatchOutput exact_charging(
     const auto request_id = request_counter.fetch_add(1);
     protocol::PayloadBuilder builder(
         protocol::KernelOperation::exact_charging, request_id);
+    if (std::isnan(deadline_remaining)) {
+        throw std::invalid_argument("native exact deadline must not be NaN");
+    }
+    const auto deadline_absolute =
+        std::isinf(deadline_remaining) && deadline_remaining > 0.0
+        ? deadline_remaining
+        : std::chrono::duration<double>(
+              std::chrono::steady_clock::now().time_since_epoch()).count()
+            + std::max(0.0, deadline_remaining);
     builder.add(protocol::NumericType::int64, node_kinds, node_count, node_count);
     builder.add(protocol::NumericType::float64, ready, node_count, node_count);
     builder.add(protocol::NumericType::float64, due, node_count, node_count);
@@ -484,16 +527,18 @@ inline kernels::ExactBatchOutput exact_charging(
         route_count + 1, route_count + 1);
     builder.add(protocol::NumericType::int64, order_indices,
         order_count, order_count);
-    builder.add(protocol::NumericType::float64, &deadline_remaining, 1, 1);
+    builder.add(protocol::NumericType::float64, &deadline_absolute, 1, 1);
     builder.add(protocol::NumericType::int64, &batch_size, 1, 1);
-    Socket socket(socket_path);
+    Socket socket(
+        socket_path,
+        std::min(deadline_absolute, transaction_deadline_absolute));
     protocol::SharedMapping output_mapping;
     protocol::ControlFrame response;
     const auto output = transact(
         socket_path, builder.finish(), output_mapping, response, socket);
     if (output.header().operation != protocol::KernelOperation::exact_charging
         || output.header().request_id != response.request_id
-        || output.header().array_count != 8) {
+        || output.header().array_count != 9) {
         throw std::runtime_error("native exact output schema is invalid");
     }
     const auto one_dimensional = [&](const std::size_t index,
@@ -534,7 +579,12 @@ inline kernels::ExactBatchOutput exact_charging(
             5, protocol::NumericType::int64,
             static_cast<std::uint64_t>(route_count), 3)
         || !one_dimensional(6, protocol::NumericType::int64, 10)
-        || !one_dimensional(7, protocol::NumericType::float64, 4)) {
+        || output.descriptor(7).type != protocol::NumericType::int64
+        || output.descriptor(7).dimensions != 1
+        || output.descriptor(7).shape[0] != output.descriptor(7).count
+        || output.descriptor(7).shape[1] != 0
+        || output.descriptor(7).count > route_count
+        || !one_dimensional(8, protocol::NumericType::float64, 4)) {
         throw std::runtime_error("native exact output schema is invalid");
     }
     kernels::ExactBatchOutput result;
@@ -556,6 +606,7 @@ inline kernels::ExactBatchOutput exact_charging(
     result.metrics = copy_float64(4);
     result.label_counters = copy_int64(5);
     result.batch_counters = copy_int64(6);
+    result.completion_order = copy_int64(7);
     std::int64_t depot = -1;
     for (std::size_t node = 0; node < node_count; ++node) {
         if (node_kinds[node] == kernels::depot_kind) {
@@ -569,7 +620,7 @@ inline kernels::ExactBatchOutput exact_charging(
     kernels::validate_exact_batch_output(
         result, node_kinds, order_offsets, order_indices, node_count,
         route_count, order_count, depot, batch_size);
-    record_telemetry(output, 7);
+    record_telemetry(output, 8);
     acknowledge(socket, response);
     return result;
 }
@@ -713,39 +764,43 @@ inline void test_fault(
         && fault != "pause_after_response_before_ack"
         && fault != "descriptor_count_overflow"
         && fault != "route_index_oob"
+        && fault != "empty_route"
+        && fault != "wrong_rank"
         && fault != "trailing_payload"
         && fault != "oversized_control"
         && fault != "shared_memory_identity") {
         throw std::invalid_argument("unknown native scheduler fault injection");
     }
     const auto request_id = request_counter.fetch_add(1);
-    const std::array<std::int64_t, 1> kinds{kernels::depot_kind};
-    const std::array<double, 1> ready{0.0};
-    const std::array<double, 1> due{1.0e9};
-    const std::array<double, 1> service{0.0};
-    const std::array<double, 1> distances{0.0};
+    const std::array<std::int64_t, 2> kinds{
+        kernels::depot_kind, kernels::customer_kind};
+    const std::array<double, 2> ready{0.0, 0.0};
+    const std::array<double, 2> due{1.0e9, 1.0e9};
+    const std::array<double, 2> service{0.0, 0.0};
+    const std::array<double, 4> distances{0.0, 1.0, 1.0, 0.0};
     const std::array<double, 5> vehicle{1.0, 1.0, 1.0, 1.0, 1.0};
     const bool invalid_route = fault == "route_index_oob";
-    const std::array<std::int64_t, 2> offsets{
-        0, invalid_route ? 1 : 0};
-    const std::array<std::int64_t, 1> invalid_indices{99};
-    const double deadline_remaining = 10.0;
+    const bool empty_route = fault == "empty_route";
+    const std::array<std::int64_t, 2> offsets{0, empty_route ? 0 : 1};
+    const std::array<std::int64_t, 1> route_indices{
+        invalid_route ? 99 : 1};
+    const double deadline_absolute = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() + 10.0;
     const std::int64_t batch_size = 1;
     protocol::PayloadBuilder builder(
         protocol::KernelOperation::exact_charging, request_id);
-    builder.add(protocol::NumericType::int64, kinds.data(), 1, 1);
-    builder.add(protocol::NumericType::float64, ready.data(), 1, 1);
-    builder.add(protocol::NumericType::float64, due.data(), 1, 1);
-    builder.add(protocol::NumericType::float64, service.data(), 1, 1);
-    builder.add(protocol::NumericType::float64, distances.data(), 1, 1, 1);
+    builder.add(protocol::NumericType::int64, kinds.data(), 2, 2);
+    builder.add(protocol::NumericType::float64, ready.data(), 2, 2);
+    builder.add(protocol::NumericType::float64, due.data(), 2, 2);
+    builder.add(protocol::NumericType::float64, service.data(), 2, 2);
+    builder.add(protocol::NumericType::float64, distances.data(), 4, 2, 2);
     builder.add(protocol::NumericType::float64, vehicle.data(), 5, 5);
     builder.add(protocol::NumericType::int64, offsets.data(), 2, 2);
     builder.add(protocol::NumericType::int64,
-        invalid_route ? invalid_indices.data() : nullptr,
-        invalid_route ? 1 : 0,
-        invalid_route ? 1 : 0);
+        empty_route ? nullptr : route_indices.data(), empty_route ? 0 : 1,
+        empty_route ? 0 : 1);
     builder.add(
-        protocol::NumericType::float64, &deadline_remaining, 1, 1);
+        protocol::NumericType::float64, &deadline_absolute, 1, 1);
     builder.add(protocol::NumericType::int64, &batch_size, 1, 1);
     auto input_bytes = builder.finish();
     if (fault == "descriptor_count_overflow") {
@@ -753,6 +808,12 @@ inline void test_fault(
             input_bytes.data());
         header->arrays[0].count = std::numeric_limits<std::uint64_t>::max();
         header->arrays[0].shape[0] = header->arrays[0].count;
+    } else if (fault == "wrong_rank") {
+        auto* header = reinterpret_cast<protocol::PayloadHeader*>(
+            input_bytes.data());
+        header->arrays[1].dimensions = 2;
+        header->arrays[1].shape[0] = 1;
+        header->arrays[1].shape[1] = 2;
     } else if (fault == "trailing_payload") {
         input_bytes.push_back(0U);
     }

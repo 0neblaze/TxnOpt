@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 from itertools import product
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+from evrptw import _core as native_core
 from evrptw._core import (
     exact_charging_batch_numeric,
     propagate_routes_numeric,
@@ -20,6 +22,7 @@ from evrptw.cache_incremental import (
 )
 from evrptw.charging import solve_exact_charging
 from evrptw.models import Instance, Node, NodeType, Vehicle
+from evrptw.native_scheduler import NativeHostScheduler
 from evrptw.neighborhoods import _energy_reachable_optimistically, screen_route_candidate
 from evrptw.validation import validate_routes
 
@@ -98,6 +101,46 @@ def _pack(
     )
 
 
+def test_exact_completion_order_is_backend_observed_and_host_preserved(
+    tmp_path: Path,
+) -> None:
+    instance = Instance(
+        "completion_order_fixture",
+        (
+            Node("D0", NodeType.DEPOT, 0.0, 0.0, 0.0, 0.0, 200.0, 0.0),
+            Node("F1", NodeType.STATION, 4.0, 0.0, 0.0, 0.0, 200.0, 0.0),
+            Node("C1", NodeType.CUSTOMER, 8.0, 0.0, 1.0, 0.0, 100.0, 0.0),
+            Node("C2", NodeType.CUSTOMER, 9.0, 0.0, 1.0, 0.0, 100.0, 0.0),
+        ),
+        Vehicle(10.0, 5.0, 1.0, 0.1, 1.0),
+        distance_backend="python",
+    )
+    packed = _pack(instance, (("C1", "C2"), ("C1",)))
+    local = tuple(
+        int(value)
+        for value in native_core._test_exact_completion_order_v2(*packed)
+    )
+    assert local == (1, 0)
+
+    endpoint = tmp_path / "completion-order.sock"
+    with NativeHostScheduler(endpoint):
+        host = tuple(
+            int(value)
+            for value in native_core._test_exact_completion_order_v2(
+                *packed, str(endpoint)
+            )
+        )
+    assert host == local
+
+
+def test_initial_and_lane_hashes_bind_exact_completion_order() -> None:
+    initial_a, initial_b, lane_a, lane_b = (
+        native_core._test_initial_completion_hash_v2()
+    )
+    assert initial_a != initial_b
+    assert lane_a != lane_b
+
+
 def _decode_paths(
     instance: Instance,
     offsets: np.ndarray[tuple[int, ...], np.dtype[np.int64]],
@@ -142,7 +185,7 @@ def test_exact_charging_batch_numeric_rejects_wrong_dtype_and_shape() -> None:
 
 def test_exact_charging_batch_numeric_frozen_fixture_matches_python() -> None:
     instance = _instance()
-    orders = (("C1",), ())
+    orders = (("C1",), ("C1",))
     path_offsets, path_indices, status, reason, metrics, counters, batch = (
         exact_charging_batch_numeric(*_pack(instance, orders, batch_size=2))
     )
@@ -223,7 +266,7 @@ def test_exact_charging_batch_numeric_randomized_differential() -> None:
         orders: list[tuple[str, ...]] = []
         for _ in range(4):
             random.shuffle(order_names)
-            orders.append(tuple(order_names[: int(random.integers(0, 4))]))
+            orders.append(tuple(order_names[: int(random.integers(1, 4))]))
         order_tuple = tuple(orders)
         native = exact_charging_batch_numeric(*_pack(instance, order_tuple, batch_size=3))
         expected = tuple(solve_exact_charging(instance, order) for order in order_tuple)
@@ -300,7 +343,7 @@ def test_exact_charging_batch_numeric_rechecks_station_due_after_recharge() -> N
 
 def test_exact_charging_batch_numeric_batch_boundaries_preserve_results() -> None:
     instance = _instance()
-    orders = (("C1",), (), ("C1",))
+    orders = (("C1",), ("C1",), ("C1",))
     single = exact_charging_batch_numeric(*_pack(instance, orders, batch_size=1))
     wide = exact_charging_batch_numeric(*_pack(instance, orders, batch_size=128))
 
@@ -529,13 +572,15 @@ def test_screen_route_batch_transaction_v2_preserves_order_and_cache_semantics()
     c1_index = next(
         index for index, node in enumerate(instance.nodes) if node.name == "C1"
     )
-    route_offsets = np.asarray([0, 1, 2, 3, 3], dtype=np.int64)
-    route_indices = np.asarray([c1_index, -1, c1_index], dtype=np.int64)
+    route_offsets = np.asarray([0, 1, 2, 3, 5], dtype=np.int64)
+    route_indices = np.asarray(
+        [c1_index, -1, c1_index, c1_index, c1_index], dtype=np.int64
+    )
     candidate_ids = np.asarray([10, 11, 12, 13], dtype=np.int64)
     options = scalar_inputs[9]
     incremental = np.zeros((4, 6), dtype=np.float64)
-    negative_offsets = np.asarray([0, 0], dtype=np.int64)
-    negative_indices = np.asarray([], dtype=np.int64)
+    negative_offsets = np.asarray([0, 2], dtype=np.int64)
+    negative_indices = np.asarray([c1_index, c1_index], dtype=np.int64)
     negative_reason_codes = np.asarray([1], dtype=np.int64)
 
     first = screen_route_batch_transaction_v2(
@@ -652,6 +697,29 @@ def test_screen_route_batch_transaction_v2_accepts_empty_owned_batch() -> None:
     np.testing.assert_array_equal(result[5], np.zeros(5, dtype=np.int64))
     assert isinstance(result[6], str)
     assert len(result[6]) == 64
+
+
+def test_native_exact_and_screen_batches_reject_empty_candidate_rows() -> None:
+    instance = _instance()
+    exact_inputs = list(_pack(instance, (("C1",),)))
+    exact_inputs[6] = np.asarray([0, 0], dtype=np.int64)
+    exact_inputs[7] = np.asarray([], dtype=np.int64)
+    with pytest.raises(ValueError, match="non-empty rows"):
+        exact_charging_batch_numeric(*exact_inputs)
+
+    scalar_inputs = _screen_pack(instance, ("C1",), full=True)
+    with pytest.raises(ValueError, match="empty candidate row"):
+        screen_route_batch_transaction_v2(
+            *scalar_inputs[:8],
+            np.asarray([0, 0], dtype=np.int64),
+            np.asarray([], dtype=np.int64),
+            np.asarray([10], dtype=np.int64),
+            scalar_inputs[9],
+            np.zeros((1, 6), dtype=np.float64),
+            np.asarray([0], dtype=np.int64),
+            np.asarray([], dtype=np.int64),
+            np.asarray([], dtype=np.int64),
+        )
 
 
 def test_screen_routes_numeric_randomized_python_differential() -> None:

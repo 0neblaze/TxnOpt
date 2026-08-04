@@ -126,6 +126,8 @@ thread_local std::string native_kernel_scheduler_endpoint;
 thread_local bool native_kernel_scheduler_required = false;
 #endif
 thread_local std::int64_t screen_batch_thread_launch_failure_after = -1;
+thread_local bool candidate_round_projection_failure_injection = false;
+thread_local bool candidate_round_semantic_failure_injection = false;
 
 template <typename Callback>
 class ScopeRollback final {
@@ -186,6 +188,25 @@ private:
     std::string previous_endpoint_;
     bool previous_required_;
     evrptw::native_client::KernelClientTelemetryCollector* previous_collector_;
+};
+
+class NativeSchedulerDeadlineContext final {
+public:
+    explicit NativeSchedulerDeadlineContext(double absolute_deadline)
+        : previous_(std::exchange(
+              evrptw::native_client::transaction_deadline_absolute,
+              absolute_deadline)) {}
+
+    NativeSchedulerDeadlineContext(const NativeSchedulerDeadlineContext&) = delete;
+    NativeSchedulerDeadlineContext& operator=(
+        const NativeSchedulerDeadlineContext&) = delete;
+
+    ~NativeSchedulerDeadlineContext() noexcept {
+        evrptw::native_client::transaction_deadline_absolute = previous_;
+    }
+
+private:
+    double previous_ = std::numeric_limits<double>::infinity();
 };
 #endif
 
@@ -607,6 +628,95 @@ void append_evidence_values(
         }
     }
 }
+
+template <typename T>
+void append_raw_native_bytes(
+    std::string& evidence,
+    std::span<const T> values) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    if (!values.empty()) {
+        evidence.append(
+            reinterpret_cast<const char*>(values.data()),
+            values.size_bytes());
+    }
+}
+
+class TypedEvidenceWriterV2 final {
+public:
+    explicit TypedEvidenceWriterV2(const std::string_view domain)
+        : evidence_("stage05.2-typed-evidence-v2") {
+        add_bytes(0, domain, {domain.size()});
+    }
+
+    void add_i64(
+        const std::uint64_t field_id,
+        const std::span<const std::int64_t> values,
+        const std::initializer_list<std::size_t> shape) {
+        add_header(field_id, 1, shape, values.size_bytes());
+        for (const auto value : values) {
+            append_evidence_i64(evidence_, value);
+        }
+    }
+
+    void add_f64(
+        const std::uint64_t field_id,
+        const std::span<const double> values,
+        const std::initializer_list<std::size_t> shape) {
+        add_header(field_id, 2, shape, values.size_bytes());
+        for (const auto value : values) {
+            append_evidence_f64(evidence_, value);
+        }
+    }
+
+    void add_bytes(
+        const std::uint64_t field_id,
+        const std::string_view values,
+        const std::initializer_list<std::size_t> shape) {
+        add_header(field_id, 3, shape, values.size());
+        evidence_.append(values);
+    }
+
+    [[nodiscard]] std::string digest() const {
+        return native_sha256_hex(evidence_);
+    }
+
+private:
+    std::string evidence_;
+
+    void add_header(
+        const std::uint64_t field_id,
+        const std::uint64_t dtype_code,
+        const std::initializer_list<std::size_t> shape,
+        const std::size_t byte_length) {
+        append_evidence_u64(evidence_, field_id);
+        append_evidence_u64(evidence_, dtype_code);
+        append_evidence_u64(
+            evidence_, static_cast<std::uint64_t>(shape.size()));
+        std::size_t element_count = 1;
+        for (const auto dimension : shape) {
+            if (dimension != 0
+                && element_count
+                    > std::numeric_limits<std::size_t>::max() / dimension) {
+                throw std::overflow_error(
+                    "typed evidence shape element count overflows");
+            }
+            element_count *= dimension;
+            append_evidence_u64(
+                evidence_, static_cast<std::uint64_t>(dimension));
+        }
+        const auto element_size = dtype_code == 3 ? std::size_t{1} : sizeof(std::uint64_t);
+        if (element_count > std::numeric_limits<std::size_t>::max() / element_size
+            || element_count * element_size != byte_length) {
+            throw std::logic_error(
+                "typed evidence byte length does not match its shape");
+        }
+        if (byte_length > std::numeric_limits<std::uint64_t>::max()) {
+            throw std::overflow_error("typed evidence byte length overflows");
+        }
+        append_evidence_u64(
+            evidence_, static_cast<std::uint64_t>(byte_length));
+    }
+};
 
 template <typename T>
 void append_evidence_array(
@@ -2297,7 +2407,8 @@ screen_route_batch_transaction_owned_from_python_v2(
 py::tuple project_screen_batch_result_v2(
     const evrptw::native_search::ScreenBatchResultV2& result);
 
-py::tuple exact_charging_batch_numeric(
+evrptw::native_kernels::ExactBatchOutput
+exact_charging_batch_owned_from_python_v2(
     py::handle node_kind,
     py::handle ready_time,
     py::handle due_date,
@@ -3840,6 +3951,17 @@ private:
 
 class NativeBudgetStateV2 {
 public:
+    struct RoundReservation final {
+        std::int64_t requested = 0;
+        std::int64_t granted = 0;
+        std::int64_t remaining = 0;
+    };
+
+    struct ExactReservation final {
+        std::int64_t requested = 0;
+        std::int64_t granted = 0;
+    };
+
     NativeBudgetStateV2(std::int64_t exact_budget, std::int64_t round_budget)
         : exact_budget_(exact_budget), round_budget_(round_budget) {
         if (exact_budget_ == 0 || exact_budget_ < -1 || round_budget_ <= 0) {
@@ -3855,11 +3977,13 @@ public:
         if (round_active_ && lane_id_ == lane_id && iteration_ == iteration) {
             return state();
         }
+        auto projected = project_values(
+            true, lane_id, iteration, 0, started_, completed_, interrupted_);
         round_active_ = true;
         lane_id_ = lane_id;
         iteration_ = iteration;
         round_used_ = 0;
-        return state();
+        return projected;
     }
 
     py::array_t<std::int64_t> begin_shared_iteration_round(
@@ -3871,55 +3995,72 @@ public:
             // Candidate Control shares one per-iteration budget across all
             // semantic ALNS lanes.  Preserve the lane that owns the current
             // transaction for replay without resetting the shared counter.
+            auto projected = project_values(
+                true, semantic_lane_id, iteration_, round_used_, started_,
+                completed_, interrupted_);
             lane_id_ = semantic_lane_id;
-            return state();
+            return projected;
         }
         return begin_round(semantic_lane_id, iteration);
     }
 
+    void begin_shared_iteration_round_owned(
+        std::int64_t semantic_lane_id, std::int64_t iteration) {
+        if (semantic_lane_id < 0 || iteration < 0) {
+            throw std::invalid_argument("native round identity must be non-negative");
+        }
+        if (round_active_ && iteration_ == iteration) {
+            lane_id_ = semantic_lane_id;
+            return;
+        }
+        round_active_ = true;
+        lane_id_ = semantic_lane_id;
+        iteration_ = iteration;
+        round_used_ = 0;
+    }
+
     py::array_t<std::int64_t> finish_round() {
+        auto projected = project_values(
+            false, -1, -1, 0, started_, completed_, interrupted_);
         round_active_ = false;
         lane_id_ = -1;
         iteration_ = -1;
         round_used_ = 0;
-        return state();
+        return projected;
     }
 
     py::array_t<std::int64_t> reserve_round(
         std::int64_t requested, bool atomic) {
-        if (requested <= 0) {
-            py::array_t<std::int64_t> output(3);
-            checked_data(output)[0] = requested;
-            checked_data(output)[1] = 0;
-            checked_data(output)[2] = round_remaining();
-            return output;
-        }
-        std::int64_t granted = requested;
-        if (round_active_) {
-            granted = atomic
-                ? (requested <= round_remaining() ? requested : 0)
-                : std::min(requested, round_remaining());
-        }
-        round_used_ += granted;
+        const auto reservation = plan_round_reservation(requested, atomic);
         py::array_t<std::int64_t> output(3);
-        checked_data(output)[0] = requested;
-        checked_data(output)[1] = granted;
-        checked_data(output)[2] = round_remaining();
+        checked_data(output)[0] = reservation.requested;
+        checked_data(output)[1] = reservation.granted;
+        checked_data(output)[2] = reservation.remaining;
+        commit_round_reservation(reservation);
         return output;
     }
 
     py::array_t<std::int64_t> reserve_exact(std::int64_t requested) {
-        if (requested <= 0) {
-            throw std::invalid_argument("exact-call reservation must be positive");
-        }
-        const auto granted = exact_budget_ < 0
-            ? requested
-            : std::min(requested, std::max<std::int64_t>(0, exact_budget_ - started_));
-        started_ += granted;
+        const auto reservation = plan_exact_reservation(requested);
         py::array_t<std::int64_t> output(2);
-        checked_data(output)[0] = requested;
-        checked_data(output)[1] = granted;
+        checked_data(output)[0] = reservation.requested;
+        checked_data(output)[1] = reservation.granted;
+        commit_exact_reservation(reservation);
         return output;
+    }
+
+    [[nodiscard]] RoundReservation reserve_round_owned(
+        std::int64_t requested, bool atomic) {
+        const auto reservation = plan_round_reservation(requested, atomic);
+        commit_round_reservation(reservation);
+        return reservation;
+    }
+
+    [[nodiscard]] ExactReservation reserve_exact_owned(
+        std::int64_t requested) {
+        const auto reservation = plan_exact_reservation(requested);
+        commit_exact_reservation(reservation);
+        return reservation;
     }
 
     [[nodiscard]] std::int64_t exact_remaining() const {
@@ -3933,19 +4074,40 @@ public:
     }
 
     py::array_t<std::int64_t> complete_exact(std::int64_t count) {
-        if (count < 0 || completed_ + interrupted_ + count > started_) {
+        const auto unsettled = started_ - completed_ - interrupted_;
+        if (count < 0 || unsettled < 0 || count > unsettled) {
             throw std::runtime_error("invalid completed exact-call count");
         }
-        completed_ += count;
-        return state();
+        validate_exact_settlement(count, 0);
+        auto projected = project_state_after_settlement(count, 0);
+        settle_exact_owned(count, 0);
+        return projected;
     }
 
     py::array_t<std::int64_t> interrupt_exact(std::int64_t count) {
-        if (count < 0 || completed_ + interrupted_ + count > started_) {
+        const auto unsettled = started_ - completed_ - interrupted_;
+        if (count < 0 || unsettled < 0 || count > unsettled) {
             throw std::runtime_error("invalid interrupted exact-call count");
         }
-        interrupted_ += count;
-        return state();
+        validate_exact_settlement(0, count);
+        auto projected = project_state_after_settlement(0, count);
+        settle_exact_owned(0, count);
+        return projected;
+    }
+
+    void settle_exact_owned(
+        std::int64_t completed, std::int64_t interrupted) {
+        validate_exact_settlement(completed, interrupted);
+        completed_ += completed;
+        interrupted_ += interrupted;
+    }
+
+    void test_fail_next_state_projection() {
+        if (state_projection_failure_injection_) {
+            throw std::logic_error(
+                "native budget state projection failure is already armed");
+        }
+        state_projection_failure_injection_ = true;
     }
 
     py::array_t<std::int64_t> snapshot() const {
@@ -3961,42 +4123,32 @@ public:
         const auto* values = checked_data<std::int64_t>(snapshot_array);
         if ((values[0] != 0 && values[0] != 1) || values[3] < 0
             || values[5] < 0 || values[6] < 0 || values[7] < 0
-            || values[6] + values[7] > values[5]
+            || values[6] > values[5] || values[7] > values[5] - values[6]
             || (values[0] == 1 && (values[1] < 0 || values[2] < 0))) {
             throw std::invalid_argument("native budget snapshot values are invalid");
         }
-        round_active_ = values[0] == 1;
-        lane_id_ = values[1];
-        iteration_ = values[2];
-        round_used_ = values[3];
+        const auto active = values[0] == 1;
+        const auto lane = active ? values[1] : -1;
+        const auto iteration = active ? values[2] : -1;
+        const auto round_used = active ? values[3] : 0;
+        if (round_used > round_budget_
+            || (exact_budget_ >= 0 && values[5] > exact_budget_)) {
+            throw std::invalid_argument("native budget snapshot exceeds configured limits");
+        }
+        auto projected = project_values(
+            active, lane, iteration, round_used, values[5], values[6], values[7]);
+        round_active_ = active;
+        lane_id_ = lane;
+        iteration_ = iteration;
+        round_used_ = round_used;
         started_ = values[5];
         completed_ = values[6];
         interrupted_ = values[7];
-        if (!round_active_) {
-            lane_id_ = -1;
-            iteration_ = -1;
-            round_used_ = 0;
-        }
-        if (round_used_ > round_budget_
-            || (exact_budget_ >= 0 && started_ > exact_budget_)) {
-            throw std::invalid_argument("native budget snapshot exceeds configured limits");
-        }
-        return state();
+        return projected;
     }
 
     py::array_t<std::int64_t> state() const {
-        py::array_t<std::int64_t> output(9);
-        auto* values = checked_data(output);
-        values[0] = round_active_ ? 1 : 0;
-        values[1] = lane_id_;
-        values[2] = iteration_;
-        values[3] = round_used_;
-        values[4] = round_remaining();
-        values[5] = started_;
-        values[6] = completed_;
-        values[7] = interrupted_;
-        values[8] = exact_budget_ >= 0 && started_ >= exact_budget_ ? 1 : 0;
-        return output;
+        return project_state_after_settlement(0, 0);
     }
 
     [[nodiscard]] bool budget_reached() const noexcept {
@@ -4023,6 +4175,98 @@ private:
     std::int64_t started_ = 0;
     std::int64_t completed_ = 0;
     std::int64_t interrupted_ = 0;
+    mutable bool state_projection_failure_injection_ = false;
+
+    [[nodiscard]] RoundReservation plan_round_reservation(
+        std::int64_t requested, bool atomic) const {
+        if (requested <= 0) {
+            return {requested, 0, round_remaining()};
+        }
+        auto granted = requested;
+        if (round_active_) {
+            granted = atomic
+                ? (requested <= round_remaining() ? requested : 0)
+                : std::min(requested, round_remaining());
+        }
+        const auto remaining = round_active_
+            ? std::max<std::int64_t>(0, round_remaining() - granted)
+            : round_budget_;
+        return {requested, granted, remaining};
+    }
+
+    void commit_round_reservation(const RoundReservation& reservation) {
+        if (reservation.granted > 0
+            && round_used_ > std::numeric_limits<std::int64_t>::max()
+                    - reservation.granted) {
+            throw std::overflow_error("native round budget counter overflow");
+        }
+        round_used_ += reservation.granted;
+    }
+
+    [[nodiscard]] ExactReservation plan_exact_reservation(
+        std::int64_t requested) const {
+        if (requested <= 0) {
+            throw std::invalid_argument("exact-call reservation must be positive");
+        }
+        const auto granted = exact_budget_ < 0
+            ? requested
+            : std::min(
+                requested,
+                std::max<std::int64_t>(0, exact_budget_ - started_));
+        return {requested, granted};
+    }
+
+    void commit_exact_reservation(const ExactReservation& reservation) {
+        if (reservation.granted > 0
+            && started_ > std::numeric_limits<std::int64_t>::max()
+                    - reservation.granted) {
+            throw std::overflow_error("native exact budget counter overflow");
+        }
+        started_ += reservation.granted;
+    }
+
+    void validate_exact_settlement(
+        std::int64_t completed, std::int64_t interrupted) const {
+        const auto unsettled = started_ - completed_ - interrupted_;
+        if (completed < 0 || interrupted < 0 || unsettled < 0
+            || completed > unsettled
+            || interrupted > unsettled - completed) {
+            throw std::runtime_error("invalid exact-call settlement");
+        }
+    }
+
+    py::array_t<std::int64_t> project_state_after_settlement(
+        std::int64_t completed, std::int64_t interrupted) const {
+        validate_exact_settlement(completed, interrupted);
+        return project_values(
+            round_active_, lane_id_, iteration_, round_used_, started_,
+            completed_ + completed, interrupted_ + interrupted);
+    }
+
+    py::array_t<std::int64_t> project_values(
+        bool round_active, std::int64_t lane_id, std::int64_t iteration,
+        std::int64_t round_used, std::int64_t started,
+        std::int64_t completed, std::int64_t interrupted) const {
+        if (state_projection_failure_injection_) {
+            state_projection_failure_injection_ = false;
+            throw std::runtime_error(
+                "injected native budget state projection failure");
+        }
+        py::array_t<std::int64_t> output(9);
+        auto* values = checked_data(output);
+        values[0] = round_active ? 1 : 0;
+        values[1] = lane_id;
+        values[2] = iteration;
+        values[3] = round_used;
+        values[4] = round_active
+            ? std::max<std::int64_t>(0, round_budget_ - round_used)
+            : round_budget_;
+        values[5] = started;
+        values[6] = completed;
+        values[7] = interrupted;
+        values[8] = exact_budget_ >= 0 && started >= exact_budget_ ? 1 : 0;
+        return output;
+    }
 
     [[nodiscard]] std::int64_t round_remaining() const {
         return round_active_ ? std::max<std::int64_t>(0, round_budget_ - round_used_)
@@ -4033,6 +4277,16 @@ private:
         return NativeSnapshot{
             round_active_, lane_id_, iteration_, round_used_,
             started_, completed_, interrupted_};
+    }
+
+    void restore_native(const NativeSnapshot& snapshot) noexcept {
+        round_active_ = snapshot.round_active;
+        lane_id_ = snapshot.lane_id;
+        iteration_ = snapshot.iteration;
+        round_used_ = snapshot.round_used;
+        started_ = snapshot.started;
+        completed_ = snapshot.completed;
+        interrupted_ = snapshot.interrupted;
     }
 
     void rollback_preserving_exact_noexcept(
@@ -6830,60 +7084,37 @@ using evrptw::native_kernels::screen_reason_legacy_energy;
 using evrptw::native_kernels::screen_reason_structure;
 using evrptw::native_kernels::station_kind;
 
-py::tuple exact_charging_batch_numeric(
-    py::handle node_kind,
-    py::handle ready_time,
-    py::handle due_date,
-    py::handle service_time,
-    py::handle distance,
-    py::handle vehicle,
-    py::handle order_offsets,
-    py::handle order_indices,
-    py::handle deadline_remaining,
-    py::handle batch_size) {
-    auto kind_array = checked_array<std::int64_t>(node_kind, "node_kind", 1);
-    auto ready_array = checked_array<double>(ready_time, "ready_time", 1);
-    auto due_array = checked_array<double>(due_date, "due_date", 1);
-    auto service_array = checked_array<double>(service_time, "service_time", 1);
-    auto distance_array = checked_array<double>(distance, "distance", 2);
-    auto vehicle_array = checked_array<double>(vehicle, "vehicle", 1);
-    auto offsets_array = checked_array<std::int64_t>(order_offsets, "order_offsets", 1);
-    auto indices_array = checked_array<std::int64_t>(order_indices, "order_indices", 1);
-    auto deadline_array = checked_array<double>(deadline_remaining, "deadline_remaining", 1);
-    auto batch_size_array = checked_array<std::int64_t>(batch_size, "batch_size", 1);
-    const auto kind_info = kind_array.request();
-    const auto ready_info = ready_array.request();
-    const auto due_info = due_array.request();
-    const auto service_info = service_array.request();
-    const auto distance_info = distance_array.request();
-    const auto vehicle_info = vehicle_array.request();
-    const auto offsets_info = offsets_array.request();
-    const auto indices_info = indices_array.request();
-    const auto deadline_info = deadline_array.request();
-    const auto batch_size_info = batch_size_array.request();
-    const auto node_count = static_cast<std::size_t>(kind_info.shape[0]);
+evrptw::native_kernels::ExactBatchOutput
+exact_charging_batch_owned_from_python_views_v2(
+    const py::array_t<std::int64_t>& kind_array,
+    const py::array_t<double>& ready_array,
+    const py::array_t<double>& due_array,
+    const py::array_t<double>& service_array,
+    const py::array_t<double>& distance_array,
+    const py::array_t<double>& vehicle_array,
+    const std::span<const std::int64_t> order_offsets,
+    const std::span<const std::int64_t> order_indices,
+    const double deadline_remaining,
+    const std::int64_t batch_size) {
+    const auto helper_started = std::chrono::steady_clock::now();
+    const auto node_count = static_cast<std::size_t>(kind_array.shape(0));
     if (node_count == 0) {
         throw std::invalid_argument("node arrays must not be empty");
     }
-    if (ready_info.shape[0] != kind_info.shape[0] || due_info.shape[0] != kind_info.shape[0]
-        || service_info.shape[0] != kind_info.shape[0]) {
+    if (ready_array.shape(0) != kind_array.shape(0)
+        || due_array.shape(0) != kind_array.shape(0)
+        || service_array.shape(0) != kind_array.shape(0)) {
         throw std::invalid_argument("node metadata arrays must share one length");
     }
-    if (distance_info.shape[0] != kind_info.shape[0]
-        || distance_info.shape[1] != kind_info.shape[0]) {
+    if (distance_array.shape(0) != kind_array.shape(0)
+        || distance_array.shape(1) != kind_array.shape(0)) {
         throw std::invalid_argument("distance must have shape (n, n)");
     }
-    if (vehicle_info.shape[0] != 5) {
+    if (vehicle_array.shape(0) != 5) {
         throw std::invalid_argument("vehicle must have shape (5,)");
     }
-    if (offsets_info.shape[0] == 0) {
+    if (order_offsets.empty()) {
         throw std::invalid_argument("order_offsets must contain at least the initial zero");
-    }
-    if (deadline_info.shape[0] != 1) {
-        throw std::invalid_argument("deadline_remaining must have shape (1,)");
-    }
-    if (batch_size_info.shape[0] != 1) {
-        throw std::invalid_argument("batch_size must have shape (1,)");
     }
 
     const auto* kinds = checked_data<std::int64_t>(kind_array);
@@ -6892,14 +7123,12 @@ py::tuple exact_charging_batch_numeric(
     const auto* service = checked_data<double>(service_array);
     const auto* distances = checked_data<double>(distance_array);
     const auto* vehicle_values = checked_data<double>(vehicle_array);
-    const auto* offsets = checked_data<std::int64_t>(offsets_array);
-    const auto* indices = checked_data<std::int64_t>(indices_array);
-    const auto* deadline = checked_data<double>(deadline_array);
-    const auto* batch = checked_data<std::int64_t>(batch_size_array);
-    if (batch[0] <= 0) {
+    const auto* offsets = order_offsets.data();
+    const auto* indices = order_indices.data();
+    if (batch_size <= 0) {
         throw std::invalid_argument("batch_size must be positive");
     }
-    if (std::isnan(deadline[0])) {
+    if (std::isnan(deadline_remaining)) {
         throw std::invalid_argument("deadline_remaining must not be NaN");
     }
     if (!std::isfinite(vehicle_values[0]) || vehicle_values[0] < 0.0
@@ -6937,14 +7166,16 @@ py::tuple exact_charging_batch_numeric(
     if (depot < 0) {
         throw std::invalid_argument("node_kind must contain exactly one depot");
     }
-    const auto route_count = static_cast<std::size_t>(offsets_info.shape[0] - 1);
+    const auto route_count = order_offsets.size() - 1;
     if (offsets[0] != 0
-        || offsets[route_count] != static_cast<std::int64_t>(indices_info.shape[0])) {
+        || offsets[route_count]
+            != static_cast<std::int64_t>(order_indices.size())) {
         throw std::invalid_argument("order_offsets must span order_indices exactly");
     }
     for (std::size_t route = 0; route < route_count; ++route) {
-        if (offsets[route] < 0 || offsets[route] > offsets[route + 1]) {
-            throw std::invalid_argument("order_offsets must be monotone");
+        if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]) {
+            throw std::invalid_argument(
+                "order_offsets must be monotone with non-empty rows");
         }
         std::vector<bool> seen(node_count, false);
         for (auto position = offsets[route]; position < offsets[route + 1]; ++position) {
@@ -6960,6 +7191,26 @@ py::tuple exact_charging_batch_numeric(
         }
     }
 
+    std::vector<std::int64_t> owned_kinds(kinds, kinds + node_count);
+    std::vector<double> owned_ready(ready, ready + node_count);
+    std::vector<double> owned_due(due, due + node_count);
+    std::vector<double> owned_service(service, service + node_count);
+    std::vector<double> owned_distances(
+        distances, distances + node_count * node_count);
+    std::array<double, 5> owned_vehicle{};
+    std::copy(vehicle_values, vehicle_values + 5, owned_vehicle.begin());
+    std::vector<std::int64_t> owned_offsets(
+        offsets, offsets + route_count + 1);
+    std::vector<std::int64_t> owned_indices;
+    if (!order_indices.empty()) {
+        owned_indices.assign(order_indices.begin(), order_indices.end());
+    }
+    const auto ownership_elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - helper_started).count();
+    const auto kernel_deadline_remaining = std::isfinite(deadline_remaining)
+        ? std::max(0.0, deadline_remaining - ownership_elapsed)
+        : deadline_remaining;
+
     evrptw::native_kernels::ExactBatchOutput result;
     {
         py::gil_scoped_release release;
@@ -6973,10 +7224,12 @@ py::tuple exact_charging_batch_numeric(
             try {
                 result = evrptw::native_client::exact_charging(
                     native_kernel_scheduler_endpoint,
-                    kinds, ready, due, service, distances, vehicle_values,
-                    offsets, indices, node_count, route_count,
-                    static_cast<std::size_t>(indices_info.shape[0]),
-                    deadline[0], batch[0]);
+                    owned_kinds.data(), owned_ready.data(), owned_due.data(),
+                    owned_service.data(), owned_distances.data(),
+                    owned_vehicle.data(), owned_offsets.data(),
+                    owned_indices.data(), node_count, route_count,
+                    owned_indices.size(),
+                    kernel_deadline_remaining, batch_size);
             } catch (const std::exception& error) {
                 throw std::runtime_error(
                     std::string("host scheduler IPC failed without fallback: ")
@@ -6985,28 +7238,100 @@ py::tuple exact_charging_batch_numeric(
         } else {
 #endif
         result = evrptw::native_kernels::run_exact_charging_batch(
-            kinds,
-            ready,
-            due,
-            service,
-            distances,
-            vehicle_values,
-            offsets,
-            indices,
+            owned_kinds.data(),
+            owned_ready.data(),
+            owned_due.data(),
+            owned_service.data(),
+            owned_distances.data(),
+            owned_vehicle.data(),
+            owned_offsets.data(),
+            owned_indices.data(),
             node_count,
             route_count,
             depot,
             stations,
-            deadline[0],
-            batch[0]);
+            kernel_deadline_remaining,
+            batch_size);
 #ifdef __linux__
         }
 #endif
     }
     evrptw::native_kernels::validate_exact_batch_output(
-        result, kinds, offsets, indices, node_count, route_count,
-        static_cast<std::size_t>(indices_info.shape[0]), depot, batch[0]);
+        result, owned_kinds.data(), owned_offsets.data(), owned_indices.data(),
+        node_count, route_count, owned_indices.size(), depot, batch_size);
 
+    return result;
+}
+
+evrptw::native_kernels::ExactBatchOutput
+exact_charging_batch_owned_from_python_v2(
+    py::handle node_kind,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle vehicle,
+    py::handle order_offsets,
+    py::handle order_indices,
+    py::handle deadline_remaining,
+    py::handle batch_size) {
+    auto kind_array = checked_array<std::int64_t>(node_kind, "node_kind", 1);
+    auto ready_array = checked_array<double>(ready_time, "ready_time", 1);
+    auto due_array = checked_array<double>(due_date, "due_date", 1);
+    auto service_array = checked_array<double>(service_time, "service_time", 1);
+    auto distance_array = checked_array<double>(distance, "distance", 2);
+    auto vehicle_array = checked_array<double>(vehicle, "vehicle", 1);
+    auto offsets_array = checked_array<std::int64_t>(
+        order_offsets, "order_offsets", 1);
+    auto indices_array = checked_array<std::int64_t>(
+        order_indices, "order_indices", 1);
+    auto deadline_array = checked_array<double>(
+        deadline_remaining, "deadline_remaining", 1);
+    auto batch_size_array = checked_array<std::int64_t>(
+        batch_size, "batch_size", 1);
+    const auto node_count = kind_array.shape(0);
+    if (node_count == 0) {
+        throw std::invalid_argument("node arrays must not be empty");
+    }
+    if (ready_array.shape(0) != node_count || due_array.shape(0) != node_count
+        || service_array.shape(0) != node_count) {
+        throw std::invalid_argument(
+            "node metadata arrays must share one length");
+    }
+    if (distance_array.shape(0) != node_count
+        || distance_array.shape(1) != node_count) {
+        throw std::invalid_argument("distance must have shape (n, n)");
+    }
+    if (vehicle_array.shape(0) != 5) {
+        throw std::invalid_argument("vehicle must have shape (5,)");
+    }
+    if (offsets_array.shape(0) == 0) {
+        throw std::invalid_argument(
+            "order_offsets must contain at least the initial zero");
+    }
+    if (deadline_array.shape(0) != 1) {
+        throw std::invalid_argument(
+            "deadline_remaining must have shape (1,)");
+    }
+    if (batch_size_array.shape(0) != 1) {
+        throw std::invalid_argument("batch_size must have shape (1,)");
+    }
+    return exact_charging_batch_owned_from_python_views_v2(
+        kind_array, ready_array, due_array, service_array, distance_array,
+        vehicle_array,
+        std::span<const std::int64_t>(
+            checked_data<std::int64_t>(offsets_array),
+            static_cast<std::size_t>(offsets_array.size())),
+        std::span<const std::int64_t>(
+            checked_data<std::int64_t>(indices_array),
+            static_cast<std::size_t>(indices_array.size())),
+        checked_data<double>(deadline_array)[0],
+        checked_data<std::int64_t>(batch_size_array)[0]);
+}
+
+py::tuple project_exact_charging_batch_output_v2(
+    const evrptw::native_kernels::ExactBatchOutput& result) {
+    const auto route_count = result.statuses.size();
     py::array_t<std::int64_t> path_offsets_array(result.path_offsets.size());
     py::array_t<std::int64_t> path_indices_array(result.path_indices.size());
     py::array_t<std::int64_t> status_array(result.statuses.size());
@@ -7036,6 +7361,81 @@ py::tuple exact_charging_batch_numeric(
         std::move(batch_counters_array));
 }
 
+py::array_t<std::int64_t> test_exact_completion_order_v2(
+    py::handle node_kind, py::handle ready_time, py::handle due_date,
+    py::handle service_time, py::handle distance, py::handle vehicle,
+    py::handle order_offsets, py::handle order_indices,
+    py::handle deadline_remaining, py::handle batch_size,
+    const std::string& scheduler_endpoint) {
+#ifdef __linux__
+    NativeSchedulerThreadContext scheduler_context(
+        scheduler_endpoint, !scheduler_endpoint.empty(), nullptr);
+#else
+    if (!scheduler_endpoint.empty()) {
+        throw std::runtime_error(
+            "native exact completion host test requires Linux");
+    }
+#endif
+    const auto result = exact_charging_batch_owned_from_python_v2(
+        node_kind, ready_time, due_date, service_time, distance, vehicle,
+        order_offsets, order_indices, deadline_remaining, batch_size);
+    py::array_t<std::int64_t> output(result.completion_order.size());
+    std::copy(
+        result.completion_order.begin(), result.completion_order.end(),
+        checked_data(output));
+    return output;
+}
+
+py::tuple test_initial_completion_hash_v2() {
+    evrptw::native_kernels::ExactBatchOutput exact;
+    exact.path_offsets = {0, 2, 4};
+    exact.path_indices = {0, 0, 0, 0};
+    exact.statuses = {0, 0};
+    exact.reasons = {0, 0};
+    exact.metrics.assign(8, 0.0);
+    exact.label_counters.assign(6, 0);
+    exact.batch_counters = {2, 2, 2, 0, 1, 0, 0, 0, 1, 128};
+    exact.completion_order = {0, 1};
+
+    evrptw::native_search::InitialStateV2 initial_a;
+    initial_a.exact = exact;
+    initial_a.objective_integer = {2, 0};
+    initial_a.objective_float = {0.0, 0.0};
+    initial_a.accounting = {2, 2, 0, 0};
+    initial_a.request_sha256.assign(64, '0');
+    auto initial_b = initial_a;
+    initial_b.exact.completion_order = {1, 0};
+
+    evrptw::native_search::LaneStateV2 lane_a;
+    lane_a.route_offsets = {0, 1, 2};
+    lane_a.route_indices = {1, 2};
+    lane_a.exact = exact;
+    lane_a.objective_integer = initial_a.objective_integer;
+    lane_a.objective_float = initial_a.objective_float;
+    auto lane_b = lane_a;
+    lane_b.exact.completion_order = {1, 0};
+    return py::make_tuple(
+        initial_a.sha256(), initial_b.sha256(),
+        lane_a.sha256(), lane_b.sha256());
+}
+
+py::tuple exact_charging_batch_numeric(
+    py::handle node_kind,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle vehicle,
+    py::handle order_offsets,
+    py::handle order_indices,
+    py::handle deadline_remaining,
+    py::handle batch_size) {
+    return project_exact_charging_batch_output_v2(
+        exact_charging_batch_owned_from_python_v2(
+            node_kind, ready_time, due_date, service_time, distance, vehicle,
+            order_offsets, order_indices, deadline_remaining, batch_size));
+}
+
 evrptw::native_kernels::ExactBatchOutput exact_charging_batch_owned(
     const evrptw::native_search::ProblemV2& problem,
     const std::vector<std::int64_t>& order_offsets,
@@ -7053,9 +7453,10 @@ evrptw::native_kernels::ExactBatchOutput exact_charging_batch_owned(
     }
     for (std::size_t route = 0; route + 1 < order_offsets.size(); ++route) {
         if (order_offsets[route] < 0
-            || order_offsets[route] > order_offsets[route + 1]) {
+            || order_offsets[route] >= order_offsets[route + 1]) {
             throw std::invalid_argument(
-                "owned exact batch route offsets must be monotonic");
+                "owned exact batch route offsets must be monotonic with "
+                "non-empty rows");
         }
     }
     if (depot < 0 || static_cast<std::size_t>(depot) >= problem.node_count()
@@ -8391,6 +8792,12 @@ screen_route_batch_transaction_owned_v2(
         }
     };
     validate_offsets(offsets, candidate_count, routes_size, "route_offsets");
+    for (std::size_t candidate = 0; candidate < candidate_count; ++candidate) {
+        if (offsets[candidate] == offsets[candidate + 1]) {
+            throw std::invalid_argument(
+                "route_offsets cannot contain an empty candidate row");
+        }
+    }
     validate_offsets(
         negative_route_offsets,
         negative_count,
@@ -8890,6 +9297,71 @@ py::tuple screen_route_batch_transaction_v2(
         1);
 }
 
+py::tuple project_candidate_round_result_v2(
+    const evrptw::native_search::CandidateRoundResultV2& result) {
+    result.validate();
+    if (std::exchange(candidate_round_projection_failure_injection, false)) {
+        throw std::runtime_error(
+            "injected native candidate-round result projection failure");
+    }
+    const auto candidate_count = result.candidate_count();
+    py::array_t<std::int64_t> resolution_array(result.resolutions.size());
+    py::array_t<std::int64_t> source_array(result.sources.size());
+    py::array_t<std::int64_t> journal_array(
+        {static_cast<py::ssize_t>(candidate_count), py::ssize_t(3)});
+    py::array_t<std::int64_t> exact_ids_array(
+        result.exact_candidate_ids.size());
+    py::array_t<std::int64_t> completion_array(
+        result.completion_order.size());
+    py::array_t<std::int64_t> counters(result.counters.size());
+    py::array_t<double> timings(result.timings.size());
+    std::copy(
+        result.resolutions.begin(), result.resolutions.end(),
+        checked_data(resolution_array));
+    std::copy(
+        result.sources.begin(), result.sources.end(), checked_data(source_array));
+    std::copy(
+        result.cache_journal.begin(), result.cache_journal.end(),
+        checked_data(journal_array));
+    std::copy(
+        result.exact_candidate_ids.begin(), result.exact_candidate_ids.end(),
+        checked_data(exact_ids_array));
+    std::copy(
+        result.completion_order.begin(), result.completion_order.end(),
+        checked_data(completion_array));
+    std::copy(
+        result.counters.begin(), result.counters.end(), checked_data(counters));
+    std::copy(
+        result.timings.begin(), result.timings.end(), checked_data(timings));
+    return py::make_tuple(
+        project_screen_batch_result_v2(result.screening),
+        std::move(resolution_array),
+        std::move(source_array),
+        std::move(journal_array),
+        std::move(exact_ids_array),
+        std::move(completion_array),
+        project_exact_charging_batch_output_v2(result.exact),
+        std::move(counters),
+        std::move(timings),
+        result.digest);
+}
+
+void test_candidate_round_projection_failure_v2() {
+    if (candidate_round_projection_failure_injection) {
+        throw std::logic_error(
+            "candidate-round result projection failure is already armed");
+    }
+    candidate_round_projection_failure_injection = true;
+}
+
+void test_candidate_round_semantic_failure_v2() {
+    if (candidate_round_semantic_failure_injection) {
+        throw std::logic_error(
+            "candidate-round semantic failure is already armed");
+    }
+    candidate_round_semantic_failure_injection = true;
+}
+
 py::tuple candidate_round_transaction_impl(
     py::handle node_kind,
     py::handle demand,
@@ -8968,6 +9440,8 @@ py::tuple candidate_round_transaction_impl(
     const auto* batch_values = checked_data<std::int64_t>(batch_array);
     const auto* context_values = checked_data<std::int64_t>(context_array);
     auto* receipt_values = checked_data<std::int64_t>(receipt_array);
+    const std::span<const std::int64_t> route_values{
+        routes, static_cast<std::size_t>(routes_array.size())};
     if (receipt_values[0] != 2
         || receipt_values[1] != 0
         || std::any_of(receipt_values + 2, receipt_values + 6,
@@ -8985,6 +9459,11 @@ py::tuple candidate_round_transaction_impl(
         throw std::invalid_argument(
             "candidate round deadline_remaining must be finite and positive");
     }
+#ifdef __linux__
+    NativeSchedulerDeadlineContext scheduler_deadline_context(
+        std::chrono::duration<double>(started.time_since_epoch()).count()
+        + deadline_values[0]);
+#endif
     if (batch_values[0] <= 0) {
         throw std::invalid_argument("candidate round batch_size must be positive");
     }
@@ -9025,7 +9504,6 @@ py::tuple candidate_round_transaction_impl(
         negative_indices,
         negative_reason_codes,
         control_values[2]);
-    py::tuple screening = project_screen_batch_result_v2(screening_state);
     const auto screening_completed = std::chrono::steady_clock::now();
     const auto* statuses = screening_state.statuses.data();
     const auto* duplicates = screening_state.duplicate_of.data();
@@ -9138,45 +9616,57 @@ py::tuple candidate_round_transaction_impl(
         journal[index * 3 + 1] = 2;
         journal[index * 3 + 2] = static_cast<std::int64_t>(ordinal);
         exact_ids.push_back(ids[index]);
-        exact_routes.insert(
-            exact_routes.end(), routes + offsets[index], routes + offsets[index + 1]);
+        const auto route = route_values.subspan(
+            static_cast<std::size_t>(offsets[index]),
+            static_cast<std::size_t>(offsets[index + 1] - offsets[index]));
+        exact_routes.insert(exact_routes.end(), route.begin(), route.end());
         exact_offsets.push_back(static_cast<std::int64_t>(exact_routes.size()));
     }
-    py::array_t<std::int64_t> exact_offsets_array(exact_offsets.size());
-    py::array_t<std::int64_t> exact_routes_array(exact_routes.size());
-    std::copy(
-        exact_offsets.begin(), exact_offsets.end(), checked_data(exact_offsets_array));
-    std::copy(
-        exact_routes.begin(), exact_routes.end(), checked_data(exact_routes_array));
     const auto exact_started = std::chrono::steady_clock::now();
     const auto elapsed_before_exact = std::chrono::duration<double>(
         exact_started - started).count();
-    py::array_t<double> exact_deadline_array(1);
-    checked_data(exact_deadline_array)[0] = std::max(
+    const auto exact_deadline = std::max(
         0.0, deadline_values[0] - elapsed_before_exact);
     receipt_values[1] = 2;
     receipt_values[2] = static_cast<std::int64_t>(exact_ids.size());
-    py::tuple exact_payload;
+    evrptw::native_kernels::ExactBatchOutput exact_output;
     try {
-        exact_payload = exact_charging_batch_numeric(
-            node_kind,
-            ready_time,
-            due_date,
-            service_time,
-            distance,
-            vehicle,
-            exact_offsets_array,
-            exact_routes_array,
-            exact_deadline_array,
-            batch_array);
+        auto exact_kind_array = checked_array<std::int64_t>(
+            node_kind, "node_kind", 1);
+        auto exact_ready_array = checked_array<double>(
+            ready_time, "ready_time", 1);
+        auto exact_due_array = checked_array<double>(
+            due_date, "due_date", 1);
+        auto exact_service_array = checked_array<double>(
+            service_time, "service_time", 1);
+        auto exact_distance_array = checked_array<double>(
+            distance, "distance", 2);
+        auto exact_vehicle_array = checked_array<double>(
+            vehicle, "vehicle", 1);
+        exact_output = exact_charging_batch_owned_from_python_views_v2(
+            exact_kind_array, exact_ready_array, exact_due_array,
+            exact_service_array, exact_distance_array, exact_vehicle_array,
+            exact_offsets, exact_routes, exact_deadline, batch_values[0]);
+        if (std::isfinite(deadline_values[0])
+            && std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - started).count()
+                >= deadline_values[0]
+            && exact_output.batch_counters.size() == 10
+            && exact_output.batch_counters[3] == 0
+            && !exact_ids.empty()) {
+            throw std::runtime_error(
+                "native candidate round crossed its outer deadline");
+        }
     } catch (...) {
         receipt_values[4] = receipt_values[2];
         throw;
     }
-    auto exact_batch_counters = py::cast<py::array_t<std::int64_t>>(
-        exact_payload[6]);
-    const auto* exact_counter_values = checked_data<std::int64_t>(
-        exact_batch_counters);
+    const auto& exact_counter_values = exact_output.batch_counters;
+    if (exact_counter_values.size() != 10) {
+        receipt_values[4] = receipt_values[2];
+        throw std::runtime_error(
+            "native candidate round exact counters have an invalid shape");
+    }
     receipt_values[1] = 3;
     receipt_values[2] = exact_counter_values[1];
     receipt_values[3] = exact_counter_values[2];
@@ -9204,87 +9694,124 @@ py::tuple candidate_round_transaction_impl(
         }
     }
 
-    py::array_t<std::int64_t> resolution_array(resolutions.size());
-    py::array_t<std::int64_t> source_array(sources.size());
-    py::array_t<std::int64_t> journal_array(
-        {static_cast<py::ssize_t>(candidate_count), py::ssize_t(3)});
-    py::array_t<std::int64_t> exact_ids_array(exact_ids.size());
-    py::array_t<std::int64_t> completion_array(exact_ids.size());
-    std::copy(resolutions.begin(), resolutions.end(), checked_data(resolution_array));
-    std::copy(sources.begin(), sources.end(), checked_data(source_array));
-    std::copy(journal.begin(), journal.end(), checked_data(journal_array));
-    std::copy(exact_ids.begin(), exact_ids.end(), checked_data(exact_ids_array));
-    std::copy(exact_ids.begin(), exact_ids.end(), checked_data(completion_array));
-
-    py::array_t<std::int64_t> counters(10);
-    auto* counter_values = checked_data(counters);
-    counter_values[0] = static_cast<std::int64_t>(candidate_count);
-    counter_values[1] = static_cast<std::int64_t>(rankable.size());
-    counter_values[2] = static_cast<std::int64_t>(selected_count);
-    counter_values[3] = rejected_count;
-    counter_values[4] = negative_hit_count;
-    counter_values[5] = cache_hit_count;
-    counter_values[6] = static_cast<std::int64_t>(exact_ids.size());
-    counter_values[7] = budget_skip_count;
-    counter_values[8] = duplicate_count;
-    counter_values[9] = 0;
+    std::array<std::int64_t, 10> counters{
+        static_cast<std::int64_t>(candidate_count),
+        static_cast<std::int64_t>(rankable.size()),
+        static_cast<std::int64_t>(selected_count),
+        rejected_count,
+        negative_hit_count,
+        cache_hit_count,
+        static_cast<std::int64_t>(exact_ids.size()),
+        budget_skip_count,
+        duplicate_count,
+        0,
+    };
 
     const auto completed = std::chrono::steady_clock::now();
-    py::array_t<double> timings(4);
-    auto* timing_values = checked_data(timings);
-    timing_values[0] = std::chrono::duration<double>(
-        screening_completed - screening_started).count();
-    timing_values[1] = std::chrono::duration<double>(
-        exact_completed - exact_started).count();
-    timing_values[2] = std::chrono::duration<double>(completed - started).count();
-    timing_values[3] = 0.0;
-
-    std::string evidence(evidence_domain);
-    const auto append_i64 = [&evidence](std::int64_t value) {
-        const auto bits = static_cast<std::uint64_t>(value);
-        for (std::size_t byte = 0; byte < 8; ++byte) {
-            evidence.push_back(
-                static_cast<char>((bits >> (byte * 8)) & 0xffU));
-        }
+    std::array<double, 4> timings{
+        std::chrono::duration<double>(
+            screening_completed - screening_started).count(),
+        std::chrono::duration<double>(
+            exact_completed - exact_started).count(),
+        std::chrono::duration<double>(completed - started).count(),
+        0.0,
     };
-    for (std::size_t index = 0; index < 3; ++index) {
-        append_i64(context_values[index]);
+    std::vector<std::int64_t> completion_ids;
+    completion_ids.reserve(exact_output.completion_order.size());
+    for (const auto ordinal : exact_output.completion_order) {
+        if (ordinal < 0
+            || static_cast<std::size_t>(ordinal) >= exact_ids.size()) {
+            throw std::logic_error(
+                "native candidate round exact completion ordinal is invalid");
+        }
+        completion_ids.push_back(exact_ids[static_cast<std::size_t>(ordinal)]);
     }
-    for (const auto value : resolutions) {
-        append_i64(value);
+
+    std::string digest;
+    if (evidence_domain == "stage05.2-candidate-round-transaction-v2") {
+        TypedEvidenceWriterV2 writer(evidence_domain);
+        writer.add_i64(1, {context_values, 3}, {3});
+        writer.add_i64(2, resolutions, {candidate_count});
+        writer.add_i64(3, sources, {candidate_count});
+        writer.add_i64(4, journal, {candidate_count, 3});
+        writer.add_i64(5, exact_ids, {exact_ids.size()});
+        writer.add_i64(6, completion_ids, {completion_ids.size()});
+        writer.add_i64(
+            7, exact_output.path_offsets, {exact_output.path_offsets.size()});
+        writer.add_i64(
+            8, exact_output.path_indices, {exact_output.path_indices.size()});
+        writer.add_i64(
+            9, exact_output.statuses, {exact_output.statuses.size()});
+        writer.add_i64(
+            10, exact_output.reasons, {exact_output.reasons.size()});
+        writer.add_f64(
+            11, exact_output.metrics, {exact_output.statuses.size(), 4});
+        writer.add_i64(
+            12, exact_output.label_counters,
+            {exact_output.statuses.size(), 3});
+        writer.add_i64(
+            13, exact_output.batch_counters,
+            {exact_output.batch_counters.size()});
+        writer.add_bytes(
+            14, screening_state.digest, {screening_state.digest.size()});
+        writer.add_i64(15, counters, {counters.size()});
+        digest = writer.digest();
+    } else {
+        std::string evidence(evidence_domain);
+        for (const auto value : std::span(context_values, std::size_t{3})) {
+            append_evidence_i64(evidence, value);
+        }
+        for (const auto value : resolutions) {
+            append_evidence_i64(evidence, value);
+        }
+        for (const auto value : sources) {
+            append_evidence_i64(evidence, value);
+        }
+        for (const auto value : journal) {
+            append_evidence_i64(evidence, value);
+        }
+        for (const auto value : exact_ids) {
+            append_evidence_i64(evidence, value);
+        }
+        for (const auto value : exact_ids) {
+            append_evidence_i64(evidence, value);
+        }
+        append_raw_native_bytes<std::int64_t>(
+            evidence, exact_output.path_offsets);
+        append_raw_native_bytes<std::int64_t>(
+            evidence, exact_output.path_indices);
+        append_raw_native_bytes<std::int64_t>(evidence, exact_output.statuses);
+        append_raw_native_bytes<std::int64_t>(evidence, exact_output.reasons);
+        append_raw_native_bytes<double>(evidence, exact_output.metrics);
+        append_raw_native_bytes<std::int64_t>(
+            evidence, exact_output.label_counters);
+        append_raw_native_bytes<std::int64_t>(
+            evidence, exact_output.batch_counters);
+        evidence += screening_state.digest;
+        digest = native_sha256_hex(evidence);
     }
-    for (const auto value : sources) {
-        append_i64(value);
-    }
-    for (const auto value : journal) {
-        append_i64(value);
-    }
-    for (const auto value : exact_ids) {
-        append_i64(value);
-    }
-    for (const auto value : exact_ids) {
-        append_i64(value);
-    }
-    for (const auto item : exact_payload) {
-        evidence += py::cast<std::string>(
-            py::reinterpret_borrow<py::object>(item).attr("tobytes")());
-    }
-    evidence += screening_state.digest;
-    const auto digest = native_sha256_hex(evidence);
-    timing_values[2] = std::chrono::duration<double>(
+    timings[2] = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
+    evrptw::native_search::CandidateRoundResultV2 result{
+        std::move(screening_state),
+        std::move(resolutions),
+        std::move(sources),
+        std::move(journal),
+        std::move(exact_ids),
+        std::move(completion_ids),
+        std::move(exact_output),
+        counters,
+        timings,
+        digest,
+    };
+    if (std::exchange(candidate_round_semantic_failure_injection, false)
+        && !result.sources.empty()) {
+        result.sources.front() = result.screening.candidate_ids.front();
+    }
+    result.validate();
+    auto projected = project_candidate_round_result_v2(result);
     receipt_values[1] = 4;
-    return py::make_tuple(
-        std::move(screening),
-        std::move(resolution_array),
-        std::move(source_array),
-        std::move(journal_array),
-        std::move(exact_ids_array),
-        std::move(completion_array),
-        std::move(exact_payload),
-        std::move(counters),
-        std::move(timings),
-        digest);
+    return projected;
 }
 
 py::tuple candidate_round_transaction_v1(
@@ -10703,19 +11230,21 @@ public:
             throw std::runtime_error(
                 "full native warm start does not fit the exact-call budget");
         }
-        const auto reservation = budget_.reserve_exact(route_count);
-        const auto* reserved = checked_data<std::int64_t>(reservation);
-        if (reserved[1] != route_count) {
+        const auto reservation = budget_.reserve_exact_owned(route_count);
+        if (reservation.granted != route_count) {
             throw std::runtime_error(
                 "full native warm start does not fit the exact-call budget");
         }
+        ScopeRollback warm_exact_settlement([&]() noexcept {
+            budget_.settle_exact_owned(0, route_count);
+        });
         py::tuple initialized;
+        std::vector<std::int64_t> warm_completion_order;
         const auto warm_exact_started = std::chrono::steady_clock::now();
         append_causal_exact_work(
             {stable_int63("initialization"), stable_int63("initial_solution"), -1},
             warm_transaction_id, route_count);
-        try {
-            if (owned_request_.has_value()) {
+        if (owned_request_.has_value()) {
                 evrptw::native_search::InitialStateV2 state;
                 {
                     py::gil_scoped_release release;
@@ -10747,9 +11276,10 @@ public:
 #endif
                 initial_state_operation_count_ =
                     initial_state_host_owned_ ? 1 : 0;
+                warm_completion_order = state.exact.completion_order;
                 initialized = legacy_initial_state_payload(std::move(state));
-            } else {
-                initialized = full_native_initialize_impl_v2(
+        } else {
+            initialized = full_native_initialize_impl_v2(
                     node_kind_,
                     ready_time_,
                     due_date_,
@@ -10760,11 +11290,7 @@ public:
                     indices_array,
                     control_array,
                     deadline_array,
-                    false);
-            }
-        } catch (...) {
-            budget_.interrupt_exact(route_count);
-            throw;
+                false);
         }
         auto exact_payload = py::cast<py::tuple>(initialized[0]);
         auto exact_counters = py::cast<py::array_t<std::int64_t>>(exact_payload[6]);
@@ -10772,16 +11298,23 @@ public:
         if (counter_values[2] != route_count || counter_values[3] != 0) {
             const auto completed = std::clamp<std::int64_t>(
                 counter_values[2], 0, route_count);
-            budget_.complete_exact(completed);
-            budget_.interrupt_exact(route_count - completed);
+            budget_.settle_exact_owned(completed, route_count - completed);
+            warm_exact_settlement.release();
             throw std::runtime_error(
                 "full native warm-start exact transaction did not complete atomically");
+        }
+        if (warm_completion_order.empty()) {
+            warm_completion_order.resize(static_cast<std::size_t>(route_count));
+            std::iota(
+                warm_completion_order.begin(), warm_completion_order.end(),
+                std::int64_t{0});
         }
         record_exact_backend_metrics(
             exact_payload,
             std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - warm_exact_started).count());
-        budget_.complete_exact(route_count);
+        budget_.settle_exact_owned(route_count, 0);
+        warm_exact_settlement.release();
         record_exact_journal_batch(
             {
                 stable_int63("initialization"),
@@ -10791,6 +11324,7 @@ public:
             offsets_array,
             indices_array,
             exact_payload,
+            warm_completion_order,
             warm_transaction_id);
 
         auto status_array = py::cast<py::array_t<std::int64_t>>(exact_payload[2]);
@@ -11126,17 +11660,18 @@ public:
         const auto& canonical_expected = prepared_plans.canonical_expected;
 
         auto round_budget_snapshot = budget_.native_snapshot();
-        if (!suppress_round_budget_) {
-            // Candidate Control owns one exact budget across every ALNS lane
-            // in the same iteration while the state retains the real lane for
-            // replay and transaction hashing.
-            budget_.begin_shared_iteration_round(context[0], context[2]);
-        }
         bool round_protocol_active = false;
         bool negative_store_active = false;
         bool attempted_mark_active = false;
         bool rollback_owned_locally = true;
         try {
+        if (!suppress_round_budget_) {
+            // Candidate Control owns one exact budget across every ALNS lane
+            // in the same iteration while the state retains the real lane for
+            // replay and transaction hashing.  The internal path is typed and
+            // allocation-free; the surrounding transaction owns rollback.
+            budget_.begin_shared_iteration_round_owned(context[0], context[2]);
+        }
         auto attempted_flags = suppress_attempted_plan_journal_
             ? py::array_t<std::int64_t>(plan_count)
             : attempted_plans_.lookup(plans_array, routes_array, indices_array);
@@ -11356,7 +11891,7 @@ public:
             bool exact_accounted = false;
             bool exact_started = false;
             std::int64_t requested_exact = 0;
-            auto budget_snapshot = budget_.snapshot();
+            const auto budget_snapshot = budget_.native_snapshot();
             try {
                 auto cached = route_cache_.lookup_exact_many_owned(
                     evrptw::native_search::RouteBatchViewV2{
@@ -11417,12 +11952,12 @@ public:
                     continue;
                 }
                 if (requested_exact > 0) {
-                    const auto round_receipt = budget_.reserve_round(
+                    const auto round_receipt = budget_.reserve_round_owned(
                         requested_exact, true);
-                    const auto exact_receipt = budget_.reserve_exact(requested_exact);
-                    if (checked_data<std::int64_t>(round_receipt)[1] != requested_exact
-                        || checked_data<std::int64_t>(exact_receipt)[1]
-                            != requested_exact) {
+                    const auto exact_receipt =
+                        budget_.reserve_exact_owned(requested_exact);
+                    if (round_receipt.granted != requested_exact
+                        || exact_receipt.granted != requested_exact) {
                         throw std::logic_error(
                             "full native plan budget changed during atomic reservation");
                     }
@@ -11464,6 +11999,38 @@ public:
                         throw std::logic_error(
                             "full native owned exact dispatch lost its counters");
                     }
+                    if (std::chrono::duration<double>(
+                            std::chrono::steady_clock::now()
+                            - transaction_started).count()
+                        >= remaining_seconds) {
+                        std::fill(
+                            exact_payload.statuses.begin(),
+                            exact_payload.statuses.end(),
+                            evrptw::native_kernels::interrupted_status);
+                        std::fill(
+                            exact_payload.reasons.begin(),
+                            exact_payload.reasons.end(),
+                            evrptw::native_kernels::deadline_reason);
+                        std::fill(
+                            exact_payload.path_offsets.begin(),
+                            exact_payload.path_offsets.end(), std::int64_t{0});
+                        exact_payload.path_indices.clear();
+                        std::fill(
+                            exact_payload.metrics.begin(),
+                            exact_payload.metrics.end(), 0.0);
+                        std::fill(
+                            exact_payload.label_counters.begin(),
+                            exact_payload.label_counters.end(), std::int64_t{0});
+                        exact_payload.completion_order.clear();
+                        exact_payload.batch_counters[2] = 0;
+                        exact_payload.batch_counters[3] = requested_exact;
+                        evrptw::native_kernels::validate_exact_batch_output(
+                            exact_payload, live_problem_->node_kind.data(),
+                            missing_offsets.data(), missing_indices.data(),
+                            live_problem_->node_count(),
+                            missing_offsets.size() - 1, missing_indices.size(),
+                            depot_, exact_batch_size);
+                    }
                     const auto completed = exact_payload.batch_counters[2];
                     const auto interrupted = exact_payload.batch_counters[3];
                     record_exact_backend_metrics(
@@ -11471,8 +12038,7 @@ public:
                         std::chrono::duration<double>(
                             std::chrono::steady_clock::now()
                             - candidate_exact_started).count());
-                    budget_.complete_exact(completed);
-                    budget_.interrupt_exact(interrupted);
+                    budget_.settle_exact_owned(completed, interrupted);
                     exact_accounted = true;
                     if (completed != requested_exact || interrupted != 0) {
                         throw NativeExactDeadlineInterruption(
@@ -11504,8 +12070,18 @@ public:
                         route_resolutions[global_route] = 2;
                         exact_route_rows.push_back(
                             static_cast<std::int64_t>(global_route));
-                        completion_order.push_back(
-                            static_cast<std::int64_t>(global_route));
+                    }
+                    for (const auto exact_ordinal : exact_payload.completion_order) {
+                        if (exact_ordinal < 0
+                            || static_cast<std::size_t>(exact_ordinal)
+                                >= missing_local_rows.size()) {
+                            throw std::logic_error(
+                                "full native exact completion ordinal is invalid");
+                        }
+                        const auto local = missing_local_rows[
+                            static_cast<std::size_t>(exact_ordinal)];
+                        completion_order.push_back(static_cast<std::int64_t>(
+                            first_route + local));
                     }
                     record_exact_journal_batch(
                         {
@@ -11576,9 +12152,9 @@ public:
                     route_cache_.rollback_store_batch();
                 }
                 if (exact_started && exact_reserved && !exact_accounted) {
-                    budget_.interrupt_exact(requested_exact);
+                    budget_.settle_exact_owned(0, requested_exact);
                 } else if (!exact_started) {
-                    budget_.restore(budget_snapshot);
+                    budget_.restore_native(budget_snapshot);
                 }
                 throw;
             }
@@ -18370,6 +18946,11 @@ public:
                 {static_cast<py::ssize_t>(batch.results.size()), py::ssize_t(4)});
             py::array_t<std::int64_t> labels(
                 {static_cast<py::ssize_t>(batch.results.size()), py::ssize_t(3)});
+            py::array_t<std::int64_t> completion_order(
+                batch.completion_order.size());
+            std::copy(
+                batch.completion_order.begin(), batch.completion_order.end(),
+                checked_data(completion_order));
             for (std::size_t route = 0; route < batch.results.size(); ++route) {
                 const auto& result = batch.results[route];
                 path_indices.insert(
@@ -18397,7 +18978,8 @@ public:
                 std::move(context), std::move(route_offsets),
                 std::move(route_indices), std::move(path_offsets_array),
                 std::move(path_indices_array), std::move(statuses),
-                std::move(reasons), std::move(metrics), std::move(labels));
+                std::move(reasons), std::move(metrics), std::move(labels),
+                std::move(completion_order));
             append_nested_evidence(evidence, batch_payload);
             batches[static_cast<py::ssize_t>(ordinal)] = std::move(batch_payload);
         }
@@ -18575,6 +19157,7 @@ public:
             lane.exact.label_counters.begin(),
             lane.exact.label_counters.end(), checked_data(labels));
         auto batch_counters = integer_vector(lane.exact.batch_counters);
+        auto completion_order = integer_vector(lane.exact.completion_order);
         py::array_t<std::int64_t> objective_integer(2);
         std::copy(
             lane.objective_integer.begin(), lane.objective_integer.end(),
@@ -18603,6 +19186,7 @@ public:
             std::move(path_offsets), std::move(path_indices),
             std::move(statuses), std::move(reasons), std::move(metrics),
             std::move(labels), std::move(batch_counters),
+            std::move(completion_order),
             std::move(objective_integer), std::move(objective_float),
             std::move(accounting), std::move(rng_seeds),
             std::move(next_iteration), std::move(lane_count),
@@ -18782,6 +19366,7 @@ private:
         std::vector<std::int64_t> route_offsets;
         std::vector<std::int64_t> route_indices;
         std::vector<NativeRouteCacheV2::ExactPayload> results;
+        std::vector<std::int64_t> completion_order;
     };
 
     struct ControlJournalBatch {
@@ -19861,10 +20446,21 @@ private:
             throw std::logic_error(
                 "full native exact backend batch size changed during solve");
         }
+        auto projected_totals = exact_backend_totals_;
         for (std::size_t index = 0; index < 9; ++index) {
-            exact_backend_totals_[index] += values[index];
+            if (projected_totals[index]
+                > std::numeric_limits<std::int64_t>::max() - values[index]) {
+                throw std::overflow_error(
+                    "full native exact backend counter overflow");
+            }
+            projected_totals[index] += values[index];
         }
-        exact_backend_totals_[9] = values[9];
+        projected_totals[9] = values[9];
+        const auto projected_seconds = exact_backend_seconds_ + elapsed_seconds;
+        if (!std::isfinite(projected_seconds)) {
+            throw std::overflow_error(
+                "full native exact backend elapsed time overflow");
+        }
         if (values[8] == 1) {
             if (values[1] <= 0) {
                 throw std::logic_error(
@@ -19872,7 +20468,8 @@ private:
             }
             exact_launch_occupancies_.push_back(values[1]);
         }
-        exact_backend_seconds_ += elapsed_seconds;
+        exact_backend_totals_ = projected_totals;
+        exact_backend_seconds_ = projected_seconds;
     }
 
     void record_exact_backend_metrics(
@@ -19898,10 +20495,21 @@ private:
             throw std::logic_error(
                 "full native owned exact backend batch size changed during solve");
         }
+        auto projected_totals = exact_backend_totals_;
         for (std::size_t index = 0; index < 9; ++index) {
-            exact_backend_totals_[index] += values[index];
+            if (projected_totals[index]
+                > std::numeric_limits<std::int64_t>::max() - values[index]) {
+                throw std::overflow_error(
+                    "full native owned exact backend counter overflow");
+            }
+            projected_totals[index] += values[index];
         }
-        exact_backend_totals_[9] = values[9];
+        projected_totals[9] = values[9];
+        const auto projected_seconds = exact_backend_seconds_ + elapsed_seconds;
+        if (!std::isfinite(projected_seconds)) {
+            throw std::overflow_error(
+                "full native owned exact backend elapsed time overflow");
+        }
         if (values[8] == 1) {
             if (values[1] <= 0) {
                 throw std::logic_error(
@@ -19909,7 +20517,8 @@ private:
             }
             exact_launch_occupancies_.push_back(values[1]);
         }
-        exact_backend_seconds_ += elapsed_seconds;
+        exact_backend_totals_ = projected_totals;
+        exact_backend_seconds_ = projected_seconds;
     }
 
     void record_exact_journal_batch(
@@ -19917,6 +20526,7 @@ private:
         const py::array_t<std::int64_t>& route_offsets,
         const py::array_t<std::int64_t>& route_indices,
         const py::tuple& exact_payload,
+        const std::span<const std::int64_t> completion_order,
         const std::int64_t transaction_id) {
         if (exact_payload.size() != 7 || route_offsets.size() < 2) {
             throw std::logic_error(
@@ -19950,6 +20560,21 @@ private:
         batch.route_indices.assign(
             checked_data<std::int64_t>(route_indices),
             checked_data<std::int64_t>(route_indices) + route_indices.size());
+        batch.completion_order.assign(
+            completion_order.begin(), completion_order.end());
+        if (batch.completion_order.size() != route_count) {
+            throw std::logic_error(
+                "full native exact journal completion order is incomplete");
+        }
+        std::vector<bool> completion_seen(route_count, false);
+        for (const auto ordinal : batch.completion_order) {
+            if (ordinal < 0 || static_cast<std::size_t>(ordinal) >= route_count
+                || completion_seen[static_cast<std::size_t>(ordinal)]) {
+                throw std::logic_error(
+                    "full native exact journal completion order is invalid");
+            }
+            completion_seen[static_cast<std::size_t>(ordinal)] = true;
+        }
         batch.results.reserve(route_count);
         const auto* path_boundaries = checked_data<std::int64_t>(path_offsets);
         const auto* paths = checked_data<std::int64_t>(path_indices);
@@ -20003,6 +20628,7 @@ private:
         batch.context = context;
         batch.route_offsets = route_offsets;
         batch.route_indices = route_indices;
+        batch.completion_order = exact_payload.completion_order;
         batch.results.reserve(route_count);
         for (std::size_t route = 0; route < route_count; ++route) {
             NativeRouteCacheV2::ExactPayload result;
@@ -20800,10 +21426,11 @@ py::tuple native_initial_state_payload(
         state.exact.label_counters.begin(), state.exact.label_counters.end(),
         checked_data(labels));
     auto batch_counters = integer_vector(state.exact.batch_counters);
+    auto completion_order = integer_vector(state.exact.completion_order);
     auto exact = py::make_tuple(
         std::move(path_offsets), std::move(path_indices), std::move(statuses),
         std::move(reasons), std::move(metrics), std::move(labels),
-        std::move(batch_counters));
+        std::move(batch_counters), std::move(completion_order));
     py::array_t<std::int64_t> objective_integer(2);
     std::copy(
         state.objective_integer.begin(), state.objective_integer.end(),
@@ -20886,6 +21513,10 @@ py::tuple full_native_alns_v2(
         initial_route_offsets, initial_route_indices, control,
         deadline_remaining, protocol_control, protocol_options,
         stage04_integer, stage04_float, operator_integer, operator_float);
+#ifdef __linux__
+    NativeSchedulerDeadlineContext scheduler_deadline_context(
+        owned_request.config.deadline[1]);
+#endif
     auto initial_offsets = checked_array<std::int64_t>(
         initial_route_offsets, "initial_route_offsets", 1);
     auto initial_indices = checked_array<std::int64_t>(
@@ -22202,6 +22833,9 @@ PYBIND11_MODULE(_core, module) {
         .def(
             "interrupt_exact", &NativeBudgetStateV2::interrupt_exact,
             py::arg("count"))
+        .def(
+            "_test_fail_next_state_projection",
+            &NativeBudgetStateV2::test_fail_next_state_projection)
         .def("snapshot", &NativeBudgetStateV2::snapshot)
         .def("restore", &NativeBudgetStateV2::restore, py::arg("snapshot"))
         .def("state", &NativeBudgetStateV2::state);
@@ -22501,6 +23135,23 @@ PYBIND11_MODULE(_core, module) {
         py::arg("deadline_remaining"),
         py::arg("batch_size"));
     module.def(
+        "_test_exact_completion_order_v2",
+        &test_exact_completion_order_v2,
+        py::arg("node_kind"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("vehicle"),
+        py::arg("order_offsets"),
+        py::arg("order_indices"),
+        py::arg("deadline_remaining"),
+        py::arg("batch_size"),
+        py::arg("scheduler_endpoint") = "");
+    module.def(
+        "_test_initial_completion_hash_v2",
+        &test_initial_completion_hash_v2);
+    module.def(
         "screen_routes_numeric",
         &screen_routes_numeric,
         py::arg("node_kind"),
@@ -22799,6 +23450,12 @@ PYBIND11_MODULE(_core, module) {
         "_test_screen_batch_thread_launch_failure_v2",
         &test_screen_batch_thread_launch_failure_v2,
         py::arg("after"));
+    module.def(
+        "_test_candidate_round_projection_failure_v2",
+        &test_candidate_round_projection_failure_v2);
+    module.def(
+        "_test_candidate_round_semantic_failure_v2",
+        &test_candidate_round_semantic_failure_v2);
     module.def(
         "full_native_initialize_v2",
         &full_native_initialize_v2,
