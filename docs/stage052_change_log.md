@@ -3433,3 +3433,36 @@ compatibility fallback（兼容回退）。
   也不证明 full-native/host-scheduler 完工。下一步继续 typed helper pools 与 typed
   evaluate-plans/probe/outer inputs。production capability bits 继续全部为 0；不创建性能
   attempt04，不启动 Paired/Pilot/Formal/CUDA，不切换默认架构。
+
+## 2026-08-04：insertion plan pool 完成 typed output ownership
+
+- 新增 C++ `InsertionPlanPoolV2`，自有保存 plan→route 与 route→customer 两层 CSR、以及
+  `[target_route, insertion_position]` metadata。纯 `insertion_candidate_plans_owned_v2()`
+  只接收连续 `std::span` 与基础配置；公开 `insertion_candidate_plans_v2()` 仍返回历史四数组
+  ABI，其中 metadata 保持连续 `int64[N,2]`、target 外层/position 内层的确定性枚举顺序，
+  `allow_new_route=true` 的 singleton 路线仍位于最后。
+- `legacy_standard_probe` 的 sequential multi-customer 与 single-removed 两个内部 consumer 改为
+  直接传递 C++ offsets/indices 和初始化时固化的 `ProblemV2::demand`；sequential 排序读取 owned
+  metadata，不再从 Python projection 反向读取。只有仍接受 NumPy 的 `evaluate_plans` seam 和公开
+  返回边界执行一次独立 projection。capacity compensated sum、epsilon、new-route 条件、方案顺序、
+  exact budget 与 staged commit 语义均未改变。
+- 输入 CSR 在任何 pointer range 构造前完整验证 route offset 上界。Standards 首轮审查同时指出
+  result validator 若在未验证全部 plan offset 前读取 metadata，畸形中间 offset 可能越界；修复为
+  route CSR、plan CSR、metadata 三阶段校验，并在 `int64_t` cast 前验证所有 vector sizes，使用
+  `metadata.size() % 2` 和 `/ 2` 避免 `plan_count * 2` 溢出。复审确认该 P1 关闭；独立 Spec 与
+  Standards 最终均 ACCEPT。
+- clean code checkpoint `94afd978d476df699b1b21146fd77bdba5c6494b` 的 wheel SHA-256 为
+  `9b083528466beec2a674955c3379e6503ace7c27f048fae15864825f475a5e32`，extension 为
+  `ada9521be77fd52d8b06c12a36e7ce62e619cc8a164f9727a0d8c643107e6015`，scheduler 保持
+  `a1cd6e81caa49cdd7d162e44ee1274b7645dd26fd0f6b8760ae004b8d5e80617`；安装后的 extension
+  自报 revision 与 checkpoint 完全一致。
+- clean-wheel 聚焦公开枚举与两类 standard repair 路径为 `6 passed, 338 deselected`；扩大
+  非真实数据 full-native 集合为 `86 passed, 258 deselected`；完整
+  `tests/test_native_execution.py` 为 `332 passed, 12 skipped`、耗时 `797.17s`；四实例三 seed
+  真实 per-solve fixed-work 全字段差分为 `12 passed`、耗时 `424.25s`。Ruff、83-file strict
+  mypy 与 `git diff --check` 通过。
+- 本条只完成 insertion helper 的 owned output/pure-span computation；公开 adapter、projector 与
+  `evaluate_plans` 仍使用 pybind/NumPy，`legacy_standard_probe` 整体没有释放 GIL，不能报告为
+  whole-call GIL-safe 或性能收益。production capability bits 继续全部为 0；不创建 attempt04，
+  不启动 Paired/Pilot/Formal/CUDA，不切换默认架构。下一 helper slice 为
+  `route_merge_candidate_pool_v2`。
