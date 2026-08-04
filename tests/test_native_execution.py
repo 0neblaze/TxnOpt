@@ -9606,7 +9606,6 @@ def _stage052_shared_memory_names() -> set[str]:
         ("worker_exception", "injected native scheduler worker exception"),
         ("descriptor_count_overflow", "array byte size overflows"),
         ("route_index_oob", "route indices are invalid"),
-        ("empty_route", "offsets are not monotone"),
         ("wrong_rank", "dimensions are invalid"),
         ("trailing_payload", "payload has trailing bytes"),
         ("oversized_control", "request frame is invalid"),

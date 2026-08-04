@@ -167,7 +167,7 @@ std::vector<std::uint8_t> run_exact(
             "native scheduler exact vehicle parameters are invalid");
     }
     for (std::size_t route = 0; route < route_count; ++route) {
-        if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]) {
+        if (offsets[route] < 0 || offsets[route] > offsets[route + 1]) {
             throw std::runtime_error(
                 "native scheduler exact offsets are not monotone");
         }

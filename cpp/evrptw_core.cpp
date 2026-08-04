@@ -7173,9 +7173,8 @@ exact_charging_batch_owned_from_python_views_v2(
         throw std::invalid_argument("order_offsets must span order_indices exactly");
     }
     for (std::size_t route = 0; route < route_count; ++route) {
-        if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]) {
-            throw std::invalid_argument(
-                "order_offsets must be monotone with non-empty rows");
+        if (offsets[route] < 0 || offsets[route] > offsets[route + 1]) {
+            throw std::invalid_argument("order_offsets must be monotone");
         }
         std::vector<bool> seen(node_count, false);
         for (auto position = offsets[route]; position < offsets[route + 1]; ++position) {
@@ -7386,6 +7385,36 @@ py::array_t<std::int64_t> test_exact_completion_order_v2(
     return output;
 }
 
+std::string test_exact_payload_hash_v2(
+    py::handle node_kind, py::handle ready_time, py::handle due_date,
+    py::handle service_time, py::handle distance, py::handle vehicle,
+    py::handle order_offsets, py::handle order_indices,
+    py::handle deadline_remaining, py::handle batch_size,
+    const std::string& scheduler_endpoint) {
+#ifdef __linux__
+    NativeSchedulerThreadContext scheduler_context(
+        scheduler_endpoint, !scheduler_endpoint.empty(), nullptr);
+#else
+    if (!scheduler_endpoint.empty()) {
+        throw std::runtime_error(
+            "native exact payload host test requires Linux");
+    }
+#endif
+    const auto result = exact_charging_batch_owned_from_python_v2(
+        node_kind, ready_time, due_date, service_time, distance, vehicle,
+        order_offsets, order_indices, deadline_remaining, batch_size);
+    std::string evidence("stage05.2-test-exact-payload-v2");
+    append_raw_native_bytes<std::int64_t>(evidence, result.path_offsets);
+    append_raw_native_bytes<std::int64_t>(evidence, result.path_indices);
+    append_raw_native_bytes<std::int64_t>(evidence, result.statuses);
+    append_raw_native_bytes<std::int64_t>(evidence, result.reasons);
+    append_raw_native_bytes<double>(evidence, result.metrics);
+    append_raw_native_bytes<std::int64_t>(evidence, result.label_counters);
+    append_raw_native_bytes<std::int64_t>(evidence, result.batch_counters);
+    append_raw_native_bytes<std::int64_t>(evidence, result.completion_order);
+    return native_sha256_hex(evidence);
+}
+
 py::tuple test_initial_completion_hash_v2() {
     evrptw::native_kernels::ExactBatchOutput exact;
     exact.path_offsets = {0, 2, 4};
@@ -7453,10 +7482,9 @@ evrptw::native_kernels::ExactBatchOutput exact_charging_batch_owned(
     }
     for (std::size_t route = 0; route + 1 < order_offsets.size(); ++route) {
         if (order_offsets[route] < 0
-            || order_offsets[route] >= order_offsets[route + 1]) {
+            || order_offsets[route] > order_offsets[route + 1]) {
             throw std::invalid_argument(
-                "owned exact batch route offsets must be monotonic with "
-                "non-empty rows");
+                "owned exact batch route offsets must be monotonic");
         }
     }
     if (depot < 0 || static_cast<std::size_t>(depot) >= problem.node_count()
@@ -8792,12 +8820,6 @@ screen_route_batch_transaction_owned_v2(
         }
     };
     validate_offsets(offsets, candidate_count, routes_size, "route_offsets");
-    for (std::size_t candidate = 0; candidate < candidate_count; ++candidate) {
-        if (offsets[candidate] == offsets[candidate + 1]) {
-            throw std::invalid_argument(
-                "route_offsets cannot contain an empty candidate row");
-        }
-    }
     validate_offsets(
         negative_route_offsets,
         negative_count,
@@ -9484,6 +9506,12 @@ py::tuple candidate_round_transaction_impl(
     // a later native or Python validation step throws, so started work cannot
     // be silently refunded with the result payload.
     receipt_values[1] = 1;
+    for (std::size_t candidate = 0; candidate < candidate_count; ++candidate) {
+        if (offsets[candidate] == offsets[candidate + 1]) {
+            throw std::invalid_argument(
+                "candidate round route_offsets contain an empty candidate row");
+        }
+    }
 
     const auto screening_started = std::chrono::steady_clock::now();
     auto screening_state = screen_route_batch_transaction_owned_from_python_v2(
@@ -23137,6 +23165,20 @@ PYBIND11_MODULE(_core, module) {
     module.def(
         "_test_exact_completion_order_v2",
         &test_exact_completion_order_v2,
+        py::arg("node_kind"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("vehicle"),
+        py::arg("order_offsets"),
+        py::arg("order_indices"),
+        py::arg("deadline_remaining"),
+        py::arg("batch_size"),
+        py::arg("scheduler_endpoint") = "");
+    module.def(
+        "_test_exact_payload_hash_v2",
+        &test_exact_payload_hash_v2,
         py::arg("node_kind"),
         py::arg("ready_time"),
         py::arg("due_date"),

@@ -764,7 +764,6 @@ inline void test_fault(
         && fault != "pause_after_response_before_ack"
         && fault != "descriptor_count_overflow"
         && fault != "route_index_oob"
-        && fault != "empty_route"
         && fault != "wrong_rank"
         && fault != "trailing_payload"
         && fault != "oversized_control"
@@ -780,8 +779,7 @@ inline void test_fault(
     const std::array<double, 4> distances{0.0, 1.0, 1.0, 0.0};
     const std::array<double, 5> vehicle{1.0, 1.0, 1.0, 1.0, 1.0};
     const bool invalid_route = fault == "route_index_oob";
-    const bool empty_route = fault == "empty_route";
-    const std::array<std::int64_t, 2> offsets{0, empty_route ? 0 : 1};
+    const std::array<std::int64_t, 2> offsets{0, 1};
     const std::array<std::int64_t, 1> route_indices{
         invalid_route ? 99 : 1};
     const double deadline_absolute = std::chrono::duration<double>(
@@ -796,9 +794,8 @@ inline void test_fault(
     builder.add(protocol::NumericType::float64, distances.data(), 4, 2, 2);
     builder.add(protocol::NumericType::float64, vehicle.data(), 5, 5);
     builder.add(protocol::NumericType::int64, offsets.data(), 2, 2);
-    builder.add(protocol::NumericType::int64,
-        empty_route ? nullptr : route_indices.data(), empty_route ? 0 : 1,
-        empty_route ? 0 : 1);
+    builder.add(
+        protocol::NumericType::int64, route_indices.data(), 1, 1);
     builder.add(
         protocol::NumericType::float64, &deadline_absolute, 1, 1);
     builder.add(protocol::NumericType::int64, &batch_size, 1, 1);

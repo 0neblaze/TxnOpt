@@ -1677,10 +1677,7 @@ class _Evaluator:
             )
             raise
         runtime.record(transaction.audit)
-        if (
-            self.measurement_trace is not None
-            and self.measurement_trace.runtime_semantic_enabled
-        ):
+        if self.measurement_trace is not None:
             self.measurement_trace.record_screening_aggregate(
                 {
                     "event_type": "native_candidate_transaction",
@@ -1999,10 +1996,7 @@ class _Evaluator:
             if result.accepted
             else "rejected"
         )
-        if (
-            self.measurement_trace is not None
-            and self.measurement_trace.runtime_semantic_enabled
-        ):
+        if self.measurement_trace is not None:
             decision_checks = (
                 _NEGATIVE_SEQUENCE_CACHE_HIT_CHECKS if negative_cache_hit else result.checks
             )

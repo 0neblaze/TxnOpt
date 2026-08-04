@@ -1341,6 +1341,8 @@ def test_campaign_successor_revision_accepts_only_exact_pinned_producer_fix(
         "src/evrptw/alns.py",
         "tests/test_alns_wall_clock_only.py",
         "cpp/evrptw_core.cpp",
+        "cpp/native_host_scheduler.cpp",
+        "cpp/native_kernel_client.hpp",
         "tests/test_artifacts_v3.py",
         "src/evrptw/cache_incremental.py",
         "src/evrptw/candidate_transaction.py",

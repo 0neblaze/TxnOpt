@@ -163,20 +163,26 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
 )
 _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
     "cpp/evrptw_core.cpp": (
-        "a96c4a6a9defe44bbcde9a0bac47b6d27fb73336762f0b695cd905cc8d08f152"
+        "215a7236380421e767489638c687feb3636bcad0a745dae79f2bd69be5495efa"
     ),
-    "src/evrptw/alns.py": "a943561fea217fbd26182faa6604064dab4c731671a35142ffd98fa2900cd883",
+    "cpp/native_host_scheduler.cpp": (
+        "0d475509c9be78699a0541cbf60fa2f5f01f63f9133a6c12211d3d467565dbc2"
+    ),
+    "cpp/native_kernel_client.hpp": (
+        "b7a810471711badd1c51dc3dbb0001af4fe7efff61f8e0615ac3c4129a1a30e0"
+    ),
+    "src/evrptw/alns.py": "ee2373c515bc1e16984c1610f035a4b8647d56e4e9297b50766d5b4eb454a46b",
     "src/evrptw/cache_incremental.py": (
         "babe9c2f6315c73a81fbb4c7cbb6d673035cc62c903aa19ee3d430c94e09bdaa"
     ),
     "src/evrptw/candidate_transaction.py": (
-        "a8e3ca9f6b6158a40db5e02eb07ca6290a74c1a271a323d84be4611eca486d80"
+        "fbdaa558fec19470872bf22d0cb43870ab145969ac0e5005041ebb52022b10d2"
     ),
     "src/evrptw/experiments/stage03_measurement_review.py": (
         "7299f13a15571ecd6a1617299b8d769baba6a8c3773947304231cdce11438fb8"
     ),
     "src/evrptw/measurement.py": (
-        "3e6b5cbfa63a881834d03e14167c0f940b505e5d81400296cd56930bc401917f"
+        "9d3e1253f78c33ef91e590971d6eaa4ab65c90c6be1260aac3c6e920f43f239f"
     ),
     "tests/test_alns_wall_clock_only.py": (
         "0bf741d1e4929564882dd8ff48775f0c589e957328aa00c7309176656fd16481"

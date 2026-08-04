@@ -7,6 +7,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -799,6 +800,39 @@ def test_auto_native_copy_is_used_and_independently_verified(
             "exit_code": 1,
         }
 
+    def fake_native_verify_retention_tree(
+        *,
+        root: Path,
+        segments: tuple[RetentionSegment, ...],
+        expected_trees: tuple[ExpectedSegmentTree, ...],
+        workers: int,
+    ) -> SimpleNamespace:
+        expected_by_id = {tree.segment_id: tree for tree in expected_trees}
+        segment_identities: dict[str, tuple[int, int, str]] = {}
+        for segment in segments:
+            observed = compute_tree_identity(root / segment.logical_prefix)
+            expected = expected_by_id[segment.segment_id]
+            assert observed == (
+                expected.file_count,
+                expected.byte_count,
+                expected.tree_sha256,
+            )
+            segment_identities[segment.segment_id] = observed
+        file_count, byte_count, tree_sha256 = compute_tree_identity(root)
+        return SimpleNamespace(
+            file_count=file_count,
+            byte_count=byte_count,
+            tree_sha256=tree_sha256,
+            segment_identities=segment_identities,
+            observation={
+                "backend": "test_native_verifier",
+                "workers": workers,
+                "file_count": file_count,
+                "byte_count": byte_count,
+                "tree_sha256": tree_sha256,
+            },
+        )
+
     monkeypatch.setattr(
         storage_governance_module,
         "_windows_path_for_mounted_drive",
@@ -808,6 +842,11 @@ def test_auto_native_copy_is_used_and_independently_verified(
         storage_governance_module,
         "_native_copy_segment",
         fake_native_copy,
+    )
+    monkeypatch.setattr(
+        storage_governance_module,
+        "_native_verify_retention_tree",
+        fake_native_verify_retention_tree,
     )
     receipt = governance.retain_run(
         RetentionRequest(

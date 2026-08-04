@@ -133,6 +133,19 @@ def test_exact_completion_order_is_backend_observed_and_host_preserved(
     assert host == local
 
 
+def test_empty_exact_route_payload_is_local_host_equivalent(tmp_path: Path) -> None:
+    packed = _pack(_instance(), ((),))
+    local_hash = native_core._test_exact_payload_hash_v2(*packed)
+    assert isinstance(local_hash, str) and len(local_hash) == 64
+
+    endpoint = tmp_path / "empty-exact-route.sock"
+    with NativeHostScheduler(endpoint):
+        host_hash = native_core._test_exact_payload_hash_v2(
+            *packed, str(endpoint)
+        )
+    assert host_hash == local_hash
+
+
 def test_initial_and_lane_hashes_bind_exact_completion_order() -> None:
     initial_a, initial_b, lane_a, lane_b = (
         native_core._test_initial_completion_hash_v2()
@@ -699,27 +712,47 @@ def test_screen_route_batch_transaction_v2_accepts_empty_owned_batch() -> None:
     assert len(result[6]) == 64
 
 
-def test_native_exact_and_screen_batches_reject_empty_candidate_rows() -> None:
+def test_native_exact_and_screen_batches_preserve_empty_route_semantics() -> None:
     instance = _instance()
     exact_inputs = list(_pack(instance, (("C1",),)))
     exact_inputs[6] = np.asarray([0, 0], dtype=np.int64)
     exact_inputs[7] = np.asarray([], dtype=np.int64)
-    with pytest.raises(ValueError, match="non-empty rows"):
+    path_offsets, path_indices, status, reason, metrics, _, _ = (
         exact_charging_batch_numeric(*exact_inputs)
+    )
+    expected = solve_exact_charging(instance, ())
+    assert _decode_paths(instance, path_offsets, path_indices) == (expected.route,)
+    np.testing.assert_array_equal(status, np.asarray([0], dtype=np.int64))
+    np.testing.assert_array_equal(reason, np.asarray([0], dtype=np.int64))
+    np.testing.assert_allclose(
+        metrics[0],
+        np.asarray(
+            [
+                expected.distance,
+                expected.total_energy,
+                expected.charged_energy,
+                expected.charging_time,
+            ]
+        ),
+    )
 
-    scalar_inputs = _screen_pack(instance, ("C1",), full=True)
-    with pytest.raises(ValueError, match="empty candidate row"):
-        screen_route_batch_transaction_v2(
-            *scalar_inputs[:8],
-            np.asarray([0, 0], dtype=np.int64),
-            np.asarray([], dtype=np.int64),
-            np.asarray([10], dtype=np.int64),
-            scalar_inputs[9],
-            np.zeros((1, 6), dtype=np.float64),
-            np.asarray([0], dtype=np.int64),
-            np.asarray([], dtype=np.int64),
-            np.asarray([], dtype=np.int64),
-        )
+    scalar_inputs = _screen_pack(instance, (), full=True)
+    scalar_codes, scalar_metrics = screen_routes_numeric(*scalar_inputs)
+    screened = screen_route_batch_transaction_v2(
+        *scalar_inputs[:8],
+        np.asarray([0, 0], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+        np.asarray([10], dtype=np.int64),
+        scalar_inputs[9],
+        np.zeros((1, 6), dtype=np.float64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(screened[0], np.asarray([10], dtype=np.int64))
+    np.testing.assert_array_equal(screened[1], np.asarray([0], dtype=np.int64))
+    np.testing.assert_array_equal(screened[3][0], scalar_codes)
+    np.testing.assert_allclose(screened[4][0], scalar_metrics, equal_nan=True)
 
 
 def test_screen_routes_numeric_randomized_python_differential() -> None:
