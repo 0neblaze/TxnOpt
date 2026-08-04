@@ -1079,27 +1079,32 @@ py::array_t<std::int64_t> dynamic_removal_selection_v2(
     return output;
 }
 
-py::tuple changed_candidate_pool_v1(
+evrptw::native_search::ChangedCandidatePoolV1
+changed_candidate_pool_owned_v1(
     std::int64_t operation,
-    py::handle route_offsets,
-    py::handle route_indices) {
-    auto offsets_array = checked_array<std::int64_t>(
-        route_offsets, "route_offsets", 1);
-    auto indices_array = checked_array<std::int64_t>(
-        route_indices, "route_indices", 1);
-    if (operation < 0 || operation > 2 || offsets_array.size() < 2) {
+    std::span<const std::int64_t> route_offsets,
+    std::span<const std::int64_t> route_indices) {
+    constexpr auto maximum_i64_size =
+        static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
+    if (operation < 0 || operation > 2 || route_offsets.size() < 2
+        || route_offsets.size() - 1 > maximum_i64_size
+        || route_indices.size() > maximum_i64_size) {
         throw std::invalid_argument("changed-candidate operation/routes are invalid");
     }
-    const auto* offsets = checked_data<std::int64_t>(offsets_array);
-    const auto* indices = checked_data<std::int64_t>(indices_array);
-    const auto route_count = static_cast<std::size_t>(offsets_array.size() - 1);
-    if (offsets[0] != 0 || offsets[route_count] != indices_array.size()) {
+    const auto* offsets = route_offsets.data();
+    const auto* indices = route_indices.data();
+    const auto route_count = route_offsets.size() - 1;
+    if (offsets[0] != 0
+        || offsets[route_count]
+            != static_cast<std::int64_t>(route_indices.size())) {
         throw std::invalid_argument("changed-candidate route offsets do not span indices");
     }
     std::vector<std::vector<std::int64_t>> routes;
     routes.reserve(route_count);
     for (std::size_t route = 0; route < route_count; ++route) {
-        if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]) {
+        if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]
+            || offsets[route + 1]
+                > static_cast<std::int64_t>(route_indices.size())) {
             throw std::invalid_argument(
                 "changed-candidate routes must be monotone and non-empty");
         }
@@ -1118,10 +1123,20 @@ py::tuple changed_candidate_pool_v1(
                             std::size_t right_index,
                             const std::vector<std::int64_t>& right,
                             const std::vector<std::int64_t>& removed) {
+        if (changed_route_indices.size() > maximum_i64_size - 2
+            || change_indices.size() > maximum_i64_size - left.size()
+            || removed_indices.size() > maximum_i64_size - removed.size()) {
+            throw std::overflow_error(
+                "changed-candidate pool output overflowed");
+        }
         changed_route_indices.push_back(static_cast<std::int64_t>(left_index));
         changed_route_indices.push_back(static_cast<std::int64_t>(right_index));
         change_indices.insert(change_indices.end(), left.begin(), left.end());
         change_offsets.push_back(static_cast<std::int64_t>(change_indices.size()));
+        if (change_indices.size() > maximum_i64_size - right.size()) {
+            throw std::overflow_error(
+                "changed-candidate pool output overflowed");
+        }
         change_indices.insert(change_indices.end(), right.begin(), right.end());
         change_offsets.push_back(static_cast<std::int64_t>(change_indices.size()));
         removed_indices.insert(removed_indices.end(), removed.begin(), removed.end());
@@ -1215,27 +1230,43 @@ py::tuple changed_candidate_pool_v1(
             }
         }
     }
+    evrptw::native_search::ChangedCandidatePoolV1 result{
+        std::move(changed_route_indices),
+        std::move(change_offsets),
+        std::move(change_indices),
+        std::move(removed_offsets),
+        std::move(removed_indices),
+        operation,
+        static_cast<std::int64_t>(route_count),
+    };
+    result.validate();
+    return result;
+}
+
+py::tuple project_changed_candidate_pool_v1(
+    const evrptw::native_search::ChangedCandidatePoolV1& pool) {
+    pool.validate();
     py::array_t<std::int64_t> changed_array(
         std::vector<py::ssize_t>{
-            static_cast<py::ssize_t>(changed_route_indices.size() / 2), 2});
-    py::array_t<std::int64_t> change_offsets_array(change_offsets.size());
-    py::array_t<std::int64_t> change_indices_array(change_indices.size());
-    py::array_t<std::int64_t> removed_offsets_array(removed_offsets.size());
-    py::array_t<std::int64_t> removed_indices_array(removed_indices.size());
+            static_cast<py::ssize_t>(pool.candidate_count()), 2});
+    py::array_t<std::int64_t> change_offsets_array(pool.change_offsets.size());
+    py::array_t<std::int64_t> change_indices_array(pool.change_indices.size());
+    py::array_t<std::int64_t> removed_offsets_array(pool.removed_offsets.size());
+    py::array_t<std::int64_t> removed_indices_array(pool.removed_indices.size());
     std::copy(
-        changed_route_indices.begin(), changed_route_indices.end(),
+        pool.changed_route_indices.begin(), pool.changed_route_indices.end(),
         checked_data(changed_array));
     std::copy(
-        change_offsets.begin(), change_offsets.end(),
+        pool.change_offsets.begin(), pool.change_offsets.end(),
         checked_data(change_offsets_array));
     std::copy(
-        change_indices.begin(), change_indices.end(),
+        pool.change_indices.begin(), pool.change_indices.end(),
         checked_data(change_indices_array));
     std::copy(
-        removed_offsets.begin(), removed_offsets.end(),
+        pool.removed_offsets.begin(), pool.removed_offsets.end(),
         checked_data(removed_offsets_array));
     std::copy(
-        removed_indices.begin(), removed_indices.end(),
+        pool.removed_indices.begin(), pool.removed_indices.end(),
         checked_data(removed_indices_array));
     return py::make_tuple(
         std::move(changed_array),
@@ -1243,6 +1274,25 @@ py::tuple changed_candidate_pool_v1(
         std::move(change_indices_array),
         std::move(removed_offsets_array),
         std::move(removed_indices_array));
+}
+
+py::tuple changed_candidate_pool_v1(
+    std::int64_t operation,
+    py::handle route_offsets,
+    py::handle route_indices) {
+    auto offsets_array = checked_array<std::int64_t>(
+        route_offsets, "route_offsets", 1);
+    auto indices_array = checked_array<std::int64_t>(
+        route_indices, "route_indices", 1);
+    const auto pool = changed_candidate_pool_owned_v1(
+        operation,
+        std::span<const std::int64_t>{
+            checked_data<std::int64_t>(offsets_array),
+            static_cast<std::size_t>(offsets_array.size())},
+        std::span<const std::int64_t>{
+            checked_data<std::int64_t>(indices_array),
+            static_cast<std::size_t>(indices_array.size())});
+    return project_changed_candidate_pool_v1(pool);
 }
 
 evrptw::native_search::InsertionPlanPoolV2
@@ -1664,53 +1714,60 @@ py::tuple route_merge_candidate_pool_v2(
     return project_route_merge_candidate_pool_v2(pool);
 }
 
-py::tuple assemble_changed_candidate_plans_v1(
-    py::handle current_route_offsets,
-    py::handle current_route_indices,
-    py::handle changed_route_indices,
-    py::handle change_offsets,
-    py::handle change_indices) {
-    auto current_offsets_array = checked_array<std::int64_t>(
-        current_route_offsets, "current_route_offsets", 1);
-    auto current_indices_array = checked_array<std::int64_t>(
-        current_route_indices, "current_route_indices", 1);
-    auto changed_routes_array = checked_array<std::int64_t>(
-        changed_route_indices, "changed_route_indices", 2);
-    auto change_offsets_array = checked_array<std::int64_t>(
-        change_offsets, "change_offsets", 1);
-    auto change_indices_array = checked_array<std::int64_t>(
-        change_indices, "change_indices", 1);
-    if (current_offsets_array.size() < 2 || changed_routes_array.shape(1) != 2) {
+evrptw::native_search::CandidatePlanPoolV1
+assemble_changed_candidate_plans_owned_v1(
+    std::span<const std::int64_t> current_route_offsets,
+    std::span<const std::int64_t> current_route_indices,
+    std::span<const std::int64_t> changed_route_indices,
+    std::span<const std::int64_t> change_offsets,
+    std::span<const std::int64_t> change_indices) {
+    constexpr auto maximum_i64_size =
+        static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
+    if (current_route_offsets.size() < 2
+        || current_route_offsets.size() - 1 > maximum_i64_size
+        || current_route_indices.size() > maximum_i64_size
+        || changed_route_indices.size() % 2 != 0
+        || changed_route_indices.size() > maximum_i64_size
+        || change_indices.size() > maximum_i64_size) {
         throw std::invalid_argument("changed-candidate plan shape is invalid");
     }
-    const auto route_count = static_cast<std::size_t>(
-        current_offsets_array.size() - 1);
-    const auto candidate_count = static_cast<std::size_t>(
-        changed_routes_array.shape(0));
-    if (change_offsets_array.size()
-        != static_cast<py::ssize_t>(candidate_count * 2 + 1)) {
+    const auto route_count = current_route_offsets.size() - 1;
+    const auto candidate_count = changed_route_indices.size() / 2;
+    if (change_offsets.empty()
+        || change_offsets.size() - 1 != changed_route_indices.size()
+        || (candidate_count != 0
+            && route_count
+                > (maximum_i64_size - 1) / candidate_count)) {
         throw std::invalid_argument("changed-candidate change offsets do not align");
     }
-    const auto* current_offsets = checked_data<std::int64_t>(current_offsets_array);
-    const auto* current_indices = checked_data<std::int64_t>(current_indices_array);
-    const auto* changed_routes = checked_data<std::int64_t>(changed_routes_array);
-    const auto* changes = checked_data<std::int64_t>(change_offsets_array);
-    const auto* changed_indices = checked_data<std::int64_t>(change_indices_array);
+    const auto* current_offsets = current_route_offsets.data();
+    const auto* current_indices = current_route_indices.data();
+    const auto* changed_routes = changed_route_indices.data();
+    const auto* changes = change_offsets.data();
+    const auto* changed_indices = change_indices.data();
     if (current_offsets[0] != 0
-        || current_offsets[route_count] != current_indices_array.size()
+        || current_offsets[route_count]
+            != static_cast<std::int64_t>(current_route_indices.size())
         || changes[0] != 0
-        || changes[candidate_count * 2] != change_indices_array.size()) {
+        || changes[candidate_count * 2]
+            != static_cast<std::int64_t>(change_indices.size())) {
         throw std::invalid_argument("changed-candidate plan boundary is invalid");
     }
     for (std::size_t route = 0; route < route_count; ++route) {
         if (current_offsets[route] < 0
-            || current_offsets[route] > current_offsets[route + 1]) {
-            throw std::invalid_argument("current route offsets must be monotonic");
+            || current_offsets[route] >= current_offsets[route + 1]
+            || current_offsets[route + 1]
+                > static_cast<std::int64_t>(current_route_indices.size())) {
+            throw std::invalid_argument(
+                "current route offsets must be monotonic and non-empty");
         }
     }
-    for (std::size_t change = 0; change < candidate_count * 2; ++change) {
-        if (changes[change] < 0 || changes[change] > changes[change + 1]) {
-            throw std::invalid_argument("change offsets must be monotonic");
+    for (std::size_t change = 0; change < changed_route_indices.size(); ++change) {
+        if (changes[change] < 0 || changes[change] >= changes[change + 1]
+            || changes[change + 1]
+                > static_cast<std::int64_t>(change_indices.size())) {
+            throw std::invalid_argument(
+                "change offsets must be monotonic and non-empty");
         }
     }
     std::vector<std::int64_t> plan_offsets{0};
@@ -1739,6 +1796,11 @@ py::tuple assemble_changed_candidate_plans_v1(
                 begin = changes[candidate * 2 + 1];
                 end = changes[candidate * 2 + 2];
             }
+            const auto length = static_cast<std::size_t>(end - begin);
+            if (plan_route_indices.size() > maximum_i64_size - length) {
+                throw std::overflow_error(
+                    "changed-candidate plan indices overflowed");
+            }
             plan_route_indices.insert(
                 plan_route_indices.end(), source + begin, source + end);
             plan_route_offsets.push_back(
@@ -1747,21 +1809,72 @@ py::tuple assemble_changed_candidate_plans_v1(
         plan_offsets.push_back(
             static_cast<std::int64_t>(plan_route_offsets.size() - 1));
     }
-    py::array_t<std::int64_t> plan_offsets_output(plan_offsets.size());
-    py::array_t<std::int64_t> route_offsets_output(plan_route_offsets.size());
-    py::array_t<std::int64_t> route_indices_output(plan_route_indices.size());
+    evrptw::native_search::CandidatePlanPoolV1 result{
+        std::move(plan_offsets),
+        std::move(plan_route_offsets),
+        std::move(plan_route_indices),
+        static_cast<std::int64_t>(route_count),
+    };
+    result.validate();
+    return result;
+}
+
+py::tuple project_candidate_plan_pool_v1(
+    const evrptw::native_search::CandidatePlanPoolV1& pool) {
+    pool.validate();
+    py::array_t<std::int64_t> plan_offsets_output(pool.plan_offsets.size());
+    py::array_t<std::int64_t> route_offsets_output(pool.route_offsets.size());
+    py::array_t<std::int64_t> route_indices_output(pool.route_indices.size());
     std::copy(
-        plan_offsets.begin(), plan_offsets.end(),
+        pool.plan_offsets.begin(), pool.plan_offsets.end(),
         checked_data(plan_offsets_output));
     std::copy(
-        plan_route_offsets.begin(), plan_route_offsets.end(),
+        pool.route_offsets.begin(), pool.route_offsets.end(),
         checked_data(route_offsets_output));
     std::copy(
-        plan_route_indices.begin(), plan_route_indices.end(),
+        pool.route_indices.begin(), pool.route_indices.end(),
         checked_data(route_indices_output));
     return py::make_tuple(
         std::move(plan_offsets_output), std::move(route_offsets_output),
         std::move(route_indices_output));
+}
+
+py::tuple assemble_changed_candidate_plans_v1(
+    py::handle current_route_offsets,
+    py::handle current_route_indices,
+    py::handle changed_route_indices,
+    py::handle change_offsets,
+    py::handle change_indices) {
+    auto current_offsets_array = checked_array<std::int64_t>(
+        current_route_offsets, "current_route_offsets", 1);
+    auto current_indices_array = checked_array<std::int64_t>(
+        current_route_indices, "current_route_indices", 1);
+    auto changed_routes_array = checked_array<std::int64_t>(
+        changed_route_indices, "changed_route_indices", 2);
+    auto change_offsets_array = checked_array<std::int64_t>(
+        change_offsets, "change_offsets", 1);
+    auto change_indices_array = checked_array<std::int64_t>(
+        change_indices, "change_indices", 1);
+    if (changed_routes_array.shape(1) != 2) {
+        throw std::invalid_argument("changed-candidate plan shape is invalid");
+    }
+    const auto pool = assemble_changed_candidate_plans_owned_v1(
+        std::span<const std::int64_t>{
+            checked_data<std::int64_t>(current_offsets_array),
+            static_cast<std::size_t>(current_offsets_array.size())},
+        std::span<const std::int64_t>{
+            checked_data<std::int64_t>(current_indices_array),
+            static_cast<std::size_t>(current_indices_array.size())},
+        std::span<const std::int64_t>{
+            checked_data<std::int64_t>(changed_routes_array),
+            static_cast<std::size_t>(changed_routes_array.size())},
+        std::span<const std::int64_t>{
+            checked_data<std::int64_t>(change_offsets_array),
+            static_cast<std::size_t>(change_offsets_array.size())},
+        std::span<const std::int64_t>{
+            checked_data<std::int64_t>(change_indices_array),
+            static_cast<std::size_t>(change_indices_array.size())});
+    return project_candidate_plan_pool_v1(pool);
 }
 
 class PythonFloatSum {
@@ -2050,11 +2163,23 @@ py::tuple changed_candidate_plan_selection_v1(
         throw std::invalid_argument(
             "changed candidate-plan selection controls must be positive");
     }
-    auto pool = changed_candidate_pool_v1(
-        operation, current_route_offsets, current_route_indices);
-    auto plans = assemble_changed_candidate_plans_v1(
-        current_route_offsets, current_route_indices,
-        pool[0], pool[1], pool[2]);
+    auto current_offsets_array = checked_array<std::int64_t>(
+        current_route_offsets, "current_route_offsets", 1);
+    auto current_indices_array = checked_array<std::int64_t>(
+        current_route_indices, "current_route_indices", 1);
+    const std::span<const std::int64_t> current_offsets{
+        checked_data<std::int64_t>(current_offsets_array),
+        static_cast<std::size_t>(current_offsets_array.size())};
+    const std::span<const std::int64_t> current_indices{
+        checked_data<std::int64_t>(current_indices_array),
+        static_cast<std::size_t>(current_indices_array.size())};
+    const auto pool_state = changed_candidate_pool_owned_v1(
+        operation, current_offsets, current_indices);
+    const auto plans_state = assemble_changed_candidate_plans_owned_v1(
+        current_offsets, current_indices, pool_state.changed_route_indices,
+        pool_state.change_offsets, pool_state.change_indices);
+    auto pool = project_changed_candidate_pool_v1(pool_state);
+    auto plans = project_candidate_plan_pool_v1(plans_state);
     auto plan_offsets_array = py::cast<py::array_t<std::int64_t>>(plans[0]);
     auto route_offsets_array = py::cast<py::array_t<std::int64_t>>(plans[1]);
     auto route_indices_array = py::cast<py::array_t<std::int64_t>>(plans[2]);
@@ -12868,37 +12993,33 @@ public:
         }
         last_quality_acceptance_outcome_.reset();
         const auto& quality_lane = live_lane_state(1);
-        auto live_offsets = lane_vector_array(quality_lane.route_offsets);
-        auto live_indices = lane_vector_array(quality_lane.route_indices);
-        auto pool = changed_candidate_pool_v1(
-            operation, live_offsets, live_indices);
-        auto changed_routes = py::cast<py::array_t<std::int64_t>>(pool[0]);
-        auto change_offsets = py::cast<py::array_t<std::int64_t>>(pool[1]);
-        auto change_indices = py::cast<py::array_t<std::int64_t>>(pool[2]);
-        const auto candidate_count = changed_routes.shape(0);
+        const auto pool_state = changed_candidate_pool_owned_v1(
+            operation, quality_lane.route_offsets, quality_lane.route_indices);
+        auto pool = project_changed_candidate_pool_v1(pool_state);
+        const auto candidate_count = pool_state.candidate_count();
         const auto route_count = quality_lane.route_offsets.size() - 1;
         const auto* base_offsets = quality_lane.route_offsets.data();
         const auto* base_indices = quality_lane.route_indices.data();
-        const auto* changed = checked_data<std::int64_t>(changed_routes);
-        const auto* changes = checked_data<std::int64_t>(change_offsets);
-        const auto* changed_indices = checked_data<std::int64_t>(change_indices);
+        const auto* changed = pool_state.changed_route_indices.data();
+        const auto* changes = pool_state.change_offsets.data();
+        const auto* changed_indices = pool_state.change_indices.data();
         std::vector<std::int64_t> plan_offsets{0};
         std::vector<std::int64_t> route_offsets{0};
         std::vector<std::int64_t> route_indices;
         std::unordered_set<std::string> seen_plans;
-        for (py::ssize_t candidate = 0; candidate < candidate_count; ++candidate) {
+        for (std::size_t candidate = 0; candidate < candidate_count; ++candidate) {
             std::string identity("stage05.2-native-quality-plan-v2");
             std::vector<std::vector<std::int64_t>> routes;
             routes.reserve(static_cast<std::size_t>(route_count));
-            for (py::ssize_t route = 0; route < route_count; ++route) {
+            for (std::size_t route = 0; route < route_count; ++route) {
                 const auto first_changed = changed[candidate * 2];
                 const auto second_changed = changed[candidate * 2 + 1];
                 const std::int64_t* begin = nullptr;
                 const std::int64_t* end = nullptr;
-                if (route == first_changed) {
+                if (static_cast<std::int64_t>(route) == first_changed) {
                     begin = changed_indices + changes[candidate * 2];
                     end = changed_indices + changes[candidate * 2 + 1];
-                } else if (route == second_changed) {
+                } else if (static_cast<std::int64_t>(route) == second_changed) {
                     begin = changed_indices + changes[candidate * 2 + 1];
                     end = changed_indices + changes[candidate * 2 + 2];
                 } else {

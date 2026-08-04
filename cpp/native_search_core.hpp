@@ -320,6 +320,119 @@ struct RouteMergeCandidatePoolV2 final {
     }
 };
 
+struct ChangedCandidatePoolV1 final {
+    std::vector<std::int64_t> changed_route_indices;
+    std::vector<std::int64_t> change_offsets;
+    std::vector<std::int64_t> change_indices;
+    std::vector<std::int64_t> removed_offsets;
+    std::vector<std::int64_t> removed_indices;
+    std::int64_t operation = -1;
+    std::int64_t input_route_count = 0;
+
+    [[nodiscard]] std::size_t candidate_count() const noexcept {
+        return changed_route_indices.size() / 2;
+    }
+
+    void validate() const {
+        constexpr auto maximum_i64_size =
+            static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
+        if (change_offsets.empty() || removed_offsets.empty()
+            || changed_route_indices.size() % 2 != 0
+            || candidate_count() > maximum_i64_size
+            || change_indices.size() > maximum_i64_size
+            || removed_indices.size() > maximum_i64_size
+            || change_offsets.size() - 1 != changed_route_indices.size()
+            || removed_offsets.size() - 1 != candidate_count()
+            || change_offsets.front() != 0 || removed_offsets.front() != 0
+            || change_offsets.back()
+                != static_cast<std::int64_t>(change_indices.size())
+            || removed_offsets.back()
+                != static_cast<std::int64_t>(removed_indices.size())
+            || operation < 0 || operation > 2 || input_route_count <= 0) {
+            throw std::logic_error(
+                "native changed-candidate pool is inconsistent");
+        }
+        for (std::size_t change = 0; change + 1 < change_offsets.size(); ++change) {
+            if (change_offsets[change] < 0
+                || change_offsets[change] >= change_offsets[change + 1]
+                || change_offsets[change + 1]
+                    > static_cast<std::int64_t>(change_indices.size())) {
+                throw std::logic_error(
+                    "native changed-candidate route offsets are invalid");
+            }
+        }
+        for (std::size_t candidate = 0; candidate < candidate_count(); ++candidate) {
+            const auto left = changed_route_indices[candidate * 2];
+            const auto right = changed_route_indices[candidate * 2 + 1];
+            if (left < 0 || right <= left || right >= input_route_count
+                || removed_offsets[candidate] < 0
+                || removed_offsets[candidate] > removed_offsets[candidate + 1]
+                || removed_offsets[candidate + 1]
+                    > static_cast<std::int64_t>(removed_indices.size())) {
+                throw std::logic_error(
+                    "native changed-candidate metadata is invalid");
+            }
+            const auto removed_count =
+                removed_offsets[candidate + 1] - removed_offsets[candidate];
+            const auto expected_removed_count =
+                operation == 0 ? 1 : (operation == 1 ? 2 : 0);
+            if (removed_count != expected_removed_count) {
+                throw std::logic_error(
+                    "native changed-candidate removal identity is invalid");
+            }
+        }
+    }
+};
+
+struct CandidatePlanPoolV1 final {
+    std::vector<std::int64_t> plan_offsets;
+    std::vector<std::int64_t> route_offsets;
+    std::vector<std::int64_t> route_indices;
+    std::int64_t routes_per_plan = 0;
+
+    [[nodiscard]] std::size_t plan_count() const noexcept {
+        return plan_offsets.empty() ? 0 : plan_offsets.size() - 1;
+    }
+
+    void validate() const {
+        constexpr auto maximum_i64_size =
+            static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
+        if (plan_offsets.empty() || route_offsets.empty()
+            || plan_count() > maximum_i64_size
+            || route_offsets.size() - 1 > maximum_i64_size
+            || route_indices.size() > maximum_i64_size
+            || plan_offsets.front() != 0 || route_offsets.front() != 0
+            || plan_offsets.back()
+                != static_cast<std::int64_t>(route_offsets.size() - 1)
+            || route_offsets.back()
+                != static_cast<std::int64_t>(route_indices.size())
+            || routes_per_plan <= 0) {
+            throw std::logic_error(
+                "native candidate-plan pool is inconsistent");
+        }
+        for (std::size_t route = 0; route + 1 < route_offsets.size(); ++route) {
+            if (route_offsets[route] < 0
+                || route_offsets[route] >= route_offsets[route + 1]
+                || route_offsets[route + 1]
+                    > static_cast<std::int64_t>(route_indices.size())) {
+                throw std::logic_error(
+                    "native candidate-plan route offsets are invalid");
+            }
+        }
+        for (std::size_t plan = 0; plan < plan_count(); ++plan) {
+            if (plan_offsets[plan] < 0
+                || plan_offsets[plan] >= plan_offsets[plan + 1]
+                || plan_offsets[plan + 1]
+                    > static_cast<std::int64_t>(route_offsets.size() - 1)
+                || plan_offsets[plan + 1] - plan_offsets[plan]
+                    != routes_per_plan) {
+                throw std::logic_error(
+                    "native candidate-plan offsets are invalid");
+            }
+        }
+    }
+};
+
 [[nodiscard]] inline DynamicRemovalSelectionV2 select_dynamic_removal_v2(
     const std::int64_t customer_count,
     const std::int64_t stagnation_iterations,

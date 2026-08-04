@@ -1717,6 +1717,9 @@ def test_native_changed_candidate_pool_matches_python_order(
     ]
 
     assert observed == expected
+    for output in payload:
+        assert output.dtype == np.int64
+        assert output.flags.c_contiguous
 
     plan_offsets, plan_route_offsets, plan_route_indices = (
         native_core.assemble_changed_candidate_plans_v1(
@@ -1747,6 +1750,76 @@ def test_native_changed_candidate_pool_matches_python_order(
     )
 
     assert observed_plans == expected_plans
+
+
+def test_native_changed_candidate_empty_pool_and_malformed_csr_are_safe() -> None:
+    from evrptw import _core as native_core
+
+    offsets = np.asarray([0, 2], dtype=np.int64)
+    indices = np.asarray([1, 2], dtype=np.int64)
+    for operation in range(3):
+        changed, changes, change_indices, removed, removed_indices = (
+            native_core.changed_candidate_pool_v1(operation, offsets, indices)
+        )
+        assert changed.shape == (0, 2)
+        assert changes.tolist() == [0]
+        assert change_indices.tolist() == []
+        assert removed.tolist() == [0]
+        assert removed_indices.tolist() == []
+        plans = native_core.assemble_changed_candidate_plans_v1(
+            offsets,
+            indices,
+            changed,
+            changes,
+            change_indices,
+        )
+        assert tuple(output.tolist() for output in plans) == ([0], [0], [])
+
+    with pytest.raises(
+        ValueError,
+        match="changed-candidate routes must be monotone and non-empty",
+    ):
+        native_core.changed_candidate_pool_v1(
+            0,
+            np.asarray([0, 3, 2], dtype=np.int64),
+            indices,
+        )
+
+    with pytest.raises(ValueError, match="change offsets must be monotonic"):
+        native_core.assemble_changed_candidate_plans_v1(
+            np.asarray([0, 1, 2], dtype=np.int64),
+            indices,
+            np.asarray([[0, 1]], dtype=np.int64),
+            np.asarray([0, 3, 2], dtype=np.int64),
+            indices,
+        )
+
+    with pytest.raises(ValueError, match="current route offsets.*non-empty"):
+        native_core.assemble_changed_candidate_plans_v1(
+            np.asarray([0, 0, 0], dtype=np.int64),
+            np.asarray([], dtype=np.int64),
+            np.asarray([[0, 1]], dtype=np.int64),
+            np.asarray([0, 0, 0], dtype=np.int64),
+            np.asarray([], dtype=np.int64),
+        )
+
+    with pytest.raises(ValueError, match="current route offsets.*non-empty"):
+        native_core.assemble_changed_candidate_plans_v1(
+            np.asarray([0, 0, 1], dtype=np.int64),
+            np.asarray([1], dtype=np.int64),
+            np.asarray([[0, 1]], dtype=np.int64),
+            np.asarray([0, 1, 2], dtype=np.int64),
+            np.asarray([1, 2], dtype=np.int64),
+        )
+
+    with pytest.raises(ValueError, match="change offsets.*non-empty"):
+        native_core.assemble_changed_candidate_plans_v1(
+            np.asarray([0, 1, 2], dtype=np.int64),
+            indices,
+            np.asarray([[0, 1]], dtype=np.int64),
+            np.asarray([0, 0, 1], dtype=np.int64),
+            np.asarray([1], dtype=np.int64),
+        )
 
 
 @pytest.mark.parametrize(
