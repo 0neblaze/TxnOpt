@@ -3119,3 +3119,25 @@ compatibility fallback（兼容回退）。
   `149 passed, 187 deselected`。本条仍未迁移 route/negative cache 与 budget 的 Python
   receipt adapters，也未迁移 live lane apply、Stage 4 controller 或 terminal projection；
   capability bits 继续全部为 0，不创建 attempt04，不启动 Paired/Pilot/Formal/CUDA。
+
+## 2026-08-04：live lane apply 的 C++ 权威状态
+
+- `NativeSearchEngineV2` 新增四份有界的 C++ `LaneStateV2` live state，分别拥有 legacy、
+  quality-shadow、constraint/current 和 global-best 的 routes、exact payload 与正式
+  objective。lane swap 同时交换 C++ ownership；candidate acceptance、global-best 更新、
+  Stage 4 restart 和 global-search rollback 先更新或恢复 C++ state，再重建现有 Python
+  mirrors。`solution_state()`、`lane_solution_state()` 与 `best_solution_payload()` 改由 C++
+  state 生成独立数组，Python mirrors 只保留尚未迁完的内部 ABI 兼容用途。
+- 所有通用 candidate-round 与 constraint-probe 特殊路径均保存同构 C++ candidate lane；
+  legacy deferred candidate、refinement replacement、暂存/恢复和丢弃路径同步转移或清空
+  ownership。acceptance、vehicle-first comparison 与 incumbent identity 改读 C++ state，
+  不再从 candidate/current objective mirrors 做决策。
+- owned-request 的每份 live lane 在读取边界独立验证 route offsets、customer exact-once
+  coverage、exact path/customer order、depot/station 结构、feasibility、metrics、labels 与
+  objective 重算。新增 live-lane mirror tamper fault：在 apply 前篡改 Python current
+  objective，必须 fail fast、从 C++ state 恢复全部 lane mirrors、保持候选未消费并允许同一
+  apply 正常重试。该故障与上一条 candidate-round 故障的聚焦集合当前为 `20 passed`。
+- 本条是 live-lane ownership checkpoint，不代表 whole-search 已脱离 Python objects；
+  operators、cache adapters、terminal projection 和外层 whole-call GIL release 仍需继续
+  迁移并通过完整 differential/fault gates。production capability bits 保持 0，不创建
+  attempt04，不启动 Paired/Pilot/Formal/CUDA。

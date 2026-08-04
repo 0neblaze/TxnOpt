@@ -276,6 +276,30 @@ private:
     }
 };
 
+class PythonCompatibleFloatSumV2 final {
+public:
+    void add(double value) {
+        const auto next = total_ + value;
+        if (std::fabs(total_) >= std::fabs(value)) {
+            compensation_ += (total_ - next) + value;
+        } else {
+            compensation_ += (value - next) + total_;
+        }
+        total_ = next;
+    }
+
+    [[nodiscard]] double value() const {
+        if (compensation_ != 0.0 && std::isfinite(compensation_)) {
+            return total_ + compensation_;
+        }
+        return total_;
+    }
+
+private:
+    double total_ = 0.0;
+    double compensation_ = 0.0;
+};
+
 struct InitialStateV2 final {
     native_kernels::ExactBatchOutput exact;
     std::array<std::int64_t, 2> objective_integer{};
@@ -574,6 +598,142 @@ struct LaneStateV2 final {
         initial.accounting = {route_count, route_count, 0, 0};
         initial.request_sha256 = request.sha256();
         initial.validate(request);
+    }
+
+    void validate_live(const ProblemV2& problem) const {
+        problem.validate();
+        if (route_offsets.size() < 2 || route_offsets.front() != 0
+            || route_offsets.back()
+                != static_cast<std::int64_t>(route_indices.size())) {
+            throw std::runtime_error(
+                "native live lane route boundary is invalid");
+        }
+        const auto route_count = route_offsets.size() - 1;
+        for (std::size_t route = 0; route < route_count; ++route) {
+            if (route_offsets[route] < 0
+                || route_offsets[route] >= route_offsets[route + 1]) {
+                throw std::runtime_error(
+                    "native live lane route offsets are not monotone");
+            }
+        }
+        std::unordered_set<std::int64_t> expected_customers;
+        std::unordered_set<std::int64_t> route_customers;
+        std::int64_t depot = -1;
+        for (std::size_t node = 0; node < problem.node_count(); ++node) {
+            if (problem.node_kind[node] == native_kernels::customer_kind) {
+                expected_customers.insert(static_cast<std::int64_t>(node));
+            } else if (problem.node_kind[node] == native_kernels::depot_kind) {
+                if (depot >= 0) {
+                    throw std::runtime_error(
+                        "native live lane problem has multiple depots");
+                }
+                depot = static_cast<std::int64_t>(node);
+            }
+        }
+        for (const auto customer : route_indices) {
+            if (customer < 0
+                || static_cast<std::size_t>(customer) >= problem.node_count()
+                || problem.node_kind[static_cast<std::size_t>(customer)]
+                    != native_kernels::customer_kind
+                || !route_customers.insert(customer).second) {
+                throw std::runtime_error(
+                    "native live lane contains an invalid customer");
+            }
+        }
+        if (depot < 0 || route_customers != expected_customers) {
+            throw std::runtime_error(
+                "native live lane does not cover every customer exactly once");
+        }
+        if (exact.path_offsets.size() != route_count + 1
+            || exact.path_offsets.front() != 0
+            || exact.path_offsets.back()
+                != static_cast<std::int64_t>(exact.path_indices.size())
+            || exact.statuses.size() != route_count
+            || exact.reasons.size() != route_count
+            || exact.metrics.size() != route_count * 4
+            || exact.label_counters.size() != route_count * 3
+            || (!exact.batch_counters.empty()
+                && exact.batch_counters.size() != 10)) {
+            throw std::runtime_error(
+                "native live lane exact result has an invalid schema");
+        }
+        PythonCompatibleFloatSumV2 total_distance;
+        PythonCompatibleFloatSumV2 total_charging_time;
+        double ordered_total_distance = 0.0;
+        double ordered_total_charging_time = 0.0;
+        std::int64_t charging_count = 0;
+        for (std::size_t route = 0; route < route_count; ++route) {
+            const auto first_path = exact.path_offsets[route];
+            const auto end_path = exact.path_offsets[route + 1];
+            auto expected = route_offsets[route];
+            const auto expected_end = route_offsets[route + 1];
+            if (first_path < 0 || first_path >= end_path
+                || end_path > static_cast<std::int64_t>(exact.path_indices.size())
+                || exact.path_indices[static_cast<std::size_t>(first_path)]
+                    != depot
+                || exact.path_indices[static_cast<std::size_t>(end_path - 1)]
+                    != depot
+                || exact.statuses[route] != native_kernels::feasible_status
+                || exact.reasons[route] != native_kernels::no_failure_reason) {
+                throw std::runtime_error(
+                    "native live lane exact route is infeasible");
+            }
+            for (auto position = first_path; position < end_path; ++position) {
+                const auto node = exact.path_indices[
+                    static_cast<std::size_t>(position)];
+                if (node < 0
+                    || static_cast<std::size_t>(node) >= problem.node_count()) {
+                    throw std::runtime_error(
+                        "native live lane exact path node is invalid");
+                }
+                const auto kind = problem.node_kind[
+                    static_cast<std::size_t>(node)];
+                if (kind == native_kernels::customer_kind) {
+                    if (expected >= expected_end
+                        || route_indices[static_cast<std::size_t>(expected)]
+                            != node) {
+                        throw std::runtime_error(
+                            "native live lane exact customer order is invalid");
+                    }
+                    ++expected;
+                } else if (kind == native_kernels::station_kind) {
+                    ++charging_count;
+                } else if (node == depot && position != first_path
+                    && position != end_path - 1) {
+                    throw std::runtime_error(
+                        "native live lane exact path has an interior depot");
+                }
+            }
+            if (expected != expected_end) {
+                throw std::runtime_error(
+                    "native live lane exact path omits a customer");
+            }
+            for (std::size_t field = 0; field < 4; ++field) {
+                const auto value = exact.metrics[route * 4 + field];
+                if (!std::isfinite(value) || value < 0.0) {
+                    throw std::runtime_error(
+                        "native live lane exact metric is invalid");
+                }
+            }
+            total_distance.add(exact.metrics[route * 4]);
+            total_charging_time.add(exact.metrics[route * 4 + 3]);
+            ordered_total_distance += exact.metrics[route * 4];
+            ordered_total_charging_time += exact.metrics[route * 4 + 3];
+        }
+        const auto expected_distance = exact.batch_counters.empty()
+            ? total_distance.value() : ordered_total_distance;
+        const auto expected_charging_time = exact.batch_counters.empty()
+            ? total_charging_time.value() : ordered_total_charging_time;
+        if (objective_integer[0] != static_cast<std::int64_t>(route_count)
+            || objective_integer[1] != charging_count
+            || objective_float[0] != expected_distance
+            || objective_float[1] != expected_charging_time
+            || std::any_of(
+                exact.label_counters.begin(), exact.label_counters.end(),
+                [](std::int64_t value) { return value < 0; })) {
+            throw std::runtime_error(
+                "native live lane objective/accounting is invalid");
+        }
     }
 
 private:

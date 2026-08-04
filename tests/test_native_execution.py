@@ -4729,6 +4729,66 @@ def test_native_deferred_candidate_round_owns_cpp_staged_state_and_rejects_mirro
     assert candidate_objective == python_event["candidate_objective_key"]
 
 
+def test_native_live_lane_cpp_state_rejects_and_repairs_mirror_tamper() -> None:
+    """Candidate apply must read C++ live lanes and roll back a mirror drift."""
+
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = _native_search_engine(
+        native_core,
+        context,
+        10,
+        1,
+        16,
+        1_000_000,
+        16,
+        1,
+        context.reachability_epsilon,
+        1,
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    engine.constraint_probe(
+        0,
+        1,
+        0x5EED,
+        np.asarray([5, 7, 0], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+    before = engine.solution_state()
+
+    engine.inject_live_lane_mirror_tamper_once()
+    with pytest.raises(
+        RuntimeError,
+        match="live.constraint.objective_integer",
+    ):
+        engine.apply_last_candidate(1.0, 0.5)
+
+    after = engine.solution_state()
+    for expected, actual in zip(before, after, strict=True):
+        np.testing.assert_equal(actual, expected)
+    assert engine.apply_last_candidate(1.0, 0.5) == (1, 0, 0)
+
+
 def test_native_full_search_lanes_share_one_candidate_round_budget() -> None:
     from evrptw import _core as native_core
 

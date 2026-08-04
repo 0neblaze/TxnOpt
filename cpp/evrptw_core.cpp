@@ -9688,6 +9688,25 @@ public:
         best_exact_payload_ = std::move(prepared_best_exact);
         best_objective_integer_ = std::move(prepared_best_objective_integer);
         best_objective_float_ = std::move(prepared_best_objective_float);
+        if (initial_four_lane_state_.has_value()) {
+            live_lane_states_[0] = initial_four_lane_state_->legacy;
+            live_lane_states_[1] = initial_four_lane_state_->quality_shadow;
+            live_lane_states_[2] = initial_four_lane_state_->constraint;
+            live_lane_states_[3] = initial_four_lane_state_->global_best;
+        } else {
+            live_lane_states_[0] = lane_state_from_mirror(
+                legacy_offsets_, legacy_indices_, legacy_exact_payload_,
+                legacy_objective_integer_, legacy_objective_float_);
+            live_lane_states_[1] = lane_state_from_mirror(
+                quality_offsets_, quality_indices_, quality_exact_payload_,
+                quality_objective_integer_, quality_objective_float_);
+            live_lane_states_[2] = lane_state_from_mirror(
+                current_offsets_, current_indices_, current_exact_payload_,
+                current_objective_integer_, current_objective_float_);
+            live_lane_states_[3] = lane_state_from_mirror(
+                best_offsets_, best_indices_, best_exact_payload_,
+                best_objective_integer_, best_objective_float_);
+        }
         batch_size_ = checked_data<std::int64_t>(control_array)[2];
         rng_.emplace(std::move(prepared_rng));
         constraint_rng_.emplace(std::move(prepared_constraint_rng));
@@ -9724,6 +9743,7 @@ public:
             }
             validate_initial_search_state_mirror();
         }
+        validate_live_lane_mirrors();
         initialized_ = true;
         return initialized;
     }
@@ -10993,6 +11013,8 @@ public:
                         std::move(last_candidate_objective_integer_);
                     legacy_candidate_objective_float_ =
                         std::move(last_candidate_objective_float_);
+                    legacy_candidate_lane_state_ =
+                        std::move(last_candidate_lane_state_);
                     last_candidate_ready_ = false;
                     legacy_candidate_ready_ = true;
                     legacy_candidate_operator_ = 2;
@@ -11297,6 +11319,8 @@ public:
                         std::move(last_candidate_objective_integer_);
                     legacy_candidate_objective_float_ =
                         std::move(last_candidate_objective_float_);
+                    legacy_candidate_lane_state_ =
+                        std::move(last_candidate_lane_state_);
                     last_candidate_ready_ = false;
                     legacy_candidate_ready_ = true;
                     legacy_candidate_operator_ = 3;
@@ -11343,7 +11367,8 @@ public:
             throw std::runtime_error(
                 "full native search engine already has an active operation");
         }
-        if (!legacy_candidate_ready_ || last_candidate_ready_
+        if (!legacy_candidate_ready_ || !legacy_candidate_lane_state_.has_value()
+            || last_candidate_ready_
             || pending_composite_active_) {
             throw std::runtime_error(
                 "full native legacy lane has no prepared candidate to apply");
@@ -11366,6 +11391,7 @@ public:
             std::move(legacy_candidate_objective_integer_);
         last_candidate_objective_float_ =
             std::move(legacy_candidate_objective_float_);
+        last_candidate_lane_state_ = std::move(legacy_candidate_lane_state_);
         last_candidate_ready_ = true;
         legacy_candidate_ready_ = false;
         const auto comparison = last_candidate_comparison();
@@ -11653,6 +11679,8 @@ public:
                         std::move(last_candidate_objective_integer_);
                     legacy_candidate_objective_float_ =
                         std::move(last_candidate_objective_float_);
+                    legacy_candidate_lane_state_ =
+                        std::move(last_candidate_lane_state_);
                     last_candidate_ready_ = false;
                     legacy_candidate_ready_ = true;
                     legacy_candidate_operator_ = 1;
@@ -12037,14 +12065,20 @@ public:
                     throw std::logic_error(
                         "full native refinement lost its final feasible plan");
                 }
+                if (!last_candidate_lane_state_.has_value()
+                    || !legacy_candidate_lane_state_.has_value()) {
+                    throw std::logic_error(
+                        "full native refinement lost candidate ownership");
+                }
+                const auto objective_key = [](const auto& state) {
+                    return std::make_tuple(
+                        state.objective_integer[0], state.objective_float[0],
+                        state.objective_float[1], state.objective_integer[1]);
+                };
                 const auto refined_key =
-                    evrptw::formal_objective::key_from_arrays(
-                    last_candidate_objective_integer_,
-                    last_candidate_objective_float_);
+                    objective_key(*last_candidate_lane_state_);
                 const auto legacy_key =
-                    evrptw::formal_objective::key_from_arrays(
-                    legacy_candidate_objective_integer_,
-                    legacy_candidate_objective_float_);
+                    objective_key(*legacy_candidate_lane_state_);
                 commit_pending_composite_noexcept();
                 if (refined_key < legacy_key) {
                     legacy_candidate_offsets_ = std::move(last_candidate_offsets_);
@@ -12055,14 +12089,18 @@ public:
                         std::move(last_candidate_objective_integer_);
                     legacy_candidate_objective_float_ =
                         std::move(last_candidate_objective_float_);
+                    legacy_candidate_lane_state_ =
+                        std::move(last_candidate_lane_state_);
                     checked_data(metadata)[1] = 1;
                 }
+                last_candidate_lane_state_.reset();
                 last_candidate_ready_ = false;
             } catch (...) {
                 defer_composite_commit_ = false;
                 if (pending_composite_active_) {
                     rollback_pending_composite();
                 }
+                last_candidate_lane_state_.reset();
                 last_candidate_ready_ = false;
                 throw;
             }
@@ -12252,6 +12290,7 @@ public:
                     checked_data(outcome)[3] =
                         py::cast<std::int64_t>(acceptance[2]);
                 } else {
+                    last_candidate_lane_state_.reset();
                     last_candidate_ready_ = false;
                 }
                 accumulate_full_stage04_outcome_noexcept(
@@ -12768,6 +12807,7 @@ public:
                 pending.erase(pending.begin()
                     + static_cast<std::ptrdiff_t>(selected_customer));
                 if (!pending.empty()) {
+                    last_candidate_lane_state_.reset();
                     last_candidate_ready_ = false;
                     last_candidate_offsets_ = py::array_t<std::int64_t>();
                     last_candidate_indices_ = py::array_t<std::int64_t>();
@@ -12787,6 +12827,8 @@ public:
                 std::move(last_candidate_objective_integer_);
             legacy_candidate_objective_float_ =
                 std::move(last_candidate_objective_float_);
+            legacy_candidate_lane_state_ =
+                std::move(last_candidate_lane_state_);
             last_candidate_ready_ = false;
             legacy_candidate_ready_ = true;
             legacy_candidate_operator_ = 0;
@@ -12869,6 +12911,8 @@ public:
                 std::move(last_candidate_objective_integer_);
             auto selected_objective_float =
                 std::move(last_candidate_objective_float_);
+            auto selected_lane_state =
+                std::move(last_candidate_lane_state_);
             last_candidate_ready_ = false;
             const auto restore_selected = [&]() {
                 last_candidate_offsets_ = std::move(selected_offsets);
@@ -12878,6 +12922,8 @@ public:
                     std::move(selected_objective_integer);
                 last_candidate_objective_float_ =
                     std::move(selected_objective_float);
+                last_candidate_lane_state_ =
+                    std::move(selected_lane_state);
                 last_candidate_ready_ = true;
             };
             try {
@@ -12958,6 +13004,8 @@ public:
                 std::move(last_candidate_objective_integer_);
             legacy_candidate_objective_float_ =
                 std::move(last_candidate_objective_float_);
+            legacy_candidate_lane_state_ =
+                std::move(last_candidate_lane_state_);
             last_candidate_ready_ = false;
             legacy_candidate_ready_ = true;
             legacy_candidate_operator_ = 0;
@@ -13005,6 +13053,7 @@ public:
             std::move(last_candidate_objective_integer_);
         legacy_candidate_objective_float_ =
             std::move(last_candidate_objective_float_);
+        legacy_candidate_lane_state_ = std::move(last_candidate_lane_state_);
         last_candidate_ready_ = false;
         legacy_candidate_ready_ = true;
         legacy_candidate_operator_ = 0;
@@ -13693,6 +13742,7 @@ public:
             return output;
         };
         ScopeRollback discard_pending_legacy([this]() noexcept {
+            legacy_candidate_lane_state_.reset();
             legacy_candidate_ready_ = false;
             legacy_candidate_operator_ = -1;
             legacy_candidate_destroy_operator_ = -1;
@@ -13777,6 +13827,7 @@ public:
                     accumulate_full_stage04_outcome_noexcept(
                         2, false, 1, false, false, true);
                 }
+                legacy_candidate_lane_state_.reset();
                 legacy_candidate_ready_ = false;
                 legacy_candidate_operator_ = -1;
                 legacy_candidate_destroy_operator_ = -1;
@@ -13820,6 +13871,7 @@ public:
                     ++full_operator_totals_[13][0];
                 }
             }
+            legacy_candidate_lane_state_.reset();
             legacy_candidate_ready_ = false;
             legacy_candidate_operator_ = -1;
             legacy_candidate_destroy_operator_ = -1;
@@ -13982,6 +14034,7 @@ public:
             return output;
         };
         ScopeRollback discard_pending_legacy([this]() noexcept {
+            legacy_candidate_lane_state_.reset();
             legacy_candidate_ready_ = false;
             legacy_candidate_operator_ = -1;
             legacy_candidate_destroy_operator_ = -1;
@@ -14013,6 +14066,7 @@ public:
                     }
                 }
             }
+            legacy_candidate_lane_state_.reset();
             legacy_candidate_ready_ = false;
             legacy_candidate_operator_ = -1;
             legacy_candidate_destroy_operator_ = -1;
@@ -14178,6 +14232,7 @@ public:
                     ++full_operator_totals_[13][0];
                 }
             }
+            legacy_candidate_lane_state_.reset();
             legacy_candidate_ready_ = false;
             legacy_candidate_operator_ = -1;
             legacy_candidate_destroy_operator_ = -1;
@@ -14487,6 +14542,13 @@ public:
                     std::move(candidate_objective_integer);
                 last_candidate_objective_float_ =
                     std::move(candidate_objective_float);
+                last_candidate_lane_state_ = lane_state_from_mirror(
+                    last_candidate_offsets_, last_candidate_indices_,
+                    last_candidate_exact_payload_,
+                    last_candidate_objective_integer_,
+                    last_candidate_objective_float_);
+            } else {
+                last_candidate_lane_state_.reset();
             }
             last_candidate_ready_ = candidate_ready;
             suppress_attempted_plan_journal_ = false;
@@ -14507,7 +14569,7 @@ public:
             throw std::runtime_error(
                 "full native search engine already has an active operation");
         }
-        if (!last_candidate_ready_) {
+        if (!last_candidate_ready_ || !last_candidate_lane_state_.has_value()) {
             throw std::runtime_error(
                 "full native search engine has no prepared candidate to apply");
         }
@@ -14517,12 +14579,34 @@ public:
             throw std::invalid_argument(
                 "full native candidate acceptance inputs are invalid");
         }
-        const auto current_key = evrptw::formal_objective::key_from_arrays(
-            current_objective_integer_, current_objective_float_);
-        const auto candidate_key = evrptw::formal_objective::key_from_arrays(
-            last_candidate_objective_integer_, last_candidate_objective_float_);
-        const auto best_key = evrptw::formal_objective::key_from_arrays(
-            best_objective_integer_, best_objective_float_);
+        if (live_lane_mirror_tamper_injection_) {
+            live_lane_mirror_tamper_injection_ = false;
+            ++checked_data<std::int64_t>(current_objective_integer_)[0];
+        }
+        try {
+            validate_live_lane_mirrors();
+        } catch (...) {
+            for (std::size_t lane = 0; lane < live_lane_states_.size(); ++lane) {
+                publish_live_lane_mirror(lane);
+            }
+            throw;
+        }
+        validate_initial_lane_mirror(
+            *last_candidate_lane_state_, last_candidate_offsets_,
+            last_candidate_indices_, last_candidate_exact_payload_,
+            last_candidate_objective_integer_,
+            last_candidate_objective_float_, "live.candidate");
+        const auto objective_key = [](const auto& state) {
+            return std::make_tuple(
+                state.objective_integer[0], state.objective_float[0],
+                state.objective_float[1], state.objective_integer[1]);
+        };
+        const auto& current_state = live_lane_state(2);
+        const auto& candidate_state = *last_candidate_lane_state_;
+        const auto& best_state = live_lane_state(3);
+        const auto current_key = objective_key(current_state);
+        const auto candidate_key = objective_key(candidate_state);
+        const auto best_key = objective_key(best_state);
         const auto current_vehicles = std::get<0>(current_key);
         const auto candidate_vehicles = std::get<0>(candidate_key);
         bool accepted = false;
@@ -14533,56 +14617,26 @@ public:
             accepted = true;
         } else if (candidate_vehicles == current_vehicles
                    && std::get<1>(candidate_key) != std::get<1>(current_key)) {
-            const auto distance_delta =
-                checked_data<double>(last_candidate_objective_float_)[0]
-                - checked_data<double>(current_objective_float_)[0];
+            const auto distance_delta = candidate_state.objective_float[0]
+                - current_state.objective_float[0];
             accepted = random_draw < std::exp(-distance_delta / temperature);
         }
         const auto improved_best = accepted && candidate_key < best_key;
         const auto vehicle_reduction = accepted
             && candidate_vehicles < current_vehicles;
-        py::array_t<std::int64_t> next_current_offsets;
-        py::array_t<std::int64_t> next_current_indices;
-        py::tuple next_current_exact;
-        py::array_t<std::int64_t> next_current_objective_integer;
-        py::array_t<double> next_current_objective_float;
-        py::array_t<std::int64_t> next_best_offsets;
-        py::array_t<std::int64_t> next_best_indices;
-        py::tuple next_best_exact;
-        py::array_t<std::int64_t> next_best_objective_integer;
-        py::array_t<double> next_best_objective_float;
-        if (accepted) {
-            next_current_offsets = last_candidate_offsets_;
-            next_current_indices = last_candidate_indices_;
-            next_current_exact = last_candidate_exact_payload_;
-            next_current_objective_integer = last_candidate_objective_integer_;
-            next_current_objective_float = last_candidate_objective_float_;
-        }
-        if (improved_best) {
-            next_best_offsets = last_candidate_offsets_;
-            next_best_indices = last_candidate_indices_;
-            next_best_exact = last_candidate_exact_payload_;
-            next_best_objective_integer = last_candidate_objective_integer_;
-            next_best_objective_float = last_candidate_objective_float_;
-        }
         auto result = py::make_tuple(
             accepted ? 1 : 0,
             improved_best ? 1 : 0,
             vehicle_reduction ? 1 : 0);
         if (accepted) {
-            current_offsets_ = std::move(next_current_offsets);
-            current_indices_ = std::move(next_current_indices);
-            current_exact_payload_ = std::move(next_current_exact);
-            current_objective_integer_ = std::move(next_current_objective_integer);
-            current_objective_float_ = std::move(next_current_objective_float);
+            live_lane_states_[2] = candidate_state;
+            publish_live_lane_mirror(2);
         }
         if (improved_best) {
-            best_offsets_ = std::move(next_best_offsets);
-            best_indices_ = std::move(next_best_indices);
-            best_exact_payload_ = std::move(next_best_exact);
-            best_objective_integer_ = std::move(next_best_objective_integer);
-            best_objective_float_ = std::move(next_best_objective_float);
+            live_lane_states_[3] = candidate_state;
+            publish_live_lane_mirror(3);
         }
+        last_candidate_lane_state_.reset();
         last_candidate_ready_ = false;
         return result;
     }
@@ -15119,15 +15173,9 @@ public:
             && stage04_restart_count_ < stage04_max_restarts_
             && main_stagnation_iterations_
                 >= stage04_restart_stagnation_threshold_) {
-            legacy_offsets_ = owned_array_copy<std::int64_t>(
-                best_offsets_, "restart_best_offsets", 1);
-            legacy_indices_ = owned_array_copy<std::int64_t>(
-                best_indices_, "restart_best_indices", 1);
-            legacy_exact_payload_ = owned_exact_state_copy(best_exact_payload_);
-            legacy_objective_integer_ = owned_array_copy<std::int64_t>(
-                best_objective_integer_, "restart_best_objective_integer", 1);
-            legacy_objective_float_ = owned_array_copy<double>(
-                best_objective_float_, "restart_best_objective_float", 1);
+            validate_live_lane_mirrors();
+            live_lane_states_[0] = live_lane_state(3);
+            publish_live_lane_mirror(0);
             main_stagnation_iterations_ = 0;
             ++stage04_restart_count_;
             stage04_reheat_floor_ =
@@ -15344,20 +15392,17 @@ public:
             result[1] = probe;
             iteration_candidate_ready = last_candidate_ready_;
             if (iteration_candidate_ready) {
+                if (!last_candidate_lane_state_.has_value()) {
+                    throw std::logic_error(
+                        "full native constraint iteration lost candidate ownership");
+                }
+                const auto& candidate_state = *last_candidate_lane_state_;
+                const auto& current_state = live_lane_state(2);
                 const auto candidate_is_incumbent =
-                    last_candidate_offsets_.size() == current_offsets_.size()
-                    && last_candidate_indices_.size() == current_indices_.size()
-                    && std::equal(
-                        checked_data<std::int64_t>(last_candidate_offsets_),
-                        checked_data<std::int64_t>(last_candidate_offsets_)
-                            + last_candidate_offsets_.size(),
-                        checked_data<std::int64_t>(current_offsets_))
-                    && std::equal(
-                        checked_data<std::int64_t>(last_candidate_indices_),
-                        checked_data<std::int64_t>(last_candidate_indices_)
-                            + last_candidate_indices_.size(),
-                        checked_data<std::int64_t>(current_indices_));
+                    candidate_state.route_offsets == current_state.route_offsets
+                    && candidate_state.route_indices == current_state.route_indices;
                 if (candidate_is_incumbent) {
+                    last_candidate_lane_state_.reset();
                     last_candidate_ready_ = false;
                     iteration_candidate_ready = false;
                 }
@@ -15371,20 +15416,11 @@ public:
             require_deadline();
             std::int64_t comparison = 1;
             if (iteration_candidate_ready) {
-                const auto candidate_key =
-                    evrptw::formal_objective::key_from_arrays(
-                    last_candidate_objective_integer_,
-                    last_candidate_objective_float_);
-                const auto current_key =
-                    evrptw::formal_objective::key_from_arrays(
-                    current_objective_integer_, current_objective_float_);
-                comparison = candidate_key < current_key
-                    ? -1
-                    : candidate_key == current_key ? 0 : 1;
+                comparison = last_candidate_comparison();
             }
             if (iteration_candidate_ready && !budget_.budget_reached()) {
                 const auto current_distance =
-                    checked_data<double>(current_objective_float_)[0];
+                    live_lane_state(2).objective_float[0];
                 const auto applied = apply_last_candidate(
                     std::max(1.0, current_distance * 0.05), 0.0);
                 outcome_values[2] = 1;
@@ -15392,6 +15428,7 @@ public:
                 outcome_values[4] = PyLong_AS_LONG(applied[1].ptr());
                 outcome_values[5] = PyLong_AS_LONG(applied[2].ptr());
             } else if (iteration_candidate_ready) {
+                last_candidate_lane_state_.reset();
                 last_candidate_ready_ = false;
             }
             const auto accepted = outcome_values[3] != 0;
@@ -15421,6 +15458,7 @@ public:
                 rollback_pending_composite();
             }
             if (iteration_candidate_ready) {
+                last_candidate_lane_state_.reset();
                 last_candidate_ready_ = false;
             }
             throw;
@@ -15928,6 +15966,13 @@ public:
         auto previous_indices = current_indices_;
         struct GlobalSearchSnapshot {
             NativeBudgetStateV2::NativeSnapshot budget;
+            std::array<
+                std::optional<evrptw::native_search::LaneStateV2>, 4>
+                live_lanes;
+            std::optional<evrptw::native_search::LaneStateV2>
+                last_candidate_lane;
+            std::optional<evrptw::native_search::LaneStateV2>
+                legacy_candidate_lane;
             py::array_t<std::int64_t> current_offsets;
             py::array_t<std::int64_t> current_indices;
             py::tuple current_exact;
@@ -15957,6 +16002,8 @@ public:
         };
         GlobalSearchSnapshot snapshot{
             entry_budget,
+            live_lane_states_, last_candidate_lane_state_,
+            legacy_candidate_lane_state_,
             current_offsets_, current_indices_, current_exact_payload_,
             current_objective_integer_, current_objective_float_,
             best_offsets_, best_indices_, best_exact_payload_,
@@ -15978,6 +16025,11 @@ public:
                 }
                 budget_.rollback_outer_preserving_exact_noexcept(snapshot.budget);
                 causal_journal_.rollback_noexcept(snapshot.causal);
+                live_lane_states_ = std::move(snapshot.live_lanes);
+                last_candidate_lane_state_ =
+                    std::move(snapshot.last_candidate_lane);
+                legacy_candidate_lane_state_ =
+                    std::move(snapshot.legacy_candidate_lane);
                 defer_composite_commit_ = false;
                 defer_iteration_commit_ = false;
                 defer_global_commit_ = false;
@@ -16480,6 +16532,19 @@ public:
         candidate_round_mirror_tamper_injection_ = true;
     }
 
+    void inject_live_lane_mirror_tamper_once() {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (!initialized_ || live_lane_mirror_tamper_injection_) {
+            throw std::runtime_error(
+                "full native live-lane mirror injection is invalid");
+        }
+        live_lane_mirror_tamper_injection_ = true;
+    }
+
     void inject_constraint_search_deadline_after_completed_once(
         std::int64_t completed_iterations) {
         std::unique_lock state_lock(state_mutex_, std::try_to_lock);
@@ -16586,23 +16651,18 @@ public:
             throw std::runtime_error(
                 "full native search engine must be initialized before solution inspection");
         }
+        validate_live_lane_mirrors();
+        const auto& current = live_lane_state(2);
+        const auto& best = live_lane_state(3);
         return py::make_tuple(
-            owned_array_copy<std::int64_t>(
-                current_offsets_, "current_route_offsets", 1),
-            owned_array_copy<std::int64_t>(
-                current_indices_, "current_route_indices", 1),
-            owned_array_copy<std::int64_t>(
-                current_objective_integer_, "current_objective_integer", 1),
-            owned_array_copy<double>(
-                current_objective_float_, "current_objective_float", 1),
-            owned_array_copy<std::int64_t>(
-                best_offsets_, "best_route_offsets", 1),
-            owned_array_copy<std::int64_t>(
-                best_indices_, "best_route_indices", 1),
-            owned_array_copy<std::int64_t>(
-                best_objective_integer_, "best_objective_integer", 1),
-            owned_array_copy<double>(
-                best_objective_float_, "best_objective_float", 1));
+            lane_vector_array(current.route_offsets),
+            lane_vector_array(current.route_indices),
+            lane_fixed_array(current.objective_integer),
+            lane_fixed_array(current.objective_float),
+            lane_vector_array(best.route_offsets),
+            lane_vector_array(best.route_indices),
+            lane_fixed_array(best.objective_integer),
+            lane_fixed_array(best.objective_float));
     }
 
     py::tuple lane_solution_state(std::int64_t lane) const {
@@ -16615,20 +16675,20 @@ public:
             throw std::invalid_argument(
                 "full native lane solution inspection is invalid");
         }
-        const auto* offsets = lane == 0 ? &legacy_offsets_
-            : lane == 1 ? &quality_offsets_ : &current_offsets_;
-        const auto* indices = lane == 0 ? &legacy_indices_
-            : lane == 1 ? &quality_indices_ : &current_indices_;
-        const auto* objective_integer = lane == 0 ? &legacy_objective_integer_
-            : lane == 1 ? &quality_objective_integer_ : &current_objective_integer_;
-        const auto* objective_float = lane == 0 ? &legacy_objective_float_
-            : lane == 1 ? &quality_objective_float_ : &current_objective_float_;
+        validate_live_lane_mirrors();
+        const auto& state = live_lane_state(static_cast<std::size_t>(lane));
+        auto objective_integer = py::array_t<std::int64_t>(2);
+        std::copy(
+            state.objective_integer.begin(), state.objective_integer.end(),
+            checked_data(objective_integer));
+        auto objective_float = py::array_t<double>(2);
+        std::copy(
+            state.objective_float.begin(), state.objective_float.end(),
+            checked_data(objective_float));
         return py::make_tuple(
-            owned_array_copy<std::int64_t>(*offsets, "lane_route_offsets", 1),
-            owned_array_copy<std::int64_t>(*indices, "lane_route_indices", 1),
-            owned_array_copy<std::int64_t>(
-                *objective_integer, "lane_objective_integer", 1),
-            owned_array_copy<double>(*objective_float, "lane_objective_float", 1));
+            lane_vector_array(state.route_offsets),
+            lane_vector_array(state.route_indices),
+            std::move(objective_integer), std::move(objective_float));
     }
 
     py::tuple best_solution_payload() const {
@@ -16641,16 +16701,20 @@ public:
             throw std::runtime_error(
                 "full native search engine must be initialized before best inspection");
         }
+        validate_live_lane_mirrors();
+        const auto& best = live_lane_state(3);
+        auto objective_integer = py::array_t<std::int64_t>(2);
+        std::copy(
+            best.objective_integer.begin(), best.objective_integer.end(),
+            checked_data(objective_integer));
+        auto objective_float = py::array_t<double>(2);
+        std::copy(
+            best.objective_float.begin(), best.objective_float.end(),
+            checked_data(objective_float));
         return py::make_tuple(
-            owned_array_copy<std::int64_t>(
-                best_offsets_, "best_route_offsets", 1),
-            owned_array_copy<std::int64_t>(
-                best_indices_, "best_route_indices", 1),
-            owned_exact_state_copy(best_exact_payload_),
-            owned_array_copy<std::int64_t>(
-                best_objective_integer_, "best_objective_integer", 1),
-            owned_array_copy<double>(
-                best_objective_float_, "best_objective_float", 1));
+            lane_vector_array(best.route_offsets),
+            lane_vector_array(best.route_indices), lane_exact_payload(best),
+            std::move(objective_integer), std::move(objective_float));
     }
 
     py::tuple exact_backend_metrics_payload() const {
@@ -16978,9 +17042,12 @@ private:
         const py::array_t<std::int64_t>& objective_integer,
         const py::array_t<double>& objective_float,
         std::string_view lane) const {
-        if (exact.size() != 7) {
+        const auto expected_exact_size =
+            expected.exact.batch_counters.empty() ? py::ssize_t{6}
+                                                  : py::ssize_t{7};
+        if (exact.size() != expected_exact_size) {
             throw std::logic_error(
-                "full native initial search-state exact mirror is invalid");
+                "full native search-state exact mirror is invalid");
         }
         const auto route_count = static_cast<py::ssize_t>(
             expected.route_offsets.size() - 1);
@@ -17016,9 +17083,6 @@ private:
         const auto labels = checked(
             exact[5], std::string(lane) + ".exact.label_counters", 2,
             std::int64_t{});
-        const auto batch_counters = checked(
-            exact[6], std::string(lane) + ".exact.batch_counters", 1,
-            std::int64_t{});
         const auto objective_integer_checked = checked(
             objective_integer, std::string(lane) + ".objective_integer", 1,
             std::int64_t{});
@@ -17051,9 +17115,14 @@ private:
         require_initial_mirror_equal(
             labels, expected.exact.label_counters,
             std::string(lane) + ".exact.label_counters");
-        require_initial_mirror_equal(
-            batch_counters, expected.exact.batch_counters,
-            std::string(lane) + ".exact.batch_counters");
+        if (expected_exact_size == 7) {
+            const auto batch_counters = checked(
+                exact[6], std::string(lane) + ".exact.batch_counters", 1,
+                std::int64_t{});
+            require_initial_mirror_equal(
+                batch_counters, expected.exact.batch_counters,
+                std::string(lane) + ".exact.batch_counters");
+        }
         require_initial_mirror_equal(
             objective_integer_checked, expected.objective_integer,
             std::string(lane) + ".objective_integer");
@@ -17090,6 +17159,25 @@ private:
             initial_four_lane_state_->global_best,
             best_offsets_, best_indices_, best_exact_payload_,
             best_objective_integer_, best_objective_float_, "global_best");
+    }
+
+    void validate_live_lane_mirrors() const {
+        validate_initial_lane_mirror(
+            live_lane_state(2), current_offsets_, current_indices_,
+            current_exact_payload_, current_objective_integer_,
+            current_objective_float_, "live.constraint");
+        validate_initial_lane_mirror(
+            live_lane_state(0), legacy_offsets_, legacy_indices_,
+            legacy_exact_payload_, legacy_objective_integer_,
+            legacy_objective_float_, "live.legacy");
+        validate_initial_lane_mirror(
+            live_lane_state(1), quality_offsets_, quality_indices_,
+            quality_exact_payload_, quality_objective_integer_,
+            quality_objective_float_, "live.quality_shadow");
+        validate_initial_lane_mirror(
+            live_lane_state(3), best_offsets_, best_indices_,
+            best_exact_payload_, best_objective_integer_,
+            best_objective_float_, "live.global_best");
     }
 
     struct ExactJournalBatch {
@@ -17356,6 +17444,7 @@ private:
     bool global_search_envelope_failure_injection_ = false;
     std::int64_t initial_mirror_schema_failure_injection_ = 0;
     bool candidate_round_mirror_tamper_injection_ = false;
+    bool live_lane_mirror_tamper_injection_ = false;
     std::int64_t constraint_search_deadline_after_completed_injection_ = -1;
     bool defer_composite_commit_ = false;
     bool defer_iteration_commit_ = false;
@@ -17380,6 +17469,12 @@ private:
     std::optional<evrptw::native_search::RequestV2> owned_request_;
     std::optional<evrptw::native_search::InitialFourLaneStateV2>
         initial_four_lane_state_;
+    std::array<std::optional<evrptw::native_search::LaneStateV2>, 4>
+        live_lane_states_;
+    std::optional<evrptw::native_search::LaneStateV2>
+        last_candidate_lane_state_;
+    std::optional<evrptw::native_search::LaneStateV2>
+        legacy_candidate_lane_state_;
     std::string initial_request_sha256_;
     std::string initial_state_sha256_;
     std::string initial_four_lane_state_sha256_;
@@ -17733,6 +17828,10 @@ private:
         last_candidate_objective_integer_ =
             std::move(candidate_objective_integer);
         last_candidate_objective_float_ = std::move(candidate_objective_float);
+        last_candidate_lane_state_ = lane_state_from_mirror(
+            last_candidate_offsets_, last_candidate_indices_,
+            last_candidate_exact_payload_, last_candidate_objective_integer_,
+            last_candidate_objective_float_);
         last_candidate_ready_ = true;
         return plan_id;
     }
@@ -17777,14 +17876,17 @@ private:
     }
 
     [[nodiscard]] std::int64_t last_candidate_comparison() const {
-        if (!last_candidate_ready_) {
+        if (!last_candidate_ready_ || !last_candidate_lane_state_.has_value()) {
             throw std::logic_error(
                 "full native candidate comparison has no prepared candidate");
         }
-        const auto candidate = evrptw::formal_objective::key_from_arrays(
-            last_candidate_objective_integer_, last_candidate_objective_float_);
-        const auto current = evrptw::formal_objective::key_from_arrays(
-            current_objective_integer_, current_objective_float_);
+        const auto objective_key = [](const auto& state) {
+            return std::make_tuple(
+                state.objective_integer[0], state.objective_float[0],
+                state.objective_float[1], state.objective_integer[1]);
+        };
+        const auto candidate = objective_key(*last_candidate_lane_state_);
+        const auto current = objective_key(live_lane_state(2));
         return candidate < current ? -1 : candidate == current ? 0 : 1;
     }
 
@@ -17916,7 +18018,180 @@ private:
             owned_array_copy<std::int64_t>(payload[6], "batch_counters", 1));
     }
 
+    template <typename T>
+    static py::array_t<T> lane_vector_array(const std::vector<T>& values) {
+        py::array_t<T> output(values.size());
+        std::copy(values.begin(), values.end(), checked_data(output));
+        return output;
+    }
+
+    template <typename T, std::size_t Size>
+    static py::array_t<T> lane_fixed_array(
+        const std::array<T, Size>& values) {
+        py::array_t<T> output(Size);
+        std::copy(values.begin(), values.end(), checked_data(output));
+        return output;
+    }
+
+    static py::tuple lane_exact_payload(
+        const evrptw::native_search::LaneStateV2& state) {
+        const auto route_count = static_cast<py::ssize_t>(
+            state.exact.statuses.size());
+        auto path_offsets = lane_vector_array(state.exact.path_offsets);
+        auto path_indices = lane_vector_array(state.exact.path_indices);
+        auto statuses = lane_vector_array(state.exact.statuses);
+        auto reasons = lane_vector_array(state.exact.reasons);
+        py::array_t<double> metrics({route_count, py::ssize_t{4}});
+        std::copy(
+            state.exact.metrics.begin(), state.exact.metrics.end(),
+            checked_data(metrics));
+        py::array_t<std::int64_t> labels({route_count, py::ssize_t{3}});
+        std::copy(
+            state.exact.label_counters.begin(),
+            state.exact.label_counters.end(), checked_data(labels));
+        if (state.exact.batch_counters.empty()) {
+            return py::make_tuple(
+                std::move(path_offsets), std::move(path_indices),
+                std::move(statuses), std::move(reasons), std::move(metrics),
+                std::move(labels));
+        }
+        return py::make_tuple(
+            std::move(path_offsets), std::move(path_indices),
+            std::move(statuses), std::move(reasons), std::move(metrics),
+            std::move(labels), lane_vector_array(state.exact.batch_counters));
+    }
+
+    static evrptw::native_search::LaneStateV2 lane_state_from_mirror(
+        py::handle route_offsets,
+        py::handle route_indices,
+        const py::tuple& exact,
+        py::handle objective_integer,
+        py::handle objective_float) {
+        auto offsets = checked_array<std::int64_t>(
+            route_offsets, "live_lane.route_offsets", 1);
+        auto indices = checked_array<std::int64_t>(
+            route_indices, "live_lane.route_indices", 1);
+        auto integers = checked_array<std::int64_t>(
+            objective_integer, "live_lane.objective_integer", 1);
+        auto floats = checked_array<double>(
+            objective_float, "live_lane.objective_float", 1);
+        if ((exact.size() != 6 && exact.size() != 7)
+            || offsets.size() < 2 || integers.size() != 2
+            || floats.size() != 2) {
+            throw std::logic_error(
+                "full native live lane mirror has an invalid schema");
+        }
+        auto path_offsets = checked_array<std::int64_t>(
+            exact[0], "live_lane.path_offsets", 1);
+        auto path_indices = checked_array<std::int64_t>(
+            exact[1], "live_lane.path_indices", 1);
+        auto statuses = checked_array<std::int64_t>(
+            exact[2], "live_lane.statuses", 1);
+        auto reasons = checked_array<std::int64_t>(
+            exact[3], "live_lane.reasons", 1);
+        auto metrics = checked_array<double>(
+            exact[4], "live_lane.metrics", 2);
+        auto labels = checked_array<std::int64_t>(
+            exact[5], "live_lane.label_counters", 2);
+        const auto route_count = static_cast<py::ssize_t>(offsets.size() - 1);
+        if (path_offsets.size() != route_count + 1
+            || statuses.size() != route_count || reasons.size() != route_count
+            || metrics.shape(0) != route_count || metrics.shape(1) != 4
+            || labels.shape(0) != route_count || labels.shape(1) != 3) {
+            throw std::logic_error(
+                "full native live lane exact mirror has an invalid shape");
+        }
+        const auto copy_i64 = [](const py::array_t<std::int64_t>& array) {
+            return std::vector<std::int64_t>(
+                checked_data<std::int64_t>(array),
+                checked_data<std::int64_t>(array) + array.size());
+        };
+        const auto copy_f64 = [](const py::array_t<double>& array) {
+            return std::vector<double>(
+                checked_data<double>(array),
+                checked_data<double>(array) + array.size());
+        };
+        evrptw::native_search::LaneStateV2 state;
+        state.route_offsets = copy_i64(offsets);
+        state.route_indices = copy_i64(indices);
+        state.exact.path_offsets = copy_i64(path_offsets);
+        state.exact.path_indices = copy_i64(path_indices);
+        state.exact.statuses = copy_i64(statuses);
+        state.exact.reasons = copy_i64(reasons);
+        state.exact.metrics = copy_f64(metrics);
+        state.exact.label_counters = copy_i64(labels);
+        if (exact.size() == 7) {
+            state.exact.batch_counters = copy_i64(
+                checked_array<std::int64_t>(
+                    exact[6], "live_lane.batch_counters", 1));
+        }
+        std::copy(
+            checked_data<std::int64_t>(integers),
+            checked_data<std::int64_t>(integers) + 2,
+            state.objective_integer.begin());
+        std::copy(
+            checked_data<double>(floats), checked_data<double>(floats) + 2,
+            state.objective_float.begin());
+        return state;
+    }
+
+    [[nodiscard]] const evrptw::native_search::LaneStateV2&
+    live_lane_state(std::size_t lane) const {
+        if (lane >= live_lane_states_.size()
+            || !live_lane_states_[lane].has_value()) {
+            throw std::logic_error(
+                "full native live lane has no C++-owned state");
+        }
+        if (owned_request_.has_value()) {
+            live_lane_states_[lane]->validate_live(owned_request_->problem);
+        }
+        return *live_lane_states_[lane];
+    }
+
+    void publish_live_lane_mirror(std::size_t lane) {
+        const auto& state = live_lane_state(lane);
+        auto offsets = lane_vector_array(state.route_offsets);
+        auto indices = lane_vector_array(state.route_indices);
+        auto exact = lane_exact_payload(state);
+        py::array_t<std::int64_t> objective_integer(2);
+        std::copy(
+            state.objective_integer.begin(), state.objective_integer.end(),
+            checked_data(objective_integer));
+        py::array_t<double> objective_float(2);
+        std::copy(
+            state.objective_float.begin(), state.objective_float.end(),
+            checked_data(objective_float));
+        if (lane == 0) {
+            legacy_offsets_ = std::move(offsets);
+            legacy_indices_ = std::move(indices);
+            legacy_exact_payload_ = std::move(exact);
+            legacy_objective_integer_ = std::move(objective_integer);
+            legacy_objective_float_ = std::move(objective_float);
+        } else if (lane == 1) {
+            quality_offsets_ = std::move(offsets);
+            quality_indices_ = std::move(indices);
+            quality_exact_payload_ = std::move(exact);
+            quality_objective_integer_ = std::move(objective_integer);
+            quality_objective_float_ = std::move(objective_float);
+        } else if (lane == 2) {
+            current_offsets_ = std::move(offsets);
+            current_indices_ = std::move(indices);
+            current_exact_payload_ = std::move(exact);
+            current_objective_integer_ = std::move(objective_integer);
+            current_objective_float_ = std::move(objective_float);
+        } else if (lane == 3) {
+            best_offsets_ = std::move(offsets);
+            best_indices_ = std::move(indices);
+            best_exact_payload_ = std::move(exact);
+            best_objective_integer_ = std::move(objective_integer);
+            best_objective_float_ = std::move(objective_float);
+        } else {
+            throw std::logic_error("full native live lane identity is invalid");
+        }
+    }
+
     void swap_active_with_lane_noexcept(std::int64_t lane) noexcept {
+        std::swap(live_lane_states_[2], live_lane_states_[lane]);
         if (lane == 0) {
             std::swap(current_offsets_, legacy_offsets_);
             std::swap(current_indices_, legacy_indices_);
@@ -20239,6 +20514,9 @@ PYBIND11_MODULE(_core, module) {
         .def(
             "inject_candidate_round_mirror_tamper_once",
             &NativeSearchEngineV2::inject_candidate_round_mirror_tamper_once)
+        .def(
+            "inject_live_lane_mirror_tamper_once",
+            &NativeSearchEngineV2::inject_live_lane_mirror_tamper_once)
         .def(
             "inject_constraint_probe_envelope_failure_once",
             &NativeSearchEngineV2::inject_constraint_probe_envelope_failure_once)
