@@ -589,6 +589,7 @@ void handle_connection(
         auto injected_fault = request_fault;
         if (!test_request && allow_fault_injection
             && !production_fault.empty()
+            && production_fault != "exact_path_offset_oob"
             && !production_fault_consumed.exchange(
                 true, std::memory_order_acq_rel)) {
             injected_fault = production_fault;
@@ -614,6 +615,14 @@ void handle_connection(
         const protocol::PayloadView input_view(input.address(), input.size());
         if (input_view.header().request_id != request_id) {
             throw std::runtime_error("native scheduler request identity mismatch");
+        }
+        if (!test_request && allow_fault_injection
+            && production_fault == "exact_path_offset_oob"
+            && input_view.header().operation
+                == protocol::KernelOperation::exact_charging
+            && !production_fault_consumed.exchange(
+                true, std::memory_order_acq_rel)) {
+            injected_fault = production_fault;
         }
         if (injected_fault == "worker_exception") {
             throw std::runtime_error(
@@ -642,6 +651,21 @@ void handle_connection(
                 || output_view.descriptor(0).count < 2) {
                 throw std::runtime_error(
                     "injected initial-state corruption has the wrong operation");
+            }
+            const auto& offsets = output_view.descriptor(0);
+            auto* offset_values = reinterpret_cast<std::int64_t*>(
+                output_bytes.data() + offsets.offset);
+            offset_values[offsets.count - 1] = static_cast<std::int64_t>(
+                output_view.descriptor(1).count + 1);
+        }
+        if (injected_fault == "exact_path_offset_oob") {
+            const protocol::PayloadView output_view(
+                output_bytes.data(), output_bytes.size());
+            if (output_view.header().operation
+                    != protocol::KernelOperation::exact_charging
+                || output_view.descriptor(0).count < 1) {
+                throw std::runtime_error(
+                    "injected exact corruption has the wrong operation");
             }
             const auto& offsets = output_view.descriptor(0);
             auto* offset_values = reinterpret_cast<std::int64_t*>(
@@ -751,7 +775,8 @@ int main(int argc, char** argv) {
             && (!allow_fault_injection
                 || (production_fault != "pause_before_execute"
                     && production_fault
-                        != "initial_state_path_offset_oob"))) {
+                        != "initial_state_path_offset_oob"
+                    && production_fault != "exact_path_offset_oob"))) {
             throw std::invalid_argument(
                 "native scheduler production fault is invalid");
         }

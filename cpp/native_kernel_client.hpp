@@ -496,6 +496,47 @@ inline kernels::ExactBatchOutput exact_charging(
         || output.header().array_count != 8) {
         throw std::runtime_error("native exact output schema is invalid");
     }
+    const auto one_dimensional = [&](const std::size_t index,
+                                     const protocol::NumericType type,
+                                     const std::uint64_t count) {
+        const auto& item = output.descriptor(index);
+        return item.type == type && item.dimensions == 1
+            && item.count == count && item.shape[0] == count
+            && item.shape[1] == 0;
+    };
+    const auto two_dimensional = [&](const std::size_t index,
+                                     const protocol::NumericType type,
+                                     const std::uint64_t first,
+                                     const std::uint64_t second) {
+        const auto& item = output.descriptor(index);
+        return item.type == type && item.dimensions == 2
+            && item.count == first * second && item.shape[0] == first
+            && item.shape[1] == second;
+    };
+    const auto& path_descriptor = output.descriptor(1);
+    if (!one_dimensional(
+            0, protocol::NumericType::int64,
+            static_cast<std::uint64_t>(route_count + 1))
+        || path_descriptor.type != protocol::NumericType::int64
+        || path_descriptor.dimensions != 1
+        || path_descriptor.shape[0] != path_descriptor.count
+        || path_descriptor.shape[1] != 0
+        || !one_dimensional(
+            2, protocol::NumericType::int64,
+            static_cast<std::uint64_t>(route_count))
+        || !one_dimensional(
+            3, protocol::NumericType::int64,
+            static_cast<std::uint64_t>(route_count))
+        || !two_dimensional(
+            4, protocol::NumericType::float64,
+            static_cast<std::uint64_t>(route_count), 4)
+        || !two_dimensional(
+            5, protocol::NumericType::int64,
+            static_cast<std::uint64_t>(route_count), 3)
+        || !one_dimensional(6, protocol::NumericType::int64, 10)
+        || !one_dimensional(7, protocol::NumericType::float64, 4)) {
+        throw std::runtime_error("native exact output schema is invalid");
+    }
     kernels::ExactBatchOutput result;
     const auto copy_int64 = [&](std::size_t index) {
         const auto count = static_cast<std::size_t>(output.descriptor(index).count);
@@ -510,15 +551,24 @@ inline kernels::ExactBatchOutput exact_charging(
     };
     result.path_offsets = copy_int64(0);
     result.path_indices = copy_int64(1);
-    if (!result.path_offsets.empty()) {
-        result.path_indices.resize(
-            static_cast<std::size_t>(result.path_offsets.back()));
-    }
     result.statuses = copy_int64(2);
     result.reasons = copy_int64(3);
     result.metrics = copy_float64(4);
     result.label_counters = copy_int64(5);
     result.batch_counters = copy_int64(6);
+    std::int64_t depot = -1;
+    for (std::size_t node = 0; node < node_count; ++node) {
+        if (node_kinds[node] == kernels::depot_kind) {
+            if (depot >= 0) {
+                throw std::runtime_error(
+                    "native exact output schema is invalid: request has multiple depots");
+            }
+            depot = static_cast<std::int64_t>(node);
+        }
+    }
+    kernels::validate_exact_batch_output(
+        result, node_kinds, order_offsets, order_indices, node_count,
+        route_count, order_count, depot, batch_size);
     record_telemetry(output, 7);
     acknowledge(socket, response);
     return result;

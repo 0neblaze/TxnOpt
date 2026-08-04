@@ -8,6 +8,8 @@
 #include <optional>
 #include <queue>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -420,6 +422,137 @@ ExactBatchOutput run_exact_charging_batch(
     }
     output.batch_counters[3] = static_cast<std::int64_t>(route_count) - output.batch_counters[2];
     return output;
+}
+
+inline void validate_exact_batch_output(
+    const ExactBatchOutput& output,
+    const std::int64_t* node_kinds,
+    const std::int64_t* order_offsets,
+    const std::int64_t* order_indices,
+    const std::size_t node_count,
+    const std::size_t route_count,
+    const std::size_t order_count,
+    const std::int64_t depot,
+    const std::int64_t batch_size) {
+    const auto invalid = [](const std::string_view detail) {
+        throw std::runtime_error(
+            "native exact output schema is invalid: " + std::string(detail));
+    };
+    if (node_kinds == nullptr || order_offsets == nullptr
+        || (order_count > 0 && order_indices == nullptr)
+        || node_count == 0 || depot < 0
+        || static_cast<std::size_t>(depot) >= node_count
+        || node_kinds[static_cast<std::size_t>(depot)] != depot_kind
+        || batch_size <= 0 || order_offsets[0] != 0
+        || order_offsets[route_count] != static_cast<std::int64_t>(order_count)) {
+        invalid("request identity is inconsistent");
+    }
+    if (output.path_offsets.size() != route_count + 1
+        || output.statuses.size() != route_count
+        || output.reasons.size() != route_count
+        || output.metrics.size() != route_count * 4
+        || output.label_counters.size() != route_count * 3
+        || output.batch_counters.size() != 10
+        || output.path_offsets.front() != 0
+        || output.path_offsets.back()
+            != static_cast<std::int64_t>(output.path_indices.size())) {
+        invalid("array extents do not align");
+    }
+    const auto& counters = output.batch_counters;
+    if (std::any_of(counters.begin(), counters.end(), [](const auto value) {
+            return value < 0;
+        })
+        || counters[0] != static_cast<std::int64_t>(route_count)
+        || counters[1] != static_cast<std::int64_t>(route_count)
+        || counters[1] != counters[2] + counters[3]
+        || counters[4] != counters[8]
+        || counters[8] != (route_count == 0 ? 0 : 1)
+        || counters[9] != batch_size) {
+        invalid("batch counters are inconsistent");
+    }
+    std::int64_t completed = 0;
+    std::int64_t interrupted = 0;
+    for (std::size_t route = 0; route < route_count; ++route) {
+        const auto order_begin = order_offsets[route];
+        const auto order_end = order_offsets[route + 1];
+        if (order_begin < 0 || order_begin > order_end
+            || order_end > static_cast<std::int64_t>(order_count)) {
+            invalid("request route offsets are inconsistent");
+        }
+        for (auto position = order_begin; position < order_end; ++position) {
+            const auto node = order_indices[position];
+            if (node < 0 || static_cast<std::size_t>(node) >= node_count
+                || node_kinds[static_cast<std::size_t>(node)] != customer_kind) {
+                invalid("request customer order is invalid");
+            }
+        }
+        const auto path_begin = output.path_offsets[route];
+        const auto path_end = output.path_offsets[route + 1];
+        if (path_begin < 0 || path_begin > path_end
+            || path_end > static_cast<std::int64_t>(output.path_indices.size())) {
+            invalid("path offsets are not monotonic");
+        }
+        for (std::size_t field = 0; field < 3; ++field) {
+            if (output.label_counters[route * 3 + field] < 0) {
+                invalid("label counters are negative");
+            }
+        }
+        const auto status = output.statuses[route];
+        const auto reason = output.reasons[route];
+        const auto* metrics = output.metrics.data() + route * 4;
+        if (status == feasible_status) {
+            ++completed;
+            if (reason != no_failure_reason || path_end - path_begin < 2
+                || output.path_indices[static_cast<std::size_t>(path_begin)] != depot
+                || output.path_indices[static_cast<std::size_t>(path_end - 1)] != depot
+                || std::any_of(metrics, metrics + 4, [](const auto value) {
+                    return !std::isfinite(value) || value < 0.0;
+                })) {
+                invalid("feasible result fields are inconsistent");
+            }
+            auto customer_position = order_begin;
+            for (auto position = path_begin + 1; position < path_end - 1; ++position) {
+                const auto node = output.path_indices[static_cast<std::size_t>(position)];
+                if (node < 0 || static_cast<std::size_t>(node) >= node_count
+                    || node_kinds[static_cast<std::size_t>(node)] == depot_kind) {
+                    invalid("feasible path contains an invalid interior node");
+                }
+                if (node_kinds[static_cast<std::size_t>(node)] == customer_kind) {
+                    if (customer_position >= order_end
+                        || order_indices[customer_position] != node) {
+                        invalid("feasible path changed the customer order");
+                    }
+                    ++customer_position;
+                } else if (node_kinds[static_cast<std::size_t>(node)] != station_kind) {
+                    invalid("feasible path contains an unknown node kind");
+                }
+            }
+            if (customer_position != order_end) {
+                invalid("feasible path omitted a customer");
+            }
+        } else if (status == infeasible_status) {
+            ++completed;
+            if (reason != no_feasible_pattern_reason || path_begin != path_end
+                || !std::isinf(metrics[0]) || metrics[0] < 0.0
+                || metrics[1] != 0.0 || metrics[2] != 0.0
+                || metrics[3] != 0.0) {
+                invalid("infeasible result fields are inconsistent");
+            }
+        } else if (status == interrupted_status) {
+            ++interrupted;
+            if (reason != deadline_reason || path_begin != path_end
+                || std::any_of(metrics, metrics + 4, [](const auto value) {
+                    return !std::isfinite(value) || value != 0.0;
+                })) {
+                invalid("interrupted result fields are inconsistent");
+            }
+        } else {
+            invalid("status code is unknown");
+        }
+    }
+    if (completed != counters[2] || interrupted != counters[3]) {
+        invalid("result states do not reconcile with batch counters");
+    }
 }
 constexpr std::int64_t screen_reason_none = 0;
 constexpr std::int64_t screen_reason_structure = 1;

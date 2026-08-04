@@ -613,6 +613,9 @@ class NativeSearchEngineV2:
         int,
         npt.NDArray[np.int64],
     ]: ...
+    def cache_execution_coverage_receipt(
+        self,
+    ) -> tuple[npt.NDArray[np.int64], str]: ...
     def solution_state(
         self,
     ) -> tuple[

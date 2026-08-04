@@ -49,6 +49,7 @@ class NativeHostScheduler:
             None,
             "pause_before_execute",
             "initial_state_path_offset_oob",
+            "exact_path_offset_oob",
         }:
             raise ValueError("native scheduler production fault is invalid")
         if self.production_fault is not None and not self.enable_fault_injection:

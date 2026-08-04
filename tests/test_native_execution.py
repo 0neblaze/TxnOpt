@@ -2502,6 +2502,68 @@ def test_native_search_engine_plan_transaction_matches_python_across_rounds(
     native_plan_transaction_receipts[worker_count] = receipt
 
 
+def test_native_plan_transaction_reports_typed_cache_execution_coverage() -> None:
+    """The lifetime receipt reports typed-path coverage without claiming ownership."""
+
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = _native_search_engine(
+        native_core,
+        context,
+        10,
+        2,
+        16,
+        1_000_000,
+        16,
+        1,
+        context.reachability_epsilon,
+        1,
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+
+    initial_flags, initial_digest = engine.cache_execution_coverage_receipt()
+    assert initial_flags.tolist() == [0, 0, 0, 0, 0]
+    assert initial_digest == hashlib.sha256(
+        b"stage05.2-native-cache-execution-coverage-v1" + initial_flags.tobytes()
+    ).hexdigest()
+
+    transaction = engine.evaluate_plans(
+        np.asarray([0, 1], dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([2, 1], dtype=np.int64),
+        np.asarray([2, 3, 7], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+    )
+    assert transaction[0].tolist() == [0]
+
+    flags, digest = engine.cache_execution_coverage_receipt()
+    # negative lookup, exact-cache lookup, exact dispatch, exact-cache store,
+    # typed terminal-state projection complete.  The last flag deliberately
+    # remains false until the Python-facing snapshot projection is migrated.
+    assert flags.tolist() == [1, 1, 1, 1, 0]
+    assert digest == hashlib.sha256(
+        b"stage05.2-native-cache-execution-coverage-v1" + flags.tobytes()
+    ).hexdigest()
+
+
 def test_native_search_engine_deadline_before_exact_rolls_back_logical_state() -> None:
     from evrptw import _core as native_core
 
@@ -7652,6 +7714,49 @@ def test_host_initial_state_rejects_self_hashed_invalid_path_before_ack(
         assert recovered[1] == native_core.native_search_request_receipt_v2(
             *captured[0]
         )[1]
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if _stage052_shared_memory_names().issubset(before):
+            break
+        time.sleep(0.01)
+    assert _stage052_shared_memory_names().issubset(before)
+
+
+def test_host_exact_rejects_self_hashed_invalid_path_before_ack(
+    tmp_path: Path,
+) -> None:
+    endpoint = tmp_path / "native-exact-corruption.sock"
+    before = _stage052_shared_memory_names()
+    config = replace(
+        _native_config("host_scheduler"),
+        scheduler_socket_path=str(endpoint),
+    )
+    with NativeHostScheduler(
+        endpoint,
+        enable_fault_injection=True,
+        production_fault="exact_path_offset_oob",
+    ):
+        with pytest.raises(RuntimeError, match="exact output schema is invalid"):
+            solve_alns(
+                _fixture_instance(),
+                seed=2014,
+                max_iterations=1,
+                time_limit_seconds=2.0,
+                **_full_native_solve_kwargs(),
+                native_execution_config=config,
+            )
+        # The production fault is one-shot.  A second solve proves that the
+        # scheduler reclaimed the unacknowledged output and stayed healthy.
+        recovered = solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            **_full_native_solve_kwargs(),
+            native_execution_config=config,
+        )
+        assert recovered.feasible
 
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:

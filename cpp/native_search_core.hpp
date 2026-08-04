@@ -23,6 +23,39 @@
 
 namespace evrptw::native_search {
 
+struct RouteBatchViewV2 final {
+    std::span<const std::int64_t> offsets;
+    std::span<const std::int64_t> indices;
+
+    [[nodiscard]] std::size_t route_count() const noexcept {
+        return offsets.empty() ? 0U : offsets.size() - 1U;
+    }
+
+    [[nodiscard]] std::span<const std::int64_t> route(
+        const std::size_t row) const {
+        if (row >= route_count()) {
+            throw std::out_of_range("native route batch row is out of range");
+        }
+        return indices.subspan(
+            static_cast<std::size_t>(offsets[row]),
+            static_cast<std::size_t>(offsets[row + 1] - offsets[row]));
+    }
+
+    void validate(const std::string_view name) const {
+        if (offsets.empty() || offsets.front() != 0
+            || offsets.back() != static_cast<std::int64_t>(indices.size())) {
+            throw std::invalid_argument(
+                std::string(name) + " boundary is invalid");
+        }
+        for (std::size_t row = 0; row + 1 < offsets.size(); ++row) {
+            if (offsets[row] < 0 || offsets[row] > offsets[row + 1]) {
+                throw std::invalid_argument(
+                    std::string(name) + " offsets must be monotonic");
+            }
+        }
+    }
+};
+
 struct ProblemV2 final {
     std::vector<std::int64_t> node_kind;
     std::vector<double> demand;
