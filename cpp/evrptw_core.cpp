@@ -7078,7 +7078,27 @@ py::tuple screen_routes_numeric(
     return py::make_tuple(std::move(codes), std::move(metrics));
 }
 
-py::tuple candidate_control_repair_v2(
+py::tuple project_candidate_control_repair_v2(
+    const evrptw::native_search::RepairResultV2& result) {
+    result.validate();
+    py::array_t<std::int64_t> route_offsets(result.route_offsets.size());
+    py::array_t<std::int64_t> route_indices(result.route_indices.size());
+    py::array_t<std::int64_t> counters(result.counters.size());
+    std::copy(
+        result.route_offsets.begin(), result.route_offsets.end(),
+        checked_data(route_offsets));
+    std::copy(
+        result.route_indices.begin(), result.route_indices.end(),
+        checked_data(route_indices));
+    std::copy(
+        result.counters.begin(), result.counters.end(),
+        checked_data(counters));
+    return py::make_tuple(
+        std::move(route_offsets), std::move(route_indices),
+        std::move(counters));
+}
+
+evrptw::native_search::RepairResultV2 candidate_control_repair_owned_v2(
     py::handle node_kind,
     py::handle demand,
     py::handle ready_time,
@@ -7341,26 +7361,57 @@ py::tuple candidate_control_repair_v2(
                 static_cast<std::int64_t>(output_indices.size()));
         }
     }
-    py::array_t<std::int64_t> output_offsets_array(output_offsets.size());
-    py::array_t<std::int64_t> output_indices_array(output_indices.size());
-    py::array_t<std::int64_t> counters(7);
-    std::copy(
-        output_offsets.begin(), output_offsets.end(),
-        checked_data(output_offsets_array));
-    std::copy(
-        output_indices.begin(), output_indices.end(),
-        checked_data(output_indices_array));
-    auto* counter_values = checked_data(counters);
-    counter_values[0] = failure_code;
-    counter_values[1] = new_routes;
-    counter_values[2] = static_cast<std::int64_t>(changed_routes.size());
-    counter_values[3] = screening_calls;
-    counter_values[4] = screening_passes;
-    counter_values[5] = screening_rejections;
-    counter_values[6] = static_cast<std::int64_t>(pending.size());
-    return py::make_tuple(
-        std::move(output_offsets_array), std::move(output_indices_array),
-        std::move(counters));
+    evrptw::native_search::RepairResultV2 result{
+        std::move(output_offsets),
+        std::move(output_indices),
+        {
+            failure_code,
+            new_routes,
+            static_cast<std::int64_t>(changed_routes.size()),
+            screening_calls,
+            screening_passes,
+            screening_rejections,
+            static_cast<std::int64_t>(pending.size()),
+        },
+        -1,
+    };
+    result.validate();
+    return result;
+}
+
+py::tuple candidate_control_repair_v2(
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle lexical_rank,
+    py::handle partial_route_offsets,
+    py::handle partial_route_indices,
+    py::handle removed_customer_indices,
+    double epsilon,
+    std::int64_t route_change_limit,
+    bool allow_new_routes) {
+    return project_candidate_control_repair_v2(
+        candidate_control_repair_owned_v2(
+            node_kind,
+            demand,
+            ready_time,
+            due_date,
+            service_time,
+            distance,
+            reachable,
+            vehicle,
+            lexical_rank,
+            partial_route_offsets,
+            partial_route_indices,
+            removed_customer_indices,
+            epsilon,
+            route_change_limit,
+            allow_new_routes));
 }
 
 py::tuple project_constraint_removal_v2(
@@ -11414,26 +11465,24 @@ public:
                 legacy_nodes + route_boundaries[source_route],
                 legacy_nodes + route_boundaries[source_route + 1],
                 checked_data(removed_indices_array));
-            auto repair = candidate_control_repair_v2(
+            auto repair = candidate_control_repair_owned_v2(
                 node_kind_, demand_, ready_time_, due_date_, service_time_,
                 distance_, reachable_, vehicle_, lexical_rank_,
                 partial_offsets_array, partial_indices_array,
                 removed_indices_array, screening_epsilon_, route_change_limit,
                 false);
-            auto repaired_offsets =
-                py::cast<py::array_t<std::int64_t>>(repair[0]);
-            auto repaired_indices =
-                py::cast<py::array_t<std::int64_t>>(repair[1]);
-            auto repair_metadata =
-                py::cast<py::array_t<std::int64_t>>(repair[2]);
-            attempt[2] = checked_data<std::int64_t>(repair_metadata)[0];
-            attempt[5] = checked_data<std::int64_t>(repair_metadata)[1];
-            if (attempt[2] != 0 || repaired_offsets.size() - 1 != route_count - 1) {
+            attempt[2] = repair.counters[0];
+            attempt[5] = repair.counters[1];
+            if (attempt[2] != 0
+                || repair.route_offsets.size() - 1
+                    != static_cast<std::size_t>(route_count - 1)) {
                 continue;
             }
             std::string identity("stage05.2-native-legacy-elimination-plan-v2");
-            append_evidence_array(identity, repaired_offsets);
-            append_evidence_array(identity, repaired_indices);
+            append_evidence_vector<std::int64_t>(
+                identity, repair.route_offsets, {repair.route_offsets.size()});
+            append_evidence_vector<std::int64_t>(
+                identity, repair.route_indices, {repair.route_indices.size()});
             if (!seen_plans.insert(identity).second) {
                 continue;
             }
@@ -11441,16 +11490,13 @@ public:
                 source_route_by_plan.size());
             attempt[3] = plan_id;
             source_route_by_plan.push_back(source_route);
-            const auto* repaired_boundaries =
-                checked_data<std::int64_t>(repaired_offsets);
-            const auto* repaired_nodes =
-                checked_data<std::int64_t>(repaired_indices);
-            for (py::ssize_t route = 0;
-                 route + 1 < repaired_offsets.size(); ++route) {
+            for (std::size_t route = 0;
+                 route + 1 < repair.route_offsets.size(); ++route) {
                 packed_route_indices.insert(
                     packed_route_indices.end(),
-                    repaired_nodes + repaired_boundaries[route],
-                    repaired_nodes + repaired_boundaries[route + 1]);
+                    repair.route_indices.begin() + repair.route_offsets[route],
+                    repair.route_indices.begin()
+                        + repair.route_offsets[route + 1]);
                 packed_route_offsets.push_back(
                     static_cast<std::int64_t>(packed_route_indices.size()));
             }
@@ -12127,25 +12173,23 @@ public:
         std::copy(
             partial_indices.begin(), partial_indices.end(),
             checked_data(partial_indices_array));
-        auto repair = candidate_control_repair_v2(
+        auto repair_state = candidate_control_repair_owned_v2(
             node_kind_, demand_, ready_time_, due_date_, service_time_,
             distance_, reachable_, vehicle_, lexical_rank_,
             partial_offsets_array, partial_indices_array, removed_array,
             screening_epsilon_, route_change_limit, true);
-        auto repaired_offsets = py::cast<py::array_t<std::int64_t>>(repair[0]);
-        auto repaired_indices = py::cast<py::array_t<std::int64_t>>(repair[1]);
-        auto repair_counters = py::cast<py::array_t<std::int64_t>>(repair[2]);
         py::array_t<std::int64_t> metadata(8);
         auto* metadata_values = checked_data(metadata);
         metadata_values[0] = iteration;
         metadata_values[1] = destroy_operation;
         metadata_values[2] = remove_count;
-        metadata_values[3] = checked_data<std::int64_t>(repair_counters)[0];
-        metadata_values[4] = checked_data<std::int64_t>(repair_counters)[1];
+        metadata_values[3] = repair_state.counters[0];
+        metadata_values[4] = repair_state.counters[1];
         metadata_values[5] = -1;
         metadata_values[6] = 0;
         metadata_values[7] = -2;
         if (metadata_values[3] != 0) {
+            auto repair = project_candidate_control_repair_v2(repair_state);
             accumulate_vehicle_repair_outcome(false, 1, false, false);
             *rng_ = std::move(next_rng);
             return py::make_tuple(
@@ -12155,9 +12199,13 @@ public:
                 py::none(), lane_solution_state(0));
         }
 
+        auto repair = project_candidate_control_repair_v2(repair_state);
+        auto repaired_offsets = py::cast<py::array_t<std::int64_t>>(repair[0]);
+        auto repaired_indices = py::cast<py::array_t<std::int64_t>>(repair[1]);
         py::array_t<std::int64_t> plan_offsets(2);
         checked_data(plan_offsets)[0] = 0;
-        checked_data(plan_offsets)[1] = repaired_offsets.size() - 1;
+        checked_data(plan_offsets)[1] = static_cast<std::int64_t>(
+            repair_state.route_offsets.size() - 1);
         py::array_t<std::int64_t> context(3);
         checked_data(context)[0] = stable_int63("legacy");
         checked_data(context)[1] = stable_int63("vehicle_count_aware_repair");
@@ -13025,12 +13073,11 @@ public:
         std::copy(
             partial_indices.begin(), partial_indices.end(),
             checked_data(partial_indices_array));
-        auto repair = candidate_control_repair_v2(
+        auto repair_state = candidate_control_repair_owned_v2(
             node_kind_, demand_, ready_time_, due_date_, service_time_,
             distance_, reachable_, vehicle_, lexical_rank_,
             partial_offsets_array, partial_indices_array, removed_array,
             screening_epsilon_, route_change_limit, true);
-        auto repair_counters = py::cast<py::array_t<std::int64_t>>(repair[2]);
         py::array_t<std::int64_t> metadata(8);
         auto* values = checked_data(metadata);
         values[0] = iteration;
@@ -13038,7 +13085,7 @@ public:
         values[2] = destroy;
         values[3] = repair_operation;
         values[4] = remove_count;
-        values[5] = checked_data<std::int64_t>(repair_counters)[0];
+        values[5] = repair_state.counters[0];
         values[6] = -1;
         values[7] = 0;
         const auto record_total_exact_work = [&]() {
@@ -13053,6 +13100,7 @@ public:
             repair_names[static_cast<std::size_t>(repair_operation)]);
         checked_data(insertion_context)[2] = iteration;
         if (values[5] != 0) {
+            auto repair = project_candidate_control_repair_v2(repair_state);
             accumulate_standard_outcome(false, 1, false, false);
             *rng_ = std::move(next_rng);
             return py::make_tuple(
@@ -13061,6 +13109,8 @@ public:
                 std::move(partial_indices_array), std::move(repair),
                 py::none(), py::none(), lane_solution_state(0));
         }
+        auto repair = project_candidate_control_repair_v2(repair_state);
+        auto repair_counters = py::cast<py::array_t<std::int64_t>>(repair[2]);
         if (removed.size() != 1) {
             struct SequentialInsertionOption {
                 double score;
@@ -13645,9 +13695,7 @@ public:
         std::vector<std::array<std::int64_t, 8>> attempt_rows;
         std::vector<std::int64_t> removed_offsets{0};
         std::vector<std::int64_t> removed_indices;
-        py::tuple selected_repair;
-        py::array_t<std::int64_t> selected_offsets;
-        py::array_t<std::int64_t> selected_indices;
+        std::optional<evrptw::native_search::RepairResultV2> selected_repair;
         const auto candidate_limit = std::max<std::int64_t>(
             16, evaluation_budget * 4);
         std::int64_t considered = 0;
@@ -13698,40 +13746,25 @@ public:
                         checked_data(partial_indices_array));
                     std::copy(
                         removed.begin(), removed.end(), checked_data(removed_array));
-                    auto repair = candidate_control_repair_v2(
+                    auto repair = candidate_control_repair_owned_v2(
                         node_kind_, demand_, ready_time_, due_date_, service_time_,
                         distance_, reachable_, vehicle_, lexical_rank_,
                         partial_offsets_array, partial_indices_array, removed_array,
                         screening_epsilon_, route_change_limit, false);
-                    auto repaired_offsets =
-                        py::cast<py::array_t<std::int64_t>>(repair[0]);
-                    auto repaired_indices =
-                        py::cast<py::array_t<std::int64_t>>(repair[1]);
-                    auto counters =
-                        py::cast<py::array_t<std::int64_t>>(repair[2]);
-                    const auto failure = checked_data<std::int64_t>(counters)[0];
+                    const auto failure = repair.counters[0];
                     bool changed = false;
                     if (failure == 0
-                        && repaired_offsets.size()
-                            == static_cast<py::ssize_t>(
-                                quality_lane.route_offsets.size())
-                        && repaired_indices.size()
-                            == static_cast<py::ssize_t>(
-                                quality_lane.route_indices.size())) {
-                        changed = !std::equal(
-                            checked_data<std::int64_t>(repaired_offsets),
-                            checked_data<std::int64_t>(repaired_offsets)
-                                + repaired_offsets.size(),
-                            quality_lane.route_offsets.data())
-                            || !std::equal(
-                                checked_data<std::int64_t>(repaired_indices),
-                                checked_data<std::int64_t>(repaired_indices)
-                                    + repaired_indices.size(),
-                                quality_lane.route_indices.data());
+                        && repair.route_offsets.size()
+                            == quality_lane.route_offsets.size()
+                        && repair.route_indices.size()
+                            == quality_lane.route_indices.size()) {
+                        changed = repair.route_offsets
+                                != quality_lane.route_offsets
+                            || repair.route_indices != quality_lane.route_indices;
                     }
                     attempt_rows.push_back({
                         static_cast<std::int64_t>(source), start, length,
-                        failure, checked_data<std::int64_t>(counters)[1],
+                        failure, repair.counters[1],
                         considered, changed ? 1 : 0, 0});
                     removed_indices.insert(
                         removed_indices.end(), removed.begin(), removed.end());
@@ -13739,8 +13772,6 @@ public:
                         static_cast<std::int64_t>(removed_indices.size()));
                     if (changed) {
                         selected_repair = std::move(repair);
-                        selected_offsets = std::move(repaired_offsets);
-                        selected_indices = std::move(repaired_indices);
                         found = true;
                     }
                 }
@@ -13774,9 +13805,20 @@ public:
                 std::move(removed_indices_array), py::none(), py::none(),
                 std::move(outcome), lane_solution_state(1));
         }
+        if (!selected_repair.has_value()) {
+            throw std::logic_error(
+                "full native quality route-segment lost repair ownership");
+        }
+        auto selected_repair_projection =
+            project_candidate_control_repair_v2(*selected_repair);
+        auto selected_offsets = py::cast<py::array_t<std::int64_t>>(
+            selected_repair_projection[0]);
+        auto selected_indices = py::cast<py::array_t<std::int64_t>>(
+            selected_repair_projection[1]);
         py::array_t<std::int64_t> plan_offsets(2);
         checked_data(plan_offsets)[0] = 0;
-        checked_data(plan_offsets)[1] = selected_offsets.size() - 1;
+        checked_data(plan_offsets)[1] = static_cast<std::int64_t>(
+            selected_repair->route_offsets.size() - 1);
         py::array_t<std::int64_t> context(3);
         checked_data(context)[0] = stable_int63("quality_shadow");
         checked_data(context)[1] = stable_int63("route_segment_destroy");
@@ -13829,7 +13871,8 @@ public:
             restore_lane.rollback_now();
             return py::make_tuple(
                 std::move(attempts), std::move(removed_offsets_array),
-                std::move(removed_indices_array), std::move(selected_repair),
+                std::move(removed_indices_array),
+                std::move(selected_repair_projection),
                 std::move(transaction), std::move(outcome),
                 lane_solution_state(1));
         } catch (...) {
@@ -14969,6 +15012,36 @@ public:
             last_constraint_removal_owned(expected_iteration));
     }
 
+    [[nodiscard]] const evrptw::native_search::RepairResultV2&
+    last_constraint_repair_owned(
+        std::int64_t expected_iteration) const {
+        if (!last_constraint_repair_.has_value()
+            || last_constraint_repair_->iteration != expected_iteration) {
+            throw std::logic_error(
+                "full native constraint repair state is unavailable");
+        }
+        return *last_constraint_repair_;
+    }
+
+    void invalidate_constraint_repair_for_iteration_noexcept(
+        std::int64_t iteration) noexcept {
+        if (last_constraint_repair_.has_value()
+            && last_constraint_repair_->iteration == iteration) {
+            last_constraint_repair_.reset();
+        }
+    }
+
+    py::tuple constraint_repair_state(
+        std::int64_t expected_iteration) const {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        return project_candidate_control_repair_v2(
+            last_constraint_repair_owned(expected_iteration));
+    }
+
     std::int64_t main_stagnation_iterations() const {
         std::unique_lock state_lock(state_mutex_, std::try_to_lock);
         if (!state_lock.owns_lock()) {
@@ -15068,10 +15141,11 @@ public:
             auto result = py::make_tuple(
                 std::move(removal), py::none(), py::none());
             require_deadline();
+            invalidate_constraint_repair_for_iteration_noexcept(context[2]);
             last_constraint_removal_ = std::move(removal_state);
             return result;
         }
-        auto repair = candidate_control_repair_v2(
+        auto repair_state = candidate_control_repair_owned_v2(
             node_kind_,
             demand_,
             ready_time_,
@@ -15087,11 +15161,13 @@ public:
             screening_epsilon_,
             route_change_limit,
             false);
-        auto repair_metadata = py::cast<py::array_t<std::int64_t>>(repair[2]);
-        if (checked_data<std::int64_t>(repair_metadata)[0] != 0) {
+        repair_state.iteration = context[2];
+        auto repair = project_candidate_control_repair_v2(repair_state);
+        if (repair_state.counters[0] != 0) {
             auto result = py::make_tuple(
                 std::move(removal), std::move(repair), py::none());
             require_deadline();
+            invalidate_constraint_repair_for_iteration_noexcept(context[2]);
             last_constraint_removal_ = std::move(removal_state);
             return result;
         }
@@ -15099,7 +15175,8 @@ public:
         auto repaired_indices = py::cast<py::array_t<std::int64_t>>(repair[1]);
         py::array_t<std::int64_t> plan_offsets(2);
         checked_data(plan_offsets)[0] = 0;
-        checked_data(plan_offsets)[1] = repaired_offsets.size() - 1;
+        checked_data(plan_offsets)[1] = static_cast<std::int64_t>(
+            repair_state.route_offsets.size() - 1);
         std::vector<std::int64_t> expected(
             all_customers_.begin(), all_customers_.end());
         std::stable_sort(
@@ -15189,6 +15266,7 @@ public:
             }
             last_candidate_ready_ = candidate_ready;
             last_constraint_removal_ = std::move(removal_state);
+            last_constraint_repair_ = std::move(repair_state);
             suppress_attempted_plan_journal_ = false;
             restore_attempted_plan_policy.release();
             return result;
@@ -15441,6 +15519,7 @@ public:
         last_completed_constraint_iteration_ = -1;
         last_dynamic_removal_selection_.reset();
         last_constraint_removal_.reset();
+        last_constraint_repair_.reset();
         stage04_reheat_count_ = 0;
         stage04_restart_count_ = 0;
         stage04_reheat_floor_ = 0.0;
@@ -16120,6 +16199,7 @@ public:
             accumulate_full_stage04_outcome_noexcept(
                 static_cast<std::size_t>(operation + 9), false, 1, false,
                 false, true);
+            invalidate_constraint_repair_for_iteration_noexcept(iteration);
             last_completed_constraint_iteration_ = iteration;
             last_dynamic_removal_selection_ = selection;
             last_constraint_removal_ = std::move(removal_state);
@@ -16138,6 +16218,7 @@ public:
         require_deadline();
         checked_data(adjusted_deadline)[0] = remaining_at_boundary();
         auto previous_constraint_removal = last_constraint_removal_;
+        auto previous_constraint_repair = last_constraint_repair_;
         defer_iteration_commit_ = true;
         bool iteration_candidate_ready = false;
         try {
@@ -16220,6 +16301,7 @@ public:
         } catch (...) {
             defer_iteration_commit_ = false;
             last_constraint_removal_ = std::move(previous_constraint_removal);
+            last_constraint_repair_ = std::move(previous_constraint_repair);
             if (pending_composite_active_) {
                 rollback_pending_composite();
             }
@@ -16381,20 +16463,21 @@ public:
 
             std::int64_t appended_routes = 0;
             if (!probe[1].is_none()) {
-                auto repair = py::cast<py::tuple>(probe[1]);
-                auto repair_offsets = py::cast<py::array_t<std::int64_t>>(repair[0]);
-                auto repair_indices = py::cast<py::array_t<std::int64_t>>(repair[1]);
-                auto repair_metadata = py::cast<py::array_t<std::int64_t>>(repair[2]);
-                const auto* repair_boundaries =
-                    checked_data<std::int64_t>(repair_offsets);
-                const auto* repair_nodes = checked_data<std::int64_t>(repair_indices);
-                if (checked_data<std::int64_t>(repair_metadata)[0] == 0) {
-                    appended_routes = repair_offsets.size() - 1;
-                    for (py::ssize_t route = 0; route < appended_routes; ++route) {
+                if (last_constraint_repair_.has_value()
+                    && last_constraint_repair_->iteration == iteration) {
+                    const auto& repair = *last_constraint_repair_;
+                    appended_routes = static_cast<std::int64_t>(
+                        repair.route_offsets.size() - 1);
+                    for (std::int64_t route = 0;
+                         route < appended_routes; ++route) {
                         route_indices.insert(
                             route_indices.end(),
-                            repair_nodes + repair_boundaries[route],
-                            repair_nodes + repair_boundaries[route + 1]);
+                            repair.route_indices.begin()
+                                + repair.route_offsets[
+                                    static_cast<std::size_t>(route)],
+                            repair.route_indices.begin()
+                                + repair.route_offsets[
+                                    static_cast<std::size_t>(route + 1)]);
                         route_offsets.push_back(
                             static_cast<std::int64_t>(route_indices.size()));
                     }
@@ -16783,6 +16866,8 @@ public:
                 last_dynamic_removal_selection;
             std::optional<evrptw::native_search::ConstraintRemovalResultV2>
                 last_constraint_removal;
+            std::optional<evrptw::native_search::RepairResultV2>
+                last_constraint_repair;
             std::int64_t main_stagnation_iterations;
             bool last_iteration_global_best_improved;
             NativeCausalJournalV2::Snapshot causal;
@@ -16815,6 +16900,7 @@ public:
             last_constraint_iteration_outcome_,
             last_dynamic_removal_selection_,
             last_constraint_removal_,
+            last_constraint_repair_,
             main_stagnation_iterations_, last_iteration_global_best_improved_,
             causal_journal_.snapshot()};
         defer_global_commit_ = true;
@@ -16903,6 +16989,8 @@ public:
                     snapshot.last_dynamic_removal_selection;
                 last_constraint_removal_ =
                     std::move(snapshot.last_constraint_removal);
+                last_constraint_repair_ =
+                    std::move(snapshot.last_constraint_repair);
                 main_stagnation_iterations_ = snapshot.main_stagnation_iterations;
                 last_iteration_global_best_improved_ =
                     snapshot.last_iteration_global_best_improved;
@@ -17084,10 +17172,10 @@ public:
             rollback.release();
             return result;
         }
-        auto repair = py::cast<py::tuple>(probe[1]);
+        const auto& repair = last_constraint_repair_owned(start_iteration);
         auto transaction = py::cast<py::tuple>(probe[2]);
         if (outcome.operation != 0
-            || py::cast<py::array_t<std::int64_t>>(repair[0]).size() != 2) {
+            || repair.route_offsets.size() != 2) {
             throw std::logic_error(
                 "native global bootstrap did not produce the expected constraint transaction");
         }
@@ -17206,14 +17294,8 @@ public:
             removal.removed_indices.begin(), removal.removed_indices.end(),
             checked_data(removed_indices) + removed_size);
 
-        auto repaired_offsets = py::cast<py::array_t<std::int64_t>>(repair[0]);
-        auto repaired_indices = py::cast<py::array_t<std::int64_t>>(repair[1]);
         const auto repaired_route_changed =
-            previous_indices.size()
-                != static_cast<std::size_t>(repaired_indices.size())
-            || !std::equal(
-                previous_indices.begin(), previous_indices.end(),
-                checked_data<std::int64_t>(repaired_indices));
+            previous_indices != repair.route_indices;
         repaired[17] = repaired_route_changed ? 0 : -1;
         py::array_t<std::int64_t> plan_offsets(event_count + 1);
         std::vector<std::int64_t> plan_boundaries{0, 0, 1, 2};
@@ -17227,17 +17309,15 @@ public:
         checked_data(route_offsets)[0] = 0;
         checked_data(route_offsets)[1] = removal.partial_indices.size();
         checked_data(route_offsets)[2] =
-            removal.partial_indices.size() + repaired_indices.size();
+            removal.partial_indices.size() + repair.route_indices.size();
         py::array_t<std::int64_t> route_indices(
-            removal.partial_indices.size() + repaired_indices.size());
+            removal.partial_indices.size() + repair.route_indices.size());
         std::copy(
             removal.partial_indices.begin(), removal.partial_indices.end(),
             checked_data(route_indices));
         std::copy(
-            checked_data<std::int64_t>(repaired_indices),
-            checked_data<std::int64_t>(repaired_indices) + repaired_indices.size(),
+            repair.route_indices.begin(), repair.route_indices.end(),
             checked_data(route_indices) + removal.partial_indices.size());
-        static_cast<void>(repaired_offsets);
 
         py::array_t<std::int64_t> objective_integer(
             {event_count, py::ssize_t(2)});
@@ -18399,6 +18479,8 @@ private:
         last_dynamic_removal_selection_;
     std::optional<evrptw::native_search::ConstraintRemovalResultV2>
         last_constraint_removal_;
+    std::optional<evrptw::native_search::RepairResultV2>
+        last_constraint_repair_;
     std::vector<std::int64_t> exact_launch_occupancies_;
     std::vector<ExactJournalBatch> exact_journal_;
     std::list<ControlJournalBatch> control_journal_;
@@ -21610,6 +21692,10 @@ PYBIND11_MODULE(_core, module) {
         .def(
             "constraint_removal_state",
             &NativeSearchEngineV2::constraint_removal_state,
+            py::arg("expected_iteration"))
+        .def(
+            "constraint_repair_state",
+            &NativeSearchEngineV2::constraint_repair_state,
             py::arg("expected_iteration"))
         .def(
             "run_constraint_search", &NativeSearchEngineV2::run_constraint_search,

@@ -3269,6 +3269,20 @@ def test_native_search_engine_constraint_probe_composes_all_native_layers() -> N
     with pytest.raises(RuntimeError, match="constraint removal state is unavailable"):
         engine.constraint_removal_state(1)
 
+    expected_owned_repair = tuple(value.copy() for value in repair)
+    repair[0].fill(-1)
+    repair[1].fill(-1)
+    repair[2].fill(-1)
+    owned_repair = engine.constraint_repair_state(0)
+    for expected, observed in zip(
+        expected_owned_repair,
+        owned_repair,
+        strict=True,
+    ):
+        np.testing.assert_equal(observed, expected)
+    with pytest.raises(RuntimeError, match="constraint repair state is unavailable"):
+        engine.constraint_repair_state(1)
+
     with pytest.raises(RuntimeError, match="unapplied candidate"):
         engine.constraint_probe(
             0,
@@ -3310,9 +3324,79 @@ def test_native_search_engine_constraint_probe_composes_all_native_layers() -> N
     assert fresh_solution[1].tolist() == [2, 1]
     assert fresh_solution[2].tolist() == [1, 0]
     assert fresh_best[1].tolist() == [1, 2]
-    np.testing.assert_allclose(fresh_best[2][4], np.asarray([[4.0, 4.0, 0.0, 0.0]]))
+    np.testing.assert_allclose(
+        fresh_best[2][4],
+        np.asarray([[4.0, 4.0, 0.0, 0.0]]),
+    )
     with pytest.raises(RuntimeError, match="no prepared candidate"):
         engine.apply_last_candidate(1.0, 0.5)
+
+
+def test_native_constraint_repair_failure_does_not_publish_owned_state() -> None:
+    from evrptw import _core as native_core
+
+    base = _candidate_plan_fixture()
+    instance = replace(
+        base,
+        vehicle=replace(base.vehicle, load_capacity=2.0),
+    )
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = _native_search_engine(native_core, context,
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray(
+            [context.name_to_index[name] for name in ("C1", "C2", "C3", "C4")],
+            dtype=np.int64,
+        ),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+
+    _first_removal, first_repair, first_transaction = engine.constraint_probe(
+        0,
+        1,
+        0x5EED,
+        np.asarray([5, 7, 0], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        1,
+    )
+    assert first_repair is not None
+    assert first_repair[2].tolist() == [0, 0, 1, 2, 2, 0, 0]
+    assert first_transaction is not None
+    assert engine.constraint_repair_state(0)[2].tolist() == [
+        0, 0, 1, 2, 2, 0, 0,
+    ]
+    engine.apply_last_candidate(1.0, 0.5)
+
+    _removal, repair, transaction = engine.constraint_probe(
+        0,
+        2,
+        0x5EED,
+        np.asarray([5, 7, 0], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        1,
+    )
+
+    assert repair is not None
+    assert repair[0].tolist() == [0]
+    assert repair[1].tolist() == []
+    assert repair[2].tolist() == [1, 0, 1, 8, 8, 0, 1]
+    assert transaction is None
+    with pytest.raises(RuntimeError, match="constraint repair state is unavailable"):
+        engine.constraint_repair_state(0)
 
 
 def test_native_search_engine_constraint_iteration_owns_python_rng_and_policy() -> None:
@@ -4155,6 +4239,8 @@ def test_native_global_search_matches_python_exact_infeasible_event() -> None:
     assert decoded.neighborhood_events[2]["reason"] == "constraint_repair_infeasible"
     assert decoded.neighborhood_events[2]["candidate_objective_key"] == ()
     assert decoded.termination[4:].tolist() == [10, 1, 1, 0, 2, 2, 0]
+    repair_state = engine.constraint_repair_state(0)
+    assert repair_state[2].tolist()[0] == 0
 
 
 def test_native_global_search_matches_python_no_removable_customer_events() -> None:
@@ -4217,6 +4303,8 @@ def test_native_global_search_matches_python_no_removable_customer_events() -> N
     assert decoded.neighborhood_events[1]["reason"] == "no_removable_customer"
     assert decoded.stage04_calls.tolist() == [[1, 0, 0, 0]]
     assert decoded.termination[4:].tolist() == [10, 1, 1, 0, 1, 1, 0]
+    with pytest.raises(RuntimeError, match="constraint repair state is unavailable"):
+        engine.constraint_repair_state(0)
 
 
 @pytest.mark.parametrize("max_iterations", [2, 3, 5, 6, 22])
@@ -4518,7 +4606,7 @@ def test_native_global_search_failure_restores_nonempty_removal_state() -> None:
     )
     stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
     engine.configure_stage04(stage04_integer, stage04_float)
-    prior_removal, _prior_repair, prior_transaction = engine.constraint_probe(
+    prior_removal, prior_repair, prior_transaction = engine.constraint_probe(
         0,
         1,
         0x5EED,
@@ -4528,7 +4616,9 @@ def test_native_global_search_failure_restores_nonempty_removal_state() -> None:
         -1,
     )
     assert prior_transaction is not None
+    assert prior_repair is not None
     prior_removal_state = tuple(value.copy() for value in prior_removal)
+    prior_repair_state = tuple(value.copy() for value in prior_repair)
     engine.apply_last_candidate(1.0, 0.5)
 
     engine.inject_global_search_envelope_failure_once()
@@ -4556,6 +4646,15 @@ def test_native_global_search_failure_restores_nonempty_removal_state() -> None:
         np.testing.assert_equal(observed, expected)
     with pytest.raises(RuntimeError, match="constraint removal state is unavailable"):
         engine.constraint_removal_state(0)
+    restored_repair = engine.constraint_repair_state(99)
+    for expected, observed in zip(
+        prior_repair_state,
+        restored_repair,
+        strict=True,
+    ):
+        np.testing.assert_equal(observed, expected)
+    with pytest.raises(RuntimeError, match="constraint repair state is unavailable"):
+        engine.constraint_repair_state(0)
 
 
 def test_native_search_engine_owns_three_isolated_lane_states() -> None:
@@ -6404,6 +6503,8 @@ def test_native_constraint_iteration_deadline_boundary_rolls_back_all_state() ->
     assert engine.solution_state()[1].tolist() == [1, 2]
     with pytest.raises(RuntimeError, match="constraint removal state is unavailable"):
         engine.constraint_removal_state(0)
+    with pytest.raises(RuntimeError, match="constraint repair state is unavailable"):
+        engine.constraint_repair_state(0)
     _selection, _probe, same_round = engine.constraint_iteration(
         0,
         0,
@@ -6898,6 +6999,8 @@ def test_native_search_engine_constraint_probe_envelope_failure_rolls_back() -> 
         engine.apply_last_candidate(1.0, 0.5)
     with pytest.raises(RuntimeError, match="constraint removal state is unavailable"):
         engine.constraint_removal_state(0)
+    with pytest.raises(RuntimeError, match="constraint repair state is unavailable"):
+        engine.constraint_repair_state(0)
 
     _removal, _repair, recovered = engine.constraint_probe(
         0,

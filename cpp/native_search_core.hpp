@@ -156,6 +156,46 @@ struct ConstraintRemovalResultV2 final {
     }
 };
 
+struct RepairResultV2 final {
+    std::vector<std::int64_t> route_offsets;
+    std::vector<std::int64_t> route_indices;
+    std::array<std::int64_t, 7> counters{};
+    std::int64_t iteration = -1;
+
+    void validate() const {
+        if (route_offsets.empty() || route_offsets.front() != 0
+            || route_offsets.back()
+                != static_cast<std::int64_t>(route_indices.size())
+            || counters[0] < 0 || counters[0] > 2) {
+            throw std::logic_error(
+                "native candidate-control repair result is inconsistent");
+        }
+        for (std::size_t index = 0; index + 1 < route_offsets.size(); ++index) {
+            if (route_offsets[index] < 0
+                || route_offsets[index] > route_offsets[index + 1]
+                || (counters[0] == 0
+                    && route_offsets[index] == route_offsets[index + 1])) {
+                throw std::logic_error(
+                    "native candidate-control repair offsets are not monotonic");
+            }
+        }
+        for (std::size_t index = 1; index < counters.size(); ++index) {
+            if (counters[index] < 0) {
+                throw std::logic_error(
+                    "native candidate-control repair counter is negative");
+            }
+        }
+        if (counters[3] != counters[4] + counters[5]
+            || (counters[0] == 0 && counters[6] != 0)
+            || (counters[0] == 0 && route_offsets.size() < 2)
+            || (counters[0] != 0
+                && (route_offsets.size() != 1 || !route_indices.empty()))) {
+            throw std::logic_error(
+                "native candidate-control repair status is inconsistent");
+        }
+    }
+};
+
 [[nodiscard]] inline DynamicRemovalSelectionV2 select_dynamic_removal_v2(
     const std::int64_t customer_count,
     const std::int64_t stagnation_iterations,
