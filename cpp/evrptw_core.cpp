@@ -7363,7 +7363,44 @@ py::tuple candidate_control_repair_v2(
         std::move(counters));
 }
 
-py::tuple constraint_removal_v2(
+py::tuple project_constraint_removal_v2(
+    const evrptw::native_search::ConstraintRemovalResultV2& result) {
+    result.validate();
+    py::array_t<std::int64_t> partial_offsets(result.partial_offsets.size());
+    py::array_t<std::int64_t> partial_indices(result.partial_indices.size());
+    py::array_t<std::int64_t> removed_indices(result.removed_indices.size());
+    py::array_t<std::int64_t> score_nodes(result.score_nodes.size());
+    py::array_t<double> score_values(result.score_values.size());
+    py::array_t<std::int64_t> score_routes(result.score_routes.size());
+    py::array_t<std::int64_t> metadata(result.metadata.size());
+    std::copy(
+        result.partial_offsets.begin(), result.partial_offsets.end(),
+        checked_data(partial_offsets));
+    std::copy(
+        result.partial_indices.begin(), result.partial_indices.end(),
+        checked_data(partial_indices));
+    std::copy(
+        result.removed_indices.begin(), result.removed_indices.end(),
+        checked_data(removed_indices));
+    std::copy(
+        result.score_nodes.begin(), result.score_nodes.end(),
+        checked_data(score_nodes));
+    std::copy(
+        result.score_values.begin(), result.score_values.end(),
+        checked_data(score_values));
+    std::copy(
+        result.score_routes.begin(), result.score_routes.end(),
+        checked_data(score_routes));
+    std::copy(
+        result.metadata.begin(), result.metadata.end(), checked_data(metadata));
+    return py::make_tuple(
+        std::move(partial_offsets), std::move(partial_indices),
+        std::move(removed_indices), std::move(score_nodes),
+        std::move(score_values), std::move(score_routes), std::move(metadata));
+}
+
+evrptw::native_search::ConstraintRemovalResultV2
+constraint_removal_owned_v2(
     std::int64_t operation,
     py::handle node_kind,
     py::handle demand,
@@ -7509,21 +7546,10 @@ py::tuple constraint_removal_v2(
     }
 
     if (all_customers.size() <= 1 || requested_count == 0) {
-        py::array_t<std::int64_t> partial_offsets_array(1);
-        checked_data(partial_offsets_array)[0] = 0;
-        py::array_t<std::int64_t> partial_indices_array(0);
-        py::array_t<std::int64_t> removed_output_array(0);
-        py::array_t<std::int64_t> score_nodes(0);
-        py::array_t<double> score_values(0);
-        py::array_t<std::int64_t> score_routes(0);
-        py::array_t<std::int64_t> metadata(3);
-        checked_data(metadata)[0] = 2;
-        checked_data(metadata)[1] = -1;
-        checked_data(metadata)[2] = 0;
-        return py::make_tuple(
-            std::move(partial_offsets_array), std::move(partial_indices_array),
-            std::move(removed_output_array), std::move(score_nodes),
-            std::move(score_values), std::move(score_routes), std::move(metadata));
+        evrptw::native_search::ConstraintRemovalResultV2 result{
+            {0}, {}, {}, {}, {}, {}, {2, -1, 0}, -1};
+        result.validate();
+        return result;
     }
 
     struct Score {
@@ -7719,34 +7745,71 @@ py::tuple constraint_removal_v2(
             partial_offsets.push_back(static_cast<std::int64_t>(partial_indices.size()));
         }
     }
-    py::array_t<std::int64_t> partial_offsets_array(partial_offsets.size());
-    py::array_t<std::int64_t> partial_indices_array(partial_indices.size());
-    py::array_t<std::int64_t> removed_output_array(removed_output.size());
-    py::array_t<std::int64_t> score_nodes(scores.size());
-    py::array_t<double> score_values(scores.size());
-    py::array_t<std::int64_t> score_routes(scores.size());
-    py::array_t<std::int64_t> metadata(3);
-    std::copy(
-        partial_offsets.begin(), partial_offsets.end(),
-        checked_data(partial_offsets_array));
-    std::copy(
-        partial_indices.begin(), partial_indices.end(),
-        checked_data(partial_indices_array));
-    std::copy(
-        removed_output.begin(), removed_output.end(),
-        checked_data(removed_output_array));
+    std::vector<std::int64_t> score_nodes;
+    std::vector<double> score_values;
+    std::vector<std::int64_t> score_routes;
+    score_nodes.reserve(scores.size());
+    score_values.reserve(scores.size());
+    score_routes.reserve(scores.size());
     for (std::size_t index = 0; index < scores.size(); ++index) {
-        checked_data(score_nodes)[index] = scores[index].customer;
-        checked_data(score_values)[index] = scores[index].value;
-        checked_data(score_routes)[index] = static_cast<std::int64_t>(scores[index].route);
+        score_nodes.push_back(scores[index].customer);
+        score_values.push_back(scores[index].value);
+        score_routes.push_back(static_cast<std::int64_t>(scores[index].route));
     }
-    checked_data(metadata)[0] = scores.empty() ? 1 : 0;
-    checked_data(metadata)[1] = anchor;
-    checked_data(metadata)[2] = static_cast<std::int64_t>(actual_count);
-    return py::make_tuple(
-        std::move(partial_offsets_array), std::move(partial_indices_array),
-        std::move(removed_output_array), std::move(score_nodes),
-        std::move(score_values), std::move(score_routes), std::move(metadata));
+    evrptw::native_search::ConstraintRemovalResultV2 result{
+        std::move(partial_offsets),
+        std::move(partial_indices),
+        std::move(removed_output),
+        std::move(score_nodes),
+        std::move(score_values),
+        std::move(score_routes),
+        {
+            scores.empty() ? 1 : 0,
+            anchor,
+            static_cast<std::int64_t>(actual_count),
+        },
+        -1,
+    };
+    result.validate();
+    return result;
+}
+
+py::tuple constraint_removal_v2(
+    std::int64_t operation,
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle lexical_rank,
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle path_offsets,
+    py::handle path_indices,
+    py::handle result_metrics,
+    std::int64_t requested_count,
+    std::uint64_t seed) {
+    return project_constraint_removal_v2(constraint_removal_owned_v2(
+        operation,
+        node_kind,
+        demand,
+        ready_time,
+        due_date,
+        service_time,
+        distance,
+        reachable,
+        vehicle,
+        lexical_rank,
+        route_offsets,
+        route_indices,
+        path_offsets,
+        path_indices,
+        result_metrics,
+        requested_count,
+        seed));
 }
 
 py::tuple screen_route_batch_transaction_impl(
@@ -14884,6 +14947,28 @@ public:
             last_dynamic_removal_selection_owned(expected_iteration));
     }
 
+    [[nodiscard]] const evrptw::native_search::ConstraintRemovalResultV2&
+    last_constraint_removal_owned(
+        std::int64_t expected_iteration) const {
+        if (!last_constraint_removal_.has_value()
+            || last_constraint_removal_->iteration != expected_iteration) {
+            throw std::logic_error(
+                "full native constraint removal state is unavailable");
+        }
+        return *last_constraint_removal_;
+    }
+
+    py::tuple constraint_removal_state(
+        std::int64_t expected_iteration) const {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        return project_constraint_removal_v2(
+            last_constraint_removal_owned(expected_iteration));
+    }
+
     std::int64_t main_stagnation_iterations() const {
         std::unique_lock state_lock(state_mutex_, std::try_to_lock);
         if (!state_lock.owns_lock()) {
@@ -14959,7 +15044,7 @@ public:
         auto constraint_indices = lane_vector_array(
             constraint_lane.route_indices);
         auto constraint_exact = lane_exact_payload(constraint_lane);
-        auto removal = constraint_removal_v2(
+        auto removal_state = constraint_removal_owned_v2(
             operation,
             node_kind_,
             demand_,
@@ -14977,11 +15062,13 @@ public:
             constraint_exact[4],
             requested_count,
             seed);
-        auto removal_metadata = py::cast<py::array_t<std::int64_t>>(removal[6]);
-        if (checked_data<std::int64_t>(removal_metadata)[0] != 0) {
+        removal_state.iteration = context[2];
+        auto removal = project_constraint_removal_v2(removal_state);
+        if (removal_state.metadata[0] != 0) {
             auto result = py::make_tuple(
                 std::move(removal), py::none(), py::none());
             require_deadline();
+            last_constraint_removal_ = std::move(removal_state);
             return result;
         }
         auto repair = candidate_control_repair_v2(
@@ -15005,6 +15092,7 @@ public:
             auto result = py::make_tuple(
                 std::move(removal), std::move(repair), py::none());
             require_deadline();
+            last_constraint_removal_ = std::move(removal_state);
             return result;
         }
         auto repaired_offsets = py::cast<py::array_t<std::int64_t>>(repair[0]);
@@ -15100,6 +15188,7 @@ public:
                 last_candidate_lane_state_.reset();
             }
             last_candidate_ready_ = candidate_ready;
+            last_constraint_removal_ = std::move(removal_state);
             suppress_attempted_plan_journal_ = false;
             restore_attempted_plan_policy.release();
             return result;
@@ -15351,6 +15440,7 @@ public:
         last_finished_stage04_iteration_ = -1;
         last_completed_constraint_iteration_ = -1;
         last_dynamic_removal_selection_.reset();
+        last_constraint_removal_.reset();
         stage04_reheat_count_ = 0;
         stage04_restart_count_ = 0;
         stage04_reheat_floor_ = 0.0;
@@ -15989,7 +16079,7 @@ public:
             auto constraint_indices = lane_vector_array(
                 constraint_lane.route_indices);
             auto constraint_exact = lane_exact_payload(constraint_lane);
-            auto removal = constraint_removal_v2(
+            auto removal_state = constraint_removal_owned_v2(
                 operation,
                 node_kind_,
                 demand_,
@@ -16007,9 +16097,11 @@ public:
                 constraint_exact[4],
                 requested_count,
                 0);
+            removal_state.iteration = iteration;
             outcome.probe_seed = 0;
             auto probe = py::make_tuple(
-                std::move(removal), py::none(), py::none());
+                project_constraint_removal_v2(removal_state),
+                py::none(), py::none());
             projection.set_probe(probe);
             causal_context_ = {
                 stable_int63("constraint_lane"),
@@ -16030,6 +16122,7 @@ public:
                 false, true);
             last_completed_constraint_iteration_ = iteration;
             last_dynamic_removal_selection_ = selection;
+            last_constraint_removal_ = std::move(removal_state);
             last_constraint_iteration_outcome_ = outcome;
             return projection.finish(
                 *last_dynamic_removal_selection_,
@@ -16044,6 +16137,7 @@ public:
         py::array_t<double> adjusted_deadline(1);
         require_deadline();
         checked_data(adjusted_deadline)[0] = remaining_at_boundary();
+        auto previous_constraint_removal = last_constraint_removal_;
         defer_iteration_commit_ = true;
         bool iteration_candidate_ready = false;
         try {
@@ -16125,6 +16219,7 @@ public:
                 *last_constraint_iteration_outcome_);
         } catch (...) {
             defer_iteration_commit_ = false;
+            last_constraint_removal_ = std::move(previous_constraint_removal);
             if (pending_composite_active_) {
                 rollback_pending_composite();
             }
@@ -16261,6 +16356,7 @@ public:
             auto probe = py::cast<py::tuple>(iteration_payload[1]);
             const auto selection = last_dynamic_removal_selection_owned(
                 iteration);
+            const auto& removal = last_constraint_removal_owned(iteration);
             const auto outcome = last_constraint_iteration_outcome_owned(
                 iteration);
             const auto after_budget = budget_.native_snapshot();
@@ -16307,11 +16403,7 @@ public:
                     event[13] = 2;
                 }
             } else {
-                auto removal = py::cast<py::tuple>(probe[0]);
-                auto removal_metadata =
-                    py::cast<py::array_t<std::int64_t>>(removal[6]);
-                event[13] = checked_data<std::int64_t>(removal_metadata)[0] != 0
-                    ? 1 : 3;
+                event[13] = removal.metadata[0] != 0 ? 1 : 3;
             }
             plan_offsets.push_back(plan_offsets.back() + appended_routes);
 
@@ -16689,6 +16781,8 @@ public:
                 last_constraint_iteration_outcome;
             std::optional<evrptw::native_search::DynamicRemovalSelectionV2>
                 last_dynamic_removal_selection;
+            std::optional<evrptw::native_search::ConstraintRemovalResultV2>
+                last_constraint_removal;
             std::int64_t main_stagnation_iterations;
             bool last_iteration_global_best_improved;
             NativeCausalJournalV2::Snapshot causal;
@@ -16720,6 +16814,7 @@ public:
             last_constraint_acceptance_outcome_,
             last_constraint_iteration_outcome_,
             last_dynamic_removal_selection_,
+            last_constraint_removal_,
             main_stagnation_iterations_, last_iteration_global_best_improved_,
             causal_journal_.snapshot()};
         defer_global_commit_ = true;
@@ -16806,6 +16901,8 @@ public:
                     snapshot.last_constraint_iteration_outcome;
                 last_dynamic_removal_selection_ =
                     snapshot.last_dynamic_removal_selection;
+                last_constraint_removal_ =
+                    std::move(snapshot.last_constraint_removal);
                 main_stagnation_iterations_ = snapshot.main_stagnation_iterations;
                 last_iteration_global_best_improved_ =
                     snapshot.last_iteration_global_best_improved;
@@ -16838,14 +16935,12 @@ public:
         auto probe = py::cast<py::tuple>(constraint[1]);
         const auto selection = last_dynamic_removal_selection_owned(
             start_iteration);
+        const auto& removal = last_constraint_removal_owned(start_iteration);
         const auto outcome = last_constraint_iteration_outcome_owned(
             start_iteration);
-        auto removal = py::cast<py::tuple>(probe[0]);
         if (probe[1].is_none()) {
-            auto removal_metadata =
-                py::cast<py::array_t<std::int64_t>>(removal[6]);
             if (!probe[2].is_none()
-                || checked_data<std::int64_t>(removal_metadata)[0] != 2
+                || removal.metadata[0] != 2
                 || selection.requested_count != 0
                 || outcome.operation < 0 || outcome.operation >= 4
                 || outcome.candidate_feasible != 0) {
@@ -17080,35 +17175,37 @@ public:
         py::array_t<double> ranking(event_count);
         std::fill(
             checked_data(ranking), checked_data(ranking) + event_count, 0.0);
-        auto removal_scores = py::cast<py::array_t<double>>(removal[4]);
-        checked_data(ranking)[1] = checked_data<double>(removal_scores)[0];
+        if (removal.score_values.empty()) {
+            throw std::logic_error(
+                "native global bootstrap lost the constraint score set");
+        }
+        checked_data(ranking)[1] = removal.score_values.front();
 
-        auto removed = py::cast<py::array_t<std::int64_t>>(removal[2]);
-        if (removed.size() <= 0) {
+        if (removal.removed_indices.empty()) {
             throw std::logic_error(
                 "native global bootstrap lost the removed-customer set");
         }
+        const auto removed_size = removal.removed_indices.size();
         py::array_t<std::int64_t> removed_offsets(event_count + 1);
         std::vector<std::int64_t> removed_boundaries{
-            0, 0, removed.size(), removed.size() * 2};
+            0, 0,
+            static_cast<std::int64_t>(removed_size),
+            static_cast<std::int64_t>(removed_size * 2)};
         if (!budget_boundary) {
-            removed_boundaries.push_back(removed.size() * 2);
+            removed_boundaries.push_back(
+                static_cast<std::int64_t>(removed_size * 2));
         }
         std::copy(
             removed_boundaries.begin(), removed_boundaries.end(),
             checked_data(removed_offsets));
-        py::array_t<std::int64_t> removed_indices(removed.size() * 2);
+        py::array_t<std::int64_t> removed_indices(removed_size * 2);
         std::copy(
-            checked_data<std::int64_t>(removed),
-            checked_data<std::int64_t>(removed) + removed.size(),
+            removal.removed_indices.begin(), removal.removed_indices.end(),
             checked_data(removed_indices));
         std::copy(
-            checked_data<std::int64_t>(removed),
-            checked_data<std::int64_t>(removed) + removed.size(),
-            checked_data(removed_indices) + removed.size());
+            removal.removed_indices.begin(), removal.removed_indices.end(),
+            checked_data(removed_indices) + removed_size);
 
-        auto remaining_offsets = py::cast<py::array_t<std::int64_t>>(removal[0]);
-        auto remaining_indices = py::cast<py::array_t<std::int64_t>>(removal[1]);
         auto repaired_offsets = py::cast<py::array_t<std::int64_t>>(repair[0]);
         auto repaired_indices = py::cast<py::array_t<std::int64_t>>(repair[1]);
         const auto repaired_route_changed =
@@ -17128,20 +17225,18 @@ public:
             checked_data(plan_offsets));
         py::array_t<std::int64_t> route_offsets(3);
         checked_data(route_offsets)[0] = 0;
-        checked_data(route_offsets)[1] = remaining_indices.size();
+        checked_data(route_offsets)[1] = removal.partial_indices.size();
         checked_data(route_offsets)[2] =
-            remaining_indices.size() + repaired_indices.size();
+            removal.partial_indices.size() + repaired_indices.size();
         py::array_t<std::int64_t> route_indices(
-            remaining_indices.size() + repaired_indices.size());
+            removal.partial_indices.size() + repaired_indices.size());
         std::copy(
-            checked_data<std::int64_t>(remaining_indices),
-            checked_data<std::int64_t>(remaining_indices) + remaining_indices.size(),
+            removal.partial_indices.begin(), removal.partial_indices.end(),
             checked_data(route_indices));
         std::copy(
             checked_data<std::int64_t>(repaired_indices),
             checked_data<std::int64_t>(repaired_indices) + repaired_indices.size(),
-            checked_data(route_indices) + remaining_indices.size());
-        static_cast<void>(remaining_offsets);
+            checked_data(route_indices) + removal.partial_indices.size());
         static_cast<void>(repaired_offsets);
 
         py::array_t<std::int64_t> objective_integer(
@@ -18302,6 +18397,8 @@ private:
         last_constraint_iteration_outcome_;
     std::optional<evrptw::native_search::DynamicRemovalSelectionV2>
         last_dynamic_removal_selection_;
+    std::optional<evrptw::native_search::ConstraintRemovalResultV2>
+        last_constraint_removal_;
     std::vector<std::int64_t> exact_launch_occupancies_;
     std::vector<ExactJournalBatch> exact_journal_;
     std::list<ControlJournalBatch> control_journal_;
@@ -21509,6 +21606,10 @@ PYBIND11_MODULE(_core, module) {
         .def(
             "dynamic_removal_selection_state",
             &NativeSearchEngineV2::dynamic_removal_selection_state,
+            py::arg("expected_iteration"))
+        .def(
+            "constraint_removal_state",
+            &NativeSearchEngineV2::constraint_removal_state,
             py::arg("expected_iteration"))
         .def(
             "run_constraint_search", &NativeSearchEngineV2::run_constraint_search,

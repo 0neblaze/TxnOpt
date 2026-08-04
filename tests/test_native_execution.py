@@ -3251,6 +3251,24 @@ def test_native_search_engine_constraint_probe_composes_all_native_layers() -> N
     assert transaction[5].tolist() == [0]
     assert transaction[10].tolist()[5:8] == [2, 2, 0]
 
+    expected_owned_removal = tuple(value.copy() for value in removal)
+    removal[0].fill(-1)
+    removal[1].fill(-1)
+    removal[2].fill(-1)
+    removal[3].fill(-1)
+    removal[4].fill(np.nan)
+    removal[5].fill(-1)
+    removal[6].fill(-1)
+    owned_removal = engine.constraint_removal_state(0)
+    for expected, observed in zip(
+        expected_owned_removal,
+        owned_removal,
+        strict=True,
+    ):
+        np.testing.assert_equal(observed, expected)
+    with pytest.raises(RuntimeError, match="constraint removal state is unavailable"):
+        engine.constraint_removal_state(1)
+
     with pytest.raises(RuntimeError, match="unapplied candidate"):
         engine.constraint_probe(
             0,
@@ -4462,7 +4480,6 @@ def test_native_global_search_envelope_failure_rolls_back_logical_state() -> Non
     np.testing.assert_equal(state_after[1][2:5], state_before[1][2:5])
     with pytest.raises(RuntimeError, match="dynamic removal selection is unavailable"):
         engine.dynamic_removal_selection_state(0)
-
     retry = engine.run_global_search(
         0,
         1,
@@ -4474,6 +4491,71 @@ def test_native_global_search_envelope_failure_rolls_back_logical_state() -> Non
         -1,
     )
     assert retry[13].tolist()[2] == 1
+
+
+def test_native_global_search_failure_restores_nonempty_removal_state() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = _native_search_engine(native_core, context,
+        10, 1, 16, 1_000_000, 16, 1, context.reachability_epsilon, 1
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 1, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    prior_removal, _prior_repair, prior_transaction = engine.constraint_probe(
+        0,
+        1,
+        0x5EED,
+        np.asarray([5, 7, 99], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
+        -1,
+    )
+    assert prior_transaction is not None
+    prior_removal_state = tuple(value.copy() for value in prior_removal)
+    engine.apply_last_candidate(1.0, 0.5)
+
+    engine.inject_global_search_envelope_failure_once()
+    with pytest.raises(RuntimeError, match="global-search envelope failure"):
+        engine.run_global_search(
+            0,
+            1,
+            1,
+            np.asarray([4, 8, 3], dtype=np.int64),
+            np.asarray(
+                [0.05, 0.10, 0.10, 0.20, 0.20, 0.35],
+                dtype=np.float64,
+            ),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            -1,
+        )
+
+    restored_removal = engine.constraint_removal_state(99)
+    for expected, observed in zip(
+        prior_removal_state,
+        restored_removal,
+        strict=True,
+    ):
+        np.testing.assert_equal(observed, expected)
+    with pytest.raises(RuntimeError, match="constraint removal state is unavailable"):
+        engine.constraint_removal_state(0)
 
 
 def test_native_search_engine_owns_three_isolated_lane_states() -> None:
@@ -6320,6 +6402,8 @@ def test_native_constraint_iteration_deadline_boundary_rolls_back_all_state() ->
     assert after[1][2:5] == [0, 1, 0]
     assert after[1][5:8] == [2, 2, 0]
     assert engine.solution_state()[1].tolist() == [1, 2]
+    with pytest.raises(RuntimeError, match="constraint removal state is unavailable"):
+        engine.constraint_removal_state(0)
     _selection, _probe, same_round = engine.constraint_iteration(
         0,
         0,
@@ -6812,6 +6896,8 @@ def test_native_search_engine_constraint_probe_envelope_failure_rolls_back() -> 
     assert failed[1].tolist()[5:8] == [2, 2, 0]
     with pytest.raises(RuntimeError, match="no prepared candidate"):
         engine.apply_last_candidate(1.0, 0.5)
+    with pytest.raises(RuntimeError, match="constraint removal state is unavailable"):
+        engine.constraint_removal_state(0)
 
     _removal, _repair, recovered = engine.constraint_probe(
         0,

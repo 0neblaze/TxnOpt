@@ -117,6 +117,45 @@ struct DynamicRemovalSelectionV2 final {
     }
 };
 
+struct ConstraintRemovalResultV2 final {
+    std::vector<std::int64_t> partial_offsets;
+    std::vector<std::int64_t> partial_indices;
+    std::vector<std::int64_t> removed_indices;
+    std::vector<std::int64_t> score_nodes;
+    std::vector<double> score_values;
+    std::vector<std::int64_t> score_routes;
+    std::array<std::int64_t, 3> metadata{};
+    std::int64_t iteration = -1;
+
+    void validate() const {
+        if (partial_offsets.empty() || partial_offsets.front() != 0
+            || partial_offsets.back()
+                != static_cast<std::int64_t>(partial_indices.size())
+            || score_nodes.size() != score_values.size()
+            || score_nodes.size() != score_routes.size()
+            || metadata[0] < 0 || metadata[0] > 2
+            || metadata[2] < 0
+            || metadata[2]
+                != static_cast<std::int64_t>(removed_indices.size())) {
+            throw std::logic_error(
+                "native constraint removal result is inconsistent");
+        }
+        for (std::size_t index = 0; index + 1 < partial_offsets.size(); ++index) {
+            if (partial_offsets[index] < 0
+                || partial_offsets[index] > partial_offsets[index + 1]) {
+                throw std::logic_error(
+                    "native constraint removal offsets are not monotonic");
+            }
+        }
+        for (const auto score : score_values) {
+            if (!std::isfinite(score)) {
+                throw std::logic_error(
+                    "native constraint removal score is not finite");
+            }
+        }
+    }
+};
+
 [[nodiscard]] inline DynamicRemovalSelectionV2 select_dynamic_removal_v2(
     const std::int64_t customer_count,
     const std::int64_t stagnation_iterations,

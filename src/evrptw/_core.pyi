@@ -549,6 +549,18 @@ class NativeSearchEngineV2:
         self,
         expected_iteration: int,
     ) -> npt.NDArray[np.int64]: ...
+    def constraint_removal_state(
+        self,
+        expected_iteration: int,
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+    ]: ...
     def run_constraint_search(
         self,
         start_iteration: int,
