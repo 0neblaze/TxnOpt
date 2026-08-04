@@ -66,6 +66,15 @@ struct AcceptanceOutcomeV2 final {
     }
 };
 
+struct ThreeLaneTerminationStateV2 final {
+    std::int64_t reason = 0;
+    std::int64_t exact_budget = 0;
+    std::int64_t started = 0;
+    std::int64_t completed = 0;
+    std::int64_t interrupted = 0;
+    std::int64_t completed_iterations = 0;
+};
+
 struct ProblemV2 final {
     std::vector<std::int64_t> node_kind;
     std::vector<double> demand;

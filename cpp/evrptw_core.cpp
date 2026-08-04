@@ -9431,6 +9431,27 @@ private:
     py::int_ one_;
 };
 
+class ThreeLaneTerminationProjectionV2 final {
+public:
+    ThreeLaneTerminationProjectionV2()
+        : payload_(6), values_(checked_data(payload_)) {}
+
+    py::array_t<std::int64_t> finish(
+        const evrptw::native_search::ThreeLaneTerminationStateV2& state) {
+        values_[0] = state.reason;
+        values_[1] = state.exact_budget;
+        values_[2] = state.started;
+        values_[3] = state.completed;
+        values_[4] = state.interrupted;
+        values_[5] = state.completed_iterations;
+        return std::move(payload_);
+    }
+
+private:
+    py::array_t<std::int64_t> payload_;
+    std::int64_t* values_;
+};
+
 class NativeSearchEngineV2 {
 public:
     NativeSearchEngineV2(
@@ -14143,6 +14164,8 @@ public:
         last_quality_acceptance_outcome_.reset();
         last_constraint_acceptance_outcome_.reset();
         last_three_lane_legacy_acceptance_outcome_.reset();
+        last_three_lane_termination_state_.reset();
+        ThreeLaneTerminationProjectionV2 termination_projection;
         const auto total_deadline = checked_data<double>(deadline_array)[0];
         const auto remaining_deadline = [&]() {
             return total_deadline - std::chrono::duration<double>(
@@ -14165,16 +14188,14 @@ public:
             legacy_candidate_destroy_operator_ = -1;
             legacy_candidate_repair_operator_ = -1;
         });
-        const auto make_termination = [this](
+        const auto make_termination = [this, &termination_projection](
             std::int64_t reason, std::int64_t completed_iterations) {
-            const auto budget = budget_.native_snapshot();
-            py::array_t<std::int64_t> output(6);
-            checked_data(output)[0] = reason;
-            checked_data(output)[1] = budget_.exact_budget_;
-            checked_data(output)[2] = budget.started;
-            checked_data(output)[3] = budget.completed;
-            checked_data(output)[4] = budget.interrupted;
-            checked_data(output)[5] = completed_iterations;
+            last_three_lane_termination_state_ =
+                three_lane_termination_state_owned(
+                    reason, completed_iterations);
+            auto output = termination_projection.finish(
+                *last_three_lane_termination_state_);
+            cache_execution_coverage_flags_[4] = 1;
             return output;
         };
 
@@ -14428,6 +14449,8 @@ public:
         last_quality_acceptance_outcome_.reset();
         last_constraint_acceptance_outcome_.reset();
         last_three_lane_legacy_acceptance_outcome_.reset();
+        last_three_lane_termination_state_.reset();
+        ThreeLaneTerminationProjectionV2 termination_projection;
         const auto total_deadline = checked_data<double>(deadline_array)[0];
         const auto remaining_deadline = [&]() {
             return total_deadline - std::chrono::duration<double>(
@@ -14443,16 +14466,14 @@ public:
             checked_data(output)[0] = remaining;
             return output;
         };
-        const auto make_termination = [this](
+        const auto make_termination = [this, &termination_projection](
             std::int64_t reason, std::int64_t completed_iterations) {
-            const auto budget = budget_.native_snapshot();
-            py::array_t<std::int64_t> output(6);
-            checked_data(output)[0] = reason;
-            checked_data(output)[1] = budget_.exact_budget_;
-            checked_data(output)[2] = budget.started;
-            checked_data(output)[3] = budget.completed;
-            checked_data(output)[4] = budget.interrupted;
-            checked_data(output)[5] = completed_iterations;
+            last_three_lane_termination_state_ =
+                three_lane_termination_state_owned(
+                    reason, completed_iterations);
+            auto output = termination_projection.finish(
+                *last_three_lane_termination_state_);
+            cache_execution_coverage_flags_[4] = 1;
             return output;
         };
         ScopeRollback discard_pending_legacy([this]() noexcept {
@@ -14740,23 +14761,33 @@ public:
             std::move(full_stage04), native_sha256_hex(evidence));
     }
 
-    py::array_t<std::int64_t> three_lane_termination_state(
+    evrptw::native_search::ThreeLaneTerminationStateV2
+    three_lane_termination_state_owned(
         std::int64_t reason,
         std::int64_t completed_iterations) const {
-        if (!initialized_ || reason < 0 || reason > 2
+        if (!initialized_ || reason < 0 || reason > 3
             || completed_iterations < 0) {
             throw std::invalid_argument(
                 "full native three-lane termination state is invalid");
         }
         const auto budget = budget_.native_snapshot();
-        py::array_t<std::int64_t> output(6);
-        checked_data(output)[0] = reason;
-        checked_data(output)[1] = budget_.exact_budget_;
-        checked_data(output)[2] = budget.started;
-        checked_data(output)[3] = budget.completed;
-        checked_data(output)[4] = budget.interrupted;
-        checked_data(output)[5] = completed_iterations;
-        return output;
+        return {
+            reason,
+            budget_.exact_budget_,
+            budget.started,
+            budget.completed,
+            budget.interrupted,
+            completed_iterations,
+        };
+    }
+
+    [[nodiscard]] const evrptw::native_search::ThreeLaneTerminationStateV2&
+    last_three_lane_termination_state_owned() const {
+        if (!last_three_lane_termination_state_.has_value()) {
+            throw std::logic_error(
+                "full native three-lane termination state is unavailable");
+        }
+        return *last_three_lane_termination_state_;
     }
 
     [[nodiscard]] bool last_three_lane_acceptance_accepted() const noexcept {
@@ -18082,8 +18113,7 @@ private:
     // negative lookup, exact-cache lookup, exact dispatch, exact-cache store,
     // typed terminal-state projection complete.
     // Lifetime coverage only.  This is observability, not transaction-bound
-    // ownership evidence.  Index 4 remains zero until typed terminal-state
-    // projection replaces the Python-facing snapshot adapters.
+    // ownership evidence.
     std::array<std::int64_t, 5> cache_execution_coverage_flags_{};
     std::optional<evrptw::native_search::AcceptanceOutcomeV2>
         last_quality_acceptance_outcome_;
@@ -18091,6 +18121,8 @@ private:
         last_constraint_acceptance_outcome_;
     std::optional<evrptw::native_search::AcceptanceOutcomeV2>
         last_three_lane_legacy_acceptance_outcome_;
+    std::optional<evrptw::native_search::ThreeLaneTerminationStateV2>
+        last_three_lane_termination_state_;
     std::vector<std::int64_t> exact_launch_occupancies_;
     std::vector<ExactJournalBatch> exact_journal_;
     std::list<ControlJournalBatch> control_journal_;
@@ -19966,28 +19998,21 @@ py::tuple full_native_alns_v2(
     // the real operator/RNG/Stage 4 trajectory with a synthetic event window.
     const auto three_lane = true;
     py::tuple global;
-    py::tuple terminal_global;
-    std::optional<py::array_t<std::int64_t>> terminal_override;
+    using ThreeLaneTerminationStateV2 =
+        evrptw::native_search::ThreeLaneTerminationStateV2;
+    std::optional<ThreeLaneTerminationStateV2> terminal_global_state;
+    std::optional<ThreeLaneTerminationStateV2> terminal_override;
     if (three_lane) {
         const auto mark_three_lane_termination = [](
             const py::tuple& semantic,
-            std::int64_t reason) {
-            if (semantic.size() != 14 || reason < 1 || reason > 3) {
+            const ThreeLaneTerminationStateV2& terminal_state) {
+            if (semantic.size() != 14 || terminal_state.reason < 1
+                || terminal_state.reason > 3) {
                 throw std::invalid_argument(
                     "full native three-lane terminal semantic payload is invalid");
             }
-            auto source_termination = py::cast<py::array_t<std::int64_t>>(
-                semantic[11]);
-            if (source_termination.size() != 6) {
-                throw std::invalid_argument(
-                    "full native three-lane terminal state is invalid");
-            }
-            py::array_t<std::int64_t> termination(6);
-            std::copy(
-                checked_data<std::int64_t>(source_termination),
-                checked_data<std::int64_t>(source_termination) + 6,
-                checked_data(termination));
-            checked_data(termination)[0] = reason;
+            ThreeLaneTerminationProjectionV2 projection;
+            auto termination = projection.finish(terminal_state);
             py::tuple output(14);
             for (py::ssize_t index = 0; index < 13; ++index) {
                 output[index] = index == 11
@@ -20004,27 +20029,24 @@ py::tuple full_native_alns_v2(
             return output;
         };
         const auto pre_bootstrap_termination =
-            engine.three_lane_termination_state(0, 0);
-        const auto pre_bootstrap_started =
-            checked_data<std::int64_t>(pre_bootstrap_termination)[2];
+            engine.three_lane_termination_state_owned(0, 0);
+        const auto pre_bootstrap_started = pre_bootstrap_termination.started;
         auto bootstrap = engine.run_three_lane_bootstrap(
             operator_integer_values[0],
             operator_integer_values[4],
             -1, thresholds, fractions, deadline, batch);
         const auto bootstrap_exhaustion_eligible =
             engine.last_three_lane_acceptance_accepted();
-        terminal_global = bootstrap;
+        const auto bootstrap_termination =
+            engine.last_three_lane_termination_state_owned();
+        terminal_global_state = bootstrap_termination;
         if (base_control_values[1] == 1
-            || checked_data<std::int64_t>(
-                py::cast<py::array_t<std::int64_t>>(bootstrap[11]))[0] != 0) {
+            || bootstrap_termination.reason != 0) {
             global = std::move(bootstrap);
         } else {
             py::list iteration_list;
             iteration_list.append(bootstrap);
-            auto bootstrap_termination = py::cast<py::array_t<std::int64_t>>(
-                bootstrap[11]);
-            std::int64_t previous_started =
-                checked_data<std::int64_t>(bootstrap_termination)[2];
+            std::int64_t previous_started = bootstrap_termination.started;
             std::int64_t no_exact_rounds =
                 bootstrap_exhaustion_eligible
                 && previous_started == pre_bootstrap_started
@@ -20035,8 +20057,9 @@ py::tuple full_native_alns_v2(
                     std::chrono::steady_clock::now() - solve_started).count();
                 const auto remaining = checked_data<double>(deadline)[0] - elapsed;
                 if (remaining <= 0.0) {
-                    terminal_override = engine.three_lane_termination_state(
+                    terminal_override = engine.three_lane_termination_state_owned(
                         2, iteration);
+                    terminal_global_state = terminal_override;
                     break;
                 }
                 py::array_t<double> followup_deadline(1);
@@ -20058,10 +20081,8 @@ py::tuple full_native_alns_v2(
                     -1,
                     thresholds, fractions, followup_deadline, batch);
                 auto followup_termination =
-                    py::cast<py::array_t<std::int64_t>>(followup[11]);
-                auto* followup_terminal_values =
-                    checked_data<std::int64_t>(followup_termination);
-                const auto started = followup_terminal_values[2];
+                    engine.last_three_lane_termination_state_owned();
+                const auto started = followup_termination.started;
                 const auto exhaustion_eligible =
                     engine.last_three_lane_acceptance_accepted();
                 if (exhaustion_eligible) {
@@ -20071,16 +20092,19 @@ py::tuple full_native_alns_v2(
                 previous_started = started;
                 if (exhaustion_eligible
                     && protocol_values[0] == 1
-                    && followup_terminal_values[5] >= protocol_values[5]
+                    && followup_termination.completed_iterations
+                        >= protocol_values[5]
                     && no_exact_rounds >= protocol_values[4]) {
-                    followup = mark_three_lane_termination(followup, 3);
-                    terminal_global = followup;
+                    followup_termination.reason = 3;
+                    followup = mark_three_lane_termination(
+                        followup, followup_termination);
+                    terminal_global_state = followup_termination;
                     iteration_list.append(followup);
                     break;
                 }
-                terminal_global = followup;
+                terminal_global_state = followup_termination;
                 iteration_list.append(followup);
-                if (followup_terminal_values[0] != 0) {
+                if (followup_termination.reason != 0) {
                     break;
                 }
             }
@@ -20216,7 +20240,6 @@ py::tuple full_native_alns_v2(
                 std::move(stage_weights), std::move(stage_calls),
                 std::move(stage_rewards), std::move(termination),
                 native_sha256_hex(evidence));
-            terminal_global = global;
         } else {
             std::vector<std::int64_t> event_values;
             std::vector<double> ranking_values;
@@ -20422,7 +20445,6 @@ py::tuple full_native_alns_v2(
                 std::move(stage_weights), std::move(stage_calls),
                 std::move(stage_rewards), std::move(termination),
                 native_sha256_hex(evidence));
-            terminal_global = global;
         }
     }
     auto best = engine.best_solution_payload();
@@ -20456,23 +20478,35 @@ py::tuple full_native_alns_v2(
     }
     py::array_t<std::int64_t> events;
     py::array_t<std::int64_t> termination;
+    ThreeLaneTerminationStateV2 final_three_lane_termination;
     if (three_lane) {
+        if (!terminal_global_state.has_value()) {
+            throw std::logic_error(
+                "full native three-lane terminal state was not published");
+        }
+        final_three_lane_termination = terminal_override.has_value()
+            ? *terminal_override : *terminal_global_state;
+        ThreeLaneTerminationProjectionV2 projection;
         events = py::array_t<std::int64_t>(
             py::array::ShapeContainer{0, 26});
-        termination = terminal_override.has_value()
-            ? std::move(*terminal_override)
-            : py::cast<py::array_t<std::int64_t>>(terminal_global[11]);
+        termination = projection.finish(final_three_lane_termination);
     } else {
         events = py::cast<py::array_t<std::int64_t>>(global[0]);
         termination = py::cast<py::array_t<std::int64_t>>(global[13]);
     }
     const auto* terminal_values = checked_data<std::int64_t>(termination);
+    const auto terminal_reason = three_lane
+        ? final_three_lane_termination.reason : terminal_values[0];
+    const auto terminal_completed_iterations = three_lane
+        ? final_three_lane_termination.completed_iterations
+        : terminal_values[2];
     py::array_t<std::int64_t> counters(8);
     auto* counter_values = checked_data(counters);
-    counter_values[0] = three_lane
-        ? (terminal_values[0] == 0 ? 1 : 0) : terminal_values[2];
-    counter_values[1] = three_lane ? terminal_values[2] : terminal_values[8];
-    counter_values[2] = three_lane ? terminal_values[3] : terminal_values[9];
+    counter_values[0] = terminal_completed_iterations;
+    counter_values[1] = three_lane
+        ? final_three_lane_termination.started : terminal_values[8];
+    counter_values[2] = three_lane
+        ? final_three_lane_termination.completed : terminal_values[9];
     std::vector<py::tuple> legacy_acceptances;
     if (three_lane) {
         if (global.size() == 2) {
@@ -20488,7 +20522,6 @@ py::tuple full_native_alns_v2(
             legacy_acceptances.push_back(py::cast<py::tuple>(global[4]));
         }
     }
-    counter_values[0] = three_lane ? terminal_values[5] : terminal_values[2];
     counter_values[3] = 0;
     counter_values[4] = 0;
     for (const auto& acceptance : legacy_acceptances) {
@@ -20496,9 +20529,10 @@ py::tuple full_native_alns_v2(
         counter_values[4] += py::cast<std::int64_t>(acceptance[1]);
     }
     counter_values[5] = three_lane
-        && (terminal_values[0] == 1 || terminal_values[0] == 2)
+        && (terminal_reason == 1 || terminal_reason == 2)
         ? 0 : counter_values[0] - counter_values[3];
-    counter_values[6] = three_lane ? terminal_values[4] : terminal_values[10];
+    counter_values[6] = three_lane
+        ? final_three_lane_termination.interrupted : terminal_values[10];
     counter_values[7] = 0;
     py::array_t<std::int64_t> trajectory(
         {static_cast<py::ssize_t>(counter_values[0]), py::ssize_t(7)});
@@ -20537,7 +20571,9 @@ py::tuple full_native_alns_v2(
                 : 0;
         }
     }
-    engine.append_causal_termination(terminal_values[0], terminal_values[5]);
+    engine.append_causal_termination(
+        terminal_reason,
+        three_lane ? terminal_completed_iterations : terminal_values[5]);
     auto causal_journal = engine.causal_journal_payload();
     auto initial_state_receipt = engine.initial_state_receipt_payload();
     const auto elapsed = std::chrono::duration<double>(

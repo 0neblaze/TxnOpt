@@ -2556,8 +2556,8 @@ def test_native_plan_transaction_reports_typed_cache_execution_coverage() -> Non
 
     flags, digest = engine.cache_execution_coverage_receipt()
     # negative lookup, exact-cache lookup, exact dispatch, exact-cache store,
-    # typed terminal-state projection complete.  The last flag deliberately
-    # remains false until the Python-facing snapshot projection is migrated.
+    # typed terminal-state projection complete.  This transaction did not run
+    # a three-lane terminal projection, so the last lifetime flag remains false.
     assert flags.tolist() == [1, 1, 1, 1, 0]
     assert digest == hashlib.sha256(
         b"stage05.2-native-cache-execution-coverage-v1" + flags.tobytes()
@@ -5138,6 +5138,12 @@ def test_native_three_lane_bootstrap_is_one_call_and_matches_python_best() -> No
         python_result.charging_subproblem_calls,
         0,
     ]
+    coverage_flags, coverage_digest = engine.cache_execution_coverage_receipt()
+    assert coverage_flags.tolist() == [1, 1, 1, 1, 1]
+    assert coverage_digest == hashlib.sha256(
+        b"stage05.2-native-cache-execution-coverage-v1"
+        + coverage_flags.tobytes()
+    ).hexdigest()
     weights, rewards, calls, totals = engine.full_stage04_state()
     assert weights.tolist() == [1.0] * len(FULL_NATIVE_OPERATOR_NAMES)
     assert calls.tolist() == [
