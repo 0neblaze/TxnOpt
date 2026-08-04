@@ -3588,3 +3588,46 @@ compatibility fallback（兼容回退）。
   pybind/NumPy seam，不能宣称 whole-call GIL-safe 或性能收益。production capability bits 继续全部为 0；
   不创建 attempt04，不启动 Paired/Pilot/Formal/CUDA，不切换默认架构。下一 slice 为 typed
   ranking/prepare/decide/order。
+
+## 2026-08-05：candidate ranking/prepare/decide/order 完成 typed ownership
+
+- 新增独立的 owned adapter/projector seam：candidate-plan rank、prepare、decide 与 feasible-order
+  核心均只接收 typed spans/vectors，并自有保存输出；公开 Python ABI 继续返回历史 dtype、shape、
+  C-contiguity 与 tuple 顺序。`changed_candidate_plan_selection_v1` 现以 `CandidatePlanPoolV1`、
+  `ScreenBatchResultV2`、vector eligibility/lower bounds/attempted state 和 owned ranking 为唯一搜索
+  决策源，NumPy 只在 evidence/return boundary 投影。
+- `NativeSearchEngineV2::evaluate_plans` 的 canonical expected customers、screen lower bounds、
+  ranked/selected plans、exact-loop plan identity、integer/float objectives 与 feasible order 全程由
+  C++ vectors 驱动；`CandidateRoundState` 直接从这些 vectors 构造。Python arrays 仅在 evidence、
+  mirror validation 与最终 return 前一次性投影，历史 evidence append 顺序、NaN 初始化字节、
+  transaction schema、tamper injection 和 Python tuple ABI 保持不变。
+- 公开 adapter 与 full-native engine 共用唯一 canonical objective order helper；只规范化 feasible
+  objective rows，浮点分量继续使用 `1e-9` half-away-from-zero 语义。新增亚纳秒 raw objective
+  差异但 canonical tie 时由 route lexical order 决胜的回归，避免把实现专属浮点噪声变成搜索分叉。
+- rank/prepare/decide/order output validators 独立重算 CPython compensated distance、changed-route
+  count、完整排序/selected prefix、customer coverage、first-seen unique-route CSR、vehicle cap 与
+  feasible adjacent order。CSR terminal 超过 `INT64_MAX`、实际空 plan/route row、未知 current/candidate
+  node、单 feasible plan comparator bypass、空 pool/空 feasible set 与非 feasible NaN 均有显式回归。
+- `ScreenBatchPythonProblemV2` 在 adapter 边界持有 problem arrays 强引用，changed selection 直接把
+  owned plan CSR 交给 typed screen core；GIL 释放期间 spans 与本地 vectors 生命周期覆盖完整同步调用，
+  正常和异常展开均先恢复 GIL。晚期 projection 分配仍处于完整 transaction try/catch 内，cache、budget、
+  attempted-plan journal 和 negative-cache 的 rollback/fail-fast/zero-fallback 边界不变。
+- clean code checkpoint `bb67eccb0542a2e09f4a22718dda46b70dda00a6` 的 wheel SHA-256 为
+  `4ba751c35654c209770e42b447c6f0035d99844ea50a815e5a776c4eebec0de1`，extension 为
+  `7a5fbf6856a8d175f147aa96bf76b3a003f1409c559423ef1cf157ddbf491bd0`，scheduler 保持
+  `6bf66e7bfcfc4cb2c6ee8dae8c39fd6c54280771612944886780e34962307e30`；安装后的 extension 自报
+  revision 与 checkpoint 完全一致。
+- WIP wheel 的直接 candidate/full-native transaction 聚焦集合为 `30 passed, 317 deselected`，扩大
+  非真实数据 full-native 集合为 `106 passed, 241 deselected`，完整文件为 `335 passed, 12 skipped`、
+  耗时 `782.13s`。clean-checkpoint wheel 的完整 `tests/test_native_execution.py` 再次为
+  `335 passed, 12 skipped`、耗时 `771.82s`；四实例三 seed 真实 per-solve fixed-work 全字段差分为
+  `12 passed`、耗时 `409.47s`。Ruff、83-file strict mypy 与 `git diff --check` 通过。
+- 独立 Spec 复审确认上轮唯一 P2 已关闭：changed selection 与 full-native evaluate-plans 的内部消费者
+  不再以 Python arrays 为状态源；独立 Standards 复审确认 shared canonical ordering、validators、
+  empty spans、GIL/lifetime、rollback、evidence bytes、ABI 与 mirror tamper 均无 P1/P2 finding。两项
+  最终均 ACCEPT。
+- 本条只完成 candidate plan 的 prepare/screen/decide/rank/order typed control boundary；exact dispatch、
+  outer candidate-round envelope 与完整 full-native search engine 仍有 pybind/NumPy seam，不能宣称
+  whole-call GIL-safe 或性能收益。production capability bits 继续全部为 0；不创建 attempt04，不启动
+  Paired/Pilot/Formal/CUDA，不切换默认架构。下一 slice 为 typed exact dispatch 与 candidate-round
+  transaction envelope。
