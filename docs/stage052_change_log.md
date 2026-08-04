@@ -3315,3 +3315,41 @@ compatibility fallback（兼容回退）。
   双审查均 ACCEPT，并按 Standards 建议补上同 iteration rollback 身份门。production
   capability bits 继续全部为 0，不创建 attempt04，不启动 Paired/Pilot/Formal/CUDA，
   不切换默认架构。
+
+## 2026-08-04：dynamic removal typed ownership 与 canonical telemetry 边界
+
+- 新增 C++ `DynamicRemovalSelectionV2`，统一持有 tier、requested/lower/upper count、
+  stagnation、trigger、reset flag 与仅供内部验证的 iteration identity。Stage 2.3 的
+  large/medium 优先级、periodic exploration 晋级、`1..n-1` clamp、zero-removal 和
+  global-best-reset 记录语义保持不变；公开 `dynamic_removal_selection_v2()` 仍返回历史
+  `int64[7]` ABI。constraint iteration、constraint search 与 global search 的预算选择和事件
+  投影全部改读 typed state，不再从返回 NumPy selection array 反向读取搜索控制值。
+- `ConstraintIterationProjectionV2` 现在预分配 selection/outcome arrays；成功提交时同时发布
+  带相同 iteration identity 的 selection 与 outcome。新增只读状态接口证明 Python 修改返回
+  selection 不会影响原生状态，错误 iteration fail fast。global-search snapshot 同时保存并恢复
+  selection、constraint outcome、acceptance outcome 与 completed-iteration identity；envelope
+  fault 后失败轮 selection 不可见，并可按原输入重试。公开绑定已同步 `_core.pyi`。
+- 首次真实四实例三 seed fixed-work 门控诚实得到 `3 passed, 9 failed`：所有失败轴的 objective、
+  routes、candidate-work hash、route-result hash、exact started/completed 和非遥测 operator
+  statistics 均已相同，首个分叉只出现在 route-merge 的
+  `pair_prefilter_rejected_aggregate` / `prefilter_rejected_aggregate`。这两类事件描述 safe
+  prefilter/pair pruning 避免的实现专属工作量，不是 candidate transaction、预算、cache 或
+  acceptance 决策；原生与 Python 合法地具有不同 aggregate reason/count/hash。
+- canonical candidate trajectory 因此只排除上述两类预筛聚合遥测，并在过滤后连续分配
+  semantic ordinal，防止遥测数量改变后续 candidate ID。普通 `prefilter_rejected`、candidate
+  pool、Candidate Control、exact result、budget、acceptance 与 Stage 4 事件仍参与严格比较。
+  两类 aggregate 继续保留在 raw neighborhood evidence；pair-pruning 还保留专门的 native-
+  ablation audit stream。回归证明有无两类遥测时 surviving semantic event 与 candidate ID
+  完全相同。修复后的原失败单轴通过；提交前与 exact-wheel 的完整真实门控分别均为
+  `12 passed`，正式复验耗时 `421.46s`。
+- clean code checkpoint `c7d3e19e1304e743dc5787e39ef02c69be58fea2` 的 wheel SHA-256 为
+  `30f7478d9bbed68661f2dd0b825c5f53d537036fe629a72117630edeaa054175`，extension 为
+  `6178055cff5eac7888530533fea8142250124509c49a31fab8ea7631b290ae02`，scheduler 保持
+  `a1cd6e81caa49cdd7d162e44ee1274b7645dd26fd0f6b8760ae004b8d5e80617`。
+- clean-wheel 验证：dynamic-selection/constraint/global/semantic-trajectory 聚焦集合
+  `25 passed, 317 deselected`；完整 `tests/test_native_execution.py` 为
+  `330 passed, 12 skipped`、耗时 `796.10s`；四实例三 seed 真实 fixed-work 为
+  `12 passed`、耗时 `421.46s`。Ruff、83-file strict mypy 与 `git diff --check` 通过；独立
+  Spec 与 Standards 双审查均 ACCEPT。production capability bits 继续全部为 0；本条只封存
+  per-solve 与 reviewer semantic projection 检查点，不声称 full-native/host-scheduler 已完成，
+  不创建 attempt04，不启动 Paired/Pilot/Formal/CUDA，不切换默认架构。
