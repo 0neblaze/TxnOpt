@@ -698,8 +698,20 @@ def _semantic_candidate_trajectory(result: ALNSResult) -> list[dict[str, object]
         "route_segment_destroy",
         "ejection_chain",
     }
+    implementation_telemetry_statuses = {
+        "pair_prefilter_rejected_aggregate",
+        "prefilter_rejected_aggregate",
+    }
     trajectory: list[dict[str, object]] = []
-    for ordinal, raw_event in enumerate(result.neighborhood_events):
+    for raw_event in result.neighborhood_events:
+        if raw_event.get("status") in implementation_telemetry_statuses:
+            # Prefilter aggregates describe implementation-specific work
+            # avoided before the candidate transaction. They remain in raw
+            # neighborhood evidence (pair pruning also has a dedicated native-
+            # ablation stream), but are not a search decision and therefore
+            # cannot shift canonical ordinals.
+            continue
+        ordinal = len(trajectory)
         event = {
             key: value
             for key, value in raw_event.items()

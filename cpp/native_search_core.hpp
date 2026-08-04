@@ -94,6 +94,97 @@ struct ConstraintIterationOutcomeV2 final {
     std::int64_t iteration = -1;
 };
 
+struct DynamicRemovalSelectionV2 final {
+    std::int64_t tier = 0;
+    std::int64_t requested_count = 0;
+    std::int64_t lower_bound = 0;
+    std::int64_t upper_bound = 0;
+    std::int64_t stagnation_iterations = 0;
+    std::int64_t trigger = 0;
+    std::int64_t global_best_reset = 0;
+    std::int64_t iteration = -1;
+
+    [[nodiscard]] std::array<std::int64_t, 7> values() const noexcept {
+        return {
+            tier,
+            requested_count,
+            lower_bound,
+            upper_bound,
+            stagnation_iterations,
+            trigger,
+            global_best_reset,
+        };
+    }
+};
+
+[[nodiscard]] inline DynamicRemovalSelectionV2 select_dynamic_removal_v2(
+    const std::int64_t customer_count,
+    const std::int64_t stagnation_iterations,
+    const std::int64_t iteration,
+    const std::array<std::int64_t, 3>& thresholds,
+    const std::array<double, 6>& fractions,
+    const bool global_best_reset) {
+    if (customer_count < 0 || stagnation_iterations < 0 || iteration < 0) {
+        throw std::invalid_argument(
+            "dynamic removal selection v2 values cannot be negative");
+    }
+    const auto medium_threshold = thresholds[0];
+    const auto large_threshold = thresholds[1];
+    const auto exploration_period = thresholds[2];
+    if (medium_threshold < 0 || large_threshold <= medium_threshold
+        || exploration_period <= 0) {
+        throw std::invalid_argument("dynamic removal thresholds are invalid");
+    }
+    for (std::size_t index = 0; index < 3; ++index) {
+        const auto minimum = fractions[index * 2];
+        const auto maximum = fractions[index * 2 + 1];
+        if (!std::isfinite(minimum) || !std::isfinite(maximum)
+            || minimum <= 0.0 || maximum < minimum || maximum > 1.0) {
+            throw std::invalid_argument(
+                "dynamic removal fraction bounds are invalid");
+        }
+    }
+
+    DynamicRemovalSelectionV2 selection;
+    selection.stagnation_iterations = stagnation_iterations;
+    selection.global_best_reset = global_best_reset ? 1 : 0;
+    selection.iteration = iteration;
+    if (stagnation_iterations >= large_threshold) {
+        selection.tier = 2;
+        selection.trigger = 2;
+    } else if (stagnation_iterations >= medium_threshold) {
+        selection.tier = 1;
+        selection.trigger = 1;
+    }
+    if (iteration > 0 && iteration % exploration_period == 0
+        && stagnation_iterations > medium_threshold && selection.tier < 2) {
+        ++selection.tier;
+        selection.trigger += 3;
+    }
+    if (customer_count > 1) {
+        const auto upper_customer_bound = customer_count - 1;
+        const auto tier_offset = static_cast<std::size_t>(selection.tier) * 2;
+        selection.lower_bound = std::max<std::int64_t>(
+            1,
+            std::min<std::int64_t>(
+                upper_customer_bound,
+                static_cast<std::int64_t>(std::ceil(
+                    static_cast<double>(customer_count)
+                    * fractions[tier_offset]))));
+        selection.upper_bound = std::max<std::int64_t>(
+            selection.lower_bound,
+            std::min<std::int64_t>(
+                upper_customer_bound,
+                static_cast<std::int64_t>(std::floor(
+                    static_cast<double>(customer_count)
+                    * fractions[tier_offset + 1]))));
+        selection.requested_count = selection.lower_bound;
+    } else {
+        selection.trigger = 6;
+    }
+    return selection;
+}
+
 struct ProblemV2 final {
     std::vector<std::int64_t> node_kind;
     std::vector<double> demand;

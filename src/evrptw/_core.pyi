@@ -545,6 +545,10 @@ class NativeSearchEngineV2:
         ],
         npt.NDArray[np.int64],
     ]: ...
+    def dynamic_removal_selection_state(
+        self,
+        expected_iteration: int,
+    ) -> npt.NDArray[np.int64]: ...
     def run_constraint_search(
         self,
         start_iteration: int,

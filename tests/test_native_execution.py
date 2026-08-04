@@ -11,6 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -115,6 +116,43 @@ def test_native_search_engine_rejects_disabled_local_work_pool() -> None:
 
     with pytest.raises(ValueError, match="worker_count is invalid"):
         native_core.NativeSearchEngineV2(100, 100, 10, 4096, 10, 10, 1e-9, 0)
+
+
+def test_semantic_candidate_trajectory_excludes_pair_pruning_telemetry() -> None:
+    result: Any = SimpleNamespace(
+        neighborhood_events=(
+            {
+                "operator": "route_merge",
+                "status": "pair_prefilter_rejected_aggregate",
+                "reason": "capacity_prefilter",
+                "iteration": 0,
+                "route_indices": (1, 2),
+            },
+            {
+                "operator": "route_merge",
+                "status": "prefilter_rejected_aggregate",
+                "reason": "time_window_prefilter",
+                "iteration": 0,
+                "aggregate_count": 5,
+            },
+            {
+                "operator": "route_merge",
+                "status": "rejected",
+                "reason": "capacity_prefilter",
+                "iteration": 0,
+                "route_indices": (1, 2),
+            },
+        )
+    )
+
+    trajectory = _semantic_candidate_trajectory(result)
+    without_telemetry: Any = SimpleNamespace(
+        neighborhood_events=(result.neighborhood_events[-1],)
+    )
+
+    assert len(trajectory) == 1
+    assert trajectory[0]["status"] == "rejected"
+    assert trajectory == _semantic_candidate_trajectory(without_telemetry)
 
 
 def _fixture_instance() -> Instance:
@@ -3301,6 +3339,18 @@ def test_native_search_engine_constraint_iteration_owns_python_rng_and_policy() 
 
     assert selection.tolist() == [0, 1, 1, 1, 0, 0, 0]
     assert outcome.tolist() == [0, 2488652245, 1, 1, 0, 0]
+    selection.fill(-1)
+    assert engine.dynamic_removal_selection_state(0).tolist() == [
+        0,
+        1,
+        1,
+        1,
+        0,
+        0,
+        0,
+    ]
+    with pytest.raises(RuntimeError, match="dynamic removal selection is unavailable"):
+        engine.dynamic_removal_selection_state(1)
     assert probe[0][2].tolist() == [2]
     assert probe[1][1].tolist() == [2, 1]
     assert probe[2][11].tolist() == [0]
@@ -4410,6 +4460,8 @@ def test_native_global_search_envelope_failure_rolls_back_logical_state() -> Non
     np.testing.assert_equal(state_after[3], state_before[3])
     assert state_after[1][5] > state_before[1][5]
     np.testing.assert_equal(state_after[1][2:5], state_before[1][2:5])
+    with pytest.raises(RuntimeError, match="dynamic removal selection is unavailable"):
+        engine.dynamic_removal_selection_state(0)
 
     retry = engine.run_global_search(
         0,

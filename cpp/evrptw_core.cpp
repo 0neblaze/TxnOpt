@@ -1054,76 +1054,28 @@ py::array_t<std::int64_t> dynamic_removal_selection_v2(
     auto threshold_array = checked_array<std::int64_t>(
         thresholds, "thresholds", 1);
     auto fraction_array = checked_array<double>(fractions, "fractions", 1);
-    if (customer_count < 0 || stagnation_iterations < 0 || iteration < 0
-        || threshold_array.size() != 3 || fraction_array.size() != 6) {
+    if (threshold_array.size() != 3 || fraction_array.size() != 6) {
         throw std::invalid_argument(
             "dynamic removal selection v2 input/config shape is invalid");
     }
-    const auto* threshold_values = checked_data<std::int64_t>(threshold_array);
-    const auto* fraction_values = checked_data<double>(fraction_array);
-    const auto medium_threshold = threshold_values[0];
-    const auto large_threshold = threshold_values[1];
-    const auto exploration_period = threshold_values[2];
-    if (medium_threshold < 0 || large_threshold <= medium_threshold
-        || exploration_period <= 0) {
-        throw std::invalid_argument(
-            "dynamic removal thresholds are invalid");
-    }
-    for (std::size_t index = 0; index < 3; ++index) {
-        const auto minimum = fraction_values[index * 2];
-        const auto maximum = fraction_values[index * 2 + 1];
-        if (!std::isfinite(minimum) || !std::isfinite(maximum)
-            || minimum <= 0.0 || maximum < minimum || maximum > 1.0) {
-            throw std::invalid_argument(
-                "dynamic removal fraction bounds are invalid");
-        }
-    }
-    std::int64_t tier = 0;
-    std::int64_t trigger = 0;
-    if (stagnation_iterations >= large_threshold) {
-        tier = 2;
-        trigger = 2;
-    } else if (stagnation_iterations >= medium_threshold) {
-        tier = 1;
-        trigger = 1;
-    }
-    if (iteration > 0 && iteration % exploration_period == 0
-        && stagnation_iterations > medium_threshold && tier < 2) {
-        ++tier;
-        trigger += 3;
-    }
-    std::int64_t requested = 0;
-    std::int64_t lower_bound = 0;
-    std::int64_t upper_bound = 0;
-    if (customer_count > 1) {
-        const auto upper_customer_bound = customer_count - 1;
-        lower_bound = std::max<std::int64_t>(
-            1,
-            std::min<std::int64_t>(
-                upper_customer_bound,
-                static_cast<std::int64_t>(std::ceil(
-                    static_cast<double>(customer_count)
-                    * fraction_values[static_cast<std::size_t>(tier) * 2]))));
-        upper_bound = std::max<std::int64_t>(
-            lower_bound,
-            std::min<std::int64_t>(
-                upper_customer_bound,
-                static_cast<std::int64_t>(std::floor(
-                    static_cast<double>(customer_count)
-                    * fraction_values[static_cast<std::size_t>(tier) * 2 + 1]))));
-        requested = lower_bound;
-    } else {
-        trigger = 6;
-    }
+    std::array<std::int64_t, 3> threshold_values{};
+    std::array<double, 6> fraction_values{};
+    std::copy_n(
+        checked_data<std::int64_t>(threshold_array),
+        threshold_values.size(), threshold_values.begin());
+    std::copy_n(
+        checked_data<double>(fraction_array),
+        fraction_values.size(), fraction_values.begin());
+    const auto selection = evrptw::native_search::select_dynamic_removal_v2(
+        customer_count,
+        stagnation_iterations,
+        iteration,
+        threshold_values,
+        fraction_values,
+        global_best_reset);
     py::array_t<std::int64_t> output(7);
-    auto* values = checked_data(output);
-    values[0] = tier;
-    values[1] = requested;
-    values[2] = lower_bound;
-    values[3] = upper_bound;
-    values[4] = stagnation_iterations;
-    values[5] = trigger;
-    values[6] = global_best_reset ? 1 : 0;
+    const auto values = selection.values();
+    std::copy(values.begin(), values.end(), checked_data(output));
     return output;
 }
 
@@ -9510,12 +9462,11 @@ private:
 class ConstraintIterationProjectionV2 final {
 public:
     ConstraintIterationProjectionV2()
-        : payload_(3), outcome_(6), outcome_values_(checked_data(outcome_)) {
+        : payload_(3), selection_(7), outcome_(6),
+          selection_values_(checked_data(selection_)),
+          outcome_values_(checked_data(outcome_)) {
+        payload_[0] = selection_;
         payload_[2] = outcome_;
-    }
-
-    void set_selection(py::handle selection) {
-        payload_[0] = selection;
     }
 
     void set_probe(py::handle probe) {
@@ -9523,7 +9474,11 @@ public:
     }
 
     py::tuple finish(
+        const evrptw::native_search::DynamicRemovalSelectionV2& selection,
         const evrptw::native_search::ConstraintIterationOutcomeV2& outcome) {
+        const auto selection_state = selection.values();
+        std::copy(
+            selection_state.begin(), selection_state.end(), selection_values_);
         outcome_values_[0] = outcome.operation;
         outcome_values_[1] = outcome.probe_seed;
         outcome_values_[2] = outcome.candidate_feasible;
@@ -9535,9 +9490,19 @@ public:
 
 private:
     py::tuple payload_;
+    py::array_t<std::int64_t> selection_;
     py::array_t<std::int64_t> outcome_;
+    std::int64_t* selection_values_;
     std::int64_t* outcome_values_;
 };
+
+py::array_t<std::int64_t> project_dynamic_removal_selection_v2(
+    const evrptw::native_search::DynamicRemovalSelectionV2& selection) {
+    py::array_t<std::int64_t> output(7);
+    const auto values = selection.values();
+    std::copy(values.begin(), values.end(), checked_data(output));
+    return output;
+}
 
 class NativeSearchEngineV2 {
 public:
@@ -14895,6 +14860,30 @@ public:
         return *last_constraint_iteration_outcome_;
     }
 
+    [[nodiscard]] const evrptw::native_search::DynamicRemovalSelectionV2&
+    last_dynamic_removal_selection_owned(
+        std::int64_t expected_iteration) const {
+        if (!last_dynamic_removal_selection_.has_value()
+            || last_dynamic_removal_selection_->iteration
+                != expected_iteration
+            || last_completed_constraint_iteration_ != expected_iteration) {
+            throw std::logic_error(
+                "full native dynamic removal selection is unavailable");
+        }
+        return *last_dynamic_removal_selection_;
+    }
+
+    py::array_t<std::int64_t> dynamic_removal_selection_state(
+        std::int64_t expected_iteration) const {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        return project_dynamic_removal_selection_v2(
+            last_dynamic_removal_selection_owned(expected_iteration));
+    }
+
     std::int64_t main_stagnation_iterations() const {
         std::unique_lock state_lock(state_mutex_, std::try_to_lock);
         if (!state_lock.owns_lock()) {
@@ -15361,6 +15350,7 @@ public:
         }
         last_finished_stage04_iteration_ = -1;
         last_completed_constraint_iteration_ = -1;
+        last_dynamic_removal_selection_.reset();
         stage04_reheat_count_ = 0;
         stage04_restart_count_ = 0;
         stage04_reheat_floor_ = 0.0;
@@ -15919,14 +15909,36 @@ public:
             throw std::invalid_argument(
                 "full native constraint iteration already completed");
         }
+        auto threshold_array = owned_array_copy<std::int64_t>(
+            thresholds, "thresholds", 1);
+        auto fraction_array = owned_array_copy<double>(
+            fractions, "fractions", 1);
         auto deadline_array = owned_array_copy<double>(
             deadline_remaining, "deadline_remaining", 1);
-        if (deadline_array.size() != 1
+        if (threshold_array.size() != 3 || fraction_array.size() != 6
+            || deadline_array.size() != 1
             || !std::isfinite(checked_data<double>(deadline_array)[0])
             || checked_data<double>(deadline_array)[0] <= 0.0) {
             throw std::invalid_argument(
-                "full native constraint iteration deadline is invalid");
+                "full native constraint iteration config/deadline is invalid");
         }
+        std::array<std::int64_t, 3> threshold_values{};
+        std::array<double, 6> fraction_values{};
+        std::copy_n(
+            checked_data<std::int64_t>(threshold_array),
+            threshold_values.size(), threshold_values.begin());
+        std::copy_n(
+            checked_data<double>(fraction_array),
+            fraction_values.size(), fraction_values.begin());
+        const auto selection =
+            evrptw::native_search::select_dynamic_removal_v2(
+                static_cast<std::int64_t>(all_customers_.size()),
+                stagnation_iterations,
+                iteration,
+                threshold_values,
+                fraction_values,
+                global_best_reset);
+        const auto requested_count = selection.requested_count;
         last_constraint_iteration_outcome_.reset();
         ConstraintIterationProjectionV2 projection;
         const auto deadline_seconds = checked_data<double>(deadline_array)[0];
@@ -15956,20 +15968,11 @@ public:
             "worst_energy_detour",
             "shaw_related",
         };
-        auto selection = dynamic_removal_selection_v2(
-            static_cast<std::int64_t>(all_customers_.size()),
-            stagnation_iterations,
-            iteration,
-            thresholds,
-            fractions,
-            global_best_reset);
-        projection.set_selection(selection);
         // Python reserves a per-probe seed immediately after selecting the
         // constraint operator, even when the dynamic removal count is zero.
         // Consume it on every path so later weighted operator draws remain
         // byte-for-byte aligned with random.Random.
         const auto probe_seed = next_constraint_rng.randbelow(1ULL << 32U);
-        const auto requested_count = checked_data<std::int64_t>(selection)[1];
         evrptw::native_search::ConstraintIterationOutcomeV2 outcome{
             operation,
             static_cast<std::int64_t>(probe_seed),
@@ -16026,8 +16029,11 @@ public:
                 static_cast<std::size_t>(operation + 9), false, 1, false,
                 false, true);
             last_completed_constraint_iteration_ = iteration;
+            last_dynamic_removal_selection_ = selection;
             last_constraint_iteration_outcome_ = outcome;
-            return projection.finish(*last_constraint_iteration_outcome_);
+            return projection.finish(
+                *last_dynamic_removal_selection_,
+                *last_constraint_iteration_outcome_);
         }
         py::array_t<std::int64_t> context_ids(3);
         auto* context = checked_data(context_ids);
@@ -16112,8 +16118,11 @@ public:
                 static_cast<std::size_t>(operation + 9), accepted, comparison,
                 improved_best, vehicle_reduction, true);
             last_completed_constraint_iteration_ = iteration;
+            last_dynamic_removal_selection_ = selection;
             last_constraint_iteration_outcome_ = outcome;
-            return projection.finish(*last_constraint_iteration_outcome_);
+            return projection.finish(
+                *last_dynamic_removal_selection_,
+                *last_constraint_iteration_outcome_);
         } catch (...) {
             defer_iteration_commit_ = false;
             if (pending_composite_active_) {
@@ -16249,12 +16258,11 @@ public:
                 termination_reason = 2;
                 break;
             }
-            auto selection = py::cast<py::array_t<std::int64_t>>(
-                iteration_payload[0]);
             auto probe = py::cast<py::tuple>(iteration_payload[1]);
+            const auto selection = last_dynamic_removal_selection_owned(
+                iteration);
             const auto outcome = last_constraint_iteration_outcome_owned(
                 iteration);
-            const auto* selection_values = checked_data<std::int64_t>(selection);
             const auto after_budget = budget_.native_snapshot();
 
             auto* event = checked_data(event_integer) + ordinal * 16;
@@ -16262,8 +16270,8 @@ public:
             event[1] = 2;  // constraint_lane
             event[2] = iteration;
             event[3] = 9 + outcome.operation;
-            event[4] = selection_values[1];
-            event[5] = selection_values[2];
+            event[4] = selection.requested_count;
+            event[5] = selection.lower_bound;
             event[6] = outcome.candidate_feasible;
             event[7] = outcome.accepted;
             event[8] = outcome.improved_global_best;
@@ -16675,6 +16683,12 @@ public:
             std::int64_t stage04_intensification_remaining;
             std::int64_t last_finished_stage04_iteration;
             std::int64_t last_completed_constraint_iteration;
+            std::optional<evrptw::native_search::AcceptanceOutcomeV2>
+                last_constraint_acceptance_outcome;
+            std::optional<evrptw::native_search::ConstraintIterationOutcomeV2>
+                last_constraint_iteration_outcome;
+            std::optional<evrptw::native_search::DynamicRemovalSelectionV2>
+                last_dynamic_removal_selection;
             std::int64_t main_stagnation_iterations;
             bool last_iteration_global_best_improved;
             NativeCausalJournalV2::Snapshot causal;
@@ -16703,6 +16717,9 @@ public:
             stage04_intensification_remaining_,
             last_finished_stage04_iteration_,
             last_completed_constraint_iteration_,
+            last_constraint_acceptance_outcome_,
+            last_constraint_iteration_outcome_,
+            last_dynamic_removal_selection_,
             main_stagnation_iterations_, last_iteration_global_best_improved_,
             causal_journal_.snapshot()};
         defer_global_commit_ = true;
@@ -16783,6 +16800,12 @@ public:
                     snapshot.last_finished_stage04_iteration;
                 last_completed_constraint_iteration_ =
                     snapshot.last_completed_constraint_iteration;
+                last_constraint_acceptance_outcome_ =
+                    snapshot.last_constraint_acceptance_outcome;
+                last_constraint_iteration_outcome_ =
+                    snapshot.last_constraint_iteration_outcome;
+                last_dynamic_removal_selection_ =
+                    snapshot.last_dynamic_removal_selection;
                 main_stagnation_iterations_ = snapshot.main_stagnation_iterations;
                 last_iteration_global_best_improved_ =
                     snapshot.last_iteration_global_best_improved;
@@ -16812,18 +16835,18 @@ public:
             const auto terminal_budget = budget_.native_snapshot();
             return make_empty_terminal(2, entry_budget, terminal_budget);
         }
-        auto selection = py::cast<py::array_t<std::int64_t>>(constraint[0]);
         auto probe = py::cast<py::tuple>(constraint[1]);
+        const auto selection = last_dynamic_removal_selection_owned(
+            start_iteration);
         const auto outcome = last_constraint_iteration_outcome_owned(
             start_iteration);
         auto removal = py::cast<py::tuple>(probe[0]);
-        const auto* selection_values = checked_data<std::int64_t>(selection);
         if (probe[1].is_none()) {
             auto removal_metadata =
                 py::cast<py::array_t<std::int64_t>>(removal[6]);
             if (!probe[2].is_none()
                 || checked_data<std::int64_t>(removal_metadata)[0] != 2
-                || selection_values[1] != 0
+                || selection.requested_count != 0
                 || outcome.operation < 0 || outcome.operation >= 4
                 || outcome.candidate_feasible != 0) {
                 throw std::logic_error(
@@ -17015,13 +17038,13 @@ public:
         ranked_removal[5] = 1;
         ranked_removal[9] = 1;
         ranked_removal[12] = 1;
-        ranked_removal[13] = selection_values[1];
-        ranked_removal[14] = selection_values[2];
+        ranked_removal[13] = selection.requested_count;
+        ranked_removal[14] = selection.lower_bound;
         ranked_removal[15] = 2;
         ranked_removal[16] = 0;
         ranked_removal[17] = 0;
         ranked_removal[22] = initial_stagnation_iterations;
-        ranked_removal[24] = selection_values[0];
+        ranked_removal[24] = selection.tier;
         ranked_removal[25] = 0;
 
         auto* repaired = initialize_event(2);
@@ -17038,13 +17061,13 @@ public:
         repaired[10] = outcome.candidate_feasible;
         repaired[11] = static_cast<std::int64_t>(
             candidate_round.exact_route_rows.size());
-        repaired[13] = selection_values[1];
-        repaired[14] = selection_values[2];
+        repaired[13] = selection.requested_count;
+        repaired[14] = selection.lower_bound;
         repaired[15] = 2;
         repaired[17] = 0;
         repaired[20] = candidate_feasible ? 0 : -2;
         repaired[22] = initial_stagnation_iterations;
-        repaired[24] = selection_values[0];
+        repaired[24] = selection.tier;
         repaired[25] = 0;
 
         if (!budget_boundary) {
@@ -18277,6 +18300,8 @@ private:
         last_three_lane_termination_state_;
     std::optional<evrptw::native_search::ConstraintIterationOutcomeV2>
         last_constraint_iteration_outcome_;
+    std::optional<evrptw::native_search::DynamicRemovalSelectionV2>
+        last_dynamic_removal_selection_;
     std::vector<std::int64_t> exact_launch_occupancies_;
     std::vector<ExactJournalBatch> exact_journal_;
     std::list<ControlJournalBatch> control_journal_;
@@ -21481,6 +21506,10 @@ PYBIND11_MODULE(_core, module) {
             py::arg("fractions"), py::arg("deadline_remaining"),
             py::arg("batch_size"),
             py::arg("route_change_limit"))
+        .def(
+            "dynamic_removal_selection_state",
+            &NativeSearchEngineV2::dynamic_removal_selection_state,
+            py::arg("expected_iteration"))
         .def(
             "run_constraint_search", &NativeSearchEngineV2::run_constraint_search,
             py::arg("start_iteration"), py::arg("iteration_count"),
