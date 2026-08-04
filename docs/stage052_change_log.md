@@ -3389,3 +3389,47 @@ compatibility fallback（兼容回退）。
   typed evaluate-plans/probe/outer search inputs，最后才能释放 whole-call GIL。production
   capability bits 继续全部为 0；不创建性能 attempt04，不启动 Paired/Pilot/Formal/CUDA，
   不切换默认架构。
+
+## 2026-08-04：candidate-control repair 输出完成 typed ownership
+
+- 新增 C++ `RepairResultV2`，自有保存 repaired-route CSR、七字段 counters 与 iteration
+  identity。校验覆盖 offsets 首尾/严格单调、indices 长度、status 0/1/2、非负 counters、
+  `calls == passes + rejections`、成功 pending=0/非空路线，以及失败严格 `[0], []`。
+  公开 `candidate_control_repair_v2()` 保持历史三数组 ABI、dtype、字段顺序和失败 partial-work
+  counters；`constraint_repair_state(expected_iteration)` 返回独立复制并拒绝 stale iteration。
+- legacy route elimination、vehicle-count-aware、standard repair/refinement、quality route-segment
+  与 constraint probe 五个 C++ consumers 全部改读 typed offsets/indices/counters。Python tuple 只在
+  公开返回或仍要求数组的 `evaluate_plans` seam 投影。legacy elimination 的 identity hash 从
+  array encoder 改为同 shape 的 vector encoder，ndim→shape→count→values 字节编码与路线顺序保持
+  一致；constraint/global semantic stream 的成功 repair 路线也改读 owned state。
+- repair 只有在 post-repair deadline、exact transaction 和 envelope gate 正常完成后才发布；
+  safe repair 成功但 exact candidate infeasible 仍保留有效 repair state。repair status 1/2、
+  no-removal 和 zero-removal 均不发布。constraint-iteration catch 与 global snapshot 保存并 move-
+  restore optional repair，initialize 清空状态；非空 iteration 99 快照在 iteration 0 global fault
+  后逐数组恢复。
+- Standards 首轮复审发现同 iteration stale-state blocker：同一 iteration 先成功、再正常
+  repair-failure/no-repair 时，旧成功 state 可能被 `run_constraint_search` 误用于本轮 canonical
+  routes。新增 `invalidate_constraint_repair_for_iteration_noexcept()`，只在三个无成功 repair 的
+  正常出口失效相同 iteration，不删除其他 iteration 的证据，异常仍由快照恢复。真实回归在同一
+  engine/iteration 先成功并 apply，再产生 status 1 `[1,0,1,8,8,0,1]`，旧 state 随后必须
+  unavailable；Standards 修复后复审 ACCEPT。
+- TDD/验证过程保留其余非通过记录：缺少 state accessor 的初始 red test；首次编译发现三处已删
+  `repair_counters` 仅用于返回 envelope 的残留引用；一项测试曾误把 safe-repair 成功后的 exact-
+  infeasible 事件当作 repair failure；新 failure test 首次插入位置错误，使原 solution assertions
+  落入新函数并触发 `NameError`。这些问题分别通过 ABI-only counter projection、正确的 exact-
+  infeasible publish 断言、独立 capacity=2/route-change-limit=1 status-1 fixture 和恢复原测试作用
+  域解决，失败结果不计入通过证据。
+- clean code checkpoint `3cbf2dba16880b938b9d505daf7f42636165c40c` 的 wheel SHA-256
+  为 `ebb4a8dda097d061f2b78a0024303237aeb925bf9da5187fce6d03b5ad74a414`，extension
+  为 `c71c77a9f1fd42954c29f138f4082096153767c63260436887a529a3d012ceac`，scheduler
+  保持 `a1cd6e81caa49cdd7d162e44ee1274b7645dd26fd0f6b8760ae004b8d5e80617`。
+  clean-wheel 聚焦 repair/constraint/global/legacy/three-lane 集合为
+  `36 passed, 308 deselected`；完整 `tests/test_native_execution.py` 为
+  `332 passed, 12 skipped`、耗时 `792.45s`；四实例三 seed 真实 per-solve fixed-work
+  全字段差分为 `12 passed`、耗时 `422.70s`。Ruff、83-file strict mypy 与
+  `git diff --check` 通过；独立 Spec、Standards 与 code review 最终均 ACCEPT。
+- 本条仍只是 repair **输出端** ownership：`candidate_control_repair_owned_v2()` 继续接收十二个
+  `py::handle` 数组并读取 NumPy storage，projection 同样需要 GIL；不能释放 whole-call GIL，
+  也不证明 full-native/host-scheduler 完工。下一步继续 typed helper pools 与 typed
+  evaluate-plans/probe/outer inputs。production capability bits 继续全部为 0；不创建性能
+  attempt04，不启动 Paired/Pilot/Formal/CUDA，不切换默认架构。
