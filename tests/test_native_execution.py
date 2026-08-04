@@ -6524,6 +6524,64 @@ def test_native_stage04_iteration_finish_is_exactly_once_and_monotonic() -> None
         engine.record_constraint_stage04_outcome(3, 0, False, 1, False, False)
 
 
+def test_native_stage04_boundary_projection_failure_is_precommit() -> None:
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = _native_search_engine(
+        native_core,
+        context,
+        10,
+        1,
+        16,
+        1_000_000,
+        16,
+        1,
+        context.reachability_epsilon,
+        1,
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(
+        replace(
+            Stage04Config(),
+            segment_length=1,
+            min_calls_per_operator=1,
+            reward_accepted_equal=2.0,
+        )
+    )
+    engine.configure_stage04(stage04_integer, stage04_float)
+    engine.record_constraint_stage04_outcome(0, 0, True, 0, False, False)
+    before = tuple(value.copy() for value in engine.constraint_stage04_state())
+
+    engine.inject_stage04_boundary_projection_failure_once()
+    with pytest.raises(RuntimeError, match="Stage 4 boundary projection"):
+        engine.finish_stage04_iteration(0, False)
+
+    after = engine.constraint_stage04_state()
+    for expected, observed in zip(before, after, strict=True):
+        np.testing.assert_equal(observed, expected)
+    statuses, weights, calls, rewards, *_ = engine.finish_stage04_iteration(0, False)
+    assert statuses.tolist() == [1, 0, 0, 0]
+    np.testing.assert_allclose(weights[0], np.asarray([1.0, 1.04]))
+    assert calls.tolist() == [1, 0, 0, 0]
+    np.testing.assert_allclose(rewards, np.asarray([2.0, 0.0, 0.0, 0.0]))
+
+
 def test_native_constraint_iteration_preserves_preexisting_unapplied_candidate() -> None:
     from evrptw import _core as native_core
 

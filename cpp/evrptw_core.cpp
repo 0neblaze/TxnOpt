@@ -9452,6 +9452,61 @@ private:
     std::int64_t* values_;
 };
 
+class Stage04BoundaryProjectionV2 final {
+public:
+    Stage04BoundaryProjectionV2()
+        : payload_(6), statuses_(4), old_new_weights_({py::ssize_t(4), py::ssize_t(2)}),
+          calls_at_boundary_(4), rewards_at_boundary_(4), control_status_(7),
+          control_float_(1), status_values_(checked_data(statuses_)),
+          weight_values_(checked_data(old_new_weights_)),
+          call_values_(checked_data(calls_at_boundary_)),
+          reward_values_(checked_data(rewards_at_boundary_)),
+          control_values_(checked_data(control_status_)),
+          control_float_values_(checked_data(control_float_)) {
+        payload_[0] = statuses_;
+        payload_[1] = old_new_weights_;
+        payload_[2] = calls_at_boundary_;
+        payload_[3] = rewards_at_boundary_;
+        payload_[4] = control_status_;
+        payload_[5] = control_float_;
+    }
+
+    py::tuple finish(
+        const evrptw::native_search::Stage04BoundaryStateV2& state) {
+        std::copy(
+            state.statuses.begin(), state.statuses.end(), status_values_);
+        std::copy(
+            state.old_new_weights.begin(), state.old_new_weights.end(),
+            weight_values_);
+        std::copy(
+            state.calls_at_boundary.begin(), state.calls_at_boundary.end(),
+            call_values_);
+        std::copy(
+            state.rewards_at_boundary.begin(), state.rewards_at_boundary.end(),
+            reward_values_);
+        std::copy(
+            state.control_status.begin(), state.control_status.end(),
+            control_values_);
+        control_float_values_[0] = state.reheat_floor;
+        return std::move(payload_);
+    }
+
+private:
+    py::tuple payload_;
+    py::array_t<std::int64_t> statuses_;
+    py::array_t<double> old_new_weights_;
+    py::array_t<std::int64_t> calls_at_boundary_;
+    py::array_t<double> rewards_at_boundary_;
+    py::array_t<std::int64_t> control_status_;
+    py::array_t<double> control_float_;
+    std::int64_t* status_values_;
+    double* weight_values_;
+    std::int64_t* call_values_;
+    double* reward_values_;
+    std::int64_t* control_values_;
+    double* control_float_values_;
+};
+
 class NativeSearchEngineV2 {
 public:
     NativeSearchEngineV2(
@@ -15595,6 +15650,21 @@ public:
             throw std::runtime_error(
                 "full native search engine already has an active operation");
         }
+        Stage04BoundaryProjectionV2 projection;
+        if (stage04_boundary_projection_failure_injection_) {
+            stage04_boundary_projection_failure_injection_ = false;
+            throw std::runtime_error(
+                "injected full native Stage 4 boundary projection failure");
+        }
+        return projection.finish(finish_stage04_iteration_owned_no_lock(
+            iteration, budget_boundary, advance_intensification));
+    }
+
+    evrptw::native_search::Stage04BoundaryStateV2
+    finish_stage04_iteration_owned_no_lock(
+        std::int64_t iteration,
+        bool budget_boundary,
+        bool advance_intensification) {
         if (!stage04_configured_ || iteration < 0) {
             throw std::invalid_argument(
                 "full native Stage 4 boundary state is invalid");
@@ -15608,20 +15678,9 @@ public:
             throw std::runtime_error(
                 "full native Stage 4 boundary cannot cross a candidate transaction");
         }
-        py::array_t<std::int64_t> statuses(4);
-        py::array_t<double> old_new_weights(
-            {py::ssize_t(4), py::ssize_t(2)});
-        py::array_t<std::int64_t> calls_at_boundary(4);
-        py::array_t<double> rewards_at_boundary(4);
-        auto* status_values = checked_data(statuses);
-        auto* weight_values = checked_data(old_new_weights);
-        std::copy(
-            constraint_segment_calls_.begin(), constraint_segment_calls_.end(),
-            checked_data(calls_at_boundary));
-        std::copy(
-            constraint_segment_rewards_.begin(),
-            constraint_segment_rewards_.end(),
-            checked_data(rewards_at_boundary));
+        evrptw::native_search::Stage04BoundaryStateV2 boundary;
+        boundary.calls_at_boundary = constraint_segment_calls_;
+        boundary.rewards_at_boundary = constraint_segment_rewards_;
         auto next_weights = constraint_weights_;
         auto next_rewards = constraint_segment_rewards_;
         auto next_calls = constraint_segment_calls_;
@@ -15631,9 +15690,10 @@ public:
         const auto is_boundary =
             (iteration + 1) % stage04_segment_length_ == 0;
         for (std::size_t index = 0; index < 4; ++index) {
-            status_values[index] = -1;
-            weight_values[index * 2] = constraint_weights_[index];
-            weight_values[index * 2 + 1] = constraint_weights_[index];
+            boundary.statuses[index] = -1;
+            boundary.old_new_weights[index * 2] = constraint_weights_[index];
+            boundary.old_new_weights[index * 2 + 1] =
+                constraint_weights_[index];
         }
         const auto effective_budget_boundary =
             budget_boundary || budget_.budget_reached();
@@ -15650,10 +15710,11 @@ public:
                     next_weights[index] = stage04_weight_smoothing_
                             * next_weights[index]
                         + (1.0 - stage04_weight_smoothing_) * reacted;
-                    status_values[index] = 1;
-                    weight_values[index * 2 + 1] = next_weights[index];
+                    boundary.statuses[index] = 1;
+                    boundary.old_new_weights[index * 2 + 1] =
+                        next_weights[index];
                 } else {
-                    status_values[index] = 0;
+                    boundary.statuses[index] = 0;
                 }
                 next_rewards[index] = 0.0;
                 next_calls[index] = 0;
@@ -15674,66 +15735,100 @@ public:
                 next_full_calls[index] = 0;
             }
         }
+        auto next_reheat_floor = stage04_reheat_floor_;
+        auto next_reheat_count = stage04_reheat_count_;
+        auto next_restart_count = stage04_restart_count_;
+        auto next_stagnation_iterations = main_stagnation_iterations_;
+        auto next_intensification_active = stage04_intensification_active_;
+        auto next_intensification_remaining =
+            stage04_intensification_remaining_;
         bool reheat_triggered = false;
         if (stage04_reheat_enabled_
-            && stage04_reheat_count_ < stage04_max_reheats_
+            && next_reheat_count < stage04_max_reheats_
             && main_stagnation_iterations_
                 >= stage04_reheat_stagnation_threshold_) {
-            stage04_reheat_floor_ =
+            next_reheat_floor =
                 stage04_initial_temperature_ * stage04_reheat_factor_;
-            ++stage04_reheat_count_;
+            ++next_reheat_count;
             reheat_triggered = true;
         }
+        std::optional<evrptw::native_search::LaneStateV2> restart_lane;
+        py::array_t<std::int64_t> restart_offsets;
+        py::array_t<std::int64_t> restart_indices;
+        py::tuple restart_exact;
+        py::array_t<std::int64_t> restart_objective_integer;
+        py::array_t<double> restart_objective_float;
         bool restart_triggered = false;
         if (stage04_restart_enabled_
-            && stage04_restart_count_ < stage04_max_restarts_
+            && next_restart_count < stage04_max_restarts_
             && main_stagnation_iterations_
                 >= stage04_restart_stagnation_threshold_) {
             validate_live_lane_mirrors();
-            live_lane_states_[0] = live_lane_state(3);
-            publish_live_lane_mirror(0);
-            main_stagnation_iterations_ = 0;
-            ++stage04_restart_count_;
-            stage04_reheat_floor_ =
+            restart_lane = live_lane_state(3);
+            restart_offsets = lane_vector_array(restart_lane->route_offsets);
+            restart_indices = lane_vector_array(restart_lane->route_indices);
+            restart_exact = lane_exact_payload(*restart_lane);
+            restart_objective_integer = py::array_t<std::int64_t>(2);
+            std::copy(
+                restart_lane->objective_integer.begin(),
+                restart_lane->objective_integer.end(),
+                checked_data(restart_objective_integer));
+            restart_objective_float = py::array_t<double>(2);
+            std::copy(
+                restart_lane->objective_float.begin(),
+                restart_lane->objective_float.end(),
+                checked_data(restart_objective_float));
+            next_stagnation_iterations = 0;
+            ++next_restart_count;
+            next_reheat_floor =
                 stage04_initial_temperature_ * stage04_reheat_factor_;
             if (stage04_intensification_enabled_
-                && !stage04_intensification_active_) {
-                stage04_intensification_active_ = true;
-                stage04_intensification_remaining_ =
+                && !next_intensification_active) {
+                next_intensification_active = true;
+                next_intensification_remaining =
                     stage04_intensification_iterations_;
             }
             restart_triggered = true;
         }
-        if (stage04_intensification_active_ && advance_intensification) {
-            if (stage04_intensification_remaining_ > 0) {
-                --stage04_intensification_remaining_;
+        if (next_intensification_active && advance_intensification) {
+            if (next_intensification_remaining > 0) {
+                --next_intensification_remaining;
             } else {
-                stage04_intensification_active_ = false;
+                next_intensification_active = false;
             }
         }
-        py::array_t<std::int64_t> control_status(7);
-        checked_data(control_status)[0] = reheat_triggered ? 1 : 0;
-        checked_data(control_status)[1] = stage04_reheat_count_;
-        checked_data(control_status)[2] = restart_triggered ? 1 : 0;
-        checked_data(control_status)[3] = stage04_restart_count_;
-        checked_data(control_status)[4] =
-            stage04_intensification_active_ ? 1 : 0;
-        checked_data(control_status)[5] = stage04_intensification_remaining_;
-        checked_data(control_status)[6] = main_stagnation_iterations_;
-        py::array_t<double> control_float(1);
-        checked_data(control_float)[0] = stage04_reheat_floor_;
-        auto result = py::make_tuple(
-            std::move(statuses), std::move(old_new_weights),
-            std::move(calls_at_boundary), std::move(rewards_at_boundary),
-            std::move(control_status), std::move(control_float));
+        boundary.control_status = {
+            reheat_triggered ? 1 : 0,
+            next_reheat_count,
+            restart_triggered ? 1 : 0,
+            next_restart_count,
+            next_intensification_active ? 1 : 0,
+            next_intensification_remaining,
+            next_stagnation_iterations,
+        };
+        boundary.reheat_floor = next_reheat_floor;
+        if (restart_lane.has_value()) {
+            live_lane_states_[0] = std::move(restart_lane);
+            legacy_offsets_ = std::move(restart_offsets);
+            legacy_indices_ = std::move(restart_indices);
+            legacy_exact_payload_ = std::move(restart_exact);
+            legacy_objective_integer_ = std::move(restart_objective_integer);
+            legacy_objective_float_ = std::move(restart_objective_float);
+        }
         constraint_weights_ = next_weights;
         constraint_segment_rewards_ = next_rewards;
         constraint_segment_calls_ = next_calls;
-        full_operator_weights_ = next_full_weights;
-        full_operator_segment_rewards_ = next_full_rewards;
-        full_operator_segment_calls_ = next_full_calls;
+        full_operator_weights_ = std::move(next_full_weights);
+        full_operator_segment_rewards_ = std::move(next_full_rewards);
+        full_operator_segment_calls_ = std::move(next_full_calls);
+        stage04_reheat_floor_ = next_reheat_floor;
+        stage04_reheat_count_ = next_reheat_count;
+        stage04_restart_count_ = next_restart_count;
+        main_stagnation_iterations_ = next_stagnation_iterations;
+        stage04_intensification_active_ = next_intensification_active;
+        stage04_intensification_remaining_ = next_intensification_remaining;
         last_finished_stage04_iteration_ = iteration;
-        return result;
+        return boundary;
     }
 
     py::tuple constraint_iteration(
@@ -17085,6 +17180,19 @@ public:
         global_search_envelope_failure_injection_ = true;
     }
 
+    void inject_stage04_boundary_projection_failure_once() {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        if (stage04_boundary_projection_failure_injection_) {
+            throw std::runtime_error(
+                "full native Stage 4 boundary projection injection is already armed");
+        }
+        stage04_boundary_projection_failure_injection_ = true;
+    }
+
     void inject_initial_mirror_schema_failure_once(std::int64_t code) {
         std::unique_lock state_lock(state_mutex_, std::try_to_lock);
         if (!state_lock.owns_lock()) {
@@ -18041,6 +18149,7 @@ private:
     bool constraint_iteration_deadline_injection_ = false;
     bool exact_kernel_deadline_injection_ = false;
     bool global_search_envelope_failure_injection_ = false;
+    bool stage04_boundary_projection_failure_injection_ = false;
     std::int64_t initial_mirror_schema_failure_injection_ = 0;
     bool candidate_round_mirror_tamper_injection_ = false;
     bool live_lane_mirror_tamper_injection_ = false;
@@ -21358,6 +21467,10 @@ PYBIND11_MODULE(_core, module) {
         .def(
             "inject_global_search_envelope_failure_once",
             &NativeSearchEngineV2::inject_global_search_envelope_failure_once)
+        .def(
+            "inject_stage04_boundary_projection_failure_once",
+            &NativeSearchEngineV2::
+                inject_stage04_boundary_projection_failure_once)
         .def(
             "inject_constraint_iteration_deadline_before_commit_once",
             &NativeSearchEngineV2::

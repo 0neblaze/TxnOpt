@@ -75,6 +75,15 @@ struct ThreeLaneTerminationStateV2 final {
     std::int64_t completed_iterations = 0;
 };
 
+struct Stage04BoundaryStateV2 final {
+    std::array<std::int64_t, 4> statuses{};
+    std::array<double, 8> old_new_weights{};
+    std::array<std::int64_t, 4> calls_at_boundary{};
+    std::array<double, 4> rewards_at_boundary{};
+    std::array<std::int64_t, 7> control_status{};
+    double reheat_floor = 0.0;
+};
+
 struct ProblemV2 final {
     std::vector<std::int64_t> node_kind;
     std::vector<double> demand;
