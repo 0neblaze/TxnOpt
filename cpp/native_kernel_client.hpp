@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "native_kernel_protocol.hpp"
+#include "native_search_core.hpp"
 #include "native_sha256.hpp"
 #include "native_solver_kernels.hpp"
 
@@ -267,6 +268,51 @@ inline void acknowledge(
         || released.request_id != response.request_id) {
         throw std::runtime_error("native kernel scheduler release receipt is invalid");
     }
+}
+
+struct SearchRequestReceipt final {
+    std::array<std::int64_t, 8> counts{};
+    std::string sha256;
+};
+
+inline SearchRequestReceipt search_request_receipt(
+    std::string_view socket_path,
+    const evrptw::native_search::RequestV2& request) {
+    const auto request_id = request_counter.fetch_add(1);
+    Socket socket(socket_path);
+    protocol::SharedMapping output_mapping;
+    protocol::ControlFrame response;
+    const auto output = transact(
+        socket_path,
+        evrptw::native_search::request_payload(request, request_id),
+        output_mapping,
+        response,
+        socket);
+    if (output.header().operation
+            != protocol::KernelOperation::search_request_receipt
+        || output.header().request_id != response.request_id
+        || output.header().array_count != 3
+        || output.descriptor(0).count != 8
+        || output.descriptor(1).count != 64) {
+        throw std::runtime_error(
+            "native search-request receipt schema is invalid");
+    }
+    SearchRequestReceipt receipt;
+    const auto* counts = output.data<std::int64_t>(
+        0, protocol::NumericType::int64);
+    std::copy(counts, counts + receipt.counts.size(), receipt.counts.begin());
+    const auto* sha256 = output.data<std::uint8_t>(
+        1, protocol::NumericType::uint8);
+    receipt.sha256.assign(
+        reinterpret_cast<const char*>(sha256),
+        static_cast<std::size_t>(output.descriptor(1).count));
+    if (receipt.sha256 != request.sha256()) {
+        throw std::runtime_error(
+            "native search-request receipt hash mismatch");
+    }
+    record_telemetry(output, 2);
+    acknowledge(socket, response);
+    return receipt;
 }
 
 inline kernels::ExactBatchOutput exact_charging(

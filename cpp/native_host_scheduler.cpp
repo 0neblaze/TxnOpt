@@ -19,6 +19,7 @@
 
 #include "native_concurrency.hpp"
 #include "native_kernel_protocol.hpp"
+#include "native_search_core.hpp"
 #include "native_sha256.hpp"
 #include "native_solver_kernels.hpp"
 
@@ -438,6 +439,23 @@ std::vector<std::uint8_t> execute(
     case protocol::KernelOperation::screen_routes:
         throw std::logic_error(
             "native screening-batch operation requires the shared work pool");
+    case protocol::KernelOperation::search_request_receipt: {
+        const auto request = evrptw::native_search::request_from_payload(input);
+        const auto counts = evrptw::native_search::receipt_counts(request);
+        const auto sha256 = request.sha256();
+        protocol::PayloadBuilder builder(
+            protocol::KernelOperation::search_request_receipt,
+            input.header().request_id);
+        builder.add(protocol::NumericType::int64, counts.data(), counts.size(),
+            counts.size());
+        builder.add(protocol::NumericType::uint8, sha256.data(), sha256.size(),
+            sha256.size());
+        const std::array<double, 4> telemetry{
+            queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0};
+        builder.add(protocol::NumericType::float64, telemetry.data(),
+            telemetry.size(), telemetry.size());
+        return builder.finish();
+    }
     }
     throw std::runtime_error("native scheduler operation is invalid");
 }

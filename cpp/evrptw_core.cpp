@@ -51,6 +51,7 @@
 #include "native_concurrency.hpp"
 #include "native_candidate_plan_runtime.hpp"
 #include "native_kernel_client.hpp"
+#include "native_search_core.hpp"
 #include "native_solver_kernels.hpp"
 
 namespace py = pybind11;
@@ -9101,6 +9102,41 @@ public:
         node_names_ = std::move(decoded);
     }
 
+    void configure_node_names_owned(
+        const evrptw::native_search::ProblemV2& problem) {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock() || initialized_) {
+            throw std::runtime_error(
+                "full native node names must be configured before initialization");
+        }
+        const auto& offsets = problem.node_name_offsets;
+        const auto& bytes = problem.node_name_bytes;
+        if (offsets.size() < 2 || offsets.front() != 0
+            || offsets.back() != static_cast<std::int64_t>(bytes.size())) {
+            throw std::invalid_argument("full native node-name SoA is invalid");
+        }
+        std::vector<std::string> decoded;
+        decoded.reserve(offsets.size() - 1);
+        std::unordered_set<std::string> unique;
+        for (std::size_t index = 0; index + 1 < offsets.size(); ++index) {
+            const auto first = offsets[index];
+            const auto last = offsets[index + 1];
+            if (first < 0 || first >= last
+                || last > static_cast<std::int64_t>(bytes.size())) {
+                throw std::invalid_argument(
+                    "full native node-name offsets must be non-empty and monotonic");
+            }
+            std::string name(
+                reinterpret_cast<const char*>(bytes.data() + first),
+                static_cast<std::size_t>(last - first));
+            if (!unique.insert(name).second) {
+                throw std::invalid_argument("full native node names must be unique");
+            }
+            decoded.push_back(std::move(name));
+        }
+        node_names_ = std::move(decoded);
+    }
+
     py::tuple initialize(
         py::handle node_kind,
         py::handle demand,
@@ -17693,6 +17729,147 @@ thread_local std::shared_ptr<NativeWorkPool> scheduler_work_pool_context;
 thread_local double scheduler_queue_wait_seconds_context = 0.0;
 thread_local std::size_t scheduler_queue_depth_context = 0;
 
+template <typename T>
+std::vector<T> owned_search_vector(
+    py::handle value,
+    const char* name,
+    int dimensions) {
+    auto array = checked_array<T>(value, name, dimensions);
+    return std::vector<T>(
+        checked_data<T>(array), checked_data<T>(array) + array.size());
+}
+
+template <typename T, std::size_t Size>
+std::array<T, Size> owned_search_array(
+    py::handle value,
+    const char* name) {
+    auto array = checked_array<T>(value, name, 1);
+    if (array.size() != static_cast<py::ssize_t>(Size)) {
+        throw std::invalid_argument(
+            std::string(name) + " has an invalid fixed shape");
+    }
+    std::array<T, Size> output{};
+    std::copy(
+        checked_data<T>(array), checked_data<T>(array) + Size,
+        output.begin());
+    return output;
+}
+
+evrptw::native_search::RequestV2 owned_native_search_request_v2(
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle lexical_rank,
+    py::handle node_name_offsets,
+    py::handle node_name_bytes,
+    py::handle initial_route_offsets,
+    py::handle initial_route_indices,
+    py::handle control,
+    py::handle deadline_remaining,
+    py::handle protocol_control,
+    py::handle protocol_options,
+    py::handle stage04_integer,
+    py::handle stage04_float,
+    py::handle operator_integer,
+    py::handle operator_float) {
+    evrptw::native_search::RequestV2 request;
+    auto& problem = request.problem;
+    problem.node_kind = owned_search_vector<std::int64_t>(
+        node_kind, "node_kind", 1);
+    problem.demand = owned_search_vector<double>(demand, "demand", 1);
+    problem.ready_time = owned_search_vector<double>(
+        ready_time, "ready_time", 1);
+    problem.due_date = owned_search_vector<double>(due_date, "due_date", 1);
+    problem.service_time = owned_search_vector<double>(
+        service_time, "service_time", 1);
+    problem.distance = owned_search_vector<double>(distance, "distance", 2);
+    problem.reachable = owned_search_vector<std::uint8_t>(
+        reachable, "reachable", 2);
+    problem.vehicle = owned_search_array<double, 5>(vehicle, "vehicle");
+    problem.lexical_rank = owned_search_vector<std::int64_t>(
+        lexical_rank, "lexical_rank", 1);
+    problem.node_name_offsets = owned_search_vector<std::int64_t>(
+        node_name_offsets, "node_name_offsets", 1);
+    problem.node_name_bytes = owned_search_vector<std::uint8_t>(
+        node_name_bytes, "node_name_bytes", 1);
+    problem.initial_route_offsets = owned_search_vector<std::int64_t>(
+        initial_route_offsets, "initial_route_offsets", 1);
+    problem.initial_route_indices = owned_search_vector<std::int64_t>(
+        initial_route_indices, "initial_route_indices", 1);
+    auto& config = request.config;
+    config.search_control = owned_search_array<std::int64_t, 5>(
+        control, "control");
+    auto deadline_array = checked_array<double>(
+        deadline_remaining, "deadline_remaining", 1);
+    if (deadline_array.size() != 1) {
+        throw std::invalid_argument(
+            "deadline_remaining has an invalid fixed shape");
+    }
+    config.deadline_remaining = checked_data<double>(deadline_array)[0];
+    config.protocol_control = owned_search_array<std::int64_t, 13>(
+        protocol_control, "protocol_control");
+    config.protocol_options = owned_search_array<double, 2>(
+        protocol_options, "protocol_options");
+    config.stage04_integer = owned_search_array<std::int64_t, 15>(
+        stage04_integer, "stage04_integer");
+    config.stage04_float = owned_search_array<double, 15>(
+        stage04_float, "stage04_float");
+    config.operator_integer = owned_search_array<std::int64_t, 24>(
+        operator_integer, "operator_integer");
+    config.operator_float = owned_search_array<double, 7>(
+        operator_float, "operator_float");
+    request.validate();
+    return request;
+}
+
+py::tuple native_search_request_receipt_v2(
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle lexical_rank,
+    py::handle node_name_offsets,
+    py::handle node_name_bytes,
+    py::handle initial_route_offsets,
+    py::handle initial_route_indices,
+    py::handle control,
+    py::handle deadline_remaining,
+    py::handle protocol_control,
+    py::handle protocol_options,
+    py::handle stage04_integer,
+    py::handle stage04_float,
+    py::handle operator_integer,
+    py::handle operator_float) {
+    const auto request = owned_native_search_request_v2(
+        node_kind, demand, ready_time, due_date, service_time, distance,
+        reachable, vehicle, lexical_rank, node_name_offsets, node_name_bytes,
+        initial_route_offsets, initial_route_indices, control,
+        deadline_remaining, protocol_control, protocol_options,
+        stage04_integer, stage04_float, operator_integer, operator_float);
+    py::array_t<std::int64_t> counts(8);
+    auto* values = checked_data(counts);
+    values[0] = static_cast<std::int64_t>(request.problem.node_count());
+    values[1] = static_cast<std::int64_t>(request.problem.route_count());
+    values[2] = static_cast<std::int64_t>(
+        request.problem.initial_route_indices.size());
+    values[3] = static_cast<std::int64_t>(
+        request.problem.node_name_bytes.size());
+    values[4] = static_cast<std::int64_t>(request.problem.distance.size());
+    values[5] = request.config.search_control[1];
+    values[6] = request.config.protocol_control[2];
+    values[7] = request.config.search_control[3];
+    return py::make_tuple(std::move(counts), request.sha256());
+}
+
 py::tuple full_native_alns_v2(
     py::handle node_kind,
     py::handle demand,
@@ -17715,15 +17892,12 @@ py::tuple full_native_alns_v2(
     py::handle stage04_float,
     py::handle operator_integer,
     py::handle operator_float) {
-    static_cast<void>(node_kind);
-    static_cast<void>(demand);
-    static_cast<void>(ready_time);
-    static_cast<void>(due_date);
-    static_cast<void>(service_time);
-    static_cast<void>(distance);
-    static_cast<void>(reachable);
-    static_cast<void>(vehicle);
-    static_cast<void>(lexical_rank);
+    const auto owned_request = owned_native_search_request_v2(
+        node_kind, demand, ready_time, due_date, service_time, distance,
+        reachable, vehicle, lexical_rank, node_name_offsets, node_name_bytes,
+        initial_route_offsets, initial_route_indices, control,
+        deadline_remaining, protocol_control, protocol_options,
+        stage04_integer, stage04_float, operator_integer, operator_float);
     auto initial_offsets = checked_array<std::int64_t>(
         initial_route_offsets, "initial_route_offsets", 1);
     auto initial_indices = checked_array<std::int64_t>(
@@ -17757,8 +17931,7 @@ py::tuple full_native_alns_v2(
         throw std::invalid_argument(
             "full native v2 configuration arrays have an invalid shape");
     }
-    const auto* protocol_values = checked_data<std::int64_t>(
-        protocol_control_array);
+    const auto* protocol_values = owned_request.config.protocol_control.data();
     if ((protocol_values[0] != 0 && protocol_values[0] != 1)
         || protocol_values[1] <= 0 || protocol_values[2] <= 0
         || (protocol_values[3] != 1 && protocol_values[3] != 4)
@@ -17766,12 +17939,16 @@ py::tuple full_native_alns_v2(
         throw std::invalid_argument(
             "full native v2 Candidate Control values are invalid");
     }
-    const auto* options = checked_data<double>(protocol_options_array);
+    const auto* options = owned_request.config.protocol_options.data();
     if (!(options[0] > 0.0 && options[0] <= 1.0)
         || !std::isfinite(options[1]) || options[1] <= 0.0) {
         throw std::invalid_argument("full native v2 protocol options are invalid");
     }
-    const auto* base_control_values = checked_data<std::int64_t>(base_control);
+    const auto* base_control_values = owned_request.config.search_control.data();
+    const auto* operator_integer_values =
+        owned_request.config.operator_integer.data();
+    const auto* operator_float_values =
+        owned_request.config.operator_float.data();
     if (base_control_values[1] < 1) {
         throw std::invalid_argument(
             "full native v2 iteration count must be positive");
@@ -17795,7 +17972,7 @@ py::tuple full_native_alns_v2(
         options[1],
         client_dispatch_threads,
         scheduler_work_pool_context);
-    engine.configure_node_names(node_name_offsets, node_name_bytes);
+    engine.configure_node_names_owned(owned_request.problem);
     engine.suppress_plan_screening_negative_cache(true);
     static_cast<void>(engine.initialize(
         node_kind,
@@ -17817,13 +17994,13 @@ py::tuple full_native_alns_v2(
     }
     py::array_t<std::int64_t> thresholds(3);
     std::copy(
-        checked_data<std::int64_t>(operator_integer_array) + 21,
-        checked_data<std::int64_t>(operator_integer_array) + 24,
+        operator_integer_values + 21,
+        operator_integer_values + 24,
         checked_data(thresholds));
     py::array_t<double> fractions(6);
     std::copy(
-        checked_data<double>(operator_float_array) + 1,
-        checked_data<double>(operator_float_array) + 7,
+        operator_float_values + 1,
+        operator_float_values + 7,
         checked_data(fractions));
     py::array_t<std::int64_t> batch(1);
     checked_data(batch)[0] = base_control_values[2];
@@ -17885,8 +18062,8 @@ py::tuple full_native_alns_v2(
         const auto pre_bootstrap_started =
             checked_data<std::int64_t>(pre_bootstrap_termination)[2];
         auto bootstrap = engine.run_three_lane_bootstrap(
-            checked_data<std::int64_t>(operator_integer_array)[0],
-            checked_data<std::int64_t>(operator_integer_array)[4],
+            operator_integer_values[0],
+            operator_integer_values[4],
             -1, thresholds, fractions, deadline, batch);
         terminal_global = bootstrap;
         if (base_control_values[1] == 1
@@ -17918,18 +18095,18 @@ py::tuple full_native_alns_v2(
                 checked_data(followup_deadline)[0] = remaining;
                 auto followup = engine.run_three_lane_followup(
                     iteration, base_control_values[1], options[0],
-                    checked_data<std::int64_t>(operator_integer_array)[0],
-                    checked_data<std::int64_t>(operator_integer_array)[4],
-                    checked_data<std::int64_t>(operator_integer_array)[12],
-                    checked_data<std::int64_t>(operator_integer_array)[13],
+                    operator_integer_values[0],
+                    operator_integer_values[4],
+                    operator_integer_values[12],
+                    operator_integer_values[13],
                     std::min(
-                        checked_data<std::int64_t>(operator_integer_array)[8],
-                        checked_data<std::int64_t>(operator_integer_array)[11]),
+                        operator_integer_values[8],
+                        operator_integer_values[11]),
                     std::min(
-                        checked_data<std::int64_t>(operator_integer_array)[9],
-                        checked_data<std::int64_t>(operator_integer_array)[10]),
-                    checked_data<std::int64_t>(operator_integer_array)[14],
-                    checked_data<std::int64_t>(operator_integer_array)[15],
+                        operator_integer_values[9],
+                        operator_integer_values[10]),
+                    operator_integer_values[14],
+                    operator_integer_values[15],
                     -1,
                     thresholds, fractions, followup_deadline, batch);
                 auto followup_termination =
@@ -18557,6 +18734,51 @@ py::tuple full_native_alns_v2(
 }
 
 #ifdef __linux__
+py::tuple native_search_request_host_receipt_v2(
+    const std::string& socket_path,
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle lexical_rank,
+    py::handle node_name_offsets,
+    py::handle node_name_bytes,
+    py::handle initial_route_offsets,
+    py::handle initial_route_indices,
+    py::handle control,
+    py::handle deadline_remaining,
+    py::handle protocol_control,
+    py::handle protocol_options,
+    py::handle stage04_integer,
+    py::handle stage04_float,
+    py::handle operator_integer,
+    py::handle operator_float) {
+    if (socket_path.empty()) {
+        throw std::invalid_argument(
+            "native search-request scheduler endpoint is empty");
+    }
+    const auto request = owned_native_search_request_v2(
+        node_kind, demand, ready_time, due_date, service_time, distance,
+        reachable, vehicle, lexical_rank, node_name_offsets, node_name_bytes,
+        initial_route_offsets, initial_route_indices, control,
+        deadline_remaining, protocol_control, protocol_options,
+        stage04_integer, stage04_float, operator_integer, operator_float);
+    evrptw::native_client::SearchRequestReceipt receipt;
+    {
+        py::gil_scoped_release release;
+        receipt = evrptw::native_client::search_request_receipt(
+            socket_path, request);
+    }
+    py::array_t<std::int64_t> counts(receipt.counts.size());
+    std::copy(
+        receipt.counts.begin(), receipt.counts.end(), checked_data(counts));
+    return py::make_tuple(std::move(counts), std::move(receipt.sha256));
+}
+
 py::tuple full_native_alns_host_v2(
     const std::string& socket_path,
     py::handle node_kind,
@@ -19332,6 +19554,30 @@ PYBIND11_MODULE(_core, module) {
         py::arg("control"),
         py::arg("deadline_remaining"));
     module.def(
+        "native_search_request_receipt_v2",
+        &native_search_request_receipt_v2,
+        py::arg("node_kind"),
+        py::arg("demand"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("reachable"),
+        py::arg("vehicle"),
+        py::arg("lexical_rank"),
+        py::arg("node_name_offsets"),
+        py::arg("node_name_bytes"),
+        py::arg("initial_route_offsets"),
+        py::arg("initial_route_indices"),
+        py::arg("control"),
+        py::arg("deadline_remaining"),
+        py::arg("protocol_control"),
+        py::arg("protocol_options"),
+        py::arg("stage04_integer"),
+        py::arg("stage04_float"),
+        py::arg("operator_integer"),
+        py::arg("operator_float"));
+    module.def(
         "full_native_alns_v2",
         &full_native_alns_v2,
         py::arg("node_kind"),
@@ -19356,6 +19602,31 @@ PYBIND11_MODULE(_core, module) {
         py::arg("operator_integer"),
         py::arg("operator_float"));
 #ifdef __linux__
+    module.def(
+        "native_search_request_host_receipt_v2",
+        &native_search_request_host_receipt_v2,
+        py::arg("socket_path"),
+        py::arg("node_kind"),
+        py::arg("demand"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("reachable"),
+        py::arg("vehicle"),
+        py::arg("lexical_rank"),
+        py::arg("node_name_offsets"),
+        py::arg("node_name_bytes"),
+        py::arg("initial_route_offsets"),
+        py::arg("initial_route_indices"),
+        py::arg("control"),
+        py::arg("deadline_remaining"),
+        py::arg("protocol_control"),
+        py::arg("protocol_options"),
+        py::arg("stage04_integer"),
+        py::arg("stage04_float"),
+        py::arg("operator_integer"),
+        py::arg("operator_float"));
     module.def(
         "full_native_alns_host_v2",
         &full_native_alns_host_v2,

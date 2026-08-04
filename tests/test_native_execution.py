@@ -7057,6 +7057,96 @@ def test_full_native_v2_one_call_matches_python_first_iteration(
     assert native_result.backend_metrics["total_seconds"] == timings["exact_seconds"]
 
 
+def test_full_native_v2_owns_and_hashes_the_complete_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full-search boundary must produce a typed owned-input receipt."""
+
+    from evrptw import _core as native_core
+
+    original = native_core.full_native_alns_v2
+    receipts: list[tuple[np.ndarray[Any, np.dtype[np.int64]], str]] = []
+
+    def inspect_request(*args: object) -> object:
+        receipt = native_core.native_search_request_receipt_v2(*args)
+        assert isinstance(receipt, tuple) and len(receipt) == 2
+        counts, request_sha256 = receipt
+        assert isinstance(counts, np.ndarray)
+        assert counts.dtype == np.dtype(np.int64)
+        assert counts.shape == (8,)
+        assert isinstance(request_sha256, str) and len(request_sha256) == 64
+        duplicate_indices = list(args)
+        invalid_indices = np.array(duplicate_indices[12], copy=True)
+        invalid_indices[-1] = invalid_indices[0]
+        duplicate_indices[12] = invalid_indices
+        with pytest.raises(ValueError, match="warm start"):
+            native_core.native_search_request_receipt_v2(*duplicate_indices)
+        mutated_distance = list(args)
+        changed_distance = np.array(mutated_distance[5], copy=True)
+        changed_distance[0, 1] += 0.25
+        mutated_distance[5] = changed_distance
+        changed_receipt = native_core.native_search_request_receipt_v2(
+            *mutated_distance
+        )
+        assert changed_receipt[1] != request_sha256
+        receipts.append((counts, request_sha256))
+        return original(*args)
+
+    monkeypatch.setattr(native_core, "full_native_alns_v2", inspect_request)
+    solve_alns(
+        _fixture_instance(),
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **_full_native_solve_kwargs(),
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    assert len(receipts) == 1
+    assert receipts[0][0].tolist() == [3, 1, 2, 6, 9, 1, 1, 4]
+
+
+def test_full_native_v2_complete_request_crosses_host_binary_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The complete typed search envelope survives UDS/shared-memory transport."""
+
+    from evrptw import _core as native_core
+
+    original = native_core.full_native_alns_v2
+    captured: list[tuple[object, ...]] = []
+
+    def capture_request(*args: object) -> object:
+        captured.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(native_core, "full_native_alns_v2", capture_request)
+    solve_alns(
+        _fixture_instance(),
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        **_full_native_solve_kwargs(),
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    assert len(captured) == 1
+    local_counts, local_sha256 = native_core.native_search_request_receipt_v2(
+        *captured[0]
+    )
+    endpoint = tmp_path / "native-search-request.sock"
+    with NativeHostScheduler(endpoint, worker_threads=24):
+        host_counts, host_sha256 = (
+            native_core.native_search_request_host_receipt_v2(
+                str(endpoint), *captured[0]
+            )
+        )
+
+    np.testing.assert_array_equal(host_counts, local_counts)
+    assert host_sha256 == local_sha256
+
+
 def test_full_native_completion_flags_are_derived_from_causal_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
