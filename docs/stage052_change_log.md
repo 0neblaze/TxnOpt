@@ -3190,3 +3190,34 @@ compatibility fallback（兼容回退）。
   生命周期、异常安全或语义 blocker。复审同时保留非阻断债务：旧 helper 的临时 py-array
   projection、逐次 O(n) lane validation 和缺少防止未来重新读取 mirror 的静态守卫，均需在
   后续 typed helper/GIL ownership 切片继续处理。
+
+## 2026-08-04：candidate-plan cache/exact 的 typed C++ 事务
+
+- `NativeSearchEngineV2.evaluate_plans()` 的 route/negative cache lookup、negative store、
+  exact dispatch、exact result journal 与 exact-cache store 改为连续 `RouteBatchViewV2`
+  和 owned C++ payload；Python ABI 只在公开入口适配一次数组。cache store wrapper 在发布
+  active batch 前完成 Python object、tuple、buffer 与 raw-pointer 获取，发布后只做平凡复制；
+  exact payload 扩展失败和 cache conflict 均在 rollback guard 内，禁止活动批事务逃逸。
+- local pool 与 host scheduler 共用 `validate_exact_batch_output()`：在任何 exact-call completion
+  accounting、path indexing、journal、cache store、telemetry 或 ACK 前，验证 typed descriptor、
+  shape、CSR offset、status/reason、metrics、label/batch counters、node kind、depot/station path 和
+  fixed customer order。新增 `exact_path_offset_oob` production fault，证明自哈希但损坏的 host
+  输出在 ACK 前被拒绝、server-owned shared memory 被回收，且同一 scheduler 可继续下一次求解；
+  仍无 serial/Python fallback。
+- 原 `cache_ownership_receipt` 改为诚实的 lifetime
+  `cache_execution_coverage_receipt`。它只记录 typed negative lookup、exact-cache lookup、exact
+  dispatch 与 exact-cache store 是否曾执行；第 5 位 `typed terminal-state projection complete`
+  明确保留为 0。该回执不是 transaction-bound ownership evidence，production capability bits
+  继续全部为 0。
+- clean code checkpoint `e25590dfea1cb4c5e6f5aa23eec85c122faf048f` 的 wheel SHA-256 为
+  `3f17343bf8855159cc4c755104f471cab62855bf7fd6a84c6a818dca9b9c0938`，extension 为
+  `5b70be1fd29265d16c492c2c5937cf9c192e03fc353fe7187be3c2b426684b75`，scheduler 为
+  `a1cd6e81caa49cdd7d162e44ee1274b7645dd26fd0f6b8760ae004b8d5e80617`。安装后的 extension
+  自报 revision 与 checkpoint 完全一致。
+- clean-wheel 正式验证：cache/exact/deadline/commit/host-corruption 聚焦集合
+  `11 passed, 329 deselected`；四实例三 seed fixed-work 全字段差分 `12 passed`、耗时
+  `91.61s`；完整 `tests/test_native_execution.py` 为 `328 passed, 12 skipped`、耗时
+  `783.91s`。Ruff、83-file strict mypy 与 `git diff --check` 通过。独立 Spec 与 Standards
+  两轴复审均 ACCEPT，确认 ACK 前验证、active-batch 异常安全和回执误报三个 blocker 全部关闭。
+  本条仍不是 full-native/host-scheduler 完工证明，不创建 attempt04，不启动
+  Paired/Pilot/Formal/CUDA，不切换默认架构。
