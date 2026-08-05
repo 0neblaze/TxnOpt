@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 import random
 import socket
 import stat
 import struct
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -255,6 +256,52 @@ def _full_native_solve_kwargs() -> dict[str, object]:
         "screening_config": CheapScreeningConfig(),
         "cache_incremental_config": CacheIncrementalConfig(enabled=True),
         "stage04_config": Stage04Config(),
+    }
+
+
+def _solve_host_scheduler_process(
+    socket_path: str,
+    barrier: Any,
+    pid_queue: Any,
+    start_event: Any,
+) -> dict[str, object]:
+    pid_queue.put(os.getpid())
+    barrier.wait(timeout=30.0)
+    if not start_event.wait(timeout=30.0):
+        raise RuntimeError("parent did not release the topology probe")
+    started = time.monotonic()
+    instance = _candidate_plan_fixture()
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = (
+        ("C1", "C2"),
+        ("C3", "C4"),
+    )
+    threads_before = len(tuple((Path("/proc") / str(os.getpid()) / "task").iterdir()))
+    result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=3,
+        time_limit_seconds=10.0,
+        **solve_kwargs,  # type: ignore[arg-type]
+        native_execution_config=replace(
+            _native_config("host_scheduler"),
+            scheduler_socket_path=socket_path,
+        ),
+    )
+    threads_after = len(tuple((Path("/proc") / str(os.getpid()) / "task").iterdir()))
+    return {
+        "process_id": os.getpid(),
+        "parent_process_id": os.getppid(),
+        "started_monotonic": started,
+        "completed_monotonic": time.monotonic(),
+        "threads_before": threads_before,
+        "threads_after": threads_after,
+        "cpu_affinity": tuple(sorted(os.sched_getaffinity(0))),
+        "objective": result.objective.key if result.objective is not None else None,
+        "customer_sequences": result.customer_sequences,
+        "candidate_work_hash": result.candidate_work_hash,
+        "route_result_hash": result.route_result_hash,
+        "native_statistics": result.native_execution_statistics,
     }
 
 
@@ -9353,6 +9400,51 @@ def test_host_scheduler_requires_exactly_one_owned_initial_state(
         )
 
 
+@pytest.mark.parametrize(
+    ("timing_index", "value", "message"),
+    [
+        (13, 0.0, "global request concurrency telemetry is invalid"),
+        (14, 0.0, "global request concurrency telemetry is invalid"),
+        (15, -1.0, "returned invalid timings"),
+    ],
+)
+def test_host_scheduler_rejects_invalid_global_process_topology_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    timing_index: int,
+    value: float,
+    message: str,
+) -> None:
+    from evrptw import _core as native_core
+
+    original = native_core.full_native_alns_host_v2
+
+    def corrupt_topology(*args: object) -> object:
+        payload = list(original(*args))
+        timings = np.array(payload[4], copy=True)
+        timings[timing_index] = value
+        payload[4] = timings
+        return tuple(payload)
+
+    monkeypatch.setattr(native_core, "full_native_alns_host_v2", corrupt_topology)
+    endpoint = tmp_path / "native-scheduler-invalid-topology.sock"
+    with NativeHostScheduler(endpoint, worker_threads=24), pytest.raises(
+        RuntimeError,
+        match=message,
+    ):
+        solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            **_full_native_solve_kwargs(),
+            native_execution_config=replace(
+                _native_config("host_scheduler"),
+                scheduler_socket_path=str(endpoint),
+            ),
+        )
+
+
 def test_local_full_native_cannot_forge_host_initial_state_ownership(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9446,6 +9538,108 @@ def test_host_scheduler_v2_six_clients_share_pool_and_isolate_state(
         assert result.native_execution_statistics["screening_batch_request_count"] < sum(
             result.native_execution_statistics["candidate_screening_occupancies"]
         )
+
+
+def test_host_scheduler_v2_six_os_processes_share_one_24_thread_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    for name in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        monkeypatch.setenv(name, "1")
+    endpoint = tmp_path / "native-scheduler-six-process.sock"
+    context = multiprocessing.get_context("spawn")
+    original_affinity = os.sched_getaffinity(0)
+    if len(original_affinity) < 24:
+        pytest.skip("requires a host with at least 24 logical CPUs")
+    selected_affinity = frozenset(sorted(original_affinity)[:24])
+    os.sched_setaffinity(0, selected_affinity)
+    try:
+        with (
+            NativeHostScheduler(endpoint, worker_threads=24) as scheduler,
+            context.Manager() as manager,
+            ProcessPoolExecutor(max_workers=6, mp_context=context) as clients,
+        ):
+            barrier = manager.Barrier(6)
+            pid_queue = manager.Queue()
+            start_event = manager.Event()
+            futures = tuple(
+                clients.submit(
+                    _solve_host_scheduler_process,
+                    str(endpoint),
+                    barrier,
+                    pid_queue,
+                    start_event,
+                )
+                for _ in range(6)
+            )
+            client_pids = {int(pid_queue.get(timeout=30.0)) for _ in range(6)}
+            assert len(client_pids) == 6
+            externally_observed_peak_threads = {pid: 0 for pid in client_pids}
+            for pid in client_pids:
+                task_directory = Path("/proc") / str(pid) / "task"
+                assert task_directory.is_dir()
+                externally_observed_peak_threads[pid] = len(
+                    tuple(task_directory.iterdir())
+                )
+            start_event.set()
+            while not all(future.done() for future in futures):
+                for pid in client_pids:
+                    task_directory = Path("/proc") / str(pid) / "task"
+                    if task_directory.is_dir():
+                        externally_observed_peak_threads[pid] = max(
+                            externally_observed_peak_threads[pid],
+                            len(tuple(task_directory.iterdir())),
+                        )
+                time.sleep(0.001)
+            records = tuple(future.result(timeout=1.0) for future in futures)
+            assert scheduler.observed_thread_count() == 31
+            assert os.sched_getaffinity(scheduler.process_id) == selected_affinity
+    finally:
+        os.sched_setaffinity(0, original_affinity)
+
+    assert len({record["process_id"] for record in records}) == 6
+    assert len({record["parent_process_id"] for record in records}) == 1
+    assert max(float(record["started_monotonic"]) for record in records) < min(
+        float(record["completed_monotonic"]) for record in records
+    )
+    peak_active_tasks = max(
+        int(record["native_statistics"]["work_pool_peak_active_tasks"])  # type: ignore[index]
+        for record in records
+    )
+    assert 2 <= peak_active_tasks <= 24
+    assert set(externally_observed_peak_threads) == {
+        int(record["process_id"]) for record in records
+    }
+    assert all(
+        1 <= peak <= 2 for peak in externally_observed_peak_threads.values()
+    )
+    reference = records[0]
+    for record in records:
+        # The Manager barrier may keep one Python proxy thread alive in a
+        # spawned client.  The native receipt below independently proves that
+        # the client owns no compute-dispatch thread or per-solve work pool.
+        assert 1 <= record["threads_before"] <= 2
+        assert 1 <= record["threads_after"] <= 2
+        assert record["cpu_affinity"] == tuple(sorted(selected_affinity))
+        assert record["objective"] == reference["objective"]
+        assert record["customer_sequences"] == reference["customer_sequences"]
+        assert record["candidate_work_hash"] == reference["candidate_work_hash"]
+        assert record["route_result_hash"] == reference["route_result_hash"]
+        statistics = record["native_statistics"]
+        assert isinstance(statistics, dict)
+        assert statistics["fallback_count"] == 0
+        assert statistics["shared_native_work_pool"] is True
+        assert statistics["work_pool_thread_count"] == 24
+        assert statistics["client_dispatch_thread_count"] == 0
+        assert statistics["remote_kernel_request_count"] > 0
+        assert statistics["global_peak_active_requests"] >= 2
+        assert statistics["global_peak_distinct_client_pids"] >= 2
+        assert statistics["scheduler_observed_peer_pid"] == record["process_id"]
 
 
 def test_full_native_v2_concurrent_solves_isolate_state() -> None:

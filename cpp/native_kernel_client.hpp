@@ -44,6 +44,9 @@ struct KernelClientTelemetry final {
     std::size_t request_count = 0;
     std::size_t screening_batch_request_count = 0;
     std::size_t initial_state_request_count = 0;
+    std::size_t global_peak_active_requests = 0;
+    std::size_t global_peak_distinct_client_pids = 0;
+    std::int64_t observed_peer_pid = 0;
 };
 
 inline thread_local KernelClientTelemetry telemetry;
@@ -62,6 +65,19 @@ public:
             telemetry_.peak_active_tasks,
             static_cast<std::size_t>(values[2]));
         telemetry_.pool_thread_count = static_cast<std::size_t>(values[3]);
+        telemetry_.global_peak_active_requests = std::max(
+            telemetry_.global_peak_active_requests,
+            static_cast<std::size_t>(values[4]));
+        telemetry_.global_peak_distinct_client_pids = std::max(
+            telemetry_.global_peak_distinct_client_pids,
+            static_cast<std::size_t>(values[5]));
+        const auto peer_pid = static_cast<std::int64_t>(values[6]);
+        if (telemetry_.observed_peer_pid != 0
+            && telemetry_.observed_peer_pid != peer_pid) {
+            throw std::runtime_error(
+                "native scheduler peer PID changed within one solve");
+        }
+        telemetry_.observed_peer_pid = peer_pid;
         ++telemetry_.request_count;
         telemetry_.screening_batch_request_count += screening_batch ? 1U : 0U;
         telemetry_.initial_state_request_count += initial_state ? 1U : 0U;
@@ -93,8 +109,8 @@ inline void record_telemetry(
     bool initial_state = false) {
     const auto& descriptor = output.descriptor(index);
     if (descriptor.type != protocol::NumericType::float64
-        || descriptor.count != 4 || descriptor.dimensions != 1
-        || descriptor.shape[0] != 4 || descriptor.shape[1] != 0) {
+        || descriptor.count != 7 || descriptor.dimensions != 1
+        || descriptor.shape[0] != 7 || descriptor.shape[1] != 0) {
         throw std::runtime_error("native kernel scheduler telemetry is invalid");
     }
     const auto* values = output.data<double>(
@@ -104,7 +120,15 @@ inline void record_telemetry(
         || values[1] != static_cast<double>(static_cast<std::size_t>(values[1]))
         || !std::isfinite(values[2]) || values[2] < 1.0 || values[2] > 24.0
         || values[2] != static_cast<double>(static_cast<std::size_t>(values[2]))
-        || values[3] != 24.0) {
+        || values[3] != 24.0
+        || !std::isfinite(values[4]) || values[4] < 1.0 || values[4] > 6.0
+        || values[4] != static_cast<double>(static_cast<std::size_t>(values[4]))
+        || !std::isfinite(values[5]) || values[5] < 1.0 || values[5] > 6.0
+        || values[5] != static_cast<double>(static_cast<std::size_t>(values[5]))
+        || !std::isfinite(values[6]) || values[6] <= 0.0
+        || values[6] != static_cast<double>(static_cast<std::int64_t>(values[6]))
+        || static_cast<std::int64_t>(values[6])
+            != static_cast<std::int64_t>(::getpid())) {
         throw std::runtime_error("native kernel scheduler telemetry values are invalid");
     }
     if (telemetry_collector != nullptr) {
@@ -116,6 +140,19 @@ inline void record_telemetry(
         telemetry.peak_active_tasks = std::max(
             telemetry.peak_active_tasks, static_cast<std::size_t>(values[2]));
         telemetry.pool_thread_count = static_cast<std::size_t>(values[3]);
+        telemetry.global_peak_active_requests = std::max(
+            telemetry.global_peak_active_requests,
+            static_cast<std::size_t>(values[4]));
+        telemetry.global_peak_distinct_client_pids = std::max(
+            telemetry.global_peak_distinct_client_pids,
+            static_cast<std::size_t>(values[5]));
+        const auto peer_pid = static_cast<std::int64_t>(values[6]);
+        if (telemetry.observed_peer_pid != 0
+            && telemetry.observed_peer_pid != peer_pid) {
+            throw std::runtime_error(
+                "native scheduler peer PID changed within one solve");
+        }
+        telemetry.observed_peer_pid = peer_pid;
         ++telemetry.request_count;
         telemetry.screening_batch_request_count += screening_batch ? 1U : 0U;
         telemetry.initial_state_request_count += initial_state ? 1U : 0U;
@@ -584,7 +621,7 @@ inline kernels::ExactBatchOutput exact_charging(
         || output.descriptor(7).shape[0] != output.descriptor(7).count
         || output.descriptor(7).shape[1] != 0
         || output.descriptor(7).count > route_count
-        || !one_dimensional(8, protocol::NumericType::float64, 4)) {
+        || !one_dimensional(8, protocol::NumericType::float64, 7)) {
         throw std::runtime_error("native exact output schema is invalid");
     }
     kernels::ExactBatchOutput result;

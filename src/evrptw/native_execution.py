@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import struct
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -13831,7 +13832,7 @@ def execute_full_native_alns(
     timings_array = _require_array(
         payload[4],
         dtype=np.dtype(np.float64),
-        shape=(13,),
+        shape=(16,),
         name="full native timings",
     )
     if any(not math.isfinite(float(value)) or float(value) < 0.0 for value in timings_array):
@@ -13843,7 +13844,7 @@ def execute_full_native_alns(
         abs_tol=1e-12,
     ):
         raise RuntimeError("full native ALNS timing intervals do not reconcile")
-    telemetry_values = timings_array[4:13]
+    telemetry_values = timings_array[4:16]
     if any(float(value) != int(value) for value in telemetry_values):
         raise RuntimeError("full native ALNS concurrency telemetry is not integral")
     initial_state_receipt = _decode_native_initial_state_receipt(
@@ -13876,11 +13877,22 @@ def execute_full_native_alns(
             raise RuntimeError(
                 "host scheduler did not own exactly one initial search state"
             )
+        if not (
+            1 <= int(timings_array[14]) <= int(timings_array[13]) <= 6
+        ):
+            raise RuntimeError(
+                "host scheduler global request concurrency telemetry is invalid"
+            )
+        if int(timings_array[15]) != os.getpid():
+            raise RuntimeError("host scheduler peer PID does not match the client")
     elif (
         int(timings_array[9]) != 0
         or int(timings_array[10]) != 0
         or int(timings_array[11]) != 0
         or int(timings_array[12]) != 0
+        or int(timings_array[13]) != 0
+        or int(timings_array[14]) != 0
+        or int(timings_array[15]) != 0
     ):
         raise RuntimeError("local full-native reported host-only telemetry")
     trajectory_array = payload[5]
@@ -14061,6 +14073,9 @@ def execute_full_native_alns(
             "remote_kernel_request_count": float(timings_array[10]),
             "screening_batch_request_count": float(timings_array[11]),
             "initial_state_request_count": float(timings_array[12]),
+            "global_peak_active_requests": float(timings_array[13]),
+            "global_peak_distinct_client_pids": float(timings_array[14]),
+            "scheduler_observed_peer_pid": float(timings_array[15]),
         },
         trajectory=tuple(
             {

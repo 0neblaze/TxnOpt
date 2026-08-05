@@ -9,12 +9,14 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "native_concurrency.hpp"
@@ -32,6 +34,66 @@ std::atomic<std::uint64_t> segment_counter{0};
 std::string scheduler_run_nonce;
 std::string production_fault;
 std::atomic<bool> production_fault_consumed{false};
+
+struct SchedulerConcurrencySnapshot final {
+    std::size_t peak_active_requests;
+    std::size_t peak_distinct_client_pids;
+};
+
+class SchedulerConcurrencyTelemetry final {
+public:
+    void begin(pid_t peer_pid) {
+        std::lock_guard lock(mutex_);
+        ++active_requests_;
+        ++active_by_pid_[peer_pid];
+        peak_active_requests_ = std::max(
+            peak_active_requests_, active_requests_);
+        peak_distinct_client_pids_ = std::max(
+            peak_distinct_client_pids_, active_by_pid_.size());
+    }
+
+    void end(pid_t peer_pid) noexcept {
+        std::lock_guard lock(mutex_);
+        const auto found = active_by_pid_.find(peer_pid);
+        if (found == active_by_pid_.end() || active_requests_ == 0) {
+            std::terminate();
+        }
+        --active_requests_;
+        if (--found->second == 0) {
+            active_by_pid_.erase(found);
+        }
+    }
+
+    SchedulerConcurrencySnapshot snapshot() const {
+        std::lock_guard lock(mutex_);
+        return {peak_active_requests_, peak_distinct_client_pids_};
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::unordered_map<pid_t, std::size_t> active_by_pid_;
+    std::size_t active_requests_ = 0;
+    std::size_t peak_active_requests_ = 0;
+    std::size_t peak_distinct_client_pids_ = 0;
+};
+
+class ActiveRequestGuard final {
+public:
+    ActiveRequestGuard(
+        SchedulerConcurrencyTelemetry& telemetry, pid_t peer_pid)
+        : telemetry_(telemetry), peer_pid_(peer_pid) {
+        telemetry_.begin(peer_pid_);
+    }
+
+    ~ActiveRequestGuard() noexcept { telemetry_.end(peer_pid_); }
+
+    ActiveRequestGuard(const ActiveRequestGuard&) = delete;
+    ActiveRequestGuard& operator=(const ActiveRequestGuard&) = delete;
+
+private:
+    SchedulerConcurrencyTelemetry& telemetry_;
+    pid_t peer_pid_;
+};
 
 bool read_exact(int descriptor, void* output, std::size_t size) {
     auto* cursor = static_cast<std::uint8_t*>(output);
@@ -228,8 +290,9 @@ std::vector<std::uint8_t> run_exact(
         output.batch_counters.size(), output.batch_counters.size());
     builder.add(protocol::NumericType::int64, output.completion_order.data(),
         output.completion_order.size(), output.completion_order.size());
-    const std::array<double, 4> telemetry{
-        queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0};
+    const std::array<double, 7> telemetry{
+        queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0,
+        0.0, 0.0, 0.0};
     builder.add(protocol::NumericType::float64, telemetry.data(),
         telemetry.size(), telemetry.size());
     return builder.finish();
@@ -314,8 +377,9 @@ std::vector<std::uint8_t> run_screen(
         output.metrics.size(), output.metrics.size());
     const std::int64_t queries = output.reachability_queries;
     builder.add(protocol::NumericType::int64, &queries, 1, 1);
-    const std::array<double, 4> telemetry{
-        queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0};
+    const std::array<double, 7> telemetry{
+        queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0,
+        0.0, 0.0, 0.0};
     builder.add(protocol::NumericType::float64, telemetry.data(),
         telemetry.size(), telemetry.size());
     return builder.finish();
@@ -475,10 +539,10 @@ std::vector<std::uint8_t> run_screen_routes(
         route_count, 15);
     builder.add(protocol::NumericType::int64, queries.data(), queries.size(),
         queries.size());
-    const std::array<double, 4> telemetry{
+    const std::array<double, 7> telemetry{
         queue_wait_seconds, static_cast<double>(queue_depth),
         static_cast<double>(request_peak_active_tasks),
-        static_cast<double>(pool.thread_count())};
+        static_cast<double>(pool.thread_count()), 0.0, 0.0, 0.0};
     builder.add(protocol::NumericType::float64, telemetry.data(),
         telemetry.size(), telemetry.size());
     return builder.finish();
@@ -507,8 +571,9 @@ std::vector<std::uint8_t> execute(
             counts.size());
         builder.add(protocol::NumericType::uint8, sha256.data(), sha256.size(),
             sha256.size());
-        const std::array<double, 4> telemetry{
-            queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0};
+        const std::array<double, 7> telemetry{
+            queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0,
+            0.0, 0.0, 0.0};
         builder.add(protocol::NumericType::float64, telemetry.data(),
             telemetry.size(), telemetry.size());
         return builder.finish();
@@ -554,8 +619,9 @@ std::vector<std::uint8_t> execute(
             state.exact.completion_order.data(),
             state.exact.completion_order.size(),
             state.exact.completion_order.size());
-        const std::array<double, 4> telemetry{
-            queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0};
+        const std::array<double, 7> telemetry{
+            queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0,
+            0.0, 0.0, 0.0};
         builder.add(protocol::NumericType::float64, telemetry.data(),
             telemetry.size(), telemetry.size());
         return builder.finish();
@@ -567,20 +633,25 @@ std::vector<std::uint8_t> execute(
 void patch_pool_telemetry(
     std::vector<std::uint8_t>& output,
     const NativeWorkPool& pool,
-    std::size_t request_peak_active_tasks) {
+    std::size_t request_peak_active_tasks,
+    SchedulerConcurrencySnapshot concurrency,
+    pid_t peer_pid) {
     const protocol::PayloadView view(output.data(), output.size());
     if (view.header().array_count == 0) {
         throw std::logic_error("native scheduler output telemetry is missing");
     }
     const auto& descriptor = view.descriptor(view.header().array_count - 1);
     if (descriptor.type != protocol::NumericType::float64
-        || descriptor.count != 4) {
+        || descriptor.count != 7) {
         throw std::logic_error("native scheduler output telemetry is invalid");
     }
     auto* values = reinterpret_cast<double*>(
         output.data() + descriptor.offset);
     values[2] = static_cast<double>(request_peak_active_tasks);
     values[3] = static_cast<double>(pool.thread_count());
+    values[4] = static_cast<double>(concurrency.peak_active_requests);
+    values[5] = static_cast<double>(concurrency.peak_distinct_client_pids);
+    values[6] = static_cast<double>(peer_pid);
 }
 
 void send_failure(
@@ -602,9 +673,20 @@ void handle_connection(
     int listening_descriptor,
     double queue_wait_seconds,
     std::size_t queue_depth,
-    bool allow_fault_injection) noexcept {
+    bool allow_fault_injection,
+    SchedulerConcurrencyTelemetry& concurrency_telemetry) noexcept {
     std::uint64_t request_id = 0;
     try {
+        ucred peer_credentials{};
+        socklen_t peer_credentials_size = sizeof(peer_credentials);
+        if (::getsockopt(
+                descriptor, SOL_SOCKET, SO_PEERCRED, &peer_credentials,
+                &peer_credentials_size) != 0
+            || peer_credentials_size != sizeof(peer_credentials)
+            || peer_credentials.pid <= 0) {
+            throw std::runtime_error(
+                "native scheduler peer credentials are invalid");
+        }
         protocol::ControlFrame request;
         if (!read_exact(descriptor, &request, sizeof(request))) {
             ::close(descriptor);
@@ -691,23 +773,28 @@ void handle_connection(
         }
         std::vector<std::uint8_t> output_bytes;
         std::size_t request_peak_active_tasks = 0;
-        if (input_view.header().operation
-            == protocol::KernelOperation::screen_routes) {
-            output_bytes = run_screen_routes(
-                input_view, queue_wait_seconds, queue_depth, pool,
-                request_peak_active_tasks);
-        } else {
-            const auto pool_submitted_at = std::chrono::steady_clock::now();
-            pool.parallel_for(1, [&](std::size_t) {
-                const auto pool_wait_seconds = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - pool_submitted_at).count();
-                request_peak_active_tasks = pool.active_task_count();
-                output_bytes = execute(
-                    input_view, queue_wait_seconds + pool_wait_seconds,
-                    queue_depth);
-                request_peak_active_tasks = std::max(
-                    request_peak_active_tasks, pool.active_task_count());
-            });
+        {
+            ActiveRequestGuard active_request(
+                concurrency_telemetry, peer_credentials.pid);
+            if (input_view.header().operation
+                == protocol::KernelOperation::screen_routes) {
+                output_bytes = run_screen_routes(
+                    input_view, queue_wait_seconds, queue_depth, pool,
+                    request_peak_active_tasks);
+            } else {
+                const auto pool_submitted_at = std::chrono::steady_clock::now();
+                pool.parallel_for(1, [&](std::size_t) {
+                    const auto pool_wait_seconds = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now()
+                        - pool_submitted_at).count();
+                    request_peak_active_tasks = pool.active_task_count();
+                    output_bytes = execute(
+                        input_view, queue_wait_seconds + pool_wait_seconds,
+                        queue_depth);
+                    request_peak_active_tasks = std::max(
+                        request_peak_active_tasks, pool.active_task_count());
+                });
+            }
         }
         if (injected_fault == "initial_state_path_offset_oob") {
             const protocol::PayloadView output_view(
@@ -740,7 +827,8 @@ void handle_connection(
                 output_view.descriptor(1).count + 1);
         }
         patch_pool_telemetry(
-            output_bytes, pool, request_peak_active_tasks);
+            output_bytes, pool, request_peak_active_tasks,
+            concurrency_telemetry.snapshot(), peer_credentials.pid);
         const auto output_name = "/evrptw-s52-kernel-" + std::to_string(::getpid())
             + "-" + scheduler_run_nonce + "-"
             + std::to_string(segment_counter.fetch_add(1));
@@ -870,6 +958,7 @@ int main(int argc, char** argv) {
         }
         NativeWorkPool pool(worker_threads);
         NativeRequestQueue queue;
+        SchedulerConcurrencyTelemetry concurrency_telemetry;
         std::atomic<bool> stopping{false};
         listener = make_listener(socket_path);
         std::vector<std::thread> request_threads;
@@ -895,7 +984,7 @@ int main(int argc, char** argv) {
                     handle_connection(
                         request->descriptor, pool, stopping, listener,
                         queue_wait_seconds, request->queue_depth_on_submit,
-                        allow_fault_injection);
+                        allow_fault_injection, concurrency_telemetry);
                 }
             });
         }

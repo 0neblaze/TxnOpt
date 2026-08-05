@@ -5958,6 +5958,15 @@ def _solve_full_native_alns(
             "initial_state_request_count": int(
                 native_result.timings["initial_state_request_count"]
             ),
+            "global_peak_active_requests": int(
+                native_result.timings["global_peak_active_requests"]
+            ),
+            "global_peak_distinct_client_pids": int(
+                native_result.timings["global_peak_distinct_client_pids"]
+            ),
+            "scheduler_observed_peer_pid": int(
+                native_result.timings["scheduler_observed_peer_pid"]
+            ),
             "initial_state_receipt": {
                 "schema_version": "stage05.2-native-initial-state-receipt-v3",
                 "host_owned": native_result.initial_state_receipt.host_owned,

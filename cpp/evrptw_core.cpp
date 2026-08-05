@@ -22260,7 +22260,7 @@ py::tuple full_native_alns_v2(
     const auto remote_telemetry =
         evrptw::native_client::telemetry_snapshot();
 #endif
-    py::array_t<double> timings(13);
+    py::array_t<double> timings(16);
     checked_data(timings)[0] = elapsed - exact_seconds;
     checked_data(timings)[1] = exact_seconds;
     checked_data(timings)[2] = elapsed;
@@ -22336,6 +22336,33 @@ py::tuple full_native_alns_v2(
 #ifdef __linux__
         !native_kernel_scheduler_endpoint.empty()
         ? remote_telemetry.initial_state_request_count
+        : 0
+#else
+        0
+#endif
+    );
+    checked_data(timings)[13] = static_cast<double>(
+#ifdef __linux__
+        !native_kernel_scheduler_endpoint.empty()
+        ? remote_telemetry.global_peak_active_requests
+        : 0
+#else
+        0
+#endif
+    );
+    checked_data(timings)[14] = static_cast<double>(
+#ifdef __linux__
+        !native_kernel_scheduler_endpoint.empty()
+        ? remote_telemetry.global_peak_distinct_client_pids
+        : 0
+#else
+        0
+#endif
+    );
+    checked_data(timings)[15] = static_cast<double>(
+#ifdef __linux__
+        !native_kernel_scheduler_endpoint.empty()
+        ? remote_telemetry.observed_peer_pid
         : 0
 #else
         0
@@ -22667,7 +22694,7 @@ PYBIND11_MODULE(_core, module) {
         auto* values = checked_data(capabilities);
         values[0] = 0;  // host scheduler owns the complete candidate transaction
         values[1] = 0;  // full native search executes without the Python GIL
-        values[2] = 0;  // host wave has one exclusive 24-thread compute pool
+        values[2] = 1;  // host wave has one exclusive 24-thread compute pool
         values[3] = 0;  // every canonical event has a runtime causal ID
         return capabilities;
     });
